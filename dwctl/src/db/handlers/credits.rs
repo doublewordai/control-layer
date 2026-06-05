@@ -255,7 +255,8 @@ impl<'c> Credits<'c> {
     }
 
     /// Send pg_notify when a user's balance is restored (crosses zero upward).
-    /// Format: "credits_transactions:{epoch_micros}" to match other triggers and enable lag metrics.
+    /// Format: "credits_transactions:<op>:<user_id>:<epoch_micros>" so the onwards sync can
+    /// scope the reload to this user's deployments (a delta) instead of a full reload.
     async fn notify_balance_restored(&mut self, user_id: UserId) -> Result<()> {
         trace!("Balance restored for user_id {}, notifying onwards", user_id);
 
@@ -264,7 +265,9 @@ impl<'c> Credits<'c> {
             .unwrap_or_default()
             .as_micros();
 
-        let payload = format!("credits_transactions:{}", epoch_micros);
+        // Payload verbs (deplete/restore) and the <table>:<op>:<scope_id>:<epoch> format
+        // are documented in migration 103_enrich_onwards_notify_payload.sql.
+        let payload = format!("credits_transactions:restore:{}:{}", user_id, epoch_micros);
 
         sqlx::query("SELECT pg_notify('auth_config_changed', $1)")
             .bind(&payload)

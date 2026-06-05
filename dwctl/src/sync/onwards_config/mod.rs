@@ -28,22 +28,60 @@ use crate::{
     types::{ApiKeyId, DeploymentId},
 };
 
-/// Parse the NOTIFY payload to extract the timestamp
-/// Payload format: "table_name:epoch_microseconds"
-/// Returns the table name and the elapsed time since the notification was sent
-fn parse_notify_payload(payload: &str) -> Option<(&str, std::time::Duration)> {
-    let parts: Vec<&str> = payload.split(':').collect();
-    if parts.len() != 2 {
-        return None;
-    }
-    let table_name = parts[0];
-    let epoch_micros: i64 = parts[1].parse().ok()?;
+/// A parsed change notification from the `auth_config_changed` channel.
+///
+/// Backward-compatible across payload formats: the legacy `table:epoch` (no entity
+/// id ⇒ full reload), the enriched `table:op:id:epoch`, and the JSON
+/// `{table, operation, id, timestamp}` form emitted by some triggers.
+#[derive(Debug, Clone)]
+struct NotifyChange {
+    table: String,
+    /// `INSERT` / `UPDATE` / `DELETE`, when the payload carries it.
+    #[allow(dead_code)]
+    op: Option<String>,
+    /// The change's scope entity id (a deployment id or a user id, depending on the
+    /// table), used to scope the delta. `None` ⇒ fall back to a full reload.
+    scope_id: Option<uuid::Uuid>,
+    /// Time from the database change to receipt, for the lag metric.
+    lag: std::time::Duration,
+}
 
-    // Calculate elapsed time since the notification was sent
+fn parse_notify_payload(payload: &str) -> Option<NotifyChange> {
     let now_micros = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok()?.as_micros() as i64;
+    let lag_from = |epoch: i64| std::time::Duration::from_micros(now_micros.saturating_sub(epoch).max(0) as u64);
 
-    let lag_micros = now_micros.saturating_sub(epoch_micros);
-    Some((table_name, std::time::Duration::from_micros(lag_micros as u64)))
+    let trimmed = payload.trim();
+    if trimmed.starts_with('{') {
+        // JSON form: {"table": ..., "operation": ..., "id": ..., "timestamp": ...}
+        let v: serde_json::Value = serde_json::from_str(trimmed).ok()?;
+        let table = v.get("table")?.as_str()?.to_string();
+        let op = v.get("operation").and_then(|o| o.as_str()).map(str::to_string);
+        let scope_id = v.get("id").and_then(|i| i.as_str()).and_then(|s| uuid::Uuid::parse_str(s).ok());
+        let lag = v
+            .get("timestamp")
+            .and_then(serde_json::Value::as_i64)
+            .map(lag_from)
+            .unwrap_or_default();
+        return Some(NotifyChange { table, op, scope_id, lag });
+    }
+
+    match trimmed.split(':').collect::<Vec<_>>().as_slice() {
+        // Legacy `table:epoch` — no entity id, so the caller does a full reload.
+        [table, epoch] => Some(NotifyChange {
+            table: (*table).to_string(),
+            op: None,
+            scope_id: None,
+            lag: lag_from(epoch.parse().ok()?),
+        }),
+        // Enriched `table:op:id:epoch`.
+        [table, op, id, epoch] => Some(NotifyChange {
+            table: (*table).to_string(),
+            op: Some((*op).to_string()),
+            scope_id: uuid::Uuid::parse_str(id).ok(),
+            lag: lag_from(epoch.parse().ok()?),
+        }),
+        _ => None,
+    }
 }
 
 /// Complete data needed for one onwards target configuration
@@ -101,6 +139,20 @@ struct OnwardsApiKey {
     user_verified: bool,
 }
 
+/// In-memory assembled routing state held by the sync task.
+///
+/// Holding the assembled state lets a change patch only the affected slice (via a
+/// scoped re-query) instead of re-running the heavy `load_full_state` query on every
+/// reload. [`assemble`] rebuilds the onwards [`Targets`] from this — pure, no DB — on
+/// each send, so the dwctl→onwards handoff stays a free in-process channel swap.
+#[derive(Debug, Clone, Default)]
+struct TargetState {
+    /// Regular (non-composite) targets, keyed by deployment id.
+    regular: HashMap<DeploymentId, OnwardsTarget>,
+    /// Composite models (each carries its own deployment id internally).
+    composites: Vec<OnwardsCompositeModel>,
+}
+
 /// Manages the integration between onwards-pilot and the onwards proxy
 pub struct OnwardsConfigSync {
     db: PgPool,
@@ -118,6 +170,10 @@ pub struct OnwardsConfigSync {
     /// Default rate-limit tiers applied to API keys based on the owning user's
     /// `verified` flag. Used when a key has no per-key override.
     rate_limit_tiers: RateLimitTiersConfig,
+    /// Assembled in-memory routing state. Patched in place by scoped deltas (and
+    /// fully reloaded by cold start / fallback / reconnect), then reassembled into
+    /// `Targets` on each publish.
+    state: TargetState,
 }
 
 pub struct SyncConfig {
@@ -162,8 +218,10 @@ impl OnwardsConfigSync {
         strict_mode: bool,
         rate_limit_tiers: RateLimitTiersConfig,
     ) -> Result<(Self, Targets, WatchTargetsStream), anyhow::Error> {
-        // Load initial configuration (including composite models)
-        let initial_targets = load_targets_from_db(&db, &escalation_models, strict_mode, &rate_limit_tiers).await?;
+        // Load initial configuration (including composite models) into the in-memory
+        // state, then assemble the first snapshot from it.
+        let state = load_full_state(&db, &escalation_models, &[]).await?;
+        let initial_targets = assemble(&state, strict_mode, &rate_limit_tiers)?;
 
         // If daemon limits are provided, populate them
         if let Some(ref limits) = daemon_capacity_limits {
@@ -188,6 +246,7 @@ impl OnwardsConfigSync {
             cache_info_state,
             strict_mode,
             rate_limit_tiers,
+            state,
         };
         let stream = WatchTargetsStream::new(receiver);
 
@@ -199,12 +258,210 @@ impl OnwardsConfigSync {
         self.sender.clone()
     }
 
+    /// Reload routing state and return the assembled `Targets` for the caller to
+    /// publish. An empty `scope` does a full reload; a non-empty `scope` re-queries
+    /// only those deployments and replaces that slice of the in-memory state in
+    /// place. Both paths run the same SQL, so a scoped patch yields the same result
+    /// a full reload would. Also refreshes daemon capacity limits and cache metrics.
+    async fn reload_into_state(&mut self, scope: &[DeploymentId]) -> Result<Targets, anyhow::Error> {
+        if scope.is_empty() {
+            self.state = load_full_state(&self.db, &self.escalation_models, &[]).await?;
+        } else {
+            let slice = load_full_state(&self.db, &self.escalation_models, scope).await?;
+            let affected: std::collections::HashSet<DeploymentId> = scope.iter().copied().collect();
+            // Drop the affected deployments, then re-insert whatever still exists
+            // (deleted / now-inaccessible deployments simply don't come back).
+            self.state.regular.retain(|id, _| !affected.contains(id));
+            self.state.composites.retain(|c| !affected.contains(&c.id));
+            self.state.regular.extend(slice.regular);
+            self.state.composites.extend(slice.composites);
+        }
+
+        let new_targets = assemble(&self.state, self.strict_mode, &self.rate_limit_tiers)?;
+
+        if let Some(ref limits) = self.daemon_capacity_limits
+            && let Err(e) = update_daemon_capacity_limits(&self.db, limits, self.default_batch_capacity).await
+        {
+            error!("Failed to update daemon capacity limits: {}", e);
+        }
+
+        if let Err(e) = crate::metrics::update_cache_info_metrics(&self.db, &new_targets, &mut self.cache_info_state).await {
+            error!("Failed to update cache info metrics: {}", e);
+        }
+
+        Ok(new_targets)
+    }
+
+    /// Map a change notification to the deployments it affects, so the reload can be
+    /// scoped to that slice. An empty result requests a full reload — used when the
+    /// payload carries no scope id, for system-wide changes, and for tables whose
+    /// impact can't be narrowed. Over-scoping is safe (extra deployments just get
+    /// re-queried); under-scoping is not, so anything uncertain falls back to a full
+    /// reload, and the periodic fallback is the ultimate self-heal.
+    async fn resolve_change_scope(&self, change: Option<&NotifyChange>) -> Vec<DeploymentId> {
+        let Some(change) = change else {
+            return Vec::new();
+        };
+        let Some(scope_id) = change.scope_id else {
+            return Vec::new();
+        };
+        match change.table.as_str() {
+            // A deployed_models change (endpoint, rates, flags) is embedded by any composite
+            // that uses it as a component, so re-query the deployment AND its parent composites.
+            "deployed_models" => {
+                let mut scope = vec![scope_id];
+                match self.composites_for_component(scope_id).await {
+                    Ok(parents) => scope.extend(parents),
+                    Err(e) => {
+                        error!("Failed to resolve composites for component {scope_id}: {e}; full reload");
+                        return Vec::new();
+                    }
+                }
+                scope
+            }
+            // The scope id is itself a deployment id: re-query just that deployment.
+            // (The inference_endpoints trigger emits one notify per deployment on the
+            // endpoint, so the scope id is already a deployment id for that table too.)
+            "deployment_groups" | "model_tariffs" | "model_traffic_rules" | "deployed_model_components" | "inference_endpoints" => {
+                vec![scope_id]
+            }
+            // The scope id is a user id whose key list on their reachable deployments changed,
+            // but the user STILL reaches those deployments — a key, balance, or verified change
+            // does not alter reachability. So scope to the user's current reachable set.
+            // (`credits_transactions` is the app-level balance-crossing notify.) The system
+            // user (nil uuid) reaches everything, so fall back to a full reload.
+            "api_keys" | "credits_transactions" | "users" if scope_id != uuid::Uuid::nil() => {
+                match self.deployments_for_user(scope_id).await {
+                    Ok(ids) => ids,
+                    Err(e) => {
+                        error!("Failed to resolve deployments for user {scope_id}: {e}; doing a full reload");
+                        Vec::new()
+                    }
+                }
+            }
+            // A user_groups change (a user joined or left group G) can only change the key
+            // list of the deployments G grants. A REVOCATION removes access to a deployment
+            // the user can NO LONGER reach, so `deployments_for_user` (current reachability)
+            // would miss it and leave the revoked key cached. Scoping by the GROUP's
+            // deployments (migration 105 emits the group id here) captures that revoked
+            // deployment AND stays a cheap delta. A nil group id is not a real grant, so it
+            // falls through to a full reload.
+            "user_groups" if scope_id != uuid::Uuid::nil() => match self.deployments_for_group(scope_id).await {
+                Ok(ids) => ids,
+                Err(e) => {
+                    error!("Failed to resolve deployments for group {scope_id}: {e}; doing a full reload");
+                    Vec::new()
+                }
+            },
+            // user_organizations membership does NOT grant deployment access — the routing
+            // query joins user_groups + the public group only and never references
+            // user_organizations — so an org change can't alter any deployment's key list. It
+            // still arrives as a NOTIFY, so fall back to a full reload: wasteful but correct,
+            // and org-membership churn is rare. (A revocation here also could not be
+            // user-scoped, so a full reload is the safe floor regardless.)
+            "user_organizations" => Vec::new(),
+            // Unmapped → full reload. Two distinct causes, logged differently: a user-table
+            // change by the system user (nil uuid, which reaches everything) is expected, so
+            // debug; a genuinely unknown table means a trigger fires without a resolver arm
+            // (config drift), which should surface without debug logging, so warn.
+            other => {
+                if scope_id == uuid::Uuid::nil() {
+                    debug!("System-user (nil) change to '{other}'; falling back to a full reload");
+                } else {
+                    warn!("No delta scope mapping for table '{other}' (scope_id={scope_id}); falling back to a full reload");
+                }
+                Vec::new()
+            }
+        }
+    }
+
+    /// All deployments a user can reach — group-assigned, public, or batch-escalation
+    /// targets (batch keys get automatic access to escalation models for failover, so a
+    /// key/membership change for the owner must re-query those targets too). Ignores
+    /// balance (the scoped re-query re-applies the balance gate) and deliberately
+    /// over-includes, so a key/membership change is never missed.
+    async fn deployments_for_user(&self, user_id: uuid::Uuid) -> Result<Vec<DeploymentId>, anyhow::Error> {
+        let ids = sqlx::query_scalar!(
+            r#"
+            SELECT dm.id
+            FROM deployed_models dm
+            WHERE dm.deleted = FALSE
+              AND (
+                EXISTS (
+                    SELECT 1 FROM user_groups ug
+                    INNER JOIN deployment_groups dg ON ug.group_id = dg.group_id
+                    WHERE dg.deployment_id = dm.id AND ug.user_id = $1
+                )
+                OR EXISTS (
+                    SELECT 1 FROM deployment_groups dg
+                    WHERE dg.deployment_id = dm.id
+                      AND dg.group_id = '00000000-0000-0000-0000-000000000000'
+                )
+                OR dm.alias = ANY($2::text[])
+              )
+            "#,
+            user_id,
+            &self.escalation_models
+        )
+        .fetch_all(&self.db)
+        .await?;
+        Ok(ids)
+    }
+
+    /// All deployments a group grants access to (its `deployment_groups` rows). A
+    /// `user_groups` change (a user joining or leaving the group) can only affect these
+    /// deployments — and, unlike `deployments_for_user`, this set still includes a deployment
+    /// the user was just REVOKED from, so the scoped delta refreshes its key list instead of
+    /// leaving the revoked key cached. `group_id` is indexed (idx_deployment_groups_group_id).
+    async fn deployments_for_group(&self, group_id: uuid::Uuid) -> Result<Vec<DeploymentId>, anyhow::Error> {
+        let ids = sqlx::query_scalar!(
+            r#"
+            SELECT deployment_id
+            FROM deployment_groups
+            WHERE group_id = $1
+            "#,
+            group_id
+        )
+        .fetch_all(&self.db)
+        .await?;
+        Ok(ids)
+    }
+
+    /// Composite deployments that embed `component_id` as an enabled component. They copy the
+    /// component's config (endpoint, rate limits, flags), so a change to the component must
+    /// also re-query its parent composites — otherwise they'd serve stale component config.
+    async fn composites_for_component(&self, component_id: DeploymentId) -> Result<Vec<DeploymentId>, anyhow::Error> {
+        let ids = sqlx::query_scalar!(
+            r#"
+            SELECT DISTINCT dmc.composite_model_id
+            FROM deployed_model_components dmc
+            JOIN deployed_models cm ON cm.id = dmc.composite_model_id
+            WHERE dmc.deployed_model_id = $1 AND dmc.enabled = TRUE AND cm.deleted = FALSE
+            "#,
+            component_id
+        )
+        .fetch_all(&self.db)
+        .await?;
+        Ok(ids)
+    }
+
     /// Starts the background task that listens for database changes and updates the configuration
     #[instrument(skip(self, config, shutdown_token), err)]
     pub async fn start(mut self, config: SyncConfig, shutdown_token: CancellationToken) -> Result<(), anyhow::Error> {
         // Debouncing: prevent rapid-fire reloads
         let mut last_reload_time = std::time::Instant::now();
         const MIN_RELOAD_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+        // The constructor already loaded the initial state, so the first connect skips
+        // the resync; each reconnect does a full resync to catch changes that arrived
+        // while the listener was down (those NOTIFYs were missed).
+        let mut first_connect = true;
+
+        // Content hash of the routing-config tables as of our last successful sync. The
+        // periodic fallback recomputes it and skips the full reload when unchanged —
+        // balance and structural changes both arrive via NOTIFY (deltas) now, so the
+        // full reload is only needed to catch a genuinely missed change.
+        let mut last_config_hash: Option<String> = None;
 
         // Fallback sync interval (0 = disabled)
         let fallback_interval = if config.fallback_interval_milliseconds > 0 {
@@ -225,6 +482,22 @@ impl OnwardsConfigSync {
                 tx.send(SyncStatus::Connected).await?;
             }
             info!("Started onwards configuration listener");
+
+            if first_connect {
+                first_connect = false;
+            } else {
+                info!("Reconnected to database — running a full resync to catch missed changes");
+                match self.reload_into_state(&[]).await {
+                    Ok(targets) => {
+                        if self.sender.send(targets).is_err() {
+                            error!("Resync send failed (receivers dropped); exiting sync task");
+                            break 'outer;
+                        }
+                        last_config_hash = config_content_hash(&self.db).await.ok();
+                    }
+                    Err(e) => error!("Resync after reconnect failed: {}", e),
+                }
+            }
 
             // Create fallback sync timer (if enabled)
             let mut fallback_timer = fallback_interval.map(|interval| {
@@ -265,36 +538,64 @@ impl OnwardsConfigSync {
                                 debug!("Received notification on channel: {} with payload: {:?}",
                                       notification.channel(), notification.payload());
 
-                                // Parse the notification timestamp for lag measurement
-                                let notify_info = parse_notify_payload(notification.payload());
-
-                                // Debounce: skip if we just reloaded recently
-                                if last_reload_time.elapsed() < MIN_RELOAD_INTERVAL {
-                                    debug!("Skipping reload due to debouncing (last reload was {:?} ago)",
-                                           last_reload_time.elapsed());
-                                    continue;
+                                // Parse the change notification (table + optional scope id + lag).
+                                let change = parse_notify_payload(notification.payload());
+                                if change.is_none() {
+                                    // An unparseable payload means a trigger bug, a version
+                                    // mismatch, or an external sender — surface it at warn so
+                                    // it is visible without debug logging enabled.
+                                    warn!(
+                                        payload = %notification.payload(),
+                                        "Unparseable NOTIFY payload, falling back to a full reload"
+                                    );
                                 }
 
-                                // Reload configuration from database (including composite models)
+                                // Which deployments this change touches (empty = full reload).
+                                let mut scope = self.resolve_change_scope(change.as_ref()).await;
+
+                                // Debounce by COALESCING, not dropping. If we reloaded very recently,
+                                // wait out the rest of the window and fold every notification that
+                                // arrives during it into a single reload. Dropping a notification (the
+                                // old behaviour) was only safe when every reload was a full reload;
+                                // with scoped deltas a dropped notification's scope would never be
+                                // re-queried until the periodic fallback, leaving the cache stale (and
+                                // a request routed against it failing) for up to the fallback interval.
+                                let elapsed = last_reload_time.elapsed();
+                                if elapsed < MIN_RELOAD_INTERVAL {
+                                    tokio::time::sleep(MIN_RELOAD_INTERVAL - elapsed).await;
+                                }
+                                // Fold in everything buffered during the window. An empty scope means a
+                                // full reload, which subsumes the rest. `try_recv()` awaits the next
+                                // notification rather than returning immediately, so bound each drain
+                                // step with a short timeout: collect what is already buffered, then
+                                // stop. Anything still in flight is handled on a later loop iteration
+                                // (never dropped).
+                                while let Ok(Ok(Some(n))) =
+                                    tokio::time::timeout(std::time::Duration::from_millis(5), listener.try_recv()).await
+                                {
+                                    if scope.is_empty() {
+                                        continue; // already a full reload; just drain the queue
+                                    }
+                                    let extra = self
+                                        .resolve_change_scope(parse_notify_payload(n.payload()).as_ref())
+                                        .await;
+                                    if extra.is_empty() {
+                                        scope.clear();
+                                    } else {
+                                        scope.extend(extra);
+                                    }
+                                }
+
+                                // Reload — scoped to the affected deployments when the
+                                // payload identifies them, otherwise a full reload.
                                 last_reload_time = std::time::Instant::now();
-                                match load_targets_from_db(&self.db, &self.escalation_models, self.strict_mode, &self.rate_limit_tiers).await {
+                                match self.reload_into_state(&scope).await {
                                     Ok(new_targets) => {
-                                        debug!("Loaded {} targets from database", new_targets.targets.len());
-                                        for entry in new_targets.targets.iter() {
-                                            let alias = entry.key();
-                                            debug!("Target '{}' loaded", alias);
-                                        }
-
-                                        // Update daemon capacity limits if configured
-                                        if let Some(ref limits) = self.daemon_capacity_limits
-                                            && let Err(e) = update_daemon_capacity_limits(&self.db, limits, self.default_batch_capacity).await {
-                                                error!("Failed to update daemon capacity limits: {}", e);
-                                            }
-
-                                        // Update cache info metrics
-                                        if let Err(e) = crate::metrics::update_cache_info_metrics(&self.db, &new_targets, &mut self.cache_info_state).await {
-                                            error!("Failed to update cache info metrics: {}", e);
-                                        }
+                                        debug!(
+                                            "Reloaded {} targets ({})",
+                                            new_targets.targets.len(),
+                                            if scope.is_empty() { "full" } else { "delta" }
+                                        );
 
                                         // Send update through watch channel
                                         if let Err(e) = self.sender.send(new_targets) {
@@ -303,19 +604,30 @@ impl OnwardsConfigSync {
                                             break;
                                         }
 
-                                        // Record metric for LISTEN/NOTIFY sync
-                                        metrics::counter!("dwctl_cache_sync_total", "source" => "listen_notify").increment(1);
+                                        // Record metric for LISTEN/NOTIFY sync, labelled by whether the
+                                        // reload was a scoped delta or a full reload — so delta-vs-full
+                                        // frequency is observable in production.
+                                        metrics::counter!(
+                                            "dwctl_cache_sync_total",
+                                            "source" => "listen_notify",
+                                            "mode" => if scope.is_empty() { "full" } else { "delta" }
+                                        )
+                                        .increment(1);
 
                                         // Record cache sync lag metric (time from DB change to cache update)
-                                        if let Some((table_name, lag)) = notify_info {
-                                            let lag_seconds = lag.as_secs_f64();
-                                            histogram!("dwctl_cache_sync_lag_seconds", "table" => table_name.to_string())
+                                        if let Some(ref c) = change {
+                                            let lag_seconds = c.lag.as_secs_f64();
+                                            histogram!("dwctl_cache_sync_lag_seconds", "table" => c.table.clone())
                                                 .record(lag_seconds);
                                             info!("Updated onwards configuration successfully (sync lag: {:.3}ms from {})",
-                                                  lag_seconds * 1000.0, table_name);
+                                                  lag_seconds * 1000.0, c.table);
                                         } else {
                                             info!("Updated onwards configuration successfully");
                                         }
+
+                                        // Remember the config we just synced so the periodic
+                                        // fallback can skip the full reload until it changes again.
+                                        last_config_hash = config_content_hash(&self.db).await.ok();
                                     }
                                     Err(e) => {
                                         error!("Failed to load targets from database: {}", e);
@@ -364,36 +676,37 @@ impl OnwardsConfigSync {
                         }
 
                         last_reload_time = std::time::Instant::now();
-                        match load_targets_from_db(&self.db, &self.escalation_models, self.strict_mode, &self.rate_limit_tiers).await {
-                            Ok(new_targets) => {
-                                debug!("Fallback sync: loaded {} targets from database", new_targets.targets.len());
 
-                                // Update daemon capacity limits if configured
-                                if let Some(ref limits) = self.daemon_capacity_limits
-                                    && let Err(e) = update_daemon_capacity_limits(&self.db, limits, self.default_batch_capacity).await {
-                                        error!("Failed to update daemon capacity limits: {}", e);
-                                    }
-
-                                // Update cache info metrics
-                                if let Err(e) = crate::metrics::update_cache_info_metrics(&self.db, &new_targets, &mut self.cache_info_state).await {
-                                    error!("Failed to update cache info metrics: {}", e);
-                                }
-
-                                // Send update through watch channel
-                                if let Err(e) = self.sender.send(new_targets) {
-                                    error!("Failed to send targets update: {}", e);
-                                    // If all receivers are dropped, we can exit
-                                    break;
-                                }
-
-                                // Record metric for fallback sync
-                                metrics::counter!("dwctl_cache_sync_total", "source" => "fallback").increment(1);
-                                debug!("Fallback sync: updated onwards configuration successfully");
+                        // Hash-gate the fallback: only run the expensive full reload when the
+                        // routing config actually changed since our last sync. Balance and
+                        // structural changes arrive via NOTIFY (deltas), so in steady state the
+                        // hash is unchanged and the full reload is skipped entirely.
+                        match config_content_hash(&self.db).await {
+                            Ok(hash) if last_config_hash.as_deref() == Some(hash.as_str()) => {
+                                debug!("Fallback sync: config unchanged, skipping full reload");
+                                metrics::counter!("dwctl_cache_sync_total", "source" => "fallback_skipped").increment(1);
                             }
-                            Err(e) => {
-                                error!("Fallback sync: failed to load targets from database: {}", e);
-                                metrics::counter!("dwctl_cache_sync_errors_total", "source" => "fallback").increment(1);
-                                // Continue - fallback sync errors shouldn't crash the service
+                            hash_result => {
+                                // Hash changed (a missed change) or couldn't be computed — do
+                                // the full reload to be safe.
+                                match self.reload_into_state(&[]).await {
+                                    Ok(new_targets) => {
+                                        debug!("Fallback sync: reloaded {} targets", new_targets.targets.len());
+                                        if let Err(e) = self.sender.send(new_targets) {
+                                            error!("Failed to send targets update: {}", e);
+                                            // If all receivers are dropped, we can exit
+                                            break;
+                                        }
+                                        metrics::counter!("dwctl_cache_sync_total", "source" => "fallback").increment(1);
+                                        debug!("Fallback sync: updated onwards configuration successfully");
+                                        last_config_hash = hash_result.ok();
+                                    }
+                                    Err(e) => {
+                                        error!("Fallback sync: failed to load targets from database: {}", e);
+                                        metrics::counter!("dwctl_cache_sync_errors_total", "source" => "fallback").increment(1);
+                                        // Continue - fallback sync errors shouldn't crash the service
+                                    }
+                                }
                             }
                         }
                     }
@@ -469,7 +782,11 @@ struct OnwardsCompositeModel {
 
 /// Loads composite models with their components and API keys from the database
 #[tracing::instrument(skip(db, escalation_models))]
-async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]) -> Result<Vec<OnwardsCompositeModel>, anyhow::Error> {
+async fn load_composite_models_from_db(
+    db: &PgPool,
+    escalation_models: &[String],
+    deployment_filter: &[DeploymentId],
+) -> Result<Vec<OnwardsCompositeModel>, anyhow::Error> {
     debug!(
         "Loading composite models from database (escalation_models: {:?})",
         escalation_models
@@ -518,8 +835,10 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
           AND cm.deleted = FALSE
           AND dmc.enabled = TRUE
           AND dm.deleted = FALSE
+          AND (cardinality($1::uuid[]) = 0 OR cm.id = ANY($1::uuid[]))
         ORDER BY cm.id, dmc.sort_order ASC
-        "#
+        "#,
+        deployment_filter
     )
     .fetch_all(db)
     .await?;
@@ -604,9 +923,11 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
         ) ak
         WHERE cm.is_composite = TRUE
           AND cm.deleted = FALSE
+          AND (cardinality($2::uuid[]) = 0 OR cm.id = ANY($2::uuid[]))
         ORDER BY cm.id, ak.id
         "#,
-        escalation_models
+        escalation_models,
+        deployment_filter
     )
     .fetch_all(db)
     .await?;
@@ -640,7 +961,9 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
         FROM deployed_models
         WHERE is_composite = TRUE
           AND deleted = FALSE
-        "#
+          AND (cardinality($1::uuid[]) = 0 OR id = ANY($1::uuid[]))
+        "#,
+        deployment_filter
     )
     .fetch_all(db)
     .await?;
@@ -1180,19 +1503,20 @@ fn convert_to_config_file(
     }
 }
 
-/// Loads the current targets configuration from the database (including composite models)
+/// Loads the complete routing state from the database (regular + composite models,
+/// with routing rules attached).
+///
+/// This is the heavy query — the ledger-summing balance gate × the per-model key
+/// cross-product. The sync runs it on cold start and the periodic self-heal resync
+/// only; steady-state changes patch [`TargetState`] via scoped deltas instead.
 ///
 /// `escalation_models` - Model aliases that batch API keys should have automatic access to.
-/// This enables batch processing to route requests to escalation models without needing
-/// separate API key configuration.
-/// `strict_mode` - Enable strict mode with schema validation (only known OpenAI API paths accepted)
 #[tracing::instrument(skip(db, escalation_models))]
-pub async fn load_targets_from_db(
+async fn load_full_state(
     db: &PgPool,
     escalation_models: &[String],
-    strict_mode: bool,
-    rate_limit_tiers: &RateLimitTiersConfig,
-) -> Result<Targets, anyhow::Error> {
+    deployment_filter: &[DeploymentId],
+) -> Result<TargetState, anyhow::Error> {
     let query_start = std::time::Instant::now();
     debug!("Loading onwards targets from database (with composite models)");
 
@@ -1302,9 +1626,11 @@ pub async fn load_targets_from_db(
         ) ak ON true
         WHERE dm.deleted = FALSE
           AND dm.is_composite = FALSE
+          AND (cardinality($2::uuid[]) = 0 OR dm.id = ANY($2::uuid[]))
         ORDER BY dm.id, ak.id
         "#,
-        escalation_models
+        escalation_models,
+        deployment_filter
     )
     .fetch_all(db)
     .await?;
@@ -1372,7 +1698,7 @@ pub async fn load_targets_from_db(
     debug!("Loaded {} deployed models", targets_map.len());
 
     // Load composite models (pass escalation_models to grant batch API keys access)
-    let composites = load_composite_models_from_db(db, escalation_models).await?;
+    let composites = load_composite_models_from_db(db, escalation_models, deployment_filter).await?;
 
     // Load traffic routing rules for all non-deleted models (regular + composite)
     let traffic_rule_rows = sqlx::query!(
@@ -1384,8 +1710,10 @@ pub async fn load_targets_from_db(
         WHERE mtr.deployed_model_id IN (
             SELECT id FROM deployed_models WHERE deleted = FALSE
         )
+          AND (cardinality($1::uuid[]) = 0 OR mtr.deployed_model_id = ANY($1::uuid[]))
         ORDER BY mtr.deployed_model_id, mtr.api_key_purpose
-        "#
+        "#,
+        deployment_filter
     )
     .fetch_all(db)
     .await?;
@@ -1413,8 +1741,6 @@ pub async fn load_targets_from_db(
         }
     }
 
-    let targets: Vec<_> = targets_map.into_values().collect();
-
     // Attach routing rules to composite models
     let composites: Vec<_> = composites
         .into_iter()
@@ -1426,11 +1752,71 @@ pub async fn load_targets_from_db(
         })
         .collect();
 
-    // Convert to ConfigFile format
-    let config = convert_to_config_file(targets, composites, strict_mode, rate_limit_tiers);
+    Ok(TargetState {
+        regular: targets_map,
+        composites,
+    })
+}
 
-    // Convert ConfigFile to Targets
+/// Assembles the in-memory [`TargetState`] into the onwards [`Targets`] config.
+///
+/// Pure (no DB): clones the state and runs the existing conversion, so it can be
+/// called on every send after an in-memory delta patch.
+fn assemble(state: &TargetState, strict_mode: bool, rate_limit_tiers: &RateLimitTiersConfig) -> Result<Targets, anyhow::Error> {
+    let targets: Vec<_> = state.regular.values().cloned().collect();
+    let composites = state.composites.clone();
+    let config = convert_to_config_file(targets, composites, strict_mode, rate_limit_tiers);
     Targets::from_config(config)
+}
+
+/// Cheap content hash over the small routing-config tables (NOT the 28M-row credits
+/// ledger), used by the periodic fallback to skip the full reload when nothing has
+/// changed. `row::text` captures every column, so the hash changes on any real content
+/// change but is stable across no-op upserts (same content ⇒ same text). Ordering by the
+/// row text makes it deterministic without assuming a primary key.
+async fn config_content_hash(db: &PgPool) -> Result<String, sqlx::Error> {
+    sqlx::query_scalar!(
+        r#"
+        SELECT md5(
+            coalesce((SELECT string_agg(dm::text, ',' ORDER BY dm::text) FROM deployed_models dm), '') ||
+            coalesce((SELECT string_agg(ak::text, ',' ORDER BY ak::text) FROM api_keys ak), '') ||
+            coalesce((SELECT string_agg(ie::text, ',' ORDER BY ie::text) FROM inference_endpoints ie), '') ||
+            coalesce((SELECT string_agg(dg::text, ',' ORDER BY dg::text) FROM deployment_groups dg), '') ||
+            coalesce((SELECT string_agg(ug::text, ',' ORDER BY ug::text) FROM user_groups ug), '') ||
+            coalesce((SELECT string_agg(uo::text, ',' ORDER BY uo::text) FROM user_organizations uo), '') ||
+            coalesce((SELECT string_agg(mt::text, ',' ORDER BY mt::text) FROM model_tariffs mt), '') ||
+            coalesce((SELECT string_agg(mtr::text, ',' ORDER BY mtr::text) FROM model_traffic_rules mtr), '') ||
+            coalesce((SELECT string_agg(dmc::text, ',' ORDER BY dmc::text) FROM deployed_model_components dmc), '') ||
+            -- users: only id + verified (the column that drives the rate-limit tier), not the
+            -- whole row, to avoid thrashing the hash on volatile columns like last_login.
+            -- WARNING: if a new routing-affecting users column is added (e.g. another
+            -- rate-limit flag), include it here or the fallback sync will miss the change.
+            -- Conversely, do NOT fold non-routing volatile columns (timestamps / audit
+            -- fields like last_login) into a table's full-row hash above, or the hash will
+            -- thrash on no-op updates and trigger needless full reloads.
+            coalesce((SELECT string_agg(u.id::text || ':' || u.verified::text, ',' ORDER BY u.id::text) FROM users u), '')
+        ) AS "hash!"
+        "#
+    )
+    .fetch_one(db)
+    .await
+}
+
+/// Full reload helper: load the complete state and assemble it in one call.
+///
+/// Production code goes through [`OnwardsConfigSync::reload_into_state`], which keeps
+/// the in-memory state for scoped deltas; this one-shot is retained for tests that
+/// assert on a freshly-built `Targets`.
+#[cfg(test)]
+#[tracing::instrument(skip(db, escalation_models, rate_limit_tiers))]
+pub async fn load_targets_from_db(
+    db: &PgPool,
+    escalation_models: &[String],
+    strict_mode: bool,
+    rate_limit_tiers: &RateLimitTiersConfig,
+) -> Result<Targets, anyhow::Error> {
+    let state = load_full_state(db, escalation_models, &[]).await?;
+    assemble(&state, strict_mode, rate_limit_tiers)
 }
 
 /// Updates the daemon capacity limits DashMap from deployed_models.

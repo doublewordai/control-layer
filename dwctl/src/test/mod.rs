@@ -501,19 +501,29 @@ async fn test_e2e_traffic_routing_rules(pool: PgPool) {
         "messages": [{"role": "user", "content": "test"}]
     });
 
+    // Let the config watcher settle, then poll for the converged baseline (matches the
+    // deny/redirect scenarios below). The app runs the automatic delta sync alongside the
+    // manual sync above, so the cache can briefly show a pre-convergence state (404
+    // model-missing or 403 key-not-yet-authorized) before it settles.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let mut baseline_status = 0u16;
     for i in 0..50 {
         let resp = server
             .post("/ai/v1/chat/completions")
             .add_header("authorization", format!("Bearer {}", realtime_key.key))
             .json(&chat_body)
             .await;
-        if resp.status_code().as_u16() != 404 {
-            assert_eq!(resp.status_code().as_u16(), 200, "Baseline request should succeed");
+        baseline_status = resp.status_code().as_u16();
+        if baseline_status == 200 {
             break;
         }
-        assert!(i < 49, "Model never became available after polling");
-        tokio::task::yield_now().await;
+        assert!(
+            i < 49,
+            "Baseline request never succeeded after polling, last status: {baseline_status}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
+    assert_eq!(baseline_status, 200, "Baseline request should succeed");
 
     // ===== Scenario 1: Deny batch purpose =====
 

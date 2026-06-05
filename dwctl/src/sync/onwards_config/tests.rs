@@ -3,7 +3,7 @@ use std::{str::FromStr, time::Duration};
 use onwards::{
     auth::ConstantTimeString,
     load_balancer::ProviderPool,
-    target::{LoadBalanceStrategy as OnwardsLoadBalanceStrategy, RoutingAction, TargetSpecOrList},
+    target::{LoadBalanceStrategy as OnwardsLoadBalanceStrategy, RoutingAction, TargetSpecOrList, Targets},
 };
 use tokio::{sync::mpsc, time::timeout};
 use tokio_util::sync::CancellationToken;
@@ -107,38 +107,269 @@ fn test_convert_to_config_file_with_single_target() {
 
 #[test]
 fn test_parse_notify_payload() {
-    // Test valid payload
     let now_micros = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_micros() as i64;
-    let payload = format!("api_keys:{}", now_micros);
-    let result = parse_notify_payload(&payload);
-    assert!(result.is_some());
-    let (table_name, lag) = result.unwrap();
-    assert_eq!(table_name, "api_keys");
-    // Lag should be very small (< 100ms) since we just created the timestamp
-    assert!(lag.as_millis() < 100, "Lag should be < 100ms, got {:?}", lag);
 
-    // Test payload from 1 second ago
-    let old_micros = now_micros - 1_000_000; // 1 second ago
-    let old_payload = format!("deployed_models:{}", old_micros);
-    let result = parse_notify_payload(&old_payload);
-    assert!(result.is_some());
-    let (table_name, lag) = result.unwrap();
-    assert_eq!(table_name, "deployed_models");
-    // Lag should be around 1 second
+    // Legacy `table:epoch` — recent timestamp, no scope id (⇒ full reload).
+    let c = parse_notify_payload(&format!("api_keys:{}", now_micros)).unwrap();
+    assert_eq!(c.table, "api_keys");
+    assert!(c.scope_id.is_none());
+    assert!(c.lag.as_millis() < 100, "Lag should be < 100ms, got {:?}", c.lag);
+
+    // Legacy from ~1 second ago.
+    let c = parse_notify_payload(&format!("deployed_models:{}", now_micros - 1_000_000)).unwrap();
+    assert_eq!(c.table, "deployed_models");
     assert!(
-        lag.as_millis() >= 1000 && lag.as_millis() < 1100,
+        c.lag.as_millis() >= 1000 && c.lag.as_millis() < 1100,
         "Lag should be ~1s, got {:?}",
-        lag
+        c.lag
     );
 
-    // Test invalid payloads
+    // Enriched `table:op:id:epoch`.
+    let id = uuid::Uuid::new_v4();
+    let c = parse_notify_payload(&format!("deployment_groups:INSERT:{}:{}", id, now_micros)).unwrap();
+    assert_eq!(c.table, "deployment_groups");
+    assert_eq!(c.op.as_deref(), Some("INSERT"));
+    assert_eq!(c.scope_id, Some(id));
+
+    // JSON form (as emitted by the tariff/component triggers).
+    let c = parse_notify_payload(&format!(
+        r#"{{"table":"model_tariffs","operation":"DELETE","id":"{}","timestamp":{}}}"#,
+        id, now_micros
+    ))
+    .unwrap();
+    assert_eq!(c.table, "model_tariffs");
+    assert_eq!(c.op.as_deref(), Some("DELETE"));
+    assert_eq!(c.scope_id, Some(id));
+
+    // Invalid payloads.
     assert!(parse_notify_payload("").is_none());
     assert!(parse_notify_payload("no_colon").is_none());
     assert!(parse_notify_payload("table:not_a_number").is_none());
-    assert!(parse_notify_payload("too:many:colons").is_none());
+    assert!(parse_notify_payload("only:three:parts").is_none());
+}
+
+#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
+async fn test_scoped_reload_matches_full_reload(pool: sqlx::PgPool) {
+    // The deployment-scoped query must return exactly the same per-deployment data as a
+    // full reload — this is the invariant that makes a scoped delta == a full reload.
+    let full = super::load_full_state(&pool, &[], &[]).await.unwrap();
+    assert!(!full.regular.is_empty(), "fixture should have regular deployments");
+
+    for (id, full_target) in &full.regular {
+        let slice = super::load_full_state(&pool, &[], std::slice::from_ref(id)).await.unwrap();
+        assert_eq!(slice.regular.len(), 1, "scoped reload should return exactly one regular deployment");
+        let scoped = slice.regular.get(id).expect("scoped reload missing the requested deployment");
+        assert_eq!(scoped.alias, full_target.alias);
+
+        let mut scoped_keys: Vec<_> = scoped.api_keys.iter().map(|k| (k.id, k.secret.clone())).collect();
+        let mut full_keys: Vec<_> = full_target.api_keys.iter().map(|k| (k.id, k.secret.clone())).collect();
+        scoped_keys.sort();
+        full_keys.sort();
+        assert_eq!(
+            scoped_keys, full_keys,
+            "scoped key set must match full reload for '{}'",
+            full_target.alias
+        );
+    }
+
+    // Composite deployments converge too.
+    for composite in &full.composites {
+        let slice = super::load_full_state(&pool, &[], std::slice::from_ref(&composite.id))
+            .await
+            .unwrap();
+        let scoped = slice
+            .composites
+            .iter()
+            .find(|c| c.id == composite.id)
+            .expect("scoped reload missing the requested composite");
+        let mut scoped_keys: Vec<_> = scoped.api_keys.iter().map(|k| k.id).collect();
+        let mut full_keys: Vec<_> = composite.api_keys.iter().map(|k| k.id).collect();
+        scoped_keys.sort();
+        full_keys.sort();
+        assert_eq!(
+            scoped_keys, full_keys,
+            "scoped composite key set must match full reload for '{}'",
+            composite.alias
+        );
+    }
+}
+
+#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
+async fn test_user_scoped_change_resolves_reachable_deployments(pool: sqlx::PgPool) {
+    // A user-owned change (api_keys / user_groups / credits_transactions / users) must
+    // resolve to every deployment that user can reach, so the delta reload patches all of
+    // them. Under-resolving here would leave a deployment serving stale config until the
+    // periodic fallback — this guards the user -> deployments resolution path directly.
+    let (sync, _, _) = super::OnwardsConfigSync::new(pool.clone()).await.unwrap();
+    let id = |s: &str| uuid::Uuid::parse_str(s).unwrap();
+
+    // From cache_base: user A is in group cache-private-a (granted the private regular model
+    // and the private composite); the two public models are reachable by everyone. The query
+    // over-includes (ignores balance), so metered-public is present despite being balance-gated.
+    let user_a = id("00000000-0000-0000-0000-0000000000a1");
+    let regular_public = id("40000000-0000-0000-0000-000000000001");
+    let regular_private = id("40000000-0000-0000-0000-000000000002");
+    let metered_public = id("40000000-0000-0000-0000-000000000003");
+    let private_composite = id("50000000-0000-0000-0000-000000000001");
+    let mut expected_a = vec![regular_public, regular_private, metered_public, private_composite];
+    expected_a.sort();
+
+    let mut got = sync.deployments_for_user(user_a).await.unwrap();
+    got.sort();
+    assert_eq!(
+        got, expected_a,
+        "user A should reach public + group-private deployments (incl. the composite)"
+    );
+
+    // Key / balance / verified changes don't alter reachability (the user still reaches the
+    // same deployments), so they scope to the user's reachable set via deployments_for_user.
+    for table in ["api_keys", "credits_transactions", "users"] {
+        let change = super::NotifyChange {
+            table: table.to_string(),
+            op: Some("UPDATE".to_string()),
+            scope_id: Some(user_a),
+            lag: Duration::ZERO,
+        };
+        let mut scope = sync.resolve_change_scope(Some(&change)).await;
+        scope.sort();
+        assert_eq!(
+            scope, expected_a,
+            "a '{table}' change for user A must scope to their reachable deployments"
+        );
+    }
+
+    // A user_groups change is scoped by the GROUP (migration 105): it resolves the
+    // deployments that group grants — a set that still includes a deployment the user was
+    // just REVOKED from, which deployments_for_user (current reachability) would miss. So the
+    // scope id here is a GROUP id and it resolves to that group's deployment set.
+    let group_a = id("00000000-0000-0000-0000-000000000aa1");
+    let mut group_a_deployments = vec![regular_private, private_composite];
+    group_a_deployments.sort();
+    let ug_change = super::NotifyChange {
+        table: "user_groups".to_string(),
+        op: Some("DELETE".to_string()),
+        scope_id: Some(group_a),
+        lag: Duration::ZERO,
+    };
+    let mut ug_scope = sync.resolve_change_scope(Some(&ug_change)).await;
+    ug_scope.sort();
+    assert_eq!(
+        ug_scope, group_a_deployments,
+        "a user_groups change must scope to the group's granted deployments (catches revocations)"
+    );
+
+    // user_organizations membership does not grant deployment access, so it falls back to a
+    // full reload (empty scope) rather than a delta.
+    let uo_change = super::NotifyChange {
+        table: "user_organizations".to_string(),
+        op: Some("DELETE".to_string()),
+        scope_id: Some(user_a),
+        lag: Duration::ZERO,
+    };
+    assert!(
+        sync.resolve_change_scope(Some(&uo_change)).await.is_empty(),
+        "a user_organizations change must trigger a full reload (org membership doesn't grant access)"
+    );
+
+    // A user with no group membership reaches only the public deployments.
+    let user_b = id("00000000-0000-0000-0000-0000000000b1");
+    let mut expected_b = vec![regular_public, metered_public];
+    expected_b.sort();
+    let mut got_b = sync.deployments_for_user(user_b).await.unwrap();
+    got_b.sort();
+    assert_eq!(got_b, expected_b, "user B (no group) should reach only public deployments");
+
+    // The system user (nil uuid) reaches everything, so a nil-scoped change falls back to a
+    // full reload (empty scope) rather than a narrow delta.
+    let nil_change = super::NotifyChange {
+        table: "api_keys".to_string(),
+        op: Some("UPDATE".to_string()),
+        scope_id: Some(uuid::Uuid::nil()),
+        lag: Duration::ZERO,
+    };
+    assert!(
+        sync.resolve_change_scope(Some(&nil_change)).await.is_empty(),
+        "a system-user (nil) change must fall back to a full reload"
+    );
+
+    // Close the loop: the user-resolved scope feeds a delta reload that matches a full reload
+    // for each resolved regular deployment.
+    let full = super::load_full_state(&pool, &[], &[]).await.unwrap();
+    let slice = super::load_full_state(&pool, &[], &expected_a).await.unwrap();
+    for dep_id in &expected_a {
+        if let Some(full_t) = full.regular.get(dep_id) {
+            let scoped_t = slice
+                .regular
+                .get(dep_id)
+                .expect("scoped reload missing a resolved regular deployment");
+            let mut scoped_keys: Vec<_> = scoped_t.api_keys.iter().map(|k| k.id).collect();
+            let mut full_keys: Vec<_> = full_t.api_keys.iter().map(|k| k.id).collect();
+            scoped_keys.sort();
+            full_keys.sort();
+            assert_eq!(
+                scoped_keys, full_keys,
+                "scoped reload must match full reload for a user-resolved deployment"
+            );
+        }
+    }
+}
+
+#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
+async fn test_component_change_resolves_parent_composite(pool: sqlx::PgPool) {
+    // A deployed_models change to a component embedded in a composite must re-query the
+    // component AND its parent composite, so the composite never serves stale component
+    // config. cache_base composite 50...01 embeds 40...06 and 40...05 as enabled components.
+    let (sync, _, _) = super::OnwardsConfigSync::new(pool.clone()).await.unwrap();
+    let id = |s: &str| uuid::Uuid::parse_str(s).unwrap();
+
+    let component = id("40000000-0000-0000-0000-000000000006");
+    let composite = id("50000000-0000-0000-0000-000000000001");
+
+    // composites_for_component finds the enabled, non-deleted parent.
+    assert_eq!(
+        sync.composites_for_component(component).await.unwrap(),
+        vec![composite],
+        "the component's enabled parent composite must be resolved"
+    );
+
+    // resolve_change_scope folds the parent into the scope alongside the component itself.
+    let change = super::NotifyChange {
+        table: "deployed_models".to_string(),
+        op: Some("UPDATE".to_string()),
+        scope_id: Some(component),
+        lag: Duration::ZERO,
+    };
+    let mut scope = sync.resolve_change_scope(Some(&change)).await;
+    scope.sort();
+    let mut expected = vec![component, composite];
+    expected.sort();
+    assert_eq!(
+        scope, expected,
+        "a component change must re-query the component and its parent composite"
+    );
+}
+
+#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
+async fn test_config_content_hash_detects_changes(pool: sqlx::PgPool) {
+    // Stable when nothing changes (so the fallback skips the full reload)...
+    let before = super::config_content_hash(&pool).await.unwrap();
+    let again = super::config_content_hash(&pool).await.unwrap();
+    assert_eq!(before, again, "hash must be stable when the config is unchanged");
+    assert!(!before.is_empty());
+
+    // ...but a routing-config change must move it (so the fallback won't skip a real change).
+    sqlx::query(
+        "UPDATE deployed_models SET alias = alias || '-changed' \
+         WHERE id = (SELECT id FROM deployed_models WHERE NOT deleted LIMIT 1)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let after = super::config_content_hash(&pool).await.unwrap();
+    assert_ne!(before, after, "hash must change when a config row changes");
 }
 
 #[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
@@ -762,6 +993,129 @@ async fn test_api_keys_noop_upsert_does_not_trigger_notify(pool: sqlx::PgPool) {
     );
 }
 
+/// Removing a user from a group / organization must fire a scoped DELETE notify so the
+/// delta sync reloads the affected deployments — otherwise the removal only takes effect at
+/// the periodic fallback. Verifies the membership DELETE triggers fire and carry the right
+/// scope id: the GROUP id for user_groups (migration 105, so the group's deployments —
+/// including a just-revoked one — get re-queried) and the removed user's id for
+/// user_organizations.
+#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
+async fn test_membership_delete_fires_scoped_notify(pool: sqlx::PgPool) {
+    use sqlx::postgres::PgListener;
+
+    // cache_base puts user A in group cache-private-a (id ...0aa1) via a user_groups row.
+    let user_a = "00000000-0000-0000-0000-0000000000a1";
+    let group_a = "00000000-0000-0000-0000-000000000aa1";
+
+    let mut listener = PgListener::connect_with(&pool).await.unwrap();
+    listener.listen("auth_config_changed").await.unwrap();
+
+    // Removing the group membership must notify with the GROUP's id (migration 105), so the
+    // delta scopes to the group's deployments and catches the deployment just revoked.
+    sqlx::query("DELETE FROM user_groups WHERE user_id = $1::uuid")
+        .bind(user_a)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let n = timeout(Duration::from_secs(2), listener.recv())
+        .await
+        .expect("user_groups DELETE should notify")
+        .expect("failed to receive notification");
+    assert!(
+        n.payload().starts_with(&format!("user_groups:DELETE:{group_a}:")),
+        "user_groups DELETE must emit a scoped notify carrying the group id, got: {}",
+        n.payload()
+    );
+    while let Ok(Ok(Some(_))) = timeout(Duration::from_millis(50), listener.try_recv()).await {}
+
+    // user_organizations needs an organization-type user (enforced by the membership
+    // type-check trigger) plus a membership row to delete.
+    let org_id = "00000000-0000-0000-0000-0000000000f1";
+    sqlx::query(
+        "INSERT INTO users (id, username, email, display_name, auth_source, is_admin, is_deleted, is_internal, user_type) \
+         VALUES ($1::uuid, 'cache_org', 'cache_org@example.com', 'Cache Org', 'test', false, false, false, 'organization')",
+    )
+    .bind(org_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    while let Ok(Ok(Some(_))) = timeout(Duration::from_millis(50), listener.try_recv()).await {}
+
+    sqlx::query("INSERT INTO user_organizations (user_id, organization_id) VALUES ($1::uuid, $2::uuid)")
+        .bind(user_a)
+        .bind(org_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let ins = timeout(Duration::from_secs(2), listener.recv())
+        .await
+        .expect("user_organizations INSERT should notify")
+        .expect("failed to receive notification");
+    assert!(
+        ins.payload().starts_with(&format!("user_organizations:INSERT:{user_a}:")),
+        "user_organizations INSERT must emit a scoped notify, got: {}",
+        ins.payload()
+    );
+    while let Ok(Ok(Some(_))) = timeout(Duration::from_millis(50), listener.try_recv()).await {}
+
+    // Removing the organization membership must notify with the removed user's id (OLD row).
+    sqlx::query("DELETE FROM user_organizations WHERE user_id = $1::uuid AND organization_id = $2::uuid")
+        .bind(user_a)
+        .bind(org_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let del = timeout(Duration::from_secs(2), listener.recv())
+        .await
+        .expect("user_organizations DELETE should notify")
+        .expect("failed to receive notification");
+    assert!(
+        del.payload().starts_with(&format!("user_organizations:DELETE:{user_a}:")),
+        "user_organizations DELETE must emit a scoped notify for the removed user, got: {}",
+        del.payload()
+    );
+}
+
+/// Deleting an inference_endpoint must not silently strand stale routing config. The FK
+/// deployed_models.hosted_on -> inference_endpoints(id) is ON DELETE CASCADE, so the endpoint's
+/// deployments are deleted and fire their own deployed_models:DELETE notify; migration 104's
+/// inference_endpoints trigger deliberately emits nothing on DELETE. Verify the cascade notify
+/// reaches the sync and the endpoint itself stays silent (guards the cascade-order assumption).
+#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
+async fn test_endpoint_delete_surfaces_via_deployment_cascade(pool: sqlx::PgPool) {
+    use sqlx::postgres::PgListener;
+
+    // cache-endpoint-custom (30...02) hosts regular-private (40...02).
+    let endpoint = "30000000-0000-0000-0000-000000000002";
+
+    let mut listener = PgListener::connect_with(&pool).await.unwrap();
+    listener.listen("auth_config_changed").await.unwrap();
+
+    sqlx::query("DELETE FROM inference_endpoints WHERE id = $1::uuid")
+        .bind(endpoint)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // Collect the cascade burst. The first notification can take a while under CI load, so
+    // wait generously for it, then drain the rest of the burst with a short window.
+    let mut payloads = Vec::new();
+    if let Ok(Ok(n)) = timeout(Duration::from_secs(3), listener.recv()).await {
+        payloads.push(n.payload().to_string());
+    }
+    while let Ok(Ok(n)) = timeout(Duration::from_millis(300), listener.recv()).await {
+        payloads.push(n.payload().to_string());
+    }
+    assert!(
+        payloads.iter().any(|p| p.starts_with("deployed_models:DELETE:")),
+        "endpoint delete should surface via a cascaded deployed_models:DELETE notify, got: {payloads:?}"
+    );
+    assert!(
+        !payloads.iter().any(|p| p.starts_with("inference_endpoints:")),
+        "the inference_endpoints trigger must stay silent on DELETE (cascade covers it), got: {payloads:?}"
+    );
+}
+
 /// Test that batch API keys get automatic access to composite escalation targets
 #[sqlx::test]
 async fn test_batch_api_key_access_to_composite_escalation_target(pool: sqlx::PgPool) {
@@ -1092,6 +1446,129 @@ async fn test_fallback_sync_triggers_without_notifications(pool: sqlx::PgPool) {
     // Cleanup
     shutdown_token.cancel();
     let _ = timeout(Duration::from_secs(1), sync_handle).await;
+}
+
+/// Regression: a burst of NOTIFYs that arrive within the debounce window must ALL be
+/// applied, not dropped. With scoped delta reloads a dropped notification's scope is never
+/// re-queried (the old full-reload sync was rescued by the next full reload, the delta sync
+/// is not). Fallback is disabled here, so the NOTIFY stream is the only path to the cache —
+/// a dropped change would never appear, which is exactly the bug that broke routing for
+/// requests issued right after a burst of config changes.
+#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
+async fn test_rapid_notify_burst_is_not_dropped(pool: sqlx::PgPool) {
+    let (sync, _initial, _stream) = super::OnwardsConfigSync::new(pool.clone()).await.unwrap();
+    let mut rx = sync.sender().subscribe();
+
+    let (status_tx, mut status_rx) = mpsc::channel(10);
+    let config = SyncConfig {
+        status_tx: Some(status_tx),
+        fallback_interval_milliseconds: 0, // disabled: NOTIFY is the only path to the cache
+    };
+    let token = CancellationToken::new();
+    let handle = tokio::spawn({
+        let token = token.clone();
+        async move { sync.start(config, token).await }
+    });
+
+    // Once Connected the listener is active; drain the initial snapshot.
+    assert_eq!(status_rx.recv().await, Some(super::SyncStatus::Connecting));
+    assert_eq!(status_rx.recv().await, Some(super::SyncStatus::Connected));
+    rx.borrow_and_update();
+
+    // Rename two public deployments from cache_base back-to-back, so the second NOTIFY lands
+    // inside the first's debounce window.
+    for (id, alias) in [
+        ("40000000-0000-0000-0000-000000000001", "burst-regular-public"),
+        ("40000000-0000-0000-0000-000000000003", "burst-metered-public"),
+    ] {
+        sqlx::query("UPDATE deployed_models SET alias = $1 WHERE id = $2::uuid")
+            .bind(alias)
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    // Both renames must reach the cache. The dropped-notification bug leaves the second one
+    // missing forever (fallback is off), so this poll times out and fails.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let have_both = {
+            let t = rx.borrow();
+            t.targets.contains_key("burst-regular-public") && t.targets.contains_key("burst-metered-public")
+        };
+        if have_both {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "both burst renames must reach the cache; present aliases: {:?}",
+            rx.borrow().targets.iter().map(|e| e.key().clone()).collect::<Vec<_>>()
+        );
+        let _ = timeout(Duration::from_millis(100), rx.changed()).await;
+    }
+
+    token.cancel();
+    let _ = timeout(Duration::from_secs(1), handle).await;
+}
+
+/// The e2e regression at the unit level: revoking a user's group membership must drop their
+/// key from the deployments that group granted. The bug was that a user-scoped delta queried
+/// the user's CURRENT reachable deployments, which no longer include the revoked one — so its
+/// stale key list (still carrying the revoked key) was never refreshed, and a request kept
+/// being authorized after access was revoked. Fallback is OFF so only the NOTIFY path can
+/// update the cache.
+#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
+async fn test_membership_revocation_removes_key_from_cache(pool: sqlx::PgPool) {
+    let (sync, _initial, _stream) = super::OnwardsConfigSync::new(pool.clone()).await.unwrap();
+    let mut rx = sync.sender().subscribe();
+
+    // user A reaches regular-private only via group cache-private-a, so A's key is in its pool.
+    let private_has_key_a = |t: &Targets| {
+        t.targets
+            .get("regular-private")
+            .map(|p| pool_has_key(p.value(), KEY_A_SECRET))
+            .unwrap_or(false)
+    };
+    assert!(private_has_key_a(&rx.borrow()), "user A's key should start on regular-private");
+
+    let (status_tx, mut status_rx) = mpsc::channel(10);
+    let config = SyncConfig {
+        status_tx: Some(status_tx),
+        fallback_interval_milliseconds: 0, // disabled: NOTIFY is the only path to the cache
+    };
+    let token = CancellationToken::new();
+    let handle = tokio::spawn({
+        let token = token.clone();
+        async move { sync.start(config, token).await }
+    });
+    assert_eq!(status_rx.recv().await, Some(super::SyncStatus::Connecting));
+    assert_eq!(status_rx.recv().await, Some(super::SyncStatus::Connected));
+    rx.borrow_and_update();
+
+    // Revoke A's membership in the group that grants regular-private.
+    sqlx::query("DELETE FROM user_groups WHERE user_id = $1::uuid AND group_id = $2::uuid")
+        .bind("00000000-0000-0000-0000-0000000000a1")
+        .bind("00000000-0000-0000-0000-000000000aa1")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // The cache must drop A's key from regular-private. The under-scoping bug leaves it forever.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if !private_has_key_a(&rx.borrow()) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "revoking A's membership must remove A's key from regular-private's pool"
+        );
+        let _ = timeout(Duration::from_millis(100), rx.changed()).await;
+    }
+
+    token.cancel();
+    let _ = timeout(Duration::from_secs(1), handle).await;
 }
 
 #[cfg(test)]
