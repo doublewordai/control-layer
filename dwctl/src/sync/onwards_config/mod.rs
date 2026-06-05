@@ -325,11 +325,12 @@ impl OnwardsConfigSync {
             "deployment_groups" | "model_tariffs" | "model_traffic_rules" | "deployed_model_components" | "inference_endpoints" => {
                 vec![scope_id]
             }
-            // The scope id is a user id: re-query every deployment that user can reach,
-            // since a key/membership/balance change alters those deployments' key lists.
-            // (`credits_transactions` is the app-level balance-crossing notify.) The
-            // system user (nil uuid) reaches everything, so fall back to a full reload.
-            "api_keys" | "user_groups" | "user_organizations" | "credits_transactions" | "users" if scope_id != uuid::Uuid::nil() => {
+            // The scope id is a user id whose key list on their reachable deployments changed,
+            // but the user STILL reaches those deployments — a key, balance, or verified change
+            // does not alter reachability. So scope to the user's current reachable set.
+            // (`credits_transactions` is the app-level balance-crossing notify.) The system
+            // user (nil uuid) reaches everything, so fall back to a full reload.
+            "api_keys" | "credits_transactions" | "users" if scope_id != uuid::Uuid::nil() => {
                 match self.deployments_for_user(scope_id).await {
                     Ok(ids) => ids,
                     Err(e) => {
@@ -338,6 +339,13 @@ impl OnwardsConfigSync {
                     }
                 }
             }
+            // Membership changes can REVOKE access: when a user is removed from a group or
+            // organization, the affected deployment is one the user can NO LONGER reach, so
+            // `deployments_for_user` (current reachability) would miss it and leave its key
+            // list stale — the revoked key would keep working until the periodic fallback.
+            // Full-reload instead so every deployment's key list is refreshed (this is what
+            // the pre-delta sync always did, and why this scenario passed before).
+            "user_groups" | "user_organizations" => Vec::new(),
             // Unmapped → full reload. Two distinct causes, logged differently: a user-table
             // change by the system user (nil uuid, which reaches everything) is expected, so
             // debug; a genuinely unknown table means a trigger fires without a resolver arm

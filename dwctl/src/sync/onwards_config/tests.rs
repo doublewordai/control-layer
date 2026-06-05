@@ -3,7 +3,7 @@ use std::{str::FromStr, time::Duration};
 use onwards::{
     auth::ConstantTimeString,
     load_balancer::ProviderPool,
-    target::{LoadBalanceStrategy as OnwardsLoadBalanceStrategy, RoutingAction, TargetSpecOrList},
+    target::{LoadBalanceStrategy as OnwardsLoadBalanceStrategy, RoutingAction, TargetSpecOrList, Targets},
 };
 use tokio::{sync::mpsc, time::timeout};
 use tokio_util::sync::CancellationToken;
@@ -224,11 +224,9 @@ async fn test_user_scoped_change_resolves_reachable_deployments(pool: sqlx::PgPo
         "user A should reach public + group-private deployments (incl. the composite)"
     );
 
-    // resolve_change_scope routes every user-owned table through deployments_for_user, so a
-    // verified flip (users) or a key/membership/balance change scopes to the same set.
-    // (user_organizations takes the same path; its trigger firing is covered end-to-end by
-    // test_membership_delete_fires_scoped_notify.)
-    for table in ["api_keys", "user_groups", "credits_transactions", "users"] {
+    // Key / balance / verified changes don't alter reachability (the user still reaches the
+    // same deployments), so they scope to the user's reachable set via deployments_for_user.
+    for table in ["api_keys", "credits_transactions", "users"] {
         let change = super::NotifyChange {
             table: table.to_string(),
             op: Some("UPDATE".to_string()),
@@ -240,6 +238,23 @@ async fn test_user_scoped_change_resolves_reachable_deployments(pool: sqlx::PgPo
         assert_eq!(
             scope, expected_a,
             "a '{table}' change for user A must scope to their reachable deployments"
+        );
+    }
+
+    // Membership changes (user_groups / user_organizations) can REVOKE access: the affected
+    // deployment is one the user no longer reaches, which deployments_for_user (current
+    // reachability) cannot see. They must fall back to a full reload (empty scope) so the
+    // revoked deployment's key list is refreshed — a user-scoped delta would leave it stale.
+    for table in ["user_groups", "user_organizations"] {
+        let change = super::NotifyChange {
+            table: table.to_string(),
+            op: Some("DELETE".to_string()),
+            scope_id: Some(user_a),
+            lag: Duration::ZERO,
+        };
+        assert!(
+            sync.resolve_change_scope(Some(&change)).await.is_empty(),
+            "a '{table}' change must trigger a full reload (revocation can't be user-scoped)"
         );
     }
 
@@ -1062,9 +1077,13 @@ async fn test_endpoint_delete_surfaces_via_deployment_cascade(pool: sqlx::PgPool
         .await
         .unwrap();
 
-    // Collect the whole burst the cascade produces (recv until it goes quiet).
+    // Collect the cascade burst. The first notification can take a while under CI load, so
+    // wait generously for it, then drain the rest of the burst with a short window.
     let mut payloads = Vec::new();
-    while let Ok(Ok(n)) = timeout(Duration::from_millis(400), listener.recv()).await {
+    if let Ok(Ok(n)) = timeout(Duration::from_secs(3), listener.recv()).await {
+        payloads.push(n.payload().to_string());
+    }
+    while let Ok(Ok(n)) = timeout(Duration::from_millis(300), listener.recv()).await {
         payloads.push(n.payload().to_string());
     }
     assert!(
@@ -1465,6 +1484,65 @@ async fn test_rapid_notify_burst_is_not_dropped(pool: sqlx::PgPool) {
             tokio::time::Instant::now() < deadline,
             "both burst renames must reach the cache; present aliases: {:?}",
             rx.borrow().targets.iter().map(|e| e.key().clone()).collect::<Vec<_>>()
+        );
+        let _ = timeout(Duration::from_millis(100), rx.changed()).await;
+    }
+
+    token.cancel();
+    let _ = timeout(Duration::from_secs(1), handle).await;
+}
+
+/// The e2e regression at the unit level: revoking a user's group membership must drop their
+/// key from the deployments that group granted. The bug was that a user-scoped delta queried
+/// the user's CURRENT reachable deployments, which no longer include the revoked one — so its
+/// stale key list (still carrying the revoked key) was never refreshed, and a request kept
+/// being authorized after access was revoked. Fallback is OFF so only the NOTIFY path can
+/// update the cache.
+#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
+async fn test_membership_revocation_removes_key_from_cache(pool: sqlx::PgPool) {
+    let (sync, _initial, _stream) = super::OnwardsConfigSync::new(pool.clone()).await.unwrap();
+    let mut rx = sync.sender().subscribe();
+
+    // user A reaches regular-private only via group cache-private-a, so A's key is in its pool.
+    let private_has_key_a = |t: &Targets| {
+        t.targets
+            .get("regular-private")
+            .map(|p| pool_has_key(p.value(), KEY_A_SECRET))
+            .unwrap_or(false)
+    };
+    assert!(private_has_key_a(&rx.borrow()), "user A's key should start on regular-private");
+
+    let (status_tx, mut status_rx) = mpsc::channel(10);
+    let config = SyncConfig {
+        status_tx: Some(status_tx),
+        fallback_interval_milliseconds: 0, // disabled: NOTIFY is the only path to the cache
+    };
+    let token = CancellationToken::new();
+    let handle = tokio::spawn({
+        let token = token.clone();
+        async move { sync.start(config, token).await }
+    });
+    assert_eq!(status_rx.recv().await, Some(super::SyncStatus::Connecting));
+    assert_eq!(status_rx.recv().await, Some(super::SyncStatus::Connected));
+    rx.borrow_and_update();
+
+    // Revoke A's membership in the group that grants regular-private.
+    sqlx::query("DELETE FROM user_groups WHERE user_id = $1::uuid AND group_id = $2::uuid")
+        .bind("00000000-0000-0000-0000-0000000000a1")
+        .bind("00000000-0000-0000-0000-000000000aa1")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // The cache must drop A's key from regular-private. The under-scoping bug leaves it forever.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if !private_has_key_a(&rx.borrow()) {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "revoking A's membership must remove A's key from regular-private's pool"
         );
         let _ = timeout(Duration::from_millis(100), rx.changed()).await;
     }
