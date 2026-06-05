@@ -36,6 +36,7 @@ import {
   DialogDescription,
 } from "../../../ui/dialog";
 import { CodeBlock } from "../../../ui/code-block";
+import { dwImgLinkRenderer } from "../../../ui/dw-img-linkify";
 import type { FileRequest } from "../../../../api/control-layer/types";
 import { useServerPagination } from "../../../../hooks/useServerPagination";
 
@@ -302,7 +303,7 @@ export function FileRequests() {
                 }
 
                 return content ? (
-                  <CodeBlock language="json">
+                  <CodeBlock language="json" renderer={dwImgLinkRenderer}>
                     {JSON.stringify(content, null, 2)}
                   </CodeBlock>
                 ) : (

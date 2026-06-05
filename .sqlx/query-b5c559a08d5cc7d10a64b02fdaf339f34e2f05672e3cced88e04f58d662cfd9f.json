@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT 1 AS \"exists!\"\n        FROM image_access\n        WHERE sha256 = $1\n          AND (user_id = $2 OR organization_id = $3)\n        LIMIT 1\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "exists!",
+        "type_info": "Int4"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Bytea",
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "b5c559a08d5cc7d10a64b02fdaf339f34e2f05672e3cced88e04f58d662cfd9f"
+}

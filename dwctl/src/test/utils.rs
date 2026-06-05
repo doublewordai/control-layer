@@ -66,6 +66,10 @@ pub async fn create_test_app_state_with_config(pool: PgPool, config: crate::conf
     );
 
     let response_store = std::sync::Arc::new(crate::responses::store::FusilladeResponseStore::new(request_manager.clone()));
+    // Tests use the disabled no-op normaliser — they never exercise the
+    // ingest/sign/read paths.
+    let image_normalizer: std::sync::Arc<dyn crate::image_normalizer::ImageNormalizer> =
+        std::sync::Arc::new(crate::image_normalizer::DisabledNormalizer);
     crate::AppState::builder()
         .db(test_pools)
         .config(shared_config)
@@ -73,6 +77,7 @@ pub async fn create_test_app_state_with_config(pool: PgPool, config: crate::conf
         .task_runner(task_runner)
         .limiters(limiters)
         .response_store(response_store)
+        .image_normalizer(image_normalizer)
         .build()
 }
 
@@ -143,6 +148,8 @@ pub async fn create_test_app_state_with_fusillade(pool: PgPool, config: crate::c
     );
 
     let response_store = std::sync::Arc::new(crate::responses::store::FusilladeResponseStore::new(request_manager.clone()));
+    let image_normalizer: std::sync::Arc<dyn crate::image_normalizer::ImageNormalizer> =
+        std::sync::Arc::new(crate::image_normalizer::DisabledNormalizer);
     crate::AppState::builder()
         .db(test_pools)
         .config(shared_config)
@@ -150,6 +157,7 @@ pub async fn create_test_app_state_with_fusillade(pool: PgPool, config: crate::c
         .task_runner(task_runner)
         .limiters(limiters)
         .response_store(response_store)
+        .image_normalizer(image_normalizer)
         .build()
 }
 
@@ -323,6 +331,7 @@ pub fn create_test_config() -> crate::config::Config {
         support_email: "support@test.com".to_string(),
         connections: Default::default(),
         responses: Default::default(),
+        image_normalizer: Default::default(),
         openapi: Default::default(),
     }
 }

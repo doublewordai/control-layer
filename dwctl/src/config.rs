@@ -191,6 +191,15 @@ pub struct Config {
     /// fusillade.
     #[serde(default)]
     pub responses: ResponsesConfig,
+    /// Image-input normalisation configuration.
+    ///
+    /// When enabled, image references in `/v1/chat/completions` and
+    /// `/v1/responses` request bodies are routed through a hardened
+    /// content-addressed store before being forwarded to upstream
+    /// providers. See `crate::image_normalizer::config` for the full
+    /// shape and defaults.
+    #[serde(default)]
+    pub image_normalizer: crate::image_normalizer::ImageNormalizerConfig,
     /// OpenAPI spec exposure controls. Defaults disable the Admin spec
     /// (which describes internal management endpoints) and enable the
     /// AI spec (which mirrors the publicly-documented OpenAI surface).
@@ -1928,6 +1937,7 @@ impl Default for Config {
             support_email: "support@doubleword.ai".to_string(),
             connections: ConnectionsConfig::default(),
             responses: ResponsesConfig::default(),
+            image_normalizer: crate::image_normalizer::ImageNormalizerConfig::default(),
             openapi: OpenApiConfig::default(),
         }
     }

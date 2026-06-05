@@ -22,6 +22,7 @@ import {
   DialogDescription,
 } from "../../../ui/dialog";
 import { CodeBlock } from "../../../ui/code-block";
+import { dwImgLinkRenderer } from "../../../ui/dw-img-linkify";
 import { createBatchResultsColumns } from "./batch-results-columns";
 import type { BatchStatus } from "../../../../api/control-layer/types";
 
@@ -272,7 +273,7 @@ export default function BatchResults({
                 return (
                   <div className="space-y-4">
                     {content ? (
-                      <CodeBlock language="json">
+                      <CodeBlock language="json" renderer={dwImgLinkRenderer}>
                         {JSON.stringify(content, null, 2)}
                       </CodeBlock>
                     ) : (

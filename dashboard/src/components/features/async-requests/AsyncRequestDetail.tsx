@@ -8,6 +8,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { Card, CardContent, CardHeader, CardTitle } from "../../ui/card";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "../../ui/collapsible";
 import { CodeBlock } from "../../ui/code-block";
+import { dwImgLinkRenderer } from "../../ui/dw-img-linkify";
 import { copyToClipboard } from "../../../utils";
 import { formatTimestamp } from "../../../utils";
 
@@ -167,7 +168,7 @@ export function AsyncRequestDetail() {
               <CollapsibleContent>
                 <CardContent className="px-6 pb-6 pt-0">
                   <div className="rounded-lg overflow-hidden border border-doubleword-border">
-                    <CodeBlock language="json" variant="light">{inputJson}</CodeBlock>
+                    <CodeBlock language="json" variant="light" renderer={dwImgLinkRenderer}>{inputJson}</CodeBlock>
                   </div>
                 </CardContent>
               </CollapsibleContent>

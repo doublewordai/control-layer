@@ -27,6 +27,7 @@ use crate::db::{
     models::users::UserDBResponse,
 };
 use crate::errors::{Error, Result};
+use crate::image_normalizer::{ImageInput, ImageNormalizer, Mode as ImageNormalizerMode, walker as image_walker};
 use crate::types::Resource;
 use axum::{
     Json,
@@ -254,7 +255,9 @@ impl OpenAIBatchRequest {
 }
 
 /// Configuration for file stream processing.
-#[derive(Debug)]
+//
+// Debug is implemented manually below because the `normalizer` field
+// holds an `Arc<dyn ImageNormalizer>` which does not implement Debug.
 struct FileStreamConfig {
     /// Maximum file size in bytes (0 = unlimited)
     max_file_size: u64,
@@ -264,6 +267,154 @@ struct FileStreamConfig {
     max_request_body_size: u64,
     /// Channel buffer size for streaming
     buffer_size: usize,
+    /// Optional image normaliser. When `Some`, each parsed template's body is
+    /// walked for `image_url` fields containing HTTP(S) URLs (per the user's
+    /// mode); each is ingested into the content store and replaced with an
+    /// opaque `dw-img://` token. The dispatcher swaps tokens for short-lived
+    /// signed URLs at send time. When `None`, bodies pass through unchanged.
+    normalizer: Option<Arc<dyn ImageNormalizer>>,
+    /// Walker mode. Image normalisation is a deployment-level posture
+    /// (controlled by `config.image_normalizer.enabled`); when on, batch
+    /// ingest pins this to [`ImageNormalizerMode::All`] so every image
+    /// input — HTTP URLs *and* `data:` URIs — flows through the
+    /// content-addressed store.
+    normalizer_mode: ImageNormalizerMode,
+    /// Optional DB pool for `image_access` bookkeeping. `None` disables
+    /// the bookkeeping (the substitution itself still runs).
+    access_pool: Option<sqlx::PgPool>,
+    /// Who to attribute `image_access` rows to: the acting human, plus the
+    /// owning org when the upload is in org context (so org members can view
+    /// it, but personal uploads stay private to the user).
+    access_attribution: Option<crate::api::handlers::images::ImageAttribution>,
+}
+
+impl std::fmt::Debug for FileStreamConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FileStreamConfig")
+            .field("max_file_size", &self.max_file_size)
+            .field("max_requests_per_file", &self.max_requests_per_file)
+            .field("max_request_body_size", &self.max_request_body_size)
+            .field("buffer_size", &self.buffer_size)
+            .field("normalizer_enabled", &self.normalizer.is_some())
+            .field("normalizer_mode", &self.normalizer_mode)
+            .field("image_access_enabled", &self.access_pool.is_some())
+            .field("access_attribution", &self.access_attribution)
+            .finish()
+    }
+}
+
+/// Walk a single batch template's body and replace `image_url` fields with
+/// opaque `dw-img://{sha256}` tokens via the normaliser. Records each ingested
+/// image in `image_access` so the user can later view their submitted bytes
+/// via the dashboard endpoint. No-op when the normaliser is unset or the
+/// body is not valid JSON (the existing line parser would already have
+/// rejected non-JSON).
+/// Returned by `normalize_template_body_in_place` so the caller can map
+/// transient/store errors to a different `FileUploadError` than a real
+/// "bad input" — important for user-facing messaging (transient outages
+/// should not surface as "fix your file").
+#[derive(Debug)]
+enum BatchNormalizeError {
+    /// User-supplied URL/data was unacceptable (bad scheme, denied IP,
+    /// MIME mismatch, oversized, malformed). Surface as a validation
+    /// error.
+    BadInput(String),
+    /// Upstream fetch failed in a way that isn't worth a retry from the
+    /// client (e.g. origin 4xx). Surface as a fetch failure.
+    FetchFailed(String),
+    /// Transient: timed out or origin 5xx after the configured retries.
+    /// Surface as a "try again" so users aren't told to fix their file.
+    Transient(String),
+    /// The content store itself failed (GCS unreachable, IAM error).
+    /// Surface as "service unavailable".
+    StoreFailed(String),
+}
+
+async fn normalize_template_body_in_place(
+    normalizer: Option<&Arc<dyn ImageNormalizer>>,
+    mode: ImageNormalizerMode,
+    template: &mut fusillade::RequestTemplateInput,
+    access_pool: Option<&sqlx::PgPool>,
+    access_attribution: Option<crate::api::handlers::images::ImageAttribution>,
+) -> std::result::Result<(), BatchNormalizeError> {
+    let Some(normalizer) = normalizer else {
+        return Ok(());
+    };
+    let mut body_value: serde_json::Value = match serde_json::from_str(&template.body) {
+        Ok(v) => v,
+        Err(_) => return Ok(()), // non-JSON body — let existing handling deal with it
+    };
+    // Async closures can't propagate enum errors cleanly through the
+    // walker's `Result<String, E>` shape, so we route the variant via a
+    // shared cell — set once on first failure, returned to the caller.
+    let err_cell: std::sync::Mutex<Option<BatchNormalizeError>> = std::sync::Mutex::new(None);
+    let walker_result = image_walker::substitute_with(&mut body_value, mode, |url| {
+        let normalizer = Arc::clone(normalizer);
+        let access_pool = access_pool.cloned();
+        let err_cell = &err_cell;
+        let is_data_uri = url.starts_with("data:");
+        async move {
+            let input = if is_data_uri {
+                ImageInput::DataUri(url)
+            } else {
+                ImageInput::HttpUrl(url)
+            };
+            match normalizer.ingest(input).await {
+                Ok(ingested) => {
+                    if let (Some(pool), Some(attribution)) = (access_pool, access_attribution) {
+                        // Batch ingest is already async (file upload latency dominates),
+                        // so we AWAIT the bookkeeping write rather than fire-and-forget —
+                        // the user's later "view what I submitted" lookup depends on it.
+                        // Records real (mime, bytes_len) captured from the ingest result.
+                        crate::api::handlers::images::record_image_access(
+                            &pool,
+                            attribution,
+                            ingested.token,
+                            &ingested.mime,
+                            ingested.bytes_len,
+                        )
+                        .await;
+                    }
+                    Ok::<String, ()>(ingested.token.to_dw_img_uri())
+                }
+                Err(e) => {
+                    let mapped = match e {
+                        crate::image_normalizer::NormalizeError::BadInput(m) => BatchNormalizeError::BadInput(m),
+                        crate::image_normalizer::NormalizeError::FetchFailed(m) => BatchNormalizeError::FetchFailed(m),
+                        crate::image_normalizer::NormalizeError::Transient(m) => BatchNormalizeError::Transient(m),
+                        crate::image_normalizer::NormalizeError::StoreFailed(m) => BatchNormalizeError::StoreFailed(m),
+                        crate::image_normalizer::NormalizeError::NotFound => {
+                            BatchNormalizeError::StoreFailed("image token not found in store".to_string())
+                        }
+                    };
+                    if let Ok(mut g) = err_cell.lock()
+                        && g.is_none()
+                    {
+                        *g = Some(mapped);
+                    }
+                    // Bubble up a sentinel so the walker stops; the real
+                    // error lives in `err_cell`.
+                    Err(())
+                }
+            }
+        }
+    })
+    .await;
+    if walker_result.is_err() {
+        // Unwrap the variant set by the closure above.
+        let e = err_cell
+            .into_inner()
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| BatchNormalizeError::StoreFailed("unknown normalisation error".into()));
+        return Err(e);
+    }
+    let count = walker_result.expect("walker_result is Ok by control flow above");
+    if count > 0 {
+        template.body = serde_json::to_string(&body_value)
+            .map_err(|e| BatchNormalizeError::StoreFailed(format!("re-serialise after image normalisation: {e}")))?;
+    }
+    Ok(())
 }
 
 /// Errors that can occur during file upload processing.
@@ -288,6 +439,30 @@ enum FileUploadError {
     ModelAccessDenied { model: String, line: u64 },
     /// Per-line validation error (custom_id, method, url, etc.)
     ValidationError { line: u64, message: String },
+    /// Image normalisation transient failure (origin timeout / 5xx after
+    /// retries, GCS network blip). Surface as 503 so the client retries
+    /// rather than thinking the file is malformed.
+    ImageTransient { line: u64, message: String },
+    /// Image normaliser content-store backend failed (GCS unreachable,
+    /// IAM error). 502/503 territory; not the user's fault.
+    ImageStoreFailed { line: u64, message: String },
+    /// Image fetch failed in a non-retryable way (origin returned a 4xx, or
+    /// every resolved address was deny-listed). The file referenced an image
+    /// we could not retrieve — an upstream/reference problem, not a malformed
+    /// batch file, so it must NOT surface as a validation (400) error.
+    ImageFetchFailed { line: u64, message: String },
+}
+
+/// Map a `BatchNormalizeError` variant to the `FileUploadError` that
+/// gives the user the right action: "fix your file" vs. "try again" vs.
+/// "service issue".
+fn map_batch_normalize_error(e: BatchNormalizeError, line: u64) -> FileUploadError {
+    match e {
+        BatchNormalizeError::BadInput(message) => FileUploadError::ValidationError { line, message },
+        BatchNormalizeError::FetchFailed(message) => FileUploadError::ImageFetchFailed { line, message },
+        BatchNormalizeError::Transient(message) => FileUploadError::ImageTransient { line, message },
+        BatchNormalizeError::StoreFailed(message) => FileUploadError::ImageStoreFailed { line, message },
+    }
 }
 
 impl FileUploadError {
@@ -342,6 +517,15 @@ impl FileUploadError {
             },
             FileUploadError::ValidationError { line, message } => Error::BadRequest {
                 message: format!("Line {}: {}", line, message),
+            },
+            FileUploadError::ImageTransient { line, message } => Error::ServiceUnavailable {
+                message: format!("Line {}: image fetch failed after retries, please retry: {}", line, message),
+            },
+            FileUploadError::ImageStoreFailed { line, message } => Error::ServiceUnavailable {
+                message: format!("Line {}: image content store temporarily unavailable: {}", line, message),
+            },
+            FileUploadError::ImageFetchFailed { line, message } => Error::ServiceUnavailable {
+                message: format!("Line {}: referenced image could not be fetched (upstream error): {}", line, message),
             },
         }
     }
@@ -444,6 +628,10 @@ fn create_file_stream(
         accessible_models,
         allowed_url_paths,
     } = req_ctx;
+    let normalizer = config.normalizer.clone();
+    let normalizer_mode = config.normalizer_mode;
+    let access_pool = config.access_pool.clone();
+    let access_attribution = config.access_attribution;
     let (tx, rx) = mpsc::channel(config.buffer_size);
     // std::sync::Mutex is appropriate here because:
     // 1. Lock is held only briefly (no await points while locked)
@@ -631,7 +819,23 @@ fn create_file_stream(
                                             // Transform to internal format (includes model access validation)
                                             match openai_req.to_internal(&endpoint, api_key.clone(), &accessible_models, &allowed_url_paths)
                                             {
-                                                Ok(template) => {
+                                                Ok(mut template) => {
+                                                    // Normalise image URLs in the per-template body
+                                                    // before the size cap check, since substitution
+                                                    // replaces (potentially large) HTTP URLs with
+                                                    // short opaque tokens — bodies usually shrink.
+                                                    if let Err(e) = normalize_template_body_in_place(
+                                                        normalizer.as_ref(),
+                                                        normalizer_mode,
+                                                        &mut template,
+                                                        access_pool.as_ref(),
+                                                        access_attribution,
+                                                    )
+                                                    .await
+                                                    {
+                                                        abort!(map_batch_normalize_error(e, line_count + 1));
+                                                    }
+
                                                     // Check per-request body size limit (0 = unlimited)
                                                     if config.max_request_body_size > 0
                                                         && template.body.len() as u64 > config.max_request_body_size
@@ -715,7 +919,20 @@ fn create_file_stream(
                             match serde_json::from_str::<OpenAIBatchRequest>(trimmed) {
                                 Ok(openai_req) => {
                                     match openai_req.to_internal(&endpoint, api_key.clone(), &accessible_models, &allowed_url_paths) {
-                                        Ok(template) => {
+                                        Ok(mut template) => {
+                                            // Normalise image URLs in the trailing line as well.
+                                            if let Err(e) = normalize_template_body_in_place(
+                                                normalizer.as_ref(),
+                                                normalizer_mode,
+                                                &mut template,
+                                                access_pool.as_ref(),
+                                                access_attribution,
+                                            )
+                                            .await
+                                            {
+                                                abort!(map_batch_normalize_error(e, line_count + 1));
+                                            }
+
                                             // Check per-request body size limit (0 = unlimited)
                                             if config.max_request_body_size > 0 && template.body.len() as u64 > config.max_request_body_size
                                             {
@@ -853,16 +1070,41 @@ pub async fn upload_file<P: PoolProvider>(
         message: format!("Invalid multipart request: {}", e),
     })?;
 
+    // When in org context, attribute file ownership to the org (not the individual user).
+    // Also used for the hidden API key lookup below.
+    let target_user_id = current_user.active_organization.unwrap_or(current_user.id);
+    let uploaded_by = Some(target_user_id.to_string());
+
+    // Re-use the AppState-bound normaliser singleton (built once at
+    // startup). The dispatcher will JIT-resign any `dw-img://` tokens
+    // produced here with a fresh short-lived signed URL before sending
+    // to the provider.
+    let normalizer = if config.image_normalizer.enabled {
+        Some(state.image_normalizer.clone())
+    } else {
+        None
+    };
+    // Image normalisation is a system-wide setting (controlled by
+    // `config.image_normalizer.enabled`). When on, every image input —
+    // HTTP(S) URL or `data:` URI — gets normalised through the store.
+    let normalizer_mode = ImageNormalizerMode::All;
     let stream_config = FileStreamConfig {
         max_file_size: config.limits.files.max_file_size,
         max_requests_per_file: config.limits.files.max_requests_per_file,
         max_request_body_size: config.limits.requests.max_body_size,
         buffer_size: config.batches.files.upload_buffer_size,
+        normalizer,
+        normalizer_mode,
+        access_pool: Some(state.db.write().clone()),
+        // image_access is attributed to the acting human plus, for org-context
+        // uploads, the owning org — so org members can view org-key images
+        // while a personal upload stays private to the user. This is distinct
+        // from file ownership above, which is credited to the org.
+        access_attribution: Some(crate::api::handlers::images::ImageAttribution {
+            user_id: current_user.id,
+            organization_id: current_user.active_organization,
+        }),
     };
-    // When in org context, attribute file ownership to the org (not the individual user).
-    // Also used for the hidden API key lookup below.
-    let target_user_id = current_user.active_organization.unwrap_or(current_user.id);
-    let uploaded_by = Some(target_user_id.to_string());
 
     // Get or create user-specific hidden batch API key for batch request execution.
     // We need the key ID for per-member attribution within orgs.
@@ -3325,6 +3567,26 @@ mod tests {
                 assert!(message.contains("custom_id too long"));
             }
             _ => panic!("Expected BadRequest error"),
+        }
+    }
+
+    #[test]
+    fn test_batch_fetch_failed_maps_to_service_unavailable_not_validation() {
+        // A non-retryable upstream image fetch failure must surface as a 503
+        // service error, not a 400 "fix your file" validation error: the
+        // batch file isn't malformed, the referenced image just couldn't be
+        // fetched.
+        let mapped = super::map_batch_normalize_error(super::BatchNormalizeError::FetchFailed("origin 404".to_string()), 5);
+        assert!(
+            matches!(mapped, super::FileUploadError::ImageFetchFailed { .. }),
+            "FetchFailed must map to ImageFetchFailed, got {mapped:?}"
+        );
+        match mapped.into_http_error() {
+            crate::errors::Error::ServiceUnavailable { message } => {
+                assert!(message.contains("Line 5"));
+                assert!(message.contains("origin 404"));
+            }
+            _ => panic!("Expected ServiceUnavailable error"),
         }
     }
 

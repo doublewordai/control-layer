@@ -79,7 +79,7 @@ jsonwebtoken = { version = "10", features = ["rust_crypto"] }
 argon2 = "0.5"
 base64 = "0.22"
 bytes = "1.5"
-onwards = { version = "0.29", features = ["multi-step"] }
+onwards = { version = "0.30", features = ["multi-step"] }
 thiserror = "2.0.14"
 axum-prometheus = "0.10"
 # Metrics facade and exporter (same versions as axum-prometheus uses)
@@ -161,6 +161,11 @@ hex = "0.4.3"
 # modern rustls 0.23 / aws-lc-rs path instead.
 aws-sdk-s3 = { version = "1.21", default-features = false, features = ["sigv4a", "default-https-client", "rt-tokio"] }
 aws-credential-types = "1.1"
+# GCS for the image normaliser's content-addressed object store.
+# `auth` feature pulls google-cloud-auth so we can use ADC (Workload
+# Identity in production); `rustls-tls` avoids OpenSSL on Alpine images.
+google-cloud-storage = "1.12"
+google-cloud-auth = "1.10"
 
 [dev-dependencies]
 axum-test = { version = "18.4.1" }

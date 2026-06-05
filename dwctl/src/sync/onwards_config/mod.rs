@@ -928,6 +928,12 @@ fn convert_composite_to_target_spec(
                     // Each provider uses its own trusted setting from the database
                     // This allows fine-grained control over which providers bypass error sanitization
                     trusted: Some(target.trusted),
+                    // None → inherit trace-context propagation from the resolved
+                    // `trusted` value: trusted (self-hosted) providers propagate
+                    // W3C trace headers for distributed tracing; untrusted
+                    // (third-party) providers do not, so our trace IDs aren't
+                    // leaked to them.
+                    propagate_trace_context: None,
                 }
             }
         })
@@ -1087,6 +1093,10 @@ fn convert_to_config_file(
                 }),
                 request_timeout_secs: None,
                 trusted: Some(target.trusted),
+                // None → inherit from resolved `trusted` (see composite-model
+                // site above): self-hosted providers propagate W3C trace
+                // context, third-party providers do not.
+                propagate_trace_context: None,
             };
 
             // Build fallback configuration. For single-provider (standard)

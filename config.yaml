@@ -492,3 +492,88 @@ background_services:
     ingest_workers: 4 # Concurrent file ingestion workers
     activate_workers: 1 # Batch activation workers (low to avoid capacity contention)
     discovery_workers: 1 # Sync discovery workers
+
+# Image input normalisation.
+#
+# When enabled, image references in `/v1/chat/completions` and
+# `/v1/responses` request bodies are routed through a hardened
+# content-addressed object store before being forwarded to upstream
+# providers. Both HTTP(S) `image_url` values and inline `data:` URIs
+# are normalised: each image is fetched (HTTP) or decoded (data URI),
+# validated (IP allow-list for HTTP fetches, plus a MIME allow-list
+# and size cap for both), uploaded to the store, and replaced in the
+# body with a short-lived signed URL.
+#
+# Defaults are conservative — the feature is off until an operator
+# enables it and configures a backend bucket.
+image_normalizer:
+  enabled: false # Default: false; set to true after configuring a backend
+  backend:
+    # `memory` (tests / local dev), `gcs`, or `s3_compatible` (production).
+    type: memory
+    #
+    # Google Cloud Storage (Workload Identity — no static keys):
+    # type: gcs
+    # bucket: doubleword-images
+    # region: europe-west4
+    #
+    # Any S3-compatible store via a custom endpoint (Cloudflare R2, MinIO,
+    # Backblaze B2, AWS S3). Credentials are NOT set here — they are read
+    # from the environment so they never land in config or a config dump.
+    # (Unprefixed, NOT DWCTL_, so the config loader leaves them alone.)
+    #   IMAGE_NORMALIZER_S3_ACCESS_KEY_ID
+    #   IMAGE_NORMALIZER_S3_SECRET_ACCESS_KEY
+    # type: s3_compatible
+    # bucket: doubleword-images
+    # endpoint_url: https://<account_id>.r2.cloudflarestorage.com
+    # region: auto            # R2 uses "auto"; AWS S3 uses e.g. us-east-1
+    # force_path_style: true  # required by most S3-compatible endpoints
+  fetcher:
+    max_bytes: 20971520        # 20 MiB
+    timeout_secs: 30
+    max_redirects: 3
+    max_retries: 3
+    retry_base_delay_ms: 250
+    allowed_mime:
+      - image/png
+      - image/jpeg
+      - image/webp
+      - image/gif
+  signing:
+    realtime_ttl_secs: 900            # 15 min — covers a chat completion
+    # dispatch_ttl_secs: 1800         # Optional override. When omitted,
+                                      # derived as
+                                      #   processing_timeout_ms (from
+                                      #   background_services.batch_daemon)
+                                      #   + dispatch_ttl_headroom_secs
+                                      # so the URL is always valid for at
+                                      # least one full dispatch attempt.
+                                      # Each retry gets a brand-new URL.
+    dispatch_ttl_headroom_secs: 300   # +5 min on top of processing_timeout
+    dashboard_ttl_secs: 300           # 5 min — dashboard image-view path
+
+# NOTE on bucket data lifetime:
+#
+# This dwctl process never garbage-collects objects from the image
+# normaliser bucket — that's a GCS-side concern, configured out-of-band
+# via the bucket's Object Lifecycle Management policy
+# (Terraform / gcloud).
+#
+# Recommended lifecycle rule for production:
+#
+#   age (days)  = max_batch_completion_window + investigation_buffer
+#   action      = Delete
+#
+# Example (covers 24h batches + 6 days of headroom for support / replay):
+#
+#   gcloud storage buckets update gs://<bucket> --lifecycle-file=- <<EOF
+#   {"lifecycle":{"rule":[{"action":{"type":"Delete"},
+#                          "condition":{"age":7}}]}}
+#   EOF
+#
+# Tighter retention is fine — the worst-case batch dispatch attempt is
+# bounded by background_services.batch_daemon.processing_timeout_ms,
+# and dispatch URLs are signed per-attempt. The only constraint is the
+# bucket retention MUST exceed the maximum time a batch can sit
+# between ingest and final dispatch attempt (typically the batch
+# completion window, 24h for OpenAI-style "24h" batches).
