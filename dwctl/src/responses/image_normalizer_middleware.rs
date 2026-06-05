@@ -26,7 +26,10 @@
 //! - `NormalizeError::Transient` → 503 (retried internally and still
 //!   failing; client can retry).
 //! - `NormalizeError::FetchFailed` → 502 (non-retryable upstream error).
-//! - `NormalizeError::StoreFailed` / other → 500.
+//! - `NormalizeError::StoreFailed` → 503 (the content store was briefly
+//!   unreachable — a transient dependency failure the client can retry,
+//!   not an internal bug).
+//! - `NormalizeError::NotFound` / other → 500 (internal inconsistency).
 //!
 //! The middleware never falls through to passing the original URL on a
 //! normalisation failure — that would defeat the purpose during degraded
@@ -262,7 +265,7 @@ pub(crate) fn normalize_error_response(err: NormalizeError) -> Response {
         NormalizeError::BadInput(_) => (StatusCode::BAD_REQUEST, "image_url_rejected"),
         NormalizeError::Transient(_) => (StatusCode::SERVICE_UNAVAILABLE, "image_fetch_transient"),
         NormalizeError::FetchFailed(_) => (StatusCode::BAD_GATEWAY, "image_fetch_failed"),
-        NormalizeError::StoreFailed(_) => (StatusCode::INTERNAL_SERVER_ERROR, "image_store_failed"),
+        NormalizeError::StoreFailed(_) => (StatusCode::SERVICE_UNAVAILABLE, "image_store_failed"),
         NormalizeError::NotFound => (StatusCode::INTERNAL_SERVER_ERROR, "image_token_not_found"),
     };
     let body = serde_json::json!({
@@ -494,5 +497,22 @@ mod tests {
         let url = body["messages"][0]["content"][1]["image_url"]["url"].as_str().unwrap();
         assert!(url.starts_with("dw-img://"), "expected a dw-img token, got {url}");
         assert!(!url.contains("base64"), "raw base64 must be replaced");
+    }
+
+    #[test]
+    fn error_response_maps_each_variant_to_the_right_status() {
+        // Locks the realtime error contract. In particular a store outage is
+        // 503 (transient dependency, retryable), NOT 500 — it is not a bug in
+        // our code, and 503 lets retry-aware clients back off and retry.
+        let cases = [
+            (NormalizeError::BadInput("x".into()), StatusCode::BAD_REQUEST),
+            (NormalizeError::Transient("x".into()), StatusCode::SERVICE_UNAVAILABLE),
+            (NormalizeError::FetchFailed("x".into()), StatusCode::BAD_GATEWAY),
+            (NormalizeError::StoreFailed("x".into()), StatusCode::SERVICE_UNAVAILABLE),
+            (NormalizeError::NotFound, StatusCode::INTERNAL_SERVER_ERROR),
+        ];
+        for (err, expected) in cases {
+            assert_eq!(normalize_error_response(err).status(), expected);
+        }
     }
 }

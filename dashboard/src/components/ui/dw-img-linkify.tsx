@@ -41,7 +41,7 @@ function linkifyNode(node: rendererNode): rendererNode | rendererNode[] {
               className: ["dw-img-link"],
               href: dwImageUrl(seg.sha256),
               target: "_blank",
-              rel: "noreferrer",
+              rel: "noreferrer noopener",
               title: tokenTooltip(seg.sha256),
               style: { textDecoration: "underline", cursor: "pointer" },
             },

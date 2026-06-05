@@ -446,6 +446,11 @@ enum FileUploadError {
     /// Image normaliser content-store backend failed (GCS unreachable,
     /// IAM error). 502/503 territory; not the user's fault.
     ImageStoreFailed { line: u64, message: String },
+    /// Image fetch failed in a non-retryable way (origin returned a 4xx, or
+    /// every resolved address was deny-listed). The file referenced an image
+    /// we could not retrieve — an upstream/reference problem, not a malformed
+    /// batch file, so it must NOT surface as a validation (400) error.
+    ImageFetchFailed { line: u64, message: String },
 }
 
 /// Map a `BatchNormalizeError` variant to the `FileUploadError` that
@@ -453,9 +458,8 @@ enum FileUploadError {
 /// "service issue".
 fn map_batch_normalize_error(e: BatchNormalizeError, line: u64) -> FileUploadError {
     match e {
-        BatchNormalizeError::BadInput(message) | BatchNormalizeError::FetchFailed(message) => {
-            FileUploadError::ValidationError { line, message }
-        }
+        BatchNormalizeError::BadInput(message) => FileUploadError::ValidationError { line, message },
+        BatchNormalizeError::FetchFailed(message) => FileUploadError::ImageFetchFailed { line, message },
         BatchNormalizeError::Transient(message) => FileUploadError::ImageTransient { line, message },
         BatchNormalizeError::StoreFailed(message) => FileUploadError::ImageStoreFailed { line, message },
     }
@@ -519,6 +523,9 @@ impl FileUploadError {
             },
             FileUploadError::ImageStoreFailed { line, message } => Error::ServiceUnavailable {
                 message: format!("Line {}: image content store temporarily unavailable: {}", line, message),
+            },
+            FileUploadError::ImageFetchFailed { line, message } => Error::ServiceUnavailable {
+                message: format!("Line {}: referenced image could not be fetched (upstream error): {}", line, message),
             },
         }
     }
@@ -3560,6 +3567,26 @@ mod tests {
                 assert!(message.contains("custom_id too long"));
             }
             _ => panic!("Expected BadRequest error"),
+        }
+    }
+
+    #[test]
+    fn test_batch_fetch_failed_maps_to_service_unavailable_not_validation() {
+        // A non-retryable upstream image fetch failure must surface as a 503
+        // service error, not a 400 "fix your file" validation error: the
+        // batch file isn't malformed, the referenced image just couldn't be
+        // fetched.
+        let mapped = super::map_batch_normalize_error(super::BatchNormalizeError::FetchFailed("origin 404".to_string()), 5);
+        assert!(
+            matches!(mapped, super::FileUploadError::ImageFetchFailed { .. }),
+            "FetchFailed must map to ImageFetchFailed, got {mapped:?}"
+        );
+        match mapped.into_http_error() {
+            crate::errors::Error::ServiceUnavailable { message } => {
+                assert!(message.contains("Line 5"));
+                assert!(message.contains("origin 404"));
+            }
+            _ => panic!("Expected ServiceUnavailable error"),
         }
     }
 

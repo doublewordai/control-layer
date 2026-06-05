@@ -179,6 +179,21 @@ impl<S: ImageStore + 'static> ImageNormalizer for DefaultImageNormalizer<S> {
             }
             ImageInput::DataUri(uri) => {
                 let decoded = data_uri::parse(&uri)?;
+                // Enforce the same size and MIME policy as the HTTP fetch
+                // path — a `data:` URI must not bypass the normaliser's
+                // content limits (an oversized payload is a memory/storage
+                // DoS, and a non-image MIME would otherwise be stored and
+                // signed for a downstream provider).
+                let len = decoded.bytes.len() as u64;
+                if len > self.fetcher.max_bytes() {
+                    return Err(NormalizeError::BadInput(format!(
+                        "data: URI payload {len} bytes exceeds cap {}",
+                        self.fetcher.max_bytes()
+                    )));
+                }
+                if !self.fetcher.mime_allowed(&decoded.mime) {
+                    return Err(NormalizeError::BadInput(format!("mime not allowed: {}", decoded.mime)));
+                }
                 (decoded.mime, Bytes::from(decoded.bytes))
             }
         };
@@ -228,6 +243,10 @@ pub fn from_config(cfg: &ImageNormalizerConfig) -> Result<Arc<dyn ImageNormalize
         .ok_or_else(|| anyhow::anyhow!("image_normalizer.enabled = true but image_normalizer.backend is not set"))?;
     Ok(match backend {
         BackendConfig::Memory => {
+            tracing::warn!(
+                "image_normalizer enabled with the in-memory backend: stored image bytes are lost on \
+                 restart and are not shared across replicas — use gcs or s3_compatible in production"
+            );
             let store = Arc::new(MemoryStore::new());
             Arc::new(DefaultImageNormalizer::new(cfg.fetcher.clone(), store))
         }
@@ -313,6 +332,34 @@ mod tests {
         let store = Arc::new(MemoryStore::new());
         let n = DefaultImageNormalizer::new(FetcherConfig::default(), store);
         let err = n.ingest(ImageInput::DataUri("data:image/png,raw".to_string())).await.unwrap_err();
+        assert!(matches!(err, NormalizeError::BadInput(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn ingest_oversized_data_uri_is_rejected() {
+        // A `data:` URI larger than the configured cap must be refused the
+        // same way the HTTP fetch path refuses an oversized body — a data
+        // URI must not be a way to bypass `max_bytes`.
+        let store = Arc::new(MemoryStore::new());
+        let cfg = FetcherConfig {
+            max_bytes: 8,
+            ..FetcherConfig::default()
+        };
+        let n = DefaultImageNormalizer::new(cfg, store);
+        let err = n.ingest(ImageInput::DataUri(TINY_PNG_DATA_URI.to_string())).await.unwrap_err();
+        assert!(matches!(err, NormalizeError::BadInput(_)), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn ingest_data_uri_with_disallowed_mime_is_rejected() {
+        // A non-image `data:` URI decodes cleanly but must still be refused —
+        // the MIME allow-list applies to data URIs, not just HTTP fetches.
+        let store = Arc::new(MemoryStore::new());
+        let n = DefaultImageNormalizer::new(FetcherConfig::default(), store);
+        let err = n
+            .ingest(ImageInput::DataUri("data:text/html;base64,PGgxPmhpPC9oMT4=".to_string()))
+            .await
+            .unwrap_err();
         assert!(matches!(err, NormalizeError::BadInput(_)), "got {err:?}");
     }
 

@@ -65,6 +65,18 @@ impl ImageFetcher {
         Self { config: Arc::new(config) }
     }
 
+    /// Maximum decoded payload size in bytes. Shared cap so the `data:` URI
+    /// ingest path can enforce the same limit the HTTP fetch path does.
+    pub fn max_bytes(&self) -> u64 {
+        self.config.max_bytes
+    }
+
+    /// Whether `mime` is in the configured allow-list. Shared so the `data:`
+    /// URI ingest path applies the same MIME policy as the HTTP fetch path.
+    pub fn mime_allowed(&self, mime: &str) -> bool {
+        self.config.mime_allowed(mime)
+    }
+
     /// Fetch the bytes at `url`. Performs retries internally; the returned
     /// error is final.
     pub async fn fetch(&self, url: &str) -> Result<FetchedImage, FetchError> {

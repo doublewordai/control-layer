@@ -498,11 +498,11 @@ background_services:
 # When enabled, image references in `/v1/chat/completions` and
 # `/v1/responses` request bodies are routed through a hardened
 # content-addressed object store before being forwarded to upstream
-# providers. HTTP(S) `image_url` values are fetched once, validated
-# (IP allow-list, MIME, size), uploaded to the store, and replaced
-# in the body with a short-lived signed URL. `data:` URIs pass
-# through unchanged in the default mode (a per-user opt-in mode that
-# also covers data: URIs is wired in by a follow-up commit).
+# providers. Both HTTP(S) `image_url` values and inline `data:` URIs
+# are normalised: each image is fetched (HTTP) or decoded (data URI),
+# validated (IP allow-list for HTTP fetches, plus a MIME allow-list
+# and size cap for both), uploaded to the store, and replaced in the
+# body with a short-lived signed URL.
 #
 # Defaults are conservative — the feature is off until an operator
 # enables it and configures a backend bucket.
