@@ -871,6 +871,8 @@ async fn test_request_logging_disabled(pool: PgPool) {
         .task_runner(task_runner)
         .limiters(limiters)
         .response_store(response_store)
+        .image_normalizer(std::sync::Arc::new(crate::image_normalizer::DisabledNormalizer)
+            as std::sync::Arc<dyn crate::image_normalizer::ImageNormalizer>)
         .build();
     let onwards_router = axum::Router::new(); // Empty onwards router for testing
     let router = super::build_router(&mut app_state, onwards_router, None, None, None, false, None)
@@ -1436,6 +1438,8 @@ async fn test_build_router_with_metrics_disabled(pool: PgPool) {
         .task_runner(task_runner)
         .limiters(limiters)
         .response_store(response_store)
+        .image_normalizer(std::sync::Arc::new(crate::image_normalizer::DisabledNormalizer)
+            as std::sync::Arc<dyn crate::image_normalizer::ImageNormalizer>)
         .build();
 
     let onwards_router = axum::Router::new();
@@ -1495,6 +1499,8 @@ async fn test_build_router_with_metrics_enabled(pool: PgPool) {
         .task_runner(task_runner)
         .limiters(limiters)
         .response_store(response_store)
+        .image_normalizer(std::sync::Arc::new(crate::image_normalizer::DisabledNormalizer)
+            as std::sync::Arc<dyn crate::image_normalizer::ImageNormalizer>)
         .build();
 
     let onwards_router = axum::Router::new();

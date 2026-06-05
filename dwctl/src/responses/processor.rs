@@ -73,6 +73,18 @@ where
     /// daemon-test fixture that injects ResolvedTools through its own
     /// shim).
     pub tool_resolver: Option<Arc<dyn DaemonToolResolver>>,
+    /// Optional image normaliser for JIT signing of `dw-img://` tokens
+    /// embedded in the request body. When set, the processor walks the
+    /// body before either dispatch branch, replaces every token with a
+    /// fresh signed URL (TTL = `dispatch_ttl`), and persists the swapped
+    /// body back into `request.data.body` for the rest of the dispatch.
+    /// `None` skips JIT signing — bodies pass through unchanged (used
+    /// when image normalisation is disabled in config).
+    pub image_normalizer: Option<Arc<dyn crate::image_normalizer::ImageNormalizer>>,
+    /// TTL applied to signed URLs generated at dispatch. Refreshed on
+    /// every dispatch attempt so retries get a new URL and the leak
+    /// window per attempt is bounded.
+    pub dispatch_ttl: std::time::Duration,
     /// Default processor used for non-`/v1/responses` endpoints. Owns
     /// no state — declared as a field so the trait dispatch below has
     /// a stable receiver.
@@ -119,8 +131,28 @@ where
             http_client,
             loop_config,
             tool_resolver: None,
+            image_normalizer: None,
+            // 30 min default. Realistic upstream processing windows are
+            // shorter; this gives retries a generous-enough budget while
+            // keeping the leak window per attempt bounded. The startup
+            // wiring in `lib.rs` overrides this from
+            // `config.image_normalizer.signing.dispatch_ttl()`.
+            dispatch_ttl: std::time::Duration::from_secs(1800),
             default: DefaultRequestProcessor,
         }
+    }
+
+    /// Wire in the image normaliser for JIT signing. Without this, the
+    /// processor passes bodies through unchanged. The TTL controls how
+    /// long the signed URL handed to the upstream is valid.
+    pub fn with_image_normalizer(
+        mut self,
+        normalizer: Arc<dyn crate::image_normalizer::ImageNormalizer>,
+        ttl: std::time::Duration,
+    ) -> Self {
+        self.image_normalizer = Some(normalizer);
+        self.dispatch_ttl = ttl;
+        self
     }
 
     /// Wire in the production tool resolver. Without this, the daemon
@@ -143,12 +175,71 @@ where
 {
     async fn process(
         &self,
-        request: Request<Claimed>,
+        mut request: Request<Claimed>,
         http: H,
         storage: &S,
         should_retry: ShouldRetry,
         cancellation: CancellationFuture,
     ) -> fusillade::Result<RequestCompletionResult> {
+        // JIT signing: any `dw-img://{sha256}` token embedded in the body
+        // (placed there by the file-ingest path) gets resolved to a fresh
+        // short-lived signed URL right before dispatch. This means the
+        // long-lived value at rest in the database is only the opaque
+        // token; the signed URL only exists for the dispatch attempt's
+        // TTL, so retries get fresh URLs and per-attempt leak windows
+        // remain bounded. No-op when the normaliser is unset.
+        if let Some(normalizer) = self.image_normalizer.clone() {
+            let ttl = self.dispatch_ttl;
+            // Fail loud if the body isn't parseable JSON. A row that
+            // contains `dw-img://` tokens by construction always has a
+            // JSON body; an unparseable body here means corruption, and
+            // silently dispatching the literal token to an upstream
+            // (which can't fetch a `dw-img://` URL) would manifest as a
+            // confusing upstream error far from the root cause.
+            // Use ValidationError (not Other): a body that won't parse as
+            // JSON is malformed input that will never succeed on retry —
+            // semantically a validation failure, not a transient/unknown
+            // error. (The fusillade daemon currently treats all process()
+            // Err variants the same, but classifying it correctly future-
+            // proofs against fusillade differentiating non-retryable errors.)
+            let mut body_value: serde_json::Value = serde_json::from_str(&request.data.body).map_err(|e| {
+                fusillade::FusilladeError::ValidationError(format!(
+                    "JIT image signing: request body is not valid JSON ({e}); refusing to dispatch with unresolved tokens"
+                ))
+            })?;
+            let result = crate::image_normalizer::walker::substitute_with(
+                &mut body_value,
+                crate::image_normalizer::Mode::TokensOnly,
+                |maybe_token| {
+                    let normalizer = Arc::clone(&normalizer);
+                    async move {
+                        let token: crate::image_normalizer::ImageToken = maybe_token
+                            .parse()
+                            .map_err(|e: crate::image_normalizer::TokenParseError| format!("invalid dw-img token: {e}"))?;
+                        let signed = normalizer.sign(token, ttl).await.map_err(|e| format!("sign failed: {e}"))?;
+                        Ok::<String, String>(signed.url)
+                    }
+                },
+            )
+            .await;
+            match result {
+                Ok(count) if count > 0 => match serde_json::to_string(&body_value) {
+                    Ok(new_body) => request.data.body = new_body,
+                    Err(e) => {
+                        return Err(fusillade::FusilladeError::Other(anyhow::anyhow!(
+                            "re-serialise body after JIT signing: {e}"
+                        )));
+                    }
+                },
+                Ok(_) => {} // no tokens found, leave body alone
+                Err(e) => {
+                    return Err(fusillade::FusilladeError::Other(anyhow::anyhow!(
+                        "JIT image-URL signing failed: {e}"
+                    )));
+                }
+            }
+        }
+
         // Multi-step path is gated on the request's API path. fusillade's
         // RequestData splits URL into `endpoint` (base URL like
         // https://api.openai.com) and `path` (e.g. /v1/responses), so we

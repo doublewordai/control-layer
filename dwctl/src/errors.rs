@@ -139,6 +139,14 @@ pub enum Error {
     /// Too many concurrent requests - rate limiting
     #[error("Too many requests: {message}")]
     TooManyRequests { message: String },
+
+    /// A transient dependency failure that the client should retry
+    /// (e.g. an upstream fetch timed out after retries, or a backing
+    /// store was briefly unreachable). Produces 503 so retry-aware
+    /// clients back off and retry rather than treating it as a
+    /// permanent 4xx/5xx.
+    #[error("Service temporarily unavailable: {message}")]
+    ServiceUnavailable { message: String },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -172,6 +180,7 @@ impl Error {
             Error::ModelAccessDenied { .. } => StatusCode::FORBIDDEN,
             Error::ModalityAccessDenied { .. } => StatusCode::FORBIDDEN,
             Error::TooManyRequests { .. } => StatusCode::TOO_MANY_REQUESTS,
+            Error::ServiceUnavailable { .. } => StatusCode::SERVICE_UNAVAILABLE,
         }
     }
 
@@ -231,6 +240,7 @@ impl Error {
             Error::ModelAccessDenied { message, .. } => message.clone(),
             Error::ModalityAccessDenied { message, .. } => message.clone(),
             Error::TooManyRequests { message } => message.clone(),
+            Error::ServiceUnavailable { message } => message.clone(),
         }
     }
 }
@@ -268,6 +278,9 @@ impl IntoResponse for Error {
             }
             Error::TooManyRequests { .. } => {
                 tracing::info!("Rate limit exceeded: {}", self);
+            }
+            Error::ServiceUnavailable { .. } => {
+                tracing::warn!("Service temporarily unavailable: {}", self);
             }
         }
 
@@ -343,6 +356,16 @@ impl IntoResponse for Error {
                 });
 
                 (status, [(RETRY_AFTER, retry_after_secs)], axum::response::Json(body)).into_response()
+            }
+            Error::ServiceUnavailable { message } => {
+                use axum::http::header::RETRY_AFTER;
+                use serde_json::json;
+                let body = json!({
+                    "error": "service_unavailable",
+                    "message": message,
+                    "retry_after_seconds": 30
+                });
+                (status, [(RETRY_AFTER, "30")], axum::response::Json(body)).into_response()
             }
             _ => {
                 // For all other errors, return simple text message (unchanged)

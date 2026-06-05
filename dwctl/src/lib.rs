@@ -151,6 +151,7 @@ mod email;
 pub mod encryption;
 mod error_enrichment;
 pub mod errors;
+pub mod image_normalizer;
 mod leader_election;
 pub mod limits;
 mod metrics;
@@ -297,6 +298,11 @@ where
     /// wiring; the GET /v1/responses/{id} handler degrades to 404 in
     /// that case rather than panicking.
     pub response_step_manager: Option<Arc<fusillade::PostgresResponseStepManager<P>>>,
+    /// Singleton image normaliser used by the realtime middleware, the
+    /// batch ingest path, the dispatcher's JIT-signing step, and the
+    /// dashboard `/images/:sha256` endpoint. Built once at startup so
+    /// the GCS client + ADC signer are not re-initialised per request.
+    pub image_normalizer: Arc<dyn crate::image_normalizer::ImageNormalizer>,
 }
 
 impl<P> AppState<P>
@@ -1217,6 +1223,10 @@ pub async fn build_router(
             "/models/{id}/components/{component_id}",
             delete(api::handlers::deployments::remove_model_component),
         )
+        // Image content store — short-lived signed URL for normalised
+        // image bytes the user has previously submitted. Authorisation
+        // is per-user via the image_access table.
+        .route("/images/{sha256}", get(api::handlers::images::get_image))
         // Groups management
         .route("/groups", get(api::handlers::groups::list_groups))
         .route("/groups", post(api::handlers::groups::create_group))
@@ -1453,6 +1463,29 @@ pub async fn build_router(
         tool_injection_state,
         crate::tool_injection::tool_injection_middleware,
     ));
+
+    // Apply the image-input normaliser middleware. This runs BEFORE
+    // tool_injection in request flow (i.e. as an outer Tower layer added
+    // after the inner one). For each `/chat/completions` and `/responses`
+    // request, it walks the body for HTTP(S) `image_url` values, fetches +
+    // stores them via `image_normalizer`, and substitutes signed URLs into
+    // the body before the request reaches onwards.
+    let onwards_router = {
+        let cfg = state.current_config();
+        // Re-use the AppState-bound singleton built once at startup.
+        let normalizer = state.image_normalizer.clone();
+        let realtime_ttl = cfg.image_normalizer.signing.realtime_ttl();
+        let image_normalizer_state = crate::responses::image_normalizer_middleware::ImageNormalizerMiddlewareState {
+            enabled: cfg.image_normalizer.enabled,
+            normalizer,
+            realtime_ttl,
+            pool: Some(state.db.write().clone()),
+        };
+        onwards_router.layer(middleware::from_fn_with_state(
+            image_normalizer_state,
+            crate::responses::image_normalizer_middleware::image_normalizer_middleware,
+        ))
+    };
 
     // Apply error enrichment middleware to onwards router (before outlet logging)
     let onwards_router = onwards_router.layer(middleware::from_fn_with_state(
@@ -2727,6 +2760,15 @@ impl Application {
         let response_store =
             Arc::new(crate::responses::store::FusilladeResponseStore::new(request_manager.clone()).with_step_manager(step_manager.clone()));
 
+        // Build the image normaliser ONCE — fail loud at startup if
+        // `image_normalizer.enabled = true` but no backend is configured.
+        // This single instance is threaded through the processor builder,
+        // the realtime middleware, the batch ingest handler, and the
+        // dashboard image-view handler via AppState — never reconstructed
+        // per request.
+        let image_normalizer =
+            crate::image_normalizer::from_config(&config.image_normalizer).map_err(|e| anyhow::anyhow!("image normaliser config: {e}"))?;
+
         // Build the multi-step processor's dependencies. These also end
         // up wired into the responses middleware state below; cloning
         // them is cheap (Arc + reqwest::Client share their internal
@@ -2772,15 +2814,24 @@ impl Application {
                 Arc::new(crate::responses::processor::DbToolResolver {
                     pool: (*db_pools).write().clone(),
                 });
-            let processor = Arc::new(
-                crate::responses::processor::DwctlRequestProcessor::new(
-                    response_store.clone(),
-                    multi_step_tool_executor.clone(),
-                    multi_step_http_client.clone(),
-                    multi_step_loop_config,
-                )
-                .with_tool_resolver(tool_resolver),
-            );
+            // Derive dispatch TTL from the batch daemon's processing timeout so
+            // the signed URL is always valid for at least one full dispatch
+            // attempt — never the cause of a batch failure on its own.
+            let processing_timeout = std::time::Duration::from_millis(config.background_services.batch_daemon.processing_timeout_ms);
+            let dispatch_ttl = config.image_normalizer.signing.dispatch_ttl(processing_timeout);
+            let mut processor_builder = crate::responses::processor::DwctlRequestProcessor::new(
+                response_store.clone(),
+                multi_step_tool_executor.clone(),
+                multi_step_http_client.clone(),
+                multi_step_loop_config,
+            )
+            .with_tool_resolver(tool_resolver);
+            if config.image_normalizer.enabled {
+                // Re-use the AppState-bound singleton built above; no second
+                // GCS client / ADC signer init.
+                processor_builder = processor_builder.with_image_normalizer(image_normalizer.clone(), dispatch_ttl);
+            }
+            let processor = Arc::new(processor_builder);
             Some(
                 processor
                     as Arc<
@@ -2934,6 +2985,8 @@ impl Application {
             multi_step_tool_executor,
             multi_step_http_client,
             loop_config: multi_step_loop_config,
+            image_normalizer: image_normalizer.clone(),
+            image_normalizer_enabled: config.image_normalizer.enabled,
         };
 
         // Build onwards router from targets with body transform, response sanitization, and tool executor.
@@ -2965,6 +3018,7 @@ impl Application {
             .maybe_connections_encryption_key(bg_services.connections_encryption_key.clone())
             .response_store(response_store)
             .response_step_manager(bg_services.step_manager.clone())
+            .image_normalizer(image_normalizer)
             .build();
 
         if let Some(config_path) = config_path {

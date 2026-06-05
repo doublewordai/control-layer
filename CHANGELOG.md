@@ -1,5 +1,17 @@
 # Changelog
 
+## [8.59.0](https://github.com/doublewordai/control-layer/compare/v8.58.1...v8.59.0) (2026-06-05)
+
+
+### Features
+
+* image input normalisation ([#1083](https://github.com/doublewordai/control-layer/issues/1083)) ([97d006c](https://github.com/doublewordai/control-layer/commit/97d006c4231dd00c490ce9fa94a3a6476dad38dc))
+
+
+### Bug Fixes
+
+* **openapi:** use Doubleword-served models in API doc examples ([#1125](https://github.com/doublewordai/control-layer/issues/1125)) ([27fc25f](https://github.com/doublewordai/control-layer/commit/27fc25fffd140c51874e8ec66dafc5e8db2b324f))
+
 ## [8.58.1](https://github.com/doublewordai/control-layer/compare/v8.58.0...v8.58.1) (2026-06-03)
 
 

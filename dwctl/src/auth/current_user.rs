@@ -437,6 +437,9 @@ async fn try_api_key_auth(parts: &axum::http::request::Parts, db: &PgPool) -> Op
             payment_provider_id: api_key_data.payment_provider_id,
             organizations: vec![],
             active_organization,
+            // API-key-derived current users don't expose the opt-in
+            // flag — it's surfaced by the dashboard session path that
+            // hits Users::get_by_id (which carries the real value).
         },
         api_key_data.last_login,
     )))
