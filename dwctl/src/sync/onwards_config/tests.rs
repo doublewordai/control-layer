@@ -1409,6 +1409,70 @@ async fn test_fallback_sync_triggers_without_notifications(pool: sqlx::PgPool) {
     let _ = timeout(Duration::from_secs(1), sync_handle).await;
 }
 
+/// Regression: a burst of NOTIFYs that arrive within the debounce window must ALL be
+/// applied, not dropped. With scoped delta reloads a dropped notification's scope is never
+/// re-queried (the old full-reload sync was rescued by the next full reload, the delta sync
+/// is not). Fallback is disabled here, so the NOTIFY stream is the only path to the cache —
+/// a dropped change would never appear, which is exactly the bug that broke routing for
+/// requests issued right after a burst of config changes.
+#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
+async fn test_rapid_notify_burst_is_not_dropped(pool: sqlx::PgPool) {
+    let (sync, _initial, _stream) = super::OnwardsConfigSync::new(pool.clone()).await.unwrap();
+    let mut rx = sync.sender().subscribe();
+
+    let (status_tx, mut status_rx) = mpsc::channel(10);
+    let config = SyncConfig {
+        status_tx: Some(status_tx),
+        fallback_interval_milliseconds: 0, // disabled: NOTIFY is the only path to the cache
+    };
+    let token = CancellationToken::new();
+    let handle = tokio::spawn({
+        let token = token.clone();
+        async move { sync.start(config, token).await }
+    });
+
+    // Once Connected the listener is active; drain the initial snapshot.
+    assert_eq!(status_rx.recv().await, Some(super::SyncStatus::Connecting));
+    assert_eq!(status_rx.recv().await, Some(super::SyncStatus::Connected));
+    rx.borrow_and_update();
+
+    // Rename two public deployments from cache_base back-to-back, so the second NOTIFY lands
+    // inside the first's debounce window.
+    for (id, alias) in [
+        ("40000000-0000-0000-0000-000000000001", "burst-regular-public"),
+        ("40000000-0000-0000-0000-000000000003", "burst-metered-public"),
+    ] {
+        sqlx::query("UPDATE deployed_models SET alias = $1 WHERE id = $2::uuid")
+            .bind(alias)
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    // Both renames must reach the cache. The dropped-notification bug leaves the second one
+    // missing forever (fallback is off), so this poll times out and fails.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let have_both = {
+            let t = rx.borrow();
+            t.targets.contains_key("burst-regular-public") && t.targets.contains_key("burst-metered-public")
+        };
+        if have_both {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "both burst renames must reach the cache; present aliases: {:?}",
+            rx.borrow().targets.iter().map(|e| e.key().clone()).collect::<Vec<_>>()
+        );
+        let _ = timeout(Duration::from_millis(100), rx.changed()).await;
+    }
+
+    token.cancel();
+    let _ = timeout(Duration::from_secs(1), handle).await;
+}
+
 #[cfg(test)]
 mod resolve_key_rate_limit_tests {
     use super::*;

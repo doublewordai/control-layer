@@ -509,17 +509,45 @@ impl OnwardsConfigSync {
                                     );
                                 }
 
-                                // Debounce: skip if we just reloaded recently
-                                if last_reload_time.elapsed() < MIN_RELOAD_INTERVAL {
-                                    debug!("Skipping reload due to debouncing (last reload was {:?} ago)",
-                                           last_reload_time.elapsed());
-                                    continue;
+                                // Which deployments this change touches (empty = full reload).
+                                let mut scope = self.resolve_change_scope(change.as_ref()).await;
+
+                                // Debounce by COALESCING, not dropping. If we reloaded very recently,
+                                // wait out the rest of the window and fold every notification that
+                                // arrives during it into a single reload. Dropping a notification (the
+                                // old behaviour) was only safe when every reload was a full reload;
+                                // with scoped deltas a dropped notification's scope would never be
+                                // re-queried until the periodic fallback, leaving the cache stale (and
+                                // a request routed against it failing) for up to the fallback interval.
+                                let elapsed = last_reload_time.elapsed();
+                                if elapsed < MIN_RELOAD_INTERVAL {
+                                    tokio::time::sleep(MIN_RELOAD_INTERVAL - elapsed).await;
+                                }
+                                // Fold in everything buffered during the window. An empty scope means a
+                                // full reload, which subsumes the rest. `try_recv()` awaits the next
+                                // notification rather than returning immediately, so bound each drain
+                                // step with a short timeout: collect what is already buffered, then
+                                // stop. Anything still in flight is handled on a later loop iteration
+                                // (never dropped).
+                                while let Ok(Ok(Some(n))) =
+                                    tokio::time::timeout(std::time::Duration::from_millis(5), listener.try_recv()).await
+                                {
+                                    if scope.is_empty() {
+                                        continue; // already a full reload; just drain the queue
+                                    }
+                                    let extra = self
+                                        .resolve_change_scope(parse_notify_payload(n.payload()).as_ref())
+                                        .await;
+                                    if extra.is_empty() {
+                                        scope.clear();
+                                    } else {
+                                        scope.extend(extra);
+                                    }
                                 }
 
                                 // Reload — scoped to the affected deployments when the
                                 // payload identifies them, otherwise a full reload.
                                 last_reload_time = std::time::Instant::now();
-                                let scope = self.resolve_change_scope(change.as_ref()).await;
                                 match self.reload_into_state(&scope).await {
                                     Ok(new_targets) => {
                                         debug!(
