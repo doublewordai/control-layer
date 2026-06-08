@@ -24,9 +24,11 @@
 --   model_tariffs              -> deployment id  = COALESCE(NEW.deployed_model_id, OLD.deployed_model_id)
 --   model_traffic_rules        -> deployment id  = COALESCE(NEW.deployed_model_id, OLD.deployed_model_id)
 --   deployed_model_components  -> deployment id  = COALESCE(NEW.composite_model_id, OLD.composite_model_id)
+--   inference_endpoints        -> deployment id  = each live deployed_model hosted on the endpoint
 --   api_keys                   -> user id        = user_id (the key owner)
 --   user_groups                -> user id        = COALESCE(NEW.user_id, OLD.user_id)
 --   user_organizations         -> user id        = COALESCE(NEW.user_id, OLD.user_id)
+--   users (verified)           -> user id        = NEW.id
 --
 -- <op> values: trigger-emitted notifies carry the SQL operation (INSERT / UPDATE /
 -- DELETE). The credits_transactions notify is emitted by the application (not a
@@ -34,30 +36,23 @@
 --   * deplete -- a user's balance was exhausted        (request_logging/batcher.rs)
 --   * restore -- a user's balance crossed zero upward  (db/handlers/credits.rs)
 --
--- The legacy 2-part `<table>:<epoch_micros>` form (introduced in migration 049)
--- carries no scope id and therefore requests a FULL reload. As of THIS migration
--- the `users` trigger (users_verified_notify, migration 099) is kept on the legacy
--- form, because `users` was not yet in resolve_change_scope's delta dispatch, so any
--- scope id emitted for it would be ignored and a full reload done anyway.
---
--- SUPERSEDED: migration 104 adds a `users` arm to resolve_change_scope and upgrades
--- users_verified_notify to the enriched `users:<op>:<user_id>:<epoch>` form, making a
--- verified change a per-user delta. The notes in this file describe the state as of
--- migration 103 only.
---
--- DESIGN: the old shared notify_config_change() served tables with DIFFERENT
--- scope columns AND different trigger levels (row vs statement). A single
--- NEW/OLD-reading function cannot be shared by statement-level triggers, because
--- NEW/OLD are not bound for statement-level firing. We therefore use *per-table*
--- trigger functions:
---   * row-level tables read COALESCE(NEW.col, OLD.col) directly;
---   * statement-level tables (model_traffic_rules, user_organizations, api_keys)
---     read their transition tables and emit one notify per DISTINCT scope id.
--- notify_config_change() is retained only for `users` (legacy 2-part payload).
+-- DESIGN: the old shared notify_config_change() served tables with DIFFERENT scope
+-- columns AND different trigger levels (row vs statement). A single NEW/OLD-reading
+-- function cannot be shared by statement-level triggers, because NEW/OLD are not
+-- bound for statement-level firing. We therefore use *per-table* trigger functions:
+--   * row-level tables read the changed row's column directly (COALESCE(NEW.col,
+--     OLD.col), or NEW.id for the UPDATE-only users.verified trigger);
+--   * statement-level tables (model_traffic_rules, user_organizations, api_keys,
+--     inference_endpoints) read their transition tables and emit one notify per
+--     DISTINCT scope id. Their UPDATE path reads BOTH transition tables, so a row
+--     whose scope id MOVED notifies the old scope as well as the new.
+-- The legacy 2-part `<table>:<epoch_micros>` helper notify_config_change() (migration
+-- 049) is kept defined for backward compatibility but is no longer used by any
+-- onwards trigger (users.verified now emits the enriched per-user form above).
 --
 -- This migration is idempotent-friendly: it CREATE OR REPLACEs functions and
--- DROP TRIGGER IF EXISTS / CREATE TRIGGERs, so it runs cleanly on a database that
--- already carries the triggers from migrations 002/049/067/074/101/042/054/099.
+-- DROP TRIGGER IF EXISTS / CREATE TRIGGERs, so it runs cleanly on a fresh database
+-- and on one already carrying earlier onwards triggers (002/049/067/074/101/042/054/099).
 
 -- ---------------------------------------------------------------------------
 -- Shared helper retained for `users` only: legacy 2-part `<table>:<epoch>`
@@ -200,6 +195,26 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+-- UPDATE reads BOTH transition tables (via a dedicated function) so a rule whose
+-- deployed_model_id MOVED notifies the OLD deployment as well as the new one;
+-- INSERT/DELETE keep the base function above.
+CREATE OR REPLACE FUNCTION notify_traffic_rules_config_change_update() RETURNS trigger AS $$
+DECLARE
+    target_id UUID;
+BEGIN
+    FOR target_id IN
+        SELECT deployed_model_id FROM new_rows
+        UNION
+        SELECT deployed_model_id FROM old_rows
+    LOOP
+        PERFORM pg_notify('auth_config_changed',
+            TG_TABLE_NAME || ':' || TG_OP || ':' || target_id::text || ':'
+            || (extract(epoch FROM clock_timestamp()) * 1000000)::bigint::text);
+    END LOOP;
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
 DROP TRIGGER IF EXISTS model_traffic_rules_notify ON model_traffic_rules;
 DROP TRIGGER IF EXISTS model_traffic_rules_notify_insert ON model_traffic_rules;
 DROP TRIGGER IF EXISTS model_traffic_rules_notify_update ON model_traffic_rules;
@@ -210,8 +225,8 @@ CREATE TRIGGER model_traffic_rules_notify_insert
     FOR EACH STATEMENT EXECUTE FUNCTION notify_traffic_rules_config_change();
 CREATE TRIGGER model_traffic_rules_notify_update
     AFTER UPDATE ON model_traffic_rules
-    REFERENCING NEW TABLE AS new_rows
-    FOR EACH STATEMENT EXECUTE FUNCTION notify_traffic_rules_config_change();
+    REFERENCING NEW TABLE AS new_rows OLD TABLE AS old_rows
+    FOR EACH STATEMENT EXECUTE FUNCTION notify_traffic_rules_config_change_update();
 CREATE TRIGGER model_traffic_rules_notify_delete
     AFTER DELETE ON model_traffic_rules
     REFERENCING OLD TABLE AS old_rows
@@ -245,6 +260,26 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+-- UPDATE reads BOTH transition tables (via a dedicated function) so a membership
+-- whose user_id MOVED notifies the OLD user as well as the new one; INSERT/DELETE
+-- keep the base function above.
+CREATE OR REPLACE FUNCTION notify_user_organizations_config_change_update() RETURNS trigger AS $$
+DECLARE
+    target_id UUID;
+BEGIN
+    FOR target_id IN
+        SELECT user_id FROM new_rows
+        UNION
+        SELECT user_id FROM old_rows
+    LOOP
+        PERFORM pg_notify('auth_config_changed',
+            TG_TABLE_NAME || ':' || TG_OP || ':' || target_id::text || ':'
+            || (extract(epoch FROM clock_timestamp()) * 1000000)::bigint::text);
+    END LOOP;
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
 DROP TRIGGER IF EXISTS user_organizations_notify ON user_organizations;
 DROP TRIGGER IF EXISTS user_organizations_notify_insert ON user_organizations;
 DROP TRIGGER IF EXISTS user_organizations_notify_update ON user_organizations;
@@ -255,8 +290,8 @@ CREATE TRIGGER user_organizations_notify_insert
     FOR EACH STATEMENT EXECUTE FUNCTION notify_user_organizations_config_change();
 CREATE TRIGGER user_organizations_notify_update
     AFTER UPDATE ON user_organizations
-    REFERENCING NEW TABLE AS new_rows
-    FOR EACH STATEMENT EXECUTE FUNCTION notify_user_organizations_config_change();
+    REFERENCING NEW TABLE AS new_rows OLD TABLE AS old_rows
+    FOR EACH STATEMENT EXECUTE FUNCTION notify_user_organizations_config_change_update();
 CREATE TRIGGER user_organizations_notify_delete
     AFTER DELETE ON user_organizations
     REFERENCING OLD TABLE AS old_rows
@@ -369,3 +404,117 @@ CREATE TRIGGER api_keys_notify_update
     AFTER UPDATE ON api_keys
     REFERENCING OLD TABLE AS old_rows NEW TABLE AS new_rows
     FOR EACH STATEMENT EXECUTE FUNCTION notify_api_keys_config_change();
+
+-- ---------------------------------------------------------------------------
+-- inference_endpoints (STATEMENT-level, INSERT/UPDATE/DELETE). The onwards sync
+-- reads url / api_key / auth headers from it (`INNER JOIN inference_endpoints ie
+-- ON dm.hosted_on = ie.id`), so an endpoint change must reload the deployments
+-- hosted on it. scope = each DEPLOYMENT id hosted on an affected endpoint. NEW/OLD
+-- are unbound at statement level, so the shared function branches on TG_OP and
+-- reads the bound transition table (new_rows on INSERT, old_rows on DELETE, both on
+-- UPDATE), then for each affected endpoint id emits one notify per live deployment
+-- hosted on it. An endpoint with no live deployments emits nothing.
+--
+-- DELETE note: inference_endpoints -> deployed_models is ON DELETE CASCADE and this
+-- AFTER STATEMENT trigger fires after the cascade, so the DELETE branch finds zero
+-- hosted deployments and emits nothing here — fine, because each cascade-deleted
+-- deployment already fires the row-level deployed_models DELETE trigger above. The
+-- symmetric DELETE branch is kept to match the per-deployment shape and to stay
+-- correct if the FK is ever changed away from CASCADE.
+-- ---------------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION notify_inference_endpoints_config_change() RETURNS trigger AS $$
+DECLARE
+    endpoint_id UUID;
+    target_id UUID;
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        FOR endpoint_id IN SELECT DISTINCT id FROM old_rows LOOP
+            FOR target_id IN
+                SELECT DISTINCT dm.id
+                FROM deployed_models dm
+                WHERE dm.hosted_on = endpoint_id
+                  AND dm.deleted = FALSE
+            LOOP
+                PERFORM pg_notify('auth_config_changed',
+                    TG_TABLE_NAME || ':' || TG_OP || ':' || target_id::text || ':'
+                    || (extract(epoch FROM clock_timestamp()) * 1000000)::bigint::text);
+            END LOOP;
+        END LOOP;
+    ELSIF TG_OP = 'UPDATE' THEN
+        -- Both transition tables exist; the endpoint id is immutable so the union
+        -- coincides, but taking it keeps the path symmetric and future-proof.
+        FOR endpoint_id IN
+            SELECT id FROM new_rows
+            UNION
+            SELECT id FROM old_rows
+        LOOP
+            FOR target_id IN
+                SELECT DISTINCT dm.id
+                FROM deployed_models dm
+                WHERE dm.hosted_on = endpoint_id
+                  AND dm.deleted = FALSE
+            LOOP
+                PERFORM pg_notify('auth_config_changed',
+                    TG_TABLE_NAME || ':' || TG_OP || ':' || target_id::text || ':'
+                    || (extract(epoch FROM clock_timestamp()) * 1000000)::bigint::text);
+            END LOOP;
+        END LOOP;
+    ELSE
+        -- INSERT exposes only new_rows.
+        FOR endpoint_id IN SELECT DISTINCT id FROM new_rows LOOP
+            FOR target_id IN
+                SELECT DISTINCT dm.id
+                FROM deployed_models dm
+                WHERE dm.hosted_on = endpoint_id
+                  AND dm.deleted = FALSE
+            LOOP
+                PERFORM pg_notify('auth_config_changed',
+                    TG_TABLE_NAME || ':' || TG_OP || ':' || target_id::text || ':'
+                    || (extract(epoch FROM clock_timestamp()) * 1000000)::bigint::text);
+            END LOOP;
+        END LOOP;
+    END IF;
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS inference_endpoints_notify ON inference_endpoints;
+DROP TRIGGER IF EXISTS inference_endpoints_notify_insert ON inference_endpoints;
+DROP TRIGGER IF EXISTS inference_endpoints_notify_update ON inference_endpoints;
+DROP TRIGGER IF EXISTS inference_endpoints_notify_delete ON inference_endpoints;
+CREATE TRIGGER inference_endpoints_notify_insert
+    AFTER INSERT ON inference_endpoints
+    REFERENCING NEW TABLE AS new_rows
+    FOR EACH STATEMENT EXECUTE FUNCTION notify_inference_endpoints_config_change();
+CREATE TRIGGER inference_endpoints_notify_update
+    AFTER UPDATE ON inference_endpoints
+    REFERENCING NEW TABLE AS new_rows OLD TABLE AS old_rows
+    FOR EACH STATEMENT EXECUTE FUNCTION notify_inference_endpoints_config_change();
+CREATE TRIGGER inference_endpoints_notify_delete
+    AFTER DELETE ON inference_endpoints
+    REFERENCING OLD TABLE AS old_rows
+    FOR EACH STATEMENT EXECUTE FUNCTION notify_inference_endpoints_config_change();
+
+-- ---------------------------------------------------------------------------
+-- users.verified (row-level, AFTER UPDATE OF verified, gated on the flag actually
+-- changing). The verified flag drives the rate-limit tier of every key the user
+-- owns, so a change only affects that user's reachable deployments — emit the user
+-- id (users:<op>:<user_id>:<epoch>) so the consumer does a per-user delta. This
+-- replaces migration 099's legacy users_verified_notify (which used the 2-part
+-- notify_config_change() / full-reload form).
+-- ---------------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION notify_users_verified_config_change() RETURNS trigger AS $$
+BEGIN
+    PERFORM pg_notify('auth_config_changed',
+        TG_TABLE_NAME || ':' || TG_OP || ':' || NEW.id::text || ':'
+        || (extract(epoch FROM clock_timestamp()) * 1000000)::bigint::text);
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS users_verified_notify ON users;
+CREATE TRIGGER users_verified_notify
+    AFTER UPDATE OF verified ON users
+    FOR EACH ROW
+    WHEN (OLD.verified IS DISTINCT FROM NEW.verified)
+    EXECUTE FUNCTION notify_users_verified_config_change();

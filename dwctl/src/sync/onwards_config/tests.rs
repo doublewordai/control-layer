@@ -1058,7 +1058,7 @@ async fn test_membership_delete_fires_scoped_notify(pool: sqlx::PgPool) {
 
 /// Deleting an inference_endpoint must not silently strand stale routing config. The FK
 /// deployed_models.hosted_on -> inference_endpoints(id) is ON DELETE CASCADE, so the endpoint's
-/// deployments are deleted and fire their own deployed_models:DELETE notify; migration 104's
+/// deployments are deleted and fire their own deployed_models:DELETE notify; migration 103's
 /// inference_endpoints trigger deliberately emits nothing on DELETE. Verify the cascade notify
 /// reaches the sync and the endpoint itself stays silent (guards the cascade-order assumption).
 #[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
