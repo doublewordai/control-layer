@@ -968,12 +968,15 @@ pub struct LimitsConfig {
 
 /// Request limits configuration.
 ///
-/// Controls per-request body size limits within batch JSONL files
-/// to prevent individual requests from overwhelming inference providers.
+/// Controls per-request body size limits for individual requests, both within
+/// batch JSONL files and on the realtime AI proxy path, to prevent individual
+/// requests from overwhelming inference providers.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RequestLimitsConfig {
-    /// Maximum body size in bytes for individual requests within batch JSONL files.
+    /// Maximum body size in bytes for individual requests. Applies to requests
+    /// within batch JSONL files and to realtime request bodies on the onwards
+    /// AI proxy path (/ai/v1/*).
     /// Set to 0 for unlimited (not recommended for production).
     /// Default: 10MB
     pub max_body_size: u64,
