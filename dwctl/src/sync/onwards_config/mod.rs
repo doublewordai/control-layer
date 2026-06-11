@@ -174,7 +174,13 @@ impl OnwardsConfigSync {
         // Populate cache info metrics on startup
         let mut cache_info_state = crate::metrics::CacheInfoState::new();
         if let Err(e) = crate::metrics::update_cache_info_metrics(&db, &initial_targets, &mut cache_info_state).await {
-            crate::background_error!(ONWARDS_SYNC, "cache_info_metrics", Error, "Failed to update cache info metrics: {}", e);
+            crate::background_error!(
+                ONWARDS_SYNC,
+                "cache_info_metrics",
+                Error,
+                "Failed to update cache info metrics: {}",
+                e
+            );
         }
 
         // Create watch channel with initial state
@@ -1152,7 +1158,9 @@ fn convert_to_config_file(
     for composite in composites {
         if composite.components.is_empty() {
             crate::background_error!(
-                ONWARDS_SYNC, "composite_no_components", Warning,
+                ONWARDS_SYNC,
+                "composite_no_components",
+                Warning,
                 "Composite model '{}' has no enabled components - requests will return 503",
                 composite.alias
             );

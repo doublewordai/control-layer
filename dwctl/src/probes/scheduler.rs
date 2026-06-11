@@ -83,7 +83,14 @@ impl ProbeScheduler {
                         let probe = match ProbeManager::get_probe(&pool, probe_id).await {
                             Ok(p) => p,
                             Err(e) => {
-                                crate::background_error!(PROBE_SCHEDULER, "probe_fetch", Warning, "Error fetching probe {}: {}", probe_id, e);
+                                crate::background_error!(
+                                    PROBE_SCHEDULER,
+                                    "probe_fetch",
+                                    Warning,
+                                    "Error fetching probe {}: {}",
+                                    probe_id,
+                                    e
+                                );
                                 return;
                             }
                         };
@@ -165,7 +172,14 @@ impl ProbeScheduler {
                         }
                     }
                     Err(e) => {
-                        crate::background_error!(PROBE_SCHEDULER, "probe_execute", Warning, "Error executing probe {}: {}", probe.name, e);
+                        crate::background_error!(
+                            PROBE_SCHEDULER,
+                            "probe_execute",
+                            Warning,
+                            "Error executing probe {}: {}",
+                            probe.name,
+                            e
+                        );
                     }
                 }
 
@@ -237,7 +251,14 @@ impl ProbeScheduler {
         for probe_id in active_probe_ids.difference(&running_probe_ids) {
             tracing::info!("Starting scheduler for newly activated probe {}", probe_id);
             if let Err(e) = self.start_scheduler(*probe_id, shutdown_token.clone()).await {
-                crate::background_error!(PROBE_SCHEDULER, "scheduler_start", Warning, "Failed to start scheduler for probe {}: {}", probe_id, e);
+                crate::background_error!(
+                    PROBE_SCHEDULER,
+                    "scheduler_start",
+                    Warning,
+                    "Failed to start scheduler for probe {}: {}",
+                    probe_id,
+                    e
+                );
             }
         }
 
@@ -245,7 +266,14 @@ impl ProbeScheduler {
         for probe_id in running_probe_ids.difference(&active_probe_ids) {
             tracing::info!("Stopping scheduler for deactivated probe {}", probe_id);
             if let Err(e) = self.stop_scheduler(*probe_id).await {
-                crate::background_error!(PROBE_SCHEDULER, "scheduler_stop", Warning, "Failed to stop scheduler for probe {}: {}", probe_id, e);
+                crate::background_error!(
+                    PROBE_SCHEDULER,
+                    "scheduler_stop",
+                    Warning,
+                    "Failed to stop scheduler for probe {}: {}",
+                    probe_id,
+                    e
+                );
             }
         }
 

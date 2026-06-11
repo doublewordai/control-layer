@@ -1874,7 +1874,13 @@ impl BackgroundServices {
                 }
                 Some(Ok((task_id, Ok(())))) => {
                     let task_name = self.task_names.get(&task_id).copied().unwrap_or("unknown");
-                    crate::background_error!(SUPERVISOR, "task_exit_unexpected", Error, task = task_name, "Background task completed unexpectedly");
+                    crate::background_error!(
+                        SUPERVISOR,
+                        "task_exit_unexpected",
+                        Error,
+                        task = task_name,
+                        "Background task completed unexpectedly"
+                    );
                     anyhow::bail!("Background task '{}' completed early", task_name)
                 }
                 Some(Ok((task_id, Err(e)))) if self.shutdown_token.is_cancelled() => {

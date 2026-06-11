@@ -33,11 +33,11 @@
 //! - **Batch enrichment**: User and pricing lookups are batched using `IN` clauses,
 //!   reducing from O(N) queries to O(1) per batch.
 
-use crate::metrics::errors::component::ANALYTICS_BATCHER;
 use crate::config::{Config, ONWARDS_CONFIG_CHANGED_CHANNEL};
 use crate::db::handlers::Credits;
 use crate::db::models::api_keys::ApiKeyPurpose;
 use crate::metrics::MetricsRecorder;
+use crate::metrics::errors::component::ANALYTICS_BATCHER;
 use crate::request_logging::serializers::HttpAnalyticsRow;
 use chrono::{DateTime, Utc};
 use metrics::{counter, histogram};

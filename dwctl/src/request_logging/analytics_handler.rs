@@ -44,8 +44,8 @@
 //! let layer = RequestLoggerLayer::new(outlet_config, handler);
 //! ```
 
-use crate::metrics::errors::component::ANALYTICS;
 use crate::config::Config;
+use crate::metrics::errors::component::ANALYTICS;
 use crate::request_logging::AiResponse;
 use crate::request_logging::batcher::{AnalyticsSender, RawAnalyticsRecord};
 use crate::request_logging::serializers::{Auth, UsageMetrics, parse_ai_response};
