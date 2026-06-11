@@ -1,9 +1,12 @@
 //! Unified background-error metric and log.
 //!
 //! `background_error!` emits the `dwctl_background_errors_total` counter AND a `tracing`
-//! event from a single call site, so the metric and the log can never drift. It is ONLY for
-//! background (off-request-path) failures - foreground failures are already counted by
-//! `dwctl_http_requests_total{status}`. See `pr-background-errors.md` for the full plan.
+//! event from a single call site, so the metric and the log can never drift. It is for failures
+//! we want attributed in the unified error metric - primarily background (off-request-path)
+//! failures, since foreground route failures that surface as a 5xx are already counted by
+//! `dwctl_http_requests_total{status}`. A handful of request-path sites also use it for failures
+//! that are swallowed (logged but not returned as the response status), which would otherwise be
+//! invisible.
 
 use metrics::counter;
 
@@ -23,6 +26,7 @@ pub mod component {
     pub const ANALYTICS_BATCHER: &str = "analytics_batcher";
     pub const RESPONSES_WRITER: &str = "responses_writer";
     pub const BATCH_POPULATE: &str = "batch_populate";
+    pub const PAYMENTS: &str = "payments";
 }
 
 /// Increment `dwctl_background_errors_total`. `component`/`reason`/`severity` are `&'static str`

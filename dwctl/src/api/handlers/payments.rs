@@ -79,6 +79,7 @@ use crate::{
     api::models::users::CurrentUser,
     auth::permissions,
     db::{handlers::repository::Repository, handlers::users::Users, models::users::UserUpdateDBRequest},
+    metrics::errors::component::PAYMENTS,
     payment_providers,
 };
 
@@ -301,7 +302,8 @@ pub async fn process_payment<P: PoolProvider>(
                 let detail = format!("{e:?}");
                 let status = StatusCode::from(e);
                 if status.is_server_error() {
-                    tracing::error!(error = %detail, %status, "Failed to process payment session");
+                    crate::background_error!(PAYMENTS, "process_failed", Error,
+                        error = %detail, %status, "Failed to process payment session");
                 } else {
                     tracing::warn!(error = %detail, %status, "Payment session rejected");
                 }

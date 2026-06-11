@@ -392,7 +392,7 @@ impl OnwardsConfigSync {
                                 debug!("Fallback sync: updated onwards configuration successfully");
                             }
                             Err(e) => {
-                                crate::background_error!(ONWARDS_SYNC, "load_targets", Error, "Fallback sync: failed to load targets from database: {}", e);
+                                crate::background_error!(ONWARDS_SYNC, "load_targets_fallback", Error, "Fallback sync: failed to load targets from database: {}", e);
                                 // Continue - fallback sync errors shouldn't crash the service
                             }
                         }

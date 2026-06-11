@@ -26,8 +26,8 @@
 //!   * **Sustained fusillade outage**: `flush_batch` retries with
 //!     exponential backoff up to `max_retries` (default 3). If every
 //!     attempt fails the batch is dropped, logged at `error`, and
-//!     `dwctl_requests_writer_flush_errors_total` increments. There is
-//!     no requeue or dead-letter table.
+//!     `dwctl_background_errors_total{component="responses_writer", reason="flush_drop"}`
+//!     increments. There is no requeue or dead-letter table.
 //!
 //! Both losses are acceptable here because billing and usage accounting
 //! read from `http_analytics` and `credit_transactions`, not `requests`.
