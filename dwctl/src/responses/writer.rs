@@ -56,6 +56,7 @@
 //! one fusillade transaction per flush, no dwctl_pool access on the bulk path
 //! ```
 
+use crate::metrics::errors::component::RESPONSES_WRITER;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -64,7 +65,7 @@ use metrics::{counter, gauge, histogram};
 use sqlx_pool_router::PoolProvider;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tracing::{Instrument, debug, error, info, info_span, warn};
+use tracing::{Instrument, debug, info, info_span, warn};
 use uuid::Uuid;
 
 /// Channel capacity. Records sit here when the writer can't keep up; once
@@ -289,13 +290,13 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> RequestsWriter<P> {
             }
 
             if let Some(e) = last_error {
-                error!(
+                crate::background_error!(
+                    RESPONSES_WRITER, "flush_drop", Error,
                     error = %e,
                     batch_size,
                     attempts = self.max_retries + 1,
                     "Failed to flush responses batch after all retries, dropping batch"
                 );
-                counter!("dwctl_requests_writer_flush_errors_total").increment(1);
                 buffer.clear();
                 return;
             }

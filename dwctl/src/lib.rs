@@ -175,6 +175,7 @@ pub mod webhooks;
 #[cfg(test)]
 mod test;
 
+use crate::metrics::errors::component::{ONWARDS_HEARTBEAT, SUPERVISOR};
 use crate::{
     api::models::{
         deployments::{DeployedModelCreate, StandardModelCreate},
@@ -1873,7 +1874,7 @@ impl BackgroundServices {
                 }
                 Some(Ok((task_id, Ok(())))) => {
                     let task_name = self.task_names.get(&task_id).copied().unwrap_or("unknown");
-                    tracing::warn!(task = task_name, "Background task completed unexpectedly");
+                    crate::background_error!(SUPERVISOR, "task_exit_unexpected", Error, task = task_name, "Background task completed unexpectedly");
                     anyhow::bail!("Background task '{}' completed early", task_name)
                 }
                 Some(Ok((task_id, Err(e)))) if self.shutdown_token.is_cancelled() => {
@@ -1882,7 +1883,7 @@ impl BackgroundServices {
                 }
                 Some(Ok((task_id, Err(e)))) => {
                     let task_name = self.task_names.get(&task_id).copied().unwrap_or("unknown");
-                    tracing::error!(task = task_name, error = %e, "Background task failed");
+                    crate::background_error!(SUPERVISOR, "task_failed", Error, task = task_name, error = %e, "Background task failed");
                     anyhow::bail!("Background task '{}' failed: {}", task_name, e)
                 }
                 Some(Err(e)) if self.shutdown_token.is_cancelled() => {
@@ -1893,7 +1894,7 @@ impl BackgroundServices {
                 Some(Err(e)) => {
                     let task_id = e.id();
                     let task_name = self.task_names.get(&task_id).copied().unwrap_or("unknown");
-                    tracing::error!(task = task_name, error = %e, "Background task panicked");
+                    crate::background_error!(SUPERVISOR, "task_panicked", Error, task = task_name, error = %e, "Background task panicked");
                     anyhow::bail!("Background task '{}' panicked: {}", task_name, e)
                 }
             }
@@ -2000,12 +2001,12 @@ impl BackgroundServices {
                 }
                 Ok((task_id, Err(e))) => {
                     let task_name = self.task_names.get(&task_id).copied().unwrap_or("unknown");
-                    tracing::error!(task = task_name, error = %e, "Background task failed");
+                    crate::background_error!(SUPERVISOR, "task_failed", Error, task = task_name, error = %e, "Background task failed");
                 }
                 Err(e) => {
                     let task_id = e.id();
                     let task_name = self.task_names.get(&task_id).copied().unwrap_or("unknown");
-                    tracing::error!(task = task_name, error = %e, "Background task panicked");
+                    crate::background_error!(SUPERVISOR, "task_panicked", Error, task = task_name, error = %e, "Background task panicked");
                 }
             }
         }
@@ -2911,7 +2912,7 @@ impl Application {
                 true
             }
             Err(e) => {
-                tracing::warn!(error = %e, "Failed to register onwards daemon (table may not exist yet)");
+                crate::background_error!(ONWARDS_HEARTBEAT, "registration", Warning, error = %e, "Failed to register onwards daemon (table may not exist yet)");
                 false
             }
         };
@@ -2937,7 +2938,7 @@ impl Application {
                             .await;
 
                             if let Err(e) = result {
-                                tracing::warn!(error = %e, "Failed to send onwards daemon heartbeat");
+                                crate::background_error!(ONWARDS_HEARTBEAT, "heartbeat", Warning, error = %e, "Failed to send onwards daemon heartbeat");
                             }
                         }
                         _ = heartbeat_shutdown.cancelled() => {

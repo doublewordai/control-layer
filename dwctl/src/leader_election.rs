@@ -1,5 +1,6 @@
 //! Leader election using PostgreSQL advisory locks for multi-instance deployments.
 
+use crate::metrics::errors::component::LEADER_ELECTION;
 use crate::config;
 use sqlx::PgPool;
 use std::sync::Arc;
@@ -42,7 +43,7 @@ pub async fn leader_election_task<F1, F2, Fut1, Fut2>(
                 if is_leader.load(Ordering::Relaxed) {
                     is_leader.store(false, Ordering::Relaxed);
                     if let Err(e) = on_lose_leadership(pool.clone(), config.clone()).await {
-                        tracing::error!("Failed to execute on_lose_leadership callback during shutdown: {}", e);
+                        crate::background_error!(LEADER_ELECTION, "lose_callback", Error, "Failed to execute on_lose_leadership callback during shutdown: {}", e);
                     }
                 }
                 break;
@@ -68,7 +69,7 @@ pub async fn leader_election_task<F1, F2, Fut1, Fut2>(
                             leader_conn = Some(conn); // Keep connection alive
 
                             if let Err(e) = on_gain_leadership(pool.clone(), config.clone()).await {
-                                tracing::error!("Failed to execute on_gain_leadership callback: {}", e);
+                                crate::background_error!(LEADER_ELECTION, "gain_callback", Error, "Failed to execute on_gain_leadership callback: {}", e);
                             }
                         }
                         Ok(false) => {
@@ -76,12 +77,12 @@ pub async fn leader_election_task<F1, F2, Fut1, Fut2>(
                             debug!("Following - will retry");
                         }
                         Err(e) => {
-                            tracing::error!("Failed to check leader lock: {}", e);
+                            crate::background_error!(LEADER_ELECTION, "lock_check", Warning, "Failed to check leader lock: {}", e);
                         }
                     }
                 }
                 Err(e) => {
-                    tracing::error!("Failed to acquire connection for leader election: {}", e);
+                    crate::background_error!(LEADER_ELECTION, "db_acquire", Warning, "Failed to acquire connection for leader election: {}", e);
                 }
             }
         } else {
@@ -101,13 +102,13 @@ pub async fn leader_election_task<F1, F2, Fut1, Fut2>(
                         leader_conn = None;
 
                         if let Err(e) = on_lose_leadership(pool.clone(), config.clone()).await {
-                            tracing::error!("Failed to execute on_lose_leadership callback: {}", e);
+                            crate::background_error!(LEADER_ELECTION, "lose_callback", Error, "Failed to execute on_lose_leadership callback: {}", e);
                         }
                     }
                 }
             } else {
                 // We think we're leader but have no connection, this can't happen
-                tracing::error!("Inconsistent state: is_leader=true but no connection");
+                crate::background_error!(LEADER_ELECTION, "invariant_violation", Critical, "Inconsistent state: is_leader=true but no connection");
                 is_leader.store(false, Ordering::Relaxed);
             }
         }

@@ -4,6 +4,7 @@
 //! on the leader replica. It periodically polls the database for active probes
 //! and manages background tasks that execute each probe at its configured interval.
 
+use crate::metrics::errors::component::PROBE_SCHEDULER;
 use crate::probes::db::ProbeManager;
 use sqlx::PgPool;
 use std::collections::HashMap;
@@ -82,7 +83,7 @@ impl ProbeScheduler {
                         let probe = match ProbeManager::get_probe(&pool, probe_id).await {
                             Ok(p) => p,
                             Err(e) => {
-                                tracing::error!("Error fetching probe {}: {}", probe_id, e);
+                                crate::background_error!(PROBE_SCHEDULER, "probe_fetch", Warning, "Error fetching probe {}: {}", probe_id, e);
                                 return;
                             }
                         };
@@ -139,7 +140,7 @@ impl ProbeScheduler {
                 let probe = match ProbeManager::get_probe(&pool, probe_id).await {
                     Ok(p) => p,
                     Err(e) => {
-                        tracing::error!("Error fetching probe {}: {}", probe_id, e);
+                        crate::background_error!(PROBE_SCHEDULER, "probe_fetch", Warning, "Error fetching probe {}: {}", probe_id, e);
                         break;
                     }
                 };
@@ -164,7 +165,7 @@ impl ProbeScheduler {
                         }
                     }
                     Err(e) => {
-                        tracing::error!("Error executing probe {}: {}", probe.name, e);
+                        crate::background_error!(PROBE_SCHEDULER, "probe_execute", Warning, "Error executing probe {}: {}", probe.name, e);
                     }
                 }
 
@@ -236,7 +237,7 @@ impl ProbeScheduler {
         for probe_id in active_probe_ids.difference(&running_probe_ids) {
             tracing::info!("Starting scheduler for newly activated probe {}", probe_id);
             if let Err(e) = self.start_scheduler(*probe_id, shutdown_token.clone()).await {
-                tracing::error!("Failed to start scheduler for probe {}: {}", probe_id, e);
+                crate::background_error!(PROBE_SCHEDULER, "scheduler_start", Warning, "Failed to start scheduler for probe {}: {}", probe_id, e);
             }
         }
 
@@ -244,7 +245,7 @@ impl ProbeScheduler {
         for probe_id in running_probe_ids.difference(&active_probe_ids) {
             tracing::info!("Stopping scheduler for deactivated probe {}", probe_id);
             if let Err(e) = self.stop_scheduler(*probe_id).await {
-                tracing::error!("Failed to stop scheduler for probe {}: {}", probe_id, e);
+                crate::background_error!(PROBE_SCHEDULER, "scheduler_stop", Warning, "Failed to stop scheduler for probe {}: {}", probe_id, e);
             }
         }
 
@@ -292,7 +293,7 @@ impl ProbeScheduler {
             tokio::select! {
                 _ = interval.tick() => {
                     if let Err(e) = self.sync_with_database(shutdown_token.clone()).await {
-                        tracing::error!("Error syncing probe schedulers with database: {}", e);
+                        crate::background_error!(PROBE_SCHEDULER, "db_sync", Warning, "Error syncing probe schedulers with database: {}", e);
                     }
                 }
                 _ = shutdown_token.cancelled() => {
@@ -381,12 +382,12 @@ impl ProbeScheduler {
                                         ) {
                                             tracing::debug!("Received probe change notification: probe_id={}, active={}", probe_id, active);
                                             if let Err(e) = self.handle_probe_change(probe_id, active, shutdown_token.clone()).await {
-                                                tracing::error!("Failed to handle probe change for {}: {}", probe_id, e);
+                                                crate::background_error!(PROBE_SCHEDULER, "probe_change", Warning, "Failed to handle probe change for {}: {}", probe_id, e);
                                             }
                                         }
                                     }
                                     Err(e) => {
-                                        tracing::warn!("Failed to parse notification payload: {}", e);
+                                        crate::background_error!(PROBE_SCHEDULER, "payload_parse", Warning, "Failed to parse notification payload: {}", e);
                                     }
                                 }
                             }
@@ -401,7 +402,7 @@ impl ProbeScheduler {
                     _ = fallback_interval.tick() => {
                         tracing::debug!("Running fallback sync");
                         if let Err(e) = self.sync_with_database(shutdown_token.clone()).await {
-                            tracing::error!("Error during fallback sync: {}", e);
+                            crate::background_error!(PROBE_SCHEDULER, "db_sync", Warning, "Error during fallback sync: {}", e);
                         }
                     }
                 }

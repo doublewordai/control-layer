@@ -296,9 +296,17 @@ pub async fn process_payment<P: PoolProvider>(
                 .into_response())
             }
             _ => {
-                tracing::error!("Failed to process payment session: {:?}", e);
+                // Map the provider error to its real status. InvalidData / NoCustomerId are
+                // client 400s; hardcoding 500 here pages on a client's bad/expired session id.
+                let detail = format!("{e:?}");
+                let status = StatusCode::from(e);
+                if status.is_server_error() {
+                    tracing::error!(error = %detail, %status, "Failed to process payment session");
+                } else {
+                    tracing::warn!(error = %detail, %status, "Payment session rejected");
+                }
                 Ok((
-                    StatusCode::INTERNAL_SERVER_ERROR,
+                    status,
                     Json(json!({
                         "message": "Unable to process payment. Please contact support."
                     })),

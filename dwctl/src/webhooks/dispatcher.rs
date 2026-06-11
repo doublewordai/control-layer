@@ -29,6 +29,7 @@
 //! On shutdown, unprocessed deliveries become re-claimable after the 5-minute
 //! crash safety window.
 
+use crate::metrics::errors::component::WEBHOOK_DISPATCH;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -118,7 +119,7 @@ impl WebhookDispatcher {
         let mut conn = match self.pool.acquire().await {
             Ok(c) => c,
             Err(e) => {
-                tracing::warn!(error = %e, "Failed to acquire connection for retry claims");
+                crate::background_error!(WEBHOOK_DISPATCH, "db_acquire", Warning, error = %e, "Failed to acquire connection for retry claims");
                 return;
             }
         };
@@ -128,7 +129,7 @@ impl WebhookDispatcher {
             match repo.claim_retriable_deliveries(self.claim_batch_size).await {
                 Ok(d) => d,
                 Err(e) => {
-                    tracing::warn!(error = %e, "Failed to claim retriable deliveries");
+                    crate::background_error!(WEBHOOK_DISPATCH, "claim", Warning, error = %e, "Failed to claim retriable deliveries");
                     return;
                 }
             }
@@ -173,7 +174,7 @@ impl WebhookDispatcher {
             let payload_str = match serde_json::to_string(&delivery.payload) {
                 Ok(s) => s,
                 Err(e) => {
-                    tracing::warn!(error = %e, delivery_id = %delivery.id, "Failed to serialize delivery payload, marking exhausted");
+                    crate::background_error!(WEBHOOK_DISPATCH, "payload_serialize", Warning, error = %e, delivery_id = %delivery.id, "Failed to serialize delivery payload, marking exhausted");
                     let mut repo = Webhooks::new(&mut conn);
                     let _ = repo.mark_exhausted(delivery.id).await;
                     continue;
@@ -185,7 +186,7 @@ impl WebhookDispatcher {
             let signature = match signing::sign_payload(&msg_id, timestamp, &payload_str, secret) {
                 Some(s) => s,
                 None => {
-                    tracing::warn!(delivery_id = %delivery.id, "Failed to sign webhook payload");
+                    crate::background_error!(WEBHOOK_DISPATCH, "sign", Warning, delivery_id = %delivery.id, "Failed to sign webhook payload");
                     continue;
                 }
             };
@@ -222,7 +223,7 @@ impl WebhookDispatcher {
         let mut conn = match self.pool.acquire().await {
             Ok(c) => c,
             Err(e) => {
-                tracing::warn!(error = %e, "Failed to acquire connection for result drain");
+                crate::background_error!(WEBHOOK_DISPATCH, "db_acquire", Warning, error = %e, "Failed to acquire connection for result drain");
                 return;
             }
         };
@@ -239,10 +240,10 @@ impl WebhookDispatcher {
                 SendOutcome::Success { status_code } => {
                     counter!("dwctl_webhook_deliveries_total", "outcome" => "success").increment(1);
                     if let Err(e) = repo.mark_delivered(result.delivery_id, status_code as i32).await {
-                        tracing::warn!(error = %e, delivery_id = %result.delivery_id, "Failed to mark delivery as delivered");
+                        crate::background_error!(WEBHOOK_DISPATCH, "mark_delivered", Warning, error = %e, delivery_id = %result.delivery_id, "Failed to mark delivery as delivered");
                     }
                     if let Err(e) = repo.reset_failures(result.webhook_id).await {
-                        tracing::warn!(error = %e, webhook_id = %result.webhook_id, "Failed to reset webhook failures");
+                        crate::background_error!(WEBHOOK_DISPATCH, "reset_failures", Warning, error = %e, webhook_id = %result.webhook_id, "Failed to reset webhook failures");
                     }
                     tracing::debug!(
                         webhook_id = %result.webhook_id,
@@ -263,7 +264,7 @@ impl WebhookDispatcher {
                         )
                         .await
                     {
-                        tracing::warn!(error = %e, delivery_id = %result.delivery_id, "Failed to mark delivery as failed");
+                        crate::background_error!(WEBHOOK_DISPATCH, "mark_failed", Warning, error = %e, delivery_id = %result.delivery_id, "Failed to mark delivery as failed");
                     }
                     // increment_failures returns None if the webhook was deleted
                     // while this delivery was in-flight — not an error.
@@ -276,7 +277,7 @@ impl WebhookDispatcher {
                             );
                         }
                         Err(e) => {
-                            tracing::warn!(error = %e, webhook_id = %result.webhook_id, "Failed to increment webhook failures");
+                            crate::background_error!(WEBHOOK_DISPATCH, "increment_failures", Warning, error = %e, webhook_id = %result.webhook_id, "Failed to increment webhook failures");
                         }
                         Ok(Some(_)) => {}
                     }
@@ -382,7 +383,7 @@ async fn run_sender(
             };
 
             if let Err(e) = tx.send(result).await {
-                tracing::warn!(delivery_id = %request.delivery_id, "Failed to send webhook result back: {}", e);
+                crate::background_error!(WEBHOOK_DISPATCH, "result_send", Warning, delivery_id = %request.delivery_id, "Failed to send webhook result back: {}", e);
             }
         });
     }

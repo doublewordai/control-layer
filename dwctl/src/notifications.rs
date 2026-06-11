@@ -19,6 +19,7 @@
 //! use a unique partial index on `webhook_deliveries(webhook_id, event_type,
 //! resource_id)` for deduplication.
 
+use crate::metrics::errors::component::{AUTO_TOPUP, NOTIFICATIONS};
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
@@ -154,7 +155,7 @@ pub async fn run_notification_poller(
                 Some(svc)
             }
             Err(e) => {
-                tracing::warn!(error = %e, "Failed to create email service, email notifications disabled");
+                crate::background_error!(NOTIFICATIONS, "email_service_init", Critical, error = %e, "Failed to create email service, email notifications disabled");
                 None
             }
         }
@@ -171,12 +172,12 @@ pub async fn run_notification_poller(
                     Some(l)
                 }
                 Err(e) => {
-                    tracing::warn!(error = %e, "Failed to subscribe to {WEBHOOK_EVENT_CHANNEL} channel");
+                    crate::background_error!(NOTIFICATIONS, "listener_setup", Critical, error = %e, "Failed to subscribe to {WEBHOOK_EVENT_CHANNEL} channel");
                     None
                 }
             },
             Err(e) => {
-                tracing::warn!(error = %e, "Failed to connect PG listener for webhook events");
+                crate::background_error!(NOTIFICATIONS, "listener_setup", Critical, error = %e, "Failed to connect PG listener for webhook events");
                 None
             }
         }
@@ -252,7 +253,7 @@ pub async fn run_notification_poller(
         let mut conn = match dwctl_pool.acquire().await {
             Ok(c) => c,
             Err(e) => {
-                tracing::warn!(error = %e, "Failed to acquire database connection for notification poller tick");
+                crate::background_error!(NOTIFICATIONS, "db_acquire", Warning, error = %e, "Failed to acquire database connection for notification poller tick");
                 continue;
             }
         };
@@ -262,7 +263,7 @@ pub async fn run_notification_poller(
             let events = std::mem::take(&mut pending_webhook_events);
             let _ = process_platform_events(&mut conn, &events)
                 .await
-                .inspect_err(|e| tracing::warn!(error = %e, "Failed to process platform webhook events"));
+                .inspect_err(|e| crate::background_error!(NOTIFICATIONS, "platform_event_process", Warning, error = %e, "Failed to process platform webhook events"));
         }
 
         // === Step 2: Poll fusillade for completed batches ===
@@ -277,7 +278,7 @@ pub async fn run_notification_poller(
                     if dispatcher.is_some() {
                         let _ = create_batch_deliveries(&mut conn, &infos)
                             .await
-                            .inspect_err(|e| tracing::warn!(error = %e, "Failed to create webhook delivery records"));
+                            .inspect_err(|e| crate::background_error!(NOTIFICATIONS, "batch_delivery_create", Warning, error = %e, "Failed to create webhook delivery records"));
                     }
 
                     // === Step 4: Send email notifications ===
@@ -287,7 +288,7 @@ pub async fn run_notification_poller(
                 }
             }
             Err(e) => {
-                tracing::warn!(error = %e, "Failed to poll for completed batches");
+                crate::background_error!(NOTIFICATIONS, "poll_completed_batches", Warning, error = %e, "Failed to poll for completed batches");
             }
         }
 
@@ -295,7 +296,7 @@ pub async fn run_notification_poller(
         if dispatcher.is_some() {
             let _ = process_new_batches(&mut conn)
                 .await
-                .inspect_err(|e| tracing::warn!(error = %e, "Failed to process new batch webhooks"));
+                .inspect_err(|e| crate::background_error!(NOTIFICATIONS, "new_batch_process", Warning, error = %e, "Failed to process new batch webhooks"));
         }
 
         // === Step 6: Low-balance notifications ===
@@ -304,7 +305,7 @@ pub async fn run_notification_poller(
             let candidates = {
                 let mut users = Users::new(&mut conn);
                 users.users_with_low_balance_threshold().await.unwrap_or_else(|e| {
-                    tracing::warn!(error = %e, "Failed to fetch low-balance threshold users");
+                    crate::background_error!(NOTIFICATIONS, "low_balance_fetch", Warning, error = %e, "Failed to fetch low-balance threshold users");
                     vec![]
                 })
             };
@@ -326,7 +327,7 @@ pub async fn run_notification_poller(
                 let refreshed = if !needs_refresh.is_empty() {
                     let mut credits = Credits::new(&mut conn);
                     credits.get_users_balances_bulk(&needs_refresh, Some(1)).await.unwrap_or_else(|e| {
-                        tracing::warn!(error = %e, "Failed to refresh balances for low-balance users");
+                        crate::background_error!(NOTIFICATIONS, "balance_refresh", Warning, error = %e, "Failed to refresh balances for low-balance users");
                         Default::default()
                     })
                 } else {
@@ -360,7 +361,7 @@ pub async fn run_notification_poller(
                     let _ = users
                         .clear_low_balance_notification_sent(&recovered)
                         .await
-                        .inspect_err(|e| tracing::warn!(error = %e, "Failed to clear recovered low-balance flags"));
+                        .inspect_err(|e| crate::background_error!(NOTIFICATIONS, "low_balance_flag_clear", Warning, error = %e, "Failed to clear recovered low-balance flags"));
                 }
             }
         }
@@ -512,7 +513,8 @@ async fn process_platform_events(conn: &mut sqlx::pool::PoolConnection<sqlx::Pos
             };
 
             let _ = repo.try_create_delivery(&delivery_request).await.inspect_err(|e| {
-                tracing::warn!(
+                crate::background_error!(
+                    NOTIFICATIONS, "delivery_create", Warning,
                     error = %e,
                     webhook_id = %webhook.id,
                     event_type = %event_type,
@@ -623,7 +625,8 @@ async fn process_new_batches(conn: &mut sqlx::pool::PoolConnection<sqlx::Postgre
             };
 
             let _ = repo.try_create_delivery(&delivery_request).await.inspect_err(|e| {
-                tracing::warn!(
+                crate::background_error!(
+                    NOTIFICATIONS, "delivery_create", Warning,
                     error = %e,
                     webhook_id = %webhook.id,
                     batch_id = %batch.id,
@@ -649,7 +652,7 @@ async fn send_email_notifications(
         match users.get_bulk(user_ids).await {
             Ok(u) => u,
             Err(e) => {
-                tracing::warn!(error = %e, "Failed to fetch users for email notifications");
+                crate::background_error!(NOTIFICATIONS, "user_fetch", Warning, error = %e, "Failed to fetch users for email notifications");
                 return;
             }
         }
@@ -672,7 +675,8 @@ async fn send_email_notifications(
             .send_batch_completion_email(&user.email, Some(name), info, is_first_batch)
             .await
         {
-            tracing::warn!(
+            crate::background_error!(
+                NOTIFICATIONS, "email_send", Warning,
                 batch_id = %info.batch_id,
                 email = %user.email,
                 error = %e,
@@ -693,7 +697,8 @@ async fn send_email_notifications(
         if is_first_batch {
             let mut users = Users::new(&mut *conn);
             if let Err(e) = users.mark_first_batch_email_sent(info.user_id).await {
-                tracing::warn!(
+                crate::background_error!(
+                    NOTIFICATIONS, "mark_email_sent", Warning,
                     user_id = %info.user_id,
                     error = %e,
                     "Failed to mark first batch email as sent"
@@ -724,7 +729,7 @@ async fn process_auto_topups(
     let candidates = {
         let mut users = Users::new(&mut *conn);
         users.users_with_auto_topup_enabled().await.unwrap_or_else(|e| {
-            tracing::warn!(error = %e, "Failed to fetch auto-topup eligible users");
+            crate::background_error!(AUTO_TOPUP, "eligible_fetch", Warning, error = %e, "Failed to fetch auto-topup eligible users");
             vec![]
         })
     };
@@ -742,7 +747,7 @@ async fn process_auto_topups(
     let refreshed = {
         let mut credits = Credits::new(&mut *conn);
         credits.get_users_balances_bulk(&all_ids, Some(1)).await.unwrap_or_else(|e| {
-            tracing::warn!(error = %e, "Failed to refresh balances for auto-topup users");
+            crate::background_error!(AUTO_TOPUP, "balance_refresh", Warning, error = %e, "Failed to refresh balances for auto-topup users");
             Default::default()
         })
     };
@@ -773,8 +778,7 @@ async fn process_auto_topups(
         match credits.get_monthly_auto_topup_spend_bulk(&limit_user_ids).await {
             Ok(spends) => spends,
             Err(e) => {
-                tracing::warn!(error = %e, "Failed to batch-fetch monthly auto-topup spend, aborting auto-topup run");
-                counter!("dwctl_auto_topup_errors_total", "stage" => "monthly_limit_check").increment(1);
+                crate::background_error!(AUTO_TOPUP, "monthly_spend_fetch", Error, error = %e, "Failed to batch-fetch monthly auto-topup spend, aborting auto-topup run");
                 return;
             }
         }
@@ -807,11 +811,11 @@ async fn process_auto_topups(
                         .send_auto_topup_limit_reached_email(&user.email, Some(name), &monthly_limit, &balance)
                         .await
                     {
-                        tracing::warn!(user_id = %user.id, error = %e, "Failed to send auto top-up limit reached email");
+                        crate::background_error!(AUTO_TOPUP, "email_send", Warning, user_id = %user.id, error = %e, "Failed to send auto top-up limit reached email");
                     } else {
                         let mut users = Users::new(&mut *conn);
                         let _ = users.mark_auto_topup_limit_notification_sent(&[user.id]).await.inspect_err(
-                            |e| tracing::warn!(user_id = %user.id, error = %e, "Failed to mark auto-topup limit notification as sent"),
+                            |e| crate::background_error!(AUTO_TOPUP, "mark_limit_notified", Warning, user_id = %user.id, error = %e, "Failed to mark auto-topup limit notification as sent"),
                         );
                     }
                 }
@@ -833,7 +837,7 @@ async fn process_auto_topups(
                     // Spend is back under the limit (new month or limit raised) — clear the flag
                     let mut users = Users::new(&mut *conn);
                     let _ = users.clear_auto_topup_limit_notification_sent(&[user.id]).await.inspect_err(
-                        |e| tracing::warn!(user_id = %user.id, error = %e, "Failed to clear auto-topup limit notification flag"),
+                        |e| crate::background_error!(AUTO_TOPUP, "clear_limit_flag", Warning, user_id = %user.id, error = %e, "Failed to clear auto-topup limit notification flag"),
                     );
                 }
                 (user.auto_topup_amount, "Automatic top-up")
@@ -869,8 +873,7 @@ async fn process_auto_topups(
                 }
                 Ok(false) => {}
                 Err(e) => {
-                    tracing::warn!(user_id = %user.id, error = %e, "Failed to check auto-topup idempotency");
-                    counter!("dwctl_auto_topup_errors_total", "stage" => "idempotency_check").increment(1);
+                    crate::background_error!(AUTO_TOPUP, "idempotency_check", Error, user_id = %user.id, error = %e, "Failed to check auto-topup idempotency");
                     continue;
                 }
             }
@@ -881,21 +884,19 @@ async fn process_auto_topups(
             Ok(Some(pm_id)) => pm_id,
             Ok(None) => {
                 tracing::warn!(user_id = %user.id, "No default payment method found, skipping auto top-up");
-                counter!("dwctl_auto_topup_charge_failures_total").increment(1);
                 if let Some(email_svc) = email_service {
                     let name = user.display_name.as_deref().unwrap_or(&user.username);
                     if let Err(e) = email_svc
                         .send_auto_topup_failed_email(&user.email, Some(name), &user.auto_topup_amount, &user.auto_topup_threshold)
                         .await
                     {
-                        tracing::warn!(user_id = %user.id, error = %e, "Failed to send auto top-up failure email");
+                        crate::background_error!(AUTO_TOPUP, "email_send", Warning, user_id = %user.id, error = %e, "Failed to send auto top-up failure email");
                     }
                 }
                 continue;
             }
             Err(e) => {
-                tracing::warn!(user_id = %user.id, error = %e, "Failed to fetch default payment method");
-                counter!("dwctl_auto_topup_errors_total", "stage" => "payment_method_lookup").increment(1);
+                crate::background_error!(AUTO_TOPUP, "payment_method_lookup", Error, user_id = %user.id, error = %e, "Failed to fetch default payment method");
                 continue;
             }
         };
@@ -907,19 +908,19 @@ async fn process_auto_topups(
         {
             Ok(id) => id,
             Err(e) => {
-                tracing::warn!(
+                crate::background_error!(
+                    AUTO_TOPUP, "charge", Warning,
                     user_id = %user.id,
                     error = %e,
                     "Failed to charge auto top-up"
                 );
-                counter!("dwctl_auto_topup_charge_failures_total").increment(1);
                 if let Some(email_svc) = email_service {
                     let name = user.display_name.as_deref().unwrap_or(&user.username);
                     if let Err(e) = email_svc
                         .send_auto_topup_failed_email(&user.email, Some(name), &user.auto_topup_amount, &user.auto_topup_threshold)
                         .await
                     {
-                        tracing::warn!(user_id = %user.id, error = %e, "Failed to send auto top-up failure email");
+                        crate::background_error!(AUTO_TOPUP, "email_send", Warning, user_id = %user.id, error = %e, "Failed to send auto top-up failure email");
                     }
                 }
                 continue;
@@ -941,7 +942,7 @@ async fn process_auto_topups(
         // been charged regardless of what happens with the credit-transaction insert
         // below. Mark verified now for the onwards rate-limit tier.
         if let Err(e) = Users::new(&mut *conn).set_verified(user.id).await {
-            tracing::warn!(user_id = %user.id, error = %e, "Failed to mark user verified after auto top-up");
+            crate::background_error!(AUTO_TOPUP, "mark_verified", Warning, user_id = %user.id, error = %e, "Failed to mark user verified after auto top-up");
         }
 
         let mut credits = Credits::new(&mut *conn);
@@ -960,7 +961,7 @@ async fn process_auto_topups(
                         .send_auto_topup_success_email(&user.email, Some(name), &charge_amount, &user.auto_topup_threshold, &new_balance)
                         .await
                     {
-                        tracing::warn!(user_id = %user.id, error = %e, "Failed to send auto top-up success email");
+                        crate::background_error!(AUTO_TOPUP, "email_send", Warning, user_id = %user.id, error = %e, "Failed to send auto top-up success email");
                     }
                 }
                 // First-payment match (no-op unless enabled and this is the user's
@@ -970,7 +971,7 @@ async fn process_auto_topups(
                     .grant_first_payment_match(credits_config.first_payment_match_up_to, user.id, charge_amount, &request.source_id)
                     .await
                 {
-                    tracing::error!(user_id = %user.id, error = %e, "First-payment match failed after auto top-up; purchase unaffected, grant manually if needed");
+                    crate::background_error!(AUTO_TOPUP, "first_payment_match", Critical, user_id = %user.id, error = %e, "First-payment match failed after auto top-up; purchase unaffected, grant manually if needed");
                 }
             }
             Err(crate::db::errors::DbError::UniqueViolation { constraint, .. })
@@ -980,15 +981,15 @@ async fn process_auto_topups(
                 tracing::info!(user_id = %user.id, "Auto top-up credit transaction already exists (race), treating as success");
             }
             Err(e) => {
-                tracing::error!(
+                crate::background_error!(
+                    AUTO_TOPUP, "credit_record", Critical,
                     user_id = %user.id,
                     payment_intent_id = %payment_intent_id,
                     amount = %user.auto_topup_amount,
                     error = %e,
-                    "CRITICAL: Auto top-up payment succeeded but credit transaction failed. \
+                    "Auto top-up payment succeeded but credit transaction failed. \
                      User was charged but did not receive credits. Manual reconciliation required."
                 );
-                counter!("dwctl_auto_topup_credit_failures_total").increment(1);
                 // Do NOT send "payment failed" email here — the payment actually succeeded.
                 // The user was charged but credits weren't recorded due to a DB error.
                 // The CRITICAL log + metric above should trigger an alert for manual reconciliation.
@@ -1011,7 +1012,8 @@ async fn send_low_balance_notifications(
         let name = user.display_name.as_deref().unwrap_or(&user.username);
 
         if let Err(e) = email_service.send_low_balance_email(&user.email, Some(name), &balance).await {
-            tracing::warn!(
+            crate::background_error!(
+                NOTIFICATIONS, "email_send", Warning,
                 user_id = %user.id,
                 email = %user.email,
                 error = %e,
@@ -1028,7 +1030,7 @@ async fn send_low_balance_notifications(
     if !sent_ids.is_empty() {
         let mut users_repo = Users::new(&mut *conn);
         if let Err(e) = users_repo.mark_low_balance_notification_sent(&sent_ids).await {
-            tracing::warn!(error = %e, "Failed to mark low-balance notifications as sent");
+            crate::background_error!(NOTIFICATIONS, "mark_low_balance_sent", Warning, error = %e, "Failed to mark low-balance notifications as sent");
         }
     }
 }
