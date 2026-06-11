@@ -323,9 +323,10 @@ enum BatchNormalizeError {
     /// missing). The user's URL is at fault — surface as a client error so
     /// they fix the reference, not a retryable/server failure.
     Unfetchable(String),
-    /// Upstream fetch failed in a way that isn't worth a retry from the
-    /// client but isn't a clean origin 4xx either (e.g. a transport-level
-    /// send error). Surface as a fetch failure.
+    /// Upstream fetch failed for a reason that isn't a clean origin 4xx —
+    /// e.g. a transport-level send error or a redirect without a Location
+    /// header. Not the file's fault, so surface as a service error (503) the
+    /// client may retry, not a validation error.
     FetchFailed(String),
     /// Transient: timed out or origin 5xx after the configured retries.
     /// Surface as a "try again" so users aren't told to fix their file.
@@ -1045,8 +1046,10 @@ Each line must be a valid JSON object containing `custom_id`, `method`, `url`, a
         (status = 400, description = "Invalid file format, malformed JSON, missing required fields, etc."),
         (status = 403, description = "Model referenced in the file is not configured or not accessible to your account."),
         (status = 413, description = "File exceeds the maximum allowed size."),
+        (status = 422, description = "A referenced image URL could not be retrieved because its origin refused access (e.g. 403/404). The file is well-formed but references an image that is forbidden, gated, or missing."),
         (status = 429, description = "Too many concurrent uploads. Retry after a short delay."),
-        (status = 500, description = "An unexpected error occurred. Retry the request or contact support if the issue persists.")
+        (status = 500, description = "An unexpected error occurred. Retry the request or contact support if the issue persists."),
+        (status = 503, description = "A referenced image could not be fetched due to a transient upstream/store error, or the service is briefly overloaded. Retry after a short delay.")
     )
 )]
 #[tracing::instrument(skip_all, fields(user_id = %current_user.id))]

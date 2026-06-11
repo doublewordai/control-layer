@@ -184,17 +184,7 @@ impl ImageFetcher {
                 continue;
             }
 
-            if status.is_server_error() {
-                return Err(FetchError::Transient(format!("origin {status}")));
-            }
-            if status.is_client_error() {
-                // A 4xx means the user's URL is forbidden/gated/missing — their
-                // bad input, not our gateway failing. Map to a client error.
-                return Err(FetchError::Unfetchable(format!("origin {status}")));
-            }
-            if !status.is_success() {
-                return Err(FetchError::FetchFailed(format!("origin {status}")));
-            }
+            classify_status(status)?;
 
             // Validate Content-Type.
             let mime = resp
@@ -230,6 +220,37 @@ impl ImageFetcher {
         // Loop bound prevents falling out here, but keep the compiler happy.
         Err(FetchError::BadInput("redirect cap exceeded".into()))
     }
+}
+
+/// Classify a final (non-redirect) origin response status into a fetch
+/// outcome. `Ok(())` means proceed to read the body; any `Err` is terminal
+/// for this attempt.
+///
+/// The 4xx split is the crux of this module's user-facing error contract:
+///   - **408 Request Timeout / 429 Too Many Requests** are *transient* 4xx —
+///     the URL is fine, the origin is just slow or rate-limiting us — so they
+///     retry rather than being reported to the caller as a bad URL.
+///   - Every **other 4xx** means the caller's URL is forbidden/gated/missing
+///     (`Unfetchable`) — their bad input, surfaced as a 422, not a 5xx.
+///   - **5xx** is transient (origin-side, retryable).
+///   - Anything else non-2xx (e.g. an unexpected 1xx, or a non-standard ≥600)
+///     is an odd response we treat as a non-retryable `FetchFailed` (502).
+fn classify_status(status: reqwest::StatusCode) -> Result<(), FetchError> {
+    use reqwest::StatusCode;
+    if status.is_success() {
+        return Ok(());
+    }
+    let msg = format!("origin {status}");
+    if status == StatusCode::REQUEST_TIMEOUT || status == StatusCode::TOO_MANY_REQUESTS {
+        return Err(FetchError::Transient(msg));
+    }
+    if status.is_server_error() {
+        return Err(FetchError::Transient(msg));
+    }
+    if status.is_client_error() {
+        return Err(FetchError::Unfetchable(msg));
+    }
+    Err(FetchError::FetchFailed(msg))
 }
 
 /// Resolve `host:port` and return the first IP that passes the deny-list.
@@ -304,5 +325,45 @@ mod tests {
         let f = ImageFetcher::new(FetcherConfig::default());
         let err = f.fetch("not a url").await.unwrap_err();
         assert!(matches!(err, FetchError::BadInput(_)), "got {err:?}");
+    }
+
+    // The HTTP path itself can't be exercised in a unit test (the IP filter
+    // denies the loopback a local mock server would bind to), so the
+    // status→error contract is locked here on the extracted classifier.
+
+    #[test]
+    fn classify_status_allows_success() {
+        assert!(classify_status(reqwest::StatusCode::OK).is_ok());
+        assert!(classify_status(reqwest::StatusCode::NO_CONTENT).is_ok());
+    }
+
+    #[test]
+    fn classify_status_maps_plain_4xx_to_unfetchable() {
+        // A gated/forbidden/missing URL is the caller's bad input → 422.
+        for s in [
+            reqwest::StatusCode::UNAUTHORIZED,
+            reqwest::StatusCode::FORBIDDEN,
+            reqwest::StatusCode::NOT_FOUND,
+            reqwest::StatusCode::GONE,
+        ] {
+            let err = classify_status(s).unwrap_err();
+            assert!(matches!(err, FetchError::Unfetchable(_)), "{s} → {err:?}");
+        }
+    }
+
+    #[test]
+    fn classify_status_maps_busy_4xx_and_5xx_to_transient() {
+        // 408/429 mean the origin is slow/rate-limiting, not that the URL is
+        // bad — retry rather than telling the user to fix the URL.
+        for s in [
+            reqwest::StatusCode::REQUEST_TIMEOUT,
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            reqwest::StatusCode::BAD_GATEWAY,
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+        ] {
+            let err = classify_status(s).unwrap_err();
+            assert!(matches!(err, FetchError::Transient(_)), "{s} → {err:?}");
+        }
     }
 }

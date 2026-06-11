@@ -270,10 +270,7 @@ impl IntoResponse for Error {
             Error::Unauthenticated { .. } | Error::InsufficientPermissions { .. } => {
                 tracing::info!("Authorization error: {}", self);
             }
-            Error::BadRequest { .. }
-            | Error::UnprocessableEntity { .. }
-            | Error::NotFound { .. }
-            | Error::PayloadTooLarge { .. } => {
+            Error::BadRequest { .. } | Error::UnprocessableEntity { .. } | Error::NotFound { .. } | Error::PayloadTooLarge { .. } => {
                 tracing::debug!("Client error: {}", self);
             }
             Error::Conflict { .. } => {

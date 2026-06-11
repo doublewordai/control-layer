@@ -512,7 +512,10 @@ mod tests {
             (NormalizeError::BadInput("x".into()), StatusCode::BAD_REQUEST),
             // A 4xx from the origin (e.g. a 403 on a gated URL) is the user's
             // bad input — 422, not a 502 gateway error.
-            (NormalizeError::Unfetchable("origin 403 Forbidden".into()), StatusCode::UNPROCESSABLE_ENTITY),
+            (
+                NormalizeError::Unfetchable("origin 403 Forbidden".into()),
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
             (NormalizeError::Transient("x".into()), StatusCode::SERVICE_UNAVAILABLE),
             (NormalizeError::FetchFailed("x".into()), StatusCode::BAD_GATEWAY),
             (NormalizeError::StoreFailed("x".into()), StatusCode::SERVICE_UNAVAILABLE),
