@@ -38,7 +38,14 @@ pub enum FetchError {
     /// MIME mismatch, redirect-cap exceeded, etc. Never retried.
     #[error("bad input: {0}")]
     BadInput(String),
-    /// Non-retryable upstream error (e.g. 4xx). Surfaces immediately.
+    /// The origin refused to serve the resource (a 4xx response). The
+    /// user's URL is at fault — gated, forbidden, missing, or auth-walled —
+    /// so this is never retried and is not a gateway failure on our side.
+    #[error("origin rejected the request: {0}")]
+    Unfetchable(String),
+    /// Non-retryable failure while talking to the origin that is not a clean
+    /// 4xx (e.g. a transport-level send error, or a redirect with no
+    /// Location). Surfaces immediately as a gateway error.
     #[error("fetch failed: {0}")]
     FetchFailed(String),
     /// Retried up to the configured limit and still failing. Indicates
@@ -105,6 +112,7 @@ impl ImageFetcher {
             match self.fetch_once(url).await {
                 Ok(image) => return Ok(image),
                 Err(e @ FetchError::BadInput(_)) => return Err(e),
+                Err(e @ FetchError::Unfetchable(_)) => return Err(e),
                 Err(e @ FetchError::FetchFailed(_)) => return Err(e),
                 Err(e @ FetchError::Transient(_)) => {
                     warn!(error = %e, attempt, "image fetch transient failure");
@@ -178,6 +186,11 @@ impl ImageFetcher {
 
             if status.is_server_error() {
                 return Err(FetchError::Transient(format!("origin {status}")));
+            }
+            if status.is_client_error() {
+                // A 4xx means the user's URL is forbidden/gated/missing — their
+                // bad input, not our gateway failing. Map to a client error.
+                return Err(FetchError::Unfetchable(format!("origin {status}")));
             }
             if !status.is_success() {
                 return Err(FetchError::FetchFailed(format!("origin {status}")));

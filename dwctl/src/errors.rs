@@ -93,6 +93,13 @@ pub enum Error {
     #[error("{message}")]
     BadRequest { message: String },
 
+    /// The request was well-formed but references something we cannot
+    /// process — e.g. an image URL whose origin returned a 4xx (forbidden,
+    /// gated, missing). The caller's input is at fault, but the request
+    /// itself is not malformed, so this is 422 rather than 400.
+    #[error("{message}")]
+    UnprocessableEntity { message: String },
+
     /// Requested resource not found
     #[error("{resource} with ID {id} not found")]
     NotFound { resource: String, id: String },
@@ -161,6 +168,7 @@ impl Error {
             Error::Unauthenticated { .. } => StatusCode::UNAUTHORIZED,
             Error::InsufficientPermissions { .. } => StatusCode::FORBIDDEN,
             Error::BadRequest { .. } => StatusCode::BAD_REQUEST,
+            Error::UnprocessableEntity { .. } => StatusCode::UNPROCESSABLE_ENTITY,
             Error::NotFound { .. } => StatusCode::NOT_FOUND,
             Error::Internal { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             Error::Database(db_err) => match db_err {
@@ -192,6 +200,7 @@ impl Error {
                 format!("Insufficient permissions to {action} {resource}")
             }
             Error::BadRequest { message } => message.clone(),
+            Error::UnprocessableEntity { message } => message.clone(),
             Error::PayloadTooLarge { message } => message.clone(),
             Error::NotFound { resource, id } => {
                 format!("{resource} with ID {id} not found")
@@ -261,7 +270,10 @@ impl IntoResponse for Error {
             Error::Unauthenticated { .. } | Error::InsufficientPermissions { .. } => {
                 tracing::info!("Authorization error: {}", self);
             }
-            Error::BadRequest { .. } | Error::NotFound { .. } | Error::PayloadTooLarge { .. } => {
+            Error::BadRequest { .. }
+            | Error::UnprocessableEntity { .. }
+            | Error::NotFound { .. }
+            | Error::PayloadTooLarge { .. } => {
                 tracing::debug!("Client error: {}", self);
             }
             Error::Conflict { .. } => {
