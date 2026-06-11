@@ -26,8 +26,8 @@
 //!   * **Sustained fusillade outage**: `flush_batch` retries with
 //!     exponential backoff up to `max_retries` (default 3). If every
 //!     attempt fails the batch is dropped, logged at `error`, and
-//!     `dwctl_requests_writer_flush_errors_total` increments. There is
-//!     no requeue or dead-letter table.
+//!     `dwctl_background_errors_total{component="responses_writer", reason="flush_drop"}`
+//!     increments. There is no requeue or dead-letter table.
 //!
 //! Both losses are acceptable here because billing and usage accounting
 //! read from `http_analytics` and `credit_transactions`, not `requests`.
@@ -56,6 +56,7 @@
 //! one fusillade transaction per flush, no dwctl_pool access on the bulk path
 //! ```
 
+use crate::metrics::errors::component::RESPONSES_WRITER;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -64,7 +65,7 @@ use metrics::{counter, gauge, histogram};
 use sqlx_pool_router::PoolProvider;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tracing::{Instrument, debug, error, info, info_span, warn};
+use tracing::{Instrument, debug, info, info_span, warn};
 use uuid::Uuid;
 
 /// Channel capacity. Records sit here when the writer can't keep up; once
@@ -289,13 +290,13 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> RequestsWriter<P> {
             }
 
             if let Some(e) = last_error {
-                error!(
+                crate::background_error!(
+                    RESPONSES_WRITER, "flush_drop", Error,
                     error = %e,
                     batch_size,
                     attempts = self.max_retries + 1,
                     "Failed to flush responses batch after all retries, dropping batch"
                 );
-                counter!("dwctl_requests_writer_flush_errors_total").increment(1);
                 buffer.clear();
                 return;
             }
