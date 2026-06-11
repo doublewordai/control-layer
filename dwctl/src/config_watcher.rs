@@ -1,10 +1,11 @@
+use crate::metrics::errors::component::CONFIG_WATCHER;
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, anyhow};
 use notify::{Config as NotifyConfig, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
+use tracing::info;
 
 use crate::{Config, SharedConfig};
 
@@ -88,7 +89,7 @@ fn initialize_watcher(config_path: PathBuf) -> anyhow::Result<WatcherState> {
             }
             Ok(_) => {}
             Err(error) => {
-                error!(path = %callback_config_path.display(), error = %error, "Config watch error");
+                crate::background_error!(CONFIG_WATCHER, "watch_error", Error, path = %callback_config_path.display(), error = %error, "Config watch error");
             }
         },
         NotifyConfig::default(),
@@ -111,7 +112,8 @@ pub async fn watch_config_file(config_path: PathBuf, shared_config: SharedConfig
         mut rx,
         _watcher,
     }) = initialize_watcher(config_path.clone()).map(Some).unwrap_or_else(|error| {
-        warn!(
+        crate::background_error!(
+            CONFIG_WATCHER, "setup_failed", Critical,
             path = %config_path.display(),
             error = %error,
             "Config watcher setup failed; live config reload disabled"
@@ -148,10 +150,10 @@ pub async fn watch_config_file(config_path: PathBuf, shared_config: SharedConfig
                         info!(path = %config_path.display(), "Reloaded config from disk");
                     }
                     Ok(Err(error)) => {
-                        warn!(path = %config_path.display(), error = %error, "Config reload failed; continuing with previous config");
+                        crate::background_error!(CONFIG_WATCHER, "reload_invalid", Warning, path = %config_path.display(), error = %error, "Config reload failed; continuing with previous config");
                     }
                     Err(error) => {
-                        error!(path = %config_path.display(), error = %error, "Config reload task failed");
+                        crate::background_error!(CONFIG_WATCHER, "reload_join", Error, path = %config_path.display(), error = %error, "Config reload task failed");
                     }
                 }
             }

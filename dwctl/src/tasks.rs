@@ -4,6 +4,7 @@
 //! work. Job definitions live alongside their handlers (e.g. batch population
 //! is defined in `api::handlers::batches`); this module wires them together.
 
+use crate::metrics::errors::component::TASK_WORKER;
 use std::sync::{Arc, OnceLock, Weak};
 
 use anyhow::Result;
@@ -170,7 +171,7 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> TaskRunner<P> {
                 "create-batch-worker",
                 tokio::spawn(async move {
                     if let Err(e) = worker.run().await {
-                        tracing::error!(error = %e, worker = i, "Create-batch worker error");
+                        crate::background_error!(TASK_WORKER, "create_batch", Error, error = %e, worker = i, "Create-batch worker error");
                     }
                 }),
             ));
@@ -186,7 +187,7 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> TaskRunner<P> {
                     "cascade-batch-state-worker",
                     tokio::spawn(async move {
                         if let Err(e) = worker.run().await {
-                            tracing::error!(error = %e, worker = i, "Cascade-batch-state worker error");
+                            crate::background_error!(TASK_WORKER, "cascade_batch_state", Error, error = %e, worker = i, "Cascade-batch-state worker error");
                         }
                     }),
                 ));
@@ -212,7 +213,7 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> TaskRunner<P> {
                 "sync-discovery-worker",
                 tokio::spawn(async move {
                     if let Err(e) = worker.run().await {
-                        tracing::error!(error = %e, worker = i, "Sync-connection worker error");
+                        crate::background_error!(TASK_WORKER, "sync_connection", Error, error = %e, worker = i, "Sync-connection worker error");
                     }
                 }),
             ));
@@ -226,7 +227,7 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> TaskRunner<P> {
                 "ingest-file-worker",
                 tokio::spawn(async move {
                     if let Err(e) = worker.run().await {
-                        tracing::error!(error = %e, worker = i, "Ingest-file worker error");
+                        crate::background_error!(TASK_WORKER, "ingest_file", Error, error = %e, worker = i, "Ingest-file worker error");
                     }
                 }),
             ));
@@ -240,7 +241,7 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> TaskRunner<P> {
                 "activate-batch-worker",
                 tokio::spawn(async move {
                     if let Err(e) = worker.run().await {
-                        tracing::error!(error = %e, worker = i, "Activate-batch worker error");
+                        crate::background_error!(TASK_WORKER, "activate_batch", Error, error = %e, worker = i, "Activate-batch worker error");
                     }
                 }),
             ));

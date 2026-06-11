@@ -37,6 +37,7 @@ use crate::config::{Config, ONWARDS_CONFIG_CHANGED_CHANNEL};
 use crate::db::handlers::Credits;
 use crate::db::models::api_keys::ApiKeyPurpose;
 use crate::metrics::MetricsRecorder;
+use crate::metrics::errors::component::ANALYTICS_BATCHER;
 use crate::request_logging::serializers::HttpAnalyticsRow;
 use chrono::{DateTime, Utc};
 use metrics::{counter, histogram};
@@ -276,8 +277,7 @@ where
             let enriched = match self.enrich_batch(buffer).await {
                 Ok(enriched) => enriched,
                 Err(e) => {
-                    error!(error = %e, batch_size = batch_size, ?correlation_ids, "Failed to enrich analytics batch");
-                    counter!("dwctl_analytics_batch_errors_total", "phase" => "enrich").increment(1);
+                    crate::background_error!(ANALYTICS_BATCHER, "enrich", Error, error = %e, batch_size = batch_size, ?correlation_ids, "Failed to enrich analytics batch");
                     buffer.clear();
                     return;
                 }
@@ -321,14 +321,14 @@ where
             }
 
             if let Some(e) = last_error {
-                error!(
+                crate::background_error!(
+                    ANALYTICS_BATCHER, "write_drop", Critical,
                     error = %e,
                     batch_size = batch_size,
                     attempts = self.max_retries + 1,
                     ?correlation_ids,
                     "Failed to write analytics batch after all retries, dropping batch"
                 );
-                counter!("dwctl_analytics_batch_errors_total", "phase" => "write").increment(1);
                 buffer.clear();
                 return;
             }
@@ -841,7 +841,8 @@ where
 
             // Get analytics_id
             let Some(&analytics_id) = analytics_ids.get(&(record.raw.instance_id, record.raw.correlation_id)) else {
-                warn!(
+                crate::background_error!(
+                    ANALYTICS_BATCHER, "analytics_id_missing", Warning,
                     instance_id = %record.raw.instance_id,
                     correlation_id = record.raw.correlation_id,
                     "Analytics ID not found for credit transaction"
