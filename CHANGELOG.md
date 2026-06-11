@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.60.0](https://github.com/doublewordai/control-layer/compare/v8.59.0...v8.60.0) (2026-06-11)
+
+
+### Features
+
+* standardise error logs into having metric emissions ([#1130](https://github.com/doublewordai/control-layer/issues/1130)) ([bfda345](https://github.com/doublewordai/control-layer/commit/bfda34584ed12fe179c087c1c3e89d26bbba398a))
+
 ## [8.59.0](https://github.com/doublewordai/control-layer/compare/v8.58.1...v8.59.0) (2026-06-05)
 
 
