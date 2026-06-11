@@ -23,8 +23,9 @@
 //!
 //! - `NormalizeError::BadInput` → 400 (the URL is unacceptable: bad scheme,
 //!   denied IP, MIME mismatch, oversized).
-//! - `NormalizeError::Unfetchable` → 422 (the origin returned a 4xx — the
-//!   user's URL is forbidden/gated/missing; their bad input, not our failure).
+//! - `NormalizeError::Unfetchable` → 422 (the origin returned a non-408/429
+//!   4xx — the user's URL is forbidden/gated/missing; their bad input, not our
+//!   failure). 408/429 are classified as transient and retried instead.
 //! - `NormalizeError::Transient` → 503 (retried internally and still
 //!   failing; client can retry).
 //! - `NormalizeError::FetchFailed` → 502 (non-retryable upstream error: a

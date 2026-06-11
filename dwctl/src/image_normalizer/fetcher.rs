@@ -38,9 +38,10 @@ pub enum FetchError {
     /// MIME mismatch, redirect-cap exceeded, etc. Never retried.
     #[error("bad input: {0}")]
     BadInput(String),
-    /// The origin refused to serve the resource (a 4xx response). The
-    /// user's URL is at fault — gated, forbidden, missing, or auth-walled —
-    /// so this is never retried and is not a gateway failure on our side.
+    /// The origin refused to serve the resource (a non-408/429 4xx response;
+    /// 408/429 are transient and retried instead). The user's URL is at fault —
+    /// gated, forbidden, missing, or auth-walled — so this is never retried and
+    /// is not a gateway failure on our side.
     #[error("origin rejected the request: {0}")]
     Unfetchable(String),
     /// Non-retryable failure while talking to the origin that is not a clean
@@ -234,7 +235,7 @@ impl ImageFetcher {
 ///     (`Unfetchable`) — their bad input, surfaced as a 422, not a 5xx.
 ///   - **5xx** is transient (origin-side, retryable).
 ///   - Anything else non-2xx (e.g. an unexpected 1xx, or a non-standard ≥600)
-///     is an odd response we treat as a non-retryable `FetchFailed` (502).
+///     is an odd response we treat as a non-retryable `FetchFailed`.
 fn classify_status(status: reqwest::StatusCode) -> Result<(), FetchError> {
     use reqwest::StatusCode;
     if status.is_success() {

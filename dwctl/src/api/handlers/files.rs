@@ -459,9 +459,9 @@ enum FileUploadError {
     /// (unprocessable) rather than 400 (malformed) or a 5xx.
     ImageUnfetchable { line: u64, message: String },
     /// Image fetch failed in a non-retryable way that is NOT a clean origin
-    /// 4xx (e.g. a transport-level send error, or every resolved address was
-    /// deny-listed). An upstream/reference problem, not a malformed batch
-    /// file, so it must NOT surface as a validation (400) error.
+    /// 4xx (e.g. a transport-level send error, or a redirect without a Location
+    /// header). An upstream/reference problem, not a malformed batch file, so
+    /// it must NOT surface as a validation (400) error.
     ImageFetchFailed { line: u64, message: String },
 }
 
