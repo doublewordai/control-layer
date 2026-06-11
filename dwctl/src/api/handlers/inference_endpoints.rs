@@ -199,16 +199,22 @@ pub async fn update_inference_endpoint<P: PoolProvider>(
                 );
             }
             Err(sync_error) => {
-                tracing::error!("Failed to update aliases for endpoint {}: {}", endpoint.id, sync_error);
-                // Convert SyncError to our Error type
+                // Log per type: an alias conflict is an expected client 409 (warn); a genuine
+                // sync failure is a server 500 (error). Don't blanket error-log the 409.
                 let converted_error = match sync_error {
-                    crate::sync::endpoint_sync::SyncError::AliasConflicts { conflicts } => Error::Conflict {
-                        message: "Alias conflicts detected during endpoint update".to_string(),
-                        conflicts: Some(conflicts),
-                    },
-                    crate::sync::endpoint_sync::SyncError::Other(_) => Error::Internal {
-                        operation: "update endpoint aliases".to_string(),
-                    },
+                    crate::sync::endpoint_sync::SyncError::AliasConflicts { conflicts } => {
+                        tracing::warn!(endpoint_id = %endpoint.id, ?conflicts, "Alias conflicts during endpoint update");
+                        Error::Conflict {
+                            message: "Alias conflicts detected during endpoint update".to_string(),
+                            conflicts: Some(conflicts),
+                        }
+                    }
+                    crate::sync::endpoint_sync::SyncError::Other(e) => {
+                        tracing::error!(endpoint_id = %endpoint.id, error = %e, "Failed to update aliases for endpoint");
+                        Error::Internal {
+                            operation: "update endpoint aliases".to_string(),
+                        }
+                    }
                 };
                 tx.rollback().await.map_err(|e| Error::Database(e.into()))?;
                 return Err(converted_error);
@@ -411,16 +417,18 @@ pub async fn create_inference_endpoint<P: PoolProvider>(
                 tracing::debug!("Sync succeeded: {:?}", result);
             }
             Err(sync_error) => {
-                tracing::error!("Sync failed with error: {:?}", sync_error);
+                // Log per type: an alias conflict is an expected client 409 (warn); a genuine
+                // sync failure is a server 500 (error). Don't blanket error-log the 409.
                 match sync_error {
                     crate::sync::endpoint_sync::SyncError::AliasConflicts { conflicts } => {
+                        tracing::warn!(endpoint_id = %endpoint.id, ?conflicts, "Alias conflicts during endpoint creation");
                         return Err(crate::errors::Error::Conflict {
                             message: "Alias conflicts detected during endpoint creation".to_string(),
                             conflicts: Some(conflicts),
                         });
                     }
                     crate::sync::endpoint_sync::SyncError::Other(e) => {
-                        tracing::error!("Other sync error: {:#}", e);
+                        tracing::error!(endpoint_id = %endpoint.id, error = %e, "Failed to sync endpoint models during creation");
                         return Err(crate::errors::Error::Internal {
                             operation: "sync endpoint models during creation".to_string(),
                         });

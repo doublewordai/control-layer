@@ -286,6 +286,13 @@ prevent name clashes.
 - Database errors wrap `DbError` which auto-converts to appropriate HTTP status codes
 - Provide descriptive error messages focused on what went wrong, not implementation details
 
+**Background Error Logging:**
+
+- For failures off the request path (background tasks, pollers, daemon loops, sync jobs), use the `background_error!` macro instead of a bare `tracing::error!`/`warn!`. It emits the log and the `dwctl_background_errors_total` metric together, so the failure shows up on dashboards and alerts instead of being invisible.
+- Example: `crate::background_error!(component::WEBHOOK_DISPATCH, "delivery_create", Critical, error = %e, "Failed to create webhook delivery");`
+- Severity tiers: `Critical` (logs at error, pages), `Error` (logs at error, no page), `Warning` (logs at warn, no page). `component` and `reason` must be `&'static str` literals.
+- Foreground handlers that already return a 5xx do NOT need this - those are counted by `dwctl_http_requests_total{status}`.
+
 **API Handlers:**
 
 - Add `#[tracing::instrument(skip_all)]` to all handler functions for observability
