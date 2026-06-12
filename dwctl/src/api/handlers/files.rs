@@ -451,6 +451,11 @@ enum FileUploadError {
     /// we could not retrieve — an upstream/reference problem, not a malformed
     /// batch file, so it must NOT surface as a validation (400) error.
     ImageFetchFailed { line: u64, message: String },
+    /// Upload specified an unsupported `purpose`. Only `batch` is accepted; any
+    /// other value (e.g. the typo `batches`) is a client error. Caught before
+    /// the file is written so it can't surface as a 500 on read-back — and
+    /// can't leave an orphaned file committed.
+    InvalidPurpose { purpose: String },
 }
 
 /// Map a `BatchNormalizeError` variant to the `FileUploadError` that
@@ -526,6 +531,9 @@ impl FileUploadError {
             },
             FileUploadError::ImageFetchFailed { line, message } => Error::ServiceUnavailable {
                 message: format!("Line {}: referenced image could not be fetched (upstream error): {}", line, message),
+            },
+            FileUploadError::InvalidPurpose { purpose } => Error::BadRequest {
+                message: format!("Invalid purpose '{}'. Only 'batch' is supported.", purpose),
             },
         }
     }
@@ -686,7 +694,14 @@ fn create_file_stream(
             match field_name {
                 "purpose" => {
                     if let Ok(value) = field.text().await {
-                        metadata.purpose = Some(value);
+                        // Validate eagerly: an unsupported purpose is a client (400)
+                        // error. Without this it's stored raw, the file is committed,
+                        // and the read-back parse fails as a 500 — leaving an orphaned
+                        // file. `abort!` rolls the stream back. Only "batch" is supported.
+                        match value.parse::<fusillade::Purpose>() {
+                            Ok(fusillade::Purpose::Batch) => metadata.purpose = Some(value),
+                            _ => abort!(FileUploadError::InvalidPurpose { purpose: value }),
+                        }
                     }
                 }
                 "expires_after[anchor]" => {
@@ -2167,6 +2182,49 @@ mod tests {
         upload_response.assert_status(axum::http::StatusCode::BAD_REQUEST);
         let error_body = upload_response.text();
         assert!(error_body.contains("model"));
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_upload_invalid_purpose_returns_400(pool: PgPool) {
+        // An unsupported purpose (e.g. the typo "batches") must be a 400 — and must
+        // NOT write a file. Previously it was stored raw, the read-back parse failed
+        // as a 500, and an orphaned file was left committed.
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+
+        let jsonl = r#"{"custom_id":"r1","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}}"#;
+        let file_part = axum_test::multipart::Part::bytes(jsonl.as_bytes()).file_name("test-batch.jsonl");
+
+        let resp = app
+            .post("/ai/v1/files")
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .multipart(
+                axum_test::multipart::MultipartForm::new()
+                    .add_text("purpose", "batches")
+                    .add_part("file", file_part),
+            )
+            .await;
+
+        // 400, not a 500, and the message names the bad value.
+        resp.assert_status(axum::http::StatusCode::BAD_REQUEST);
+        let body = resp.text();
+        assert!(body.contains("purpose") && body.contains("batches"), "unexpected body: {body}");
+
+        // And no orphaned file was committed.
+        let list = app
+            .get("/ai/v1/files")
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        list.assert_status(axum::http::StatusCode::OK);
+        let listed: serde_json::Value = list.json();
+        assert_eq!(
+            listed["data"].as_array().map(|a| a.len()),
+            Some(0),
+            "expected no files, got: {listed}"
+        );
     }
 
     #[sqlx::test]
