@@ -898,11 +898,58 @@ pub struct EmailConfig {
     pub templates_dir: Option<String>,
 }
 
-/// Email transport configuration - either SMTP or file-based for testing.
+/// Per-provider configuration for HTTP-based transactional email.
+///
+/// Each variant captures exactly the inputs that provider needs. New
+/// providers (Mailgun, SES, Postmark, …) are added as additional variants
+/// alongside a matching client in [`crate::email_http`] — no need to widen
+/// a one-size-fits-all `Http { … }` struct or invent overloaded fields.
+///
+/// YAML uses `provider` as the discriminator (e.g. `provider: resend`);
+/// thanks to `#[serde(flatten)]` on [`EmailTransportConfig::Http`], the
+/// per-provider fields sit at the same indentation as `type: http`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(tag = "provider", rename_all = "lowercase")]
+pub enum HttpProviderConfig {
+    /// Resend (https://resend.com).
+    Resend {
+        /// Bearer API key, e.g. `re_xxx`.
+        api_key: String,
+        /// Optional base URL override (for tests or custom Resend deployments).
+        /// Defaults to the public Resend endpoint when unset.
+        #[serde(default)]
+        base_url: Option<String>,
+    },
+    // Future providers — add a variant here plus a struct in
+    // `email_http.rs` that implements `HttpEmailClient`:
+    //
+    // Mailgun {
+    //     api_key: String,
+    //     sending_domain: String,
+    //     #[serde(default)]
+    //     region: MailgunRegion,  // Us / Eu
+    // },
+    //
+    // Ses {
+    //     access_key_id: String,
+    //     secret_access_key: String,
+    //     region: String,
+    // },
+    //
+    // Postmark {
+    //     server_token: String,
+    // },
+}
+
+/// Email transport configuration — SMTP, file-based (for development), or a
+/// transactional provider's HTTP API.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum EmailTransportConfig {
-    /// Send emails via SMTP server
+    /// Send emails via SMTP server.
+    ///
+    /// Kept for backward compatibility; new deployments should prefer the
+    /// `Http` transport with a transactional provider.
     Smtp {
         /// SMTP server hostname
         host: String,
@@ -915,10 +962,31 @@ pub enum EmailTransportConfig {
         /// Use TLS encryption
         use_tls: bool,
     },
-    /// Write emails to files (for development/testing)
+    /// Write emails to files (for development/testing).
     File {
         /// Directory path where email files will be written
         path: String,
+    },
+    /// Send emails via a transactional provider's HTTP API.
+    ///
+    /// Preferred over SMTP for hosted providers: a single API key (or
+    /// equivalent), no per-send TLS handshake cost, and structured error
+    /// responses that can be classified as transient vs permanent for
+    /// retry.
+    ///
+    /// The inner [`HttpProviderConfig`] is flattened into the YAML so the
+    /// per-provider fields sit alongside `type: http`:
+    ///
+    /// ```yaml
+    /// email:
+    ///   transport:
+    ///     type: http
+    ///     provider: resend
+    ///     api_key: "re_..."
+    /// ```
+    Http {
+        #[serde(flatten)]
+        provider: HttpProviderConfig,
     },
 }
 
@@ -2379,6 +2447,78 @@ impl Config {
 mod tests {
     use super::*;
     use figment::Jail;
+
+    /// Round-trip the HTTP transport YAML through the real config loader to
+    /// pin the wire format.
+    ///
+    /// `EmailTransportConfig::Http` carries `#[serde(flatten)]` on
+    /// `HttpProviderConfig`, which is internally tagged on `provider`. Both
+    /// tags (`type` outer, `provider` inner) need to sit at the same YAML
+    /// indentation. If a future refactor breaks that flattening these tests
+    /// catch it before a deployed `config.yaml` does.
+    #[test]
+    fn http_transport_yaml_uses_flat_provider_field() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: hello
+email:
+  type: http
+  provider: resend
+  api_key: re_test_xxx
+  from_email: noreply@example.com
+  from_name: Tester
+"#,
+            )?;
+
+            let config = Config::load(&Args {
+                config: "test.yaml".into(),
+                validate: false,
+            })?;
+            match config.email.transport {
+                EmailTransportConfig::Http {
+                    provider: HttpProviderConfig::Resend { api_key, base_url },
+                } => {
+                    assert_eq!(api_key, "re_test_xxx");
+                    assert!(base_url.is_none(), "base_url should default to None when omitted");
+                }
+                other => panic!("expected EmailTransportConfig::Http(Resend), got {other:?}"),
+            }
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn http_transport_yaml_carries_optional_base_url() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: hello
+email:
+  type: http
+  provider: resend
+  api_key: re_test_xxx
+  base_url: https://staging.example.com
+  from_email: noreply@example.com
+  from_name: Tester
+"#,
+            )?;
+
+            let config = Config::load(&Args {
+                config: "test.yaml".into(),
+                validate: false,
+            })?;
+            match config.email.transport {
+                EmailTransportConfig::Http {
+                    provider: HttpProviderConfig::Resend { base_url, .. },
+                } => assert_eq!(base_url.as_deref(), Some("https://staging.example.com")),
+                other => panic!("expected EmailTransportConfig::Http(Resend), got {other:?}"),
+            }
+            Ok(())
+        });
+    }
 
     #[test]
     fn test_model_sources_config() {

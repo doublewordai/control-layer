@@ -1,14 +1,25 @@
-//! Email service for sending password reset emails and notifications
+//! Email service for sending password reset emails and notifications.
+//!
+//! Transport selection is config-driven via [`crate::config::EmailTransportConfig`]:
+//! `Smtp` (legacy / self-hosted), `File` (development), and `Http` (hosted
+//! transactional providers via [`crate::email_http`]). All transports route
+//! through [`EmailService::dispatch`], which records the
+//! `dwctl_email_send_total{provider, template, outcome}` counter.
 
-use crate::notifications::{BatchNotificationInfo, BatchOutcome};
-use crate::{config::Config, errors::Error};
+use std::path::Path;
+use std::sync::Arc;
+
 use lettre::{
     AsyncFileTransport, AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor,
     message::{Mailbox, header::ContentType},
     transport::smtp::authentication::Credentials,
 };
 use minijinja::{Environment, context};
-use std::path::Path;
+
+use crate::config::HttpProviderConfig;
+use crate::email_http::{HttpEmailClient, ResendClient};
+use crate::notifications::{BatchNotificationInfo, BatchOutcome};
+use crate::{config::Config, errors::Error};
 
 struct EmailTemplates {
     password_reset: String,
@@ -77,9 +88,41 @@ pub struct EmailService {
     templates: EmailTemplates,
 }
 
+/// Backend used by [`EmailService`] to deliver a built [`EmailEnvelope`].
+///
+/// `Smtp` and `File` are lettre-backed (existing behavior). `Http` delegates
+/// to a provider-specific [`HttpEmailClient`] (e.g. [`ResendClient`]).
 enum EmailTransport {
     Smtp(AsyncSmtpTransport<Tokio1Executor>),
     File(AsyncFileTransport<Tokio1Executor>),
+    Http(Arc<dyn HttpEmailClient>),
+}
+
+/// Transport-independent representation of a prepared email.
+///
+/// Built by the public `send_*` methods on [`EmailService`] and consumed by
+/// [`EmailService::dispatch`]. The SMTP/File paths turn this back into a
+/// `lettre::Message`; the HTTP path serializes it to the provider's JSON shape.
+///
+/// `template_id` is a stable identifier (e.g. `"password_reset"`) used as a
+/// label on the `dwctl_email_send_total` Prometheus counter.
+#[derive(Debug, Clone)]
+pub(crate) struct EmailEnvelope {
+    pub template_id: &'static str,
+    pub from: Mailbox,
+    pub to: Mailbox,
+    pub reply_to: Option<Mailbox>,
+    pub subject: String,
+    pub body: EmailBody,
+}
+
+/// Body of an email — either HTML or plain text. Determines the
+/// `Content-Type` for SMTP/File transports and which field is populated
+/// in the provider JSON body for HTTP transports.
+#[derive(Debug, Clone)]
+pub(crate) enum EmailBody {
+    Html(String),
+    Text(String),
 }
 
 impl EmailService {
@@ -123,6 +166,19 @@ impl EmailService {
                 let file_transport = AsyncFileTransport::<Tokio1Executor>::new(emails_dir);
                 EmailTransport::File(file_transport)
             }
+            crate::config::EmailTransportConfig::Http { provider } => {
+                // Hosted transactional provider over HTTPS. Each provider
+                // implements `HttpEmailClient` in `email_http`; add a match
+                // arm here when introducing a new one.
+                let client: Arc<dyn HttpEmailClient> = match provider {
+                    HttpProviderConfig::Resend { api_key, base_url } => {
+                        Arc::new(ResendClient::new(api_key.clone(), base_url.clone()).map_err(|e| Error::Internal {
+                            operation: format!("create Resend client: {e}"),
+                        })?)
+                    }
+                };
+                EmailTransport::Http(client)
+            }
         };
 
         let templates = match &email_config.templates_dir {
@@ -155,50 +211,114 @@ impl EmailService {
             operation: format!("render email template: {e}"),
         })?;
 
-        self.send_email(to_email, to_name, subject, &body).await
+        self.send_email("password_reset", to_email, to_name, subject, &body).await
     }
 
-    async fn send_email(&self, to_email: &str, to_name: Option<&str>, subject: &str, body: &str) -> Result<(), Error> {
-        // Create from mailbox
+    /// Build a standard HTML-body envelope for one recipient and dispatch it.
+    ///
+    /// Used by every template-driven sender. `template_id` is a stable string
+    /// (e.g. `"password_reset"`) that becomes the `template` label on the
+    /// `dwctl_email_send_total` counter.
+    async fn send_email(
+        &self,
+        template_id: &'static str,
+        to_email: &str,
+        to_name: Option<&str>,
+        subject: &str,
+        body: &str,
+    ) -> Result<(), Error> {
+        let envelope = self.build_envelope(template_id, to_email, to_name, subject, EmailBody::Html(body.to_string()))?;
+        self.dispatch(envelope).await
+    }
+
+    /// Construct an [`EmailEnvelope`] with this service's `from` / `reply_to`
+    /// configuration applied. Shared by `send_email` and `send_support_request`.
+    fn build_envelope(
+        &self,
+        template_id: &'static str,
+        to_email: &str,
+        to_name: Option<&str>,
+        subject: &str,
+        body: EmailBody,
+    ) -> Result<EmailEnvelope, Error> {
         let from_address = self.from_email.parse().map_err(|e| Error::Internal {
             operation: format!("Failed to parse from email: {e}"),
         })?;
         let from = Mailbox::new(Some(self.from_name.clone()), from_address);
 
-        // Create to mailbox
         let to_address = to_email.parse().map_err(|e| Error::Internal {
             operation: format!("Failed to parse to email: {e}"),
         })?;
         let to = Mailbox::new(to_name.map(|n| n.to_string()), to_address);
 
-        let mut builder = Message::builder().from(from).to(to).subject(subject).header(ContentType::TEXT_HTML);
+        let reply_to = self
+            .reply_to
+            .as_deref()
+            .map(|email| -> Result<Mailbox, Error> {
+                let addr = email.parse().map_err(|e| Error::Internal {
+                    operation: format!("Failed to parse reply-to email: {e}"),
+                })?;
+                Ok(Mailbox::new(Some(self.from_name.clone()), addr))
+            })
+            .transpose()?;
 
-        if let Some(ref reply_to_email) = self.reply_to {
-            let reply_to_address = reply_to_email.parse().map_err(|e| Error::Internal {
-                operation: format!("Failed to parse reply-to email: {e}"),
-            })?;
-            let reply_to = Mailbox::new(Some(self.from_name.clone()), reply_to_address);
-            builder = builder.reply_to(reply_to);
-        }
-
-        let message = builder.body(body.to_string()).map_err(|e| Error::Internal {
-            operation: format!("build email message: {e}"),
-        })?;
-
-        self.dispatch(message).await
+        Ok(EmailEnvelope {
+            template_id,
+            from,
+            to,
+            reply_to,
+            subject: subject.to_string(),
+            body,
+        })
     }
 
-    /// Send a pre-built message via the configured transport.
-    async fn dispatch(&self, message: Message) -> Result<(), Error> {
+    /// Dispatch a prepared envelope via the configured transport and record
+    /// the `dwctl_email_send_total{provider, template, outcome}` counter.
+    ///
+    /// `outcome` is `"sent"` on success and `"failed"` on any error.
+    async fn dispatch(&self, envelope: EmailEnvelope) -> Result<(), Error> {
+        let template_id = envelope.template_id;
+        let provider = transport_label(&self.transport);
+
+        let result = self.dispatch_inner(envelope).await;
+        let outcome = if result.is_ok() { "sent" } else { "failed" };
+        metrics::counter!(
+            "dwctl_email_send_total",
+            "provider" => provider,
+            "template" => template_id,
+            "outcome" => outcome,
+        )
+        .increment(1);
+        result
+    }
+
+    async fn dispatch_inner(&self, envelope: EmailEnvelope) -> Result<(), Error> {
         match &self.transport {
             EmailTransport::Smtp(smtp) => {
+                let message = build_lettre_message(&envelope)?;
                 smtp.send(message).await.map_err(|e| Error::Internal {
                     operation: format!("send SMTP email: {e}"),
                 })?;
             }
             EmailTransport::File(file) => {
+                let message = build_lettre_message(&envelope)?;
                 file.send(message).await.map_err(|e| Error::Internal {
                     operation: format!("send file email: {e}"),
+                })?;
+            }
+            EmailTransport::Http(client) => {
+                client.send(&envelope).await.map_err(|e| {
+                    // is_transient is preserved in tracing so callers (worker
+                    // contexts in particular) can decide whether to retry.
+                    tracing::warn!(
+                        provider = client.provider_name(),
+                        transient = e.is_transient(),
+                        error = %e,
+                        "HTTP email send failed",
+                    );
+                    Error::Internal {
+                        operation: format!("send HTTP email via {}: {e}", client.provider_name()),
+                    }
                 })?;
             }
         }
@@ -229,7 +349,8 @@ impl EmailService {
             .map_err(|e| Error::Internal {
                 operation: format!("render email template: {e}"),
             })?;
-        self.send_email(to_email, to_name, &subject, &body).await
+        let template_id = if first_batch { "first_batch" } else { "batch_complete" };
+        self.send_email(template_id, to_email, to_name, &subject, &body).await
     }
 
     pub fn render_batch_completion_body(
@@ -324,7 +445,7 @@ impl EmailService {
         let body = self.render_low_balance_body(name, balance).map_err(|e| Error::Internal {
             operation: format!("render email template: {e}"),
         })?;
-        self.send_email(to_email, to_name, subject, &body).await
+        self.send_email("low_balance", to_email, to_name, subject, &body).await
     }
 
     fn render_low_balance_body(&self, to_name: &str, balance: &rust_decimal::Decimal) -> Result<String, minijinja::Error> {
@@ -360,7 +481,7 @@ impl EmailService {
             .map_err(|e| Error::Internal {
                 operation: format!("render email template: {e}"),
             })?;
-        self.send_email(to_email, to_name, &subject, &body).await
+        self.send_email("auto_topup_success", to_email, to_name, &subject, &body).await
     }
 
     pub async fn send_auto_topup_failed_email(
@@ -377,7 +498,7 @@ impl EmailService {
             .map_err(|e| Error::Internal {
                 operation: format!("render email template: {e}"),
             })?;
-        self.send_email(to_email, to_name, subject, &body).await
+        self.send_email("auto_topup_failed", to_email, to_name, subject, &body).await
     }
 
     pub async fn send_auto_topup_limit_reached_email(
@@ -416,7 +537,8 @@ impl EmailService {
                 operation: format!("render email template: {e}"),
             })?;
 
-        self.send_email(to_email, to_name, &subject, &body).await
+        self.send_email("auto_topup_limit_reached", to_email, to_name, &subject, &body)
+            .await
     }
 
     fn render_auto_topup_body(
@@ -459,10 +581,15 @@ impl EmailService {
                 operation: format!("render email template: {e}"),
             })?;
 
-        self.send_email(to_email, None, &subject, &body).await
+        self.send_email("org_invite", to_email, None, &subject, &body).await
     }
 
-    /// Send a support request email to the configured support address, with reply-to set to the user's email.
+    /// Send a support request email to the configured support address, with
+    /// reply-to set to the user's email so the support team can reply directly.
+    ///
+    /// Note this overrides the service's default `reply_to`; the address the
+    /// support team replies to should always be the requesting user, not the
+    /// no-reply sender.
     pub async fn send_support_request(
         &self,
         support_email: &str,
@@ -471,39 +598,24 @@ impl EmailService {
         subject: &str,
         message: &str,
     ) -> Result<(), Error> {
-        // Build from mailbox
-        let from_address = self.from_email.parse().map_err(|e| Error::Internal {
-            operation: format!("Failed to parse from email: {e}"),
-        })?;
-        let from = Mailbox::new(Some(self.from_name.clone()), from_address);
+        let display_name = user_name.unwrap_or(user_email);
+        let body = format!("Support request from {} ({}):\n\n{}", display_name, user_email, message);
 
-        // Build to mailbox (support address)
-        let to_address = support_email.parse().map_err(|e| Error::Internal {
-            operation: format!("Failed to parse support email: {e}"),
-        })?;
-        let to = Mailbox::new(Some("Doubleword Support".to_string()), to_address);
-
-        // Reply-to is the user's email
+        // Build the standard envelope, then override reply-to with the user's
+        // address so support can reply directly to the requester.
+        let mut envelope = self.build_envelope(
+            "support_request",
+            support_email,
+            Some("Doubleword Support"),
+            subject,
+            EmailBody::Text(body),
+        )?;
         let reply_to_address = user_email.parse().map_err(|e| Error::Internal {
             operation: format!("Failed to parse user email for reply-to: {e}"),
         })?;
-        let reply_to = Mailbox::new(user_name.map(|n| n.to_string()), reply_to_address);
+        envelope.reply_to = Some(Mailbox::new(user_name.map(|n| n.to_string()), reply_to_address));
 
-        let display_name = user_name.unwrap_or(user_email);
-        let body = format!("Support request from {} ({}):\n\n{}", display_name, user_email, message,);
-
-        let msg = Message::builder()
-            .from(from)
-            .to(to)
-            .reply_to(reply_to)
-            .subject(subject)
-            .header(ContentType::TEXT_PLAIN)
-            .body(body)
-            .map_err(|e| Error::Internal {
-                operation: format!("build support email message: {e}"),
-            })?;
-
-        self.dispatch(msg).await
+        self.dispatch(envelope).await
     }
 
     fn render_org_invite_body(
@@ -535,7 +647,8 @@ impl EmailService {
                 operation: format!("render email template: {e}"),
             })?;
 
-        self.send_email(to_email, None, &subject, &body).await
+        self.send_email("org_email_change_verify_new", to_email, None, &subject, &body)
+            .await
     }
 
     /// Send the verification link to the *current* contact address — the
@@ -556,7 +669,8 @@ impl EmailService {
                 operation: format!("render email template: {e}"),
             })?;
 
-        self.send_email(to_email, None, &subject, &body).await
+        self.send_email("org_email_change_verify_old", to_email, None, &subject, &body)
+            .await
     }
 
     fn render_org_email_change_verify_new_body(&self, org_name: &str, confirm_link: &str) -> Result<String, minijinja::Error> {
@@ -586,6 +700,45 @@ impl EmailService {
             support_email,
         })
     }
+}
+
+/// Static identifier for the configured transport, used as the `provider`
+/// label on `dwctl_email_send_total`. SMTP/File use literal strings;
+/// HTTP defers to the provider client (e.g. `"resend"`).
+fn transport_label(t: &EmailTransport) -> &'static str {
+    match t {
+        EmailTransport::Smtp(_) => "smtp",
+        EmailTransport::File(_) => "file",
+        EmailTransport::Http(client) => client.provider_name(),
+    }
+}
+
+/// Convert a transport-independent [`EmailEnvelope`] into a `lettre::Message`
+/// for the SMTP and File transports. The HTTP transport bypasses this and
+/// serializes the envelope directly to its provider's wire format.
+fn build_lettre_message(envelope: &EmailEnvelope) -> Result<Message, Error> {
+    let content_type = match &envelope.body {
+        EmailBody::Html(_) => ContentType::TEXT_HTML,
+        EmailBody::Text(_) => ContentType::TEXT_PLAIN,
+    };
+
+    let mut builder = Message::builder()
+        .from(envelope.from.clone())
+        .to(envelope.to.clone())
+        .subject(&envelope.subject)
+        .header(content_type);
+
+    if let Some(reply_to) = &envelope.reply_to {
+        builder = builder.reply_to(reply_to.clone());
+    }
+
+    let body_str = match &envelope.body {
+        EmailBody::Html(s) | EmailBody::Text(s) => s.clone(),
+    };
+
+    builder.body(body_str).map_err(|e| Error::Internal {
+        operation: format!("build email message: {e}"),
+    })
 }
 
 #[cfg(test)]
@@ -742,7 +895,9 @@ mod tests {
         ];
 
         for (name, email) in cases {
-            let result = email_service.send_email(email, name, "Test Subject", "<p>Hello</p>").await;
+            let result = email_service
+                .send_email("test_recipients", email, name, "Test Subject", "<p>Hello</p>")
+                .await;
             assert!(
                 result.is_ok(),
                 "send_email failed for name={name:?}, email={email:?}: {:?}",
