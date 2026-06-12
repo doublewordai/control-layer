@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT DISTINCT dmc.composite_model_id\n            FROM deployed_model_components dmc\n            JOIN deployed_models cm ON cm.id = dmc.composite_model_id\n            WHERE dmc.deployed_model_id = $1 AND dmc.enabled = TRUE AND cm.deleted = FALSE\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "composite_model_id",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "f9c5aea04d6fb9eac056399da28f9d81fb7effc6d2dae280d9244ac2551a4772"
+}
