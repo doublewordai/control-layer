@@ -549,6 +549,16 @@ async fn test_strict_mode_body_limit_uses_configured_max_body_size(pool: PgPool)
         chat_response.status_code(),
         chat_response.text()
     );
+
+    // Only the 3MB request reached the provider; the 6MB one was rejected
+    // before being forwarded.
+    let provider_requests = mock_server.received_requests().await.unwrap();
+    assert_eq!(
+        provider_requests.len(),
+        1,
+        "Expected only the within-limit request to reach the provider, got {} requests",
+        provider_requests.len()
+    );
 }
 
 /// Test that strict mode allows POST /v1/completions (legacy completions endpoint)
