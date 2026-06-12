@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.60.2](https://github.com/doublewordai/control-layer/compare/v8.60.1...v8.60.2) (2026-06-12)
+
+
+### Bug Fixes
+
+* onwards body limit ([#1135](https://github.com/doublewordai/control-layer/issues/1135)) ([1a66eac](https://github.com/doublewordai/control-layer/commit/1a66eac585ca659ddd9eb35d7207279de6270d74))
+
 ## [8.60.1](https://github.com/doublewordai/control-layer/compare/v8.60.0...v8.60.1) (2026-06-12)
 
 
