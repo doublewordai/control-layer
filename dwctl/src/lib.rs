@@ -2997,12 +2997,21 @@ impl Application {
         };
 
         // Build onwards router from targets with body transform, response sanitization, and tool executor.
+        // Realtime request bodies share the same configurable cap as batch
+        // file requests (limits.requests.max_body_size, 0 = unlimited);
+        // without an explicit limit onwards' strict mode would fall back to
+        // Axum's 2 MB default and 413 large payloads.
+        let onwards_body_limit = match config.limits.requests.max_body_size {
+            0 => usize::MAX,
+            n => usize::try_from(n).unwrap_or(usize::MAX),
+        };
         let onwards_app_state = onwards::AppState::with_transform(bg_services.onwards_targets.clone(), body_transform)
             .with_response_transform(onwards::create_openai_sanitizer())
             .with_streaming_header("x-fusillade-stream")
             .with_response_id_header("x-fusillade-request-id")
             .with_tool_executor(Arc::new(tool_executor))
-            .with_response_store(response_store.clone() as Arc<dyn onwards::ResponseStore>);
+            .with_response_store(response_store.clone() as Arc<dyn onwards::ResponseStore>)
+            .with_body_limit(onwards_body_limit);
         let onwards_router = if bg_services.onwards_targets.strict_mode {
             tracing::info!("Strict mode enabled - using typed request validation");
             onwards::strict::build_strict_router(onwards_app_state)
