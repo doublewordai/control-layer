@@ -276,6 +276,7 @@ const UsersGroups: React.FC = () => {
         onView: (org) => navigate(`/organizations/${org.id}`),
         onEdit: (org) => setEditingOrg(org),
         onDelete: (org) => setDeletingOrg(org),
+        onManageBilling: (org) => navigate(`/cost-management?user=${org.id}`),
         canDelete: isPlatformManager,
       }),
     [navigate, isPlatformManager],
