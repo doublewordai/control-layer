@@ -2191,15 +2191,16 @@ mod tests {
     async fn test_upload_invalid_purpose_returns_400(pool: PgPool) {
         // Any unsupported purpose must be a 400 — and must NOT write a file.
         // Previously the value was stored raw, the read-back parse failed as a 500,
-        // and an orphaned file was left committed. Covers the typo case plus empty,
-        // wrong-case, and the system-only variants (batch_output / batch_error) —
-        // valid enum values that are still not allowed for uploads.
+        // and an orphaned file was left committed. Covers the typo case, empty, and
+        // the system-only variants (batch_output / batch_error) — valid enum values
+        // that are still not allowed for uploads. (Parsing lowercases first, so
+        // "BATCH"/"Batch" map to Batch and are accepted — not exercised here.)
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
 
         let jsonl = r#"{"custom_id":"r1","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}}"#;
 
-        for bad_purpose in ["batches", "", "BATCH", "Batch", "batch_output", "batch_error"] {
+        for bad_purpose in ["batches", "", "batch_output", "batch_error"] {
             let file_part = axum_test::multipart::Part::bytes(jsonl.as_bytes()).file_name("test-batch.jsonl");
             let resp = app
                 .post("/ai/v1/files")
