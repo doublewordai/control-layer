@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.60.3](https://github.com/doublewordai/control-layer/compare/v8.60.2...v8.60.3) (2026-06-15)
+
+
+### Bug Fixes
+
+* count only successful requests in per-user model usage ([#1129](https://github.com/doublewordai/control-layer/issues/1129)) ([626ae97](https://github.com/doublewordai/control-layer/commit/626ae971c27476a06db21e950bc80ca782eccfcd))
+
 ## [8.60.2](https://github.com/doublewordai/control-layer/compare/v8.60.1...v8.60.2) (2026-06-15)
 
 
