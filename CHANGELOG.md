@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.60.1](https://github.com/doublewordai/control-layer/compare/v8.60.0...v8.60.1) (2026-06-12)
+
+
+### Bug Fixes
+
+* **deps:** bump fusillade to 17.3.1 for batchless flex pending counts ([#1134](https://github.com/doublewordai/control-layer/issues/1134)) ([4ad4e88](https://github.com/doublewordai/control-layer/commit/4ad4e88c5bc49f9acc29d0bcc420d73269b33aec))
+
 ## [8.60.0](https://github.com/doublewordai/control-layer/compare/v8.59.0...v8.60.0) (2026-06-11)
 
 

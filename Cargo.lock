@@ -1865,7 +1865,7 @@ checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
 
 [[package]]
 name = "dwctl"
-version = "8.60.0"
+version = "8.60.1"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -2333,9 +2333,9 @@ checksum = "e6d5a32815ae3f33302d95fdcb2ce17862f8c65363dcfd29360480ba1001fc9c"
 
 [[package]]
 name = "fusillade"
-version = "17.3.0"
+version = "17.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a2d7c6a4f2c18f63135407350c4800930d750952266a735e6598b53436707d4e"
+checksum = "6d7d8d233bdac82c23e30e54296af94b041e1149779ee8ae7b8afc4564d420c6"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4195,9 +4195,9 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "onwards"
-version = "0.30.0"
+version = "0.31.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "94888fe9419a12b4b64660405d779bc19e584786163c5caccc6097f20b3d48f6"
+checksum = "24cba240c965ceab8a0b0e2df3d636eac49111fd431d884801217dae85daee0e"
 dependencies = [
  "anyhow",
  "async-stream",
