@@ -1,13 +1,14 @@
 "use client";
 
 import { type ColumnDef } from "@tanstack/react-table";
-import { ArrowUpDown, Edit2, Trash2, Eye } from "lucide-react";
+import { ArrowUpDown, Edit2, Trash2, Eye, Receipt } from "lucide-react";
 import type { Organization } from "@/api/control-layer/types";
 
 interface OrganizationColumnActions {
   onView: (org: Organization) => void;
   onEdit: (org: Organization) => void;
   onDelete: (org: Organization) => void;
+  onManageBilling?: (org: Organization) => void;
   canDelete: boolean;
 }
 
@@ -89,6 +90,16 @@ export const createOrganizationColumns = (
             <Eye className="h-4 w-4" />
             <span className="sr-only">View</span>
           </button>
+          {actions.onManageBilling && (
+            <button
+              onClick={() => actions.onManageBilling?.(org)}
+              className="h-8 w-8 p-0 rounded text-gray-600 hover:text-gray-900 hover:bg-gray-100 transition-all flex items-center justify-center"
+              title="Manage billing"
+            >
+              <Receipt className="h-4 w-4" />
+              <span className="sr-only">Manage Billing</span>
+            </button>
+          )}
           <button
             onClick={() => actions.onEdit(org)}
             className="h-8 w-8 p-0 rounded text-gray-600 hover:text-gray-900 hover:bg-gray-100 transition-all flex items-center justify-center"
