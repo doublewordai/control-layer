@@ -696,7 +696,13 @@ struct UserUsageRow {
     pub last_active_at: Option<DateTime<Utc>>,
 }
 
-/// Get usage data grouped by user for a specific model
+/// Get usage data grouped by user for a specific model.
+///
+/// Only counts successful (2xx) requests, matching the `/usage` page
+/// (`get_user_model_breakdown_for_range` / `refresh_user_model_usage`). Without
+/// the status filter, request counts are inflated by failed requests — chiefly
+/// 429 rate-limit responses and 5xx errors from batch retries, which carry no
+/// tokens or cost but still create `http_analytics` rows.
 #[instrument(skip(db), err)]
 pub async fn get_model_user_usage(
     db: &PgPool,
@@ -723,6 +729,7 @@ pub async fn get_model_user_usage(
             AND ha.timestamp >= $2
             AND ha.timestamp <= $3
             AND ha.user_id IS NOT NULL
+            AND ha.status_code BETWEEN 200 AND 299
         GROUP BY ha.user_id, u.email
         ORDER BY request_count DESC
         "#,
@@ -745,6 +752,7 @@ pub async fn get_model_user_usage(
             AND timestamp >= $2
             AND timestamp <= $3
             AND user_id IS NOT NULL
+            AND status_code BETWEEN 200 AND 299
         "#,
         model_alias,
         start_date,
