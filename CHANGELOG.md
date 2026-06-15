@@ -1,5 +1,14 @@
 # Changelog
 
+## [8.60.2](https://github.com/doublewordai/control-layer/compare/v8.60.1...v8.60.2) (2026-06-15)
+
+
+### Bug Fixes
+
+* any non success response when fetching images gets turned into a 502, implying an error on our server ([#1132](https://github.com/doublewordai/control-layer/issues/1132)) ([b500fbb](https://github.com/doublewordai/control-layer/commit/b500fbbd2e75a0c73967454c06bfc342dc834f6a))
+* onwards body limit ([#1135](https://github.com/doublewordai/control-layer/issues/1135)) ([1a66eac](https://github.com/doublewordai/control-layer/commit/1a66eac585ca659ddd9eb35d7207279de6270d74))
+* validate purpose on file upload ([#1137](https://github.com/doublewordai/control-layer/issues/1137)) ([eede166](https://github.com/doublewordai/control-layer/commit/eede166a5df3024c7268ce91fbbb86f99193e605))
+
 ## [8.60.1](https://github.com/doublewordai/control-layer/compare/v8.60.0...v8.60.1) (2026-06-12)
 
 
