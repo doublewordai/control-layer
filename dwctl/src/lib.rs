@@ -175,6 +175,7 @@ pub mod webhooks;
 #[cfg(test)]
 mod test;
 
+use crate::metrics::errors::component::{ONWARDS_HEARTBEAT, SUPERVISOR};
 use crate::{
     api::models::{
         deployments::{DeployedModelCreate, StandardModelCreate},
@@ -1873,7 +1874,13 @@ impl BackgroundServices {
                 }
                 Some(Ok((task_id, Ok(())))) => {
                     let task_name = self.task_names.get(&task_id).copied().unwrap_or("unknown");
-                    tracing::warn!(task = task_name, "Background task completed unexpectedly");
+                    crate::background_error!(
+                        SUPERVISOR,
+                        "task_exit_unexpected",
+                        Error,
+                        task = task_name,
+                        "Background task completed unexpectedly"
+                    );
                     anyhow::bail!("Background task '{}' completed early", task_name)
                 }
                 Some(Ok((task_id, Err(e)))) if self.shutdown_token.is_cancelled() => {
@@ -1882,7 +1889,7 @@ impl BackgroundServices {
                 }
                 Some(Ok((task_id, Err(e)))) => {
                     let task_name = self.task_names.get(&task_id).copied().unwrap_or("unknown");
-                    tracing::error!(task = task_name, error = %e, "Background task failed");
+                    crate::background_error!(SUPERVISOR, "task_failed", Error, task = task_name, error = %e, "Background task failed");
                     anyhow::bail!("Background task '{}' failed: {}", task_name, e)
                 }
                 Some(Err(e)) if self.shutdown_token.is_cancelled() => {
@@ -1893,7 +1900,7 @@ impl BackgroundServices {
                 Some(Err(e)) => {
                     let task_id = e.id();
                     let task_name = self.task_names.get(&task_id).copied().unwrap_or("unknown");
-                    tracing::error!(task = task_name, error = %e, "Background task panicked");
+                    crate::background_error!(SUPERVISOR, "task_panicked", Error, task = task_name, error = %e, "Background task panicked");
                     anyhow::bail!("Background task '{}' panicked: {}", task_name, e)
                 }
             }
@@ -2000,12 +2007,12 @@ impl BackgroundServices {
                 }
                 Ok((task_id, Err(e))) => {
                     let task_name = self.task_names.get(&task_id).copied().unwrap_or("unknown");
-                    tracing::error!(task = task_name, error = %e, "Background task failed");
+                    crate::background_error!(SUPERVISOR, "task_failed", Error, task = task_name, error = %e, "Background task failed");
                 }
                 Err(e) => {
                     let task_id = e.id();
                     let task_name = self.task_names.get(&task_id).copied().unwrap_or("unknown");
-                    tracing::error!(task = task_name, error = %e, "Background task panicked");
+                    crate::background_error!(SUPERVISOR, "task_panicked", Error, task = task_name, error = %e, "Background task panicked");
                 }
             }
         }
@@ -2911,7 +2918,7 @@ impl Application {
                 true
             }
             Err(e) => {
-                tracing::warn!(error = %e, "Failed to register onwards daemon (table may not exist yet)");
+                crate::background_error!(ONWARDS_HEARTBEAT, "registration", Warning, error = %e, "Failed to register onwards daemon (table may not exist yet)");
                 false
             }
         };
@@ -2937,7 +2944,7 @@ impl Application {
                             .await;
 
                             if let Err(e) = result {
-                                tracing::warn!(error = %e, "Failed to send onwards daemon heartbeat");
+                                crate::background_error!(ONWARDS_HEARTBEAT, "heartbeat", Warning, error = %e, "Failed to send onwards daemon heartbeat");
                             }
                         }
                         _ = heartbeat_shutdown.cancelled() => {
@@ -2990,12 +2997,21 @@ impl Application {
         };
 
         // Build onwards router from targets with body transform, response sanitization, and tool executor.
+        // Realtime request bodies share the same configurable cap as batch
+        // file requests (limits.requests.max_body_size, 0 = unlimited);
+        // without an explicit limit onwards' strict mode would fall back to
+        // Axum's 2 MB default and 413 large payloads.
+        let onwards_body_limit = match config.limits.requests.max_body_size {
+            0 => usize::MAX,
+            n => usize::try_from(n).unwrap_or(usize::MAX),
+        };
         let onwards_app_state = onwards::AppState::with_transform(bg_services.onwards_targets.clone(), body_transform)
             .with_response_transform(onwards::create_openai_sanitizer())
             .with_streaming_header("x-fusillade-stream")
             .with_response_id_header("x-fusillade-request-id")
             .with_tool_executor(Arc::new(tool_executor))
-            .with_response_store(response_store.clone() as Arc<dyn onwards::ResponseStore>);
+            .with_response_store(response_store.clone() as Arc<dyn onwards::ResponseStore>)
+            .with_body_limit(onwards_body_limit);
         let onwards_router = if bg_services.onwards_targets.strict_mode {
             tracing::info!("Strict mode enabled - using typed request validation");
             onwards::strict::build_strict_router(onwards_app_state)

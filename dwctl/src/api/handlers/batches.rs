@@ -4,6 +4,7 @@
 //!
 //! Repository methods are delegated to the fusillade/ crate.
 
+use crate::metrics::errors::component::BATCH_POPULATE;
 use sqlx_pool_router::PoolProvider;
 
 use crate::AppState;
@@ -65,14 +66,16 @@ pub async fn build_create_batch_job<P: sqlx_pool_router::PoolProvider + Clone + 
                 .populate_batch(batch_id, fusillade::FileId(input.file_id))
                 .await
             {
-                tracing::error!(
-                    batch_id = %input.batch_id,
-                    error = %e,
-                    "Failed to populate batch"
-                );
-
                 return match &e {
                     fusillade::FusilladeError::ValidationError(_) => {
+                        // Terminal populate failure (no-templates / file-deleted). Should be
+                        // impossible to reach - a validation gap - so it pages.
+                        crate::background_error!(
+                            BATCH_POPULATE, "populate_failed", Critical,
+                            batch_id = %input.batch_id,
+                            error = %e,
+                            "Failed to populate batch"
+                        );
                         if let Err(mark_err) = cx.state.request_manager.mark_batch_failed(batch_id, &e.to_string()).await {
                             tracing::error!(
                                 batch_id = %input.batch_id,
@@ -84,7 +87,16 @@ pub async fn build_create_batch_job<P: sqlx_pool_router::PoolProvider + Clone + 
                             Err(TaskError::Fatal(e.to_string()))
                         }
                     }
-                    _ => Err(TaskError::Retryable(e.to_string())),
+                    _ => {
+                        // Transient DB/other error - the job retries; not a per-event page.
+                        crate::background_error!(
+                            BATCH_POPULATE, "db_error", Error,
+                            batch_id = %input.batch_id,
+                            error = %e,
+                            "Failed to populate batch, will retry"
+                        );
+                        Err(TaskError::Retryable(e.to_string()))
+                    }
                 };
             }
 
@@ -1654,8 +1666,13 @@ pub async fn list_batches<P: PoolProvider>(
             completion_windows,
         })
         .await
-        .map_err(|e| Error::Internal {
-            operation: format!("list batches: {}", e),
+        .map_err(|e| match &e {
+            // Invalid client-supplied filter (e.g. an unsupported ?status= value) is a bad
+            // request, not a server fault - map to 400 so it does not page as a 5xx.
+            fusillade::FusilladeError::ValidationError(msg) => Error::BadRequest { message: msg.clone() },
+            _ => Error::Internal {
+                operation: format!("list batches: {}", e),
+            },
         })?;
 
     // Check if there are more results

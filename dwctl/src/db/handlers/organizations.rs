@@ -535,7 +535,11 @@ impl<'c> Organizations<'c> {
     }
 
     /// Accept an invite: set status to active, set user_id, clear token
-    #[instrument(skip(self), fields(invite_id = %abbrev_uuid(&invite_id), user_id = %abbrev_uuid(&user_id)), err)]
+    ///
+    /// Errors here are expected client conditions (UniqueViolation means already a member,
+    /// a 409; NotFound means invite not pending, a 404), so log at warn rather than error. A
+    /// genuine server error still pages via the 5xx route metric regardless of this log level.
+    #[instrument(skip(self), fields(invite_id = %abbrev_uuid(&invite_id), user_id = %abbrev_uuid(&user_id)), err(level = "warn"))]
     pub async fn accept_invite(&mut self, invite_id: UserId, user_id: UserId) -> Result<OrganizationMemberDBResponse> {
         let row = sqlx::query_as!(
             MemberRow,

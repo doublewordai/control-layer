@@ -7,6 +7,7 @@
 //! facade in the request_logging module.
 
 mod cache_info;
+pub mod errors;
 mod gen_ai;
 mod recorder;
 
