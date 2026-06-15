@@ -319,9 +319,10 @@ enum BatchNormalizeError {
     /// MIME mismatch, oversized, malformed). Surface as a validation
     /// error.
     BadInput(String),
-    /// The origin returned a 4xx for a referenced image (forbidden, gated,
-    /// missing). The user's URL is at fault — surface as a client error so
-    /// they fix the reference, not a retryable/server failure.
+    /// The origin returned a non-408/429 4xx for a referenced image (forbidden,
+    /// gated, missing; 408/429 are transient and handled as `Transient`). The
+    /// user's URL is at fault — surface as a client error so they fix the
+    /// reference, not a retryable/server failure.
     Unfetchable(String),
     /// Upstream fetch failed for a reason that isn't a clean origin 4xx —
     /// e.g. a transport-level send error or a redirect without a Location
@@ -453,10 +454,11 @@ enum FileUploadError {
     /// Image normaliser content-store backend failed (GCS unreachable,
     /// IAM error). 502/503 territory; not the user's fault.
     ImageStoreFailed { line: u64, message: String },
-    /// A referenced image's origin returned a 4xx (forbidden, gated, missing).
-    /// The file references an image the user cannot grant us access to — their
-    /// bad input, but the batch file itself is well-formed, so this is 422
-    /// (unprocessable) rather than 400 (malformed) or a 5xx.
+    /// A referenced image's origin returned a non-408/429 4xx (forbidden, gated,
+    /// missing; 408/429 are transient and surface as `ImageTransient`). The file
+    /// references an image the user cannot grant us access to — their bad input,
+    /// but the batch file itself is well-formed, so this is 422 (unprocessable)
+    /// rather than 400 (malformed) or a 5xx.
     ImageUnfetchable { line: u64, message: String },
     /// Image fetch failed in a way that is NOT a clean origin 4xx (e.g. a
     /// transport-level send error, or a redirect without a Location header).
