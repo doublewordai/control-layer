@@ -71,6 +71,8 @@ pub enum ImageInput {
 pub enum NormalizeError {
     #[error("bad input: {0}")]
     BadInput(String),
+    #[error("the provided image URL could not be retrieved: {0}; ensure it is publicly accessible and does not require authentication")]
+    Unfetchable(String),
     #[error("fetch failed: {0}")]
     FetchFailed(String),
     #[error("transient failure: {0}")]
@@ -85,6 +87,7 @@ impl From<fetcher::FetchError> for NormalizeError {
     fn from(e: fetcher::FetchError) -> Self {
         match e {
             fetcher::FetchError::BadInput(m) => NormalizeError::BadInput(m),
+            fetcher::FetchError::Unfetchable(m) => NormalizeError::Unfetchable(m),
             fetcher::FetchError::FetchFailed(m) => NormalizeError::FetchFailed(m),
             fetcher::FetchError::Transient(m) => NormalizeError::Transient(m),
         }

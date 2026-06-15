@@ -319,8 +319,15 @@ enum BatchNormalizeError {
     /// MIME mismatch, oversized, malformed). Surface as a validation
     /// error.
     BadInput(String),
-    /// Upstream fetch failed in a way that isn't worth a retry from the
-    /// client (e.g. origin 4xx). Surface as a fetch failure.
+    /// The origin returned a non-408/429 4xx for a referenced image (forbidden,
+    /// gated, missing; 408/429 are transient and handled as `Transient`). The
+    /// user's URL is at fault — surface as a client error so they fix the
+    /// reference, not a retryable/server failure.
+    Unfetchable(String),
+    /// Upstream fetch failed for a reason that isn't a clean origin 4xx —
+    /// e.g. a transport-level send error or a redirect without a Location
+    /// header. Not the file's fault, so surface as a service error (503) the
+    /// client may retry, not a validation error.
     FetchFailed(String),
     /// Transient: timed out or origin 5xx after the configured retries.
     /// Surface as a "try again" so users aren't told to fix their file.
@@ -380,6 +387,7 @@ async fn normalize_template_body_in_place(
                 Err(e) => {
                     let mapped = match e {
                         crate::image_normalizer::NormalizeError::BadInput(m) => BatchNormalizeError::BadInput(m),
+                        crate::image_normalizer::NormalizeError::Unfetchable(m) => BatchNormalizeError::Unfetchable(m),
                         crate::image_normalizer::NormalizeError::FetchFailed(m) => BatchNormalizeError::FetchFailed(m),
                         crate::image_normalizer::NormalizeError::Transient(m) => BatchNormalizeError::Transient(m),
                         crate::image_normalizer::NormalizeError::StoreFailed(m) => BatchNormalizeError::StoreFailed(m),
@@ -446,10 +454,17 @@ enum FileUploadError {
     /// Image normaliser content-store backend failed (GCS unreachable,
     /// IAM error). 502/503 territory; not the user's fault.
     ImageStoreFailed { line: u64, message: String },
-    /// Image fetch failed in a non-retryable way (origin returned a 4xx, or
-    /// every resolved address was deny-listed). The file referenced an image
-    /// we could not retrieve — an upstream/reference problem, not a malformed
-    /// batch file, so it must NOT surface as a validation (400) error.
+    /// A referenced image's origin returned a non-408/429 4xx (forbidden, gated,
+    /// missing; 408/429 are transient and surface as `ImageTransient`). The file
+    /// references an image the user cannot grant us access to — their bad input,
+    /// but the batch file itself is well-formed, so this is 422 (unprocessable)
+    /// rather than 400 (malformed) or a 5xx.
+    ImageUnfetchable { line: u64, message: String },
+    /// Image fetch failed in a way that is NOT a clean origin 4xx (e.g. a
+    /// transport-level send error, or a redirect without a Location header).
+    /// An upstream/reference problem, not a malformed batch file, so it must
+    /// NOT surface as a validation (400) error (this path maps to 503, which
+    /// the client may retry).
     ImageFetchFailed { line: u64, message: String },
     /// Upload specified an unsupported `purpose`. Only `batch` is accepted; any
     /// other value (e.g. the typo `batches`) is a client error. Detected during
@@ -464,6 +479,7 @@ enum FileUploadError {
 fn map_batch_normalize_error(e: BatchNormalizeError, line: u64) -> FileUploadError {
     match e {
         BatchNormalizeError::BadInput(message) => FileUploadError::ValidationError { line, message },
+        BatchNormalizeError::Unfetchable(message) => FileUploadError::ImageUnfetchable { line, message },
         BatchNormalizeError::FetchFailed(message) => FileUploadError::ImageFetchFailed { line, message },
         BatchNormalizeError::Transient(message) => FileUploadError::ImageTransient { line, message },
         BatchNormalizeError::StoreFailed(message) => FileUploadError::ImageStoreFailed { line, message },
@@ -528,6 +544,12 @@ impl FileUploadError {
             },
             FileUploadError::ImageStoreFailed { line, message } => Error::ServiceUnavailable {
                 message: format!("Line {}: image content store temporarily unavailable: {}", line, message),
+            },
+            FileUploadError::ImageUnfetchable { line, message } => Error::UnprocessableEntity {
+                message: format!(
+                    "Line {}: referenced image could not be retrieved ({}); ensure the URL is publicly accessible and does not require authentication",
+                    line, message
+                ),
             },
             FileUploadError::ImageFetchFailed { line, message } => Error::ServiceUnavailable {
                 message: format!("Line {}: referenced image could not be fetched (upstream error): {}", line, message),
@@ -1044,8 +1066,10 @@ Each line must be a valid JSON object containing `custom_id`, `method`, `url`, a
         (status = 400, description = "Invalid file format, malformed JSON, missing required fields, etc."),
         (status = 403, description = "Model referenced in the file is not configured or not accessible to your account."),
         (status = 413, description = "File exceeds the maximum allowed size."),
+        (status = 422, description = "A referenced image URL could not be retrieved because its origin refused access (e.g. 403/404). The file is well-formed but references an image that is forbidden, gated, or missing."),
         (status = 429, description = "Too many concurrent uploads. Retry after a short delay."),
-        (status = 500, description = "An unexpected error occurred. Retry the request or contact support if the issue persists.")
+        (status = 500, description = "An unexpected error occurred. Retry the request or contact support if the issue persists."),
+        (status = 503, description = "A referenced image could not be fetched due to a transient upstream/store error, or the service is briefly overloaded. Retry after a short delay.")
     )
 )]
 #[tracing::instrument(skip_all, fields(user_id = %current_user.id))]
@@ -3649,11 +3673,12 @@ mod tests {
 
     #[test]
     fn test_batch_fetch_failed_maps_to_service_unavailable_not_validation() {
-        // A non-retryable upstream image fetch failure must surface as a 503
+        // A non-retryable upstream image fetch failure that is not a clean
+        // origin 4xx (e.g. a transport-level send error) must surface as a 503
         // service error, not a 400 "fix your file" validation error: the
         // batch file isn't malformed, the referenced image just couldn't be
         // fetched.
-        let mapped = super::map_batch_normalize_error(super::BatchNormalizeError::FetchFailed("origin 404".to_string()), 5);
+        let mapped = super::map_batch_normalize_error(super::BatchNormalizeError::FetchFailed("send: connection reset".to_string()), 5);
         assert!(
             matches!(mapped, super::FileUploadError::ImageFetchFailed { .. }),
             "FetchFailed must map to ImageFetchFailed, got {mapped:?}"
@@ -3661,9 +3686,28 @@ mod tests {
         match mapped.into_http_error() {
             crate::errors::Error::ServiceUnavailable { message } => {
                 assert!(message.contains("Line 5"));
-                assert!(message.contains("origin 404"));
+                assert!(message.contains("connection reset"));
             }
             _ => panic!("Expected ServiceUnavailable error"),
+        }
+    }
+
+    #[test]
+    fn test_batch_unfetchable_maps_to_unprocessable_entity_not_server_error() {
+        // A referenced image whose origin returned a 4xx (e.g. a 403 on a
+        // gated URL) is the user's bad input — surface as 422, not a 5xx. The
+        // batch file is well-formed; the image reference just can't be fetched.
+        let mapped = super::map_batch_normalize_error(super::BatchNormalizeError::Unfetchable("origin 403 Forbidden".to_string()), 5);
+        assert!(
+            matches!(mapped, super::FileUploadError::ImageUnfetchable { .. }),
+            "Unfetchable must map to ImageUnfetchable, got {mapped:?}"
+        );
+        match mapped.into_http_error() {
+            crate::errors::Error::UnprocessableEntity { message } => {
+                assert!(message.contains("Line 5"));
+                assert!(message.contains("403 Forbidden"));
+            }
+            _ => panic!("Expected UnprocessableEntity error"),
         }
     }
 
