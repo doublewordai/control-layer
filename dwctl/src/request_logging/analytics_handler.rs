@@ -45,15 +45,15 @@
 //! ```
 
 use crate::config::Config;
+use crate::metrics::errors::component::ANALYTICS;
 use crate::request_logging::AiResponse;
 use crate::request_logging::batcher::{AnalyticsSender, RawAnalyticsRecord};
 use crate::request_logging::serializers::{Auth, UsageMetrics, parse_ai_response};
 use crate::request_logging::utils::{extract_header_as_string, extract_header_as_uuid};
 use axum::http::Uri;
-use metrics::counter;
 use outlet::{RequestData, RequestHandler, ResponseData};
 use serde_json::Value;
-use tracing::{Instrument, error, info_span, warn};
+use tracing::{Instrument, info_span};
 use uuid::Uuid;
 
 /// A request handler that sends analytics data to a background batcher.
@@ -149,19 +149,14 @@ impl RequestHandler for AnalyticsHandler {
                             "Failed to parse successful AI response — tokens will be zero"
                         );
                         if let Some(endpoint) = usage_required_endpoint {
-                            counter!(
-                                "dwctl_usage_extraction_failures_total",
-                                "endpoint" => endpoint,
-                                "reason" => "parse_error"
-                            )
-                            .increment(1);
-                            error!(
+                            crate::background_error!(
+                                ANALYTICS, "parse_error", Error,
                                 correlation_id = correlation_id,
                                 uri = %request_data.uri,
                                 endpoint,
                                 fusillade_stream,
                                 error = %e.error,
-                                "CRITICAL: failed to serialize usage for successful generative response"
+                                "Failed to serialize usage for successful generative response"
                             );
                         }
                     }
@@ -179,13 +174,8 @@ impl RequestHandler for AnalyticsHandler {
                 && metrics.total_tokens == 0
                 && let Some(endpoint) = usage_required_endpoint
             {
-                counter!(
-                    "dwctl_usage_extraction_failures_total",
-                    "endpoint" => endpoint,
-                    "reason" => "missing_usage"
-                )
-                .increment(1);
-                error!(
+                crate::background_error!(
+                    ANALYTICS, "missing_usage", Error,
                     correlation_id = correlation_id,
                     uri = %request_data.uri,
                     endpoint,
@@ -193,7 +183,7 @@ impl RequestHandler for AnalyticsHandler {
                     fusillade_stream,
                     request_model = ?metrics.request_model,
                     response_model = ?metrics.response_model,
-                    "CRITICAL: successful generative response recorded zero tokens"
+                    "Successful generative response recorded zero tokens"
                 );
             }
 
@@ -250,8 +240,8 @@ impl RequestHandler for AnalyticsHandler {
 
             // Send to batcher (non-blocking, just puts in channel)
             if let Err(e) = self.sender.send(record).await {
-                counter!("dwctl_analytics_send_errors_total").increment(1);
-                warn!(
+                crate::background_error!(
+                    ANALYTICS, "send_failed", Error,
                     correlation_id = correlation_id,
                     error = %e,
                     "Failed to send analytics record to batcher - channel may be full or closed"

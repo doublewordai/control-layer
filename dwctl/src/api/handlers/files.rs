@@ -319,8 +319,15 @@ enum BatchNormalizeError {
     /// MIME mismatch, oversized, malformed). Surface as a validation
     /// error.
     BadInput(String),
-    /// Upstream fetch failed in a way that isn't worth a retry from the
-    /// client (e.g. origin 4xx). Surface as a fetch failure.
+    /// The origin returned a non-408/429 4xx for a referenced image (forbidden,
+    /// gated, missing; 408/429 are transient and handled as `Transient`). The
+    /// user's URL is at fault — surface as a client error so they fix the
+    /// reference, not a retryable/server failure.
+    Unfetchable(String),
+    /// Upstream fetch failed for a reason that isn't a clean origin 4xx —
+    /// e.g. a transport-level send error or a redirect without a Location
+    /// header. Not the file's fault, so surface as a service error (503) the
+    /// client may retry, not a validation error.
     FetchFailed(String),
     /// Transient: timed out or origin 5xx after the configured retries.
     /// Surface as a "try again" so users aren't told to fix their file.
@@ -380,6 +387,7 @@ async fn normalize_template_body_in_place(
                 Err(e) => {
                     let mapped = match e {
                         crate::image_normalizer::NormalizeError::BadInput(m) => BatchNormalizeError::BadInput(m),
+                        crate::image_normalizer::NormalizeError::Unfetchable(m) => BatchNormalizeError::Unfetchable(m),
                         crate::image_normalizer::NormalizeError::FetchFailed(m) => BatchNormalizeError::FetchFailed(m),
                         crate::image_normalizer::NormalizeError::Transient(m) => BatchNormalizeError::Transient(m),
                         crate::image_normalizer::NormalizeError::StoreFailed(m) => BatchNormalizeError::StoreFailed(m),
@@ -446,11 +454,23 @@ enum FileUploadError {
     /// Image normaliser content-store backend failed (GCS unreachable,
     /// IAM error). 502/503 territory; not the user's fault.
     ImageStoreFailed { line: u64, message: String },
-    /// Image fetch failed in a non-retryable way (origin returned a 4xx, or
-    /// every resolved address was deny-listed). The file referenced an image
-    /// we could not retrieve — an upstream/reference problem, not a malformed
-    /// batch file, so it must NOT surface as a validation (400) error.
+    /// A referenced image's origin returned a non-408/429 4xx (forbidden, gated,
+    /// missing; 408/429 are transient and surface as `ImageTransient`). The file
+    /// references an image the user cannot grant us access to — their bad input,
+    /// but the batch file itself is well-formed, so this is 422 (unprocessable)
+    /// rather than 400 (malformed) or a 5xx.
+    ImageUnfetchable { line: u64, message: String },
+    /// Image fetch failed in a way that is NOT a clean origin 4xx (e.g. a
+    /// transport-level send error, or a redirect without a Location header).
+    /// An upstream/reference problem, not a malformed batch file, so it must
+    /// NOT surface as a validation (400) error (this path maps to 503, which
+    /// the client may retry).
     ImageFetchFailed { line: u64, message: String },
+    /// Upload specified an unsupported `purpose`. Only `batch` is accepted; any
+    /// other value (e.g. the typo `batches`) is a client error. Detected during
+    /// multipart parsing and aborted before the upload is committed — avoiding a
+    /// 500 on read-back and preventing an orphaned file (regardless of field order).
+    InvalidPurpose { purpose: String },
 }
 
 /// Map a `BatchNormalizeError` variant to the `FileUploadError` that
@@ -459,6 +479,7 @@ enum FileUploadError {
 fn map_batch_normalize_error(e: BatchNormalizeError, line: u64) -> FileUploadError {
     match e {
         BatchNormalizeError::BadInput(message) => FileUploadError::ValidationError { line, message },
+        BatchNormalizeError::Unfetchable(message) => FileUploadError::ImageUnfetchable { line, message },
         BatchNormalizeError::FetchFailed(message) => FileUploadError::ImageFetchFailed { line, message },
         BatchNormalizeError::Transient(message) => FileUploadError::ImageTransient { line, message },
         BatchNormalizeError::StoreFailed(message) => FileUploadError::ImageStoreFailed { line, message },
@@ -524,8 +545,17 @@ impl FileUploadError {
             FileUploadError::ImageStoreFailed { line, message } => Error::ServiceUnavailable {
                 message: format!("Line {}: image content store temporarily unavailable: {}", line, message),
             },
+            FileUploadError::ImageUnfetchable { line, message } => Error::UnprocessableEntity {
+                message: format!(
+                    "Line {}: referenced image could not be retrieved ({}); ensure the URL is publicly accessible and does not require authentication",
+                    line, message
+                ),
+            },
             FileUploadError::ImageFetchFailed { line, message } => Error::ServiceUnavailable {
                 message: format!("Line {}: referenced image could not be fetched (upstream error): {}", line, message),
+            },
+            FileUploadError::InvalidPurpose { purpose } => Error::BadRequest {
+                message: format!("Invalid purpose '{}'. Only 'batch' is supported.", purpose),
             },
         }
     }
@@ -686,7 +716,16 @@ fn create_file_stream(
             match field_name {
                 "purpose" => {
                     if let Ok(value) = field.text().await {
-                        metadata.purpose = Some(value);
+                        // Validate eagerly: an unsupported purpose is a client (400)
+                        // error. Without this it's stored raw, the upload can still
+                        // commit, and the read-back parse fails as a 500 — leaving an
+                        // orphaned file. `abort!` stops the stream so nothing is
+                        // committed (regardless of multipart field order). Only "batch"
+                        // is supported.
+                        match value.parse::<fusillade::batch::Purpose>() {
+                            Ok(fusillade::batch::Purpose::Batch) => metadata.purpose = Some(value),
+                            _ => abort!(FileUploadError::InvalidPurpose { purpose: value }),
+                        }
                     }
                 }
                 "expires_after[anchor]" => {
@@ -1027,8 +1066,10 @@ Each line must be a valid JSON object containing `custom_id`, `method`, `url`, a
         (status = 400, description = "Invalid file format, malformed JSON, missing required fields, etc."),
         (status = 403, description = "Model referenced in the file is not configured or not accessible to your account."),
         (status = 413, description = "File exceeds the maximum allowed size."),
+        (status = 422, description = "A referenced image URL could not be retrieved because its origin refused access (e.g. 403/404). The file is well-formed but references an image that is forbidden, gated, or missing."),
         (status = 429, description = "Too many concurrent uploads. Retry after a short delay."),
-        (status = 500, description = "An unexpected error occurred. Retry the request or contact support if the issue persists.")
+        (status = 500, description = "An unexpected error occurred. Retry the request or contact support if the issue persists."),
+        (status = 503, description = "A referenced image could not be fetched due to a transient upstream/store error, or the service is briefly overloaded. Retry after a short delay.")
     )
 )]
 #[tracing::instrument(skip_all, fields(user_id = %current_user.id))]
@@ -1182,16 +1223,10 @@ pub async fn upload_file<P: PoolProvider>(
             operation: format!("retrieve created file: {}", e),
         })?;
 
-    // Validate purpose (only batch is supported)
-    if let Some(purpose) = file.purpose
-        && purpose != fusillade::Purpose::Batch
-    {
-        return Err(Error::BadRequest {
-            message: format!("Invalid purpose '{}'. Only 'batch' is supported.", purpose),
-        });
-    }
-
-    // Convert fusillade Purpose to API Purpose
+    // Convert fusillade Purpose to API Purpose. The purpose is validated during
+    // multipart parsing (only `batch` is accepted), so a file read back here always
+    // has purpose `batch` or none — the old post-read-back re-check was unreachable
+    // (a corrupt purpose would already fail to parse in get_file above).
     let api_purpose = match file.purpose {
         Some(fusillade::batch::Purpose::Batch) => Purpose::Batch,
         Some(fusillade::batch::Purpose::BatchOutput) => Purpose::BatchOutput,
@@ -2167,6 +2202,57 @@ mod tests {
         upload_response.assert_status(axum::http::StatusCode::BAD_REQUEST);
         let error_body = upload_response.text();
         assert!(error_body.contains("model"));
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_upload_invalid_purpose_returns_400(pool: PgPool) {
+        // Any unsupported purpose must be a 400 — and must NOT write a file.
+        // Previously the value was stored raw, the read-back parse failed as a 500,
+        // and an orphaned file was left committed. Covers the typo case, empty, and
+        // the system-only variants (batch_output / batch_error) — valid enum values
+        // that are still not allowed for uploads. (Parsing lowercases first, so
+        // "BATCH"/"Batch" map to Batch and are accepted — not exercised here.)
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+
+        let jsonl = r#"{"custom_id":"r1","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}}"#;
+
+        for bad_purpose in ["batches", "", "batch_output", "batch_error"] {
+            let file_part = axum_test::multipart::Part::bytes(jsonl.as_bytes()).file_name("test-batch.jsonl");
+            let resp = app
+                .post("/ai/v1/files")
+                .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+                .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+                .multipart(
+                    axum_test::multipart::MultipartForm::new()
+                        .add_text("purpose", bad_purpose)
+                        .add_part("file", file_part),
+                )
+                .await;
+
+            // 400 (not a 500), with the canonical message.
+            resp.assert_status(axum::http::StatusCode::BAD_REQUEST);
+            let body = resp.text();
+            assert!(
+                body.contains("Only 'batch' is supported"),
+                "purpose={bad_purpose:?}: unexpected body: {body}"
+            );
+        }
+
+        // None of those uploads left an orphaned file behind.
+        let list = app
+            .get("/ai/v1/files")
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        list.assert_status(axum::http::StatusCode::OK);
+        let listed: serde_json::Value = list.json();
+        assert_eq!(
+            listed["data"].as_array().map(|a| a.len()),
+            Some(0),
+            "expected no files, got: {listed}"
+        );
     }
 
     #[sqlx::test]
@@ -3526,6 +3612,21 @@ mod tests {
     }
 
     #[test]
+    fn test_file_upload_error_into_http_error_invalid_purpose() {
+        let err = super::FileUploadError::InvalidPurpose {
+            purpose: "batches".to_string(),
+        };
+        let http_err = err.into_http_error();
+        match http_err {
+            crate::errors::Error::BadRequest { message } => {
+                assert!(message.contains("batches"));
+                assert!(message.contains("Only 'batch' is supported"));
+            }
+            _ => panic!("Expected BadRequest error"),
+        }
+    }
+
+    #[test]
     fn test_file_upload_error_into_http_error_empty_file() {
         let err = super::FileUploadError::EmptyFile;
         let http_err = err.into_http_error();
@@ -3572,11 +3673,12 @@ mod tests {
 
     #[test]
     fn test_batch_fetch_failed_maps_to_service_unavailable_not_validation() {
-        // A non-retryable upstream image fetch failure must surface as a 503
+        // A non-retryable upstream image fetch failure that is not a clean
+        // origin 4xx (e.g. a transport-level send error) must surface as a 503
         // service error, not a 400 "fix your file" validation error: the
         // batch file isn't malformed, the referenced image just couldn't be
         // fetched.
-        let mapped = super::map_batch_normalize_error(super::BatchNormalizeError::FetchFailed("origin 404".to_string()), 5);
+        let mapped = super::map_batch_normalize_error(super::BatchNormalizeError::FetchFailed("send: connection reset".to_string()), 5);
         assert!(
             matches!(mapped, super::FileUploadError::ImageFetchFailed { .. }),
             "FetchFailed must map to ImageFetchFailed, got {mapped:?}"
@@ -3584,9 +3686,28 @@ mod tests {
         match mapped.into_http_error() {
             crate::errors::Error::ServiceUnavailable { message } => {
                 assert!(message.contains("Line 5"));
-                assert!(message.contains("origin 404"));
+                assert!(message.contains("connection reset"));
             }
             _ => panic!("Expected ServiceUnavailable error"),
+        }
+    }
+
+    #[test]
+    fn test_batch_unfetchable_maps_to_unprocessable_entity_not_server_error() {
+        // A referenced image whose origin returned a 4xx (e.g. a 403 on a
+        // gated URL) is the user's bad input — surface as 422, not a 5xx. The
+        // batch file is well-formed; the image reference just can't be fetched.
+        let mapped = super::map_batch_normalize_error(super::BatchNormalizeError::Unfetchable("origin 403 Forbidden".to_string()), 5);
+        assert!(
+            matches!(mapped, super::FileUploadError::ImageUnfetchable { .. }),
+            "Unfetchable must map to ImageUnfetchable, got {mapped:?}"
+        );
+        match mapped.into_http_error() {
+            crate::errors::Error::UnprocessableEntity { message } => {
+                assert!(message.contains("Line 5"));
+                assert!(message.contains("403 Forbidden"));
+            }
+            _ => panic!("Expected UnprocessableEntity error"),
         }
     }
 

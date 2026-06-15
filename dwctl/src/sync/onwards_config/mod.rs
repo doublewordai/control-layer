@@ -1,5 +1,6 @@
 //! Configuration synchronization to onwards routing layer.
 
+use crate::metrics::errors::component::ONWARDS_SYNC;
 use std::{collections::HashMap, num::NonZeroU32, sync::Arc};
 
 use metrics::histogram;
@@ -173,7 +174,13 @@ impl OnwardsConfigSync {
         // Populate cache info metrics on startup
         let mut cache_info_state = crate::metrics::CacheInfoState::new();
         if let Err(e) = crate::metrics::update_cache_info_metrics(&db, &initial_targets, &mut cache_info_state).await {
-            error!("Failed to update cache info metrics: {}", e);
+            crate::background_error!(
+                ONWARDS_SYNC,
+                "cache_info_metrics",
+                Error,
+                "Failed to update cache info metrics: {}",
+                e
+            );
         }
 
         // Create watch channel with initial state
@@ -288,12 +295,12 @@ impl OnwardsConfigSync {
                                         // Update daemon capacity limits if configured
                                         if let Some(ref limits) = self.daemon_capacity_limits
                                             && let Err(e) = update_daemon_capacity_limits(&self.db, limits, self.default_batch_capacity).await {
-                                                error!("Failed to update daemon capacity limits: {}", e);
+                                                crate::background_error!(ONWARDS_SYNC, "capacity_limits", Error, "Failed to update daemon capacity limits: {}", e);
                                             }
 
                                         // Update cache info metrics
                                         if let Err(e) = crate::metrics::update_cache_info_metrics(&self.db, &new_targets, &mut self.cache_info_state).await {
-                                            error!("Failed to update cache info metrics: {}", e);
+                                            crate::background_error!(ONWARDS_SYNC, "cache_info_metrics", Error, "Failed to update cache info metrics: {}", e);
                                         }
 
                                         // Send update through watch channel
@@ -318,7 +325,7 @@ impl OnwardsConfigSync {
                                         }
                                     }
                                     Err(e) => {
-                                        error!("Failed to load targets from database: {}", e);
+                                        crate::background_error!(ONWARDS_SYNC, "load_targets", Error, "Failed to load targets from database: {}", e);
                                         // Return error if database operations fail consistently
                                         if e.to_string().contains("closed pool") || e.to_string().contains("connection closed") {
                                             error!("Database pool closed, exiting sync task");
@@ -371,12 +378,12 @@ impl OnwardsConfigSync {
                                 // Update daemon capacity limits if configured
                                 if let Some(ref limits) = self.daemon_capacity_limits
                                     && let Err(e) = update_daemon_capacity_limits(&self.db, limits, self.default_batch_capacity).await {
-                                        error!("Failed to update daemon capacity limits: {}", e);
+                                        crate::background_error!(ONWARDS_SYNC, "capacity_limits", Error, "Failed to update daemon capacity limits: {}", e);
                                     }
 
                                 // Update cache info metrics
                                 if let Err(e) = crate::metrics::update_cache_info_metrics(&self.db, &new_targets, &mut self.cache_info_state).await {
-                                    error!("Failed to update cache info metrics: {}", e);
+                                    crate::background_error!(ONWARDS_SYNC, "cache_info_metrics", Error, "Failed to update cache info metrics: {}", e);
                                 }
 
                                 // Send update through watch channel
@@ -391,8 +398,7 @@ impl OnwardsConfigSync {
                                 debug!("Fallback sync: updated onwards configuration successfully");
                             }
                             Err(e) => {
-                                error!("Fallback sync: failed to load targets from database: {}", e);
-                                metrics::counter!("dwctl_cache_sync_errors_total", "source" => "fallback").increment(1);
+                                crate::background_error!(ONWARDS_SYNC, "load_targets_fallback", Error, "Fallback sync: failed to load targets from database: {}", e);
                                 // Continue - fallback sync errors shouldn't crash the service
                             }
                         }
@@ -1151,7 +1157,10 @@ fn convert_to_config_file(
     // Convert composite models (including those with no components - they'll return 503)
     for composite in composites {
         if composite.components.is_empty() {
-            warn!(
+            crate::background_error!(
+                ONWARDS_SYNC,
+                "composite_no_components",
+                Warning,
                 "Composite model '{}' has no enabled components - requests will return 503",
                 composite.alias
             );

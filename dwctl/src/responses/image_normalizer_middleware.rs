@@ -23,9 +23,13 @@
 //!
 //! - `NormalizeError::BadInput` → 400 (the URL is unacceptable: bad scheme,
 //!   denied IP, MIME mismatch, oversized).
+//! - `NormalizeError::Unfetchable` → 422 (the origin returned a non-408/429
+//!   4xx — the user's URL is forbidden/gated/missing; their bad input, not our
+//!   failure). 408/429 are classified as transient and retried instead.
 //! - `NormalizeError::Transient` → 503 (retried internally and still
 //!   failing; client can retry).
-//! - `NormalizeError::FetchFailed` → 502 (non-retryable upstream error).
+//! - `NormalizeError::FetchFailed` → 502 (non-retryable upstream error: a
+//!   transport-level failure on our side, not a clean origin 4xx).
 //! - `NormalizeError::StoreFailed` → 503 (the content store was briefly
 //!   unreachable — a transient dependency failure the client can retry,
 //!   not an internal bug).
@@ -263,6 +267,7 @@ pub(crate) async fn normalize_value_to_tokens(
 pub(crate) fn normalize_error_response(err: NormalizeError) -> Response {
     let (status, code) = match &err {
         NormalizeError::BadInput(_) => (StatusCode::BAD_REQUEST, "image_url_rejected"),
+        NormalizeError::Unfetchable(_) => (StatusCode::UNPROCESSABLE_ENTITY, "image_url_unfetchable"),
         NormalizeError::Transient(_) => (StatusCode::SERVICE_UNAVAILABLE, "image_fetch_transient"),
         NormalizeError::FetchFailed(_) => (StatusCode::BAD_GATEWAY, "image_fetch_failed"),
         NormalizeError::StoreFailed(_) => (StatusCode::SERVICE_UNAVAILABLE, "image_store_failed"),
@@ -506,6 +511,12 @@ mod tests {
         // our code, and 503 lets retry-aware clients back off and retry.
         let cases = [
             (NormalizeError::BadInput("x".into()), StatusCode::BAD_REQUEST),
+            // A 4xx from the origin (e.g. a 403 on a gated URL) is the user's
+            // bad input — 422, not a 502 gateway error.
+            (
+                NormalizeError::Unfetchable("origin 403 Forbidden".into()),
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
             (NormalizeError::Transient("x".into()), StatusCode::SERVICE_UNAVAILABLE),
             (NormalizeError::FetchFailed("x".into()), StatusCode::BAD_GATEWAY),
             (NormalizeError::StoreFailed("x".into()), StatusCode::SERVICE_UNAVAILABLE),

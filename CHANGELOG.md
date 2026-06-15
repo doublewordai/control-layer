@@ -1,5 +1,28 @@
 # Changelog
 
+## [8.60.2](https://github.com/doublewordai/control-layer/compare/v8.60.1...v8.60.2) (2026-06-15)
+
+
+### Bug Fixes
+
+* any non success response when fetching images gets turned into a 502, implying an error on our server ([#1132](https://github.com/doublewordai/control-layer/issues/1132)) ([b500fbb](https://github.com/doublewordai/control-layer/commit/b500fbbd2e75a0c73967454c06bfc342dc834f6a))
+* onwards body limit ([#1135](https://github.com/doublewordai/control-layer/issues/1135)) ([1a66eac](https://github.com/doublewordai/control-layer/commit/1a66eac585ca659ddd9eb35d7207279de6270d74))
+* validate purpose on file upload ([#1137](https://github.com/doublewordai/control-layer/issues/1137)) ([eede166](https://github.com/doublewordai/control-layer/commit/eede166a5df3024c7268ce91fbbb86f99193e605))
+
+## [8.60.1](https://github.com/doublewordai/control-layer/compare/v8.60.0...v8.60.1) (2026-06-12)
+
+
+### Bug Fixes
+
+* **deps:** bump fusillade to 17.3.1 for batchless flex pending counts ([#1134](https://github.com/doublewordai/control-layer/issues/1134)) ([4ad4e88](https://github.com/doublewordai/control-layer/commit/4ad4e88c5bc49f9acc29d0bcc420d73269b33aec))
+
+## [8.60.0](https://github.com/doublewordai/control-layer/compare/v8.59.0...v8.60.0) (2026-06-11)
+
+
+### Features
+
+* standardise error logs into having metric emissions ([#1130](https://github.com/doublewordai/control-layer/issues/1130)) ([bfda345](https://github.com/doublewordai/control-layer/commit/bfda34584ed12fe179c087c1c3e89d26bbba398a))
+
 ## [8.59.0](https://github.com/doublewordai/control-layer/compare/v8.58.1...v8.59.0) (2026-06-05)
 
 

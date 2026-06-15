@@ -346,7 +346,8 @@ batches:
 #     # Set to 0 to reject immediately when no slot is available
 #     max_upload_wait_secs: 60
 #   requests:
-#     # Maximum body size per individual request in batch JSONL files (bytes)
+#     # Maximum body size per individual request (bytes). Applies to requests
+#     # in batch JSONL files and to realtime request bodies on /ai/v1/*.
 #     # Set to 0 for unlimited (not recommended for production)
 #     # Default: 10MB (10485760)
 #     max_body_size: 10485760
