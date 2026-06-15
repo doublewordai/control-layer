@@ -463,6 +463,11 @@ enum FileUploadError {
     /// header). An upstream/reference problem, not a malformed batch file, so
     /// it must NOT surface as a validation (400) error.
     ImageFetchFailed { line: u64, message: String },
+    /// Upload specified an unsupported `purpose`. Only `batch` is accepted; any
+    /// other value (e.g. the typo `batches`) is a client error. Detected during
+    /// multipart parsing and aborted before the upload is committed — avoiding a
+    /// 500 on read-back and preventing an orphaned file (regardless of field order).
+    InvalidPurpose { purpose: String },
 }
 
 /// Map a `BatchNormalizeError` variant to the `FileUploadError` that
@@ -545,6 +550,9 @@ impl FileUploadError {
             },
             FileUploadError::ImageFetchFailed { line, message } => Error::ServiceUnavailable {
                 message: format!("Line {}: referenced image could not be fetched (upstream error): {}", line, message),
+            },
+            FileUploadError::InvalidPurpose { purpose } => Error::BadRequest {
+                message: format!("Invalid purpose '{}'. Only 'batch' is supported.", purpose),
             },
         }
     }
@@ -705,7 +713,16 @@ fn create_file_stream(
             match field_name {
                 "purpose" => {
                     if let Ok(value) = field.text().await {
-                        metadata.purpose = Some(value);
+                        // Validate eagerly: an unsupported purpose is a client (400)
+                        // error. Without this it's stored raw, the upload can still
+                        // commit, and the read-back parse fails as a 500 — leaving an
+                        // orphaned file. `abort!` stops the stream so nothing is
+                        // committed (regardless of multipart field order). Only "batch"
+                        // is supported.
+                        match value.parse::<fusillade::batch::Purpose>() {
+                            Ok(fusillade::batch::Purpose::Batch) => metadata.purpose = Some(value),
+                            _ => abort!(FileUploadError::InvalidPurpose { purpose: value }),
+                        }
                     }
                 }
                 "expires_after[anchor]" => {
@@ -1203,16 +1220,10 @@ pub async fn upload_file<P: PoolProvider>(
             operation: format!("retrieve created file: {}", e),
         })?;
 
-    // Validate purpose (only batch is supported)
-    if let Some(purpose) = file.purpose
-        && purpose != fusillade::Purpose::Batch
-    {
-        return Err(Error::BadRequest {
-            message: format!("Invalid purpose '{}'. Only 'batch' is supported.", purpose),
-        });
-    }
-
-    // Convert fusillade Purpose to API Purpose
+    // Convert fusillade Purpose to API Purpose. The purpose is validated during
+    // multipart parsing (only `batch` is accepted), so a file read back here always
+    // has purpose `batch` or none — the old post-read-back re-check was unreachable
+    // (a corrupt purpose would already fail to parse in get_file above).
     let api_purpose = match file.purpose {
         Some(fusillade::batch::Purpose::Batch) => Purpose::Batch,
         Some(fusillade::batch::Purpose::BatchOutput) => Purpose::BatchOutput,
@@ -2188,6 +2199,57 @@ mod tests {
         upload_response.assert_status(axum::http::StatusCode::BAD_REQUEST);
         let error_body = upload_response.text();
         assert!(error_body.contains("model"));
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_upload_invalid_purpose_returns_400(pool: PgPool) {
+        // Any unsupported purpose must be a 400 — and must NOT write a file.
+        // Previously the value was stored raw, the read-back parse failed as a 500,
+        // and an orphaned file was left committed. Covers the typo case, empty, and
+        // the system-only variants (batch_output / batch_error) — valid enum values
+        // that are still not allowed for uploads. (Parsing lowercases first, so
+        // "BATCH"/"Batch" map to Batch and are accepted — not exercised here.)
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+
+        let jsonl = r#"{"custom_id":"r1","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}}"#;
+
+        for bad_purpose in ["batches", "", "batch_output", "batch_error"] {
+            let file_part = axum_test::multipart::Part::bytes(jsonl.as_bytes()).file_name("test-batch.jsonl");
+            let resp = app
+                .post("/ai/v1/files")
+                .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+                .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+                .multipart(
+                    axum_test::multipart::MultipartForm::new()
+                        .add_text("purpose", bad_purpose)
+                        .add_part("file", file_part),
+                )
+                .await;
+
+            // 400 (not a 500), with the canonical message.
+            resp.assert_status(axum::http::StatusCode::BAD_REQUEST);
+            let body = resp.text();
+            assert!(
+                body.contains("Only 'batch' is supported"),
+                "purpose={bad_purpose:?}: unexpected body: {body}"
+            );
+        }
+
+        // None of those uploads left an orphaned file behind.
+        let list = app
+            .get("/ai/v1/files")
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        list.assert_status(axum::http::StatusCode::OK);
+        let listed: serde_json::Value = list.json();
+        assert_eq!(
+            listed["data"].as_array().map(|a| a.len()),
+            Some(0),
+            "expected no files, got: {listed}"
+        );
     }
 
     #[sqlx::test]
@@ -3541,6 +3603,21 @@ mod tests {
         match http_err {
             crate::errors::Error::BadRequest { message } => {
                 assert!(message.contains("No file field"));
+            }
+            _ => panic!("Expected BadRequest error"),
+        }
+    }
+
+    #[test]
+    fn test_file_upload_error_into_http_error_invalid_purpose() {
+        let err = super::FileUploadError::InvalidPurpose {
+            purpose: "batches".to_string(),
+        };
+        let http_err = err.into_http_error();
+        match http_err {
+            crate::errors::Error::BadRequest { message } => {
+                assert!(message.contains("batches"));
+                assert!(message.contains("Only 'batch' is supported"));
             }
             _ => panic!("Expected BadRequest error"),
         }
