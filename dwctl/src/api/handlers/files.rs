@@ -1199,16 +1199,10 @@ pub async fn upload_file<P: PoolProvider>(
             operation: format!("retrieve created file: {}", e),
         })?;
 
-    // Validate purpose (only batch is supported)
-    if let Some(purpose) = file.purpose
-        && purpose != fusillade::Purpose::Batch
-    {
-        return Err(Error::BadRequest {
-            message: format!("Invalid purpose '{}'. Only 'batch' is supported.", purpose),
-        });
-    }
-
-    // Convert fusillade Purpose to API Purpose
+    // Convert fusillade Purpose to API Purpose. The purpose is validated during
+    // multipart parsing (only `batch` is accepted), so a file read back here always
+    // has purpose `batch` or none — the old post-read-back re-check was unreachable
+    // (a corrupt purpose would already fail to parse in get_file above).
     let api_purpose = match file.purpose {
         Some(fusillade::batch::Purpose::Batch) => Purpose::Batch,
         Some(fusillade::batch::Purpose::BatchOutput) => Purpose::BatchOutput,
