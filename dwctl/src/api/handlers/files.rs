@@ -458,10 +458,11 @@ enum FileUploadError {
     /// bad input, but the batch file itself is well-formed, so this is 422
     /// (unprocessable) rather than 400 (malformed) or a 5xx.
     ImageUnfetchable { line: u64, message: String },
-    /// Image fetch failed in a non-retryable way that is NOT a clean origin
-    /// 4xx (e.g. a transport-level send error, or a redirect without a Location
-    /// header). An upstream/reference problem, not a malformed batch file, so
-    /// it must NOT surface as a validation (400) error.
+    /// Image fetch failed in a way that is NOT a clean origin 4xx (e.g. a
+    /// transport-level send error, or a redirect without a Location header).
+    /// An upstream/reference problem, not a malformed batch file, so it must
+    /// NOT surface as a validation (400) error (this path maps to 503, which
+    /// the client may retry).
     ImageFetchFailed { line: u64, message: String },
     /// Upload specified an unsupported `purpose`. Only `batch` is accepted; any
     /// other value (e.g. the typo `batches`) is a client error. Detected during

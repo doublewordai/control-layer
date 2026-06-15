@@ -42,7 +42,7 @@ pub enum FetchError {
     /// 408/429 are transient and retried instead). The user's URL is at fault —
     /// gated, forbidden, missing, or auth-walled — so this is never retried and
     /// is not a gateway failure on our side.
-    #[error("origin rejected the request: {0}")]
+    #[error("{0}")]
     Unfetchable(String),
     /// Non-retryable failure while talking to the origin that is not a clean
     /// 4xx (e.g. a transport-level send error, or a redirect with no
