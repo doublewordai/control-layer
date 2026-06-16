@@ -24,6 +24,7 @@ use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::Duration;
+use url::Url;
 
 use super::token::ImageToken;
 
@@ -147,8 +148,22 @@ impl ImageStore for MemoryStore {
     }
 
     fn owns_url(&self, url: &str) -> bool {
-        // We hand out `{base_url}/{hex}?expires=...` URLs.
-        url.starts_with(self.base_url.trim_end_matches('/'))
+        // We hand out `{base_url}/{hex}?expires=...` URLs. Match the parsed
+        // origin (scheme + host + port) exactly and require the candidate path
+        // to extend our base path at a `/` boundary — so neither a different
+        // host nor a sibling prefix (`/dw-img2`, `/dw-img.evil`) can be
+        // mistaken for one of ours.
+        let (Ok(base), Ok(u)) = (Url::parse(&self.base_url), Url::parse(url)) else {
+            return false;
+        };
+        if base.scheme() != u.scheme() || base.host_str() != u.host_str() || base.port_or_known_default() != u.port_or_known_default() {
+            return false;
+        }
+        let prefix = base.path().trim_end_matches('/');
+        match u.path().strip_prefix(prefix) {
+            Some(rest) => rest.is_empty() || rest.starts_with('/'),
+            None => false,
+        }
     }
 }
 
@@ -284,10 +299,18 @@ impl ImageStore for GcsStore {
     }
 
     fn owns_url(&self, url: &str) -> bool {
-        // V4 signed URLs are `https://storage.googleapis.com/{bucket}/images/...`.
-        // Bind to our bucket + the content-addressed `images/` key prefix so an
-        // arbitrary external URL can't be mistaken for one of ours.
-        url.contains("storage.googleapis.com") && url.contains(&format!("/{}/images/", self.bucket))
+        // V4 signed URLs are path-style:
+        // `https://storage.googleapis.com/{bucket}/images/...`. Parse and match
+        // the host *exactly* (so a suffix-spoof like
+        // `storage.googleapis.com.evil.com` is rejected) and look for our
+        // bucket + content-addressed `images/` prefix on the path only (so it
+        // can't be smuggled in via the query string).
+        let Ok(u) = Url::parse(url) else {
+            return false;
+        };
+        u.scheme() == "https"
+            && u.host_str() == Some("storage.googleapis.com")
+            && u.path().starts_with(&format!("/{}/images/", self.bucket))
     }
 }
 
@@ -312,8 +335,9 @@ const S3_MAX_PRESIGN: Duration = Duration::from_secs(7 * 24 * 60 * 60 - 60);
 pub struct S3CompatStore {
     bucket: String,
     /// The configured endpoint (e.g. `https://<acct>.r2.cloudflarestorage.com`),
-    /// trailing slash trimmed. Presigned URLs from this store start with it,
-    /// so it lets us recognise our own signed URLs in [`owns_url`].
+    /// trailing slash trimmed. Parsed in [`owns_url`] to match the host of our
+    /// own presigned URLs — exactly for path-style, or as `{bucket}.{host}` for
+    /// virtual-hosted addressing.
     endpoint: String,
     client: aws_sdk_s3::Client,
 }
@@ -431,11 +455,31 @@ impl ImageStore for S3CompatStore {
     }
 
     fn owns_url(&self, url: &str) -> bool {
-        // Path-style presigned URLs from this store look like
-        // `{endpoint}/{bucket}/images/{hex}/{hex}/{sha}?X-Amz-...`. Bind to
-        // both our endpoint (host) and our bucket + content-addressed key
-        // prefix so an arbitrary external URL can't be mistaken for ours.
-        url.starts_with(&self.endpoint) && url.contains(&format!("/{}/images/", self.bucket))
+        // Presigned URLs from this store are either path-style
+        // (`{endpoint}/{bucket}/images/{hex}/{hex}/{sha}?X-Amz-...`) or, when
+        // `force_path_style` is off, virtual-hosted
+        // (`https://{bucket}.{endpoint-host}/images/...`). Parse both endpoint
+        // and candidate and match the host *exactly* — rejecting suffix-spoofs
+        // like `…r2.cloudflarestorage.com.evil.com` — then look for the
+        // content-addressed `images/` prefix on the path only (never the query).
+        let (Ok(ep), Ok(u)) = (Url::parse(&self.endpoint), Url::parse(url)) else {
+            return false;
+        };
+        if u.scheme() != ep.scheme() {
+            return false;
+        }
+        let (Some(ep_host), Some(u_host)) = (ep.host_str(), u.host_str()) else {
+            return false;
+        };
+        // Path-style: same host[:port], `/{bucket}/images/...`.
+        if u_host == ep_host && u.port_or_known_default() == ep.port_or_known_default() {
+            return u.path().starts_with(&format!("/{}/images/", self.bucket));
+        }
+        // Virtual-hosted: `{bucket}.{endpoint-host}`, `/images/...`.
+        if u_host == format!("{}.{}", self.bucket, ep_host) {
+            return u.path().starts_with("/images/");
+        }
+        false
     }
 }
 
@@ -548,10 +592,35 @@ mod tests {
         // so it still gets normalised rather than forwarded raw.
         let spoofed = format!("https://evil.example.com/images-bucket/images/{}/{}/{}", &hex[..2], &hex[2..4], hex);
         assert!(!s.owns_url(&spoofed));
+        // Host suffix-spoof: our endpoint host as a *prefix* of an
+        // attacker-controlled host must not match (exact-host parsing).
+        assert!(!s.owns_url("https://acct.r2.cloudflarestorage.com.evil.com/images-bucket/images/ab/cd/abcd"));
+        // The owned key prefix smuggled into the query string, on a foreign
+        // host → not ours (we only inspect the parsed path).
+        assert!(!s.owns_url("https://evil.example.com/x?next=/images-bucket/images/ab/cd/abcd"));
         // Arbitrary external image URL → not ours.
         assert!(!s.owns_url("https://example.com/cat.png"));
         // A data: URI is never ours.
         assert!(!s.owns_url("data:image/png;base64,AAAA"));
+    }
+
+    #[test]
+    fn s3_owns_url_matches_virtual_hosted_urls() {
+        // With `force_path_style = false`, presigned URLs are virtual-hosted:
+        // `https://{bucket}.{endpoint-host}/images/...`.
+        let s = S3CompatStore::new(
+            "images-bucket",
+            "https://acct.r2.cloudflarestorage.com",
+            "auto",
+            false,
+            "AKIDEXAMPLE",
+            "secret",
+        );
+        assert!(s.owns_url("https://images-bucket.acct.r2.cloudflarestorage.com/images/ab/cd/abcd?X-Amz-Signature=deadbeef"));
+        // A different bucket label on the host → not ours.
+        assert!(!s.owns_url("https://other.acct.r2.cloudflarestorage.com/images/ab/cd/abcd"));
+        // Bucket as a suffix-spoof of an external host → not ours.
+        assert!(!s.owns_url("https://images-bucket.acct.r2.cloudflarestorage.com.evil.com/images/ab/cd/abcd"));
     }
 
     #[test]
@@ -573,6 +642,14 @@ mod tests {
         let s = MemoryStore::new().with_base_url("http://test.local/img");
         assert!(s.owns_url("http://test.local/img/abcd?expires=123"));
         assert!(!s.owns_url("https://example.com/cat.png"));
+        // Sibling prefixes sharing the leading characters must NOT match —
+        // the path has to extend `/img` at a `/` boundary.
+        assert!(!s.owns_url("http://test.local/img2/abcd"));
+        assert!(!s.owns_url("http://test.local/img.evil/abcd"));
+        // Same host + path but a different scheme → not ours.
+        assert!(!s.owns_url("https://test.local/img/abcd"));
+        // Same path on a different host → not ours.
+        assert!(!s.owns_url("http://evil.test/img/abcd"));
     }
 
     #[test]
@@ -581,6 +658,13 @@ mod tests {
         assert!(s.owns_url("https://storage.googleapis.com/images-bucket/images/ab/cd/abcd?X-Goog-Signature=x"));
         assert!(!s.owns_url("https://storage.googleapis.com/other-bucket/images/ab/cd/abcd"));
         assert!(!s.owns_url("https://example.com/cat.png"));
+        // Host suffix-spoof: `storage.googleapis.com` as a prefix of an
+        // attacker host must not match (exact-host parsing).
+        assert!(!s.owns_url("https://storage.googleapis.com.evil.com/images-bucket/images/ab/cd/abcd"));
+        // Our key prefix smuggled into the query on a foreign host → not ours.
+        assert!(!s.owns_url("https://evil.example.com/x?u=/images-bucket/images/ab/cd/abcd"));
+        // Plain http (signed URLs are always https) → not ours.
+        assert!(!s.owns_url("http://storage.googleapis.com/images-bucket/images/ab/cd/abcd"));
     }
 
     #[tokio::test]
