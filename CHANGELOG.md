@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.60.5](https://github.com/doublewordai/control-layer/compare/v8.60.4...v8.60.5) (2026-06-16)
+
+
+### Bug Fixes
+
+* bump fusillade ([#1144](https://github.com/doublewordai/control-layer/issues/1144)) ([eb14b5c](https://github.com/doublewordai/control-layer/commit/eb14b5c13bb7dd7bdaf9ff6dac594b11a08fe08f))
+
 ## [8.60.4](https://github.com/doublewordai/control-layer/compare/v8.60.3...v8.60.4) (2026-06-15)
 
 
