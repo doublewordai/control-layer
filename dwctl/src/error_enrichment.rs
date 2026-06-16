@@ -238,9 +238,12 @@ pub async fn get_user_id_of_api_key(pool: PgPool, api_key: &str) -> Result<UserI
 #[instrument(skip_all, name = "dwctl.get_api_key_user_and_purpose")]
 async fn get_api_key_user_and_purpose(pool: PgPool, api_key: &str) -> Result<Option<(UserId, String)>, DbError> {
     let mut conn = pool.acquire().await?;
-    let row = sqlx::query!("SELECT user_id, purpose FROM api_keys WHERE secret = $1 AND is_deleted = false", api_key)
-        .fetch_optional(&mut *conn)
-        .await?;
+    let row = sqlx::query!(
+        "SELECT user_id, purpose FROM api_keys WHERE secret = $1 AND is_deleted = false",
+        api_key
+    )
+    .fetch_optional(&mut *conn)
+    .await?;
     Ok(row.map(|r| (r.user_id, r.purpose)))
 }
 
