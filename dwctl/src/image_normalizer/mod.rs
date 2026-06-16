@@ -136,6 +136,15 @@ pub trait ImageNormalizer: Send + Sync {
     /// Read bytes for `token` directly. Used by the dashboard image
     /// endpoint (after authorisation).
     async fn read(&self, token: ImageToken) -> Result<(String, Bytes), NormalizeError>;
+
+    /// True if `url` already points at an object in our own store (a URL we
+    /// previously signed). Callers use this to avoid re-ingesting/re-signing
+    /// an already-normalised URL — which would waste a re-fetch and clobber a
+    /// longer upstream TTL (e.g. the batch dispatch TTL) with a shorter one.
+    /// Default `false` preserves prior always-ingest behaviour.
+    fn owns_url(&self, _url: &str) -> bool {
+        false
+    }
 }
 
 /// No-op normaliser used when `config.enabled = false`. Surfaces an error
@@ -221,6 +230,10 @@ impl<S: ImageStore + 'static> ImageNormalizer for DefaultImageNormalizer<S> {
 
     async fn read(&self, token: ImageToken) -> Result<(String, Bytes), NormalizeError> {
         Ok(self.store.read(token).await?)
+    }
+
+    fn owns_url(&self, url: &str) -> bool {
+        self.store.owns_url(url)
     }
 }
 

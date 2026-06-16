@@ -155,6 +155,16 @@ pub async fn image_normalizer_middleware(
         let pool_for_access = pool_for_access.clone();
         let is_data_uri = url.starts_with("data:");
         async move {
+            // Pass through URLs that already point at our own normalised
+            // store. These were signed upstream (e.g. by the batch dispatch
+            // JIT-signing path, which uses the long dispatch TTL). Re-ingesting
+            // and re-signing here would (a) waste a round-trip re-fetching an
+            // image we already host and (b) clobber that longer TTL with the
+            // shorter realtime TTL — which is what caused batch image fetches
+            // to 403 on expired URLs when the worker was backlogged.
+            if !is_data_uri && normalizer.owns_url(&url) {
+                return Ok::<String, NormalizeError>(url);
+            }
             let input = if is_data_uri {
                 ImageInput::DataUri(url)
             } else {
@@ -389,6 +399,38 @@ mod tests {
         assert!(
             substituted.starts_with("http://test.local/dw-img/"),
             "expected MemoryStore-backed signed URL, got: {substituted}",
+        );
+    }
+
+    #[tokio::test]
+    async fn passes_through_url_already_in_our_store_unchanged() {
+        // Regression: a request whose image_url already points at our own
+        // normalised store (e.g. signed upstream by the batch dispatch path
+        // with the long dispatch TTL) must be forwarded UNCHANGED. Re-ingesting
+        // + re-signing here would clobber the upstream TTL with the shorter
+        // realtime TTL — the root cause of batch image fetches 403-ing on
+        // expired URLs. With MemoryStore, our own URLs start with the base_url.
+        let already_ours = "http://test.local/dw-img/abcdef0123456789?expires=9999999999";
+        let router = build_router(state_for_tests());
+        let (status, echoed) = post_json(
+            router,
+            "/chat/completions",
+            json!({
+                "model": "vision",
+                "messages": [{
+                    "role": "user",
+                    "content": [{ "type": "image_url", "image_url": { "url": already_ours } }]
+                }]
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let forwarded = echoed["messages"][0]["content"][0]["image_url"]["url"]
+            .as_str()
+            .expect("image_url.url should still be a string");
+        assert_eq!(
+            forwarded, already_ours,
+            "a URL already in our store must pass through unchanged (no re-sign / TTL clobber)"
         );
     }
 

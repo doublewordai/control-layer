@@ -64,6 +64,18 @@ pub trait ImageStore: Send + Sync {
     /// True if an object with this token already exists. Cheap check used
     /// by the ingest path to skip uploads on dedup hits.
     async fn exists(&self, token: ImageToken) -> Result<bool, StoreError>;
+
+    /// True if `url` already points at an object in THIS store — i.e. a URL
+    /// we previously signed. Used to avoid re-ingesting and re-signing our
+    /// own signed URLs: doing so would (a) waste a round-trip re-fetching an
+    /// image we already host and (b) clobber a longer upstream TTL (e.g. the
+    /// batch dispatch TTL) with whatever TTL the re-signing path uses.
+    ///
+    /// Default `false` (treat nothing as ours, always ingest) preserves the
+    /// prior behaviour for backends that don't override it.
+    fn owns_url(&self, _url: &str) -> bool {
+        false
+    }
 }
 
 // ============================ MemoryStore =================================
@@ -132,6 +144,11 @@ impl ImageStore for MemoryStore {
     async fn exists(&self, token: ImageToken) -> Result<bool, StoreError> {
         let map = self.inner.lock().expect("MemoryStore mutex poisoned");
         Ok(map.contains_key(&token))
+    }
+
+    fn owns_url(&self, url: &str) -> bool {
+        // We hand out `{base_url}/{hex}?expires=...` URLs.
+        url.starts_with(self.base_url.trim_end_matches('/'))
     }
 }
 
@@ -265,6 +282,13 @@ impl ImageStore for GcsStore {
             },
         }
     }
+
+    fn owns_url(&self, url: &str) -> bool {
+        // V4 signed URLs are `https://storage.googleapis.com/{bucket}/images/...`.
+        // Bind to our bucket + the content-addressed `images/` key prefix so an
+        // arbitrary external URL can't be mistaken for one of ours.
+        url.contains("storage.googleapis.com") && url.contains(&format!("/{}/images/", self.bucket))
+    }
 }
 
 // ========================== S3CompatStore =================================
@@ -287,6 +311,10 @@ const S3_MAX_PRESIGN: Duration = Duration::from_secs(7 * 24 * 60 * 60 - 60);
 /// so it is created eagerly in [`S3CompatStore::new`].
 pub struct S3CompatStore {
     bucket: String,
+    /// The configured endpoint (e.g. `https://<acct>.r2.cloudflarestorage.com`),
+    /// trailing slash trimmed. Presigned URLs from this store start with it,
+    /// so it lets us recognise our own signed URLs in [`owns_url`].
+    endpoint: String,
     client: aws_sdk_s3::Client,
 }
 
@@ -301,15 +329,17 @@ impl S3CompatStore {
     ) -> Self {
         let creds =
             aws_credential_types::Credentials::new(access_key_id.into(), secret_access_key.into(), None, None, "dwctl-image-normalizer");
+        let endpoint = endpoint_url.into();
         let s3_config = aws_sdk_s3::config::Builder::new()
             .region(aws_sdk_s3::config::Region::new(region.into()))
             .credentials_provider(creds)
-            .endpoint_url(endpoint_url.into())
+            .endpoint_url(endpoint.clone())
             .force_path_style(force_path_style)
             .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
             .build();
         Self {
             bucket: bucket.into(),
+            endpoint: endpoint.trim_end_matches('/').to_string(),
             client: aws_sdk_s3::Client::from_conf(s3_config),
         }
     }
@@ -399,6 +429,14 @@ impl ImageStore for S3CompatStore {
             }
         }
     }
+
+    fn owns_url(&self, url: &str) -> bool {
+        // Path-style presigned URLs from this store look like
+        // `{endpoint}/{bucket}/images/{hex}/{hex}/{sha}?X-Amz-...`. Bind to
+        // both our endpoint (host) and our bucket + content-addressed key
+        // prefix so an arbitrary external URL can't be mistaken for ours.
+        url.starts_with(&self.endpoint) && url.contains(&format!("/{}/images/", self.bucket))
+    }
 }
 
 #[cfg(test)]
@@ -485,6 +523,64 @@ mod tests {
             "secret",
         );
         assert_eq!(s.bucket, "imgs");
+    }
+
+    #[test]
+    fn s3_owns_url_matches_own_presigned_urls_only() {
+        let s = S3CompatStore::new(
+            "images-bucket",
+            "https://acct.r2.cloudflarestorage.com",
+            "auto",
+            true,
+            "AKIDEXAMPLE",
+            "secret",
+        );
+        let hex = tok(0xab).to_hex();
+        // Our own path-style presigned URL → owned.
+        let ours = format!(
+            "https://acct.r2.cloudflarestorage.com/images-bucket/images/{}/{}/{}?x-id=GetObject&X-Amz-Signature=deadbeef",
+            &hex[..2],
+            &hex[2..4],
+            hex
+        );
+        assert!(s.owns_url(&ours));
+        // Same bucket+key path but a DIFFERENT (external) host → not ours,
+        // so it still gets normalised rather than forwarded raw.
+        let spoofed = format!("https://evil.example.com/images-bucket/images/{}/{}/{}", &hex[..2], &hex[2..4], hex);
+        assert!(!s.owns_url(&spoofed));
+        // Arbitrary external image URL → not ours.
+        assert!(!s.owns_url("https://example.com/cat.png"));
+        // A data: URI is never ours.
+        assert!(!s.owns_url("data:image/png;base64,AAAA"));
+    }
+
+    #[test]
+    fn s3_owns_url_endpoint_trailing_slash_trimmed() {
+        let s = S3CompatStore::new(
+            "imgs",
+            "https://acct.r2.cloudflarestorage.com/",
+            "auto",
+            true,
+            "AKIDEXAMPLE",
+            "secret",
+        );
+        assert_eq!(s.endpoint, "https://acct.r2.cloudflarestorage.com");
+        assert!(s.owns_url("https://acct.r2.cloudflarestorage.com/imgs/images/ab/cd/abcd"));
+    }
+
+    #[test]
+    fn memory_store_owns_url() {
+        let s = MemoryStore::new().with_base_url("http://test.local/img");
+        assert!(s.owns_url("http://test.local/img/abcd?expires=123"));
+        assert!(!s.owns_url("https://example.com/cat.png"));
+    }
+
+    #[test]
+    fn gcs_owns_url_matches_bucket_and_key_prefix() {
+        let s = GcsStore::new("images-bucket", "europe-west4");
+        assert!(s.owns_url("https://storage.googleapis.com/images-bucket/images/ab/cd/abcd?X-Goog-Signature=x"));
+        assert!(!s.owns_url("https://storage.googleapis.com/other-bucket/images/ab/cd/abcd"));
+        assert!(!s.owns_url("https://example.com/cat.png"));
     }
 
     #[tokio::test]
