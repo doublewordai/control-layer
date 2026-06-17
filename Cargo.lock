@@ -2333,9 +2333,9 @@ checksum = "e6d5a32815ae3f33302d95fdcb2ce17862f8c65363dcfd29360480ba1001fc9c"
 
 [[package]]
 name = "fusillade"
-version = "18.0.1"
+version = "18.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "960cf97f8e3fc88cc93d6ad918bbb19f90c09fbad4bd09469bce81382870df0d"
+checksum = "bd3868ec40891b50efee32ac38298dae5c2012600c6e08e837ddc294c78ee75c"
 dependencies = [
  "anyhow",
  "async-trait",
