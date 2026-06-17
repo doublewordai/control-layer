@@ -218,7 +218,7 @@ use tower_http::{
     set_header::SetResponseHeaderLayer,
     trace::TraceLayer,
 };
-use tracing::{debug, info, instrument};
+use tracing::{debug, info, instrument, warn};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use uuid::Uuid;
 
@@ -972,6 +972,12 @@ fn create_cors_layer(cors: &CorsConfig) -> anyhow::Result<CorsLayer> {
 /// `Access-Control-Allow-Credentials: true` via [`stamp_credentials_for_allowlisted_origins`].
 /// Otherwise this is the plain allowlist layer.
 fn apply_cors(router: Router, cors: &CorsConfig) -> anyhow::Result<Router> {
+    if cors.allow_any_origin_without_credentials {
+        warn!(
+            "CORS: allow_any_origin_without_credentials is enabled — any origin may call the API without credentials; credentialed CORS stays limited to allowed_origins"
+        );
+    }
+
     let router = router.layer(create_cors_layer(cors)?);
 
     // In public mode the CORS layer left credentials off so arbitrary origins
@@ -979,16 +985,20 @@ fn apply_cors(router: Router, cors: &CorsConfig) -> anyhow::Result<Router> {
     // first-party allowlist via an outer middleware — it must wrap the CORS layer
     // so it also post-processes the preflight responses the layer short-circuits.
     if cors.allow_any_origin_without_credentials && cors.allow_credentials {
-        let allowlist = Arc::new(credentialed_origins(cors)?);
+        let allowlist = Arc::new(origins_to_grant_credentials(cors)?);
         Ok(router.layer(middleware::from_fn_with_state(allowlist, stamp_credentials_for_allowlisted_origins)))
     } else {
         Ok(router)
     }
 }
 
-/// Exact-match `Origin` header values that should receive credentialed CORS,
-/// derived from the configured `allowed_origins` (wildcard entries are ignored).
-fn credentialed_origins(cors: &CorsConfig) -> anyhow::Result<Vec<HeaderValue>> {
+/// Exact-match `Origin` values that should be granted credentialed CORS, derived
+/// from the configured `allowed_origins`.
+///
+/// Only `Url` entries are collected: a wildcard never grants credentials (the
+/// Fetch spec requires an explicit origin for credentialed CORS), so any
+/// `CorsOrigin::Wildcard` is intentionally skipped here.
+fn origins_to_grant_credentials(cors: &CorsConfig) -> anyhow::Result<Vec<HeaderValue>> {
     let mut out = Vec::new();
     for origin in &cors.allowed_origins {
         if let CorsOrigin::Url(url) = origin {
@@ -1008,9 +1018,7 @@ async fn stamp_credentials_for_allowlisted_origins(
     next: middleware::Next,
 ) -> Response {
     let origin = request.headers().get(http::header::ORIGIN).cloned();
-    let allow = origin
-        .as_ref()
-        .is_some_and(|o| allowlist.iter().any(|allowed| allowed == o));
+    let allow = origin.as_ref().is_some_and(|o| allowlist.iter().any(|allowed| allowed == o));
     let mut response = next.run(request).await;
     if allow {
         response
@@ -3386,5 +3394,36 @@ mod cors_tests {
         let h = resp.headers();
         assert!(h.get("access-control-allow-origin").is_none());
         assert!(h.get("access-control-allow-credentials").is_none());
+    }
+
+    /// Drive an actual (non-preflight) GET from `origin` and return the headers.
+    async fn actual_get(cors: &CorsConfig, origin: &str) -> HeaderMap {
+        let app = apply_cors(Router::new().route("/", get(|| async { "ok" })), cors).expect("apply_cors");
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/")
+                    .header("origin", origin)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        resp.headers().clone()
+    }
+
+    #[tokio::test]
+    async fn third_party_actual_get_is_reflected_without_credentials() {
+        let h = actual_get(&cors_config(true), "https://evil.example.com").await;
+        assert_eq!(acao(&h).as_deref(), Some("https://evil.example.com"));
+        assert_eq!(acac(&h), None);
+    }
+
+    #[tokio::test]
+    async fn first_party_actual_get_keeps_credentials() {
+        let h = actual_get(&cors_config(true), "https://app.doubleword.ai").await;
+        assert_eq!(acao(&h).as_deref(), Some("https://app.doubleword.ai"));
+        assert_eq!(acac(&h).as_deref(), Some("true"));
     }
 }
