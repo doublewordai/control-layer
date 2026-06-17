@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.60.6](https://github.com/doublewordai/control-layer/compare/v8.60.5...v8.60.6) (2026-06-16)
+
+
+### Bug Fixes
+
+* **image-normalizer:** don't re-sign URLs already in our own store ([#1150](https://github.com/doublewordai/control-layer/issues/1150)) ([2aaa8ab](https://github.com/doublewordai/control-layer/commit/2aaa8ab6f853594d6939aa2f723616d11d968be3))
+
 ## [8.60.5](https://github.com/doublewordai/control-layer/compare/v8.60.4...v8.60.5) (2026-06-16)
 
 
