@@ -1,5 +1,13 @@
 # Changelog
 
+## [8.60.7](https://github.com/doublewordai/control-layer/compare/v8.60.6...v8.60.7) (2026-06-17)
+
+
+### Bug Fixes
+
+* block platform keys from doing inference ([#1148](https://github.com/doublewordai/control-layer/issues/1148)) ([5b25362](https://github.com/doublewordai/control-layer/commit/5b253627f8f92cb5cf498c3ab50b68a1045fab3a))
+* bump fusillade to 18.0.2 ([#1154](https://github.com/doublewordai/control-layer/issues/1154)) ([ca91646](https://github.com/doublewordai/control-layer/commit/ca916460e71a228fef258cdc0d66fdeb842d1096))
+
 ## [8.60.6](https://github.com/doublewordai/control-layer/compare/v8.60.5...v8.60.6) (2026-06-16)
 
 
