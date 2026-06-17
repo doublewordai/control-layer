@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { extractErrorMessage } from "./AsyncRequestDetail";
+import { extractErrorMessage } from "./errorMessage";
 
 describe("extractErrorMessage", () => {
   it("returns a plain-text response_body as-is", () => {
