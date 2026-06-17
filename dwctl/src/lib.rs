@@ -182,7 +182,7 @@ use crate::{
         users::Role,
     },
     auth::password,
-    config::CorsOrigin,
+    config::{CorsConfig, CorsOrigin},
     db::handlers::{Deployments, Groups, Repository, Users},
     db::models::{deployments::DeploymentCreateDBRequest, users::UserCreateDBRequest},
     metrics::GenAiMetrics,
@@ -192,8 +192,9 @@ use sqlx_pool_router::{DbPools, PoolProvider};
 
 use anyhow::Context;
 use auth::middleware::admin_ai_proxy_middleware;
-use axum::extract::DefaultBodyLimit;
+use axum::extract::{DefaultBodyLimit, Request, State};
 use axum::http::HeaderValue;
+use axum::response::Response;
 use axum::{
     Router, ServiceExt, http, middleware,
     routing::{delete, get, patch, post},
@@ -212,7 +213,11 @@ use std::str::FromStr;
 use std::sync::{Arc, OnceLock};
 use tokio::net::TcpListener;
 use tower::Layer;
-use tower_http::{cors::CorsLayer, set_header::SetResponseHeaderLayer, trace::TraceLayer};
+use tower_http::{
+    cors::{AllowOrigin, CorsLayer},
+    set_header::SetResponseHeaderLayer,
+    trace::TraceLayer,
+};
 use tracing::{debug, info, instrument};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use uuid::Uuid;
@@ -906,35 +911,13 @@ async fn setup_database(
     Ok((embedded_db, db_pools, fusillade_pools, outlet_pools))
 }
 
-/// Create CORS layer from configuration
-fn create_cors_layer(config: &Config) -> anyhow::Result<CorsLayer> {
-    let mut origins = Vec::new();
-    for origin in &config.auth.security.cors.allowed_origins {
-        let header_value = match origin {
-            CorsOrigin::Wildcard => "*".parse::<HeaderValue>()?,
-            CorsOrigin::Url(url) => {
-                // Strip trailing slash that Url::parse adds during normalization
-                let url_str = url.as_str().trim_end_matches('/');
-                url_str.parse::<HeaderValue>()?
-            }
-        };
-        origins.push(header_value);
-    }
-
-    info!("Configuring CORS with allowed origins: {:?}", origins);
-
+/// Build the base CORS layer (methods, headers, max-age, exposed headers) from
+/// configuration. Origin/credential handling differs by mode — see [`apply_cors`].
+fn create_cors_layer(cors: &CorsConfig) -> anyhow::Result<CorsLayer> {
     // Parse exposed headers as HeaderName
-    let exposed: Vec<http::HeaderName> = config
-        .auth
-        .security
-        .cors
-        .exposed_headers
-        .iter()
-        .filter_map(|h| h.parse().ok())
-        .collect();
+    let exposed: Vec<http::HeaderName> = cors.exposed_headers.iter().filter_map(|h| h.parse().ok()).collect();
 
-    let mut cors = CorsLayer::new()
-        .allow_origin(origins)
+    let mut cors_layer = CorsLayer::new()
         .allow_methods([
             http::Method::GET,
             http::Method::POST,
@@ -944,14 +927,97 @@ fn create_cors_layer(config: &Config) -> anyhow::Result<CorsLayer> {
             http::Method::OPTIONS,
         ])
         .allow_headers([http::header::CONTENT_TYPE, http::header::AUTHORIZATION, http::header::ACCEPT])
-        .allow_credentials(config.auth.security.cors.allow_credentials)
         .expose_headers(exposed);
 
-    if let Some(max_age) = config.auth.security.cors.max_age {
-        cors = cors.max_age(std::time::Duration::from_secs(max_age));
+    if cors.allow_any_origin_without_credentials {
+        // Public mode: reflect ANY origin, credentials OFF at this layer. The CORS
+        // spec forbids credentials alongside a wildcard, so we never grant them to
+        // all origins here — first-party credentials are re-added per-origin by the
+        // middleware in `apply_cors`.
+        info!(
+            "Configuring CORS: reflecting any origin without credentials (credentialed allowlist: {:?})",
+            cors.allowed_origins
+        );
+        cors_layer = cors_layer.allow_origin(AllowOrigin::mirror_request()).allow_credentials(false);
+    } else {
+        // Allowlist mode (default): only configured origins; credentials governed
+        // by `allow_credentials`.
+        let mut origins = Vec::new();
+        for origin in &cors.allowed_origins {
+            let header_value = match origin {
+                CorsOrigin::Wildcard => "*".parse::<HeaderValue>()?,
+                CorsOrigin::Url(url) => {
+                    // Strip trailing slash that Url::parse adds during normalization
+                    let url_str = url.as_str().trim_end_matches('/');
+                    url_str.parse::<HeaderValue>()?
+                }
+            };
+            origins.push(header_value);
+        }
+        info!("Configuring CORS with allowed origins: {:?}", origins);
+        cors_layer = cors_layer.allow_origin(origins).allow_credentials(cors.allow_credentials);
     }
 
-    Ok(cors)
+    if let Some(max_age) = cors.max_age {
+        cors_layer = cors_layer.max_age(std::time::Duration::from_secs(max_age));
+    }
+
+    Ok(cors_layer)
+}
+
+/// Apply CORS handling to the router.
+///
+/// When `allow_any_origin_without_credentials` is set, every origin is allowed
+/// *without* credentials, and first-party `allowed_origins` additionally receive
+/// `Access-Control-Allow-Credentials: true` via [`stamp_credentials_for_allowlisted_origins`].
+/// Otherwise this is the plain allowlist layer.
+fn apply_cors(router: Router, cors: &CorsConfig) -> anyhow::Result<Router> {
+    let router = router.layer(create_cors_layer(cors)?);
+
+    // In public mode the CORS layer left credentials off so arbitrary origins
+    // never receive them. Re-grant `Access-Control-Allow-Credentials` to the
+    // first-party allowlist via an outer middleware — it must wrap the CORS layer
+    // so it also post-processes the preflight responses the layer short-circuits.
+    if cors.allow_any_origin_without_credentials && cors.allow_credentials {
+        let allowlist = Arc::new(credentialed_origins(cors)?);
+        Ok(router.layer(middleware::from_fn_with_state(allowlist, stamp_credentials_for_allowlisted_origins)))
+    } else {
+        Ok(router)
+    }
+}
+
+/// Exact-match `Origin` header values that should receive credentialed CORS,
+/// derived from the configured `allowed_origins` (wildcard entries are ignored).
+fn credentialed_origins(cors: &CorsConfig) -> anyhow::Result<Vec<HeaderValue>> {
+    let mut out = Vec::new();
+    for origin in &cors.allowed_origins {
+        if let CorsOrigin::Url(url) = origin {
+            let url_str = url.as_str().trim_end_matches('/');
+            out.push(url_str.parse::<HeaderValue>()?);
+        }
+    }
+    Ok(out)
+}
+
+/// Stamp `Access-Control-Allow-Credentials: true` onto responses whose request
+/// `Origin` is in the first-party allowlist. Used only in public CORS mode, where
+/// the CORS layer reflects every origin but withholds credentials.
+async fn stamp_credentials_for_allowlisted_origins(
+    State(allowlist): State<Arc<Vec<HeaderValue>>>,
+    request: Request,
+    next: middleware::Next,
+) -> Response {
+    let origin = request.headers().get(http::header::ORIGIN).cloned();
+    let allow = origin
+        .as_ref()
+        .is_some_and(|o| allowlist.iter().any(|allowed| allowed == o));
+    let mut response = next.run(request).await;
+    if allow {
+        response
+            .headers_mut()
+            .insert(http::header::ACCESS_CONTROL_ALLOW_CREDENTIALS, HeaderValue::from_static("true"));
+    }
+    response
 }
 
 /// Build the (name, value) pairs for the configured security response headers.
@@ -1605,11 +1671,10 @@ pub async fn build_router(
         .merge(openapi_router.with_state(state.clone()))
         .fallback_service(fallback.with_state(state.clone()));
 
-    // Create CORS layer from config
-    let cors_layer = create_cors_layer(&config)?;
-
-    // Apply CORS to main router (request logging already applied to onwards_router above)
-    let mut router = router.layer(cors_layer);
+    // Apply CORS to the main router (request logging already applied to
+    // onwards_router above). When configured, this also opens uncredentialed
+    // CORS to any origin while keeping cookie-credentialed access first-party.
+    let mut router = apply_cors(router, &config.auth.security.cors)?;
 
     // Apply browser security response headers. `if_not_present` means any
     // stricter per-route header (e.g. `Referrer-Policy: no-referrer` on
@@ -3222,5 +3287,104 @@ mod security_header_tests {
             ..Default::default()
         };
         assert!(security_header_pairs(&cfg).is_err());
+    }
+}
+
+#[cfg(test)]
+mod cors_tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{HeaderMap, Request};
+    use tower::ServiceExt;
+    use url::Url;
+
+    fn cors_config(allow_any_origin_without_credentials: bool) -> CorsConfig {
+        CorsConfig {
+            allowed_origins: vec![CorsOrigin::Url(Url::parse("https://app.doubleword.ai").unwrap())],
+            allow_credentials: true,
+            max_age: Some(3600),
+            exposed_headers: vec![],
+            allow_any_origin_without_credentials,
+        }
+    }
+
+    /// Drive a CORS preflight (OPTIONS) from `origin` through the real CORS
+    /// stack and return the response headers.
+    async fn preflight(cors: &CorsConfig, origin: &str) -> HeaderMap {
+        let app = apply_cors(Router::new().route("/", get(|| async { "ok" })), cors).expect("apply_cors");
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("OPTIONS")
+                    .uri("/")
+                    .header("origin", origin)
+                    .header("access-control-request-method", "GET")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        resp.headers().clone()
+    }
+
+    fn acao(h: &HeaderMap) -> Option<String> {
+        h.get("access-control-allow-origin").map(|v| v.to_str().unwrap().to_string())
+    }
+
+    fn acac(h: &HeaderMap) -> Option<String> {
+        h.get("access-control-allow-credentials").map(|v| v.to_str().unwrap().to_string())
+    }
+
+    #[tokio::test]
+    async fn third_party_origin_allowed_without_credentials() {
+        let h = preflight(&cors_config(true), "https://evil.example.com").await;
+        assert_eq!(
+            acao(&h).as_deref(),
+            Some("https://evil.example.com"),
+            "non-allowlisted origin should be reflected when the flag is set",
+        );
+        assert_eq!(
+            acac(&h),
+            None,
+            "non-allowlisted origin must NOT receive Access-Control-Allow-Credentials",
+        );
+    }
+
+    #[tokio::test]
+    async fn first_party_origin_keeps_credentials() {
+        let h = preflight(&cors_config(true), "https://app.doubleword.ai").await;
+        assert_eq!(acao(&h).as_deref(), Some("https://app.doubleword.ai"));
+        assert_eq!(acac(&h).as_deref(), Some("true"), "allowlisted origin must keep credentialed CORS",);
+    }
+
+    #[tokio::test]
+    async fn flag_off_blocks_non_allowlisted_origin() {
+        let h = preflight(&cors_config(false), "https://evil.example.com").await;
+        assert_eq!(
+            acao(&h),
+            None,
+            "with the flag off, non-allowlisted origins get no CORS (unchanged behavior)",
+        );
+    }
+
+    #[tokio::test]
+    async fn near_miss_origin_does_not_get_credentials() {
+        // A look-alike of an allowlisted origin is reflected (public mode) but
+        // MUST NOT be treated as first-party — exact match only, no suffix slip.
+        let h = preflight(&cors_config(true), "https://app.doubleword.ai.evil.com").await;
+        assert_eq!(acao(&h).as_deref(), Some("https://app.doubleword.ai.evil.com"),);
+        assert_eq!(acac(&h), None, "a look-alike of an allowlisted origin must not receive credentials",);
+    }
+
+    #[tokio::test]
+    async fn request_without_origin_gets_no_cors_headers() {
+        let app = apply_cors(Router::new().route("/", get(|| async { "ok" })), &cors_config(true)).expect("apply_cors");
+        let resp = app
+            .oneshot(Request::builder().method("GET").uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let h = resp.headers();
+        assert!(h.get("access-control-allow-origin").is_none());
+        assert!(h.get("access-control-allow-credentials").is_none());
     }
 }
