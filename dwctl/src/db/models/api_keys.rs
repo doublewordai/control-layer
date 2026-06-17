@@ -21,6 +21,33 @@ pub enum ApiKeyPurpose {
     Playground,
 }
 
+/// Whether an API key `purpose` (raw DB string) is permitted on the inference
+/// data plane (`/ai/*`). `platform` keys are management-only: they are not
+/// accepted for inference - rejected by the `current_user` gate and the Flex
+/// pre-dispatch check, and excluded from onwards' key set (so onwards 403s them
+/// if one is presented).
+///
+/// Single source of truth for those Rust-side checks. The onwards key-sync
+/// queries in `sync::onwards_config` mirror this list as a SQL
+/// `ak.purpose IN (...)` filter (SQL cannot call this) - keep them in sync.
+pub fn is_inference_purpose(purpose: &str) -> bool {
+    matches!(purpose, "realtime" | "batch" | "playground")
+}
+
+#[cfg(test)]
+mod purpose_tests {
+    use super::is_inference_purpose;
+
+    #[test]
+    fn inference_purposes_allowed_platform_rejected() {
+        assert!(is_inference_purpose("realtime"));
+        assert!(is_inference_purpose("batch"));
+        assert!(is_inference_purpose("playground"));
+        assert!(!is_inference_purpose("platform"));
+        assert!(!is_inference_purpose("unknown"));
+    }
+}
+
 /// Database request for creating a new API key
 #[derive(Debug, Clone)]
 pub struct ApiKeyCreateDBRequest {
