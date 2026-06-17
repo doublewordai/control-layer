@@ -66,7 +66,7 @@ function prettyJson(raw: string): string {
 // canonical FailureReason envelope (always set on failed rows, and the only
 // source for batch failures, which leave response_body null). Prefer the
 // cleanest available string, mirroring the server's parse_failure_error.
-function extractErrorMessage(request: {
+export function extractErrorMessage(request: {
   response_body?: string | null;
   error?: string | null;
 }): string {
@@ -86,17 +86,22 @@ function extractErrorMessage(request: {
   const bodyMessage = fromBody(request.response_body);
   if (bodyMessage) return bodyMessage;
 
-  // Fall back to the FailureReason envelope (batch failures, or realtime rows
-  // with an empty body): {"type": ..., "details": {"status": ..., "body": ...}}
+  // Fall back to `error`. This mirrors the server's parse_failure_error, which
+  // accepts several shapes:
   if (request.error) {
+    // 1. FailureReason envelope: {"type": ..., "details": {"status", "body"}}
     try {
       const reason = JSON.parse(request.error);
       const inner = fromBody(reason?.details?.body);
       if (inner) return inner;
     } catch {
-      // Not an envelope - fall through to the raw string.
+      // Not JSON - fall through.
     }
-    return request.error;
+    // 2. Legacy "Upstream returned {status}: {body}".
+    const legacy = request.error.match(/^Upstream returned \d+: ([\s\S]+)$/);
+    if (legacy) return fromBody(legacy[1]) ?? legacy[1];
+    // 3. Raw OpenAI envelope or plain string.
+    return fromBody(request.error) ?? request.error;
   }
 
   return "Request failed";
