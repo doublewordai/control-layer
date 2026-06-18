@@ -2048,7 +2048,7 @@ impl Default for CorsConfig {
     fn default() -> Self {
         Self {
             allowed_origins: vec![
-                CorsOrigin::Url(Url::parse("htt://localhost:3001").unwrap()), // Development frontend (Vite)
+                CorsOrigin::Url(Url::parse("http://localhost:3001").unwrap()), // Development frontend (Vite)
             ],
             allow_credentials: true,
             max_age: Some(3600), // Cache preflight for 1 hour
