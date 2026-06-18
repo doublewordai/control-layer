@@ -395,6 +395,8 @@ onwards:
   # responses carry zeroed cache_* usage fields and outbound cache_control
   # markers are stripped, while billing/analytics is unaffected. For local
   # validation only until the real classification engine lands.
+  # Note: a real classifier runs concurrently with the upstream model call under
+  # a deadline, so it does not add to request latency (the no-op is free).
   # Set via environment: DWCTL_ONWARDS__CACHE_CLASSIFIER_ENABLED=true
   cache_classifier_enabled: false
 
