@@ -1,5 +1,17 @@
 # Changelog
 
+## [8.61.0](https://github.com/doublewordai/control-layer/compare/v8.60.7...v8.61.0) (2026-06-18)
+
+
+### Features
+
+* **cors:** optional any-origin CORS without credentials ([#1155](https://github.com/doublewordai/control-layer/issues/1155)) ([c00b0a5](https://github.com/doublewordai/control-layer/commit/c00b0a51a2c0f83cf527aa8112e726a91ebc9c6a))
+
+
+### Bug Fixes
+
+* **cors:** correct scheme in default dev-frontend origin ([#1156](https://github.com/doublewordai/control-layer/issues/1156)) ([33b6b48](https://github.com/doublewordai/control-layer/commit/33b6b484f490d7d8c1e4034431e5326fe3831631))
+
 ## [8.60.7](https://github.com/doublewordai/control-layer/compare/v8.60.6...v8.60.7) (2026-06-17)
 
 
