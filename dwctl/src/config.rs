@@ -1001,6 +1001,20 @@ pub struct OnwardsConfig {
     /// When false (default), all requests are passed through transparently.
     /// When true, only known OpenAI API paths are accepted and validated.
     pub strict_mode: bool,
+    /// Wire a cached-input-pricing classifier into the embedded onwards proxy.
+    ///
+    /// When false (the default), onwards is left dormant: no classifier is
+    /// injected, so the cache request-fork, `cache_control` stripping, and
+    /// response usage injection are all skipped and onwards behaviour is
+    /// byte-identical to today.
+    ///
+    /// When true, the no-op classifier ([`onwards::NoopCacheClassifier`]) is injected.
+    /// This activates the spine end-to-end for local validation: responses
+    /// carry the (zeroed) `cache_*` usage fields and outbound `cache_control`
+    /// markers are stripped, while billing/analytics is unaffected. There is
+    /// no real classification yet — the no-op returns all-zero stats. The real
+    /// dwctl classifier will replace the no-op here in a later wave.
+    pub cache_classifier_enabled: bool,
 }
 
 /// File limits configuration.
