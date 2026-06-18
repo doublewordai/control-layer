@@ -3078,13 +3078,25 @@ impl Application {
             0 => usize::MAX,
             n => usize::try_from(n).unwrap_or(usize::MAX),
         };
-        let onwards_app_state = onwards::AppState::with_transform(bg_services.onwards_targets.clone(), body_transform)
+        let mut onwards_app_state = onwards::AppState::with_transform(bg_services.onwards_targets.clone(), body_transform)
             .with_response_transform(onwards::create_openai_sanitizer())
             .with_streaming_header("x-fusillade-stream")
             .with_response_id_header("x-fusillade-request-id")
             .with_tool_executor(Arc::new(tool_executor))
             .with_response_store(response_store.clone() as Arc<dyn onwards::ResponseStore>)
             .with_body_limit(onwards_body_limit);
+
+        // Cached-input-pricing seam (dormant by default). When
+        // `onwards.cache_classifier_enabled` is set, inject the no-op classifier so
+        // the spine runs end-to-end for local validation: responses carry the
+        // zeroed `cache_*` usage fields and outbound `cache_control` markers
+        // are stripped, while billing/analytics stays unaffected. Left unset
+        // (the default), no classifier is wired and onwards is byte-identical to
+        // today. The real dwctl classifier replaces the no-op here in a later wave.
+        if config.onwards.cache_classifier_enabled {
+            tracing::info!("Cache classifier enabled - wiring NoopCacheClassifier into onwards");
+            onwards_app_state = onwards_app_state.with_cache_classifier(Arc::new(onwards::NoopCacheClassifier));
+        }
         let onwards_router = if bg_services.onwards_targets.strict_mode {
             tracing::info!("Strict mode enabled - using typed request validation");
             onwards::strict::build_strict_router(onwards_app_state)
