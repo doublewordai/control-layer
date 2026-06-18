@@ -37,15 +37,6 @@ vi.mock("../../../contexts/organization/useOrganizationContext", () => ({
   })),
 }));
 
-// Mock bootstrap content
-vi.mock("../../../hooks/use-bootstrap-content", () => ({
-  useBootstrapContent: vi.fn(() => ({
-    content: "",
-    isClosed: true,
-    close: vi.fn(),
-  })),
-}));
-
 // Mock modals
 vi.mock("../../modals/CreateAsyncModal/CreateAsyncModal", () => ({
   CreateAsyncModal: () => null,
