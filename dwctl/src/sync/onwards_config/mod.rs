@@ -607,6 +607,15 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                 )
             )
             AND ak.is_deleted = false
+            -- Inference data plane only: platform (management) keys must never
+            -- enter onwards' key set. Mirrors is_inference_purpose in
+            -- db::models::api_keys (SQL cannot call it). The system key is
+            -- purpose 'platform' (it calls admin endpoints, see migration 071)
+            -- but is used internally for onwards inference, so it is exempt.
+            AND (
+                ak.user_id = '00000000-0000-0000-0000-000000000000'
+                OR ak.purpose IN ('realtime', 'batch', 'playground')
+            )
         ) ak
         WHERE cm.is_composite = TRUE
           AND cm.deleted = FALSE
@@ -1308,6 +1317,15 @@ pub async fn load_targets_from_db(
                 )
             )
             AND ak.is_deleted = false
+            -- Inference data plane only: platform (management) keys must never
+            -- enter onwards' key set. Mirrors is_inference_purpose in
+            -- db::models::api_keys (SQL cannot call it). The system key is
+            -- purpose 'platform' (it calls admin endpoints, see migration 071)
+            -- but is used internally for onwards inference, so it is exempt.
+            AND (
+                ak.user_id = '00000000-0000-0000-0000-000000000000'
+                OR ak.purpose IN ('realtime', 'batch', 'playground')
+            )
         ) ak ON true
         WHERE dm.deleted = FALSE
           AND dm.is_composite = FALSE

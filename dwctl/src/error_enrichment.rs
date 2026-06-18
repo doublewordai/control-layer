@@ -14,6 +14,9 @@
 //!
 //! ## Error Cases Enriched
 //!
+//! 0. **403 Forbidden - Non-inference key**: A `platform` (management) key was
+//!    used for inference. Onwards excludes these from its key set, so they 403
+//!    with a generic body; we explain the real reason.
 //! 1. **403 Forbidden - Insufficient Credits**: User's balance < 0 for paid models
 //!    - Shows current balance
 //! 2. **403 Forbidden - Model Access Denied**: User is not a member of a group with access to the requested model
@@ -89,9 +92,16 @@ pub async fn error_enrichment_middleware(State(pool): State<PgPool>, request: Re
     {
         debug!("Intercepted 403 response on AI proxy path, attempting enrichment");
 
+        // One lookup of the key's owner + purpose, reused by the checks below so
+        // a 403 does not fan out into several by-secret queries. None for an
+        // unknown/invalid token, in which case the checks fall through.
+        let key_info = get_api_key_user_and_purpose(pool.clone(), &key).await.ok().flatten();
+
         // Order matters: the more fundamental the failure, the earlier it runs, so
         // when several conditions could explain the 403 we surface the one that's
         // most useful to act on.
+        //   0. Non-inference purpose (e.g. platform) — onwards excludes these from
+        //      its key set, so the request can't do inference at all.
         //   1. Model access (group membership) — without this the user can't reach
         //      the model at all, so report it first.
         //   2. Modality (traffic routing rule) — user has the model but their key
@@ -99,10 +109,28 @@ pub async fn error_enrichment_middleware(State(pool): State<PgPool>, request: Re
         //   3. Insufficient balance — onwards excludes keys with balance ≤ 0; this
         //      is the catch-all if neither of the above explains the 403.
 
+        // 0. Non-inference key: explain why an otherwise-valid key was rejected,
+        //    rather than leaving onwards' generic "forbidden" body.
+        if let Some((_, purpose)) = key_info.as_ref()
+            && !crate::db::models::api_keys::is_inference_purpose(purpose)
+        {
+            let body = serde_json::json!({
+                "error": {
+                    "message": format!("API keys with purpose '{purpose}' cannot be used for inference requests."),
+                    "type": "invalid_request_error"
+                }
+            });
+            return Response::builder()
+                .status(StatusCode::FORBIDDEN)
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap_or_else(|_| StatusCode::FORBIDDEN.into_response());
+        }
+
         // 1. Model access via group membership
         if let Some(model) = &model_name
-            && let Ok(user_id) = get_user_id_of_api_key(pool.clone(), &key).await
-            && let Ok(has_access) = check_user_has_model_access(pool.clone(), user_id, model).await
+            && let Some((user_id, _)) = key_info.as_ref()
+            && let Ok(has_access) = check_user_has_model_access(pool.clone(), *user_id, model).await
             && !has_access
         {
             return Error::ModelAccessDenied {
@@ -203,6 +231,22 @@ pub async fn get_user_id_of_api_key(pool: PgPool, api_key: &str) -> Result<UserI
         .ok_or_else(|| anyhow::anyhow!("API key not found or associated user doesn't exist").into())
 }
 
+/// Look up an API key's owning user and `purpose` by secret in a single query.
+/// Returns `None` when the key does not exist or is deleted. Combining the two
+/// lookups keeps the 403 enrichment path (and the Flex check) to one by-secret
+/// query instead of fanning out.
+#[instrument(skip_all, name = "dwctl.get_api_key_user_and_purpose")]
+async fn get_api_key_user_and_purpose(pool: PgPool, api_key: &str) -> Result<Option<(UserId, String)>, DbError> {
+    let mut conn = pool.acquire().await?;
+    let row = sqlx::query!(
+        "SELECT user_id, purpose FROM api_keys WHERE secret = $1 AND is_deleted = false",
+        api_key
+    )
+    .fetch_optional(&mut *conn)
+    .await?;
+    Ok(row.map(|r| (r.user_id, r.purpose)))
+}
+
 #[instrument(skip_all, name = "dwctl.get_balance_of_api_key")]
 pub async fn get_balance_of_api_key(pool: PgPool, api_key: &str) -> Result<Decimal, DbError> {
     // Look up user_id from API key
@@ -256,9 +300,22 @@ pub async fn check_user_has_model_access(pool: PgPool, user_id: UserId, model_al
 /// `onwards` entirely — without the modality check here, a Batch-purpose key
 /// could send a Flex request and skip a deny rule onwards would have enforced.
 pub async fn validate_api_key_model_access(pool: PgPool, api_key: &str, model: &str) -> Result<(), String> {
-    let user_id = get_user_id_of_api_key(pool.clone(), api_key)
+    // One by-secret lookup of the key's owner + purpose, reused below.
+    let (user_id, purpose) = get_api_key_user_and_purpose(pool.clone(), api_key)
         .await
-        .map_err(|_| "Invalid API key".to_string())?;
+        .map_err(|_| "Invalid API key".to_string())?
+        .ok_or_else(|| "Invalid API key".to_string())?;
+
+    // Reject non-inference keys (e.g. `platform`) up front. Flex bypasses
+    // onwards entirely, so this is the only place the purpose gate - mirrored
+    // from `current_user` - runs for Flex requests. Live/realtime traffic is
+    // covered by onwards (platform keys are excluded from its synced key set).
+    // The system key (nil user) is purpose 'platform' but is used internally
+    // for inference, so it is exempt here, mirroring the onwards key-sync
+    // exemption.
+    if user_id != uuid::Uuid::nil() && !crate::db::models::api_keys::is_inference_purpose(&purpose) {
+        return Err(format!("API keys with purpose '{purpose}' cannot be used for inference requests."));
+    }
 
     let has_access = check_user_has_model_access(pool.clone(), user_id, model)
         .await
@@ -735,6 +792,66 @@ mod tests {
         validate_api_key_model_access(pool.clone(), &api_key.secret, "open-model")
             .await
             .expect("expected access to be granted on a model without a deny rule");
+    }
+
+    /// Direct unit test: `validate_api_key_model_access` rejects a non-inference
+    /// (platform) key on the Flex path, before any model-access check.
+    #[sqlx::test]
+    async fn test_validate_api_key_model_access_rejects_platform_purpose(pool: PgPool) {
+        let user = create_test_user(&pool, Role::StandardUser).await;
+
+        let mut api_key_conn = pool.acquire().await.unwrap();
+        let mut api_keys_repo = ApiKeys::new(&mut api_key_conn);
+        let api_key = api_keys_repo
+            .create(&ApiKeyCreateDBRequest {
+                user_id: user.id,
+                name: "Platform Key".to_string(),
+                description: None,
+                purpose: ApiKeyPurpose::Platform,
+                requests_per_second: None,
+                burst_size: None,
+                created_by: user.id,
+            })
+            .await
+            .unwrap();
+
+        let result = validate_api_key_model_access(pool.clone(), &api_key.secret, "any-model").await;
+        let err = result.expect_err("expected platform-purpose rejection");
+        assert!(
+            err.contains("platform") && err.contains("inference"),
+            "expected non-inference purpose message, got: {err}"
+        );
+    }
+
+    /// The system key is purpose 'platform' but is exempt from the inference
+    /// purpose gate on the Flex path (it is used internally for inference),
+    /// mirroring the onwards key-sync exemption.
+    #[sqlx::test]
+    async fn test_validate_api_key_model_access_exempts_system_key_from_purpose_gate(pool: PgPool) {
+        let mut api_key_conn = pool.acquire().await.unwrap();
+        let mut api_keys_repo = ApiKeys::new(&mut api_key_conn);
+        let api_key = api_keys_repo
+            .create(&ApiKeyCreateDBRequest {
+                user_id: uuid::Uuid::nil(),
+                name: "System Key".to_string(),
+                description: None,
+                purpose: ApiKeyPurpose::Platform,
+                requests_per_second: None,
+                burst_size: None,
+                created_by: uuid::Uuid::nil(),
+            })
+            .await
+            .unwrap();
+
+        // The purpose gate must NOT fire for the system (nil) user. A
+        // model-access error is acceptable - we only assert the key was not
+        // rejected on purpose grounds.
+        if let Err(msg) = validate_api_key_model_access(pool.clone(), &api_key.secret, "any-model").await {
+            assert!(
+                !msg.contains("cannot be used for inference requests"),
+                "system key must be exempt from the purpose gate, got: {msg}"
+            );
+        }
     }
 
     /// Integration test: Error enrichment middleware passes through when no auth header
