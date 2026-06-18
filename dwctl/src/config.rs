@@ -877,6 +877,14 @@ pub struct CorsConfig {
     pub max_age: Option<u64>,
     /// Custom headers to expose to the browser (in addition to CORS-safelisted headers)
     pub exposed_headers: Vec<String>,
+    /// When set, in addition to the credentialed `allowed_origins` allowlist,
+    /// allow ANY other origin to make CORS requests *without* credentials.
+    /// First-party allowlisted origins still receive
+    /// `Access-Control-Allow-Credentials: true`; every other origin gets a
+    /// reflected `Access-Control-Allow-Origin` and no credentials. This lets
+    /// third-party browser apps call the public API without ever exposing
+    /// cookie-credentialed access to arbitrary sites.
+    pub allow_any_origin_without_credentials: bool,
 }
 
 /// Email configuration for password resets and notifications.
@@ -2064,6 +2072,7 @@ impl Default for CorsConfig {
             allow_credentials: true,
             max_age: Some(3600), // Cache preflight for 1 hour
             exposed_headers: vec!["location".to_string()],
+            allow_any_origin_without_credentials: false,
         }
     }
 }
@@ -2437,6 +2446,53 @@ model_sources:
             let internal = &config.model_sources[1];
             assert_eq!(internal.name, "internal");
             assert_eq!(internal.sync_interval, Duration::from_secs(10)); // default
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn cors_allow_any_origin_without_credentials_parses() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: hello
+auth:
+  security:
+    cors:
+      allowed_origins:
+        - "https://app.doubleword.ai"
+      allow_credentials: true
+      allow_any_origin_without_credentials: true
+"#,
+            )?;
+
+            let args = Args {
+                config: "test.yaml".into(),
+                validate: false,
+            };
+            let config = Config::load(&args)?;
+
+            assert!(config.auth.security.cors.allow_any_origin_without_credentials);
+            assert!(config.auth.security.cors.allow_credentials);
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn cors_allow_any_origin_without_credentials_defaults_false() {
+        Jail::expect_with(|jail| {
+            jail.create_file("test.yaml", "secret_key: hello\n")?;
+
+            let args = Args {
+                config: "test.yaml".into(),
+                validate: false,
+            };
+            let config = Config::load(&args)?;
+
+            assert!(!config.auth.security.cors.allow_any_origin_without_credentials);
 
             Ok(())
         });
