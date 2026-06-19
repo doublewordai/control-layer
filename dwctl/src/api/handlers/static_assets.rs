@@ -31,21 +31,7 @@ pub async fn serve_embedded_asset<P: PoolProvider + Clone>(State(state): State<A
         path = "index.html";
     }
 
-    // Check for bootstrap.js override via environment variable
-    // This allows injecting custom bootstrap code via Helm/ConfigMap
-    // Falls through to the embedded dashboard bootstrap.js if not set
-    if path == "bootstrap.js"
-        && let Ok(content) = std::env::var("DASHBOARD_BOOTSTRAP_JS")
-    {
-        debug!("Serving bootstrap.js from DASHBOARD_BOOTSTRAP_JS environment variable");
-        return Response::builder()
-            .header(axum::http::header::CONTENT_TYPE, "text/javascript")
-            .header(axum::http::header::CACHE_CONTROL, "no-cache")
-            .body(Body::from(content))
-            .unwrap();
-    }
-
-    // Fall back to embedded static assets
+    // Serve embedded static assets
     if let Some(content) = static_assets::Assets::get(path) {
         let mime = mime_guess::from_path(path).first_or_octet_stream();
 

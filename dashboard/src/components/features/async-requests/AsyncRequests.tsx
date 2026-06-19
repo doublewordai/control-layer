@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
-import { Code, Play, X, Filter, Clock, DollarSign, Check, ChevronsUpDown, Zap, FastForward, Trash2, Loader2 } from "lucide-react";
+import { Code, Play, Filter, Clock, DollarSign, Check, ChevronsUpDown, Zap, FastForward, Trash2, Loader2 } from "lucide-react";
 import { type ColumnDef } from "@tanstack/react-table";
 import { toast } from "sonner";
 import { Button } from "../../ui/button";
@@ -44,7 +44,6 @@ import type {
 } from "../../../api/control-layer/types";
 import { CreateAsyncModal } from "../../modals/CreateAsyncModal/CreateAsyncModal";
 import { ApiExamples } from "../../modals";
-import { useBootstrapContent } from "../../../hooks/use-bootstrap-content";
 import { useOrganizationContext } from "../../../contexts/organization/useOrganizationContext";
 import { useServerPagination } from "../../../hooks/useServerPagination";
 import { usePersistedFilter } from "../../../hooks/usePersistedFilter";
@@ -309,7 +308,6 @@ export function AsyncRequests() {
   const modelParam = searchParams.get("model");
   const [createModalOpen, setCreateModalOpen] = useState(createParam === "true");
   const [showApiExamples, setShowApiExamples] = useState(false);
-  const bootstrapBanner = useBootstrapContent();
   const { hasPermission } = useAuthorization();
   const isPlatformManager = hasPermission("manage-models");
   const { isOrgContext, activeOrganizationId } = useOrganizationContext();
@@ -436,22 +434,6 @@ export function AsyncRequests() {
           </Button>
         </div>
       </div>
-
-      {/* Bootstrap banner - content from trusted server-side source (bootstrap.js) */}
-      {bootstrapBanner.content && !bootstrapBanner.isClosed && (
-        <div className="relative mb-6">
-          <div
-            dangerouslySetInnerHTML={{ __html: bootstrapBanner.content }}
-          />
-          <button
-            onClick={bootstrapBanner.close}
-            className="absolute top-3 right-3 rounded-sm opacity-50 transition-opacity hover:opacity-100 focus:ring-2 focus:ring-ring focus:ring-offset-2 focus:outline-hidden"
-            aria-label="Close banner"
-          >
-            <X className="h-4 w-4 text-doubleword-neutral-600" />
-          </button>
-        </div>
-      )}
 
       <DataTable
         columns={columns}
