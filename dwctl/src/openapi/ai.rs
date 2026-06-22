@@ -186,7 +186,7 @@ fn create_response() {}
         get_model,
         create_response,
         // Responses API delete (actual handler)
-        crate::responses::handler::delete_response,
+        crate::inference::handler::delete_response,
         // Batch API endpoints (actual handlers)
         api::handlers::files::upload_file,
         api::handlers::files::list_files,
@@ -230,8 +230,8 @@ fn create_response() {}
             extra_types::ResponseObject,
             extra_types::ResponseInput,
             extra_types::ResponseItem,
-            crate::responses::handler::ResponseDeleted,
-            crate::responses::handler::ResponseDeletedObjectType,
+            crate::inference::handler::ResponseDeleted,
+            crate::inference::handler::ResponseDeletedObjectType,
             // File/Batch types
             api::models::files::ListFilesQuery,
             api::models::files::FileResponse,

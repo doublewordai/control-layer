@@ -16,8 +16,8 @@ use outlet::{RequestData, RequestHandler, ResponseData};
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use super::store::{ONWARDS_RESPONSE_ID_HEADER, lookup_created_by};
 use super::writer::{RawCompletedRequest, RequestsWriterSender};
+use crate::inference::store::{ONWARDS_RESPONSE_ID_HEADER, lookup_created_by};
 
 /// Outlet handler that forwards completion records to the in-process writer.
 ///

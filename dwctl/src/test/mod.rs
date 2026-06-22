@@ -854,7 +854,7 @@ async fn test_request_logging_disabled(pool: PgPool) {
         .await
         .expect("Failed to create task runner"),
     );
-    let response_store = std::sync::Arc::new(crate::responses::store::FusilladeResponseStore::new(request_manager.clone()));
+    let response_store = std::sync::Arc::new(crate::inference::store::FusilladeResponseStore::new(request_manager.clone()));
     let mut app_state = AppState::builder()
         .db(DbPools::new(pool.clone()))
         .config(shared_config)
@@ -1421,7 +1421,7 @@ async fn test_build_router_with_metrics_disabled(pool: PgPool) {
         .await
         .expect("Failed to create task runner"),
     );
-    let response_store = std::sync::Arc::new(crate::responses::store::FusilladeResponseStore::new(request_manager.clone()));
+    let response_store = std::sync::Arc::new(crate::inference::store::FusilladeResponseStore::new(request_manager.clone()));
     let mut app_state = AppState::builder()
         .db(DbPools::new(pool))
         .config(shared_config)
@@ -1482,7 +1482,7 @@ async fn test_build_router_with_metrics_enabled(pool: PgPool) {
         .await
         .expect("Failed to create task runner"),
     );
-    let response_store = std::sync::Arc::new(crate::responses::store::FusilladeResponseStore::new(request_manager.clone()));
+    let response_store = std::sync::Arc::new(crate::inference::store::FusilladeResponseStore::new(request_manager.clone()));
     let mut app_state = AppState::builder()
         .db(DbPools::new(pool))
         .config(shared_config)

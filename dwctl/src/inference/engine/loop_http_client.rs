@@ -23,9 +23,9 @@ use fusillade::{FusilladeError, PoolProvider as FusilladePool, RequestData, Reqw
 use onwards::traits::{RequestContext, ToolExecutor};
 use onwards::{LoopConfig, LoopError, MultiStepStore, UpstreamTarget};
 
-use crate::responses::processor::DaemonToolResolver;
-use crate::responses::store::{FusilladeResponseStore, PendingResponseInput};
-use crate::tool_executor::ResolvedTools;
+use crate::inference::engine::processor::DaemonToolResolver;
+use crate::inference::store::{FusilladeResponseStore, PendingResponseInput};
+use crate::inference::tools::ResolvedTools;
 
 /// Runs the Open Responses multi-step loop as a single
 /// [`fusillade::HttpClient::execute`] call.
