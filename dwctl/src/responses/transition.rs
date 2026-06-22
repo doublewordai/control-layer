@@ -161,8 +161,22 @@ fn translate_input_items(items: &[Value]) -> Result<Vec<Value>, String> {
                 // `role`/`content` would be a regression.
                 let mut translated = serde_json::Map::new();
                 for (k, v) in obj {
-                    if k != "type" {
-                        translated.insert(k.clone(), v.clone());
+                    match k.as_str() {
+                        // Drop the Open Responses item discriminator; a
+                        // chat-completions message carries no top-level `type`.
+                        "type" => {}
+                        // Rewrite typed content parts (`input_text`,
+                        // `input_image`, …) into their chat-completions
+                        // equivalents. Verbatim forwarding left Responses-only
+                        // part types in place, which the loopback
+                        // /v1/chat/completions handler's typed deserialization
+                        // rejected with a 422.
+                        "content" => {
+                            translated.insert(k.clone(), translate_message_content(v));
+                        }
+                        _ => {
+                            translated.insert(k.clone(), v.clone());
+                        }
                     }
                 }
                 out.push(Value::Object(translated));
@@ -269,6 +283,78 @@ fn translate_input_items(items: &[Value]) -> Result<Vec<Value>, String> {
         }
     }
     Ok(out)
+}
+
+/// Translate an Open Responses message `content` value into chat-completions
+/// shape.
+///
+/// String content is valid in both schemas and passes through untouched. An
+/// array of typed content parts is rewritten part-by-part: the upstream
+/// chat-completions `ContentPart` enum only accepts `text` and `image_url`,
+/// so Responses-only part types (`input_text`, `output_text`, `input_image`,
+/// `refusal`, …) must be mapped before the body is fired at the loopback
+/// `/v1/chat/completions` handler.
+///
+/// This mirrors onwards' typed `convert_message_content`
+/// (`onwards/src/strict/adapter.rs`) at the JSON layer this translator
+/// operates on. Without it, array-form content was forwarded verbatim and the
+/// loopback handler's `Json<ChatCompletionRequest>` extractor rejected
+/// `input_text` parts with a 422 (empty body), failing every array-content
+/// request that took the multi-step executor path.
+fn translate_message_content(content: &Value) -> Value {
+    let Value::Array(parts) = content else {
+        return content.clone();
+    };
+    let translated: Vec<Value> = parts.iter().filter_map(translate_content_part).collect();
+    // A message whose parts all dropped collapses to empty-string content
+    // rather than an empty array, matching the adapter's behavior and keeping
+    // the upstream message well-formed.
+    if translated.is_empty() {
+        Value::String(String::new())
+    } else {
+        Value::Array(translated)
+    }
+}
+
+/// Map one Open Responses content part to its chat-completions equivalent.
+///
+/// Returns `None` for parts with no chat-completions representation
+/// (`input_file`, unknown types); these are dropped with a trace rather than
+/// forwarded, since the upstream schema would reject them. Already
+/// chat-shaped parts (`text`, `image_url`) pass through unchanged so a client
+/// that sent chat-completions content directly still works.
+fn translate_content_part(part: &Value) -> Option<Value> {
+    match part.get("type").and_then(|t| t.as_str()) {
+        Some("input_text") | Some("output_text") => {
+            let text = part.get("text").and_then(|t| t.as_str()).unwrap_or_default();
+            Some(json!({"type": "text", "text": text}))
+        }
+        Some("input_image") => {
+            // Responses carries the image as a bare `image_url` string;
+            // chat-completions wraps it in an object with optional detail.
+            let url = part.get("image_url").and_then(|u| u.as_str())?;
+            let mut image_url = serde_json::Map::new();
+            image_url.insert("url".to_string(), json!(url));
+            if let Some(detail) = part.get("detail").and_then(|d| d.as_str()) {
+                image_url.insert("detail".to_string(), json!(detail));
+            }
+            Some(json!({"type": "image_url", "image_url": Value::Object(image_url)}))
+        }
+        Some("refusal") => {
+            let text = part.get("refusal").and_then(|t| t.as_str()).unwrap_or_default();
+            Some(json!({"type": "text", "text": text}))
+        }
+        // Already chat-completions-shaped — forward unchanged.
+        Some("text") | Some("image_url") => Some(part.clone()),
+        Some("input_file") => {
+            tracing::debug!("dropping 'input_file' content part during /v1/responses translation");
+            None
+        }
+        other => {
+            tracing::warn!(part_type = ?other, "dropping unknown content part during /v1/responses translation");
+            None
+        }
+    }
 }
 
 /// Normalize the `tools` array into chat-completions wrapped shape:
@@ -722,6 +808,110 @@ mod tests {
         assert_eq!(p.initial_messages[3]["tool_calls"][0]["function"]["name"], "search");
         assert_eq!(p.initial_messages[4]["role"], "tool");
         assert_eq!(p.initial_messages[4]["tool_call_id"], "call_a");
+    }
+
+    #[test]
+    fn translates_input_text_content_parts_to_chat_text() {
+        // The production 422 repro: a Responses client sends array-form
+        // content with `input_text` parts. Verbatim forwarding left the
+        // `input_text` type in place, which the loopback
+        // /v1/chat/completions handler rejected with a 422 (empty body).
+        // After translation the part must be chat-completions `text`.
+        let body = r#"{
+            "model": "m",
+            "input": [
+                {"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}
+            ]
+        }"#;
+        let p = parse_parent_request(body).unwrap();
+        let msg = &p.initial_messages[0];
+        assert_eq!(msg["role"], "user");
+        let parts = msg["content"].as_array().unwrap();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0]["type"], "text");
+        assert_eq!(parts[0]["text"], "hello");
+    }
+
+    #[test]
+    fn translates_output_text_content_parts_to_chat_text() {
+        let body = r#"{
+            "model": "m",
+            "input": [
+                {"type":"message","role":"assistant","content":[{"type":"output_text","text":"hi","annotations":[]}]}
+            ]
+        }"#;
+        let p = parse_parent_request(body).unwrap();
+        let parts = p.initial_messages[0]["content"].as_array().unwrap();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0]["type"], "text");
+        assert_eq!(parts[0]["text"], "hi");
+    }
+
+    #[test]
+    fn passes_string_content_through_unchanged() {
+        // String content is valid in both schemas — it must not be
+        // rewritten into an array.
+        let body = r#"{
+            "model": "m",
+            "input": [{"type":"message","role":"user","content":"plain string"}]
+        }"#;
+        let p = parse_parent_request(body).unwrap();
+        assert_eq!(p.initial_messages[0]["content"], "plain string");
+    }
+
+    #[test]
+    fn translates_input_image_content_part_to_image_url() {
+        let body = r#"{
+            "model": "m",
+            "input": [
+                {"type":"message","role":"user","content":[
+                    {"type":"input_image","image_url":"https://x/y.png","detail":"low"}
+                ]}
+            ]
+        }"#;
+        let p = parse_parent_request(body).unwrap();
+        let parts = p.initial_messages[0]["content"].as_array().unwrap();
+        assert_eq!(parts[0]["type"], "image_url");
+        assert_eq!(parts[0]["image_url"]["url"], "https://x/y.png");
+        assert_eq!(parts[0]["image_url"]["detail"], "low");
+    }
+
+    #[test]
+    fn mixed_content_parts_keep_representable_drop_rest() {
+        // input_file has no chat-completions representation; it is dropped
+        // while the representable input_text part is kept.
+        let body = r#"{
+            "model": "m",
+            "input": [
+                {"type":"message","role":"user","content":[
+                    {"type":"input_text","text":"keep me"},
+                    {"type":"input_file","file_id":"f1"}
+                ]}
+            ]
+        }"#;
+        let p = parse_parent_request(body).unwrap();
+        let parts = p.initial_messages[0]["content"].as_array().unwrap();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0]["type"], "text");
+        assert_eq!(parts[0]["text"], "keep me");
+    }
+
+    #[test]
+    fn all_unrepresentable_content_parts_collapse_to_empty_string() {
+        // A message whose parts all drop becomes empty-string content
+        // rather than an empty array, keeping the upstream message
+        // well-formed instead of triggering a fresh validation error.
+        let body = r#"{
+            "model": "m",
+            "input": [
+                {"type":"message","role":"user","content":[
+                    {"type":"input_file","file_id":"f1"},
+                    {"type":"some_future_type","blob":"x"}
+                ]}
+            ]
+        }"#;
+        let p = parse_parent_request(body).unwrap();
+        assert_eq!(p.initial_messages[0]["content"], "");
     }
 
     #[test]
