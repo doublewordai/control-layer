@@ -1050,7 +1050,7 @@ version = "3.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "519bd3116aeeb42d5372c29d982d16d0170d3d4a5ed85fc7dd91642ffff3c67c"
 dependencies = [
- "darling 0.23.0",
+ "darling 0.20.11",
  "ident_case",
  "prettyplease",
  "proc-macro2",
@@ -2333,9 +2333,9 @@ checksum = "e6d5a32815ae3f33302d95fdcb2ce17862f8c65363dcfd29360480ba1001fc9c"
 
 [[package]]
 name = "fusillade"
-version = "18.0.1"
+version = "19.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "960cf97f8e3fc88cc93d6ad918bbb19f90c09fbad4bd09469bce81382870df0d"
+checksum = "2a89113de963b8279cc0f538706227dc7980d22c1688d7f3347b2e6ca6b5bd3f"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4195,9 +4195,9 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "onwards"
-version = "0.31.1"
+version = "0.33.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5817a049b6885fd6761e39b5df436d15657e7d245a370ee51f2674f0cd06a187"
+checksum = "5a17965893c3585e9a3882297def8b86f413458d3fae719afff761975f1e786f"
 dependencies = [
  "anyhow",
  "async-stream",
