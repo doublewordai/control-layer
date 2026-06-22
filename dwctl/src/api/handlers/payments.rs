@@ -773,13 +773,10 @@ pub async fn enable_auto_topup<P: PoolProvider>(
             // captured), so passing it would stamp a fake name on the Stripe
             // customer and their receipts. Leave it unset and let Stripe
             // collect the real name at checkout / in the billing portal.
-            let new_id = provider
-                .create_customer(&target.email, None)
-                .await
-                .map_err(|e| {
-                    tracing::error!("Failed to create payment provider customer: {:?}", e);
-                    StatusCode::INTERNAL_SERVER_ERROR
-                })?;
+            let new_id = provider.create_customer(&target.email, None).await.map_err(|e| {
+                tracing::error!("Failed to create payment provider customer: {:?}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
 
             Users::new(&mut conn)
                 .set_payment_provider_id_if_empty(target.id, &new_id)
