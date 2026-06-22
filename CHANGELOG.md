@@ -1,5 +1,13 @@
 # Changelog
 
+## [8.61.2](https://github.com/doublewordai/control-layer/compare/v8.61.1...v8.61.2) (2026-06-22)
+
+
+### Bug Fixes
+
+* **dashboard:** show a clean error message for failed responses ([#1153](https://github.com/doublewordai/control-layer/issues/1153)) ([d7011de](https://github.com/doublewordai/control-layer/commit/d7011de39f45c6139a284dbdfb74e45a1b632891))
+* **responses:** translate content parts in multi-step executor input ([#1161](https://github.com/doublewordai/control-layer/issues/1161)) ([ce50bd7](https://github.com/doublewordai/control-layer/commit/ce50bd7c13d525a299848772c11ed6965847f84c))
+
 ## [8.61.1](https://github.com/doublewordai/control-layer/compare/v8.61.0...v8.61.1) (2026-06-19)
 
 
