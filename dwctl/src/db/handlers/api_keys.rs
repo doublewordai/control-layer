@@ -2068,6 +2068,7 @@ mod tests {
             connections: Default::default(),
             responses: Default::default(),
             image_normalizer: Default::default(),
+            file_input: Default::default(),
             openapi: Default::default(),
         };
         crate::seed_database(&config.model_sources, &pool).await.unwrap();

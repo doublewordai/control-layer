@@ -151,6 +151,7 @@ mod email;
 pub mod encryption;
 mod error_enrichment;
 pub mod errors;
+pub mod file_input;
 pub mod image_normalizer;
 pub mod inference;
 mod leader_election;
@@ -1557,6 +1558,25 @@ pub async fn build_router(
         onwards_router.layer(middleware::from_fn_with_state(
             image_normalizer_state,
             crate::inference::image_normalizer_middleware::image_normalizer_middleware,
+        ))
+    };
+
+    // Apply the input_file (PDF / document) normaliser middleware. For each
+    // `/responses` request it fetches any `input_file.file_url` through the
+    // hardened fetcher and inlines the bytes as base64 `file_data`, so the
+    // document survives the strict Responses-to-Chat-Completions conversion
+    // (which has no URL form for files). Unresolvable references are rejected
+    // with a clear 4xx instead of being silently dropped downstream.
+    let onwards_router = {
+        let cfg = state.current_config();
+        let fetcher = std::sync::Arc::new(crate::image_normalizer::fetcher::ImageFetcher::new(cfg.file_input.fetcher.clone()));
+        let file_input_state = crate::inference::file_input_middleware::FileInputMiddlewareState {
+            enabled: cfg.file_input.enabled,
+            fetcher,
+        };
+        onwards_router.layer(middleware::from_fn_with_state(
+            file_input_state,
+            crate::inference::file_input_middleware::file_input_middleware,
         ))
     };
 
