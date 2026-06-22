@@ -11,6 +11,7 @@ import { CodeBlock } from "../../ui/code-block";
 import { dwImgLinkRenderer } from "../../ui/dw-img-linkify";
 import { copyToClipboard } from "../../../utils";
 import { formatTimestamp } from "../../../utils";
+import { extractErrorMessage } from "./errorMessage";
 
 
 const getStatusColor = (status: string): string => {
@@ -60,6 +61,7 @@ function prettyJson(raw: string): string {
     return raw;
   }
 }
+
 
 
 function CopyIconButton({ value }: { value: string }) {
@@ -191,7 +193,7 @@ export function AsyncRequestDetail() {
               ) : status === "failed" ? (
                 <div className="rounded-lg border border-red-200 bg-red-50 p-4">
                   <p className="text-sm text-red-700">
-                    {request.error || "Request failed"}
+                    {extractErrorMessage(request)}
                   </p>
                 </div>
               ) : (
