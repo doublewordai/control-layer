@@ -152,6 +152,7 @@ pub mod encryption;
 mod error_enrichment;
 pub mod errors;
 pub mod image_normalizer;
+pub mod inference;
 mod leader_election;
 pub mod limits;
 mod metrics;
@@ -160,14 +161,11 @@ mod openapi;
 mod payment_providers;
 mod probes;
 mod request_logging;
-pub mod responses;
 pub mod sample_files;
 mod static_assets;
 mod sync;
 pub mod tasks;
 pub mod telemetry;
-pub mod tool_executor;
-pub mod tool_injection;
 mod types;
 pub mod webhooks;
 
@@ -298,7 +296,7 @@ where
     pub connections_encryption_key: Option<Vec<u8>>,
     /// Response store for Open Responses API lifecycle tracking.
     /// Reads/writes to fusillade's requests table.
-    pub response_store: Arc<crate::responses::store::FusilladeResponseStore<P>>,
+    pub response_store: Arc<crate::inference::store::FusilladeResponseStore<P>>,
     /// Multi-step response_steps storage. Optional so deployments that
     /// don't use the multi-step Open Responses path can omit the
     /// wiring; the GET /v1/responses/{id} handler degrades to 404 in
@@ -1094,10 +1092,10 @@ pub async fn build_router(
     state: &mut AppState,
     onwards_router: Router,
     analytics_sender: Option<request_logging::batcher::AnalyticsSender>,
-    requests_writer_sender: Option<crate::responses::writer::RequestsWriterSender>,
+    requests_writer_sender: Option<crate::inference::engine::writer::RequestsWriterSender>,
     metrics_recorder: Option<GenAiMetrics>,
     strict_mode: bool,
-    responses_middleware_state: Option<crate::responses::middleware::ResponsesMiddlewareState>,
+    responses_middleware_state: Option<crate::inference::middleware::ResponsesMiddlewareState>,
 ) -> anyhow::Result<Router> {
     let config = state.current_config();
 
@@ -1143,7 +1141,7 @@ pub async fn build_router(
         // sender to give the handler; without a sender the handler would
         // silently swallow rows.
         if let (Some(rms), Some(sender)) = (responses_middleware_state.as_ref(), requests_writer_sender.clone()) {
-            let fusillade_handler = crate::responses::outlet_handler::FusilladeOutletHandler::new(sender, rms.dwctl_pool.clone());
+            let fusillade_handler = crate::inference::engine::outlet_handler::FusilladeOutletHandler::new(sender, rms.dwctl_pool.clone());
             multi_handler = multi_handler.with(fusillade_handler);
         }
 
@@ -1500,8 +1498,8 @@ pub async fn build_router(
                 .route("/files/{file_id}/content", get(api::handlers::files::get_file_content))
                 .route("/files/{file_id}/cost-estimate", get(api::handlers::files::get_file_cost_estimate))
                 // Responses retrieval (Open Responses API)
-                .route("/responses/{response_id}", get(crate::responses::handler::get_response))
-                .route("/responses/{response_id}", delete(crate::responses::handler::delete_response))
+                .route("/responses/{response_id}", get(crate::inference::handler::get_response))
+                .route("/responses/{response_id}", delete(crate::inference::handler::delete_response))
                 // Batches management
                 .route("/batches", post(api::handlers::batches::create_batch))
                 .route("/batches", get(api::handlers::batches::list_batches))
@@ -1531,12 +1529,12 @@ pub async fn build_router(
 
     // Apply tool injection middleware to the onwards router so that per-request tool
     // schemas are resolved and injected into the request body before onwards processes it.
-    let tool_injection_state = crate::tool_injection::ToolInjectionState {
+    let tool_injection_state = crate::inference::tools::ToolInjectionState {
         db: state.db.write().clone(),
     };
     let onwards_router = onwards_router.layer(middleware::from_fn_with_state(
         tool_injection_state,
-        crate::tool_injection::tool_injection_middleware,
+        crate::inference::tools::tool_injection_middleware,
     ));
 
     // Apply the image-input normaliser middleware. This runs BEFORE
@@ -1550,7 +1548,7 @@ pub async fn build_router(
         // Re-use the AppState-bound singleton built once at startup.
         let normalizer = state.image_normalizer.clone();
         let realtime_ttl = cfg.image_normalizer.signing.realtime_ttl();
-        let image_normalizer_state = crate::responses::image_normalizer_middleware::ImageNormalizerMiddlewareState {
+        let image_normalizer_state = crate::inference::image_normalizer_middleware::ImageNormalizerMiddlewareState {
             enabled: cfg.image_normalizer.enabled,
             normalizer,
             realtime_ttl,
@@ -1558,7 +1556,7 @@ pub async fn build_router(
         };
         onwards_router.layer(middleware::from_fn_with_state(
             image_normalizer_state,
-            crate::responses::image_normalizer_middleware::image_normalizer_middleware,
+            crate::inference::image_normalizer_middleware::image_normalizer_middleware,
         ))
     };
 
@@ -1581,7 +1579,7 @@ pub async fn build_router(
     let onwards_router = if let Some(rms) = responses_middleware_state {
         onwards_router.layer(middleware::from_fn_with_state(
             rms,
-            crate::responses::middleware::responses_middleware,
+            crate::inference::middleware::responses_middleware,
         ))
     } else {
         onwards_router
@@ -1909,7 +1907,7 @@ pub struct BackgroundServices {
     /// `RequestsWriter` (replaces the underway response jobs). Always set
     /// once `setup_background_services` runs; `None` only in test harnesses
     /// that bypass that path.
-    requests_writer_sender: Option<crate::responses::writer::RequestsWriterSender>,
+    requests_writer_sender: Option<crate::inference::engine::writer::RequestsWriterSender>,
     // JoinSet is cancel-safe - can be polled in select! without losing tasks
     background_tasks: tokio::task::JoinSet<anyhow::Result<()>>,
     // Map task IDs to names for logging
@@ -2644,7 +2642,7 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
     // complete-response jobs. Outlet's FusilladeOutletHandler holds the
     // sender; this task drains the channel and flushes to fusillade.
     let requests_writer_sender = {
-        let (writer, sender) = crate::responses::writer::RequestsWriter::new(
+        let (writer, sender) = crate::inference::engine::writer::RequestsWriter::new(
             request_manager.clone(),
             config.background_services.task_workers.response_writer_batch_size,
         );
@@ -2838,7 +2836,7 @@ impl Application {
         );
         let step_manager = Arc::new(fusillade::PostgresResponseStepManager::new(fusillade_pools.clone()));
         let response_store =
-            Arc::new(crate::responses::store::FusilladeResponseStore::new(request_manager.clone()).with_step_manager(step_manager.clone()));
+            Arc::new(crate::inference::store::FusilladeResponseStore::new(request_manager.clone()).with_step_manager(step_manager.clone()));
 
         // Build the image normaliser ONCE — fail loud at startup if
         // `image_normalizer.enabled = true` but no backend is configured.
@@ -2855,7 +2853,7 @@ impl Application {
         // connection pool / TLS root-cert cache across clones).
         let multi_step_reqwest_client = reqwest::Client::new();
         let multi_step_tool_executor_pool = Arc::new(db_pools.write().clone());
-        let multi_step_tool_executor = Arc::new(crate::tool_executor::HttpToolExecutor::new(
+        let multi_step_tool_executor = Arc::new(crate::inference::tools::HttpToolExecutor::new(
             multi_step_reqwest_client.clone(),
             Some(multi_step_tool_executor_pool.clone()),
         ));
@@ -2890,8 +2888,8 @@ impl Application {
         let multi_step_processor_for_setup = if cfg!(test) {
             None
         } else {
-            let tool_resolver: Arc<dyn crate::responses::processor::DaemonToolResolver> =
-                Arc::new(crate::responses::processor::DbToolResolver {
+            let tool_resolver: Arc<dyn crate::inference::engine::processor::DaemonToolResolver> =
+                Arc::new(crate::inference::engine::processor::DbToolResolver {
                     pool: (*db_pools).write().clone(),
                 });
             // Derive dispatch TTL from the batch daemon's processing timeout so
@@ -2899,7 +2897,7 @@ impl Application {
             // attempt — never the cause of a batch failure on its own.
             let processing_timeout = std::time::Duration::from_millis(config.background_services.batch_daemon.processing_timeout_ms);
             let dispatch_ttl = config.image_normalizer.signing.dispatch_ttl(processing_timeout);
-            let mut processor_builder = crate::responses::processor::DwctlRequestProcessor::new(
+            let mut processor_builder = crate::inference::engine::processor::DwctlRequestProcessor::new(
                 response_store.clone(),
                 multi_step_tool_executor.clone(),
                 multi_step_http_client.clone(),
@@ -2963,7 +2961,7 @@ impl Application {
         // clients/pools would double TLS init cost per test and add
         // unnecessary parallelism pressure.
         let tool_executor =
-            crate::tool_executor::HttpToolExecutor::new(multi_step_reqwest_client.clone(), Some(multi_step_tool_executor_pool.clone()));
+            crate::inference::tools::HttpToolExecutor::new(multi_step_reqwest_client.clone(), Some(multi_step_tool_executor_pool.clone()));
 
         // Register onwards as a fusillade daemon so realtime requests get a valid daemon_id.
         let onwards_daemon_id = uuid::Uuid::new_v4();
@@ -3048,9 +3046,9 @@ impl Application {
         // Responses middleware state. Non-background realtime no longer
         // does any DB work up front; the completion path goes through
         // FusilladeOutletHandler -> RequestsWriter.
-        let responses_middleware_state = crate::responses::middleware::ResponsesMiddlewareState {
+        let responses_middleware_state = crate::inference::middleware::ResponsesMiddlewareState {
             request_manager: bg_services.request_manager.clone(),
-            daemon_id: crate::responses::store::OnwardsDaemonId(onwards_daemon_id),
+            daemon_id: crate::inference::store::OnwardsDaemonId(onwards_daemon_id),
             loopback_base_url: {
                 let addr = config.bind_address();
                 let addr = if addr.starts_with("0.0.0.0:") {
