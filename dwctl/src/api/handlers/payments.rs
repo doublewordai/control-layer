@@ -88,7 +88,6 @@ struct BillingTarget {
     id: crate::types::UserId,
     payment_provider_id: Option<String>,
     email: String,
-    display_name: Option<String>,
 }
 
 /// Resolve the billing target for payment operations.
@@ -117,14 +116,12 @@ async fn resolve_billing_target(user: &CurrentUser, conn: &mut sqlx::PgConnectio
             id: org.id,
             payment_provider_id: org.payment_provider_id,
             email: org.email,
-            display_name: org.display_name,
         })
     } else {
         Ok(BillingTarget {
             id: user.id,
             payment_provider_id: user.payment_provider_id.clone(),
             email: user.email.clone(),
-            display_name: user.display_name.clone(),
         })
     }
 }
@@ -771,8 +768,13 @@ pub async fn enable_auto_topup<P: PoolProvider>(
     let customer_id = match &target.payment_provider_id {
         Some(id) if !id.is_empty() => id.clone(),
         _ => {
+            // Don't send a name: for SSO/proxy users dwctl only ever stores a
+            // randomly generated display_name (the real IdP name is never
+            // captured), so passing it would stamp a fake name on the Stripe
+            // customer and their receipts. Leave it unset and let Stripe
+            // collect the real name at checkout / in the billing portal.
             let new_id = provider
-                .create_customer(&target.email, target.display_name.as_deref())
+                .create_customer(&target.email, None)
                 .await
                 .map_err(|e| {
                     tracing::error!("Failed to create payment provider customer: {:?}", e);
