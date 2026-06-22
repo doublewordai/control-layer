@@ -294,7 +294,7 @@ async fn test_blocking_response_id_matches_fusillade_id(pool: PgPool) {
 #[sqlx::test]
 #[test_log::test]
 async fn test_multi_step_chain_assembles_and_is_retrievable_via_get(pool: PgPool) {
-    use crate::responses::store::{FusilladeResponseStore, PendingResponseInput};
+    use crate::inference::store::{FusilladeResponseStore, PendingResponseInput};
     use crate::test::utils::setup_fusillade_pool;
     use fusillade::{PostgresRequestManager, PostgresResponseStepManager, ReqwestHttpClient, TestDbPools};
     use onwards::{MultiStepStore, StepDescriptor, StepKind as OnwardsStepKind};

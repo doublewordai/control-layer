@@ -15,7 +15,7 @@
 //! The middleware is a no-op for requests that carry no API key or target paths other
 //! than `/v1/responses`.
 
-use crate::tool_executor::{ResolvedToolSet, ResolvedTools, ToolDefinition};
+use crate::inference::tools::{ResolvedToolSet, ResolvedTools, ToolDefinition};
 use axum::{body::Body, extract::State, http::Request, middleware::Next, response::Response};
 use serde_json::Value;
 use sqlx::PgPool;

@@ -38,8 +38,8 @@ use uuid::Uuid;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use crate::responses::store::{FusilladeResponseStore, PendingResponseInput};
-use crate::tool_executor::{HttpToolExecutor, ResolvedToolSet, ResolvedTools, ToolDefinition};
+use crate::inference::store::{FusilladeResponseStore, PendingResponseInput};
+use crate::inference::tools::{HttpToolExecutor, ResolvedToolSet, ResolvedTools, ToolDefinition};
 
 use crate::test::utils::setup_fusillade_pool;
 

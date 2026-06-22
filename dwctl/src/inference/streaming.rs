@@ -40,8 +40,8 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
-use crate::responses::store::FusilladeResponseStore;
-use crate::tool_executor::HttpToolExecutor;
+use crate::inference::store::FusilladeResponseStore;
+use crate::inference::tools::HttpToolExecutor;
 
 /// Buffer size for the SSE event channel between the loop and the
 /// HTTP response stream. Sized for the largest expected per-iteration
@@ -91,7 +91,7 @@ impl EventSink for SseEventSink {
 pub fn run_inline_streaming<P>(
     response_store: Arc<FusilladeResponseStore<P>>,
     tool_executor: Arc<HttpToolExecutor>,
-    tool_resolved: Arc<crate::tool_executor::ResolvedToolSet>,
+    tool_resolved: Arc<crate::inference::tools::ResolvedToolSet>,
     http_client: Arc<ReqwestHttpClient>,
     upstream: UpstreamTarget,
     loop_config: LoopConfig,
@@ -110,7 +110,7 @@ where
         let sink = SseEventSink::new(tx.clone());
         let tool_ctx = RequestContext::new()
             .with_model(model_alias)
-            .with_extension(crate::tool_executor::ResolvedTools(tool_resolved));
+            .with_extension(crate::inference::tools::ResolvedTools(tool_resolved));
 
         let result = onwards::run_response_loop(
             &*response_store,
@@ -207,7 +207,7 @@ where
 pub async fn run_inline_blocking<P>(
     response_store: Arc<FusilladeResponseStore<P>>,
     tool_executor: Arc<HttpToolExecutor>,
-    tool_resolved: Arc<crate::tool_executor::ResolvedToolSet>,
+    tool_resolved: Arc<crate::inference::tools::ResolvedToolSet>,
     http_client: Arc<ReqwestHttpClient>,
     upstream: UpstreamTarget,
     loop_config: LoopConfig,
@@ -219,7 +219,7 @@ where
 {
     let tool_ctx = RequestContext::new()
         .with_model(model_alias)
-        .with_extension(crate::tool_executor::ResolvedTools(tool_resolved));
+        .with_extension(crate::inference::tools::ResolvedTools(tool_resolved));
 
     let result = onwards::run_response_loop(
         &*response_store,

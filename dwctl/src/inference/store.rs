@@ -926,9 +926,13 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> MultiStepStore for Fusilla
         // populated by the warm path. There is no longer a parent
         // fusillade row to fetch it from.
         let pending = self.pending_input(request_id)?;
-        let parsed = super::transition::parse_parent_request(&pending.body).map_err(StoreError::StorageError)?;
+        let parsed = super::engine::transition::parse_parent_request(&pending.body).map_err(StoreError::StorageError)?;
         let chain = <Self as MultiStepStore>::list_chain(self, request_id, scope_parent).await?;
-        Ok(super::transition::decide_next_action(&parsed, &chain, &pending.resolved_tool_names))
+        Ok(super::engine::transition::decide_next_action(
+            &parsed,
+            &chain,
+            &pending.resolved_tool_names,
+        ))
     }
 
     async fn record_step(
@@ -1054,7 +1058,7 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> MultiStepStore for Fusilla
 
     async fn assemble_response(&self, request_id: &str) -> Result<serde_json::Value, StoreError> {
         let chain = <Self as MultiStepStore>::list_chain(self, request_id, None).await?;
-        Ok(super::assembly::assemble_from_chain(request_id, &chain))
+        Ok(super::engine::assembly::assemble_from_chain(request_id, &chain))
     }
 }
 
