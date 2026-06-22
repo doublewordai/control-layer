@@ -877,6 +877,14 @@ pub struct CorsConfig {
     pub max_age: Option<u64>,
     /// Custom headers to expose to the browser (in addition to CORS-safelisted headers)
     pub exposed_headers: Vec<String>,
+    /// When set, in addition to the credentialed `allowed_origins` allowlist,
+    /// allow ANY other origin to make CORS requests *without* credentials.
+    /// First-party allowlisted origins still receive
+    /// `Access-Control-Allow-Credentials: true`; every other origin gets a
+    /// reflected `Access-Control-Allow-Origin` and no credentials. This lets
+    /// third-party browser apps call the public API without ever exposing
+    /// cookie-credentialed access to arbitrary sites.
+    pub allow_any_origin_without_credentials: bool,
 }
 
 /// Email configuration for password resets and notifications.
@@ -1001,6 +1009,25 @@ pub struct OnwardsConfig {
     /// When false (default), all requests are passed through transparently.
     /// When true, only known OpenAI API paths are accepted and validated.
     pub strict_mode: bool,
+    /// Wire a cached-input-pricing classifier into the embedded onwards proxy.
+    ///
+    /// When false (the default), onwards is left dormant: no classifier is
+    /// injected, so the cache request-fork, `cache_control` stripping, and
+    /// response usage injection are all skipped and onwards behaviour is
+    /// byte-identical to today — zero runtime overhead (no extra allocations,
+    /// no request-path changes).
+    ///
+    /// When true, the no-op classifier ([`onwards::NoopCacheClassifier`]) is injected.
+    /// This activates the spine end-to-end for local validation: responses
+    /// carry the (zeroed) `cache_*` usage fields and outbound `cache_control`
+    /// markers are stripped, while billing/analytics is unaffected. There is
+    /// no real classification yet — the no-op returns all-zero stats. The real
+    /// dwctl classifier will replace the no-op here in a later wave. When a real
+    /// classifier lands it runs concurrently with the upstream model call under a
+    /// deadline, so it does not add to request latency.
+    ///
+    /// Set via environment: `DWCTL_ONWARDS__CACHE_CLASSIFIER_ENABLED=true`
+    pub cache_classifier_enabled: bool,
 }
 
 /// File limits configuration.
@@ -2040,11 +2067,12 @@ impl Default for CorsConfig {
     fn default() -> Self {
         Self {
             allowed_origins: vec![
-                CorsOrigin::Url(Url::parse("htt://localhost:3001").unwrap()), // Development frontend (Vite)
+                CorsOrigin::Url(Url::parse("http://localhost:3001").unwrap()), // Development frontend (Vite)
             ],
             allow_credentials: true,
             max_age: Some(3600), // Cache preflight for 1 hour
             exposed_headers: vec!["location".to_string()],
+            allow_any_origin_without_credentials: false,
         }
     }
 }
@@ -2418,6 +2446,53 @@ model_sources:
             let internal = &config.model_sources[1];
             assert_eq!(internal.name, "internal");
             assert_eq!(internal.sync_interval, Duration::from_secs(10)); // default
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn cors_allow_any_origin_without_credentials_parses() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: hello
+auth:
+  security:
+    cors:
+      allowed_origins:
+        - "https://app.doubleword.ai"
+      allow_credentials: true
+      allow_any_origin_without_credentials: true
+"#,
+            )?;
+
+            let args = Args {
+                config: "test.yaml".into(),
+                validate: false,
+            };
+            let config = Config::load(&args)?;
+
+            assert!(config.auth.security.cors.allow_any_origin_without_credentials);
+            assert!(config.auth.security.cors.allow_credentials);
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn cors_allow_any_origin_without_credentials_defaults_false() {
+        Jail::expect_with(|jail| {
+            jail.create_file("test.yaml", "secret_key: hello\n")?;
+
+            let args = Args {
+                config: "test.yaml".into(),
+                validate: false,
+            };
+            let config = Config::load(&args)?;
+
+            assert!(!config.auth.security.cors.allow_any_origin_without_credentials);
 
             Ok(())
         });

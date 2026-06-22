@@ -4,6 +4,12 @@ import { Play, ArrowLeft, GitCompare, X as XIcon } from "lucide-react";
 import { toast } from "sonner";
 import OpenAI from "openai";
 import type { ChatCompletionMessageParam } from "openai/resources/chat/completions";
+import {
+  type DeltaWithReasoning,
+  applyDelta,
+  createReasoningAccumulator,
+  finalizeReasoning,
+} from "./reasoning";
 import { useQuery } from "@tanstack/react-query";
 import { useModels, dwctlApi } from "../../../../api/control-layer";
 import { type ModelType } from "../../../../utils/modelType";
@@ -48,10 +54,6 @@ interface Message {
   metrics?: MessageMetrics;
 }
 
-interface DeltaWithReasoning {
-  content?: string | null;
-  reasoning_content?: string | null;
-}
 
 const Playground: React.FC = () => {
   const navigate = useNavigate();
@@ -507,30 +509,30 @@ const Playground: React.FC = () => {
             },
           );
 
-          let fullContentB = "";
-          let fullReasoningContentB = "";
+          const accB = createReasoningAccumulator();
           let chunkCountB = 0;
 
           for await (const chunk of streamB) {
-            const delta = chunk.choices[0]?.delta as
-              | DeltaWithReasoning
-              | undefined;
-            const content = delta?.content || "";
-            const reasoning = delta?.reasoning_content || "";
+            const { contentDelta, reasoningDelta, content, reasoning } =
+              applyDelta(
+                accB,
+                chunk.choices[0]?.delta as DeltaWithReasoning | undefined,
+              );
 
             if (reasoning) {
-              fullReasoningContentB += reasoning;
-              setStreamingReasoningContentModelB(fullReasoningContentB);
+              setStreamingReasoningContentModelB(reasoning);
             }
 
-            if (content) {
+            if (contentDelta) {
               chunkCountB++;
-              fullContentB += content;
-              setStreamingContentModelB(fullContentB);
+              setStreamingContentModelB(content);
             }
 
             // Track time to first token (either content or reasoning)
-            if ((content || reasoning) && firstTokenTimeB === undefined) {
+            if (
+              (contentDelta || reasoningDelta) &&
+              firstTokenTimeB === undefined
+            ) {
               firstTokenTimeB = performance.now() - startTimeB;
             }
 
@@ -542,6 +544,8 @@ const Playground: React.FC = () => {
               inputTokensB = chunk.usage.prompt_tokens;
             }
           }
+
+          const finalB = finalizeReasoning(accB);
 
           const endTimeB = performance.now();
           const totalTimeB = endTimeB - startTimeB;
@@ -560,8 +564,8 @@ const Playground: React.FC = () => {
 
           const assistantMessageB: Message = {
             role: "assistant",
-            content: fullContentB,
-            reasoningContent: fullReasoningContentB || undefined,
+            content: finalB.content,
+            reasoningContent: finalB.reasoning || undefined,
             timestamp: new Date(),
             metrics: metricsB,
           };
@@ -620,32 +624,28 @@ const Playground: React.FC = () => {
         },
       );
 
-      let fullContent = "";
-      let fullReasoningContent = "";
+      const acc = createReasoningAccumulator();
       let chunkCount = 0;
 
       for await (const chunk of stream) {
-        const delta = chunk.choices[0]?.delta as
-          | DeltaWithReasoning
-          | undefined;
-        const content = delta?.content || "";
-        const reasoning = delta?.reasoning_content || "";
+        const { contentDelta, reasoningDelta, content, reasoning } = applyDelta(
+          acc,
+          chunk.choices[0]?.delta as DeltaWithReasoning | undefined,
+        );
 
         if (reasoning) {
-          fullReasoningContent += reasoning;
-          setStreamingReasoningContent(fullReasoningContent);
+          setStreamingReasoningContent(reasoning);
         }
 
-        if (content) {
+        if (contentDelta) {
           chunkCount++;
-          fullContent += content;
 
           // Update immediately without requestAnimationFrame to avoid batching
-          setStreamingContent(fullContent);
+          setStreamingContent(content);
         }
 
         // Track time to first token (either content or reasoning)
-        if ((content || reasoning) && firstTokenTime === undefined) {
+        if ((contentDelta || reasoningDelta) && firstTokenTime === undefined) {
           firstTokenTime = performance.now() - startTime;
         }
 
@@ -658,6 +658,7 @@ const Playground: React.FC = () => {
         }
       }
 
+      const final = finalizeReasoning(acc);
       const endTime = performance.now();
       const totalTime = endTime - startTime;
 
@@ -676,8 +677,8 @@ const Playground: React.FC = () => {
       // Add the complete assistant message
       const assistantMessage: Message = {
         role: "assistant",
-        content: fullContent,
-        reasoningContent: fullReasoningContent || undefined,
+        content: final.content,
+        reasoningContent: final.reasoning || undefined,
         timestamp: new Date(),
         metrics,
       };
@@ -761,30 +762,26 @@ const Playground: React.FC = () => {
         },
       );
 
-      let fullContent = "";
-      let fullReasoningContent = "";
+      const acc = createReasoningAccumulator();
       let chunkCount = 0;
 
       for await (const chunk of stream) {
-        const delta = chunk.choices[0]?.delta as
-          | DeltaWithReasoning
-          | undefined;
-        const content = delta?.content || "";
-        const reasoning = delta?.reasoning_content || "";
+        const { contentDelta, reasoningDelta, content, reasoning } = applyDelta(
+          acc,
+          chunk.choices[0]?.delta as DeltaWithReasoning | undefined,
+        );
 
         if (reasoning) {
-          fullReasoningContent += reasoning;
-          setStreamingReasoningContentModelB(fullReasoningContent);
+          setStreamingReasoningContentModelB(reasoning);
         }
 
-        if (content) {
+        if (contentDelta) {
           chunkCount++;
-          fullContent += content;
-          setStreamingContentModelB(fullContent);
+          setStreamingContentModelB(content);
         }
 
         // Track time to first token (either content or reasoning)
-        if ((content || reasoning) && firstTokenTime === undefined) {
+        if ((contentDelta || reasoningDelta) && firstTokenTime === undefined) {
           firstTokenTime = performance.now() - startTime;
         }
 
@@ -796,6 +793,8 @@ const Playground: React.FC = () => {
           inputTokens = chunk.usage.prompt_tokens;
         }
       }
+
+      const final = finalizeReasoning(acc);
 
       const endTime = performance.now();
       const totalTime = endTime - startTime;
@@ -814,8 +813,8 @@ const Playground: React.FC = () => {
 
       const assistantMessage: Message = {
         role: "assistant",
-        content: fullContent,
-        reasoningContent: fullReasoningContent || undefined,
+        content: final.content,
+        reasoningContent: final.reasoning || undefined,
         timestamp: new Date(),
         metrics,
       };

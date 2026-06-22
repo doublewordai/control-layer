@@ -388,6 +388,17 @@ onwards:
   # When true, only known OpenAI API paths are accepted and validated.
   # Set via environment: DWCTL_ONWARDS__STRICT_MODE=true
   strict_mode: false
+  # Wire a cached-input-pricing classifier into the embedded onwards proxy.
+  # When false (default), onwards is dormant: no request fork, no cache_control
+  # stripping, no usage injection — behaviour is identical to today.
+  # When true, the no-op classifier is injected so the spine runs end-to-end:
+  # responses carry zeroed cache_* usage fields and outbound cache_control
+  # markers are stripped, while billing/analytics is unaffected. For local
+  # validation only until the real classification engine lands.
+  # Note: a real classifier runs concurrently with the upstream model call under
+  # a deadline, so it does not add to request latency (the no-op is free).
+  # Set via environment: DWCTL_ONWARDS__CACHE_CLASSIFIER_ENABLED=true
+  cache_classifier_enabled: false
 
 # Background services configuration
 # Controls which background services run on this instance

@@ -387,7 +387,7 @@ async fn try_api_key_auth(parts: &axum::http::request::Parts, db: &PgPool) -> Op
         purpose_str == "platform"
     } else if path.starts_with("/ai/") {
         // AI inference endpoints accept any inference-type key
-        matches!(purpose_str.as_str(), "realtime" | "batch" | "playground")
+        crate::db::models::api_keys::is_inference_purpose(purpose_str)
     } else {
         // For other paths, allow any purpose
         true

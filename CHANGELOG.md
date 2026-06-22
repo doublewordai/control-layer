@@ -1,5 +1,40 @@
 # Changelog
 
+## [8.61.1](https://github.com/doublewordai/control-layer/compare/v8.61.0...v8.61.1) (2026-06-19)
+
+
+### Bug Fixes
+
+* **deps:** bump fusillade to 19.0.0 ([#1162](https://github.com/doublewordai/control-layer/issues/1162)) ([e041b40](https://github.com/doublewordai/control-layer/commit/e041b40d7e86ff26d7d973bf7ee0f853230bb9d1))
+* **playground:** render reasoning from all backend fields ([#1158](https://github.com/doublewordai/control-layer/issues/1158)) ([e1ee0a6](https://github.com/doublewordai/control-layer/commit/e1ee0a6b22d89853f1e3d012ebde41ea21120ce0))
+
+## [8.61.0](https://github.com/doublewordai/control-layer/compare/v8.60.7...v8.61.0) (2026-06-18)
+
+
+### Features
+
+* **cors:** optional any-origin CORS without credentials ([#1155](https://github.com/doublewordai/control-layer/issues/1155)) ([c00b0a5](https://github.com/doublewordai/control-layer/commit/c00b0a51a2c0f83cf527aa8112e726a91ebc9c6a))
+
+
+### Bug Fixes
+
+* **cors:** correct scheme in default dev-frontend origin ([#1156](https://github.com/doublewordai/control-layer/issues/1156)) ([33b6b48](https://github.com/doublewordai/control-layer/commit/33b6b484f490d7d8c1e4034431e5326fe3831631))
+
+## [8.60.7](https://github.com/doublewordai/control-layer/compare/v8.60.6...v8.60.7) (2026-06-17)
+
+
+### Bug Fixes
+
+* block platform keys from doing inference ([#1148](https://github.com/doublewordai/control-layer/issues/1148)) ([5b25362](https://github.com/doublewordai/control-layer/commit/5b253627f8f92cb5cf498c3ab50b68a1045fab3a))
+* bump fusillade to 18.0.2 ([#1154](https://github.com/doublewordai/control-layer/issues/1154)) ([ca91646](https://github.com/doublewordai/control-layer/commit/ca916460e71a228fef258cdc0d66fdeb842d1096))
+
+## [8.60.6](https://github.com/doublewordai/control-layer/compare/v8.60.5...v8.60.6) (2026-06-16)
+
+
+### Bug Fixes
+
+* **image-normalizer:** don't re-sign URLs already in our own store ([#1150](https://github.com/doublewordai/control-layer/issues/1150)) ([2aaa8ab](https://github.com/doublewordai/control-layer/commit/2aaa8ab6f853594d6939aa2f723616d11d968be3))
+
 ## [8.60.5](https://github.com/doublewordai/control-layer/compare/v8.60.4...v8.60.5) (2026-06-16)
 
 

@@ -751,6 +751,9 @@ const EditRoutingModal: React.FC<{
   const [fallbackOn429, setFallbackOn429] = useState(
     model.fallback?.on_status?.includes(429) ?? false,
   );
+  const [fallbackOn404, setFallbackOn404] = useState(
+    model.fallback?.on_status?.includes(404) ?? false,
+  );
   const [fallbackOn5xx, setFallbackOn5xx] = useState(
     model.fallback?.on_status?.some((s) => s >= 500 && s < 600) ?? false,
   );
@@ -769,6 +772,7 @@ const EditRoutingModal: React.FC<{
     setFallbackEnabled(model.fallback?.enabled ?? false);
     setFallbackOnRateLimit(model.fallback?.on_rate_limit ?? false);
     setFallbackOn429(model.fallback?.on_status?.includes(429) ?? false);
+    setFallbackOn404(model.fallback?.on_status?.includes(404) ?? false);
     setFallbackOn5xx(
       model.fallback?.on_status?.some((s) => s >= 500 && s < 600) ?? false,
     );
@@ -781,6 +785,9 @@ const EditRoutingModal: React.FC<{
     const onStatus: number[] = [];
     if (fallbackOn429) {
       onStatus.push(429);
+    }
+    if (fallbackOn404) {
+      onStatus.push(404);
     }
     if (fallbackOn5xx) {
       onStatus.push(500, 502, 503, 504);
@@ -899,6 +906,20 @@ const EditRoutingModal: React.FC<{
                   <Switch
                     checked={fallbackOn429}
                     onCheckedChange={setFallbackOn429}
+                  />
+                </div>
+
+                <div className="flex items-center justify-between">
+                  <div>
+                    <Label className="text-sm">Model unavailable (404)</Label>
+                    <p className="text-xs text-gray-500">
+                      When the provider returns 404 — e.g. a self-hosted model
+                      that isn't currently live
+                    </p>
+                  </div>
+                  <Switch
+                    checked={fallbackOn404}
+                    onCheckedChange={setFallbackOn404}
                   />
                 </div>
 
@@ -1199,13 +1220,18 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
     }
     if (model.fallback.on_status && model.fallback.on_status.length > 0) {
       const has429 = model.fallback.on_status.includes(429);
+      const has404 = model.fallback.on_status.includes(404);
       const serverErrors = model.fallback.on_status.filter((s) => s >= 500);
       const otherErrors = model.fallback.on_status.filter(
-        (s) => s < 500 && s !== 429,
+        (s) => s < 500 && s !== 429 && s !== 404,
       );
       // Upstream 429 = when the provider returns rate limit errors
       if (has429) {
         fallbackTriggers.push("Provider rate limit (429)");
+      }
+      // Upstream 404 = e.g. a self-hosted model that isn't currently live
+      if (has404) {
+        fallbackTriggers.push("Model unavailable (404)");
       }
       if (serverErrors.length > 0) {
         fallbackTriggers.push(`Server errors (${serverErrors.join(", ")})`);
