@@ -1,5 +1,13 @@
 # Changelog
 
+## [8.61.1](https://github.com/doublewordai/control-layer/compare/v8.61.0...v8.61.1) (2026-06-19)
+
+
+### Bug Fixes
+
+* **deps:** bump fusillade to 19.0.0 ([#1162](https://github.com/doublewordai/control-layer/issues/1162)) ([e041b40](https://github.com/doublewordai/control-layer/commit/e041b40d7e86ff26d7d973bf7ee0f853230bb9d1))
+* **playground:** render reasoning from all backend fields ([#1158](https://github.com/doublewordai/control-layer/issues/1158)) ([e1ee0a6](https://github.com/doublewordai/control-layer/commit/e1ee0a6b22d89853f1e3d012ebde41ea21120ce0))
+
 ## [8.61.0](https://github.com/doublewordai/control-layer/compare/v8.60.7...v8.61.0) (2026-06-18)
 
 
