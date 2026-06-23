@@ -206,6 +206,12 @@ pub struct Config {
     /// Both surfaces require authentication regardless of these flags.
     #[serde(default)]
     pub openapi: OpenApiConfig,
+    /// Default cache-pricing multipliers. The per-model `model_cache_tariffs` row is
+    /// the source of truth (its presence enables caching for that model); these
+    /// defaults just let "enable caching on this model" be a one-liner — any field the
+    /// caller doesn't specify is filled from here. Editable config (data, not code).
+    #[serde(default)]
+    pub cache_pricing: CachePricingConfig,
 }
 
 /// Controls exposure of the OpenAPI specs and Scalar doc UIs.
@@ -1013,8 +1019,9 @@ pub struct OnwardsConfig {
     /// usage fields into the response, and commits prefix writes to the index on
     /// success. onwards itself stays cache-agnostic. Because classify races the
     /// (slower) model call under a deadline, it does not add request latency.
-    /// Per-model activation is still gated by `deployed_models.cache_pricing_enabled`,
-    /// so flipping this flag on does nothing until a model opts in.
+    /// Per-model activation is still gated by the presence of an active
+    /// `model_cache_tariffs` row for the model, so flipping this flag on does nothing
+    /// until a model is enabled.
     ///
     /// Set via environment: `DWCTL_ONWARDS__CACHE_CLASSIFIER_ENABLED=true`
     pub cache_classifier_enabled: bool,
@@ -1035,6 +1042,35 @@ impl Default for OnwardsConfig {
             strict_mode: false,
             cache_classifier_enabled: false,
             tokenizer_url: "http://localhost:8088".to_string(),
+        }
+    }
+}
+
+/// Default cache-pricing multipliers, used when enabling caching on a model without
+/// explicit per-tier values. The `model_cache_tariffs` row remains the source of truth
+/// (and what billing reads as of inference time) — these only pre-fill it at creation.
+///
+/// Defaults mirror Anthropic's published premiums: 5m write 1.25×, 1h write 2×, read
+/// 0.1×; 24h defaults to 2.5×. Floor 1024 tokens.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CachePricingConfig {
+    pub default_write_multiplier_5m: rust_decimal::Decimal,
+    pub default_write_multiplier_1h: rust_decimal::Decimal,
+    pub default_write_multiplier_24h: rust_decimal::Decimal,
+    pub default_read_multiplier: rust_decimal::Decimal,
+    pub default_min_prefix_tokens: i32,
+}
+
+impl Default for CachePricingConfig {
+    fn default() -> Self {
+        use rust_decimal::Decimal;
+        Self {
+            default_write_multiplier_5m: Decimal::new(125, 2), // 1.25
+            default_write_multiplier_1h: Decimal::new(2, 0),   // 2.0
+            default_write_multiplier_24h: Decimal::new(25, 1), // 2.5
+            default_read_multiplier: Decimal::new(1, 1),       // 0.1
+            default_min_prefix_tokens: 1024,
         }
     }
 }
@@ -1978,6 +2014,7 @@ impl Default for Config {
             responses: ResponsesConfig::default(),
             image_normalizer: crate::image_normalizer::ImageNormalizerConfig::default(),
             openapi: OpenApiConfig::default(),
+            cache_pricing: CachePricingConfig::default(),
         }
     }
 }

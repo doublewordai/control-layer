@@ -201,13 +201,11 @@ mod tests {
         let key = create_test_api_key_for_user(&pool, user.id).await;
         let endpoint = create_test_endpoint(&pool, "ep", user.id).await;
         let id = create_test_model(&pool, "m", ALIAS, endpoint, user.id).await;
-        sqlx::query!("UPDATE deployed_models SET cache_pricing_enabled = true WHERE id = $1", id)
-            .execute(&pool)
-            .await
-            .unwrap();
+        // Presence of a cache-tariff row enables caching for the model.
         sqlx::query!(
-            r#"INSERT INTO model_cache_tariffs (deployed_model_id, ttl_tier, write_multiplier, min_prefix_tokens)
-               VALUES ($1, '1h', 2.0, 1024)"#,
+            r#"INSERT INTO model_cache_tariffs
+                 (deployed_model_id, write_multiplier_5m, write_multiplier_1h, write_multiplier_24h, min_prefix_tokens)
+               VALUES ($1, 1.25, 2.0, 2.5, 1024)"#,
             id
         )
         .execute(&pool)

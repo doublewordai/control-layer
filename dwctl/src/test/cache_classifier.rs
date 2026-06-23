@@ -141,16 +141,13 @@ async fn proxied_usage(pool: &PgPool, opts: ProxiedOpts) -> serde_json::Value {
         .add_header(&admin_headers[1].0, &admin_headers[1].1)
         .await;
 
-    // Opt the model into cache pricing (keyed by alias — the routing/gate key) and
-    // give it a 1h tariff so the per-model gate enables with min_prefix 1024.
+    // Enable cache pricing by inserting a tariff row (presence = enabled), keyed by
+    // alias — the routing/gate key. All tiers set; min_prefix 1024.
     if opts.opt_in_cache {
-        sqlx::query!("UPDATE deployed_models SET cache_pricing_enabled = true WHERE alias = 'cache-test'")
-            .execute(pool)
-            .await
-            .expect("opt model into cache pricing");
         sqlx::query!(
-            r#"INSERT INTO model_cache_tariffs (deployed_model_id, ttl_tier, write_multiplier, min_prefix_tokens)
-               SELECT id, '1h', 2.0, 1024 FROM deployed_models WHERE alias = 'cache-test'"#,
+            r#"INSERT INTO model_cache_tariffs
+                 (deployed_model_id, write_multiplier_5m, write_multiplier_1h, write_multiplier_24h, min_prefix_tokens)
+               SELECT id, 1.25, 2.0, 2.5, 1024 FROM deployed_models WHERE alias = 'cache-test'"#,
         )
         .execute(pool)
         .await

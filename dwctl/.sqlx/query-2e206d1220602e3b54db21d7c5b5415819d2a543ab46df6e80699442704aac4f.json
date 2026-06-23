@@ -212,11 +212,6 @@
         "ordinal": 41,
         "name": "backoff_max_total_ms",
         "type_info": "Int4"
-      },
-      {
-        "ordinal": 42,
-        "name": "cache_pricing_enabled",
-        "type_info": "Bool"
       }
     ],
     "parameters": {
@@ -303,8 +298,7 @@
       false,
       false,
       false,
-      true,
-      false
+      true
     ]
   },
   "hash": "2e206d1220602e3b54db21d7c5b5415819d2a543ab46df6e80699442704aac4f"
