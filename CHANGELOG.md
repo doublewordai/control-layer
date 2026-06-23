@@ -1,5 +1,33 @@
 # Changelog
 
+## [8.61.2](https://github.com/doublewordai/control-layer/compare/v8.61.1...v8.61.2) (2026-06-22)
+
+
+### Bug Fixes
+
+* **dashboard:** show a clean error message for failed responses ([#1153](https://github.com/doublewordai/control-layer/issues/1153)) ([d7011de](https://github.com/doublewordai/control-layer/commit/d7011de39f45c6139a284dbdfb74e45a1b632891))
+* **responses:** translate content parts in multi-step executor input ([#1161](https://github.com/doublewordai/control-layer/issues/1161)) ([ce50bd7](https://github.com/doublewordai/control-layer/commit/ce50bd7c13d525a299848772c11ed6965847f84c))
+
+## [8.61.1](https://github.com/doublewordai/control-layer/compare/v8.61.0...v8.61.1) (2026-06-19)
+
+
+### Bug Fixes
+
+* **deps:** bump fusillade to 19.0.0 ([#1162](https://github.com/doublewordai/control-layer/issues/1162)) ([e041b40](https://github.com/doublewordai/control-layer/commit/e041b40d7e86ff26d7d973bf7ee0f853230bb9d1))
+* **playground:** render reasoning from all backend fields ([#1158](https://github.com/doublewordai/control-layer/issues/1158)) ([e1ee0a6](https://github.com/doublewordai/control-layer/commit/e1ee0a6b22d89853f1e3d012ebde41ea21120ce0))
+
+## [8.61.0](https://github.com/doublewordai/control-layer/compare/v8.60.7...v8.61.0) (2026-06-18)
+
+
+### Features
+
+* **cors:** optional any-origin CORS without credentials ([#1155](https://github.com/doublewordai/control-layer/issues/1155)) ([c00b0a5](https://github.com/doublewordai/control-layer/commit/c00b0a51a2c0f83cf527aa8112e726a91ebc9c6a))
+
+
+### Bug Fixes
+
+* **cors:** correct scheme in default dev-frontend origin ([#1156](https://github.com/doublewordai/control-layer/issues/1156)) ([33b6b48](https://github.com/doublewordai/control-layer/commit/33b6b484f490d7d8c1e4034431e5326fe3831631))
+
 ## [8.60.7](https://github.com/doublewordai/control-layer/compare/v8.60.6...v8.60.7) (2026-06-17)
 
 

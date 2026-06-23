@@ -9,7 +9,6 @@ import {
   FileInput,
   FileCheck,
   AlertCircle,
-  X,
   Users,
   ChevronsUpDown,
   Check,
@@ -60,7 +59,6 @@ import { useDebounce } from "../../../../hooks/useDebounce";
 import { usePersistedFilter } from "../../../../hooks/usePersistedFilter";
 import { useAuthorization } from "../../../../utils/authorization";
 import { useOrganizationContext } from "../../../../contexts/organization/useOrganizationContext";
-import { useBootstrapContent } from "@/hooks/use-bootstrap-content";
 import { ApiExamples } from "../../../modals";
 import { cn } from "@/lib/utils";
 
@@ -707,7 +705,6 @@ export function Batches({
     </Popover>
   );
 
-  const bootstrapBanner = useBootstrapContent();
   const [showApiExamples, setShowApiExamples] = useState(false);
 
   return (
@@ -786,22 +783,6 @@ export function Batches({
             </TabsList>
           </div>
         </div>
-
-        {/* Bootstrap Banner */}
-        {bootstrapBanner.content && !bootstrapBanner.isClosed && (
-          <div className="relative mb-6">
-            <div
-              dangerouslySetInnerHTML={{ __html: bootstrapBanner.content }}
-            />
-            <button
-              onClick={bootstrapBanner.close}
-              className="absolute top-3 right-3 rounded-sm opacity-50 transition-opacity hover:opacity-100 focus:ring-2 focus:ring-ring focus:ring-offset-2 focus:outline-hidden"
-              aria-label="Close banner"
-            >
-              <X className="h-4 w-4 text-doubleword-neutral-600" />
-            </button>
-          </div>
-        )}
 
         {/* Content */}
         <TabsContent value="batches" className="space-y-4">

@@ -46,7 +46,7 @@ pub struct ResponsesMiddlewareState<P: PoolProvider + Clone = sqlx_pool_router::
     /// the middleware routes the request through
     /// [`super::streaming::run_inline_streaming`] using these.
     pub response_store: Arc<super::store::FusilladeResponseStore<P>>,
-    pub multi_step_tool_executor: Arc<crate::tool_executor::HttpToolExecutor>,
+    pub multi_step_tool_executor: Arc<crate::inference::tools::HttpToolExecutor>,
     pub multi_step_http_client: Arc<fusillade::ReqwestHttpClient>,
     pub loop_config: onwards::LoopConfig,
     /// Image-input normaliser (content-addressed store). On the **Flex**
@@ -132,7 +132,7 @@ pub async fn responses_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
     if request_value.get("tools").is_none()
         && is_responses_api
         && let Some(key) = api_key.as_deref()
-        && let Ok(Some(resolved)) = crate::tool_injection::resolve_tools_for_request(&state.dwctl_pool, key, Some(model)).await
+        && let Ok(Some(resolved)) = crate::inference::tools::resolve_tools_for_request(&state.dwctl_pool, key, Some(model)).await
     {
         let openai_tools = resolved.to_openai_tools_array();
         if !openai_tools.is_empty() {
@@ -780,18 +780,18 @@ async fn warm_path_setup<P: PoolProvider + Clone + Send + Sync + 'static>(
     request_value: &serde_json::Value,
     api_key: &str,
     model: &str,
-) -> Option<(uuid::Uuid, Arc<crate::tool_executor::ResolvedToolSet>, onwards::UpstreamTarget)> {
+) -> Option<(uuid::Uuid, Arc<crate::inference::tools::ResolvedToolSet>, onwards::UpstreamTarget)> {
     let created_by = response_store::lookup_created_by(&state.dwctl_pool, Some(api_key)).await;
 
-    let resolved = match crate::tool_injection::resolve_tools_for_request(&state.dwctl_pool, api_key, Some(model)).await {
+    let resolved = match crate::inference::tools::resolve_tools_for_request(&state.dwctl_pool, api_key, Some(model)).await {
         Ok(Some(set)) => Arc::new(set),
-        Ok(None) => Arc::new(crate::tool_executor::ResolvedToolSet::new(
+        Ok(None) => Arc::new(crate::inference::tools::ResolvedToolSet::new(
             std::collections::HashMap::new(),
             std::collections::HashMap::new(),
         )),
         Err(e) => {
             tracing::warn!(error = %e, "warm-path: tool resolution failed; running with no tools");
-            Arc::new(crate::tool_executor::ResolvedToolSet::new(
+            Arc::new(crate::inference::tools::ResolvedToolSet::new(
                 std::collections::HashMap::new(),
                 std::collections::HashMap::new(),
             ))
