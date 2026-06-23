@@ -77,6 +77,61 @@ impl EventSink for SseEventSink {
     }
 }
 
+/// One pre-rendered SSE frame for the **flex replay** paths.
+///
+/// Flex tiers are daemon-processed: by the time the result exists it is
+/// already complete, so there is no live loop to forward. When a flex
+/// client asked for `stream:true` we render the finished result into a
+/// sequence of these frames and replay them in one shot via [`replay_sse`].
+///
+/// `event` is the SSE `event:` name — `None` emits an unnamed `data:` frame
+/// (the chat-completions chunk shape), `Some` names the event (`response.*`
+/// for the Responses surface). `data` is the JSON payload.
+pub struct ReplayFrame {
+    pub event: Option<&'static str>,
+    pub data: Value,
+}
+
+impl ReplayFrame {
+    /// Unnamed `data:`-only frame — the chat-completions chunk shape.
+    pub fn unnamed(data: Value) -> Self {
+        Self { event: None, data }
+    }
+
+    /// Named event frame — the Responses `response.*` shape.
+    pub fn named(event: &'static str, data: Value) -> Self {
+        Self { event: Some(event), data }
+    }
+}
+
+/// Build a finite SSE response that replays pre-rendered [`ReplayFrame`]s.
+///
+/// Shared by both flex streaming surfaces (chat-completions and responses):
+/// the daemon already produced the terminal result and the caller rendered
+/// it into frames, so this just emits them as one closed event stream — no
+/// channel, no live loop. The stream never yields an `Err` (the frames are
+/// pre-computed), hence the `Infallible` item error.
+///
+/// `done_sentinel` appends a trailing `data: [DONE]` frame — the
+/// chat-completions terminator. The Responses surface terminates on its
+/// `response.completed` event and passes `false`.
+pub fn replay_sse(frames: Vec<ReplayFrame>, done_sentinel: bool) -> Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>> {
+    let mut events: Vec<Result<Event, std::convert::Infallible>> = frames
+        .into_iter()
+        .map(|f| {
+            let mut event = Event::default().data(f.data.to_string());
+            if let Some(name) = f.event {
+                event = event.event(name);
+            }
+            Ok(event)
+        })
+        .collect();
+    if done_sentinel {
+        events.push(Ok(Event::default().data("[DONE]")));
+    }
+    Sse::new(futures::stream::iter(events)).keep_alive(KeepAlive::default())
+}
+
 /// Run the multi-step loop inline against an SSE response.
 ///
 /// Called by the responses middleware when the user requested

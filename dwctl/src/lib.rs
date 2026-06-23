@@ -1095,7 +1095,7 @@ pub async fn build_router(
     requests_writer_sender: Option<crate::inference::engine::writer::RequestsWriterSender>,
     metrics_recorder: Option<GenAiMetrics>,
     strict_mode: bool,
-    responses_middleware_state: Option<crate::inference::middleware::ResponsesMiddlewareState>,
+    inference_middleware_state: Option<crate::inference::middleware::InferenceMiddlewareState>,
 ) -> anyhow::Result<Router> {
     let config = state.current_config();
 
@@ -1140,7 +1140,7 @@ pub async fn build_router(
         // both the responses middleware is active and we actually have a
         // sender to give the handler; without a sender the handler would
         // silently swallow rows.
-        if let (Some(rms), Some(sender)) = (responses_middleware_state.as_ref(), requests_writer_sender.clone()) {
+        if let (Some(rms), Some(sender)) = (inference_middleware_state.as_ref(), requests_writer_sender.clone()) {
             let fusillade_handler = crate::inference::engine::outlet_handler::FusilladeOutletHandler::new(sender, rms.dwctl_pool.clone());
             multi_handler = multi_handler.with(fusillade_handler);
         }
@@ -1576,10 +1576,10 @@ pub async fn build_router(
     // Apply responses middleware to create pending fusillade rows for /v1/responses requests.
     // This runs BEFORE outlet (outer layer executes first), so the X-Onwards-Response-Id
     // header is set before outlet captures the request and passes it to FusilladeOutletHandler.
-    let onwards_router = if let Some(rms) = responses_middleware_state {
+    let onwards_router = if let Some(rms) = inference_middleware_state {
         onwards_router.layer(middleware::from_fn_with_state(
             rms,
-            crate::inference::middleware::responses_middleware,
+            crate::inference::middleware::inference_middleware,
         ))
     } else {
         onwards_router
@@ -3046,7 +3046,7 @@ impl Application {
         // Responses middleware state. Non-background realtime no longer
         // does any DB work up front; the completion path goes through
         // FusilladeOutletHandler -> RequestsWriter.
-        let responses_middleware_state = crate::inference::middleware::ResponsesMiddlewareState {
+        let inference_middleware_state = crate::inference::middleware::InferenceMiddlewareState {
             request_manager: bg_services.request_manager.clone(),
             daemon_id: crate::inference::store::OnwardsDaemonId(onwards_daemon_id),
             loopback_base_url: {
@@ -3134,7 +3134,7 @@ impl Application {
             bg_services.requests_writer_sender.clone(),
             metrics_recorder,
             bg_services.onwards_targets.strict_mode,
-            Some(responses_middleware_state),
+            Some(inference_middleware_state),
         )
         .await?;
 

@@ -708,7 +708,7 @@ fn state_to_status(state: &str) -> &'static str {
 }
 
 /// Convert a `RequestDetail` into an Open Responses API Response object.
-fn detail_to_response_object(detail: &fusillade::RequestDetail) -> serde_json::Value {
+pub fn detail_to_response_object(detail: &fusillade::RequestDetail) -> serde_json::Value {
     let status = state_to_status(&detail.status);
 
     // Derive background from the stored request body if available.
@@ -889,6 +889,149 @@ pub fn detail_to_chat_completion_object(detail: &fusillade::RequestDetail) -> (u
             )
         }
     }
+}
+
+/// Replay a finished `chat.completion` object as the `chat.completion.chunk`
+/// sequence an OpenAI streaming client expects.
+///
+/// Flex chat-completions are dispatched by the daemon as a single,
+/// non-streaming upstream call, so there is no live token feed to forward.
+/// When the caller asked for `stream:true` we still owe them an SSE stream —
+/// so we replay the completed body as a minimal but well-formed chunk
+/// sequence: per choice, a role-priming chunk, a single content chunk
+/// carrying the full message (content and/or `tool_calls`), then a finish
+/// chunk carrying `finish_reason`. The terminating `data: [DONE]` sentinel
+/// is emitted by the caller, not included here.
+///
+/// `include_usage` mirrors `stream_options.include_usage`: when set, a
+/// trailing usage-only chunk (empty `choices`, populated `usage`) is
+/// appended, matching OpenAI's behaviour.
+///
+/// `completion` is expected to be a successful (`object: "chat.completion"`)
+/// body. If it has no `choices` array the result is just the optional usage
+/// chunk — the caller should only reach this on a 2xx upstream result.
+pub fn chat_completion_to_stream_chunks(completion: &serde_json::Value, include_usage: bool) -> Vec<serde_json::Value> {
+    // Carry the completion's identity fields onto every chunk so the
+    // replayed stream is indistinguishable from a native one.
+    let id = completion.get("id").cloned().unwrap_or(serde_json::Value::Null);
+    let created = completion.get("created").cloned().unwrap_or(serde_json::Value::Null);
+    let model = completion.get("model").cloned().unwrap_or(serde_json::Value::Null);
+    let system_fingerprint = completion.get("system_fingerprint").cloned();
+
+    let base_chunk = |delta: serde_json::Value, index: i64, finish_reason: serde_json::Value| {
+        let mut choice = serde_json::json!({
+            "index": index,
+            "delta": delta,
+            "finish_reason": finish_reason,
+        });
+        // Preserve per-choice logprobs slot as null (OpenAI always emits it).
+        choice["logprobs"] = serde_json::Value::Null;
+        let mut chunk = serde_json::json!({
+            "id": id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [choice],
+        });
+        if let Some(fp) = system_fingerprint.clone() {
+            chunk["system_fingerprint"] = fp;
+        }
+        chunk
+    };
+
+    let mut chunks = Vec::new();
+
+    if let Some(choices) = completion.get("choices").and_then(|c| c.as_array()) {
+        for choice in choices {
+            let index = choice.get("index").and_then(|i| i.as_i64()).unwrap_or(0);
+            let message = choice.get("message").cloned().unwrap_or_else(|| serde_json::json!({}));
+            let role = message.get("role").cloned().unwrap_or_else(|| serde_json::Value::String("assistant".to_string()));
+            let finish_reason = choice.get("finish_reason").cloned().unwrap_or(serde_json::Value::Null);
+
+            // 1. Role-priming chunk: delta carries the role and an empty
+            //    content string, finish_reason null — exactly what a native
+            //    stream's first chunk looks like.
+            chunks.push(base_chunk(
+                serde_json::json!({ "role": role, "content": "" }),
+                index,
+                serde_json::Value::Null,
+            ));
+
+            // 2. Content/tool-call chunk: the full assistant payload in one
+            //    delta. We don't tokenise — there's nothing to tokenise from,
+            //    the upstream call already finished — but the client receives
+            //    the complete message before the finish marker.
+            let mut delta = serde_json::Map::new();
+            if let Some(content) = message.get("content")
+                && !content.is_null()
+            {
+                delta.insert("content".to_string(), content.clone());
+            }
+            if let Some(tool_calls) = message.get("tool_calls")
+                && !tool_calls.is_null()
+            {
+                delta.insert("tool_calls".to_string(), tool_calls.clone());
+            }
+            if !delta.is_empty() {
+                chunks.push(base_chunk(serde_json::Value::Object(delta), index, serde_json::Value::Null));
+            }
+
+            // 3. Finish chunk: empty delta, the choice's finish_reason.
+            chunks.push(base_chunk(serde_json::json!({}), index, finish_reason));
+        }
+    }
+
+    // 4. Optional usage chunk: empty choices, populated usage — only when
+    //    the client opted in via stream_options.include_usage.
+    if include_usage && let Some(usage) = completion.get("usage") {
+        let mut chunk = serde_json::json!({
+            "id": id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": model,
+            "choices": [],
+            "usage": usage.clone(),
+        });
+        if let Some(fp) = system_fingerprint {
+            chunk["system_fingerprint"] = fp;
+        }
+        chunks.push(chunk);
+    }
+
+    chunks
+}
+
+/// Replay a finished Responses-API object as the `response.*` SSE event
+/// sequence a streaming client expects.
+///
+/// Flex `/v1/responses` is daemon-processed, so — exactly like the
+/// chat-completions case — there is no live token feed to forward. When the
+/// client asked for `stream:true` we still owe them the event-stream shape,
+/// so we replay the completed object as the minimal valid sequence the live
+/// warm path also emits ([`crate::inference::streaming::run_inline_streaming`]
+/// via onwards): a `response.created` event carrying the in-progress stub,
+/// then a `response.completed` event carrying the full response object. The
+/// Responses streaming surface has no `[DONE]` sentinel — `response.completed`
+/// is itself the terminator.
+///
+/// Each tuple is `(event_name, data)`; `event_name` is fed to the SSE
+/// `event:` field. Only successful (`status:"completed"`) objects should be
+/// replayed — the caller surfaces failures as a JSON error envelope before
+/// any stream byte is sent.
+pub fn response_object_to_stream_events(response: &serde_json::Value) -> Vec<(&'static str, serde_json::Value)> {
+    // `response.created` mirrors the live loop's once-per-response stub
+    // (see onwards `response_loop`): id + object + in-progress status only.
+    let created = serde_json::json!({
+        "id": response.get("id").cloned().unwrap_or(serde_json::Value::Null),
+        "object": "response",
+        "status": "in_progress",
+    });
+    vec![
+        ("response.created", created),
+        // `response.completed` carries the full assembled object, matching
+        // the `NextAction::Complete(payload)` the live loop emits.
+        ("response.completed", response.clone()),
+    ]
 }
 
 #[async_trait]
@@ -1158,6 +1301,126 @@ mod tests {
         let id = format!("resp_{uuid}");
         let parsed = parse_response_id(&id).unwrap();
         assert_eq!(parsed, uuid);
+    }
+
+    #[test]
+    fn test_chat_completion_to_stream_chunks_basic() {
+        let completion = serde_json::json!({
+            "id": "chatcmpl-abc",
+            "object": "chat.completion",
+            "created": 1_700_000_000,
+            "model": "gpt-test",
+            "choices": [{
+                "index": 0,
+                "message": { "role": "assistant", "content": "hello world" },
+                "finish_reason": "stop",
+            }],
+            "usage": { "prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7 },
+        });
+
+        let chunks = chat_completion_to_stream_chunks(&completion, false);
+        // role chunk + content chunk + finish chunk. No usage chunk (not requested).
+        assert_eq!(chunks.len(), 3);
+
+        // Identity fields are carried onto every chunk and re-objected.
+        for c in &chunks {
+            assert_eq!(c["id"], "chatcmpl-abc");
+            assert_eq!(c["object"], "chat.completion.chunk");
+            assert_eq!(c["created"], 1_700_000_000_i64);
+            assert_eq!(c["model"], "gpt-test");
+            assert_eq!(c["choices"][0]["index"], 0);
+        }
+
+        // Role chunk.
+        assert_eq!(chunks[0]["choices"][0]["delta"]["role"], "assistant");
+        assert_eq!(chunks[0]["choices"][0]["delta"]["content"], "");
+        assert!(chunks[0]["choices"][0]["finish_reason"].is_null());
+
+        // Content chunk carries the full message text.
+        assert_eq!(chunks[1]["choices"][0]["delta"]["content"], "hello world");
+        assert!(chunks[1]["choices"][0]["finish_reason"].is_null());
+
+        // Finish chunk: empty delta, finish_reason present.
+        assert_eq!(chunks[2]["choices"][0]["delta"], serde_json::json!({}));
+        assert_eq!(chunks[2]["choices"][0]["finish_reason"], "stop");
+    }
+
+    #[test]
+    fn test_chat_completion_to_stream_chunks_include_usage() {
+        let completion = serde_json::json!({
+            "id": "chatcmpl-abc",
+            "model": "gpt-test",
+            "choices": [{
+                "index": 0,
+                "message": { "role": "assistant", "content": "hi" },
+                "finish_reason": "stop",
+            }],
+            "usage": { "total_tokens": 7 },
+        });
+
+        let chunks = chat_completion_to_stream_chunks(&completion, true);
+        // role + content + finish + usage.
+        assert_eq!(chunks.len(), 4);
+        let usage_chunk = chunks.last().unwrap();
+        assert_eq!(usage_chunk["choices"], serde_json::json!([]));
+        assert_eq!(usage_chunk["usage"]["total_tokens"], 7);
+    }
+
+    #[test]
+    fn test_response_object_to_stream_events() {
+        let response = serde_json::json!({
+            "id": "resp_abc",
+            "object": "response",
+            "status": "completed",
+            "model": "gpt-test",
+            "output": [{ "type": "message", "role": "assistant", "content": "hi" }],
+            "usage": { "total_tokens": 4 },
+        });
+
+        let events = response_object_to_stream_events(&response);
+        assert_eq!(events.len(), 2);
+
+        // `response.created` is the in-progress stub: id + object + status only.
+        assert_eq!(events[0].0, "response.created");
+        assert_eq!(events[0].1["id"], "resp_abc");
+        assert_eq!(events[0].1["object"], "response");
+        assert_eq!(events[0].1["status"], "in_progress");
+        // The stub does not leak output/usage.
+        assert!(events[0].1.get("output").is_none());
+
+        // `response.completed` carries the full object verbatim — terminator,
+        // no `[DONE]`.
+        assert_eq!(events[1].0, "response.completed");
+        assert_eq!(events[1].1, response);
+    }
+
+    #[test]
+    fn test_chat_completion_to_stream_chunks_tool_calls() {
+        let completion = serde_json::json!({
+            "id": "chatcmpl-tc",
+            "model": "gpt-test",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": serde_json::Value::Null,
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": { "name": "get_weather", "arguments": "{}" },
+                    }],
+                },
+                "finish_reason": "tool_calls",
+            }],
+        });
+
+        let chunks = chat_completion_to_stream_chunks(&completion, false);
+        // role + tool_calls content chunk + finish.
+        assert_eq!(chunks.len(), 3);
+        // Null content is omitted from the delta; tool_calls is carried through.
+        assert!(chunks[1]["choices"][0]["delta"].get("content").is_none());
+        assert_eq!(chunks[1]["choices"][0]["delta"]["tool_calls"][0]["id"], "call_1");
+        assert_eq!(chunks[2]["choices"][0]["finish_reason"], "tool_calls");
     }
 
     #[test]
