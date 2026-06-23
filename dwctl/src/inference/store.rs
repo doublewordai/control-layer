@@ -1010,31 +1010,102 @@ pub fn chat_completion_to_stream_chunks(completion: &serde_json::Value, include_
 /// Flex `/v1/responses` is daemon-processed, so — exactly like the
 /// chat-completions case — there is no live token feed to forward. When the
 /// client asked for `stream:true` we still owe them the event-stream shape,
-/// so we replay the completed object as the minimal valid sequence the live
-/// warm path also emits ([`crate::inference::streaming::run_inline_streaming`]
-/// via onwards): a `response.created` event carrying the in-progress stub,
-/// then a `response.completed` event carrying the full response object. The
-/// Responses streaming surface has no `[DONE]` sentinel — `response.completed`
-/// is itself the terminator.
+/// so we replay the finished object as the OpenAI Responses streaming
+/// lifecycle.
 ///
-/// Each tuple is `(event_name, data)`; `event_name` is fed to the SSE
-/// `event:` field. Only successful (`status:"completed"`) objects should be
-/// replayed — the caller surfaces failures as a JSON error envelope before
-/// any stream byte is sent.
+/// Crucially, real Responses clients (the Vercel AI SDK / OpenAI SDK that
+/// opencode uses) dispatch on the `type` field **inside** each event's JSON
+/// and reconstruct the assistant text from the *lifecycle* events
+/// (`response.output_item.added` → text-start, `response.output_text.delta` →
+/// text-delta, `response.output_item.done` → text-end). They do **not** read
+/// text out of `response.completed`. So a minimal created+completed pair would
+/// leave the client with empty text — we must replay the full lifecycle:
+///
+///   response.created
+///   ├─ per assistant message item:
+///   │    response.output_item.added      (opens the text part)
+///   │    response.output_text.delta      (the whole text in one delta)
+///   │    response.output_text.done
+///   │    response.output_item.done       (closes the text part)
+///   response.completed                   (terminator; carries usage)
+///
+/// Tool-call / reasoning items in `output` are passed through inside
+/// `response.completed` but not given their own lifecycle events here (the
+/// flex surface is text-first; extend this if tool streaming over flex is
+/// needed). Each tuple is `(event_name, data)`; the event name is fed to the
+/// SSE `event:` field *and* stamped into `data["type"]` (clients read the
+/// latter). The Responses surface has no `[DONE]` sentinel —
+/// `response.completed` is the terminator.
 pub fn response_object_to_stream_events(response: &serde_json::Value) -> Vec<(&'static str, serde_json::Value)> {
-    // `response.created` mirrors the live loop's once-per-response stub
-    // (see onwards `response_loop`): id + object + in-progress status only.
-    let created = serde_json::json!({
-        "id": response.get("id").cloned().unwrap_or(serde_json::Value::Null),
-        "object": "response",
-        "status": "in_progress",
+    let id = response.get("id").cloned().unwrap_or(serde_json::Value::Null);
+    let created_at = response.get("created_at").cloned().unwrap_or(serde_json::Value::Null);
+    let model = response.get("model").cloned().unwrap_or(serde_json::Value::Null);
+
+    // In-progress stub carried by the lifecycle "open" events (clients read
+    // id/created_at/model off `response.created` for response metadata).
+    let stub = serde_json::json!({
+        "id": id, "object": "response", "status": "in_progress",
+        "created_at": created_at, "model": model, "output": [],
     });
-    vec![
-        ("response.created", created),
-        // `response.completed` carries the full assembled object, matching
-        // the `NextAction::Complete(payload)` the live loop emits.
-        ("response.completed", response.clone()),
-    ]
+
+    // Stamp `type` + a monotonic `sequence_number` onto each event, matching
+    // the OpenAI Responses streaming envelope.
+    let mut seq: i64 = 0;
+    let mut mk = |name: &'static str, mut data: serde_json::Value| -> (&'static str, serde_json::Value) {
+        data["type"] = serde_json::Value::String(name.to_string());
+        data["sequence_number"] = serde_json::Value::from(seq);
+        seq += 1;
+        (name, data)
+    };
+
+    let mut events: Vec<(&'static str, serde_json::Value)> = Vec::new();
+    events.push(mk("response.created", serde_json::json!({ "response": stub })));
+
+    // Walk assistant message items and replay each as a text part.
+    if let Some(output) = response.get("output").and_then(|o| o.as_array()) {
+        for (output_index, item) in output.iter().enumerate() {
+            if item.get("type").and_then(|t| t.as_str()) != Some("message") {
+                continue; // tool_call / reasoning: carried in completed only
+            }
+            let item_id = item.get("id").and_then(|i| i.as_str()).unwrap_or("msg_0").to_string();
+            // Concatenate all output_text parts into the single replayed delta.
+            let text: String = item
+                .get("content")
+                .and_then(|c| c.as_array())
+                .map(|parts| {
+                    parts
+                        .iter()
+                        .filter(|p| p.get("type").and_then(|t| t.as_str()) == Some("output_text"))
+                        .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+                        .collect::<String>()
+                })
+                .unwrap_or_default();
+
+            events.push(mk(
+                "response.output_item.added",
+                serde_json::json!({
+                    "output_index": output_index,
+                    "item": { "type": "message", "id": item_id, "status": "in_progress", "role": "assistant", "content": [] },
+                }),
+            ));
+            events.push(mk(
+                "response.output_text.delta",
+                serde_json::json!({ "item_id": item_id, "output_index": output_index, "content_index": 0, "delta": text }),
+            ));
+            events.push(mk(
+                "response.output_text.done",
+                serde_json::json!({ "item_id": item_id, "output_index": output_index, "content_index": 0, "text": text }),
+            ));
+            events.push(mk(
+                "response.output_item.done",
+                serde_json::json!({ "output_index": output_index, "item": item.clone() }),
+            ));
+        }
+    }
+
+    // Terminator: carries the full assembled object (usage, status, etc.).
+    events.push(mk("response.completed", serde_json::json!({ "response": response.clone() })));
+    events
 }
 
 #[async_trait]
@@ -1376,25 +1447,52 @@ mod tests {
             "object": "response",
             "status": "completed",
             "model": "gpt-test",
-            "output": [{ "type": "message", "role": "assistant", "content": "hi" }],
+            "created_at": 1_700_000_000_i64,
+            "output": [{
+                "type": "message",
+                "id": "msg_1",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{ "type": "output_text", "text": "hi", "annotations": [] }],
+            }],
             "usage": { "total_tokens": 4 },
         });
 
         let events = response_object_to_stream_events(&response);
-        assert_eq!(events.len(), 2);
+        // created + (item.added, text.delta, text.done, item.done) + completed
+        let names: Vec<&str> = events.iter().map(|(n, _)| *n).collect();
+        assert_eq!(
+            names,
+            vec![
+                "response.created",
+                "response.output_item.added",
+                "response.output_text.delta",
+                "response.output_text.done",
+                "response.output_item.done",
+                "response.completed",
+            ]
+        );
 
-        // `response.created` is the in-progress stub: id + object + status only.
-        assert_eq!(events[0].0, "response.created");
-        assert_eq!(events[0].1["id"], "resp_abc");
-        assert_eq!(events[0].1["object"], "response");
-        assert_eq!(events[0].1["status"], "in_progress");
-        // The stub does not leak output/usage.
-        assert!(events[0].1.get("output").is_none());
+        // Every event stamps `type` (clients dispatch on it) and a sequence.
+        for (i, (name, data)) in events.iter().enumerate() {
+            assert_eq!(data["type"], *name);
+            assert_eq!(data["sequence_number"], i as i64);
+        }
 
-        // `response.completed` carries the full object verbatim — terminator,
-        // no `[DONE]`.
-        assert_eq!(events[1].0, "response.completed");
-        assert_eq!(events[1].1, response);
+        // created carries response metadata (id/created_at/model) for the client.
+        assert_eq!(events[0].1["response"]["id"], "resp_abc");
+        assert_eq!(events[0].1["response"]["status"], "in_progress");
+
+        // The text-bearing events must carry the assistant text — this is what
+        // the AI SDK reconstructs the message from (NOT response.completed).
+        assert_eq!(events[1].1["item"]["type"], "message");
+        assert_eq!(events[2].1["delta"], "hi");
+        assert_eq!(events[2].1["item_id"], events[1].1["item"]["id"]);
+        assert_eq!(events[3].1["text"], "hi");
+
+        // completed carries the full object (usage, terminal status).
+        assert_eq!(events[5].1["response"], response);
+        assert_eq!(events[5].1["response"]["usage"]["total_tokens"], 4);
     }
 
     #[test]
