@@ -945,7 +945,10 @@ pub fn chat_completion_to_stream_chunks(completion: &serde_json::Value, include_
         for choice in choices {
             let index = choice.get("index").and_then(|i| i.as_i64()).unwrap_or(0);
             let message = choice.get("message").cloned().unwrap_or_else(|| serde_json::json!({}));
-            let role = message.get("role").cloned().unwrap_or_else(|| serde_json::Value::String("assistant".to_string()));
+            let role = message
+                .get("role")
+                .cloned()
+                .unwrap_or_else(|| serde_json::Value::String("assistant".to_string()));
             let finish_reason = choice.get("finish_reason").cloned().unwrap_or(serde_json::Value::Null);
 
             // 1. Role-priming chunk: delta carries the role and an empty

@@ -28,7 +28,7 @@ use sqlx_pool_router::PoolProvider;
 
 use super::image_normalizer_middleware::{normalize_error_response, normalize_value_to_tokens};
 use super::store::{self as response_store, ONWARDS_RESPONSE_ID_HEADER, OnwardsDaemonId};
-use super::streaming::{ReplayFrame, replay_sse};
+use super::streaming::{ReplayFrame, flex_stream_response};
 use crate::image_normalizer::ImageNormalizer;
 
 /// State for the inference middleware.
@@ -679,102 +679,15 @@ async fn handle_chat_completion_flex<P: PoolProvider + Clone + Send + Sync + 'st
     }
 }
 
-/// How a terminal flex result should be rendered to a streaming client.
-///
-/// A flex streaming request always polls the daemon to a terminal state
-/// *before* sending any byte, so — unlike a live stream — we can still choose
-/// a plain JSON error response when the result is a failure (matching how
-/// OpenAI reports an error that happens before the stream opens).
-enum FlexStreamRender {
-    /// 2xx — replay these frames as an SSE stream. `done_sentinel` appends the
-    /// chat-completions `data: [DONE]` terminator (the Responses surface ends
-    /// on `response.completed` and passes `false`).
-    Stream { frames: Vec<ReplayFrame>, done_sentinel: bool },
-    /// Non-2xx — surface as a plain JSON error envelope with this status,
-    /// before any stream byte is sent.
-    Error { status: StatusCode, body: serde_json::Value },
-}
-
-/// Shared scaffold for the streaming flex surfaces (chat-completions and
-/// responses). Enqueues the pending row, blocks on the daemon until terminal,
-/// then defers to `render` to turn the terminal [`fusillade::RequestDetail`]
-/// into either an SSE replay or a JSON error. Enqueue and timeout failures map
-/// to the canonical 500 / 504 envelopes shared by both surfaces.
-///
-/// The per-surface differences (response shape, event names, `[DONE]`) live
-/// entirely in `render`; everything else — the daemon round-trip and the
-/// failure envelopes — is shared here.
-async fn run_flex_stream<P, F>(
-    state: &InferenceMiddlewareState<P>,
-    flex_input: fusillade::CreateFlexInput,
-    request_id: uuid::Uuid,
-    render: F,
-) -> Response
-where
-    P: PoolProvider + Clone + Send + Sync + 'static,
-    F: FnOnce(&fusillade::RequestDetail) -> FlexStreamRender,
-{
-    if let Err(e) = fusillade::Storage::create_flex(&*state.request_manager, flex_input).await {
-        tracing::error!(error = %e, "Failed to create streaming flex batch in fusillade");
-        return Response::builder()
-            .status(StatusCode::INTERNAL_SERVER_ERROR)
-            .header("content-type", "application/json")
-            .body(Body::from(
-                serde_json::json!({
-                    "error": {
-                        "message": "Failed to enqueue request",
-                        "type": "server_error",
-                        "code": 500,
-                    }
-                })
-                .to_string(),
-            ))
-            .unwrap();
-    }
-
-    let poll_interval = std::time::Duration::from_millis(500);
-    let timeout = std::time::Duration::from_secs(3600);
-
-    match response_store::poll_until_terminal(&state.request_manager, request_id, poll_interval, timeout).await {
-        Ok(detail) => match render(&detail) {
-            FlexStreamRender::Stream { frames, done_sentinel } => {
-                tracing::debug!(request_id = %request_id, "Flex terminal — replaying as SSE");
-                replay_sse(frames, done_sentinel).into_response()
-            }
-            FlexStreamRender::Error { status, body } => {
-                // Pre-stream failure: a plain JSON error envelope, not a
-                // half-open event stream.
-                tracing::debug!(request_id = %request_id, %status, "Flex terminal — error, surfaced as JSON");
-                (status, Json(body)).into_response()
-            }
-        },
-        Err(e) => {
-            // poll_until_terminal conflates the 1h timeout (504-shaped) with a
-            // storage/connection error (500-shaped); 504 is the dominant case
-            // in practice, so we surface that and log the underlying error.
-            tracing::error!(error = %e, request_id = %request_id, "Streaming flex poll failed");
-            (
-                StatusCode::GATEWAY_TIMEOUT,
-                Json(serde_json::json!({
-                    "error": {
-                        "message": format!("Request timed out: {e}"),
-                        "type": "server_error",
-                        "code": 504,
-                    }
-                })),
-            )
-                .into_response()
-        }
-    }
-}
-
 /// Handle a streaming flex `/v1/chat/completions` request.
 ///
-/// Blocks on the daemon (the `stream`/`stream_options` keys were stripped from
-/// the daemon-bound body by the caller, so it makes one non-streaming upstream
-/// call) then replays the finished `chat.completion` as an SSE
-/// `chat.completion.chunk` stream terminated by `data: [DONE]`. Errors surface
-/// as a plain JSON envelope. `include_usage` mirrors the client's
+/// Respond-first (see [`flex_stream_response`]): returns `200
+/// text/event-stream` immediately and fills the stream once the daemon
+/// finishes the (non-streaming, since the caller stripped `stream`) upstream
+/// call. The finished `chat.completion` is replayed as a
+/// `chat.completion.chunk` stream terminated by `data: [DONE]`; a non-2xx
+/// result is emitted as an in-stream `data: {"error": …}` frame (still
+/// followed by `[DONE]`). `include_usage` mirrors the client's
 /// `stream_options.include_usage`.
 async fn handle_chat_completion_flex_streaming<P: PoolProvider + Clone + Send + Sync + 'static>(
     state: &InferenceMiddlewareState<P>,
@@ -782,55 +695,83 @@ async fn handle_chat_completion_flex_streaming<P: PoolProvider + Clone + Send + 
     request_id: uuid::Uuid,
     include_usage: bool,
 ) -> Response {
-    run_flex_stream(state, flex_input, request_id, |detail| {
-        let (status, body) = response_store::detail_to_chat_completion_object(detail);
-        let status_code = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-        if status_code.is_success() {
-            let frames = response_store::chat_completion_to_stream_chunks(&body, include_usage)
-                .into_iter()
-                .map(ReplayFrame::unnamed)
-                .collect();
-            FlexStreamRender::Stream { frames, done_sentinel: true }
-        } else {
-            FlexStreamRender::Error { status: status_code, body }
-        }
-    })
+    flex_stream_response(
+        state.request_manager.clone(),
+        flex_input,
+        request_id,
+        true,
+        move |result| match result {
+            Ok(detail) => {
+                let (status, body) = response_store::detail_to_chat_completion_object(detail);
+                if status < 400 {
+                    response_store::chat_completion_to_stream_chunks(&body, include_usage)
+                        .into_iter()
+                        .map(ReplayFrame::unnamed)
+                        .collect()
+                } else {
+                    // `body` is already the chat-completions error envelope
+                    // ({"error": …}); emit it verbatim as one in-stream frame.
+                    vec![ReplayFrame::unnamed(body)]
+                }
+            }
+            Err(msg) => vec![ReplayFrame::unnamed(serde_json::json!({
+                "error": { "message": format!("Request failed: {msg}"), "type": "server_error", "code": 504 }
+            }))],
+        },
+    )
     .await
 }
 
 /// Handle a streaming flex `/v1/responses` request (`stream:true`, not
 /// `background`).
 ///
-/// Symmetric with [`handle_chat_completion_flex_streaming`]: blocks on the
-/// daemon then replays the finished Responses object as the `response.*` SSE
-/// event sequence the live warm path also emits (`response.created` →
-/// `response.completed`). There is no `[DONE]` sentinel on this surface —
-/// `response.completed` is the terminator. Failures surface as a plain JSON
-/// error envelope with the upstream status.
+/// Symmetric with [`handle_chat_completion_flex_streaming`]: respond-first,
+/// then replay the finished Responses object as the `response.*` SSE event
+/// sequence the live warm path also emits — `response.created` →
+/// `response.completed` on success, `response.created` → `response.failed` on
+/// error. There is no `[DONE]` sentinel on this surface; the terminal event
+/// is the terminator.
 async fn handle_responses_flex_streaming<P: PoolProvider + Clone + Send + Sync + 'static>(
     state: &InferenceMiddlewareState<P>,
     flex_input: fusillade::CreateFlexInput,
     request_id: uuid::Uuid,
 ) -> Response {
-    run_flex_stream(state, flex_input, request_id, |detail| {
-        let response = response_store::detail_to_response_object(detail);
-        if response["status"] == "completed" {
-            let frames = response_store::response_object_to_stream_events(&response)
-                .into_iter()
-                .map(|(event, data)| ReplayFrame::named(event, data))
-                .collect();
-            FlexStreamRender::Stream { frames, done_sentinel: false }
-        } else {
-            // detail_to_response_object stamps the upstream status onto
-            // error.code for failed responses; fall back to 500 otherwise
-            // (e.g. canceled), matching handle_flex.
-            let status = response["error"]["code"]
-                .as_u64()
-                .and_then(|c| StatusCode::from_u16(c as u16).ok())
-                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-            FlexStreamRender::Error { status, body: response }
-        }
-    })
+    flex_stream_response(
+        state.request_manager.clone(),
+        flex_input,
+        request_id,
+        false,
+        move |result| match result {
+            Ok(detail) => {
+                let response = response_store::detail_to_response_object(detail);
+                if response["status"] == "completed" {
+                    response_store::response_object_to_stream_events(&response)
+                        .into_iter()
+                        .map(|(event, data)| ReplayFrame::named(event, data))
+                        .collect()
+                } else {
+                    // Failure path: emit the created stub then `response.failed`
+                    // carrying the response object (which holds status + error),
+                    // mirroring the live loop's terminal `Failed` event.
+                    let stub = serde_json::json!({
+                        "id": response.get("id").cloned().unwrap_or(serde_json::Value::Null),
+                        "object": "response",
+                        "status": "in_progress",
+                    });
+                    vec![
+                        ReplayFrame::named("response.created", stub),
+                        ReplayFrame::named("response.failed", response),
+                    ]
+                }
+            }
+            Err(msg) => {
+                let err = serde_json::json!({
+                    "error": { "message": format!("Request failed: {msg}"), "type": "server_error", "code": 504 }
+                });
+                vec![ReplayFrame::named("response.failed", err)]
+            }
+        },
+    )
     .await
 }
 

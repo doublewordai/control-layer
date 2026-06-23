@@ -77,12 +77,17 @@ impl EventSink for SseEventSink {
     }
 }
 
-/// One pre-rendered SSE frame for the **flex replay** paths.
+/// Buffer for the flex replay channel. A flex replay emits only a handful
+/// of frames (role/content/finish, or created/completed), so this is tiny —
+/// it exists only to decouple the poll task from the HTTP writer.
+const FLEX_REPLAY_BUFFER: usize = 16;
+
+/// One rendered SSE frame for the **flex replay** paths.
 ///
 /// Flex tiers are daemon-processed: by the time the result exists it is
 /// already complete, so there is no live loop to forward. When a flex
 /// client asked for `stream:true` we render the finished result into a
-/// sequence of these frames and replay them in one shot via [`replay_sse`].
+/// sequence of these frames and emit them via [`flex_stream_response`].
 ///
 /// `event` is the SSE `event:` name — `None` emits an unnamed `data:` frame
 /// (the chat-completions chunk shape), `Some` names the event (`response.*`
@@ -104,32 +109,90 @@ impl ReplayFrame {
     }
 }
 
-/// Build a finite SSE response that replays pre-rendered [`ReplayFrame`]s.
+/// Respond-first SSE for the blocking flex streaming surfaces
+/// (chat-completions and responses).
 ///
-/// Shared by both flex streaming surfaces (chat-completions and responses):
-/// the daemon already produced the terminal result and the caller rendered
-/// it into frames, so this just emits them as one closed event stream — no
-/// channel, no live loop. The stream never yields an `Err` (the frames are
-/// pre-computed), hence the `Infallible` item error.
+/// Flex is daemon-processed and can sit queued for a long time, so we return
+/// `200 text/event-stream` immediately and poll the daemon *inside* the
+/// stream. axum's [`KeepAlive`] injects `:` comments while we wait, keeping
+/// the client connection warm past idle timeouts (a poll-then-respond design
+/// would send no bytes — not even headers — until the daemon finished, and a
+/// client idle timeout could fire first).
 ///
-/// `done_sentinel` appends a trailing `data: [DONE]` frame — the
-/// chat-completions terminator. The Responses surface terminates on its
-/// `response.completed` event and passes `false`.
-pub fn replay_sse(frames: Vec<ReplayFrame>, done_sentinel: bool) -> Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>> {
-    let mut events: Vec<Result<Event, std::convert::Infallible>> = frames
-        .into_iter()
-        .map(|f| {
-            let mut event = Event::default().data(f.data.to_string());
-            if let Some(name) = f.event {
+/// When the request reaches a terminal state, `render` turns the outcome —
+/// `Ok(detail)` on a terminal row, `Err(msg)` on timeout/poll failure — into
+/// the frames to emit: success chunks/events on 2xx, an in-stream error frame
+/// otherwise. Errors are delivered *down the stream*, not as an HTTP status,
+/// because the `200` was already committed.
+///
+/// Enqueue failure is the one exception: it happens before any byte is sent,
+/// so it still returns a clean JSON `500`.
+///
+/// `done_sentinel` appends a trailing `data: [DONE]` (the chat-completions
+/// terminator); the Responses surface ends on `response.completed`/`.failed`
+/// and passes `false`.
+pub async fn flex_stream_response<P, F>(
+    request_manager: Arc<fusillade::PostgresRequestManager<P, ReqwestHttpClient>>,
+    flex_input: fusillade::CreateFlexInput,
+    request_id: uuid::Uuid,
+    done_sentinel: bool,
+    render: F,
+) -> axum::response::Response
+where
+    P: fusillade::PoolProvider + Clone + Send + Sync + 'static,
+    F: FnOnce(Result<&fusillade::RequestDetail, &str>) -> Vec<ReplayFrame> + Send + 'static,
+{
+    use axum::response::IntoResponse;
+
+    // Enqueue synchronously so an enqueue failure is a clean JSON 500 — it
+    // happens before the stream opens, so we're not yet committed to a 200.
+    if let Err(e) = fusillade::Storage::create_flex(&*request_manager, flex_input).await {
+        tracing::error!(error = %e, "Failed to create streaming flex batch in fusillade");
+        return axum::response::Response::builder()
+            .status(axum::http::StatusCode::INTERNAL_SERVER_ERROR)
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                serde_json::json!({
+                    "error": { "message": "Failed to enqueue request", "type": "server_error", "code": 500 }
+                })
+                .to_string(),
+            ))
+            .unwrap();
+    }
+
+    let (tx, rx) = mpsc::channel::<Result<Event, std::convert::Infallible>>(FLEX_REPLAY_BUFFER);
+
+    // Poll task: the HTTP response is already returning; this fills the stream
+    // once the daemon reaches a terminal state. Until then the channel is idle
+    // and axum's keep-alive holds the connection open.
+    tokio::spawn(async move {
+        let poll_interval = std::time::Duration::from_millis(500);
+        let timeout = std::time::Duration::from_secs(3600);
+        let result = crate::inference::store::poll_until_terminal(&request_manager, request_id, poll_interval, timeout).await;
+
+        let frames = match &result {
+            Ok(detail) => render(Ok(detail)),
+            Err(e) => {
+                tracing::error!(error = %e, request_id = %request_id, "Streaming flex poll failed");
+                render(Err(&e.to_string()))
+            }
+        };
+
+        for frame in frames {
+            let mut event = Event::default().data(frame.data.to_string());
+            if let Some(name) = frame.event {
                 event = event.event(name);
             }
-            Ok(event)
-        })
-        .collect();
-    if done_sentinel {
-        events.push(Ok(Event::default().data("[DONE]")));
-    }
-    Sse::new(futures::stream::iter(events)).keep_alive(KeepAlive::default())
+            if tx.send(Ok(event)).await.is_err() {
+                return; // client disconnected
+            }
+        }
+        if done_sentinel {
+            let _ = tx.send(Ok(Event::default().data("[DONE]"))).await;
+        }
+    });
+
+    Sse::new(ReceiverStream::new(rx)).keep_alive(KeepAlive::default()).into_response()
 }
 
 /// Run the multi-step loop inline against an SSE response.
