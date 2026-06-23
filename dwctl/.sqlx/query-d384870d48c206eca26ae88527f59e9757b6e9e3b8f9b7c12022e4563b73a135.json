@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT bool_or(dm.cache_pricing_enabled) AS enabled,\n                   MIN(mct.min_prefix_tokens)        AS min_prefix\n            FROM deployed_models dm\n            LEFT JOIN model_cache_tariffs mct\n              ON mct.deployed_model_id = dm.id\n             AND (mct.valid_until IS NULL OR mct.valid_until > now())\n            WHERE dm.alias = $1 AND dm.deleted = false\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "enabled",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 1,
+        "name": "min_prefix",
+        "type_info": "Int4"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      null,
+      null
+    ]
+  },
+  "hash": "d384870d48c206eca26ae88527f59e9757b6e9e3b8f9b7c12022e4563b73a135"
+}

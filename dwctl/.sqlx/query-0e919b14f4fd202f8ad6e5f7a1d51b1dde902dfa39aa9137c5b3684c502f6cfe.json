@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            WITH user_checkpoint AS (\n                SELECT checkpoint_seq, balance\n                FROM user_balance_checkpoints\n                WHERE user_id = $1\n            )\n            SELECT\n                COALESCE((SELECT balance FROM user_checkpoint), 0) +\n                COALESCE((\n                    SELECT SUM(\n                        CASE WHEN transaction_type IN ('admin_grant', 'purchase') THEN amount ELSE -amount END\n                    )\n                    FROM credits_transactions\n                    WHERE user_id = $1\n                    AND seq > COALESCE((SELECT checkpoint_seq FROM user_checkpoint), 0)\n                ), 0) as \"balance!\",\n                (SELECT MAX(seq) FROM credits_transactions WHERE user_id = $1) as latest_seq\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "balance!",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 1,
+        "name": "latest_seq",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null,
+      null
+    ]
+  },
+  "hash": "0e919b14f4fd202f8ad6e5f7a1d51b1dde902dfa39aa9137c5b3684c502f6cfe"
+}

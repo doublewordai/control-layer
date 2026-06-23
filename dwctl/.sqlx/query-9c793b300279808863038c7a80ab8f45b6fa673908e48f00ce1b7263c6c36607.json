@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM deployment_tool_sources WHERE deployment_id = $1 AND tool_source_id = $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "9c793b300279808863038c7a80ab8f45b6fa673908e48f00ce1b7263c6c36607"
+}

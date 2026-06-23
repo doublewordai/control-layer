@@ -1,0 +1,35 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT\n                probe_id,\n                COUNT(*) as total,\n                COUNT(*) FILTER (WHERE success = true) as successful\n            FROM probe_results\n            WHERE probe_id = ANY($1) AND executed_at >= $2\n            GROUP BY probe_id\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "probe_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "total",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "successful",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "UuidArray",
+        "Timestamptz"
+      ]
+    },
+    "nullable": [
+      false,
+      null,
+      null
+    ]
+  },
+  "hash": "ea5dc57fa27e316d8473891e1a67b54b721571e263727fb45c856e2ac6c202eb"
+}

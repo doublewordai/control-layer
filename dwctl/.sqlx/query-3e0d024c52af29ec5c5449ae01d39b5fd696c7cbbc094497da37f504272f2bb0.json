@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE sync_operations SET status = $2, completed_at = now() WHERE id = $1 AND completed_at IS NULL AND status != 'deleted'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Varchar"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "3e0d024c52af29ec5c5449ae01d39b5fd696c7cbbc094497da37f504272f2bb0"
+}

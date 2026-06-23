@@ -1,0 +1,104 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT\n            dm.alias as \"alias!\",\n            dm.model_name as \"model_name!\",\n            dm.type as \"model_type?\",\n            ie.name as \"endpoint_name?\",\n            ie.url as \"endpoint_url?\",\n            dm.is_composite as \"is_composite!\",\n            dm.lb_strategy,\n            dm.sanitize_responses as \"sanitize_responses!\",\n            dm.requests_per_second,\n            dm.capacity,\n            dm.batch_capacity,\n            dm.throughput,\n            EXISTS(\n                SELECT 1 FROM model_tariffs mt\n                WHERE mt.deployed_model_id = dm.id\n                  AND mt.valid_until IS NULL\n                  AND (mt.input_price_per_token > 0 OR mt.output_price_per_token > 0)\n            ) as \"is_metered!\",\n            (\n                SELECT json_agg(json_build_object('group_id', g.id::text, 'group_name', g.name))::text\n                FROM deployment_groups dg\n                INNER JOIN groups g ON dg.group_id = g.id\n                WHERE dg.deployment_id = dm.id\n            ) as \"groups_json?\",\n            (\n                SELECT json_agg(json_build_object(\n                    'component', comp.alias,\n                    'component_endpoint', ie2.name,\n                    'weight', dmc.weight,\n                    'sort_order', dmc.sort_order,\n                    'enabled', dmc.enabled\n                ))::text\n                FROM deployed_model_components dmc\n                INNER JOIN deployed_models comp ON dmc.deployed_model_id = comp.id\n                LEFT JOIN inference_endpoints ie2 ON comp.hosted_on = ie2.id\n                WHERE dmc.composite_model_id = dm.id AND comp.deleted = FALSE\n            ) as \"components_json?\"\n        FROM deployed_models dm\n        LEFT JOIN inference_endpoints ie ON dm.hosted_on = ie.id\n        WHERE dm.deleted = FALSE\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "alias!",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 1,
+        "name": "model_name!",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "model_type?",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 3,
+        "name": "endpoint_name?",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 4,
+        "name": "endpoint_url?",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 5,
+        "name": "is_composite!",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 6,
+        "name": "lb_strategy",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 7,
+        "name": "sanitize_responses!",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 8,
+        "name": "requests_per_second",
+        "type_info": "Float4"
+      },
+      {
+        "ordinal": 9,
+        "name": "capacity",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 10,
+        "name": "batch_capacity",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 11,
+        "name": "throughput",
+        "type_info": "Float4"
+      },
+      {
+        "ordinal": 12,
+        "name": "is_metered!",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 13,
+        "name": "groups_json?",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 14,
+        "name": "components_json?",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      true,
+      true,
+      true,
+      false,
+      false,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "b20106c74421a409fd559cfa08db39971d145baabd771b3ee9006592008829ce"
+}

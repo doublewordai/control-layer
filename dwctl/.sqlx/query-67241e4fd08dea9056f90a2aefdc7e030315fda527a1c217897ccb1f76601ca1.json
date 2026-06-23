@@ -1,0 +1,35 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT\n                d.id as deployment_id,\n                d.alias as deployment_alias,\n                ak.secret as system_api_key\n            FROM deployed_models d\n            JOIN deployment_groups dg ON dg.deployment_id = d.id\n            JOIN api_keys ak ON ak.id = '00000000-0000-0000-0000-000000000000'::uuid\n            WHERE d.alias = $1\n            AND dg.group_id IN (\n                SELECT ug.group_id FROM user_groups ug WHERE ug.user_id = $2\n                UNION\n                SELECT '00000000-0000-0000-0000-000000000000'::uuid\n                WHERE $2 != '00000000-0000-0000-0000-000000000000'::uuid\n            )\n            LIMIT 1\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "deployment_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "deployment_alias",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "system_api_key",
+        "type_info": "Varchar"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "67241e4fd08dea9056f90a2aefdc7e030315fda527a1c217897ccb1f76601ca1"
+}

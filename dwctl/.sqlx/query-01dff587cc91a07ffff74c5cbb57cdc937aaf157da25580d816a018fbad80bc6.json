@@ -1,0 +1,34 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT alias, throughput, allowed_batch_completion_windows\n            FROM deployed_models\n            WHERE alias = ANY($1)\n              AND deleted = false\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "alias",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 1,
+        "name": "throughput",
+        "type_info": "Float4"
+      },
+      {
+        "ordinal": 2,
+        "name": "allowed_batch_completion_windows",
+        "type_info": "TextArray"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "TextArray"
+      ]
+    },
+    "nullable": [
+      false,
+      true,
+      true
+    ]
+  },
+  "hash": "01dff587cc91a07ffff74c5cbb57cdc937aaf157da25580d816a018fbad80bc6"
+}

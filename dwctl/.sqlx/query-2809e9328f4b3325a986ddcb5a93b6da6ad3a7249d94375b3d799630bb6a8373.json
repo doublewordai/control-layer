@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE sync_entries SET status = 'activated', batch_id = $2 WHERE id = $1 AND status != 'deleted'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "2809e9328f4b3325a986ddcb5a93b6da6ad3a7249d94375b3d799630bb6a8373"
+}

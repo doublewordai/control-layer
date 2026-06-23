@@ -995,31 +995,48 @@ impl Default for RequestLimitsConfig {
 /// Controls behavior of the onwards routing layer used for AI proxy requests.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
-#[derive(Default)]
 pub struct OnwardsConfig {
     /// Enable strict mode with schema validation and typed handlers.
     /// When false (default), all requests are passed through transparently.
     /// When true, only known OpenAI API paths are accepted and validated.
     pub strict_mode: bool,
-    /// Wire a cached-input-pricing classifier into the embedded onwards proxy.
+    /// Enable cached-input pricing (the dwctl-owned cache tower layer).
     ///
-    /// When false (the default), onwards is left dormant: no classifier is
-    /// injected, so the cache request-fork, `cache_control` stripping, and
-    /// response usage injection are all skipped and onwards behaviour is
-    /// byte-identical to today — zero runtime overhead (no extra allocations,
-    /// no request-path changes).
+    /// When false (the default), the cache layer is not added to the stack:
+    /// onwards is byte-identical to today and there is zero request-path
+    /// overhead (no body read, no classify fork, no injection).
     ///
-    /// When true, the no-op classifier ([`onwards::NoopCacheClassifier`]) is injected.
-    /// This activates the spine end-to-end for local validation: responses
-    /// carry the (zeroed) `cache_*` usage fields and outbound `cache_control`
-    /// markers are stripped, while billing/analytics is unaffected. There is
-    /// no real classification yet — the no-op returns all-zero stats. The real
-    /// dwctl classifier will replace the no-op here in a later wave. When a real
-    /// classifier lands it runs concurrently with the upstream model call under a
-    /// deadline, so it does not add to request latency.
+    /// When true, [`crate::prompt_cache::cache_middleware`] wraps the onwards
+    /// router (inner to outlet, so billing sees the injected fields). On each
+    /// cacheable request it forks the classifier concurrently with the upstream
+    /// call, strips `cache_control` markers, injects the resulting `cache_*`
+    /// usage fields into the response, and commits prefix writes to the index on
+    /// success. onwards itself stays cache-agnostic. Because classify races the
+    /// (slower) model call under a deadline, it does not add request latency.
+    /// Per-model activation is still gated by `deployed_models.cache_pricing_enabled`,
+    /// so flipping this flag on does nothing until a model opts in.
     ///
     /// Set via environment: `DWCTL_ONWARDS__CACHE_CLASSIFIER_ENABLED=true`
     pub cache_classifier_enabled: bool,
+
+    /// Base URL of the tokenizer-svc used to count cache-prefix tokens.
+    ///
+    /// Only consulted when `cache_classifier_enabled` is true. The classifier
+    /// calls `{tokenizer_url}/v1/models` (alias → tokenizer version) and
+    /// `{tokenizer_url}/v1/tokenize` (prefix → cumulative token counts).
+    ///
+    /// Set via environment: `DWCTL_ONWARDS__TOKENIZER_URL=http://tokenizer-svc:8080`
+    pub tokenizer_url: String,
+}
+
+impl Default for OnwardsConfig {
+    fn default() -> Self {
+        Self {
+            strict_mode: false,
+            cache_classifier_enabled: false,
+            tokenizer_url: "http://localhost:8088".to_string(),
+        }
+    }
 }
 
 /// File limits configuration.

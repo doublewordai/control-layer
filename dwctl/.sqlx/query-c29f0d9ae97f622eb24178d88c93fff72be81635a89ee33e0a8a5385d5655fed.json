@@ -1,0 +1,20 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                    INSERT INTO tool_call_analytics\n                        (analytics_id, tool_source_id, tool_name, started_at, duration_ms,\n                         http_status_code, success, error_kind)\n                    VALUES (NULL, $1, $2, $3, $4, $5, $6, $7)\n                    ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Timestamptz",
+        "Int8",
+        "Int4",
+        "Bool",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "c29f0d9ae97f622eb24178d88c93fff72be81635a89ee33e0a8a5385d5655fed"
+}

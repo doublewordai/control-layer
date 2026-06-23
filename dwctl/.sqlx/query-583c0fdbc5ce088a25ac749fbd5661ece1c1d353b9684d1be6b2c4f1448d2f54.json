@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM group_tool_sources WHERE group_id = $1 AND tool_source_id = $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "583c0fdbc5ce088a25ac749fbd5661ece1c1d353b9684d1be6b2c4f1448d2f54"
+}

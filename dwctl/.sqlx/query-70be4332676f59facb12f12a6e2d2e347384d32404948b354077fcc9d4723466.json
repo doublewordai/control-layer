@@ -1,0 +1,34 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT DISTINCT ON (external_key)\n                   external_key,\n                   external_last_modified AS \"last_modified\",\n                   status AS \"status!\"\n            FROM sync_entries\n            WHERE connection_id = $1\n              AND status IN ('activated', 'failed')\n            ORDER BY external_key, external_last_modified DESC NULLS LAST, updated_at DESC\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "external_key",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 1,
+        "name": "last_modified",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 2,
+        "name": "status!",
+        "type_info": "Varchar"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      true,
+      false
+    ]
+  },
+  "hash": "70be4332676f59facb12f12a6e2d2e347384d32404948b354077fcc9d4723466"
+}

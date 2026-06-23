@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO user_balance_checkpoints (user_id, checkpoint_seq, balance)\n            SELECT\n                u.user_id,\n                latest.seq,\n                COALESCE(c.balance, 0) + COALESCE(delta.sum, 0)\n            FROM unnest($1::uuid[]) AS u(user_id)\n            LEFT JOIN user_balance_checkpoints c ON c.user_id = u.user_id\n            LEFT JOIN LATERAL (\n                SELECT SUM(\n                    CASE WHEN transaction_type IN ('admin_grant', 'purchase') THEN amount ELSE -amount END\n                ) as sum\n                FROM credits_transactions t\n                WHERE t.user_id = u.user_id\n                AND t.seq > COALESCE(c.checkpoint_seq, 0)\n            ) delta ON true\n            LEFT JOIN LATERAL (\n                SELECT MAX(seq) as seq\n                FROM credits_transactions t\n                WHERE t.user_id = u.user_id\n            ) latest ON true\n            WHERE latest.seq IS NOT NULL\n            ON CONFLICT (user_id) DO UPDATE SET\n                checkpoint_seq = EXCLUDED.checkpoint_seq,\n                balance = EXCLUDED.balance,\n                updated_at = NOW()\n            RETURNING user_id, balance\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "user_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "balance",
+        "type_info": "Numeric"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "UuidArray"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "c1d613529341f2abc53c201ac6d915fbbd2305e9113bb88568376865d74e862e"
+}

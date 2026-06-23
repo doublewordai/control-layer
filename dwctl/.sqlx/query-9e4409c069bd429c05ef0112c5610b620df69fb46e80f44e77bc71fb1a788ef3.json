@@ -1,0 +1,69 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO pending_org_email_changes\n                (organization_id, new_email, requested_by, new_email_token_hash, old_email_token_hash, expires_at)\n            VALUES ($1, $2, $3, $4, $5, $6)\n            ON CONFLICT (organization_id) DO UPDATE SET\n                new_email = EXCLUDED.new_email,\n                requested_by = EXCLUDED.requested_by,\n                new_email_token_hash = EXCLUDED.new_email_token_hash,\n                old_email_token_hash = EXCLUDED.old_email_token_hash,\n                new_email_confirmed_at = NULL,\n                old_email_confirmed_at = NULL,\n                expires_at = EXCLUDED.expires_at,\n                created_at = NOW()\n            RETURNING id, organization_id, new_email, requested_by,\n                      new_email_confirmed_at, old_email_confirmed_at,\n                      created_at, expires_at\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "organization_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "new_email",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 3,
+        "name": "requested_by",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 4,
+        "name": "new_email_confirmed_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 5,
+        "name": "old_email_confirmed_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 6,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 7,
+        "name": "expires_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Varchar",
+        "Uuid",
+        "Varchar",
+        "Varchar",
+        "Timestamptz"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "9e4409c069bd429c05ef0112c5610b620df69fb46e80f44e77bc71fb1a788ef3"
+}

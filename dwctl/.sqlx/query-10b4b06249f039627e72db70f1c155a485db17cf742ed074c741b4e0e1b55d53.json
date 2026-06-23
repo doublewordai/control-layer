@@ -1,0 +1,60 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT\n                date_trunc('hour', timestamp) + INTERVAL '10 minute' * FLOOR(EXTRACT(minute FROM timestamp) / 10) as timestamp,\n                COUNT(*) as requests_count,\n                COALESCE(SUM(prompt_tokens), 0)::bigint as input_tokens,\n                COALESCE(SUM(completion_tokens), 0)::bigint as output_tokens,\n                AVG(duration_ms)::float8 as avg_latency_ms,\n                PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY duration_ms)::float8 as p95_latency_ms,\n                PERCENTILE_CONT(0.99) WITHIN GROUP (ORDER BY duration_ms)::float8 as p99_latency_ms\n            FROM http_analytics\n            WHERE timestamp >= $1 AND timestamp <= $2 AND model = $3\n            GROUP BY date_trunc('hour', timestamp) + INTERVAL '10 minute' * FLOOR(EXTRACT(minute FROM timestamp) / 10)\n            ORDER BY timestamp\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "timestamp",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 1,
+        "name": "requests_count",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "input_tokens",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 3,
+        "name": "output_tokens",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 4,
+        "name": "avg_latency_ms",
+        "type_info": "Float8"
+      },
+      {
+        "ordinal": 5,
+        "name": "p95_latency_ms",
+        "type_info": "Float8"
+      },
+      {
+        "ordinal": 6,
+        "name": "p99_latency_ms",
+        "type_info": "Float8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Timestamptz",
+        "Timestamptz",
+        "Text"
+      ]
+    },
+    "nullable": [
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "10b4b06249f039627e72db70f1c155a485db17cf742ed074c741b4e0e1b55d53"
+}

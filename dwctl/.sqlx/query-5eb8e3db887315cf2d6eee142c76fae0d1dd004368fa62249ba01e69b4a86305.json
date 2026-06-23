@@ -1,0 +1,38 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT mtr.deployed_model_id, mtr.api_key_purpose, mtr.action,\n               dm.alias as \"redirect_target_alias?\"\n        FROM model_traffic_rules mtr\n        LEFT JOIN deployed_models dm ON dm.id = mtr.redirect_target_id\n        WHERE mtr.deployed_model_id IN (\n            SELECT id FROM deployed_models WHERE deleted = FALSE\n        )\n        ORDER BY mtr.deployed_model_id, mtr.api_key_purpose\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "deployed_model_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "api_key_purpose",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "action",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 3,
+        "name": "redirect_target_alias?",
+        "type_info": "Varchar"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "5eb8e3db887315cf2d6eee142c76fae0d1dd004368fa62249ba01e69b4a86305"
+}

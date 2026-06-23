@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE sync_operations SET status = 'deleted' WHERE connection_id = $1 AND status != 'deleted'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "0674a97c0a58b423b26720517f63ddda5c61feb7b4ca306d100b1eb3c3798426"
+}

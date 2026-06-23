@@ -1,0 +1,30 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT status_code, COUNT(*) as status_count FROM http_analytics WHERE timestamp >= $1 AND timestamp <= $2 AND model = $3 AND status_code IS NOT NULL GROUP BY status_code ORDER BY status_count DESC",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "status_code",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 1,
+        "name": "status_count",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Timestamptz",
+        "Timestamptz",
+        "Text"
+      ]
+    },
+    "nullable": [
+      true,
+      null
+    ]
+  },
+  "hash": "306be3312e5e04f436956222cac0f3c6dd5803f3f1a288bf7025ba65612c3979"
+}

@@ -1,0 +1,43 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT prefix_hash, cumulative_token_count, ttl_tier, expires_at\n            FROM prompt_cache_entries\n            WHERE org_id = $1 AND virtual_model = $2 AND tokenizer_version = $3\n              AND prefix_hash = ANY($4) AND expires_at > now()\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "prefix_hash",
+        "type_info": "Bytea"
+      },
+      {
+        "ordinal": 1,
+        "name": "cumulative_token_count",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 2,
+        "name": "ttl_tier",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "expires_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text",
+        "ByteaArray"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "5b0b9709694bb39ec02d7ddacc58aba2862272ebe3c80144e1e7a34a86b1d45d"
+}

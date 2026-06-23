@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT mtr.api_key_purpose\n        FROM model_traffic_rules mtr\n        JOIN deployed_models dm ON dm.id = mtr.deployed_model_id\n        JOIN api_keys ak ON ak.purpose = mtr.api_key_purpose\n        WHERE dm.alias = $1\n          AND dm.deleted = false\n          AND ak.secret = $2\n          AND ak.is_deleted = false\n          AND mtr.action = 'deny'\n        LIMIT 1\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "api_key_purpose",
+        "type_info": "Varchar"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "29823fb645f652635de0c30668831c0f2b8d6f5fabb74aaa9e6c6056fca00951"
+}

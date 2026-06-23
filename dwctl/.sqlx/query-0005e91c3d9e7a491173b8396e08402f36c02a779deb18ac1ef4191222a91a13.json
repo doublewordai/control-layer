@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE sync_operations SET\n                status = $2,\n                started_at = COALESCE($3, started_at),\n                completed_at = COALESCE($4, completed_at)\n            WHERE id = $1 AND status != 'deleted'\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Varchar",
+        "Timestamptz",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "0005e91c3d9e7a491173b8396e08402f36c02a779deb18ac1ef4191222a91a13"
+}

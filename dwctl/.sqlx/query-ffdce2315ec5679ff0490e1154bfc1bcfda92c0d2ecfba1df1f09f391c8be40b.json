@@ -1,0 +1,32 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT dm.alias, t.input_price_per_token, t.output_price_per_token\n        FROM model_tariffs t\n        JOIN deployed_models dm ON dm.id = t.deployed_model_id\n        WHERE t.api_key_purpose = 'realtime' AND t.valid_until IS NULL\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "alias",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 1,
+        "name": "input_price_per_token",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 2,
+        "name": "output_price_per_token",
+        "type_info": "Numeric"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "ffdce2315ec5679ff0490e1154bfc1bcfda92c0d2ecfba1df1f09f391c8be40b"
+}
