@@ -88,6 +88,11 @@ struct BillingTarget {
     id: crate::types::UserId,
     payment_provider_id: Option<String>,
     email: String,
+    /// Name to put on the payment-provider customer. Set for organizations
+    /// (a real, user-provided org name), but `None` for individuals: their
+    /// display_name is only ever a randomly generated placeholder, never the
+    /// real IdP name, so we don't want it on Stripe customers / receipts.
+    display_name: Option<String>,
 }
 
 /// Resolve the billing target for payment operations.
@@ -116,12 +121,16 @@ async fn resolve_billing_target(user: &CurrentUser, conn: &mut sqlx::PgConnectio
             id: org.id,
             payment_provider_id: org.payment_provider_id,
             email: org.email,
+            display_name: org.display_name,
         })
     } else {
         Ok(BillingTarget {
             id: user.id,
             payment_provider_id: user.payment_provider_id.clone(),
             email: user.email.clone(),
+            // Intentionally omitted: an individual's display_name is a
+            // generated placeholder, not their real name (see BillingTarget).
+            display_name: None,
         })
     }
 }
@@ -768,15 +777,17 @@ pub async fn enable_auto_topup<P: PoolProvider>(
     let customer_id = match &target.payment_provider_id {
         Some(id) if !id.is_empty() => id.clone(),
         _ => {
-            // Don't send a name: for SSO/proxy users dwctl only ever stores a
-            // randomly generated display_name (the real IdP name is never
-            // captured), so passing it would stamp a fake name on the Stripe
-            // customer and their receipts. Leave it unset and let Stripe
-            // collect the real name at checkout / in the billing portal.
-            let new_id = provider.create_customer(&target.email, None).await.map_err(|e| {
-                tracing::error!("Failed to create payment provider customer: {:?}", e);
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?;
+            // `display_name` is the real org name for organizations and `None`
+            // for individuals (whose stored name is a generated placeholder) -
+            // see `resolve_billing_target`. Stripe collects the real name at
+            // checkout / in the billing portal where we don't supply one.
+            let new_id = provider
+                .create_customer(&target.email, target.display_name.as_deref())
+                .await
+                .map_err(|e| {
+                    tracing::error!("Failed to create payment provider customer: {:?}", e);
+                    StatusCode::INTERNAL_SERVER_ERROR
+                })?;
 
             Users::new(&mut conn)
                 .set_payment_provider_id_if_empty(target.id, &new_id)
