@@ -201,6 +201,8 @@ impl Classifier {
             pending.writes.push(CacheEntry {
                 scope: scope.clone(),
                 prefix_hash: parsed.cumulative_hashes[bp.block_index].clone(),
+                // Cap at u32::MAX — a prefix exceeding ~4.3B tokens is beyond any model's
+                // context window; if that ever becomes realistic the column needs BIGINT.
                 cumulative_token_count: bp_cumulative.min(u32::MAX as u64) as u32,
                 ttl_tier: bp.ttl_tier,
                 expires_at: now + bp.ttl_tier.duration(),

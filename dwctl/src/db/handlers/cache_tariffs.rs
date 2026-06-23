@@ -12,7 +12,7 @@ use crate::config::CachePricingConfig;
 use crate::db::errors::Result;
 use crate::types::DeploymentId;
 use rust_decimal::Decimal;
-use sqlx::PgConnection;
+use sqlx::{Connection, PgConnection};
 use tracing::instrument;
 
 /// Optional per-tier overrides for [`CacheTariffs::enable`]. Any `None` field is filled
@@ -40,13 +40,17 @@ impl<'c> CacheTariffs<'c> {
     /// again just supersedes the previous version, keeping the old one for audit.
     #[instrument(skip(self, defaults, overrides), fields(deployed_model_id = %model_id), err)]
     pub async fn enable(&mut self, model_id: DeploymentId, defaults: &CachePricingConfig, overrides: CacheTariffOverrides) -> Result<()> {
-        // Ledger: never edit a version in place — expire the active one first.
+        // Atomic: expire the active version and insert the new one in one transaction, so a
+        // failed insert can't leave the model unintentionally disabled, and concurrent
+        // enables can't race into two active rows (ledger: never edit a version in place).
+        let mut tx = self.db.begin().await?;
+
         sqlx::query!(
             r#"UPDATE model_cache_tariffs SET valid_until = now()
                WHERE deployed_model_id = $1 AND (valid_until IS NULL OR valid_until > now())"#,
             model_id,
         )
-        .execute(&mut *self.db)
+        .execute(&mut *tx)
         .await?;
 
         sqlx::query!(
@@ -61,9 +65,10 @@ impl<'c> CacheTariffs<'c> {
             overrides.read_multiplier.unwrap_or(defaults.default_read_multiplier),
             overrides.min_prefix_tokens.unwrap_or(defaults.default_min_prefix_tokens),
         )
-        .execute(&mut *self.db)
+        .execute(&mut *tx)
         .await?;
 
+        tx.commit().await?;
         Ok(())
     }
 

@@ -65,6 +65,8 @@ impl ParsedPrompt {
     /// **longest prefix first**, so the first index hit is the longest read.
     pub fn read_candidates(&self, bp: &Breakpoint) -> Vec<Vec<u8>> {
         let i = bp.block_index;
+        // The range `start..=i` is inclusive on both ends, so subtract `WALK_BACK - 1`
+        // (not `WALK_BACK`) to get exactly `WALK_BACK` candidates (e.g. i=24 → 5..=24 = 20).
         let start = i.saturating_sub(WALK_BACK - 1);
         (start..=i).rev().map(|j| self.cumulative_hashes[j].clone()).collect()
     }
@@ -148,6 +150,12 @@ fn strip_cache_control(block: &serde_json::Value) -> serde_json::Value {
 
 /// `role` + canonical JSON of the marker-stripped block. The role is included so the
 /// same text under different roles hashes differently.
+///
+/// "Canonical" here relies on `serde_json` being built **without** the `preserve_order`
+/// feature: `Value::Object` is then a `BTreeMap`, so `to_vec` emits keys in sorted order
+/// and two blocks that differ only in key insertion order (common across SDKs/languages)
+/// hash identically. If a dependency ever enables `preserve_order` (→ `IndexMap`,
+/// insertion order), this would need explicit key-sorting to keep the cache-hit rate up.
 fn canonical_block_bytes(role: &str, stripped_block: &serde_json::Value) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(role.as_bytes());

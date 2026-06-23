@@ -60,6 +60,10 @@ pub async fn cache_middleware(State(state): State<CacheLayerState>, request: Req
         Ok(b) => b,
         Err(_) => {
             // Can't read the body — forward an empty one (degraded; onwards will 4xx).
+            // Drop the framing headers so the empty body isn't paired with a stale
+            // Content-Length / Transfer-Encoding from the original request.
+            parts.headers.remove(header::CONTENT_LENGTH);
+            parts.headers.remove(header::TRANSFER_ENCODING);
             return next.run(Request::from_parts(parts, Body::empty())).await;
         }
     };

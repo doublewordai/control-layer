@@ -167,10 +167,13 @@ async fn proxied_usage(pool: &PgPool, opts: ProxiedOpts) -> serde_json::Value {
     // Push config to onwards, then poll until the model is routable (avoid sleeps).
     bg_services.sync_onwards_config(pool).await.expect("Failed to sync onwards config");
 
-    // Poll until the model becomes routable (the onwards sync runs in the background).
-    // A short sleep per miss gives that task real wall-clock — `yield_now` alone can
-    // starve it under CI load (cooperative yield returns instantly). Returns immediately
-    // once routable; the sleep only bites while we're still waiting.
+    // Poll until the proxied request succeeds. The onwards config sync runs in the
+    // background and propagates several things independently — model routing, the API
+    // key, the user's credits, the group→model link — so under CI load there's a window
+    // where the model is routable (no longer 404) but authorisation hasn't landed yet
+    // (transient 403). Treat BOTH 404 and 403 as "not synced yet" and keep polling; a
+    // short sleep per miss gives the sync task real wall-clock (`yield_now` alone starves
+    // it under load). Any other status — or a 403 that never clears — is a real failure.
     for i in 0..150 {
         let resp = server
             .post("/ai/v1/chat/completions")
@@ -178,12 +181,12 @@ async fn proxied_usage(pool: &PgPool, opts: ProxiedOpts) -> serde_json::Value {
             .json(&opts.body)
             .await;
         let status = resp.status_code().as_u16();
-        if status != 404 {
-            assert_eq!(status, 200, "proxied request should succeed once synced");
+        if status == 200 {
             let body: serde_json::Value = resp.json();
             return body["usage"].clone();
         }
-        assert!(i < 149, "model never became routable (last status {status})");
+        assert!(status == 404 || status == 403, "unexpected proxied status {status} (expected eventual 200)");
+        assert!(i < 149, "request never succeeded once synced (last status {status})");
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
     unreachable!("polling loop returns or panics before exhausting iterations");

@@ -1,0 +1,188 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            -- Step 1: Find candidate batches that are terminal by count\n            WITH candidates AS (\n                SELECT b.id,\n                       COALESCE(counts.completed, 0)::BIGINT as completed_requests,\n                       COALESCE(counts.failed, 0)::BIGINT as failed_requests,\n                       COALESCE(counts.canceled, 0)::BIGINT as canceled_requests,\n                       COALESCE(counts.pending, 0)::BIGINT as pending_requests,\n                       COALESCE(counts.in_progress, 0)::BIGINT as in_progress_requests\n                FROM batches b\n                -- Count requests by state for each batch\n                LEFT JOIN LATERAL (\n                    SELECT\n                        COUNT(*) FILTER (WHERE state = 'completed') as completed,\n                        COUNT(*) FILTER (WHERE state = 'failed') as failed,\n                        -- Canceled = explicitly canceled OR will be canceled (pending/in-progress with cancelling_at set)\n                        COUNT(*) FILTER (WHERE state = 'canceled' OR (state IN ('pending', 'claimed', 'processing') AND b.cancelling_at IS NOT NULL)) as canceled,\n                        COUNT(*) FILTER (WHERE state = 'pending' AND b.cancelling_at IS NULL) as pending,\n                        COUNT(*) FILTER (WHERE state IN ('claimed', 'processing') AND b.cancelling_at IS NULL) as in_progress\n                    FROM requests WHERE batch_id = b.id\n                ) counts ON TRUE\n                WHERE b.notification_sent_at IS NULL  -- Not yet notified\n                  AND b.deleted_at IS NULL            -- Not deleted\n                  AND b.cancelling_at IS NULL         -- Not canceled (don't email on user-canceled batches)\n                  AND b.total_requests > 0            -- Has requests\n                  AND (\n                      -- Terminal by count: all requests reached terminal state\n                      COALESCE(counts.completed, 0) + COALESCE(counts.failed, 0) + COALESCE(counts.canceled, 0) = b.total_requests\n                  )\n            ),\n            -- Step 2: Atomically claim batches and set terminal timestamps\n            updated AS (\n                UPDATE batches b\n                SET notification_sent_at = NOW(),  -- Claim for notification (prevents duplicates)\n                    -- Set terminal timestamps via COALESCE (no-op if already set by get_batch)\n                    finalizing_at = COALESCE(b.finalizing_at, NOW()),\n                    completed_at = COALESCE(b.completed_at,\n                        CASE WHEN c.completed_requests > 0 THEN NOW() END),\n                    failed_at = COALESCE(b.failed_at,\n                        CASE WHEN c.completed_requests = 0 THEN NOW() END)\n                FROM candidates c\n                WHERE b.id = c.id\n                  AND b.notification_sent_at IS NULL  -- Re-check to handle concurrent pollers\n                RETURNING b.id, b.file_id, b.endpoint, b.completion_window, b.metadata,\n                          b.output_file_id, b.error_file_id, b.created_by, b.created_at,\n                          b.expires_at, b.cancelling_at, b.errors, b.total_requests,\n                          b.requests_started_at, b.finalizing_at, b.completed_at,\n                          b.failed_at, b.cancelled_at, b.deleted_at, b.notification_sent_at, b.api_key_id,\n                          c.completed_requests, c.failed_requests, c.canceled_requests,\n                          c.pending_requests, c.in_progress_requests\n            )\n            SELECT u.*,\n                   f.name as input_file_name,\n                   f.description as input_file_description,\n                   (SELECT string_agg(DISTINCT r.model, ', ') FROM requests r WHERE r.batch_id = u.id) as model\n            FROM updated u\n            LEFT JOIN files f ON f.id = u.file_id\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "file_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "endpoint",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "completion_window",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "metadata",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 5,
+        "name": "output_file_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 6,
+        "name": "error_file_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 7,
+        "name": "created_by",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 8,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 9,
+        "name": "expires_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 10,
+        "name": "cancelling_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 11,
+        "name": "errors",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 12,
+        "name": "total_requests",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 13,
+        "name": "requests_started_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 14,
+        "name": "finalizing_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 15,
+        "name": "completed_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 16,
+        "name": "failed_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 17,
+        "name": "cancelled_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 18,
+        "name": "deleted_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 19,
+        "name": "notification_sent_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 20,
+        "name": "api_key_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 21,
+        "name": "completed_requests",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 22,
+        "name": "failed_requests",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 23,
+        "name": "canceled_requests",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 24,
+        "name": "pending_requests",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 25,
+        "name": "in_progress_requests",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 26,
+        "name": "input_file_name",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 27,
+        "name": "input_file_description",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 28,
+        "name": "model",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      true,
+      false,
+      false,
+      true,
+      true,
+      true,
+      false,
+      false,
+      false,
+      true,
+      true,
+      false,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      null,
+      null,
+      null,
+      null,
+      null,
+      true,
+      true,
+      null
+    ]
+  },
+  "hash": "c17bd0b23818ce0662374a159f882679efd07c472f3e577a29c529491cc99894"
+}

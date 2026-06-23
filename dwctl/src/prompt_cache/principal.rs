@@ -48,6 +48,13 @@ impl PrincipalResolver {
     /// Resolve a validated bearer token to its billing principal. `None` => the token
     /// is not a live key (→ un-scopable → no caching). Hits and misses are both
     /// memoised; both are safe (immutable mapping; secrets are never reused).
+    ///
+    /// Threat model for memoising `None`: an attacker probing invalid tokens can only
+    /// fill `None` entries, which grant no access — onwards validates the key *before*
+    /// this is ever reached, so a polluting probe never corresponds to a request that
+    /// caches or bills. The blast radius is at worst a wasted DB miss on the first real
+    /// lookup of a key that happened to collide with a probed string (negligible:
+    /// secrets are crypto-random), and the TTL bounds even that. So caching `None` is fine.
     pub async fn resolve(&self, token: &str) -> CacheResult<Option<UserId>> {
         if let Some(cached) = self.l1.get(token).await {
             return Ok(cached);
