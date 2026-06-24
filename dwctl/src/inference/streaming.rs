@@ -197,7 +197,7 @@ where
 
 /// Run the multi-step loop inline against an SSE response.
 ///
-/// Called by the responses middleware when the user requested
+/// Called by the inference middleware when the user requested
 /// `stream: true` (and not `background: true`). Returns an axum
 /// `Sse<Stream>` ready to be sent as the HTTP response.
 ///

@@ -58,7 +58,7 @@ pub struct PendingResponseInput {
     pub resolved_tool_names: HashSet<String>,
 }
 
-/// Header set by the responses middleware so the outlet handler knows which
+/// Header set by the inference middleware so the outlet handler knows which
 /// fusillade row to update with the response body.
 pub const ONWARDS_RESPONSE_ID_HEADER: &str = "x-onwards-response-id";
 

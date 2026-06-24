@@ -345,11 +345,11 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
             // the completed object instead, so it's chat-only.
             let flex_stream_include_usage =
                 flex_stream && is_chat_completions_api && request_value["stream_options"]["include_usage"].as_bool().unwrap_or(false);
-            if flex_stream {
-                if let Some(obj) = request_value.as_object_mut() {
-                    obj.remove("stream");
-                    obj.remove("stream_options");
-                }
+            if flex_stream
+                && let Some(obj) = request_value.as_object_mut()
+            {
+                obj.remove("stream");
+                obj.remove("stream_options");
             }
 
             let flex_input = fusillade::CreateFlexInput {
@@ -765,10 +765,22 @@ async fn handle_responses_flex_streaming<P: PoolProvider + Clone + Send + Sync +
                 }
             }
             Err(msg) => {
+                // Poll itself failed (timeout / DB error). Emit the same
+                // `response.created` → `response.failed` lifecycle as the
+                // detail-failure branch above so clients tracking the standard
+                // Responses lifecycle don't see a `failed` with no `created`.
+                let stub = serde_json::json!({
+                    "id": serde_json::Value::Null,
+                    "object": "response",
+                    "status": "in_progress",
+                });
                 let err = serde_json::json!({
                     "error": { "message": format!("Request failed: {msg}"), "type": "server_error", "code": 504 }
                 });
-                vec![ReplayFrame::named("response.failed", err)]
+                vec![
+                    ReplayFrame::named("response.created", stub),
+                    ReplayFrame::named("response.failed", err),
+                ]
             }
         },
     )
