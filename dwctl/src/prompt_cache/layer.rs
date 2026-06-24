@@ -18,9 +18,9 @@ use std::time::Duration;
 
 use axum::body::Body;
 use axum::extract::{Request, State};
-use axum::http::{Method, header};
+use axum::http::{Method, StatusCode, header};
 use axum::middleware::Next;
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use tracing::warn;
 
 use super::classifier::{Classifier, ClassifyOutcome, ClassifyRequest};
@@ -71,13 +71,20 @@ pub async fn cache_middleware(State(state): State<CacheLayerState>, request: Req
     // Bounded by the same limit onwards enforces (never more restrictive than the entry).
     let body_bytes = match axum::body::to_bytes(body, state.body_limit).await {
         Ok(b) => b,
-        Err(_) => {
-            // Can't read the body — forward an empty one (degraded; onwards will 4xx).
-            // Drop the framing headers so the empty body isn't paired with a stale
-            // Content-Length / Transfer-Encoding from the original request.
-            parts.headers.remove(header::CONTENT_LENGTH);
-            parts.headers.remove(header::TRANSFER_ENCODING);
-            return next.run(Request::from_parts(parts, Body::empty())).await;
+        Err(e) => {
+            // Can't read the body within the limit. Return the structured 400 the rest of the
+            // stack uses (matches image_normalizer_middleware) rather than forwarding an empty
+            // body: an empty forward would surface to the client as a confusing JSON-parse 4xx
+            // from onwards instead of a clear body-read error.
+            warn!(error = %e, "Failed to read request body in cache middleware");
+            let body = serde_json::json!({
+                "error": {
+                    "message": format!("failed to read request body: {e}"),
+                    "type": "invalid_request_error",
+                    "code": "body_read_failed",
+                }
+            });
+            return (StatusCode::BAD_REQUEST, axum::Json(body)).into_response();
         }
     };
 

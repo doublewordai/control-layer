@@ -17,7 +17,8 @@
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use axum::response::Response;
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use futures::Stream;
 use http_body_util::BodyExt;
@@ -323,8 +324,21 @@ pub async fn inject_cache_stats_into_response(mut response: Response, stats: &Ca
         let body_bytes = match axum::body::to_bytes(body, usize::MAX).await {
             Ok(b) => b,
             Err(e) => {
+                // Buffering the upstream response failed (e.g. the upstream connection broke
+                // mid-read). Forwarding an empty body would hand the client a misleading 200
+                // with no content; instead return a structured 5xx and veto the commit.
                 error!("Failed to buffer response body for cache injection: {}", e);
-                return (Response::from_parts(parts, axum::body::Body::empty()), CommitGate::Ready(false));
+                let err_body = serde_json::json!({
+                    "error": {
+                        "message": format!("failed to read upstream response body: {e}"),
+                        "type": "internal_error",
+                        "code": "response_body_read_failed",
+                    }
+                });
+                return (
+                    (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(err_body)).into_response(),
+                    CommitGate::Ready(false),
+                );
             }
         };
 

@@ -424,20 +424,23 @@ struct CacheTokens {
     creation_24h: i64,
 }
 
-/// Pull the cache split out of a single `usage` JSON object. `cache_read_input_tokens`
-/// falls back to the OpenAI-standard `prompt_tokens_details.cached_tokens` (the layer sets
-/// both); creation is read per tier from the `cache_creation` object.
+/// Pull the cache split out of a single `usage` JSON object. Reads come **only** from
+/// `cache_read_input_tokens` — the field the dwctl cache layer injects whenever it applies
+/// caching (it sets `prompt_tokens_details.cached_tokens` too, but that's for client
+/// visibility). We deliberately do *not* fall back to `prompt_tokens_details.cached_tokens`:
+/// providers (e.g. OpenAI) report their *own* server-side cached_tokens there, and reading
+/// it would attribute a provider's caching to dwctl's billing for a model dwctl isn't
+/// caching — breaking the "non-cache models produce a zero cache split" invariant. Creation
+/// is read per tier from the `cache_creation` object.
+///
+/// ASSUMPTION (holds today): upstream endpoints are OpenAI-shaped and do NOT report
+/// `cache_read_input_tokens` / `cache_creation` themselves. Those are Anthropic's native
+/// field names, identical to the ones dwctl injects — so if egress ever routes to an
+/// Anthropic-native provider, a model dwctl isn't caching could still leak its provider-side
+/// cache tokens here. The fix then is to gate extraction on dwctl-cache-enablement (the
+/// model's tariff presence, known to the batcher) rather than trusting the response fields.
 fn cache_tokens_from_usage(usage: &Value) -> CacheTokens {
-    let read = usage
-        .get("cache_read_input_tokens")
-        .and_then(Value::as_i64)
-        .or_else(|| {
-            usage
-                .get("prompt_tokens_details")
-                .and_then(|d| d.get("cached_tokens"))
-                .and_then(Value::as_i64)
-        })
-        .unwrap_or(0);
+    let read = usage.get("cache_read_input_tokens").and_then(Value::as_i64).unwrap_or(0);
     let tier = |k: &str| {
         usage
             .get("cache_creation")
@@ -1970,14 +1973,16 @@ mod tests {
     }
 
     #[test]
-    fn extract_cache_tokens_falls_back_to_cached_tokens() {
-        // No Anthropic-style field, but the OpenAI-standard cached_tokens is present.
+    fn extract_cache_tokens_ignores_provider_native_cached_tokens() {
+        // Only the provider's own `prompt_tokens_details.cached_tokens` is present (e.g. an
+        // OpenAI-backed model dwctl is NOT caching). It must NOT be attributed to dwctl's
+        // cache billing — reads come solely from the `cache_read_input_tokens` our layer sets.
         let body = serde_json::json!({
             "usage": {"prompt_tokens": 100, "completion_tokens": 2, "prompt_tokens_details": {"cached_tokens": 64}}
         })
         .to_string();
         let c = extract_cache_tokens(&response_with_body(body));
-        assert_eq!(c.read, 64);
+        assert_eq!(c.read, 0, "provider-native cached_tokens is not a dwctl cache read");
     }
 
     #[test]
