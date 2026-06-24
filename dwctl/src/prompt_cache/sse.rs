@@ -82,9 +82,20 @@ where
     }
 }
 
-/// Find `\n\n` in the buffer, returning the index of the first `\n`.
+/// Find the end-of-event separator, returning `pos` such that `pos + 2` is the index just
+/// past the separator (the caller's `split_to(pos + 2)` then yields the event with its
+/// trailing blank line). Handles both `\n\n` (LF) and `\r\n\r\n` (CRLF), since the SSE spec
+/// permits either; the separator that starts earlier wins.
 fn find_event_boundary(buf: &[u8]) -> Option<usize> {
-    buf.windows(2).position(|window| window == b"\n\n")
+    let lf = buf.windows(2).position(|w| w == b"\n\n");
+    let crlf = buf.windows(4).position(|w| w == b"\r\n\r\n");
+    match (lf, crlf) {
+        // `\r\n\r\n` is 4 bytes, so its end-marker is start + 2 to satisfy the `pos + 2` caller.
+        (Some(l), Some(c)) => Some(if l <= c { l } else { c + 2 }),
+        (Some(l), None) => Some(l),
+        (None, Some(c)) => Some(c + 2),
+        (None, None) => None,
+    }
 }
 
 #[cfg(test)]
@@ -102,6 +113,18 @@ mod tests {
         let out: Vec<_> = SseBufferedStream::new(stream(vec![b"data: {\"a\":1}\n\n"])).collect().await;
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].as_ref().unwrap().as_ref(), b"data: {\"a\":1}\n\n");
+    }
+
+    #[tokio::test]
+    async fn crlf_separated_events_are_split() {
+        // SSE permits CRLF (`\r\n\r\n`) separators — two events must come out as two items,
+        // not accumulate until the buffer cap and error.
+        let out: Vec<_> = SseBufferedStream::new(stream(vec![b"data: {\"a\":1}\r\n\r\ndata: {\"b\":2}\r\n\r\n"]))
+            .collect()
+            .await;
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].as_ref().unwrap().as_ref(), b"data: {\"a\":1}\r\n\r\n");
+        assert_eq!(out[1].as_ref().unwrap().as_ref(), b"data: {\"b\":2}\r\n\r\n");
     }
 
     #[tokio::test]

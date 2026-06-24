@@ -95,9 +95,11 @@ pub async fn cache_middleware(State(state): State<CacheLayerState>, request: Req
         .headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        // Accept both casings, as the rest of the stack does (error_enrichment, image_normalizer).
+        // Accept both casings and trim stray whitespace, as the rest of the stack does
+        // (error_enrichment, image_normalizer) — else a key resolves differently here and
+        // silently disables caching for that request.
         .and_then(|v| v.strip_prefix("Bearer ").or_else(|| v.strip_prefix("bearer ")))
-        .map(String::from);
+        .map(|t| t.trim().to_string());
 
     // Fork classify, parallel with the upstream call. Owns its inputs so the task is
     // `'static`; this is the one body clone (a future parse-once refactor would remove it).
