@@ -1916,6 +1916,9 @@ pub struct TaskWorkersConfig {
     /// Number of cascade-batch-state workers (default: 1).
     /// Updates child request states after a batch is cancelled or deleted.
     pub cascade_batch_state_workers: usize,
+    /// Number of purge-user-data workers (default: 1).
+    /// Erases a deleted user's fusillade data (batches, files, requests).
+    pub purge_user_data_workers: usize,
     /// Maximum records per flush in the in-process responses writer
     /// (default: 100). Larger values amortise commit overhead across the
     /// batch; smaller values reduce per-record latency from outlet send
@@ -1929,6 +1932,7 @@ impl Default for TaskWorkersConfig {
         Self {
             create_batch_workers: 1,
             cascade_batch_state_workers: 1,
+            purge_user_data_workers: 1,
             response_writer_batch_size: 100,
         }
     }

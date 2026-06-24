@@ -23,6 +23,7 @@ use axum::{
     response::Json,
 };
 use rust_decimal::prelude::ToPrimitive;
+use serde::{Deserialize, Serialize};
 use tracing::error;
 
 // GET /user - List users (admin only)
@@ -504,15 +505,95 @@ pub async fn delete_user<P: PoolProvider>(
         }
     }
 
-    let mut conn = state.db.write().acquire().await.expect("Failed to acquire database connection");
-    let mut repo = Users::new(&mut conn);
+    // Soft-delete + scrub the user row and hard-delete their API keys
+    // (atomic, in repo.delete). Scoped so the connection borrow is released
+    // before we enqueue the background purge below.
+    let deleted = {
+        let mut conn = state.db.write().acquire().await.expect("Failed to acquire database connection");
+        let mut repo = Users::new(&mut conn);
+        repo.delete(user_id).await?
+    };
 
-    match repo.delete(user_id).await? {
-        true => Ok(StatusCode::NO_CONTENT),
-        false => Err(Error::NotFound {
+    if !deleted {
+        return Err(Error::NotFound {
             resource: "User".to_string(),
             id: user_id.to_string(),
-        }),
+        });
+    }
+
+    // Erase the user's fusillade data (files, batches, requests) in the
+    // background. API keys were already hard-deleted synchronously above so
+    // they stop authenticating immediately; fusillade data can be unbounded,
+    // so it is offloaded to an at-least-once underway job.
+    enqueue_purge_user_data(&state, user_id_str).await;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Input for the user-data purge background job. Carries the user id as a
+/// string because fusillade keys ownership (`created_by` / `uploaded_by`) as
+/// text.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PurgeUserDataInput {
+    pub user_id: String,
+}
+
+/// Build the underway job that erases a deleted user's fusillade data
+/// (batchless requests, batches, files) via `Storage::bulk_delete_data`,
+/// looping in chunks until nothing is left. Retryable on error so a crashed
+/// or partial purge is resumed.
+pub async fn build_purge_user_data_job<P: sqlx_pool_router::PoolProvider + Clone + Send + Sync + 'static>(
+    pool: sqlx::PgPool,
+    state: crate::tasks::TaskState<P>,
+) -> anyhow::Result<underway::Job<PurgeUserDataInput, crate::tasks::TaskState<P>>> {
+    use fusillade::Storage;
+    use underway::Job;
+    use underway::job::To;
+    use underway::task::Error as TaskError;
+
+    // Chunk size per bulk_delete_data call. bulk_delete_data only touches the
+    // user's batch/file rows and batchless requests (child rows are reaped by
+    // the orphan-purge daemon), so even large accounts drain in a few passes.
+    const BATCH_SIZE: i64 = 1000;
+
+    Job::<PurgeUserDataInput, _>::builder()
+        .state(state)
+        .step(|cx, input: PurgeUserDataInput| async move {
+            let mut total: u64 = 0;
+            loop {
+                match cx.state.request_manager.bulk_delete_data(&input.user_id, BATCH_SIZE).await {
+                    Ok(0) => {
+                        if total > 0 {
+                            tracing::info!(user_id = %input.user_id, rows = total, "Purged user fusillade data");
+                        }
+                        return To::done();
+                    }
+                    Ok(n) => total += n,
+                    Err(e) => {
+                        tracing::error!(user_id = %input.user_id, error = %e, "Failed to purge user fusillade data");
+                        return Err(TaskError::Retryable(e.to_string()));
+                    }
+                }
+            }
+        })
+        .name("purge-user-data")
+        .pool(pool)
+        .build()
+        .await
+        .map_err(Into::into)
+}
+
+/// Enqueue the purge-user-data job. Best-effort: logs a warning on failure so
+/// the delete handler still returns success (the row + keys are already gone;
+/// fusillade data can be cleaned up on a later deletion or manually).
+async fn enqueue_purge_user_data<P: PoolProvider>(state: &AppState<P>, user_id: String) {
+    if let Err(e) = state
+        .task_runner
+        .purge_user_data_job
+        .enqueue(&PurgeUserDataInput { user_id: user_id.clone() })
+        .await
+    {
+        tracing::warn!(user_id = %user_id, error = %e, "Failed to enqueue purge-user-data job (fusillade data will remain until retried)");
     }
 }
 
