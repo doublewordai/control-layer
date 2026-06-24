@@ -2254,6 +2254,17 @@ impl Config {
             }
         }
 
+        // Cached-input pricing needs a tokenizer-svc URL to count cache-prefix tokens.
+        // Without it, every cacheable request silently degrades to no caching — fail fast
+        // at startup instead, so an operator who flips the flag gets a clear error.
+        if self.onwards.cache_classifier_enabled && self.onwards.tokenizer_url.trim().is_empty() {
+            return Err(Error::Internal {
+                operation: "Config validation: onwards.cache_classifier_enabled is true but onwards.tokenizer_url is \
+                     empty. Set DWCTL_ONWARDS__TOKENIZER_URL to the tokenizer-svc base URL, or disable the classifier."
+                    .to_string(),
+            });
+        }
+
         // Validate JWT expiry duration is reasonable
         if self.auth.security.jwt_expiry.as_secs() < 300 {
             // Less than 5 minutes

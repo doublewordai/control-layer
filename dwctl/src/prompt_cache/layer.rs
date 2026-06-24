@@ -26,20 +26,32 @@ use tracing::warn;
 use super::classifier::{Classifier, ClassifyOutcome, ClassifyRequest};
 use super::inject::{CommitGate, inject_cache_stats_into_response, strip_cache_control};
 
+/// Bound on the index commit (off the response path). A slow/hung DB can't leak the
+/// spawned task or hold a pool connection indefinitely; a miss just drops the write
+/// (best-effort — §11 reconciliation backstops it). Generous vs the classify deadline
+/// because it's off-path and is real DB work, not a race against generation.
+const COMMIT_DEADLINE: Duration = Duration::from_secs(30);
+
 /// State for [`cache_middleware`]. Added to the stack only when caching is enabled.
 #[derive(Clone)]
 pub struct CacheLayerState {
     pub classifier: Classifier,
     pub deadline: Duration,
+    /// Max bytes to buffer when reading a cacheable request body. Set to the *same* limit
+    /// the onwards router enforces (`limits.requests.max_body_size`) so this layer is never
+    /// more restrictive than the entry point — a request onwards would accept is buffered,
+    /// one it would reject degrades here too. Bounds memory (defence-in-depth vs a DoS).
+    pub body_limit: usize,
 }
 
 impl CacheLayerState {
-    pub fn new(classifier: Classifier) -> Self {
+    pub fn new(classifier: Classifier, body_limit: usize) -> Self {
         Self {
             classifier,
             // Mirrors onwards' old `DEFAULT_CLASSIFY_DEADLINE`; only bites on an
             // index/tokenizer outage (classify normally finishes during generation).
             deadline: Duration::from_secs(5),
+            body_limit,
         }
     }
 }
@@ -56,7 +68,8 @@ pub async fn cache_middleware(State(state): State<CacheLayerState>, request: Req
     }
 
     let (mut parts, body) = request.into_parts();
-    let body_bytes = match axum::body::to_bytes(body, usize::MAX).await {
+    // Bounded by the same limit onwards enforces (never more restrictive than the entry).
+    let body_bytes = match axum::body::to_bytes(body, state.body_limit).await {
         Ok(b) => b,
         Err(_) => {
             // Can't read the body — forward an empty one (degraded; onwards will 4xx).
@@ -95,10 +108,13 @@ pub async fn cache_middleware(State(state): State<CacheLayerState>, request: Req
     });
 
     // Sanitise the outbound body: strip markers + ensure include_usage (no-op → keep).
+    // Re-frame: set Content-Length and drop any stale Transfer-Encoding (sending both is
+    // invalid HTTP). `from(u64)` is the unambiguous numeric HeaderValue ctor.
     let forward = strip_cache_control(&body_bytes).unwrap_or(body_bytes);
+    parts.headers.remove(header::TRANSFER_ENCODING);
     parts
         .headers
-        .insert(header::CONTENT_LENGTH, axum::http::HeaderValue::from(forward.len()));
+        .insert(header::CONTENT_LENGTH, axum::http::HeaderValue::from(forward.len() as u64));
     let response = next.run(Request::from_parts(parts, Body::from(forward))).await;
 
     // Join classify under the deadline (≈never waits — it raced the slower generation).
@@ -139,10 +155,8 @@ pub async fn cache_middleware(State(state): State<CacheLayerState>, request: Req
             CommitGate::Ready(false) => {}
             CommitGate::Deferred(rx) => {
                 tokio::spawn(async move {
-                    if rx.await.unwrap_or(false)
-                        && let Err(e) = classifier.commit(&pending).await
-                    {
-                        warn!(error = %e, "cache index commit failed");
+                    if rx.await.unwrap_or(false) {
+                        commit_with_deadline(&classifier, &pending).await;
                     }
                 });
             }
@@ -152,12 +166,20 @@ pub async fn cache_middleware(State(state): State<CacheLayerState>, request: Req
     response
 }
 
+/// Commit the pending write under [`COMMIT_DEADLINE`], so a slow/hung DB can't leak the
+/// task or hold a connection. A timeout or error just drops the write (best-effort).
+async fn commit_with_deadline(classifier: &Classifier, pending: &super::stats::PendingWrite) {
+    match tokio::time::timeout(COMMIT_DEADLINE, classifier.commit(pending)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => warn!(error = %e, "cache index commit failed"),
+        Err(_) => warn!("cache index commit timed out"),
+    }
+}
+
 /// Spawn the success-gated index commit off the response path.
 fn spawn_commit(classifier: Classifier, pending: super::stats::PendingWrite) {
     tokio::spawn(async move {
-        if let Err(e) = classifier.commit(&pending).await {
-            warn!(error = %e, "cache index commit failed");
-        }
+        commit_with_deadline(&classifier, &pending).await;
     });
 }
 
@@ -241,7 +263,7 @@ mod tests {
         );
         let app = Router::new()
             .route("/v1/chat/completions", post(mock_upstream))
-            .layer(from_fn_with_state(CacheLayerState::new(classifier), cache_middleware));
+            .layer(from_fn_with_state(CacheLayerState::new(classifier, usize::MAX), cache_middleware));
         let server = axum_test::TestServer::new(app).unwrap();
 
         // First request: nothing cached yet → all-creation, response carries zeroed read.
@@ -303,7 +325,7 @@ mod tests {
         );
         let app = Router::new()
             .route("/v1/embeddings", post(mock_upstream))
-            .layer(from_fn_with_state(CacheLayerState::new(classifier), cache_middleware));
+            .layer(from_fn_with_state(CacheLayerState::new(classifier, usize::MAX), cache_middleware));
         let server = axum_test::TestServer::new(app).unwrap();
         let r = server
             .post("/v1/embeddings")

@@ -473,9 +473,11 @@ fn extract_cache_tokens(response_data: &ResponseData) -> CacheTokens {
     }
 
     // Streaming: scan SSE frames, keeping the last one that carries a usage object.
+    // SSE allows `data:<value>` and `data: <value>` — strip the colon then an optional space.
     let mut last = CacheTokens::default();
     for line in body_str.lines() {
-        if let Some(data) = line.strip_prefix("data: ") {
+        if let Some(data) = line.strip_prefix("data:") {
+            let data = data.strip_prefix(' ').unwrap_or(data);
             let trimmed = data.trim();
             if trimmed != "[DONE]"
                 && let Ok(value) = serde_json::from_str::<Value>(trimmed)

@@ -1608,9 +1608,15 @@ pub async fn build_router(
                 crate::prompt_cache::TokenizerClient::new(cfg.onwards.tokenizer_url.clone()),
                 Arc::new(crate::prompt_cache::PostgresIndex::new(pool)),
             );
+            // Bound the cache layer's body buffer by the same limit onwards uses (0 =
+            // unlimited), so it's never more restrictive than the entry point.
+            let body_limit = match cfg.limits.requests.max_body_size {
+                0 => usize::MAX,
+                n => usize::try_from(n).unwrap_or(usize::MAX),
+            };
             tracing::info!("Cached-input pricing enabled - wiring cache layer into onwards stack");
             onwards_router.layer(middleware::from_fn_with_state(
-                crate::prompt_cache::CacheLayerState::new(classifier),
+                crate::prompt_cache::CacheLayerState::new(classifier, body_limit),
                 crate::prompt_cache::cache_middleware,
             ))
         } else {

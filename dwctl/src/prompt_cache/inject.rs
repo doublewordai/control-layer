@@ -160,7 +160,10 @@ fn scan_inject_sse(body: &[u8], stats: &CacheStats, already_edited: bool) -> Sse
         }
         first = false;
 
-        if let Some(data) = line.strip_prefix("data: ") {
+        // SSE allows `data:<value>` and `data: <value>` — strip the colon, then an
+        // optional single space (matches onwards' own SSE parser).
+        if let Some(data) = line.strip_prefix("data:") {
+            let data = data.strip_prefix(' ').unwrap_or(data);
             let trimmed = data.trim();
             if trimmed != "[DONE]"
                 && let Ok(mut chunk) = serde_json::from_str::<Value>(trimmed)
@@ -326,7 +329,7 @@ pub async fn inject_cache_stats_into_response(mut response: Response, stats: &Ca
                 parts.headers.remove(axum::http::header::CONTENT_ENCODING);
                 parts
                     .headers
-                    .insert(axum::http::header::CONTENT_LENGTH, axum::http::HeaderValue::from(len));
+                    .insert(axum::http::header::CONTENT_LENGTH, axum::http::HeaderValue::from(len as u64));
                 (
                     Response::from_parts(parts, axum::body::Body::from(rewritten)),
                     CommitGate::Ready(status_ok),
@@ -338,7 +341,7 @@ pub async fn inject_cache_stats_into_response(mut response: Response, stats: &Ca
                 parts.headers.remove(axum::http::header::TRANSFER_ENCODING);
                 parts
                     .headers
-                    .insert(axum::http::header::CONTENT_LENGTH, axum::http::HeaderValue::from(len));
+                    .insert(axum::http::header::CONTENT_LENGTH, axum::http::HeaderValue::from(len as u64));
                 (
                     Response::from_parts(parts, axum::body::Body::from(body_bytes)),
                     CommitGate::Ready(false),
@@ -417,6 +420,15 @@ mod tests {
         assert!(inject_into_sse_body(sse.as_bytes(), &stats()).is_none());
     }
 
+    #[test]
+    fn inject_sse_handles_data_prefix_without_space() {
+        // `data:{…}` (no space after the colon) is valid SSE and must still be injected.
+        let sse = "data:{\"choices\":[],\"usage\":{\"prompt_tokens\":2000}}\n\ndata:[DONE]\n\n";
+        let out = inject_into_sse_body(sse.as_bytes(), &stats()).expect("no-space data: frame is injected");
+        let s = std::str::from_utf8(&out).unwrap();
+        assert!(s.contains("\"cache_read_input_tokens\":1024"), "got: {s}");
+    }
+
     #[tokio::test]
     async fn inject_response_streaming_edits_split_usage_frame() {
         use axum::body::Body;
@@ -456,6 +468,32 @@ mod tests {
         let _ = axum::body::to_bytes(out.into_body(), usize::MAX).await.unwrap();
         match gate {
             CommitGate::Deferred(rx) => assert!(!rx.await.unwrap(), "error frame → veto"),
+            CommitGate::Ready(_) => panic!("streaming response must yield a deferred gate"),
+        }
+    }
+
+    #[tokio::test]
+    async fn inject_response_streaming_disconnect_vetoes_commit() {
+        use axum::body::Body;
+        // A clean stream WITH a usage frame — but the client disconnects before draining
+        // it (we drop the response body without reading it). VerdictStream's Drop must then
+        // fire the verdict, and because the terminal usage frame was never polled, the
+        // verdict is `false` → no commit for a stream the client never finished paying for.
+        let chunks: Vec<Result<Bytes, std::io::Error>> = vec![
+            Ok(Bytes::from_static(b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n")),
+            Ok(Bytes::from_static(
+                b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":2000}}\n\ndata: [DONE]\n\n",
+            )),
+        ];
+        let resp = Response::builder()
+            .header("content-type", "text/event-stream")
+            .body(Body::from_stream(futures::stream::iter(chunks)))
+            .unwrap();
+        let (out, gate) = inject_cache_stats_into_response(resp, &stats()).await;
+        // Client disconnect: drop the response (and its body) WITHOUT consuming the stream.
+        drop(out);
+        match gate {
+            CommitGate::Deferred(rx) => assert!(!rx.await.unwrap(), "disconnect before terminal frame → veto"),
             CommitGate::Ready(_) => panic!("streaming response must yield a deferred gate"),
         }
     }
