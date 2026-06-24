@@ -292,9 +292,11 @@ pub async fn inject_cache_stats_into_response(mut response: Response, stats: &Ca
 
         let (tx, rx) = oneshot::channel();
         let body_stream = BodyExt::into_data_stream(std::mem::take(response.body_mut()));
-        // Re-aggregate provider chunks into complete SSE events so a terminal usage
-        // frame split across body chunks isn't missed; normalise the error type once.
-        let buffered = SseBufferedStream::new(body_stream).map(|r| r.map_err(std::io::Error::other));
+        // Normalise the error type to io::Error *before* buffering, so SseBufferedStream can
+        // emit its own io::Error on an over-limit buffer (its `E: From<io::Error>` bound).
+        // Re-aggregate provider chunks into complete SSE events so a terminal usage frame
+        // split across body chunks isn't missed.
+        let buffered = SseBufferedStream::new(body_stream.map(|r| r.map_err(std::io::Error::other)));
         let transformed = VerdictStream {
             inner: Box::pin(buffered),
             stats: *stats,

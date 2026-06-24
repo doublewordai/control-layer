@@ -33,7 +33,7 @@
 //! - **Batch enrichment**: User and pricing lookups are batched using `IN` clauses,
 //!   reducing from O(N) queries to O(1) per batch.
 
-use crate::config::{Config, ONWARDS_CONFIG_CHANGED_CHANNEL};
+use crate::config::{CachePricingConfig, Config, ONWARDS_CONFIG_CHANGED_CHANNEL};
 use crate::db::handlers::Credits;
 use crate::db::models::api_keys::ApiKeyPurpose;
 use crate::metrics::MetricsRecorder;
@@ -148,6 +148,7 @@ struct CacheTariffRow {
 }
 
 /// The cache multipliers resolved for one request at a point in time.
+#[derive(Clone, Copy)]
 struct CacheMultipliers {
     read: Decimal,
     write_5m: Decimal,
@@ -155,20 +156,27 @@ struct CacheMultipliers {
     write_24h: Decimal,
 }
 
-impl Default for CacheMultipliers {
-    fn default() -> Self {
-        // Reached only if a request carries cache tokens with no tariff valid at its time
-        // (unreachable in practice — classify gates on an active row; the call site emits a
-        // `cache_tariff_missing` background error if it ever does). Reads keep the standard
-        // 0.1 discount; writes default to Anthropic's 1.25× — the premium the large majority
-        // of models carry, so it's a fair representative rather than the old ×1 (which always
-        // under-charged creation). Any mismatch in this dead path is surfaced by the metric.
+impl CacheMultipliers {
+    /// The operator-configured defaults ([`CachePricingConfig`]) — the same values a freshly
+    /// enabled tariff would get. Used as the fallback when a request carries cache tokens with
+    /// no tariff valid at its time (unreachable in practice — classify gates on an active row,
+    /// and the call site emits a `cache_tariff_missing` background error if it ever happens).
+    fn from_config(c: &CachePricingConfig) -> Self {
         Self {
-            read: Decimal::new(1, 1),        // 0.1
-            write_5m: Decimal::new(125, 2),  // 1.25
-            write_1h: Decimal::new(125, 2),  // 1.25
-            write_24h: Decimal::new(125, 2), // 1.25
+            read: c.default_read_multiplier,
+            write_5m: c.default_write_multiplier_5m,
+            write_1h: c.default_write_multiplier_1h,
+            write_24h: c.default_write_multiplier_24h,
         }
+    }
+}
+
+impl Default for CacheMultipliers {
+    /// Mirrors the shipped [`CachePricingConfig`] defaults (read 0.1, writes 1.25/2.0/2.5) so
+    /// the hardcoded default and the config defaults can't drift. Production reads the live
+    /// config via [`CacheMultipliers::from_config`]; this is for tests/standalone callers.
+    fn default() -> Self {
+        Self::from_config(&CachePricingConfig::default())
     }
 }
 
@@ -256,6 +264,9 @@ where
     last_onwards_sync_notification: Arc<RwLock<Instant>>,
     /// Minimum interval between onwards sync notifications (from config).
     onwards_sync_notification_interval: Duration,
+    /// Fallback cache multipliers (from `config.cache_pricing`) for the unreachable path where
+    /// a request carries cache tokens but no tariff resolved. Operator-tunable, not hardcoded.
+    cache_fallback_multipliers: CacheMultipliers,
 }
 
 impl<M> AnalyticsBatcher<M>
@@ -281,6 +292,7 @@ where
         let max_retries = config.analytics.max_retries;
         let retry_base_delay = std::time::Duration::from_millis(config.analytics.retry_base_delay_ms);
         let onwards_sync_notification_interval = Duration::from_millis(config.analytics.balance_notification_interval_milliseconds);
+        let cache_fallback_multipliers = CacheMultipliers::from_config(&config.cache_pricing);
 
         let batcher = Self {
             pool,
@@ -295,6 +307,7 @@ where
                     .unwrap_or_else(Instant::now),
             )),
             onwards_sync_notification_interval,
+            cache_fallback_multipliers,
         };
 
         (batcher, sender)
@@ -596,7 +609,7 @@ where
                 );
             }
 
-            let cache_mults = cache_mults_resolved.unwrap_or_default();
+            let cache_mults = cache_mults_resolved.unwrap_or(self.cache_fallback_multipliers);
             let total_cost = compute_total_cost(&raw, input_price, output_price, &cache_mults);
             let uncached_cost = compute_list_price(&raw, input_price, output_price);
 
@@ -1498,12 +1511,14 @@ mod tests {
     }
 
     #[test]
-    fn default_multipliers_keep_read_discount_and_anthropic_write_premium() {
+    fn default_multipliers_mirror_config_pricing_defaults() {
+        // Default delegates to CachePricingConfig::default() so the two can't drift.
         let m = CacheMultipliers::default();
-        assert_eq!(m.read, Decimal::new(1, 1), "default read keeps the 0.1 discount");
-        assert_eq!(m.write_5m, Decimal::new(125, 2), "default write = Anthropic 1.25x");
-        assert_eq!(m.write_1h, Decimal::new(125, 2));
-        assert_eq!(m.write_24h, Decimal::new(125, 2));
+        let c = CachePricingConfig::default();
+        assert_eq!(m.read, c.default_read_multiplier, "read = config default (0.1)");
+        assert_eq!(m.write_5m, c.default_write_multiplier_5m, "5m = config default (1.25)");
+        assert_eq!(m.write_1h, c.default_write_multiplier_1h, "1h = config default (2.0)");
+        assert_eq!(m.write_24h, c.default_write_multiplier_24h, "24h = config default (2.5)");
     }
 
     #[test]

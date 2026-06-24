@@ -155,7 +155,12 @@ impl Classifier {
         let read_block = read.as_ref().map(|r| r.block); // index into parsed.blocks
         let read_tokens = read.as_ref().map(|r| r.tokens).unwrap_or(0);
 
-        let deepest = parsed.breakpoints.last().expect("non-empty checked above").block_index;
+        // Parse guarantees ≥1 breakpoint here (the is-empty check above bails early), but
+        // degrade to no-caching rather than panic if that invariant ever drifts in a refactor.
+        let Some(deepest_bp) = parsed.breakpoints.last() else {
+            return Ok(ClassifyOutcome::zero_active());
+        };
+        let deepest = deepest_bp.block_index;
 
         let mut stats = CacheStats {
             read: read_tokens as u64,

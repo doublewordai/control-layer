@@ -5,8 +5,11 @@
 //! complete event (terminated by `\n\n`) before yielding. The cache injection
 //! ([`super::inject`]) needs complete events to find + edit the terminal usage frame.
 //!
-//! Copied from onwards' generic `sse.rs` (which the core proxy also uses, so it can't
-//! be relocated) — kept self-contained here for the dwctl-owned cache layer (§0).
+//! Adapted from onwards' generic `sse.rs` (which the core proxy also uses, so it can't
+//! be relocated) — kept self-contained here for the dwctl-owned cache layer (§0). One
+//! intentional divergence: an over-limit buffer is surfaced as a stream **error** rather
+//! than a clean EOF, so a protocol violation can't masquerade as a complete response (the
+//! commit gate + the client both see a failure). Hence the `E: From<io::Error>` bound.
 
 use bytes::{Bytes, BytesMut};
 use futures::Stream;
@@ -36,6 +39,7 @@ impl<S> SseBufferedStream<S> {
 impl<S, E> Stream for SseBufferedStream<S>
 where
     S: Stream<Item = Result<Bytes, E>> + Unpin,
+    E: From<std::io::Error>,
 {
     type Item = Result<Bytes, E>;
 
@@ -57,7 +61,11 @@ where
                             MAX_SSE_BUFFER_SIZE
                         );
                         this.buffer.clear();
-                        return Poll::Ready(None);
+                        // Surface the protocol violation as a stream error, not a clean EOF — a
+                        // silent None would hand downstream a truncated-but-"complete" response.
+                        return Poll::Ready(Some(Err(E::from(std::io::Error::other(format!(
+                            "SSE buffer exceeded maximum size of {MAX_SSE_BUFFER_SIZE} bytes"
+                        ))))));
                     }
                 }
                 Poll::Ready(Some(Err(e))) => return Poll::Ready(Some(Err(e))),
@@ -83,9 +91,9 @@ fn find_event_boundary(buf: &[u8]) -> Option<usize> {
 mod tests {
     use super::*;
     use futures::StreamExt;
-    use std::convert::Infallible;
 
-    fn stream(chunks: Vec<&'static [u8]>) -> impl Stream<Item = Result<Bytes, Infallible>> + Unpin {
+    // Error type is io::Error to satisfy the `E: From<io::Error>` bound; these streams never err.
+    fn stream(chunks: Vec<&'static [u8]>) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Unpin {
         futures::stream::iter(chunks.into_iter().map(|c| Ok(Bytes::from_static(c))))
     }
 
@@ -115,5 +123,16 @@ mod tests {
             .await;
         let joined: Vec<u8> = out.iter().flat_map(|b| b.to_vec()).collect();
         assert_eq!(joined, b"data: partial");
+    }
+
+    #[tokio::test]
+    async fn over_limit_buffer_yields_error_not_clean_eof() {
+        // An upstream that never emits a `\n\n` delimiter pushes the buffer past the cap.
+        // The last item must be an Err (protocol violation surfaced), not a silent end.
+        let big = vec![b'x'; MAX_SSE_BUFFER_SIZE + 1];
+        let s = futures::stream::iter(vec![Ok::<_, std::io::Error>(Bytes::from(big))]);
+        let out: Vec<_> = SseBufferedStream::new(s).collect().await;
+        assert_eq!(out.len(), 1, "one error item, then terminate");
+        assert!(out[0].is_err(), "over-limit buffer surfaces an error, not a clean EOF");
     }
 }

@@ -35,6 +35,8 @@ pub enum ParseError {
     TooManyBreakpoints { found: usize },
     #[error("invalid cache_control ttl: {0:?}")]
     InvalidTtl(String),
+    #[error("unsupported cache_control type: {0:?} (only \"ephemeral\")")]
+    UnsupportedType(String),
 }
 
 /// A single content block in canonical order.
@@ -140,7 +142,14 @@ pub fn parse_chat_completions(body: &[u8]) -> Result<ParsedPrompt, ParseError> {
 }
 
 /// `cache_control: { type: "ephemeral", ttl: "5m"|"1h"|"24h" }` — ttl defaults to 5m.
+/// A present-but-non-`ephemeral` `type` is rejected so a typo'd/unsupported marker degrades
+/// to "no cache" (→ classify bails) rather than silently being honoured as a breakpoint.
 fn parse_ttl(cache_control: &serde_json::Value) -> Result<TtlTier, ParseError> {
+    if let Some(t) = cache_control.get("type").and_then(|t| t.as_str())
+        && t != "ephemeral"
+    {
+        return Err(ParseError::UnsupportedType(t.to_string()));
+    }
     let ttl = cache_control.get("ttl").and_then(|t| t.as_str()).unwrap_or("5m");
     TtlTier::parse(ttl).ok_or_else(|| ParseError::InvalidTtl(ttl.to_string()))
 }
@@ -236,6 +245,21 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, ParseError::InvalidTtl(t) if t == "2h"));
+    }
+
+    #[test]
+    fn unsupported_cache_control_type_errors() {
+        let err = parse_chat_completions(
+            serde_json::json!({
+                "messages": [{"role": "system", "content": [
+                    {"type": "text", "text": "x", "cache_control": {"type": "persistent"}}
+                ]}]
+            })
+            .to_string()
+            .as_bytes(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, ParseError::UnsupportedType(t) if t == "persistent"));
     }
 
     #[test]

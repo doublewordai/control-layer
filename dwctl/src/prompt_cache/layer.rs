@@ -95,7 +95,8 @@ pub async fn cache_middleware(State(state): State<CacheLayerState>, request: Req
         .headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
+        // Accept both casings, as the rest of the stack does (error_enrichment, image_normalizer).
+        .and_then(|v| v.strip_prefix("Bearer ").or_else(|| v.strip_prefix("bearer ")))
         .map(String::from);
 
     // Fork classify, parallel with the upstream call. Owns its inputs so the task is
