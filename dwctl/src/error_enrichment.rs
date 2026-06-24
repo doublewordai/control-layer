@@ -296,7 +296,7 @@ pub async fn check_user_has_model_access(pool: PgPool, user_id: UserId, model_al
 /// Returns `Ok(())` if the request should be allowed, or a user-facing error message
 /// if not.
 ///
-/// Used by the responses middleware to fail fast on Flex requests that bypass
+/// Used by the inference middleware to fail fast on Flex requests that bypass
 /// `onwards` entirely — without the modality check here, a Batch-purpose key
 /// could send a Flex request and skip a deny rule onwards would have enforced.
 pub async fn validate_api_key_model_access(pool: PgPool, api_key: &str, model: &str) -> Result<(), String> {

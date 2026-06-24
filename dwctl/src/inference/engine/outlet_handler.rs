@@ -69,7 +69,7 @@ impl FusilladeOutletHandler {
     /// this here keeps the two handler paths from drifting on which headers
     /// are gating vs. just warned-about.
     fn extract_complete_response_ctx(request: &RequestData) -> Option<CompleteResponseCtx> {
-        // Only the responses middleware sets `x-onwards-response-id`, so its
+        // Only the inference middleware sets `x-onwards-response-id`, so its
         // absence means this is either a daemon-driven fusillade batch request
         // (daemon handles its own completion) or unrelated traffic. Silent
         // no-op — no warning, no work to do.
@@ -307,7 +307,7 @@ mod tests {
 
     #[test]
     fn test_extract_response_id_present_with_fusillade_request_header() {
-        // Responses middleware sets `x-fusillade-request-id` for the ID
+        // Inference middleware sets `x-fusillade-request-id` for the ID
         // override and `x-onwards-response-id` for outlet routing. Both
         // headers together must produce a valid response id.
         let mut headers = HashMap::new();
