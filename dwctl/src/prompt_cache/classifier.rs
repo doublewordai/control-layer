@@ -251,6 +251,13 @@ impl Classifier {
             return Ok(v);
         }
         let Ok(models) = self.tokenizer.models().await else {
+            // Service unreachable → deliberately NOT memoised. A genuine "model not in the
+            // list" result IS cached below (a stable fact), but an outage is transient: leaving
+            // it uncached means caching resumes the instant tokenizer-svc recovers rather than
+            // staying dark for the cache TTL. The cost is one cheap failed `/v1/models` GET per
+            // cacheable request during the outage — best-effort, off the user path. (Caching
+            // None at the 300s TTL here would instead blind the cache for up to 5 min after
+            // recovery, which is worse than the redundant probes.)
             return Ok(None);
         };
         let mut found = None;

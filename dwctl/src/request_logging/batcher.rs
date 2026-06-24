@@ -157,36 +157,35 @@ struct CacheMultipliers {
 
 impl Default for CacheMultipliers {
     fn default() -> Self {
-        // Reached only if a request somehow carries cache tokens with no tariff valid at
-        // its time (unreachable in practice — classify gates on an active row). Reads keep
-        // the 10% discount (never *over*-charge a read); creation gets no premium (×1) — a
-        // safe under-charge. Honours the no-overcharge contract (§7).
+        // Reached only if a request carries cache tokens with no tariff valid at its time
+        // (unreachable in practice — classify gates on an active row; the call site emits a
+        // `cache_tariff_missing` background error if it ever does). Reads keep the standard
+        // 0.1 discount; writes default to Anthropic's 1.25× — the premium the large majority
+        // of models carry, so it's a fair representative rather than the old ×1 (which always
+        // under-charged creation). Any mismatch in this dead path is surfaced by the metric.
         Self {
-            read: Decimal::new(1, 1), // 0.1
-            write_5m: Decimal::ONE,
-            write_1h: Decimal::ONE,
-            write_24h: Decimal::ONE,
+            read: Decimal::new(1, 1),        // 0.1
+            write_5m: Decimal::new(125, 2),  // 1.25
+            write_1h: Decimal::new(125, 2),  // 1.25
+            write_24h: Decimal::new(125, 2), // 1.25
         }
     }
 }
 
 /// Resolve the multipliers from the model's cache-tariff row valid at `timestamp` — the
 /// most-recently-effective version still in its window. One row carries all tiers, so
-/// there is no per-tier resolution or gap.
-fn resolve_cache_multipliers(rows: &[CacheTariffRow], timestamp: DateTime<Utc>) -> CacheMultipliers {
-    match rows
-        .iter()
+/// there is no per-tier resolution or gap. `None` when no version was valid at `timestamp`
+/// (so the caller can distinguish "no tariff" from a real row and fall back deliberately).
+fn resolve_cache_multipliers(rows: &[CacheTariffRow], timestamp: DateTime<Utc>) -> Option<CacheMultipliers> {
+    rows.iter()
         .filter(|r| r.valid_from <= timestamp && r.valid_until.is_none_or(|u| u > timestamp))
         .max_by_key(|r| r.valid_from)
-    {
-        Some(r) => CacheMultipliers {
+        .map(|r| CacheMultipliers {
             read: r.read_multiplier,
             write_5m: r.write_multiplier_5m,
             write_1h: r.write_multiplier_1h,
             write_24h: r.write_multiplier_24h,
-        },
-        None => CacheMultipliers::default(),
-    }
+        })
 }
 
 /// The cache-adjusted request cost (plan §8.4). Reduces to the plain
@@ -572,14 +571,32 @@ where
                 (None, None, None)
             };
 
-            // Resolve cache multipliers (default-safe if the model has no cache tariffs)
-            // and fold the cache discount into the request cost.
-            let cache_mults = raw
+            // Resolve cache multipliers from the tariff row valid at inference time. `None`
+            // for the normal non-cache model (no tariff) and for the dead anomaly path below.
+            let cache_mults_resolved = raw
                 .request_model
                 .as_deref()
                 .and_then(|alias| cache_tariff_map.get(alias))
-                .map(|rows| resolve_cache_multipliers(rows, pricing_timestamp))
-                .unwrap_or_default();
+                .and_then(|rows| resolve_cache_multipliers(rows, pricing_timestamp));
+
+            // Anomaly guard: classify only records cache tokens when a tariff is active, so
+            // cache tokens with no tariff valid at billing time means something drifted. Bill
+            // at safe defaults, but surface it — this should never fire in practice.
+            let has_cache_tokens = raw.cache_read_input_tokens > 0
+                || raw.cache_creation_5m_input_tokens > 0
+                || raw.cache_creation_1h_input_tokens > 0
+                || raw.cache_creation_24h_input_tokens > 0;
+            if cache_mults_resolved.is_none() && has_cache_tokens {
+                crate::background_error!(
+                    ANALYTICS_BATCHER,
+                    "cache_tariff_missing",
+                    Warning,
+                    model = raw.request_model.as_deref().unwrap_or("?"),
+                    "request carries cache tokens but no cache tariff was valid at inference time; billing at default multipliers"
+                );
+            }
+
+            let cache_mults = cache_mults_resolved.unwrap_or_default();
             let total_cost = compute_total_cost(&raw, input_price, output_price, &cache_mults);
             let uncached_cost = compute_list_price(&raw, input_price, output_price);
 
@@ -1463,7 +1480,7 @@ mod tests {
         let now = chrono::Utc::now();
         // Two versions; the newer (valid_from 1h ago) wins over the older (5h ago).
         let rows = vec![tariff_row(Decimal::from(2), 1, None), tariff_row(Decimal::from(3), 5, None)];
-        let m = resolve_cache_multipliers(&rows, now);
+        let m = resolve_cache_multipliers(&rows, now).expect("a valid version exists");
         assert_eq!(m.write_1h, Decimal::from(2), "latest valid version wins");
         assert_eq!(m.write_5m, Decimal::new(125, 2), "all tiers come from that one row");
         assert_eq!(m.write_24h, Decimal::new(25, 1));
@@ -1471,17 +1488,22 @@ mod tests {
     }
 
     #[test]
-    fn resolve_multipliers_defaults_when_empty_or_expired() {
+    fn resolve_multipliers_none_when_empty_or_expired() {
         let now = chrono::Utc::now();
-        // empty → safe defaults
-        let m = resolve_cache_multipliers(&[], now);
-        assert_eq!(m.read, Decimal::new(1, 1), "default read keeps the 10% discount");
-        assert_eq!(m.write_1h, Decimal::ONE);
-        // expired version ignored → defaults
+        // empty → no version valid → None (the caller falls back to defaults deliberately).
+        assert!(resolve_cache_multipliers(&[], now).is_none(), "no rows → None");
+        // expired version ignored → None.
         let expired = vec![tariff_row(Decimal::from(5), 2, Some(now - chrono::Duration::hours(1)))];
-        let m = resolve_cache_multipliers(&expired, now);
-        assert_eq!(m.write_1h, Decimal::ONE, "expired version ignored → default");
-        assert_eq!(m.read, Decimal::new(1, 1));
+        assert!(resolve_cache_multipliers(&expired, now).is_none(), "expired version ignored → None");
+    }
+
+    #[test]
+    fn default_multipliers_keep_read_discount_and_anthropic_write_premium() {
+        let m = CacheMultipliers::default();
+        assert_eq!(m.read, Decimal::new(1, 1), "default read keeps the 0.1 discount");
+        assert_eq!(m.write_5m, Decimal::new(125, 2), "default write = Anthropic 1.25x");
+        assert_eq!(m.write_1h, Decimal::new(125, 2));
+        assert_eq!(m.write_24h, Decimal::new(125, 2));
     }
 
     #[test]
