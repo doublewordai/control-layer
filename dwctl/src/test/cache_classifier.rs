@@ -185,7 +185,10 @@ async fn proxied_usage(pool: &PgPool, opts: ProxiedOpts) -> serde_json::Value {
             let body: serde_json::Value = resp.json();
             return body["usage"].clone();
         }
-        assert!(status == 404 || status == 403, "unexpected proxied status {status} (expected eventual 200)");
+        assert!(
+            status == 404 || status == 403,
+            "unexpected proxied status {status} (expected eventual 200)"
+        );
         assert!(i < 149, "request never succeeded once synced (last status {status})");
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
