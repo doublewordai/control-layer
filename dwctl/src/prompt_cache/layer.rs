@@ -118,8 +118,12 @@ pub async fn cache_middleware(State(state): State<CacheLayerState>, request: Req
     let response = next.run(Request::from_parts(parts, Body::from(forward))).await;
 
     // Join classify under the deadline (≈never waits — it raced the slower generation).
+    // Time out against `&mut handle` (a JoinHandle is Unpin → itself a Future) so the handle
+    // survives an elapsed timeout and we can `abort()` it: a *dropped* JoinHandle detaches the
+    // task to run on, so under a tokenizer/DB stall a moved-in handle would leak an orphan
+    // classify task per request. Aborting cancels it at its next await instead.
     let outcome = match classify_handle {
-        Some(handle) => match tokio::time::timeout(state.deadline, handle).await {
+        Some(mut handle) => match tokio::time::timeout(state.deadline, &mut handle).await {
             Ok(Ok(Ok(result))) => result,
             Ok(Ok(Err(e))) => {
                 warn!(error = %e, "cache classify failed — billing un-cached");
@@ -129,7 +133,10 @@ pub async fn cache_middleware(State(state): State<CacheLayerState>, request: Req
                 warn!(error = %e, "cache classify task panicked");
                 ClassifyOutcome::inactive()
             }
-            Err(_) => ClassifyOutcome::inactive(), // deadline — best-effort, §11 backstops
+            Err(_) => {
+                handle.abort(); // deadline — best-effort, §11 backstops; don't leak the task
+                ClassifyOutcome::inactive()
+            }
         },
         None => ClassifyOutcome::inactive(),
     };
