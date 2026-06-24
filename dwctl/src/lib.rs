@@ -1585,6 +1585,25 @@ pub async fn build_router(
         onwards_router
     };
 
+    // Apply the generic edge protocol-translation middleware as the OUTERMOST
+    // layer on the onwards router. On the request path it runs first, so any
+    // foreign-protocol request (today: Anthropic `/v1/messages`) is translated
+    // to Chat Completions and its URI rewritten BEFORE image_normalizer,
+    // tool_injection, and onwards see it. On the response path it runs last, so
+    // outlet logging, billing, and usage extraction all observe Chat
+    // Completions, and only the final client bytes are reframed back into the
+    // foreign protocol. Native `/chat/completions` requests match no translator
+    // and pass through untouched.
+    let onwards_router = {
+        let translation_registry = crate::inference::translation::TranslationRegistry::new(vec![std::sync::Arc::new(
+            crate::inference::translation::anthropic::AnthropicMessages,
+        )]);
+        onwards_router.layer(middleware::from_fn_with_state(
+            translation_registry,
+            crate::inference::translation::middleware::translation_middleware,
+        ))
+    };
+
     // Build the app with admin API and onwards proxy nested. serve the (restricted) openai spec.
     // Strict mode requires different nesting:
     // - Batches routes (no /v1 prefix) need to be at /ai/v1/files, /ai/v1/batches

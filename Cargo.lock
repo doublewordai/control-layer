@@ -1872,6 +1872,7 @@ dependencies = [
  "arc-swap",
  "argon2",
  "async-openai",
+ "async-stream",
  "async-stripe",
  "async-stripe-billing",
  "async-stripe-checkout",
