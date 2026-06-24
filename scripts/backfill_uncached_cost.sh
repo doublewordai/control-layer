@@ -33,7 +33,10 @@ remaining() {
     "SELECT count(*) FROM http_analytics WHERE uncached_cost IS NULL AND total_cost IS NOT NULL;"
 }
 
-echo "backfill_uncached_cost: $(remaining) rows to fill (batch=${BATCH_SIZE})"
+# Capture into a variable first: `echo "$(remaining)"` would swallow a psql failure under
+# set -e (echo succeeds even if the substitution failed), but an assignment propagates it.
+start_remaining=$(remaining)
+echo "backfill_uncached_cost: ${start_remaining} rows to fill (batch=${BATCH_SIZE})"
 
 total=0
 while :; do
@@ -63,4 +66,5 @@ while :; do
   sleep "${SLEEP_SECONDS}"
 done
 
-echo "backfill_uncached_cost: done — ${total} rows filled, $(remaining) remaining"
+end_remaining=$(remaining)
+echo "backfill_uncached_cost: done — ${total} rows filled, ${end_remaining} remaining"

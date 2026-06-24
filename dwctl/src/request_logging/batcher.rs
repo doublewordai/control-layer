@@ -216,9 +216,28 @@ fn compute_total_cost(
     let c5 = Decimal::from(raw.cache_creation_5m_input_tokens.max(0));
     let c1 = Decimal::from(raw.cache_creation_1h_input_tokens.max(0));
     let c24 = Decimal::from(raw.cache_creation_24h_input_tokens.max(0));
+    let prompt = Decimal::from(raw.prompt_tokens.max(0));
+    let cached_total = read + c5 + c1 + c24;
+
+    // Billing safety: the cached split can never exceed the prompt. If it does, the
+    // classifier/provider reported a corrupt count — and since writes bill at a premium,
+    // trusting it could massively overcharge. Distrust the split entirely and bill the whole
+    // input at the base rate (= the list price), surfacing it so a classifier bug is visible.
+    if cached_total > prompt {
+        crate::background_error!(
+            ANALYTICS_BATCHER,
+            "cache_split_exceeds_prompt",
+            Warning,
+            model = raw.request_model.as_deref().unwrap_or("?"),
+            prompt_tokens = raw.prompt_tokens,
+            "cached token split exceeds prompt_tokens; ignoring the split and billing at base rate"
+        );
+        return Some(prompt * inp + Decimal::from(raw.completion_tokens.max(0)) * outp);
+    }
+
     // Uncached = full input minus the cached portion, floored at zero (our tokenizer and
     // the provider's can differ; never let the cached count drive uncached negative).
-    let uncached = (Decimal::from(raw.prompt_tokens.max(0)) - (read + c5 + c1 + c24)).max(Decimal::ZERO);
+    let uncached = (prompt - cached_total).max(Decimal::ZERO);
 
     let input_cost = uncached * inp + read * inp * m.read + c5 * inp * m.write_5m + c1 * inp * m.write_1h + c24 * inp * m.write_24h;
     let output_cost = Decimal::from(raw.completion_tokens.max(0)) * outp;
@@ -947,7 +966,8 @@ where
             let c1 = record.raw.cache_creation_1h_input_tokens;
             let c24 = record.raw.cache_creation_24h_input_tokens;
             cache_read_vec.push(record.raw.cache_read_input_tokens);
-            cache_creation_total_vec.push(c5 + c1 + c24);
+            // Saturating: corrupt/huge counts must never wrap into a negative total.
+            cache_creation_total_vec.push(c5.saturating_add(c1).saturating_add(c24));
             cache_5m_vec.push(c5);
             cache_1h_vec.push(c1);
             cache_24h_vec.push(c24);
@@ -1460,12 +1480,17 @@ mod tests {
     }
 
     #[test]
-    fn cache_read_never_drives_uncached_negative() {
-        // Our tokenizer counted more cached tokens than the provider's prompt_tokens.
-        let r = cost_record(100, 0, 1000, 0, 0, 0);
-        let cost = compute_total_cost(&r, Some(inp()), Some(Decimal::ZERO), &CacheMultipliers::default()).unwrap();
-        // uncached floored to 0; only the read term: 1000*0.001*0.1 = 0.1
-        assert_eq!(cost, Decimal::new(1, 1));
+    fn corrupt_split_exceeding_prompt_bills_at_base_rate() {
+        // Cached tokens (1000) exceed the prompt (100) — an impossible, corrupt count from
+        // the classifier/provider. The split is distrusted and the whole input is billed at
+        // base rate (the list price), never at the cache write premium that would massively
+        // overcharge on a mistake.
+        let r = cost_record(100, 5, 1000, 0, 0, 0);
+        let cost = compute_total_cost(&r, Some(inp()), Some(outp()), &CacheMultipliers::default()).unwrap();
+        // list price = 100*0.001 + 5*0.002 = 0.11
+        assert_eq!(cost, Decimal::new(11, 2));
+        // No savings shown for a distrusted split: total == un-discounted list price.
+        assert_eq!(cost, compute_list_price(&r, Some(inp()), Some(outp())).unwrap());
     }
 
     #[test]
