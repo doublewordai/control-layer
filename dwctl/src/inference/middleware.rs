@@ -345,9 +345,7 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
             // the completed object instead, so it's chat-only.
             let flex_stream_include_usage =
                 flex_stream && is_chat_completions_api && request_value["stream_options"]["include_usage"].as_bool().unwrap_or(false);
-            if flex_stream
-                && let Some(obj) = request_value.as_object_mut()
-            {
+            if flex_stream && let Some(obj) = request_value.as_object_mut() {
                 obj.remove("stream");
                 obj.remove("stream_options");
             }

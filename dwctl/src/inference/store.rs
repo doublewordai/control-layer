@@ -1525,6 +1525,112 @@ mod tests {
     }
 
     #[test]
+    fn test_chat_completion_to_stream_chunks_multiple_choices() {
+        // n>1: each choice must produce its own role/content/finish triplet,
+        // each carrying that choice's own `index`.
+        let completion = serde_json::json!({
+            "id": "chatcmpl-multi",
+            "model": "gpt-test",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": { "role": "assistant", "content": "first" },
+                    "finish_reason": "stop",
+                },
+                {
+                    "index": 1,
+                    "message": { "role": "assistant", "content": "second" },
+                    "finish_reason": "length",
+                },
+            ],
+        });
+
+        let chunks = chat_completion_to_stream_chunks(&completion, false);
+        // Two choices × (role + content + finish) = 6 chunks, no usage.
+        assert_eq!(chunks.len(), 6);
+
+        // Choice 0 triplet.
+        assert_eq!(chunks[0]["choices"][0]["index"], 0);
+        assert_eq!(chunks[0]["choices"][0]["delta"]["role"], "assistant");
+        assert_eq!(chunks[1]["choices"][0]["index"], 0);
+        assert_eq!(chunks[1]["choices"][0]["delta"]["content"], "first");
+        assert_eq!(chunks[2]["choices"][0]["index"], 0);
+        assert_eq!(chunks[2]["choices"][0]["finish_reason"], "stop");
+
+        // Choice 1 triplet, carrying its own index.
+        assert_eq!(chunks[3]["choices"][0]["index"], 1);
+        assert_eq!(chunks[3]["choices"][0]["delta"]["role"], "assistant");
+        assert_eq!(chunks[4]["choices"][0]["index"], 1);
+        assert_eq!(chunks[4]["choices"][0]["delta"]["content"], "second");
+        assert_eq!(chunks[5]["choices"][0]["index"], 1);
+        assert_eq!(chunks[5]["choices"][0]["finish_reason"], "length");
+    }
+
+    #[test]
+    fn test_response_object_to_stream_events_multiple_items() {
+        // Multiple assistant message items: each gets its own lifecycle
+        // (added/delta/done/done) and `sequence_number` stays strictly
+        // monotonic across the whole stream.
+        let response = serde_json::json!({
+            "id": "resp_multi",
+            "object": "response",
+            "status": "completed",
+            "model": "gpt-test",
+            "created_at": 1_700_000_000_i64,
+            "output": [
+                {
+                    "type": "message",
+                    "id": "msg_1",
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [{ "type": "output_text", "text": "alpha", "annotations": [] }],
+                },
+                {
+                    "type": "message",
+                    "id": "msg_2",
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [{ "type": "output_text", "text": "beta", "annotations": [] }],
+                },
+            ],
+            "usage": { "total_tokens": 9 },
+        });
+
+        let events = response_object_to_stream_events(&response);
+        let names: Vec<&str> = events.iter().map(|(n, _)| *n).collect();
+        assert_eq!(
+            names,
+            vec![
+                "response.created",
+                // msg_1 lifecycle
+                "response.output_item.added",
+                "response.output_text.delta",
+                "response.output_text.done",
+                "response.output_item.done",
+                // msg_2 lifecycle
+                "response.output_item.added",
+                "response.output_text.delta",
+                "response.output_text.done",
+                "response.output_item.done",
+                "response.completed",
+            ]
+        );
+
+        // sequence_number is strictly monotonic 0..N across all items.
+        for (i, (_, data)) in events.iter().enumerate() {
+            assert_eq!(data["sequence_number"], i as i64);
+        }
+
+        // Each item's text/output_index belongs to the right message.
+        assert_eq!(events[1].1["item"]["id"], "msg_1");
+        assert_eq!(events[2].1["delta"], "alpha");
+        assert_eq!(events[2].1["output_index"], 0);
+        assert_eq!(events[5].1["item"]["id"], "msg_2");
+        assert_eq!(events[6].1["delta"], "beta");
+        assert_eq!(events[6].1["output_index"], 1);
+    }
+
+    #[test]
     fn test_parse_response_id_without_prefix() {
         let uuid = Uuid::new_v4();
         let parsed = parse_response_id(&uuid.to_string()).unwrap();
