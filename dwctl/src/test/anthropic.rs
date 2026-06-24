@@ -37,19 +37,31 @@ async fn seed_model_and_key(server: &TestServer, pool: &PgPool, mock_uri: &str) 
 
     // Public group (all-zeros UUID) makes the model accessible to all users.
     let group_id = "00000000-0000-0000-0000-000000000000";
-    server
+    let assoc = server
         .post(&format!("/admin/api/v1/groups/{group_id}/models/{deployment_id}"))
         .add_header(&h[0].0, &h[0].1)
         .add_header(&h[1].0, &h[1].1)
         .await;
+    assert!(
+        assoc.status_code().is_success(),
+        "model-group association failed: {} {}",
+        assoc.status_code(),
+        assoc.text()
+    );
 
     let user = create_test_user(pool, Role::StandardUser).await;
-    server
+    let grant = server
         .post("/admin/api/v1/transactions")
         .add_header(&h[0].0, &h[0].1)
         .add_header(&h[1].0, &h[1].1)
         .json(&serde_json::json!({ "user_id": user.id, "transaction_type": "admin_grant", "amount": 1000, "source_id": admin.id }))
         .await;
+    assert!(
+        grant.status_code().is_success(),
+        "credits grant failed: {} {}",
+        grant.status_code(),
+        grant.text()
+    );
 
     let key: serde_json::Value = server
         .post(&format!("/admin/api/v1/users/{}/api-keys", user.id))

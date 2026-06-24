@@ -233,6 +233,20 @@ impl StreamReframer for AnthropicStreamReframer {
         out
     }
 
+    fn error(&mut self, message: &str) -> Vec<u8> {
+        if self.finished {
+            return Vec::new();
+        }
+        self.finished = true;
+        let mut out = Vec::new();
+        push_event(
+            &mut out,
+            "error",
+            &json!({ "type": "error", "error": { "type": "api_error", "message": message } }),
+        );
+        out
+    }
+
     fn finish(&mut self) -> Vec<u8> {
         if !self.started || self.finished {
             return Vec::new();
@@ -444,7 +458,11 @@ mod tests {
         assert!(sse.contains(r#""type":"thinking_delta""#));
         assert!(sse.contains(r#""thinking":"think ""#));
         // thinking block opens at index 0, text block at index 1.
-        let starts: Vec<i64> = indices(&sse).into_iter().filter(|(e, _)| e == "content_block_start").map(|(_, i)| i).collect();
+        let starts: Vec<i64> = indices(&sse)
+            .into_iter()
+            .filter(|(e, _)| e == "content_block_start")
+            .map(|(_, i)| i)
+            .collect();
         assert_eq!(starts, vec![0, 1]);
         // thinking is emitted before the answer text.
         assert!(sse.find("thinking_delta").unwrap() < sse.find("text_delta").unwrap());

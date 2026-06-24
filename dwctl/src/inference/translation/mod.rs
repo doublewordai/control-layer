@@ -109,20 +109,49 @@ pub trait StreamReframer: Send {
     /// Returns the foreign SSE bytes to forward to the client (may be empty).
     fn push(&mut self, chunk: &serde_json::Value) -> Vec<u8>;
 
+    /// The upstream stream ended abnormally (a transport error mid-stream). Emit a
+    /// terminal foreign-protocol error event instead of a clean close. Idempotent.
+    fn error(&mut self, message: &str) -> Vec<u8>;
+
     /// The upstream stream has ended; emit any closing events (idempotent).
     fn finish(&mut self) -> Vec<u8>;
 }
 
 /// Ordered registry of translators. First `detect()` match wins; no match
 /// means the request passes through untouched (native Chat Completions path).
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct TranslationRegistry {
     translators: Vec<Arc<dyn ProtocolTranslator>>,
+    /// Cap on the inbound foreign request body the middleware will buffer before
+    /// translating. `usize::MAX` means unlimited.
+    max_body_size: usize,
+}
+
+impl Default for TranslationRegistry {
+    fn default() -> Self {
+        Self {
+            translators: Vec::new(),
+            max_body_size: usize::MAX,
+        }
+    }
 }
 
 impl TranslationRegistry {
     pub fn new(translators: Vec<Arc<dyn ProtocolTranslator>>) -> Self {
-        Self { translators }
+        Self {
+            translators,
+            max_body_size: usize::MAX,
+        }
+    }
+
+    /// Set the maximum inbound body size the middleware will buffer (bytes).
+    pub fn with_max_body_size(mut self, max_body_size: usize) -> Self {
+        self.max_body_size = max_body_size;
+        self
+    }
+
+    pub fn max_body_size(&self) -> usize {
+        self.max_body_size
     }
 
     /// Return the first translator that claims this request, if any.

@@ -480,6 +480,17 @@ mod tests {
     }
 
     #[test]
+    fn top_k_is_passed_through() {
+        // OpenAI has no typed top_k; it rides through as an additive field rather
+        // than being silently dropped.
+        let out = translate(json!({
+            "model": "m", "max_tokens": 1, "top_k": 40,
+            "messages": [ { "role": "user", "content": "hi" } ]
+        }));
+        assert_eq!(out["top_k"], 40);
+    }
+
+    #[test]
     fn thinking_param_maps_to_reasoning_effort() {
         let out = translate(json!({
             "model": "m", "max_tokens": 1, "messages": [ { "role": "user", "content": "hi" } ],

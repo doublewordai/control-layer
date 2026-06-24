@@ -35,6 +35,12 @@ pub fn to_chat_completions(req: MessagesRequest) -> Result<Value, TranslationErr
     if let Some(p) = req.top_p {
         out.insert("top_p".into(), json!(p));
     }
+    if let Some(k) = req.top_k {
+        // OpenAI has no standard `top_k`; forwarded as an additive field that
+        // top_k-aware backends (vLLM / sglang) honour and others ignore. Dropping
+        // it would silently change sampling for clients that set it.
+        out.insert("top_k".into(), json!(k));
+    }
     if let Some(s) = &req.stop_sequences {
         out.insert("stop".into(), json!(s));
     }
@@ -142,6 +148,11 @@ fn convert_assistant(content: &Content) -> Value {
 
 /// User turn: `tool_result` blocks -> `tool` messages (emitted first, so they
 /// follow the prior assistant `tool_calls`); text/image -> a `user` message.
+///
+/// Anthropic allows `tool_result` and text/image to coexist in one message;
+/// OpenAI does not, so they are split into separate messages here. This is the
+/// standard OpenAI conversation shape and has been validated against the target
+/// backends.
 fn convert_user(content: &Content, out: &mut Vec<Value>) {
     match content {
         Content::Text(t) => out.push(json!({ "role": "user", "content": t })),

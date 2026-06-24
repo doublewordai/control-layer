@@ -37,7 +37,10 @@ pub fn from_chat_completions(body: Bytes) -> Result<Bytes, TranslationError> {
             }
         }
     } else if let Some(reasoning) = message.and_then(reasoning_text) {
-        content.push(ResponseContentBlock::Thinking { thinking: reasoning, signature: None });
+        content.push(ResponseContentBlock::Thinking {
+            thinking: reasoning,
+            signature: None,
+        });
     }
 
     if let Some(text) = message.and_then(|m| m.get("content")).and_then(Value::as_str)
@@ -68,7 +71,10 @@ pub fn from_chat_completions(body: Bytes) -> Result<Bytes, TranslationError> {
     // `choices[].stop_reason`. When present, Anthropic reports
     // `stop_reason: "stop_sequence"` plus the matched string; otherwise we map
     // the standard `finish_reason`. (Absent or a non-string token id falls back.)
-    let matched_stop = choice.and_then(|c| c.get("stop_reason")).and_then(Value::as_str).filter(|s| !s.is_empty());
+    let matched_stop = choice
+        .and_then(|c| c.get("stop_reason"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty());
     let (stop_reason, stop_sequence) = match matched_stop {
         Some(s) => (StopReason::StopSequence, Some(s.to_string())),
         None => (map_stop_reason(finish_reason), None),

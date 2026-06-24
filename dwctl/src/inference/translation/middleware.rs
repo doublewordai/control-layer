@@ -8,7 +8,7 @@ use axum::{
     extract::State,
     http::{Request, StatusCode, header},
     middleware::Next,
-    response::{IntoResponse, Response},
+    response::Response,
 };
 use bytes::Bytes;
 use futures::StreamExt;
@@ -27,11 +27,13 @@ pub async fn translation_middleware(State(registry): State<TranslationRegistry>,
 
     let (mut parts, body) = request.into_parts();
 
-    let body_bytes = match axum::body::to_bytes(body, usize::MAX).await {
+    // Bound the buffered request body by the configured limit so a translated
+    // route cannot be used as an unbounded-memory DoS vector.
+    let body_bytes = match axum::body::to_bytes(body, registry.max_body_size()).await {
         Ok(b) => b,
         Err(e) => {
-            warn!(error = %e, "edge translation: failed to read request body");
-            return error_response(translator.as_ref(), StatusCode::BAD_REQUEST, "failed to read request body");
+            warn!(error = %e, "edge translation: request body too large or unreadable");
+            return error_response(translator.as_ref(), StatusCode::PAYLOAD_TOO_LARGE, "request body too large");
         }
     };
 
@@ -75,14 +77,14 @@ async fn translate_response_back(translator: &dyn ProtocolTranslator, response: 
         .unwrap_or(false);
 
     if is_sse {
-        return reframe_sse(translator, body);
+        return reframe_sse(translator, status, body);
     }
 
     let body_bytes = match axum::body::to_bytes(body, usize::MAX).await {
         Ok(b) => b,
         Err(e) => {
             warn!(error = %e, "edge translation: failed to read upstream response body");
-            return (StatusCode::BAD_GATEWAY, "failed to read upstream response").into_response();
+            return error_response(translator, StatusCode::BAD_GATEWAY, "failed to read upstream response");
         }
     };
 
@@ -91,7 +93,7 @@ async fn translate_response_back(translator: &dyn ProtocolTranslator, response: 
             Ok(new_body) => json_response(status, new_body),
             Err(e) => {
                 warn!(error = %e, translator = translator.name(), "edge translation: response translate failed");
-                (StatusCode::BAD_GATEWAY, "response translation failed").into_response()
+                error_response(translator, StatusCode::BAD_GATEWAY, "response translation failed")
             }
         }
     } else {
@@ -120,14 +122,26 @@ fn error_response(translator: &dyn ProtocolTranslator, status: StatusCode, messa
 /// stream the foreign-protocol events out. Stays streaming (no buffering): each
 /// complete `\n\n`-delimited SSE event is parsed and fed to the reframer as it
 /// arrives.
-fn reframe_sse(translator: &dyn ProtocolTranslator, body: Body) -> Response {
+fn reframe_sse(translator: &dyn ProtocolTranslator, status: StatusCode, body: Body) -> Response {
     let mut reframer = translator.stream_reframer();
     let mut data = body.into_data_stream();
 
     let out = async_stream::stream! {
         let mut buf: Vec<u8> = Vec::new();
         while let Some(item) = data.next().await {
-            let Ok(chunk) = item else { break };
+            let chunk = match item {
+                Ok(c) => c,
+                Err(e) => {
+                    // Upstream stream failed mid-flight: emit a terminal foreign
+                    // error event rather than a clean close, and stop.
+                    warn!(error = %e, "edge translation: upstream SSE transport error");
+                    let ev = reframer.error("upstream stream error");
+                    if !ev.is_empty() {
+                        yield Ok::<Bytes, std::io::Error>(Bytes::from(ev));
+                    }
+                    return;
+                }
+            };
             buf.extend_from_slice(&chunk);
             // Drain every complete SSE event (terminated by a blank line).
             while let Some(pos) = find_subsequence(&buf, b"\n\n") {
@@ -139,10 +153,15 @@ fn reframe_sse(translator: &dyn ProtocolTranslator, body: Body) -> Response {
                     if data_part.is_empty() || data_part == "[DONE]" {
                         continue;
                     }
-                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(data_part) {
-                        let emitted = reframer.push(&val);
-                        if !emitted.is_empty() {
-                            yield Ok::<Bytes, std::io::Error>(Bytes::from(emitted));
+                    match serde_json::from_str::<serde_json::Value>(data_part) {
+                        Ok(val) => {
+                            let emitted = reframer.push(&val);
+                            if !emitted.is_empty() {
+                                yield Ok::<Bytes, std::io::Error>(Bytes::from(emitted));
+                            }
+                        }
+                        Err(e) => {
+                            debug!(error = %e, "edge translation: dropping unparseable SSE data line");
                         }
                     }
                 }
@@ -155,6 +174,9 @@ fn reframe_sse(translator: &dyn ProtocolTranslator, body: Body) -> Response {
     };
 
     let mut resp = Response::new(Body::from_stream(out));
+    // Preserve the downstream status (e.g. a non-200 event-stream) rather than
+    // defaulting to 200.
+    *resp.status_mut() = status;
     resp.headers_mut()
         .insert(header::CONTENT_TYPE, header::HeaderValue::from_static("text/event-stream"));
     resp
@@ -239,6 +261,52 @@ mod tests {
         assert_eq!(body["stop_reason"], "end_turn");
         assert_eq!(body["usage"]["input_tokens"], 4);
         assert_eq!(body["usage"]["output_tokens"], 2);
+    }
+
+    /// An over-limit request body is rejected as an Anthropic error, not buffered.
+    #[tokio::test]
+    async fn oversized_request_body_is_rejected_as_anthropic_error() {
+        let inner = Router::new().route("/messages", post(fake_onwards_chat_completions));
+        let registry = TranslationRegistry::new(vec![Arc::new(AnthropicMessages)]).with_max_body_size(16);
+        let inner = inner.layer(axum::middleware::from_fn_with_state(registry, translation_middleware));
+        let server = axum_test::TestServer::new(Router::new().nest("/ai/v1", inner)).expect("test server");
+
+        let response = server
+            .post("/ai/v1/messages")
+            .add_header("x-api-key", "sk-test")
+            .json(&serde_json::json!({
+                "model": "claude-x", "max_tokens": 50,
+                "messages": [ { "role": "user", "content": "this body is well over sixteen bytes" } ]
+            }))
+            .await;
+
+        assert_eq!(response.status_code().as_u16(), 413);
+        let body: serde_json::Value = response.json();
+        assert_eq!(body["type"], "error");
+        assert_eq!(body["error"]["type"], "request_too_large");
+    }
+
+    /// A 2xx downstream body that cannot be translated becomes an Anthropic error
+    /// envelope, not a plain-text 502.
+    #[tokio::test]
+    async fn untranslatable_success_body_becomes_anthropic_error() {
+        async fn bad_handler(_req: Request) -> Response {
+            json_response(StatusCode::OK, Bytes::from_static(b"not a chat completion"))
+        }
+        let server = test_app(Router::new().route("/messages", post(bad_handler)));
+
+        let response = server
+            .post("/ai/v1/messages")
+            .add_header("x-api-key", "sk-test")
+            .json(&serde_json::json!({
+                "model": "claude-x", "max_tokens": 50,
+                "messages": [ { "role": "user", "content": "hi" } ]
+            }))
+            .await;
+
+        assert_eq!(response.status_code().as_u16(), 502);
+        let body: serde_json::Value = response.json();
+        assert_eq!(body["type"], "error");
     }
 
     /// Non-strict onwards derives the upstream path from the inbound path. This
