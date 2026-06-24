@@ -79,7 +79,7 @@ jsonwebtoken = { version = "10", features = ["rust_crypto"] }
 argon2 = "0.5"
 base64 = "0.22"
 bytes = "1.5"
-onwards = { version = "0.33.2", features = ["multi-step"] }
+onwards = { version = "0.33.3", features = ["multi-step"] }
 thiserror = "2.0.14"
 axum-prometheus = "0.10"
 # Metrics facade and exporter (same versions as axum-prometheus uses)
