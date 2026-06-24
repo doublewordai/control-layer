@@ -54,7 +54,7 @@ impl TtlTier {
 }
 
 /// The cache scope keying every entry (plan §8.1):
-/// - `org_id` = `target_user_id` (org or personal user = `api_key.user_id`), so all
+/// - `principal_id` = `target_user_id` (org or personal user = `api_key.user_id`), so all
 ///   of a customer's modalities share one cache scope.
 /// - `virtual_model` = the user-facing alias (`deployed_models.alias`), not the
 ///   rewritten underlying `model_name`.
@@ -62,7 +62,7 @@ impl TtlTier {
 ///   change so stale prefixes age out by TTL.
 #[derive(Debug, Clone)]
 pub struct IndexScope {
-    pub org_id: UserId,
+    pub principal_id: UserId,
     pub virtual_model: String,
     pub tokenizer_version: String,
 }

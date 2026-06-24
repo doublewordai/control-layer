@@ -281,7 +281,7 @@ mod tests {
 
         // The commit is spawned — poll the index until the write lands (no sleep).
         let scope = IndexScope {
-            org_id: user.id,
+            principal_id: user.id,
             virtual_model: ALIAS.into(),
             tokenizer_version: TOK_VER.into(),
         };

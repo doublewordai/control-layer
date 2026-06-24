@@ -17,9 +17,14 @@ use sha2::{Digest, Sha256};
 
 use super::index::TtlTier;
 
-/// Per-request breakpoint cap (plan §5.6 anti-abuse).
+/// Per-request breakpoint cap (plan §5.6 anti-abuse). Mirrors Anthropic's public limit
+/// of **4 `cache_control` breakpoints** per request — enough for the common
+/// tools→system→history→latest-turn pattern; more than that is rejected as abuse.
 pub const MAX_BREAKPOINTS: usize = 4;
-/// Walk-back window per breakpoint (plan §1).
+/// Walk-back window per breakpoint (plan §1). Mirrors Anthropic's documented **20-block**
+/// look-back: from a breakpoint we search up to 20 earlier block boundaries for a prior
+/// write before giving up (a match further back is a genuine miss — the documented fix is
+/// a second breakpoint). Bounds the per-request lookup-candidate set.
 pub const WALK_BACK: usize = 20;
 
 #[derive(Debug, thiserror::Error)]

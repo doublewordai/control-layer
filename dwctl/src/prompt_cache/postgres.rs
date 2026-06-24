@@ -34,10 +34,10 @@ impl CacheIndex for PostgresIndex {
             r#"
             SELECT prefix_hash, cumulative_token_count, ttl_tier, expires_at
             FROM prompt_cache_entries
-            WHERE org_id = $1 AND virtual_model = $2 AND tokenizer_version = $3
+            WHERE principal_id = $1 AND virtual_model = $2 AND tokenizer_version = $3
               AND prefix_hash = ANY($4) AND expires_at > now()
             "#,
-            scope.org_id,
+            scope.principal_id,
             scope.virtual_model,
             scope.tokenizer_version,
             candidate_hashes,
@@ -65,16 +65,16 @@ impl CacheIndex for PostgresIndex {
         sqlx::query!(
             r#"
             INSERT INTO prompt_cache_entries
-              (org_id, virtual_model, tokenizer_version, prefix_hash,
+              (principal_id, virtual_model, tokenizer_version, prefix_hash,
                cumulative_token_count, ttl_tier, expires_at)
             VALUES ($1, $2, $3, $4, $5, $6, $7)
-            ON CONFLICT (org_id, virtual_model, tokenizer_version, prefix_hash)
+            ON CONFLICT (principal_id, virtual_model, tokenizer_version, prefix_hash)
             DO UPDATE SET
               cumulative_token_count = EXCLUDED.cumulative_token_count,
               ttl_tier               = EXCLUDED.ttl_tier,
               expires_at             = EXCLUDED.expires_at
             "#,
-            entry.scope.org_id,
+            entry.scope.principal_id,
             entry.scope.virtual_model,
             entry.scope.tokenizer_version,
             entry.prefix_hash,
@@ -95,10 +95,10 @@ impl CacheIndex for PostgresIndex {
             r#"
             UPDATE prompt_cache_entries
             SET expires_at = $5
-            WHERE org_id = $1 AND virtual_model = $2 AND tokenizer_version = $3
+            WHERE principal_id = $1 AND virtual_model = $2 AND tokenizer_version = $3
               AND prefix_hash = $4
             "#,
-            scope.org_id,
+            scope.principal_id,
             scope.virtual_model,
             scope.tokenizer_version,
             prefix_hash,
@@ -117,7 +117,7 @@ mod tests {
 
     fn scope() -> IndexScope {
         IndexScope {
-            org_id: uuid::Uuid::new_v4(),
+            principal_id: uuid::Uuid::new_v4(),
             virtual_model: "test-model".to_string(),
             tokenizer_version: "sha256:abc".to_string(),
         }
@@ -160,7 +160,7 @@ mod tests {
         // Same hash under a different org is a different entry.
         idx.write(&entry(&s, b"shared", 5, TtlTier::OneHour)).await.unwrap();
         let other = IndexScope {
-            org_id: uuid::Uuid::new_v4(),
+            principal_id: uuid::Uuid::new_v4(),
             ..s.clone()
         };
         assert!(idx.lookup(&other, &[b"shared".to_vec()]).await.unwrap().is_empty());

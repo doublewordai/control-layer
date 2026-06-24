@@ -120,7 +120,7 @@ impl Classifier {
         let Some(api_key) = req.api_key else {
             return Ok(ClassifyOutcome::inactive());
         };
-        let Some(org_id) = self.principal.resolve(api_key).await? else {
+        let Some(principal_id) = self.principal.resolve(api_key).await? else {
             return Ok(ClassifyOutcome::inactive());
         };
         let cfg = self.model_config.resolve(req.virtual_model).await?;
@@ -129,8 +129,14 @@ impl Classifier {
         }
 
         // From here the model is cache-enabled: any bail is `zero_active`.
-        let Ok(parsed) = parse_chat_completions(req.body) else {
-            return Ok(ClassifyOutcome::zero_active()); // unparseable / >4 breakpoints
+        let parsed = match parse_chat_completions(req.body) {
+            Ok(p) => p,
+            Err(e) => {
+                // Best-effort: degrade to no caching (uniform zeros). Log at debug so the
+                // silent degradation is diagnosable without warn-level noise on every odd body.
+                tracing::debug!(error = %e, virtual_model = req.virtual_model, "cache classify: body not cacheable (unparseable / >4 breakpoints)");
+                return Ok(ClassifyOutcome::zero_active());
+            }
         };
         if parsed.breakpoints.is_empty() {
             return Ok(ClassifyOutcome::zero_active()); // markers are required to cache (§1)
@@ -139,7 +145,7 @@ impl Classifier {
             return Ok(ClassifyOutcome::zero_active()); // model not mapped in tokenizer-svc
         };
         let scope = IndexScope {
-            org_id,
+            principal_id,
             virtual_model: req.virtual_model.to_string(),
             tokenizer_version,
         };
@@ -330,7 +336,7 @@ mod tests {
     struct H {
         classifier: Classifier,
         secret: String,
-        org_id: uuid::Uuid,
+        principal_id: uuid::Uuid,
         pool: PgPool,
         _server: MockServer,
     }
@@ -380,7 +386,7 @@ mod tests {
         H {
             classifier,
             secret: key.secret,
-            org_id: user.id,
+            principal_id: user.id,
             pool: pool.clone(),
             _server: server,
         }
@@ -416,7 +422,7 @@ mod tests {
         let h = harness(&pool, true, 1500, 1024).await;
         // Seed the entry this prefix would write, as if a prior request created it.
         let scope = IndexScope {
-            org_id: h.org_id,
+            principal_id: h.principal_id,
             virtual_model: ALIAS.to_string(),
             tokenizer_version: TOK_VER.to_string(),
         };

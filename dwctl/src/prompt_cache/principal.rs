@@ -1,5 +1,5 @@
 //! Resolve a request's (validated) bearer token to its billing principal — the
-//! cache scope's `org_id` (= `api_keys.user_id`, the `target_user_id`: org or
+//! cache scope's `principal_id` (= `api_keys.user_id`, the `target_user_id`: org or
 //! personal user). Two-tier, per the design:
 //!
 //! - **L1**: an in-process memo. The `api_key -> user_id` mapping is **immutable**
@@ -33,6 +33,9 @@ pub struct PrincipalResolver {
 
 impl PrincipalResolver {
     pub fn new(pool: PgPool) -> Self {
+        // 100k entries ≈ a few MB (String key + Option<Uuid>) — comfortably covers the
+        // active-key working set of a busy tenant; cold keys evict + take one DB miss on
+        // next use (cheap, indexed point lookup). Bump via `with_capacity` if churn warrants.
         Self::with_capacity(pool, 100_000)
     }
 
