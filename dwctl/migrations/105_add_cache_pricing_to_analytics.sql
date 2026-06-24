@@ -1,4 +1,4 @@
--- Cached-input pricing on the analytics/billing path (plan §8.2/§8.4).
+-- Cached-input pricing on the analytics/billing path.
 --
 -- Records the per-request cache token split (read + per-tier creation) and makes the
 -- request cost cache-aware. `prompt_tokens` is unchanged: it stays the full input count

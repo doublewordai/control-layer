@@ -1,4 +1,4 @@
-//! The dwctl-owned cache tower layer (design §0) — the integration point.
+//! The dwctl-owned cache tower layer — the integration point.
 //!
 //! Wrapping the (cache-agnostic) onwards router, on each cacheable request it:
 //!   1. reads the body, extracts the virtual model + bearer token,
@@ -28,7 +28,7 @@ use super::inject::{CommitGate, inject_cache_stats_into_response, strip_cache_co
 
 /// Bound on the index commit (off the response path). A slow/hung DB can't leak the
 /// spawned task or hold a pool connection indefinitely; a miss just drops the write
-/// (best-effort — §11 reconciliation backstops it). Generous vs the classify deadline
+/// (best-effort — a reconciliation pass backstops it). Generous vs the classify deadline
 /// because it's off-path and is real DB work, not a race against generation.
 const COMMIT_DEADLINE: Duration = Duration::from_secs(30);
 
@@ -57,7 +57,7 @@ impl CacheLayerState {
 }
 
 /// v1: only chat-completions (the parser handles that body shape). Responses + others
-/// pass straight through (tool-Responses per-step caching is a fast-follow, §0).
+/// pass straight through (tool-Responses per-step caching is a fast-follow).
 fn is_cacheable(req: &Request) -> bool {
     req.method() == Method::POST && req.uri().path().ends_with("/chat/completions")
 }
@@ -100,7 +100,7 @@ pub async fn cache_middleware(State(state): State<CacheLayerState>, request: Req
         .map(String::from);
 
     // Fork classify, parallel with the upstream call. Owns its inputs so the task is
-    // `'static`; this is the one body clone (the §19 parse-once work would remove it).
+    // `'static`; this is the one body clone (a future parse-once refactor would remove it).
     let classify_handle = virtual_model.map(|model| {
         let classifier = state.classifier.clone();
         let body = body_bytes.to_vec();
@@ -142,7 +142,7 @@ pub async fn cache_middleware(State(state): State<CacheLayerState>, request: Req
                 ClassifyOutcome::inactive()
             }
             Err(_) => {
-                handle.abort(); // deadline — best-effort, §11 backstops; don't leak the task
+                handle.abort(); // deadline — best-effort, reconciliation backstops; don't leak the task
                 ClassifyOutcome::inactive()
             }
         },
@@ -151,7 +151,7 @@ pub async fn cache_middleware(State(state): State<CacheLayerState>, request: Req
 
     // Disabled model (or a degraded classify) → leave the response untouched. Enabled
     // models always get the cache_* fields (zeros when this prompt cached nothing), so
-    // the cohort has one uniform response shape (§0.2).
+    // the cohort has one uniform response shape.
     if !outcome.active {
         return response;
     }

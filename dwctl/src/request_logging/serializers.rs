@@ -134,7 +134,7 @@ pub struct UsageMetrics {
     pub completion_tokens: i64,
     pub reasoning_tokens: i64,
     pub total_tokens: i64,
-    // Cached-input split (plan §8.2), read from the response `usage` the dwctl cache layer
+    // Cached-input split, read from the response `usage` the dwctl cache layer
     // injected. Zero on non-cache requests / models. `prompt_tokens` stays the full input
     // count; it typically equals cache_read + cache_creation + uncached, but the split need
     // not reconcile exactly (our tokenizer and the provider's can disagree — billing floors
@@ -415,7 +415,7 @@ impl UsageMetrics {
     }
 }
 
-/// The cache token split read from a response `usage` object (plan §5.2 extension fields).
+/// The cache token split read from a response `usage` object.
 #[derive(Debug, Clone, Copy, Default)]
 struct CacheTokens {
     read: i64,
@@ -440,13 +440,16 @@ struct CacheTokens {
 /// cache tokens here. The fix then is to gate extraction on dwctl-cache-enablement (the
 /// model's tariff presence, known to the batcher) rather than trusting the response fields.
 fn cache_tokens_from_usage(usage: &Value) -> CacheTokens {
-    let read = usage.get("cache_read_input_tokens").and_then(Value::as_i64).unwrap_or(0);
+    // Floor at 0: token counts can't be negative, but a malformed response could carry one —
+    // never let it reach the analytics columns or the cost math (the batcher floors too).
+    let read = usage.get("cache_read_input_tokens").and_then(Value::as_i64).unwrap_or(0).max(0);
     let tier = |k: &str| {
         usage
             .get("cache_creation")
             .and_then(|c| c.get(k))
             .and_then(Value::as_i64)
             .unwrap_or(0)
+            .max(0)
     };
     CacheTokens {
         read,

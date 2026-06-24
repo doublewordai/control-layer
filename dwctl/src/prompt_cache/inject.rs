@@ -1,5 +1,5 @@
-//! OpenAI-shaped request sanitisation and response usage injection (plan §5.2/§5.3),
-//! relocated into dwctl for the dwctl-owned cache layer (§0).
+//! OpenAI-shaped request sanitisation and response usage injection,
+//! relocated into dwctl for the dwctl-owned cache layer.
 //!
 //! Two jobs, both run by the cache tower layer (only when a cacheable request is
 //! classified):
@@ -30,7 +30,7 @@ use super::sse::SseBufferedStream;
 use super::stats::CacheStats;
 
 /// Whether the cache-index write may be committed — the success signal that must match
-/// what billing uses (§0.2). A streamed response is HTTP 200 the moment it opens, so the
+/// what billing uses. A streamed response is HTTP 200 the moment it opens, so the
 /// status alone is not enough: a mid-stream error frame (which billing reclassifies to
 /// 500 and bills as zero) must veto the write. The verdict is therefore:
 /// `status < 400` **and** no error frame **and** a terminal usage frame was seen.
@@ -95,7 +95,7 @@ pub fn strip_cache_control(body: &[u8]) -> Option<Bytes> {
     }
 }
 
-/// Splice the OpenAI-shaped cache fields (§5.2) into a `usage` object in place.
+/// Splice the OpenAI-shaped cache fields into a `usage` object in place.
 /// `prompt_tokens` is left as the full input count; only the cache breakdown is added.
 fn splice_cache_fields(usage: &mut serde_json::Map<String, Value>, stats: &CacheStats) {
     let details = usage.entry("prompt_tokens_details").or_insert_with(|| serde_json::json!({}));
@@ -126,7 +126,7 @@ pub fn inject_into_usage_json(body: &[u8], stats: &CacheStats) -> Option<Bytes> 
 
 /// The outcome of scanning one SSE body chunk: the (optionally) rewritten bytes plus the
 /// two billing-success signals observed in it. Accumulated across chunks by the streaming
-/// path so the cache-commit gate matches what billing sees (§0.2).
+/// path so the cache-commit gate matches what billing sees.
 struct SseScan {
     /// `Some` only if a usage frame was found *and* injected this call.
     rewritten: Option<Bytes>,

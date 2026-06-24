@@ -1,4 +1,4 @@
-//! Per-model cache configuration: the §6.6 enablement gate + the §1 minimum-prefix
+//! Per-model cache configuration: the enablement gate + the minimum-prefix
 //! floor, resolved from a **virtual model** (alias) and cached in-process.
 //!
 //! There is no separate enable flag: a model has caching ON iff it has a

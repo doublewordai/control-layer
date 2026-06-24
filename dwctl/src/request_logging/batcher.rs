@@ -76,7 +76,7 @@ pub struct RawAnalyticsRecord {
     pub completion_tokens: i64,
     pub reasoning_tokens: i64,
     pub total_tokens: i64,
-    // Cached-input split (plan §8.2). `prompt_tokens` stays the full input count; these break
+    // Cached-input split. `prompt_tokens` stays the full input count; these break
     // out the cached portion so the batcher can apply the cache multipliers. The split usually
     // reconciles to `prompt_tokens` but isn't guaranteed to (tokenizer drift; cost logic floors
     // uncached at 0 — see compute_cost).
@@ -120,7 +120,7 @@ struct EnrichedRecord {
     provider_name: Option<String>,
     input_price_per_token: Option<Decimal>,
     output_price_per_token: Option<Decimal>,
-    /// The cache-adjusted request cost (plan §8.4): uncached tokens at list price, cache
+    /// The cache-adjusted request cost: uncached tokens at list price, cache
     /// reads at the read multiplier, per-tier creation at its write multiplier, plus output.
     /// `None` when the model has no pricing (→ no analytics cost, no ledger row). Written to
     /// `http_analytics.total_cost` AND used as the billed `credits_transactions.amount`.
@@ -196,7 +196,7 @@ fn resolve_cache_multipliers(rows: &[CacheTariffRow], timestamp: DateTime<Utc>) 
         })
 }
 
-/// The cache-adjusted request cost (plan §8.4). Reduces to the plain
+/// The cache-adjusted request cost. Reduces to the plain
 /// `prompt × input + completion × output` when there are no cache tokens, so non-cache
 /// requests are unaffected. `None` when the model has no pricing at all (→ no ledger row),
 /// matching the old generated `total_cost`'s NULL.
@@ -1086,7 +1086,7 @@ where
                 continue;
             }
 
-            // The cache-adjusted cost was computed during enrichment (§8.4) and is the same
+            // The cache-adjusted cost was computed during enrichment and is the same
             // value written to http_analytics.total_cost. `None` = no pricing configured.
             let Some(total_cost) = record.total_cost else { continue };
 

@@ -1592,7 +1592,7 @@ pub async fn build_router(
         error_enrichment::error_enrichment_middleware,
     ));
 
-    // Apply the cached-input pricing layer (dwctl-owned, design §0). Placed inner
+    // Apply the cached-input pricing layer (dwctl-owned). Placed inner
     // to outlet so the billing/analytics capture sees the injected `cache_*` usage
     // fields, but OUTER to the body-mutating layers (image normaliser, tool
     // injection) so the classifier hashes the original user body — stable across

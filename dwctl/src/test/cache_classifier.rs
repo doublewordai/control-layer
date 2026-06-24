@@ -1,6 +1,6 @@
 //! Full-stack tests for the cached-input pricing wiring (`onwards.cache_classifier_enabled`).
 //!
-//! Exercises the dwctl-owned cache tower layer (design §0) end to end through a real
+//! Exercises the dwctl-owned cache tower layer end to end through a real
 //! proxied chat completion against a mock upstream, with the layer in its production
 //! slot (inner to outlet, wrapping the embedded onwards router):
 //!
@@ -259,7 +259,7 @@ async fn cache_enabled_but_model_not_opted_in_leaves_usage_untouched(pool: PgPoo
 }
 
 /// flag ON, model opted in, but a PLAIN prompt (no markers): the model is "active", so
-/// the response still carries a uniform, all-zero `cache_*` block (§0.2) — clients of a
+/// the response still carries a uniform, all-zero `cache_*` block — clients of a
 /// cache-enabled model always see the same usage shape, and billing always has stats.
 #[sqlx::test]
 #[test_log::test]

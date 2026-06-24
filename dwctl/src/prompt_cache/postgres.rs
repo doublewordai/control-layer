@@ -1,4 +1,4 @@
-//! Postgres baseline for the [`CacheIndex`] (plan §6.4): always correct, the single
+//! Postgres baseline for the [`CacheIndex`]: always correct, the single
 //! source of truth. A Redis accelerator (later) write-behinds to this and reads
 //! through it; nothing is ever *reliant* on Redis.
 

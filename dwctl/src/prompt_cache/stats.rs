@@ -3,7 +3,7 @@
 //!
 //! `CacheStats` is what gets shaped into the response `usage` (OpenAI extension fields
 //! today, Anthropic-native later — see `inject.rs`). `PendingWrite` is the index
-//! mutation the cache layer commits **locally** on a 2xx response (plan §0/§6.3) — no
+//! mutation the cache layer commits **locally** on a 2xx response — no
 //! correlation id, because classify and commit share one dwctl scope.
 
 use chrono::{DateTime, Utc};
@@ -45,11 +45,11 @@ impl CacheStats {
 }
 
 /// The index mutation a classified request implies, committed by the cache layer once
-/// the upstream response is known successful (success-gated, post-response — §6.3).
+/// the upstream response is known successful (success-gated, post-response).
 #[derive(Debug, Clone, Default)]
 pub struct PendingWrite {
     /// New entries to upsert — one per breakpoint beyond the matched read (each marked
-    /// prefix is independently cacheable, §1). Empty for a pure read.
+    /// prefix is independently cacheable). Empty for a pure read.
     pub writes: Vec<CacheEntry>,
     /// A matched read entry whose expiry should slide forward (the sliding-TTL refresh
     /// on read). `None` when there was no read hit.

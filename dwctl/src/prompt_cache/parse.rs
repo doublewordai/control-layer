@@ -1,5 +1,5 @@
 //! Parse an OpenAI chat-completions request into the cache primitives
-//! (plan §1, §3, §5.1, §6.3 B1-B2): the ordered content blocks, a cumulative content
+//!: the ordered content blocks, a cumulative content
 //! hash at every block boundary, and the explicit `cache_control` breakpoints (≤4)
 //! with their TTL tiers.
 //!
@@ -10,18 +10,18 @@
 //! matches, and the hashed bytes are exactly what onwards forwards after stripping.
 //!
 //! v1 scope: text content blocks on chat-completions messages. Tools-level markers
-//! and image-token caching are deferred (§19) — image blocks still contribute to the
+//! and image-token caching are deferred — image blocks still contribute to the
 //! prefix hash but carry no text, so their tokens fall into the uncached tail.
 
 use sha2::{Digest, Sha256};
 
 use super::index::TtlTier;
 
-/// Per-request breakpoint cap (plan §5.6 anti-abuse). Mirrors Anthropic's public limit
+/// Per-request breakpoint cap. Mirrors Anthropic's public limit
 /// of **4 `cache_control` breakpoints** per request — enough for the common
 /// tools→system→history→latest-turn pattern; more than that is rejected as abuse.
 pub const MAX_BREAKPOINTS: usize = 4;
-/// Walk-back window per breakpoint (plan §1). Mirrors Anthropic's documented **20-block**
+/// Walk-back window per breakpoint. Mirrors Anthropic's documented **20-block**
 /// look-back: from a breakpoint we search up to 20 earlier block boundaries for a prior
 /// write before giving up (a match further back is a genuine miss — the documented fix is
 /// a second breakpoint). Bounds the per-request lookup-candidate set.

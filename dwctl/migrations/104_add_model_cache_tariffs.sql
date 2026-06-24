@@ -1,4 +1,4 @@
--- Cached-input pricing: per-model cache pricing as data, not code (plan §8.3).
+-- Cached-input pricing: per-model cache pricing as data, not code.
 --
 -- ONE row per model per pricing version, holding ALL three TTL tiers. This is a
 -- deliberate design choice:
@@ -24,7 +24,7 @@ CREATE TABLE model_cache_tariffs (
     write_multiplier_1h   DECIMAL(6,4) NOT NULL,
     write_multiplier_24h  DECIMAL(6,4) NOT NULL,
     read_multiplier       DECIMAL(6,4) NOT NULL DEFAULT 0.1,  -- flat across tiers, data-driven
-    min_prefix_tokens     INTEGER      NOT NULL,              -- per-model floor below which caching is skipped (§1)
+    min_prefix_tokens     INTEGER      NOT NULL,              -- per-model floor below which caching is skipped
     -- Ledger window. Never UPDATE/DELETE a row's pricing in place: insert a new
     -- version and expire the old one, so the as-of-inference lookup stays stable.
     valid_from            TIMESTAMPTZ  NOT NULL DEFAULT now(),

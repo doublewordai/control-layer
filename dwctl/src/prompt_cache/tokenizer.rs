@@ -1,4 +1,4 @@
-//! Client for **tokenizer-svc** (plan §6.5): the sole source of token counts for
+//! Client for **tokenizer-svc**: the sole source of token counts for
 //! cache *writes* (reads need no tokenization — the count is stored on the entry).
 //!
 //! tokenizer-svc is a dumb string->count service. We send the prompt segments to
@@ -53,7 +53,7 @@ struct ModelsResponse {
 #[derive(Debug, thiserror::Error)]
 pub enum TokenizerError {
     /// The model has no tokenizer mapping (`422 UNMAPPED_MODEL`). The caller skips
-    /// caching for this request — full price, no customer-facing error (§6.5).
+    /// caching for this request — full price, no customer-facing error.
     #[error("model {0:?} is not mapped in tokenizer-svc")]
     Unmapped(String),
     #[error("tokenizer-svc request failed: {0}")]
@@ -84,7 +84,7 @@ impl TokenizerClient {
 
     /// Count tokens for each segment. Special tokens are NOT added (the service is
     /// configured `add_special_tokens=false`), so counts are additive across
-    /// segments and the totals reconcile (§5.2/§6.5).
+    /// segments and the totals reconcile.
     pub async fn tokenize(&self, virtual_model: &str, segments: &[String]) -> TokenizerResult<TokenizeResponse> {
         let resp = self
             .http
@@ -96,7 +96,7 @@ impl TokenizerClient {
     }
 
     /// The set of models this tokenizer-svc image has baked. control-layer uses this
-    /// to drive per-model cache enablement (§6.6 Stage 2).
+    /// to drive per-model cache enablement.
     pub async fn models(&self) -> TokenizerResult<Vec<ModelInfo>> {
         let resp = self
             .http

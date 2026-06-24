@@ -1,4 +1,4 @@
-//! The classify orchestration (plan §6.3 branch B): turn a request into a neutral
+//! The classify orchestration: turn a request into a neutral
 //! [`CacheStats`] split plus the [`PendingWrite`] to commit on success.
 //!
 //! Flow: resolve principal → per-model gate → parse markers → find the longest cached
@@ -7,10 +7,10 @@
 //! stored on the entry); only the new write span is tokenized, and it runs in parallel
 //! with generation. Any recoverable failure (tokenizer down, model unmapped, parse
 //! error, no principal) degrades to all-zero "no caching" — never an error to the
-//! customer (best-effort; §11 reconciliation backstops residual overcharges).
+//! customer (best-effort; a reconciliation pass backstops residual overcharges).
 //!
 //! v1 scope: chat-completions message bodies. Tool-using multi-step Responses are a
-//! fast-follow (§0); image tokens fall into the uncached tail (§19).
+//! fast-follow; image tokens fall into the uncached tail.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -38,7 +38,7 @@ pub struct ClassifyRequest<'a> {
 ///
 /// `active` is true once the per-model gate passes (the model is cache-enabled),
 /// independent of whether this particular prompt cached anything. It drives the
-/// uniform-zeros injection (§0.2): an enabled model always gets the `cache_*` usage
+/// uniform-zeros injection: an enabled model always gets the `cache_*` usage
 /// fields on its response — zeroed when nothing cached — so the cohort has one
 /// response shape; a disabled model's response is left untouched. `stats`/`pending`
 /// carry the actual read/write split (both zero when `active` but nothing cached).
@@ -139,7 +139,7 @@ impl Classifier {
             }
         };
         if parsed.breakpoints.is_empty() {
-            return Ok(ClassifyOutcome::zero_active()); // markers are required to cache (§1)
+            return Ok(ClassifyOutcome::zero_active()); // markers are required to cache
         }
         let Some(tokenizer_version) = self.tokenizer_version(req.virtual_model).await? else {
             return Ok(ClassifyOutcome::zero_active()); // model not mapped in tokenizer-svc
@@ -237,7 +237,7 @@ impl Classifier {
     }
 
     /// Commit a [`PendingWrite`] to the index — the success-gated, post-response step
-    /// the cache layer runs on a 2xx (§6.3 step 8): upsert the new write entries and
+    /// the cache layer runs on a 2xx: upsert the new write entries and
     /// slide the matched read's TTL.
     pub async fn commit(&self, pending: &PendingWrite) -> CacheResult<()> {
         for entry in &pending.writes {

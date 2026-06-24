@@ -6,7 +6,7 @@
 //! ([`super::inject`]) needs complete events to find + edit the terminal usage frame.
 //!
 //! Adapted from onwards' generic `sse.rs` (which the core proxy also uses, so it can't
-//! be relocated) — kept self-contained here for the dwctl-owned cache layer (§0). One
+//! be relocated) — kept self-contained here for the dwctl-owned cache layer. One
 //! intentional divergence: an over-limit buffer is surfaced as a stream **error** rather
 //! than a clean EOF, so a protocol violation can't masquerade as a complete response (the
 //! commit gate + the client both see a failure). Hence the `E: From<io::Error>` bound.

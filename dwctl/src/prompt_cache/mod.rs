@@ -1,4 +1,4 @@
-//! Cached-input pricing subsystem (plan: `input-token-cache-pricing.md`, design §0).
+//! Cached-input pricing subsystem: an Anthropic-style prompt cache, owned by dwctl.
 //!
 //! **dwctl-owned.** Caching is implemented entirely here, as tower layers wrapping the
 //! (cache-agnostic) onwards router: a request layer forks `classify()` in parallel

@@ -47,9 +47,13 @@ impl<'c> CacheTariffs<'c> {
         // the loser's INSERT; the transaction just keeps each enable all-or-nothing.
         let mut tx = self.db.begin().await?;
 
+        // Expire the version that is active *now* — same as-of-now predicate the resolver uses,
+        // so a future-dated version (valid_from > now()) isn't expired before it takes effect.
         sqlx::query!(
             r#"UPDATE model_cache_tariffs SET valid_until = now()
-               WHERE deployed_model_id = $1 AND (valid_until IS NULL OR valid_until > now())"#,
+               WHERE deployed_model_id = $1
+                 AND valid_from <= now()
+                 AND (valid_until IS NULL OR valid_until > now())"#,
             model_id,
         )
         .execute(&mut *tx)
@@ -79,9 +83,13 @@ impl<'c> CacheTariffs<'c> {
     /// resolver's cache TTL.
     #[instrument(skip(self), fields(deployed_model_id = %model_id), err)]
     pub async fn disable(&mut self, model_id: DeploymentId) -> Result<bool> {
+        // Only expire the currently-effective version (valid_from <= now()), matching the
+        // resolver's as-of-now active check — a future-dated version is left intact.
         let res = sqlx::query!(
             r#"UPDATE model_cache_tariffs SET valid_until = now()
-               WHERE deployed_model_id = $1 AND (valid_until IS NULL OR valid_until > now())"#,
+               WHERE deployed_model_id = $1
+                 AND valid_from <= now()
+                 AND (valid_until IS NULL OR valid_until > now())"#,
             model_id,
         )
         .execute(&mut *self.db)

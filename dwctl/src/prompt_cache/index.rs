@@ -1,4 +1,4 @@
-//! The `CacheIndex` abstraction (plan §6.4): a Postgres baseline plus an optional
+//! The `CacheIndex` abstraction: a Postgres baseline plus an optional
 //! Redis accelerator behind one trait. It is a **cache, not a ledger** — billing
 //! truth is `credits_transactions`. A lost entry degrades to "cache miss / full
 //! price" (safe); the index is never walked to reprice.
@@ -9,13 +9,13 @@ use chrono::{DateTime, Utc};
 use crate::types::UserId;
 
 /// A cumulative prefix-content hash: the content up to and including a breakpoint
-/// block, **excluding** the `cache_control` directive (plan §3). Identical content
+/// block, **excluding** the `cache_control` directive. Identical content
 /// carrying different markers therefore matches — and it is the same byte span
 /// onwards forwards upstream after stripping markers.
 pub type PrefixHash = Vec<u8>;
 
 /// TTL tier of a cache entry. The window is *sliding*: every read resets expiry to
-/// `now + duration(tier)` (plan §1), so a tier is the max tolerated gap between
+/// `now + duration(tier)`, so a tier is the max tolerated gap between
 /// uses, not a fixed lifetime. The tier sets the write premium; the read discount
 /// is flat across tiers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,7 +53,7 @@ impl TtlTier {
     }
 }
 
-/// The cache scope keying every entry (plan §8.1):
+/// The cache scope keying every entry:
 /// - `principal_id` = `target_user_id` (org or personal user = `api_key.user_id`), so all
 ///   of a customer's modalities share one cache scope.
 /// - `virtual_model` = the user-facing alias (`deployed_models.alias`), not the
@@ -77,8 +77,8 @@ pub struct CacheMatch {
     pub expires_at: DateTime<Utc>,
 }
 
-/// A new cache write to record. Committed post-response, success-gated (plan §6.3
-/// step 8): gap-capping + billing integrity.
+/// A new cache write to record. Committed post-response, success-gated: gap-capping
+/// + billing integrity.
 #[derive(Debug, Clone)]
 pub struct CacheEntry {
     pub scope: IndexScope,
@@ -106,7 +106,7 @@ pub type CacheResult<T> = std::result::Result<T, CacheError>;
 #[async_trait]
 pub trait CacheIndex: Send + Sync {
     /// Which of `candidate_hashes` are live entries for `scope`. No tokenization —
-    /// the stored token count rides on the match (plan §3).
+    /// the stored token count rides on the match.
     async fn lookup(&self, scope: &IndexScope, candidate_hashes: &[PrefixHash]) -> CacheResult<Vec<CacheMatch>>;
 
     /// Record a new write. Write-through (durable immediately); upsert on the
