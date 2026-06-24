@@ -42,8 +42,8 @@ use fusillade::{
 use onwards::LoopConfig;
 use onwards::traits::ToolExecutor;
 
-use crate::responses::loop_http_client::ResponseLoopHttpClient;
-use crate::responses::store::FusilladeResponseStore;
+use crate::inference::engine::loop_http_client::ResponseLoopHttpClient;
+use crate::inference::store::FusilladeResponseStore;
 
 /// Dispatches per-claim work to the multi-step loop for `/v1/responses`
 /// requests, falling through to [`DefaultRequestProcessor`] for
@@ -98,7 +98,7 @@ where
 /// alias.
 #[async_trait]
 pub trait DaemonToolResolver: Send + Sync {
-    async fn resolve(&self, api_key: &str, model_alias: &str) -> Result<Option<crate::tool_executor::ResolvedToolSet>, anyhow::Error>;
+    async fn resolve(&self, api_key: &str, model_alias: &str) -> Result<Option<crate::inference::tools::ResolvedToolSet>, anyhow::Error>;
 }
 
 /// Production [`DaemonToolResolver`] backed by the same query the
@@ -109,8 +109,8 @@ pub struct DbToolResolver {
 
 #[async_trait]
 impl DaemonToolResolver for DbToolResolver {
-    async fn resolve(&self, api_key: &str, model_alias: &str) -> Result<Option<crate::tool_executor::ResolvedToolSet>, anyhow::Error> {
-        crate::tool_injection::resolve_tools_for_request(&self.pool, api_key, Some(model_alias)).await
+    async fn resolve(&self, api_key: &str, model_alias: &str) -> Result<Option<crate::inference::tools::ResolvedToolSet>, anyhow::Error> {
+        crate::inference::tools::resolve_tools_for_request(&self.pool, api_key, Some(model_alias)).await
     }
 }
 

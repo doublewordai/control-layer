@@ -65,7 +65,7 @@ pub async fn create_test_app_state_with_config(pool: PgPool, config: crate::conf
         .expect("Failed to create task runner"),
     );
 
-    let response_store = std::sync::Arc::new(crate::responses::store::FusilladeResponseStore::new(request_manager.clone()));
+    let response_store = std::sync::Arc::new(crate::inference::store::FusilladeResponseStore::new(request_manager.clone()));
     // Tests use the disabled no-op normaliser — they never exercise the
     // ingest/sign/read paths.
     let image_normalizer: std::sync::Arc<dyn crate::image_normalizer::ImageNormalizer> =
@@ -147,7 +147,7 @@ pub async fn create_test_app_state_with_fusillade(pool: PgPool, config: crate::c
         .expect("Failed to create task runner"),
     );
 
-    let response_store = std::sync::Arc::new(crate::responses::store::FusilladeResponseStore::new(request_manager.clone()));
+    let response_store = std::sync::Arc::new(crate::inference::store::FusilladeResponseStore::new(request_manager.clone()));
     let image_normalizer: std::sync::Arc<dyn crate::image_normalizer::ImageNormalizer> =
         std::sync::Arc::new(crate::image_normalizer::DisabledNormalizer);
     crate::AppState::builder()

@@ -4,7 +4,7 @@
 //! body with a fresh short-lived signed URL before forwarding to onwards.
 //!
 //! Modelled directly on the existing
-//! [`tool_injection_middleware`](crate::tool_injection::tool_injection_middleware)
+//! [`tool_injection_middleware`](crate::inference::tools::tool_injection_middleware)
 //! pattern: read the body once via `axum::body::to_bytes`, mutate the JSON
 //! in place, restore the body via `Body::from(...)`.
 //!
