@@ -88,6 +88,10 @@ struct BillingTarget {
     id: crate::types::UserId,
     payment_provider_id: Option<String>,
     email: String,
+    /// Name to put on the payment-provider customer. Set for organizations
+    /// (a real, user-provided org name), but `None` for individuals: their
+    /// display_name is only ever a randomly generated placeholder, never the
+    /// real IdP name, so we don't want it on Stripe customers / receipts.
     display_name: Option<String>,
 }
 
@@ -124,7 +128,9 @@ async fn resolve_billing_target(user: &CurrentUser, conn: &mut sqlx::PgConnectio
             id: user.id,
             payment_provider_id: user.payment_provider_id.clone(),
             email: user.email.clone(),
-            display_name: user.display_name.clone(),
+            // Intentionally omitted: an individual's display_name is a
+            // generated placeholder, not their real name (see BillingTarget).
+            display_name: None,
         })
     }
 }
@@ -771,6 +777,10 @@ pub async fn enable_auto_topup<P: PoolProvider>(
     let customer_id = match &target.payment_provider_id {
         Some(id) if !id.is_empty() => id.clone(),
         _ => {
+            // `display_name` is the real org name for organizations and `None`
+            // for individuals (whose stored name is a generated placeholder) -
+            // see `resolve_billing_target`. Stripe collects the real name at
+            // checkout / in the billing portal where we don't supply one.
             let new_id = provider
                 .create_customer(&target.email, target.display_name.as_deref())
                 .await

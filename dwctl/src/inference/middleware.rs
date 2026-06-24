@@ -28,11 +28,12 @@ use sqlx_pool_router::PoolProvider;
 
 use super::image_normalizer_middleware::{normalize_error_response, normalize_value_to_tokens};
 use super::store::{self as response_store, ONWARDS_RESPONSE_ID_HEADER, OnwardsDaemonId};
+use super::streaming::{ReplayFrame, flex_stream_response};
 use crate::image_normalizer::ImageNormalizer;
 
-/// State for the responses middleware.
+/// State for the inference middleware.
 #[derive(Clone)]
-pub struct ResponsesMiddlewareState<P: PoolProvider + Clone = sqlx_pool_router::DbPools> {
+pub struct InferenceMiddlewareState<P: PoolProvider + Clone = sqlx_pool_router::DbPools> {
     pub request_manager: Arc<PostgresRequestManager<P, ReqwestHttpClient>>,
     pub daemon_id: OnwardsDaemonId,
     /// Base URL for loopback requests (e.g., "http://127.0.0.1:3001/ai").
@@ -62,8 +63,8 @@ pub struct ResponsesMiddlewareState<P: PoolProvider + Clone = sqlx_pool_router::
 
 /// Middleware that routes inference requests based on service_tier and background.
 #[tracing::instrument(skip_all)]
-pub async fn responses_middleware<P: PoolProvider + Clone + Send + Sync + 'static>(
-    State(state): State<ResponsesMiddlewareState<P>>,
+pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'static>(
+    State(state): State<InferenceMiddlewareState<P>>,
     req: Request<Body>,
     next: Next,
 ) -> Response {
@@ -82,7 +83,7 @@ pub async fn responses_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
     let body_bytes = match axum::body::to_bytes(body, usize::MAX).await {
         Ok(bytes) => bytes,
         Err(e) => {
-            tracing::error!(error = %e, "Failed to read request body in responses middleware");
+            tracing::error!(error = %e, "Failed to read request body in inference middleware");
             return Response::builder().status(StatusCode::BAD_REQUEST).body(Body::empty()).unwrap();
         }
     };
@@ -90,7 +91,7 @@ pub async fn responses_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
     let mut request_value: serde_json::Value = match serde_json::from_slice(&body_bytes) {
         Ok(v) => v,
         Err(e) => {
-            tracing::error!(error = %e, "Failed to parse request body in responses middleware");
+            tracing::error!(error = %e, "Failed to parse request body in inference middleware");
             return Response::builder().status(StatusCode::BAD_REQUEST).body(Body::empty()).unwrap();
         }
     };
@@ -126,7 +127,7 @@ pub async fn responses_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
     //
     // The cross-cutting `tool_injection_middleware` runs *inside* this
     // layer (axum applies later-added layers as outer wrappers, so
-    // when responses_middleware fires, tool_injection hasn't yet
+    // when inference_middleware fires, tool_injection hasn't yet
     // populated request.extensions::<ResolvedTools>). We do the same
     // DB resolve directly here.
     if request_value.get("tools").is_none()
@@ -146,10 +147,18 @@ pub async fn responses_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
     // `service_tier:"flex"` — they route to different handlers because
     // their response shapes differ:
     //   - `/v1/responses` → `handle_flex` (Responses-API output shape,
-    //     supports `background=true` for fire-and-poll)
-    //   - `/v1/chat/completions` → `handle_chat_completion_flex` (always
-    //     blocks; OpenAI chat-completions surface has no `background`
-    //     field)
+    //     supports `background=true` for fire-and-poll). With
+    //     `stream:true` (and not `background`) →
+    //     `handle_responses_flex_streaming`, which replays the finished
+    //     object as a `response.*` SSE event sequence.
+    //   - `/v1/chat/completions` → `handle_chat_completion_flex` (blocks;
+    //     OpenAI chat-completions surface has no `background` field). With
+    //     `stream:true` → `handle_chat_completion_flex_streaming`, which
+    //     replays the finished completion as a `chat.completion.chunk` SSE
+    //     stream.
+    //
+    // Both streaming paths share `run_flex_stream` (enqueue → poll daemon
+    // → render); only the terminal-result rendering differs.
     //
     // `/v1/embeddings` doesn't have a flex handler yet — its response
     // shape isn't a chat completion either, and the
@@ -313,6 +322,34 @@ pub async fn responses_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                     }
                 }
             }
+            // Did the client ask for a streamed flex response? Flex is
+            // daemon-processed, so there is no live token feed — we honour
+            // `stream:true` by blocking on the daemon and replaying the
+            // finished result as SSE (see `run_flex_stream`). The daemon
+            // itself must therefore make a *non*-streaming upstream call, so
+            // strip `stream`/`stream_options` from the daemon-bound body.
+            //
+            // Chat completions has no `background` field, so any `stream` on
+            // it replays. Responses only replays when not `background`
+            // (background returns 202 immediately and the client polls
+            // `GET /v1/responses/{id}`). Realtime never reaches this arm.
+            let flex_stream = if is_chat_completions_api {
+                request_value["stream"].as_bool().unwrap_or(false)
+            } else if is_responses_api {
+                !background && request_value["stream"].as_bool().unwrap_or(false)
+            } else {
+                false
+            };
+            // `stream_options.include_usage` is the chat-completions opt-in for
+            // a trailing usage chunk; the Responses surface carries usage in
+            // the completed object instead, so it's chat-only.
+            let flex_stream_include_usage =
+                flex_stream && is_chat_completions_api && request_value["stream_options"]["include_usage"].as_bool().unwrap_or(false);
+            if flex_stream && let Some(obj) = request_value.as_object_mut() {
+                obj.remove("stream");
+                obj.remove("stream_options");
+            }
+
             let flex_input = fusillade::CreateFlexInput {
                 request_id,
                 body: request_value.to_string(),
@@ -324,10 +361,12 @@ pub async fn responses_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                 created_by: created_by.unwrap_or_default(),
             };
 
-            if is_chat_completions_api {
-                handle_chat_completion_flex(&state, flex_input, request_id).await
-            } else {
-                handle_flex(&state, flex_input, &resp_id, model, background).await
+            match (is_chat_completions_api, flex_stream) {
+                (true, true) => handle_chat_completion_flex_streaming(&state, flex_input, request_id, flex_stream_include_usage).await,
+                (true, false) => handle_chat_completion_flex(&state, flex_input, request_id).await,
+                // Responses (embeddings flex was downgraded to realtime above).
+                (false, true) => handle_responses_flex_streaming(&state, flex_input, request_id).await,
+                (false, false) => handle_flex(&state, flex_input, &resp_id, model, background).await,
             }
         }
     }
@@ -425,7 +464,7 @@ fn warm_path_branch(is_responses_api: bool, is_flex: bool, background: bool, str
 /// `completed` state via the batched persist path.
 #[allow(clippy::too_many_arguments)]
 async fn handle_realtime<P: PoolProvider + Clone + Send + Sync + 'static>(
-    state: &ResponsesMiddlewareState<P>,
+    state: &InferenceMiddlewareState<P>,
     realtime_input: fusillade::CreateRealtimeInput,
     resp_id: &str,
     model: &str,
@@ -501,7 +540,7 @@ async fn handle_realtime<P: PoolProvider + Clone + Send + Sync + 'static>(
 /// With `background=false`, holds the connection and polls until complete.
 /// With `background=true`, returns 202 immediately.
 async fn handle_flex<P: PoolProvider + Clone + Send + Sync + 'static>(
-    state: &ResponsesMiddlewareState<P>,
+    state: &InferenceMiddlewareState<P>,
     flex_input: fusillade::CreateFlexInput,
     resp_id: &str,
     model: &str,
@@ -581,7 +620,7 @@ async fn handle_flex<P: PoolProvider + Clone + Send + Sync + 'static>(
 /// the OpenAI chat-completions error envelope is returned with the upstream HTTP
 /// status surfaced.
 async fn handle_chat_completion_flex<P: PoolProvider + Clone + Send + Sync + 'static>(
-    state: &ResponsesMiddlewareState<P>,
+    state: &InferenceMiddlewareState<P>,
     flex_input: fusillade::CreateFlexInput,
     request_id: uuid::Uuid,
 ) -> Response {
@@ -638,6 +677,114 @@ async fn handle_chat_completion_flex<P: PoolProvider + Clone + Send + Sync + 'st
     }
 }
 
+/// Handle a streaming flex `/v1/chat/completions` request.
+///
+/// Respond-first (see [`flex_stream_response`]): returns `200
+/// text/event-stream` immediately and fills the stream once the daemon
+/// finishes the (non-streaming, since the caller stripped `stream`) upstream
+/// call. The finished `chat.completion` is replayed as a
+/// `chat.completion.chunk` stream terminated by `data: [DONE]`; a non-2xx
+/// result is emitted as an in-stream `data: {"error": …}` frame (still
+/// followed by `[DONE]`). `include_usage` mirrors the client's
+/// `stream_options.include_usage`.
+async fn handle_chat_completion_flex_streaming<P: PoolProvider + Clone + Send + Sync + 'static>(
+    state: &InferenceMiddlewareState<P>,
+    flex_input: fusillade::CreateFlexInput,
+    request_id: uuid::Uuid,
+    include_usage: bool,
+) -> Response {
+    flex_stream_response(
+        state.request_manager.clone(),
+        flex_input,
+        request_id,
+        true,
+        move |result| match result {
+            Ok(detail) => {
+                let (status, body) = response_store::detail_to_chat_completion_object(detail);
+                if status < 400 {
+                    response_store::chat_completion_to_stream_chunks(&body, include_usage)
+                        .into_iter()
+                        .map(ReplayFrame::unnamed)
+                        .collect()
+                } else {
+                    // `body` is already the chat-completions error envelope
+                    // ({"error": …}); emit it verbatim as one in-stream frame.
+                    vec![ReplayFrame::unnamed(body)]
+                }
+            }
+            Err(msg) => vec![ReplayFrame::unnamed(serde_json::json!({
+                "error": { "message": format!("Request failed: {msg}"), "type": "server_error", "code": 504 }
+            }))],
+        },
+    )
+    .await
+}
+
+/// Handle a streaming flex `/v1/responses` request (`stream:true`, not
+/// `background`).
+///
+/// Symmetric with [`handle_chat_completion_flex_streaming`]: respond-first,
+/// then replay the finished Responses object as the `response.*` SSE event
+/// sequence the live warm path also emits — `response.created` →
+/// `response.completed` on success, `response.created` → `response.failed` on
+/// error. There is no `[DONE]` sentinel on this surface; the terminal event
+/// is the terminator.
+async fn handle_responses_flex_streaming<P: PoolProvider + Clone + Send + Sync + 'static>(
+    state: &InferenceMiddlewareState<P>,
+    flex_input: fusillade::CreateFlexInput,
+    request_id: uuid::Uuid,
+) -> Response {
+    flex_stream_response(
+        state.request_manager.clone(),
+        flex_input,
+        request_id,
+        false,
+        move |result| match result {
+            Ok(detail) => {
+                let response = response_store::detail_to_response_object(detail);
+                if response["status"] == "completed" {
+                    response_store::response_object_to_stream_events(&response)
+                        .into_iter()
+                        .map(|(event, data)| ReplayFrame::named(event, data))
+                        .collect()
+                } else {
+                    // Failure path: emit the created stub then `response.failed`
+                    // carrying the response object (which holds status + error),
+                    // mirroring the live loop's terminal `Failed` event.
+                    let stub = serde_json::json!({
+                        "id": response.get("id").cloned().unwrap_or(serde_json::Value::Null),
+                        "object": "response",
+                        "status": "in_progress",
+                    });
+                    vec![
+                        ReplayFrame::named("response.created", stub),
+                        ReplayFrame::named("response.failed", response),
+                    ]
+                }
+            }
+            Err(msg) => {
+                // Poll itself failed (timeout / DB error). Emit the same
+                // `response.created` → `response.failed` lifecycle as the
+                // detail-failure branch above so clients tracking the standard
+                // Responses lifecycle don't see a `failed` with no `created`.
+                let stub = serde_json::json!({
+                    "id": serde_json::Value::Null,
+                    "object": "response",
+                    "status": "in_progress",
+                });
+                let err = serde_json::json!({
+                    "error": { "message": format!("Request failed: {msg}"), "type": "server_error", "code": 504 }
+                });
+                vec![
+                    ReplayFrame::named("response.created", stub),
+                    ReplayFrame::named("response.failed", err),
+                ]
+            }
+        },
+    )
+    .await
+}
+
 /// Check if a request should be intercepted by this middleware.
 pub(crate) fn should_intercept(method: &axum::http::Method, path: &str) -> bool {
     method == axum::http::Method::POST
@@ -650,7 +797,7 @@ pub(crate) fn should_intercept(method: &axum::http::Method, path: &str) -> bool 
 /// (no API key, missing tool resolution, etc.) and should fall through
 /// to the standard single-step / daemon paths.
 async fn try_warm_path_stream<P: PoolProvider + Clone + Send + Sync + 'static>(
-    state: &ResponsesMiddlewareState<P>,
+    state: &InferenceMiddlewareState<P>,
     request_value: &serde_json::Value,
     api_key: Option<&str>,
     model: &str,
@@ -677,7 +824,7 @@ async fn try_warm_path_stream<P: PoolProvider + Clone + Send + Sync + 'static>(
 /// returns a single JSON response instead of an SSE stream — so tools
 /// dispatch correctly even when the user opted out of streaming.
 async fn try_warm_path_blocking<P: PoolProvider + Clone + Send + Sync + 'static>(
-    state: &ResponsesMiddlewareState<P>,
+    state: &InferenceMiddlewareState<P>,
     request_value: &serde_json::Value,
     api_key: Option<&str>,
     model: &str,
@@ -712,7 +859,7 @@ async fn try_warm_path_blocking<P: PoolProvider + Clone + Send + Sync + 'static>
 /// task and returns a 202 with the in_progress response shape — the
 /// caller polls `GET /v1/responses/{id}` for the terminal state.
 async fn try_warm_path_background<P: PoolProvider + Clone + Send + Sync + 'static>(
-    state: &ResponsesMiddlewareState<P>,
+    state: &InferenceMiddlewareState<P>,
     request_value: &serde_json::Value,
     api_key: Option<&str>,
     model: &str,
@@ -776,7 +923,7 @@ async fn try_warm_path_background<P: PoolProvider + Clone + Send + Sync + 'stati
 /// `pending` state) is just state at insert: warm path doesn't go
 /// through the daemon's claim cycle.
 async fn warm_path_setup<P: PoolProvider + Clone + Send + Sync + 'static>(
-    state: &ResponsesMiddlewareState<P>,
+    state: &InferenceMiddlewareState<P>,
     request_value: &serde_json::Value,
     api_key: &str,
     model: &str,

@@ -1,5 +1,13 @@
 # Changelog
 
+## [8.61.3](https://github.com/doublewordai/control-layer/compare/v8.61.2...v8.61.3) (2026-06-24)
+
+
+### Bug Fixes
+
+* **deps:** bump onwards to 0.33.3 ([#1173](https://github.com/doublewordai/control-layer/issues/1173)) ([12d50c8](https://github.com/doublewordai/control-layer/commit/12d50c8d3424e647a371f529bc5a3e48b79300af))
+* stop sending generated display name to stripe on customer creation ([#1169](https://github.com/doublewordai/control-layer/issues/1169)) ([7870071](https://github.com/doublewordai/control-layer/commit/7870071ace5f91a593e1867f943c3421910d55fc))
+
 ## [8.61.2](https://github.com/doublewordai/control-layer/compare/v8.61.1...v8.61.2) (2026-06-22)
 
 
