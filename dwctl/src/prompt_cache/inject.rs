@@ -139,6 +139,15 @@ struct SseScan {
 /// fields into the first usage frame found. Editing touches only that one frame; every
 /// other line (deltas, `[DONE]`) is preserved byte-for-byte. Assumes uncompressed UTF-8
 /// `text/event-stream`; non-UTF-8 bodies are a graceful no-op (no scan, no edit).
+///
+/// Each `data:` line is parsed as a complete JSON object. The SSE spec permits one object
+/// to span several `data:` lines (joined by `\n`), but every OpenAI-compatible
+/// chat-completions provider emits one compact line per frame, so we don't reassemble.
+/// This deliberately matches the billing-path scanner `extract_cache_tokens`
+/// (request_logging::serializers) line-for-line: the commit gate's "saw a usage frame" and
+/// billing's "found usage" must make the *same* call, or the cache could commit a write for
+/// a frame billing reads as zero. If a multi-line provider ever appears, both must learn to
+/// reassemble together — not this one alone.
 fn scan_inject_sse(body: &[u8], stats: &CacheStats, already_edited: bool) -> SseScan {
     let Ok(body_str) = std::str::from_utf8(body) else {
         return SseScan {

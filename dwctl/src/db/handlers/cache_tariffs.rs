@@ -41,8 +41,10 @@ impl<'c> CacheTariffs<'c> {
     #[instrument(skip(self, defaults, overrides), fields(deployed_model_id = %model_id), err)]
     pub async fn enable(&mut self, model_id: DeploymentId, defaults: &CachePricingConfig, overrides: CacheTariffOverrides) -> Result<()> {
         // Atomic: expire the active version and insert the new one in one transaction, so a
-        // failed insert can't leave the model unintentionally disabled, and concurrent
-        // enables can't race into two active rows (ledger: never edit a version in place).
+        // failed insert can't leave the model unintentionally disabled (ledger: never edit a
+        // version in place). Two concurrent enables can't both land an active row — the
+        // `idx_model_cache_tariffs_unique_active` partial unique index (migration 104) fails
+        // the loser's INSERT; the transaction just keeps each enable all-or-nothing.
         let mut tx = self.db.begin().await?;
 
         sqlx::query!(
@@ -161,5 +163,35 @@ mod tests {
         .unwrap();
         assert_eq!(total, Some(2), "old version retained for audit");
         assert_eq!(active, Some(1), "exactly one active version");
+    }
+
+    #[sqlx::test]
+    async fn partial_unique_index_rejects_two_active_versions(pool: PgPool) {
+        let user = create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
+        let endpoint = create_test_endpoint(&pool, "ep", user.id).await;
+        let id = create_test_model(&pool, "m", "dup-active-alias", endpoint, user.id).await;
+
+        const INSERT_ACTIVE: &str = "INSERT INTO model_cache_tariffs
+               (deployed_model_id, write_multiplier_5m, write_multiplier_1h, write_multiplier_24h, min_prefix_tokens)
+             VALUES ($1, 1.25, 2.0, 2.5, 1024)";
+
+        // First active row is fine.
+        sqlx::query(INSERT_ACTIVE)
+            .bind(id)
+            .execute(&pool)
+            .await
+            .expect("first active row inserts");
+
+        // A second active row (valid_until NULL) for the same model must violate the partial
+        // unique index — the backstop that stops two concurrent enable()s double-activating.
+        let err = sqlx::query(INSERT_ACTIVE)
+            .bind(id)
+            .execute(&pool)
+            .await
+            .expect_err("second active row must be rejected");
+        assert!(
+            err.as_database_error().is_some_and(|e| e.is_unique_violation()),
+            "expected a unique violation from idx_model_cache_tariffs_unique_active, got: {err:?}"
+        );
     }
 }

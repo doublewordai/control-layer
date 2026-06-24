@@ -180,11 +180,23 @@ impl Classifier {
 
         // Tokenize the suffix (the only tokenization; reads needed none). Failure →
         // degrade to no caching (safe under the best-effort contract).
-        let Ok(tok) = self.tokenizer.tokenize(req.virtual_model, &segments).await else {
-            return Ok(ClassifyOutcome::zero_active());
+        let tok = match self.tokenizer.tokenize(req.virtual_model, &segments).await {
+            Ok(tok) => tok,
+            Err(e) => {
+                tracing::debug!(error = %e, virtual_model = req.virtual_model, "cache classify: tokenize failed, degrading to no write");
+                return Ok(ClassifyOutcome::zero_active());
+            }
         };
         if tok.cumulative.len() != segments.len() {
-            return Ok(ClassifyOutcome::zero_active()); // shape mismatch — bail safely
+            // The tokenizer returned a different number of cumulative counts than segments we
+            // sent — we can't map tokens to blocks safely, so bail (no write) rather than guess.
+            tracing::debug!(
+                segments = segments.len(),
+                cumulative = tok.cumulative.len(),
+                virtual_model = req.virtual_model,
+                "cache classify: tokenizer segment-count mismatch, degrading to no write"
+            );
+            return Ok(ClassifyOutcome::zero_active());
         }
 
         // cumulative token count *at* each block in the write span (with the read offset).

@@ -76,8 +76,10 @@ pub struct RawAnalyticsRecord {
     pub completion_tokens: i64,
     pub reasoning_tokens: i64,
     pub total_tokens: i64,
-    // Cached-input split (plan §8.2). `prompt_tokens` stays the full input count; these
-    // break out the cached portion so the batcher can apply the cache multipliers.
+    // Cached-input split (plan §8.2). `prompt_tokens` stays the full input count; these break
+    // out the cached portion so the batcher can apply the cache multipliers. The split usually
+    // reconciles to `prompt_tokens` but isn't guaranteed to (tokenizer drift; cost logic floors
+    // uncached at 0 — see compute_cost).
     pub cache_read_input_tokens: i64,
     pub cache_creation_5m_input_tokens: i64,
     pub cache_creation_1h_input_tokens: i64,

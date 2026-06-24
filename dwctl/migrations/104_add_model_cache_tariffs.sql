@@ -32,4 +32,14 @@ CREATE TABLE model_cache_tariffs (
     UNIQUE (deployed_model_id, valid_from)
 );
 
+-- At most one ACTIVE (un-expired) version per model. This is the integrity backstop the
+-- ledger relies on: enable() expires the current version then inserts a new one, but two
+-- concurrent enables can each see "no active row" and both insert (their valid_from differs,
+-- so the UNIQUE above doesn't catch it) → two active rows → an ambiguous as-of lookup. The
+-- partial unique index makes the second INSERT fail, serialising enables. Mirrors
+-- model_tariffs (042_add_model_tariffs.sql).
+CREATE UNIQUE INDEX idx_model_cache_tariffs_unique_active
+    ON model_cache_tariffs (deployed_model_id)
+    WHERE valid_until IS NULL;
+
 CREATE INDEX idx_model_cache_tariffs_model ON model_cache_tariffs (deployed_model_id);

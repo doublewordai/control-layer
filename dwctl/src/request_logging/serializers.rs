@@ -135,8 +135,10 @@ pub struct UsageMetrics {
     pub reasoning_tokens: i64,
     pub total_tokens: i64,
     // Cached-input split (plan §8.2), read from the response `usage` the dwctl cache layer
-    // injected. Zero on non-cache requests / models. `prompt_tokens` still holds the full
-    // input count (= cache_read + cache_creation + uncached).
+    // injected. Zero on non-cache requests / models. `prompt_tokens` stays the full input
+    // count; it typically equals cache_read + cache_creation + uncached, but the split need
+    // not reconcile exactly (our tokenizer and the provider's can disagree — billing floors
+    // uncached at 0 to absorb the drift).
     pub cache_read_input_tokens: i64,
     pub cache_creation_5m_input_tokens: i64,
     pub cache_creation_1h_input_tokens: i64,

@@ -37,18 +37,23 @@ echo "backfill_uncached_cost: $(remaining) rows to fill (batch=${BATCH_SIZE})"
 
 total=0
 while :; do
-  # Each batch is one transaction (one psql invocation). RETURNING 1 lets us count rows.
+  # Each batch is one transaction (one psql invocation). The UPDATE is a CTE and the
+  # statement is a final SELECT count(*), so psql emits exactly one numeric row. No `grep …
+  # || true` pipeline — that would swallow a psql/DB error as a clean "0 rows" and stop the
+  # backfill silently; here a failed psql aborts the script under `set -e`.
   affected=$(psql "$DATABASE_URL" -qtA -c "
     WITH batch AS (
       SELECT id FROM http_analytics
       WHERE uncached_cost IS NULL AND total_cost IS NOT NULL
       LIMIT ${BATCH_SIZE}
+    ), upd AS (
+      UPDATE http_analytics h
+         SET uncached_cost = h.total_cost
+        FROM batch
+       WHERE h.id = batch.id
+      RETURNING 1
     )
-    UPDATE http_analytics h
-       SET uncached_cost = h.total_cost
-      FROM batch
-     WHERE h.id = batch.id
-    RETURNING 1;" | grep -c '^1$' || true)
+    SELECT count(*) FROM upd;")
 
   if [ "${affected}" -eq 0 ]; then
     break
