@@ -364,47 +364,6 @@ jobs:
         working-directory: ./dashboard
         run: pnpm install --frozen-lockfile
 
-      # TEMP DIAGNOSTICS: the Playwright browser download hangs forever on the
-      # depot-ubuntu-24.04 runner but works from a fresh local cache. The
-      # downloader has no stall timeout, so a blocked/black-holed connection
-      # turns into an infinite hang. These steps probe IPv4 vs IPv6 reachability
-      # to the CDN and enable verbose download logging so the next run shows
-      # where it stalls. Remove once diagnosed.
-      - name: Network diagnostics (Playwright CDN)
-        continue-on-error: true
-        run: |
-          set -x
-          echo "## interfaces / routes"
-          ip addr || true
-          ip -6 route || true
-          echo "## playwright version"
-          (cd dashboard && npx playwright --version) || true
-          echo "## DNS for cdn.playwright.dev"
-          getent ahosts cdn.playwright.dev || true
-          echo "## env (proxy vars)"
-          env | grep -iE 'proxy|no_proxy' || echo "no proxy vars set"
-          echo "## curl IPv4 to cdn.playwright.dev"
-          curl -4 -sS -I --connect-timeout 10 --max-time 30 \
-            -w 'v4 dns=%{time_namelookup}s connect=%{time_connect}s ttfb=%{time_starttransfer}s code=%{http_code}\n' \
-            https://cdn.playwright.dev/ || echo "IPv4 probe failed or timed out"
-          echo "## curl IPv6 to cdn.playwright.dev"
-          curl -6 -sS -I --connect-timeout 10 --max-time 30 \
-            -w 'v6 dns=%{time_namelookup}s connect=%{time_connect}s ttfb=%{time_starttransfer}s code=%{http_code}\n' \
-            https://cdn.playwright.dev/ || echo "IPv6 probe failed or timed out"
-          echo "## curl default (family not forced)"
-          curl -sS -I --connect-timeout 10 --max-time 30 \
-            -w 'default dns=%{time_namelookup}s connect=%{time_connect}s ttfb=%{time_starttransfer}s code=%{http_code}\n' \
-            https://cdn.playwright.dev/ || echo "default probe failed or timed out"
-
-      - name: Install Playwright browsers
-        working-directory: ./dashboard
-        timeout-minutes: 8
-        env:
-          DEBUG: pw:install
-        run: |
-          set -x
-          npx playwright install chromium --only-shell
-
       - name: Install hurl
         # Pinned: hurl 8.0.0 (2026-04-27) ships an RFC 9535 JSONPath rewrite
         # that breaks our existing `count` / `nth` patterns on filter results
