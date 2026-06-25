@@ -287,6 +287,7 @@ jobs:
       DATABASE_URL: postgres://postgres:postgres@localhost:5432/dwctl
       TEST_API_KEY: sk-openresponses-compliance
       TEST_MODEL: gemini-2.5-flash
+      OPENRESPONSES_COMPLIANCE_FILTER: basic-response,assistant-phase,response-output-phase-schema,streaming-response,system-prompt,tool-calling,image-input,multi-turn
 
     steps:
       - name: Log in to GitHub Container Registry
@@ -580,14 +581,11 @@ jobs:
         uses: oven-sh/setup-bun@v2
 
       - name: Clone openresponses
-        # Pinned before WebSocket/compact tests were added (PR #71).
-        # Update this once dwctl/onwards supports WebSocket transport.
+        # Track upstream main, but run only the currently supported HTTP
+        # /responses tests via OPENRESPONSES_COMPLIANCE_FILTER below.
+        # Add WebSocket and /responses/compact tests once those surfaces exist.
         run: |
-          git init /tmp/openresponses
-          cd /tmp/openresponses
-          git remote add origin https://github.com/openresponses/openresponses
-          git fetch --depth 1 origin fa29df56b658c05ca06a401307040cda2345a470
-          git checkout --detach FETCH_HEAD
+          git clone --depth 1 https://github.com/openresponses/openresponses /tmp/openresponses
 
       - name: Install openresponses dependencies
         run: cd /tmp/openresponses && bun install
@@ -599,6 +597,7 @@ jobs:
             --base-url http://localhost:3001/ai/v1 \
             --api-key "${TEST_API_KEY}" \
             --model "${TEST_MODEL}" \
+            --filter "${OPENRESPONSES_COMPLIANCE_FILTER}" \
             --verbose
 
       - name: Show dwctl logs
