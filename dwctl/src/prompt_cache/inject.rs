@@ -188,10 +188,17 @@ fn scan_inject_sse(body: &[u8], stats: &CacheStats, already_edited: bool) -> Sse
                 {
                     saw_usage = true;
                     if !already_edited && !edited {
+                        // Preserve the line's terminator style: on a CRLF stream this `line`
+                        // (split on '\n') ends with '\r', which the reserialized JSON drops —
+                        // re-append it so we don't emit a lone '\n' amid '\r\n' framing.
+                        let has_cr = line.ends_with('\r');
                         splice_cache_fields(usage_obj, stats);
                         if let Ok(reserialized) = serde_json::to_string(&chunk) {
                             out.push_str("data: ");
                             out.push_str(&reserialized);
+                            if has_cr {
+                                out.push('\r');
+                            }
                             edited = true;
                             continue;
                         }
@@ -424,6 +431,19 @@ mod tests {
     fn inject_non_streaming_none_when_no_usage() {
         let body = serde_json::json!({"choices":[]}).to_string();
         assert!(inject_into_usage_json(body.as_bytes(), &stats()).is_none());
+    }
+
+    #[test]
+    fn inject_sse_preserves_crlf_on_edited_frame() {
+        // CRLF-framed stream: the rewritten usage frame must keep its trailing '\r' so the
+        // '\r\n\r\n' event boundary stays intact (no lone '\n' amid CRLF).
+        let sse = "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":2000}}\r\n\r\ndata: [DONE]\r\n\r\n";
+        let out = inject_into_sse_body(sse.as_bytes(), &stats()).unwrap();
+        let s = std::str::from_utf8(&out).unwrap();
+        assert!(s.contains("\"cache_read_input_tokens\":1024"), "got: {s}");
+        // The injected frame is still terminated by CRLF, not a bare LF.
+        assert!(s.contains("}\r\n\r\n"), "edited frame must keep CRLF framing, got: {s}");
+        assert!(!s.contains("}\n\r"), "must not produce a malformed \\n\\r, got: {s}");
     }
 
     #[test]

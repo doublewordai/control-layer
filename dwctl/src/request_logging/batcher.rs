@@ -624,6 +624,10 @@ where
                     "cache_tariff_missing",
                     Warning,
                     model = raw.request_model.as_deref().unwrap_or("?"),
+                    fallback_read = %self.cache_fallback_multipliers.read,
+                    fallback_write_5m = %self.cache_fallback_multipliers.write_5m,
+                    fallback_write_1h = %self.cache_fallback_multipliers.write_1h,
+                    fallback_write_24h = %self.cache_fallback_multipliers.write_24h,
                     "request carries cache tokens but no cache tariff was valid at inference time; billing at default multipliers"
                 );
             }

@@ -28,8 +28,10 @@ set -euo pipefail
 BATCH_SIZE="${BATCH_SIZE:-10000}"
 SLEEP_SECONDS="${SLEEP_SECONDS:-0.2}"
 
+# `-v ON_ERROR_STOP=1` makes psql exit non-zero on a SQL error (so set -e / assignments trip),
+# and `-X` ignores ~/.psqlrc so a user's config can't alter behaviour. Applied to every call.
 remaining() {
-  psql "$DATABASE_URL" -qtAc \
+  psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -X -qtAc \
     "SELECT count(*) FROM http_analytics WHERE uncached_cost IS NULL AND total_cost IS NOT NULL;"
 }
 
@@ -44,7 +46,7 @@ while :; do
   # statement is a final SELECT count(*), so psql emits exactly one numeric row. No `grep …
   # || true` pipeline — that would swallow a psql/DB error as a clean "0 rows" and stop the
   # backfill silently; here a failed psql aborts the script under `set -e`.
-  affected=$(psql "$DATABASE_URL" -qtA -c "
+  affected=$(psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -X -qtA -c "
     WITH batch AS (
       SELECT id FROM http_analytics
       WHERE uncached_cost IS NULL AND total_cost IS NOT NULL

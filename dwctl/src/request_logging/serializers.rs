@@ -468,8 +468,16 @@ fn extract_cache_tokens(response_data: &ResponseData) -> CacheTokens {
     let Some(body) = &response_data.body else {
         return CacheTokens::default();
     };
-    let Ok(bytes) = utils::decompress_response_if_needed(body.as_ref(), &response_data.headers) else {
-        return CacheTokens::default();
+    // On a decompress failure (e.g. a mis-set Content-Encoding on an actually-plain body),
+    // fall back to the raw bytes rather than silently returning zero cache tokens — zeroing
+    // would drop the read discount and overcharge a cache-enabled request. Log so the
+    // mis-encoding is diagnosable.
+    let bytes = match utils::decompress_response_if_needed(body.as_ref(), &response_data.headers) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(error = %e, "cache token extraction: response decompress failed, falling back to raw body");
+            body.as_ref().to_vec()
+        }
     };
     let body_str = String::from_utf8_lossy(&bytes);
 

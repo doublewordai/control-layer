@@ -38,6 +38,9 @@ CREATE TABLE model_cache_tariffs (
 -- so the UNIQUE above doesn't catch it) → two active rows → an ambiguous as-of lookup. The
 -- partial unique index makes the second INSERT fail, serialising enables. Mirrors
 -- model_tariffs (042_add_model_tariffs.sql).
+-- The losing concurrent enable() surfaces as a "duplicate key value violates unique
+-- constraint" error (its whole transaction rolls back, so no partial row is left); callers
+-- doing concurrent/manual tariff edits should retry or surface that to the operator.
 CREATE UNIQUE INDEX idx_model_cache_tariffs_unique_active
     ON model_cache_tariffs (deployed_model_id)
     WHERE valid_until IS NULL;
