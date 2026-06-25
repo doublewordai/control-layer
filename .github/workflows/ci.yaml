@@ -376,6 +376,7 @@ jobs:
             --detach \
             --name dwctl-openresponses-compliance \
             --network host \
+            --env RUST_LOG=onwards::strict::handlers=debug,onwards::target=debug,dwctl::sync::onwards_config=debug,info \
             --volume /tmp/dwctl-openresponses-compliance.yaml:/app/config.yaml:ro \
             "${{ steps.image.outputs.image }}" \
             --config /app/config.yaml
