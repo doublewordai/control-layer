@@ -287,6 +287,10 @@ jobs:
       DATABASE_URL: postgres://postgres:postgres@localhost:5432/dwctl
       TEST_API_KEY: sk-openresponses-compliance
       TEST_MODEL: gemini-2.5-flash
+      # Run all currently supported HTTP /responses tests. The full upstream
+      # suite also covers WebSocket transport (#1178) and /responses/compact
+      # (#1179), which are tracked separately until those surfaces exist.
+      OPENRESPONSES_COMPLIANCE_FILTER: basic-response,assistant-phase,response-output-phase-schema,streaming-response,system-prompt,tool-calling,image-input,multi-turn
 
     steps:
       - name: Log in to GitHub Container Registry
@@ -595,6 +599,7 @@ jobs:
             --base-url http://localhost:3001/ai/v1 \
             --api-key "${TEST_API_KEY}" \
             --model "${TEST_MODEL}" \
+            --filter "${OPENRESPONSES_COMPLIANCE_FILTER}" \
             --json > /tmp/openresponses-compliance-results.json
           status=$?
           set -e
