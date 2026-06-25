@@ -1095,7 +1095,7 @@ pub async fn build_router(
     requests_writer_sender: Option<crate::inference::engine::writer::RequestsWriterSender>,
     metrics_recorder: Option<GenAiMetrics>,
     strict_mode: bool,
-    responses_middleware_state: Option<crate::inference::middleware::ResponsesMiddlewareState>,
+    inference_middleware_state: Option<crate::inference::middleware::InferenceMiddlewareState>,
 ) -> anyhow::Result<Router> {
     let config = state.current_config();
 
@@ -1137,10 +1137,10 @@ pub async fn build_router(
 
         // Add FusilladeOutletHandler so completed responses get written to
         // fusillade via the in-process RequestsWriter. We only attach when
-        // both the responses middleware is active and we actually have a
+        // both the inference middleware is active and we actually have a
         // sender to give the handler; without a sender the handler would
         // silently swallow rows.
-        if let (Some(rms), Some(sender)) = (responses_middleware_state.as_ref(), requests_writer_sender.clone()) {
+        if let (Some(rms), Some(sender)) = (inference_middleware_state.as_ref(), requests_writer_sender.clone()) {
             let fusillade_handler = crate::inference::engine::outlet_handler::FusilladeOutletHandler::new(sender, rms.dwctl_pool.clone());
             multi_handler = multi_handler.with(fusillade_handler);
         }
@@ -1573,13 +1573,13 @@ pub async fn build_router(
         onwards_router
     };
 
-    // Apply responses middleware to create pending fusillade rows for /v1/responses requests.
+    // Apply inference middleware to create pending fusillade rows for inference requests.
     // This runs BEFORE outlet (outer layer executes first), so the X-Onwards-Response-Id
     // header is set before outlet captures the request and passes it to FusilladeOutletHandler.
-    let onwards_router = if let Some(rms) = responses_middleware_state {
+    let onwards_router = if let Some(rms) = inference_middleware_state {
         onwards_router.layer(middleware::from_fn_with_state(
             rms,
-            crate::inference::middleware::responses_middleware,
+            crate::inference::middleware::inference_middleware,
         ))
     } else {
         onwards_router
@@ -2203,7 +2203,7 @@ pub(crate) struct BackgroundServicesInput {
     /// passed in by-clone here.
     pub model_capacity_limits: Arc<dashmap::DashMap<String, usize>>,
     /// dwctl primary pool (used for probe scheduler, notification
-    /// poller, and the responses middleware setup).
+    /// poller, and the inference middleware setup).
     pub pool: PgPool,
     /// Fusillade pool wrapper; kept around inside this function only
     /// to clone the write pool for the metrics sampler — fusillade's
@@ -2848,7 +2848,7 @@ impl Application {
             crate::image_normalizer::from_config(&config.image_normalizer).map_err(|e| anyhow::anyhow!("image normaliser config: {e}"))?;
 
         // Build the multi-step processor's dependencies. These also end
-        // up wired into the responses middleware state below; cloning
+        // up wired into the inference middleware state below; cloning
         // them is cheap (Arc + reqwest::Client share their internal
         // connection pool / TLS root-cert cache across clones).
         let multi_step_reqwest_client = reqwest::Client::new();
@@ -3043,10 +3043,10 @@ impl Application {
         // OR the leader-gained closure). All daemons see the
         // multi-step processor at claim time.
 
-        // Responses middleware state. Non-background realtime no longer
+        // Inference middleware state. Non-background realtime no longer
         // does any DB work up front; the completion path goes through
         // FusilladeOutletHandler -> RequestsWriter.
-        let responses_middleware_state = crate::inference::middleware::ResponsesMiddlewareState {
+        let inference_middleware_state = crate::inference::middleware::InferenceMiddlewareState {
             request_manager: bg_services.request_manager.clone(),
             daemon_id: crate::inference::store::OnwardsDaemonId(onwards_daemon_id),
             loopback_base_url: {
@@ -3134,7 +3134,7 @@ impl Application {
             bg_services.requests_writer_sender.clone(),
             metrics_recorder,
             bg_services.onwards_targets.strict_mode,
-            Some(responses_middleware_state),
+            Some(inference_middleware_state),
         )
         .await?;
 
