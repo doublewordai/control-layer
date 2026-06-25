@@ -169,7 +169,7 @@ google-cloud-storage = "1.12"
 google-cloud-auth = "1.10"
 
 [dev-dependencies]
-axum-test = { version = "18.4.1" }
+axum-test = { version = "20.0.0" }
 sqlx = { version = "0.8", features = [
   "postgres",
   "runtime-tokio-rustls",
