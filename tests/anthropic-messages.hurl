@@ -173,3 +173,25 @@ HTTP 200
 header "Content-Type" contains "text/event-stream"
 body contains "event: message_start"
 body contains "event: message_stop"
+
+# --- models: Anthropic-shaped list via anthropic-version + x-api-key ---------
+# The anthropic-version header makes the edge layer reframe onwards' OpenAI list
+# into the Anthropic models shape; the accessible alias must appear.
+GET http://localhost:3001/ai/v1/models
+x-api-key: {{api_key}}
+anthropic-version: 2023-06-01
+HTTP 200
+[Asserts]
+jsonpath "$.has_more" == false
+jsonpath "$.data[0].type" == "model"
+jsonpath "$.data[*].id" includes "anthropic-e2e"
+
+# --- models: native OpenAI list passes through untouched ---------------------
+# Same endpoint, no anthropic-version: the edge layer must NOT claim it, so the
+# response keeps the OpenAI shape (object: "list", per-model object: "model").
+GET http://localhost:3001/ai/v1/models
+Authorization: Bearer {{api_key}}
+HTTP 200
+[Asserts]
+jsonpath "$.object" == "list"
+jsonpath "$.data[0].object" == "model"

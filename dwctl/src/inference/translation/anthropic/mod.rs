@@ -1,6 +1,7 @@
 //! Anthropic Messages (`/v1/messages`) edge translator.
 
 pub mod model;
+pub mod models;
 pub mod request;
 pub mod response;
 pub mod streaming;
