@@ -433,12 +433,13 @@ struct CacheTokens {
 /// caching — breaking the "non-cache models produce a zero cache split" invariant. Creation
 /// is read per tier from the `cache_creation` object.
 ///
-/// ASSUMPTION (holds today): upstream endpoints are OpenAI-shaped and do NOT report
-/// `cache_read_input_tokens` / `cache_creation` themselves. Those are Anthropic's native
-/// field names, identical to the ones dwctl injects — so if egress ever routes to an
-/// Anthropic-native provider, a model dwctl isn't caching could still leak its provider-side
-/// cache tokens here. The fix then is to gate extraction on dwctl-cache-enablement (the
-/// model's tariff presence, known to the batcher) rather than trusting the response fields.
+/// NOTE: these are also Anthropic's native usage field names, so a model dwctl isn't caching
+/// that's routed to an Anthropic-native provider could carry the provider's *own* cache
+/// tokens here. That does NOT affect billing: the batcher gates the cache discount on dwctl
+/// enablement (a tariff valid at inference time), so provider-side tokens on a non-enabled
+/// model are billed at list price (see `charged_cost`). What's read here only populates the
+/// analytics columns — so the residual is cosmetic (provider cache tokens shown for a model
+/// dwctl isn't caching), not a billing leak.
 fn cache_tokens_from_usage(usage: &Value) -> CacheTokens {
     // Floor at 0: token counts can't be negative, but a malformed response could carry one —
     // never let it reach the analytics columns or the cost math (the batcher floors too).

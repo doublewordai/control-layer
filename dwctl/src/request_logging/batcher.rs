@@ -196,6 +196,23 @@ fn resolve_cache_multipliers(rows: &[CacheTariffRow], timestamp: DateTime<Utc>) 
         })
 }
 
+/// The charged cost for a record, gating the cache discount on dwctl enablement: when a
+/// tariff was valid at inference (`cache_mults` is `Some`) apply the cache-adjusted pricing;
+/// otherwise bill the full input at list price. The `None` case deliberately ignores any
+/// cache_* tokens in the response — without an active tariff those are the upstream
+/// provider's own caching, not dwctl's, and must not earn dwctl's discount.
+fn charged_cost(
+    raw: &RawAnalyticsRecord,
+    input_price: Option<Decimal>,
+    output_price: Option<Decimal>,
+    cache_mults: Option<CacheMultipliers>,
+) -> Option<Decimal> {
+    match cache_mults {
+        Some(m) => compute_total_cost(raw, input_price, output_price, &m),
+        None => compute_list_price(raw, input_price, output_price),
+    }
+}
+
 /// The cache-adjusted request cost. Reduces to the plain
 /// `prompt × input + completion × output` when there are no cache tokens, so non-cache
 /// requests are unaffected. `None` when the model has no pricing at all (→ no ledger row),
@@ -283,9 +300,6 @@ where
     last_onwards_sync_notification: Arc<RwLock<Instant>>,
     /// Minimum interval between onwards sync notifications (from config).
     onwards_sync_notification_interval: Duration,
-    /// Fallback cache multipliers (from `config.cache_pricing`) for the unreachable path where
-    /// a request carries cache tokens but no tariff resolved. Operator-tunable, not hardcoded.
-    cache_fallback_multipliers: CacheMultipliers,
 }
 
 impl<M> AnalyticsBatcher<M>
@@ -311,7 +325,6 @@ where
         let max_retries = config.analytics.max_retries;
         let retry_base_delay = std::time::Duration::from_millis(config.analytics.retry_base_delay_ms);
         let onwards_sync_notification_interval = Duration::from_millis(config.analytics.balance_notification_interval_milliseconds);
-        let cache_fallback_multipliers = CacheMultipliers::from_config(&config.cache_pricing);
 
         let batcher = Self {
             pool,
@@ -326,7 +339,6 @@ where
                     .unwrap_or_else(Instant::now),
             )),
             onwards_sync_notification_interval,
-            cache_fallback_multipliers,
         };
 
         (batcher, sender)
@@ -605,35 +617,33 @@ where
 
             // Resolve cache multipliers from the tariff row valid at inference time. `None`
             // for the normal non-cache model (no tariff) and for the dead anomaly path below.
+            // Resolve the cache multipliers from the tariff row valid at inference time. `None`
+            // means this model was NOT dwctl-cache-enabled then (the lookup is as-of inference
+            // against an append-only ledger, so a tariff that was active then always resolves).
             let cache_mults_resolved = raw
                 .request_model
                 .as_deref()
                 .and_then(|alias| cache_tariff_map.get(alias))
                 .and_then(|rows| resolve_cache_multipliers(rows, pricing_timestamp));
 
-            // Anomaly guard: classify only records cache tokens when a tariff is active, so
-            // cache tokens with no tariff valid at billing time means something drifted. Bill
-            // at safe defaults, but surface it — this should never fire in practice.
-            let has_cache_tokens = raw.cache_read_input_tokens > 0
-                || raw.cache_creation_5m_input_tokens > 0
-                || raw.cache_creation_1h_input_tokens > 0
-                || raw.cache_creation_24h_input_tokens > 0;
-            if cache_mults_resolved.is_none() && has_cache_tokens {
+            // dwctl only injects cache tokens when a tariff is active, so if no tariff was valid
+            // at inference yet the response still carries cache_* tokens, those are the upstream
+            // provider's own (e.g. Anthropic's native caching) — surface that we're ignoring them.
+            if cache_mults_resolved.is_none()
+                && (raw.cache_read_input_tokens > 0
+                    || raw.cache_creation_5m_input_tokens > 0
+                    || raw.cache_creation_1h_input_tokens > 0
+                    || raw.cache_creation_24h_input_tokens > 0)
+            {
                 crate::background_error!(
                     ANALYTICS_BATCHER,
-                    "cache_tariff_missing",
+                    "provider_cache_tokens_ignored",
                     Warning,
                     model = raw.request_model.as_deref().unwrap_or("?"),
-                    fallback_read = %self.cache_fallback_multipliers.read,
-                    fallback_write_5m = %self.cache_fallback_multipliers.write_5m,
-                    fallback_write_1h = %self.cache_fallback_multipliers.write_1h,
-                    fallback_write_24h = %self.cache_fallback_multipliers.write_24h,
-                    "request carries cache tokens but no cache tariff was valid at inference time; billing at default multipliers"
+                    "response carried cache tokens but the model is not dwctl-cache-enabled; ignoring them and billing at list price"
                 );
             }
-
-            let cache_mults = cache_mults_resolved.unwrap_or(self.cache_fallback_multipliers);
-            let total_cost = compute_total_cost(&raw, input_price, output_price, &cache_mults);
+            let total_cost = charged_cost(&raw, input_price, output_price, cache_mults_resolved);
             let uncached_cost = compute_list_price(&raw, input_price, output_price);
 
             enriched.push(EnrichedRecord {
@@ -1495,6 +1505,30 @@ mod tests {
         assert_eq!(cost, Decimal::new(11, 2));
         // No savings shown for a distrusted split: total == un-discounted list price.
         assert_eq!(cost, compute_list_price(&r, Some(inp()), Some(outp())).unwrap());
+    }
+
+    #[test]
+    fn charged_cost_gates_discount_on_enablement() {
+        // 600 cache-read tokens reported on the response.
+        let r = cost_record(1000, 100, 600, 0, 0, 0);
+
+        // Not dwctl-cache-enabled (no tariff → None): the provider's cache tokens are ignored
+        // and the full input is billed at list price — no read discount.
+        let not_enabled = charged_cost(&r, Some(inp()), Some(outp()), None).unwrap();
+        assert_eq!(not_enabled, compute_list_price(&r, Some(inp()), Some(outp())).unwrap());
+        assert_eq!(not_enabled, Decimal::new(12, 1)); // 1000*0.001 + 100*0.002
+
+        // Cache-enabled (Some): the read discount applies, so it costs strictly less.
+        let m = CacheMultipliers {
+            read: Decimal::new(1, 1), // 0.1
+            write_5m: Decimal::ONE,
+            write_1h: Decimal::ONE,
+            write_24h: Decimal::ONE,
+        };
+        let enabled = charged_cost(&r, Some(inp()), Some(outp()), Some(m)).unwrap();
+        // 400 uncached*0.001 + 600 read*0.001*0.1 + 100*0.002 = 0.66
+        assert_eq!(enabled, Decimal::new(66, 2));
+        assert!(enabled < not_enabled, "the discount must make the enabled case cheaper");
     }
 
     #[test]
