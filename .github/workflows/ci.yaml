@@ -287,7 +287,6 @@ jobs:
       DATABASE_URL: postgres://postgres:postgres@localhost:5432/dwctl
       TEST_API_KEY: sk-openresponses-compliance
       TEST_MODEL: gemini-2.5-flash
-      OPENRESPONSES_COMPLIANCE_FILTER: basic-response,assistant-phase,response-output-phase-schema,streaming-response,system-prompt,tool-calling,image-input,multi-turn
 
     steps:
       - name: Log in to GitHub Container Registry
@@ -581,9 +580,7 @@ jobs:
         uses: oven-sh/setup-bun@v2
 
       - name: Clone openresponses
-        # Track upstream main, but run only the currently supported HTTP
-        # /responses tests via OPENRESPONSES_COMPLIANCE_FILTER below.
-        # Add WebSocket and /responses/compact tests once those surfaces exist.
+        # Track upstream main so CI surfaces newly added compliance coverage.
         run: |
           git clone --depth 1 https://github.com/openresponses/openresponses /tmp/openresponses
 
@@ -598,7 +595,6 @@ jobs:
             --base-url http://localhost:3001/ai/v1 \
             --api-key "${TEST_API_KEY}" \
             --model "${TEST_MODEL}" \
-            --filter "${OPENRESPONSES_COMPLIANCE_FILTER}" \
             --json > /tmp/openresponses-compliance-results.json
           status=$?
           set -e
