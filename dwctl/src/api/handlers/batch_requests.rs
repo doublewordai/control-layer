@@ -282,6 +282,19 @@ pub async fn get_batch_request<P: PoolProvider>(
     .await
     .map_err(|e| Error::Database(e.into()))?;
 
+    let endpoint = sqlx::query_scalar::<_, String>(
+        r#"
+        SELECT t.path
+        FROM fusillade.requests r
+        JOIN fusillade.request_templates t ON r.template_id = t.id
+        WHERE r.id = $1 AND r.created_by IS NOT NULL
+        "#,
+    )
+    .bind(request_id)
+    .fetch_optional(state.db.read())
+    .await
+    .map_err(|e| Error::Database(e.into()))?;
+
     // Look up the creator's email via UUID primary-key lookup (org IDs and unparseable
     // values return None without a query). Uses the primary pool to avoid replica lag
     // right after response creation.
@@ -315,6 +328,7 @@ pub async fn get_batch_request<P: PoolProvider>(
         reasoning_tokens: analytics.as_ref().and_then(|a| a.reasoning_tokens),
         total_tokens: analytics.as_ref().and_then(|a| a.total_tokens),
         total_cost: analytics.as_ref().and_then(|a| a.total_cost),
+        endpoint,
         body: detail.body.unwrap_or_default(),
         response_body: detail.response_body,
         error: detail.error,
@@ -627,6 +641,7 @@ mod tests {
         response.assert_status_ok();
         let body: serde_json::Value = response.json();
         assert_eq!(body["id"], request_id.to_string());
+        assert_eq!(body["endpoint"], "/v1/chat/completions");
         assert_eq!(body["created_by_email"], user.email);
     }
 
