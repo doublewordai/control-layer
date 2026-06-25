@@ -205,17 +205,13 @@ fn chat_usage_to_response_usage(usage: Value) -> Value {
         "output_tokens": output_tokens,
         "total_tokens": total_tokens,
         "input_tokens_details": {
-            "cached_tokens": usage
-                .get("input_tokens_details")
-                .and_then(|details| details.get("cached_tokens"))
-                .and_then(Value::as_i64)
+            "cached_tokens": nested_token_count(&usage, "input_tokens_details", "cached_tokens")
+                .or_else(|| nested_token_count(&usage, "prompt_tokens_details", "cached_tokens"))
                 .unwrap_or(0),
         },
         "output_tokens_details": {
-            "reasoning_tokens": usage
-                .get("output_tokens_details")
-                .and_then(|details| details.get("reasoning_tokens"))
-                .and_then(Value::as_i64)
+            "reasoning_tokens": nested_token_count(&usage, "output_tokens_details", "reasoning_tokens")
+                .or_else(|| nested_token_count(&usage, "completion_tokens_details", "reasoning_tokens"))
                 .unwrap_or(0),
         },
     })
@@ -223,6 +219,13 @@ fn chat_usage_to_response_usage(usage: Value) -> Value {
 
 fn token_count(usage: &Value, key: &str) -> Option<i64> {
     usage.get(key).and_then(Value::as_i64)
+}
+
+fn nested_token_count(usage: &Value, details_key: &str, token_key: &str) -> Option<i64> {
+    usage
+        .get(details_key)
+        .and_then(|details| details.get(token_key))
+        .and_then(Value::as_i64)
 }
 
 #[cfg(test)]
@@ -318,7 +321,12 @@ mod tests {
                 StepKind::ModelCall,
                 json!({
                     "choices": [{"message": {"role":"assistant","content":"a"}}],
-                    "usage": {"prompt_tokens": 10, "completion_tokens": 20}
+                    "usage": {
+                        "prompt_tokens": 10,
+                        "completion_tokens": 20,
+                        "prompt_tokens_details": {"cached_tokens": 3},
+                        "completion_tokens_details": {"reasoning_tokens": 4}
+                    }
                 }),
             ),
             step(
@@ -334,7 +342,7 @@ mod tests {
         assert_eq!(r["usage"]["input_tokens"], 15);
         assert_eq!(r["usage"]["output_tokens"], 35);
         assert_eq!(r["usage"]["total_tokens"], 50);
-        assert_eq!(r["usage"]["input_tokens_details"]["cached_tokens"], 0);
-        assert_eq!(r["usage"]["output_tokens_details"]["reasoning_tokens"], 0);
+        assert_eq!(r["usage"]["input_tokens_details"]["cached_tokens"], 3);
+        assert_eq!(r["usage"]["output_tokens_details"]["reasoning_tokens"], 4);
     }
 }
