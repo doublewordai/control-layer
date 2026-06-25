@@ -112,13 +112,31 @@ status < 300
 [Captures]
 api_key: jsonpath "$.key"
 
+# --- sanity: the SHARED routing path via a plain OpenAI request --------------
+# Same model + key, no Anthropic translation. This isolates the model-routing
+# (sync) from the Anthropic-specific path: if this 404s, the model never reached
+# onwards' route cache; if it succeeds, routing works and any /messages failure
+# is in the translation layer. Retries absorb the onwards sync delay.
+POST http://localhost:3001/ai/v1/chat/completions
+Authorization: Bearer {{api_key}}
+[Options]
+retry: 40
+retry-interval: 500
+{
+  "model": "anthropic-e2e",
+  "max_tokens": 64,
+  "messages": [ { "role": "user", "content": "hello" } ]
+}
+HTTP 200
+[Asserts]
+jsonpath "$.choices[0].message" exists
+
 # --- blocking: Anthropic request via x-api-key ------------------------------
-# Retries to absorb the onwards LISTEN/NOTIFY sync delay after model creation.
 POST http://localhost:3001/ai/v1/messages
 x-api-key: {{api_key}}
 anthropic-version: 2023-06-01
 [Options]
-retry: 40
+retry: 10
 retry-interval: 500
 {
   "model": "anthropic-e2e",
