@@ -603,6 +603,11 @@ jobs:
             .results[] | "\(.status | ascii_upcase): \(.name)"
           ' /tmp/openresponses-compliance-results.json
           jq -r '
+            .results[]
+            | select(.status == "failed")
+            | "\n\(.name):\n" + ((.errors // []) | map("  - " + .) | join("\n"))
+          ' /tmp/openresponses-compliance-results.json
+          jq -r '
             "Results: \(.summary.passed) passed, \(.summary.failed) failed, \(.summary.skipped) skipped, \(.summary.total) total"
           ' /tmp/openresponses-compliance-results.json
 
