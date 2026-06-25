@@ -2069,7 +2069,7 @@ mod tests {
             responses: Default::default(),
             image_normalizer: Default::default(),
             openapi: Default::default(),
-            cache_pricing: Default::default(),
+            cache: Default::default(),
         };
         crate::seed_database(&config.model_sources, &pool).await.unwrap();
 

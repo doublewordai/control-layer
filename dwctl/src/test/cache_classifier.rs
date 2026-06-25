@@ -1,4 +1,4 @@
-//! Full-stack tests for the cached-input pricing wiring (`onwards.cache_classifier_enabled`).
+//! Full-stack tests for the cached-input pricing wiring (`cache.enabled`).
 //!
 //! Exercises the dwctl-owned cache tower layer end to end through a real
 //! proxied chat completion against a mock upstream, with the layer in its production
@@ -22,9 +22,9 @@ use sqlx::PgPool;
 
 /// Options for [`proxied_usage`].
 struct ProxiedOpts {
-    /// `onwards.cache_classifier_enabled` — whether the cache layer is in the stack.
+    /// `cache.enabled` — whether the cache layer is in the stack.
     cache_classifier_enabled: bool,
-    /// When set, `onwards.tokenizer_url` points here (a mock tokenizer-svc).
+    /// When set, `cache.tokenizer_url` points here (a mock tokenizer-svc).
     tokenizer_url: Option<String>,
     /// When true, the `cache-test` model is opted into cache pricing after creation.
     opt_in_cache: bool,
@@ -58,9 +58,9 @@ async fn proxied_usage(pool: &PgPool, opts: ProxiedOpts) -> serde_json::Value {
         .await;
 
     let mut config = create_test_config();
-    config.onwards.cache_classifier_enabled = opts.cache_classifier_enabled;
+    config.cache.enabled = opts.cache_classifier_enabled;
     if let Some(url) = &opts.tokenizer_url {
-        config.onwards.tokenizer_url = url.clone();
+        config.cache.tokenizer_url = url.clone();
     }
     config.background_services.onwards_sync.enabled = true;
 

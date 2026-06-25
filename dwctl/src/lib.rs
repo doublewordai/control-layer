@@ -1600,12 +1600,12 @@ pub async fn build_router(
     // only when enabled; otherwise the stack is byte-identical to today.
     let onwards_router = {
         let cfg = state.current_config();
-        if cfg.onwards.cache_classifier_enabled {
+        if cfg.cache.enabled {
             let pool = state.db.write().clone();
             let classifier = crate::prompt_cache::Classifier::new(
                 crate::prompt_cache::PrincipalResolver::new(pool.clone()),
                 crate::prompt_cache::ModelConfigResolver::new(pool.clone()),
-                crate::prompt_cache::TokenizerClient::new(cfg.onwards.tokenizer_url.clone()),
+                crate::prompt_cache::TokenizerClient::new(cfg.cache.tokenizer_url.clone()),
                 Arc::new(crate::prompt_cache::PostgresIndex::new(pool)),
             );
             // Bound the cache layer's body buffer by the same limit onwards uses (0 =
@@ -3135,8 +3135,8 @@ impl Application {
             n => usize::try_from(n).unwrap_or(usize::MAX),
         };
         // onwards stays cache-agnostic: cached-input pricing now lives entirely in
-        // the dwctl cache tower layer (wired in `build_router`, gated on
-        // `onwards.cache_classifier_enabled`). No classifier is injected here.
+        // the dwctl cache tower layer (wired in `build_router`, gated on `cache.enabled`).
+        // No classifier is injected here.
         let onwards_app_state = onwards::AppState::with_transform(bg_services.onwards_targets.clone(), body_transform)
             .with_response_transform(onwards::create_openai_sanitizer())
             .with_streaming_header("x-fusillade-stream")
