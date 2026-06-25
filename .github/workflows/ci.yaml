@@ -590,7 +590,8 @@ jobs:
           bun run bin/compliance-test.ts \
             --base-url http://localhost:3001/ai/v1 \
             --api-key "${TEST_API_KEY}" \
-            --model "${TEST_MODEL}"
+            --model "${TEST_MODEL}" \
+            --verbose
 
       - name: Show dwctl logs
         if: always()
