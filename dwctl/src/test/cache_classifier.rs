@@ -174,7 +174,12 @@ async fn proxied_usage(pool: &PgPool, opts: ProxiedOpts) -> serde_json::Value {
     // (transient 403). Treat BOTH 404 and 403 as "not synced yet" and keep polling; a
     // short sleep per miss gives the sync task real wall-clock (`yield_now` alone starves
     // it under load). Any other status — or a 403 that never clears — is a real failure.
-    for i in 0..150 {
+    //
+    // Budget is generous (≈15s) because under `llvm-cov` coverage instrumentation the sync
+    // task is heavily slowed; the loop returns the instant a 200 arrives, so the cap only
+    // bites on the (rare, slow-CI) path, never the happy path.
+    const MAX_POLLS: usize = 300;
+    for i in 0..MAX_POLLS {
         let resp = server
             .post("/ai/v1/chat/completions")
             .add_header("authorization", format!("Bearer {}", api_key))
@@ -189,8 +194,8 @@ async fn proxied_usage(pool: &PgPool, opts: ProxiedOpts) -> serde_json::Value {
             status == 404 || status == 403,
             "unexpected proxied status {status} (expected eventual 200)"
         );
-        assert!(i < 149, "request never succeeded once synced (last status {status})");
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(i < MAX_POLLS - 1, "request never succeeded once synced (last status {status})");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
     unreachable!("polling loop returns or panics before exhausting iterations");
 }
