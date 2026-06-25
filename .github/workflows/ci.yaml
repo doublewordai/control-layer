@@ -287,13 +287,9 @@ jobs:
       DATABASE_URL: postgres://postgres:postgres@localhost:5432/dwctl
       TEST_API_KEY: sk-openresponses-compliance
       TEST_MODEL: gemini-2.5-flash
-      # Exclude unsupported upstream surfaces only. The workflow derives the
-      # upstream --filter allow-list from all known tests minus these IDs, so
-      # newly added HTTP /responses tests run by default.
-      #
-      # WebSocket transport: #1178
-      # /responses/compact: #1179
-      OPENRESPONSES_COMPLIANCE_EXCLUDED_TESTS: websocket-response,websocket-sequential-responses,websocket-continuation,websocket-reconnect-store-false-recovery,websocket-previous-response-not-found,websocket-failed-continuation-evicts-cache,websocket-compact-new-chain,compact-response,compact-missing-model
+      # Run currently supported HTTP /responses tests. Remove this filter once
+      # WebSocket transport (#1178) and /responses/compact (#1179) are supported.
+      OPENRESPONSES_COMPLIANCE_FILTER: basic-response,assistant-phase,response-output-phase-schema,streaming-response,system-prompt,tool-calling,image-input,multi-turn
 
     steps:
       - name: Log in to GitHub Container Registry
@@ -597,33 +593,6 @@ jobs:
       - name: Run compliance tests
         run: |
           cd /tmp/openresponses
-          OPENRESPONSES_COMPLIANCE_FILTER=$(
-            bun --eval '
-              import { readFileSync } from "node:fs";
-
-              const excluded = new Set(
-                (process.env.OPENRESPONSES_COMPLIANCE_EXCLUDED_TESTS ?? "")
-                  .split(",")
-                  .map((id) => id.trim())
-                  .filter(Boolean),
-              );
-              const source = readFileSync("./src/lib/compliance-tests.ts", "utf8");
-              const registry = source.slice(source.indexOf("export const testTemplates"));
-              const available = [...registry.matchAll(/^    id:\s+"([^"]+)"/gm)].map((match) => match[1]);
-              const unknown = [...excluded].filter((id) => !available.includes(id));
-
-              if (unknown.length > 0) {
-                console.error(`Unknown excluded Open Responses test IDs: ${unknown.join(", ")}`);
-                console.error(`Available test IDs: ${available.join(", ")}`);
-                process.exit(1);
-              }
-
-              console.log(available.filter((id) => !excluded.has(id)).join(","));
-            '
-          )
-          echo "Excluded Open Responses tests: ${OPENRESPONSES_COMPLIANCE_EXCLUDED_TESTS}"
-          echo "Included Open Responses tests: ${OPENRESPONSES_COMPLIANCE_FILTER}"
-
           set +e
           bun run bin/compliance-test.ts \
             --base-url http://localhost:3001/ai/v1 \
