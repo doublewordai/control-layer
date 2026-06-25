@@ -586,6 +586,9 @@ jobs:
         # Track upstream main so CI surfaces newly added compliance coverage.
         run: |
           git clone --depth 1 https://github.com/openresponses/openresponses /tmp/openresponses
+          cd /tmp/openresponses
+          echo "Open Responses commit: $(git rev-parse HEAD)"
+          git log -1 --oneline
 
       - name: Install openresponses dependencies
         run: cd /tmp/openresponses && bun install
@@ -593,6 +596,12 @@ jobs:
       - name: Run compliance tests
         run: |
           cd /tmp/openresponses
+          echo "Open Responses commit: $(git rev-parse HEAD)"
+          echo "Base URL: http://localhost:3001/ai/v1"
+          echo "Model: ${TEST_MODEL}"
+          echo "Filter: ${OPENRESPONSES_COMPLIANCE_FILTER}"
+          echo
+
           set +e
           bun run bin/compliance-test.ts \
             --base-url http://localhost:3001/ai/v1 \
@@ -603,6 +612,13 @@ jobs:
           status=$?
           set -e
 
+          if ! jq -e . /tmp/openresponses-compliance-results.json > /dev/null; then
+            echo "Compliance runner did not emit valid JSON. Raw output:"
+            cat /tmp/openresponses-compliance-results.json
+            exit "$status"
+          fi
+
+          echo "=== Open Responses compliance summary ==="
           jq -r '
             .results[] | "\(.status | ascii_upcase): \(.name)"
           ' /tmp/openresponses-compliance-results.json
@@ -615,13 +631,77 @@ jobs:
             "Results: \(.summary.passed) passed, \(.summary.failed) failed, \(.summary.skipped) skipped, \(.summary.total) total"
           ' /tmp/openresponses-compliance-results.json
 
+          if [ "$status" -ne 0 ]; then
+            echo
+            echo "=== Failed result payloads ==="
+            jq '
+              .results[]
+              | select(.status == "failed")
+            ' /tmp/openresponses-compliance-results.json
+
+            failed_filters=$(
+              jq -r '
+                .results[]
+                | select(.status == "failed")
+                | .id
+              ' /tmp/openresponses-compliance-results.json | paste -sd, -
+            )
+
+            if [ -n "$failed_filters" ]; then
+              echo
+              echo "=== Verbose rerun of failed test(s): ${failed_filters} ==="
+              bun run bin/compliance-test.ts \
+                --base-url http://localhost:3001/ai/v1 \
+                --api-key "${TEST_API_KEY}" \
+                --model "${TEST_MODEL}" \
+                --filter "${failed_filters}" \
+                --verbose || true
+            fi
+
+            echo
+            echo "=== Current /models response ==="
+            curl -sS \
+              -H "Authorization: Bearer ${TEST_API_KEY}" \
+              http://localhost:3001/ai/v1/models | jq . || true
+
+            echo
+            echo "=== Compliance fixture database state ==="
+            psql "$DATABASE_URL" -c "
+              SELECT
+                dm.alias,
+                dm.model_name,
+                dm.open_responses_adapter,
+                dm.trusted,
+                dm.deleted,
+                ie.url AS endpoint_url,
+                dg.group_id,
+                ak.purpose,
+                ak.is_deleted AS api_key_deleted
+              FROM deployed_models dm
+              LEFT JOIN inference_endpoints ie ON ie.id = dm.hosted_on
+              LEFT JOIN deployment_groups dg ON dg.deployment_id = dm.id
+              LEFT JOIN api_keys ak ON ak.user_id = '10000000-0000-0000-0000-000000000001'
+              WHERE dm.id = '10000000-0000-0000-0000-000000000003';
+            "
+          fi
+
           exit "$status"
 
       - name: Show dwctl logs
         if: always()
         run: |
           echo "=== dwctl Server Logs ==="
-          docker logs dwctl-openresponses-compliance || echo "No dwctl container found"
+          docker logs dwctl-openresponses-compliance 2>&1 | tee /tmp/dwctl-openresponses-compliance.log || echo "No dwctl container found"
+
+      - name: Upload Open Responses compliance artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: openresponses-compliance-results
+          path: |
+            /tmp/openresponses-compliance-results.json
+            /tmp/dwctl-openresponses-compliance.log
+          if-no-files-found: ignore
 
       - name: Stop dwctl
         if: always()
