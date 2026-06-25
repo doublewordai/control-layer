@@ -55,6 +55,7 @@ tracing-opentelemetry = "0.32.1"
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "fs", "set-header", "trace"] }
 async-trait = "0.1"
+async-stream = "0.3"
 url = { version = "2.4", features = ["serde"] }
 clap = { version = "4.4", features = ["derive", "env"] }
 reqwest = { version = "0.13", default-features = false, features = [
@@ -79,7 +80,7 @@ jsonwebtoken = { version = "10", features = ["rust_crypto"] }
 argon2 = "0.5"
 base64 = "0.22"
 bytes = "1.5"
-onwards = { version = "0.33.3", features = ["multi-step"] }
+onwards = { version = "0.33.4", features = ["multi-step"] }
 thiserror = "2.0.14"
 axum-prometheus = "0.10"
 # Metrics facade and exporter (same versions as axum-prometheus uses)
