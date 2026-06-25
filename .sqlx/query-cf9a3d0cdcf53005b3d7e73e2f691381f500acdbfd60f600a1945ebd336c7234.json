@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE model_cache_tariffs SET valid_until = now()\n               WHERE deployed_model_id = $1\n                 AND valid_from <= now()\n                 AND (valid_until IS NULL OR valid_until > now())",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "cf9a3d0cdcf53005b3d7e73e2f691381f500acdbfd60f600a1945ebd336c7234"
+}

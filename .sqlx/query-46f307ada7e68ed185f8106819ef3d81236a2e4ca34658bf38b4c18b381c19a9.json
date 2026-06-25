@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT MIN(mct.min_prefix_tokens) AS min_prefix\n            FROM deployed_models dm\n            JOIN model_cache_tariffs mct\n              ON mct.deployed_model_id = dm.id\n             AND mct.valid_from <= now()\n             AND (mct.valid_until IS NULL OR mct.valid_until > now())\n            WHERE dm.alias = $1 AND dm.deleted = false\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "min_prefix",
+        "type_info": "Int4"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "46f307ada7e68ed185f8106819ef3d81236a2e4ca34658bf38b4c18b381c19a9"
+}

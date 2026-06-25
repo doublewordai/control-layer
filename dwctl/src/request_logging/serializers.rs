@@ -134,6 +134,15 @@ pub struct UsageMetrics {
     pub completion_tokens: i64,
     pub reasoning_tokens: i64,
     pub total_tokens: i64,
+    // Cached-input split, read from the response `usage` the dwctl cache layer
+    // injected. Zero on non-cache requests / models. `prompt_tokens` stays the full input
+    // count; it typically equals cache_read + cache_creation + uncached, but the split need
+    // not reconcile exactly (our tokenizer and the provider's can disagree — billing floors
+    // uncached at 0 to absorb the drift).
+    pub cache_read_input_tokens: i64,
+    pub cache_creation_5m_input_tokens: i64,
+    pub cache_creation_1h_input_tokens: i64,
+    pub cache_creation_24h_input_tokens: i64,
     pub response_type: String,
     pub server_address: String,
     pub server_port: u16,
@@ -358,6 +367,11 @@ impl UsageMetrics {
         // Extract token metrics and response model from response
         let response_metrics = TokenMetrics::from(parsed_response);
 
+        // The cache split lives in extension fields the typed parse drops, so read it from
+        // the raw `usage` object. It only exists on a successful response that carried a
+        // usage frame, so an errored/partial stream naturally extracts zero (no cache bill).
+        let cache_tokens = extract_cache_tokens(response_data);
+
         // Streams that started with HTTP 200 but ended with an embedded provider error frame
         // get reclassified to 500 so success-rate / availability metrics, the credits-eligibility
         // check, and dashboards keyed on `status_code BETWEEN 200 AND 299` exclude them.
@@ -390,11 +404,107 @@ impl UsageMetrics {
             completion_tokens: response_metrics.completion_tokens,
             reasoning_tokens: response_metrics.reasoning_tokens,
             total_tokens: response_metrics.total_tokens,
+            cache_read_input_tokens: cache_tokens.read,
+            cache_creation_5m_input_tokens: cache_tokens.creation_5m,
+            cache_creation_1h_input_tokens: cache_tokens.creation_1h,
+            cache_creation_24h_input_tokens: cache_tokens.creation_24h,
             response_type: response_metrics.response_type,
             server_address: config.host.clone(),
             server_port: config.port,
         }
     }
+}
+
+/// The cache token split read from a response `usage` object.
+#[derive(Debug, Clone, Copy, Default)]
+struct CacheTokens {
+    read: i64,
+    creation_5m: i64,
+    creation_1h: i64,
+    creation_24h: i64,
+}
+
+/// Pull the cache split out of a single `usage` JSON object. Reads come **only** from
+/// `cache_read_input_tokens` — the field the dwctl cache layer injects whenever it applies
+/// caching (it sets `prompt_tokens_details.cached_tokens` too, but that's for client
+/// visibility). We deliberately do *not* fall back to `prompt_tokens_details.cached_tokens`:
+/// providers (e.g. OpenAI) report their *own* server-side cached_tokens there, and reading
+/// it would attribute a provider's caching to dwctl's billing for a model dwctl isn't
+/// caching — breaking the "non-cache models produce a zero cache split" invariant. Creation
+/// is read per tier from the `cache_creation` object.
+///
+/// NOTE: these are also Anthropic's native usage field names, so a model dwctl isn't caching
+/// that's routed to an Anthropic-native provider could carry the provider's *own* cache
+/// tokens here. That does NOT affect billing: the batcher gates the cache discount on dwctl
+/// enablement (a tariff valid at inference time), so provider-side tokens on a non-enabled
+/// model are billed at list price (see `charged_cost`). What's read here only populates the
+/// analytics columns — so the residual is cosmetic (provider cache tokens shown for a model
+/// dwctl isn't caching), not a billing leak.
+fn cache_tokens_from_usage(usage: &Value) -> CacheTokens {
+    // Floor at 0: token counts can't be negative, but a malformed response could carry one —
+    // never let it reach the analytics columns or the cost math (the batcher floors too).
+    let read = usage.get("cache_read_input_tokens").and_then(Value::as_i64).unwrap_or(0).max(0);
+    let tier = |k: &str| {
+        usage
+            .get("cache_creation")
+            .and_then(|c| c.get(k))
+            .and_then(Value::as_i64)
+            .unwrap_or(0)
+            .max(0)
+    };
+    CacheTokens {
+        read,
+        creation_5m: tier("ephemeral_5m_input_tokens"),
+        creation_1h: tier("ephemeral_1h_input_tokens"),
+        creation_24h: tier("ephemeral_24h_input_tokens"),
+    }
+}
+
+/// Extract the cache split from a response body, handling both shapes: a non-streaming
+/// JSON body carries `usage` at the top level; a streaming SSE body carries it in the
+/// terminal `data:` frame (take the last one seen). Returns all-zero when there is no
+/// usage object (non-cache request, error body, or a stream that died before its usage
+/// frame) — which is exactly the no-cache-billing case.
+fn extract_cache_tokens(response_data: &ResponseData) -> CacheTokens {
+    let Some(body) = &response_data.body else {
+        return CacheTokens::default();
+    };
+    // On a decompress failure (e.g. a mis-set Content-Encoding on an actually-plain body),
+    // fall back to the raw bytes rather than silently returning zero cache tokens — zeroing
+    // would drop the read discount and overcharge a cache-enabled request. Log so the
+    // mis-encoding is diagnosable.
+    let bytes = match utils::decompress_response_if_needed(body.as_ref(), &response_data.headers) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(error = %e, "cache token extraction: response decompress failed, falling back to raw body");
+            body.as_ref().to_vec()
+        }
+    };
+    let body_str = String::from_utf8_lossy(&bytes);
+
+    // Non-streaming: the whole body is one JSON object with a top-level `usage`.
+    if let Ok(value) = serde_json::from_str::<Value>(body_str.trim())
+        && let Some(usage) = value.get("usage").filter(|u| u.is_object())
+    {
+        return cache_tokens_from_usage(usage);
+    }
+
+    // Streaming: scan SSE frames, keeping the last one that carries a usage object.
+    // SSE allows `data:<value>` and `data: <value>` — strip the colon then an optional space.
+    let mut last = CacheTokens::default();
+    for line in body_str.lines() {
+        if let Some(data) = line.strip_prefix("data:") {
+            let data = data.strip_prefix(' ').unwrap_or(data);
+            let trimmed = data.trim();
+            if trimmed != "[DONE]"
+                && let Ok(value) = serde_json::from_str::<Value>(trimmed)
+                && let Some(usage) = value.get("usage").filter(|u| u.is_object())
+            {
+                last = cache_tokens_from_usage(usage);
+            }
+        }
+    }
+    last
 }
 
 impl Auth {
@@ -669,7 +779,7 @@ impl From<&AiResponse> for TokenMetrics {
 
 #[cfg(test)]
 mod tests {
-    use super::{UsageMetrics, parse_ai_request, parse_ai_response};
+    use super::{UsageMetrics, extract_cache_tokens, parse_ai_request, parse_ai_response};
     use crate::request_logging::models::{AiRequest, AiResponse};
     use async_openai::types::chat::{CreateChatCompletionResponse, CreateChatCompletionStreamResponse};
     use async_openai::types::completions::CreateCompletionResponse;
@@ -1830,5 +1940,73 @@ mod tests {
         assert_eq!(metrics.completion_tokens, 25);
         assert_eq!(metrics.total_tokens, 40);
         assert_eq!(metrics.response_type, "response_stream");
+    }
+
+    fn response_with_body(body: impl Into<Bytes>) -> ResponseData {
+        ResponseData {
+            correlation_id: 1,
+            timestamp: SystemTime::now(),
+            status: StatusCode::OK,
+            headers: HashMap::new(),
+            body: Some(body.into()),
+            duration: Duration::from_millis(1),
+            duration_to_first_byte: Duration::from_millis(1),
+        }
+    }
+
+    #[test]
+    fn extract_cache_tokens_non_streaming() {
+        let body = serde_json::json!({
+            "usage": {
+                "prompt_tokens": 2000, "completion_tokens": 5,
+                "cache_read_input_tokens": 1000,
+                "cache_creation": {"ephemeral_5m_input_tokens": 0, "ephemeral_1h_input_tokens": 500, "ephemeral_24h_input_tokens": 0},
+                "prompt_tokens_details": {"cached_tokens": 1000}
+            }
+        })
+        .to_string();
+        let c = extract_cache_tokens(&response_with_body(body));
+        assert_eq!(c.read, 1000);
+        assert_eq!(c.creation_1h, 500);
+        assert_eq!(c.creation_5m, 0);
+        assert_eq!(c.creation_24h, 0);
+    }
+
+    #[test]
+    fn extract_cache_tokens_streaming_terminal_frame() {
+        // Only the terminal usage frame carries the split; deltas + [DONE] are ignored.
+        let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n\
+                   data: {\"choices\":[],\"usage\":{\"prompt_tokens\":2000,\"cache_read_input_tokens\":1500,\"cache_creation\":{\"ephemeral_24h_input_tokens\":1500}}}\n\n\
+                   data: [DONE]\n\n";
+        let c = extract_cache_tokens(&response_with_body(sse));
+        assert_eq!(c.read, 1500);
+        assert_eq!(c.creation_24h, 1500);
+        assert_eq!(c.creation_1h, 0);
+    }
+
+    #[test]
+    fn extract_cache_tokens_ignores_provider_native_cached_tokens() {
+        // Only the provider's own `prompt_tokens_details.cached_tokens` is present (e.g. an
+        // OpenAI-backed model dwctl is NOT caching). It must NOT be attributed to dwctl's
+        // cache billing — reads come solely from the `cache_read_input_tokens` our layer sets.
+        let body = serde_json::json!({
+            "usage": {"prompt_tokens": 100, "completion_tokens": 2, "prompt_tokens_details": {"cached_tokens": 64}}
+        })
+        .to_string();
+        let c = extract_cache_tokens(&response_with_body(body));
+        assert_eq!(c.read, 0, "provider-native cached_tokens is not a dwctl cache read");
+    }
+
+    #[test]
+    fn extract_cache_tokens_absent_is_zero() {
+        // A plain response (no cache fields) and an error body both extract zero.
+        let plain = serde_json::json!({"usage": {"prompt_tokens": 10, "completion_tokens": 2}}).to_string();
+        let c = extract_cache_tokens(&response_with_body(plain));
+        assert_eq!(c.read, 0);
+        assert_eq!(c.creation_1h, 0);
+
+        let err = serde_json::json!({"error": {"message": "bad"}}).to_string();
+        let c = extract_cache_tokens(&response_with_body(err));
+        assert_eq!(c.read, 0);
     }
 }
