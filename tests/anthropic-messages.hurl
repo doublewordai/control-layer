@@ -56,8 +56,26 @@ status < 300
 [Captures]
 deployment_id: jsonpath "$.id"
 
-# Associate the deployment with the public group (all-zeros UUID).
-POST http://localhost:3001/admin/api/v1/groups/00000000-0000-0000-0000-000000000000/models/{{deployment_id}}
+# Create a dedicated group, add the user, and grant the model to it. (Mirrors
+# tests/perms/models.hurl; the system "Everyone" group is special-cased, so we
+# use a real group + explicit membership to make the model routable.)
+POST http://localhost:3001/admin/api/v1/groups
+[Cookies]
+dwctl_session: {{admin_jwt}}
+{
+  "name": "anthropic-e2e-group-{{newUuid}}",
+  "description": "anthropic e2e access"
+}
+HTTP 201
+[Captures]
+group_id: jsonpath "$.id"
+
+POST http://localhost:3001/admin/api/v1/groups/{{group_id}}/users/{{user1_id}}
+[Cookies]
+dwctl_session: {{admin_jwt}}
+HTTP 204
+
+POST http://localhost:3001/admin/api/v1/groups/{{group_id}}/models/{{deployment_id}}
 [Cookies]
 dwctl_session: {{admin_jwt}}
 HTTP *
@@ -101,7 +119,7 @@ POST http://localhost:3001/ai/v1/messages
 x-api-key: {{api_key}}
 anthropic-version: 2023-06-01
 [Options]
-retry: 20
+retry: 40
 retry-interval: 500
 {
   "model": "anthropic-e2e",
