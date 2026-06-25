@@ -401,7 +401,12 @@ jobs:
             exit 1
           fi
 
-          psql "$DATABASE_URL" <<SQL
+          psql \
+            -v ON_ERROR_STOP=1 \
+            -v gemini_api_key="${GEMINI_API_KEY}" \
+            -v test_api_key="${TEST_API_KEY}" \
+            -v test_model="${TEST_MODEL}" \
+            "$DATABASE_URL" <<'SQL'
           INSERT INTO users (id, username, email, display_name, auth_source, verified)
           VALUES (
             '10000000-0000-0000-0000-000000000001',
@@ -419,7 +424,7 @@ jobs:
             'gemini-compliance',
             'Gemini endpoint for Open Responses adapter compliance tests',
             'https://generativelanguage.googleapis.com/v1beta/openai/',
-            '${GEMINI_API_KEY}',
+            :'gemini_api_key',
             '10000000-0000-0000-0000-000000000001'
           )
           ON CONFLICT (id) DO UPDATE SET
@@ -441,8 +446,8 @@ jobs:
           )
           VALUES (
             '10000000-0000-0000-0000-000000000003',
-            '${TEST_MODEL}',
-            '${TEST_MODEL}',
+            :'test_model',
+            :'test_model',
             'Open Responses adapter compliance model',
             'standard',
             ARRAY['chat'],
@@ -483,7 +488,7 @@ jobs:
             '10000000-0000-0000-0000-000000000004',
             'Open Responses compliance key',
             'Realtime key for Open Responses compliance tests',
-            '${TEST_API_KEY}',
+            :'test_api_key',
             'realtime',
             '10000000-0000-0000-0000-000000000001',
             '10000000-0000-0000-0000-000000000001',
@@ -526,7 +531,7 @@ jobs:
             models_response=$(curl -sf \
               -H "Authorization: Bearer ${TEST_API_KEY}" \
               http://localhost:3001/ai/v1/models 2>/dev/null || true)
-            if echo "$models_response" | grep -q "\"id\":\"${TEST_MODEL}\""; then
+            if echo "$models_response" | jq -e --arg model "${TEST_MODEL}" '.data[]? | select(.id == $model)' > /dev/null; then
               echo "Compliance fixture is ready"
               exit 0
             fi
@@ -578,8 +583,11 @@ jobs:
         # Pinned before WebSocket/compact tests were added (PR #71).
         # Update this once dwctl/onwards supports WebSocket transport.
         run: |
-          git clone https://github.com/openresponses/openresponses /tmp/openresponses
-          cd /tmp/openresponses && git checkout fa29df5
+          git init /tmp/openresponses
+          cd /tmp/openresponses
+          git remote add origin https://github.com/openresponses/openresponses
+          git fetch --depth 1 origin fa29df56b658c05ca06a401307040cda2345a470
+          git checkout --detach FETCH_HEAD
 
       - name: Install openresponses dependencies
         run: cd /tmp/openresponses && bun install
@@ -598,6 +606,10 @@ jobs:
         run: |
           echo "=== dwctl Server Logs ==="
           docker logs dwctl-openresponses-compliance || echo "No dwctl container found"
+
+      - name: Stop dwctl
+        if: always()
+        run: docker rm -f dwctl-openresponses-compliance || true
 
   security-scan:
     if: (github.event_name == 'pull_request' && !startsWith(github.head_ref, 'release-please--')) || github.event_name == 'merge_group'

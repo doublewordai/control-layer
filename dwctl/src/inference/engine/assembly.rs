@@ -26,7 +26,7 @@ pub(crate) fn assemble_from_chain(request_id: &str, chain: &[ChainStep]) -> Valu
     let mut pending_tool_calls: Vec<(String, String, String)> = Vec::new();
     let mut total_usage: Option<Value> = None;
     let created_at = first_created_at(chain).unwrap_or_else(|| Utc::now().timestamp());
-    let model = first_model(chain).unwrap_or_default();
+    let model = first_model(chain).unwrap_or_else(|| "unknown".to_string());
 
     for step in chain {
         if !matches!(step.state, StepState::Completed) {
