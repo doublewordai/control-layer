@@ -148,7 +148,9 @@ HTTP 200
 [Asserts]
 jsonpath "$.type" == "message"
 jsonpath "$.role" == "assistant"
-jsonpath "$.content[0].type" == "text"
+# The mock may answer with text or a tool call; assert a typed content block
+# exists rather than assuming which (both are valid Anthropic content blocks).
+jsonpath "$.content[0].type" exists
 jsonpath "$.stop_reason" exists
 jsonpath "$.usage.input_tokens" exists
 jsonpath "$.usage.output_tokens" exists
