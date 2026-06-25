@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.63.0](https://github.com/doublewordai/control-layer/compare/v8.62.0...v8.63.0) (2026-06-25)
+
+
+### Features
+
+* input-caching ([#1172](https://github.com/doublewordai/control-layer/issues/1172)) ([9bf7a0b](https://github.com/doublewordai/control-layer/commit/9bf7a0b5631a3606a6d951ff8600b7a0577be40a))
+
 ## [8.62.0](https://github.com/doublewordai/control-layer/compare/v8.61.3...v8.62.0) (2026-06-25)
 
 
