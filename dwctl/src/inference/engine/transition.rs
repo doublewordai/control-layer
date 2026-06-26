@@ -318,11 +318,12 @@ fn translate_message_content(content: &Value) -> Value {
 
 /// Map one Open Responses content part to its chat-completions equivalent.
 ///
-/// Returns `None` for parts with no chat-completions representation
-/// (`input_file`, unknown types); these are dropped with a trace rather than
-/// forwarded, since the upstream schema would reject them. Already
-/// chat-shaped parts (`text`, `image_url`) pass through unchanged so a client
-/// that sent chat-completions content directly still works.
+/// Returns `None` for parts with no chat-completions representation (unknown
+/// types, or an `input_file` carrying only a `file_url` that was never
+/// inlined); these are dropped with a trace rather than forwarded, since the
+/// upstream schema would reject them. Already chat-shaped parts (`text`,
+/// `image_url`) pass through unchanged so a client that sent chat-completions
+/// content directly still works.
 fn translate_content_part(part: &Value) -> Option<Value> {
     match part.get("type").and_then(|t| t.as_str()) {
         Some("input_text") | Some("output_text") => {
@@ -347,8 +348,28 @@ fn translate_content_part(part: &Value) -> Option<Value> {
         // Already chat-completions-shaped — forward unchanged.
         Some("text") | Some("image_url") => Some(part.clone()),
         Some("input_file") => {
-            tracing::debug!("dropping 'input_file' content part during /v1/responses translation");
-            None
+            // Map to the Chat Completions `file` content part, which carries
+            // `file_data` (base64) or `file_id`. `file_url` has no chat
+            // representation; by this point the file_input middleware should
+            // have inlined it, so an `input_file` left with only a url (e.g.
+            // the feature is disabled) is dropped with a trace.
+            let file_data = part.get("file_data").and_then(|v| v.as_str());
+            let file_id = part.get("file_id").and_then(|v| v.as_str());
+            if file_data.is_none() && file_id.is_none() {
+                tracing::debug!("dropping 'input_file' with no file_data/file_id during /v1/responses translation");
+                return None;
+            }
+            let mut file = serde_json::Map::new();
+            if let Some(data) = file_data {
+                file.insert("file_data".to_string(), json!(data));
+            }
+            if let Some(id) = file_id {
+                file.insert("file_id".to_string(), json!(id));
+            }
+            if let Some(filename) = part.get("filename").and_then(|v| v.as_str()) {
+                file.insert("filename".to_string(), json!(filename));
+            }
+            Some(json!({"type": "file", "file": Value::Object(file)}))
         }
         other => {
             tracing::warn!(part_type = ?other, "dropping unknown content part during /v1/responses translation");
@@ -878,22 +899,45 @@ mod tests {
 
     #[test]
     fn mixed_content_parts_keep_representable_drop_rest() {
-        // input_file has no chat-completions representation; it is dropped
-        // while the representable input_text part is kept.
+        // input_text is kept as text, input_file with a file_id maps to a chat
+        // `file` part, and a genuinely unrepresentable future type is dropped.
         let body = r#"{
             "model": "m",
             "input": [
                 {"type":"message","role":"user","content":[
                     {"type":"input_text","text":"keep me"},
-                    {"type":"input_file","file_id":"f1"}
+                    {"type":"input_file","file_id":"f1","filename":"doc.pdf"},
+                    {"type":"some_future_type","blob":"x"}
+                ]}
+            ]
+        }"#;
+        let p = parse_parent_request(body).unwrap();
+        let parts = p.initial_messages[0]["content"].as_array().unwrap();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["type"], "text");
+        assert_eq!(parts[0]["text"], "keep me");
+        assert_eq!(parts[1]["type"], "file");
+        assert_eq!(parts[1]["file"]["file_id"], "f1");
+        assert_eq!(parts[1]["file"]["filename"], "doc.pdf");
+    }
+
+    #[test]
+    fn input_file_with_file_data_maps_to_chat_file_part() {
+        // The common case after file_input normalisation: file_url has been
+        // inlined as base64 file_data, which maps straight to a chat file part.
+        let body = r#"{
+            "model": "m",
+            "input": [
+                {"type":"message","role":"user","content":[
+                    {"type":"input_file","file_data":"data:application/pdf;base64,QUJD"}
                 ]}
             ]
         }"#;
         let p = parse_parent_request(body).unwrap();
         let parts = p.initial_messages[0]["content"].as_array().unwrap();
         assert_eq!(parts.len(), 1);
-        assert_eq!(parts[0]["type"], "text");
-        assert_eq!(parts[0]["text"], "keep me");
+        assert_eq!(parts[0]["type"], "file");
+        assert_eq!(parts[0]["file"]["file_data"], "data:application/pdf;base64,QUJD");
     }
 
     #[test]
@@ -905,11 +949,13 @@ mod tests {
             "model": "m",
             "input": [
                 {"type":"message","role":"user","content":[
-                    {"type":"input_file","file_id":"f1"},
+                    {"type":"input_file","file_url":"https://x/y.pdf"},
                     {"type":"some_future_type","blob":"x"}
                 ]}
             ]
         }"#;
+        // input_file with only a (non-inlined) file_url has no chat
+        // representation and is dropped, as is the unknown type.
         let p = parse_parent_request(body).unwrap();
         assert_eq!(p.initial_messages[0]["content"], "");
     }

@@ -34,6 +34,7 @@ use serde_json::Value;
 
 use crate::image_normalizer::NormalizeError;
 use crate::image_normalizer::config::FetcherConfig;
+use crate::image_normalizer::fetcher::ImageFetcher;
 
 /// Configuration for `input_file` normalisation.
 ///
@@ -65,6 +66,13 @@ impl Default for FileInputConfig {
 /// The image fetcher's defaults are sound for documents too (size cap,
 /// timeouts, redirect re-validation, IP deny-list); only the accepted MIME
 /// types differ.
+///
+/// Only `application/pdf` is allowed by default: PDF is the dominant document
+/// input and the one with broad upstream model support, so we start narrow and
+/// let operators widen `allowed_mime` (e.g. for text/csv/docx) when their
+/// upstream actually accepts those types. Note the fetched bytes are inlined as
+/// base64, inflating the on-wire body by ~33%, so operators enabling this
+/// should keep `max_bytes` aligned with their upstream request-size limits.
 fn default_file_fetcher() -> FetcherConfig {
     FetcherConfig {
         allowed_mime: vec!["application/pdf".to_string()],
@@ -105,7 +113,9 @@ where
             if let Some(url) = part.get("file_url").and_then(Value::as_str).map(str::to_string) {
                 let (mime, bytes) = fetch(url).await?;
                 let data_uri = format!("data:{};base64,{}", mime, B64.encode(&bytes));
-                let obj = part.as_object_mut().expect("input_file content part is an object");
+                let obj = part
+                    .as_object_mut()
+                    .ok_or_else(|| NormalizeError::BadInput("input_file content part is not a JSON object".to_string()))?;
                 obj.remove("file_url");
                 obj.insert("file_data".to_string(), Value::String(data_uri));
                 count += 1;
@@ -126,6 +136,23 @@ where
         }
     }
     Ok(count)
+}
+
+/// Run [`normalize_input_files`] using the hardened [`ImageFetcher`] to fetch
+/// each `file_url`. Shared by the realtime `file_input` layer and the
+/// warm-path / flex normalisation in `responses_middleware`.
+pub async fn normalize_input_files_with_fetcher(body: &mut Value, fetcher: &ImageFetcher) -> Result<usize, NormalizeError> {
+    normalize_input_files(body, |url| {
+        let fetcher = fetcher.clone();
+        async move {
+            fetcher
+                .fetch(&url)
+                .await
+                .map(|fetched| (fetched.mime, fetched.bytes))
+                .map_err(NormalizeError::from)
+        }
+    })
+    .await
 }
 
 #[cfg(test)]

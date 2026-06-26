@@ -3085,6 +3085,10 @@ impl Application {
             loop_config: multi_step_loop_config,
             image_normalizer: image_normalizer.clone(),
             image_normalizer_enabled: config.image_normalizer.enabled,
+            file_input_fetcher: std::sync::Arc::new(crate::image_normalizer::fetcher::ImageFetcher::new(
+                config.file_input.fetcher.clone(),
+            )),
+            file_input_enabled: config.file_input.enabled,
         };
 
         // Build onwards router from targets with body transform, response sanitization, and tool executor.

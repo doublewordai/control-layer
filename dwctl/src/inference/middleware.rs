@@ -58,6 +58,15 @@ pub struct ResponsesMiddlewareState<P: PoolProvider + Clone = sqlx_pool_router::
     pub image_normalizer: Arc<dyn ImageNormalizer>,
     /// Whether image normalisation is enabled (`config.image_normalizer.enabled`).
     pub image_normalizer_enabled: bool,
+    /// Hardened fetcher for `input_file.file_url` (document MIME allow-list).
+    /// The warm-path (multi-step) and flex paths short-circuit before the
+    /// downstream `file_input` layer, so they inline `file_url` here instead
+    /// (the realtime path is handled by that layer). When disabled, the
+    /// `input_file` part is left untouched.
+    pub file_input_fetcher: Arc<crate::image_normalizer::fetcher::ImageFetcher>,
+    /// Whether `input_file` `file_url` fetch-and-inline is enabled
+    /// (`config.file_input.enabled`).
+    pub file_input_enabled: bool,
 }
 
 /// Middleware that routes inference requests based on service_tier and background.
@@ -200,7 +209,23 @@ pub async fn responses_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
     //   no tools, !flex                              → falls through to handle_realtime below
     //   any flex                                     → falls through to handle_flex below
     let stream_requested = is_responses_api && !background && request_value["stream"].as_bool().unwrap_or(false);
-    match warm_path_branch(is_responses_api, is_flex, background, stream_requested, has_tools) {
+    let warm_branch = warm_path_branch(is_responses_api, is_flex, background, stream_requested, has_tools);
+
+    // The warm path (multi-step loop) and the flex path short-circuit before
+    // the downstream `file_input` layer, and the multi-step translator only
+    // keeps an `input_file` once its `file_url` has been inlined as
+    // `file_data`. So inline `input_file.file_url` here for the warm-path
+    // branches (flex is handled in its own branch below). The realtime
+    // fall-through is normalised by the `file_input` layer instead.
+    if state.file_input_enabled
+        && !matches!(warm_branch, WarmPathBranch::FallThrough)
+        && let Err(e) = crate::file_input::normalize_input_files_with_fetcher(&mut request_value, &state.file_input_fetcher).await
+    {
+        tracing::warn!(error = %e, "input_file normalisation failed on warm path");
+        return super::file_input_middleware::file_input_error_response(e);
+    }
+
+    match warm_branch {
         WarmPathBranch::Stream => {
             if let Some(resp) = try_warm_path_stream(&state, &request_value, api_key.as_deref(), model).await {
                 return resp;
@@ -312,6 +337,16 @@ pub async fn responses_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                         return normalize_error_response(e);
                     }
                 }
+            }
+            // Flex bypasses the downstream `file_input` layer too, so inline
+            // `input_file.file_url` here before the request is persisted for
+            // the daemon. The daemon then dispatches the already-inlined
+            // `file_data` (mapped to a chat `file` part by the translator).
+            if state.file_input_enabled
+                && let Err(e) = crate::file_input::normalize_input_files_with_fetcher(&mut request_value, &state.file_input_fetcher).await
+            {
+                tracing::warn!(error = %e, "flex input_file normalisation failed");
+                return super::file_input_middleware::file_input_error_response(e);
             }
             let flex_input = fusillade::CreateFlexInput {
                 request_id,

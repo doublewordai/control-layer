@@ -23,7 +23,7 @@ use serde_json::Value;
 use std::sync::Arc;
 use tracing::{debug, warn};
 
-use crate::file_input::normalize_input_files;
+use crate::file_input::normalize_input_files_with_fetcher;
 use crate::image_normalizer::NormalizeError;
 use crate::image_normalizer::fetcher::ImageFetcher;
 
@@ -84,20 +84,7 @@ pub async fn file_input_middleware(State(state): State<FileInputMiddlewareState>
         }
     };
 
-    let fetcher = state.fetcher.clone();
-    let result = normalize_input_files(&mut body_value, |url| {
-        let fetcher = fetcher.clone();
-        async move {
-            fetcher
-                .fetch(&url)
-                .await
-                .map(|fetched| (fetched.mime, fetched.bytes))
-                .map_err(NormalizeError::from)
-        }
-    })
-    .await;
-
-    let substituted = match result {
+    let substituted = match normalize_input_files_with_fetcher(&mut body_value, &state.fetcher).await {
         Ok(n) => n,
         Err(e) => {
             warn!(error = %e, "input_file normalisation failed");
@@ -140,7 +127,7 @@ pub async fn file_input_middleware(State(state): State<FileInputMiddlewareState>
 /// File-specific codes/messages so the document case is self-diagnosing (the
 /// shared `NormalizeError` Display text is image-oriented, so we build our own
 /// message from the inner detail).
-fn file_input_error_response(err: NormalizeError) -> Response {
+pub(crate) fn file_input_error_response(err: NormalizeError) -> Response {
     let (status, code, message) = match err {
         NormalizeError::BadInput(m) => (StatusCode::BAD_REQUEST, "input_file_rejected", m),
         NormalizeError::Unfetchable(m) => (
@@ -184,11 +171,17 @@ fn path_accepts_files(path: &str) -> bool {
     path.ends_with("/responses")
 }
 
-/// Cheap pre-check on the raw body so we only pay for a JSON parse when an
-/// `input_file` content part might be present. A false positive (the substring
-/// appears elsewhere, e.g. in user text) just falls through to the normal walk,
-/// which is a no-op; a false negative is impossible because every `input_file`
-/// part carries the literal `"input_file"` type discriminator.
+/// Cheap best-effort pre-check on the raw body so we only pay for a JSON parse
+/// when an `input_file` content part is likely present. A false positive (the
+/// substring appears elsewhere, e.g. in user text) just falls through to the
+/// normal walk, which is a no-op.
+///
+/// This is an optimisation, not a correctness boundary: a client could in
+/// principle encode the discriminator with JSON escapes (`"input_file"`),
+/// which this raw-byte scan would miss. In that case normalisation is skipped
+/// and the unresolved `file_url` flows to onwards, which returns a clear
+/// strict-mode error - never a silent drop. Real OpenAI SDK clients emit the
+/// literal `"input_file"`, so the fast path applies in practice.
 fn contains_input_file(body: &[u8]) -> bool {
     // `input_file` is 10 bytes; scan for the discriminator substring.
     body.windows(b"input_file".len()).any(|w| w == b"input_file")
