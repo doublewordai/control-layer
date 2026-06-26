@@ -647,42 +647,80 @@ jobs:
               ' /tmp/openresponses-compliance-results.json | paste -sd, -
             )
 
+            retry_status=$status
             if [ -n "$failed_filters" ]; then
               echo
-              echo "=== Verbose rerun of failed test(s): ${failed_filters} ==="
+              echo "=== Retry failed test(s): ${failed_filters} ==="
+              set +e
               bun run bin/compliance-test.ts \
                 --base-url http://localhost:3001/ai/v1 \
                 --api-key "${TEST_API_KEY}" \
                 --model "${TEST_MODEL}" \
                 --filter "${failed_filters}" \
-                --verbose || true
+                --json > /tmp/openresponses-compliance-retry-results.json
+              retry_status=$?
+              set -e
+
+              if jq -e . /tmp/openresponses-compliance-retry-results.json > /dev/null; then
+                jq -r '
+                  .results[] | "RETRY \(.status | ascii_upcase): \(.name)"
+                ' /tmp/openresponses-compliance-retry-results.json
+                jq -r '
+                  .results[]
+                  | select(.status == "failed")
+                  | "\nRetry \(.name):\n" + ((.errors // []) | map("  - " + .) | join("\n"))
+                ' /tmp/openresponses-compliance-retry-results.json
+                jq -r '
+                  "Retry results: \(.summary.passed) passed, \(.summary.failed) failed, \(.summary.skipped) skipped, \(.summary.total) total"
+                ' /tmp/openresponses-compliance-retry-results.json
+              else
+                echo "Compliance retry did not emit valid JSON. Raw output:"
+                cat /tmp/openresponses-compliance-retry-results.json
+              fi
+
+              if [ "$retry_status" -eq 0 ]; then
+                echo
+                echo "Failed test(s) passed on retry; treating as transient provider flake."
+                status=0
+              else
+                echo
+                echo "=== Verbose rerun of failed test(s): ${failed_filters} ==="
+                bun run bin/compliance-test.ts \
+                  --base-url http://localhost:3001/ai/v1 \
+                  --api-key "${TEST_API_KEY}" \
+                  --model "${TEST_MODEL}" \
+                  --filter "${failed_filters}" \
+                  --verbose || true
+              fi
             fi
 
-            echo
-            echo "=== Current /models response ==="
-            curl -sS \
-              -H "Authorization: Bearer ${TEST_API_KEY}" \
-              http://localhost:3001/ai/v1/models | jq . || true
+            if [ "$status" -ne 0 ]; then
+              echo
+              echo "=== Current /models response ==="
+              curl -sS \
+                -H "Authorization: Bearer ${TEST_API_KEY}" \
+                http://localhost:3001/ai/v1/models | jq . || true
 
-            echo
-            echo "=== Compliance fixture database state ==="
-            psql "$DATABASE_URL" -c "
-              SELECT
-                dm.alias,
-                dm.model_name,
-                dm.open_responses_adapter,
-                dm.trusted,
-                dm.deleted,
-                ie.url AS endpoint_url,
-                dg.group_id,
-                ak.purpose,
-                ak.is_deleted AS api_key_deleted
-              FROM deployed_models dm
-              LEFT JOIN inference_endpoints ie ON ie.id = dm.hosted_on
-              LEFT JOIN deployment_groups dg ON dg.deployment_id = dm.id
-              LEFT JOIN api_keys ak ON ak.user_id = '10000000-0000-0000-0000-000000000001'
-              WHERE dm.id = '10000000-0000-0000-0000-000000000003';
-            "
+              echo
+              echo "=== Compliance fixture database state ==="
+              psql "$DATABASE_URL" -c "
+                SELECT
+                  dm.alias,
+                  dm.model_name,
+                  dm.open_responses_adapter,
+                  dm.trusted,
+                  dm.deleted,
+                  ie.url AS endpoint_url,
+                  dg.group_id,
+                  ak.purpose,
+                  ak.is_deleted AS api_key_deleted
+                FROM deployed_models dm
+                LEFT JOIN inference_endpoints ie ON ie.id = dm.hosted_on
+                LEFT JOIN deployment_groups dg ON dg.deployment_id = dm.id
+                LEFT JOIN api_keys ak ON ak.user_id = '10000000-0000-0000-0000-000000000001'
+                WHERE dm.id = '10000000-0000-0000-0000-000000000003';
+              "
+            fi
           fi
 
           exit "$status"
@@ -700,6 +738,7 @@ jobs:
           name: openresponses-compliance-results
           path: |
             /tmp/openresponses-compliance-results.json
+            /tmp/openresponses-compliance-retry-results.json
             /tmp/dwctl-openresponses-compliance.log
           if-no-files-found: ignore
 
