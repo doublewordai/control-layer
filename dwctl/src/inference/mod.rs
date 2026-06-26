@@ -17,6 +17,7 @@
 //! - **engine**: the multi-step Open Responses orchestration loop and the
 //!   daemon-side request processor.
 
+pub mod file_input_middleware;
 pub mod handler;
 pub mod image_normalizer_middleware;
 pub mod middleware;

@@ -335,6 +335,7 @@ pub fn create_test_config() -> crate::config::Config {
         connections: Default::default(),
         responses: Default::default(),
         image_normalizer: Default::default(),
+        file_input: Default::default(),
         openapi: Default::default(),
         cache: Default::default(),
     }

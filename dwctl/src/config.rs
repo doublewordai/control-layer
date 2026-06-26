@@ -200,6 +200,13 @@ pub struct Config {
     /// shape and defaults.
     #[serde(default)]
     pub image_normalizer: crate::image_normalizer::ImageNormalizerConfig,
+    /// `input_file` (PDF / document) handling for `/v1/responses`. When
+    /// enabled, an `input_file.file_url` is fetched through the hardened
+    /// fetcher and inlined as base64 `file_data` before forwarding, so it
+    /// survives the strict Responses-to-Chat-Completions conversion. See
+    /// `crate::file_input` for the full shape and defaults.
+    #[serde(default)]
+    pub file_input: crate::file_input::FileInputConfig,
     /// OpenAPI spec exposure controls. Defaults disable the Admin spec
     /// (which describes internal management endpoints) and enable the
     /// AI spec (which mirrors the publicly-documented OpenAI surface).
@@ -2028,6 +2035,7 @@ impl Default for Config {
             connections: ConnectionsConfig::default(),
             responses: ResponsesConfig::default(),
             image_normalizer: crate::image_normalizer::ImageNormalizerConfig::default(),
+            file_input: crate::file_input::FileInputConfig::default(),
             openapi: OpenApiConfig::default(),
             cache: CacheConfig::default(),
         }
