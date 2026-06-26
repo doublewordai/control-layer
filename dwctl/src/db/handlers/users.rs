@@ -424,6 +424,10 @@ impl<'c> Repository for Users<'c> {
         let scrubbed_email = format!("deleted-{}@deleted.local", id);
         let scrubbed_username = format!("deleted-{}", id);
 
+        // Scrub the user row and hard-delete their API keys atomically so a
+        // "deleted" account can never keep authenticating.
+        let mut tx = self.db.begin().await?;
+
         let result = sqlx::query!(
             r#"
             UPDATE users
@@ -443,8 +447,21 @@ impl<'c> Repository for Users<'c> {
             scrubbed_username,
             id
         )
-        .execute(&mut *self.db)
+        .execute(&mut *tx)
         .await?;
+
+        // Only when we actually transitioned the user to deleted (idempotent on
+        // repeat calls). Hard-delete keys owned by the user (user_id) — these
+        // authenticate as them. Keys they merely created for others (created_by)
+        // belong to those users and are left alone. The api_keys DELETE trigger
+        // emits NOTIFY, so the onwards proxy drops them from its cache at once.
+        if result.rows_affected() > 0 {
+            sqlx::query!(r#"DELETE FROM api_keys WHERE user_id = $1"#, id)
+                .execute(&mut *tx)
+                .await?;
+        }
+
+        tx.commit().await?;
 
         Ok(result.rows_affected() > 0)
     }
@@ -981,6 +998,75 @@ mod tests {
         assert_eq!(user.email, "test@example.com");
         assert_eq!(user.display_name, Some("Test User".to_string()));
         assert_eq!(user.roles, vec![Role::StandardUser]);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_delete_user_hard_deletes_api_keys(pool: PgPool) {
+        use crate::db::models::api_keys::ApiKeyCreateDBRequest;
+        let mut conn = pool.acquire().await.unwrap();
+
+        let user = {
+            let mut repo = Users::new(&mut conn);
+            repo.create(&UserCreateDBRequest::from(UserCreate {
+                username: "doomed".to_string(),
+                email: "doomed@example.com".to_string(),
+                display_name: Some("Doomed".to_string()),
+                avatar_url: None,
+                roles: vec![Role::StandardUser],
+            }))
+            .await
+            .unwrap()
+        };
+
+        {
+            let mut keys = ApiKeys::new(&mut conn);
+            keys.create(&ApiKeyCreateDBRequest {
+                user_id: user.id,
+                name: "doomed-key".to_string(),
+                description: None,
+                purpose: ApiKeyPurpose::Realtime,
+                requests_per_second: None,
+                burst_size: None,
+                created_by: user.id,
+            })
+            .await
+            .unwrap();
+        }
+
+        // create() also pre-provisions hidden Batch + Playground keys, so the
+        // user owns several keys here; the point is delete() removes them all.
+        let before: i64 = sqlx::query_scalar!(r#"SELECT COUNT(*) as "c!" FROM api_keys WHERE user_id = $1"#, user.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(before >= 1, "user should own at least the realtime key");
+
+        let deleted = {
+            let mut repo = Users::new(&mut conn);
+            repo.delete(user.id).await.unwrap()
+        };
+        assert!(deleted);
+
+        // Keys are hard-deleted and the user row is scrubbed/soft-deleted.
+        let after: i64 = sqlx::query_scalar!(r#"SELECT COUNT(*) as "c!" FROM api_keys WHERE user_id = $1"#, user.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(after, 0);
+        let row = sqlx::query!(r#"SELECT is_deleted, email FROM users WHERE id = $1"#, user.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(row.is_deleted);
+        assert!(row.email.starts_with("deleted-"));
+
+        // Idempotent: a second delete is a no-op, not an error.
+        let again = {
+            let mut repo = Users::new(&mut conn);
+            repo.delete(user.id).await.unwrap()
+        };
+        assert!(!again);
     }
 
     #[sqlx::test]

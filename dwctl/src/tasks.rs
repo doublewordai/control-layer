@@ -15,6 +15,7 @@ use tokio_util::sync::CancellationToken;
 use underway::Job;
 
 use crate::api::handlers::batches::{CascadeBatchStateInput, CreateBatchInput, build_cascade_batch_state_job, build_create_batch_job};
+use crate::api::handlers::users::{PurgeUserDataInput, build_purge_user_data_job};
 use crate::connections::sync::{
     ActivateBatchInput, IngestFileInput, SyncConnectionInput, build_activate_batch_job, build_ingest_file_job, build_sync_connection_job,
 };
@@ -98,6 +99,9 @@ pub struct TaskRunner<P: PoolProvider + Clone + 'static = sqlx_pool_router::DbPo
     /// `None` when `cascade_batch_state_workers` is 0 (avoids opening
     /// PgListener connections during Job construction in test environments).
     pub cascade_batch_state_job: Option<Arc<Job<CascadeBatchStateInput, TaskState<P>>>>,
+    /// Erases a deleted user's fusillade data. Always built (the delete handler
+    /// enqueues into it regardless of worker count).
+    pub purge_user_data_job: Arc<Job<PurgeUserDataInput, TaskState<P>>>,
     pub sync_connection_job: Arc<Job<SyncConnectionInput, TaskState<P>>>,
     pub ingest_file_job: Arc<Job<IngestFileInput, TaskState<P>>>,
     pub activate_batch_job: Arc<Job<ActivateBatchInput, TaskState<P>>>,
@@ -122,6 +126,7 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> TaskRunner<P> {
         };
         let ingest_file_job = Arc::new(build_ingest_file_job(pool.clone(), state.clone()).await?);
         let activate_batch_job = Arc::new(build_activate_batch_job(pool.clone(), state.clone()).await?);
+        let purge_user_data_job = Arc::new(build_purge_user_data_job(pool.clone(), state.clone()).await?);
         let sync_connection_job = Arc::new(build_sync_connection_job(pool, state.clone()).await?);
 
         // Wire weak cross-references. All jobs share the same Arc<OnceLock>,
@@ -142,6 +147,7 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> TaskRunner<P> {
         Ok(Self {
             create_batch_job,
             cascade_batch_state_job,
+            purge_user_data_job,
             sync_connection_job,
             ingest_file_job,
             activate_batch_job,
@@ -192,6 +198,23 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> TaskRunner<P> {
                     }),
                 ));
             }
+        }
+
+        // Purge-user-data workers — erase a deleted user's fusillade data.
+        // Always at least 1: an enqueued purge would otherwise hang and the
+        // user's data would never be erased.
+        let purge_user_data_workers = task_config.purge_user_data_workers.max(1);
+        for i in 0..purge_user_data_workers {
+            let mut worker = self.purge_user_data_job.worker();
+            worker.set_shutdown_token(shutdown_token.clone());
+            handles.push((
+                "purge-user-data-worker",
+                tokio::spawn(async move {
+                    if let Err(e) = worker.run().await {
+                        crate::background_error!(TASK_WORKER, "purge_user_data", Error, error = %e, worker = i, "Purge-user-data worker error");
+                    }
+                }),
+            ));
         }
 
         // Response lifecycle no longer runs through underway. The
