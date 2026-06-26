@@ -72,29 +72,37 @@ impl ProtocolTranslator for AnthropicModels {
 fn from_openai_models(body: Bytes) -> Result<Bytes, TranslationError> {
     let resp: Value = serde_json::from_slice(&body).map_err(|e| TranslationError::Internal(format!("parse models response: {e}")))?;
 
-    let data: Vec<ModelObject> = resp
+    // A successful upstream body MUST be an OpenAI models list (the middleware
+    // only calls this on a 2xx). Treat a missing/non-array `data`, or an entry
+    // without a string `id`, as a translation failure rather than silently
+    // returning an empty/partial list with a 200 - that would mask an upstream
+    // regression behind a plausible-looking response.
+    let models = resp
         .get("data")
         .and_then(Value::as_array)
-        .map(|models| {
-            models
-                .iter()
-                .filter_map(|m| {
-                    let id = m.get("id").and_then(Value::as_str)?.to_string();
-                    // OpenAI `created` is unix seconds; Anthropic `created_at` is
-                    // RFC 3339. onwards always sets it, but default to the epoch
-                    // rather than failing if it is ever absent.
-                    let secs = m.get("created").and_then(Value::as_i64).unwrap_or(0);
-                    let created_at = chrono::DateTime::from_timestamp(secs, 0).unwrap_or_default().to_rfc3339();
-                    Some(ModelObject {
-                        object_type: ModelObjectType::Model,
-                        display_name: id.clone(),
-                        id,
-                        created_at,
-                    })
-                })
-                .collect()
+        .ok_or_else(|| TranslationError::Internal("upstream models response has no \"data\" array".into()))?;
+
+    let data: Vec<ModelObject> = models
+        .iter()
+        .map(|m| {
+            let id = m
+                .get("id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| TranslationError::Internal("model entry is missing a string \"id\"".into()))?
+                .to_string();
+            // OpenAI `created` is unix seconds; Anthropic `created_at` is RFC 3339.
+            // onwards always sets it, but default to the epoch rather than failing
+            // if it is ever absent (a missing timestamp is benign; a missing id is not).
+            let secs = m.get("created").and_then(Value::as_i64).unwrap_or(0);
+            let created_at = chrono::DateTime::from_timestamp(secs, 0).unwrap_or_default().to_rfc3339();
+            Ok(ModelObject {
+                object_type: ModelObjectType::Model,
+                display_name: id.clone(),
+                id,
+                created_at,
+            })
         })
-        .unwrap_or_default();
+        .collect::<Result<_, TranslationError>>()?;
 
     let first_id = data.first().map(|m| m.id.clone());
     let last_id = data.last().map(|m| m.id.clone());
@@ -201,5 +209,23 @@ mod tests {
         // No models -> pagination cursors omitted.
         assert!(out.get("first_id").is_none());
         assert!(out.get("last_id").is_none());
+    }
+
+    #[test]
+    fn response_errors_when_data_is_missing_or_not_a_list() {
+        // A 2xx body that is not an OpenAI models list must fail translation, not
+        // be silently coerced into an empty 200.
+        for bad in [json!({ "object": "list" }), json!({ "data": "nope" }), json!("garbage")] {
+            let err = from_openai_models(Bytes::from(serde_json::to_vec(&bad).unwrap()));
+            assert!(err.is_err(), "expected error for {bad}");
+        }
+    }
+
+    #[test]
+    fn response_errors_on_entry_missing_id() {
+        // One malformed entry fails the whole translation rather than being dropped.
+        let openai = json!({ "object": "list", "data": [ { "id": "ok", "created": 1 }, { "created": 2 } ] });
+        let err = from_openai_models(Bytes::from(serde_json::to_vec(&openai).unwrap()));
+        assert!(err.is_err());
     }
 }
