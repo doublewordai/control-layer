@@ -160,6 +160,7 @@ mod notifications;
 mod openapi;
 mod payment_providers;
 mod probes;
+pub mod prompt_cache;
 mod request_logging;
 pub mod sample_files;
 mod static_assets;
@@ -1527,6 +1528,31 @@ pub async fn build_router(
     // Serve embedded static assets, falling back to SPA for unmatched routes
     let fallback = get(api::handlers::static_assets::serve_embedded_asset).fallback(get(api::handlers::static_assets::spa_fallback));
 
+    // ── onwards proxy middleware stack (order matters) ───────────────────────────────
+    //
+    // Tower applies layers inner-first, so the LAST `.layer()` call is the OUTERMOST
+    // wrapper: on a request it runs first; on the response it runs last. The stack below,
+    // outermost → innermost (i.e. reverse of the code order), is:
+    //
+    //   responses_mw  →  outlet (logging/billing)  →  cache  →  error_enrichment
+    //                 →  image_normalizer  →  tool_injection  →  onwards
+    //
+    // Why this order:
+    //   • outlet outermost (of the body editors): it logs the request **as the customer
+    //     sent it** (cache_control markers intact, original image URLs, pre tool-injection)
+    //     and captures the response **after** cache injection, so billing sees cache_* usage.
+    //   • cache inner to outlet, but OUTER to the body-mutating layers: it must hash the
+    //     ORIGINAL request body. The image normaliser rewrites image URLs to per-request
+    //     signed URLs (fresh expiry + V4 signature each call — NOT byte-stable), so hashing
+    //     after it would make every image request a unique key → zero cache hits. Sitting
+    //     before the reject-capable layers also means a request they 4xx (unfetchable/
+    //     forbidden image) never gets a committed write — the success gate vetoes it.
+    //   • image_normalizer before tool_injection: it fetches/sanitises external image URLs
+    //     (and can reject the request) before tools are spliced in.
+    //   • tool_injection innermost: the body onwards forwards upstream is fully resolved.
+    //
+    // Each block below adds one layer; the inline notes cover that layer's specifics.
+
     // Apply tool injection middleware to the onwards router so that per-request tool
     // schemas are resolved and injected into the request body before onwards processes it.
     let tool_injection_state = crate::inference::tools::ToolInjectionState {
@@ -1565,6 +1591,38 @@ pub async fn build_router(
         state.db.write().clone(),
         error_enrichment::error_enrichment_middleware,
     ));
+
+    // Apply the cached-input pricing layer (dwctl-owned). Placed inner
+    // to outlet so the billing/analytics capture sees the injected `cache_*` usage
+    // fields, but OUTER to the body-mutating layers (image normaliser, tool
+    // injection) so the classifier hashes the original user body — stable across
+    // requests, which per-request signed image URLs would otherwise break. Added
+    // only when enabled; otherwise the stack is byte-identical to today.
+    let onwards_router = {
+        let cfg = state.current_config();
+        if cfg.cache.enabled {
+            let pool = state.db.write().clone();
+            let classifier = crate::prompt_cache::Classifier::new(
+                crate::prompt_cache::PrincipalResolver::new(pool.clone()),
+                crate::prompt_cache::ModelConfigResolver::new(pool.clone()),
+                crate::prompt_cache::TokenizerClient::new(cfg.cache.tokenizer_url.clone()),
+                Arc::new(crate::prompt_cache::PostgresIndex::new(pool)),
+            );
+            // Bound the cache layer's body buffer by the same limit onwards uses (0 =
+            // unlimited), so it's never more restrictive than the entry point.
+            let body_limit = match cfg.limits.requests.max_body_size {
+                0 => usize::MAX,
+                n => usize::try_from(n).unwrap_or(usize::MAX),
+            };
+            tracing::info!("Cached-input pricing enabled - wiring cache layer into onwards stack");
+            onwards_router.layer(middleware::from_fn_with_state(
+                crate::prompt_cache::CacheLayerState::new(classifier, body_limit),
+                crate::prompt_cache::cache_middleware,
+            ))
+        } else {
+            onwards_router
+        }
+    };
 
     // Apply request logging layer only to onwards router
     let onwards_router = if let Some(outlet_layer) = outlet_layer.clone() {
@@ -3104,7 +3162,10 @@ impl Application {
             0 => usize::MAX,
             n => usize::try_from(n).unwrap_or(usize::MAX),
         };
-        let mut onwards_app_state = onwards::AppState::with_transform(bg_services.onwards_targets.clone(), body_transform)
+        // onwards stays cache-agnostic: cached-input pricing now lives entirely in
+        // the dwctl cache tower layer (wired in `build_router`, gated on `cache.enabled`).
+        // No classifier is injected here.
+        let onwards_app_state = onwards::AppState::with_transform(bg_services.onwards_targets.clone(), body_transform)
             .with_response_transform(onwards::create_openai_sanitizer())
             .with_streaming_header("x-fusillade-stream")
             .with_response_id_header("x-fusillade-request-id")
@@ -3112,17 +3173,6 @@ impl Application {
             .with_response_store(response_store.clone() as Arc<dyn onwards::ResponseStore>)
             .with_body_limit(onwards_body_limit);
 
-        // Cached-input-pricing seam (dormant by default). When
-        // `onwards.cache_classifier_enabled` is set, inject the no-op classifier so
-        // the spine runs end-to-end for local validation: responses carry the
-        // zeroed `cache_*` usage fields and outbound `cache_control` markers
-        // are stripped, while billing/analytics stays unaffected. Left unset
-        // (the default), no classifier is wired and onwards is byte-identical to
-        // today. The real dwctl classifier replaces the no-op here in a later wave.
-        if config.onwards.cache_classifier_enabled {
-            tracing::info!("Cache classifier enabled - wiring NoopCacheClassifier into onwards");
-            onwards_app_state = onwards_app_state.with_cache_classifier(Arc::new(onwards::NoopCacheClassifier));
-        }
         let onwards_router = if bg_services.onwards_targets.strict_mode {
             tracing::info!("Strict mode enabled - using typed request validation");
             onwards::strict::build_strict_router(onwards_app_state)

@@ -1865,7 +1865,7 @@ checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
 
 [[package]]
 name = "dwctl"
-version = "8.62.0"
+version = "8.64.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -4195,9 +4195,9 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "onwards"
-version = "0.32.0"
+version = "0.33.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0a62f56ccc0a2a925914bb2f13232592df4d8053d122536b4e590e7454e89c6c"
+checksum = "245f7822a57b6e90cc272cc7ccae9a6235c9e379b4588aa7bc60559cae9561e3"
 dependencies = [
  "anyhow",
  "async-stream",

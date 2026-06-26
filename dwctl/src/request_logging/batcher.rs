@@ -33,7 +33,7 @@
 //! - **Batch enrichment**: User and pricing lookups are batched using `IN` clauses,
 //!   reducing from O(N) queries to O(1) per batch.
 
-use crate::config::{Config, ONWARDS_CONFIG_CHANGED_CHANNEL};
+use crate::config::{CachePricingConfig, Config, ONWARDS_CONFIG_CHANGED_CHANNEL};
 use crate::db::handlers::Credits;
 use crate::db::models::api_keys::ApiKeyPurpose;
 use crate::metrics::MetricsRecorder;
@@ -76,6 +76,14 @@ pub struct RawAnalyticsRecord {
     pub completion_tokens: i64,
     pub reasoning_tokens: i64,
     pub total_tokens: i64,
+    // Cached-input split. `prompt_tokens` stays the full input count; these break
+    // out the cached portion so the batcher can apply the cache multipliers. The split usually
+    // reconciles to `prompt_tokens` but isn't guaranteed to (tokenizer drift; cost logic floors
+    // uncached at 0 — see compute_cost).
+    pub cache_read_input_tokens: i64,
+    pub cache_creation_5m_input_tokens: i64,
+    pub cache_creation_1h_input_tokens: i64,
+    pub cache_creation_24h_input_tokens: i64,
     pub response_type: String,
     pub server_address: String,
     pub server_port: u16,
@@ -112,6 +120,159 @@ struct EnrichedRecord {
     provider_name: Option<String>,
     input_price_per_token: Option<Decimal>,
     output_price_per_token: Option<Decimal>,
+    /// The cache-adjusted request cost: uncached tokens at list price, cache
+    /// reads at the read multiplier, per-tier creation at its write multiplier, plus output.
+    /// `None` when the model has no pricing (→ no analytics cost, no ledger row). Written to
+    /// `http_analytics.total_cost` AND used as the billed `credits_transactions.amount`.
+    total_cost: Option<Decimal>,
+    /// The un-discounted list price = `prompt·input + completion·output` (no cache
+    /// adjustment) — `http_analytics.uncached_cost`, for savings = `uncached_cost − total_cost`.
+    /// `None` under the same no-pricing condition as `total_cost`, so the two are NULL in
+    /// lockstep. Equals `total_cost` whenever the request cached nothing.
+    uncached_cost: Option<Decimal>,
+}
+
+/// A `model_cache_tariffs` row (per model, per tier), with its validity window so batch
+/// requests can be priced as of their creation time (mirrors `model_tariffs` handling).
+/// One `model_cache_tariffs` version: all three tiers in a single row, plus the validity
+/// window so a batch request prices as of its creation time. Completeness is guaranteed by
+/// the schema (every multiplier is NOT NULL), so there is no missing-tier case to default.
+#[derive(Clone)]
+struct CacheTariffRow {
+    write_multiplier_5m: Decimal,
+    write_multiplier_1h: Decimal,
+    write_multiplier_24h: Decimal,
+    read_multiplier: Decimal,
+    valid_from: DateTime<Utc>,
+    valid_until: Option<DateTime<Utc>>,
+}
+
+/// The cache multipliers resolved for one request at a point in time.
+#[derive(Clone, Copy)]
+struct CacheMultipliers {
+    read: Decimal,
+    write_5m: Decimal,
+    write_1h: Decimal,
+    write_24h: Decimal,
+}
+
+impl CacheMultipliers {
+    /// The operator-configured defaults ([`CachePricingConfig`]) — the same values a freshly
+    /// enabled tariff would get. Used as the fallback when a request carries cache tokens with
+    /// no tariff valid at its time (unreachable in practice — classify gates on an active row,
+    /// and the call site emits a `cache_tariff_missing` background error if it ever happens).
+    fn from_config(c: &CachePricingConfig) -> Self {
+        Self {
+            read: c.default_read_multiplier,
+            write_5m: c.default_write_multiplier_5m,
+            write_1h: c.default_write_multiplier_1h,
+            write_24h: c.default_write_multiplier_24h,
+        }
+    }
+}
+
+impl Default for CacheMultipliers {
+    /// Mirrors the shipped [`CachePricingConfig`] defaults (read 0.1, writes 1.25/2.0/2.5) so
+    /// the hardcoded default and the config defaults can't drift. Production reads the live
+    /// config via [`CacheMultipliers::from_config`]; this is for tests/standalone callers.
+    fn default() -> Self {
+        Self::from_config(&CachePricingConfig::default())
+    }
+}
+
+/// Resolve the multipliers from the model's cache-tariff row valid at `timestamp` — the
+/// most-recently-effective version still in its window. One row carries all tiers, so
+/// there is no per-tier resolution or gap. `None` when no version was valid at `timestamp`
+/// (so the caller can distinguish "no tariff" from a real row and fall back deliberately).
+fn resolve_cache_multipliers(rows: &[CacheTariffRow], timestamp: DateTime<Utc>) -> Option<CacheMultipliers> {
+    rows.iter()
+        .filter(|r| r.valid_from <= timestamp && r.valid_until.is_none_or(|u| u > timestamp))
+        .max_by_key(|r| r.valid_from)
+        .map(|r| CacheMultipliers {
+            read: r.read_multiplier,
+            write_5m: r.write_multiplier_5m,
+            write_1h: r.write_multiplier_1h,
+            write_24h: r.write_multiplier_24h,
+        })
+}
+
+/// The charged cost for a record, gating the cache discount on dwctl enablement: when a
+/// tariff was valid at inference (`cache_mults` is `Some`) apply the cache-adjusted pricing;
+/// otherwise bill the full input at list price. The `None` case deliberately ignores any
+/// cache_* tokens in the response — without an active tariff those are the upstream
+/// provider's own caching, not dwctl's, and must not earn dwctl's discount.
+fn charged_cost(
+    raw: &RawAnalyticsRecord,
+    input_price: Option<Decimal>,
+    output_price: Option<Decimal>,
+    cache_mults: Option<CacheMultipliers>,
+) -> Option<Decimal> {
+    match cache_mults {
+        Some(m) => compute_total_cost(raw, input_price, output_price, &m),
+        None => compute_list_price(raw, input_price, output_price),
+    }
+}
+
+/// The cache-adjusted request cost. Reduces to the plain
+/// `prompt × input + completion × output` when there are no cache tokens, so non-cache
+/// requests are unaffected. `None` when the model has no pricing at all (→ no ledger row),
+/// matching the old generated `total_cost`'s NULL.
+fn compute_total_cost(
+    raw: &RawAnalyticsRecord,
+    input_price: Option<Decimal>,
+    output_price: Option<Decimal>,
+    m: &CacheMultipliers,
+) -> Option<Decimal> {
+    if input_price.is_none() && output_price.is_none() {
+        return None;
+    }
+    let inp = input_price.unwrap_or(Decimal::ZERO);
+    let outp = output_price.unwrap_or(Decimal::ZERO);
+
+    let read = Decimal::from(raw.cache_read_input_tokens.max(0));
+    let c5 = Decimal::from(raw.cache_creation_5m_input_tokens.max(0));
+    let c1 = Decimal::from(raw.cache_creation_1h_input_tokens.max(0));
+    let c24 = Decimal::from(raw.cache_creation_24h_input_tokens.max(0));
+    let prompt = Decimal::from(raw.prompt_tokens.max(0));
+    let cached_total = read + c5 + c1 + c24;
+
+    // Billing safety: the cached split can never exceed the prompt. If it does, the
+    // classifier/provider reported a corrupt count — and since writes bill at a premium,
+    // trusting it could massively overcharge. Distrust the split entirely and bill the whole
+    // input at the base rate (= the list price), surfacing it so a classifier bug is visible.
+    if cached_total > prompt {
+        crate::background_error!(
+            ANALYTICS_BATCHER,
+            "cache_split_exceeds_prompt",
+            Warning,
+            model = raw.request_model.as_deref().unwrap_or("?"),
+            prompt_tokens = raw.prompt_tokens,
+            "cached token split exceeds prompt_tokens; ignoring the split and billing at base rate"
+        );
+        return Some(prompt * inp + Decimal::from(raw.completion_tokens.max(0)) * outp);
+    }
+
+    // Uncached = full input minus the cached portion, floored at zero (our tokenizer and
+    // the provider's can differ; never let the cached count drive uncached negative).
+    let uncached = (prompt - cached_total).max(Decimal::ZERO);
+
+    let input_cost = uncached * inp + read * inp * m.read + c5 * inp * m.write_5m + c1 * inp * m.write_1h + c24 * inp * m.write_24h;
+    let output_cost = Decimal::from(raw.completion_tokens.max(0)) * outp;
+    Some(input_cost + output_cost)
+}
+
+/// The un-discounted list price (`http_analytics.uncached_cost`): the full input + output
+/// at base rates, ignoring any cache split. `None` under the same no-pricing condition as
+/// [`compute_total_cost`], so the two columns are NULL in lockstep. Equals `total_cost`
+/// whenever the request cached nothing — and equals the dropped generated expression, so
+/// the backfill can copy `total_cost` into it for historical rows.
+fn compute_list_price(raw: &RawAnalyticsRecord, input_price: Option<Decimal>, output_price: Option<Decimal>) -> Option<Decimal> {
+    if input_price.is_none() && output_price.is_none() {
+        return None;
+    }
+    let inp = input_price.unwrap_or(Decimal::ZERO);
+    let outp = output_price.unwrap_or(Decimal::ZERO);
+    Some(Decimal::from(raw.prompt_tokens.max(0)) * inp + Decimal::from(raw.completion_tokens.max(0)) * outp)
 }
 
 /// Sender handle for submitting analytics records to the batcher
@@ -402,6 +563,13 @@ where
             HashMap::new()
         };
 
+        // Batch lookup: model alias → cache tariffs (per tier), for the cache multipliers.
+        let cache_tariff_map = if !models.is_empty() {
+            self.batch_lookup_cache_tariffs(&models).await?
+        } else {
+            HashMap::new()
+        };
+
         // Enrich each record
         let mut enriched = Vec::with_capacity(buffer.len());
         for raw in buffer.iter().cloned() {
@@ -426,12 +594,11 @@ where
                 );
             }
 
+            // Price batch requests as of batch creation, not processing time.
+            let pricing_timestamp = raw.batch_created_at.unwrap_or(raw.timestamp);
+
             let (provider_name, input_price, output_price) = if let Some(ref model_alias) = raw.request_model {
                 if let Some(model_info) = model_map.get(model_alias) {
-                    // Use batch_created_at for pricing if available (for batch requests)
-                    // This ensures batch requests are priced as of batch creation, not processing time
-                    let pricing_timestamp = raw.batch_created_at.unwrap_or(raw.timestamp);
-
                     // Find best matching tariff
                     let (input, output) = self.find_best_tariff(
                         &model_info.tariffs,
@@ -448,6 +615,37 @@ where
                 (None, None, None)
             };
 
+            // Resolve cache multipliers from the tariff row valid at inference time. `None`
+            // for the normal non-cache model (no tariff) and for the dead anomaly path below.
+            // Resolve the cache multipliers from the tariff row valid at inference time. `None`
+            // means this model was NOT dwctl-cache-enabled then (the lookup is as-of inference
+            // against an append-only ledger, so a tariff that was active then always resolves).
+            let cache_mults_resolved = raw
+                .request_model
+                .as_deref()
+                .and_then(|alias| cache_tariff_map.get(alias))
+                .and_then(|rows| resolve_cache_multipliers(rows, pricing_timestamp));
+
+            // dwctl only injects cache tokens when a tariff is active, so if no tariff was valid
+            // at inference yet the response still carries cache_* tokens, those are the upstream
+            // provider's own (e.g. Anthropic's native caching) — surface that we're ignoring them.
+            if cache_mults_resolved.is_none()
+                && (raw.cache_read_input_tokens > 0
+                    || raw.cache_creation_5m_input_tokens > 0
+                    || raw.cache_creation_1h_input_tokens > 0
+                    || raw.cache_creation_24h_input_tokens > 0)
+            {
+                crate::background_error!(
+                    ANALYTICS_BATCHER,
+                    "provider_cache_tokens_ignored",
+                    Warning,
+                    model = raw.request_model.as_deref().unwrap_or("?"),
+                    "response carried cache tokens but the model is not dwctl-cache-enabled; ignoring them and billing at list price"
+                );
+            }
+            let total_cost = charged_cost(&raw, input_price, output_price, cache_mults_resolved);
+            let uncached_cost = compute_list_price(&raw, input_price, output_price);
+
             enriched.push(EnrichedRecord {
                 raw,
                 user_id,
@@ -457,6 +655,8 @@ where
                 provider_name,
                 input_price_per_token: input_price,
                 output_price_per_token: output_price,
+                total_cost,
+                uncached_cost,
             });
         }
 
@@ -571,6 +771,62 @@ where
         Ok(map)
     }
 
+    /// Batch lookup cache tariffs (per model, per tier) for the given aliases.
+    ///
+    /// Fetches ALL rows (including expired) so batch requests price as of their creation
+    /// time, exactly like `batch_lookup_models_with_tariffs`. Models without cache tariffs
+    /// simply don't appear (the resolver then falls back to safe defaults).
+    #[tracing::instrument(skip_all)]
+    async fn batch_lookup_cache_tariffs(&self, aliases: &[&str]) -> Result<HashMap<String, Vec<CacheTariffRow>>, sqlx::Error> {
+        let aliases_vec: Vec<String> = aliases.iter().map(|s| s.to_string()).collect();
+
+        struct Row {
+            alias: String,
+            write_multiplier_5m: Decimal,
+            write_multiplier_1h: Decimal,
+            write_multiplier_24h: Decimal,
+            read_multiplier: Decimal,
+            valid_from: DateTime<Utc>,
+            valid_until: Option<DateTime<Utc>>,
+        }
+
+        let rows: Vec<Row> = sqlx::query_as!(
+            Row,
+            r#"
+            SELECT
+                dm.alias,
+                mct.write_multiplier_5m,
+                mct.write_multiplier_1h,
+                mct.write_multiplier_24h,
+                mct.read_multiplier,
+                mct.valid_from,
+                mct.valid_until
+            FROM deployed_models dm
+            JOIN model_cache_tariffs mct ON mct.deployed_model_id = dm.id
+            WHERE dm.alias = ANY($1)
+            ORDER BY dm.alias, mct.valid_from DESC
+            "#,
+            &aliases_vec
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut map: HashMap<String, Vec<CacheTariffRow>> = HashMap::new();
+        for row in rows {
+            map.entry(row.alias).or_default().push(CacheTariffRow {
+                write_multiplier_5m: row.write_multiplier_5m,
+                write_multiplier_1h: row.write_multiplier_1h,
+                write_multiplier_24h: row.write_multiplier_24h,
+                read_multiplier: row.read_multiplier,
+                valid_from: row.valid_from,
+                valid_until: row.valid_until,
+            });
+        }
+
+        trace!(count = map.len(), "Batch lookup cache tariffs completed");
+        Ok(map)
+    }
+
     /// Find the best matching tariff for a record.
     ///
     /// Implements fallback logic:
@@ -680,6 +936,13 @@ where
 
         let mut api_key_ids: Vec<Option<Uuid>> = Vec::with_capacity(records.len());
         let mut trace_ids: Vec<Option<String>> = Vec::with_capacity(records.len());
+        let mut cache_read_vec: Vec<i64> = Vec::with_capacity(records.len());
+        let mut cache_creation_total_vec: Vec<i64> = Vec::with_capacity(records.len());
+        let mut cache_5m_vec: Vec<i64> = Vec::with_capacity(records.len());
+        let mut cache_1h_vec: Vec<i64> = Vec::with_capacity(records.len());
+        let mut cache_24h_vec: Vec<i64> = Vec::with_capacity(records.len());
+        let mut total_cost_vec: Vec<Option<Decimal>> = Vec::with_capacity(records.len());
+        let mut uncached_cost_vec: Vec<Option<Decimal>> = Vec::with_capacity(records.len());
 
         for record in records {
             instance_ids.push(record.raw.instance_id);
@@ -712,6 +975,18 @@ where
 
             api_key_ids.push(record.api_key_id);
             trace_ids.push(record.raw.trace_id.clone());
+
+            let c5 = record.raw.cache_creation_5m_input_tokens;
+            let c1 = record.raw.cache_creation_1h_input_tokens;
+            let c24 = record.raw.cache_creation_24h_input_tokens;
+            cache_read_vec.push(record.raw.cache_read_input_tokens);
+            // Saturating: corrupt/huge counts must never wrap into a negative total.
+            cache_creation_total_vec.push(c5.saturating_add(c1).saturating_add(c24));
+            cache_5m_vec.push(c5);
+            cache_1h_vec.push(c1);
+            cache_24h_vec.push(c24);
+            total_cost_vec.push(record.total_cost);
+            uncached_cost_vec.push(record.uncached_cost);
         }
 
         let rows = sqlx::query!(
@@ -721,14 +996,20 @@ where
                 status_code, duration_ms, duration_to_first_byte_ms, prompt_tokens, completion_tokens,
                 reasoning_tokens, total_tokens, response_type, user_id, access_source,
                 input_price_per_token, output_price_per_token, fusillade_batch_id, fusillade_request_id, custom_id,
-                request_origin, batch_sla, batch_request_source, api_key_id, trace_id
+                request_origin, batch_sla, batch_request_source, api_key_id, trace_id,
+                cache_read_input_tokens, cache_creation_input_tokens,
+                cache_creation_5m_input_tokens, cache_creation_1h_input_tokens, cache_creation_24h_input_tokens,
+                total_cost, uncached_cost
             )
             SELECT * FROM UNNEST(
                 $1::uuid[], $2::bigint[], $3::timestamptz[], $4::text[], $5::text[], $6::text[],
                 $7::int[], $8::bigint[], $9::bigint[], $10::bigint[], $11::bigint[],
                 $12::bigint[], $13::bigint[], $14::text[], $15::uuid[], $16::text[],
                 $17::numeric[], $18::numeric[], $19::uuid[], $20::uuid[], $21::text[],
-                $22::text[], $23::text[], $24::text[], $25::uuid[], $26::text[]
+                $22::text[], $23::text[], $24::text[], $25::uuid[], $26::text[],
+                $27::bigint[], $28::bigint[],
+                $29::bigint[], $30::bigint[], $31::bigint[],
+                $32::numeric[], $33::numeric[]
             )
             ON CONFLICT (instance_id, correlation_id)
             DO UPDATE SET
@@ -751,7 +1032,14 @@ where
                 batch_sla = EXCLUDED.batch_sla,
                 batch_request_source = EXCLUDED.batch_request_source,
                 api_key_id = EXCLUDED.api_key_id,
-                trace_id = EXCLUDED.trace_id
+                trace_id = EXCLUDED.trace_id,
+                cache_read_input_tokens = EXCLUDED.cache_read_input_tokens,
+                cache_creation_input_tokens = EXCLUDED.cache_creation_input_tokens,
+                cache_creation_5m_input_tokens = EXCLUDED.cache_creation_5m_input_tokens,
+                cache_creation_1h_input_tokens = EXCLUDED.cache_creation_1h_input_tokens,
+                cache_creation_24h_input_tokens = EXCLUDED.cache_creation_24h_input_tokens,
+                total_cost = EXCLUDED.total_cost,
+                uncached_cost = EXCLUDED.uncached_cost
             RETURNING id, instance_id, correlation_id
             "#,
             &instance_ids,
@@ -780,6 +1068,13 @@ where
             &batch_request_sources,
             &api_key_ids as &[Option<Uuid>],
             &trace_ids as &[Option<String>],
+            &cache_read_vec,
+            &cache_creation_total_vec,
+            &cache_5m_vec,
+            &cache_1h_vec,
+            &cache_24h_vec,
+            &total_cost_vec as &[Option<Decimal>],
+            &uncached_cost_vec as &[Option<Decimal>],
         )
         .fetch_all(&mut **tx)
         .await?;
@@ -825,15 +1120,9 @@ where
                 continue;
             }
 
-            // Skip if no pricing configured
-            if record.input_price_per_token.is_none() && record.output_price_per_token.is_none() {
-                continue;
-            }
-
-            // Calculate cost
-            let input_cost = Decimal::from(record.raw.prompt_tokens) * record.input_price_per_token.unwrap_or(Decimal::ZERO);
-            let output_cost = Decimal::from(record.raw.completion_tokens) * record.output_price_per_token.unwrap_or(Decimal::ZERO);
-            let total_cost = input_cost + output_cost;
+            // The cache-adjusted cost was computed during enrichment and is the same
+            // value written to http_analytics.total_cost. `None` = no pricing configured.
+            let Some(total_cost) = record.total_cost else { continue };
 
             if total_cost <= Decimal::ZERO {
                 continue;
@@ -1101,6 +1390,10 @@ mod tests {
             completion_tokens: 20,
             reasoning_tokens: 0,
             total_tokens: 30,
+            cache_read_input_tokens: 0,
+            cache_creation_5m_input_tokens: 0,
+            cache_creation_1h_input_tokens: 0,
+            cache_creation_24h_input_tokens: 0,
             response_type: "chat_completion".to_string(),
             server_address: "localhost".to_string(),
             server_port: 8080,
@@ -1125,6 +1418,170 @@ mod tests {
         assert_eq!(parse_api_key_purpose("playground"), ApiKeyPurpose::Playground);
         assert_eq!(parse_api_key_purpose("realtime"), ApiKeyPurpose::Realtime);
         assert_eq!(parse_api_key_purpose("unknown"), ApiKeyPurpose::Realtime);
+    }
+
+    /// A minimal record carrying just the token fields the cost arithmetic reads.
+    fn cost_record(prompt: i64, completion: i64, read: i64, c5: i64, c1: i64, c24: i64) -> RawAnalyticsRecord {
+        RawAnalyticsRecord {
+            instance_id: Uuid::new_v4(),
+            correlation_id: 1,
+            timestamp: chrono::Utc::now(),
+            method: "POST".to_string(),
+            uri: "/ai/v1/chat/completions".to_string(),
+            request_model: Some("m".to_string()),
+            response_model: Some("m".to_string()),
+            status_code: 200,
+            duration_ms: 1,
+            duration_to_first_byte_ms: None,
+            prompt_tokens: prompt,
+            completion_tokens: completion,
+            reasoning_tokens: 0,
+            total_tokens: prompt + completion,
+            cache_read_input_tokens: read,
+            cache_creation_5m_input_tokens: c5,
+            cache_creation_1h_input_tokens: c1,
+            cache_creation_24h_input_tokens: c24,
+            response_type: "chat_completion".to_string(),
+            server_address: "x".to_string(),
+            server_port: 1,
+            bearer_token: None,
+            fusillade_batch_id: None,
+            fusillade_request_id: None,
+            custom_id: None,
+            batch_completion_window: None,
+            batch_created_at: None,
+            batch_request_source: String::new(),
+            trace_id: None,
+        }
+    }
+
+    // input price 0.001, output price 0.002.
+    fn inp() -> Decimal {
+        Decimal::new(1, 3)
+    }
+    fn outp() -> Decimal {
+        Decimal::new(2, 3)
+    }
+
+    #[test]
+    fn cost_without_cache_is_plain_arithmetic() {
+        // No cache tokens → identical to the old prompt×input + completion×output.
+        let r = cost_record(1000, 100, 0, 0, 0, 0);
+        let cost = compute_total_cost(&r, Some(inp()), Some(outp()), &CacheMultipliers::default()).unwrap();
+        assert_eq!(cost, Decimal::new(12, 1)); // 1000*0.001 + 100*0.002 = 1.2
+    }
+
+    #[test]
+    fn cost_with_cache_applies_per_tier_multipliers() {
+        // 2000 input: 1000 read + 500 1h-creation + 500 uncached; completion 100.
+        let r = cost_record(2000, 100, 1000, 0, 500, 0);
+        let m = CacheMultipliers {
+            read: Decimal::new(1, 1), // 0.1
+            write_5m: Decimal::ONE,
+            write_1h: Decimal::from(2), // 2.0
+            write_24h: Decimal::ONE,
+        };
+        let cost = compute_total_cost(&r, Some(inp()), Some(outp()), &m).unwrap();
+        // 500*0.001 (uncached) + 1000*0.001*0.1 (read) + 500*0.001*2.0 (1h write) + 100*0.002 (out)
+        // = 0.5 + 0.1 + 1.0 + 0.2 = 1.8
+        assert_eq!(cost, Decimal::new(18, 1));
+    }
+
+    #[test]
+    fn cost_none_when_no_pricing() {
+        let r = cost_record(1000, 100, 0, 0, 0, 0);
+        assert!(compute_total_cost(&r, None, None, &CacheMultipliers::default()).is_none());
+    }
+
+    #[test]
+    fn corrupt_split_exceeding_prompt_bills_at_base_rate() {
+        // Cached tokens (1000) exceed the prompt (100) — an impossible, corrupt count from
+        // the classifier/provider. The split is distrusted and the whole input is billed at
+        // base rate (the list price), never at the cache write premium that would massively
+        // overcharge on a mistake.
+        let r = cost_record(100, 5, 1000, 0, 0, 0);
+        let cost = compute_total_cost(&r, Some(inp()), Some(outp()), &CacheMultipliers::default()).unwrap();
+        // list price = 100*0.001 + 5*0.002 = 0.11
+        assert_eq!(cost, Decimal::new(11, 2));
+        // No savings shown for a distrusted split: total == un-discounted list price.
+        assert_eq!(cost, compute_list_price(&r, Some(inp()), Some(outp())).unwrap());
+    }
+
+    #[test]
+    fn charged_cost_gates_discount_on_enablement() {
+        // 600 cache-read tokens reported on the response.
+        let r = cost_record(1000, 100, 600, 0, 0, 0);
+
+        // Not dwctl-cache-enabled (no tariff → None): the provider's cache tokens are ignored
+        // and the full input is billed at list price — no read discount.
+        let not_enabled = charged_cost(&r, Some(inp()), Some(outp()), None).unwrap();
+        assert_eq!(not_enabled, compute_list_price(&r, Some(inp()), Some(outp())).unwrap());
+        assert_eq!(not_enabled, Decimal::new(12, 1)); // 1000*0.001 + 100*0.002
+
+        // Cache-enabled (Some): the read discount applies, so it costs strictly less.
+        let m = CacheMultipliers {
+            read: Decimal::new(1, 1), // 0.1
+            write_5m: Decimal::ONE,
+            write_1h: Decimal::ONE,
+            write_24h: Decimal::ONE,
+        };
+        let enabled = charged_cost(&r, Some(inp()), Some(outp()), Some(m)).unwrap();
+        // 400 uncached*0.001 + 600 read*0.001*0.1 + 100*0.002 = 0.66
+        assert_eq!(enabled, Decimal::new(66, 2));
+        assert!(enabled < not_enabled, "the discount must make the enabled case cheaper");
+    }
+
+    #[test]
+    fn list_price_ignores_cache_split_and_is_none_without_pricing() {
+        // Cache tokens present, but the list price is the full input+output at base rates.
+        let r = cost_record(1000, 100, 500, 0, 200, 0);
+        let list = compute_list_price(&r, Some(inp()), Some(outp())).unwrap();
+        assert_eq!(list, Decimal::new(12, 1)); // 1000*0.001 + 100*0.002 = 1.2
+        assert!(compute_list_price(&r, None, None).is_none(), "no pricing → NULL list price");
+    }
+
+    fn tariff_row(write_1h: Decimal, from_hrs: i64, valid_until: Option<DateTime<Utc>>) -> CacheTariffRow {
+        CacheTariffRow {
+            write_multiplier_5m: Decimal::new(125, 2), // 1.25
+            write_multiplier_1h: write_1h,
+            write_multiplier_24h: Decimal::new(25, 1), // 2.5
+            read_multiplier: Decimal::new(1, 1),       // 0.1
+            valid_from: chrono::Utc::now() - chrono::Duration::hours(from_hrs),
+            valid_until,
+        }
+    }
+
+    #[test]
+    fn resolve_multipliers_picks_latest_valid_version() {
+        let now = chrono::Utc::now();
+        // Two versions; the newer (valid_from 1h ago) wins over the older (5h ago).
+        let rows = vec![tariff_row(Decimal::from(2), 1, None), tariff_row(Decimal::from(3), 5, None)];
+        let m = resolve_cache_multipliers(&rows, now).expect("a valid version exists");
+        assert_eq!(m.write_1h, Decimal::from(2), "latest valid version wins");
+        assert_eq!(m.write_5m, Decimal::new(125, 2), "all tiers come from that one row");
+        assert_eq!(m.write_24h, Decimal::new(25, 1));
+        assert_eq!(m.read, Decimal::new(1, 1));
+    }
+
+    #[test]
+    fn resolve_multipliers_none_when_empty_or_expired() {
+        let now = chrono::Utc::now();
+        // empty → no version valid → None (the caller falls back to defaults deliberately).
+        assert!(resolve_cache_multipliers(&[], now).is_none(), "no rows → None");
+        // expired version ignored → None.
+        let expired = vec![tariff_row(Decimal::from(5), 2, Some(now - chrono::Duration::hours(1)))];
+        assert!(resolve_cache_multipliers(&expired, now).is_none(), "expired version ignored → None");
+    }
+
+    #[test]
+    fn default_multipliers_mirror_config_pricing_defaults() {
+        // Default delegates to CachePricingConfig::default() so the two can't drift.
+        let m = CacheMultipliers::default();
+        let c = CachePricingConfig::default();
+        assert_eq!(m.read, c.default_read_multiplier, "read = config default (0.1)");
+        assert_eq!(m.write_5m, c.default_write_multiplier_5m, "5m = config default (1.25)");
+        assert_eq!(m.write_1h, c.default_write_multiplier_1h, "1h = config default (2.0)");
+        assert_eq!(m.write_24h, c.default_write_multiplier_24h, "24h = config default (2.5)");
     }
 
     #[test]
@@ -1633,6 +2090,10 @@ mod integration_tests {
             completion_tokens,
             reasoning_tokens: 0,
             total_tokens: prompt_tokens + completion_tokens,
+            cache_read_input_tokens: 0,
+            cache_creation_5m_input_tokens: 0,
+            cache_creation_1h_input_tokens: 0,
+            cache_creation_24h_input_tokens: 0,
             response_type: "chat_completion".to_string(),
             server_address: "api.test.com".to_string(),
             server_port: 443,
@@ -1703,6 +2164,132 @@ mod integration_tests {
         let usage_tx = transactions.iter().find(|tx| tx.transaction_type == CreditTransactionType::Usage);
         assert!(usage_tx.is_some(), "Usage transaction should be created");
         assert_eq!(usage_tx.unwrap().amount, expected_cost);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_batcher_cache_discount_applied(pool: PgPool) {
+        // Model with a base tariff + a cache tariff (presence = enabled): 1h write ×2.0,
+        // read ×0.1. The other tiers are set but unused by this request.
+        let model_id = create_test_model(&pool, "cache-bill-test").await;
+        let input_price = Decimal::from_str("0.00001").unwrap();
+        let output_price = Decimal::from_str("0.00003").unwrap();
+        setup_tariff(&pool, model_id, input_price, output_price, ApiKeyPurpose::Realtime).await;
+        sqlx::query!(
+            r#"INSERT INTO model_cache_tariffs
+                 (deployed_model_id, write_multiplier_5m, write_multiplier_1h, write_multiplier_24h, read_multiplier, min_prefix_tokens)
+               VALUES ($1, 1.25, 2.0, 2.5, 0.1, 1024)"#,
+            model_id
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let initial_balance = Decimal::from_str("10.00").unwrap();
+        let user_id = setup_user_with_balance(&pool, initial_balance).await;
+        let api_key = create_api_key_for_user(&pool, user_id, ApiKeyPurpose::Realtime).await;
+
+        // 2000 input = 1000 read + 500 1h-creation + 500 uncached; 500 output.
+        let mut record = create_raw_record("cache-bill-test", Some(api_key), 2000, 500);
+        record.cache_read_input_tokens = 1000;
+        record.cache_creation_1h_input_tokens = 500;
+
+        run_batcher_with_records(&pool, vec![record]).await;
+
+        // input = 500*1e-5 (uncached) + 1000*1e-5*0.1 (read) + 500*1e-5*2.0 (1h write)
+        //       = 0.005 + 0.001 + 0.010 = 0.016 ; output = 500*3e-5 = 0.015 → 0.031
+        let expected_cost = Decimal::from_str("0.031").unwrap();
+        // List price (no caching): 2000*1e-5 + 500*3e-5 = 0.035 → savings 0.004.
+        let expected_list = Decimal::from_str("0.035").unwrap();
+
+        let mut conn = pool.acquire().await.unwrap();
+        let mut credits = Credits::new(&mut conn);
+        let final_balance = credits.get_user_balance(user_id).await.unwrap();
+        assert_eq!(
+            final_balance,
+            initial_balance - expected_cost,
+            "the cache-discounted amount is billed, not the list price"
+        );
+
+        // http_analytics carries the split, the cache-adjusted total_cost, AND the
+        // batcher-written list-price uncached_cost (savings = uncached_cost − total_cost).
+        let row = sqlx::query!(
+            r#"SELECT cache_read_input_tokens, cache_creation_input_tokens, cache_creation_1h_input_tokens,
+                      total_cost, uncached_cost
+               FROM http_analytics WHERE model = 'cache-bill-test'"#
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.cache_read_input_tokens, 1000);
+        assert_eq!(row.cache_creation_input_tokens, 500);
+        assert_eq!(row.cache_creation_1h_input_tokens, 500);
+        assert_eq!(row.total_cost.unwrap(), expected_cost, "total_cost = cache-adjusted");
+        assert_eq!(row.uncached_cost.unwrap(), expected_list, "uncached_cost = list price");
+    }
+
+    #[sqlx::test]
+    async fn total_cost_fidelity_trigger_fills_when_omitted(pool: PgPool) {
+        // Old-release-style insert: omits total_cost (it relied on the dropped generation).
+        // The fidelity trigger reconstructs it from the row's own tokens × prices.
+        let priced = Uuid::new_v4();
+        sqlx::query!(
+            r#"INSERT INTO http_analytics (instance_id, correlation_id, timestamp, method, uri,
+                 prompt_tokens, completion_tokens, input_price_per_token, output_price_per_token)
+               VALUES ($1, 1, now(), 'POST', '/v1/chat/completions', 1000, 100, 0.001, 0.002)"#,
+            priced
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let tc = sqlx::query_scalar!("SELECT total_cost FROM http_analytics WHERE instance_id = $1", priced)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            tc.unwrap(),
+            Decimal::from_str("1.2").unwrap(),
+            "trigger reconstructs list price (1000*0.001 + 100*0.002)"
+        );
+
+        // Free / un-tariffed model (NULL prices) → NULL propagates → total_cost stays NULL,
+        // exactly as the old generated CASE expression produced.
+        let free = Uuid::new_v4();
+        sqlx::query!(
+            r#"INSERT INTO http_analytics (instance_id, correlation_id, timestamp, method, uri, prompt_tokens, completion_tokens)
+               VALUES ($1, 2, now(), 'POST', '/v1/chat/completions', 1000, 100)"#,
+            free
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let tc_free = sqlx::query_scalar!("SELECT total_cost FROM http_analytics WHERE instance_id = $1", free)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(tc_free.is_none(), "no prices → total_cost NULL (free model)");
+
+        // New-release-style insert: total_cost provided → trigger no-ops (keeps the value,
+        // even if it differs from the list price, which is the whole point under caching).
+        let provided = Uuid::new_v4();
+        sqlx::query!(
+            r#"INSERT INTO http_analytics (instance_id, correlation_id, timestamp, method, uri,
+                 prompt_tokens, completion_tokens, input_price_per_token, output_price_per_token, total_cost)
+               VALUES ($1, 3, now(), 'POST', '/v1/chat/completions', 1000, 100, 0.001, 0.002, 0.5)"#,
+            provided
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let tc_provided = sqlx::query_scalar!("SELECT total_cost FROM http_analytics WHERE instance_id = $1", provided)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            tc_provided.unwrap(),
+            Decimal::from_str("0.5").unwrap(),
+            "explicit total_cost is preserved (trigger no-ops)"
+        );
     }
 
     #[sqlx::test]
