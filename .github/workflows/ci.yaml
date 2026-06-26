@@ -364,6 +364,15 @@ jobs:
         working-directory: ./dashboard
         run: pnpm install --frozen-lockfile
 
+      # DISABLED: `npx playwright install chromium` hangs at 100% download due to an upstream
+      # Playwright CDN issue (recurs across versions — not resolved by pinning). Safe to skip
+      # for now: the docker e2e job runs hurl API tests only; the Playwright E2E block in the
+      # justfile is commented out, so no browser is needed. Re-enable (uncomment) once the
+      # Playwright CDN download recovers AND the justfile E2E block is restored.
+      # - name: Install Playwright browsers
+      #   working-directory: ./dashboard
+      #   run: npx playwright install chromium --only-shell
+
       - name: Install hurl
         # Pinned: hurl 8.0.0 (2026-04-27) ships an RFC 9535 JSONPath rewrite
         # that breaks our existing `count` / `nth` patterns on filter results
