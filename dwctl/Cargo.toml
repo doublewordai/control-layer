@@ -1,6 +1,6 @@
 [package]
 name = "dwctl"
-version = "8.62.0"
+version = "8.63.0"
 edition = "2024"
 description = "The Doubleword Control Layer - A self-hostable observability and analytics platform for LLM applications"
 license = "MIT OR Apache-2.0"
@@ -80,7 +80,7 @@ jsonwebtoken = { version = "10", features = ["rust_crypto"] }
 argon2 = "0.5"
 base64 = "0.22"
 bytes = "1.5"
-onwards = { version = "0.33.4", features = ["multi-step"] }
+onwards = { version = "0.34.0", features = ["multi-step"] }
 thiserror = "2.0.14"
 axum-prometheus = "0.10"
 # Metrics facade and exporter (same versions as axum-prometheus uses)
@@ -124,6 +124,7 @@ postgresql_embedded = { version = "0.20", optional = true, features = [
 rust-embed = { version = "8.5", features = ["debug-embed"] }
 mime_guess = "2.0"
 futures = "0.3.31"
+http-body-util = "0.1"
 dashmap = { version = "6.1.0", features = ["serde"] }
 moka = { version = "0.12", features = ["future"] }
 # Stripe payment processing - Fixed at rc0 currently as this is the only semi-stable version supporting a modern stripe API

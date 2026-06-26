@@ -206,6 +206,10 @@ pub struct Config {
     /// Both surfaces require authentication regardless of these flags.
     #[serde(default)]
     pub openapi: OpenApiConfig,
+    /// Cached-input pricing (the dwctl-owned cache layer): the on/off flag, the
+    /// tokenizer-svc URL, and the default pricing multipliers. See [`CacheConfig`].
+    #[serde(default)]
+    pub cache: CacheConfig,
 }
 
 /// Controls exposure of the OpenAPI specs and Scalar doc UIs.
@@ -1001,33 +1005,85 @@ impl Default for RequestLimitsConfig {
 /// Onwards AI proxy configuration.
 ///
 /// Controls behavior of the onwards routing layer used for AI proxy requests.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
-#[derive(Default)]
 pub struct OnwardsConfig {
     /// Enable strict mode with schema validation and typed handlers.
     /// When false (default), all requests are passed through transparently.
     /// When true, only known OpenAI API paths are accepted and validated.
     pub strict_mode: bool,
-    /// Wire a cached-input-pricing classifier into the embedded onwards proxy.
+}
+
+/// Cached-input pricing — the dwctl-owned cache tower layer. All cache configuration lives
+/// here (formerly split across `onwards.*` and a top-level `cache_pricing`).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CacheConfig {
+    /// Enable cached-input pricing. When false (the default), the cache layer is not added
+    /// to the stack: onwards is byte-identical to today with zero request-path overhead
+    /// (no body read, no classify fork, no injection).
     ///
-    /// When false (the default), onwards is left dormant: no classifier is
-    /// injected, so the cache request-fork, `cache_control` stripping, and
-    /// response usage injection are all skipped and onwards behaviour is
-    /// byte-identical to today — zero runtime overhead (no extra allocations,
-    /// no request-path changes).
+    /// When true, [`crate::prompt_cache::cache_middleware`] wraps the onwards router (inner
+    /// to outlet, so billing sees the injected fields): on each cacheable request it forks
+    /// the classifier concurrently with the upstream call, strips `cache_control` markers,
+    /// injects the `cache_*` usage fields, and commits prefix writes on success. Per-model
+    /// activation is still gated by an active `model_cache_tariffs` row, so flipping this on
+    /// does nothing until a model is enabled. classify races the (slower) model call under a
+    /// deadline, so it adds no request latency.
     ///
-    /// When true, the no-op classifier ([`onwards::NoopCacheClassifier`]) is injected.
-    /// This activates the spine end-to-end for local validation: responses
-    /// carry the (zeroed) `cache_*` usage fields and outbound `cache_control`
-    /// markers are stripped, while billing/analytics is unaffected. There is
-    /// no real classification yet — the no-op returns all-zero stats. The real
-    /// dwctl classifier will replace the no-op here in a later wave. When a real
-    /// classifier lands it runs concurrently with the upstream model call under a
-    /// deadline, so it does not add to request latency.
+    /// Set via environment: `DWCTL_CACHE__ENABLED=true`
+    pub enabled: bool,
+
+    /// Base URL of the tokenizer-svc used to count cache-prefix tokens. Only consulted when
+    /// `enabled` is true; the classifier calls `{tokenizer_url}/v1/models` and
+    /// `{tokenizer_url}/v1/tokenize`. A namespace-relative service name (e.g.
+    /// `http://tokenizer-svc:8088`) resolves to the tokenizer-svc in the pod's own namespace.
     ///
-    /// Set via environment: `DWCTL_ONWARDS__CACHE_CLASSIFIER_ENABLED=true`
-    pub cache_classifier_enabled: bool,
+    /// Set via environment: `DWCTL_CACHE__TOKENIZER_URL=http://tokenizer-svc:8088`
+    pub tokenizer_url: String,
+
+    /// Default pricing multipliers (pre-fill when enabling caching on a model without
+    /// explicit per-tier values). See [`CachePricingConfig`].
+    pub pricing: CachePricingConfig,
+}
+
+impl Default for CacheConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            tokenizer_url: "http://localhost:8088".to_string(),
+            pricing: CachePricingConfig::default(),
+        }
+    }
+}
+
+/// Default cache-pricing multipliers, used when enabling caching on a model without
+/// explicit per-tier values. The `model_cache_tariffs` row remains the source of truth
+/// (and what billing reads as of inference time) — these only pre-fill it at creation.
+///
+/// Defaults mirror Anthropic's published premiums: 5m write 1.25×, 1h write 2×, read
+/// 0.1×; 24h defaults to 2.5×. Floor 1024 tokens.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CachePricingConfig {
+    pub default_write_multiplier_5m: rust_decimal::Decimal,
+    pub default_write_multiplier_1h: rust_decimal::Decimal,
+    pub default_write_multiplier_24h: rust_decimal::Decimal,
+    pub default_read_multiplier: rust_decimal::Decimal,
+    pub default_min_prefix_tokens: i32,
+}
+
+impl Default for CachePricingConfig {
+    fn default() -> Self {
+        use rust_decimal::Decimal;
+        Self {
+            default_write_multiplier_5m: Decimal::new(125, 2), // 1.25
+            default_write_multiplier_1h: Decimal::new(2, 0),   // 2.0
+            default_write_multiplier_24h: Decimal::new(25, 1), // 2.5
+            default_read_multiplier: Decimal::new(1, 1),       // 0.1
+            default_min_prefix_tokens: 1024,
+        }
+    }
 }
 
 /// File limits configuration.
@@ -1969,6 +2025,7 @@ impl Default for Config {
             responses: ResponsesConfig::default(),
             image_normalizer: crate::image_normalizer::ImageNormalizerConfig::default(),
             openapi: OpenApiConfig::default(),
+            cache: CacheConfig::default(),
         }
     }
 }
@@ -2198,6 +2255,17 @@ impl Config {
                     operation: "Config validation: Invalid password configuration: min_length must be at least 1".to_string(),
                 });
             }
+        }
+
+        // Cached-input pricing needs a tokenizer-svc URL to count cache-prefix tokens.
+        // Without it, every cacheable request silently degrades to no caching — fail fast
+        // at startup instead, so an operator who flips the flag gets a clear error.
+        if self.cache.enabled && self.cache.tokenizer_url.trim().is_empty() {
+            return Err(Error::Internal {
+                operation: "Config validation: cache.enabled is true but cache.tokenizer_url is empty. \
+                     Set DWCTL_CACHE__TOKENIZER_URL to the tokenizer-svc base URL, or disable caching."
+                    .to_string(),
+            });
         }
 
         // Validate JWT expiry duration is reasonable

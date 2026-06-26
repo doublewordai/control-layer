@@ -1,0 +1,58 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT\n                dm.alias,\n                mct.write_multiplier_5m,\n                mct.write_multiplier_1h,\n                mct.write_multiplier_24h,\n                mct.read_multiplier,\n                mct.valid_from,\n                mct.valid_until\n            FROM deployed_models dm\n            JOIN model_cache_tariffs mct ON mct.deployed_model_id = dm.id\n            WHERE dm.alias = ANY($1)\n            ORDER BY dm.alias, mct.valid_from DESC\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "alias",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 1,
+        "name": "write_multiplier_5m",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 2,
+        "name": "write_multiplier_1h",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 3,
+        "name": "write_multiplier_24h",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 4,
+        "name": "read_multiplier",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 5,
+        "name": "valid_from",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 6,
+        "name": "valid_until",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "TextArray"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "ac2fde8e53d6cb2a90176a5c537d63008e33c72c5428486701231e697176f674"
+}

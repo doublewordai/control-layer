@@ -1865,7 +1865,7 @@ checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
 
 [[package]]
 name = "dwctl"
-version = "8.62.0"
+version = "8.63.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -1904,6 +1904,7 @@ dependencies = [
  "hex",
  "hickory-resolver",
  "hmac 0.13.0",
+ "http-body-util",
  "humantime",
  "humantime-serde",
  "jsonwebtoken",
@@ -4196,9 +4197,9 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "onwards"
-version = "0.33.4"
+version = "0.34.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "245f7822a57b6e90cc272cc7ccae9a6235c9e379b4588aa7bc60559cae9561e3"
+checksum = "dccdd0f051e35e50eea9bff69178a4e2fd77caf628b13185aacfcb544d160235"
 dependencies = [
  "anyhow",
  "async-stream",
