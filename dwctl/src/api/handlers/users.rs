@@ -487,9 +487,13 @@ pub async fn delete_user<P: PoolProvider>(
             ..Default::default()
         })
         .await
-        .map_err(|_| Error::NotFound {
-            resource: "Batch".to_string(),
-            id: user_id_str.clone(),
+        .map_err(|e| {
+            // A listing failure is an internal fault (DB unreachable, etc.), not
+            // a missing resource — don't mislabel it as 404 "Batch not found".
+            tracing::error!(user_id = %user_id, error = %e, "Failed to list batches for user deletion");
+            Error::Internal {
+                operation: "list user batches for deletion".to_string(),
+            }
         })?;
 
     for batch in batches {
@@ -583,9 +587,12 @@ pub async fn build_purge_user_data_job<P: sqlx_pool_router::PoolProvider + Clone
         .map_err(Into::into)
 }
 
-/// Enqueue the purge-user-data job. Best-effort: logs a warning on failure so
-/// the delete handler still returns success (the row + keys are already gone;
-/// fusillade data can be cleaned up on a later deletion or manually).
+/// Enqueue the purge-user-data job. Best-effort: the delete handler still
+/// returns success on failure (the row + keys are already gone). But a failed
+/// enqueue means the user's fusillade data is *not* scheduled for erasure and
+/// nothing retries it automatically — a right-to-erasure gap that must be
+/// visible, so it emits the background-error metric (severity `error`:
+/// triageable, ~1-month legal window, not a page) rather than a silent warn.
 async fn enqueue_purge_user_data<P: PoolProvider>(state: &AppState<P>, user_id: String) {
     if let Err(e) = state
         .task_runner
@@ -593,7 +600,14 @@ async fn enqueue_purge_user_data<P: PoolProvider>(state: &AppState<P>, user_id: 
         .enqueue(&PurgeUserDataInput { user_id: user_id.clone() })
         .await
     {
-        tracing::warn!(user_id = %user_id, error = %e, "Failed to enqueue purge-user-data job (fusillade data will remain until retried)");
+        crate::background_error!(
+            crate::metrics::errors::component::TASK_WORKER,
+            "purge_user_data_enqueue",
+            Error,
+            user_id = %user_id,
+            error = %e,
+            "Failed to enqueue purge-user-data job; fusillade data will NOT be erased until retried (right-to-erasure gap)"
+        );
     }
 }
 
