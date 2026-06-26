@@ -1194,8 +1194,11 @@ pub async fn add_model_component<P: PoolProvider>(
     // Add the component. Its priority position is always assigned by the server
     // as "one past the current last component" so sort_order stays unique and
     // dense within the composite — the client-supplied `sort_order` is ignored
-    // (reordering is done via PATCH, which moves-and-reindexes).
+    // (reordering is done via PATCH, which moves-and-reindexes). Lock the
+    // composite first so concurrent adds can't both read the same MAX and
+    // collide on a position.
     let mut repo = Deployments::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
+    repo.lock_composite(id).await?;
     let sort_order = repo.next_component_sort_order(id).await?;
     let request = DeploymentComponentCreateDBRequest {
         composite_model_id: id,
@@ -1256,6 +1259,9 @@ pub async fn update_model_component<P: PoolProvider>(
     let mut tx = state.db.write().begin().await.map_err(|e| Error::Database(e.into()))?;
     let component = {
         let mut repo = Deployments::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
+        // Serialize with other component mutations on this composite so the
+        // move-and-reindex below isn't interleaved with a concurrent add/reorder.
+        repo.lock_composite(id).await?;
         repo.update_component(id, component_id, body.weight, body.enabled, body.sort_order)
             .await?
             .ok_or_else(|| Error::NotFound {
@@ -1296,17 +1302,26 @@ pub async fn remove_model_component<P: PoolProvider>(
     Path((id, component_id)): Path<(DeploymentId, DeploymentId)>,
     _: RequiresPermission<resource::CompositeModels, operation::UpdateAll>,
 ) -> Result<Json<String>> {
-    let mut pool_conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
-    let mut repo = Deployments::new(&mut pool_conn);
+    // Remove and then compact the remaining components back to a dense 0..n-1
+    // sequence, so a deletion doesn't leave a gap in the priority order. Lock the
+    // composite and run both in one transaction to serialize with concurrent
+    // add/reorder.
+    let mut tx = state.db.write().begin().await.map_err(|e| Error::Database(e.into()))?;
+    {
+        let mut repo = Deployments::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
+        repo.lock_composite(id).await?;
 
-    let removed = repo.remove_component(id, component_id).await?;
+        let removed = repo.remove_component(id, component_id).await?;
+        if !removed {
+            return Err(Error::NotFound {
+                resource: "component".to_string(),
+                id: format!("{}/{}", id, component_id),
+            });
+        }
 
-    if !removed {
-        return Err(Error::NotFound {
-            resource: "component".to_string(),
-            id: format!("{}/{}", id, component_id),
-        });
+        repo.compact_component_sort_order(id).await?;
     }
+    tx.commit().await.map_err(|e| Error::Database(e.into()))?;
 
     Ok(Json("Component removed".to_string()))
 }
