@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE deployed_model_components SET sort_order = $3\n                 WHERE composite_model_id = $1 AND deployed_model_id = $2\n                   AND sort_order IS DISTINCT FROM $3",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Int4"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "ab9cba22878e991180819ddd171a274a631503a80f492f2ac74c55c8e961cd90"
+}
