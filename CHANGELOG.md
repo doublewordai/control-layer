@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.65.1](https://github.com/doublewordai/control-layer/compare/v8.65.0...v8.65.1) (2026-06-26)
+
+
+### Bug Fixes
+
+* enforce unique priority order for composite model components ([#1189](https://github.com/doublewordai/control-layer/issues/1189)) ([6ac734c](https://github.com/doublewordai/control-layer/commit/6ac734c4204c143ca409b3dcde4abdc254032bac))
+
 ## [8.65.0](https://github.com/doublewordai/control-layer/compare/v8.64.0...v8.65.0) (2026-06-26)
 
 
