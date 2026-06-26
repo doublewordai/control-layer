@@ -1,3 +1,4 @@
+pub mod anthropic;
 pub mod cache_classifier;
 pub mod databases;
 pub mod multi_step_executor;

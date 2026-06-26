@@ -1,5 +1,20 @@
 # Changelog
 
+## [8.63.0](https://github.com/doublewordai/control-layer/compare/v8.62.0...v8.63.0) (2026-06-25)
+
+
+### Features
+
+* input-caching ([#1172](https://github.com/doublewordai/control-layer/issues/1172)) ([9bf7a0b](https://github.com/doublewordai/control-layer/commit/9bf7a0b5631a3606a6d951ff8600b7a0577be40a))
+
+## [8.62.0](https://github.com/doublewordai/control-layer/compare/v8.61.3...v8.62.0) (2026-06-25)
+
+
+### Features
+
+* add Anthropic /v1/messages ingress ([#1177](https://github.com/doublewordai/control-layer/issues/1177)) ([d24bd11](https://github.com/doublewordai/control-layer/commit/d24bd11ca00a8ff797c310e89cc0cd5edd32e8c4))
+* support flex + streaming for chat completions and responses ([#1171](https://github.com/doublewordai/control-layer/issues/1171)) ([e48702a](https://github.com/doublewordai/control-layer/commit/e48702a1e812d322a3b4f74d2b7fc5f43a172aa9))
+
 ## [8.61.3](https://github.com/doublewordai/control-layer/compare/v8.61.2...v8.61.3) (2026-06-24)
 
 
