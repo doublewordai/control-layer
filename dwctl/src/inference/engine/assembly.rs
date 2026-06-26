@@ -15,6 +15,7 @@
 //! includes `id`, `object: "response"`, `status`, `output`, and optional
 //! `usage` if present in any model_call response.
 
+use chrono::Utc;
 use onwards::{ChainStep, StepKind, StepState};
 use serde_json::{Value, json};
 
@@ -24,6 +25,8 @@ pub(crate) fn assemble_from_chain(request_id: &str, chain: &[ChainStep]) -> Valu
     let mut output: Vec<Value> = Vec::new();
     let mut pending_tool_calls: Vec<(String, String, String)> = Vec::new();
     let mut total_usage: Option<Value> = None;
+    let created_at = first_created_at(chain).unwrap_or_else(|| Utc::now().timestamp());
+    let model = first_model(chain).unwrap_or_else(|| "unknown".to_string());
 
     for step in chain {
         if !matches!(step.state, StepState::Completed) {
@@ -44,9 +47,16 @@ pub(crate) fn assemble_from_chain(request_id: &str, chain: &[ChainStep]) -> Valu
                     && !content.is_empty()
                 {
                     output.push(json!({
+                        "id": format!("msg_{}", step.sequence),
                         "type": "message",
+                        "status": "completed",
                         "role": "assistant",
-                        "content": [{"type": "output_text", "text": content}],
+                        "content": [{
+                            "type": "output_text",
+                            "text": content,
+                            "annotations": [],
+                            "logprobs": [],
+                        }],
                     }));
                 }
 
@@ -73,10 +83,12 @@ pub(crate) fn assemble_from_chain(request_id: &str, chain: &[ChainStep]) -> Valu
                         // function_call_output is appended when we process
                         // the corresponding tool_call step below.
                         output.push(json!({
+                            "id": format!("fc_{}_{}", step.sequence, output.len()),
                             "type": "function_call",
                             "call_id": call_id,
                             "name": name,
                             "arguments": arguments,
+                            "status": "completed",
                         }));
                         pending_tool_calls.push((call_id, name, arguments));
                     }
@@ -108,24 +120,64 @@ pub(crate) fn assemble_from_chain(request_id: &str, chain: &[ChainStep]) -> Valu
                     .map(|p| serde_json::to_string(p).unwrap_or_default())
                     .unwrap_or_default();
                 output.push(json!({
+                    "id": format!("fco_{}", step.sequence),
                     "type": "function_call_output",
                     "call_id": call_id,
                     "output": output_text,
+                    "status": "completed",
                 }));
             }
         }
     }
 
-    let mut response = json!({
+    json!({
         "id": format!("resp_{request_id}"),
         "object": "response",
+        "created_at": created_at,
+        "completed_at": created_at,
         "status": "completed",
+        "incomplete_details": null,
+        "model": model,
+        "previous_response_id": null,
+        "instructions": null,
         "output": output,
-    });
-    if let Some(usage) = total_usage {
-        response["usage"] = usage;
-    }
-    response
+        "error": null,
+        "tools": [],
+        "tool_choice": "auto",
+        "truncation": "disabled",
+        "parallel_tool_calls": true,
+        "text": {"format": {"type": "text"}},
+        "top_p": 1.0,
+        "presence_penalty": 0.0,
+        "frequency_penalty": 0.0,
+        "top_logprobs": 0,
+        "temperature": 1.0,
+        "reasoning": null,
+        "usage": total_usage.map(chat_usage_to_response_usage).unwrap_or(Value::Null),
+        "max_output_tokens": null,
+        "max_tool_calls": null,
+        "store": false,
+        "background": false,
+        "service_tier": "default",
+        "metadata": null,
+        "safety_identifier": null,
+        "prompt_cache_key": null,
+    })
+}
+
+fn first_created_at(chain: &[ChainStep]) -> Option<i64> {
+    chain
+        .iter()
+        .filter(|step| matches!(step.kind, StepKind::ModelCall) && matches!(step.state, StepState::Completed))
+        .find_map(|step| step.response_payload.as_ref()?.get("created")?.as_i64())
+}
+
+fn first_model(chain: &[ChainStep]) -> Option<String> {
+    chain
+        .iter()
+        .filter(|step| matches!(step.kind, StepKind::ModelCall) && matches!(step.state, StepState::Completed))
+        .find_map(|step| step.response_payload.as_ref()?.get("model")?.as_str())
+        .map(ToOwned::to_owned)
 }
 
 fn merge_usage(prev: Option<Value>, next: Value) -> Value {
@@ -141,6 +193,39 @@ fn merge_usage(prev: Option<Value>, next: Value) -> Value {
         }
     }
     out
+}
+
+fn chat_usage_to_response_usage(usage: Value) -> Value {
+    let input_tokens = token_count(&usage, "input_tokens").unwrap_or_else(|| token_count(&usage, "prompt_tokens").unwrap_or(0));
+    let output_tokens = token_count(&usage, "output_tokens").unwrap_or_else(|| token_count(&usage, "completion_tokens").unwrap_or(0));
+    let total_tokens = token_count(&usage, "total_tokens").unwrap_or(input_tokens + output_tokens);
+
+    json!({
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": total_tokens,
+        "input_tokens_details": {
+            "cached_tokens": nested_token_count(&usage, "input_tokens_details", "cached_tokens")
+                .or_else(|| nested_token_count(&usage, "prompt_tokens_details", "cached_tokens"))
+                .unwrap_or(0),
+        },
+        "output_tokens_details": {
+            "reasoning_tokens": nested_token_count(&usage, "output_tokens_details", "reasoning_tokens")
+                .or_else(|| nested_token_count(&usage, "completion_tokens_details", "reasoning_tokens"))
+                .unwrap_or(0),
+        },
+    })
+}
+
+fn token_count(usage: &Value, key: &str) -> Option<i64> {
+    usage.get(key).and_then(Value::as_i64)
+}
+
+fn nested_token_count(usage: &Value, details_key: &str, token_key: &str) -> Option<i64> {
+    usage
+        .get(details_key)
+        .and_then(|details| details.get(token_key))
+        .and_then(Value::as_i64)
 }
 
 #[cfg(test)]
@@ -166,15 +251,23 @@ mod tests {
             1,
             StepKind::ModelCall,
             json!({
+                "created": 123,
+                "model": "test-model",
                 "choices": [{"message": {"role":"assistant","content":"hello world"}}]
             }),
         )];
         let r = assemble_from_chain("abc", &chain);
         assert_eq!(r["object"], "response");
         assert_eq!(r["status"], "completed");
+        assert_eq!(r["created_at"], 123);
+        assert_eq!(r["completed_at"], 123);
+        assert_eq!(r["model"], "test-model");
+        assert_eq!(r["tools"].as_array().unwrap().len(), 0);
         let output = r["output"].as_array().unwrap();
         assert_eq!(output.len(), 1);
         assert_eq!(output[0]["type"], "message");
+        assert_eq!(output[0]["id"], "msg_1");
+        assert_eq!(output[0]["status"], "completed");
         assert_eq!(output[0]["content"][0]["text"], "hello world");
     }
 
@@ -208,9 +301,13 @@ mod tests {
         // assistant message (from step 3)
         assert_eq!(output.len(), 3);
         assert_eq!(output[0]["type"], "function_call");
+        assert_eq!(output[0]["id"], "fc_1_0");
+        assert_eq!(output[0]["status"], "completed");
         assert_eq!(output[0]["call_id"], "call_1");
         assert_eq!(output[0]["name"], "weather");
         assert_eq!(output[1]["type"], "function_call_output");
+        assert_eq!(output[1]["id"], "fco_2");
+        assert_eq!(output[1]["status"], "completed");
         assert_eq!(output[1]["call_id"], "call_1");
         assert_eq!(output[2]["type"], "message");
         assert_eq!(output[2]["content"][0]["text"], "It's 72 in Paris");
@@ -224,7 +321,12 @@ mod tests {
                 StepKind::ModelCall,
                 json!({
                     "choices": [{"message": {"role":"assistant","content":"a"}}],
-                    "usage": {"prompt_tokens": 10, "completion_tokens": 20}
+                    "usage": {
+                        "prompt_tokens": 10,
+                        "completion_tokens": 20,
+                        "prompt_tokens_details": {"cached_tokens": 3},
+                        "completion_tokens_details": {"reasoning_tokens": 4}
+                    }
                 }),
             ),
             step(
@@ -237,7 +339,10 @@ mod tests {
             ),
         ];
         let r = assemble_from_chain("x", &chain);
-        assert_eq!(r["usage"]["prompt_tokens"], 15);
-        assert_eq!(r["usage"]["completion_tokens"], 35);
+        assert_eq!(r["usage"]["input_tokens"], 15);
+        assert_eq!(r["usage"]["output_tokens"], 35);
+        assert_eq!(r["usage"]["total_tokens"], 50);
+        assert_eq!(r["usage"]["input_tokens_details"]["cached_tokens"], 3);
+        assert_eq!(r["usage"]["output_tokens_details"]["reasoning_tokens"], 4);
     }
 }
