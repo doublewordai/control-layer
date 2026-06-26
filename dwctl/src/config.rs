@@ -641,7 +641,7 @@ impl Default for Metadata {
         Self {
             region: None,
             organization: None,
-            docs_url: "https://docs.doubleword.ai/control-layer".to_string(),
+            docs_url: "https://doublewordai.github.io/control-layer/".to_string(),
             docs_jsonl_url: None,
             title: None,
             ai_api_base_url: None,
