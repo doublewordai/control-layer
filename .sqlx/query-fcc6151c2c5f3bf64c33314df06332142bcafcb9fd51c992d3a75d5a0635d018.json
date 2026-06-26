@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT dm.id\n            FROM deployed_models dm\n            WHERE dm.deleted = FALSE\n              AND (\n                EXISTS (\n                    SELECT 1 FROM user_groups ug\n                    INNER JOIN deployment_groups dg ON ug.group_id = dg.group_id\n                    WHERE dg.deployment_id = dm.id AND ug.user_id = $1\n                )\n                OR EXISTS (\n                    SELECT 1 FROM deployment_groups dg\n                    WHERE dg.deployment_id = dm.id\n                      AND dg.group_id = '00000000-0000-0000-0000-000000000000'\n                )\n                OR dm.alias = ANY($2::text[])\n              )\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "TextArray"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "fcc6151c2c5f3bf64c33314df06332142bcafcb9fd51c992d3a75d5a0635d018"
+}
