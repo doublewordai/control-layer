@@ -207,6 +207,41 @@ pub struct Usage {
     pub cache_creation_input_tokens: Option<u64>,
 }
 
+// ---------------------------------------------------------------------------
+// Models-list response types (`GET /v1/models`, Anthropic shape).
+// ---------------------------------------------------------------------------
+
+/// An outbound Anthropic models-list response. Anthropic paginates with
+/// `first_id`/`last_id`/`has_more`; we return the whole accessible set in one
+/// page, so `has_more` is always `false`.
+#[derive(Debug, Serialize)]
+pub struct ModelsListResponse {
+    pub data: Vec<ModelObject>,
+    pub has_more: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_id: Option<String>,
+}
+
+/// A single model in the list. `display_name` mirrors the id (the gateway has no
+/// separate human label); `created_at` is RFC 3339.
+#[derive(Debug, Serialize)]
+pub struct ModelObject {
+    #[serde(rename = "type")]
+    pub object_type: ModelObjectType,
+    pub id: String,
+    pub display_name: String,
+    pub created_at: String,
+}
+
+/// Always `"model"`.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelObjectType {
+    Model,
+}
+
 /// The Anthropic error envelope (`{"type":"error","error":{...}}`).
 #[derive(Debug, Serialize)]
 pub struct ErrorResponse {

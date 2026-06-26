@@ -1,6 +1,9 @@
-//! Anthropic Messages (`/v1/messages`) edge translator.
+//! Anthropic edge translators. This module hosts the Messages (`/v1/messages`)
+//! translator [`AnthropicMessages`] and, in the [`models`] submodule, the model
+//! listing (`/v1/models`) translator.
 
 pub mod model;
+pub mod models;
 pub mod request;
 pub mod response;
 pub mod streaming;

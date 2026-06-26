@@ -1659,10 +1659,12 @@ pub async fn build_router(
             0 => usize::MAX,
             n => usize::try_from(n).unwrap_or(usize::MAX),
         };
-        let translation_registry = crate::inference::translation::TranslationRegistry::new(vec![std::sync::Arc::new(
-            crate::inference::translation::anthropic::AnthropicMessages,
-        )])
-        .with_max_body_size(translation_body_limit);
+        let translators: Vec<std::sync::Arc<dyn crate::inference::translation::ProtocolTranslator>> = vec![
+            std::sync::Arc::new(crate::inference::translation::anthropic::AnthropicMessages),
+            std::sync::Arc::new(crate::inference::translation::anthropic::models::AnthropicModels),
+        ];
+        let translation_registry =
+            crate::inference::translation::TranslationRegistry::new(translators).with_max_body_size(translation_body_limit);
         onwards_router.layer(middleware::from_fn_with_state(
             translation_registry,
             crate::inference::translation::middleware::translation_middleware,
