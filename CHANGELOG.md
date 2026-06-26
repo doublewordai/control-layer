@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.64.0](https://github.com/doublewordai/control-layer/compare/v8.63.0...v8.64.0) (2026-06-26)
+
+
+### Features
+
+* erase a deleted user's API keys and fusillade data ([#1174](https://github.com/doublewordai/control-layer/issues/1174)) ([c5182c8](https://github.com/doublewordai/control-layer/commit/c5182c8952036823bc0a734dc478382a7860c01c))
+
 ## [8.63.0](https://github.com/doublewordai/control-layer/compare/v8.62.0...v8.63.0) (2026-06-25)
 
 
