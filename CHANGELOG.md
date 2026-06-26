@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.65.0](https://github.com/doublewordai/control-layer/compare/v8.64.0...v8.65.0) (2026-06-26)
+
+
+### Features
+
+* serve GET /v1/models in Anthropic format ([#1181](https://github.com/doublewordai/control-layer/issues/1181)) ([7ee3ac6](https://github.com/doublewordai/control-layer/commit/7ee3ac69c7b89466d5da7f666d8d3a563c4a554b))
+
 ## [8.64.0](https://github.com/doublewordai/control-layer/compare/v8.63.0...v8.64.0) (2026-06-26)
 
 
