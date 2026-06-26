@@ -805,7 +805,9 @@ pub struct ModelComponentCreate {
     /// Whether this component is enabled
     #[serde(default = "default_enabled")]
     pub enabled: bool,
-    /// Sort order for priority-based routing (lower = higher priority)
+    /// Deprecated/ignored: the priority position is assigned by the server when a
+    /// component is added (appended after the current last component). Use the
+    /// PATCH endpoint's `sort_order` to reorder. Retained for API compatibility.
     #[serde(default)]
     pub sort_order: i32,
 }
@@ -825,7 +827,10 @@ pub struct ModelComponentUpdate {
     pub weight: Option<i32>,
     /// Whether this component is enabled
     pub enabled: Option<bool>,
-    /// Sort order for priority-based routing (lower = higher priority)
+    /// Target priority position (0 = highest priority / tried first). When set, the
+    /// component is moved to this position and the composite is renumbered to a
+    /// dense, unique 0..n-1 sequence — two components can never share a position.
+    /// Out-of-range values are clamped. Omit to leave the order unchanged.
     pub sort_order: Option<i32>,
 }
 

@@ -524,7 +524,12 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
           AND cm.deleted = FALSE
           AND dmc.enabled = TRUE
           AND dm.deleted = FALSE
-        ORDER BY cm.id, dmc.sort_order ASC
+        -- Deterministic priority order: sort_order is the failover order onwards
+        -- uses (Priority strategy iterates providers in definition order). The
+        -- weight/created_at keys break any residual sort_order tie the same way
+        -- the admin API does, so the provider shown as "Primary" is the one
+        -- onwards actually tries first.
+        ORDER BY cm.id, dmc.sort_order ASC, dmc.weight DESC, dmc.created_at ASC
         "#
     )
     .fetch_all(db)

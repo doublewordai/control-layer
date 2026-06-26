@@ -4,7 +4,7 @@ use sqlx_pool_router::PoolProvider;
 
 use crate::api::models::deployments::{ModelFacets, ModelListResponse, TrafficRoutingAction, TrafficRoutingRule};
 use crate::db::models::deployments::{
-    MODEL_CATALOG_METADATA_MAX_BYTES, MODEL_CATALOG_METADATA_MAX_EXTRA_KEYS, ModelCatalogMetadata, TrafficRuleAction,
+    LoadBalancingStrategy, MODEL_CATALOG_METADATA_MAX_BYTES, MODEL_CATALOG_METADATA_MAX_EXTRA_KEYS, ModelCatalogMetadata, TrafficRuleAction,
 };
 use crate::db::models::tariffs::TariffCreateDBRequest;
 use crate::{
@@ -685,7 +685,7 @@ pub async fn update_deployed_model<P: PoolProvider>(
     // We also keep the current row so we can (a) validate the *merged* backoff
     // state — not just the fields in this PATCH — and (b) derive the
     // standard-model fallback invariant below.
-    let (model_alias, is_composite, cur_initial, cur_max, cur_factor, cur_total) = {
+    let (model_alias, is_composite, prev_lb_strategy, cur_initial, cur_max, cur_factor, cur_total) = {
         let mut repo = Deployments::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
         match repo.get_by_id(deployment_id).await {
             Ok(Some(model)) => {
@@ -698,6 +698,7 @@ pub async fn update_deployed_model<P: PoolProvider>(
                 (
                     model.alias.clone(),
                     model.is_composite,
+                    model.lb_strategy,
                     model.backoff_initial_ms,
                     model.backoff_max_ms,
                     model.backoff_factor,
@@ -768,6 +769,16 @@ pub async fn update_deployed_model<P: PoolProvider>(
     let db_request = DeploymentUpdateDBRequest::from(update);
     let mut repo = Deployments::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
     let model = repo.update(deployment_id, &db_request).await?;
+
+    // When a composite is switched into `priority` load balancing, derive the
+    // failover order from the existing weights (highest weight = highest
+    // priority) instead of leaving every component at the default sort_order = 0.
+    // Only on the actual transition, so a later weight tweak doesn't clobber a
+    // hand-tuned priority order.
+    if is_composite && prev_lb_strategy != LoadBalancingStrategy::Priority && model.lb_strategy == LoadBalancingStrategy::Priority {
+        let mut repo = Deployments::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
+        repo.renumber_components_by_weight(deployment_id).await?;
+    }
 
     // Apply traffic rule changes
     match &resolved_rules {
@@ -1180,14 +1191,18 @@ pub async fn add_model_component<P: PoolProvider>(
         }
     }
 
-    // Add the component
+    // Add the component. Its priority position is always assigned by the server
+    // as "one past the current last component" so sort_order stays unique and
+    // dense within the composite — the client-supplied `sort_order` is ignored
+    // (reordering is done via PATCH, which moves-and-reindexes).
     let mut repo = Deployments::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
+    let sort_order = repo.next_component_sort_order(id).await?;
     let request = DeploymentComponentCreateDBRequest {
         composite_model_id: id,
         deployed_model_id: component_id,
         weight: body.weight,
         enabled: body.enabled,
-        sort_order: body.sort_order,
+        sort_order,
     };
 
     let component = repo.add_component(&request).await?;
@@ -1236,16 +1251,19 @@ pub async fn update_model_component<P: PoolProvider>(
         });
     }
 
-    let mut pool_conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
-    let mut repo = Deployments::new(&mut pool_conn);
-
-    let component = repo
-        .update_component(id, component_id, body.weight, body.enabled, body.sort_order)
-        .await?
-        .ok_or_else(|| Error::NotFound {
-            resource: "component".to_string(),
-            id: format!("{}/{}", id, component_id),
-        })?;
+    // A sort_order change moves the component and renumbers the whole composite,
+    // so run on a transaction to keep that multi-row rewrite atomic.
+    let mut tx = state.db.write().begin().await.map_err(|e| Error::Database(e.into()))?;
+    let component = {
+        let mut repo = Deployments::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
+        repo.update_component(id, component_id, body.weight, body.enabled, body.sort_order)
+            .await?
+            .ok_or_else(|| Error::NotFound {
+                resource: "component".to_string(),
+                id: format!("{}/{}", id, component_id),
+            })?
+    };
+    tx.commit().await.map_err(|e| Error::Database(e.into()))?;
 
     Ok(Json(db_component_to_response(component)))
 }

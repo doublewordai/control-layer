@@ -1,0 +1,25 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE deployed_model_components\n             SET weight = COALESCE($3, weight),\n                 enabled = COALESCE($4, enabled)\n             WHERE composite_model_id = $1 AND deployed_model_id = $2\n             RETURNING id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Int4",
+        "Bool"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "05f12506a374a00def551c8f0cef40a5620e2454490519e221105600b91682c6"
+}
