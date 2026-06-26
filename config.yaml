@@ -314,6 +314,7 @@ batches:
     - "/v1/completions"
     - "/v1/embeddings"
     - "/v1/responses"
+    - "/v1/messages"
 
   # Files configuration for batch file uploads/downloads
   # NOTE: max_file_size has moved to limits.files.max_file_size
