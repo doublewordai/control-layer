@@ -1,11 +1,11 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT EXISTS(SELECT 1 FROM deployed_models WHERE id = $1 AND deleted = false)",
+  "query": "SELECT EXISTS(SELECT 1 FROM deployed_models WHERE id = $1 AND deleted = false) AS \"exists!\"",
   "describe": {
     "columns": [
       {
         "ordinal": 0,
-        "name": "exists",
+        "name": "exists!",
         "type_info": "Bool"
       }
     ],
@@ -18,5 +18,5 @@
       null
     ]
   },
-  "hash": "47a80ebff064aa32e7f48be4f6c5ba465592ccea9a3b69181cd8509d71d5619b"
+  "hash": "665baff6a7a43a4a117e6a47be12b504290513cebda8ac9191b1cfa303db2ad9"
 }
