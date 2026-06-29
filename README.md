@@ -1,7 +1,7 @@
 # The Doubleword Control Layer (dwctl)
 
-[Announcement](https://www.doubleword.ai/resources/doubleword-open-sources-the-worlds-fastest-ai-gateway) | [Benchmarking](https://docs.doubleword.ai/conceptual/21-19-2025-dwctl-benchmark) | [Technical Blog](https://fergusfinn.com/blog/control-layer/) |
-[Documentation](https://docs.doubleword.ai/control-layer/)
+[Announcement](https://www.doubleword.ai/resources/doubleword-open-sources-the-worlds-fastest-ai-gateway) | [Benchmarking](https://fergusfinn.com/blog/control-layer-benchmarking) | [Technical Blog](https://fergusfinn.com/blog/control-layer/) |
+[Documentation](https://doublewordai.github.io/control-layer/)
 
 The Doubleword Control Layer (dwctl) is the world’s fastest AI model gateway (450x less overhead than LiteLLM). It provides a single, high-performance interface for routing, managing, and securing inference across model providers, users and deployments - both open-source and proprietary.
 
@@ -29,7 +29,7 @@ wget https://raw.githubusercontent.com/doublewordai/control-layer/refs/heads/mai
 docker compose -f docker-compose.yml up -d
 ```
 
-Navigate to `http://localhost:3001` to get started. When you get to the login page you will be prompting to sign in with a username and password. Please refer to the configuration section below for how to set up an admin user. You can then refer to the documentation [here](https://docs.doubleword.ai/control-layer/usage/models-and-access) to start playing around with Control Layer features.
+Navigate to `http://localhost:3001` to get started. When you get to the login page you will be prompted to sign in with a username and password. Please refer to the configuration section below for how to set up an admin user. You can then refer to the documentation [here](https://doublewordai.github.io/control-layer/getting-started.html) to start playing around with Control Layer features.
 
 To upgrade to new versions of the control layer as they come out, run the following from the same directory:
 
@@ -51,7 +51,7 @@ docker run -p 3001:3001 \
 
 Your DATABASE_URL should match the following naming convention `postgres://username:password@localhost:5432/database_name`.  Make sure to replace the secret key with a secure random value in production.
 
-Navigate to `http://localhost:3001` to get started. When you get to the login page you will be prompting to sign in with a username and password. Please refer to the configuration section below for how to set up an admin user. You can then refer to the documentation [here](https://docs.doubleword.ai/control-layer/usage/models-and-access) to start playing around with Control Layer features.  
+Navigate to `http://localhost:3001` to get started. When you get to the login page you will be prompted to sign in with a username and password. Please refer to the configuration section below for how to set up an admin user. You can then refer to the documentation [here](https://doublewordai.github.io/control-layer/getting-started.html) to start playing around with Control Layer features.  
 
 ## Configuration
 

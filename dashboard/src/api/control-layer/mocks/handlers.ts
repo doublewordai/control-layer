@@ -1875,7 +1875,7 @@ export const handlers = [
       region: "EU West",
       organization: "Acme Corp",
       payment_enabled: true,
-      docs_url: "https://docs.doubleword.ai/control-layer",
+      docs_url: "https://doublewordai.github.io/control-layer/",
       batches: {
         enabled: true,
         allowed_completion_windows: ["24h", "1h"],
