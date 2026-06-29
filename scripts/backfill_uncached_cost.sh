@@ -59,6 +59,9 @@ batches=0
 SECONDS=0   # bash builtin: wall-clock seconds since reset
 while [ "$CURSOR" -lt "$MAX_ID" ]; do
   hi=$(( CURSOR + BATCH_SIZE ))
+  # Cap the final batch at MAX_ID so the printed `id<=` and the end CURSOR don't overshoot
+  # the table's actual max id (cosmetic + makes a resume's START_ID unambiguous).
+  if [ "$hi" -gt "$MAX_ID" ]; then hi="$MAX_ID"; fi
   # One batch = one committed transaction. The UPDATE drives off the PK range; the row count
   # comes back via a CTE + final SELECT count(*) (no grep — a psql/DB error still fails the
   # script under set -e, rather than reading as a clean "0 rows").

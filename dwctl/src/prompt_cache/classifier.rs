@@ -149,7 +149,7 @@ impl Classifier {
                 }
                 // Best-effort: degrade to no caching (uniform zeros). Log at debug so the
                 // silent degradation is diagnosable without warn-level noise on every odd body.
-                tracing::debug!(error = %e, virtual_model = req.virtual_model, "cache classify: body not cacheable (unparseable / >4 breakpoints)");
+                tracing::debug!(error = %e, virtual_model = req.virtual_model, "cache classify: body not cacheable (invalid cache_control markers / unparseable JSON)");
                 return Ok(ClassifyOutcome::zero_active());
             }
         };

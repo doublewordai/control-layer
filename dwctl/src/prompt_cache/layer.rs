@@ -154,8 +154,10 @@ pub async fn cache_middleware(State(state): State<CacheLayerState>, request: Req
                 ClassifyOutcome::inactive()
             }
             Ok(Err(e)) => {
-                cache_metrics::record_classify("panicked");
-                warn!(error = %e, "cache classify task panicked");
+                // JoinError is a panic OR a cancellation (e.g. runtime shutdown); only the
+                // former is a bug, so don't fold cancellations into the "panicked" series.
+                cache_metrics::record_classify(if e.is_panic() { "panicked" } else { "error" });
+                warn!(error = %e, "cache classify task failed");
                 ClassifyOutcome::inactive()
             }
             Err(_) => {
