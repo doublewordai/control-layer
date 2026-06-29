@@ -3,9 +3,13 @@
 //! Thin `record_*` helpers over the `metrics` facade, mirroring [`crate::metrics::errors`].
 //! Conventions:
 //! - Every metric name is `dwctl_cache_*`.
-//! - Low-cardinality labels are `&'static str` literals (`outcome`/`reason`/`tier`/
-//!   `result`/`marked`). `model` is the deployed alias (bounded, ~dozens) as an owned
-//!   `String`. NEVER label by principal / api-key / correlation-id / prefix-hash.
+//! - Low-cardinality labels are `&'static str` literals (`outcome`/`reason`/`tier`/`result`/`marked`).
+//!   The one dynamic label is `model` (owned `String`), attached **only** by `record_token_volumes`,
+//!   which is emitted solely for cache-ENABLED models — a small, validated, bounded set (the alias
+//!   has a tariff). The all-traffic metrics (`marker_requests`, `requests`) carry **no `model` label**,
+//!   because the raw request `model` is unvalidated there (unknown/typo strings) and would be
+//!   unbounded cardinality. Never label `model` from unvalidated input, nor by principal / api-key /
+//!   correlation-id / prefix-hash.
 //! - Counters created lazily on first emission (no pre-registration needed, as in
 //!   `errors.rs`); histograms use the recorder's default buckets unless tuned in the
 //!   recorder builder.
@@ -14,14 +18,13 @@ use metrics::{counter, histogram};
 
 // ── Adoption ──────────────────────────────────────────────────────────────────
 
-/// Every chat-completions request the layer sees, labelled by whether the client
-/// included any `cache_control` markers. Adoption % = `marked="true"` / all. Measured
-/// at the marker-strip step, so it covers ALL traffic regardless of model enablement,
-/// floor, or read/write outcome — i.e. how many users are putting caching in their prompts.
-pub fn record_marker_request(model: &str, marked: bool) {
+/// Every chat-completions request the layer sees, labelled by whether the client included
+/// any `cache_control` markers. Adoption % = `marked="true"` / all. Measured at the strip
+/// step — before the model is validated — so it covers ALL traffic; deliberately **no
+/// `model` label** (raw, unbounded user input here). Per-model lives on `record_token_volumes`.
+pub fn record_marker_request(marked: bool) {
     counter!(
         "dwctl_cache_marker_requests_total",
-        "model" => model.to_owned(),
         "marked" => if marked { "true" } else { "false" }
     )
     .increment(1);
@@ -29,17 +32,21 @@ pub fn record_marker_request(model: &str, marked: bool) {
 
 // ── Request outcome + token volumes ───────────────────────────────────────────
 
-/// Request-level cache behaviour. `outcome` ∈ `read` | `create_only` | `read_and_create`
-/// | `zero_active` (enabled but nothing cached) | `inactive` (model not enabled / no key).
-pub fn record_request_outcome(model: &str, outcome: &'static str) {
-    counter!("dwctl_cache_requests_total", "model" => model.to_owned(), "outcome" => outcome).increment(1);
+/// Request-level cache behaviour across ALL traffic. `outcome` ∈ `read` | `create_only` |
+/// `read_and_create` | `zero_active` (enabled but nothing cached) | `inactive` (model not
+/// enabled / no key). **No `model` label** — `inactive` covers unknown/typo models (raw
+/// input → unbounded); per-model volumes are on `record_token_volumes` (enabled-only).
+pub fn record_request_outcome(outcome: &'static str) {
+    counter!("dwctl_cache_requests_total", "outcome" => outcome).increment(1);
 }
 
-/// Token volumes for a cache-active request, from the classifier's split. Feeds the
-/// cache-reuse rate = `read / (read + creation)`. The full-prompt hit rate and the
-/// uncached residual are [DB]-derived from `http_analytics` (`prompt_tokens − read −
-/// creation`), which is also the authoritative billing source — this counter is the
-/// real-time *classified* volume (emitted before the commit success-gate).
+/// Token volumes for a cache-active request, from the classifier's split. The `model`
+/// label is safe here (unlike the all-traffic metrics): this is emitted only for
+/// cache-ACTIVE requests, so `model` is always a tariffed/enabled alias — a bounded,
+/// validated set, never raw request input. Feeds the cache-reuse rate =
+/// `read / (read + creation)`. The full-prompt hit rate and the uncached residual are
+/// [DB]-derived from `http_analytics` (`prompt_tokens − read − creation`), which is also
+/// the authoritative billing source — this counter is the real-time *classified* volume.
 pub fn record_token_volumes(model: &str, read: u64, creation_5m: u64, creation_1h: u64, creation_24h: u64) {
     if read > 0 {
         counter!("dwctl_cache_read_input_tokens_total", "model" => model.to_owned()).increment(read);

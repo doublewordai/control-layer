@@ -129,9 +129,7 @@ pub async fn cache_middleware(State(state): State<CacheLayerState>, request: Req
     // Re-frame: set Content-Length and drop any stale Transfer-Encoding (sending both is
     // invalid HTTP). `from(u64)` is the unambiguous numeric HeaderValue ctor.
     let stripped = strip_cache_control(&body_bytes);
-    if !model_label.is_empty() {
-        cache_metrics::record_marker_request(&model_label, stripped.is_some());
-    }
+    cache_metrics::record_marker_request(stripped.is_some());
     let forward = stripped.unwrap_or(body_bytes);
     parts.headers.remove(header::TRANSFER_ENCODING);
     parts
@@ -169,22 +167,21 @@ pub async fn cache_middleware(State(state): State<CacheLayerState>, request: Req
         None => ClassifyOutcome::inactive(),
     };
 
-    // Request-level cache outcome (one series per model), emitted for the whole cohort
-    // (incl. inactive) so adoption + read/write mix are visible. Skip the rare model-less body.
-    if !model_label.is_empty() {
-        let outcome_label = if !outcome.active {
-            "inactive"
-        } else if outcome.stats.read > 0 && outcome.stats.creation_total() > 0 {
-            "read_and_create"
-        } else if outcome.stats.read > 0 {
-            "read"
-        } else if outcome.stats.creation_total() > 0 {
-            "create_only"
-        } else {
-            "zero_active"
-        };
-        cache_metrics::record_request_outcome(&model_label, outcome_label);
-    }
+    // Request-level cache outcome across ALL traffic (incl. inactive). No model label:
+    // `inactive` covers unknown/typo models (raw client input) → unbounded cardinality;
+    // per-model volumes live on record_token_volumes (enabled models only).
+    let outcome_label = if !outcome.active {
+        "inactive"
+    } else if outcome.stats.read > 0 && outcome.stats.creation_total() > 0 {
+        "read_and_create"
+    } else if outcome.stats.read > 0 {
+        "read"
+    } else if outcome.stats.creation_total() > 0 {
+        "create_only"
+    } else {
+        "zero_active"
+    };
+    cache_metrics::record_request_outcome(outcome_label);
 
     // Disabled model (or a degraded classify) → leave the response untouched. Enabled
     // models always get the cache_* fields (zeros when this prompt cached nothing), so
