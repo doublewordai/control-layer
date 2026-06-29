@@ -139,7 +139,7 @@ metadata:
   title: "Doubleword Control Layer"
   # region: "UK South"
   # organization: "ACME Corp"
-  docs_url: "https://docs.doubleword.ai/batches"
+  docs_url: "https://doublewordai.github.io/control-layer/"
   docs_jsonl_url: "https://docs.doubleword.ai/batches/jsonl-files"
 
 # Authentication configuration
