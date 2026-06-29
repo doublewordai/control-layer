@@ -38,6 +38,8 @@ export const queryKeys = {
       search?: string;
       is_composite?: boolean;
       group?: string;
+      sort?: string;
+      sort_direction?: string;
     }) => ["models", "metrics", options] as const,
   },
 

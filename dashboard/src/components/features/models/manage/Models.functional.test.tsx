@@ -171,10 +171,15 @@ describe("Models Component - Functional Tests", () => {
       await user.click(
         within(container).getByRole("button", { name: /filter models/i }),
       );
-      await user.click(
-        screen.getByRole("button", { name: /filter by group/i }),
-      );
+      const groupFilter = screen.getByRole("button", { name: "Groups" });
+      expect(groupFilter).toHaveAccessibleDescription("No groups selected");
+
+      await user.click(groupFilter);
       await user.click(screen.getByRole("button", { name: "ML Research" }));
+
+      expect(groupFilter).toHaveAccessibleDescription(
+        "Selected groups: ML Research",
+      );
 
       await waitFor(() => {
         expect(
