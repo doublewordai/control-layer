@@ -121,10 +121,12 @@ pub fn record_commit_duration(seconds: f64) {
 
 // ── Safety / anti-abuse ───────────────────────────────────────────────────────
 
-/// A cacheable request whose body exceeded the buffer limit (degraded to no-cache).
-/// No `model` label: the body can't be parsed for the model once the limit trips.
-pub fn record_body_limit_hit() {
-    counter!("dwctl_cache_body_limit_hits_total").increment(1);
+/// A cacheable request whose body couldn't be buffered — the configured body limit was
+/// exceeded OR the body stream errored — so it degraded to no-cache. (`to_bytes` doesn't
+/// distinguish the two without depending on axum-internal error types; both mean "couldn't
+/// read the body to classify".) No `model` label: the body isn't parsed once the read fails.
+pub fn record_body_read_failed() {
+    counter!("dwctl_cache_body_read_failed_total").increment(1);
 }
 
 /// Marker validation rejection. `reason` ∈ `too_many_breakpoints` | `invalid_ttl` | `unsupported_type`.

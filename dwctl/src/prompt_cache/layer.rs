@@ -78,7 +78,7 @@ pub async fn cache_middleware(State(state): State<CacheLayerState>, request: Req
             // body: an empty forward would surface to the client as a confusing JSON-parse 4xx
             // from onwards instead of a clear body-read error.
             warn!(error = %e, "Failed to read request body in cache middleware");
-            cache_metrics::record_body_limit_hit();
+            cache_metrics::record_body_read_failed();
             let body = serde_json::json!({
                 "error": {
                     "message": format!("failed to read request body: {e}"),
@@ -193,14 +193,17 @@ pub async fn cache_middleware(State(state): State<CacheLayerState>, request: Req
         return response;
     }
 
-    // Classified token volumes (model-labelled) for the usage dashboards.
-    cache_metrics::record_token_volumes(
-        &model_label,
-        outcome.stats.read,
-        outcome.stats.creation_5m,
-        outcome.stats.creation_1h,
-        outcome.stats.creation_24h,
-    );
+    // Classified token volumes (model-labelled) for the usage dashboards. Guarded on a
+    // non-empty model like the other cache metrics, to avoid a stray model="" series.
+    if !model_label.is_empty() {
+        cache_metrics::record_token_volumes(
+            &model_label,
+            outcome.stats.read,
+            outcome.stats.creation_5m,
+            outcome.stats.creation_1h,
+            outcome.stats.creation_24h,
+        );
+    }
 
     let (response, gate) = inject_cache_stats_into_response(response, &outcome.stats).await;
 

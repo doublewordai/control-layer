@@ -344,7 +344,7 @@ fn get_or_install_prometheus_handle() -> PrometheusHandle {
             const CACHE_SYNC_LAG_BUCKETS: &[f64] = &[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0];
 
             // Custom histogram buckets for the cached-input-pricing layer latencies (1ms to 10s):
-            // classify, tokenizer-svc call, commit, and the streaming terminal-frame wait.
+            // classify, tokenizer-svc call, and commit.
             const CACHE_LATENCY_BUCKETS: &[f64] = &[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0];
 
             // Custom histogram buckets for fusillade retry attempts (0-10 retries)
@@ -355,11 +355,20 @@ fn get_or_install_prometheus_handle() -> PrometheusHandle {
                 .expect("Failed to set custom buckets for dwctl_analytics_lag_seconds")
                 .set_buckets_for_metric(Matcher::Full("dwctl_cache_sync_lag_seconds".to_string()), CACHE_SYNC_LAG_BUCKETS)
                 .expect("Failed to set custom buckets for dwctl_cache_sync_lag_seconds")
-                .set_buckets_for_metric(Matcher::Full("dwctl_cache_classify_duration_seconds".to_string()), CACHE_LATENCY_BUCKETS)
+                .set_buckets_for_metric(
+                    Matcher::Full("dwctl_cache_classify_duration_seconds".to_string()),
+                    CACHE_LATENCY_BUCKETS,
+                )
                 .expect("Failed to set custom buckets for dwctl_cache_classify_duration_seconds")
-                .set_buckets_for_metric(Matcher::Full("dwctl_cache_tokenizer_duration_seconds".to_string()), CACHE_LATENCY_BUCKETS)
+                .set_buckets_for_metric(
+                    Matcher::Full("dwctl_cache_tokenizer_duration_seconds".to_string()),
+                    CACHE_LATENCY_BUCKETS,
+                )
                 .expect("Failed to set custom buckets for dwctl_cache_tokenizer_duration_seconds")
-                .set_buckets_for_metric(Matcher::Full("dwctl_cache_commit_duration_seconds".to_string()), CACHE_LATENCY_BUCKETS)
+                .set_buckets_for_metric(
+                    Matcher::Full("dwctl_cache_commit_duration_seconds".to_string()),
+                    CACHE_LATENCY_BUCKETS,
+                )
                 .expect("Failed to set custom buckets for dwctl_cache_commit_duration_seconds")
                 .set_buckets_for_metric(
                     Matcher::Full("fusillade_retry_attempts_on_success".to_string()),
