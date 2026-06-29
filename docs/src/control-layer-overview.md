@@ -24,9 +24,9 @@ A single OpenAI-compatible gateway to all of your AI models across all your prov
 
 ![OpenAI-compatible API example](control-layer-api-example.png)
 
-**[Learn more about API access →](how-to/api)**
+**[Learn more about API access ->](how-to/api.md)**
 
-**[Learn more about adding endpoints →](how-to/endpoints)**
+**[Learn more about adding endpoints ->](how-to/endpoints.md)**
 
 ### **Centralized User Management & API Key Authentication**
 
@@ -36,7 +36,7 @@ The Control Layer turns unauthenticated, self-hosted model deployments into prod
 
 ![Control Layer Users & Groups Interface](control-layer-users-groups.png)
 
-**[Learn more about Users & Groups →](how-to/users-and-groups)**
+**[Learn more about Users & Groups ->](how-to/users-and-groups.md)**
 
 ### **Real-Time Monitoring & Analytics**
 
@@ -54,4 +54,4 @@ Test and compare generative, embedding, and reranker models side-by-side before 
 
 ![Control Layer Playground](control-layer-playground.png)
 
-## [Get started →](getting-started)
+## [Get started ->](getting-started.md)

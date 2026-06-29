@@ -96,7 +96,7 @@ Admins create users manually via the UI.
 
 Once deployed:
 
-1. Set up health monitoring for your endpoints (see [Set Up Health Monitoring](how-to/health-monitoring))
+1. Set up health monitoring for your endpoints (see [Set Up Health Monitoring](health-monitoring.md))
 2. Monitor the Control Layer's `/health` endpoint from your infrastructure
 3. Set up log aggregation for request logs
 
