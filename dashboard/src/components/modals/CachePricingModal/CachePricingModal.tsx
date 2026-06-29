@@ -107,6 +107,21 @@ export const CachePricingModal: React.FC<CachePricingModalProps> = ({
       if (form.enabled) {
         // Blank field → omit, so the backend fills it from the global default.
         const dec = (s: string) => (s.trim() === "" ? undefined : s.trim());
+
+        // `type="number"` accepts values parseInt would mangle ("1e3" → 1, "5.7" → 5),
+        // silently saving the wrong floor. Parse with Number and require a clean,
+        // non-negative integer instead.
+        const minPrefixRaw = form.min_prefix_tokens.trim();
+        let min_prefix_tokens: number | undefined;
+        if (minPrefixRaw !== "") {
+          const n = Number(minPrefixRaw);
+          if (!Number.isInteger(n) || n < 0) {
+            toast.error("Minimum prefix tokens must be a non-negative integer.");
+            return;
+          }
+          min_prefix_tokens = n;
+        }
+
         await updateMutation.mutateAsync({
           modelId,
           data: {
@@ -114,10 +129,7 @@ export const CachePricingModal: React.FC<CachePricingModalProps> = ({
             write_multiplier_1h: dec(form.write_multiplier_1h),
             write_multiplier_24h: dec(form.write_multiplier_24h),
             read_multiplier: dec(form.read_multiplier),
-            min_prefix_tokens:
-              form.min_prefix_tokens.trim() === ""
-                ? undefined
-                : parseInt(form.min_prefix_tokens, 10),
+            min_prefix_tokens,
           },
         });
         toast.success("Cache pricing updated");

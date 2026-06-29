@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { toast } from "sonner";
 import { CachePricingModal } from "./CachePricingModal";
 import * as hooks from "../../../api/control-layer/hooks";
 import type { CachePricing } from "../../../api/control-layer/types";
@@ -109,5 +110,21 @@ describe("CachePricingModal", () => {
 
     await waitFor(() => expect(deleteMock).toHaveBeenCalledWith("model-1"));
     expect(updateMock).not.toHaveBeenCalled();
+  });
+
+  it("rejects a non-integer minimum prefix instead of saving a mangled value", async () => {
+    const user = userEvent.setup();
+    setCurrent(enabledPricing);
+    renderModal();
+
+    const minPrefix = await screen.findByPlaceholderText("e.g. 1024");
+    await user.clear(minPrefix);
+    await user.type(minPrefix, "5.7");
+
+    const save = screen.getByRole("button", { name: /save changes/i });
+    await user.click(save);
+
+    expect(updateMock).not.toHaveBeenCalled();
+    expect(toast.error).toHaveBeenCalled();
   });
 });
