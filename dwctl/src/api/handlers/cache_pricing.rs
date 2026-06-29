@@ -6,34 +6,37 @@
 //! ~60s in-process resolver TTL), NOT by onwards' routing config — so a change takes
 //! effect within that TTL, no sync needed.
 
+use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use axum::Json;
 use rust_decimal::Decimal;
 use sqlx::PgConnection;
 use sqlx_pool_router::PoolProvider;
 
+use crate::AppState;
 use crate::api::models::cache_pricing::{CachePricingResponse, CachePricingUpdateRequest};
-use crate::auth::permissions::{operation, resource, RequiresPermission};
+use crate::auth::permissions::{RequiresPermission, operation, resource};
 use crate::db::handlers::{CacheTariffOverrides, CacheTariffs};
 use crate::errors::{Error, Result};
 use crate::types::DeploymentId;
-use crate::AppState;
 
 /// 404 unless the model exists and isn't soft-deleted (so enabling pricing on a bogus id
 /// fails cleanly rather than as an opaque FK violation).
 async fn ensure_model_exists(conn: &mut PgConnection, id: DeploymentId) -> Result<()> {
     let exists = sqlx::query_scalar!(
-        "SELECT EXISTS(SELECT 1 FROM deployed_models WHERE id = $1 AND deleted = false)",
+        r#"SELECT EXISTS(SELECT 1 FROM deployed_models WHERE id = $1 AND deleted = false) AS "exists!""#,
         id,
     )
     .fetch_one(&mut *conn)
     .await
     .map_err(|e| Error::Database(e.into()))?;
-    if exists == Some(true) {
+    if exists {
         Ok(())
     } else {
-        Err(Error::NotFound { resource: "Model".to_string(), id: id.to_string() })
+        Err(Error::NotFound {
+            resource: "Model".to_string(),
+            id: id.to_string(),
+        })
     }
 }
 
@@ -49,12 +52,16 @@ fn validate(req: &CachePricingUpdateRequest) -> Result<()> {
     ] {
         if let Some(v) = m {
             if v < Decimal::ZERO || v >= hundred {
-                return Err(Error::BadRequest { message: format!("{name} must be in [0, 100)") });
+                return Err(Error::BadRequest {
+                    message: format!("{name} must be in [0, 100)"),
+                });
             }
         }
     }
     if matches!(req.min_prefix_tokens, Some(n) if n < 0) {
-        return Err(Error::BadRequest { message: "min_prefix_tokens must be non-negative".to_string() });
+        return Err(Error::BadRequest {
+            message: "min_prefix_tokens must be non-negative".to_string(),
+        });
     }
     Ok(())
 }
@@ -68,6 +75,7 @@ fn validate(req: &CachePricingUpdateRequest) -> Result<()> {
     responses(
         (status = 200, description = "Current cache pricing (enabled=false if off)", body = CachePricingResponse),
         (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden (requires model-management access)"),
         (status = 404, description = "Model not found"),
     ),
     security(("BearerAuth" = []), ("CookieAuth" = []), ("X-Doubleword-User" = []))
@@ -98,6 +106,7 @@ pub async fn get_cache_pricing<P: PoolProvider>(
         (status = 200, description = "Cache pricing enabled/updated", body = CachePricingResponse),
         (status = 400, description = "Invalid pricing"),
         (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden (requires model-management access)"),
         (status = 404, description = "Model not found"),
     ),
     security(("BearerAuth" = []), ("CookieAuth" = []), ("X-Doubleword-User" = []))
@@ -139,6 +148,7 @@ pub async fn enable_cache_pricing<P: PoolProvider>(
     responses(
         (status = 204, description = "Cache pricing disabled (or already off)"),
         (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden (requires model-management access)"),
         (status = 404, description = "Model not found"),
     ),
     security(("BearerAuth" = []), ("CookieAuth" = []), ("X-Doubleword-User" = []))

@@ -233,8 +233,10 @@ const ModelInfo: React.FC = () => {
   } = useModel(modelId!, { include: includeParam });
 
   // Cache pricing is fetched separately (admin-only endpoint), not via the model include.
+  // Gated on `manage-models` to mirror the backend's `Models:UpdateAll` gate (the same one
+  // that guards base-price edits) rather than the incidental `manage-groups` proxy.
   const { data: cachePricing } = useModelCachePricing(modelId!, {
-    enabled: !!modelId && canManageGroups,
+    enabled: !!modelId && canManageModels,
   });
 
   const {
@@ -2526,7 +2528,7 @@ const ModelInfo: React.FC = () => {
                         </div>
                       }
                       {/* Cache Pricing Display (admin-only; data via the dedicated endpoint) */}
-                      {canManageGroups && (
+                      {canManageModels && (
                         <div className="border-t pt-6">
                           <div className="flex items-center justify-between mb-3">
                             <div className="flex items-center gap-1">

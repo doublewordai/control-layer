@@ -1279,8 +1279,14 @@ pub async fn build_router(
         .route("/models/{id}", patch(api::handlers::deployments::update_deployed_model))
         .route("/models/{id}", delete(api::handlers::deployments::delete_deployed_model))
         .route("/models/{id}/cache-pricing", get(api::handlers::cache_pricing::get_cache_pricing))
-        .route("/models/{id}/cache-pricing", put(api::handlers::cache_pricing::enable_cache_pricing))
-        .route("/models/{id}/cache-pricing", delete(api::handlers::cache_pricing::disable_cache_pricing))
+        .route(
+            "/models/{id}/cache-pricing",
+            put(api::handlers::cache_pricing::enable_cache_pricing),
+        )
+        .route(
+            "/models/{id}/cache-pricing",
+            delete(api::handlers::cache_pricing::disable_cache_pricing),
+        )
         .route(
             "/provider-display-configs",
             get(api::handlers::provider_display_configs::list_provider_display_configs),
