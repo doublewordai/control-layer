@@ -22,6 +22,7 @@ use crate::db::handlers::api_keys::ApiKeys;
 use crate::types::UserId;
 
 use super::index::CacheResult;
+use super::metrics as cache_metrics;
 
 /// Resolves bearer tokens to billing principals, backed by an in-process L1 memo
 /// over a DB read-through.
@@ -60,10 +61,14 @@ impl PrincipalResolver {
     /// secrets are crypto-random), and the TTL bounds even that. So caching `None` is fine.
     pub async fn resolve(&self, token: &str) -> CacheResult<Option<UserId>> {
         if let Some(cached) = self.l1.get(token).await {
+            // An L1 hit on a cached `None` is a cached *unknown* key, not a resolve hit —
+            // count it as unknown_key so key-probe / invalid-key volume stays accurate.
+            cache_metrics::record_principal_resolve(if cached.is_some() { "hit" } else { "unknown_key" });
             return Ok(cached);
         }
         let mut conn = self.pool.acquire().await?;
         let user_id = ApiKeys::new(&mut conn).get_user_id_by_secret(token).await?;
+        cache_metrics::record_principal_resolve(if user_id.is_some() { "miss" } else { "unknown_key" });
         self.l1.insert(token.to_string(), user_id).await;
         Ok(user_id)
     }

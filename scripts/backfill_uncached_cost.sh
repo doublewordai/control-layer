@@ -13,60 +13,82 @@
 # batches, each its own committed transaction, so locks/bloat stay small and replication /
 # autovacuum keep up. Safe to run while the app is live.
 #
-# Idempotent + resumable: the predicate `uncached_cost IS NULL AND total_cost IS NOT NULL`
-# only matches un-backfilled, *priced* rows — already-filled rows drop out, and unpriced
-# rows (total_cost NULL, correctly NULL list price) are never touched, so reruns terminate
-# cleanly with no wasted writes. Re-run any time; interrupt and resume freely.
+# Batching strategy — sweep the PRIMARY KEY (id) in fixed-width ranges. Each batch is a
+# bounded index-range scan on the existing PK, so the work per batch is constant and the
+# whole run is O(rows). We deliberately do NOT use the `WHERE uncached_cost IS NULL LIMIT n`
+# shape: with no index on that predicate it seq-scans, and as rows fill it must scan past the
+# already-done rows to find the next batch — degrading badly on a multi-GB table. The id
+# sweep needs no temporary index (it rides the PK), which is why the staging and prod runs
+# are identical, with no CREATE/DROP INDEX steps.
+#
+# Idempotent + resumable: only rows with `uncached_cost IS NULL AND total_cost IS NOT NULL`
+# are written, so already-filled and unpriced rows are no-ops. Re-run any time. To resume
+# after an interrupt, pass START_ID set to the last `id<=N` the run printed.
 #
 # Usage:
 #   DATABASE_URL=postgres://...  ./scripts/backfill_uncached_cost.sh
-# Optional env: BATCH_SIZE (default 10000), SLEEP_SECONDS between batches (default 0.2).
+# Optional env:
+#   BATCH_SIZE     id-range width swept per batch (default 20000; ~= rows/batch on a dense table)
+#   SLEEP_SECONDS  pause between batches — throttles WAL volume / replication lag (default 0.1)
+#   START_ID       resume from this id (default: the table's min id)
 
 set -euo pipefail
 
 : "${DATABASE_URL:?set DATABASE_URL to the http_analytics database}"
-BATCH_SIZE="${BATCH_SIZE:-10000}"
-SLEEP_SECONDS="${SLEEP_SECONDS:-0.2}"
+BATCH_SIZE="${BATCH_SIZE:-20000}"
+SLEEP_SECONDS="${SLEEP_SECONDS:-0.1}"
 
 # `-v ON_ERROR_STOP=1` makes psql exit non-zero on a SQL error (so set -e / assignments trip),
 # and `-X` ignores ~/.psqlrc so a user's config can't alter behaviour. Applied to every call.
-remaining() {
-  psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -X -qtAc \
-    "SELECT count(*) FROM http_analytics WHERE uncached_cost IS NULL AND total_cost IS NOT NULL;"
-}
+psql_q() { psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -X -qtAc "$1"; }
 
-# Capture into a variable first: `echo "$(remaining)"` would swallow a psql failure under
-# set -e (echo succeeds even if the substitution failed), but an assignment propagates it.
-start_remaining=$(remaining)
-echo "backfill_uncached_cost: ${start_remaining} rows to fill (batch=${BATCH_SIZE})"
+# PK bounds — index-only, instant even on a huge table. coalesce handles an empty table
+# (min=1,max=0 → the loop body never runs).
+bounds=$(psql_q "SELECT coalesce(min(id),1) || ' ' || coalesce(max(id),0) FROM http_analytics")
+MIN_ID="${bounds%% *}"
+MAX_ID="${bounds##* }"
+
+# First batch is the half-open range (CURSOR, CURSOR+BATCH], so start one below MIN_ID (or
+# below START_ID) to include the boundary row.
+CURSOR=$(( ${START_ID:-$MIN_ID} - 1 ))
+
+echo "backfill_uncached_cost: sweeping id (${CURSOR}, ${MAX_ID}]  batch=${BATCH_SIZE}  sleep=${SLEEP_SECONDS}s"
 
 total=0
-while :; do
-  # Each batch is one transaction (one psql invocation). The UPDATE is a CTE and the
-  # statement is a final SELECT count(*), so psql emits exactly one numeric row. No `grep …
-  # || true` pipeline — that would swallow a psql/DB error as a clean "0 rows" and stop the
-  # backfill silently; here a failed psql aborts the script under `set -e`.
-  affected=$(psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -X -qtA -c "
-    WITH batch AS (
-      SELECT id FROM http_analytics
-      WHERE uncached_cost IS NULL AND total_cost IS NOT NULL
-      LIMIT ${BATCH_SIZE}
-    ), upd AS (
-      UPDATE http_analytics h
-         SET uncached_cost = h.total_cost
-        FROM batch
-       WHERE h.id = batch.id
+batches=0
+SECONDS=0   # bash builtin: wall-clock seconds since reset
+while [ "$CURSOR" -lt "$MAX_ID" ]; do
+  hi=$(( CURSOR + BATCH_SIZE ))
+  # Cap the final batch at MAX_ID so the printed `id<=` and the end CURSOR don't overshoot
+  # the table's actual max id (cosmetic + makes a resume's START_ID unambiguous).
+  if [ "$hi" -gt "$MAX_ID" ]; then hi="$MAX_ID"; fi
+  # One batch = one committed transaction. The UPDATE drives off the PK range; the row count
+  # comes back via a CTE + final SELECT count(*) (no grep — a psql/DB error still fails the
+  # script under set -e, rather than reading as a clean "0 rows").
+  affected=$(psql_q "
+    WITH upd AS (
+      UPDATE http_analytics
+         SET uncached_cost = total_cost
+       WHERE id > ${CURSOR} AND id <= ${hi}
+         AND uncached_cost IS NULL
+         AND total_cost IS NOT NULL
       RETURNING 1
     )
     SELECT count(*) FROM upd;")
-
-  if [ "${affected}" -eq 0 ]; then
-    break
-  fi
-  total=$((total + affected))
-  echo "  …filled ${total} so far (last batch ${affected})"
+  total=$(( total + affected ))
+  batches=$(( batches + 1 ))
+  CURSOR="$hi"
+  printf '  id<=%-12s  filled +%-6s  (total %s)\n' "$hi" "$affected" "$total"
   sleep "${SLEEP_SECONDS}"
 done
 
-end_remaining=$(remaining)
-echo "backfill_uncached_cost: done — ${total} rows filled, ${end_remaining} remaining"
+# Summary. Duration is wall-clock (it includes the inter-batch sleeps), so `rate` is the
+# realistic throttled throughput — i.e. what a prod run of this size would take.
+elapsed=$SECONDS
+if [ "$elapsed" -gt 0 ]; then rate=$(( total / elapsed )); else rate="$total"; fi
+echo "backfill_uncached_cost: DONE"
+printf '  rows filled : %s\n' "$total"
+printf '  duration    : %dm %02ds (wall-clock, incl. throttle sleeps)\n' $(( elapsed / 60 )) $(( elapsed % 60 ))
+printf '  throughput  : ~%s rows/s\n' "$rate"
+printf '  batches     : %s  (BATCH_SIZE=%s, SLEEP_SECONDS=%s)\n' "$batches" "$BATCH_SIZE" "$SLEEP_SECONDS"
+printf '  id swept    : up to %s\n' "$MAX_ID"

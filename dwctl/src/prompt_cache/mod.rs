@@ -14,6 +14,7 @@ pub mod classifier;
 pub mod index;
 pub mod inject;
 pub mod layer;
+pub mod metrics;
 pub mod model_config;
 pub mod parse;
 pub mod postgres;
