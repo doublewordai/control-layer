@@ -16,9 +16,13 @@ export const queryKeys = {
       skip?: number;
       limit?: number;
       endpoint?: string;
+      group?: string;
       include?: string;
       accessible?: boolean;
       search?: string;
+      is_composite?: boolean;
+      sort?: string;
+      sort_direction?: string;
     }) => ["models", "query", options] as const,
     byId: (id: string, include?: string) =>
       ["models", "byId", id, include] as const,

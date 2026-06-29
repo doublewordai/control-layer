@@ -227,11 +227,12 @@ const Models: React.FC = () => {
                       )}
                       {canManageGroups && (
                         <div className="space-y-2">
-                          <Label htmlFor="group-filter">Groups</Label>
+                          <Label htmlFor="group-filter">Group</Label>
                           <Popover>
                             <PopoverTrigger asChild>
                               <button
                                 id="group-filter"
+                                aria-label="Filter by group"
                                 className="w-full inline-flex items-center justify-between rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
                                 style={{ whiteSpace: "nowrap" }}
                               >
