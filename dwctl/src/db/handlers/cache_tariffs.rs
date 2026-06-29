@@ -237,4 +237,38 @@ mod tests {
             "expected a unique violation from idx_model_cache_tariffs_unique_active, got: {err:?}"
         );
     }
+
+    #[sqlx::test]
+    async fn get_active_reflects_enable_disable(pool: PgPool) {
+        let user = create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
+        let endpoint = create_test_endpoint(&pool, "ep", user.id).await;
+        let id = create_test_model(&pool, "m", "get-active-alias", endpoint, user.id).await;
+        let defaults = CachePricingConfig::default();
+
+        let mut conn = pool.acquire().await.unwrap();
+        let mut repo = CacheTariffs::new(&mut conn);
+
+        // Never enabled → None.
+        assert!(repo.get_active(id).await.unwrap().is_none());
+
+        // Enable with one override → the active row reflects it + the defaults for the rest.
+        repo.enable(
+            id,
+            &defaults,
+            CacheTariffOverrides {
+                min_prefix_tokens: Some(2048),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let active = repo.get_active(id).await.unwrap().expect("active after enable");
+        assert_eq!(active.min_prefix_tokens, 2048);
+        assert_eq!(active.write_multiplier_5m, defaults.default_write_multiplier_5m);
+        assert!(active.valid_until.is_none(), "active version is open-ended");
+
+        // Disable → None again (the active predicate excludes the now-expired version).
+        repo.disable(id).await.unwrap();
+        assert!(repo.get_active(id).await.unwrap().is_none());
+    }
 }

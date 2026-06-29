@@ -84,7 +84,25 @@ export const CachePricingModal: React.FC<CachePricingModalProps> = ({
   const set = (key: keyof FormState, value: string | boolean) =>
     setForm((prev) => ({ ...prev, [key]: value }));
 
+  // Whether the form differs from the saved state. Each PUT appends a new tariff version
+  // (the backend is a ledger), so saving an unchanged form would pollute history — guard it.
+  const norm = (v: string) => v.trim();
+  const currentMin =
+    current?.min_prefix_tokens != null ? String(current.min_prefix_tokens) : "";
+  const hasChanges = current?.enabled
+    ? !form.enabled ||
+      norm(form.write_multiplier_5m) !== norm(current.write_multiplier_5m ?? "") ||
+      norm(form.write_multiplier_1h) !== norm(current.write_multiplier_1h ?? "") ||
+      norm(form.write_multiplier_24h) !== norm(current.write_multiplier_24h ?? "") ||
+      norm(form.read_multiplier) !== norm(current.read_multiplier ?? "") ||
+      norm(form.min_prefix_tokens) !== currentMin
+    : form.enabled;
+
   const handleSave = async () => {
+    if (!hasChanges) {
+      onClose();
+      return;
+    }
     try {
       if (form.enabled) {
         // Blank field → omit, so the backend fills it from the global default.
@@ -212,7 +230,11 @@ export const CachePricingModal: React.FC<CachePricingModalProps> = ({
           >
             Cancel
           </Button>
-          <Button type="button" onClick={handleSave} disabled={pending}>
+          <Button
+            type="button"
+            onClick={handleSave}
+            disabled={pending || !hasChanges}
+          >
             {pending ? "Saving..." : "Save Changes"}
           </Button>
         </DialogFooter>
