@@ -124,12 +124,12 @@ pub async fn cache_middleware(State(state): State<CacheLayerState>, request: Req
     });
 
     // Sanitise the outbound body: strip markers + ensure include_usage (no-op → keep).
-    // `Some` ⇒ the client included cache_control markers — the adoption signal, recorded
-    // for every request regardless of enablement/floor; `None` ⇒ nothing to strip.
-    // Re-frame: set Content-Length and drop any stale Transfer-Encoding (sending both is
-    // invalid HTTP). `from(u64)` is the unambiguous numeric HeaderValue ctor.
-    let stripped = strip_cache_control(&body_bytes);
-    cache_metrics::record_marker_request(stripped.is_some());
+    // `had_markers` is whether the client actually sent cache_control (the adoption signal,
+    // recorded for all traffic) — NOT whether the body changed, since a stream gets
+    // include_usage injected even with no markers. Re-frame: set Content-Length and drop any
+    // stale Transfer-Encoding (sending both is invalid HTTP). `from(u64)` is the numeric ctor.
+    let (stripped, had_markers) = strip_cache_control(&body_bytes);
+    cache_metrics::record_marker_request(had_markers);
     let forward = stripped.unwrap_or(body_bytes);
     parts.headers.remove(header::TRANSFER_ENCODING);
     parts

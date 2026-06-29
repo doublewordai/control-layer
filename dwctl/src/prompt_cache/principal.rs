@@ -61,7 +61,9 @@ impl PrincipalResolver {
     /// secrets are crypto-random), and the TTL bounds even that. So caching `None` is fine.
     pub async fn resolve(&self, token: &str) -> CacheResult<Option<UserId>> {
         if let Some(cached) = self.l1.get(token).await {
-            cache_metrics::record_principal_resolve("hit");
+            // An L1 hit on a cached `None` is a cached *unknown* key, not a resolve hit —
+            // count it as unknown_key so key-probe / invalid-key volume stays accurate.
+            cache_metrics::record_principal_resolve(if cached.is_some() { "hit" } else { "unknown_key" });
             return Ok(cached);
         }
         let mut conn = self.pool.acquire().await?;

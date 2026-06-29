@@ -97,7 +97,9 @@ pub fn record_tokenizer_version_cache(result: &'static str) {
 
 // ── Resolver L1 caches ────────────────────────────────────────────────────────
 
-/// principal resolver memo. `result` ∈ `hit` | `miss` | `unknown_key`.
+/// principal resolver memo. `result` ∈ `hit` (L1 hit on a known key) | `miss` (L1 miss,
+/// resolved to a known key via DB) | `unknown_key` (key not found — cached `None` or a fresh
+/// DB miss). L1 hit-rate ≈ `hit / (hit + miss)`; key-probe volume ≈ `unknown_key`.
 pub fn record_principal_resolve(result: &'static str) {
     counter!("dwctl_cache_principal_resolve_total", "result" => result).increment(1);
 }

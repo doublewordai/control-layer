@@ -68,9 +68,14 @@ fn remove_cache_control(value: &mut Value) -> bool {
 
 /// Sanitise an outbound request body: strip every `cache_control` marker and, for
 /// streaming requests, ensure `stream_options.include_usage = true`. Returns the
-/// rewritten bytes when anything changed, or `None` to leave the original untouched.
-pub fn strip_cache_control(body: &[u8]) -> Option<Bytes> {
-    let mut json: Value = serde_json::from_slice(body).ok()?;
+/// rewritten bytes when anything changed, or `None` to leave the original untouched. Also
+/// returns whether the client actually sent `cache_control` markers (`had_markers`) — the
+/// adoption signal, kept distinct from the body changing, since a stream gets
+/// `include_usage` injected even when no markers were present.
+pub fn strip_cache_control(body: &[u8]) -> (Option<Bytes>, bool) {
+    let Ok(mut json) = serde_json::from_slice::<Value>(body) else {
+        return (None, false);
+    };
     let stripped = remove_cache_control(&mut json);
 
     let mut usage_set = false;
@@ -88,11 +93,12 @@ pub fn strip_cache_control(body: &[u8]) -> Option<Bytes> {
         }
     }
 
-    if stripped || usage_set {
+    let body = if stripped || usage_set {
         serde_json::to_vec(&json).ok().map(Bytes::from)
     } else {
         None
-    }
+    };
+    (body, stripped)
 }
 
 /// Splice the OpenAI-shaped cache fields into a `usage` object in place.
@@ -403,7 +409,9 @@ mod tests {
             "messages": [{"role":"system","content":[{"type":"text","text":"x","cache_control":{"type":"ephemeral"}}]}]
         })
         .to_string();
-        let out = strip_cache_control(body.as_bytes()).expect("changed");
+        let (out, had_markers) = strip_cache_control(body.as_bytes());
+        assert!(had_markers, "body had cache_control");
+        let out = out.expect("changed");
         let v: Value = serde_json::from_slice(&out).unwrap();
         assert!(!out.windows(13).any(|w| w == b"cache_control"));
         assert_eq!(v["stream_options"]["include_usage"], true);
@@ -412,7 +420,19 @@ mod tests {
     #[test]
     fn strip_none_when_nothing_to_do() {
         let body = serde_json::json!({"messages":[{"role":"user","content":"hi"}]}).to_string();
-        assert!(strip_cache_control(body.as_bytes()).is_none());
+        let (out, had_markers) = strip_cache_control(body.as_bytes());
+        assert!(out.is_none());
+        assert!(!had_markers);
+    }
+
+    #[test]
+    fn strip_stream_without_markers_changes_body_but_not_marked() {
+        // The overcounting case: a stream with no cache_control still gets include_usage
+        // injected (body changes), but had_markers must stay false.
+        let body = serde_json::json!({"stream": true, "messages":[{"role":"user","content":"hi"}]}).to_string();
+        let (out, had_markers) = strip_cache_control(body.as_bytes());
+        assert!(out.is_some(), "include_usage injected");
+        assert!(!had_markers, "no markers present");
     }
 
     #[test]
