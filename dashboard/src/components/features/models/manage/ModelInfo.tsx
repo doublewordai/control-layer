@@ -235,9 +235,10 @@ const ModelInfo: React.FC = () => {
   // Cache pricing is fetched separately (admin-only endpoint), not via the model include.
   // Gated on `manage-models` to mirror the backend's `Models:UpdateAll` gate (the same one
   // that guards base-price edits) rather than the incidental `manage-groups` proxy.
-  const { data: cachePricing } = useModelCachePricing(modelId!, {
-    enabled: !!modelId && canManageModels,
-  });
+  const { data: cachePricing, isLoading: cachePricingLoading } =
+    useModelCachePricing(modelId!, {
+      enabled: !!modelId && canManageModels,
+    });
 
   const {
     data: endpoint,
@@ -2553,7 +2554,11 @@ const ModelInfo: React.FC = () => {
                               {cachePricing?.enabled ? "Edit" : "Configure"}
                             </Button>
                           </div>
-                          {cachePricing?.enabled ? (
+                          {cachePricingLoading ? (
+                            <p className="text-sm text-gray-500 mt-2">
+                              Loading cache pricing...
+                            </p>
+                          ) : cachePricing?.enabled ? (
                             <div className="bg-gray-50 rounded-lg p-3">
                               <div className="grid grid-cols-2 gap-4 text-sm">
                                 <div>
