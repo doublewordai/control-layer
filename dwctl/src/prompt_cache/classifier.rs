@@ -18,8 +18,9 @@ use std::sync::Arc;
 use chrono::Utc;
 
 use super::index::{CacheEntry, CacheIndex, CacheResult, IndexScope, PrefixHash};
+use super::metrics as cache_metrics;
 use super::model_config::ModelConfigResolver;
-use super::parse::parse_chat_completions;
+use super::parse::{ParseError, parse_chat_completions};
 use super::principal::PrincipalResolver;
 use super::stats::{CacheStats, PendingWrite};
 use super::tokenizer::TokenizerClient;
@@ -116,6 +117,13 @@ impl Classifier {
     /// untouched). Once the model is enabled, every bail is `zero_active` (uniform
     /// zeros injected, nothing committed) — so enabled models present one shape.
     pub async fn classify(&self, req: ClassifyRequest<'_>) -> CacheResult<ClassifyOutcome> {
+        let start = std::time::Instant::now();
+        let out = self.classify_inner(req).await;
+        cache_metrics::record_classify_duration(start.elapsed().as_secs_f64());
+        out
+    }
+
+    async fn classify_inner(&self, req: ClassifyRequest<'_>) -> CacheResult<ClassifyOutcome> {
         // Gates that fire *before* we know the model is cache-enabled → inactive.
         let Some(api_key) = req.api_key else {
             return Ok(ClassifyOutcome::inactive());
@@ -132,6 +140,13 @@ impl Classifier {
         let parsed = match parse_chat_completions(req.body) {
             Ok(p) => p,
             Err(e) => {
+                // Marker validation rejections (anti-abuse) vs a genuine unparseable body.
+                match &e {
+                    ParseError::TooManyBreakpoints { .. } => cache_metrics::record_markers_rejected("too_many_breakpoints"),
+                    ParseError::InvalidTtl(_) => cache_metrics::record_markers_rejected("invalid_ttl"),
+                    ParseError::UnsupportedType(_) => cache_metrics::record_markers_rejected("unsupported_type"),
+                    ParseError::Json(_) => cache_metrics::record_skip("unparseable"),
+                }
                 // Best-effort: degrade to no caching (uniform zeros). Log at debug so the
                 // silent degradation is diagnosable without warn-level noise on every odd body.
                 tracing::debug!(error = %e, virtual_model = req.virtual_model, "cache classify: body not cacheable (unparseable / >4 breakpoints)");
@@ -139,9 +154,11 @@ impl Classifier {
             }
         };
         if parsed.breakpoints.is_empty() {
+            cache_metrics::record_skip("no_markers");
             return Ok(ClassifyOutcome::zero_active()); // markers are required to cache
         }
         let Some(tokenizer_version) = self.tokenizer_version(req.virtual_model).await? else {
+            cache_metrics::record_skip("tokenizer_unmapped");
             return Ok(ClassifyOutcome::zero_active()); // model not mapped in tokenizer-svc
         };
         let scope = IndexScope {
@@ -188,6 +205,7 @@ impl Classifier {
         let tok = match self.tokenizer.tokenize(req.virtual_model, &segments).await {
             Ok(tok) => tok,
             Err(e) => {
+                cache_metrics::record_skip("tokenize_failed");
                 tracing::debug!(error = %e, virtual_model = req.virtual_model, "cache classify: tokenize failed, degrading to no write");
                 return Ok(ClassifyOutcome::zero_active());
             }
@@ -195,6 +213,7 @@ impl Classifier {
         if tok.cumulative.len() != segments.len() {
             // The tokenizer returned a different number of cumulative counts than segments we
             // sent — we can't map tokens to blocks safely, so bail (no write) rather than guess.
+            cache_metrics::record_skip("count_mismatch");
             tracing::debug!(
                 segments = segments.len(),
                 cumulative = tok.cumulative.len(),
@@ -208,6 +227,7 @@ impl Classifier {
         let cumulative_at = |block: usize| -> u64 { read_tokens as u64 + tok.cumulative[block - write_start] as u64 };
         let total_prefix = cumulative_at(deepest);
         if total_prefix < cfg.min_prefix_tokens as u64 {
+            cache_metrics::record_skip("below_floor");
             return Ok(ClassifyOutcome::zero_active()); // below the per-model floor → no caching
         }
 
@@ -253,8 +273,10 @@ impl Classifier {
     /// service is unreachable (→ no caching).
     async fn tokenizer_version(&self, alias: &str) -> CacheResult<Option<String>> {
         if let Some(v) = self.versions.get(alias).await {
+            cache_metrics::record_tokenizer_version_cache("hit");
             return Ok(v);
         }
+        cache_metrics::record_tokenizer_version_cache("miss");
         let Ok(models) = self.tokenizer.models().await else {
             // Service unreachable → deliberately NOT memoised. A genuine "model not in the
             // list" result IS cached below (a stable fact), but an outage is transient: leaving

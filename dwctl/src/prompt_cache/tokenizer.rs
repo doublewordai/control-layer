@@ -13,6 +13,8 @@ use std::time::Duration;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
+use super::metrics as cache_metrics;
+
 /// HTTP client for a tokenizer-svc deployment.
 #[derive(Clone)]
 pub struct TokenizerClient {
@@ -86,6 +88,19 @@ impl TokenizerClient {
     /// configured `add_special_tokens=false`), so counts are additive across
     /// segments and the totals reconcile.
     pub async fn tokenize(&self, virtual_model: &str, segments: &[String]) -> TokenizerResult<TokenizeResponse> {
+        let start = std::time::Instant::now();
+        let result = self.tokenize_inner(virtual_model, segments).await;
+        cache_metrics::record_tokenizer_duration(start.elapsed().as_secs_f64());
+        cache_metrics::record_tokenizer_request(match &result {
+            Ok(_) => "ok",
+            Err(TokenizerError::Unmapped(_)) => "unmapped_422",
+            Err(TokenizerError::Status { .. }) => "http_error",
+            Err(_) => "transport_error",
+        });
+        result
+    }
+
+    async fn tokenize_inner(&self, virtual_model: &str, segments: &[String]) -> TokenizerResult<TokenizeResponse> {
         let resp = self
             .http
             .post(format!("{}/v1/tokenize", self.base_url))

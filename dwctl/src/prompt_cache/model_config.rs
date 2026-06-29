@@ -14,6 +14,7 @@ use moka::future::Cache;
 use sqlx::PgPool;
 
 use super::index::CacheResult;
+use super::metrics as cache_metrics;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ModelCacheConfig {
@@ -52,8 +53,10 @@ impl ModelConfigResolver {
     /// Resolve the cache config for `virtual_model` (the `deployed_models.alias`).
     pub async fn resolve(&self, virtual_model: &str) -> CacheResult<ModelCacheConfig> {
         if let Some(c) = self.cache.get(virtual_model).await {
+            cache_metrics::record_model_config_resolve("hit");
             return Ok(c);
         }
+        cache_metrics::record_model_config_resolve("miss");
 
         // Caching is ON iff the model has a cache-tariff row valid now. An alias may map
         // to >1 deployed_models row (variants sharing a base model): enabled if ANY has an
