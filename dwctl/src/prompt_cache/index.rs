@@ -53,6 +53,42 @@ impl TtlTier {
     }
 }
 
+/// Which TTL tiers the platform currently offers, plus the tier a marker with no explicit
+/// `ttl` defaults to. Built once from `cache.enabled_ttls` / `cache.default_ttl` at startup
+/// (already validated there), then shared by the request-path marker validation and the
+/// classifier's parse so a no-ttl marker resolves to the same tier in both. A tier outside
+/// this set is rejected (400), not silently un-cached.
+#[derive(Debug, Clone)]
+pub struct TierPolicy {
+    default_ttl: TtlTier,
+    enabled: Vec<TtlTier>,
+}
+
+impl TierPolicy {
+    /// Build from the config strings. Unparseable tiers are dropped (config validation rejects
+    /// those at startup, so every string is a real tier here in practice).
+    pub fn from_config(enabled_ttls: &[String], default_ttl: &str) -> Self {
+        Self {
+            default_ttl: TtlTier::parse(default_ttl).unwrap_or(TtlTier::FiveMinutes),
+            enabled: enabled_ttls.iter().filter_map(|s| TtlTier::parse(s)).collect(),
+        }
+    }
+
+    /// The tier applied to a marker that omits `ttl`.
+    pub fn default_ttl(&self) -> TtlTier {
+        self.default_ttl
+    }
+
+    pub fn is_enabled(&self, tier: TtlTier) -> bool {
+        self.enabled.contains(&tier)
+    }
+
+    /// The enabled tiers as strings (for error messages).
+    pub fn enabled_strs(&self) -> Vec<&'static str> {
+        self.enabled.iter().map(|t| t.as_str()).collect()
+    }
+}
+
 /// The cache scope keying every entry:
 /// - `principal_id` = `target_user_id` (org or personal user = `api_key.user_id`), so all
 ///   of a customer's modalities share one cache scope.

@@ -145,7 +145,9 @@ pub fn record_body_read_failed() {
     counter!("dwctl_cache_body_read_failed_total").increment(1);
 }
 
-/// Marker validation rejection. `reason` ∈ `too_many_breakpoints` | `invalid_ttl` | `unsupported_type`.
+/// Marker validation rejection — now a 400 to the client (the cache layer rejects synchronously
+/// before forwarding), not a silent no-cache. `reason` ∈ `too_many_breakpoints` | `invalid_ttl` |
+/// `unsupported_type` | `tier_disabled` (a valid tier the platform has turned off in config).
 pub fn record_markers_rejected(reason: &'static str) {
     counter!("dwctl_cache_markers_rejected_total", "reason" => reason).increment(1);
 }
