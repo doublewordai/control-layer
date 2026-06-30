@@ -313,8 +313,11 @@ impl Classifier {
             }
         }
         let lookup_start = std::time::Instant::now();
-        let matches = self.index.lookup(scope, &candidates).await?;
+        let matches = self.index.lookup(scope, &candidates).await;
+        // Record before propagating so a slow-then-failing lookup (the unhealthy-DB case the
+        // metric most needs to surface) still lands in the histogram, not just successes.
         cache_metrics::record_lookup_duration(lookup_start.elapsed().as_secs_f64());
+        let matches = matches?;
         if matches.is_empty() {
             return Ok(None);
         }
