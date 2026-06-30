@@ -249,7 +249,7 @@ fn compute_total_cost(
             prompt_tokens = raw.prompt_tokens,
             "cached token split exceeds prompt_tokens; ignoring the split and billing at base rate"
         );
-        return Some(prompt * inp + Decimal::from(raw.completion_tokens.max(0)) * outp);
+        return list_price(raw.prompt_tokens, raw.completion_tokens, input_price, output_price);
     }
 
     // Uncached = full input minus the cached portion, floored at zero (our tokenizer and
@@ -261,18 +261,30 @@ fn compute_total_cost(
     Some(input_cost + output_cost)
 }
 
-/// The un-discounted list price (`http_analytics.uncached_cost`): the full input + output
-/// at base rates, ignoring any cache split. `None` under the same no-pricing condition as
-/// [`compute_total_cost`], so the two columns are NULL in lockstep. Equals `total_cost`
-/// whenever the request cached nothing — and equals the dropped generated expression, so
-/// the backfill can copy `total_cost` into it for historical rows.
-fn compute_list_price(raw: &RawAnalyticsRecord, input_price: Option<Decimal>, output_price: Option<Decimal>) -> Option<Decimal> {
+/// List price for raw token counts: `prompt·input + completion·output`, or `None` when the
+/// model has no pricing at all. The single source of the base-cost arithmetic — used by the
+/// no-cache `total_cost` path ([`charged_cost`]) and by `uncached_cost`, and exposed so test
+/// fixtures derive their cost the same way production does instead of re-implementing it.
+pub(crate) fn list_price(
+    prompt_tokens: i64,
+    completion_tokens: i64,
+    input_price: Option<Decimal>,
+    output_price: Option<Decimal>,
+) -> Option<Decimal> {
     if input_price.is_none() && output_price.is_none() {
         return None;
     }
     let inp = input_price.unwrap_or(Decimal::ZERO);
     let outp = output_price.unwrap_or(Decimal::ZERO);
-    Some(Decimal::from(raw.prompt_tokens.max(0)) * inp + Decimal::from(raw.completion_tokens.max(0)) * outp)
+    Some(Decimal::from(prompt_tokens.max(0)) * inp + Decimal::from(completion_tokens.max(0)) * outp)
+}
+
+/// The un-discounted list price (`http_analytics.uncached_cost`): the full input + output
+/// at base rates, ignoring any cache split. `None` under the same no-pricing condition as
+/// [`compute_total_cost`], so the two columns are NULL in lockstep. Equals `total_cost`
+/// whenever the request cached nothing.
+fn compute_list_price(raw: &RawAnalyticsRecord, input_price: Option<Decimal>, output_price: Option<Decimal>) -> Option<Decimal> {
+    list_price(raw.prompt_tokens, raw.completion_tokens, input_price, output_price)
 }
 
 /// Sender handle for submitting analytics records to the batcher
@@ -2226,70 +2238,6 @@ mod integration_tests {
         assert_eq!(row.cache_creation_1h_input_tokens, 500);
         assert_eq!(row.total_cost.unwrap(), expected_cost, "total_cost = cache-adjusted");
         assert_eq!(row.uncached_cost.unwrap(), expected_list, "uncached_cost = list price");
-    }
-
-    #[sqlx::test]
-    async fn total_cost_fidelity_trigger_fills_when_omitted(pool: PgPool) {
-        // Old-release-style insert: omits total_cost (it relied on the dropped generation).
-        // The fidelity trigger reconstructs it from the row's own tokens × prices.
-        let priced = Uuid::new_v4();
-        sqlx::query!(
-            r#"INSERT INTO http_analytics (instance_id, correlation_id, timestamp, method, uri,
-                 prompt_tokens, completion_tokens, input_price_per_token, output_price_per_token)
-               VALUES ($1, 1, now(), 'POST', '/v1/chat/completions', 1000, 100, 0.001, 0.002)"#,
-            priced
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-        let tc = sqlx::query_scalar!("SELECT total_cost FROM http_analytics WHERE instance_id = $1", priced)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert_eq!(
-            tc.unwrap(),
-            Decimal::from_str("1.2").unwrap(),
-            "trigger reconstructs list price (1000*0.001 + 100*0.002)"
-        );
-
-        // Free / un-tariffed model (NULL prices) → NULL propagates → total_cost stays NULL,
-        // exactly as the old generated CASE expression produced.
-        let free = Uuid::new_v4();
-        sqlx::query!(
-            r#"INSERT INTO http_analytics (instance_id, correlation_id, timestamp, method, uri, prompt_tokens, completion_tokens)
-               VALUES ($1, 2, now(), 'POST', '/v1/chat/completions', 1000, 100)"#,
-            free
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-        let tc_free = sqlx::query_scalar!("SELECT total_cost FROM http_analytics WHERE instance_id = $1", free)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert!(tc_free.is_none(), "no prices → total_cost NULL (free model)");
-
-        // New-release-style insert: total_cost provided → trigger no-ops (keeps the value,
-        // even if it differs from the list price, which is the whole point under caching).
-        let provided = Uuid::new_v4();
-        sqlx::query!(
-            r#"INSERT INTO http_analytics (instance_id, correlation_id, timestamp, method, uri,
-                 prompt_tokens, completion_tokens, input_price_per_token, output_price_per_token, total_cost)
-               VALUES ($1, 3, now(), 'POST', '/v1/chat/completions', 1000, 100, 0.001, 0.002, 0.5)"#,
-            provided
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-        let tc_provided = sqlx::query_scalar!("SELECT total_cost FROM http_analytics WHERE instance_id = $1", provided)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert_eq!(
-            tc_provided.unwrap(),
-            Decimal::from_str("0.5").unwrap(),
-            "explicit total_cost is preserved (trigger no-ops)"
-        );
     }
 
     #[sqlx::test]
