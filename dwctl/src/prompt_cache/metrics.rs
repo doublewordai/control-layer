@@ -71,6 +71,13 @@ pub fn record_classify_duration(seconds: f64) {
     histogram!("dwctl_cache_classify_duration_seconds").record(seconds);
 }
 
+/// Index-lookup (cache READ) latency — the `prompt_cache_entries` point-lookup on its own,
+/// separate from tokenize and commit so a read-path p99 spike is attributable to the DB read
+/// (or connection acquisition) rather than buried inside `classify_duration`.
+pub fn record_lookup_duration(seconds: f64) {
+    histogram!("dwctl_cache_lookup_duration_seconds").record(seconds);
+}
+
 /// Why a cache-enabled request cached nothing. `reason` ∈ `no_markers` | `unparseable`
 /// | `tokenizer_unmapped` | `tokenize_failed` | `count_mismatch` | `below_floor`.
 /// (Non-enabled models / missing keys are counted by `record_request_outcome{outcome="inactive"}`.)
