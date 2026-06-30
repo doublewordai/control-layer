@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.67.1](https://github.com/doublewordai/control-layer/compare/v8.67.0...v8.67.1) (2026-06-30)
+
+
+### Bug Fixes
+
+* extra prometheus markers for dashboard ([#1201](https://github.com/doublewordai/control-layer/issues/1201)) ([85c2a34](https://github.com/doublewordai/control-layer/commit/85c2a347a669d8cab0fb912c8b5a688a5a0ec79a))
+
 ## [8.67.0](https://github.com/doublewordai/control-layer/compare/v8.66.0...v8.67.0) (2026-06-30)
 
 
