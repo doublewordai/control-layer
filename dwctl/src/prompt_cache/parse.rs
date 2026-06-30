@@ -39,6 +39,8 @@ pub enum ParseError {
     UnsupportedType(String),
     #[error("cache_control ttl tier '{}' is not currently available", .0.as_str())]
     DisabledTier(TtlTier),
+    #[error("cache_control must be an object (e.g. {{\"type\": \"ephemeral\"}})")]
+    MalformedCacheControl,
 }
 
 /// A single content block in canonical order.
@@ -110,8 +112,10 @@ pub fn parse_chat_completions(body: &[u8], policy: &TierPolicy) -> Result<Parsed
                 Some(serde_json::Value::Array(arr)) => {
                     for block in arr {
                         let ttl = match block.get("cache_control") {
-                            Some(cc) => Some(parse_ttl(cc, policy)?),
-                            None => None,
+                            // An explicit `null` (or absent) is "no marker"; anything else is
+                            // validated by `parse_ttl` (which rejects non-object values).
+                            Some(cc) if !cc.is_null() => Some(parse_ttl(cc, policy)?),
+                            _ => None,
                         };
                         let stripped = strip_cache_control(block);
                         let text = stripped.get("text").and_then(|t| t.as_str()).unwrap_or("").to_string();
@@ -149,6 +153,12 @@ pub fn parse_chat_completions(body: &[u8], policy: &TierPolicy) -> Result<Parsed
 /// - an unknown `ttl` string → [`ParseError::InvalidTtl`]
 /// - a valid tier the platform has disabled (not in `enabled_ttls`) → [`ParseError::DisabledTier`]
 fn parse_ttl(cache_control: &serde_json::Value, policy: &TierPolicy) -> Result<TtlTier, ParseError> {
+    // A non-object marker (string/bool/array/number) is malformed — reject it rather than
+    // letting `.get(...)` return `None` and silently treating it as a default-tier breakpoint.
+    // (An explicit `null` is filtered out as "no marker" before we get here.)
+    if !cache_control.is_object() {
+        return Err(ParseError::MalformedCacheControl);
+    }
     if let Some(t) = cache_control.get("type").and_then(|t| t.as_str())
         && t != "ephemeral"
     {
@@ -164,8 +174,8 @@ fn parse_ttl(cache_control: &serde_json::Value, policy: &TierPolicy) -> Result<T
     Ok(tier)
 }
 
-/// Synchronous request-path validation of `cache_control` markers — WITHOUT the hashing the
-/// full [`parse_chat_completions`] does, so it's cheap enough to run before forwarding. Every
+/// Synchronous request-path validation of `cache_control` markers — it skips the hashing that
+/// the full [`parse_chat_completions`] does, so it's cheap enough to run before forwarding. Every
 /// marker must be ephemeral, name an *enabled* tier (or default to one), and there must be
 /// `≤ MAX_BREAKPOINTS`. A failure is turned into a 400 by the layer: the request is rejected
 /// (like a bad parameter) rather than silently un-cached, so the client learns immediately and
@@ -177,9 +187,14 @@ pub fn validate_markers(body: &serde_json::Value, policy: &TierPolicy) -> Result
         for msg in messages {
             if let Some(arr) = msg.get("content").and_then(|c| c.as_array()) {
                 for block in arr {
-                    if let Some(cc) = block.get("cache_control") {
-                        parse_ttl(cc, policy)?;
-                        breakpoints += 1;
+                    match block.get("cache_control") {
+                        // Explicit `null` (or absent) is "no marker"; a non-object value is
+                        // rejected by parse_ttl as malformed.
+                        Some(cc) if !cc.is_null() => {
+                            parse_ttl(cc, policy)?;
+                            breakpoints += 1;
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -370,6 +385,37 @@ mod tests {
             validate_markers(&too_many, &all_tiers()).unwrap_err(),
             ParseError::TooManyBreakpoints { found: 5 }
         ));
+    }
+
+    #[test]
+    fn non_object_cache_control_is_malformed() {
+        // A bare string (or any non-object) must NOT slip through as the default tier.
+        let body = serde_json::json!({
+            "messages": [{"role": "system", "content": [
+                {"type": "text", "text": "x", "cache_control": "persistent"}
+            ]}]
+        });
+        assert!(matches!(
+            validate_markers(&body, &all_tiers()).unwrap_err(),
+            ParseError::MalformedCacheControl
+        ));
+        assert!(matches!(
+            parse_chat_completions(body.to_string().as_bytes(), &all_tiers()).unwrap_err(),
+            ParseError::MalformedCacheControl
+        ));
+    }
+
+    #[test]
+    fn null_cache_control_is_no_marker() {
+        // An explicit `null` means "no marker": no breakpoint, no error.
+        let body = serde_json::json!({
+            "messages": [{"role": "system", "content": [
+                {"type": "text", "text": "x", "cache_control": null}
+            ]}]
+        });
+        assert!(validate_markers(&body, &all_tiers()).is_ok());
+        let p = parse_chat_completions(body.to_string().as_bytes(), &all_tiers()).unwrap();
+        assert!(p.breakpoints.is_empty());
     }
 
     #[test]

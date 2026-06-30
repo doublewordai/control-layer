@@ -75,6 +75,7 @@ fn marker_rejection_response(e: &ParseError, policy: &TierPolicy) -> Response {
         ParseError::InvalidTtl(_) => Some("invalid_ttl"),
         ParseError::UnsupportedType(_) => Some("unsupported_type"),
         ParseError::TooManyBreakpoints { .. } => Some("too_many_breakpoints"),
+        ParseError::MalformedCacheControl => Some("malformed_cache_control"),
         // validate_markers takes an already-parsed Value, so a JSON error can't reach here.
         ParseError::Json(_) => None,
     };

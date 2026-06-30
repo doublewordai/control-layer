@@ -159,6 +159,7 @@ impl Classifier {
                     ParseError::InvalidTtl(_) => cache_metrics::record_markers_rejected("invalid_ttl"),
                     ParseError::UnsupportedType(_) => cache_metrics::record_markers_rejected("unsupported_type"),
                     ParseError::DisabledTier(_) => cache_metrics::record_markers_rejected("tier_disabled"),
+                    ParseError::MalformedCacheControl => cache_metrics::record_markers_rejected("malformed_cache_control"),
                     ParseError::Json(_) => cache_metrics::record_skip("unparseable"),
                 }
                 // Best-effort: degrade to no caching (uniform zeros). Log at debug so the
