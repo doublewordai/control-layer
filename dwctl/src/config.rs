@@ -1045,6 +1045,22 @@ pub struct CacheConfig {
     /// Default pricing multipliers (pre-fill when enabling caching on a model without
     /// explicit per-tier values). See [`CachePricingConfig`].
     pub pricing: CachePricingConfig,
+
+    /// The cache TTL tiers the platform currently offers, as Anthropic-style strings
+    /// (`"5m"`, `"1h"`, `"24h"`). A request whose `cache_control` marker names a tier NOT in
+    /// this list is rejected with a 400 (like an unknown parameter) — not silently un-cached,
+    /// so billing stays honest. Restrict it to roll out a subset (e.g. drop `"24h"` until the
+    /// KV-store mechanism exists). A model may still carry a tariff for a disabled tier; it
+    /// just can't be reached until the tier is re-enabled here. Default: `["5m", "1h"]`.
+    ///
+    /// Set via environment: `DWCTL_CACHE__ENABLED_TTLS=5m,1h`
+    pub enabled_ttls: Vec<String>,
+
+    /// The tier a `cache_control: {type: "ephemeral"}` marker with no explicit `ttl` defaults
+    /// to (Anthropic's default is `"5m"`). Must be one of `enabled_ttls`.
+    ///
+    /// Set via environment: `DWCTL_CACHE__DEFAULT_TTL=5m`
+    pub default_ttl: String,
 }
 
 impl Default for CacheConfig {
@@ -1053,6 +1069,8 @@ impl Default for CacheConfig {
             enabled: false,
             tokenizer_url: "http://localhost:8088".to_string(),
             pricing: CachePricingConfig::default(),
+            enabled_ttls: vec!["5m".to_string(), "1h".to_string()],
+            default_ttl: "5m".to_string(),
         }
     }
 }
@@ -2273,6 +2291,35 @@ impl Config {
             });
         }
 
+        // Cache TTL tiers: every enabled tier must be a known tier (5m/1h/24h), the set must be
+        // non-empty, and the default tier must be one of them — otherwise a no-ttl marker would
+        // default straight into a rejected tier. Fail fast at startup with a clear message.
+        if self.cache.enabled {
+            for ttl in &self.cache.enabled_ttls {
+                if crate::prompt_cache::TtlTier::parse(ttl).is_none() {
+                    return Err(Error::Internal {
+                        operation: format!(
+                            "Config validation: cache.enabled_ttls contains an unknown tier {ttl:?}; allowed values are \"5m\", \"1h\", \"24h\"."
+                        ),
+                    });
+                }
+            }
+            if self.cache.enabled_ttls.is_empty() {
+                return Err(Error::Internal {
+                    operation: "Config validation: cache.enabled_ttls is empty; enable at least one tier (\"5m\", \"1h\", \"24h\")."
+                        .to_string(),
+                });
+            }
+            if !self.cache.enabled_ttls.iter().any(|t| t == &self.cache.default_ttl) {
+                return Err(Error::Internal {
+                    operation: format!(
+                        "Config validation: cache.default_ttl {:?} is not in cache.enabled_ttls {:?}.",
+                        self.cache.default_ttl, self.cache.enabled_ttls
+                    ),
+                });
+            }
+        }
+
         // Validate JWT expiry duration is reasonable
         if self.auth.security.jwt_expiry.as_secs() < 300 {
             // Less than 5 minutes
@@ -2860,6 +2907,57 @@ secret_key: "test-secret-key"
 
         let result = config.validate();
         assert!(result.is_ok()); // Should pass because both batches AND daemon are disabled
+    }
+
+    /// Helper: a config that passes validation up to the cache checks, with caching on.
+    fn cache_test_config() -> Config {
+        let mut config = Config::default();
+        config.auth.native.enabled = true;
+        config.secret_key = Some("test-secret-key".to_string());
+        config.cache.enabled = true;
+        config
+    }
+
+    #[test]
+    fn test_cache_tiers_not_validated_when_disabled() {
+        let mut config = cache_test_config();
+        config.cache.enabled = false; // disabled → tier config is not validated
+        config.cache.enabled_ttls = vec!["99h".to_string()]; // bogus, but ignored
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_cache_valid_tiers_ok() {
+        let mut config = cache_test_config();
+        config.cache.enabled_ttls = vec!["5m".to_string(), "1h".to_string()];
+        config.cache.default_ttl = "5m".to_string();
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_cache_unknown_tier_rejected() {
+        let mut config = cache_test_config();
+        config.cache.enabled_ttls = vec!["5m".to_string(), "99h".to_string()];
+        config.cache.default_ttl = "5m".to_string();
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("unknown tier"), "{err}");
+    }
+
+    #[test]
+    fn test_cache_empty_tiers_rejected() {
+        let mut config = cache_test_config();
+        config.cache.enabled_ttls = vec![];
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("enabled_ttls is empty"), "{err}");
+    }
+
+    #[test]
+    fn test_cache_default_ttl_must_be_enabled() {
+        let mut config = cache_test_config();
+        config.cache.enabled_ttls = vec!["5m".to_string()];
+        config.cache.default_ttl = "1h".to_string(); // not in enabled_ttls
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("default_ttl"), "{err}");
     }
 
     #[test]
