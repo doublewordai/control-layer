@@ -169,7 +169,7 @@ impl RequestHandler for AnalyticsHandler {
                                 endpoint,
                                 fusillade_stream,
                                 error = %zdr_safe_parse_error(e.error.as_ref()),
-                                "Failed to serialize usage for successful generative response"
+                                "Failed to parse usage from a successful generative response"
                             );
                         }
                     }

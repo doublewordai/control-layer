@@ -226,9 +226,13 @@ impl ToolExecutor for HttpToolExecutor {
                     } else {
                         // ZDR: never put the tool response body into the error — it
                         // becomes the ToolError Display, which `#[instrument(err)]`
-                        // logs, and tool outputs are disallowed payload content.
-                        let body_len = resp.text().await.map(|b| b.len()).unwrap_or(0);
-                        let msg = format!("HTTP {} ({}-byte body omitted)", status_u16, body_len);
+                        // logs, and tool outputs are disallowed payload content. Use
+                        // the advertised Content-Length where present and drop the
+                        // body unread, rather than buffering it just to size it.
+                        let msg = match resp.content_length() {
+                            Some(len) => format!("HTTP {status_u16} ({len}-byte body omitted)"),
+                            None => format!("HTTP {status_u16} (body omitted)"),
+                        };
                         (Err(ToolError::ExecutionError(msg)), Some(status_u16), Some("http_error"))
                     }
                 }
