@@ -1697,8 +1697,16 @@ mod tests {
 
     // Helper function to insert analytics data with fusillade_request_id
     async fn insert_test_analytics_with_batch_id(pool: &PgPool, data: TestBatchAnalyticsData<'_>) {
+        use crate::request_logging::batcher::list_price;
         use rust_decimal::Decimal;
         use uuid::Uuid;
+
+        let input_price = data.input_price_per_token.and_then(Decimal::from_f64_retain);
+        let output_price = data.output_price_per_token.and_then(Decimal::from_f64_retain);
+        // Derive total_cost with the same function the batcher bills with. These rows carry no
+        // cache split (the cache_* columns default to 0), so this is the plain no-cache billed
+        // cost — these tests don't exercise cache pricing.
+        let total_cost = list_price(data.prompt_tokens, data.completion_tokens, input_price, output_price);
 
         sqlx::query!(
             r#"
@@ -1706,8 +1714,8 @@ mod tests {
                 instance_id, correlation_id, timestamp, uri, method, status_code,
                 duration_ms, duration_to_first_byte_ms, model, prompt_tokens,
                 completion_tokens, reasoning_tokens, total_tokens, fusillade_batch_id, fusillade_request_id,
-                input_price_per_token, output_price_per_token
-            ) VALUES ($1, $2, $3, '/ai/chat/completions', 'POST', $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+                input_price_per_token, output_price_per_token, total_cost
+            ) VALUES ($1, $2, $3, '/ai/chat/completions', 'POST', $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
             "#,
             Uuid::new_v4(),
             1i64,
@@ -1722,8 +1730,9 @@ mod tests {
             data.prompt_tokens + data.completion_tokens,
             data.fusillade_batch_id,
             data.fusillade_request_id,
-            data.input_price_per_token.map(Decimal::from_f64_retain).flatten(),
-            data.output_price_per_token.map(Decimal::from_f64_retain).flatten(),
+            input_price,
+            output_price,
+            total_cost,
         )
         .execute(pool)
         .await
@@ -2190,12 +2199,12 @@ mod tests {
                 instance_id, correlation_id, timestamp, uri, method, status_code,
                 duration_ms, model, prompt_tokens, completion_tokens, total_tokens,
                 user_id, fusillade_batch_id,
-                input_price_per_token, output_price_per_token
+                input_price_per_token, output_price_per_token, total_cost
             ) VALUES (
                 $1, $2, $3, '/ai/chat/completions', 'POST', $12,
                 100, $4, $5, $6, $7,
                 $8, $9,
-                $10, $11
+                $10, $11, $13
             )
             "#,
             Uuid::new_v4(),
@@ -2207,8 +2216,7 @@ mod tests {
             prompt_tokens + completion_tokens,
             user_id,
             fusillade_batch_id,
-            // Derive a uniform per-token rate so that total_cost = (prompt + completion) * rate
-            // This makes the stored total_cost equal the requested total_cost value
+            // Per-token rate populates the price columns; the billed total_cost is set directly below.
             {
                 let total_tokens = (prompt_tokens + completion_tokens) as f64;
                 if total_tokens > 0.0 {
@@ -2226,6 +2234,7 @@ mod tests {
                 }
             },
             status_code,
+            Decimal::from_f64_retain(total_cost), // $13 — the billed cost, stored directly
         )
         .execute(pool)
         .await

@@ -261,18 +261,30 @@ fn compute_total_cost(
     Some(input_cost + output_cost)
 }
 
-/// The un-discounted list price (`http_analytics.uncached_cost`): the full input + output
-/// at base rates, ignoring any cache split. `None` under the same no-pricing condition as
-/// [`compute_total_cost`], so the two columns are NULL in lockstep. Equals `total_cost`
-/// whenever the request cached nothing — and equals the dropped generated expression, so
-/// the backfill can copy `total_cost` into it for historical rows.
-fn compute_list_price(raw: &RawAnalyticsRecord, input_price: Option<Decimal>, output_price: Option<Decimal>) -> Option<Decimal> {
+/// List price for raw token counts: `prompt·input + completion·output`, or `None` when the
+/// model has no pricing at all. The single source of the base-cost arithmetic — used by the
+/// no-cache `total_cost` path ([`charged_cost`]) and by `uncached_cost`, and exposed so test
+/// fixtures derive their cost the same way production does instead of re-implementing it.
+pub(crate) fn list_price(
+    prompt_tokens: i64,
+    completion_tokens: i64,
+    input_price: Option<Decimal>,
+    output_price: Option<Decimal>,
+) -> Option<Decimal> {
     if input_price.is_none() && output_price.is_none() {
         return None;
     }
     let inp = input_price.unwrap_or(Decimal::ZERO);
     let outp = output_price.unwrap_or(Decimal::ZERO);
-    Some(Decimal::from(raw.prompt_tokens.max(0)) * inp + Decimal::from(raw.completion_tokens.max(0)) * outp)
+    Some(Decimal::from(prompt_tokens.max(0)) * inp + Decimal::from(completion_tokens.max(0)) * outp)
+}
+
+/// The un-discounted list price (`http_analytics.uncached_cost`): the full input + output
+/// at base rates, ignoring any cache split. `None` under the same no-pricing condition as
+/// [`compute_total_cost`], so the two columns are NULL in lockstep. Equals `total_cost`
+/// whenever the request cached nothing.
+fn compute_list_price(raw: &RawAnalyticsRecord, input_price: Option<Decimal>, output_price: Option<Decimal>) -> Option<Decimal> {
+    list_price(raw.prompt_tokens, raw.completion_tokens, input_price, output_price)
 }
 
 /// Sender handle for submitting analytics records to the batcher
