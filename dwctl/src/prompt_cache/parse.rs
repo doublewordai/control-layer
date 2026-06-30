@@ -39,7 +39,7 @@ pub enum ParseError {
     UnsupportedType(String),
     #[error("cache_control ttl tier '{}' is not currently available", .0.as_str())]
     DisabledTier(TtlTier),
-    #[error("cache_control must be an object with string fields (e.g. {{\"type\": \"ephemeral\", \"ttl\": \"5m\"}})")]
+    #[error("cache_control must be an object with a string \"type\": \"ephemeral\" (and an optional string \"ttl\")")]
     MalformedCacheControl,
 }
 
@@ -148,9 +148,9 @@ pub fn parse_chat_completions(body: &[u8], policy: &TierPolicy) -> Result<Parsed
     })
 }
 
-/// `cache_control: { type: "ephemeral", ttl: "5m"|"1h"|"24h" }`. A missing `ttl` defaults to
-/// `policy.default_ttl` (Anthropic-style; configurable). Errors:
-/// - a non-object marker, or a present-but-non-string `type`/`ttl` → [`ParseError::MalformedCacheControl`]
+/// `cache_control: { type: "ephemeral"[, ttl: "5m"|"1h"|"24h"] }`. `type` is required; a missing
+/// `ttl` defaults to `policy.default_ttl` (Anthropic-style; configurable). Errors:
+/// - a non-object marker, a missing/non-string `type`, or a non-string `ttl` → [`ParseError::MalformedCacheControl`]
 /// - a string `type` that isn't `"ephemeral"` → [`ParseError::UnsupportedType`]
 /// - an unknown `ttl` string → [`ParseError::InvalidTtl`]
 /// - a valid tier the platform has disabled (not in `enabled_ttls`) → [`ParseError::DisabledTier`]
@@ -163,11 +163,12 @@ fn parse_ttl(cache_control: &serde_json::Value, policy: &TierPolicy) -> Result<T
     if !cache_control.is_object() {
         return Err(ParseError::MalformedCacheControl);
     }
+    // `type` is REQUIRED and must be the string "ephemeral" — Anthropic mandates it even though
+    // it's the only valid value. Missing or non-string → malformed; a different string → unsupported.
     match cache_control.get("type") {
-        None => {}
         Some(Value::String(t)) if t == "ephemeral" => {}
         Some(Value::String(t)) => return Err(ParseError::UnsupportedType(t.clone())),
-        Some(_) => return Err(ParseError::MalformedCacheControl),
+        _ => return Err(ParseError::MalformedCacheControl),
     }
     let tier = match cache_control.get("ttl") {
         None => policy.default_ttl(),
@@ -199,15 +200,16 @@ pub fn validate_markers(body: &serde_json::Value, policy: &TierPolicy) -> Result
                         Some(cc) if !cc.is_null() => {
                             parse_ttl(cc, policy)?;
                             breakpoints += 1;
+                            // Short-circuit on the request path — stop the moment the cap is exceeded.
+                            if breakpoints > MAX_BREAKPOINTS {
+                                return Err(ParseError::TooManyBreakpoints { found: breakpoints });
+                            }
                         }
                         _ => {}
                     }
                 }
             }
         }
-    }
-    if breakpoints > MAX_BREAKPOINTS {
-        return Err(ParseError::TooManyBreakpoints { found: breakpoints });
     }
     Ok(())
 }
@@ -432,6 +434,30 @@ mod tests {
         });
         assert!(matches!(
             validate_markers(&bad_type, &all_tiers()).unwrap_err(),
+            ParseError::MalformedCacheControl
+        ));
+    }
+
+    #[test]
+    fn missing_type_is_malformed() {
+        // `type` is required (Anthropic mandates it, even though "ephemeral" is the only value).
+        let no_type = serde_json::json!({
+            "messages": [{"role": "system", "content": [
+                {"type": "text", "text": "x", "cache_control": {"ttl": "1h"}}
+            ]}]
+        });
+        assert!(matches!(
+            validate_markers(&no_type, &all_tiers()).unwrap_err(),
+            ParseError::MalformedCacheControl
+        ));
+        // An empty cache_control object (no type) is malformed too.
+        let empty = serde_json::json!({
+            "messages": [{"role": "system", "content": [
+                {"type": "text", "text": "x", "cache_control": {}}
+            ]}]
+        });
+        assert!(matches!(
+            parse_chat_completions(empty.to_string().as_bytes(), &all_tiers()).unwrap_err(),
             ParseError::MalformedCacheControl
         ));
     }
