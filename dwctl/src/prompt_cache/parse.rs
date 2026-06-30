@@ -31,8 +31,8 @@ pub const WALK_BACK: usize = 20;
 pub enum ParseError {
     #[error("request body is not valid JSON: {0}")]
     Json(#[from] serde_json::Error),
-    #[error("too many cache_control breakpoints: {found} (max {MAX_BREAKPOINTS})")]
-    TooManyBreakpoints { found: usize },
+    #[error("too many cache_control breakpoints (max {MAX_BREAKPOINTS})")]
+    TooManyBreakpoints,
     #[error("invalid cache_control ttl: {0:?}")]
     InvalidTtl(String),
     #[error("unsupported cache_control type: {0:?} (only \"ephemeral\")")]
@@ -138,7 +138,7 @@ pub fn parse_chat_completions(body: &[u8], policy: &TierPolicy) -> Result<Parsed
     }
 
     if breakpoints.len() > MAX_BREAKPOINTS {
-        return Err(ParseError::TooManyBreakpoints { found: breakpoints.len() });
+        return Err(ParseError::TooManyBreakpoints);
     }
 
     Ok(ParsedPrompt {
@@ -201,8 +201,9 @@ pub fn validate_markers(body: &serde_json::Value, policy: &TierPolicy) -> Result
                             parse_ttl(cc, policy)?;
                             breakpoints += 1;
                             // Short-circuit on the request path — stop the moment the cap is exceeded.
+                            // The error reports "max N", not an exact count (we don't keep scanning).
                             if breakpoints > MAX_BREAKPOINTS {
-                                return Err(ParseError::TooManyBreakpoints { found: breakpoints });
+                                return Err(ParseError::TooManyBreakpoints);
                             }
                         }
                         _ => {}
@@ -340,7 +341,7 @@ mod tests {
             &all_tiers(),
         )
         .unwrap_err();
-        assert!(matches!(err, ParseError::TooManyBreakpoints { found: 5 }));
+        assert!(matches!(err, ParseError::TooManyBreakpoints));
     }
 
     #[test]
@@ -391,7 +392,7 @@ mod tests {
         let too_many = serde_json::json!({ "messages": [{"role": "user", "content": blocks}] });
         assert!(matches!(
             validate_markers(&too_many, &all_tiers()).unwrap_err(),
-            ParseError::TooManyBreakpoints { found: 5 }
+            ParseError::TooManyBreakpoints
         ));
     }
 

@@ -155,7 +155,7 @@ impl Classifier {
             Err(e) => {
                 // Marker validation rejections (anti-abuse) vs a genuine unparseable body.
                 match &e {
-                    ParseError::TooManyBreakpoints { .. } => cache_metrics::record_markers_rejected("too_many_breakpoints"),
+                    ParseError::TooManyBreakpoints => cache_metrics::record_markers_rejected("too_many_breakpoints"),
                     ParseError::InvalidTtl(_) => cache_metrics::record_markers_rejected("invalid_ttl"),
                     ParseError::UnsupportedType(_) => cache_metrics::record_markers_rejected("unsupported_type"),
                     ParseError::DisabledTier(_) => cache_metrics::record_markers_rejected("tier_disabled"),
