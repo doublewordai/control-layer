@@ -6,6 +6,7 @@ pub mod api_keys;
 pub mod auth;
 pub mod batch_requests;
 pub mod batches;
+pub mod cache_pricing;
 pub mod connections;
 pub mod daemons;
 pub mod deployments;

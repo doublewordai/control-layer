@@ -160,6 +160,28 @@ export interface ModelTariff {
   is_active: boolean;
 }
 
+// Cache pricing (Anthropic-style prompt-cache multipliers). Multipliers are decimal
+// strings to preserve precision, like the normal price fields.
+export interface CachePricing {
+  enabled: boolean;
+  write_multiplier_5m: string | null;
+  write_multiplier_1h: string | null;
+  write_multiplier_24h: string | null;
+  read_multiplier: string | null;
+  min_prefix_tokens: number | null;
+  valid_from: string | null;
+  valid_until: string | null;
+}
+
+// Body for enabling/re-pricing cache pricing. Omitted fields use the global defaults.
+export interface CachePricingUpdate {
+  write_multiplier_5m?: string;
+  write_multiplier_1h?: string;
+  write_multiplier_24h?: string;
+  read_multiplier?: string;
+  min_prefix_tokens?: number;
+}
+
 // Tariff definition for model create/update
 export interface TariffDefinition {
   name: string;
