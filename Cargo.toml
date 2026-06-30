@@ -1,3 +1,14 @@
 [workspace]
 members = ["dwctl"]
 resolver = "2"
+
+# COR-481: the unverified upload-volume enforcement calls two Storage methods
+# added to fusillade in https://github.com/doublewordai/fusillade/pull/303
+# (sum_owner_batch_requests_in_window, count_owner_flex_requests_since).
+#
+# This local path override lets the feature compile and be tested locally before
+# fusillade is published. It intentionally fails CI (../fusillade is not checked
+# out there) as a tripwire: BEFORE MERGE, release fusillade with these methods,
+# bump `fusillade` in dwctl/Cargo.toml to that version, and remove this patch.
+[patch.crates-io]
+fusillade = { path = "../fusillade" }
