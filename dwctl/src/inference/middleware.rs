@@ -59,6 +59,14 @@ pub struct InferenceMiddlewareState<P: PoolProvider + Clone = sqlx_pool_router::
     pub image_normalizer: Arc<dyn ImageNormalizer>,
     /// Whether image normalisation is enabled (`config.image_normalizer.enabled`).
     pub image_normalizer_enabled: bool,
+    /// COR-481: upload-volume cap for unverified creditors, in requests per hour
+    /// of completion window (`config.batches.unverified_requests_per_completion_hour`).
+    /// 0 disables the cap.
+    pub unverified_requests_per_completion_hour: usize,
+    /// Completion window that flex/async requests map to
+    /// (`config.batches.async_requests.completion_window`, e.g. "1h"). The
+    /// unverified cap is measured over a rolling window of this length.
+    pub flex_completion_window: String,
 }
 
 /// Middleware that routes inference requests based on service_tier and background.
@@ -278,6 +286,32 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
     } else {
         None
     };
+
+    // COR-481: bound how much an unverified creditor can queue via flex. Flex
+    // requests are persisted and dispatched later (they don't pass through
+    // onwards' rate limiter), so without this an unverified user could enqueue
+    // unbounded volume. No-op for verified creditors or a disabled cap.
+    if matches!(service_tier, ServiceTier::Flex)
+        && let Some(owner) = created_by.as_deref().and_then(|cb| cb.parse::<uuid::Uuid>().ok())
+        && let Err(err) = crate::api::handlers::unverified_volume::enforce_unverified_volume_limit(
+            &state.dwctl_pool,
+            &*state.request_manager,
+            state.unverified_requests_per_completion_hour,
+            owner,
+            &state.flex_completion_window,
+            1,
+            crate::api::handlers::unverified_volume::SubmissionKind::Flex,
+        )
+        .await
+    {
+        return Response::builder()
+            .status(err.status_code())
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({"error": {"message": err.user_message(), "type": "invalid_request_error"}}).to_string(),
+            ))
+            .unwrap();
+    }
 
     match service_tier {
         ServiceTier::Realtime => {
