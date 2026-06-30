@@ -91,6 +91,13 @@ const Models: React.FC = () => {
     filterGroups.length > 0 ? filterGroups.join(",") : undefined;
 
   const groups = groupsData?.data || [];
+  const groupFilterDescription =
+    filterGroups.length === 0
+      ? "No groups selected"
+      : `Selected groups: ${filterGroups
+          .map((groupId) => groups.find((group) => group.id === groupId)?.name)
+          .filter(Boolean)
+          .join(", ")}`;
 
   // Sync search query to URL params
   useEffect(() => {
@@ -227,11 +234,21 @@ const Models: React.FC = () => {
                       )}
                       {canManageGroups && (
                         <div className="space-y-2">
-                          <Label htmlFor="group-filter">Groups</Label>
+                          <Label id="group-filter-label" htmlFor="group-filter">
+                            Groups
+                          </Label>
+                          <span
+                            id="group-filter-description"
+                            className="sr-only"
+                          >
+                            {groupFilterDescription}
+                          </span>
                           <Popover>
                             <PopoverTrigger asChild>
                               <button
                                 id="group-filter"
+                                aria-labelledby="group-filter-label"
+                                aria-describedby="group-filter-description"
                                 className="w-full inline-flex items-center justify-between rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
                                 style={{ whiteSpace: "nowrap" }}
                               >
