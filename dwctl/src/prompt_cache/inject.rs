@@ -8,40 +8,20 @@
 //!    every `cache_control` marker from the request body, and ensure
 //!    `stream_options.include_usage = true` so a streaming response carries a terminal
 //!    usage frame to edit. Markers are a billing signal consumed here, not forwarded.
-//! 2. **Response usage injection** ([`inject_cache_stats_into_response`]): splice the
-//!    neutral [`CacheStats`] into the OpenAI `usage` object — `prompt_tokens_details.
-//!    cached_tokens` plus the doubleword extension fields. Non-streaming edits the JSON
-//!    body; streaming edits *only* the terminal usage frame before `[DONE]`, never
-//!    buffering the whole stream.
-
-use std::pin::Pin;
-use std::task::{Context, Poll};
+//! 2. **Response usage injection**: splice the neutral [`CacheStats`] into the OpenAI `usage`
+//!    object — `prompt_tokens_details.cached_tokens` plus the doubleword extension fields.
+//!    Non-streaming ([`inject_into_response_nonstreaming`]) buffers + edits the JSON body;
+//!    streaming ([`scan_inject_sse`]) edits *only* the terminal usage frame before `[DONE]`,
+//!    never buffering the whole stream (the cache layer drives it so the classify-await is
+//!    deferred to that frame and never holds the first token).
 
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
-use futures::Stream;
-use http_body_util::BodyExt;
 use serde_json::Value;
-use tokio::sync::oneshot;
 use tracing::error;
 
-use super::sse::SseBufferedStream;
 use super::stats::CacheStats;
-
-/// Whether the cache-index write may be committed — the success signal that must match
-/// what billing uses. A streamed response is HTTP 200 the moment it opens, so the
-/// status alone is not enough: a mid-stream error frame (which billing reclassifies to
-/// 500 and bills as zero) must veto the write. The verdict is therefore:
-/// `status < 400` **and** no error frame **and** a terminal usage frame was seen.
-pub enum CommitGate {
-    /// Non-streaming: the verdict is known as soon as the body is buffered.
-    Ready(bool),
-    /// Streaming: the verdict only settles when the stream drains (or the client
-    /// disconnects). The receiver yields `true` iff the stream completed successfully
-    /// with a usage frame and no error frame; a dropped sender (task aborted) → `false`.
-    Deferred(oneshot::Receiver<bool>),
-}
 
 /// Recursively remove every `cache_control` field from a JSON value. Returns
 /// `(rewrote, had_marker)`: `rewrote` = any key was removed (so the body changed and must be
@@ -142,13 +122,13 @@ pub fn inject_into_usage_json(body: &[u8], stats: &CacheStats) -> Option<Bytes> 
 /// The outcome of scanning one SSE body chunk: the (optionally) rewritten bytes plus the
 /// two billing-success signals observed in it. Accumulated across chunks by the streaming
 /// path so the cache-commit gate matches what billing sees.
-struct SseScan {
+pub(crate) struct SseScan {
     /// `Some` only if a usage frame was found *and* injected this call.
-    rewritten: Option<Bytes>,
+    pub rewritten: Option<Bytes>,
     /// A `data:` frame carrying an `error` payload (mid-stream provider failure).
-    saw_error: bool,
+    pub saw_error: bool,
     /// A `data:` frame carrying a `usage` object (the terminal usage frame).
-    saw_usage: bool,
+    pub saw_usage: bool,
 }
 
 /// Scan an SSE body for error/usage frames and, unless `already_edited`, inject the cache
@@ -164,7 +144,7 @@ struct SseScan {
 /// billing's "found usage" must make the *same* call, or the cache could commit a write for
 /// a frame billing reads as zero. If a multi-line provider ever appears, both must learn to
 /// reassemble together — not this one alone.
-fn scan_inject_sse(body: &[u8], stats: &CacheStats, already_edited: bool) -> SseScan {
+pub(crate) fn scan_inject_sse(body: &[u8], stats: &CacheStats, already_edited: bool) -> SseScan {
     let Ok(body_str) = std::str::from_utf8(body) else {
         return SseScan {
             rewritten: None,
@@ -238,162 +218,66 @@ pub fn inject_into_sse_body(body: &[u8], stats: &CacheStats) -> Option<Bytes> {
     scan_inject_sse(body, stats, false).rewritten
 }
 
-/// Wraps the buffered SSE stream: injects the cache fields into the terminal usage frame
-/// as it flows, accumulates the two billing-success signals (`saw_error` / `saw_usage`),
-/// and fires the commit verdict on the oneshot when the stream **ends or is dropped**.
-///
-/// Sending from `Drop` (not from a "saw the last chunk" branch) is what makes an early
-/// client disconnect resolve to a veto: the terminal usage frame never arrived, so
-/// `saw_usage` stays false → the verdict is `false` → no cache write for an unbilled call.
-struct VerdictStream {
-    inner: Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>,
-    stats: CacheStats,
-    edited: bool,
-    status_ok: bool,
-    saw_error: bool,
-    saw_usage: bool,
-    tx: Option<oneshot::Sender<bool>>,
-}
-
-impl Stream for VerdictStream {
-    type Item = Result<Bytes, std::io::Error>;
-
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let this = self.get_mut(); // Self: Unpin (all fields are)
-        match this.inner.as_mut().poll_next(cx) {
-            Poll::Ready(Some(Ok(chunk))) => {
-                let scan = scan_inject_sse(&chunk, &this.stats, this.edited);
-                this.saw_error |= scan.saw_error;
-                this.saw_usage |= scan.saw_usage;
-                match scan.rewritten {
-                    Some(rewritten) => {
-                        this.edited = true;
-                        Poll::Ready(Some(Ok(rewritten)))
-                    }
-                    None => Poll::Ready(Some(Ok(chunk))),
-                }
-            }
-            // A transport error mid-stream is a failure: veto the write.
-            Poll::Ready(Some(Err(e))) => {
-                this.saw_error = true;
-                Poll::Ready(Some(Err(e)))
-            }
-            Poll::Ready(None) => Poll::Ready(None),
-            Poll::Pending => Poll::Pending,
-        }
-    }
-}
-
-impl Drop for VerdictStream {
-    fn drop(&mut self) {
-        if let Some(tx) = self.tx.take() {
-            let _ = tx.send(self.status_ok && !self.saw_error && self.saw_usage);
-        }
-    }
-}
-
-/// Inject the cache stats into a chat-completion response, dispatching on content type:
-/// streaming SSE edits only the terminal usage frame as it flows (never fully buffered);
-/// non-streaming buffers the JSON body, splices `usage`, and rebuilds. If there is nothing
-/// to edit, the body is preserved.
-///
-/// Returns the (possibly rewritten) response **and** a [`CommitGate`] reporting whether the
-/// request succeeded for billing purposes — the caller gates the cache-index write on it.
-pub async fn inject_cache_stats_into_response(mut response: Response, stats: &CacheStats) -> (Response, CommitGate) {
+/// Inject the cache stats into a **non-streaming** chat-completion JSON response. Buffers the
+/// body, splices the cache fields into `usage`, and returns whether the request succeeded for
+/// billing — a 2xx *with* a usage object — so the caller gates the index write on it. A body that
+/// can't be buffered becomes a structured 5xx with a `false` gate. Streaming responses are handled
+/// separately by the cache layer, which defers the classify-await into the SSE stream so it never
+/// holds the first token.
+pub async fn inject_into_response_nonstreaming(response: Response, stats: &CacheStats) -> (Response, bool) {
     let status_ok = response.status().is_success();
 
-    let is_sse = response
+    // Only JSON can carry a chat-completion `usage`; don't buffer explicitly non-JSON bodies
+    // (preserve pass-through). Missing/unknown content-type → try JSON.
+    let is_json = response
         .headers()
         .get("content-type")
         .and_then(|v| v.to_str().ok())
-        .map(|v| v.contains("text/event-stream"))
-        .unwrap_or(false);
-
-    if is_sse {
-        use futures::StreamExt;
-
-        let (tx, rx) = oneshot::channel();
-        let body_stream = BodyExt::into_data_stream(std::mem::take(response.body_mut()));
-        // Normalise the error type to io::Error *before* buffering, so SseBufferedStream can
-        // emit its own io::Error on an over-limit buffer (its `E: From<io::Error>` bound).
-        // Re-aggregate provider chunks into complete SSE events so a terminal usage frame
-        // split across body chunks isn't missed.
-        let buffered = SseBufferedStream::new(body_stream.map(|r| r.map_err(std::io::Error::other)));
-        let transformed = VerdictStream {
-            inner: Box::pin(buffered),
-            stats: *stats,
-            edited: false,
-            status_ok,
-            saw_error: false,
-            saw_usage: false,
-            tx: Some(tx),
-        };
-
-        *response.body_mut() = axum::body::Body::from_stream(transformed);
-        response.headers_mut().remove(axum::http::header::CONTENT_LENGTH);
-        (response, CommitGate::Deferred(rx))
-    } else {
-        // Only JSON can carry a chat-completion `usage`; don't buffer explicitly
-        // non-JSON bodies (preserve pass-through). Missing/unknown CT → try JSON.
-        let is_json = response
-            .headers()
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            .map(|v| v.contains("application/json"))
-            .unwrap_or(true);
-        if !is_json {
-            return (response, CommitGate::Ready(false));
+        .map(|v| v.contains("application/json"))
+        .unwrap_or(true);
+    if !is_json {
+        return (response, false);
+    }
+    let (mut parts, body) = response.into_parts();
+    let body_bytes = match axum::body::to_bytes(body, usize::MAX).await {
+        Ok(b) => b,
+        Err(e) => {
+            // Buffering the upstream response failed (e.g. the upstream connection broke
+            // mid-read). Forwarding an empty body would hand the client a misleading 200 with no
+            // content; instead return a structured 5xx and veto the commit.
+            error!("Failed to buffer response body for cache injection: {}", e);
+            let err_body = serde_json::json!({
+                "error": {
+                    "message": format!("failed to read upstream response body: {e}"),
+                    "type": "internal_error",
+                    "code": "response_body_read_failed",
+                }
+            });
+            return ((StatusCode::INTERNAL_SERVER_ERROR, axum::Json(err_body)).into_response(), false);
         }
-        let (mut parts, body) = response.into_parts();
-        let body_bytes = match axum::body::to_bytes(body, usize::MAX).await {
-            Ok(b) => b,
-            Err(e) => {
-                // Buffering the upstream response failed (e.g. the upstream connection broke
-                // mid-read). Forwarding an empty body would hand the client a misleading 200
-                // with no content; instead return a structured 5xx and veto the commit.
-                error!("Failed to buffer response body for cache injection: {}", e);
-                let err_body = serde_json::json!({
-                    "error": {
-                        "message": format!("failed to read upstream response body: {e}"),
-                        "type": "internal_error",
-                        "code": "response_body_read_failed",
-                    }
-                });
-                return (
-                    (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(err_body)).into_response(),
-                    CommitGate::Ready(false),
-                );
-            }
-        };
+    };
 
-        // A present `usage` object is billing's success signal for a non-streamed call
-        // (it's where token counts come from); combined with a 2xx status, it gates the write.
-        match inject_into_usage_json(&body_bytes, stats) {
-            Some(rewritten) => {
-                let len = rewritten.len();
-                parts.headers.remove(axum::http::header::TRANSFER_ENCODING);
-                // We emit plain JSON (parse succeeded), so drop any stale Content-Encoding.
-                parts.headers.remove(axum::http::header::CONTENT_ENCODING);
-                parts
-                    .headers
-                    .insert(axum::http::header::CONTENT_LENGTH, axum::http::HeaderValue::from(len as u64));
-                (
-                    Response::from_parts(parts, axum::body::Body::from(rewritten)),
-                    CommitGate::Ready(status_ok),
-                )
-            }
-            None => {
-                // No usage object (error body, or non-completion JSON) → never commit.
-                let len = body_bytes.len();
-                parts.headers.remove(axum::http::header::TRANSFER_ENCODING);
-                parts
-                    .headers
-                    .insert(axum::http::header::CONTENT_LENGTH, axum::http::HeaderValue::from(len as u64));
-                (
-                    Response::from_parts(parts, axum::body::Body::from(body_bytes)),
-                    CommitGate::Ready(false),
-                )
-            }
+    // A present `usage` object is billing's success signal for a non-streamed call (it's where
+    // token counts come from); combined with a 2xx status, it gates the write.
+    match inject_into_usage_json(&body_bytes, stats) {
+        Some(rewritten) => {
+            let len = rewritten.len();
+            parts.headers.remove(axum::http::header::TRANSFER_ENCODING);
+            // We emit plain JSON (parse succeeded), so drop any stale Content-Encoding.
+            parts.headers.remove(axum::http::header::CONTENT_ENCODING);
+            parts
+                .headers
+                .insert(axum::http::header::CONTENT_LENGTH, axum::http::HeaderValue::from(len as u64));
+            (Response::from_parts(parts, axum::body::Body::from(rewritten)), status_ok)
+        }
+        None => {
+            // No usage object (error body, or non-completion JSON) → never commit.
+            let len = body_bytes.len();
+            parts.headers.remove(axum::http::header::TRANSFER_ENCODING);
+            parts
+                .headers
+                .insert(axum::http::header::CONTENT_LENGTH, axum::http::HeaderValue::from(len as u64));
+            (Response::from_parts(parts, axum::body::Body::from(body_bytes)), false)
         }
     }
 }
@@ -517,77 +401,27 @@ mod tests {
         assert!(s.contains("\"cache_read_input_tokens\":1024"), "got: {s}");
     }
 
-    #[tokio::test]
-    async fn inject_response_streaming_edits_split_usage_frame() {
-        use axum::body::Body;
-        // The terminal usage frame is split across two body chunks.
-        let chunks: Vec<Result<Bytes, std::io::Error>> = vec![
-            Ok(Bytes::from_static(b"data: {\"choices\":[],\"usage\":{\"prompt_")),
-            Ok(Bytes::from_static(b"tokens\":2000}}\n\ndata: [DONE]\n\n")),
-        ];
-        let resp = Response::builder()
-            .header("content-type", "text/event-stream")
-            .body(Body::from_stream(futures::stream::iter(chunks)))
-            .unwrap();
-        let (out, gate) = inject_cache_stats_into_response(resp, &stats()).await;
-        let collected = axum::body::to_bytes(out.into_body(), usize::MAX).await.unwrap();
-        let s = std::str::from_utf8(&collected).unwrap();
+    #[test]
+    fn inject_into_sse_body_edits_the_usage_frame() {
+        // The injection primitive: splice cache fields into the terminal usage frame, leaving the
+        // deltas and `[DONE]` untouched. (The streaming orchestration — deferred classify resolve
+        // + the commit gate — is exercised end-to-end in the layer tests.)
+        let body = b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":2000}}\n\ndata: [DONE]\n\n";
+        let out = inject_into_sse_body(body, &stats()).expect("usage frame present → edited");
+        let s = std::str::from_utf8(&out).unwrap();
         assert!(s.contains("\"cached_tokens\":1024"), "got: {s}");
-        // Draining the stream (a clean 200 with a usage frame, no error) → commit allowed.
-        match gate {
-            CommitGate::Deferred(rx) => assert!(rx.await.unwrap(), "clean stream → commit"),
-            CommitGate::Ready(_) => panic!("streaming response must yield a deferred gate"),
-        }
+        assert!(s.contains("data: [DONE]"), "DONE preserved");
+        assert!(s.contains("\"content\":\"hi\""), "delta preserved");
+    }
+
+    #[test]
+    fn inject_into_sse_body_none_without_usage() {
+        let body = b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n";
+        assert!(inject_into_sse_body(body, &stats()).is_none(), "no usage frame → nothing to edit");
     }
 
     #[tokio::test]
-    async fn inject_response_streaming_error_frame_vetoes_commit() {
-        use axum::body::Body;
-        // A mid-stream error frame arrives after some deltas; no usage frame follows.
-        let chunks: Vec<Result<Bytes, std::io::Error>> = vec![
-            Ok(Bytes::from_static(b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n")),
-            Ok(Bytes::from_static(b"data: {\"error\":{\"message\":\"upstream exploded\"}}\n\n")),
-        ];
-        let resp = Response::builder()
-            .header("content-type", "text/event-stream")
-            .body(Body::from_stream(futures::stream::iter(chunks)))
-            .unwrap();
-        let (out, gate) = inject_cache_stats_into_response(resp, &stats()).await;
-        let _ = axum::body::to_bytes(out.into_body(), usize::MAX).await.unwrap();
-        match gate {
-            CommitGate::Deferred(rx) => assert!(!rx.await.unwrap(), "error frame → veto"),
-            CommitGate::Ready(_) => panic!("streaming response must yield a deferred gate"),
-        }
-    }
-
-    #[tokio::test]
-    async fn inject_response_streaming_disconnect_vetoes_commit() {
-        use axum::body::Body;
-        // A clean stream WITH a usage frame — but the client disconnects before draining
-        // it (we drop the response body without reading it). VerdictStream's Drop must then
-        // fire the verdict, and because the terminal usage frame was never polled, the
-        // verdict is `false` → no commit for a stream the client never finished paying for.
-        let chunks: Vec<Result<Bytes, std::io::Error>> = vec![
-            Ok(Bytes::from_static(b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n")),
-            Ok(Bytes::from_static(
-                b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":2000}}\n\ndata: [DONE]\n\n",
-            )),
-        ];
-        let resp = Response::builder()
-            .header("content-type", "text/event-stream")
-            .body(Body::from_stream(futures::stream::iter(chunks)))
-            .unwrap();
-        let (out, gate) = inject_cache_stats_into_response(resp, &stats()).await;
-        // Client disconnect: drop the response (and its body) WITHOUT consuming the stream.
-        drop(out);
-        match gate {
-            CommitGate::Deferred(rx) => assert!(!rx.await.unwrap(), "disconnect before terminal frame → veto"),
-            CommitGate::Ready(_) => panic!("streaming response must yield a deferred gate"),
-        }
-    }
-
-    #[tokio::test]
-    async fn inject_non_streaming_error_body_vetoes_commit() {
+    async fn inject_nonstreaming_error_body_vetoes_commit() {
         use axum::body::Body;
         // A 400 JSON error body has no usage object → no injection, no commit.
         let resp = Response::builder()
@@ -595,10 +429,22 @@ mod tests {
             .header("content-type", "application/json")
             .body(Body::from(serde_json::json!({"error":{"message":"bad request"}}).to_string()))
             .unwrap();
-        let (_out, gate) = inject_cache_stats_into_response(resp, &stats()).await;
-        match gate {
-            CommitGate::Ready(ok) => assert!(!ok, "error body → no commit"),
-            CommitGate::Deferred(_) => panic!("non-streaming response must yield a ready gate"),
-        }
+        let (_out, billing_ok) = inject_into_response_nonstreaming(resp, &stats()).await;
+        assert!(!billing_ok, "error body → no commit");
+    }
+
+    #[tokio::test]
+    async fn inject_nonstreaming_success_injects_and_allows_commit() {
+        use axum::body::Body;
+        let resp = Response::builder()
+            .status(200)
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::json!({"usage":{"prompt_tokens":2000}}).to_string()))
+            .unwrap();
+        let (out, billing_ok) = inject_into_response_nonstreaming(resp, &stats()).await;
+        assert!(billing_ok, "2xx with usage → commit allowed");
+        let collected = axum::body::to_bytes(out.into_body(), usize::MAX).await.unwrap();
+        let s = std::str::from_utf8(&collected).unwrap();
+        assert!(s.contains("\"cached_tokens\":1024"), "got: {s}");
     }
 }

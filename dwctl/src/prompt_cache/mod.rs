@@ -25,7 +25,7 @@ pub mod tokenizer;
 
 pub use classifier::{Classifier, ClassifyOutcome, ClassifyRequest};
 pub use index::{CacheEntry, CacheError, CacheIndex, CacheMatch, CacheResult, IndexScope, PrefixHash, TierPolicy, TtlTier};
-pub use inject::{CommitGate, inject_cache_stats_into_response, strip_cache_control};
+pub use inject::strip_cache_control;
 pub use layer::{CacheLayerState, cache_middleware};
 pub use model_config::{ModelCacheConfig, ModelConfigResolver};
 pub use parse::{Block, Breakpoint, ParseError, ParsedPrompt, parse_chat_completions, validate_markers};
