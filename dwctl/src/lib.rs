@@ -371,6 +371,11 @@ fn get_or_install_prometheus_handle() -> PrometheusHandle {
                 )
                 .expect("Failed to set custom buckets for dwctl_cache_commit_duration_seconds")
                 .set_buckets_for_metric(
+                    Matcher::Full("dwctl_cache_lookup_duration_seconds".to_string()),
+                    CACHE_LATENCY_BUCKETS,
+                )
+                .expect("Failed to set custom buckets for dwctl_cache_lookup_duration_seconds")
+                .set_buckets_for_metric(
                     Matcher::Full("fusillade_retry_attempts_on_success".to_string()),
                     RETRY_ATTEMPTS_BUCKETS,
                 )

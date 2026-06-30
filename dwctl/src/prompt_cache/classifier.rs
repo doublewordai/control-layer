@@ -312,7 +312,9 @@ impl Classifier {
                 }
             }
         }
+        let lookup_start = std::time::Instant::now();
         let matches = self.index.lookup(scope, &candidates).await?;
+        cache_metrics::record_lookup_duration(lookup_start.elapsed().as_secs_f64());
         if matches.is_empty() {
             return Ok(None);
         }
