@@ -148,6 +148,49 @@ describe("Models Component - Functional Tests", () => {
       });
     });
 
+    it("filters models by selected group", { timeout: 10000 }, async () => {
+      const user = userEvent.setup();
+      const { container } = render(<Models />, { wrapper: createWrapper() });
+
+      await waitFor(() => {
+        expect(
+          within(container).getByRole("heading", { name: /models/i }),
+        ).toBeInTheDocument();
+      });
+
+      await waitFor(() => {
+        expect(
+          within(container).getAllByRole("listitem").length,
+        ).toBeGreaterThan(0);
+      });
+
+      expect(
+        within(container).getByText("Qwen/Qwen3.5-35B-A3B-FP8"),
+      ).toBeInTheDocument();
+
+      await user.click(
+        within(container).getByRole("button", { name: /filter models/i }),
+      );
+      const groupFilter = screen.getByRole("button", { name: "Groups" });
+      expect(groupFilter).toHaveAccessibleDescription("No groups selected");
+
+      await user.click(groupFilter);
+      await user.click(screen.getByRole("button", { name: "ML Research" }));
+
+      expect(groupFilter).toHaveAccessibleDescription(
+        "Selected groups: ML Research",
+      );
+
+      await waitFor(() => {
+        expect(
+          within(container).getByText("Qwen/Qwen3.5-397B-A17B-FP8"),
+        ).toBeInTheDocument();
+        expect(
+          within(container).queryByText("Qwen/Qwen3.5-35B-A3B-FP8"),
+        ).not.toBeInTheDocument();
+      });
+    });
+
     it("navigates to playground when clicking playground button", async () => {
       const user = userEvent.setup();
       const { container } = render(<Models />, { wrapper: createWrapper() });

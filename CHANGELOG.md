@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.68.0](https://github.com/doublewordai/control-layer/compare/v8.67.1...v8.68.0) (2026-06-30)
+
+
+### Features
+
+* global config for activated cache ttl's, and param errors surfacing t… ([#1206](https://github.com/doublewordai/control-layer/issues/1206)) ([1712a07](https://github.com/doublewordai/control-layer/commit/1712a077d4f53e940a9a7aca0069cb30725c4298))
+
 ## [8.67.1](https://github.com/doublewordai/control-layer/compare/v8.67.0...v8.67.1) (2026-06-30)
 
 
