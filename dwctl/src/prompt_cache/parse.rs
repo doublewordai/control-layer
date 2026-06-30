@@ -39,7 +39,7 @@ pub enum ParseError {
     UnsupportedType(String),
     #[error("cache_control ttl tier '{}' is not currently available", .0.as_str())]
     DisabledTier(TtlTier),
-    #[error("cache_control must be an object (e.g. {{\"type\": \"ephemeral\"}})")]
+    #[error("cache_control must be an object with string fields (e.g. {{\"type\": \"ephemeral\", \"ttl\": \"5m\"}})")]
     MalformedCacheControl,
 }
 
@@ -83,8 +83,9 @@ impl ParsedPrompt {
     }
 }
 
-/// Parse a chat-completions body into its cache primitives. Errors are surfaced for
-/// the caller to treat as "no cache" (safe) — never breaking the customer request.
+/// Parse a chat-completions body into its cache primitives. Callers decide what a `ParseError`
+/// means: the classifier degrades to "no cache" (the request is forwarded untouched), while the
+/// request-path [`validate_markers`] surfaces it to the client as a 400.
 pub fn parse_chat_completions(body: &[u8], policy: &TierPolicy) -> Result<ParsedPrompt, ParseError> {
     let v: serde_json::Value = serde_json::from_slice(body)?;
 
@@ -149,24 +150,29 @@ pub fn parse_chat_completions(body: &[u8], policy: &TierPolicy) -> Result<Parsed
 
 /// `cache_control: { type: "ephemeral", ttl: "5m"|"1h"|"24h" }`. A missing `ttl` defaults to
 /// `policy.default_ttl` (Anthropic-style; configurable). Errors:
-/// - non-`ephemeral` `type` → [`ParseError::UnsupportedType`]
+/// - a non-object marker, or a present-but-non-string `type`/`ttl` → [`ParseError::MalformedCacheControl`]
+/// - a string `type` that isn't `"ephemeral"` → [`ParseError::UnsupportedType`]
 /// - an unknown `ttl` string → [`ParseError::InvalidTtl`]
 /// - a valid tier the platform has disabled (not in `enabled_ttls`) → [`ParseError::DisabledTier`]
 fn parse_ttl(cache_control: &serde_json::Value, policy: &TierPolicy) -> Result<TtlTier, ParseError> {
-    // A non-object marker (string/bool/array/number) is malformed — reject it rather than
-    // letting `.get(...)` return `None` and silently treating it as a default-tier breakpoint.
-    // (An explicit `null` is filtered out as "no marker" before we get here.)
+    use serde_json::Value;
+    // Must be an object; a present `type`/`ttl` must be a *string*. A non-string field is
+    // malformed, not "absent" — otherwise `.as_str()` would return `None` and e.g. `ttl: 123`
+    // would silently default rather than being surfaced as a 400. (An explicit `null` marker is
+    // filtered out as "no marker" before we get here.)
     if !cache_control.is_object() {
         return Err(ParseError::MalformedCacheControl);
     }
-    if let Some(t) = cache_control.get("type").and_then(|t| t.as_str())
-        && t != "ephemeral"
-    {
-        return Err(ParseError::UnsupportedType(t.to_string()));
+    match cache_control.get("type") {
+        None => {}
+        Some(Value::String(t)) if t == "ephemeral" => {}
+        Some(Value::String(t)) => return Err(ParseError::UnsupportedType(t.clone())),
+        Some(_) => return Err(ParseError::MalformedCacheControl),
     }
-    let tier = match cache_control.get("ttl").and_then(|t| t.as_str()) {
-        Some(ttl) => TtlTier::parse(ttl).ok_or_else(|| ParseError::InvalidTtl(ttl.to_string()))?,
+    let tier = match cache_control.get("ttl") {
         None => policy.default_ttl(),
+        Some(Value::String(ttl)) => TtlTier::parse(ttl).ok_or_else(|| ParseError::InvalidTtl(ttl.clone()))?,
+        Some(_) => return Err(ParseError::MalformedCacheControl),
     };
     if !policy.is_enabled(tier) {
         return Err(ParseError::DisabledTier(tier));
@@ -401,6 +407,31 @@ mod tests {
         ));
         assert!(matches!(
             parse_chat_completions(body.to_string().as_bytes(), &all_tiers()).unwrap_err(),
+            ParseError::MalformedCacheControl
+        ));
+    }
+
+    #[test]
+    fn non_string_type_or_ttl_is_malformed() {
+        // A present-but-non-string `type`/`ttl` must not be treated as absent (which would
+        // silently default e.g. `ttl: 123` into the default tier).
+        let bad_ttl = serde_json::json!({
+            "messages": [{"role": "system", "content": [
+                {"type": "text", "text": "x", "cache_control": {"type": "ephemeral", "ttl": 123}}
+            ]}]
+        });
+        assert!(matches!(
+            validate_markers(&bad_ttl, &all_tiers()).unwrap_err(),
+            ParseError::MalformedCacheControl
+        ));
+
+        let bad_type = serde_json::json!({
+            "messages": [{"role": "system", "content": [
+                {"type": "text", "text": "x", "cache_control": {"type": true}}
+            ]}]
+        });
+        assert!(matches!(
+            validate_markers(&bad_type, &all_tiers()).unwrap_err(),
             ParseError::MalformedCacheControl
         ));
     }

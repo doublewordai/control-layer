@@ -43,27 +43,36 @@ pub enum CommitGate {
     Deferred(oneshot::Receiver<bool>),
 }
 
-/// Recursively remove all `cache_control` fields from a JSON value. Returns true if any
-/// marker was removed.
-fn remove_cache_control(value: &mut Value) -> bool {
-    let mut removed = false;
+/// Recursively remove every `cache_control` field from a JSON value. Returns
+/// `(rewrote, had_marker)`: `rewrote` = any key was removed (so the body changed and must be
+/// re-serialised before forwarding — a `cache_control` field would otherwise leak to the
+/// upstream); `had_marker` = any removed value was NON-NULL, the adoption signal. An explicit
+/// `cache_control: null` is "no marker" (matching parse/validation), but is still stripped.
+fn remove_cache_control(value: &mut Value) -> (bool, bool) {
+    let mut rewrote = false;
+    let mut had_marker = false;
     match value {
         Value::Object(map) => {
-            if map.remove("cache_control").is_some() {
-                removed = true;
+            if let Some(removed) = map.remove("cache_control") {
+                rewrote = true;
+                had_marker |= !removed.is_null();
             }
             for v in map.values_mut() {
-                removed |= remove_cache_control(v);
+                let (r, h) = remove_cache_control(v);
+                rewrote |= r;
+                had_marker |= h;
             }
         }
         Value::Array(items) => {
             for v in items.iter_mut() {
-                removed |= remove_cache_control(v);
+                let (r, h) = remove_cache_control(v);
+                rewrote |= r;
+                had_marker |= h;
             }
         }
         _ => {}
     }
-    removed
+    (rewrote, had_marker)
 }
 
 /// Sanitise an outbound request body: strip every `cache_control` marker and, for
@@ -76,7 +85,7 @@ pub fn strip_cache_control(body: &[u8]) -> (Option<Bytes>, bool) {
     let Ok(mut json) = serde_json::from_slice::<Value>(body) else {
         return (None, false);
     };
-    let stripped = remove_cache_control(&mut json);
+    let (rewrote, had_markers) = remove_cache_control(&mut json);
 
     let mut usage_set = false;
     if let Some(obj) = json.as_object_mut() {
@@ -93,12 +102,12 @@ pub fn strip_cache_control(body: &[u8]) -> (Option<Bytes>, bool) {
         }
     }
 
-    let body = if stripped || usage_set {
+    let body = if rewrote || usage_set {
         serde_json::to_vec(&json).ok().map(Bytes::from)
     } else {
         None
     };
-    (body, stripped)
+    (body, had_markers)
 }
 
 /// Splice the OpenAI-shaped cache fields into a `usage` object in place.
@@ -433,6 +442,20 @@ mod tests {
         let (out, had_markers) = strip_cache_control(body.as_bytes());
         assert!(out.is_some(), "include_usage injected");
         assert!(!had_markers, "no markers present");
+    }
+
+    #[test]
+    fn strip_null_cache_control_is_removed_but_not_marked() {
+        // An explicit `cache_control: null` is "no marker" for the adoption metric (matching
+        // parse/validation), but is still stripped so it can't leak to the upstream.
+        let body = serde_json::json!({
+            "messages": [{"role":"system","content":[{"type":"text","text":"x","cache_control":null}]}]
+        })
+        .to_string();
+        let (out, had_markers) = strip_cache_control(body.as_bytes());
+        assert!(!had_markers, "null cache_control is not a marker");
+        let out = out.expect("body rewritten to drop the null cache_control key");
+        assert!(!out.windows(13).any(|w| w == b"cache_control"), "cache_control key removed");
     }
 
     #[test]

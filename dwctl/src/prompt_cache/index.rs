@@ -65,12 +65,16 @@ pub struct TierPolicy {
 }
 
 impl TierPolicy {
-    /// Build from the config strings. Unparseable tiers are dropped (config validation rejects
-    /// those at startup, so every string is a real tier here in practice).
+    /// Build from the config strings. Config validation has already rejected unknown tiers and a
+    /// default outside the enabled set, so an unparseable tier here is a broken invariant — panic
+    /// (fail fast, surfacing the misconfiguration) rather than silently dropping it.
     pub fn from_config(enabled_ttls: &[String], default_ttl: &str) -> Self {
         Self {
-            default_ttl: TtlTier::parse(default_ttl).unwrap_or(TtlTier::FiveMinutes),
-            enabled: enabled_ttls.iter().filter_map(|s| TtlTier::parse(s)).collect(),
+            default_ttl: TtlTier::parse(default_ttl).expect("default_ttl must be a known tier (validated in config)"),
+            enabled: enabled_ttls
+                .iter()
+                .map(|s| TtlTier::parse(s).expect("enabled_ttls must contain only known tiers (validated in config)"))
+                .collect(),
         }
     }
 
