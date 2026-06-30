@@ -2909,6 +2909,57 @@ secret_key: "test-secret-key"
         assert!(result.is_ok()); // Should pass because both batches AND daemon are disabled
     }
 
+    /// Helper: a config that passes validation up to the cache checks, with caching on.
+    fn cache_test_config() -> Config {
+        let mut config = Config::default();
+        config.auth.native.enabled = true;
+        config.secret_key = Some("test-secret-key".to_string());
+        config.cache.enabled = true;
+        config
+    }
+
+    #[test]
+    fn test_cache_tiers_not_validated_when_disabled() {
+        let mut config = cache_test_config();
+        config.cache.enabled = false; // disabled → tier config is not validated
+        config.cache.enabled_ttls = vec!["99h".to_string()]; // bogus, but ignored
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_cache_valid_tiers_ok() {
+        let mut config = cache_test_config();
+        config.cache.enabled_ttls = vec!["5m".to_string(), "1h".to_string()];
+        config.cache.default_ttl = "5m".to_string();
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_cache_unknown_tier_rejected() {
+        let mut config = cache_test_config();
+        config.cache.enabled_ttls = vec!["5m".to_string(), "99h".to_string()];
+        config.cache.default_ttl = "5m".to_string();
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("unknown tier"), "{err}");
+    }
+
+    #[test]
+    fn test_cache_empty_tiers_rejected() {
+        let mut config = cache_test_config();
+        config.cache.enabled_ttls = vec![];
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("enabled_ttls is empty"), "{err}");
+    }
+
+    #[test]
+    fn test_cache_default_ttl_must_be_enabled() {
+        let mut config = cache_test_config();
+        config.cache.enabled_ttls = vec!["5m".to_string()];
+        config.cache.default_ttl = "1h".to_string(); // not in enabled_ttls
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("default_ttl"), "{err}");
+    }
+
     #[test]
     fn test_batch_insert_size_validated_when_daemon_enabled() {
         let mut config = Config::default();
