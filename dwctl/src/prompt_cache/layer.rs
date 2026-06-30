@@ -374,9 +374,12 @@ fn defer_classify_into_stream(
             saw_usage |= probe.saw_usage;
             // Inject into the (single) usage frame, but only for an active (cache-enabled) request.
             let out = if !edited && probe.saw_usage && outcome.as_ref().is_some_and(|o| o.active) {
-                edited = true;
                 let stats = outcome.as_ref().map(|o| o.stats).unwrap_or_default();
-                scan_inject_sse(&chunk, &stats, false).rewritten.unwrap_or(chunk)
+                let scan = scan_inject_sse(&chunk, &stats, false);
+                // Only mark done once it *actually* rewrote — a (rare) reserialize failure
+                // shouldn't permanently disable injection for a later usage frame.
+                edited |= scan.rewritten.is_some();
+                scan.rewritten.unwrap_or(chunk)
             } else {
                 chunk
             };
@@ -684,6 +687,90 @@ mod tests {
             "second stream reads the prefix: {t2}"
         );
         assert!(t2.contains("\"cache_creation_input_tokens\":0"), "no creation on a read: {t2}");
+    }
+
+    /// Streaming stand-in that fails mid-stream: a delta, then an error frame, and NO usage frame.
+    async fn mock_upstream_streaming_error() -> Response {
+        let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n\
+                   data: {\"error\":{\"message\":\"upstream exploded\"}}\n\n";
+        Response::builder()
+            .header("content-type", "text/event-stream")
+            .body(Body::from(sse))
+            .unwrap()
+    }
+
+    #[sqlx::test]
+    async fn streaming_error_frame_vetoes_the_write(pool: PgPool) {
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        let key = create_test_api_key_for_user(&pool, user.id).await;
+        let endpoint = create_test_endpoint(&pool, "ep", user.id).await;
+        let id = create_test_model(&pool, "m", ALIAS, endpoint, user.id).await;
+        sqlx::query!(
+            r#"INSERT INTO model_cache_tariffs
+                 (deployed_model_id, write_multiplier_5m, write_multiplier_1h, write_multiplier_24h, min_prefix_tokens)
+               VALUES ($1, 1.25, 2.0, 2.5, 1024)"#,
+            id
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let tok = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "models": [{"alias": ALIAS, "hf_repo": "o/m", "tokenizer_version": TOK_VER}]
+            })))
+            .mount(&tok)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/tokenize"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "virtual_model": ALIAS, "tokenizer_version": TOK_VER,
+                "segment_counts": [1500], "cumulative": [1500], "total": 1500
+            })))
+            .mount(&tok)
+            .await;
+
+        let classifier = Classifier::new(
+            PrincipalResolver::new(pool.clone()),
+            ModelConfigResolver::new(pool.clone()),
+            TokenizerClient::new(tok.uri()),
+            Arc::new(PostgresIndex::new(pool.clone())),
+            all_tiers(),
+        );
+        let app = Router::new()
+            .route("/v1/chat/completions", post(mock_upstream_streaming_error))
+            .layer(from_fn_with_state(CacheLayerState::new(classifier, usize::MAX), cache_middleware));
+        let server = axum_test::TestServer::new(app).unwrap();
+
+        // Drain the stream: a mid-stream error frame and no usage frame → veto.
+        let r = server
+            .post("/v1/chat/completions")
+            .add_header("authorization", format!("Bearer {}", key.secret))
+            .json(&body_streaming())
+            .await;
+        let _ = r.text();
+
+        // An unbilled stream must NOT seed the cache. Give any (erroneously) spawned commit ample
+        // chance to land, then assert the index stayed empty.
+        let scope = IndexScope {
+            principal_id: user.id,
+            virtual_model: ALIAS.into(),
+            tokenizer_version: TOK_VER.into(),
+        };
+        let hash = parse_chat_completions(&serde_json::to_vec(&body_streaming()).unwrap(), &all_tiers())
+            .unwrap()
+            .cumulative_hashes[0]
+            .clone();
+        let idx = PostgresIndex::new(pool.clone());
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            idx.lookup(&scope, std::slice::from_ref(&hash)).await.unwrap().is_empty(),
+            "an unbilled stream (error frame, no usage) must not commit a write"
+        );
     }
 
     #[sqlx::test]
