@@ -6,6 +6,7 @@ pub mod sigterm_drain;
 pub mod sla;
 pub mod strict_mode;
 pub mod utils;
+pub mod zdr_sentinel;
 
 use crate::tasks::TaskState;
 use crate::{AppState, create_initial_admin_user};
