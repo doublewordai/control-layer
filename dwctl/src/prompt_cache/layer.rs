@@ -300,6 +300,27 @@ fn outcome_label(outcome: &ClassifyOutcome) -> &'static str {
     }
 }
 
+/// RAII guard for the deferred classify handle: aborts the spawned task on drop. If the client
+/// disconnects before the stream reaches the terminal usage frame, the wrapping `async_stream` is
+/// dropped — without this, dropping the bare `JoinHandle` would *detach* the (possibly stalled)
+/// classify task into an orphan that bypasses the deadline. Aborting cancels it at its next await.
+/// `take()` hands the handle to `join_classify` on the normal path, defusing the guard.
+struct AbortOnDrop<T>(Option<tokio::task::JoinHandle<T>>);
+
+impl<T> AbortOnDrop<T> {
+    fn take(&mut self) -> Option<tokio::task::JoinHandle<T>> {
+        self.0.take()
+    }
+}
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        if let Some(h) = self.0.take() {
+            h.abort();
+        }
+    }
+}
+
 /// Defer the classify-await into the SSE stream so it never holds the first token. Returns the
 /// response immediately; as frames flow it resolves classify lazily at the terminal usage frame
 /// (bounded by the deadline — classify has almost always finished during generation), injects the
@@ -322,7 +343,9 @@ fn defer_classify_into_stream(
 
     let stream = async_stream::stream! {
         futures::pin_mut!(buffered);
-        let mut handle = Some(handle);
+        // Aborts the classify task if the stream is dropped early (client disconnect) instead of
+        // detaching it into an orphan; `take()` defuses it on the normal terminal-frame path.
+        let mut handle = AbortOnDrop(Some(handle));
         let mut outcome: Option<ClassifyOutcome> = None;
         let mut edited = false;
         let mut saw_error = false;
