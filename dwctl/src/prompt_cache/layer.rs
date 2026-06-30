@@ -24,8 +24,10 @@ use axum::response::{IntoResponse, Response};
 use tracing::warn;
 
 use super::classifier::{Classifier, ClassifyOutcome, ClassifyRequest};
+use super::index::TierPolicy;
 use super::inject::{CommitGate, inject_cache_stats_into_response, strip_cache_control};
 use super::metrics as cache_metrics;
+use super::parse::{ParseError, validate_markers};
 
 /// Bound on the index commit (off the response path). A slow/hung DB can't leak the
 /// spawned task or hold a pool connection indefinitely; a miss just drops the write
@@ -63,6 +65,38 @@ fn is_cacheable(req: &Request) -> bool {
     req.method() == Method::POST && req.uri().path().ends_with("/chat/completions")
 }
 
+/// Turn a synchronous marker-validation failure into the structured 400 the rest of the stack
+/// uses (same shape as the body-read error) — the request is rejected like a bad parameter, not
+/// silently un-cached. A disabled-tier message names the tiers that ARE available so the client
+/// can adjust.
+fn marker_rejection_response(e: &ParseError, policy: &TierPolicy) -> Response {
+    let reason = match e {
+        ParseError::DisabledTier(_) => Some("tier_disabled"),
+        ParseError::InvalidTtl(_) => Some("invalid_ttl"),
+        ParseError::UnsupportedType(_) => Some("unsupported_type"),
+        ParseError::TooManyBreakpoints => Some("too_many_breakpoints"),
+        ParseError::MalformedCacheControl => Some("malformed_cache_control"),
+        // validate_markers takes an already-parsed Value, so a JSON error can't reach here.
+        ParseError::Json(_) => None,
+    };
+    if let Some(r) = reason {
+        cache_metrics::record_markers_rejected(r);
+    }
+    let message = match e {
+        ParseError::DisabledTier(_) => format!("{e}; available tiers: {}", policy.enabled_strs().join(", ")),
+        _ => e.to_string(),
+    };
+    let body = serde_json::json!({
+        "error": {
+            "message": message,
+            "type": "invalid_request_error",
+            "code": "invalid_cache_control",
+            "param": "messages[].content[].cache_control",
+        }
+    });
+    (StatusCode::BAD_REQUEST, axum::Json(body)).into_response()
+}
+
 pub async fn cache_middleware(State(state): State<CacheLayerState>, request: Request, next: Next) -> Response {
     if !is_cacheable(&request) {
         return next.run(request).await;
@@ -90,8 +124,21 @@ pub async fn cache_middleware(State(state): State<CacheLayerState>, request: Req
         }
     };
 
-    let virtual_model = serde_json::from_slice::<serde_json::Value>(&body_bytes)
-        .ok()
+    // Parse the body once; reused both for marker validation and to extract `model` (no extra
+    // deserialization). `None` if the body isn't JSON — onwards will surface that as a 400.
+    let parsed_body = serde_json::from_slice::<serde_json::Value>(&body_bytes).ok();
+
+    // Reject disallowed/malformed cache_control markers synchronously, before forking + forwarding
+    // — a 400 like a bad parameter, NOT a silent no-cache, so the client learns immediately and
+    // isn't billed full price thinking it cached. Cheap: walks the already-parsed Value, no hashing.
+    if let Some(body) = &parsed_body
+        && let Err(e) = validate_markers(body, state.classifier.tier_policy())
+    {
+        return marker_rejection_response(&e, state.classifier.tier_policy());
+    }
+
+    let virtual_model = parsed_body
+        .as_ref()
         .and_then(|v| v.get("model").and_then(|m| m.as_str()).map(String::from));
     let api_key = parts
         .headers
@@ -276,6 +323,10 @@ mod tests {
     const ALIAS: &str = "layer-model";
     const TOK_VER: &str = "sha256:lv1";
 
+    fn all_tiers() -> TierPolicy {
+        TierPolicy::from_config(&["5m".to_string(), "1h".to_string(), "24h".to_string()], "5m")
+    }
+
     /// Stand-in for onwards/upstream: a chat completion with a `usage` object.
     async fn mock_upstream() -> Json<serde_json::Value> {
         Json(serde_json::json!({
@@ -334,6 +385,7 @@ mod tests {
             ModelConfigResolver::new(pool.clone()),
             TokenizerClient::new(tok.uri()),
             Arc::new(PostgresIndex::new(pool.clone())),
+            all_tiers(),
         );
         let app = Router::new()
             .route("/v1/chat/completions", post(mock_upstream))
@@ -359,7 +411,7 @@ mod tests {
             virtual_model: ALIAS.into(),
             tokenizer_version: TOK_VER.into(),
         };
-        let hash = parse_chat_completions(&serde_json::to_vec(&body()).unwrap())
+        let hash = parse_chat_completions(&serde_json::to_vec(&body()).unwrap(), &all_tiers())
             .unwrap()
             .cumulative_hashes[0]
             .clone();
@@ -396,6 +448,7 @@ mod tests {
             ModelConfigResolver::new(pool.clone()),
             TokenizerClient::new("http://127.0.0.1:1"),
             Arc::new(PostgresIndex::new(pool.clone())),
+            all_tiers(),
         );
         let app = Router::new()
             .route("/v1/embeddings", post(mock_upstream))
@@ -407,5 +460,40 @@ mod tests {
             .await;
         let v: serde_json::Value = r.json();
         assert!(v["usage"].get("cache_read_input_tokens").is_none());
+    }
+
+    #[sqlx::test]
+    async fn disabled_tier_marker_rejected_with_400(pool: PgPool) {
+        // Policy enables only 5m; a request carrying a 24h marker must be rejected up front
+        // (before forwarding) with a clear 400 — not silently un-cached.
+        let classifier = Classifier::new(
+            PrincipalResolver::new(pool.clone()),
+            ModelConfigResolver::new(pool.clone()),
+            TokenizerClient::new("http://127.0.0.1:1"),
+            Arc::new(PostgresIndex::new(pool.clone())),
+            TierPolicy::from_config(&["5m".to_string()], "5m"),
+        );
+        let app = Router::new()
+            .route("/v1/chat/completions", post(mock_upstream)) // must NOT be reached
+            .layer(from_fn_with_state(CacheLayerState::new(classifier, usize::MAX), cache_middleware));
+        let server = axum_test::TestServer::new(app).unwrap();
+
+        let r = server
+            .post("/v1/chat/completions")
+            .add_header("authorization", "Bearer anything")
+            .json(&serde_json::json!({
+                "model": ALIAS,
+                "messages": [{"role": "system", "content": [
+                    {"type": "text", "text": "x", "cache_control": {"type": "ephemeral", "ttl": "24h"}}
+                ]}]
+            }))
+            .await;
+
+        r.assert_status(StatusCode::BAD_REQUEST);
+        let v: serde_json::Value = r.json();
+        assert_eq!(v["error"]["code"], "invalid_cache_control");
+        let msg = v["error"]["message"].as_str().unwrap();
+        assert!(msg.contains("24h"), "message names the rejected tier: {msg}");
+        assert!(msg.contains("available tiers: 5m"), "message names the available tiers: {msg}");
     }
 }
