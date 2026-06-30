@@ -506,6 +506,28 @@ mod tests {
     }
 
     #[test]
+    fn service_tier_flex_passes_through_others_dropped() {
+        // `flex` is forwarded so the inference middleware routes to handle_flex.
+        let flex = translate(json!({
+            "model": "m", "max_tokens": 1, "messages": [ { "role": "user", "content": "hi" } ],
+            "service_tier": "flex"
+        }));
+        assert_eq!(flex["service_tier"], "flex");
+        // Anthropic's standard values are no-ops in dwctl routing and must not
+        // be forwarded (standard_only is not a valid OpenAI value).
+        for tier in ["auto", "standard_only"] {
+            let out = translate(json!({
+                "model": "m", "max_tokens": 1, "messages": [ { "role": "user", "content": "hi" } ],
+                "service_tier": tier
+            }));
+            assert!(out.get("service_tier").is_none(), "{tier} should be dropped");
+        }
+        // absent service_tier sets nothing
+        let none = translate(json!({ "model": "m", "max_tokens": 1, "messages": [] }));
+        assert!(none.get("service_tier").is_none());
+    }
+
+    #[test]
     fn authorization_bearer_preserved_and_wins_over_x_api_key() {
         // Bearer alone is preserved.
         let mut h = HeaderMap::new();

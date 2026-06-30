@@ -1,5 +1,13 @@
 # Changelog
 
+## [8.66.0](https://github.com/doublewordai/control-layer/compare/v8.65.1...v8.66.0) (2026-06-29)
+
+
+### Features
+
+* /v1/messages parity - batch endpoint and flex tier ([#1191](https://github.com/doublewordai/control-layer/issues/1191)) ([519afa6](https://github.com/doublewordai/control-layer/commit/519afa612f468b4347eb44863c10265940462fc1))
+* **prompt-cache:** Prometheus instrumentation for cached-input pricing ([#1196](https://github.com/doublewordai/control-layer/issues/1196)) ([7bb9112](https://github.com/doublewordai/control-layer/commit/7bb9112c386d899fdb648accefe03fda9f24eea1))
+
 ## [8.65.1](https://github.com/doublewordai/control-layer/compare/v8.65.0...v8.65.1) (2026-06-26)
 
 

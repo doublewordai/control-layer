@@ -75,7 +75,7 @@ pub mod tool_sources;
 pub mod users;
 pub mod webhooks;
 
-pub use cache_tariffs::{CacheTariffOverrides, CacheTariffs};
+pub use cache_tariffs::{ActiveTariff, CacheTariffOverrides, CacheTariffs};
 pub use capacity_reservations::BatchCapacityReservations;
 pub use connections::{Connections, SyncEntries, SyncOperations};
 pub use credits::Credits;

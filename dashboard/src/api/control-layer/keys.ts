@@ -29,6 +29,8 @@ export const queryKeys = {
     // Composite model components
     components: (modelId: string) =>
       ["models", "byId", modelId, "components"] as const,
+    cachePricing: (modelId: string) =>
+      ["models", "byId", modelId, "cachePricing"] as const,
     // Separate metrics query for lazy loading
     metrics: (options?: {
       skip?: number;

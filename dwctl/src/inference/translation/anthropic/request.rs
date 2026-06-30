@@ -57,6 +57,14 @@ pub fn to_chat_completions(req: MessagesRequest) -> Result<Value, TranslationErr
     if let Some(effort) = thinking_to_reasoning_effort(req.thinking.as_ref()) {
         out.insert("reasoning_effort".into(), json!(effort));
     }
+    // Only forward `service_tier` to engage dwctl's flex tier. Anthropic's
+    // standard values (`auto`, `standard_only`) describe priority-vs-standard,
+    // which dwctl routing ignores - and `standard_only` is not a valid OpenAI
+    // value, so forwarding it could 400 a downstream provider. `flex` is a
+    // dwctl-specific opt-in that the inference middleware routes to handle_flex.
+    if req.service_tier.as_deref() == Some("flex") {
+        out.insert("service_tier".into(), json!("flex"));
+    }
 
     Ok(Value::Object(out))
 }

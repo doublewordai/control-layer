@@ -37,6 +37,13 @@ pub struct MessagesRequest {
     /// Mapped to OpenAI `reasoning_effort` on the request.
     #[serde(default)]
     pub thinking: Option<Value>,
+    /// Processing-tier hint. Anthropic's standard values (`auto`,
+    /// `standard_only`) are priority-vs-standard and don't change dwctl
+    /// routing. The dwctl-specific value `flex` opts the request into the
+    /// flex tier (daemon-queued, 1h SLA, batch pricing); see
+    /// [`to_chat_completions`](super::request::to_chat_completions).
+    #[serde(default)]
+    pub service_tier: Option<String>,
 }
 
 /// Top-level `system`: either a string or an array of content blocks.

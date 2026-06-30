@@ -60,6 +60,8 @@ import type {
   DaemonsQuery,
   EndpointsQuery,
   ModelComponent,
+  CachePricing,
+  CachePricingUpdate,
   AddComponentRequest,
   UpdateComponentRequest,
   Webhook,
@@ -498,6 +500,52 @@ const modelApi = {
       );
       if (!response.ok) {
         throw new Error(`Failed to remove component: ${response.status}`);
+      }
+    },
+  },
+
+  // Per-model cache pricing (Anthropic-style prompt-cache multipliers)
+  cachePricing: {
+    async get(modelId: string): Promise<CachePricing> {
+      const response = await fetch(
+        `/admin/api/v1/models/${modelId}/cache-pricing`,
+      );
+      if (!response.ok) {
+        throw new Error(`Failed to fetch cache pricing: ${response.status}`);
+      }
+      return response.json();
+    },
+
+    async update(
+      modelId: string,
+      data: CachePricingUpdate,
+    ): Promise<CachePricing> {
+      const response = await fetch(
+        `/admin/api/v1/models/${modelId}/cache-pricing`,
+        {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(data),
+        },
+      );
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(
+          errorText || `Failed to update cache pricing: ${response.status}`,
+        );
+      }
+      return response.json();
+    },
+
+    async disable(modelId: string): Promise<void> {
+      const response = await fetch(
+        `/admin/api/v1/models/${modelId}/cache-pricing`,
+        {
+          method: "DELETE",
+        },
+      );
+      if (!response.ok) {
+        throw new Error(`Failed to disable cache pricing: ${response.status}`);
       }
     },
   },

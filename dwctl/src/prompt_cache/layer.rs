@@ -25,6 +25,7 @@ use tracing::warn;
 
 use super::classifier::{Classifier, ClassifyOutcome, ClassifyRequest};
 use super::inject::{CommitGate, inject_cache_stats_into_response, strip_cache_control};
+use super::metrics as cache_metrics;
 
 /// Bound on the index commit (off the response path). A slow/hung DB can't leak the
 /// spawned task or hold a pool connection indefinitely; a miss just drops the write
@@ -77,6 +78,7 @@ pub async fn cache_middleware(State(state): State<CacheLayerState>, request: Req
             // body: an empty forward would surface to the client as a confusing JSON-parse 4xx
             // from onwards instead of a clear body-read error.
             warn!(error = %e, "Failed to read request body in cache middleware");
+            cache_metrics::record_body_read_failed();
             let body = serde_json::json!({
                 "error": {
                     "message": format!("failed to read request body: {e}"),
@@ -101,6 +103,10 @@ pub async fn cache_middleware(State(state): State<CacheLayerState>, request: Req
         .and_then(|v| v.strip_prefix("Bearer ").or_else(|| v.strip_prefix("bearer ")))
         .map(|t| t.trim().to_string());
 
+    // Bounded metric label (the deployed alias). Cloned before `virtual_model` is moved
+    // into the classify task below; empty only for a body with no `model` field.
+    let model_label = virtual_model.clone().unwrap_or_default();
+
     // Fork classify, parallel with the upstream call. Owns its inputs so the task is
     // `'static`; this is the one body clone (a future parse-once refactor would remove it).
     let classify_handle = virtual_model.map(|model| {
@@ -118,9 +124,13 @@ pub async fn cache_middleware(State(state): State<CacheLayerState>, request: Req
     });
 
     // Sanitise the outbound body: strip markers + ensure include_usage (no-op → keep).
-    // Re-frame: set Content-Length and drop any stale Transfer-Encoding (sending both is
-    // invalid HTTP). `from(u64)` is the unambiguous numeric HeaderValue ctor.
-    let forward = strip_cache_control(&body_bytes).unwrap_or(body_bytes);
+    // `had_markers` is whether the client actually sent cache_control (the adoption signal,
+    // recorded for all traffic) — NOT whether the body changed, since a stream gets
+    // include_usage injected even with no markers. Re-frame: set Content-Length and drop any
+    // stale Transfer-Encoding (sending both is invalid HTTP). `from(u64)` is the numeric ctor.
+    let (stripped, had_markers) = strip_cache_control(&body_bytes);
+    cache_metrics::record_marker_request(had_markers);
+    let forward = stripped.unwrap_or(body_bytes);
     parts.headers.remove(header::TRANSFER_ENCODING);
     parts
         .headers
@@ -134,16 +144,24 @@ pub async fn cache_middleware(State(state): State<CacheLayerState>, request: Req
     // classify task per request. Aborting cancels it at its next await instead.
     let outcome = match classify_handle {
         Some(mut handle) => match tokio::time::timeout(state.deadline, &mut handle).await {
-            Ok(Ok(Ok(result))) => result,
+            Ok(Ok(Ok(result))) => {
+                cache_metrics::record_classify("ok");
+                result
+            }
             Ok(Ok(Err(e))) => {
+                cache_metrics::record_classify("error");
                 warn!(error = %e, "cache classify failed — billing un-cached");
                 ClassifyOutcome::inactive()
             }
             Ok(Err(e)) => {
-                warn!(error = %e, "cache classify task panicked");
+                // JoinError is a panic OR a cancellation (e.g. runtime shutdown); only the
+                // former is a bug, so don't fold cancellations into the "panicked" series.
+                cache_metrics::record_classify(if e.is_panic() { "panicked" } else { "error" });
+                warn!(error = %e, "cache classify task failed");
                 ClassifyOutcome::inactive()
             }
             Err(_) => {
+                cache_metrics::record_classify("deadline_exceeded");
                 handle.abort(); // deadline — best-effort, reconciliation backstops; don't leak the task
                 ClassifyOutcome::inactive()
             }
@@ -151,11 +169,39 @@ pub async fn cache_middleware(State(state): State<CacheLayerState>, request: Req
         None => ClassifyOutcome::inactive(),
     };
 
+    // Request-level cache outcome across ALL traffic (incl. inactive). No model label:
+    // `inactive` covers unknown/typo models (raw client input) → unbounded cardinality;
+    // per-model volumes live on record_token_volumes (enabled models only).
+    let outcome_label = if !outcome.active {
+        "inactive"
+    } else if outcome.stats.read > 0 && outcome.stats.creation_total() > 0 {
+        "read_and_create"
+    } else if outcome.stats.read > 0 {
+        "read"
+    } else if outcome.stats.creation_total() > 0 {
+        "create_only"
+    } else {
+        "zero_active"
+    };
+    cache_metrics::record_request_outcome(outcome_label);
+
     // Disabled model (or a degraded classify) → leave the response untouched. Enabled
     // models always get the cache_* fields (zeros when this prompt cached nothing), so
     // the cohort has one uniform response shape.
     if !outcome.active {
         return response;
+    }
+
+    // Classified token volumes (model-labelled) for the usage dashboards. Guarded on a
+    // non-empty model like the other cache metrics, to avoid a stray model="" series.
+    if !model_label.is_empty() {
+        cache_metrics::record_token_volumes(
+            &model_label,
+            outcome.stats.read,
+            outcome.stats.creation_5m,
+            outcome.stats.creation_1h,
+            outcome.stats.creation_24h,
+        );
     }
 
     let (response, gate) = inject_cache_stats_into_response(response, &outcome.stats).await;
@@ -169,11 +215,13 @@ pub async fn cache_middleware(State(state): State<CacheLayerState>, request: Req
         let pending = outcome.pending;
         match gate {
             CommitGate::Ready(true) => spawn_commit(classifier, pending),
-            CommitGate::Ready(false) => {}
+            CommitGate::Ready(false) => cache_metrics::record_commit_vetoed("non_2xx"),
             CommitGate::Deferred(rx) => {
                 tokio::spawn(async move {
                     if rx.await.unwrap_or(false) {
                         commit_with_deadline(&classifier, &pending).await;
+                    } else {
+                        cache_metrics::record_commit_vetoed("stream_aborted");
                     }
                 });
             }
@@ -186,10 +234,19 @@ pub async fn cache_middleware(State(state): State<CacheLayerState>, request: Req
 /// Commit the pending write under [`COMMIT_DEADLINE`], so a slow/hung DB can't leak the
 /// task or hold a connection. A timeout or error just drops the write (best-effort).
 async fn commit_with_deadline(classifier: &Classifier, pending: &super::stats::PendingWrite) {
-    match tokio::time::timeout(COMMIT_DEADLINE, classifier.commit(pending)).await {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => warn!(error = %e, "cache index commit failed"),
-        Err(_) => warn!("cache index commit timed out"),
+    let start = std::time::Instant::now();
+    let result = tokio::time::timeout(COMMIT_DEADLINE, classifier.commit(pending)).await;
+    cache_metrics::record_commit_duration(start.elapsed().as_secs_f64());
+    match result {
+        Ok(Ok(())) => cache_metrics::record_commit("ok"),
+        Ok(Err(e)) => {
+            cache_metrics::record_commit("error");
+            warn!(error = %e, "cache index commit failed");
+        }
+        Err(_) => {
+            cache_metrics::record_commit("timeout");
+            warn!("cache index commit timed out");
+        }
     }
 }
 

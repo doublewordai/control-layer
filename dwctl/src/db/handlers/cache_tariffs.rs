@@ -11,6 +11,7 @@
 use crate::config::CachePricingConfig;
 use crate::db::errors::Result;
 use crate::types::DeploymentId;
+use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use sqlx::{Connection, PgConnection};
 use tracing::instrument;
@@ -24,6 +25,19 @@ pub struct CacheTariffOverrides {
     pub write_multiplier_24h: Option<Decimal>,
     pub read_multiplier: Option<Decimal>,
     pub min_prefix_tokens: Option<i32>,
+}
+
+/// The cache tariff version effective as of *now* for a model (the row the resolver and
+/// billing use). Returned by [`CacheTariffs::get_active`]; `None` ⇒ cache pricing is off.
+#[derive(Debug, Clone)]
+pub struct ActiveTariff {
+    pub write_multiplier_5m: Decimal,
+    pub write_multiplier_1h: Decimal,
+    pub write_multiplier_24h: Decimal,
+    pub read_multiplier: Decimal,
+    pub min_prefix_tokens: i32,
+    pub valid_from: DateTime<Utc>,
+    pub valid_until: Option<DateTime<Utc>>,
 }
 
 pub struct CacheTariffs<'c> {
@@ -95,6 +109,27 @@ impl<'c> CacheTariffs<'c> {
         .execute(&mut *self.db)
         .await?;
         Ok(res.rows_affected() > 0)
+    }
+
+    /// The tariff version effective *now* (the as-of-now active check the resolver uses),
+    /// or `None` if cache pricing is currently off for this model.
+    #[instrument(skip(self), fields(deployed_model_id = %model_id), err)]
+    pub async fn get_active(&mut self, model_id: DeploymentId) -> Result<Option<ActiveTariff>> {
+        let row = sqlx::query_as!(
+            ActiveTariff,
+            r#"SELECT write_multiplier_5m, write_multiplier_1h, write_multiplier_24h,
+                      read_multiplier, min_prefix_tokens, valid_from, valid_until
+               FROM model_cache_tariffs
+               WHERE deployed_model_id = $1
+                 AND valid_from <= now()
+                 AND (valid_until IS NULL OR valid_until > now())
+               ORDER BY valid_from DESC
+               LIMIT 1"#,
+            model_id,
+        )
+        .fetch_optional(&mut *self.db)
+        .await?;
+        Ok(row)
     }
 }
 
@@ -201,5 +236,39 @@ mod tests {
             err.as_database_error().is_some_and(|e| e.is_unique_violation()),
             "expected a unique violation from idx_model_cache_tariffs_unique_active, got: {err:?}"
         );
+    }
+
+    #[sqlx::test]
+    async fn get_active_reflects_enable_disable(pool: PgPool) {
+        let user = create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
+        let endpoint = create_test_endpoint(&pool, "ep", user.id).await;
+        let id = create_test_model(&pool, "m", "get-active-alias", endpoint, user.id).await;
+        let defaults = CachePricingConfig::default();
+
+        let mut conn = pool.acquire().await.unwrap();
+        let mut repo = CacheTariffs::new(&mut conn);
+
+        // Never enabled → None.
+        assert!(repo.get_active(id).await.unwrap().is_none());
+
+        // Enable with one override → the active row reflects it + the defaults for the rest.
+        repo.enable(
+            id,
+            &defaults,
+            CacheTariffOverrides {
+                min_prefix_tokens: Some(2048),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let active = repo.get_active(id).await.unwrap().expect("active after enable");
+        assert_eq!(active.min_prefix_tokens, 2048);
+        assert_eq!(active.write_multiplier_5m, defaults.default_write_multiplier_5m);
+        assert!(active.valid_until.is_none(), "active version is open-ended");
+
+        // Disable → None again (the active predicate excludes the now-expired version).
+        repo.disable(id).await.unwrap();
+        assert!(repo.get_active(id).await.unwrap().is_none());
     }
 }

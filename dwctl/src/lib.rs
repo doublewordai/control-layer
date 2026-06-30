@@ -196,7 +196,7 @@ use axum::http::HeaderValue;
 use axum::response::Response;
 use axum::{
     Router, ServiceExt, http, middleware,
-    routing::{delete, get, patch, post},
+    routing::{delete, get, patch, post, put},
 };
 use axum_prometheus::PrometheusMetricLayerBuilder;
 use bon::Builder;
@@ -343,6 +343,10 @@ fn get_or_install_prometheus_handle() -> PrometheusHandle {
             // Custom histogram buckets for cache sync lag (1ms to 10s)
             const CACHE_SYNC_LAG_BUCKETS: &[f64] = &[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0];
 
+            // Custom histogram buckets for the cached-input-pricing layer latencies (1ms to 10s):
+            // classify, tokenizer-svc call, and commit.
+            const CACHE_LATENCY_BUCKETS: &[f64] = &[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0];
+
             // Custom histogram buckets for fusillade retry attempts (0-10 retries)
             const RETRY_ATTEMPTS_BUCKETS: &[f64] = &[0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0];
 
@@ -351,6 +355,21 @@ fn get_or_install_prometheus_handle() -> PrometheusHandle {
                 .expect("Failed to set custom buckets for dwctl_analytics_lag_seconds")
                 .set_buckets_for_metric(Matcher::Full("dwctl_cache_sync_lag_seconds".to_string()), CACHE_SYNC_LAG_BUCKETS)
                 .expect("Failed to set custom buckets for dwctl_cache_sync_lag_seconds")
+                .set_buckets_for_metric(
+                    Matcher::Full("dwctl_cache_classify_duration_seconds".to_string()),
+                    CACHE_LATENCY_BUCKETS,
+                )
+                .expect("Failed to set custom buckets for dwctl_cache_classify_duration_seconds")
+                .set_buckets_for_metric(
+                    Matcher::Full("dwctl_cache_tokenizer_duration_seconds".to_string()),
+                    CACHE_LATENCY_BUCKETS,
+                )
+                .expect("Failed to set custom buckets for dwctl_cache_tokenizer_duration_seconds")
+                .set_buckets_for_metric(
+                    Matcher::Full("dwctl_cache_commit_duration_seconds".to_string()),
+                    CACHE_LATENCY_BUCKETS,
+                )
+                .expect("Failed to set custom buckets for dwctl_cache_commit_duration_seconds")
                 .set_buckets_for_metric(
                     Matcher::Full("fusillade_retry_attempts_on_success".to_string()),
                     RETRY_ATTEMPTS_BUCKETS,
@@ -1259,6 +1278,15 @@ pub async fn build_router(
         .route("/models/{id}", get(api::handlers::deployments::get_deployed_model))
         .route("/models/{id}", patch(api::handlers::deployments::update_deployed_model))
         .route("/models/{id}", delete(api::handlers::deployments::delete_deployed_model))
+        .route("/models/{id}/cache-pricing", get(api::handlers::cache_pricing::get_cache_pricing))
+        .route(
+            "/models/{id}/cache-pricing",
+            put(api::handlers::cache_pricing::enable_cache_pricing),
+        )
+        .route(
+            "/models/{id}/cache-pricing",
+            delete(api::handlers::cache_pricing::disable_cache_pricing),
+        )
         .route(
             "/provider-display-configs",
             get(api::handlers::provider_display_configs::list_provider_display_configs),
