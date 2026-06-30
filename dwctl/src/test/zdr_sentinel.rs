@@ -12,16 +12,25 @@
 //!   proves this end-to-end while also confirming the allowed metadata (status,
 //!   model, token counts) *is* still recorded.
 //!
+//! * **Logs (async/flex path)** — `zdr_sentinel_async_batch_failure_does_not_log_payload`
+//!   runs a batch end-to-end through the real fusillade daemon against a mock
+//!   upstream that returns a sentinel error body, capturing all tracing output
+//!   and asserting the sentinel does not appear. `#[sqlx::test]` runs on a
+//!   `current_thread` tokio runtime (sqlx `test_block_on`), so a thread-local
+//!   subscriber reliably captures the daemon's spawned-task logs — the test
+//!   includes a positive control that proves capture works. It is currently
+//!   `#[ignore]`d: it already caught a real leak — the *published* fusillade
+//!   logs the provider error body at WARN in `to_error_message()`, which COR-498
+//!   scrubs in fusillade — so it activates once control-layer bumps fusillade to
+//!   the release containing that fix. (The prompt-sentinel half already passes.)
+//!
 //! ## What is covered elsewhere
 //!
-//! * **Logs / OTEL spans** — the no-payload-logging guarantee is enforced by
-//!   per-component capture tests in onwards (`strict/handlers.rs`),
+//! * **Per-component log tests + CI guard** — the no-payload-logging guarantee
+//!   is also enforced by focused capture tests in onwards (`strict/handlers.rs`),
 //!   fusillade (`request/types.rs`) and control-layer
-//!   (`request_logging::analytics_handler`), and is regression-guarded in CI by
-//!   `scripts/check-no-payload-logging.sh` (COR-500). Capturing the full app's
-//!   tracing output here is intentionally avoided — `#[sqlx::test]` runs on a
-//!   multi-threaded runtime where a thread-local subscriber would miss events
-//!   emitted on background-task worker threads.
+//!   (`request_logging::analytics_handler`), and regression-guarded in CI by
+//!   `scripts/check-no-payload-logging.sh` (COR-500).
 //!
 //! ## What this harness will cover once ZDR capture-gating lands
 //!
@@ -34,7 +43,13 @@
 //! the gate exists; un-ignore it when ZDR request logging is gated.
 
 use crate::api::models::users::Role;
-use crate::test::utils::{add_auth_headers, create_test_admin_user, create_test_config, create_test_user};
+use crate::config::{DaemonConfig, DaemonEnabled};
+use crate::db::handlers::api_keys::ApiKeys;
+use crate::db::models::api_keys::ApiKeyPurpose;
+use crate::test::utils::{
+    add_auth_headers, add_deployment_to_group, add_user_to_group, create_test_admin_user, create_test_app_with_config, create_test_config,
+    create_test_endpoint, create_test_model, create_test_user, create_test_user_with_roles,
+};
 use sqlx::PgPool;
 
 /// Unique markers that must never escape into durable product stores.
@@ -270,4 +285,201 @@ async fn zdr_sentinel_realtime_request_not_in_request_logs(pool: PgPool) {
         "completion sentinel persisted to http_requests: {row}"
     );
     let _ = fixture.user_id;
+}
+
+// ===========================================================================
+// Async / flex (batch) path — log-capture sentinel test
+// ===========================================================================
+
+// Lifelike sentinels: a regression that logs the body shows up as readable text.
+const ASYNC_PROMPT_SENTINEL: &str = "pikachu-async-prompt-3f9a17";
+const ASYNC_ERROR_SENTINEL: &str = "pikachu-fainted-error-body-8c2d04";
+
+/// A `tracing_subscriber` `MakeWriter` that appends all emitted log bytes into a
+/// shared buffer, so the test can assert what did (and did not) reach logging.
+#[derive(Clone)]
+struct CaptureWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for CaptureWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
+    type Writer = CaptureWriter;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// The async/flex (batch) failure path must not log prompt or provider-error
+/// body content. Runs a batch end-to-end through the real fusillade daemon
+/// against a mock upstream that 400s with a sentinel body, capturing all tracing
+/// output and asserting neither the prompt nor the error-body sentinel appears.
+///
+/// `#[sqlx::test]` uses a `current_thread` runtime (sqlx `test_block_on`), so the
+/// thread-local subscriber installed here captures the daemon's spawned-task
+/// logs. A positive control (a marker logged from a spawned task) proves that.
+///
+/// IGNORED until control-layer's `fusillade` dependency is bumped to a release
+/// containing COR-498. This test was written *first* and immediately caught the
+/// real leak: published fusillade (19.0.1) logs the provider error body verbatim
+/// at WARN in `FailureReason::to_error_message()` on terminal failure — live in
+/// prod. COR-498 scrubs it in fusillade; un-ignore once that lands here via the
+/// dependency bump. (The prompt-sentinel half of this test already passes.)
+#[ignore = "async/flex error-body leak fixed in fusillade (COR-498); un-ignore after the control-layer fusillade bump"]
+#[sqlx::test]
+async fn zdr_sentinel_async_batch_failure_does_not_log_payload(pool: PgPool) {
+    // Capture every tracing event on this (single) test thread for the whole test.
+    let log_buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::TRACE)
+        .with_ansi(false)
+        .with_writer(CaptureWriter(log_buf.clone()))
+        .finish();
+    let _log_guard = tracing::subscriber::set_default(subscriber);
+
+    // A user allowed to run batches, in the everyone-group, with a batch key.
+    let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+    add_user_to_group(&pool, user.id, uuid::Uuid::nil()).await;
+    let batch_api_key = {
+        let mut conn = pool.acquire().await.expect("acquire");
+        ApiKeys::new(&mut conn)
+            .get_or_create_hidden_key(user.id, ApiKeyPurpose::Batch, user.id)
+            .await
+            .expect("batch api key")
+    };
+
+    // Mock upstream: 400 with a body that echoes the prompt sentinel — exactly the
+    // shape that could leak prompt/response content through failure logging.
+    let mock_server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path("/v1/chat/completions"))
+        .respond_with(wiremock::ResponseTemplate::new(400).set_body_json(serde_json::json!({
+            "error": { "message": ASYNC_ERROR_SENTINEL, "type": "invalid_request_error" }
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let endpoint_id = create_test_endpoint(&pool, "zdr-async-endpoint", user.id).await;
+    sqlx::query("UPDATE inference_endpoints SET url = $1 WHERE id = $2")
+        .bind(mock_server.uri())
+        .bind(endpoint_id)
+        .execute(&pool)
+        .await
+        .expect("update endpoint url");
+    let deployment_id = create_test_model(&pool, "pikachu-async-model", "pikachu-async", endpoint_id, user.id).await;
+    add_deployment_to_group(&pool, deployment_id, uuid::Uuid::nil(), user.id).await;
+
+    // App with the real batch daemon running.
+    let mut config = create_test_config();
+    config.background_services.batch_daemon = DaemonConfig {
+        enabled: DaemonEnabled::Always,
+        claim_interval_ms: 100,
+        max_retries: Some(0),
+        ..Default::default()
+    };
+    config.background_services.onwards_sync.enabled = true;
+    config.background_services.probe_scheduler.enabled = false;
+    config.background_services.leader_election.enabled = false;
+    let (_server, _bg_services) = create_test_app_with_config(pool.clone(), config, false).await;
+
+    // Insert a batch whose single request carries the prompt sentinel.
+    let file_id = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO fusillade.files (id, name, purpose, size_bytes, status, uploaded_by, created_at)
+         VALUES ($1, 'zdr.jsonl', 'batch', 100, 'processed', $2, NOW())",
+    )
+    .bind(file_id)
+    .bind(user.id.to_string())
+    .execute(&pool)
+    .await
+    .expect("insert file");
+
+    let template_id = uuid::Uuid::new_v4();
+    let request_body = serde_json::json!({
+        "model": "pikachu-async",
+        "messages": [{ "role": "user", "content": ASYNC_PROMPT_SENTINEL }]
+    })
+    .to_string();
+    sqlx::query(
+        "INSERT INTO fusillade.request_templates (id, file_id, model, api_key, endpoint, path, body, custom_id, method)
+         VALUES ($1, $2, 'pikachu-async', $3, $4, '/v1/chat/completions', $5, 'req-1', 'POST')",
+    )
+    .bind(template_id)
+    .bind(file_id)
+    .bind(&batch_api_key)
+    .bind(mock_server.uri())
+    .bind(&request_body)
+    .execute(&pool)
+    .await
+    .expect("insert template");
+
+    let batch_id = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO fusillade.batches (id, created_by, file_id, endpoint, completion_window, expires_at, created_at)
+         VALUES ($1, $2, $3, '/v1/chat/completions', '24h', $4, NOW())",
+    )
+    .bind(batch_id)
+    .bind(user.id.to_string())
+    .bind(file_id)
+    .bind(chrono::Utc::now() + chrono::Duration::hours(24))
+    .execute(&pool)
+    .await
+    .expect("insert batch");
+
+    let request_id = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO fusillade.requests (id, batch_id, template_id, model, state, created_at)
+         VALUES ($1, $2, $3, 'pikachu-async', 'pending', NOW())",
+    )
+    .bind(request_id)
+    .bind(batch_id)
+    .bind(template_id)
+    .execute(&pool)
+    .await
+    .expect("insert request");
+
+    // Wait for the daemon to claim, dispatch, get the 400, and mark it failed.
+    let mut failed = false;
+    for _ in 0..150 {
+        let state: Option<String> = sqlx::query_scalar("SELECT state::text FROM fusillade.requests WHERE id = $1")
+            .bind(request_id)
+            .fetch_optional(&pool)
+            .await
+            .expect("query request state");
+        if state.as_deref() == Some("failed") {
+            failed = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(failed, "daemon never marked the request failed");
+
+    // Positive control: prove the capturing subscriber sees events emitted from a
+    // spawned task (the same mechanism the daemon uses). Without this, an empty
+    // capture could make the sentinel assertions pass vacuously.
+    const PROBE: &str = "zdr-capture-probe-marker-do-not-remove";
+    tokio::spawn(async { tracing::warn!("{PROBE}") }).await.unwrap();
+
+    let logs = String::from_utf8_lossy(&log_buf.lock().unwrap()).into_owned();
+    assert!(
+        logs.contains(PROBE),
+        "log capture is not observing spawned-task events; the sentinel assertions below would be vacuous"
+    );
+
+    // The actual ZDR assertions: no prompt or provider-error body in the logs.
+    assert!(!logs.contains(ASYNC_PROMPT_SENTINEL), "prompt content leaked into async/flex logs");
+    assert!(
+        !logs.contains(ASYNC_ERROR_SENTINEL),
+        "provider error body leaked into async/flex logs (fusillade daemon \
+         terminal-failure log). Fixed by COR-498 (fusillade) — un-ignore this \
+         test once control-layer's fusillade dependency is bumped to the release \
+         containing that scrub."
+    );
 }
