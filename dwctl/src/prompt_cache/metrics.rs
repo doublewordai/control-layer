@@ -123,9 +123,11 @@ pub fn record_commit(result: &'static str) {
     counter!("dwctl_cache_commit_total", "result" => result).increment(1);
 }
 
-/// Write skipped by the success gate. `reason` ∈ `non_2xx` (non-billable response) |
-/// `stream_aborted` (mid-stream error frame or client disconnect). A high veto rate flags
-/// upstream instability / wasted classify.
+/// Write skipped by the success gate. `reason` ∈ `non_2xx` (non-billable status) |
+/// `error_frame` (2xx stream that carried a mid-stream error frame) | `no_usage` (2xx response
+/// that never emitted a usage frame/object, so there's nothing billable to gate on). A high veto
+/// rate flags upstream instability / wasted classify. (A true client disconnect aborts the
+/// deferred classify before the gate runs, so it isn't counted here.)
 pub fn record_commit_vetoed(reason: &'static str) {
     counter!("dwctl_cache_commit_vetoed_total", "reason" => reason).increment(1);
 }

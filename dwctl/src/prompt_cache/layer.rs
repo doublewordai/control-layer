@@ -220,7 +220,10 @@ pub async fn cache_middleware(State(state): State<CacheLayerState>, request: Req
         if billing_ok {
             spawn_commit(state.classifier.clone(), outcome.pending);
         } else {
-            cache_metrics::record_commit_vetoed("non_2xx");
+            // billing_ok is false both for a non-billable status and for a 2xx JSON body with no
+            // usage object (or unparseable body) — label them apart for diagnosis.
+            let reason = if response.status().is_success() { "no_usage" } else { "non_2xx" };
+            cache_metrics::record_commit_vetoed(reason);
         }
     }
     response
@@ -404,7 +407,18 @@ fn defer_classify_into_stream(
                 // connection open on the DB write.
                 spawn_commit(classifier, outcome.pending);
             } else {
-                cache_metrics::record_commit_vetoed(if status_ok { "stream_aborted" } else { "non_2xx" });
+                // Distinguish the veto reasons so the metric is diagnosable: a 2xx stream that
+                // carried an error frame vs. one that simply never emitted a usage frame are
+                // different upstream faults. (A true client disconnect aborts the task before
+                // this runs, so it's never labelled here.)
+                let reason = if !status_ok {
+                    "non_2xx"
+                } else if saw_error {
+                    "error_frame"
+                } else {
+                    "no_usage"
+                };
+                cache_metrics::record_commit_vetoed(reason);
             }
         }
     };
