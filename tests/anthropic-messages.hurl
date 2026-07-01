@@ -31,7 +31,7 @@ POST http://localhost:3001/admin/api/v1/endpoints
 [Cookies]
 dwctl_session: {{admin_jwt}}
 {
-  "name": "anthropic-e2e-mock",
+  "name": "anthropic-e2e-mock-{{newUuid}}",
   "url": "http://mock-llm-server:3000",
   "auto_sync_models": false
 }
@@ -48,7 +48,7 @@ dwctl_session: {{admin_jwt}}
 {
   "type": "standard",
   "model_name": "gpt-4-mock",
-  "alias": "anthropic-e2e",
+  "alias": "anthropic-e2e-{{newUuid}}",
   "hosted_on": "{{endpoint_id}}"
 }
 HTTP *
@@ -57,6 +57,7 @@ status >= 200
 status < 300
 [Captures]
 deployment_id: jsonpath "$.id"
+model_alias: jsonpath "$.alias"
 
 POST http://localhost:3001/admin/api/v1/groups
 [Cookies]
@@ -90,7 +91,7 @@ dwctl_session: {{admin_jwt}}
   "user_id": "{{user1_id}}",
   "transaction_type": "admin_grant",
   "amount": 1000,
-  "source_id": "{{admin_user_id}}"
+  "source_id": "anthropic-e2e-grant-{{newUuid}}"
 }
 HTTP *
 [Asserts]
@@ -110,6 +111,7 @@ HTTP *
 status >= 200
 status < 300
 [Captures]
+api_key_id: jsonpath "$.id"
 api_key: jsonpath "$.key"
 
 # --- sanity: the SHARED routing path via a plain OpenAI request --------------
@@ -123,7 +125,7 @@ Authorization: Bearer {{api_key}}
 retry: 40
 retry-interval: 500
 {
-  "model": "anthropic-e2e",
+  "model": "{{model_alias}}",
   "max_tokens": 64,
   "messages": [ { "role": "user", "content": "hello" } ]
 }
@@ -139,7 +141,7 @@ anthropic-version: 2023-06-01
 retry: 10
 retry-interval: 500
 {
-  "model": "anthropic-e2e",
+  "model": "{{model_alias}}",
   "max_tokens": 64,
   "system": "be terse",
   "messages": [ { "role": "user", "content": "hello" } ]
@@ -163,7 +165,7 @@ anthropic-version: 2023-06-01
 retry: 10
 retry-interval: 500
 {
-  "model": "anthropic-e2e",
+  "model": "{{model_alias}}",
   "max_tokens": 64,
   "stream": true,
   "messages": [ { "role": "user", "content": "hello" } ]
@@ -184,7 +186,7 @@ HTTP 200
 [Asserts]
 jsonpath "$.has_more" == false
 jsonpath "$.data[0].type" == "model"
-jsonpath "$.data[*].id" includes "anthropic-e2e"
+jsonpath "$.data[*].id" includes "{{model_alias}}"
 
 # --- models: native OpenAI list passes through untouched ---------------------
 # Same endpoint, no anthropic-version: the edge layer must NOT claim it, so the
@@ -195,3 +197,49 @@ HTTP 200
 [Asserts]
 jsonpath "$.object" == "list"
 jsonpath "$.data[0].object" == "model"
+
+# --- cleanup: keep this fixture isolated from later permission tests ---------
+DELETE http://localhost:3001/admin/api/v1/users/{{user1_id}}/api-keys/{{api_key_id}}
+[Cookies]
+dwctl_session: {{user_jwt}}
+HTTP 204
+
+DELETE http://localhost:3001/admin/api/v1/groups/{{group_id}}/models/{{deployment_id}}
+[Cookies]
+dwctl_session: {{admin_jwt}}
+HTTP 204
+
+DELETE http://localhost:3001/admin/api/v1/groups/{{group_id}}/users/{{user1_id}}
+[Cookies]
+dwctl_session: {{admin_jwt}}
+HTTP 204
+
+POST http://localhost:3001/admin/api/v1/transactions
+[Cookies]
+dwctl_session: {{admin_jwt}}
+{
+  "user_id": "{{user1_id}}",
+  "transaction_type": "admin_removal",
+  "amount": 1000,
+  "source_id": "anthropic-e2e-cleanup-{{newUuid}}",
+  "description": "Reverse Anthropic e2e grant"
+}
+HTTP *
+[Asserts]
+status >= 200
+status < 300
+
+DELETE http://localhost:3001/admin/api/v1/models/{{deployment_id}}
+[Cookies]
+dwctl_session: {{admin_jwt}}
+HTTP 200
+
+DELETE http://localhost:3001/admin/api/v1/groups/{{group_id}}
+[Cookies]
+dwctl_session: {{admin_jwt}}
+HTTP 204
+
+DELETE http://localhost:3001/admin/api/v1/endpoints/{{endpoint_id}}
+[Cookies]
+dwctl_session: {{admin_jwt}}
+HTTP 204
