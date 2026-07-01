@@ -31,6 +31,8 @@ pub struct OrganizationUpdateDBRequest {
     pub batch_notifications_enabled: Option<bool>,
     /// `None` = don't change, `Some(None)` = disable, `Some(Some(val))` = set threshold.
     pub low_balance_threshold: Option<Option<f32>>,
+    /// Account-wide zero-data-retention flag. `None` = don't change.
+    pub zero_data_retention: Option<bool>,
 }
 
 /// Database response for an organization membership

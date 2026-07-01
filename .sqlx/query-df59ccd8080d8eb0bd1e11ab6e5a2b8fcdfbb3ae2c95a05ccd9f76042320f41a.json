@@ -127,6 +127,11 @@
         "ordinal": 24,
         "name": "verified",
         "type_info": "Bool"
+      },
+      {
+        "ordinal": 25,
+        "name": "zero_data_retention",
+        "type_info": "Bool"
       }
     ],
     "parameters": {
@@ -166,6 +171,7 @@
       true,
       true,
       true,
+      false,
       false,
       false
     ]

@@ -54,6 +54,8 @@ pub struct UserUpdateDBRequest {
     /// Monthly auto top-up spending limit.
     /// `None` = don't change, `Some(None)` = disable limit, `Some(Some(val))` = set limit.
     pub auto_topup_monthly_limit: Option<Option<f32>>,
+    /// Account-wide zero-data-retention flag. `None` = don't change.
+    pub zero_data_retention: Option<bool>,
 }
 
 impl UserUpdateDBRequest {
@@ -68,6 +70,7 @@ impl UserUpdateDBRequest {
             auto_topup_amount: update.auto_topup_amount,
             auto_topup_threshold: update.auto_topup_threshold,
             auto_topup_monthly_limit: update.auto_topup_monthly_limit,
+            zero_data_retention: update.zero_data_retention,
         }
     }
 }
@@ -102,4 +105,6 @@ pub struct UserDBResponse {
     pub auto_topup_monthly_limit: Option<f32>,
     /// User type: 'individual' or 'organization'
     pub user_type: String,
+    /// Account-wide zero-data-retention flag.
+    pub zero_data_retention: bool,
 }

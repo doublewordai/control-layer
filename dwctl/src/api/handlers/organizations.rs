@@ -474,6 +474,17 @@ pub async fn update_organization<P: PoolProvider>(
         }
     }
 
+    // SECURITY: zero-data-retention is a compliance setting only platform
+    // admins (UpdateAll) may flip - an org's own manager must not be able to
+    // opt the org out of data retention on their own.
+    if !can_all && data.zero_data_retention.is_some() {
+        return Err(Error::InsufficientPermissions {
+            required: Permission::Allow(Resource::Organizations, Operation::UpdateAll),
+            action: Operation::UpdateAll,
+            resource: format!("zero data retention for organization {id}"),
+        });
+    }
+
     // Look up the current org so we can compare emails and address verification emails.
     let mut users_repo = Users::new(&mut pool_conn);
     let current_org = users_repo.get_by_id(id).await?.ok_or_else(|| Error::NotFound {
@@ -637,6 +648,7 @@ pub async fn update_organization<P: PoolProvider>(
         email: None,
         batch_notifications_enabled: data.batch_notifications_enabled,
         low_balance_threshold: data.low_balance_threshold,
+        zero_data_retention: data.zero_data_retention,
     };
     debug_assert!(
         db_request.email.is_none(),
@@ -1727,6 +1739,7 @@ pub async fn confirm_email_change<P: PoolProvider>(
             email: Some(pending.new_email.clone()),
             batch_notifications_enabled: None,
             low_balance_threshold: None,
+            zero_data_retention: None,
         };
         org_repo.update(pending.organization_id, &update).await?;
         // The `confirm_*_email_side` UPDATE above already locked this row, so

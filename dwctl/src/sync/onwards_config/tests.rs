@@ -187,6 +187,36 @@ async fn test_cache_shape_regular_public_and_private_access(pool: sqlx::PgPool) 
     );
 }
 
+#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
+async fn test_cache_shape_zero_data_retention_label_reflects_owner(pool: sqlx::PgPool) {
+    // User A opts into zero data retention; User B does not. The onwards sync
+    // must surface the owning user's flag as a per-key "zdr" label so onwards
+    // can act on it later. The label is always emitted ("true"/"false").
+    sqlx::query!("UPDATE users SET zero_data_retention = true WHERE id = '00000000-0000-0000-0000-0000000000a1'")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let targets = super::load_targets_from_db(&pool, &[], false, &RateLimitTiersConfig::default())
+        .await
+        .unwrap();
+
+    let key_a_labels = targets.key_labels.get(KEY_A_SECRET).expect("user A's key should carry labels");
+    assert_eq!(
+        key_a_labels.get("zdr"),
+        Some(&"true".to_string()),
+        "ZDR-enabled owner's key must be labelled true"
+    );
+    assert_eq!(key_a_labels.get("purpose"), Some(&"realtime".to_string()));
+
+    let key_b_labels = targets.key_labels.get(KEY_B_SECRET).expect("user B's key should carry labels");
+    assert_eq!(
+        key_b_labels.get("zdr"),
+        Some(&"false".to_string()),
+        "non-ZDR owner's key must still carry an explicit false label"
+    );
+}
+
 #[sqlx::test(fixtures(path = "fixtures", scripts("cache_base", "cache_tariff_metered", "cache_balance_user_a_positive")))]
 async fn test_cache_shape_metered_model_requires_positive_balance(pool: sqlx::PgPool) {
     let targets = super::load_targets_from_db(&pool, &[], false, &RateLimitTiersConfig::default())

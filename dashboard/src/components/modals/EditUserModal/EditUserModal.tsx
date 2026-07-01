@@ -14,6 +14,7 @@ import {
 import { Button } from "../../ui/button";
 import { AlertBox } from "../../ui/alert-box";
 import { HoverCard, HoverCardContent, HoverCardTrigger } from "../../ui";
+import { Switch } from "../../ui/switch";
 
 interface EditUserModalProps {
   isOpen: boolean;
@@ -26,6 +27,7 @@ interface EditUserModalProps {
     username: string;
     avatar?: string;
     roles: Role[];
+    zero_data_retention: boolean;
   };
 }
 
@@ -40,6 +42,7 @@ export const EditUserModal: React.FC<EditUserModalProps> = ({
     display_name: currentUser.name,
     avatar_url: currentUser.avatar || "",
     roles: currentUser.roles,
+    zero_data_retention: currentUser.zero_data_retention,
   });
   const [error, setError] = useState<string | null>(null);
 
@@ -56,6 +59,7 @@ export const EditUserModal: React.FC<EditUserModalProps> = ({
           display_name: formData.display_name.trim() || undefined,
           avatar_url: formData.avatar_url.trim() || undefined,
           roles: formData.roles,
+          zero_data_retention: formData.zero_data_retention,
         },
       });
 
@@ -218,6 +222,39 @@ export const EditUserModal: React.FC<EditUserModalProps> = ({
                   );
                 })}
               </div>
+            </div>
+
+            <div className="flex items-start justify-between gap-4">
+              <div className="flex items-center gap-1">
+                <label
+                  htmlFor="zero_data_retention"
+                  className="text-sm font-medium text-gray-700"
+                >
+                  Zero Data Retention
+                </label>
+                <HoverCard openDelay={150} closeDelay={200}>
+                  <HoverCardTrigger asChild>
+                    <Info className="w-3 h-3 text-gray-400 cursor-pointer" />
+                  </HoverCardTrigger>
+                  <HoverCardContent side="top" align="end">
+                    <p className="text-sm">
+                      When enabled, this account is flagged for zero data
+                      retention. Applies to every API key owned by the account.
+                    </p>
+                  </HoverCardContent>
+                </HoverCard>
+              </div>
+              <Switch
+                id="zero_data_retention"
+                checked={formData.zero_data_retention}
+                onCheckedChange={(checked) =>
+                  setFormData((prev) => ({
+                    ...prev,
+                    zero_data_retention: checked,
+                  }))
+                }
+                aria-label="Toggle zero data retention"
+              />
             </div>
 
             <div className="bg-gray-50 rounded-lg p-3">
