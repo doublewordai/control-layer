@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.68.1](https://github.com/doublewordai/control-layer/compare/v8.68.0...v8.68.1) (2026-07-01)
+
+
+### Bug Fixes
+
+* stop logging tool response bodies and serde body fragments ([#1202](https://github.com/doublewordai/control-layer/issues/1202)) ([f21c29b](https://github.com/doublewordai/control-layer/commit/f21c29b82b232855365b9c8f12507b5c1895da50))
+
 ## [8.68.0](https://github.com/doublewordai/control-layer/compare/v8.67.1...v8.68.0) (2026-06-30)
 
 
