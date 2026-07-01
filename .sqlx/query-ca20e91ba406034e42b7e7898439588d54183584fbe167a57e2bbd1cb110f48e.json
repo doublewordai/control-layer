@@ -1,0 +1,58 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT write_multiplier_5m, write_multiplier_1h, write_multiplier_24h,\n                      read_multiplier, min_prefix_tokens, valid_from, valid_until\n               FROM model_cache_tariffs\n               WHERE deployed_model_id = $1\n                 AND valid_from <= now()\n                 AND (valid_until IS NULL OR valid_until > now())\n               ORDER BY valid_from DESC\n               LIMIT 1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "write_multiplier_5m",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 1,
+        "name": "write_multiplier_1h",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 2,
+        "name": "write_multiplier_24h",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 3,
+        "name": "read_multiplier",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 4,
+        "name": "min_prefix_tokens",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 5,
+        "name": "valid_from",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 6,
+        "name": "valid_until",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "ca20e91ba406034e42b7e7898439588d54183584fbe167a57e2bbd1cb110f48e"
+}

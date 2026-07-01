@@ -1,3 +1,4 @@
+pub mod anthropic;
 pub mod cache_classifier;
 pub mod databases;
 pub mod multi_step_executor;
@@ -849,6 +850,7 @@ async fn test_request_logging_disabled(pool: PgPool) {
             &crate::config::TaskWorkersConfig {
                 create_batch_workers: 0,
                 cascade_batch_state_workers: 0,
+                purge_user_data_workers: 0,
                 response_writer_batch_size: 0,
             },
         )
@@ -1416,6 +1418,7 @@ async fn test_build_router_with_metrics_disabled(pool: PgPool) {
             &crate::config::TaskWorkersConfig {
                 create_batch_workers: 0,
                 cascade_batch_state_workers: 0,
+                purge_user_data_workers: 0,
                 response_writer_batch_size: 0,
             },
         )
@@ -1477,6 +1480,7 @@ async fn test_build_router_with_metrics_enabled(pool: PgPool) {
             &crate::config::TaskWorkersConfig {
                 create_batch_workers: 0,
                 cascade_batch_state_workers: 0,
+                purge_user_data_workers: 0,
                 response_writer_batch_size: 0,
             },
         )

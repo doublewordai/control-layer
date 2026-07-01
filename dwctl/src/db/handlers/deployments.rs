@@ -1123,34 +1123,159 @@ impl<'c> Deployments<'c> {
         Ok(results)
     }
 
-    /// Update a component's weight, enabled status, and sort_order
+    /// Take a row lock on the composite model so component mutations (add /
+    /// reorder / remove) for that composite are serialized. Without this, two
+    /// concurrent adds could both read the same `MAX(sort_order)` and insert
+    /// duplicate positions (there is no DB unique constraint on the pair). Must
+    /// run inside the same transaction as the mutation it guards. Returns `false`
+    /// if the composite does not exist.
+    #[instrument(skip(self), fields(composite_id = %abbrev_uuid(&composite_model_id)), err)]
+    pub async fn lock_composite(&mut self, composite_model_id: DeploymentId) -> Result<bool> {
+        let locked = sqlx::query_scalar!(
+            "SELECT id FROM deployed_models WHERE id = $1 AND is_composite = TRUE FOR UPDATE",
+            composite_model_id
+        )
+        .fetch_optional(&mut *self.db)
+        .await?;
+
+        Ok(locked.is_some())
+    }
+
+    /// Renumber a composite's components to a dense 0..n-1 sequence in their
+    /// current priority order (sort_order, then weight DESC, then created_at).
+    /// Used after a removal so deletions don't leave gaps. Idempotent.
+    #[instrument(skip(self), fields(composite_id = %abbrev_uuid(&composite_model_id)), err)]
+    pub async fn compact_component_sort_order(&mut self, composite_model_id: DeploymentId) -> Result<()> {
+        sqlx::query!(
+            r#"
+            WITH ranked AS (
+                SELECT id, ROW_NUMBER() OVER (ORDER BY sort_order ASC, weight DESC, created_at ASC) - 1 AS new_order
+                FROM deployed_model_components
+                WHERE composite_model_id = $1
+            )
+            UPDATE deployed_model_components dmc
+            SET sort_order = ranked.new_order
+            FROM ranked
+            WHERE dmc.id = ranked.id
+              AND dmc.sort_order IS DISTINCT FROM ranked.new_order
+            "#,
+            composite_model_id
+        )
+        .execute(&mut *self.db)
+        .await?;
+
+        Ok(())
+    }
+
+    /// The sort_order to use when appending a new component: one past the
+    /// current maximum within the composite, or 0 if it has no components yet.
+    /// Callers serialize via [`Self::lock_composite`] so concurrent appends can't
+    /// observe the same maximum. With removals compacting the sequence
+    /// ([`Self::compact_component_sort_order`]) there are no gaps, so this is also
+    /// the next dense index.
+    #[instrument(skip(self), fields(composite_id = %abbrev_uuid(&composite_model_id)), err)]
+    pub async fn next_component_sort_order(&mut self, composite_model_id: DeploymentId) -> Result<i32> {
+        let next = sqlx::query_scalar!(
+            "SELECT COALESCE(MAX(sort_order) + 1, 0) FROM deployed_model_components WHERE composite_model_id = $1",
+            composite_model_id
+        )
+        .fetch_one(&mut *self.db)
+        .await?;
+
+        Ok(next.unwrap_or(0))
+    }
+
+    /// Reassign sort_order across a composite's components by descending weight
+    /// (ties broken by insertion order), producing a dense, unique 0..n-1
+    /// sequence. Used when a composite switches to the `priority` strategy so the
+    /// previous weighting determines the failover order instead of leaving every
+    /// component at the default sort_order = 0.
+    #[instrument(skip(self), fields(composite_id = %abbrev_uuid(&composite_model_id)), err)]
+    pub async fn renumber_components_by_weight(&mut self, composite_model_id: DeploymentId) -> Result<()> {
+        sqlx::query!(
+            r#"
+            WITH ranked AS (
+                SELECT id, ROW_NUMBER() OVER (ORDER BY weight DESC, created_at ASC) - 1 AS new_order
+                FROM deployed_model_components
+                WHERE composite_model_id = $1
+            )
+            UPDATE deployed_model_components dmc
+            SET sort_order = ranked.new_order
+            FROM ranked
+            WHERE dmc.id = ranked.id
+              AND dmc.sort_order IS DISTINCT FROM ranked.new_order
+            "#,
+            composite_model_id
+        )
+        .execute(&mut *self.db)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Move a component to `target_position` within its composite and renumber the
+    /// rest so sort_order stays a dense, unique 0..n-1 sequence. `target_position`
+    /// is clamped into range. Run inside a transaction so the multi-row rewrite is
+    /// atomic. This is what keeps two components from ever sharing a sort_order via
+    /// the reorder path.
     #[instrument(skip(self), fields(composite_id = %abbrev_uuid(&composite_model_id), deployed_id = %abbrev_uuid(&deployed_model_id)), err)]
-    pub async fn update_component(
+    async fn move_component_to_position(
         &mut self,
         composite_model_id: DeploymentId,
         deployed_model_id: DeploymentId,
-        weight: Option<i32>,
-        enabled: Option<bool>,
-        sort_order: Option<i32>,
+        target_position: i32,
+    ) -> Result<()> {
+        // Current order (same key the read paths use), as component ids.
+        let mut ordered: Vec<DeploymentId> = sqlx::query_scalar!(
+            "SELECT deployed_model_id FROM deployed_model_components
+             WHERE composite_model_id = $1
+             ORDER BY sort_order ASC, weight DESC, created_at ASC",
+            composite_model_id
+        )
+        .fetch_all(&mut *self.db)
+        .await?;
+
+        // Splice the moved component out and reinsert it at the requested slot.
+        if let Some(pos) = ordered.iter().position(|id| *id == deployed_model_id) {
+            ordered.remove(pos);
+        }
+        let target = target_position.clamp(0, ordered.len() as i32) as usize;
+        ordered.insert(target, deployed_model_id);
+
+        // Write back sort_order = index for the whole composite.
+        for (idx, id) in ordered.iter().enumerate() {
+            sqlx::query!(
+                "UPDATE deployed_model_components SET sort_order = $3
+                 WHERE composite_model_id = $1 AND deployed_model_id = $2
+                   AND sort_order IS DISTINCT FROM $3",
+                composite_model_id,
+                id,
+                idx as i32
+            )
+            .execute(&mut *self.db)
+            .await?;
+        }
+
+        Ok(())
+    }
+
+    /// Fetch a single component (with joined model/endpoint info) by its ids.
+    #[instrument(skip(self), fields(composite_id = %abbrev_uuid(&composite_model_id), deployed_id = %abbrev_uuid(&deployed_model_id)), err)]
+    pub async fn get_component(
+        &mut self,
+        composite_model_id: DeploymentId,
+        deployed_model_id: DeploymentId,
     ) -> Result<Option<DeploymentComponentDBResponse>> {
         let result = sqlx::query!(
             r#"
-            WITH updated AS (
-                UPDATE deployed_model_components
-                SET weight = COALESCE($3, weight),
-                    enabled = COALESCE($4, enabled),
-                    sort_order = COALESCE($5, sort_order)
-                WHERE composite_model_id = $1 AND deployed_model_id = $2
-                RETURNING id, composite_model_id, deployed_model_id, weight, enabled, sort_order, created_at
-            )
             SELECT
-                updated.id,
-                updated.composite_model_id,
-                updated.deployed_model_id,
-                updated.weight,
-                updated.enabled,
-                updated.sort_order,
-                updated.created_at,
+                dmc.id,
+                dmc.composite_model_id,
+                dmc.deployed_model_id,
+                dmc.weight,
+                dmc.enabled,
+                dmc.sort_order,
+                dmc.created_at,
                 dm.alias as model_alias,
                 dm.model_name,
                 dm.description as model_description,
@@ -1159,15 +1284,13 @@ impl<'c> Deployments<'c> {
                 dm.open_responses_adapter as "model_open_responses_adapter?",
                 dm.hosted_on as endpoint_id,
                 e.name as "endpoint_name?"
-            FROM updated
-            JOIN deployed_models dm ON dm.id = updated.deployed_model_id
+            FROM deployed_model_components dmc
+            JOIN deployed_models dm ON dm.id = dmc.deployed_model_id
             LEFT JOIN inference_endpoints e ON e.id = dm.hosted_on
+            WHERE dmc.composite_model_id = $1 AND dmc.deployed_model_id = $2
             "#,
             composite_model_id,
-            deployed_model_id,
-            weight,
-            enabled,
-            sort_order
+            deployed_model_id
         )
         .fetch_optional(&mut *self.db)
         .await?;
@@ -1189,6 +1312,52 @@ impl<'c> Deployments<'c> {
             model_trusted: r.model_trusted,
             model_open_responses_adapter: r.model_open_responses_adapter.unwrap_or(true),
         }))
+    }
+
+    /// Update a component's weight and/or enabled status, and optionally move it to
+    /// a new priority position. When `sort_order` is supplied it is treated as a
+    /// target position: the component is moved there and the whole composite is
+    /// renumbered to a dense, unique 0..n-1 sequence (so two components can never
+    /// share a sort_order). When `sort_order` is `None` the existing order is left
+    /// untouched. Returns `None` if the component does not exist.
+    ///
+    /// Must run on a transaction connection: a position change rewrites multiple
+    /// rows and the caller commits them together.
+    #[instrument(skip(self), fields(composite_id = %abbrev_uuid(&composite_model_id), deployed_id = %abbrev_uuid(&deployed_model_id)), err)]
+    pub async fn update_component(
+        &mut self,
+        composite_model_id: DeploymentId,
+        deployed_model_id: DeploymentId,
+        weight: Option<i32>,
+        enabled: Option<bool>,
+        sort_order: Option<i32>,
+    ) -> Result<Option<DeploymentComponentDBResponse>> {
+        // Apply weight/enabled first; this also tells us whether the component exists.
+        let exists = sqlx::query_scalar!(
+            "UPDATE deployed_model_components
+             SET weight = COALESCE($3, weight),
+                 enabled = COALESCE($4, enabled)
+             WHERE composite_model_id = $1 AND deployed_model_id = $2
+             RETURNING id",
+            composite_model_id,
+            deployed_model_id,
+            weight,
+            enabled
+        )
+        .fetch_optional(&mut *self.db)
+        .await?;
+
+        if exists.is_none() {
+            return Ok(None);
+        }
+
+        // A supplied sort_order is a move-to-position request; reindex the composite.
+        if let Some(target_position) = sort_order {
+            self.move_component_to_position(composite_model_id, deployed_model_id, target_position)
+                .await?;
+        }
+
+        self.get_component(composite_model_id, deployed_model_id).await
     }
 
     /// Get throughput values for the given model aliases
@@ -4130,5 +4299,266 @@ mod tests {
         let filter = DeploymentFilter::new(0, 100).with_deleted(false);
         let (providers, _, _) = repo.facets(&filter).await.unwrap();
         assert!(!providers.contains(&"DeletedProvider".to_string()));
+    }
+
+    // ===== Composite component priority ordering =====
+
+    /// Create a composite model plus `n` standalone component models (hosted on the
+    /// shared test endpoint). Returns (composite_id, [component_ids]). The
+    /// components are NOT linked yet — tests do that to exercise the link paths.
+    async fn create_composite_and_components(pool: &PgPool, user_id: UserId, n: usize) -> (DeploymentId, Vec<DeploymentId>) {
+        let sources = vec![crate::config::ModelSource {
+            name: "test".to_string(),
+            url: url::Url::parse("http://localhost:8080").unwrap(),
+            api_key: None,
+            sync_interval: std::time::Duration::from_secs(3600),
+            default_models: None,
+        }];
+        crate::seed_database(&sources, pool).await.unwrap();
+
+        let endpoint_id = get_test_endpoint_id(pool).await;
+        let mut tx = pool.begin().await.unwrap();
+        let result = {
+            let mut repo = Deployments::new(tx.acquire().await.unwrap());
+            let composite = repo
+                .create(
+                    &DeploymentCreateDBRequest::builder()
+                        .created_by(user_id)
+                        .model_name(format!("composite-{}", uuid::Uuid::new_v4()))
+                        .alias(format!("composite-{}", uuid::Uuid::new_v4()))
+                        .is_composite(true)
+                        .lb_strategy(LoadBalancingStrategy::WeightedRandom)
+                        .build(),
+                )
+                .await
+                .unwrap();
+
+            let mut ids = Vec::new();
+            for i in 0..n {
+                let component = repo
+                    .create(
+                        &DeploymentCreateDBRequest::builder()
+                            .created_by(user_id)
+                            .model_name(format!("component-{}-{}", i, uuid::Uuid::new_v4()))
+                            .alias(format!("component-{}-{}", i, uuid::Uuid::new_v4()))
+                            .hosted_on(endpoint_id)
+                            .build(),
+                    )
+                    .await
+                    .unwrap();
+                ids.push(component.id);
+            }
+            (composite.id, ids)
+        };
+        tx.commit().await.unwrap();
+        result
+    }
+
+    /// (deployed_model_id, sort_order) pairs in priority order.
+    async fn ordered_components(pool: &PgPool, composite_id: DeploymentId) -> Vec<(DeploymentId, i32)> {
+        let mut conn = pool.acquire().await.unwrap();
+        let mut repo = Deployments::new(&mut conn);
+        repo.get_components(composite_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|c| (c.deployed_model_id, c.sort_order))
+            .collect()
+    }
+
+    fn assert_dense_unique(ordered: &[(DeploymentId, i32)]) {
+        let orders: Vec<i32> = ordered.iter().map(|(_, s)| *s).collect();
+        let expected: Vec<i32> = (0..orders.len() as i32).collect();
+        assert_eq!(orders, expected, "sort_order must be a dense, unique 0..n-1 sequence");
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_next_sort_order_appends(pool: PgPool) {
+        let user = create_test_user(&pool).await;
+        let (composite, components) = create_composite_and_components(&pool, user.id, 3).await;
+
+        let mut tx = pool.begin().await.unwrap();
+        {
+            let mut repo = Deployments::new(tx.acquire().await.unwrap());
+            for component_id in &components {
+                // Mirror the handler: the server assigns the next position on add.
+                let sort_order = repo.next_component_sort_order(composite).await.unwrap();
+                repo.add_component(&DeploymentComponentCreateDBRequest {
+                    composite_model_id: composite,
+                    deployed_model_id: *component_id,
+                    weight: 50,
+                    enabled: true,
+                    sort_order,
+                })
+                .await
+                .unwrap();
+            }
+        }
+        tx.commit().await.unwrap();
+
+        let ordered = ordered_components(&pool, composite).await;
+        assert_dense_unique(&ordered);
+        // Added in order → that is the priority order.
+        assert_eq!(ordered.iter().map(|(id, _)| *id).collect::<Vec<_>>(), components);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_renumber_by_weight(pool: PgPool) {
+        let user = create_test_user(&pool).await;
+        let (composite, components) = create_composite_and_components(&pool, user.id, 3).await;
+        let weights = [10, 50, 30];
+
+        // Simulate the legacy state: every component left at sort_order = 0.
+        let mut tx = pool.begin().await.unwrap();
+        {
+            let mut repo = Deployments::new(tx.acquire().await.unwrap());
+            for (component_id, weight) in components.iter().zip(weights) {
+                repo.add_component(&DeploymentComponentCreateDBRequest {
+                    composite_model_id: composite,
+                    deployed_model_id: *component_id,
+                    weight,
+                    enabled: true,
+                    sort_order: 0,
+                })
+                .await
+                .unwrap();
+            }
+            // Convert-to-priority renumbers by weight DESC.
+            repo.renumber_components_by_weight(composite).await.unwrap();
+        }
+        tx.commit().await.unwrap();
+
+        let ordered = ordered_components(&pool, composite).await;
+        assert_dense_unique(&ordered);
+        // Highest weight (50 → idx 1) first, then 30 → idx 2, then 10 → idx 0.
+        assert_eq!(
+            ordered.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            vec![components[1], components[2], components[0]]
+        );
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_move_component_reindexes_densely(pool: PgPool) {
+        let user = create_test_user(&pool).await;
+        let (composite, components) = create_composite_and_components(&pool, user.id, 3).await;
+
+        // Link as [0, 1, 2].
+        let mut tx = pool.begin().await.unwrap();
+        {
+            let mut repo = Deployments::new(tx.acquire().await.unwrap());
+            for (i, component_id) in components.iter().enumerate() {
+                repo.add_component(&DeploymentComponentCreateDBRequest {
+                    composite_model_id: composite,
+                    deployed_model_id: *component_id,
+                    weight: 50,
+                    enabled: true,
+                    sort_order: i as i32,
+                })
+                .await
+                .unwrap();
+            }
+        }
+        tx.commit().await.unwrap();
+
+        // Move the last component to the front → [2, 0, 1], still dense/unique.
+        let mut tx = pool.begin().await.unwrap();
+        {
+            let mut repo = Deployments::new(tx.acquire().await.unwrap());
+            let moved = repo
+                .update_component(composite, components[2], None, None, Some(0))
+                .await
+                .unwrap()
+                .expect("component exists");
+            assert_eq!(moved.sort_order, 0);
+        }
+        tx.commit().await.unwrap();
+
+        let ordered = ordered_components(&pool, composite).await;
+        assert_dense_unique(&ordered);
+        assert_eq!(
+            ordered.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            vec![components[2], components[0], components[1]]
+        );
+
+        // An out-of-range target clamps to the end rather than erroring.
+        let mut tx = pool.begin().await.unwrap();
+        {
+            let mut repo = Deployments::new(tx.acquire().await.unwrap());
+            repo.update_component(composite, components[2], None, None, Some(999))
+                .await
+                .unwrap()
+                .expect("component exists");
+        }
+        tx.commit().await.unwrap();
+
+        let ordered = ordered_components(&pool, composite).await;
+        assert_dense_unique(&ordered);
+        assert_eq!(ordered.last().unwrap().0, components[2]);
+
+        // A weight-only update leaves the order untouched.
+        let order_before = ordered_components(&pool, composite).await;
+        let mut tx = pool.begin().await.unwrap();
+        {
+            let mut repo = Deployments::new(tx.acquire().await.unwrap());
+            repo.update_component(composite, components[0], Some(99), None, None)
+                .await
+                .unwrap()
+                .expect("component exists");
+        }
+        tx.commit().await.unwrap();
+        assert_eq!(ordered_components(&pool, composite).await, order_before);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_remove_compacts_sort_order(pool: PgPool) {
+        let user = create_test_user(&pool).await;
+        let (composite, components) = create_composite_and_components(&pool, user.id, 3).await;
+
+        // Link as [0, 1, 2].
+        let mut tx = pool.begin().await.unwrap();
+        {
+            let mut repo = Deployments::new(tx.acquire().await.unwrap());
+            for (i, component_id) in components.iter().enumerate() {
+                repo.add_component(&DeploymentComponentCreateDBRequest {
+                    composite_model_id: composite,
+                    deployed_model_id: *component_id,
+                    weight: 50,
+                    enabled: true,
+                    sort_order: i as i32,
+                })
+                .await
+                .unwrap();
+            }
+        }
+        tx.commit().await.unwrap();
+
+        // Remove the middle component, then compact — the survivors must close the gap.
+        let mut tx = pool.begin().await.unwrap();
+        {
+            let mut repo = Deployments::new(tx.acquire().await.unwrap());
+            assert!(repo.remove_component(composite, components[1]).await.unwrap());
+            repo.compact_component_sort_order(composite).await.unwrap();
+        }
+        tx.commit().await.unwrap();
+
+        let ordered = ordered_components(&pool, composite).await;
+        assert_dense_unique(&ordered);
+        assert_eq!(
+            ordered.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            vec![components[0], components[2]]
+        );
+
+        // The next append lands at the dense tail (no gap left behind).
+        let mut tx = pool.begin().await.unwrap();
+        let next = {
+            let mut repo = Deployments::new(tx.acquire().await.unwrap());
+            repo.next_component_sort_order(composite).await.unwrap()
+        };
+        tx.commit().await.unwrap();
+        assert_eq!(next, 2);
     }
 }

@@ -16,15 +16,21 @@ export const queryKeys = {
       skip?: number;
       limit?: number;
       endpoint?: string;
+      group?: string;
       include?: string;
       accessible?: boolean;
       search?: string;
+      is_composite?: boolean;
+      sort?: string;
+      sort_direction?: string;
     }) => ["models", "query", options] as const,
     byId: (id: string, include?: string) =>
       ["models", "byId", id, include] as const,
     // Composite model components
     components: (modelId: string) =>
       ["models", "byId", modelId, "components"] as const,
+    cachePricing: (modelId: string) =>
+      ["models", "byId", modelId, "cachePricing"] as const,
     // Separate metrics query for lazy loading
     metrics: (options?: {
       skip?: number;
@@ -34,6 +40,8 @@ export const queryKeys = {
       search?: string;
       is_composite?: boolean;
       group?: string;
+      sort?: string;
+      sort_direction?: string;
     }) => ["models", "metrics", options] as const,
   },
 

@@ -56,6 +56,19 @@ use serde_json::Value;
 use tracing::{Instrument, info_span};
 use uuid::Uuid;
 
+/// ZDR-safe descriptor for a payload (de)serialization error.
+///
+/// Logs only the underlying JSON error's location and category, never its
+/// `Display` message — serde messages can echo a fragment of the request or
+/// response body (e.g. `invalid type: string "<content>"`), which must never
+/// reach logs.
+fn zdr_safe_parse_error(err: &(dyn std::error::Error + Send + Sync + 'static)) -> String {
+    match err.downcast_ref::<serde_json::Error>() {
+        Some(e) => format!("json parse error ({:?}) at line {} column {}", e.classify(), e.line(), e.column()),
+        None => "parse error".to_string(),
+    }
+}
+
 /// A request handler that sends analytics data to a background batcher.
 ///
 /// This handler implements [`outlet::RequestHandler`] and can be used standalone or composed
@@ -145,7 +158,7 @@ impl RequestHandler for AnalyticsHandler {
                         tracing::warn!(
                             correlation_id = correlation_id,
                             uri = %request_data.uri,
-                            error = %e.error,
+                            error = %zdr_safe_parse_error(e.error.as_ref()),
                             "Failed to parse successful AI response — tokens will be zero"
                         );
                         if let Some(endpoint) = usage_required_endpoint {
@@ -155,8 +168,8 @@ impl RequestHandler for AnalyticsHandler {
                                 uri = %request_data.uri,
                                 endpoint,
                                 fusillade_stream,
-                                error = %e.error,
-                                "Failed to serialize usage for successful generative response"
+                                error = %zdr_safe_parse_error(e.error.as_ref()),
+                                "Failed to parse usage from a successful generative response"
                             );
                         }
                     }
@@ -225,6 +238,10 @@ impl RequestHandler for AnalyticsHandler {
                 completion_tokens: metrics.completion_tokens,
                 reasoning_tokens: metrics.reasoning_tokens,
                 total_tokens: metrics.total_tokens,
+                cache_read_input_tokens: metrics.cache_read_input_tokens,
+                cache_creation_5m_input_tokens: metrics.cache_creation_5m_input_tokens,
+                cache_creation_1h_input_tokens: metrics.cache_creation_1h_input_tokens,
+                cache_creation_24h_input_tokens: metrics.cache_creation_24h_input_tokens,
                 response_type: metrics.response_type,
                 server_address: metrics.server_address,
                 server_port: metrics.server_port,
@@ -260,6 +277,25 @@ mod tests {
     use std::collections::HashMap;
     use std::time::{Duration, SystemTime};
     use tokio::sync::mpsc;
+
+    /// ZDR (COR-499): the serialization-error descriptor used in the parse-failure
+    /// logs must report only the JSON error's location/category, never a fragment
+    /// of the offending body that serde's `Display` can echo.
+    #[test]
+    fn zdr_safe_parse_error_omits_body_fragment() {
+        const SENTINEL: &str = "ZDR-SENTINEL-BODY-FRAGMENT-8d2c";
+        // A type mismatch makes serde's Display echo the offending value
+        // (`invalid type: string "<content>"`), which is exactly what we must drop.
+        let err: serde_json::Error =
+            serde_json::from_str::<std::collections::HashMap<String, u32>>(&format!("{{\"k\": \"{SENTINEL}\"}}")).unwrap_err();
+        // Sanity: the raw serde message really does contain the sentinel.
+        assert!(err.to_string().contains(SENTINEL));
+
+        let boxed: Box<dyn std::error::Error + Send + Sync> = Box::new(err);
+        let safe = zdr_safe_parse_error(boxed.as_ref());
+        assert!(!safe.contains(SENTINEL), "body fragment leaked: {safe}");
+        assert!(safe.contains("line") && safe.contains("column"), "expected location: {safe}");
+    }
 
     fn create_test_request_data() -> RequestData {
         RequestData {

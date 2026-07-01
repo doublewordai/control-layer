@@ -206,6 +206,10 @@ pub struct Config {
     /// Both surfaces require authentication regardless of these flags.
     #[serde(default)]
     pub openapi: OpenApiConfig,
+    /// Cached-input pricing (the dwctl-owned cache layer): the on/off flag, the
+    /// tokenizer-svc URL, and the default pricing multipliers. See [`CacheConfig`].
+    #[serde(default)]
+    pub cache: CacheConfig,
 }
 
 /// Controls exposure of the OpenAPI specs and Scalar doc UIs.
@@ -637,7 +641,7 @@ impl Default for Metadata {
         Self {
             region: None,
             organization: None,
-            docs_url: "https://docs.doubleword.ai/control-layer".to_string(),
+            docs_url: "https://doublewordai.github.io/control-layer/".to_string(),
             docs_jsonl_url: None,
             title: None,
             ai_api_base_url: None,
@@ -1001,33 +1005,103 @@ impl Default for RequestLimitsConfig {
 /// Onwards AI proxy configuration.
 ///
 /// Controls behavior of the onwards routing layer used for AI proxy requests.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
-#[derive(Default)]
 pub struct OnwardsConfig {
     /// Enable strict mode with schema validation and typed handlers.
     /// When false (default), all requests are passed through transparently.
     /// When true, only known OpenAI API paths are accepted and validated.
     pub strict_mode: bool,
-    /// Wire a cached-input-pricing classifier into the embedded onwards proxy.
+}
+
+/// Cached-input pricing — the dwctl-owned cache tower layer. All cache configuration lives
+/// here (formerly split across `onwards.*` and a top-level `cache_pricing`).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CacheConfig {
+    /// Enable cached-input pricing. When false (the default), the cache layer is not added
+    /// to the stack: onwards is byte-identical to today with zero request-path overhead
+    /// (no body read, no classify fork, no injection).
     ///
-    /// When false (the default), onwards is left dormant: no classifier is
-    /// injected, so the cache request-fork, `cache_control` stripping, and
-    /// response usage injection are all skipped and onwards behaviour is
-    /// byte-identical to today — zero runtime overhead (no extra allocations,
-    /// no request-path changes).
+    /// When true, [`crate::prompt_cache::cache_middleware`] wraps the onwards router (inner
+    /// to outlet, so billing sees the injected fields): on each cacheable request it forks
+    /// the classifier concurrently with the upstream call, strips `cache_control` markers,
+    /// injects the `cache_*` usage fields, and commits prefix writes on success. Per-model
+    /// activation is still gated by an active `model_cache_tariffs` row, so flipping this on
+    /// does nothing until a model is enabled. classify races the (slower) model call under a
+    /// deadline, so it adds no request latency.
     ///
-    /// When true, the no-op classifier ([`onwards::NoopCacheClassifier`]) is injected.
-    /// This activates the spine end-to-end for local validation: responses
-    /// carry the (zeroed) `cache_*` usage fields and outbound `cache_control`
-    /// markers are stripped, while billing/analytics is unaffected. There is
-    /// no real classification yet — the no-op returns all-zero stats. The real
-    /// dwctl classifier will replace the no-op here in a later wave. When a real
-    /// classifier lands it runs concurrently with the upstream model call under a
-    /// deadline, so it does not add to request latency.
+    /// Set via environment: `DWCTL_CACHE__ENABLED=true`
+    pub enabled: bool,
+
+    /// Base URL of the tokenizer-svc used to count cache-prefix tokens. Only consulted when
+    /// `enabled` is true; the classifier calls `{tokenizer_url}/v1/models` and
+    /// `{tokenizer_url}/v1/tokenize`. A namespace-relative service name (e.g.
+    /// `http://tokenizer-svc:8088`) resolves to the tokenizer-svc in the pod's own namespace.
     ///
-    /// Set via environment: `DWCTL_ONWARDS__CACHE_CLASSIFIER_ENABLED=true`
-    pub cache_classifier_enabled: bool,
+    /// Set via environment: `DWCTL_CACHE__TOKENIZER_URL=http://tokenizer-svc:8088`
+    pub tokenizer_url: String,
+
+    /// Default pricing multipliers (pre-fill when enabling caching on a model without
+    /// explicit per-tier values). See [`CachePricingConfig`].
+    pub pricing: CachePricingConfig,
+
+    /// The cache TTL tiers the platform currently offers, as Anthropic-style strings
+    /// (`"5m"`, `"1h"`, `"24h"`). A request whose `cache_control` marker names a tier NOT in
+    /// this list is rejected with a 400 (like an unknown parameter) — not silently un-cached,
+    /// so billing stays honest. Restrict it to roll out a subset (e.g. drop `"24h"` until the
+    /// KV-store mechanism exists). A model may still carry a tariff for a disabled tier; it
+    /// just can't be reached until the tier is re-enabled here. Default: `["5m", "1h"]`.
+    ///
+    /// Set via environment: `DWCTL_CACHE__ENABLED_TTLS=5m,1h`
+    pub enabled_ttls: Vec<String>,
+
+    /// The tier a `cache_control: {type: "ephemeral"}` marker with no explicit `ttl` defaults
+    /// to (Anthropic's default is `"5m"`). Must be one of `enabled_ttls`.
+    ///
+    /// Set via environment: `DWCTL_CACHE__DEFAULT_TTL=5m`
+    pub default_ttl: String,
+}
+
+impl Default for CacheConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            tokenizer_url: "http://localhost:8088".to_string(),
+            pricing: CachePricingConfig::default(),
+            enabled_ttls: vec!["5m".to_string(), "1h".to_string()],
+            default_ttl: "5m".to_string(),
+        }
+    }
+}
+
+/// Default cache-pricing multipliers, used when enabling caching on a model without
+/// explicit per-tier values. The `model_cache_tariffs` row remains the source of truth
+/// (and what billing reads as of inference time) — these only pre-fill it at creation.
+///
+/// Defaults mirror Anthropic's published premiums: 5m write 1.25×, 1h write 2×, read
+/// 0.1×; 24h defaults to 2.5×. Floor 1024 tokens.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CachePricingConfig {
+    pub default_write_multiplier_5m: rust_decimal::Decimal,
+    pub default_write_multiplier_1h: rust_decimal::Decimal,
+    pub default_write_multiplier_24h: rust_decimal::Decimal,
+    pub default_read_multiplier: rust_decimal::Decimal,
+    pub default_min_prefix_tokens: i32,
+}
+
+impl Default for CachePricingConfig {
+    fn default() -> Self {
+        use rust_decimal::Decimal;
+        Self {
+            default_write_multiplier_5m: Decimal::new(125, 2), // 1.25
+            default_write_multiplier_1h: Decimal::new(2, 0),   // 2.0
+            default_write_multiplier_24h: Decimal::new(25, 1), // 2.5
+            default_read_multiplier: Decimal::new(1, 1),       // 0.1
+            default_min_prefix_tokens: 1024,
+        }
+    }
 }
 
 /// File limits configuration.
@@ -1262,6 +1336,7 @@ impl Default for BatchConfig {
                 "/v1/completions".to_string(),
                 "/v1/embeddings".to_string(),
                 "/v1/responses".to_string(),
+                "/v1/messages".to_string(),
             ],
             async_requests: AsyncRequestsConfig::default(),
             files: FilesConfig::default(),
@@ -1916,6 +1991,9 @@ pub struct TaskWorkersConfig {
     /// Number of cascade-batch-state workers (default: 1).
     /// Updates child request states after a batch is cancelled or deleted.
     pub cascade_batch_state_workers: usize,
+    /// Number of purge-user-data workers (default: 1, minimum: 1).
+    /// Erases a deleted user's fusillade data (batches, files, requests).
+    pub purge_user_data_workers: usize,
     /// Maximum records per flush in the in-process responses writer
     /// (default: 100). Larger values amortise commit overhead across the
     /// batch; smaller values reduce per-record latency from outlet send
@@ -1929,6 +2007,7 @@ impl Default for TaskWorkersConfig {
         Self {
             create_batch_workers: 1,
             cascade_batch_state_workers: 1,
+            purge_user_data_workers: 1,
             response_writer_batch_size: 100,
         }
     }
@@ -1969,6 +2048,7 @@ impl Default for Config {
             responses: ResponsesConfig::default(),
             image_normalizer: crate::image_normalizer::ImageNormalizerConfig::default(),
             openapi: OpenApiConfig::default(),
+            cache: CacheConfig::default(),
         }
     }
 }
@@ -2196,6 +2276,46 @@ impl Config {
             if self.auth.native.password.min_length < 1 {
                 return Err(Error::Internal {
                     operation: "Config validation: Invalid password configuration: min_length must be at least 1".to_string(),
+                });
+            }
+        }
+
+        // Cached-input pricing needs a tokenizer-svc URL to count cache-prefix tokens.
+        // Without it, every cacheable request silently degrades to no caching — fail fast
+        // at startup instead, so an operator who flips the flag gets a clear error.
+        if self.cache.enabled && self.cache.tokenizer_url.trim().is_empty() {
+            return Err(Error::Internal {
+                operation: "Config validation: cache.enabled is true but cache.tokenizer_url is empty. \
+                     Set DWCTL_CACHE__TOKENIZER_URL to the tokenizer-svc base URL, or disable caching."
+                    .to_string(),
+            });
+        }
+
+        // Cache TTL tiers: every enabled tier must be a known tier (5m/1h/24h), the set must be
+        // non-empty, and the default tier must be one of them — otherwise a no-ttl marker would
+        // default straight into a rejected tier. Fail fast at startup with a clear message.
+        if self.cache.enabled {
+            for ttl in &self.cache.enabled_ttls {
+                if crate::prompt_cache::TtlTier::parse(ttl).is_none() {
+                    return Err(Error::Internal {
+                        operation: format!(
+                            "Config validation: cache.enabled_ttls contains an unknown tier {ttl:?}; allowed values are \"5m\", \"1h\", \"24h\"."
+                        ),
+                    });
+                }
+            }
+            if self.cache.enabled_ttls.is_empty() {
+                return Err(Error::Internal {
+                    operation: "Config validation: cache.enabled_ttls is empty; enable at least one tier (\"5m\", \"1h\", \"24h\")."
+                        .to_string(),
+                });
+            }
+            if !self.cache.enabled_ttls.iter().any(|t| t == &self.cache.default_ttl) {
+                return Err(Error::Internal {
+                    operation: format!(
+                        "Config validation: cache.default_ttl {:?} is not in cache.enabled_ttls {:?}.",
+                        self.cache.default_ttl, self.cache.enabled_ttls
+                    ),
                 });
             }
         }
@@ -2787,6 +2907,57 @@ secret_key: "test-secret-key"
 
         let result = config.validate();
         assert!(result.is_ok()); // Should pass because both batches AND daemon are disabled
+    }
+
+    /// Helper: a config that passes validation up to the cache checks, with caching on.
+    fn cache_test_config() -> Config {
+        let mut config = Config::default();
+        config.auth.native.enabled = true;
+        config.secret_key = Some("test-secret-key".to_string());
+        config.cache.enabled = true;
+        config
+    }
+
+    #[test]
+    fn test_cache_tiers_not_validated_when_disabled() {
+        let mut config = cache_test_config();
+        config.cache.enabled = false; // disabled → tier config is not validated
+        config.cache.enabled_ttls = vec!["99h".to_string()]; // bogus, but ignored
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_cache_valid_tiers_ok() {
+        let mut config = cache_test_config();
+        config.cache.enabled_ttls = vec!["5m".to_string(), "1h".to_string()];
+        config.cache.default_ttl = "5m".to_string();
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_cache_unknown_tier_rejected() {
+        let mut config = cache_test_config();
+        config.cache.enabled_ttls = vec!["5m".to_string(), "99h".to_string()];
+        config.cache.default_ttl = "5m".to_string();
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("unknown tier"), "{err}");
+    }
+
+    #[test]
+    fn test_cache_empty_tiers_rejected() {
+        let mut config = cache_test_config();
+        config.cache.enabled_ttls = vec![];
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("enabled_ttls is empty"), "{err}");
+    }
+
+    #[test]
+    fn test_cache_default_ttl_must_be_enabled() {
+        let mut config = cache_test_config();
+        config.cache.enabled_ttls = vec!["5m".to_string()];
+        config.cache.default_ttl = "1h".to_string(); // not in enabled_ttls
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("default_ttl"), "{err}");
     }
 
     #[test]

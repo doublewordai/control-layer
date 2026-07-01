@@ -14,6 +14,7 @@ import type {
   GroupUpdateRequest,
   ModelCreate,
   ModelUpdateRequest,
+  CachePricingUpdate,
   ApiKeyCreateRequest,
   ApiKeysQuery,
   EndpointCreateRequest,
@@ -267,6 +268,59 @@ export function useDeleteModel() {
     onSuccess: (_, id) => {
       queryClient.invalidateQueries({ queryKey: queryKeys.models.all });
       queryClient.removeQueries({ queryKey: queryKeys.models.byId(id) });
+    },
+  });
+}
+
+// Cache pricing (Anthropic-style prompt-cache multipliers)
+export function useModelCachePricing(
+  modelId: string,
+  options?: { enabled?: boolean },
+) {
+  return useQuery({
+    queryKey: queryKeys.models.cachePricing(modelId),
+    queryFn: () => dwctlApi.models.cachePricing.get(modelId),
+    enabled: options?.enabled ?? true,
+  });
+}
+
+export function useUpdateModelCachePricing() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: ({
+      modelId,
+      data,
+    }: {
+      modelId: string;
+      data: CachePricingUpdate;
+    }) => dwctlApi.models.cachePricing.update(modelId, data),
+    onSuccess: (_, { modelId }) => {
+      queryClient.invalidateQueries({
+        queryKey: queryKeys.models.cachePricing(modelId),
+      });
+      queryClient.invalidateQueries({
+        queryKey: queryKeys.models.byId(modelId),
+      });
+      queryClient.invalidateQueries({ queryKey: queryKeys.models.all });
+    },
+  });
+}
+
+export function useDeleteModelCachePricing() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: (modelId: string) =>
+      dwctlApi.models.cachePricing.disable(modelId),
+    onSuccess: (_, modelId) => {
+      queryClient.invalidateQueries({
+        queryKey: queryKeys.models.cachePricing(modelId),
+      });
+      queryClient.invalidateQueries({
+        queryKey: queryKeys.models.byId(modelId),
+      });
+      queryClient.invalidateQueries({ queryKey: queryKeys.models.all });
     },
   });
 }

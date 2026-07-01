@@ -524,7 +524,12 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
           AND cm.deleted = FALSE
           AND dmc.enabled = TRUE
           AND dm.deleted = FALSE
-        ORDER BY cm.id, dmc.sort_order ASC
+        -- Deterministic priority order: sort_order is the failover order onwards
+        -- uses (Priority strategy iterates providers in definition order). The
+        -- weight/created_at keys break any residual sort_order tie the same way
+        -- the admin API does, so the provider shown as "Primary" is the one
+        -- onwards actually tries first.
+        ORDER BY cm.id, dmc.sort_order ASC, dmc.weight DESC, dmc.created_at ASC
         "#
     )
     .fetch_all(db)
@@ -533,7 +538,7 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
     // Query API keys with access to composite models (uses deployment_groups since composites are in deployed_models)
     let api_key_rows = sqlx::query!(
         r#"
-        WITH user_balances AS (
+        WITH user_balances AS MATERIALIZED (
             SELECT
                 u.id as user_id,
                 COALESCE(c.balance, 0) + COALESCE(
@@ -548,6 +553,7 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                 ) as balance
             FROM users u
             LEFT JOIN user_balance_checkpoints c ON c.user_id = u.id
+            WHERE u.is_deleted = false
         )
         SELECT
             cm.id as composite_model_id,
@@ -1218,7 +1224,7 @@ pub async fn load_targets_from_db(
     // Note: We pass escalation_models to grant batch API keys access to escalation models
     let rows = sqlx::query!(
         r#"
-        WITH user_balances AS (
+        WITH user_balances AS MATERIALIZED (
             SELECT
                 u.id as user_id,
                 COALESCE(c.balance, 0) + COALESCE(
@@ -1233,6 +1239,7 @@ pub async fn load_targets_from_db(
                 ) as balance
             FROM users u
             LEFT JOIN user_balance_checkpoints c ON c.user_id = u.id
+            WHERE u.is_deleted = false
         )
         SELECT
             dm.id as deployment_id,

@@ -160,6 +160,7 @@ mod notifications;
 mod openapi;
 mod payment_providers;
 mod probes;
+pub mod prompt_cache;
 mod request_logging;
 pub mod sample_files;
 mod static_assets;
@@ -195,7 +196,7 @@ use axum::http::HeaderValue;
 use axum::response::Response;
 use axum::{
     Router, ServiceExt, http, middleware,
-    routing::{delete, get, patch, post},
+    routing::{delete, get, patch, post, put},
 };
 use axum_prometheus::PrometheusMetricLayerBuilder;
 use bon::Builder;
@@ -342,6 +343,10 @@ fn get_or_install_prometheus_handle() -> PrometheusHandle {
             // Custom histogram buckets for cache sync lag (1ms to 10s)
             const CACHE_SYNC_LAG_BUCKETS: &[f64] = &[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0];
 
+            // Custom histogram buckets for the cached-input-pricing layer latencies (1ms to 10s):
+            // classify, tokenizer-svc call, commit, and index lookup (cache read).
+            const CACHE_LATENCY_BUCKETS: &[f64] = &[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0];
+
             // Custom histogram buckets for fusillade retry attempts (0-10 retries)
             const RETRY_ATTEMPTS_BUCKETS: &[f64] = &[0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0];
 
@@ -350,6 +355,26 @@ fn get_or_install_prometheus_handle() -> PrometheusHandle {
                 .expect("Failed to set custom buckets for dwctl_analytics_lag_seconds")
                 .set_buckets_for_metric(Matcher::Full("dwctl_cache_sync_lag_seconds".to_string()), CACHE_SYNC_LAG_BUCKETS)
                 .expect("Failed to set custom buckets for dwctl_cache_sync_lag_seconds")
+                .set_buckets_for_metric(
+                    Matcher::Full("dwctl_cache_classify_duration_seconds".to_string()),
+                    CACHE_LATENCY_BUCKETS,
+                )
+                .expect("Failed to set custom buckets for dwctl_cache_classify_duration_seconds")
+                .set_buckets_for_metric(
+                    Matcher::Full("dwctl_cache_tokenizer_duration_seconds".to_string()),
+                    CACHE_LATENCY_BUCKETS,
+                )
+                .expect("Failed to set custom buckets for dwctl_cache_tokenizer_duration_seconds")
+                .set_buckets_for_metric(
+                    Matcher::Full("dwctl_cache_commit_duration_seconds".to_string()),
+                    CACHE_LATENCY_BUCKETS,
+                )
+                .expect("Failed to set custom buckets for dwctl_cache_commit_duration_seconds")
+                .set_buckets_for_metric(
+                    Matcher::Full("dwctl_cache_lookup_duration_seconds".to_string()),
+                    CACHE_LATENCY_BUCKETS,
+                )
+                .expect("Failed to set custom buckets for dwctl_cache_lookup_duration_seconds")
                 .set_buckets_for_metric(
                     Matcher::Full("fusillade_retry_attempts_on_success".to_string()),
                     RETRY_ATTEMPTS_BUCKETS,
@@ -1095,7 +1120,7 @@ pub async fn build_router(
     requests_writer_sender: Option<crate::inference::engine::writer::RequestsWriterSender>,
     metrics_recorder: Option<GenAiMetrics>,
     strict_mode: bool,
-    responses_middleware_state: Option<crate::inference::middleware::ResponsesMiddlewareState>,
+    inference_middleware_state: Option<crate::inference::middleware::InferenceMiddlewareState>,
 ) -> anyhow::Result<Router> {
     let config = state.current_config();
 
@@ -1137,10 +1162,10 @@ pub async fn build_router(
 
         // Add FusilladeOutletHandler so completed responses get written to
         // fusillade via the in-process RequestsWriter. We only attach when
-        // both the responses middleware is active and we actually have a
+        // both the inference middleware is active and we actually have a
         // sender to give the handler; without a sender the handler would
         // silently swallow rows.
-        if let (Some(rms), Some(sender)) = (responses_middleware_state.as_ref(), requests_writer_sender.clone()) {
+        if let (Some(rms), Some(sender)) = (inference_middleware_state.as_ref(), requests_writer_sender.clone()) {
             let fusillade_handler = crate::inference::engine::outlet_handler::FusilladeOutletHandler::new(sender, rms.dwctl_pool.clone());
             multi_handler = multi_handler.with(fusillade_handler);
         }
@@ -1258,6 +1283,15 @@ pub async fn build_router(
         .route("/models/{id}", get(api::handlers::deployments::get_deployed_model))
         .route("/models/{id}", patch(api::handlers::deployments::update_deployed_model))
         .route("/models/{id}", delete(api::handlers::deployments::delete_deployed_model))
+        .route("/models/{id}/cache-pricing", get(api::handlers::cache_pricing::get_cache_pricing))
+        .route(
+            "/models/{id}/cache-pricing",
+            put(api::handlers::cache_pricing::enable_cache_pricing),
+        )
+        .route(
+            "/models/{id}/cache-pricing",
+            delete(api::handlers::cache_pricing::disable_cache_pricing),
+        )
         .route(
             "/provider-display-configs",
             get(api::handlers::provider_display_configs::list_provider_display_configs),
@@ -1527,6 +1561,31 @@ pub async fn build_router(
     // Serve embedded static assets, falling back to SPA for unmatched routes
     let fallback = get(api::handlers::static_assets::serve_embedded_asset).fallback(get(api::handlers::static_assets::spa_fallback));
 
+    // ── onwards proxy middleware stack (order matters) ───────────────────────────────
+    //
+    // Tower applies layers inner-first, so the LAST `.layer()` call is the OUTERMOST
+    // wrapper: on a request it runs first; on the response it runs last. The stack below,
+    // outermost → innermost (i.e. reverse of the code order), is:
+    //
+    //   responses_mw  →  outlet (logging/billing)  →  cache  →  error_enrichment
+    //                 →  image_normalizer  →  tool_injection  →  onwards
+    //
+    // Why this order:
+    //   • outlet outermost (of the body editors): it logs the request **as the customer
+    //     sent it** (cache_control markers intact, original image URLs, pre tool-injection)
+    //     and captures the response **after** cache injection, so billing sees cache_* usage.
+    //   • cache inner to outlet, but OUTER to the body-mutating layers: it must hash the
+    //     ORIGINAL request body. The image normaliser rewrites image URLs to per-request
+    //     signed URLs (fresh expiry + V4 signature each call — NOT byte-stable), so hashing
+    //     after it would make every image request a unique key → zero cache hits. Sitting
+    //     before the reject-capable layers also means a request they 4xx (unfetchable/
+    //     forbidden image) never gets a committed write — the success gate vetoes it.
+    //   • image_normalizer before tool_injection: it fetches/sanitises external image URLs
+    //     (and can reject the request) before tools are spliced in.
+    //   • tool_injection innermost: the body onwards forwards upstream is fully resolved.
+    //
+    // Each block below adds one layer; the inline notes cover that layer's specifics.
+
     // Apply tool injection middleware to the onwards router so that per-request tool
     // schemas are resolved and injected into the request body before onwards processes it.
     let tool_injection_state = crate::inference::tools::ToolInjectionState {
@@ -1566,6 +1625,39 @@ pub async fn build_router(
         error_enrichment::error_enrichment_middleware,
     ));
 
+    // Apply the cached-input pricing layer (dwctl-owned). Placed inner
+    // to outlet so the billing/analytics capture sees the injected `cache_*` usage
+    // fields, but OUTER to the body-mutating layers (image normaliser, tool
+    // injection) so the classifier hashes the original user body — stable across
+    // requests, which per-request signed image URLs would otherwise break. Added
+    // only when enabled; otherwise the stack is byte-identical to today.
+    let onwards_router = {
+        let cfg = state.current_config();
+        if cfg.cache.enabled {
+            let pool = state.db.write().clone();
+            let classifier = crate::prompt_cache::Classifier::new(
+                crate::prompt_cache::PrincipalResolver::new(pool.clone()),
+                crate::prompt_cache::ModelConfigResolver::new(pool.clone()),
+                crate::prompt_cache::TokenizerClient::new(cfg.cache.tokenizer_url.clone()),
+                Arc::new(crate::prompt_cache::PostgresIndex::new(pool)),
+                crate::prompt_cache::TierPolicy::from_config(&cfg.cache.enabled_ttls, &cfg.cache.default_ttl),
+            );
+            // Bound the cache layer's body buffer by the same limit onwards uses (0 =
+            // unlimited), so it's never more restrictive than the entry point.
+            let body_limit = match cfg.limits.requests.max_body_size {
+                0 => usize::MAX,
+                n => usize::try_from(n).unwrap_or(usize::MAX),
+            };
+            tracing::info!("Cached-input pricing enabled - wiring cache layer into onwards stack");
+            onwards_router.layer(middleware::from_fn_with_state(
+                crate::prompt_cache::CacheLayerState::new(classifier, body_limit),
+                crate::prompt_cache::cache_middleware,
+            ))
+        } else {
+            onwards_router
+        }
+    };
+
     // Apply request logging layer only to onwards router
     let onwards_router = if let Some(outlet_layer) = outlet_layer.clone() {
         onwards_router.layer(outlet_layer)
@@ -1573,16 +1665,44 @@ pub async fn build_router(
         onwards_router
     };
 
-    // Apply responses middleware to create pending fusillade rows for /v1/responses requests.
+    // Apply inference middleware to create pending fusillade rows for inference requests.
     // This runs BEFORE outlet (outer layer executes first), so the X-Onwards-Response-Id
     // header is set before outlet captures the request and passes it to FusilladeOutletHandler.
-    let onwards_router = if let Some(rms) = responses_middleware_state {
+    let onwards_router = if let Some(rms) = inference_middleware_state {
         onwards_router.layer(middleware::from_fn_with_state(
             rms,
-            crate::inference::middleware::responses_middleware,
+            crate::inference::middleware::inference_middleware,
         ))
     } else {
         onwards_router
+    };
+
+    // Apply the generic edge protocol-translation middleware as the OUTERMOST
+    // layer on the onwards router. On the request path it runs first, so any
+    // foreign-protocol request (today: Anthropic `/v1/messages`) is translated
+    // to Chat Completions and its URI rewritten BEFORE image_normalizer,
+    // tool_injection, and onwards see it. On the response path it runs last, so
+    // outlet logging, billing, and usage extraction all observe Chat
+    // Completions, and only the final client bytes are reframed back into the
+    // foreign protocol. Native `/chat/completions` requests match no translator
+    // and pass through untouched.
+    let onwards_router = {
+        // Bound the body the translation middleware buffers by the same cap as the
+        // rest of the inference path (limits.requests.max_body_size, 0 = unlimited).
+        let translation_body_limit = match config.limits.requests.max_body_size {
+            0 => usize::MAX,
+            n => usize::try_from(n).unwrap_or(usize::MAX),
+        };
+        let translators: Vec<std::sync::Arc<dyn crate::inference::translation::ProtocolTranslator>> = vec![
+            std::sync::Arc::new(crate::inference::translation::anthropic::AnthropicMessages),
+            std::sync::Arc::new(crate::inference::translation::anthropic::models::AnthropicModels),
+        ];
+        let translation_registry =
+            crate::inference::translation::TranslationRegistry::new(translators).with_max_body_size(translation_body_limit);
+        onwards_router.layer(middleware::from_fn_with_state(
+            translation_registry,
+            crate::inference::translation::middleware::translation_middleware,
+        ))
     };
 
     // Build the app with admin API and onwards proxy nested. serve the (restricted) openai spec.
@@ -2203,7 +2323,7 @@ pub(crate) struct BackgroundServicesInput {
     /// passed in by-clone here.
     pub model_capacity_limits: Arc<dashmap::DashMap<String, usize>>,
     /// dwctl primary pool (used for probe scheduler, notification
-    /// poller, and the responses middleware setup).
+    /// poller, and the inference middleware setup).
     pub pool: PgPool,
     /// Fusillade pool wrapper; kept around inside this function only
     /// to clone the write pool for the metrics sampler — fusillade's
@@ -2848,7 +2968,7 @@ impl Application {
             crate::image_normalizer::from_config(&config.image_normalizer).map_err(|e| anyhow::anyhow!("image normaliser config: {e}"))?;
 
         // Build the multi-step processor's dependencies. These also end
-        // up wired into the responses middleware state below; cloning
+        // up wired into the inference middleware state below; cloning
         // them is cheap (Arc + reqwest::Client share their internal
         // connection pool / TLS root-cert cache across clones).
         let multi_step_reqwest_client = reqwest::Client::new();
@@ -3043,10 +3163,10 @@ impl Application {
         // OR the leader-gained closure). All daemons see the
         // multi-step processor at claim time.
 
-        // Responses middleware state. Non-background realtime no longer
+        // Inference middleware state. Non-background realtime no longer
         // does any DB work up front; the completion path goes through
         // FusilladeOutletHandler -> RequestsWriter.
-        let responses_middleware_state = crate::inference::middleware::ResponsesMiddlewareState {
+        let inference_middleware_state = crate::inference::middleware::InferenceMiddlewareState {
             request_manager: bg_services.request_manager.clone(),
             daemon_id: crate::inference::store::OnwardsDaemonId(onwards_daemon_id),
             loopback_base_url: {
@@ -3076,7 +3196,10 @@ impl Application {
             0 => usize::MAX,
             n => usize::try_from(n).unwrap_or(usize::MAX),
         };
-        let mut onwards_app_state = onwards::AppState::with_transform(bg_services.onwards_targets.clone(), body_transform)
+        // onwards stays cache-agnostic: cached-input pricing now lives entirely in
+        // the dwctl cache tower layer (wired in `build_router`, gated on `cache.enabled`).
+        // No classifier is injected here.
+        let onwards_app_state = onwards::AppState::with_transform(bg_services.onwards_targets.clone(), body_transform)
             .with_response_transform(onwards::create_openai_sanitizer())
             .with_streaming_header("x-fusillade-stream")
             .with_response_id_header("x-fusillade-request-id")
@@ -3084,17 +3207,6 @@ impl Application {
             .with_response_store(response_store.clone() as Arc<dyn onwards::ResponseStore>)
             .with_body_limit(onwards_body_limit);
 
-        // Cached-input-pricing seam (dormant by default). When
-        // `onwards.cache_classifier_enabled` is set, inject the no-op classifier so
-        // the spine runs end-to-end for local validation: responses carry the
-        // zeroed `cache_*` usage fields and outbound `cache_control` markers
-        // are stripped, while billing/analytics stays unaffected. Left unset
-        // (the default), no classifier is wired and onwards is byte-identical to
-        // today. The real dwctl classifier replaces the no-op here in a later wave.
-        if config.onwards.cache_classifier_enabled {
-            tracing::info!("Cache classifier enabled - wiring NoopCacheClassifier into onwards");
-            onwards_app_state = onwards_app_state.with_cache_classifier(Arc::new(onwards::NoopCacheClassifier));
-        }
         let onwards_router = if bg_services.onwards_targets.strict_mode {
             tracing::info!("Strict mode enabled - using typed request validation");
             onwards::strict::build_strict_router(onwards_app_state)
@@ -3134,7 +3246,7 @@ impl Application {
             bg_services.requests_writer_sender.clone(),
             metrics_recorder,
             bg_services.onwards_targets.strict_mode,
-            Some(responses_middleware_state),
+            Some(inference_middleware_state),
         )
         .await?;
 

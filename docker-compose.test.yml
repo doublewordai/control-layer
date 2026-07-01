@@ -7,6 +7,11 @@ services:
       context: .
       dockerfile: Dockerfile
       target: dev  # or production target
+    environment:
+      # Tests create models at runtime and expect them routable within seconds.
+      # Shrink the onwards-sync fallback resync so new models land in onwards'
+      # route cache quickly even if LISTEN/NOTIFY is slow in this ephemeral stack.
+      - DWCTL_BACKGROUND_SERVICES__ONWARDS_SYNC__FALLBACK_INTERVAL_MILLISECONDS=2000
   mock-llm-server:
     # pinned image of zerob13/mock-openai-api  
     image: zerob13/mock-openai-api@sha256:bebf39045b6b960c9987f379445127a6591e86f59dedf7693b312f6e34d7152c

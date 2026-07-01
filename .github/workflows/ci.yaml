@@ -257,6 +257,495 @@ jobs:
     outputs:
       image-tag: ${{ steps.meta.outputs.tags }}
 
+  openresponses-compliance:
+    if: (github.event_name == 'pull_request' && !startsWith(github.head_ref, 'release-please--')) || github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    needs: build
+    name: Open Responses Compliance
+
+    permissions:
+      contents: read
+      packages: read
+
+    services:
+      postgres:
+        image: postgres:latest
+        env:
+          POSTGRES_DB: dwctl
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_HOST_AUTH_METHOD: trust
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 1s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+    env:
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/dwctl
+      TEST_API_KEY: sk-openresponses-compliance
+      TEST_MODEL: gemini-2.5-flash
+      # Run currently supported HTTP /responses tests. Remove this filter once
+      # WebSocket transport (#1178) and /responses/compact (#1179) are supported.
+      OPENRESPONSES_COMPLIANCE_FILTER: basic-response,assistant-phase,response-output-phase-schema,streaming-response,system-prompt,tool-calling,image-input,multi-turn
+
+    steps:
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Select built image
+        id: image
+        run: |
+          IMAGE_LIST="${{ needs.build.outputs.image-tag }}"
+          IMAGE=$(echo "$IMAGE_LIST" | head -n1)
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+          echo "Using image: $IMAGE"
+
+      - name: Write config
+        run: |
+          cat > /tmp/dwctl-openresponses-compliance.yaml <<EOF
+          host: "0.0.0.0"
+          port: 3001
+          dashboard_url: "http://localhost:3001"
+          admin_email: "test@doubleword.ai"
+          admin_password: "hunter2"
+          secret_key: "insecure-openresponses-compliance"
+          enable_metrics: false
+          enable_request_logging: false
+          database:
+            type: external
+            url: "$DATABASE_URL"
+          auth:
+            native:
+              enabled: true
+              allow_registration: false
+            proxy_header:
+              enabled: false
+          batches:
+            enabled: false
+          background_services:
+            batch_daemon:
+              enabled: never
+            leader_election:
+              enabled: false
+            probe_scheduler:
+              enabled: false
+            notifications:
+              enabled: false
+              webhooks:
+                enabled: false
+            sync_workers:
+              enabled: false
+          onwards:
+            strict_mode: true
+          EOF
+
+      - name: Validate Gemini upstream
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          if [ -z "${GEMINI_API_KEY}" ]; then
+            echo "GEMINI_API_KEY repository secret is required for Open Responses compliance"
+            exit 1
+          fi
+
+          curl --fail-with-body --silent --show-error \
+            --request POST \
+            --url https://generativelanguage.googleapis.com/v1beta/openai/chat/completions \
+            --header "Authorization: Bearer ${GEMINI_API_KEY}" \
+            --header "Content-Type: application/json" \
+            --data @- <<JSON
+          {
+            "model": "${TEST_MODEL}",
+            "messages": [
+              {
+                "role": "user",
+                "content": "Reply with ok."
+              }
+            ],
+            "max_tokens": 4
+          }
+          JSON
+
+      - name: Start dwctl
+        run: |
+          docker run \
+            --detach \
+            --name dwctl-openresponses-compliance \
+            --network host \
+            --volume /tmp/dwctl-openresponses-compliance.yaml:/app/config.yaml:ro \
+            "${{ steps.image.outputs.image }}" \
+            --config /app/config.yaml
+
+          for attempt in $(seq 1 60); do
+            if curl -sf http://localhost:3001/healthz > /dev/null 2>&1; then
+              echo "Server is ready"
+              exit 0
+            fi
+            echo "Waiting for dwctl (${attempt}/60)"
+            sleep 1
+          done
+          echo "Server failed to start"
+          docker logs dwctl-openresponses-compliance
+          exit 1
+
+      - name: Seed compliance fixture
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          if [ -z "${GEMINI_API_KEY}" ]; then
+            echo "GEMINI_API_KEY repository secret is required for Open Responses compliance"
+            exit 1
+          fi
+
+          psql \
+            -v ON_ERROR_STOP=1 \
+            -v gemini_api_key="${GEMINI_API_KEY}" \
+            -v test_api_key="${TEST_API_KEY}" \
+            -v test_model="${TEST_MODEL}" \
+            "$DATABASE_URL" <<'SQL'
+          INSERT INTO users (id, username, email, display_name, auth_source, verified)
+          VALUES (
+            '10000000-0000-0000-0000-000000000001',
+            'openresponses-compliance',
+            'openresponses-compliance@doubleword.ai',
+            'Open Responses Compliance',
+            'ci',
+            true
+          )
+          ON CONFLICT (id) DO UPDATE SET verified = EXCLUDED.verified;
+
+          INSERT INTO inference_endpoints (id, name, description, url, api_key, created_by)
+          VALUES (
+            '10000000-0000-0000-0000-000000000002',
+            'gemini-compliance',
+            'Gemini endpoint for Open Responses adapter compliance tests',
+            'https://generativelanguage.googleapis.com/v1beta/openai/',
+            :'gemini_api_key',
+            '10000000-0000-0000-0000-000000000001'
+          )
+          ON CONFLICT (id) DO UPDATE SET
+            url = EXCLUDED.url,
+            api_key = EXCLUDED.api_key,
+            updated_at = NOW();
+
+          INSERT INTO deployed_models (
+            id,
+            model_name,
+            alias,
+            description,
+            type,
+            capabilities,
+            created_by,
+            hosted_on,
+            trusted,
+            open_responses_adapter
+          )
+          VALUES (
+            '10000000-0000-0000-0000-000000000003',
+            :'test_model',
+            :'test_model',
+            'Open Responses adapter compliance model',
+            'standard',
+            ARRAY['chat'],
+            '10000000-0000-0000-0000-000000000001',
+            '10000000-0000-0000-0000-000000000002',
+            true,
+            true
+          )
+          ON CONFLICT (id) DO UPDATE SET
+            model_name = EXCLUDED.model_name,
+            alias = EXCLUDED.alias,
+            hosted_on = EXCLUDED.hosted_on,
+            trusted = EXCLUDED.trusted,
+            open_responses_adapter = EXCLUDED.open_responses_adapter,
+            deleted = FALSE,
+            updated_at = NOW();
+
+          INSERT INTO deployment_groups (deployment_id, group_id, granted_by)
+          VALUES (
+            '10000000-0000-0000-0000-000000000003',
+            '00000000-0000-0000-0000-000000000000',
+            '10000000-0000-0000-0000-000000000001'
+          )
+          ON CONFLICT (deployment_id, group_id) DO NOTHING;
+
+          INSERT INTO api_keys (
+            id,
+            name,
+            description,
+            secret,
+            purpose,
+            user_id,
+            created_by,
+            requests_per_second,
+            burst_size
+          )
+          VALUES (
+            '10000000-0000-0000-0000-000000000004',
+            'Open Responses compliance key',
+            'Realtime key for Open Responses compliance tests',
+            :'test_api_key',
+            'realtime',
+            '10000000-0000-0000-0000-000000000001',
+            '10000000-0000-0000-0000-000000000001',
+            100,
+            200
+          )
+          ON CONFLICT (id) DO UPDATE SET
+            secret = EXCLUDED.secret,
+            purpose = EXCLUDED.purpose,
+            requests_per_second = EXCLUDED.requests_per_second,
+            burst_size = EXCLUDED.burst_size,
+            is_deleted = FALSE;
+
+          INSERT INTO credits_transactions (
+            user_id,
+            transaction_type,
+            amount,
+            source_id,
+            description
+          )
+          VALUES (
+            '10000000-0000-0000-0000-000000000001',
+            'admin_grant',
+            1000,
+            'openresponses-compliance-credit',
+            'Credits for Open Responses compliance tests'
+          )
+          ON CONFLICT (source_id) DO NOTHING;
+
+          SELECT pg_sleep(0.2);
+          SELECT pg_notify(
+            'auth_config_changed',
+            'openresponses_compliance:' || (extract(epoch FROM clock_timestamp()) * 1000000)::bigint::text
+          );
+          SQL
+
+      - name: Wait for compliance fixture
+        run: |
+          for attempt in $(seq 1 30); do
+            models_response=$(curl -sf \
+              -H "Authorization: Bearer ${TEST_API_KEY}" \
+              http://localhost:3001/ai/v1/models 2>/dev/null || true)
+            if echo "$models_response" | jq -e --arg model "${TEST_MODEL}" '.data[]? | select(.id == $model)' > /dev/null; then
+              echo "Compliance fixture is ready"
+              exit 0
+            fi
+            echo "Waiting for compliance fixture (${attempt}/30)"
+            sleep 1
+          done
+          echo "Compliance fixture did not become available"
+          echo "Latest /models response:"
+          curl -sS -H "Authorization: Bearer ${TEST_API_KEY}" http://localhost:3001/ai/v1/models || true
+          echo
+          echo "Fixture database state:"
+          psql "$DATABASE_URL" <<SQL
+          WITH user_balances AS (
+            SELECT
+              u.id AS user_id,
+              COALESCE(c.balance, 0) + COALESCE(
+                (
+                  SELECT SUM(
+                    CASE WHEN ct.transaction_type IN ('purchase', 'admin_grant')
+                    THEN ct.amount ELSE -ct.amount END
+                  )
+                  FROM credits_transactions ct
+                  WHERE ct.user_id = u.id
+                    AND ct.seq > COALESCE(c.checkpoint_seq, 0)
+                ),
+                0
+              ) AS balance
+            FROM users u
+            LEFT JOIN user_balance_checkpoints c ON c.user_id = u.id
+          )
+          SELECT
+            dm.alias,
+            dg.group_id,
+            ak.secret,
+            ub.balance
+          FROM deployed_models dm
+          LEFT JOIN deployment_groups dg ON dg.deployment_id = dm.id
+          LEFT JOIN api_keys ak ON ak.user_id = '10000000-0000-0000-0000-000000000001'
+          LEFT JOIN user_balances ub ON ub.user_id = ak.user_id
+          WHERE dm.id = '10000000-0000-0000-0000-000000000003';
+          SQL
+          docker logs dwctl-openresponses-compliance
+          exit 1
+
+      - name: Install bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Clone openresponses
+        # Track upstream main so CI surfaces newly added compliance coverage.
+        run: |
+          git clone --depth 1 https://github.com/openresponses/openresponses /tmp/openresponses
+          cd /tmp/openresponses
+          echo "Open Responses commit: $(git rev-parse HEAD)"
+          git log -1 --oneline
+
+      - name: Install openresponses dependencies
+        run: cd /tmp/openresponses && bun install
+
+      - name: Run compliance tests
+        run: |
+          cd /tmp/openresponses
+          echo "Open Responses commit: $(git rev-parse HEAD)"
+          echo "Base URL: http://localhost:3001/ai/v1"
+          echo "Model: ${TEST_MODEL}"
+          echo "Filter: ${OPENRESPONSES_COMPLIANCE_FILTER}"
+          echo
+
+          set +e
+          bun run bin/compliance-test.ts \
+            --base-url http://localhost:3001/ai/v1 \
+            --api-key "${TEST_API_KEY}" \
+            --model "${TEST_MODEL}" \
+            --filter "${OPENRESPONSES_COMPLIANCE_FILTER}" \
+            --json > /tmp/openresponses-compliance-results.json
+          status=$?
+          set -e
+
+          if ! jq -e . /tmp/openresponses-compliance-results.json > /dev/null; then
+            echo "Compliance runner did not emit valid JSON. Raw output:"
+            cat /tmp/openresponses-compliance-results.json
+            exit "$status"
+          fi
+
+          echo "=== Open Responses compliance summary ==="
+          jq -r '
+            .results[] | "\(.status | ascii_upcase): \(.name)"
+          ' /tmp/openresponses-compliance-results.json
+          jq -r '
+            .results[]
+            | select(.status == "failed")
+            | "\n\(.name):\n" + ((.errors // []) | map("  - " + .) | join("\n"))
+          ' /tmp/openresponses-compliance-results.json
+          jq -r '
+            "Results: \(.summary.passed) passed, \(.summary.failed) failed, \(.summary.skipped) skipped, \(.summary.total) total"
+          ' /tmp/openresponses-compliance-results.json
+
+          if [ "$status" -ne 0 ]; then
+            echo
+            echo "=== Failed result payloads ==="
+            jq '
+              .results[]
+              | select(.status == "failed")
+            ' /tmp/openresponses-compliance-results.json
+
+            failed_filters=$(
+              jq -r '
+                .results[]
+                | select(.status == "failed")
+                | .id
+              ' /tmp/openresponses-compliance-results.json | paste -sd, -
+            )
+
+            retry_status=$status
+            if [ -n "$failed_filters" ]; then
+              echo
+              echo "=== Retry failed test(s): ${failed_filters} ==="
+              set +e
+              bun run bin/compliance-test.ts \
+                --base-url http://localhost:3001/ai/v1 \
+                --api-key "${TEST_API_KEY}" \
+                --model "${TEST_MODEL}" \
+                --filter "${failed_filters}" \
+                --json > /tmp/openresponses-compliance-retry-results.json
+              retry_status=$?
+              set -e
+
+              if jq -e . /tmp/openresponses-compliance-retry-results.json > /dev/null; then
+                jq -r '
+                  .results[] | "RETRY \(.status | ascii_upcase): \(.name)"
+                ' /tmp/openresponses-compliance-retry-results.json
+                jq -r '
+                  .results[]
+                  | select(.status == "failed")
+                  | "\nRetry \(.name):\n" + ((.errors // []) | map("  - " + .) | join("\n"))
+                ' /tmp/openresponses-compliance-retry-results.json
+                jq -r '
+                  "Retry results: \(.summary.passed) passed, \(.summary.failed) failed, \(.summary.skipped) skipped, \(.summary.total) total"
+                ' /tmp/openresponses-compliance-retry-results.json
+              else
+                echo "Compliance retry did not emit valid JSON. Raw output:"
+                cat /tmp/openresponses-compliance-retry-results.json
+              fi
+
+              if [ "$retry_status" -eq 0 ]; then
+                echo
+                echo "Failed test(s) passed on retry; treating as transient provider flake."
+                status=0
+              else
+                echo
+                echo "=== Verbose rerun of failed test(s): ${failed_filters} ==="
+                bun run bin/compliance-test.ts \
+                  --base-url http://localhost:3001/ai/v1 \
+                  --api-key "${TEST_API_KEY}" \
+                  --model "${TEST_MODEL}" \
+                  --filter "${failed_filters}" \
+                  --verbose || true
+              fi
+            fi
+
+            if [ "$status" -ne 0 ]; then
+              echo
+              echo "=== Current /models response ==="
+              curl -sS \
+                -H "Authorization: Bearer ${TEST_API_KEY}" \
+                http://localhost:3001/ai/v1/models | jq . || true
+
+              echo
+              echo "=== Compliance fixture database state ==="
+              psql "$DATABASE_URL" -c "
+                SELECT
+                  dm.alias,
+                  dm.model_name,
+                  dm.open_responses_adapter,
+                  dm.trusted,
+                  dm.deleted,
+                  ie.url AS endpoint_url,
+                  dg.group_id,
+                  ak.purpose,
+                  ak.is_deleted AS api_key_deleted
+                FROM deployed_models dm
+                LEFT JOIN inference_endpoints ie ON ie.id = dm.hosted_on
+                LEFT JOIN deployment_groups dg ON dg.deployment_id = dm.id
+                LEFT JOIN api_keys ak ON ak.user_id = '10000000-0000-0000-0000-000000000001'
+                WHERE dm.id = '10000000-0000-0000-0000-000000000003';
+              "
+            fi
+          fi
+
+          exit "$status"
+
+      - name: Show dwctl logs
+        if: always()
+        run: |
+          echo "=== dwctl Server Logs ==="
+          docker logs dwctl-openresponses-compliance 2>&1 | tee /tmp/dwctl-openresponses-compliance.log || echo "No dwctl container found"
+
+      - name: Upload Open Responses compliance artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: openresponses-compliance-results
+          path: |
+            /tmp/openresponses-compliance-results.json
+            /tmp/openresponses-compliance-retry-results.json
+            /tmp/dwctl-openresponses-compliance.log
+          if-no-files-found: ignore
+
+      - name: Stop dwctl
+        if: always()
+        run: docker rm -f dwctl-openresponses-compliance || true
+
   security-scan:
     if: (github.event_name == 'pull_request' && !startsWith(github.head_ref, 'release-please--')) || github.event_name == 'merge_group'
     runs-on: depot-ubuntu-24.04
@@ -333,15 +822,7 @@ jobs:
           curl -X POST "https://charts.somnial.co/doubleword-control-layer/high-vulnerabilities?value=${HIGH}" || echo "Failed to report high vulnerabilities"
 
   e2e-test-docker:
-    # TEMPORARILY DISABLED (2026-06-19): `npx playwright install chromium`
-    # hangs indefinitely in CI due to an upstream Playwright browser-download
-    # outage (this step was green on 2026-06-18). The job is a required check,
-    # so we skip it rather than let it hang — a skipped job reports "skipped",
-    # which satisfies the ruleset and unblocks unrelated PRs.
-    # TODO: revert to the original condition below once Playwright downloads
-    # recover.
-    #   if: (github.event_name == 'pull_request' && !startsWith(github.head_ref, 'release-please--')) || github.event_name == 'merge_group'
-    if: false
+    if: (github.event_name == 'pull_request' && !startsWith(github.head_ref, 'release-please--')) || github.event_name == 'merge_group'
     runs-on: depot-ubuntu-24.04
     needs: build
 
@@ -372,9 +853,14 @@ jobs:
         working-directory: ./dashboard
         run: pnpm install --frozen-lockfile
 
-      - name: Install Playwright browsers
-        working-directory: ./dashboard
-        run: npx playwright install chromium --only-shell
+      # DISABLED: `npx playwright install chromium` hangs at 100% download due to an upstream
+      # Playwright CDN issue (recurs across versions — not resolved by pinning). Safe to skip
+      # for now: the docker e2e job runs hurl API tests only; the Playwright E2E block in the
+      # justfile is commented out, so no browser is needed. Re-enable (uncomment) once the
+      # Playwright CDN download recovers AND the justfile E2E block is restored.
+      # - name: Install Playwright browsers
+      #   working-directory: ./dashboard
+      #   run: npx playwright install chromium --only-shell
 
       - name: Install hurl
         # Pinned: hurl 8.0.0 (2026-04-27) ships an RFC 9535 JSONPath rewrite

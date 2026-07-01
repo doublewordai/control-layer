@@ -11,6 +11,14 @@ use tokio_util::sync::CancellationToken;
 use crate::config::RateLimitTiersConfig;
 use crate::sync::onwards_config::{OnwardsTarget, SyncConfig, convert_to_config_file, parse_notify_payload};
 
+#[test]
+fn test_user_balance_ctes_materialize_and_filter_deleted_users() {
+    let source = include_str!("mod.rs");
+
+    assert_eq!(source.matches("WITH user_balances AS MATERIALIZED").count(), 2);
+    assert_eq!(source.matches("WHERE u.is_deleted = false").count(), 2);
+}
+
 // Helper function to create a test target
 fn create_test_target(model_name: &str, alias: &str, endpoint_url: &str) -> OnwardsTarget {
     OnwardsTarget {

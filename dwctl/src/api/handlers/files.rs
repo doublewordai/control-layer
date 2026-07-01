@@ -142,7 +142,7 @@ fn validate_custom_id(custom_id: &str) -> Result<()> {
 /// `/v1/chat/completions` requires a `Chat` model.
 fn validate_endpoint_model_type(url: &str, model: &str, model_type: &ModelType) -> Result<()> {
     let expected = match url {
-        "/v1/chat/completions" | "/v1/completions" | "/v1/responses" => ModelType::Chat,
+        "/v1/chat/completions" | "/v1/completions" | "/v1/responses" | "/v1/messages" => ModelType::Chat,
         "/v1/embeddings" => ModelType::Embeddings,
         // Unknown endpoints skip type validation
         _ => return Ok(()),
@@ -2845,6 +2845,38 @@ mod tests {
         add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
 
         let jsonl_content = r#"{"custom_id":"request-1","method":"POST","url":"/v1/responses","body":{"model":"gpt-4","input":"Hello"}}"#;
+
+        let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("test-batch.jsonl");
+
+        let upload_response = app
+            .post("/ai/v1/files")
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .multipart(
+                axum_test::multipart::MultipartForm::new()
+                    .add_text("purpose", "batch")
+                    .add_part("file", file_part),
+            )
+            .await;
+
+        upload_response.assert_status(axum::http::StatusCode::CREATED);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_upload_accepts_messages_url_path(pool: PgPool) {
+        // The Anthropic Messages ingress (/v1/messages) is an allowed batch URL
+        // path: the body is stored opaquely and translated at dispatch. A Chat
+        // model satisfies the endpoint's model-type check.
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+
+        let deployment = create_test_deployment(&pool, user.id, "gpt-4-model", "gpt-4").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
+
+        let jsonl_content = r#"{"custom_id":"request-1","method":"POST","url":"/v1/messages","body":{"model":"gpt-4","max_tokens":16,"messages":[{"role":"user","content":"Hello"}]}}"#;
 
         let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("test-batch.jsonl");
 

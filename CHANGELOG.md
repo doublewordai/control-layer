@@ -1,5 +1,93 @@
 # Changelog
 
+## [8.68.2](https://github.com/doublewordai/control-layer/compare/v8.68.1...v8.68.2) (2026-07-01)
+
+
+### Bug Fixes
+
+* optimize onwards config balance queries ([#1210](https://github.com/doublewordai/control-layer/issues/1210)) ([0ad44f2](https://github.com/doublewordai/control-layer/commit/0ad44f2b4f1740d70ef36c827fac150efbcc3aff))
+* **perf:** defer cache classify-await into the SSE stream so it never holds the first token ([#1208](https://github.com/doublewordai/control-layer/issues/1208)) ([7316834](https://github.com/doublewordai/control-layer/commit/73168347509e293de018da0efe0bd37b1279a1b1))
+
+## [8.68.1](https://github.com/doublewordai/control-layer/compare/v8.68.0...v8.68.1) (2026-07-01)
+
+
+### Bug Fixes
+
+* stop logging tool response bodies and serde body fragments ([#1202](https://github.com/doublewordai/control-layer/issues/1202)) ([f21c29b](https://github.com/doublewordai/control-layer/commit/f21c29b82b232855365b9c8f12507b5c1895da50))
+
+## [8.68.0](https://github.com/doublewordai/control-layer/compare/v8.67.1...v8.68.0) (2026-06-30)
+
+
+### Features
+
+* global config for activated cache ttl's, and param errors surfacing t… ([#1206](https://github.com/doublewordai/control-layer/issues/1206)) ([1712a07](https://github.com/doublewordai/control-layer/commit/1712a077d4f53e940a9a7aca0069cb30725c4298))
+
+## [8.67.1](https://github.com/doublewordai/control-layer/compare/v8.67.0...v8.67.1) (2026-06-30)
+
+
+### Bug Fixes
+
+* extra prometheus markers for dashboard ([#1201](https://github.com/doublewordai/control-layer/issues/1201)) ([85c2a34](https://github.com/doublewordai/control-layer/commit/85c2a347a669d8cab0fb912c8b5a688a5a0ec79a))
+
+## [8.67.0](https://github.com/doublewordai/control-layer/compare/v8.66.0...v8.67.0) (2026-06-30)
+
+
+### Features
+
+* api wiring for adding/editing/deleting input cache pricing tariffs ([#1198](https://github.com/doublewordai/control-layer/issues/1198)) ([6608b0c](https://github.com/doublewordai/control-layer/commit/6608b0ca297c7967c215b39201c62408b4f23823))
+
+## [8.66.0](https://github.com/doublewordai/control-layer/compare/v8.65.1...v8.66.0) (2026-06-29)
+
+
+### Features
+
+* /v1/messages parity - batch endpoint and flex tier ([#1191](https://github.com/doublewordai/control-layer/issues/1191)) ([519afa6](https://github.com/doublewordai/control-layer/commit/519afa612f468b4347eb44863c10265940462fc1))
+* **prompt-cache:** Prometheus instrumentation for cached-input pricing ([#1196](https://github.com/doublewordai/control-layer/issues/1196)) ([7bb9112](https://github.com/doublewordai/control-layer/commit/7bb9112c386d899fdb648accefe03fda9f24eea1))
+
+## [8.65.1](https://github.com/doublewordai/control-layer/compare/v8.65.0...v8.65.1) (2026-06-26)
+
+
+### Bug Fixes
+
+* enforce unique priority order for composite model components ([#1189](https://github.com/doublewordai/control-layer/issues/1189)) ([6ac734c](https://github.com/doublewordai/control-layer/commit/6ac734c4204c143ca409b3dcde4abdc254032bac))
+
+## [8.65.0](https://github.com/doublewordai/control-layer/compare/v8.64.0...v8.65.0) (2026-06-26)
+
+
+### Features
+
+* serve GET /v1/models in Anthropic format ([#1181](https://github.com/doublewordai/control-layer/issues/1181)) ([7ee3ac6](https://github.com/doublewordai/control-layer/commit/7ee3ac69c7b89466d5da7f666d8d3a563c4a554b))
+
+## [8.64.0](https://github.com/doublewordai/control-layer/compare/v8.63.0...v8.64.0) (2026-06-26)
+
+
+### Features
+
+* erase a deleted user's API keys and fusillade data ([#1174](https://github.com/doublewordai/control-layer/issues/1174)) ([c5182c8](https://github.com/doublewordai/control-layer/commit/c5182c8952036823bc0a734dc478382a7860c01c))
+
+## [8.63.0](https://github.com/doublewordai/control-layer/compare/v8.62.0...v8.63.0) (2026-06-25)
+
+
+### Features
+
+* input-caching ([#1172](https://github.com/doublewordai/control-layer/issues/1172)) ([9bf7a0b](https://github.com/doublewordai/control-layer/commit/9bf7a0b5631a3606a6d951ff8600b7a0577be40a))
+
+## [8.62.0](https://github.com/doublewordai/control-layer/compare/v8.61.3...v8.62.0) (2026-06-25)
+
+
+### Features
+
+* add Anthropic /v1/messages ingress ([#1177](https://github.com/doublewordai/control-layer/issues/1177)) ([d24bd11](https://github.com/doublewordai/control-layer/commit/d24bd11ca00a8ff797c310e89cc0cd5edd32e8c4))
+* support flex + streaming for chat completions and responses ([#1171](https://github.com/doublewordai/control-layer/issues/1171)) ([e48702a](https://github.com/doublewordai/control-layer/commit/e48702a1e812d322a3b4f74d2b7fc5f43a172aa9))
+
+## [8.61.3](https://github.com/doublewordai/control-layer/compare/v8.61.2...v8.61.3) (2026-06-24)
+
+
+### Bug Fixes
+
+* **deps:** bump onwards to 0.33.3 ([#1173](https://github.com/doublewordai/control-layer/issues/1173)) ([12d50c8](https://github.com/doublewordai/control-layer/commit/12d50c8d3424e647a371f529bc5a3e48b79300af))
+* stop sending generated display name to stripe on customer creation ([#1169](https://github.com/doublewordai/control-layer/issues/1169)) ([7870071](https://github.com/doublewordai/control-layer/commit/7870071ace5f91a593e1867f943c3421910d55fc))
+
 ## [8.61.2](https://github.com/doublewordai/control-layer/compare/v8.61.1...v8.61.2) (2026-06-22)
 
 
