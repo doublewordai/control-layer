@@ -1,5 +1,13 @@
 # Changelog
 
+## [8.68.2](https://github.com/doublewordai/control-layer/compare/v8.68.1...v8.68.2) (2026-07-01)
+
+
+### Bug Fixes
+
+* optimize onwards config balance queries ([#1210](https://github.com/doublewordai/control-layer/issues/1210)) ([0ad44f2](https://github.com/doublewordai/control-layer/commit/0ad44f2b4f1740d70ef36c827fac150efbcc3aff))
+* **perf:** defer cache classify-await into the SSE stream so it never holds the first token ([#1208](https://github.com/doublewordai/control-layer/issues/1208)) ([7316834](https://github.com/doublewordai/control-layer/commit/73168347509e293de018da0efe0bd37b1279a1b1))
+
 ## [8.68.1](https://github.com/doublewordai/control-layer/compare/v8.68.0...v8.68.1) (2026-07-01)
 
 
