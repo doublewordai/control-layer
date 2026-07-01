@@ -228,12 +228,18 @@ pub async fn inject_into_response_nonstreaming(response: Response, stats: &Cache
     let status_ok = response.status().is_success();
 
     // Only JSON can carry a chat-completion `usage`; don't buffer explicitly non-JSON bodies
-    // (preserve pass-through). Missing/unknown content-type → try JSON.
+    // (preserve pass-through). Media types are case-insensitive and may carry parameters, so match
+    // the trimmed base type case-insensitively. Missing/unknown content-type → try JSON.
     let is_json = response
         .headers()
         .get("content-type")
         .and_then(|v| v.to_str().ok())
-        .map(|v| v.contains("application/json"))
+        .map(|v| {
+            v.split(';')
+                .next()
+                .map(str::trim)
+                .is_some_and(|ct| ct.eq_ignore_ascii_case("application/json"))
+        })
         .unwrap_or(true);
     if !is_json {
         return (response, false);

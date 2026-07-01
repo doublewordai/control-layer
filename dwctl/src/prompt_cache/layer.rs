@@ -226,14 +226,17 @@ pub async fn cache_middleware(State(state): State<CacheLayerState>, request: Req
     response
 }
 
-/// Whether a response is a streaming (SSE) chat completion.
+/// Whether a response is a streaming (SSE) chat completion. Media types are case-insensitive and
+/// may carry parameters (e.g. `Text/Event-Stream; charset=utf-8`), so match the trimmed base type
+/// case-insensitively — a mis-detected SSE would wrongly take the non-streaming path and buffer
+/// the whole stream.
 fn is_streaming(response: &Response) -> bool {
     response
         .headers()
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
-        .map(|v| v.contains("text/event-stream"))
-        .unwrap_or(false)
+        .and_then(|v| v.split(';').next())
+        .is_some_and(|ct| ct.trim().eq_ignore_ascii_case("text/event-stream"))
 }
 
 /// Join the spawned classify task under the deadline, recording the classify result, the
