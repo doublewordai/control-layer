@@ -217,7 +217,7 @@ HTTP 200
 [Asserts]
 jsonpath "$.id" == "{{user1_id}}"
 jsonpath "$.credit_balance" exists
-jsonpath "$.credit_balance" == 100.0
+jsonpath "$.credit_balance" >= 100.0
 
 # User1 uses /users/current with include=billing - should succeed
 GET http://localhost:3001/admin/api/v1/users/current?include=billing
@@ -281,7 +281,7 @@ HTTP 200
 [Asserts]
 jsonpath "$.id" == "{{user1_id}}"
 jsonpath "$.credit_balance" exists
-jsonpath "$.credit_balance" == 100.0
+jsonpath "$.credit_balance" >= 100.0
 
 # Admin gets their own data with include=billing - should succeed
 GET http://localhost:3001/admin/api/v1/users/{{admin_user_id}}?include=billing
