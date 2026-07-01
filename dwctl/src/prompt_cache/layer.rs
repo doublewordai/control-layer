@@ -322,7 +322,15 @@ impl<T> AbortOnDrop<T> {
 impl<T> Drop for AbortOnDrop<T> {
     fn drop(&mut self) {
         if let Some(h) = self.0.take() {
+            // The guard was never defused via `take()`, so the stream was dropped before classify
+            // was joined — a client disconnect ahead of the terminal usage frame. Abort the task so
+            // it can't outlive the request, and record the abandonment: without this, classify and
+            // request-outcome dashboards silently undercount under high disconnect rates (the join,
+            // and its metrics, never run on this path). Cheaper and safer than a detached
+            // join-for-metrics, which would re-orphan the very task this guard exists to cancel.
             h.abort();
+            cache_metrics::record_classify("abandoned");
+            cache_metrics::record_request_outcome("aborted");
         }
     }
 }

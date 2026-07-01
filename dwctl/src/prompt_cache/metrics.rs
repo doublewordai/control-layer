@@ -34,8 +34,10 @@ pub fn record_marker_request(marked: bool) {
 
 /// Request-level cache behaviour across ALL traffic. `outcome` ∈ `read` | `create_only` |
 /// `read_and_create` | `zero_active` (enabled but nothing cached) | `inactive` (model not
-/// enabled / no key). **No `model` label** — `inactive` covers unknown/typo models (raw
-/// input → unbounded); per-model volumes are on `record_token_volumes` (enabled-only).
+/// enabled / no key) | `aborted` (cache-active streaming request whose client disconnected before
+/// classify was joined, so the read/create split is unknown). **No `model` label** — `inactive`
+/// covers unknown/typo models (raw input → unbounded); per-model volumes are on
+/// `record_token_volumes` (enabled-only).
 pub fn record_request_outcome(outcome: &'static str) {
     counter!("dwctl_cache_requests_total", "outcome" => outcome).increment(1);
 }
@@ -60,8 +62,10 @@ pub fn record_token_volumes(model: &str, read: u64, creation_5m: u64, creation_1
 
 // ── Classify path ─────────────────────────────────────────────────────────────
 
-/// Classify-join result. `outcome` ∈ `ok` | `deadline_exceeded` | `error` | `panicked`.
-/// `deadline_exceeded` is the primary "tokenizer/index outage is adding latency" signal.
+/// Classify-join result. `outcome` ∈ `ok` | `deadline_exceeded` | `error` | `panicked` |
+/// `abandoned` (streaming request whose client disconnected before the join, so the task was
+/// aborted un-joined). `deadline_exceeded` is the primary "tokenizer/index outage is adding
+/// latency" signal; a high `abandoned` rate flags wasted classify work from client disconnects.
 pub fn record_classify(outcome: &'static str) {
     counter!("dwctl_cache_classify_total", "outcome" => outcome).increment(1);
 }
