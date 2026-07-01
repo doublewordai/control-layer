@@ -153,6 +153,25 @@ pub(crate) fn scan_inject_sse(body: &[u8], stats: &CacheStats, already_edited: b
         };
     };
 
+    // Fast path: the streaming layer probes every frame with `already_edited=true` purely to
+    // collect the commit-gate signals — it can never rewrite, so skip the output-buffer rebuild
+    // (an allocation + full-body copy per SSE frame otherwise).
+    if already_edited {
+        let mut saw_error = false;
+        let mut saw_usage = false;
+        for line in body_str.split('\n') {
+            if let Some(chunk) = sse_data_json(line) {
+                saw_error |= chunk.get("error").is_some();
+                saw_usage |= chunk.get("usage").is_some_and(Value::is_object);
+            }
+        }
+        return SseScan {
+            rewritten: None,
+            saw_error,
+            saw_usage,
+        };
+    }
+
     let mut out = String::with_capacity(body_str.len() + 256);
     let mut edited = false;
     let mut saw_error = false;
@@ -165,38 +184,30 @@ pub(crate) fn scan_inject_sse(body: &[u8], stats: &CacheStats, already_edited: b
         }
         first = false;
 
-        // SSE allows `data:<value>` and `data: <value>` — strip the colon, then an
-        // optional single space (matches onwards' own SSE parser).
-        if let Some(data) = line.strip_prefix("data:") {
-            let data = data.strip_prefix(' ').unwrap_or(data);
-            let trimmed = data.trim();
-            if trimmed != "[DONE]"
-                && let Ok(mut chunk) = serde_json::from_str::<Value>(trimmed)
-                && let Some(chunk_obj) = chunk.as_object_mut()
+        if let Some(mut chunk) = sse_data_json(line) {
+            let chunk_obj = chunk.as_object_mut().expect("sse_data_json returns only objects");
+            // Observe billing signals on every frame, even after we've injected.
+            if chunk_obj.contains_key("error") {
+                saw_error = true;
+            }
+            if let Some(usage) = chunk_obj.get_mut("usage")
+                && let Some(usage_obj) = usage.as_object_mut()
             {
-                // Observe billing signals on every frame, even after we've injected.
-                if chunk_obj.contains_key("error") {
-                    saw_error = true;
-                }
-                if let Some(usage) = chunk_obj.get_mut("usage")
-                    && let Some(usage_obj) = usage.as_object_mut()
-                {
-                    saw_usage = true;
-                    if !already_edited && !edited {
-                        // Preserve the line's terminator style: on a CRLF stream this `line`
-                        // (split on '\n') ends with '\r', which the reserialized JSON drops —
-                        // re-append it so we don't emit a lone '\n' amid '\r\n' framing.
-                        let has_cr = line.ends_with('\r');
-                        splice_cache_fields(usage_obj, stats);
-                        if let Ok(reserialized) = serde_json::to_string(&chunk) {
-                            out.push_str("data: ");
-                            out.push_str(&reserialized);
-                            if has_cr {
-                                out.push('\r');
-                            }
-                            edited = true;
-                            continue;
+                saw_usage = true;
+                if !edited {
+                    // Preserve the line's terminator style: on a CRLF stream this `line`
+                    // (split on '\n') ends with '\r', which the reserialized JSON drops —
+                    // re-append it so we don't emit a lone '\n' amid '\r\n' framing.
+                    let has_cr = line.ends_with('\r');
+                    splice_cache_fields(usage_obj, stats);
+                    if let Ok(reserialized) = serde_json::to_string(&chunk) {
+                        out.push_str("data: ");
+                        out.push_str(&reserialized);
+                        if has_cr {
+                            out.push('\r');
                         }
+                        edited = true;
+                        continue;
                     }
                 }
             }
@@ -209,6 +220,21 @@ pub(crate) fn scan_inject_sse(body: &[u8], stats: &CacheStats, already_edited: b
         saw_error,
         saw_usage,
     }
+}
+
+/// Parse one SSE line's `data:` payload into its JSON object, or `None` for non-`data` lines,
+/// `[DONE]`, unparseable JSON, or non-object payloads. Shared by both the scan-only fast path and
+/// the editing path so they make the *identical* "is this a usage/error frame" call — the same
+/// invariant the module doc requires against the billing scanner.
+fn sse_data_json(line: &str) -> Option<Value> {
+    // SSE allows `data:<value>` and `data: <value>` — strip the colon, then an optional single
+    // space (matches onwards' own SSE parser).
+    let data = line.strip_prefix("data:")?;
+    let trimmed = data.strip_prefix(' ').unwrap_or(data).trim();
+    if trimmed == "[DONE]" {
+        return None;
+    }
+    serde_json::from_str::<Value>(trimmed).ok().filter(Value::is_object)
 }
 
 /// Inject the cache stats into the terminal usage frame of an SSE body. `None` if no usage
