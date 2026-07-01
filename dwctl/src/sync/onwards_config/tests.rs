@@ -12,7 +12,7 @@ use crate::config::RateLimitTiersConfig;
 use crate::sync::onwards_config::{OnwardsTarget, SyncConfig, convert_to_config_file, parse_notify_payload};
 
 #[test]
-fn test_user_balance_ctes_are_materialized_and_skip_deleted_users() {
+fn test_user_balance_ctes_materialize_and_filter_deleted_users() {
     let source = include_str!("mod.rs");
 
     assert_eq!(source.matches("WITH user_balances AS MATERIALIZED").count(), 2);
