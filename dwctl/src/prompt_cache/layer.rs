@@ -1,11 +1,13 @@
 //! The dwctl-owned cache tower layer — the integration point.
 //!
 //! Wrapping the (cache-agnostic) onwards router, on each cacheable request it:
-//!   1. reads the body, extracts the virtual model + bearer token,
+//!   1. reads the body, validates + strips `cache_control` markers, extracts the virtual model,
 //!   2. **forks** [`Classifier::classify`] (in parallel with the upstream call),
-//!   3. strips `cache_control` markers + forces `include_usage`, forwards to onwards,
-//!   4. joins classify under a deadline, **injects** the `CacheStats` into the usage,
-//!   5. on a 2xx, **commits** the `PendingWrite` to the index (off the response path).
+//!   3. forces `include_usage`, forwards to onwards,
+//!   4. **injects** the `CacheStats` into the response usage — joining classify inline for a
+//!      buffered (non-streaming) body, or **deferring** the join into the SSE stream's terminal
+//!      usage frame for a stream, so the first token is never held by classify,
+//!   5. on a billing-success completion, **commits** the `PendingWrite` to the index (off path).
 //!
 //! Everything lives in one scope, so the pending write is a local value — no
 //! correlation id, no trait injected into onwards. Failures degrade to "no caching"
@@ -23,11 +25,16 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use tracing::warn;
 
+use futures::StreamExt;
+use http_body_util::BodyExt;
+
 use super::classifier::{Classifier, ClassifyOutcome, ClassifyRequest};
-use super::index::TierPolicy;
-use super::inject::{CommitGate, inject_cache_stats_into_response, strip_cache_control};
+use super::index::{CacheResult, TierPolicy};
+use super::inject::{inject_into_response_nonstreaming, scan_inject_sse, strip_cache_control};
 use super::metrics as cache_metrics;
 use super::parse::{ParseError, validate_markers};
+use super::sse::SseBufferedStream;
+use super::stats::CacheStats;
 
 /// Bound on the index commit (off the response path). A slow/hung DB can't leak the
 /// spawned task or hold a pool connection indefinitely; a miss just drops the write
@@ -184,42 +191,113 @@ pub async fn cache_middleware(State(state): State<CacheLayerState>, request: Req
         .insert(header::CONTENT_LENGTH, axum::http::HeaderValue::from(forward.len() as u64));
     let response = next.run(Request::from_parts(parts, Body::from(forward))).await;
 
-    // Join classify under the deadline (≈never waits — it raced the slower generation).
-    // Time out against `&mut handle` (a JoinHandle is Unpin → itself a Future) so the handle
-    // survives an elapsed timeout and we can `abort()` it: a *dropped* JoinHandle detaches the
-    // task to run on, so under a tokenizer/DB stall a moved-in handle would leak an orphan
-    // classify task per request. Aborting cancels it at its next await instead.
-    let outcome = match classify_handle {
-        Some(mut handle) => match tokio::time::timeout(state.deadline, &mut handle).await {
-            Ok(Ok(Ok(result))) => {
-                cache_metrics::record_classify("ok");
-                result
-            }
-            Ok(Ok(Err(e))) => {
-                cache_metrics::record_classify("error");
-                warn!(error = %e, "cache classify failed — billing un-cached");
-                ClassifyOutcome::inactive()
-            }
-            Ok(Err(e)) => {
-                // JoinError is a panic OR a cancellation (e.g. runtime shutdown); only the
-                // former is a bug, so don't fold cancellations into the "panicked" series.
-                cache_metrics::record_classify(if e.is_panic() { "panicked" } else { "error" });
-                warn!(error = %e, "cache classify task failed");
-                ClassifyOutcome::inactive()
-            }
-            Err(_) => {
-                cache_metrics::record_classify("deadline_exceeded");
-                handle.abort(); // deadline — best-effort, reconciliation backstops; don't leak the task
-                ClassifyOutcome::inactive()
-            }
-        },
-        None => ClassifyOutcome::inactive(),
+    // Post-response work — resolve classify, inject the stats, commit on success — differs by
+    // transport. The split is the whole point of this layer's latency profile:
+    //
+    // - NON-STREAMING: by the time `next.run` yields a response the upstream round-trip is done and
+    //   the full completion generated, so classify (which raced that generation) has almost always
+    //   finished — the join here is typically instant. We then buffer the JSON body to edit it.
+    // - STREAMING: joining here would hold the *first* token until classify resolves. But the
+    //   stats are only needed at the *terminal* usage frame, so we hand the classify handle into
+    //   the SSE stream and resolve it there (bounded by the deadline). The first token flows
+    //   untouched; at worst only the final frame waits.
+    let Some(mut handle) = classify_handle else {
+        // No `model` field → classify was never spawned → nothing cacheable.
+        cache_metrics::record_request_outcome("inactive");
+        return response;
     };
 
-    // Request-level cache outcome across ALL traffic (incl. inactive). No model label:
-    // `inactive` covers unknown/typo models (raw client input) → unbounded cardinality;
-    // per-model volumes live on record_token_volumes (enabled models only).
-    let outcome_label = if !outcome.active {
+    if is_streaming(&response) {
+        return defer_classify_into_stream(response, handle, state.deadline, model_label, state.classifier.clone());
+    }
+
+    let outcome = join_classify(&mut handle, state.deadline, &model_label).await;
+    if !outcome.active {
+        // Disabled model (or a degraded classify) → leave the response untouched.
+        return response;
+    }
+    let (response, billing_ok) = inject_into_response_nonstreaming(response, &outcome.stats).await;
+    if !outcome.pending.is_empty() {
+        if billing_ok {
+            spawn_commit(state.classifier.clone(), outcome.pending);
+        } else {
+            // billing_ok is false both for a non-billable status and for a 2xx JSON body with no
+            // usage object (or unparseable body) — label them apart for diagnosis.
+            let reason = if response.status().is_success() { "no_usage" } else { "non_2xx" };
+            cache_metrics::record_commit_vetoed(reason);
+        }
+    }
+    response
+}
+
+/// Whether a response is a streaming (SSE) chat completion. Media types are case-insensitive and
+/// may carry parameters (e.g. `Text/Event-Stream; charset=utf-8`), so match the trimmed base type
+/// case-insensitively — a mis-detected SSE would wrongly take the non-streaming path and buffer
+/// the whole stream.
+fn is_streaming(response: &Response) -> bool {
+    response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(';').next())
+        .is_some_and(|ct| ct.trim().eq_ignore_ascii_case("text/event-stream"))
+}
+
+/// Join the spawned classify task under the deadline, recording the classify result, the
+/// request-outcome label, and (for an active request) the per-model token volumes. A timeout,
+/// task error, or panic resolves to `inactive` (no caching) — never an error to the customer.
+/// Used by both transports: joined inline for non-streaming, and lazily at the terminal usage
+/// frame for streaming. Borrows `&mut handle` (rather than taking ownership) so the caller can
+/// keep it inside [`AbortOnDrop`] across this await — if the client disconnects mid-join, the
+/// guard drops with the handle still in it and aborts the task, instead of this future dropping an
+/// owned handle and *detaching* it into an orphan. Also times out against the handle so we can
+/// `abort()` it on the deadline.
+async fn join_classify(
+    handle: &mut tokio::task::JoinHandle<CacheResult<ClassifyOutcome>>,
+    deadline: Duration,
+    model_label: &str,
+) -> ClassifyOutcome {
+    let outcome = match tokio::time::timeout(deadline, &mut *handle).await {
+        Ok(Ok(Ok(result))) => {
+            cache_metrics::record_classify("ok");
+            result
+        }
+        Ok(Ok(Err(e))) => {
+            cache_metrics::record_classify("error");
+            warn!(error = %e, "cache classify failed — billing un-cached");
+            ClassifyOutcome::inactive()
+        }
+        Ok(Err(e)) => {
+            // JoinError is a panic OR a cancellation (e.g. runtime shutdown); only the former is
+            // a bug, so don't fold cancellations into the "panicked" series.
+            cache_metrics::record_classify(if e.is_panic() { "panicked" } else { "error" });
+            warn!(error = %e, "cache classify task failed");
+            ClassifyOutcome::inactive()
+        }
+        Err(_) => {
+            cache_metrics::record_classify("deadline_exceeded");
+            handle.abort(); // best-effort, reconciliation backstops; don't leak the task
+            ClassifyOutcome::inactive()
+        }
+    };
+
+    // Request-level outcome across ALL traffic (incl. inactive). No model label: `inactive` covers
+    // unknown/typo models (raw client input) → unbounded cardinality; per-model volumes are below.
+    cache_metrics::record_request_outcome(outcome_label(&outcome));
+    if outcome.active && !model_label.is_empty() {
+        cache_metrics::record_token_volumes(
+            model_label,
+            outcome.stats.read,
+            outcome.stats.creation_5m,
+            outcome.stats.creation_1h,
+            outcome.stats.creation_24h,
+        );
+    }
+    outcome
+}
+
+fn outcome_label(outcome: &ClassifyOutcome) -> &'static str {
+    if !outcome.active {
         "inactive"
     } else if outcome.stats.read > 0 && outcome.stats.creation_total() > 0 {
         "read_and_create"
@@ -229,52 +307,153 @@ pub async fn cache_middleware(State(state): State<CacheLayerState>, request: Req
         "create_only"
     } else {
         "zero_active"
-    };
-    cache_metrics::record_request_outcome(outcome_label);
+    }
+}
 
-    // Disabled model (or a degraded classify) → leave the response untouched. Enabled
-    // models always get the cache_* fields (zeros when this prompt cached nothing), so
-    // the cohort has one uniform response shape.
-    if !outcome.active {
-        return response;
+/// RAII guard for the deferred classify handle: aborts the spawned task on drop. If the client
+/// disconnects before the stream reaches the terminal usage frame, the wrapping `async_stream` is
+/// dropped — without this, dropping the bare `JoinHandle` would *detach* the (possibly stalled)
+/// classify task into an orphan that bypasses the deadline. Aborting cancels it at its next await.
+/// `take()` hands the handle to `join_classify` on the normal path, defusing the guard.
+struct AbortOnDrop<T>(Option<tokio::task::JoinHandle<T>>);
+
+impl<T> AbortOnDrop<T> {
+    fn take(&mut self) -> Option<tokio::task::JoinHandle<T>> {
+        self.0.take()
     }
 
-    // Classified token volumes (model-labelled) for the usage dashboards. Guarded on a
-    // non-empty model like the other cache metrics, to avoid a stray model="" series.
-    if !model_label.is_empty() {
-        cache_metrics::record_token_volumes(
-            &model_label,
-            outcome.stats.read,
-            outcome.stats.creation_5m,
-            outcome.stats.creation_1h,
-            outcome.stats.creation_24h,
-        );
+    /// Borrow the handle *without* removing it, so an await on it stays cancellation-safe: the
+    /// guard still owns the handle and will `abort()` it on drop. Defuse with [`take`] only once
+    /// the await has completed.
+    fn as_mut(&mut self) -> Option<&mut tokio::task::JoinHandle<T>> {
+        self.0.as_mut()
     }
+}
 
-    let (response, gate) = inject_cache_stats_into_response(response, &outcome.stats).await;
-
-    // Commit the write/refresh only when the request actually succeeded for billing —
-    // the same signal billing uses, NOT a bare HTTP 200 (a streamed call is 200 the
-    // moment it opens; a mid-stream error bills zero and must not seed the cache). Off
-    // the response path either way.
-    if !outcome.pending.is_empty() {
-        let classifier = state.classifier.clone();
-        let pending = outcome.pending;
-        match gate {
-            CommitGate::Ready(true) => spawn_commit(classifier, pending),
-            CommitGate::Ready(false) => cache_metrics::record_commit_vetoed("non_2xx"),
-            CommitGate::Deferred(rx) => {
-                tokio::spawn(async move {
-                    if rx.await.unwrap_or(false) {
-                        commit_with_deadline(&classifier, &pending).await;
-                    } else {
-                        cache_metrics::record_commit_vetoed("stream_aborted");
-                    }
-                });
-            }
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        if let Some(h) = self.0.take() {
+            // The guard was never defused via `take()`, so the stream was dropped before classify
+            // was joined — a client disconnect ahead of the terminal usage frame. Abort the task so
+            // it can't outlive the request, and record the abandonment: without this, classify and
+            // request-outcome dashboards silently undercount under high disconnect rates (the join,
+            // and its metrics, never run on this path). Cheaper and safer than a detached
+            // join-for-metrics, which would re-orphan the very task this guard exists to cancel.
+            h.abort();
+            cache_metrics::record_classify("abandoned");
+            cache_metrics::record_request_outcome("aborted");
         }
     }
+}
 
+/// Defer the classify-await into the SSE stream so it never holds the first token. Returns the
+/// response immediately; as frames flow it resolves classify lazily at the terminal usage frame
+/// (bounded by the deadline — classify has almost always finished during generation), injects the
+/// stats there, and commits the index write on a billing-success completion. Every failure path
+/// (deadline, classify error, mid-stream error frame, no usage frame, client disconnect) degrades
+/// to no caching with the request unharmed.
+fn defer_classify_into_stream(
+    response: Response,
+    handle: tokio::task::JoinHandle<CacheResult<ClassifyOutcome>>,
+    deadline: Duration,
+    model_label: String,
+    classifier: Classifier,
+) -> Response {
+    let (parts, body) = response.into_parts();
+    let status_ok = parts.status.is_success();
+    // Normalise the body error to io::Error, then re-aggregate provider chunks into complete SSE
+    // events so a terminal usage frame split across body chunks isn't missed.
+    let body_stream = BodyExt::into_data_stream(body).map(|r| r.map_err(std::io::Error::other));
+    let buffered = SseBufferedStream::new(body_stream);
+
+    let stream = async_stream::stream! {
+        futures::pin_mut!(buffered);
+        // Aborts the classify task if the stream is dropped early (client disconnect) instead of
+        // detaching it into an orphan; `take()` defuses it on the normal terminal-frame path.
+        let mut handle = AbortOnDrop(Some(handle));
+        let mut outcome: Option<ClassifyOutcome> = None;
+        let mut edited = false;
+        let mut saw_error = false;
+        let mut saw_usage = false;
+
+        while let Some(item) = buffered.next().await {
+            let chunk = match item {
+                Ok(c) => c,
+                // A transport error mid-stream is a failure: forward it and veto the write.
+                Err(e) => {
+                    saw_error = true;
+                    yield Err(e);
+                    continue;
+                }
+            };
+            // Detect the billing signals on this chunk (no injection yet).
+            let probe = scan_inject_sse(&chunk, &CacheStats::default(), true);
+            saw_error |= probe.saw_error;
+            // The terminal usage frame is the only place the stats are needed: resolve classify now
+            // — the single blocking await, on the *last* frame, bounded by the deadline. Borrow the
+            // handle from the guard (don't `take()` it) so a disconnect *during* this await still
+            // drops the guard → abort + metrics; defuse it only once the join has completed.
+            if probe.saw_usage && outcome.is_none() {
+                if let Some(h) = handle.as_mut() {
+                    outcome = Some(join_classify(h, deadline, &model_label).await);
+                }
+                handle.take();
+            }
+            saw_usage |= probe.saw_usage;
+            // Inject into the (single) usage frame, but only for an active (cache-enabled) request.
+            let out = if !edited && probe.saw_usage && outcome.as_ref().is_some_and(|o| o.active) {
+                let stats = outcome.as_ref().map(|o| o.stats).unwrap_or_default();
+                let scan = scan_inject_sse(&chunk, &stats, false);
+                // Only mark done once it *actually* rewrote — a (rare) reserialize failure
+                // shouldn't permanently disable injection for a later usage frame.
+                edited |= scan.rewritten.is_some();
+                scan.rewritten.unwrap_or(chunk)
+            } else {
+                chunk
+            };
+            yield Ok(out);
+        }
+
+        // Stream drained cleanly. Resolve classify even if no usage frame ever arrived (e.g. an
+        // error-only stream) so its metrics are still recorded, then decide the commit. Borrow from
+        // the guard across the await (as above) — the consumer can still drop us mid-join here — and
+        // defuse only once it completes.
+        let outcome = match outcome {
+            Some(o) => o,
+            None => {
+                if let Some(h) = handle.as_mut() {
+                    let o = join_classify(h, deadline, &model_label).await;
+                    handle.take();
+                    o
+                } else {
+                    ClassifyOutcome::inactive()
+                }
+            }
+        };
+        if outcome.active && !outcome.pending.is_empty() {
+            if status_ok && !saw_error && saw_usage {
+                // Off the response path: the client already has every frame; don't hold the
+                // connection open on the DB write.
+                spawn_commit(classifier, outcome.pending);
+            } else {
+                // Distinguish the veto reasons so the metric is diagnosable: a 2xx stream that
+                // carried an error frame vs. one that simply never emitted a usage frame are
+                // different upstream faults. (A true client disconnect aborts the task before
+                // this runs, so it's never labelled here.)
+                let reason = if !status_ok {
+                    "non_2xx"
+                } else if saw_error {
+                    "error_frame"
+                } else {
+                    "no_usage"
+                };
+                cache_metrics::record_commit_vetoed(reason);
+            }
+        }
+    };
+
+    let mut response = Response::from_parts(parts, Body::from_stream(stream));
+    response.headers_mut().remove(header::CONTENT_LENGTH);
     response
 }
 
@@ -438,6 +617,206 @@ mod tests {
             "second request reads the cached prefix"
         );
         assert_eq!(v2["usage"]["cache_creation_input_tokens"], 0);
+    }
+
+    /// Streaming stand-in: an SSE chat completion with a delta, a terminal usage frame, and [DONE].
+    async fn mock_upstream_streaming() -> Response {
+        let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n\
+                   data: {\"choices\":[],\"usage\":{\"prompt_tokens\":2000,\"completion_tokens\":2,\"total_tokens\":2002}}\n\n\
+                   data: [DONE]\n\n";
+        Response::builder()
+            .header("content-type", "text/event-stream")
+            .body(Body::from(sse))
+            .unwrap()
+    }
+
+    fn body_streaming() -> serde_json::Value {
+        serde_json::json!({
+            "model": ALIAS,
+            "stream": true,
+            "messages": [
+                {"role":"system","content":[{"type":"text","text":"static system","cache_control":{"type":"ephemeral","ttl":"1h"}}]},
+                {"role":"user","content":"hi"}
+            ]
+        })
+    }
+
+    #[sqlx::test]
+    async fn streaming_defers_classify_then_injects_and_commits(pool: PgPool) {
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        let key = create_test_api_key_for_user(&pool, user.id).await;
+        let endpoint = create_test_endpoint(&pool, "ep", user.id).await;
+        let id = create_test_model(&pool, "m", ALIAS, endpoint, user.id).await;
+        sqlx::query!(
+            r#"INSERT INTO model_cache_tariffs
+                 (deployed_model_id, write_multiplier_5m, write_multiplier_1h, write_multiplier_24h, min_prefix_tokens)
+               VALUES ($1, 1.25, 2.0, 2.5, 1024)"#,
+            id
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let tok = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "models": [{"alias": ALIAS, "hf_repo": "o/m", "tokenizer_version": TOK_VER}]
+            })))
+            .mount(&tok)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/tokenize"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "virtual_model": ALIAS, "tokenizer_version": TOK_VER,
+                "segment_counts": [1500], "cumulative": [1500], "total": 1500
+            })))
+            .mount(&tok)
+            .await;
+
+        let classifier = Classifier::new(
+            PrincipalResolver::new(pool.clone()),
+            ModelConfigResolver::new(pool.clone()),
+            TokenizerClient::new(tok.uri()),
+            Arc::new(PostgresIndex::new(pool.clone())),
+            all_tiers(),
+        );
+        let app = Router::new()
+            .route("/v1/chat/completions", post(mock_upstream_streaming))
+            .layer(from_fn_with_state(CacheLayerState::new(classifier, usize::MAX), cache_middleware));
+        let server = axum_test::TestServer::new(app).unwrap();
+
+        // First stream: the deferred classify resolves at the terminal usage frame, which is then
+        // edited with the all-creation cache fields (deltas + [DONE] preserved).
+        let r1 = server
+            .post("/v1/chat/completions")
+            .add_header("authorization", format!("Bearer {}", key.secret))
+            .json(&body_streaming())
+            .await;
+        r1.assert_status_ok();
+        let t1 = r1.text();
+        assert!(t1.contains("\"cache_creation_input_tokens\":1500"), "creation injected: {t1}");
+        assert!(t1.contains("\"cache_read_input_tokens\":0"), "no read on first sight: {t1}");
+        assert!(t1.contains("data: [DONE]"), "DONE preserved: {t1}");
+        assert!(t1.contains("\"content\":\"hi\""), "delta preserved: {t1}");
+
+        // The write commits after the stream drains successfully.
+        let scope = IndexScope {
+            principal_id: user.id,
+            virtual_model: ALIAS.into(),
+            tokenizer_version: TOK_VER.into(),
+        };
+        let hash = parse_chat_completions(&serde_json::to_vec(&body_streaming()).unwrap(), &all_tiers())
+            .unwrap()
+            .cumulative_hashes[0]
+            .clone();
+        let idx = PostgresIndex::new(pool.clone());
+        let mut committed = false;
+        for _ in 0..100 {
+            if !idx.lookup(&scope, std::slice::from_ref(&hash)).await.unwrap().is_empty() {
+                committed = true;
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(committed, "streaming write commits after a clean usage frame");
+
+        // Second identical stream → a read hit, injected into the terminal frame.
+        let r2 = server
+            .post("/v1/chat/completions")
+            .add_header("authorization", format!("Bearer {}", key.secret))
+            .json(&body_streaming())
+            .await;
+        let t2 = r2.text();
+        assert!(
+            t2.contains("\"cache_read_input_tokens\":1500"),
+            "second stream reads the prefix: {t2}"
+        );
+        assert!(t2.contains("\"cache_creation_input_tokens\":0"), "no creation on a read: {t2}");
+    }
+
+    /// Streaming stand-in that fails mid-stream: a delta, then an error frame, and NO usage frame.
+    async fn mock_upstream_streaming_error() -> Response {
+        let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n\
+                   data: {\"error\":{\"message\":\"upstream exploded\"}}\n\n";
+        Response::builder()
+            .header("content-type", "text/event-stream")
+            .body(Body::from(sse))
+            .unwrap()
+    }
+
+    #[sqlx::test]
+    async fn streaming_error_frame_vetoes_the_write(pool: PgPool) {
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        let key = create_test_api_key_for_user(&pool, user.id).await;
+        let endpoint = create_test_endpoint(&pool, "ep", user.id).await;
+        let id = create_test_model(&pool, "m", ALIAS, endpoint, user.id).await;
+        sqlx::query!(
+            r#"INSERT INTO model_cache_tariffs
+                 (deployed_model_id, write_multiplier_5m, write_multiplier_1h, write_multiplier_24h, min_prefix_tokens)
+               VALUES ($1, 1.25, 2.0, 2.5, 1024)"#,
+            id
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let tok = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "models": [{"alias": ALIAS, "hf_repo": "o/m", "tokenizer_version": TOK_VER}]
+            })))
+            .mount(&tok)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/tokenize"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "virtual_model": ALIAS, "tokenizer_version": TOK_VER,
+                "segment_counts": [1500], "cumulative": [1500], "total": 1500
+            })))
+            .mount(&tok)
+            .await;
+
+        let classifier = Classifier::new(
+            PrincipalResolver::new(pool.clone()),
+            ModelConfigResolver::new(pool.clone()),
+            TokenizerClient::new(tok.uri()),
+            Arc::new(PostgresIndex::new(pool.clone())),
+            all_tiers(),
+        );
+        let app = Router::new()
+            .route("/v1/chat/completions", post(mock_upstream_streaming_error))
+            .layer(from_fn_with_state(CacheLayerState::new(classifier, usize::MAX), cache_middleware));
+        let server = axum_test::TestServer::new(app).unwrap();
+
+        // Drain the stream: a mid-stream error frame and no usage frame → veto.
+        let r = server
+            .post("/v1/chat/completions")
+            .add_header("authorization", format!("Bearer {}", key.secret))
+            .json(&body_streaming())
+            .await;
+        let _ = r.text();
+
+        // An unbilled stream must NOT seed the cache. Give any (erroneously) spawned commit ample
+        // chance to land, then assert the index stayed empty.
+        let scope = IndexScope {
+            principal_id: user.id,
+            virtual_model: ALIAS.into(),
+            tokenizer_version: TOK_VER.into(),
+        };
+        let hash = parse_chat_completions(&serde_json::to_vec(&body_streaming()).unwrap(), &all_tiers())
+            .unwrap()
+            .cumulative_hashes[0]
+            .clone();
+        let idx = PostgresIndex::new(pool.clone());
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            idx.lookup(&scope, std::slice::from_ref(&hash)).await.unwrap().is_empty(),
+            "an unbilled stream (error frame, no usage) must not commit a write"
+        );
     }
 
     #[sqlx::test]
