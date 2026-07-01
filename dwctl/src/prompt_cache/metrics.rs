@@ -34,10 +34,10 @@ pub fn record_marker_request(marked: bool) {
 
 /// Request-level cache behaviour across ALL traffic. `outcome` ∈ `read` | `create_only` |
 /// `read_and_create` | `zero_active` (enabled but nothing cached) | `inactive` (model not
-/// enabled / no key) | `aborted` (cache-active streaming request whose client disconnected before
-/// classify was joined, so the read/create split is unknown). **No `model` label** — `inactive`
-/// covers unknown/typo models (raw input → unbounded); per-model volumes are on
-/// `record_token_volumes` (enabled-only).
+/// enabled / no key) | `aborted` (streaming request whose client disconnected before classify was
+/// joined — the outcome is unknown, including whether it would even have been cache-active).
+/// **No `model` label** — `inactive` covers unknown/typo models (raw input → unbounded); per-model
+/// volumes are on `record_token_volumes` (enabled-only).
 pub fn record_request_outcome(outcome: &'static str) {
     counter!("dwctl_cache_requests_total", "outcome" => outcome).increment(1);
 }

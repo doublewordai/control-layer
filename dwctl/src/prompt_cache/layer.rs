@@ -194,13 +194,14 @@ pub async fn cache_middleware(State(state): State<CacheLayerState>, request: Req
     // Post-response work — resolve classify, inject the stats, commit on success — differs by
     // transport. The split is the whole point of this layer's latency profile:
     //
-    // - NON-STREAMING: `next.run` only returns once the full body is buffered, so classify (which
-    //   raced generation) is already done; joining it here is instant, then we edit the JSON.
+    // - NON-STREAMING: by the time `next.run` yields a response the upstream round-trip is done and
+    //   the full completion generated, so classify (which raced that generation) has almost always
+    //   finished — the join here is typically instant. We then buffer the JSON body to edit it.
     // - STREAMING: joining here would hold the *first* token until classify resolves. But the
     //   stats are only needed at the *terminal* usage frame, so we hand the classify handle into
     //   the SSE stream and resolve it there (bounded by the deadline). The first token flows
     //   untouched; at worst only the final frame waits.
-    let Some(handle) = classify_handle else {
+    let Some(mut handle) = classify_handle else {
         // No `model` field → classify was never spawned → nothing cacheable.
         cache_metrics::record_request_outcome("inactive");
         return response;
@@ -210,7 +211,7 @@ pub async fn cache_middleware(State(state): State<CacheLayerState>, request: Req
         return defer_classify_into_stream(response, handle, state.deadline, model_label, state.classifier.clone());
     }
 
-    let outcome = join_classify(handle, state.deadline, &model_label).await;
+    let outcome = join_classify(&mut handle, state.deadline, &model_label).await;
     if !outcome.active {
         // Disabled model (or a degraded classify) → leave the response untouched.
         return response;
@@ -246,14 +247,17 @@ fn is_streaming(response: &Response) -> bool {
 /// request-outcome label, and (for an active request) the per-model token volumes. A timeout,
 /// task error, or panic resolves to `inactive` (no caching) — never an error to the customer.
 /// Used by both transports: joined inline for non-streaming, and lazily at the terminal usage
-/// frame for streaming. Times out against `&mut handle` so we can `abort()` it on the deadline
-/// (a *dropped* handle detaches the task → an orphan per stalled request).
+/// frame for streaming. Borrows `&mut handle` (rather than taking ownership) so the caller can
+/// keep it inside [`AbortOnDrop`] across this await — if the client disconnects mid-join, the
+/// guard drops with the handle still in it and aborts the task, instead of this future dropping an
+/// owned handle and *detaching* it into an orphan. Also times out against the handle so we can
+/// `abort()` it on the deadline.
 async fn join_classify(
-    mut handle: tokio::task::JoinHandle<CacheResult<ClassifyOutcome>>,
+    handle: &mut tokio::task::JoinHandle<CacheResult<ClassifyOutcome>>,
     deadline: Duration,
     model_label: &str,
 ) -> ClassifyOutcome {
-    let outcome = match tokio::time::timeout(deadline, &mut handle).await {
+    let outcome = match tokio::time::timeout(deadline, &mut *handle).await {
         Ok(Ok(Ok(result))) => {
             cache_metrics::record_classify("ok");
             result
@@ -317,6 +321,13 @@ impl<T> AbortOnDrop<T> {
     fn take(&mut self) -> Option<tokio::task::JoinHandle<T>> {
         self.0.take()
     }
+
+    /// Borrow the handle *without* removing it, so an await on it stays cancellation-safe: the
+    /// guard still owns the handle and will `abort()` it on drop. Defuse with [`take`] only once
+    /// the await has completed.
+    fn as_mut(&mut self) -> Option<&mut tokio::task::JoinHandle<T>> {
+        self.0.as_mut()
+    }
 }
 
 impl<T> Drop for AbortOnDrop<T> {
@@ -379,11 +390,14 @@ fn defer_classify_into_stream(
             let probe = scan_inject_sse(&chunk, &CacheStats::default(), true);
             saw_error |= probe.saw_error;
             // The terminal usage frame is the only place the stats are needed: resolve classify now
-            // — the single blocking await, on the *last* frame, bounded by the deadline.
-            if probe.saw_usage && outcome.is_none()
-                && let Some(h) = handle.take()
-            {
-                outcome = Some(join_classify(h, deadline, &model_label).await);
+            // — the single blocking await, on the *last* frame, bounded by the deadline. Borrow the
+            // handle from the guard (don't `take()` it) so a disconnect *during* this await still
+            // drops the guard → abort + metrics; defuse it only once the join has completed.
+            if probe.saw_usage && outcome.is_none() {
+                if let Some(h) = handle.as_mut() {
+                    outcome = Some(join_classify(h, deadline, &model_label).await);
+                }
+                handle.take();
             }
             saw_usage |= probe.saw_usage;
             // Inject into the (single) usage frame, but only for an active (cache-enabled) request.
@@ -401,13 +415,20 @@ fn defer_classify_into_stream(
         }
 
         // Stream drained cleanly. Resolve classify even if no usage frame ever arrived (e.g. an
-        // error-only stream) so its metrics are still recorded, then decide the commit.
+        // error-only stream) so its metrics are still recorded, then decide the commit. Borrow from
+        // the guard across the await (as above) — the consumer can still drop us mid-join here — and
+        // defuse only once it completes.
         let outcome = match outcome {
             Some(o) => o,
-            None => match handle.take() {
-                Some(h) => join_classify(h, deadline, &model_label).await,
-                None => ClassifyOutcome::inactive(),
-            },
+            None => {
+                if let Some(h) = handle.as_mut() {
+                    let o = join_classify(h, deadline, &model_label).await;
+                    handle.take();
+                    o
+                } else {
+                    ClassifyOutcome::inactive()
+                }
+            }
         };
         if outcome.active && !outcome.pending.is_empty() {
             if status_ok && !saw_error && saw_usage {
