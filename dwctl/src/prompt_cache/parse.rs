@@ -119,8 +119,11 @@ pub fn parse_chat_completions(body: &[u8], policy: &TierPolicy) -> Result<Parsed
                 _ => None,
             };
             let stripped = strip_cache_control(tool);
-            // The whole tool schema is the write-side text (no single "text" field).
-            let text = serde_json::to_string(&stripped).unwrap_or_default();
+            // The whole tool schema is the write-side text (no single "text" field). A
+            // serialization failure here is not expected for a `serde_json::Value`, but if it
+            // ever happens we propagate it (→ ParseError::Json → degrade to no-cache) rather
+            // than silently caching an empty tool and undercounting its tokens.
+            let text = serde_json::to_string(&stripped)?;
 
             let canonical = canonical_block_bytes(TOOL_DEFINITION_ROLE, &stripped);
             hasher.update(&canonical);
