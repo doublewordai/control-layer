@@ -21,6 +21,7 @@ pub mod component {
     pub const PROBE_SCHEDULER: &str = "probe_scheduler";
     pub const TASK_WORKER: &str = "task_worker";
     pub const ONWARDS_SYNC: &str = "onwards_sync";
+    pub const ZDR_KEY_SYNC: &str = "zdr_key_sync";
     pub const ONWARDS_HEARTBEAT: &str = "onwards_heartbeat";
     pub const ANALYTICS: &str = "analytics";
     pub const ANALYTICS_BATCHER: &str = "analytics_batcher";

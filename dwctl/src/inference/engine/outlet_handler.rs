@@ -182,6 +182,18 @@ impl RequestHandler for FusilladeOutletHandler {
                 .unwrap_or("")
                 .to_string();
 
+            // Realtime ZDR (marker set by the inference middleware): non-persistence.
+            // Suppress both bodies before the RequestsWriter stores them, so plaintext
+            // never lands in `requests.response_body` / `request_templates.body` —
+            // mirroring how `ZdrBodyScrubber` guards the analytics inserts. This handler
+            // is not wrapped by the scrubber (that would drop its `handle_abandoned`
+            // override), so the guard lives inline here.
+            let (response_body, request_body) = if request_is_zdr(&request_data) {
+                (String::new(), String::new())
+            } else {
+                (response_body, request_body)
+            };
+
             if let Err(e) = sender
                 .send(RawCompletedRequest {
                     request_id: ctx.request_id,
@@ -263,6 +275,83 @@ impl RequestHandler for FusilladeOutletHandler {
                 metrics::counter!("dwctl_requests_writer_sends_total", "result" => "ok").increment(1);
             }
         }
+    }
+}
+
+/// TRANSITIONAL (dwctl ZDR): true when a captured request carried the ZDR marker
+/// header. dwctl's dispatch processor tags the request's `batch_metadata` at
+/// decrypt time and fusillade forwards it as
+/// [`ZDR_MARKER_HEADER`](crate::inference::zdr::ZDR_MARKER_HEADER). By the time
+/// outlet captures the loopback dispatch the body is already-decrypted plaintext,
+/// so the header is the only signal that it must not be logged. Remove once
+/// response reassembly moves into dwctl.
+fn request_is_zdr(request: &RequestData) -> bool {
+    request
+        .headers
+        .get(crate::inference::zdr::ZDR_MARKER_HEADER)
+        .and_then(|values| values.first())
+        .and_then(|bytes| std::str::from_utf8(bytes).ok())
+        == Some("1")
+}
+
+/// dwctl ZDR: a `RequestHandler` that blanks the request and response bodies of
+/// ZDR requests before the handler it wraps persists them, so plaintext ZDR
+/// bodies never reach the analytics DB (`http_requests` / `http_responses`).
+///
+/// Where it runs: it is one link in the handler chain that the `outlet` crate's
+/// `RequestLoggerLayer` drives as traffic passes through the `/ai` proxy (it is
+/// dwctl code, not part of `outlet` itself). It wraps
+/// `outlet_postgres::PostgresHandler`, the component that does the actual
+/// inserts. That handler is a generic logger that knows nothing about ZDR, so
+/// rather than teach it we blank the body in the wrapper and then delegate - it
+/// never sees the plaintext.
+///
+/// This is NOT the fusillade-side encryptor. `ZdrResponseEncryptor` (in
+/// `crate::inference::zdr`) encrypts the body fusillade writes into its OWN db
+/// (`requests.response_body`), and exists because fusillade reassembles and
+/// persists the response itself; this scrubber only guards outlet's separate
+/// analytics tables. They share nothing but the goal of keeping a ZDR body out
+/// of a db.
+///
+/// Why a plaintext ZDR body reaches outlet at all:
+///   - realtime: the body is plaintext throughout (realtime ZDR is
+///     non-persistence, not encryption). The inference middleware stamps the
+///     [`request_is_zdr`] marker on the request.
+///   - flex: the daemon must decrypt the stored ciphertext to call the provider,
+///     and that decrypted dispatch is re-sent through the `/ai` loopback, which
+///     outlet captures. Fusillade forwards the marker from `batch_metadata`.
+///
+/// The marker is present on both the request and response callbacks, so both of
+/// PostgresHandler's inserts (`http_requests`, `http_responses`) are covered.
+#[derive(Clone)]
+pub struct ZdrBodyScrubber<H> {
+    inner: H,
+}
+
+impl<H> ZdrBodyScrubber<H> {
+    pub fn new(inner: H) -> Self {
+        Self { inner }
+    }
+}
+
+impl<H: RequestHandler> RequestHandler for ZdrBodyScrubber<H> {
+    fn handle_request(&self, mut data: RequestData) -> impl std::future::Future<Output = ()> + Send {
+        if request_is_zdr(&data) {
+            data.body = None;
+        }
+        self.inner.handle_request(data)
+    }
+
+    fn handle_response(
+        &self,
+        mut request_data: RequestData,
+        mut response_data: ResponseData,
+    ) -> impl std::future::Future<Output = ()> + Send {
+        if request_is_zdr(&request_data) {
+            request_data.body = None;
+            response_data.body = None;
+        }
+        self.inner.handle_response(request_data, response_data)
     }
 }
 
@@ -450,5 +539,72 @@ mod tests {
         let request = make_request_data(headers);
         let ctx = FusilladeOutletHandler::extract_complete_response_ctx(&request).expect("should extract");
         assert_eq!(ctx.api_key, None);
+    }
+
+    // TRANSITIONAL (dwctl ZDR): the scrubber must blank bodies for ZDR-marked
+    // requests before the inner analytics handler sees them, and leave ordinary
+    // requests untouched. Remove with `ZdrBodyScrubber`.
+    #[derive(Clone, Default)]
+    struct BodyRecorder {
+        req: std::sync::Arc<std::sync::Mutex<Option<Option<Bytes>>>>,
+        resp: std::sync::Arc<std::sync::Mutex<Option<Option<Bytes>>>>,
+    }
+
+    impl RequestHandler for BodyRecorder {
+        fn handle_request(&self, data: RequestData) -> impl std::future::Future<Output = ()> + Send {
+            *self.req.lock().unwrap() = Some(data.body.clone());
+            async {}
+        }
+
+        fn handle_response(&self, request_data: RequestData, response_data: ResponseData) -> impl std::future::Future<Output = ()> + Send {
+            *self.req.lock().unwrap() = Some(request_data.body.clone());
+            *self.resp.lock().unwrap() = Some(response_data.body.clone());
+            async {}
+        }
+    }
+
+    fn body_request(zdr: bool) -> RequestData {
+        let mut headers = HashMap::new();
+        if zdr {
+            headers.insert(crate::inference::zdr::ZDR_MARKER_HEADER.to_string(), vec![Bytes::from_static(b"1")]);
+        }
+        let mut data = make_request_data(headers);
+        data.body = Some(Bytes::from_static(br#"{"secret":"prompt"}"#));
+        data
+    }
+
+    fn body_response() -> ResponseData {
+        ResponseData {
+            correlation_id: 1,
+            timestamp: SystemTime::now(),
+            status: axum::http::StatusCode::OK,
+            headers: HashMap::new(),
+            body: Some(Bytes::from_static(br#"{"secret":"reply"}"#)),
+            duration_to_first_byte: std::time::Duration::from_millis(1),
+            duration: std::time::Duration::from_millis(2),
+        }
+    }
+
+    #[tokio::test]
+    async fn zdr_scrubber_blanks_marked_request_body() {
+        let rec = BodyRecorder::default();
+        ZdrBodyScrubber::new(rec.clone()).handle_request(body_request(true)).await;
+        assert_eq!(*rec.req.lock().unwrap(), Some(None), "ZDR request body must be blanked");
+    }
+
+    #[tokio::test]
+    async fn zdr_scrubber_blanks_marked_response_bodies() {
+        let rec = BodyRecorder::default();
+        ZdrBodyScrubber::new(rec.clone()).handle_response(body_request(true), body_response()).await;
+        assert_eq!(*rec.req.lock().unwrap(), Some(None), "ZDR request body must be blanked on response log");
+        assert_eq!(*rec.resp.lock().unwrap(), Some(None), "ZDR response body must be blanked");
+    }
+
+    #[tokio::test]
+    async fn zdr_scrubber_passes_through_unmarked() {
+        let rec = BodyRecorder::default();
+        ZdrBodyScrubber::new(rec.clone()).handle_response(body_request(false), body_response()).await;
+        assert!(rec.req.lock().unwrap().clone().unwrap().is_some(), "non-ZDR request body must pass through");
+        assert!(rec.resp.lock().unwrap().clone().unwrap().is_some(), "non-ZDR response body must pass through");
     }
 }

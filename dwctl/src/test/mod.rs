@@ -817,6 +817,89 @@ async fn test_request_logging_enabled(pool: PgPool) {
     assert_eq!(result.len(), 1, "Request should be logged after async write-through completes");
 }
 
+/// TRANSITIONAL (dwctl ZDR): the analytics logger (outlet-postgres
+/// `PostgresHandler`), once wrapped by `ZdrBodyScrubber` the way `lib.rs` wires
+/// it, must write NULL bodies for ZDR-marked requests while logging ordinary
+/// ones normally. Drives the handler directly against the real outlet tables so
+/// the assertion is at the DB layer, no Redis or proxy needed. Remove with
+/// `ZdrBodyScrubber`.
+#[sqlx::test]
+#[test_log::test]
+async fn test_outlet_suppresses_zdr_bodies(pool: PgPool) {
+    use bytes::Bytes;
+    use outlet::{RequestData, RequestHandler, ResponseData};
+    use std::collections::HashMap;
+    use std::time::{Duration, SystemTime};
+
+    // Create the outlet logging tables (http_requests / http_responses). Apply
+    // the DDL directly rather than via `.run()`: `#[sqlx::test]` already ran
+    // dwctl's migrations into this database's shared `_sqlx_migrations`, and
+    // outlet's migrator would reject that unknown history (in production outlet
+    // gets its own schema/DB with its own migration table).
+    for migration in outlet_postgres::migrator().iter() {
+        sqlx::raw_sql(migration.sql.as_ref()).execute(&pool).await.expect("apply outlet migration");
+    }
+
+    // Real analytics handler wrapped in the scrubber, mirroring lib.rs wiring.
+    let handler =
+        outlet_postgres::PostgresHandler::<DbPools, serde_json::Value, serde_json::Value>::from_pool_provider(DbPools::new(pool.clone()))
+            .await
+            .expect("build PostgresHandler");
+    let handler = crate::inference::engine::outlet_handler::ZdrBodyScrubber::new(handler);
+
+    fn request(correlation_id: u64, zdr: bool) -> RequestData {
+        let mut headers = HashMap::new();
+        if zdr {
+            headers.insert(crate::inference::zdr::ZDR_MARKER_HEADER.to_string(), vec![Bytes::from_static(b"1")]);
+        }
+        RequestData {
+            correlation_id,
+            timestamp: SystemTime::now(),
+            method: axum::http::Method::POST,
+            uri: "/ai/v1/chat/completions".parse().unwrap(),
+            headers,
+            body: Some(Bytes::from_static(br#"{"secret":"prompt"}"#)),
+            trace_id: None,
+            span_id: None,
+        }
+    }
+    fn response(correlation_id: u64) -> ResponseData {
+        ResponseData {
+            correlation_id,
+            timestamp: SystemTime::now(),
+            status: axum::http::StatusCode::OK,
+            headers: HashMap::new(),
+            body: Some(Bytes::from_static(br#"{"secret":"reply"}"#)),
+            duration_to_first_byte: Duration::from_millis(1),
+            duration: Duration::from_millis(2),
+        }
+    }
+
+    // ZDR-marked (correlation_id 1): bodies must be suppressed.
+    handler.handle_request(request(1, true)).await;
+    handler.handle_response(request(1, true), response(1)).await;
+    // Ordinary (correlation_id 2): bodies logged as normal.
+    handler.handle_request(request(2, false)).await;
+    handler.handle_response(request(2, false), response(2)).await;
+
+    let body_of = |table: &str, id: i64| {
+        let sql = format!("SELECT body FROM {table} WHERE correlation_id = $1");
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, Option<serde_json::Value>>(&sql)
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .expect("query body")
+        }
+    };
+
+    assert!(body_of("http_requests", 1).await.is_none(), "ZDR request body must not be logged");
+    assert!(body_of("http_responses", 1).await.is_none(), "ZDR response body must not be logged");
+    assert!(body_of("http_requests", 2).await.is_some(), "non-ZDR request body should be logged");
+    assert!(body_of("http_responses", 2).await.is_some(), "non-ZDR response body should be logged");
+}
+
 #[sqlx::test]
 #[test_log::test]
 async fn test_request_logging_disabled(pool: PgPool) {

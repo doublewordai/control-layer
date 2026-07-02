@@ -136,6 +136,7 @@ pub async fn flex_stream_response<P, F>(
     flex_input: fusillade::CreateFlexInput,
     request_id: uuid::Uuid,
     done_sentinel: bool,
+    keystore: Option<crate::keystore::Keystore>,
     render: F,
 ) -> axum::response::Response
 where
@@ -168,7 +169,7 @@ where
     tokio::spawn(async move {
         let poll_interval = std::time::Duration::from_millis(500);
         let timeout = std::time::Duration::from_secs(3600);
-        let result = crate::inference::store::poll_until_terminal(&request_manager, request_id, poll_interval, timeout).await;
+        let result = crate::inference::store::poll_until_terminal(&request_manager, request_id, poll_interval, timeout, keystore.as_ref()).await;
 
         let frames = match &result {
             Ok(detail) => render(Ok(detail)),

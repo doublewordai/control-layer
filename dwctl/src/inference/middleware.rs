@@ -60,6 +60,13 @@ pub struct InferenceMiddlewareState<P: PoolProvider + Clone = sqlx_pool_router::
     pub image_normalizer: Arc<dyn ImageNormalizer>,
     /// Whether image normalisation is enabled (`config.image_normalizer.enabled`).
     pub image_normalizer_enabled: bool,
+    /// Encrypted key custody for ZDR flex bodies. `None` disables ZDR.
+    pub keystore: Option<crate::keystore::Keystore>,
+    /// Per-key ZDR policy map (api key secret to the owning account's
+    /// `zero_data_retention` flag), kept fresh by [`crate::sync::zdr_keys`].
+    /// Read by [`super::zdr::is_zdr_request`] on the submit path. Defaults to
+    /// empty (every key reads as non-ZDR) when the sync is not wired.
+    pub zdr_key_cache: crate::sync::zdr_keys::ZdrKeyCache,
 }
 
 /// Middleware that routes inference requests based on service_tier and background.
@@ -210,6 +217,26 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
     //   no tools, !flex                              → falls through to handle_realtime below
     //   any flex                                     → falls through to handle_flex below
     let stream_requested = is_responses_api && !background && request_value["stream"].as_bool().unwrap_or(false);
+
+    // ZDR + server-side tools (responses API) runs the multi-step tool loop —
+    // inline on the realtime warm path, async in the flex daemon — which
+    // scatters plaintext into response_steps / sub-request rows / per-step
+    // outlet logs that ZDR cannot cover. Reject at submit for both tiers, keyed
+    // on per-key policy alone (a keystore is irrelevant to whether we can
+    // safely serve the request).
+    if is_responses_api
+        && has_tools
+        && crate::inference::zdr::is_zdr_request(&state.zdr_key_cache, api_key.as_deref())
+    {
+        return Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({"error": {"message": "Zero-data-retention is not supported for requests that use server-side tools.", "type": "invalid_request_error"}}).to_string(),
+            ))
+            .unwrap();
+    }
+
     match warm_path_branch(is_responses_api, is_flex, background, stream_requested, has_tools) {
         WarmPathBranch::Stream => {
             if let Some(resp) = try_warm_path_stream(&state, &request_value, api_key.as_deref(), model).await {
@@ -316,9 +343,16 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
 
     match service_tier {
         ServiceTier::Realtime => {
+            // Realtime ZDR is non-persistence (no encryption): decided per-key
+            // from the same policy map as flex, but without a keystore since we
+            // suppress the stored copies rather than encrypt them.
+            let zdr = crate::inference::zdr::is_zdr_request(&state.zdr_key_cache, api_key.as_deref());
             let realtime_input = fusillade::CreateRealtimeInput {
                 request_id,
-                body: request_value.to_string(),
+                // ZDR: never persist the request body to `request_templates`
+                // (background path). The live upstream call runs from
+                // `body_bytes` below, independent of this stored copy.
+                body: if zdr { String::new() } else { request_value.to_string() },
                 model: model.to_string(),
                 endpoint: state.loopback_base_url.clone(),
                 method: "POST".to_string(),
@@ -326,9 +360,29 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                 api_key: api_key.clone().unwrap_or_default(),
                 created_by: created_by.unwrap_or_default(),
             };
-            handle_realtime(&state, realtime_input, &resp_id, model, background, parts, body_bytes, next).await
+            handle_realtime(&state, realtime_input, &resp_id, model, background, zdr, parts, body_bytes, next).await
         }
         ServiceTier::Flex => {
+            // ZDR is decided once here at submit (per-key policy); dispatch and
+            // retrieve key off the stored body's sentinel instead of re-checking.
+            // The tool-using case is already rejected above, before the warm-path
+            // branch, for both tiers.
+            let zdr = crate::inference::zdr::is_zdr_request(&state.zdr_key_cache, api_key.as_deref());
+            // Flex encrypts the body at rest, which requires a configured
+            // keystore. A ZDR account whose request cannot be encrypted must fail
+            // loudly - never silently fall back to plaintext, and bail before we
+            // even ingest its images below. Missing keystore is a server
+            // misconfiguration, hence 500.
+            if zdr && state.keystore.is_none() {
+                tracing::error!("ZDR flex request but no keystore configured; refusing to store plaintext");
+                return Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"error": {"message": "Zero-data-retention is enabled for this account but the server is not configured to store data securely; refusing to process the request.", "type": "server_error"}}).to_string(),
+                    ))
+                    .unwrap();
+            }
             // Flex is persisted now and dispatched later by the daemon, so —
             // unlike realtime — it does NOT pass through the image-normaliser
             // layer. Normalise image inputs to `dw-img://` tokens here so the
@@ -385,6 +439,33 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                 obj.remove("stream_options");
             }
 
+            // For ZDR, encrypt the body and store the per-request keys; any
+            // failure fails the request rather than falling back to plaintext.
+            let flex_body = if zdr {
+                let zdr_store_error = || {
+                    Response::builder()
+                        .status(StatusCode::INTERNAL_SERVER_ERROR)
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            serde_json::json!({"error": {"message": "Failed to securely store zero-data-retention request.", "type": "server_error"}}).to_string(),
+                        ))
+                        .unwrap()
+                };
+                let Some(keystore) = state.keystore.as_ref() else {
+                    tracing::error!("ZDR enabled but keystore missing; refusing to store plaintext");
+                    return zdr_store_error();
+                };
+                match crate::inference::zdr::prepare_flex_submit(keystore, &request_id, &mut request_value).await {
+                    Ok(body) => body,
+                    Err(e) => {
+                        tracing::error!(error = %e, "ZDR submit failed; refusing to store plaintext");
+                        return zdr_store_error();
+                    }
+                }
+            } else {
+                request_value.to_string()
+            };
+
             let flex_api_key = flex_batch_key
                 .as_ref()
                 .map(|key| key.secret.clone())
@@ -396,7 +477,7 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                 .unwrap_or_default();
             let flex_input = fusillade::CreateFlexInput {
                 request_id,
-                body: request_value.to_string(),
+                body: flex_body,
                 model: model.to_string(),
                 endpoint: state.loopback_base_url.clone(),
                 method: "POST".to_string(),
@@ -551,6 +632,7 @@ async fn handle_realtime<P: PoolProvider + Clone + Send + Sync + 'static>(
     resp_id: &str,
     model: &str,
     background: bool,
+    zdr: bool,
     parts: axum::http::request::Parts,
     body_bytes: bytes::Bytes,
     next: Next,
@@ -592,6 +674,17 @@ async fn handle_realtime<P: PoolProvider + Clone + Send + Sync + 'static>(
     }
     if let Ok(value) = model.parse() {
         req.headers_mut().insert("x-onwards-model", value);
+    }
+    // ZDR realtime: mark the dispatch so outlet's `ZdrBodyScrubber` blanks the
+    // `http_requests`/`http_responses` bodies and `FusilladeOutletHandler`
+    // suppresses the request/response body it would persist. Reuses the flex
+    // marker header/channel; it is harmless if it reaches the provider, exactly
+    // like flex's other `x-fusillade-batch-*` metadata headers.
+    if zdr {
+        req.headers_mut().insert(
+            crate::inference::zdr::ZDR_MARKER_HEADER,
+            "1".parse().expect("static ZDR marker is a valid header value"),
+        );
     }
 
     if background {
@@ -665,7 +758,7 @@ async fn handle_flex<P: PoolProvider + Clone + Send + Sync + 'static>(
         let poll_interval = std::time::Duration::from_millis(500);
         let timeout = std::time::Duration::from_secs(3600);
 
-        match response_store::poll_until_complete(&state.request_manager, resp_id, poll_interval, timeout).await {
+        match response_store::poll_until_complete(&state.request_manager, resp_id, poll_interval, timeout, state.keystore.as_ref()).await {
             Ok(response_obj) => {
                 let status_code = if response_obj["status"].as_str() == Some("completed") {
                     StatusCode::OK
@@ -727,7 +820,7 @@ async fn handle_chat_completion_flex<P: PoolProvider + Clone + Send + Sync + 'st
     let poll_interval = std::time::Duration::from_millis(500);
     let timeout = std::time::Duration::from_secs(3600);
 
-    match response_store::poll_until_terminal(&state.request_manager, request_id, poll_interval, timeout).await {
+    match response_store::poll_until_terminal(&state.request_manager, request_id, poll_interval, timeout, state.keystore.as_ref()).await {
         Ok(detail) => {
             let (status, body) = response_store::detail_to_chat_completion_object(&detail);
             let status_code = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
@@ -780,6 +873,7 @@ async fn handle_chat_completion_flex_streaming<P: PoolProvider + Clone + Send + 
         flex_input,
         request_id,
         true,
+        state.keystore.clone(),
         move |result| match result {
             Ok(detail) => {
                 let (status, body) = response_store::detail_to_chat_completion_object(detail);
@@ -821,6 +915,7 @@ async fn handle_responses_flex_streaming<P: PoolProvider + Clone + Send + Sync +
         flex_input,
         request_id,
         false,
+        state.keystore.clone(),
         move |result| match result {
             Ok(detail) => {
                 let response = response_store::detail_to_response_object(detail);

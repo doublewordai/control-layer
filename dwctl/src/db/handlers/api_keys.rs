@@ -2070,6 +2070,7 @@ mod tests {
             image_normalizer: Default::default(),
             openapi: Default::default(),
             cache: Default::default(),
+            keystore: None,
         };
         crate::seed_database(&config.model_sources, &pool).await.unwrap();
 

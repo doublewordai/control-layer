@@ -200,6 +200,11 @@ pub struct Config {
     /// shape and defaults.
     #[serde(default)]
     pub image_normalizer: crate::image_normalizer::ImageNormalizerConfig,
+    /// Encrypted key custody (Redis-backed wrapped-key store). Currently used by
+    /// zero-data-retention flex requests to hold per-request body keys; absent
+    /// (the default) leaves ZDR disabled.
+    #[serde(default)]
+    pub keystore: Option<crate::keystore::KeystoreConfig>,
     /// OpenAPI spec exposure controls. Defaults disable the Admin spec
     /// (which describes internal management endpoints) and enable the
     /// AI spec (which mirrors the publicly-documented OpenAI surface).
@@ -2047,6 +2052,7 @@ impl Default for Config {
             connections: ConnectionsConfig::default(),
             responses: ResponsesConfig::default(),
             image_normalizer: crate::image_normalizer::ImageNormalizerConfig::default(),
+            keystore: None,
             openapi: OpenApiConfig::default(),
             cache: CacheConfig::default(),
         }

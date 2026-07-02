@@ -104,6 +104,11 @@ pub enum Error {
     #[error("{resource} with ID {id} not found")]
     NotFound { resource: String, id: String },
 
+    /// Resource existed but is permanently gone (e.g. a zero-data-retention body
+    /// whose key was deleted or expired). Maps to 410.
+    #[error("{message}")]
+    Gone { message: String },
+
     /// Generic internal service error
     #[error("Failed to {operation}")]
     Internal { operation: String },
@@ -170,6 +175,7 @@ impl Error {
             Error::BadRequest { .. } => StatusCode::BAD_REQUEST,
             Error::UnprocessableEntity { .. } => StatusCode::UNPROCESSABLE_ENTITY,
             Error::NotFound { .. } => StatusCode::NOT_FOUND,
+            Error::Gone { .. } => StatusCode::GONE,
             Error::Internal { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             Error::Database(db_err) => match db_err {
                 DbError::NotFound => StatusCode::NOT_FOUND,
@@ -205,6 +211,7 @@ impl Error {
             Error::NotFound { resource, id } => {
                 format!("{resource} with ID {id} not found")
             }
+            Error::Gone { message } => message.clone(),
             Error::Internal { .. } => "Internal server error".to_string(),
             Error::Database(db_err) => match db_err {
                 DbError::NotFound => "Resource not found".to_string(),
@@ -270,7 +277,7 @@ impl IntoResponse for Error {
             Error::Unauthenticated { .. } | Error::InsufficientPermissions { .. } => {
                 tracing::info!("Authorization error: {}", self);
             }
-            Error::BadRequest { .. } | Error::UnprocessableEntity { .. } | Error::NotFound { .. } | Error::PayloadTooLarge { .. } => {
+            Error::BadRequest { .. } | Error::UnprocessableEntity { .. } | Error::NotFound { .. } | Error::Gone { .. } | Error::PayloadTooLarge { .. } => {
                 tracing::debug!("Client error: {}", self);
             }
             Error::Conflict { .. } => {
