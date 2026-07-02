@@ -152,6 +152,7 @@ pub mod encryption;
 mod error_enrichment;
 pub mod errors;
 pub mod image_normalizer;
+pub mod keystore;
 pub mod inference;
 mod leader_election;
 pub mod limits;
@@ -308,6 +309,9 @@ where
     /// dashboard `/images/:sha256` endpoint. Built once at startup so
     /// the GCS client + ADC signer are not re-initialised per request.
     pub image_normalizer: Arc<dyn crate::image_normalizer::ImageNormalizer>,
+    /// Encrypted key custody, built from `config.keystore`. `None` means it is
+    /// not configured (ZDR flex disabled).
+    pub keystore: Option<crate::keystore::Keystore>,
 }
 
 impl<P> AppState<P>
@@ -1150,6 +1154,11 @@ pub async fn build_router(
                 .expect("Failed to create PostgresHandler for request logging")
                 .with_request_serializer(parse_ai_request)
                 .with_response_serializer(parse_ai_response);
+            // TRANSITIONAL (dwctl ZDR): guard the analytics logger so plaintext
+            // ZDR bodies (decrypted for the upstream call, captured on the
+            // loopback) never land in http_requests / http_responses. The marker
+            // header rides on the dispatch; see ZdrBodyScrubber.
+            let postgres_handler = crate::inference::engine::outlet_handler::ZdrBodyScrubber::new(postgres_handler);
             multi_handler = multi_handler.with(postgres_handler);
         }
 
@@ -2036,6 +2045,8 @@ pub struct BackgroundServices {
     pub drop_guard: Option<tokio_util::sync::DropGuard>,
     /// Connections encryption key, derived once at startup.
     connections_encryption_key: Option<Vec<u8>>,
+    /// Encrypted key custody, built once at startup. `None` when unconfigured.
+    keystore: Option<crate::keystore::Keystore>,
 }
 
 impl BackgroundServices {
@@ -2335,6 +2346,8 @@ pub(crate) struct BackgroundServicesInput {
     pub shared_config: SharedConfig,
     pub shutdown_token: tokio_util::sync::CancellationToken,
     pub metrics_recorder: Option<GenAiMetrics>,
+    /// Shared ZDR keystore (built once by the caller). `None` = disabled.
+    pub keystore: Option<crate::keystore::Keystore>,
 }
 
 async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Result<BackgroundServices> {
@@ -2350,6 +2363,7 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
         shared_config,
         shutdown_token,
         metrics_recorder,
+        keystore,
     } = input;
 
     // Wire the multi-step processor onto the request manager *before*
@@ -2360,6 +2374,17 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
         && let Err(e) = request_manager.set_processor(processor)
     {
         tracing::warn!(error = e, "Multi-step processor was already set; skipping");
+    }
+
+    // `keystore` comes from the caller (built once and shared). Install the
+    // TRANSITIONAL ZDR response transformer on the manager before the daemon
+    // spawns below, so completed bodies are persisted encrypted.
+    if let Some(ks) = keystore.clone()
+        && let Err(e) = request_manager.set_response_transformer(std::sync::Arc::new(
+            crate::inference::zdr::ZdrResponseEncryptor::new(ks),
+        ))
+    {
+        tracing::warn!(error = e, "ZDR response transformer was already set; skipping");
     }
 
     let drop_guard = shutdown_token.clone().drop_guard();
@@ -2785,6 +2810,7 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
             None
         }
     };
+
     let task_state = tasks::TaskState {
         request_manager: request_manager.clone(),
         dwctl_pool: pool.clone(),
@@ -2821,6 +2847,7 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
         shutdown_token,
         drop_guard: Some(drop_guard),
         connections_encryption_key: encryption_key.clone(),
+        keystore,
         // Application::new_with_pool wires these once the onwards-
         // instance daemon row is registered. Kept Optional here so
         // tests that bypass that wiring still construct cleanly.
@@ -2954,8 +2981,18 @@ impl Application {
             }),
         );
         let step_manager = Arc::new(fusillade::PostgresResponseStepManager::new(fusillade_pools.clone()));
+        // Build the ZDR keystore once and share it across the response store, the
+        // daemon processor, and background services (which install the response
+        // transformer). A misconfiguration is fatal.
+        let keystore = match config.keystore.as_ref() {
+            Some(c) => Some(
+                crate::keystore::Keystore::from_config(c)
+                    .map_err(|e| anyhow::anyhow!("failed to initialise keystore: {e}"))?,
+            ),
+            None => None,
+        };
         let response_store =
-            Arc::new(crate::inference::store::FusilladeResponseStore::new(request_manager.clone()).with_step_manager(step_manager.clone()));
+            Arc::new(crate::inference::store::FusilladeResponseStore::new(request_manager.clone()).with_step_manager(step_manager.clone()).with_keystore(keystore.clone()));
 
         // Build the image normaliser ONCE — fail loud at startup if
         // `image_normalizer.enabled = true` but no backend is configured.
@@ -3028,6 +3065,7 @@ impl Application {
                 // GCS client / ADC signer init.
                 processor_builder = processor_builder.with_image_normalizer(image_normalizer.clone(), dispatch_ttl);
             }
+            processor_builder = processor_builder.with_keystore(keystore.clone());
             let processor = Arc::new(processor_builder);
             Some(
                 processor
@@ -3053,6 +3091,7 @@ impl Application {
             shared_config: shared_config.clone(),
             shutdown_token: shutdown_token.clone(),
             metrics_recorder: metrics_recorder.clone(),
+            keystore: keystore.clone(),
         })
         .await?;
 
@@ -3184,6 +3223,7 @@ impl Application {
             loop_config: multi_step_loop_config,
             image_normalizer: image_normalizer.clone(),
             image_normalizer_enabled: config.image_normalizer.enabled,
+            keystore: bg_services.keystore.clone(),
         };
 
         // Build onwards router from targets with body transform, response sanitization, and tool executor.
@@ -3226,6 +3266,7 @@ impl Application {
             .maybe_outlet_db(outlet_pools.clone())
             .limiters(limiters)
             .maybe_connections_encryption_key(bg_services.connections_encryption_key.clone())
+            .maybe_keystore(bg_services.keystore.clone())
             .response_store(response_store)
             .response_step_manager(bg_services.step_manager.clone())
             .image_normalizer(image_normalizer)

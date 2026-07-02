@@ -1,3 +1,8 @@
 [workspace]
 members = ["dwctl"]
 resolver = "2"
+
+# TRANSITIONAL: build against local fusillade carrying the ZDR ResponseTransformer
+# hook until that change is released. Repoint at the published version once it is.
+[patch.crates-io]
+fusillade = { path = "../fusillade" }

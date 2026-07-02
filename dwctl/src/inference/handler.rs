@@ -20,6 +20,7 @@ use std::collections::HashSet;
 use utoipa::ToSchema;
 
 use crate::AppState;
+use crate::inference::store::ResponseLookup;
 use crate::errors::{Error, Result};
 
 /// Response body for `DELETE /v1/responses/{response_id}`.
@@ -127,24 +128,26 @@ pub async fn get_response<P: PoolProvider>(
         });
     }
 
-    // Convert the detail to an Open Responses API response object.
-    let resp = state
-        .response_store
-        .get_response(&response_id)
-        .await
-        .map_err(|e| match e {
-            StoreError::NotFound(_) => Error::NotFound {
-                resource: "response".to_string(),
-                id: response_id.clone(),
-            },
-            _ => Error::Database(crate::db::errors::DbError::Other(anyhow::anyhow!("{e}"))),
-        })?
-        .ok_or_else(|| Error::NotFound {
+    // Convert the detail to an Open Responses API response object. ZDR gone
+    // (encrypted body whose key was shredded on a prior retrieval or expiry) is
+    // decided inside `get_response` from the same keystore lookup that would
+    // decrypt, so there is no separate probe and no time-of-check gap.
+    match state.response_store.get_response(&response_id).await.map_err(|e| match e {
+        StoreError::NotFound(_) => Error::NotFound {
+            resource: "response".to_string(),
+            id: response_id.clone(),
+        },
+        _ => Error::Database(crate::db::errors::DbError::Other(anyhow::anyhow!("{e}"))),
+    })? {
+        ResponseLookup::Found(resp) => Ok(Json(resp)),
+        ResponseLookup::NotFound => Err(Error::NotFound {
             resource: "response".to_string(),
             id: response_id,
-        })?;
-
-    Ok(Json(resp))
+        }),
+        ResponseLookup::Gone => Err(Error::Gone {
+            message: "zdr_request_unavailable: this zero-data-retention response is no longer available".to_string(),
+        }),
+    }
 }
 
 /// Delete a response by ID.

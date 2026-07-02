@@ -429,7 +429,10 @@ async fn test_multi_step_chain_assembles_and_is_retrievable_via_get(pool: PgPool
     // GET retrieval: the response is completed, the id matches the head
     // step (not any internal sub-request id), and the chain is listable.
     let resp_id = format!("resp_{request_id}");
-    let response = store.get_response(&resp_id).await.unwrap().expect("response should be retrievable");
+    let response = match store.get_response(&resp_id).await.unwrap() {
+        crate::inference::store::ResponseLookup::Found(v) => v,
+        other => panic!("response should be retrievable, got {other:?}"),
+    };
     assert_eq!(response["id"].as_str(), Some(resp_id.as_str()));
     assert_eq!(response["status"].as_str(), Some("completed"));
 

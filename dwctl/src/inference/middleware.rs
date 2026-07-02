@@ -59,6 +59,8 @@ pub struct InferenceMiddlewareState<P: PoolProvider + Clone = sqlx_pool_router::
     pub image_normalizer: Arc<dyn ImageNormalizer>,
     /// Whether image normalisation is enabled (`config.image_normalizer.enabled`).
     pub image_normalizer_enabled: bool,
+    /// Encrypted key custody for ZDR flex bodies. `None` disables ZDR.
+    pub keystore: Option<crate::keystore::Keystore>,
 }
 
 /// Middleware that routes inference requests based on service_tier and background.
@@ -294,6 +296,21 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
             handle_realtime(&state, realtime_input, &resp_id, model, background, parts, body_bytes, next).await
         }
         ServiceTier::Flex => {
+            // ZDR is decided once here at submit; dispatch and retrieve key off
+            // the stored body's sentinel instead of re-checking policy.
+            let zdr = crate::inference::zdr::is_zdr_request(state.keystore.is_some(), api_key.as_deref());
+            // The server-side tool loop scatters plaintext into sub-request rows,
+            // response_steps, and per-step outlet logs that ZDR cannot cover, so
+            // reject it at submit rather than leak.
+            if zdr && is_responses_api && has_tools {
+                return Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"error": {"message": "Zero-data-retention is not supported for requests that use server-side tools.", "type": "invalid_request_error"}}).to_string(),
+                    ))
+                    .unwrap();
+            }
             // Flex is persisted now and dispatched later by the daemon, so —
             // unlike realtime — it does NOT pass through the image-normaliser
             // layer. Normalise image inputs to `dw-img://` tokens here so the
@@ -350,9 +367,36 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                 obj.remove("stream_options");
             }
 
+            // For ZDR, encrypt the body and store the per-request keys; any
+            // failure fails the request rather than falling back to plaintext.
+            let flex_body = if zdr {
+                let zdr_store_error = || {
+                    Response::builder()
+                        .status(StatusCode::INTERNAL_SERVER_ERROR)
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            serde_json::json!({"error": {"message": "Failed to securely store zero-data-retention request.", "type": "server_error"}}).to_string(),
+                        ))
+                        .unwrap()
+                };
+                let Some(keystore) = state.keystore.as_ref() else {
+                    tracing::error!("ZDR enabled but keystore missing; refusing to store plaintext");
+                    return zdr_store_error();
+                };
+                match crate::inference::zdr::prepare_flex_submit(keystore, &request_id, &mut request_value).await {
+                    Ok(body) => body,
+                    Err(e) => {
+                        tracing::error!(error = %e, "ZDR submit failed; refusing to store plaintext");
+                        return zdr_store_error();
+                    }
+                }
+            } else {
+                request_value.to_string()
+            };
+
             let flex_input = fusillade::CreateFlexInput {
                 request_id,
-                body: request_value.to_string(),
+                body: flex_body,
                 model: model.to_string(),
                 endpoint: state.loopback_base_url.clone(),
                 method: "POST".to_string(),
@@ -583,7 +627,7 @@ async fn handle_flex<P: PoolProvider + Clone + Send + Sync + 'static>(
         let poll_interval = std::time::Duration::from_millis(500);
         let timeout = std::time::Duration::from_secs(3600);
 
-        match response_store::poll_until_complete(&state.request_manager, resp_id, poll_interval, timeout).await {
+        match response_store::poll_until_complete(&state.request_manager, resp_id, poll_interval, timeout, state.keystore.as_ref()).await {
             Ok(response_obj) => {
                 let status_code = if response_obj["status"].as_str() == Some("completed") {
                     StatusCode::OK
@@ -645,7 +689,7 @@ async fn handle_chat_completion_flex<P: PoolProvider + Clone + Send + Sync + 'st
     let poll_interval = std::time::Duration::from_millis(500);
     let timeout = std::time::Duration::from_secs(3600);
 
-    match response_store::poll_until_terminal(&state.request_manager, request_id, poll_interval, timeout).await {
+    match response_store::poll_until_terminal(&state.request_manager, request_id, poll_interval, timeout, state.keystore.as_ref()).await {
         Ok(detail) => {
             let (status, body) = response_store::detail_to_chat_completion_object(&detail);
             let status_code = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
@@ -698,6 +742,7 @@ async fn handle_chat_completion_flex_streaming<P: PoolProvider + Clone + Send + 
         flex_input,
         request_id,
         true,
+        state.keystore.clone(),
         move |result| match result {
             Ok(detail) => {
                 let (status, body) = response_store::detail_to_chat_completion_object(detail);
@@ -739,6 +784,7 @@ async fn handle_responses_flex_streaming<P: PoolProvider + Clone + Send + Sync +
         flex_input,
         request_id,
         false,
+        state.keystore.clone(),
         move |result| match result {
             Ok(detail) => {
                 let response = response_store::detail_to_response_object(detail);

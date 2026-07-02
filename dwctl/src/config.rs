@@ -200,6 +200,11 @@ pub struct Config {
     /// shape and defaults.
     #[serde(default)]
     pub image_normalizer: crate::image_normalizer::ImageNormalizerConfig,
+    /// Encrypted key custody (Redis-backed wrapped-key store). Currently used by
+    /// zero-data-retention flex requests to hold per-request body keys; absent
+    /// (the default) leaves ZDR disabled.
+    #[serde(default)]
+    pub keystore: Option<crate::keystore::KeystoreConfig>,
     /// OpenAPI spec exposure controls. Defaults disable the Admin spec
     /// (which describes internal management endpoints) and enable the
     /// AI spec (which mirrors the publicly-documented OpenAI surface).
@@ -2029,6 +2034,7 @@ impl Default for Config {
             connections: ConnectionsConfig::default(),
             responses: ResponsesConfig::default(),
             image_normalizer: crate::image_normalizer::ImageNormalizerConfig::default(),
+            keystore: None,
             openapi: OpenApiConfig::default(),
             cache: CacheConfig::default(),
         }
@@ -2462,8 +2468,12 @@ impl Config {
         Figment::new()
             // Load base config file
             .merge(Yaml::file(config_path))
-            // Environment variables can still override specific values
-            .merge(Env::prefixed("DWCTL_").split("__"))
+            // Environment variables can still override specific values.
+            // `DWCTL_ZDR_ALL_FLEX` is read directly via std::env (see
+            // inference::zdr) and is not a Config field, so it must be excluded
+            // here or figment's deny_unknown_fields rejects it. Drop this with
+            // the temporary flag.
+            .merge(Env::prefixed("DWCTL_").split("__").ignore(&["zdr_all_flex"]))
             // Common DATABASE_URL and DATABASE_REPLICA_URL patterns
             // Accept both DATABASE_REPLICA_URL and DWCTL_DATABASE_REPLICA_URL
             .merge(Env::raw().only(&["DATABASE_URL", "DATABASE_REPLICA_URL"]))

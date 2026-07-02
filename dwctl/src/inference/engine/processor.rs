@@ -89,6 +89,9 @@ where
     /// no state — declared as a field so the trait dispatch below has
     /// a stable receiver.
     pub default: DefaultRequestProcessor,
+    /// Encrypted key custody for ZDR flex bodies. `None` disables ZDR
+    /// decryption (bodies pass through unchanged).
+    pub keystore: Option<crate::keystore::Keystore>,
 }
 
 /// Resolve the tool set for a daemon-claimed request. Called once per
@@ -139,6 +142,7 @@ where
             // `config.image_normalizer.signing.dispatch_ttl()`.
             dispatch_ttl: std::time::Duration::from_secs(1800),
             default: DefaultRequestProcessor,
+            keystore: None,
         }
     }
 
@@ -152,6 +156,12 @@ where
     ) -> Self {
         self.image_normalizer = Some(normalizer);
         self.dispatch_ttl = ttl;
+        self
+    }
+
+    /// Wire in the keystore so ZDR request bodies are decrypted before dispatch.
+    pub fn with_keystore(mut self, keystore: Option<crate::keystore::Keystore>) -> Self {
+        self.keystore = keystore;
         self
     }
 
@@ -181,6 +191,42 @@ where
         should_retry: ShouldRetry,
         cancellation: CancellationFuture,
     ) -> fusillade::Result<RequestCompletionResult> {
+        // ZDR: the stored request body is a self-describing ciphertext envelope.
+        // Decrypt it here, before JIT signing and either dispatch branch, so the
+        // rest of the flow sees plaintext. The response is re-encrypted on its way
+        // back through the loopback layer.
+        if crate::inference::zdr::is_zdr_body(&request.data.body) {
+            let keystore = self.keystore.as_ref().ok_or_else(|| {
+                fusillade::FusilladeError::Other(anyhow::anyhow!("ZDR request claimed but keystore is not configured"))
+            })?;
+            let key_id = crate::inference::zdr::key_id(&request.data.id.0, crate::inference::zdr::KeyKind::Request);
+            match keystore.get(&key_id).await {
+                Ok(Some(key)) => {
+                    request.data.body = crate::inference::zdr::decrypt_body(&key, &request.data.body).map_err(|e| {
+                        fusillade::FusilladeError::Other(anyhow::anyhow!("ZDR request decrypt failed: {e}"))
+                    })?;
+                    // TRANSITIONAL (dwctl ZDR): mark the dispatch so the loopback
+                    // analytics handler blanks the now-plaintext body instead of
+                    // logging it. fusillade forwards batch_metadata entries as
+                    // `x-fusillade-batch-<key>` headers, so this rides out as
+                    // `x-fusillade-batch-zdr: 1`; the outlet handler reads that.
+                    // Piggybacks the existing header channel to avoid a fusillade
+                    // API change - drop when reassembly moves into dwctl.
+                    request.data.batch_metadata.insert(crate::inference::zdr::ZDR_MARKER_KEY.to_string(), "1".to_string());
+                }
+                Ok(None) => {
+                    // Key expired or was deleted before dispatch: the prompt is
+                    // gone and the request can never be processed. Fail it.
+                    return Err(fusillade::FusilladeError::ValidationError(
+                        "ZDR request key expired before dispatch; cannot decrypt".to_string(),
+                    ));
+                }
+                Err(e) => {
+                    return Err(fusillade::FusilladeError::Other(anyhow::anyhow!("ZDR keystore error: {e}")));
+                }
+            }
+        }
+
         // JIT signing: any `dw-img://{sha256}` token embedded in the body
         // (placed there by the file-ingest path) gets resolved to a fresh
         // short-lived signed URL right before dispatch. This means the
