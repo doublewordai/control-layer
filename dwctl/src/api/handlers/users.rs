@@ -1789,10 +1789,15 @@ mod tests {
 
         response.assert_status_forbidden();
 
-        // The rejected request must not have persisted the display_name change either.
+        // The rejected request must not have persisted ANY of its changes: the
+        // 403 rejects the whole update, so neither ZDR nor display_name changes.
         let mut conn = pool.acquire().await.unwrap();
         let persisted = Users::new(&mut conn).get_by_id(user.id).await.unwrap().unwrap();
         assert!(!persisted.zero_data_retention);
+        assert_eq!(
+            persisted.display_name, user.display_name,
+            "rejected request must not persist the display_name change"
+        );
     }
 
     async fn create_initial_credit_transaction(pool: &PgPool, user_id: UserId, amount: &str) -> Uuid {

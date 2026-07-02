@@ -29,6 +29,8 @@ interface EditUserModalProps {
     roles: Role[];
     zero_data_retention: boolean;
   };
+  /** Whether the current user may toggle zero data retention (admins only). */
+  canEditZdr?: boolean;
 }
 
 export const EditUserModal: React.FC<EditUserModalProps> = ({
@@ -37,6 +39,7 @@ export const EditUserModal: React.FC<EditUserModalProps> = ({
   onSuccess,
   userId,
   currentUser,
+  canEditZdr = false,
 }) => {
   const [formData, setFormData] = useState({
     display_name: currentUser.name,
@@ -59,7 +62,11 @@ export const EditUserModal: React.FC<EditUserModalProps> = ({
           display_name: formData.display_name.trim() || undefined,
           avatar_url: formData.avatar_url.trim() || undefined,
           roles: formData.roles,
-          zero_data_retention: formData.zero_data_retention,
+          // ZDR is admin-only server-side; only send it when the viewer can
+          // edit it, otherwise dwctl rejects the whole request with a 403.
+          ...(canEditZdr
+            ? { zero_data_retention: formData.zero_data_retention }
+            : {}),
         },
       });
 
@@ -224,6 +231,7 @@ export const EditUserModal: React.FC<EditUserModalProps> = ({
               </div>
             </div>
 
+            {canEditZdr && (
             <div className="flex items-start justify-between gap-4">
               <div className="flex items-center gap-1">
                 <label
@@ -256,6 +264,7 @@ export const EditUserModal: React.FC<EditUserModalProps> = ({
                 aria-label="Toggle zero data retention"
               />
             </div>
+            )}
 
             <div className="bg-gray-50 rounded-lg p-3">
               <p className="text-sm text-gray-600">

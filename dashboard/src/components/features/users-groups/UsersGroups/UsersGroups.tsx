@@ -750,6 +750,7 @@ const UsersGroups: React.FC = () => {
             roles: activeUser.roles,
             zero_data_retention: activeUser.zero_data_retention,
           }}
+          canEditZdr={isPlatformManager}
         />
       )}
       {activeGroup && (
