@@ -2,7 +2,8 @@ import { useOrganization } from "@/api/control-layer/hooks";
 import { useOrganizationContext } from "@/contexts";
 import { MemberManagement } from "./MemberManagement";
 import { NotificationSettings } from "../notifications/NotificationSettings";
-import { Building } from "lucide-react";
+import { Badge } from "@/components/ui/badge";
+import { Building, ShieldCheck } from "lucide-react";
 
 export function MyOrganization() {
   const { activeOrganizationId, activeOrganization } =
@@ -54,6 +55,15 @@ export function MyOrganization() {
               <span>·</span>
               <span>Created {new Date(org.created_at).toLocaleDateString()}</span>
             </>
+          )}
+          {org && (
+            <Badge
+              variant={org.zero_data_retention ? "secondary" : "outline"}
+              title="Whether request and response payloads are retained for this organization"
+            >
+              <ShieldCheck />
+              Zero data retention {org.zero_data_retention ? "on" : "off"}
+            </Badge>
           )}
         </div>
       </div>

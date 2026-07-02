@@ -130,6 +130,34 @@ describe("MyOrganization", () => {
     ).not.toBeInTheDocument();
   });
 
+  it("shows the organization's zero data retention status", async () => {
+    server.use(userWithOrg("member"));
+    server.use(
+      http.get("/admin/api/v1/organizations/:id", () =>
+        HttpResponse.json({
+          id: ORG_ID,
+          username: "acme-corp",
+          display_name: ORG_NAME,
+          email: "contact@acme.com",
+          created_at: "2025-01-15T10:00:00Z",
+          member_count: 3,
+          zero_data_retention: true,
+        }),
+      ),
+    );
+    const { container } = render(<MyOrganization />, {
+      wrapper: createWrapper(),
+    });
+
+    await waitFor(() => {
+      expect(
+        within(container).getByRole("heading", { name: ORG_NAME }),
+      ).toBeInTheDocument();
+    });
+
+    expect(container.textContent).toMatch(/zero data retention on/i);
+  });
+
   it("passes the org ID to NotificationSettings", async () => {
     server.use(userWithOrg("owner"));
     const { container } = render(<MyOrganization />, {

@@ -83,6 +83,28 @@ describe("Profile Component", () => {
     });
   });
 
+  it("shows the account's zero data retention status when enabled", async () => {
+    server.use(
+      http.get("/admin/api/v1/users/:id", () =>
+        HttpResponse.json({
+          id: "550e8400-e29b-41d4-a716-446655440001",
+          username: "sarah",
+          email: "sarah.chen@acme.com",
+          display_name: "Sarah Chen",
+          roles: ["StandardUser"],
+          created_at: "2025-03-10T10:00:00Z",
+          updated_at: "2025-12-20T15:30:00Z",
+          auth_source: "proxy-header",
+          is_admin: false,
+          zero_data_retention: true,
+        }),
+      ),
+    );
+
+    const { container } = await renderAndWaitForProfile();
+    expect(container.textContent).toMatch(/zero retention/i);
+  });
+
   it("renders profile data when loaded", async () => {
     const { container } = render(<Profile />, { wrapper: createWrapper() });
 

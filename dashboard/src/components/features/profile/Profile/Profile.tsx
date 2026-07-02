@@ -4,6 +4,7 @@ import {
   Loader2,
   Calendar,
   Shield,
+  ShieldCheck,
   AtSign,
   Info,
   Eye,
@@ -335,6 +336,27 @@ export const Profile: React.FC = () => {
                   <span className="text-gray-900">
                     {currentUser?.is_admin ? "Admin" : "User"}
                   </span>
+                </div>
+                <div className="flex items-center text-sm">
+                  <ShieldCheck className="w-4 h-4 text-gray-400 mr-2 shrink-0" />
+                  <span className="text-gray-600 w-20 shrink-0">Data:</span>
+                  <span className="text-gray-900">
+                    {currentUser?.zero_data_retention
+                      ? "Zero retention"
+                      : "Standard retention"}
+                  </span>
+                  <HoverCard openDelay={150} closeDelay={200}>
+                    <HoverCardTrigger asChild>
+                      <Info className="w-3 h-3 text-gray-400 cursor-pointer ml-1.5 shrink-0" />
+                    </HoverCardTrigger>
+                    <HoverCardContent side="top" align="start">
+                      <p className="text-sm">
+                        {currentUser?.zero_data_retention
+                          ? "Zero data retention is enabled for your account: request and response payloads are not retained."
+                          : "Zero data retention is not enabled for your account. Contact an administrator to change this."}
+                      </p>
+                    </HoverCardContent>
+                  </HoverCard>
                 </div>
               </div>
             </div>
