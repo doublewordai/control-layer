@@ -271,10 +271,10 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
         }
     }
 
-    // Resolve created_by upfront for background/flex (row must exist before
-    // returning 202). For realtime non-background, defer to the background task.
-    let needs_sync_attribution = background || matches!(service_tier, ServiceTier::Flex);
-    let created_by = if needs_sync_attribution {
+    // Resolve created_by upfront for background realtime responses (row must
+    // exist before returning 202). Flex uses the key owner's hidden batch key
+    // below, so resolving it there also supplies the attribution target.
+    let created_by = if background && matches!(service_tier, ServiceTier::Realtime) {
         response_store::lookup_created_by(&state.dwctl_pool, api_key.as_deref()).await
     } else {
         None
@@ -285,7 +285,7 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
             Ok(None) => {
                 tracing::warn!("Flex API key disappeared before hidden batch-key resolution");
                 return Response::builder()
-                    .status(StatusCode::UNAUTHORIZED)
+                    .status(StatusCode::FORBIDDEN)
                     .header("content-type", "application/json")
                     .body(Body::from(
                         serde_json::json!({"error": {"message": "Invalid API key", "type": "invalid_request_error"}}).to_string(),
@@ -391,7 +391,7 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                 .unwrap_or_else(|| api_key.clone().unwrap_or_default());
             let flex_created_by = flex_batch_key
                 .as_ref()
-                .map(|key| key.target_user_id.to_string())
+                .map(|key| key.key_owner_id.to_string())
                 .or_else(|| created_by.clone())
                 .unwrap_or_default();
             let flex_input = fusillade::CreateFlexInput {
@@ -427,7 +427,7 @@ enum ServiceTier {
 #[derive(Debug, Clone)]
 struct FlexBatchApiKey {
     secret: String,
-    target_user_id: uuid::Uuid,
+    key_owner_id: uuid::Uuid,
 }
 
 async fn resolve_flex_batch_api_key(pool: &sqlx::PgPool, api_key: Option<&str>) -> Result<Option<FlexBatchApiKey>, DbError> {
@@ -450,16 +450,16 @@ async fn resolve_flex_batch_api_key(pool: &sqlx::PgPool, api_key: Option<&str>) 
     let Some(row) = row else {
         return Ok(None);
     };
-    let target_user_id: uuid::Uuid = sqlx::Row::get(&row, "user_id");
+    let key_owner_id: uuid::Uuid = sqlx::Row::get(&row, "user_id");
     let created_by: uuid::Uuid = sqlx::Row::get(&row, "created_by");
 
     let mut conn = pool.acquire().await?;
     let mut api_keys_repo = ApiKeys::new(&mut conn);
     let secret = api_keys_repo
-        .get_or_create_hidden_key(target_user_id, ApiKeyPurpose::Batch, created_by)
+        .get_or_create_hidden_key(key_owner_id, ApiKeyPurpose::Batch, created_by)
         .await?;
 
-    Ok(Some(FlexBatchApiKey { secret, target_user_id }))
+    Ok(Some(FlexBatchApiKey { secret, key_owner_id }))
 }
 
 impl std::fmt::Display for ServiceTier {
@@ -1195,7 +1195,7 @@ mod tests {
             .expect("known realtime key should resolve");
 
         assert_ne!(flex_key.secret, realtime_key);
-        assert_eq!(flex_key.target_user_id, org.id);
+        assert_eq!(flex_key.key_owner_id, org.id);
 
         let row = sqlx::query(
             r#"
