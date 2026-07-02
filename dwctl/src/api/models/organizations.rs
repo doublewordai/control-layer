@@ -40,6 +40,9 @@ pub struct OrganizationUpdate {
     /// Omit entirely to leave unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]
     pub low_balance_threshold: Option<Option<f32>>,
+    /// Account-wide zero-data-retention flag. Admin-only: only callers with
+    /// UpdateAll on organizations may set this. Omit to leave unchanged.
+    pub zero_data_retention: Option<bool>,
 }
 
 /// Full organization details returned by the API.

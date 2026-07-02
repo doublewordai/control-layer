@@ -11,6 +11,14 @@ use tokio_util::sync::CancellationToken;
 use crate::config::RateLimitTiersConfig;
 use crate::sync::onwards_config::{OnwardsTarget, SyncConfig, convert_to_config_file, parse_notify_payload};
 
+#[test]
+fn test_user_balance_ctes_materialize_and_filter_deleted_users() {
+    let source = include_str!("mod.rs");
+
+    assert_eq!(source.matches("WITH user_balances AS MATERIALIZED").count(), 2);
+    assert_eq!(source.matches("WHERE u.is_deleted = false").count(), 2);
+}
+
 // Helper function to create a test target
 fn create_test_target(model_name: &str, alias: &str, endpoint_url: &str) -> OnwardsTarget {
     OnwardsTarget {
@@ -176,6 +184,36 @@ async fn test_cache_shape_regular_public_and_private_access(pool: sqlx::PgPool) 
     assert!(
         provider.target.sanitize_response,
         "sanitize flag should be propagated to regular target"
+    );
+}
+
+#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
+async fn test_cache_shape_zero_data_retention_label_reflects_owner(pool: sqlx::PgPool) {
+    // User A opts into zero data retention; User B does not. The onwards sync
+    // must surface the owning user's flag as a per-key "zdr" label so onwards
+    // can act on it later. The label is always emitted ("true"/"false").
+    sqlx::query!("UPDATE users SET zero_data_retention = true WHERE id = '00000000-0000-0000-0000-0000000000a1'")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let targets = super::load_targets_from_db(&pool, &[], false, &RateLimitTiersConfig::default())
+        .await
+        .unwrap();
+
+    let key_a_labels = targets.key_labels.get(KEY_A_SECRET).expect("user A's key should carry labels");
+    assert_eq!(
+        key_a_labels.get("zdr"),
+        Some(&"true".to_string()),
+        "ZDR-enabled owner's key must be labelled true"
+    );
+    assert_eq!(key_a_labels.get("purpose"), Some(&"realtime".to_string()));
+
+    let key_b_labels = targets.key_labels.get(KEY_B_SECRET).expect("user B's key should carry labels");
+    assert_eq!(
+        key_b_labels.get("zdr"),
+        Some(&"false".to_string()),
+        "non-ZDR owner's key must still carry an explicit false label"
     );
 }
 

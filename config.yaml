@@ -433,6 +433,19 @@ cache:
   # service name resolves to the tokenizer-svc in the pod's own namespace.
   # Set via environment: DWCTL_CACHE__TOKENIZER_URL=http://tokenizer-svc:8088
   tokenizer_url: http://localhost:8088
+  # The cache TTL tiers the platform currently offers (Anthropic-style: "5m", "1h", "24h").
+  # A request whose cache_control marker names a tier NOT listed here is rejected with a 400
+  # (like an unknown parameter), not silently un-cached, so billing stays honest. Restrict
+  # this to roll out a subset (e.g. omit "24h" until the KV-store mechanism exists); a model
+  # may still carry a tariff for a disabled tier, it just can't be reached until re-enabled.
+  # Set via environment: DWCTL_CACHE__ENABLED_TTLS=5m,1h
+  enabled_ttls:
+    - 5m
+    - 1h
+  # The tier a cache_control marker with no explicit ttl defaults to (Anthropic defaults to
+  # "5m"). Must be one of enabled_ttls.
+  # Set via environment: DWCTL_CACHE__DEFAULT_TTL=5m
+  default_ttl: 5m
   # Default pricing multipliers — pre-fill values when enabling caching on a model without
   # explicit per-tier rates. The model_cache_tariffs row is the source of truth, so these
   # only matter at enable-time. Defaults shown; uncomment to override.

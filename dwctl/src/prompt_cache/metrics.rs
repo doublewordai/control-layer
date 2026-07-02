@@ -34,8 +34,10 @@ pub fn record_marker_request(marked: bool) {
 
 /// Request-level cache behaviour across ALL traffic. `outcome` ∈ `read` | `create_only` |
 /// `read_and_create` | `zero_active` (enabled but nothing cached) | `inactive` (model not
-/// enabled / no key). **No `model` label** — `inactive` covers unknown/typo models (raw
-/// input → unbounded); per-model volumes are on `record_token_volumes` (enabled-only).
+/// enabled / no key) | `aborted` (streaming request whose client disconnected before classify was
+/// joined — the outcome is unknown, including whether it would even have been cache-active).
+/// **No `model` label** — `inactive` covers unknown/typo models (raw input → unbounded); per-model
+/// volumes are on `record_token_volumes` (enabled-only).
 pub fn record_request_outcome(outcome: &'static str) {
     counter!("dwctl_cache_requests_total", "outcome" => outcome).increment(1);
 }
@@ -60,8 +62,10 @@ pub fn record_token_volumes(model: &str, read: u64, creation_5m: u64, creation_1
 
 // ── Classify path ─────────────────────────────────────────────────────────────
 
-/// Classify-join result. `outcome` ∈ `ok` | `deadline_exceeded` | `error` | `panicked`.
-/// `deadline_exceeded` is the primary "tokenizer/index outage is adding latency" signal.
+/// Classify-join result. `outcome` ∈ `ok` | `deadline_exceeded` | `error` | `panicked` |
+/// `abandoned` (streaming request whose client disconnected before the join, so the task was
+/// aborted un-joined). `deadline_exceeded` is the primary "tokenizer/index outage is adding
+/// latency" signal; a high `abandoned` rate flags wasted classify work from client disconnects.
 pub fn record_classify(outcome: &'static str) {
     counter!("dwctl_cache_classify_total", "outcome" => outcome).increment(1);
 }
@@ -123,9 +127,11 @@ pub fn record_commit(result: &'static str) {
     counter!("dwctl_cache_commit_total", "result" => result).increment(1);
 }
 
-/// Write skipped by the success gate. `reason` ∈ `non_2xx` (non-billable response) |
-/// `stream_aborted` (mid-stream error frame or client disconnect). A high veto rate flags
-/// upstream instability / wasted classify.
+/// Write skipped by the success gate. `reason` ∈ `non_2xx` (non-billable status) |
+/// `error_frame` (2xx stream that carried a mid-stream error frame) | `no_usage` (2xx response
+/// that never emitted a usage frame/object, so there's nothing billable to gate on). A high veto
+/// rate flags upstream instability / wasted classify. (A true client disconnect aborts the
+/// deferred classify before the gate runs, so it isn't counted here.)
 pub fn record_commit_vetoed(reason: &'static str) {
     counter!("dwctl_cache_commit_vetoed_total", "reason" => reason).increment(1);
 }
@@ -145,7 +151,10 @@ pub fn record_body_read_failed() {
     counter!("dwctl_cache_body_read_failed_total").increment(1);
 }
 
-/// Marker validation rejection. `reason` ∈ `too_many_breakpoints` | `invalid_ttl` | `unsupported_type`.
+/// Marker validation rejection — now a 400 to the client (the cache layer rejects synchronously
+/// before forwarding), not a silent no-cache. `reason` ∈ `too_many_breakpoints` | `invalid_ttl` |
+/// `unsupported_type` | `tier_disabled` (a valid tier the platform has turned off in config) |
+/// `malformed_cache_control` (a non-object `cache_control`, a missing/non-string `type`, or a non-string `ttl`).
 pub fn record_markers_rejected(reason: &'static str) {
     counter!("dwctl_cache_markers_rejected_total", "reason" => reason).increment(1);
 }
