@@ -837,7 +837,10 @@ async fn test_outlet_suppresses_zdr_bodies(pool: PgPool) {
     // outlet's migrator would reject that unknown history (in production outlet
     // gets its own schema/DB with its own migration table).
     for migration in outlet_postgres::migrator().iter() {
-        sqlx::raw_sql(migration.sql.as_ref()).execute(&pool).await.expect("apply outlet migration");
+        sqlx::raw_sql(migration.sql.as_ref())
+            .execute(&pool)
+            .await
+            .expect("apply outlet migration");
     }
 
     // Real analytics handler wrapped in the scrubber, mirroring lib.rs wiring.
@@ -897,7 +900,10 @@ async fn test_outlet_suppresses_zdr_bodies(pool: PgPool) {
     assert!(body_of("http_requests", 1).await.is_none(), "ZDR request body must not be logged");
     assert!(body_of("http_responses", 1).await.is_none(), "ZDR response body must not be logged");
     assert!(body_of("http_requests", 2).await.is_some(), "non-ZDR request body should be logged");
-    assert!(body_of("http_responses", 2).await.is_some(), "non-ZDR response body should be logged");
+    assert!(
+        body_of("http_responses", 2).await.is_some(),
+        "non-ZDR response body should be logged"
+    );
 }
 
 #[sqlx::test]

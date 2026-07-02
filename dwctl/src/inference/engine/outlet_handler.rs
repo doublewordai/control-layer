@@ -595,16 +595,30 @@ mod tests {
     #[tokio::test]
     async fn zdr_scrubber_blanks_marked_response_bodies() {
         let rec = BodyRecorder::default();
-        ZdrBodyScrubber::new(rec.clone()).handle_response(body_request(true), body_response()).await;
-        assert_eq!(*rec.req.lock().unwrap(), Some(None), "ZDR request body must be blanked on response log");
+        ZdrBodyScrubber::new(rec.clone())
+            .handle_response(body_request(true), body_response())
+            .await;
+        assert_eq!(
+            *rec.req.lock().unwrap(),
+            Some(None),
+            "ZDR request body must be blanked on response log"
+        );
         assert_eq!(*rec.resp.lock().unwrap(), Some(None), "ZDR response body must be blanked");
     }
 
     #[tokio::test]
     async fn zdr_scrubber_passes_through_unmarked() {
         let rec = BodyRecorder::default();
-        ZdrBodyScrubber::new(rec.clone()).handle_response(body_request(false), body_response()).await;
-        assert!(rec.req.lock().unwrap().clone().unwrap().is_some(), "non-ZDR request body must pass through");
-        assert!(rec.resp.lock().unwrap().clone().unwrap().is_some(), "non-ZDR response body must pass through");
+        ZdrBodyScrubber::new(rec.clone())
+            .handle_response(body_request(false), body_response())
+            .await;
+        assert!(
+            rec.req.lock().unwrap().clone().unwrap().is_some(),
+            "non-ZDR request body must pass through"
+        );
+        assert!(
+            rec.resp.lock().unwrap().clone().unwrap().is_some(),
+            "non-ZDR response body must pass through"
+        );
     }
 }

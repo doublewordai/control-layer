@@ -739,7 +739,10 @@ async fn test_realtime_zdr_rejects_server_side_tools(pool: PgPool) {
     assert_eq!(rejected.status_code(), 400, "ZDR + server-side tools must be rejected");
     let body: serde_json::Value = rejected.json();
     assert!(
-        body["error"]["message"].as_str().unwrap_or("").contains("Zero-data-retention is not supported"),
+        body["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("Zero-data-retention is not supported"),
         "unexpected error body: {body}"
     );
 

@@ -20,8 +20,8 @@ use std::collections::HashSet;
 use utoipa::ToSchema;
 
 use crate::AppState;
-use crate::inference::store::ResponseLookup;
 use crate::errors::{Error, Result};
+use crate::inference::store::ResponseLookup;
 
 /// Response body for `DELETE /v1/responses/{response_id}`.
 ///

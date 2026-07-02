@@ -72,10 +72,7 @@ async fn load(pool: &PgPool) -> Result<HashMap<String, bool>, sqlx::Error> {
     .fetch_all(pool)
     .await?;
 
-    Ok(rows
-        .into_iter()
-        .map(|r| (r.secret, r.zero_data_retention))
-        .collect())
+    Ok(rows.into_iter().map(|r| (r.secret, r.zero_data_retention)).collect())
 }
 
 /// Reload `cache` in place from the DB, returning the number of keys loaded.
@@ -101,15 +98,9 @@ pub async fn initial_cache(pool: &PgPool) -> Result<ZdrKeyCache, sqlx::Error> {
 /// Background task: keep `cache` fresh. Listens on `auth_config_changed` and
 /// reloads (debounced), with a periodic fallback reload to recover from any
 /// missed notification. Returns when `shutdown` fires.
-pub async fn run(
-    pool: PgPool,
-    cache: ZdrKeyCache,
-    fallback_interval_ms: u64,
-    shutdown: CancellationToken,
-) -> Result<(), anyhow::Error> {
+pub async fn run(pool: PgPool, cache: ZdrKeyCache, fallback_interval_ms: u64, shutdown: CancellationToken) -> Result<(), anyhow::Error> {
     const MIN_RELOAD_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
-    let fallback =
-        (fallback_interval_ms > 0).then(|| std::time::Duration::from_millis(fallback_interval_ms));
+    let fallback = (fallback_interval_ms > 0).then(|| std::time::Duration::from_millis(fallback_interval_ms));
 
     'outer: loop {
         let mut listener = PgListener::connect_with(&pool).await?;
@@ -179,10 +170,7 @@ mod tests {
 
     #[test]
     fn is_zdr_reflects_the_maps_flag() {
-        let cache = ZdrKeyCache::from_pairs([
-            ("sk-on".to_string(), true),
-            ("sk-off".to_string(), false),
-        ]);
+        let cache = ZdrKeyCache::from_pairs([("sk-on".to_string(), true), ("sk-off".to_string(), false)]);
         assert!(cache.is_zdr("sk-on"));
         assert!(!cache.is_zdr("sk-off"));
         // Absent key (deleted/invalid, auth rejects it anyway) is non-ZDR.

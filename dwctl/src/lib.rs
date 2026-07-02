@@ -152,8 +152,8 @@ pub mod encryption;
 mod error_enrichment;
 pub mod errors;
 pub mod image_normalizer;
-pub mod keystore;
 pub mod inference;
+pub mod keystore;
 mod leader_election;
 pub mod limits;
 mod metrics;
@@ -2396,9 +2396,7 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
     // TRANSITIONAL ZDR response transformer on the manager before the daemon
     // spawns below, so completed bodies are persisted encrypted.
     if let Some(ks) = keystore.clone()
-        && let Err(e) = request_manager.set_response_transformer(std::sync::Arc::new(
-            crate::inference::zdr::ZdrResponseEncryptor::new(ks),
-        ))
+        && let Err(e) = request_manager.set_response_transformer(std::sync::Arc::new(crate::inference::zdr::ZdrResponseEncryptor::new(ks)))
     {
         tracing::warn!(error = e, "ZDR response transformer was already set; skipping");
     }
@@ -2475,15 +2473,16 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
         (onwards::target::Targets::from_config(empty_config)?, None)
     };
 
-    // Per-key ZDR policy map: an initial synchronous load so the map is never
-    // empty under live traffic (an empty map reads every key as non-ZDR and
-    // would leak a ZDR account's body during warm-up), then a lightweight
-    // listener refreshes it. Gated on the same switch as onwards config sync,
-    // with which it shares the `auth_config_changed` channel.
-    let zdr_key_cache = if config.background_services.onwards_sync.enabled {
-        let cache = crate::sync::zdr_keys::initial_cache(&pool).await?;
+    // Per-key ZDR policy map: an initial synchronous load ALWAYS runs, so the
+    // map is never empty under live traffic (an empty map reads every key as
+    // non-ZDR and would silently leak a ZDR account's body). Only the
+    // LISTEN/NOTIFY refresh loop is gated on onwards config sync, with which it
+    // shares the `auth_config_changed` channel; with sync disabled the map is
+    // still correct at startup, it just does not pick up later policy changes.
+    let zdr_key_cache = crate::sync::zdr_keys::initial_cache(&pool).await?;
+    if config.background_services.onwards_sync.enabled {
         let zdr_pool = pool.clone();
-        let zdr_cache = cache.clone();
+        let zdr_cache = zdr_key_cache.clone();
         let zdr_shutdown = shutdown_token.clone();
         let zdr_fallback = config.background_services.onwards_sync.fallback_interval_milliseconds;
         background_tasks.spawn("zdr-key-sync", async move {
@@ -2491,10 +2490,7 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
                 .await
                 .context("ZDR key sync failed")
         });
-        cache
-    } else {
-        crate::sync::zdr_keys::ZdrKeyCache::empty()
-    };
+    }
 
     // Leader election lock ID: 0x44574354_50524F42 (DWCT_PROB in hex for "dwctl probes")
     const LEADER_LOCK_ID: i64 = 0x4457_4354_5052_4F42_i64;
@@ -3024,14 +3020,14 @@ impl Application {
         // daemon processor, and background services (which install the response
         // transformer). A misconfiguration is fatal.
         let keystore = match config.keystore.as_ref() {
-            Some(c) => Some(
-                crate::keystore::Keystore::from_config(c)
-                    .map_err(|e| anyhow::anyhow!("failed to initialise keystore: {e}"))?,
-            ),
+            Some(c) => Some(crate::keystore::Keystore::from_config(c).map_err(|e| anyhow::anyhow!("failed to initialise keystore: {e}"))?),
             None => None,
         };
-        let response_store =
-            Arc::new(crate::inference::store::FusilladeResponseStore::new(request_manager.clone()).with_step_manager(step_manager.clone()).with_keystore(keystore.clone()));
+        let response_store = Arc::new(
+            crate::inference::store::FusilladeResponseStore::new(request_manager.clone())
+                .with_step_manager(step_manager.clone())
+                .with_keystore(keystore.clone()),
+        );
 
         // Build the image normaliser ONCE — fail loud at startup if
         // `image_normalizer.enabled = true` but no backend is configured.

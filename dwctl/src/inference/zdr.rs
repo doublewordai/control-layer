@@ -119,12 +119,17 @@ pub enum DecryptOutcome {
 
 /// Resolve the plaintext response body for a (possibly ZDR) request.
 ///
-/// Pure in its inputs: given the request id and the stored `response_body`, it
-/// returns the plaintext to render ([`DecryptOutcome::Decrypted`]), a signal to
-/// render the stored body untouched ([`DecryptOutcome::Unchanged`], for
-/// non-ZDR or absent bodies), or [`DecryptOutcome::Gone`] when the envelope's
-/// key is missing. One keystore lookup, so the caller decides gone-vs-render
-/// atomically without a second probe. Used by the retrieval render paths.
+/// Given the request id and the stored `response_body`, returns the plaintext
+/// to render ([`DecryptOutcome::Decrypted`]), a signal to render the stored body
+/// untouched ([`DecryptOutcome::Unchanged`], for non-ZDR or absent bodies), or
+/// [`DecryptOutcome::Gone`] when the envelope's key is missing. Used by the
+/// retrieval render paths.
+///
+/// Crypto-shred on retrieval: a successful decrypt deletes the response key, so
+/// the body is unrecoverable on any later read (a subsequent retrieval sees the
+/// key gone and returns [`DecryptOutcome::Gone`]). The delete is best-effort -
+/// if the keystore is briefly unreachable the plaintext is still returned this
+/// once and the key's TTL remains the backstop.
 pub async fn decrypt_response_body(
     keystore: &crate::keystore::Keystore,
     request_id: &Uuid,
@@ -136,8 +141,18 @@ pub async fn decrypt_response_body(
     if !is_zdr_body(body) {
         return Ok(DecryptOutcome::Unchanged);
     }
-    match keystore.get(&key_id(request_id, KeyKind::Response)).await? {
-        Some(key) => Ok(DecryptOutcome::Decrypted(decrypt_body(&key, body)?)),
+    let response_key_id = key_id(request_id, KeyKind::Response);
+    match keystore.get(&response_key_id).await? {
+        Some(key) => {
+            let plaintext = decrypt_body(&key, body)?;
+            // Shred on retrieval (plan: "Deleted on retrieval. TTL is the
+            // backstop."). Best-effort: a failed delete still returns the body
+            // and leans on the key's TTL to shred it later.
+            if let Err(e) = keystore.delete(&response_key_id).await {
+                tracing::warn!(error = %e, "ZDR response key delete-on-retrieval failed; relying on TTL");
+            }
+            Ok(DecryptOutcome::Decrypted(plaintext))
+        }
         None => Ok(DecryptOutcome::Gone),
     }
 }
@@ -164,8 +179,19 @@ impl fusillade::ResponseTransformer for ZdrResponseEncryptor {
         // absent -> not ZDR (or key already gone), pass through; unreachable ->
         // fail rather than persist plaintext.
         match self.keystore.get(&key_id(&request_id.0, KeyKind::Response)).await {
-            Ok(Some(key)) => encrypt_body(&key, body)
-                .map_err(|e| fusillade::FusilladeError::Other(anyhow::anyhow!("ZDR response encrypt failed: {e}"))),
+            Ok(Some(key)) => {
+                let encrypted = encrypt_body(&key, body)
+                    .map_err(|e| fusillade::FusilladeError::Other(anyhow::anyhow!("ZDR response encrypt failed: {e}")))?;
+                // This is the terminal store (the daemon only reaches persist() on
+                // a terminal outcome; retriable-and-will-retry failures reschedule
+                // to pending instead), so the prompt is done being dispatched -
+                // crypto-shred the request key now (plan: "Deleted when a terminal
+                // response is stored"). Best-effort: the key's TTL is the backstop.
+                if let Err(e) = self.keystore.delete(&key_id(&request_id.0, KeyKind::Request)).await {
+                    tracing::warn!(error = %e, "ZDR request key shred-on-terminal failed; relying on TTL");
+                }
+                Ok(encrypted)
+            }
             Ok(None) => Ok(body.to_string()),
             Err(e) => Err(fusillade::FusilladeError::Other(anyhow::anyhow!(
                 "ZDR keystore error during response encrypt: {e}"
@@ -208,10 +234,7 @@ mod tests {
 
     #[test]
     fn is_zdr_request_reads_the_key_map() {
-        let cache = crate::sync::zdr_keys::ZdrKeyCache::from_pairs([
-            ("sk-on".to_string(), true),
-            ("sk-off".to_string(), false),
-        ]);
+        let cache = crate::sync::zdr_keys::ZdrKeyCache::from_pairs([("sk-on".to_string(), true), ("sk-off".to_string(), false)]);
         assert!(is_zdr_request(&cache, Some("sk-on")));
         assert!(!is_zdr_request(&cache, Some("sk-off")));
         // Absent key (deleted/invalid, auth-rejected) reads as non-ZDR.

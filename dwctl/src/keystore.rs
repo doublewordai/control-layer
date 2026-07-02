@@ -136,10 +136,7 @@ impl WrapKeyring {
         }
         let (id_bytes, sealed) = rest.split_at(id_len);
         let id = std::str::from_utf8(id_bytes).map_err(|_| KeystoreError::MalformedWrappedValue)?;
-        let wrap_key = self
-            .keys
-            .get(id)
-            .ok_or_else(|| KeystoreError::UnknownWrapKeyId(id.to_string()))?;
+        let wrap_key = self.keys.get(id).ok_or_else(|| KeystoreError::UnknownWrapKeyId(id.to_string()))?;
         Ok(encryption::decrypt(wrap_key, sealed)?)
     }
 }
@@ -215,7 +212,11 @@ impl Keystore {
         let pool = RedisConfig::from_url(cfg.redis_url.clone())
             .create_pool(Some(Runtime::Tokio1))
             .map_err(|e| KeystoreError::Config(format!("failed to create redis pool: {e}")))?;
-        Ok(Self { pool, keyring, default_ttl: Duration::from_secs(cfg.default_ttl_seconds) })
+        Ok(Self {
+            pool,
+            keyring,
+            default_ttl: Duration::from_secs(cfg.default_ttl_seconds),
+        })
     }
 
     /// The configured default TTL, applied when `put` is called with `None`.
@@ -330,6 +331,9 @@ mod tests {
     fn current_id_must_be_in_keyring() {
         let mut keys = HashMap::new();
         keys.insert("a".to_string(), encryption::derive_encryption_key("x"));
-        assert!(matches!(WrapKeyring::new("missing".to_string(), keys).unwrap_err(), KeystoreError::Config(_)));
+        assert!(matches!(
+            WrapKeyring::new("missing".to_string(), keys).unwrap_err(),
+            KeystoreError::Config(_)
+        ));
     }
 }

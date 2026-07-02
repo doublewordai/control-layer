@@ -196,15 +196,15 @@ where
         // rest of the flow sees plaintext. The response is re-encrypted on its way
         // back through the loopback layer.
         if crate::inference::zdr::is_zdr_body(&request.data.body) {
-            let keystore = self.keystore.as_ref().ok_or_else(|| {
-                fusillade::FusilladeError::Other(anyhow::anyhow!("ZDR request claimed but keystore is not configured"))
-            })?;
+            let keystore = self
+                .keystore
+                .as_ref()
+                .ok_or_else(|| fusillade::FusilladeError::Other(anyhow::anyhow!("ZDR request claimed but keystore is not configured")))?;
             let key_id = crate::inference::zdr::key_id(&request.data.id.0, crate::inference::zdr::KeyKind::Request);
             match keystore.get(&key_id).await {
                 Ok(Some(key)) => {
-                    request.data.body = crate::inference::zdr::decrypt_body(&key, &request.data.body).map_err(|e| {
-                        fusillade::FusilladeError::Other(anyhow::anyhow!("ZDR request decrypt failed: {e}"))
-                    })?;
+                    request.data.body = crate::inference::zdr::decrypt_body(&key, &request.data.body)
+                        .map_err(|e| fusillade::FusilladeError::Other(anyhow::anyhow!("ZDR request decrypt failed: {e}")))?;
                     // TRANSITIONAL (dwctl ZDR): mark the dispatch so the loopback
                     // analytics handler blanks the now-plaintext body instead of
                     // logging it. fusillade forwards batch_metadata entries as
@@ -212,7 +212,10 @@ where
                     // `x-fusillade-batch-zdr: 1`; the outlet handler reads that.
                     // Piggybacks the existing header channel to avoid a fusillade
                     // API change - drop when reassembly moves into dwctl.
-                    request.data.batch_metadata.insert(crate::inference::zdr::ZDR_MARKER_KEY.to_string(), "1".to_string());
+                    request
+                        .data
+                        .batch_metadata
+                        .insert(crate::inference::zdr::ZDR_MARKER_KEY.to_string(), "1".to_string());
                 }
                 Ok(None) => {
                     // Key expired or was deleted before dispatch: the prompt is

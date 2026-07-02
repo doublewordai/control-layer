@@ -224,10 +224,7 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
     // outlet logs that ZDR cannot cover. Reject at submit for both tiers, keyed
     // on per-key policy alone (a keystore is irrelevant to whether we can
     // safely serve the request).
-    if is_responses_api
-        && has_tools
-        && crate::inference::zdr::is_zdr_request(&state.zdr_key_cache, api_key.as_deref())
-    {
+    if is_responses_api && has_tools && crate::inference::zdr::is_zdr_request(&state.zdr_key_cache, api_key.as_deref()) {
         return Response::builder()
             .status(StatusCode::BAD_REQUEST)
             .header("content-type", "application/json")

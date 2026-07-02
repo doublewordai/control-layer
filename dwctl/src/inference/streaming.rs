@@ -169,7 +169,8 @@ where
     tokio::spawn(async move {
         let poll_interval = std::time::Duration::from_millis(500);
         let timeout = std::time::Duration::from_secs(3600);
-        let result = crate::inference::store::poll_until_terminal(&request_manager, request_id, poll_interval, timeout, keystore.as_ref()).await;
+        let result =
+            crate::inference::store::poll_until_terminal(&request_manager, request_id, poll_interval, timeout, keystore.as_ref()).await;
 
         let frames = match &result {
             Ok(detail) => render(Ok(detail)),
