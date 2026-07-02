@@ -4,8 +4,9 @@
 //! Two jobs, both run by the cache tower layer (only when a cacheable request is
 //! classified):
 //!
-//! 1. **Outbound request sanitisation** ([`strip_cache_control`]): recursively remove
-//!    every `cache_control` marker from the request body, and ensure
+//! 1. **Outbound request sanitisation** ([`strip_cache_control`]): remove `cache_control`
+//!    markers from the exact locations the parser reads them (message content blocks and
+//!    tool objects) — NOT recursively — and ensure
 //!    `stream_options.include_usage = true` so a streaming response carries a terminal
 //!    usage frame to edit. Markers are a billing signal consumed here, not forwarded.
 //! 2. **Response usage injection**: splice the neutral [`CacheStats`] into the OpenAI `usage`
@@ -23,36 +24,54 @@ use tracing::error;
 
 use super::stats::CacheStats;
 
-/// Recursively remove every `cache_control` field from a JSON value. Returns
-/// `(rewrote, had_marker)`: `rewrote` = any key was removed (so the body changed and must be
-/// re-serialised before forwarding — a `cache_control` field would otherwise leak to the
-/// upstream); `had_marker` = any removed value was NON-NULL, the adoption signal. An explicit
-/// `cache_control: null` is "no marker" (matching parse/validation), but is still stripped.
-fn remove_cache_control(value: &mut Value) -> (bool, bool) {
+/// Remove `cache_control` markers from the request body at exactly the locations the parser
+/// reads them — each `messages[i].content[j]` block and each `tools[i]` object — and NOWHERE
+/// else. Returns `(rewrote, had_marker)`: `rewrote` = a marker was removed (so the body
+/// changed and must be re-serialised before forwarding — a marker would otherwise leak
+/// upstream); `had_marker` = a removed value was NON-NULL, the adoption signal. An explicit
+/// `cache_control: null` is "no marker" (matching parse/validation) but is still stripped.
+///
+/// Deliberately **not recursive**: a `cache_control` nested inside a tool's JSON Schema (e.g.
+/// a function parameter literally named `cache_control`) is the caller's own data — deleting
+/// it would corrupt the tool the model sees, and it isn't a marker. Stripping only the marker
+/// locations also keeps the forwarded bytes identical to what [`super::parse`] hashes/tokenizes.
+fn remove_cache_control(body: &mut Value) -> (bool, bool) {
     let mut rewrote = false;
     let mut had_marker = false;
-    match value {
-        Value::Object(map) => {
-            if let Some(removed) = map.remove("cache_control") {
-                rewrote = true;
-                had_marker |= !removed.is_null();
-            }
-            for v in map.values_mut() {
-                let (r, h) = remove_cache_control(v);
-                rewrote |= r;
-                had_marker |= h;
-            }
-        }
-        Value::Array(items) => {
-            for v in items.iter_mut() {
-                let (r, h) = remove_cache_control(v);
-                rewrote |= r;
-                had_marker |= h;
+    let Some(obj) = body.as_object_mut() else {
+        return (false, false);
+    };
+
+    // Message content blocks (array-form content only; string content carries no marker).
+    if let Some(messages) = obj.get_mut("messages").and_then(Value::as_array_mut) {
+        for msg in messages.iter_mut() {
+            if let Some(content) = msg.get_mut("content").and_then(Value::as_array_mut) {
+                for block in content.iter_mut() {
+                    strip_block_marker(block, &mut rewrote, &mut had_marker);
+                }
             }
         }
-        _ => {}
     }
+
+    // Tool definitions: the top-level of each tool object only — never into its schema.
+    if let Some(tools) = obj.get_mut("tools").and_then(Value::as_array_mut) {
+        for tool in tools.iter_mut() {
+            strip_block_marker(tool, &mut rewrote, &mut had_marker);
+        }
+    }
+
     (rewrote, had_marker)
+}
+
+/// Remove a single top-level `cache_control` marker from one block/tool object, recording
+/// whether the body changed and whether the marker was non-null.
+fn strip_block_marker(value: &mut Value, rewrote: &mut bool, had_marker: &mut bool) {
+    if let Some(obj) = value.as_object_mut()
+        && let Some(removed) = obj.remove("cache_control")
+    {
+        *rewrote = true;
+        *had_marker |= !removed.is_null();
+    }
 }
 
 /// Sanitise an outbound request body: strip every `cache_control` marker and, for
@@ -372,6 +391,50 @@ mod tests {
         assert!(!had_markers, "null cache_control is not a marker");
         let out = out.expect("body rewritten to drop the null cache_control key");
         assert!(!out.windows(13).any(|w| w == b"cache_control"), "cache_control key removed");
+    }
+
+    #[test]
+    fn strip_removes_tool_marker_but_preserves_schema_field_named_cache_control() {
+        // The top-level tool marker is stripped, but a `cache_control` that is a legitimate
+        // JSON-Schema property inside the tool is the caller's data and must be forwarded
+        // untouched (the recursive strip used to delete it, corrupting the tool).
+        let body = serde_json::json!({
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "set_config",
+                    "parameters": {"type": "object", "properties": {
+                        "cache_control": {"type": "string", "description": "a real argument"}
+                    }}
+                },
+                "cache_control": {"type": "ephemeral", "ttl": "1h"}
+            }],
+            "messages": [{"role": "user", "content": "hi"}]
+        })
+        .to_string();
+        let (out, had_markers) = strip_cache_control(body.as_bytes());
+        assert!(had_markers, "the top-level tool marker is a marker");
+        let v: Value = serde_json::from_slice(&out.expect("body rewritten")).unwrap();
+        assert!(v["tools"][0].get("cache_control").is_none(), "tool marker stripped");
+        assert!(
+            v["tools"][0]["function"]["parameters"]["properties"]["cache_control"].is_object(),
+            "legitimate schema field preserved"
+        );
+    }
+
+    #[test]
+    fn strip_schema_field_named_cache_control_alone_is_not_a_marker() {
+        // A tool with NO top-level marker but a schema property named cache_control: nothing
+        // to strip, no adoption signal, body left untouched.
+        let body = serde_json::json!({
+            "tools": [{"type": "function", "function": {"name": "f", "parameters": {
+                "type": "object", "properties": {"cache_control": {"type": "string"}}}}}],
+            "messages": [{"role": "user", "content": "hi"}]
+        })
+        .to_string();
+        let (out, had_markers) = strip_cache_control(body.as_bytes());
+        assert!(!had_markers, "a schema field is not a marker");
+        assert!(out.is_none(), "nothing stripped, body unchanged");
     }
 
     #[test]
