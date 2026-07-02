@@ -29,6 +29,7 @@ use sqlx_pool_router::PoolProvider;
 use super::image_normalizer_middleware::{normalize_error_response, normalize_value_to_tokens};
 use super::store::{self as response_store, ONWARDS_RESPONSE_ID_HEADER, OnwardsDaemonId};
 use super::streaming::{ReplayFrame, flex_stream_response};
+use crate::db::{errors::DbError, handlers::api_keys::ApiKeys, models::api_keys::ApiKeyPurpose};
 use crate::image_normalizer::ImageNormalizer;
 
 /// State for the inference middleware.
@@ -278,6 +279,40 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
     } else {
         None
     };
+    let flex_batch_key = if matches!(service_tier, ServiceTier::Flex) {
+        match resolve_flex_batch_api_key(&state.dwctl_pool, api_key.as_deref()).await {
+            Ok(Some(key)) => Some(key),
+            Ok(None) => {
+                tracing::warn!("Flex API key disappeared before hidden batch-key resolution");
+                return Response::builder()
+                    .status(StatusCode::UNAUTHORIZED)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"error": {"message": "Invalid API key", "type": "invalid_request_error"}}).to_string(),
+                    ))
+                    .unwrap();
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "Failed to resolve flex hidden batch key");
+                return Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "error": {
+                                "message": "Failed to prepare flex request",
+                                "type": "server_error",
+                                "code": 500,
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap();
+            }
+        }
+    } else {
+        None
+    };
 
     match service_tier {
         ServiceTier::Realtime => {
@@ -350,6 +385,15 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                 obj.remove("stream_options");
             }
 
+            let flex_api_key = flex_batch_key
+                .as_ref()
+                .map(|key| key.secret.clone())
+                .unwrap_or_else(|| api_key.clone().unwrap_or_default());
+            let flex_created_by = flex_batch_key
+                .as_ref()
+                .map(|key| key.target_user_id.to_string())
+                .or_else(|| created_by.clone())
+                .unwrap_or_default();
             let flex_input = fusillade::CreateFlexInput {
                 request_id,
                 body: request_value.to_string(),
@@ -357,8 +401,8 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                 endpoint: state.loopback_base_url.clone(),
                 method: "POST".to_string(),
                 path: endpoint.clone(),
-                api_key: api_key.clone().unwrap_or_default(),
-                created_by: created_by.unwrap_or_default(),
+                api_key: flex_api_key,
+                created_by: flex_created_by,
             };
 
             match (is_chat_completions_api, flex_stream) {
@@ -378,6 +422,44 @@ enum ServiceTier {
     Realtime,
     /// Flex: batch of 1 with 1h completion window, processed by fusillade daemon.
     Flex,
+}
+
+#[derive(Debug, Clone)]
+struct FlexBatchApiKey {
+    secret: String,
+    target_user_id: uuid::Uuid,
+}
+
+async fn resolve_flex_batch_api_key(pool: &sqlx::PgPool, api_key: Option<&str>) -> Result<Option<FlexBatchApiKey>, DbError> {
+    let Some(api_key) = api_key else {
+        return Ok(None);
+    };
+
+    let row = sqlx::query(
+        r#"
+        SELECT user_id, created_by
+        FROM api_keys
+        WHERE secret = $1 AND is_deleted = false
+        LIMIT 1
+        "#,
+    )
+    .bind(api_key)
+    .fetch_optional(pool)
+    .await?;
+
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let target_user_id: uuid::Uuid = sqlx::Row::get(&row, "user_id");
+    let created_by: uuid::Uuid = sqlx::Row::get(&row, "created_by");
+
+    let mut conn = pool.acquire().await?;
+    let mut api_keys_repo = ApiKeys::new(&mut conn);
+    let secret = api_keys_repo
+        .get_or_create_hidden_key(target_user_id, ApiKeyPurpose::Batch, created_by)
+        .await?;
+
+    Ok(Some(FlexBatchApiKey { secret, target_user_id }))
 }
 
 impl std::fmt::Display for ServiceTier {
@@ -1075,6 +1157,67 @@ mod tests {
     #[test]
     fn test_resolve_service_tier_flex() {
         assert!(matches!(resolve_service_tier(Some("flex")), ServiceTier::Flex));
+    }
+
+    #[sqlx::test]
+    async fn resolve_flex_batch_key_uses_hidden_batch_key_for_key_owner(pool: sqlx::PgPool) {
+        use crate::api::models::{api_keys::ApiKeyCreate, users::Role};
+        use crate::db::{
+            handlers::{Repository, api_keys::ApiKeys},
+            models::api_keys::{ApiKeyCreateDBRequest, ApiKeyPurpose},
+        };
+
+        let user = crate::test::utils::create_test_user(&pool, Role::BatchAPIUser).await;
+        let org = crate::test::utils::create_test_org(&pool, user.id).await;
+        let realtime_key = {
+            let mut conn = pool.acquire().await.expect("acquire connection");
+            let mut repo = ApiKeys::new(&mut conn);
+            repo.create(&ApiKeyCreateDBRequest::new(
+                org.id,
+                user.id,
+                ApiKeyCreate {
+                    name: "Org realtime key".to_string(),
+                    description: None,
+                    purpose: ApiKeyPurpose::Realtime,
+                    requests_per_second: None,
+                    burst_size: None,
+                    member_id: None,
+                },
+            ))
+            .await
+            .expect("create realtime key")
+            .secret
+        };
+
+        let flex_key = resolve_flex_batch_api_key(&pool, Some(&realtime_key))
+            .await
+            .expect("resolve flex key")
+            .expect("known realtime key should resolve");
+
+        assert_ne!(flex_key.secret, realtime_key);
+        assert_eq!(flex_key.target_user_id, org.id);
+
+        let row = sqlx::query(
+            r#"
+            SELECT user_id, created_by, purpose, hidden
+            FROM api_keys
+            WHERE secret = $1
+            "#,
+        )
+        .bind(&flex_key.secret)
+        .fetch_one(&pool)
+        .await
+        .expect("hidden key row");
+
+        let row_user_id: uuid::Uuid = sqlx::Row::get(&row, "user_id");
+        let row_created_by: uuid::Uuid = sqlx::Row::get(&row, "created_by");
+        let row_purpose: String = sqlx::Row::get(&row, "purpose");
+        let row_hidden: bool = sqlx::Row::get(&row, "hidden");
+
+        assert_eq!(row_user_id, org.id);
+        assert_eq!(row_created_by, user.id);
+        assert_eq!(row_purpose, "batch");
+        assert!(row_hidden);
     }
 
     // Routing-decision tests for `warm_path_branch`. The whole point
