@@ -9,9 +9,13 @@
 //! `cache_control` directive itself, so identical content carrying different markers
 //! matches, and the hashed bytes are exactly what onwards forwards after stripping.
 //!
-//! v1 scope: text content blocks on chat-completions messages. Tools-level markers
-//! and image-token caching are deferred — image blocks still contribute to the
-//! prefix hash but carry no text, so their tokens fall into the uncached tail.
+//! Scope: text content blocks on chat-completions messages, plus **tool definitions**
+//! (the `tools` array — hashed first, in the canonical tools → system → messages order).
+//! A tool's write-side token count is an *estimate*: we tokenize the tool's JSON, not the
+//! model's chat-template rendering of it (which adds scaffolding we don't count) — the same
+//! content-vs-rendered approximation already used for message text. Image-token caching is
+//! deferred — image blocks still contribute to the prefix hash but carry no text, so their
+//! tokens fall into the uncached tail.
 
 use sha2::{Digest, Sha256};
 
@@ -26,6 +30,11 @@ pub const MAX_BREAKPOINTS: usize = 4;
 /// write before giving up (a match further back is a genuine miss — the documented fix is
 /// a second breakpoint). Bounds the per-request lookup-candidate set.
 pub const WALK_BACK: usize = 20;
+
+/// Synthetic role for tool-definition blocks (the `tools` array). Distinct from the `tool`
+/// *message* role (tool results) so the two hash into different cache entries, and included
+/// in the block hash like any other role.
+const TOOL_DEFINITION_ROLE: &str = "tool_definition";
 
 #[derive(Debug, thiserror::Error)]
 pub enum ParseError {
@@ -93,6 +102,36 @@ pub fn parse_chat_completions(body: &[u8], policy: &TierPolicy) -> Result<Parsed
     let mut breakpoints: Vec<Breakpoint> = Vec::new();
     let mut cumulative_hashes: Vec<Vec<u8>> = Vec::new();
     let mut hasher = Sha256::new();
+
+    // Tools come FIRST in the canonical tools → system → messages order, so hash them before
+    // the messages. Each tool definition is one block; a `cache_control` on the tool object
+    // (`tools[i].cache_control` — the slot OpenAI clients set directly and the Anthropic
+    // ingress translation maps its native tool marker to) marks a breakpoint. The block text
+    // is the tool's JSON, tokenized as an estimate of the tool's contribution.
+    if let Some(tools) = v.get("tools").and_then(|t| t.as_array()) {
+        for tool in tools {
+            let ttl = match tool.get("cache_control") {
+                Some(cc) if !cc.is_null() => Some(parse_ttl(cc, policy)?),
+                _ => None,
+            };
+            let stripped = strip_cache_control(tool);
+            // The whole tool schema is the write-side text (no single "text" field).
+            let text = serde_json::to_string(&stripped).unwrap_or_default();
+
+            let canonical = canonical_block_bytes(TOOL_DEFINITION_ROLE, &stripped);
+            hasher.update(&canonical);
+            cumulative_hashes.push(hasher.clone().finalize().to_vec());
+
+            let block_index = blocks.len();
+            blocks.push(Block {
+                role: TOOL_DEFINITION_ROLE.to_string(),
+                text,
+            });
+            if let Some(ttl_tier) = ttl {
+                breakpoints.push(Breakpoint { block_index, ttl_tier });
+            }
+        }
+    }
 
     if let Some(messages) = v.get("messages").and_then(|m| m.as_array()) {
         for msg in messages {
@@ -190,6 +229,23 @@ fn parse_ttl(cache_control: &serde_json::Value, policy: &TierPolicy) -> Result<T
 /// to extract `model` — no extra deserialization.
 pub fn validate_markers(body: &serde_json::Value, policy: &TierPolicy) -> Result<(), ParseError> {
     let mut breakpoints = 0usize;
+    // Tool-definition markers (`tools[i].cache_control`) count toward the same breakpoint cap
+    // and are validated identically — a malformed/disabled marker on a tool is a 400, not a
+    // silent no-cache.
+    if let Some(tools) = body.get("tools").and_then(|t| t.as_array()) {
+        for tool in tools {
+            match tool.get("cache_control") {
+                Some(cc) if !cc.is_null() => {
+                    parse_ttl(cc, policy)?;
+                    breakpoints += 1;
+                    if breakpoints > MAX_BREAKPOINTS {
+                        return Err(ParseError::TooManyBreakpoints);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
     if let Some(messages) = body.get("messages").and_then(|m| m.as_array()) {
         for msg in messages {
             if let Some(arr) = msg.get("content").and_then(|c| c.as_array()) {
@@ -525,5 +581,107 @@ mod tests {
             "messages": [{"role": "system", "content": [{"type": "text", "text": "abc"}]}]
         });
         assert_eq!(parse(body.clone()).cumulative_hashes, parse(body).cumulative_hashes);
+    }
+
+    #[test]
+    fn tool_definition_marker_creates_breakpoint() {
+        let p = parse(serde_json::json!({
+            "tools": [
+                {"type": "function", "function": {"name": "lookup", "parameters": {}},
+                 "cache_control": {"type": "ephemeral", "ttl": "1h"}}
+            ],
+            "messages": [{"role": "user", "content": "q"}]
+        }));
+        // The tool is block 0 (hashed before the message), and carries a breakpoint.
+        assert_eq!(p.blocks.len(), 2);
+        assert_eq!(p.blocks[0].role, "tool_definition");
+        assert_eq!(p.blocks[1].role, "user");
+        assert_eq!(p.breakpoints.len(), 1);
+        assert_eq!(p.breakpoints[0].block_index, 0);
+        assert_eq!(p.breakpoints[0].ttl_tier, TtlTier::OneHour);
+        // The tool's JSON is its write-side text (tokenized as the estimate).
+        assert!(p.blocks[0].text.contains("lookup"));
+    }
+
+    #[test]
+    fn tools_hashed_before_messages() {
+        let with_tool = parse(serde_json::json!({
+            "tools": [{"type": "function", "function": {"name": "f", "parameters": {}}}],
+            "messages": [{"role": "system", "content": "sys"}, {"role": "user", "content": "q"}]
+        }));
+        let without = parse(serde_json::json!({
+            "messages": [{"role": "system", "content": "sys"}, {"role": "user", "content": "q"}]
+        }));
+        // tool + 2 messages = 3 blocks, tool first (tools → system → messages).
+        assert_eq!(with_tool.blocks.len(), 3);
+        assert_eq!(with_tool.blocks[0].role, "tool_definition");
+        assert_eq!(with_tool.blocks[1].role, "system");
+        // Adding a tool changes the system-block prefix hash — tools participate in the prefix.
+        assert_ne!(with_tool.cumulative_hashes[1], without.cumulative_hashes[0]);
+    }
+
+    #[test]
+    fn tool_marker_excluded_from_hash() {
+        // Same tool, one marked and one not — the marker is stripped before hashing, so a
+        // marked write and an unmarked follow-up (or vice-versa) still match.
+        let marked = parse(serde_json::json!({
+            "tools": [{"type": "function", "function": {"name": "f", "parameters": {}},
+                       "cache_control": {"type": "ephemeral", "ttl": "1h"}}]
+        }));
+        let unmarked = parse(serde_json::json!({
+            "tools": [{"type": "function", "function": {"name": "f", "parameters": {}}}]
+        }));
+        assert_eq!(marked.cumulative_hashes[0], unmarked.cumulative_hashes[0]);
+    }
+
+    #[test]
+    fn tool_markers_count_toward_breakpoint_cap() {
+        // 3 tool markers + 2 content markers = 5 > MAX_BREAKPOINTS, on both paths.
+        let tools: Vec<_> = (0..3)
+            .map(|i| {
+                serde_json::json!({
+                "type": "function", "function": {"name": format!("f{i}"), "parameters": {}},
+                "cache_control": {"type": "ephemeral"}})
+            })
+            .collect();
+        let body = serde_json::json!({
+            "tools": tools,
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "a", "cache_control": {"type": "ephemeral"}},
+                {"type": "text", "text": "b", "cache_control": {"type": "ephemeral"}}
+            ]}]
+        });
+        assert!(matches!(
+            validate_markers(&body, &all_tiers()).unwrap_err(),
+            ParseError::TooManyBreakpoints
+        ));
+        assert!(matches!(
+            parse_chat_completions(body.to_string().as_bytes(), &all_tiers()).unwrap_err(),
+            ParseError::TooManyBreakpoints
+        ));
+    }
+
+    #[test]
+    fn validate_markers_accepts_tool_marker() {
+        let body = serde_json::json!({
+            "tools": [{"type": "function", "function": {"name": "f", "parameters": {}},
+                       "cache_control": {"type": "ephemeral", "ttl": "1h"}}],
+            "messages": [{"role": "user", "content": "q"}]
+        });
+        assert!(validate_markers(&body, &all_tiers()).is_ok());
+    }
+
+    #[test]
+    fn disabled_tier_on_tool_marker_rejected() {
+        // A 24h marker on a tool is rejected identically to one on a content block.
+        let policy = TierPolicy::from_config(&["5m".to_string(), "1h".to_string()], "5m");
+        let body = serde_json::json!({
+            "tools": [{"type": "function", "function": {"name": "f", "parameters": {}},
+                       "cache_control": {"type": "ephemeral", "ttl": "24h"}}]
+        });
+        assert!(matches!(
+            validate_markers(&body, &policy).unwrap_err(),
+            ParseError::DisabledTier(TtlTier::TwentyFourHours)
+        ));
     }
 }
