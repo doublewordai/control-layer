@@ -1619,6 +1619,7 @@ export interface OrganizationSummary {
   id: string;
   name: string;
   role: string;
+  zero_data_retention: boolean; // Whether the organization has zero data retention enabled
 }
 
 /** Organization response — flattened User with org-specific fields */

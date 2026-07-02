@@ -727,7 +727,9 @@ describe("Organization Context", () => {
         auto_topup_monthly_limit: null,
         has_auto_topup_payment_method: false,
         active_organization_id: ORG_ID,
-        organizations: [{ id: ORG_ID, name: ORG_NAME, role }],
+        organizations: [
+          { id: ORG_ID, name: ORG_NAME, role, zero_data_retention: false },
+        ],
       });
     });
   }
