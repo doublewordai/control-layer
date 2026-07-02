@@ -1187,6 +1187,7 @@ pub async fn list_user_organizations<P: PoolProvider>(
                     id: o.id,
                     name: o.username.clone(),
                     role: m.role.clone(),
+                    zero_data_retention: o.zero_data_retention,
                 })
         })
         .collect();
@@ -1875,6 +1876,58 @@ mod tests {
         assert_eq!(members.len(), 1);
         assert_eq!(members[0]["role"].as_str().unwrap(), "owner");
         assert_eq!(members[0]["user"]["id"].as_str().unwrap(), user.id.to_string());
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_user_organizations_summary_reflects_org_zero_data_retention(pool: PgPool) {
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        let user_headers = add_auth_headers(&user);
+        let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let admin_headers = add_auth_headers(&admin);
+
+        // User self-serves an org and becomes its owner.
+        let resp = server
+            .post("/admin/api/v1/organizations")
+            .add_header(&user_headers[0].0, &user_headers[0].1)
+            .add_header(&user_headers[1].0, &user_headers[1].1)
+            .json(&json!({ "name": "zdr-org", "email": "contact@zdr-org.com" }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::CREATED);
+        let org_id = resp.json::<serde_json::Value>()["id"].as_str().unwrap().to_string();
+
+        let orgs_url = format!("/admin/api/v1/users/{}/organizations", user.id);
+
+        // The membership summary defaults to zero_data_retention = false.
+        let resp = server
+            .get(&orgs_url)
+            .add_header(&user_headers[0].0, &user_headers[0].1)
+            .add_header(&user_headers[1].0, &user_headers[1].1)
+            .await;
+        resp.assert_status(axum::http::StatusCode::OK);
+        let orgs = resp.json::<Vec<serde_json::Value>>();
+        assert_eq!(orgs.len(), 1);
+        assert_eq!(orgs[0]["zero_data_retention"].as_bool(), Some(false));
+
+        // An admin enables ZDR on the org.
+        let resp = server
+            .patch(&format!("/admin/api/v1/organizations/{org_id}"))
+            .add_header(&admin_headers[0].0, &admin_headers[0].1)
+            .add_header(&admin_headers[1].0, &admin_headers[1].1)
+            .json(&json!({ "zero_data_retention": true }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::OK);
+
+        // The member's org-membership summary now reflects the org's flag.
+        let resp = server
+            .get(&orgs_url)
+            .add_header(&user_headers[0].0, &user_headers[0].1)
+            .add_header(&user_headers[1].0, &user_headers[1].1)
+            .await;
+        resp.assert_status(axum::http::StatusCode::OK);
+        let orgs = resp.json::<Vec<serde_json::Value>>();
+        assert_eq!(orgs[0]["zero_data_retention"].as_bool(), Some(true));
     }
 
     #[sqlx::test]
