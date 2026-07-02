@@ -1050,7 +1050,7 @@ version = "3.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "519bd3116aeeb42d5372c29d982d16d0170d3d4a5ed85fc7dd91642ffff3c67c"
 dependencies = [
- "darling 0.20.11",
+ "darling 0.23.0",
  "ident_case",
  "prettyplease",
  "proc-macro2",
@@ -1312,9 +1312,9 @@ dependencies = [
 
 [[package]]
 name = "cmov"
-version = "0.5.3"
+version = "0.5.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3f88a43d011fc4a6876cb7344703e297c71dda42494fee094d5f7c76bf13f746"
+checksum = "0c9ea0ac24bc397ab3c98583a3c9ba74fa56b09a4449bbe172b9b1ddb016027a"
 
 [[package]]
 name = "colorchoice"
@@ -1872,6 +1872,7 @@ dependencies = [
  "arc-swap",
  "argon2",
  "async-openai",
+ "async-stream",
  "async-stripe",
  "async-stripe-billing",
  "async-stripe-checkout",
@@ -1896,13 +1897,14 @@ dependencies = [
  "dashmap",
  "figment",
  "flate2",
- "fusillade",
+ "fusillade 19.3.0",
  "futures",
  "google-cloud-auth",
  "google-cloud-storage",
  "hex",
  "hickory-resolver",
  "hmac 0.13.0",
+ "http-body-util",
  "humantime",
  "humantime-serde",
  "jsonwebtoken",
@@ -2336,6 +2338,40 @@ name = "fusillade"
 version = "18.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bd3868ec40891b50efee32ac38298dae5c2012600c6e08e837ddc294c78ee75c"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "dashmap",
+ "eventsource-stream",
+ "futures",
+ "hostname",
+ "humantime",
+ "metrics",
+ "openai-reassembler",
+ "opentelemetry",
+ "parking_lot",
+ "rand 0.10.1",
+ "reqwest 0.13.3",
+ "scopeguard",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "sqlx-pool-router",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "tracing",
+ "tracing-opentelemetry",
+ "uuid",
+]
+
+[[package]]
+name = "fusillade"
+version = "19.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "517323e17311969a36c92711b90c880a5c28c0bbccd3138b3b8826c35fd14927"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4195,9 +4231,9 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "onwards"
-version = "0.33.4"
+version = "0.34.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "245f7822a57b6e90cc272cc7ccae9a6235c9e379b4588aa7bc60559cae9561e3"
+checksum = "000f5b251360369b7ba7bb46d114764cced46148924c4413892f69b5a2ce9d63"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -4211,7 +4247,7 @@ dependencies = [
  "dashmap",
  "eventsource-stream",
  "flate2",
- "fusillade",
+ "fusillade 18.0.2",
  "futures-util",
  "governor",
  "http-body-util",
