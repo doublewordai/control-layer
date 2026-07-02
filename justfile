@@ -527,6 +527,8 @@ lint target *args="":
             cargo fmt --check
             echo "Running cargo clippy..."
             cargo clippy {{args}}
+            echo "Running ZDR no-payload-logging guard..."
+            ./scripts/check-no-payload-logging.sh
             echo "Checking SQLx prepared queries..."
             cargo sqlx prepare --check --workspace
             ;;
