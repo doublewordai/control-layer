@@ -98,7 +98,7 @@ fn marker_rejection_response(e: &ParseError, policy: &TierPolicy) -> Response {
             "message": message,
             "type": "invalid_request_error",
             "code": "invalid_cache_control",
-            "param": "messages[].content[].cache_control / tools[].cache_control",
+            "param": "cache_control",
         }
     });
     (StatusCode::BAD_REQUEST, axum::Json(body)).into_response()

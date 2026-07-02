@@ -10,7 +10,11 @@
 //! matches, and the hashed bytes are exactly what onwards forwards after stripping.
 //!
 //! Scope: text content blocks on chat-completions messages, plus **tool definitions**
-//! (the `tools` array — hashed first, in the canonical tools → system → messages order).
+//! (the `tools` array). Tools are hashed **before** `messages`; within each array, blocks
+//! are hashed in the order sent — we do NOT reorder or partition out `system`. So the
+//! canonical `tools → system → messages` hierarchy is a convention the caller must follow
+//! (send `system` first) for stable cache keys; order-normalization will come with a single
+//! canonical internal representation.
 //! A tool's write-side token count is an *estimate*: we tokenize the tool's JSON, not the
 //! model's chat-template rendering of it (which adds scaffolding we don't count) — the same
 //! content-vs-rendered approximation already used for message text. Image-token caching is
