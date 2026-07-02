@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.68.3](https://github.com/doublewordai/control-layer/compare/v8.68.2...v8.68.3) (2026-07-01)
+
+
+### Bug Fixes
+
+* **db:** bound credits_transactions autovacuum + raise user_id stats target ([#1212](https://github.com/doublewordai/control-layer/issues/1212)) ([5cb550b](https://github.com/doublewordai/control-layer/commit/5cb550b1132764b08cf4cedd829163f1127d9ae2))
+
 ## [8.68.2](https://github.com/doublewordai/control-layer/compare/v8.68.1...v8.68.2) (2026-07-01)
 
 
