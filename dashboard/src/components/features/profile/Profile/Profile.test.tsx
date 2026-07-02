@@ -103,7 +103,7 @@ describe("Profile Component", () => {
     server.use(currentUserWithZdr(true));
 
     const { container } = await renderAndWaitForProfile();
-    expect(container.textContent).toMatch(/zero data retention: enabled/i);
+    expect(container.textContent).toMatch(/zero data retention:\s*enabled/i);
   });
 
   it("does not show zero data retention when the account has it off", async () => {

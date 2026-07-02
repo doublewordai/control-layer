@@ -340,9 +340,10 @@ export const Profile: React.FC = () => {
                 {currentUser?.zero_data_retention && (
                   <div className="flex items-center text-sm">
                     <ShieldCheck className="w-4 h-4 text-gray-400 mr-2 shrink-0" />
-                    <span className="text-gray-900">
-                      Zero Data Retention: enabled
+                    <span className="text-gray-600 shrink-0">
+                      Zero Data Retention:
                     </span>
+                    <span className="text-gray-900 ml-1">enabled</span>
                     <HoverCard openDelay={150} closeDelay={200}>
                       <HoverCardTrigger asChild>
                         <Info className="w-3 h-3 text-gray-400 cursor-pointer ml-1.5 shrink-0" />
