@@ -1,5 +1,13 @@
 # Changelog
 
+## [8.70.0](https://github.com/doublewordai/control-layer/compare/v8.69.0...v8.70.0) (2026-07-02)
+
+
+### Features
+
+* surface zero data retention to org members (summary + org/profile pages) ([#1217](https://github.com/doublewordai/control-layer/issues/1217)) ([db5f1e9](https://github.com/doublewordai/control-layer/commit/db5f1e92325c23d3da272d73e89c91436d7cafe7))
+* tool definitions included in inour caching ([#1220](https://github.com/doublewordai/control-layer/issues/1220)) ([c82fb39](https://github.com/doublewordai/control-layer/commit/c82fb39dba91709ff0b43aab10473167514bb5b6))
+
 ## [8.69.0](https://github.com/doublewordai/control-layer/compare/v8.68.3...v8.69.0) (2026-07-02)
 
 
