@@ -113,7 +113,7 @@ impl<'c> Organizations<'c> {
                    is_admin, password_hash, external_user_id, payment_provider_id,
                    is_deleted, is_internal, batch_notifications_enabled, first_batch_email_sent,
                    low_balance_notification_sent, low_balance_threshold,
-                   auto_topup_amount, auto_topup_threshold, auto_topup_monthly_limit, user_type
+                   auto_topup_amount, auto_topup_threshold, auto_topup_monthly_limit, user_type, zero_data_retention
             FROM users
             WHERE username = $1 AND user_type = 'organization' AND is_deleted = false
             "#,
@@ -151,6 +151,7 @@ impl<'c> Organizations<'c> {
                     auto_topup_threshold: r.auto_topup_threshold,
                     auto_topup_monthly_limit: r.auto_topup_monthly_limit,
                     user_type: r.user_type,
+                    zero_data_retention: r.zero_data_retention,
                 }))
             }
             None => Ok(None),
@@ -176,7 +177,7 @@ impl<'c> Organizations<'c> {
                       is_admin, password_hash, external_user_id, payment_provider_id,
                       is_deleted, is_internal, batch_notifications_enabled, first_batch_email_sent,
                       low_balance_notification_sent, low_balance_threshold,
-                      auto_topup_amount, auto_topup_threshold, auto_topup_monthly_limit, user_type
+                      auto_topup_amount, auto_topup_threshold, auto_topup_monthly_limit, user_type, zero_data_retention
             "#,
             org_id,
             request.name,
@@ -234,6 +235,7 @@ impl<'c> Organizations<'c> {
             auto_topup_threshold: row.auto_topup_threshold,
             auto_topup_monthly_limit: row.auto_topup_monthly_limit,
             user_type: row.user_type,
+            zero_data_retention: row.zero_data_retention,
         })
     }
 
@@ -270,13 +272,14 @@ impl<'c> Organizations<'c> {
                     WHEN $6::boolean THEN false
                     ELSE low_balance_notification_sent
                 END,
+                zero_data_retention = COALESCE($8, zero_data_retention),
                 updated_at = NOW()
             WHERE id = $1 AND user_type = 'organization' AND is_deleted = false
             RETURNING id, username, email, display_name, avatar_url, auth_source, created_at, updated_at,
                       is_admin, password_hash, external_user_id, payment_provider_id,
                       batch_notifications_enabled, first_batch_email_sent,
                       low_balance_notification_sent, low_balance_threshold,
-                      auto_topup_amount, auto_topup_threshold, auto_topup_monthly_limit, user_type
+                      auto_topup_amount, auto_topup_threshold, auto_topup_monthly_limit, user_type, zero_data_retention
             "#,
             id,
             request.display_name,
@@ -285,6 +288,7 @@ impl<'c> Organizations<'c> {
             request.batch_notifications_enabled,
             request.low_balance_threshold.is_some() as bool,
             request.low_balance_threshold.flatten(),
+            request.zero_data_retention,
         )
         .fetch_optional(&mut *self.db)
         .await?
@@ -317,6 +321,7 @@ impl<'c> Organizations<'c> {
             auto_topup_threshold: row.auto_topup_threshold,
             auto_topup_monthly_limit: row.auto_topup_monthly_limit,
             user_type: row.user_type,
+            zero_data_retention: row.zero_data_retention,
         })
     }
 
@@ -1027,6 +1032,7 @@ mod tests {
                     email: Some("new@acme.example.com".to_string()),
                     batch_notifications_enabled: None,
                     low_balance_threshold: None,
+                    zero_data_retention: None,
                 },
             )
             .await
@@ -1069,6 +1075,7 @@ mod tests {
                     email: Some("new@acme.example.com".to_string()),
                     batch_notifications_enabled: None,
                     low_balance_threshold: None,
+                    zero_data_retention: None,
                 },
             )
             .await
@@ -1114,6 +1121,7 @@ mod tests {
                     email: None,
                     batch_notifications_enabled: Some(true),
                     low_balance_threshold: Some(Some(10.0)),
+                    zero_data_retention: None,
                 },
             )
             .await
@@ -1133,6 +1141,7 @@ mod tests {
                     email: None,
                     batch_notifications_enabled: None,
                     low_balance_threshold: Some(Some(25.0)),
+                    zero_data_retention: None,
                 },
             )
             .await
@@ -1153,6 +1162,7 @@ mod tests {
                     email: None,
                     batch_notifications_enabled: None,
                     low_balance_threshold: Some(None),
+                    zero_data_retention: None,
                 },
             )
             .await
@@ -1171,6 +1181,7 @@ mod tests {
                     email: None,
                     batch_notifications_enabled: None,
                     low_balance_threshold: None,
+                    zero_data_retention: None,
                 },
             )
             .await

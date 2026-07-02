@@ -748,7 +748,9 @@ const UsersGroups: React.FC = () => {
             username: activeUser.username,
             avatar: activeUser.avatar,
             roles: activeUser.roles,
+            zero_data_retention: activeUser.zero_data_retention,
           }}
+          canEditZdr={isPlatformManager}
         />
       )}
       {activeGroup && (
@@ -779,6 +781,7 @@ const UsersGroups: React.FC = () => {
         isOpen={!!editingOrg}
         onClose={() => setEditingOrg(null)}
         organization={editingOrg}
+        canEditZdr={isPlatformManager}
       />
       <Dialog
         open={!!deletingOrg}
