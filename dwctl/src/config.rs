@@ -2515,12 +2515,8 @@ impl Config {
         Figment::new()
             // Load base config file
             .merge(Yaml::file(config_path))
-            // Environment variables can still override specific values.
-            // `DWCTL_ZDR_ALL_FLEX` is read directly via std::env (see
-            // inference::zdr) and is not a Config field, so it must be excluded
-            // here or figment's deny_unknown_fields rejects it. Drop this with
-            // the temporary flag.
-            .merge(Env::prefixed("DWCTL_").split("__").ignore(&["zdr_all_flex"]))
+            // Environment variables can still override specific values
+            .merge(Env::prefixed("DWCTL_").split("__"))
             // Common DATABASE_URL and DATABASE_REPLICA_URL patterns
             // Accept both DATABASE_REPLICA_URL and DWCTL_DATABASE_REPLICA_URL
             .merge(Env::raw().only(&["DATABASE_URL", "DATABASE_REPLICA_URL"]))

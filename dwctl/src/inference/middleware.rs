@@ -61,6 +61,11 @@ pub struct InferenceMiddlewareState<P: PoolProvider + Clone = sqlx_pool_router::
     pub image_normalizer_enabled: bool,
     /// Encrypted key custody for ZDR flex bodies. `None` disables ZDR.
     pub keystore: Option<crate::keystore::Keystore>,
+    /// Per-key ZDR policy map (api key secret to the owning account's
+    /// `zero_data_retention` flag), kept fresh by [`crate::sync::zdr_keys`].
+    /// Read by [`super::zdr::is_zdr_request`] on the submit path. Defaults to
+    /// empty (every key reads as non-ZDR) when the sync is not wired.
+    pub zdr_key_cache: crate::sync::zdr_keys::ZdrKeyCache,
 }
 
 /// Middleware that routes inference requests based on service_tier and background.
@@ -211,6 +216,26 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
     //   no tools, !flex                              → falls through to handle_realtime below
     //   any flex                                     → falls through to handle_flex below
     let stream_requested = is_responses_api && !background && request_value["stream"].as_bool().unwrap_or(false);
+
+    // ZDR + server-side tools (responses API) runs the multi-step tool loop —
+    // inline on the realtime warm path, async in the flex daemon — which
+    // scatters plaintext into response_steps / sub-request rows / per-step
+    // outlet logs that ZDR cannot cover. Reject at submit for both tiers, keyed
+    // on per-key policy alone (a keystore is irrelevant to whether we can
+    // safely serve the request).
+    if is_responses_api
+        && has_tools
+        && crate::inference::zdr::is_zdr_request(&state.zdr_key_cache, api_key.as_deref())
+    {
+        return Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({"error": {"message": "Zero-data-retention is not supported for requests that use server-side tools.", "type": "invalid_request_error"}}).to_string(),
+            ))
+            .unwrap();
+    }
+
     match warm_path_branch(is_responses_api, is_flex, background, stream_requested, has_tools) {
         WarmPathBranch::Stream => {
             if let Some(resp) = try_warm_path_stream(&state, &request_value, api_key.as_deref(), model).await {
@@ -283,9 +308,16 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
 
     match service_tier {
         ServiceTier::Realtime => {
+            // Realtime ZDR is non-persistence (no encryption): decided per-key
+            // from the same policy map as flex, but without a keystore since we
+            // suppress the stored copies rather than encrypt them.
+            let zdr = crate::inference::zdr::is_zdr_request(&state.zdr_key_cache, api_key.as_deref());
             let realtime_input = fusillade::CreateRealtimeInput {
                 request_id,
-                body: request_value.to_string(),
+                // ZDR: never persist the request body to `request_templates`
+                // (background path). The live upstream call runs from
+                // `body_bytes` below, independent of this stored copy.
+                body: if zdr { String::new() } else { request_value.to_string() },
                 model: model.to_string(),
                 endpoint: state.loopback_base_url.clone(),
                 method: "POST".to_string(),
@@ -293,21 +325,26 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                 api_key: api_key.clone().unwrap_or_default(),
                 created_by: created_by.unwrap_or_default(),
             };
-            handle_realtime(&state, realtime_input, &resp_id, model, background, parts, body_bytes, next).await
+            handle_realtime(&state, realtime_input, &resp_id, model, background, zdr, parts, body_bytes, next).await
         }
         ServiceTier::Flex => {
-            // ZDR is decided once here at submit; dispatch and retrieve key off
-            // the stored body's sentinel instead of re-checking policy.
-            let zdr = crate::inference::zdr::is_zdr_request(state.keystore.is_some(), api_key.as_deref());
-            // The server-side tool loop scatters plaintext into sub-request rows,
-            // response_steps, and per-step outlet logs that ZDR cannot cover, so
-            // reject it at submit rather than leak.
-            if zdr && is_responses_api && has_tools {
+            // ZDR is decided once here at submit (per-key policy); dispatch and
+            // retrieve key off the stored body's sentinel instead of re-checking.
+            // The tool-using case is already rejected above, before the warm-path
+            // branch, for both tiers.
+            let zdr = crate::inference::zdr::is_zdr_request(&state.zdr_key_cache, api_key.as_deref());
+            // Flex encrypts the body at rest, which requires a configured
+            // keystore. A ZDR account whose request cannot be encrypted must fail
+            // loudly - never silently fall back to plaintext, and bail before we
+            // even ingest its images below. Missing keystore is a server
+            // misconfiguration, hence 500.
+            if zdr && state.keystore.is_none() {
+                tracing::error!("ZDR flex request but no keystore configured; refusing to store plaintext");
                 return Response::builder()
-                    .status(StatusCode::BAD_REQUEST)
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
                     .header("content-type", "application/json")
                     .body(Body::from(
-                        serde_json::json!({"error": {"message": "Zero-data-retention is not supported for requests that use server-side tools.", "type": "invalid_request_error"}}).to_string(),
+                        serde_json::json!({"error": {"message": "Zero-data-retention is enabled for this account but the server is not configured to store data securely; refusing to process the request.", "type": "server_error"}}).to_string(),
                     ))
                     .unwrap();
             }
@@ -513,6 +550,7 @@ async fn handle_realtime<P: PoolProvider + Clone + Send + Sync + 'static>(
     resp_id: &str,
     model: &str,
     background: bool,
+    zdr: bool,
     parts: axum::http::request::Parts,
     body_bytes: bytes::Bytes,
     next: Next,
@@ -554,6 +592,17 @@ async fn handle_realtime<P: PoolProvider + Clone + Send + Sync + 'static>(
     }
     if let Ok(value) = model.parse() {
         req.headers_mut().insert("x-onwards-model", value);
+    }
+    // ZDR realtime: mark the dispatch so outlet's `ZdrBodyScrubber` blanks the
+    // `http_requests`/`http_responses` bodies and `FusilladeOutletHandler`
+    // suppresses the request/response body it would persist. Reuses the flex
+    // marker header/channel; it is harmless if it reaches the provider, exactly
+    // like flex's other `x-fusillade-batch-*` metadata headers.
+    if zdr {
+        req.headers_mut().insert(
+            crate::inference::zdr::ZDR_MARKER_HEADER,
+            "1".parse().expect("static ZDR marker is a valid header value"),
+        );
     }
 
     if background {

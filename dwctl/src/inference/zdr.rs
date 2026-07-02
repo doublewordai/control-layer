@@ -31,24 +31,15 @@ pub const ZDR_MARKER_KEY: &str = "zdr";
 /// loopback (fusillade prefixes `batch_metadata` keys with `x-fusillade-batch-`).
 pub const ZDR_MARKER_HEADER: &str = "x-fusillade-batch-zdr";
 
-/// TEMPORARY gate: turns ZDR on for all flex requests when set - a stand-in for
-/// the per-API-key ZDR property being built separately. Read once. Remove once
-/// that property lands. Enable with `DWCTL_ZDR_ALL_FLEX=1` (or `true`).
-static ZDR_ALL_FLEX: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-    std::env::var("DWCTL_ZDR_ALL_FLEX")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
-});
-
-/// Whether a new flex request should be encrypted as ZDR. Decided once, at
-/// submit; dispatch and retrieve instead key off the body sentinel.
+/// Whether a request's key opts into ZDR. Decided once, at submit, from the
+/// per-key policy map ([`crate::sync::zdr_keys`]); dispatch and retrieve instead
+/// key off the body sentinel. A key absent from the map (deleted/invalid, which
+/// auth rejects anyway) reads as non-ZDR, and a `None` key never opts in.
 ///
-/// `keystore_configured` must be true for ZDR to be possible at all.
-pub fn is_zdr_request(keystore_configured: bool, _api_key: Option<&str>) -> bool {
-    // TODO(zdr): gate on the per-API-key ZDR property once it lands. The
-    // `_api_key` argument is threaded so that change stays local to this
-    // function.
-    keystore_configured && *ZDR_ALL_FLEX
+/// This answers per-key policy only. Callers that must encrypt (the flex path)
+/// additionally require a configured keystore.
+pub fn is_zdr_request(zdr_cache: &crate::sync::zdr_keys::ZdrKeyCache, api_key: Option<&str>) -> bool {
+    api_key.is_some_and(|key| zdr_cache.is_zdr(key))
 }
 
 /// Prepare a ZDR flex request for storage: strip the control fields fusillade's
@@ -216,8 +207,16 @@ mod tests {
     }
 
     #[test]
-    fn no_zdr_without_keystore() {
-        // Without a keystore, ZDR is impossible regardless of the env flag.
-        assert!(!is_zdr_request(false, None));
+    fn is_zdr_request_reads_the_key_map() {
+        let cache = crate::sync::zdr_keys::ZdrKeyCache::from_pairs([
+            ("sk-on".to_string(), true),
+            ("sk-off".to_string(), false),
+        ]);
+        assert!(is_zdr_request(&cache, Some("sk-on")));
+        assert!(!is_zdr_request(&cache, Some("sk-off")));
+        // Absent key (deleted/invalid, auth-rejected) reads as non-ZDR.
+        assert!(!is_zdr_request(&cache, Some("sk-unknown")));
+        // No key never opts in.
+        assert!(!is_zdr_request(&cache, None));
     }
 }

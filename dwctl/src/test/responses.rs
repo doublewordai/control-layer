@@ -590,6 +590,175 @@ async fn test_delete_response_404_for_unknown_id(pool: PgPool) {
     assert_eq!(resp.status_code(), 404);
 }
 
+/// Flip the account that owns `api_key` to zero-data-retention, then refresh
+/// the middleware's per-key cache so `is_zdr_request` sees it. The cache handle
+/// is shared, so this takes effect on the live server immediately.
+async fn enable_zdr_for_key(pool: &PgPool, bg: &crate::BackgroundServices, api_key: &str) {
+    sqlx::query(
+        "UPDATE users SET zero_data_retention = true \
+         WHERE id = (SELECT user_id FROM api_keys WHERE secret = $1)",
+    )
+    .bind(api_key)
+    .execute(pool)
+    .await
+    .unwrap();
+    bg.sync_zdr_keys(pool).await.unwrap();
+}
+
+/// Poll for the newest completed gpt-4o realtime row whose id is not `exclude`
+/// (pass `Uuid::nil()` to accept any). The outlet handler writes asynchronously.
+async fn poll_completed_row(pool: &PgPool, exclude: uuid::Uuid) -> uuid::Uuid {
+    let start = std::time::Instant::now();
+    while start.elapsed() < std::time::Duration::from_secs(5) {
+        let row = sqlx::query(
+            "SELECT id FROM fusillade.requests \
+             WHERE model = 'gpt-4o' AND state = 'completed' AND id <> $1 \
+             ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(exclude)
+        .fetch_optional(pool)
+        .await
+        .unwrap();
+        if let Some(row) = row {
+            return sqlx::Row::get(&row, "id");
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+    }
+    panic!("no completed fusillade row (excluding {exclude}) within 5s");
+}
+
+async fn response_body_len(pool: &PgPool, id: uuid::Uuid) -> i32 {
+    sqlx::query_scalar("SELECT length(coalesce(response_body, '')) FROM fusillade.requests WHERE id = $1")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+async fn request_body_len(pool: &PgPool, id: uuid::Uuid) -> i32 {
+    sqlx::query_scalar(
+        "SELECT length(coalesce(t.body, '')) \
+         FROM fusillade.requests r JOIN fusillade.request_templates t ON t.id = r.template_id \
+         WHERE r.id = $1",
+    )
+    .bind(id)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+/// A ZDR realtime request is non-persistence: it still round-trips and records a
+/// completion row, but the request and response bodies are suppressed at rest
+/// (blank in fusillade), while an identical non-ZDR request stores them.
+#[sqlx::test]
+#[test_log::test]
+async fn test_realtime_zdr_suppresses_stored_bodies(pool: PgPool) {
+    let mock_server = wiremock::MockServer::start().await;
+    mount_chat_completions_mock(&mock_server).await;
+
+    let (server, api_key, bg) = setup_ai_test(pool.clone(), &mock_server, true).await;
+
+    // Control (account NOT yet ZDR): the body IS stored. This makes the ZDR
+    // blank below a real negative, not a dead pipeline.
+    let control = server
+        .post("/ai/v1/chat/completions")
+        .add_header("Authorization", &format!("Bearer {}", api_key))
+        .add_header("Content-Type", "application/json")
+        .json(&serde_json::json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "control marker"}],
+            "service_tier": "priority"
+        }))
+        .await;
+    assert_eq!(control.status_code(), 200);
+    let control_id = poll_completed_row(&pool, uuid::Uuid::nil()).await;
+    assert!(
+        response_body_len(&pool, control_id).await > 0,
+        "non-ZDR response body should be stored"
+    );
+    assert!(
+        request_body_len(&pool, control_id).await > 0,
+        "non-ZDR request body should be stored"
+    );
+
+    // Now the account is ZDR.
+    enable_zdr_for_key(&pool, &bg, &api_key).await;
+
+    let zdr = server
+        .post("/ai/v1/chat/completions")
+        .add_header("Authorization", &format!("Bearer {}", api_key))
+        .add_header("Content-Type", "application/json")
+        .json(&serde_json::json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "secret zdr marker"}],
+            "service_tier": "priority"
+        }))
+        .await;
+    assert_eq!(zdr.status_code(), 200, "ZDR realtime request should still round-trip");
+
+    // A fresh completion row (not the control) with both bodies blanked.
+    let zdr_id = poll_completed_row(&pool, control_id).await;
+    assert_ne!(zdr_id, control_id);
+    assert_eq!(
+        response_body_len(&pool, zdr_id).await,
+        0,
+        "ZDR realtime response_body must be blank at rest"
+    );
+    assert_eq!(
+        request_body_len(&pool, zdr_id).await,
+        0,
+        "ZDR realtime request_templates.body must be blank at rest"
+    );
+}
+
+/// A ZDR account cannot use server-side tools on /v1/responses: the multi-step
+/// warm-path loop would scatter plaintext into response_steps / sub-request rows
+/// / per-step logs that ZDR cannot cover, so it is rejected at submit. A ZDR
+/// request WITHOUT tools is not rejected - the gate is tool-specific.
+#[sqlx::test]
+#[test_log::test]
+async fn test_realtime_zdr_rejects_server_side_tools(pool: PgPool) {
+    let mock_server = wiremock::MockServer::start().await;
+    mount_chat_completions_mock(&mock_server).await;
+
+    let (server, api_key, bg) = setup_ai_test(pool.clone(), &mock_server, true).await;
+    enable_zdr_for_key(&pool, &bg, &api_key).await;
+
+    // ZDR + /v1/responses + tools -> 400 at submit (before the warm path, so no
+    // upstream call is made).
+    let rejected = server
+        .post("/ai/v1/responses")
+        .add_header("Authorization", &format!("Bearer {}", api_key))
+        .add_header("Content-Type", "application/json")
+        .json(&serde_json::json!({
+            "model": "gpt-4o",
+            "input": "hello",
+            "tools": [{"type": "function", "name": "get_weather", "parameters": {"type": "object", "properties": {}}}]
+        }))
+        .await;
+    assert_eq!(rejected.status_code(), 400, "ZDR + server-side tools must be rejected");
+    let body: serde_json::Value = rejected.json();
+    assert!(
+        body["error"]["message"].as_str().unwrap_or("").contains("Zero-data-retention is not supported"),
+        "unexpected error body: {body}"
+    );
+
+    // Same ZDR key, no tools -> not rejected by the gate (falls through to the
+    // single-step realtime path).
+    let allowed = server
+        .post("/ai/v1/responses")
+        .add_header("Authorization", &format!("Bearer {}", api_key))
+        .add_header("Content-Type", "application/json")
+        .json(&serde_json::json!({"model": "gpt-4o", "input": "hello"}))
+        .await;
+    assert_ne!(
+        allowed.status_code(),
+        400,
+        "ZDR without tools must not hit the tools-rejection gate (got {})",
+        allowed.status_code()
+    );
+}
+
 // Removed: `test_flex_background_returns_202_with_queued_status`,
 // `test_flex_blocking_waits_for_completion`,
 // `test_priority_background_completes_and_is_retrievable`.

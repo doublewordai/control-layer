@@ -2026,6 +2026,10 @@ pub struct BackgroundServices {
     task_runner: Arc<tasks::TaskRunner>,
     is_leader: bool,
     onwards_targets: onwards::target::Targets,
+    /// Per-key ZDR policy map, initial-loaded and then refreshed by
+    /// [`crate::sync::zdr_keys`]. Handed to `AppState` so `is_zdr_request`
+    /// reads it on the request hot path.
+    zdr_key_cache: crate::sync::zdr_keys::ZdrKeyCache,
     #[cfg_attr(not(test), allow(dead_code))]
     onwards_sender: Option<tokio::sync::watch::Sender<onwards::target::Targets>>,
     #[allow(dead_code)] // Used in sync_onwards_config method
@@ -2241,6 +2245,17 @@ impl BackgroundServices {
             .send(new_targets)
             .map_err(|_| anyhow::anyhow!("Failed to send targets update"))?;
 
+        Ok(())
+    }
+
+    /// Manually refresh the per-key ZDR cache from the database (for testing).
+    /// The cache handle is shared (same `ArcSwap`) with the inference
+    /// middleware, so this immediately changes what `is_zdr_request` sees -
+    /// letting a test flip an account to ZDR mid-run without spawning the
+    /// LISTEN/NOTIFY loop.
+    #[cfg(test)]
+    pub async fn sync_zdr_keys(&self, pool: &sqlx::PgPool) -> anyhow::Result<()> {
+        crate::sync::zdr_keys::refresh(pool, &self.zdr_key_cache).await?;
         Ok(())
     }
 }
@@ -2459,6 +2474,28 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
         };
         (onwards::target::Targets::from_config(empty_config)?, None)
     };
+
+    // Per-key ZDR policy map: an initial synchronous load so the map is never
+    // empty under live traffic (an empty map reads every key as non-ZDR and
+    // would leak a ZDR account's body during warm-up), then a lightweight
+    // listener refreshes it. Gated on the same switch as onwards config sync,
+    // with which it shares the `auth_config_changed` channel.
+    let zdr_key_cache = if config.background_services.onwards_sync.enabled {
+        let cache = crate::sync::zdr_keys::initial_cache(&pool).await?;
+        let zdr_pool = pool.clone();
+        let zdr_cache = cache.clone();
+        let zdr_shutdown = shutdown_token.clone();
+        let zdr_fallback = config.background_services.onwards_sync.fallback_interval_milliseconds;
+        background_tasks.spawn("zdr-key-sync", async move {
+            crate::sync::zdr_keys::run(zdr_pool, zdr_cache, zdr_fallback, zdr_shutdown)
+                .await
+                .context("ZDR key sync failed")
+        });
+        cache
+    } else {
+        crate::sync::zdr_keys::ZdrKeyCache::empty()
+    };
+
     // Leader election lock ID: 0x44574354_50524F42 (DWCT_PROB in hex for "dwctl probes")
     const LEADER_LOCK_ID: i64 = 0x4457_4354_5052_4F42_i64;
 
@@ -2839,6 +2876,7 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
         task_runner,
         is_leader,
         onwards_targets: initial_targets,
+        zdr_key_cache,
         onwards_sender,
         strict_mode: config.onwards.strict_mode,
         analytics_sender,
@@ -3225,6 +3263,7 @@ impl Application {
             image_normalizer: image_normalizer.clone(),
             image_normalizer_enabled: config.image_normalizer.enabled,
             keystore: bg_services.keystore.clone(),
+            zdr_key_cache: bg_services.zdr_key_cache.clone(),
         };
 
         // Build onwards router from targets with body transform, response sanitization, and tool executor.

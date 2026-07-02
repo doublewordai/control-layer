@@ -182,6 +182,18 @@ impl RequestHandler for FusilladeOutletHandler {
                 .unwrap_or("")
                 .to_string();
 
+            // Realtime ZDR (marker set by the inference middleware): non-persistence.
+            // Suppress both bodies before the RequestsWriter stores them, so plaintext
+            // never lands in `requests.response_body` / `request_templates.body` —
+            // mirroring how `ZdrBodyScrubber` guards the analytics inserts. This handler
+            // is not wrapped by the scrubber (that would drop its `handle_abandoned`
+            // override), so the guard lives inline here.
+            let (response_body, request_body) = if request_is_zdr(&request_data) {
+                (String::new(), String::new())
+            } else {
+                (response_body, request_body)
+            };
+
             if let Err(e) = sender
                 .send(RawCompletedRequest {
                     request_id: ctx.request_id,
@@ -282,17 +294,35 @@ fn request_is_zdr(request: &RequestData) -> bool {
         == Some("1")
 }
 
-/// TRANSITIONAL (dwctl ZDR): wraps a body-logging outlet handler and blanks the
-/// request and response bodies of ZDR requests before the inner handler persists
-/// them, so plaintext ZDR bodies never reach the analytics DB (`http_requests` /
-/// `http_responses`).
+/// dwctl ZDR: a `RequestHandler` that blanks the request and response bodies of
+/// ZDR requests before the handler it wraps persists them, so plaintext ZDR
+/// bodies never reach the analytics DB (`http_requests` / `http_responses`).
 ///
-/// The analytics `PostgresHandler` is a generic logging component that knows
-/// nothing about ZDR, so rather than teach it we guard it from the outside.
-/// Detection is the [`request_is_zdr`] marker, present on both the request-log
-/// and response-log callbacks (fusillade sets it on the dispatch), which is why
-/// this covers the two separate inserts outlet-postgres does. Remove once
-/// response reassembly moves into dwctl.
+/// Where it runs: it is one link in the handler chain that the `outlet` crate's
+/// `RequestLoggerLayer` drives as traffic passes through the `/ai` proxy (it is
+/// dwctl code, not part of `outlet` itself). It wraps
+/// `outlet_postgres::PostgresHandler`, the component that does the actual
+/// inserts. That handler is a generic logger that knows nothing about ZDR, so
+/// rather than teach it we blank the body in the wrapper and then delegate - it
+/// never sees the plaintext.
+///
+/// This is NOT the fusillade-side encryptor. `ZdrResponseEncryptor` (in
+/// `crate::inference::zdr`) encrypts the body fusillade writes into its OWN db
+/// (`requests.response_body`), and exists because fusillade reassembles and
+/// persists the response itself; this scrubber only guards outlet's separate
+/// analytics tables. They share nothing but the goal of keeping a ZDR body out
+/// of a db.
+///
+/// Why a plaintext ZDR body reaches outlet at all:
+///   - realtime: the body is plaintext throughout (realtime ZDR is
+///     non-persistence, not encryption). The inference middleware stamps the
+///     [`request_is_zdr`] marker on the request.
+///   - flex: the daemon must decrypt the stored ciphertext to call the provider,
+///     and that decrypted dispatch is re-sent through the `/ai` loopback, which
+///     outlet captures. Fusillade forwards the marker from `batch_metadata`.
+///
+/// The marker is present on both the request and response callbacks, so both of
+/// PostgresHandler's inserts (`http_requests`, `http_responses`) are covered.
 #[derive(Clone)]
 pub struct ZdrBodyScrubber<H> {
     inner: H,
