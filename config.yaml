@@ -275,9 +275,12 @@ enable_request_logging: true # Enable request/response logging to database
 # expires (crypto-shred). Absent (the default) means ZDR is off and flex bodies
 # are stored in plaintext as before. See zdr-flex-encryption-plan.md.
 #
-# ZDR only activates when this section is present AND DWCTL_ZDR_ALL_FLEX=1 (a
-# temporary all-flex gate; a per-API-key flag will replace it). Configuring the
-# keystore alone does not change behaviour.
+# REQUIRED to serve flex requests from zero-data-retention accounts
+# (users.zero_data_retention, synced per-key into memory): the flex body is
+# encrypted at rest with keys held here. If a ZDR account sends a flex request
+# while this section is absent, the request is REJECTED (500) rather than stored
+# in plaintext. Non-ZDR flex requests are unaffected. Realtime ZDR needs no
+# keystore - it is non-persistence (bodies are suppressed, not encrypted).
 #
 # Local dev: run `just redis-start`, then uncomment the block below.
 keystore:
