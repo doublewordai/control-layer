@@ -43,6 +43,7 @@ const mockOrg: Organization = {
   auto_topup_threshold: null,
   has_auto_topup_payment_method: false,
   auto_topup_monthly_limit: null,
+  zero_data_retention: false,
   member_count: 5,
 };
 

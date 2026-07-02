@@ -80,6 +80,9 @@ pub struct UserUpdate {
     /// auto top-up charges, set to null to remove the limit. Omit entirely to leave unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]
     pub auto_topup_monthly_limit: Option<Option<f32>>,
+    /// Account-wide zero-data-retention flag. Admin-only: only callers with
+    /// UpdateAll on users may set this. Omit to leave unchanged.
+    pub zero_data_retention: Option<bool>,
 }
 
 /// Full user details returned by the API.
@@ -140,6 +143,8 @@ pub struct UserResponse {
     pub auto_topup_monthly_limit: Option<f32>,
     /// User type: 'individual' or 'organization'
     pub user_type: String,
+    /// Account-wide zero-data-retention flag.
+    pub zero_data_retention: bool,
     /// Organizations this user belongs to (only included if `include=organizations` is specified)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub organizations: Option<Vec<super::organizations::OrganizationSummary>>,
@@ -237,6 +242,7 @@ impl From<UserDBResponse> for UserResponse {
             has_auto_topup_payment_method: db.payment_provider_id.as_ref().is_some_and(|s| !s.is_empty()),
             auto_topup_monthly_limit: db.auto_topup_monthly_limit,
             user_type: db.user_type,
+            zero_data_retention: db.zero_data_retention,
             organizations: None,
             active_organization_id: None,
             onboarding_redirect_url: None,
