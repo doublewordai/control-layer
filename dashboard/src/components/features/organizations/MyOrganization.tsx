@@ -56,13 +56,13 @@ export function MyOrganization() {
               <span>Created {new Date(org.created_at).toLocaleDateString()}</span>
             </>
           )}
-          {org && (
+          {org?.zero_data_retention && (
             <Badge
-              variant={org.zero_data_retention ? "secondary" : "outline"}
-              title="Whether request and response payloads are retained for this organization"
+              variant="secondary"
+              title="Request and response payloads are not retained for this organization"
             >
               <ShieldCheck />
-              Zero data retention {org.zero_data_retention ? "on" : "off"}
+              Zero data retention
             </Badge>
           )}
         </div>

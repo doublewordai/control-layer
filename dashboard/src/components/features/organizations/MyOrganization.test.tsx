@@ -130,21 +130,22 @@ describe("MyOrganization", () => {
     ).not.toBeInTheDocument();
   });
 
-  it("shows the organization's zero data retention status", async () => {
-    server.use(userWithOrg("member"));
-    server.use(
-      http.get("/admin/api/v1/organizations/:id", () =>
-        HttpResponse.json({
-          id: ORG_ID,
-          username: "acme-corp",
-          display_name: ORG_NAME,
-          email: "contact@acme.com",
-          created_at: "2025-01-15T10:00:00Z",
-          member_count: 3,
-          zero_data_retention: true,
-        }),
-      ),
+  const orgDetail = (zeroDataRetention: boolean) =>
+    http.get("/admin/api/v1/organizations/:id", () =>
+      HttpResponse.json({
+        id: ORG_ID,
+        username: "acme-corp",
+        display_name: ORG_NAME,
+        email: "contact@acme.com",
+        created_at: "2025-01-15T10:00:00Z",
+        member_count: 3,
+        zero_data_retention: zeroDataRetention,
+      }),
     );
+
+  it("shows the zero data retention badge when it is enabled", async () => {
+    server.use(userWithOrg("member"));
+    server.use(orgDetail(true));
     const { container } = render(<MyOrganization />, {
       wrapper: createWrapper(),
     });
@@ -155,7 +156,23 @@ describe("MyOrganization", () => {
       ).toBeInTheDocument();
     });
 
-    expect(container.textContent).toMatch(/zero data retention on/i);
+    expect(container.textContent).toMatch(/zero data retention/i);
+  });
+
+  it("hides the zero data retention badge when it is disabled", async () => {
+    server.use(userWithOrg("member"));
+    server.use(orgDetail(false));
+    const { container } = render(<MyOrganization />, {
+      wrapper: createWrapper(),
+    });
+
+    await waitFor(() => {
+      expect(
+        within(container).getByRole("heading", { name: ORG_NAME }),
+      ).toBeInTheDocument();
+    });
+
+    expect(container.textContent).not.toMatch(/zero data retention/i);
   });
 
   it("passes the org ID to NotificationSettings", async () => {
