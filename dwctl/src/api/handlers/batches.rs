@@ -830,6 +830,7 @@ async fn reserve_capacity_for_batch<P: PoolProvider>(
         default_throughput: config.batches.default_throughput,
         relaxation_factor,
         reservation_ttl_secs: config.batches.reservation_ttl_secs,
+        include_pending_counts: config.batches.pending_capacity_counts_enabled,
     };
 
     // Use the write pool for the reservation transaction

@@ -987,6 +987,7 @@ pub(crate) async fn run_activate_batch<P: PoolProvider + Clone + Send + Sync + '
                 default_throughput: config.batches.default_throughput,
                 relaxation_factor: config.batches.relaxation_factor(&completion_window),
                 reservation_ttl_secs: config.batches.reservation_ttl_secs,
+                include_pending_counts: config.batches.pending_capacity_counts_enabled,
             };
 
             match reserve_capacity(dwctl, &*state.request_manager, &cap_input).await {

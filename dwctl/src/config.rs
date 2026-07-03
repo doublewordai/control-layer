@@ -1206,11 +1206,11 @@ pub struct BatchConfig {
     /// count is applied.
     #[serde(default, deserialize_with = "deserialize_non_negative_optional_i64")]
     pub priority_decay_window_secs: Option<i64>,
-    /// Enable the internal pending request counts monitoring endpoint.
-    /// When false, the endpoint returns an empty result without querying fusillade.
+    /// Include committed pending/claimed/processing requests in batch admission capacity checks.
+    /// When false, admission capacity checks only include active in-flight reservations.
     /// Default: false.
     #[serde(default)]
-    pub pending_request_counts_enabled: bool,
+    pub pending_capacity_counts_enabled: bool,
 }
 
 /// Configuration for the async requests feature.
@@ -1348,7 +1348,7 @@ impl Default for BatchConfig {
             default_throughput: default_batch_throughput(),
             reservation_ttl_secs: default_reservation_ttl_secs(),
             priority_decay_window_secs: None,
-            pending_request_counts_enabled: false,
+            pending_capacity_counts_enabled: false,
         }
     }
 }
@@ -3267,9 +3267,9 @@ batches:
     }
 
     #[test]
-    fn test_pending_request_counts_default_disabled() {
+    fn test_pending_capacity_counts_default_disabled() {
         let config = Config::default();
-        assert!(!config.batches.pending_request_counts_enabled);
+        assert!(!config.batches.pending_capacity_counts_enabled);
     }
 
     #[test]
