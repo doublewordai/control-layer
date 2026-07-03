@@ -174,11 +174,18 @@ impl ZdrResponseEncryptor {
 
 #[async_trait::async_trait]
 impl fusillade::ResponseTransformer for ZdrResponseEncryptor {
-    async fn transform(&self, request_id: fusillade::RequestId, body: &str) -> fusillade::Result<String> {
-        // A ZDR request has a response key in the keystore: present -> encrypt;
-        // absent -> not ZDR (or key already gone), pass through; unreachable ->
-        // fail rather than persist plaintext.
-        match self.keystore.get(&key_id(&request_id.0, KeyKind::Response)).await {
+    async fn transform(&self, request: &fusillade::RequestData, body: &str) -> fusillade::Result<String> {
+        // Authoritative ZDR signal: the marker the processor stamped on
+        // batch_metadata at dispatch, which rides through to persist. We cannot
+        // key off the stored request-body sentinel here - by persist time the
+        // request body has already been decrypted to plaintext for dispatch - nor
+        // off response-key presence alone, which fails open if the key expired.
+        let is_zdr = request.batch_metadata.get(ZDR_MARKER_KEY).is_some_and(|v| v == "1");
+        if !is_zdr {
+            return Ok(body.to_string());
+        }
+        let request_id = &request.id.0;
+        match self.keystore.get(&key_id(request_id, KeyKind::Response)).await {
             Ok(Some(key)) => {
                 let encrypted = encrypt_body(&key, body)
                     .map_err(|e| fusillade::FusilladeError::Other(anyhow::anyhow!("ZDR response encrypt failed: {e}")))?;
@@ -187,12 +194,26 @@ impl fusillade::ResponseTransformer for ZdrResponseEncryptor {
                 // to pending instead), so the prompt is done being dispatched -
                 // crypto-shred the request key now (plan: "Deleted when a terminal
                 // response is stored"). Best-effort: the key's TTL is the backstop.
-                if let Err(e) = self.keystore.delete(&key_id(&request_id.0, KeyKind::Request)).await {
+                if let Err(e) = self.keystore.delete(&key_id(request_id, KeyKind::Request)).await {
                     tracing::warn!(error = %e, "ZDR request key shred-on-terminal failed; relying on TTL");
                 }
                 Ok(encrypted)
             }
-            Ok(None) => Ok(body.to_string()),
+            // Fail closed on a definitively-absent key: this IS a ZDR request
+            // but its response key is gone (TTL expired/deleted), so there is no
+            // key to encrypt with. We must not persist the plaintext - but
+            // erroring here would bubble up as a persist failure that the daemon
+            // does NOT terminalize, stranding the request in `processing` forever.
+            // So blank the body instead: no plaintext reaches the DB and the
+            // request completes cleanly (the response is simply not retained).
+            // With a TTL sized above the flex completion window this is unreachable.
+            Ok(None) => {
+                tracing::warn!(request_id = %request_id, "ZDR response key gone at persist; storing blank (response not retained)");
+                Ok(String::new())
+            }
+            // Unreachable keystore is transient, not authoritative: propagate the
+            // error rather than blank, so a momentary Redis blip does not
+            // permanently drop a response that could still be encrypted on retry.
             Err(e) => Err(fusillade::FusilladeError::Other(anyhow::anyhow!(
                 "ZDR keystore error during response encrypt: {e}"
             ))),

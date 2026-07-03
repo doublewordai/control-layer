@@ -35,7 +35,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use fusillade::request::{Canceled, Claimed, Request, RequestCompletionResult};
+use fusillade::request::{Canceled, Claimed, Failed, FailureReason, Request, RequestCompletionResult};
 use fusillade::{
     CancellationFuture, DefaultRequestProcessor, PoolProvider as FusilladePool, RequestProcessor, ReqwestHttpClient, ShouldRetry, Storage,
 };
@@ -196,15 +196,71 @@ where
         // rest of the flow sees plaintext. The response is re-encrypted on its way
         // back through the loopback layer.
         if crate::inference::zdr::is_zdr_body(&request.data.body) {
-            let keystore = self
-                .keystore
-                .as_ref()
-                .ok_or_else(|| fusillade::FusilladeError::Other(anyhow::anyhow!("ZDR request claimed but keystore is not configured")))?;
+            let Some(keystore) = self.keystore.as_ref() else {
+                // A ZDR ciphertext was claimed but no keystore is configured, so the
+                // prompt can never be decrypted. Terminalize as a non-retriable
+                // failure (persist Failed, then return Ok(Failed)) rather than a bare
+                // Err, which would only log a task failure and leave the row stuck in
+                // `processing` ("running") until the batch window expires. The
+                // client-facing reason is deliberately generic - the real cause (a
+                // server misconfiguration) is logged for operators, never surfaced.
+                crate::background_error!(
+                    crate::metrics::errors::component::ZDR_DISPATCH,
+                    "keystore_missing",
+                    Error,
+                    request_id = %request.data.id.0,
+                    "ZDR request claimed but keystore is not configured; failing request"
+                );
+                let failed = Request {
+                    state: Failed {
+                        reason: FailureReason::RequestBuilderError {
+                            error: "Zero-data-retention request could not be processed".to_string(),
+                        },
+                        failed_at: chrono::Utc::now(),
+                        retry_attempt: request.state.retry_attempt,
+                        batch_expires_at: request.state.batch_expires_at,
+                        routed_model: request.data.model.clone(),
+                    },
+                    data: request.data,
+                };
+                storage.persist(&failed).await?;
+                return Ok(RequestCompletionResult::Failed(failed));
+            };
             let key_id = crate::inference::zdr::key_id(&request.data.id.0, crate::inference::zdr::KeyKind::Request);
             match keystore.get(&key_id).await {
                 Ok(Some(key)) => {
-                    request.data.body = crate::inference::zdr::decrypt_body(&key, &request.data.body)
-                        .map_err(|e| fusillade::FusilladeError::Other(anyhow::anyhow!("ZDR request decrypt failed: {e}")))?;
+                    match crate::inference::zdr::decrypt_body(&key, &request.data.body) {
+                        Ok(plaintext) => request.data.body = plaintext,
+                        Err(e) => {
+                            // Ciphertext present but undecryptable (corrupt envelope or
+                            // wrong wrap key) - never succeeds on retry. Terminalize as a
+                            // non-retriable failure instead of a bare Err that would strand
+                            // the row in `processing`. Client reason stays generic; the
+                            // crypto detail is logged for operators only.
+                            crate::background_error!(
+                                crate::metrics::errors::component::ZDR_DISPATCH,
+                                "decrypt_failed",
+                                Error,
+                                request_id = %request.data.id.0,
+                                error = %e,
+                                "ZDR request body could not be decrypted; failing request"
+                            );
+                            let failed = Request {
+                                state: Failed {
+                                    reason: FailureReason::RequestBuilderError {
+                                        error: "Zero-data-retention request could not be processed".to_string(),
+                                    },
+                                    failed_at: chrono::Utc::now(),
+                                    retry_attempt: request.state.retry_attempt,
+                                    batch_expires_at: request.state.batch_expires_at,
+                                    routed_model: request.data.model.clone(),
+                                },
+                                data: request.data,
+                            };
+                            storage.persist(&failed).await?;
+                            return Ok(RequestCompletionResult::Failed(failed));
+                        }
+                    }
                     // TRANSITIONAL (dwctl ZDR): mark the dispatch so the loopback
                     // analytics handler blanks the now-plaintext body instead of
                     // logging it. fusillade forwards batch_metadata entries as
@@ -218,14 +274,57 @@ where
                         .insert(crate::inference::zdr::ZDR_MARKER_KEY.to_string(), "1".to_string());
                 }
                 Ok(None) => {
-                    // Key expired or was deleted before dispatch: the prompt is
-                    // gone and the request can never be processed. Fail it.
-                    return Err(fusillade::FusilladeError::ValidationError(
-                        "ZDR request key expired before dispatch; cannot decrypt".to_string(),
-                    ));
+                    // Key expired/deleted before dispatch: the prompt is gone and
+                    // this request can never be processed. Terminalize it as a
+                    // non-retriable failure - persist the Failed state, then return
+                    // Ok(Failed) so the daemon records it as terminally failed.
+                    // Returning a bare Err would only log a task failure and leave
+                    // the row stuck in `processing` (shown as "running") until the
+                    // batch window eventually expires.
+                    let failed = Request {
+                        state: Failed {
+                            reason: FailureReason::RequestBuilderError {
+                                error: "ZDR request key expired before dispatch; cannot decrypt".to_string(),
+                            },
+                            failed_at: chrono::Utc::now(),
+                            retry_attempt: request.state.retry_attempt,
+                            batch_expires_at: request.state.batch_expires_at,
+                            routed_model: request.data.model.clone(),
+                        },
+                        data: request.data,
+                    };
+                    storage.persist(&failed).await?;
+                    return Ok(RequestCompletionResult::Failed(failed));
                 }
                 Err(e) => {
-                    return Err(fusillade::FusilladeError::Other(anyhow::anyhow!("ZDR keystore error: {e}")));
+                    // Keystore unreachable (transient - e.g. Redis restart). Return a
+                    // retriable failure so the daemon reschedules the still-`processing`
+                    // row back to `pending` and tries again, rather than a bare Err that
+                    // would strand it. Do NOT persist here: the daemon's retry path
+                    // re-pends the row itself, and a persisted Failed would look terminal
+                    // and lose the retry. Client reason stays generic; the infra detail
+                    // is logged for operators only.
+                    crate::background_error!(
+                        crate::metrics::errors::component::ZDR_DISPATCH,
+                        "keystore_unreachable",
+                        Warning,
+                        request_id = %request.data.id.0,
+                        error = %e,
+                        "ZDR keystore unreachable during dispatch; scheduling retry"
+                    );
+                    let failed = Request {
+                        state: Failed {
+                            reason: FailureReason::NetworkError {
+                                error: "Zero-data-retention request could not be processed".to_string(),
+                            },
+                            failed_at: chrono::Utc::now(),
+                            retry_attempt: request.state.retry_attempt,
+                            batch_expires_at: request.state.batch_expires_at,
+                            routed_model: request.data.model.clone(),
+                        },
+                        data: request.data,
+                    };
+                    return Ok(RequestCompletionResult::Failed(failed));
                 }
             }
         }

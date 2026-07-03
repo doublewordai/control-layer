@@ -299,6 +299,14 @@ pub async fn get_batch_request<P: PoolProvider>(
         None
     };
 
+    // ZDR bodies are stored as `dwzdr1:` ciphertext (and a failed request's
+    // error carries an encrypted body inside it). This detail view is a plain
+    // read - no keystore, so it never decrypts or shreds, and a dashboard GET
+    // cannot disturb the consumer's one-shot `/v1/responses/{id}` retrieval.
+    // Blank the ciphertext-bearing fields rather than surface the envelope; the
+    // request is ZDR iff its stored request body is one.
+    let is_zdr = detail.body.as_deref().is_some_and(crate::inference::zdr::is_zdr_body);
+
     Ok(Json(ResponseDetail {
         id: detail.id,
         batch_id: detail.batch_id,
@@ -315,9 +323,9 @@ pub async fn get_batch_request<P: PoolProvider>(
         reasoning_tokens: analytics.as_ref().and_then(|a| a.reasoning_tokens),
         total_tokens: analytics.as_ref().and_then(|a| a.total_tokens),
         total_cost: analytics.as_ref().and_then(|a| a.total_cost),
-        body: detail.body.unwrap_or_default(),
-        response_body: detail.response_body,
-        error: detail.error,
+        body: if is_zdr { String::new() } else { detail.body.unwrap_or_default() },
+        response_body: if is_zdr { None } else { detail.response_body },
+        error: if is_zdr { None } else { detail.error },
         created_by: detail.created_by,
         created_by_email,
     }))
