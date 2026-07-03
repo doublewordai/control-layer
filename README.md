@@ -267,6 +267,7 @@ batches:
   # Enable batches API endpoints (/ai/v1/files, /ai/v1/batches)
   # When disabled, these endpoints will not be available (default: false).
   enabled: false
+  pending_request_counts_enabled: false # Enable /monitoring/pending-request-counts queries (default: false)
 
   # Daemon configuration for processing batch requests
   daemon:

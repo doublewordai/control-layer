@@ -280,6 +280,7 @@ batches:
   # When set, completed FLEX requests within this lookback are included in
   # the 1h pending-request-counts bucket. Omit or set null to disable.
   priority_decay_window_secs: 600
+  pending_request_counts_enabled: false # Enable /monitoring/pending-request-counts queries (default: false)
 
   # Allowed completion windows for batch processing
   # These define the maximum time from batch creation to completion

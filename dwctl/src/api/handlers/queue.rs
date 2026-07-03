@@ -51,6 +51,10 @@ pub async fn get_pending_request_counts<P: PoolProvider>(
 ) -> Result<Json<PendingCountsByModelAndWindow>, Error> {
     let config = state.current_config();
 
+    if !config.batches.pending_request_counts_enabled {
+        return Ok(Json(HashMap::new()));
+    }
+
     // Call fusillade storage API to get pending request counts
     let windows = config
         .batches
@@ -136,7 +140,9 @@ mod tests {
         use sqlx::postgres::PgConnectOptions;
         use sqlx_pool_router::TestDbPools;
 
-        let (server, _bg): (TestServer, _) = create_test_app(pool.clone(), false).await;
+        let mut config = create_test_config();
+        config.batches.pending_request_counts_enabled = true;
+        let (server, _bg): (TestServer, _) = create_test_app_with_config(pool.clone(), config, false).await;
         let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
 
         // Connect a request_manager to the same `fusillade` schema the app
@@ -248,6 +254,7 @@ mod tests {
         let mut config = create_test_config();
         config.batches.allowed_completion_windows = vec!["1h".to_string(), "24h".to_string()];
         config.batches.priority_decay_window_secs = Some(600);
+        config.batches.pending_request_counts_enabled = true;
         let (server, _bg): (TestServer, _) = create_test_app_with_config(pool.clone(), config, false).await;
         let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
 
