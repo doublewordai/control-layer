@@ -1050,7 +1050,7 @@ version = "3.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "519bd3116aeeb42d5372c29d982d16d0170d3d4a5ed85fc7dd91642ffff3c67c"
 dependencies = [
- "darling 0.20.11",
+ "darling 0.23.0",
  "ident_case",
  "prettyplease",
  "proc-macro2",
@@ -1872,6 +1872,7 @@ dependencies = [
  "arc-swap",
  "argon2",
  "async-openai",
+ "async-stream",
  "async-stripe",
  "async-stripe-billing",
  "async-stripe-checkout",
@@ -1903,6 +1904,7 @@ dependencies = [
  "hex",
  "hickory-resolver",
  "hmac 0.13.0",
+ "http-body-util",
  "humantime",
  "humantime-serde",
  "jsonwebtoken",
@@ -2333,9 +2335,9 @@ checksum = "e6d5a32815ae3f33302d95fdcb2ce17862f8c65363dcfd29360480ba1001fc9c"
 
 [[package]]
 name = "fusillade"
-version = "18.0.2"
+version = "19.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bd3868ec40891b50efee32ac38298dae5c2012600c6e08e837ddc294c78ee75c"
+checksum = "0284b0fcdb499cf0ed7a34eafd252edcba3f74b624e1ca1a0076544165540f6c"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4195,9 +4197,9 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "onwards"
-version = "0.33.4"
+version = "0.34.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "245f7822a57b6e90cc272cc7ccae9a6235c9e379b4588aa7bc60559cae9561e3"
+checksum = "000f5b251360369b7ba7bb46d114764cced46148924c4413892f69b5a2ce9d63"
 dependencies = [
  "anyhow",
  "async-stream",

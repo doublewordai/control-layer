@@ -252,7 +252,7 @@ pub(crate) async fn reserve_capacity<P: sqlx_pool_router::PoolProvider>(
     };
 
     // Active reservations are always counted; the pending-count query above is optional.
-    let mut pending_with_reservations = pending_counts.clone();
+    let mut pending_with_reservations = pending_counts;
     for (model_id, reserved) in reserved_rows {
         if let Some(alias) = id_to_alias.get(&model_id) {
             let windows = pending_with_reservations.entry(alias.clone()).or_default();
