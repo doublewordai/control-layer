@@ -297,6 +297,7 @@ batches:
     body_timeout_ms: 86400000 # Max total time for entire response body (24 hours)
     claim_timeout_ms: 60000 # Max time in "claimed" state before auto-unclaim (1 minute)
     processing_timeout_ms: 600000 # Max time in "processing" state before auto-unclaim (10 minutes)
+    pending_request_counts_timeout_ms: 60000 # Statement timeout for pending request count queries (1 minute)
 
     # Observability
     status_log_interval_ms: 2000 # Interval for logging daemon status (set to null to disable)

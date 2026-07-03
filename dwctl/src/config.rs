@@ -1432,6 +1432,11 @@ pub struct DaemonConfig {
     /// and returned to pending (milliseconds). This handles daemon crashes during execution. (default: 600000 = 10 minutes)
     pub processing_timeout_ms: u64,
 
+    /// PostgreSQL statement timeout for pending request count queries (milliseconds).
+    /// This bounds internal queue-depth monitoring work so a slow count query
+    /// fails without accumulating behind callers' poll cadence. (default: 60000 = 1 minute)
+    pub pending_request_counts_timeout_ms: u64,
+
     /// Per-model configurations for completion window escalation via route-at-claim-time.
     /// When a request is claimed with less than `escalation_threshold_seconds` remaining
     /// before batch expiry, it's routed to the `escalation_model` instead.
@@ -1544,6 +1549,7 @@ impl Default for DaemonConfig {
             status_log_interval_ms: Some(2000),
             claim_timeout_ms: 60000,
             processing_timeout_ms: 600000,
+            pending_request_counts_timeout_ms: 60000,
             batch_metadata_fields: default_batch_metadata_fields_dwctl(),
             model_escalations: HashMap::new(),
             purge_interval_ms: 600_000,
@@ -1600,6 +1606,7 @@ impl DaemonConfig {
             status_log_interval_ms: self.status_log_interval_ms,
             claim_timeout_ms: self.claim_timeout_ms,
             processing_timeout_ms: self.processing_timeout_ms,
+            pending_request_counts_timeout_ms: self.pending_request_counts_timeout_ms,
             batch_metadata_fields: self.batch_metadata_fields.clone(),
             purge_interval_ms: self.purge_interval_ms,
             purge_batch_size: self.purge_batch_size,
