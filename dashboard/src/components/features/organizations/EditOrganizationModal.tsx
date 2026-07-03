@@ -12,27 +12,33 @@ import {
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Switch } from "@/components/ui/switch";
 import { toast } from "sonner";
 
 interface EditOrganizationModalProps {
   isOpen: boolean;
   onClose: () => void;
   organization: Organization | null;
+  /** Whether the current user may toggle zero data retention (admins only). */
+  canEditZdr?: boolean;
 }
 
 export function EditOrganizationModal({
   isOpen,
   onClose,
   organization,
+  canEditZdr = false,
 }: EditOrganizationModalProps) {
   const [email, setEmail] = useState("");
   const [displayName, setDisplayName] = useState("");
+  const [zeroDataRetention, setZeroDataRetention] = useState(false);
   const updateOrg = useUpdateOrganization();
 
   useEffect(() => {
     if (organization) {
       setEmail(organization.email || "");
       setDisplayName(organization.display_name || "");
+      setZeroDataRetention(organization.zero_data_retention ?? false);
     }
   }, [organization]);
 
@@ -46,6 +52,9 @@ export function EditOrganizationModal({
         data: {
           display_name: displayName || undefined,
           email: email || undefined,
+          ...(canEditZdr
+            ? { zero_data_retention: zeroDataRetention }
+            : {}),
         },
       });
       toast.success("Organization updated successfully");
@@ -85,6 +94,22 @@ export function EditOrganizationModal({
                 onChange={(e) => setDisplayName(e.target.value)}
               />
             </div>
+            {canEditZdr && (
+              <div className="flex items-center justify-between gap-4">
+                <div className="grid gap-1">
+                  <Label htmlFor="edit-zdr">Zero Data Retention</Label>
+                  <p className="text-sm text-muted-foreground">
+                    Applies to every API key owned by the organization.
+                  </p>
+                </div>
+                <Switch
+                  id="edit-zdr"
+                  checked={zeroDataRetention}
+                  onCheckedChange={setZeroDataRetention}
+                  aria-label="Toggle zero data retention"
+                />
+              </div>
+            )}
           </div>
           <DialogFooter>
             <Button type="button" variant="outline" onClick={onClose}>

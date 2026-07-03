@@ -224,8 +224,15 @@ impl ToolExecutor for HttpToolExecutor {
                             },
                         }
                     } else {
-                        let body = resp.text().await.unwrap_or_default();
-                        let msg = format!("HTTP {}: {}", status_u16, body);
+                        // ZDR: never put the tool response body into the error — it
+                        // becomes the ToolError Display, which `#[instrument(err)]`
+                        // logs, and tool outputs are disallowed payload content. Use
+                        // the advertised Content-Length where present and drop the
+                        // body unread, rather than buffering it just to size it.
+                        let msg = match resp.content_length() {
+                            Some(len) => format!("HTTP {status_u16} ({len}-byte body omitted)"),
+                            None => format!("HTTP {status_u16} (body omitted)"),
+                        };
                         (Err(ToolError::ExecutionError(msg)), Some(status_u16), Some("http_error"))
                     }
                 }
@@ -354,16 +361,24 @@ mod tests {
 
     #[tokio::test]
     async fn test_execute_returns_error_on_4xx() {
+        // ZDR (COR-499): the tool response body must never appear in the error,
+        // which `#[instrument(err)]` logs. Use a sentinel body and assert it is
+        // absent while the status is still reported.
+        const SENTINEL: &str = "ZDR-SENTINEL-TOOL-BODY-4a1f";
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/tool"))
-            .respond_with(ResponseTemplate::new(400).set_body_string("bad request"))
+            .respond_with(ResponseTemplate::new(400).set_body_string(SENTINEL))
             .mount(&server)
             .await;
 
         let (executor, ctx) = make_executor_and_ctx("test_tool", &server.uri(), None);
         let result = executor.execute("test_tool", "id1", &serde_json::json!({}), &ctx).await;
-        assert!(matches!(result, Err(ToolError::ExecutionError(_))));
+        let Err(ToolError::ExecutionError(msg)) = result else {
+            panic!("expected ExecutionError, got {result:?}");
+        };
+        assert!(!msg.contains(SENTINEL), "tool response body leaked into error: {msg}");
+        assert!(msg.contains("400"), "expected status in error message: {msg}");
     }
 
     #[tokio::test]

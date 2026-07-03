@@ -100,6 +100,9 @@ struct OnwardsApiKey {
     /// pick between the verified/unverified default rate-limit tiers when this
     /// key has no per-key override.
     user_verified: bool,
+    /// Account-wide zero-data-retention flag on the api_key's owning user.
+    /// Surfaced to onwards as a "zdr" key label; onwards does not act on it yet.
+    zero_data_retention: bool,
 }
 
 /// Manages the integration between onwards-pilot and the onwards proxy
@@ -538,7 +541,7 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
     // Query API keys with access to composite models (uses deployment_groups since composites are in deployed_models)
     let api_key_rows = sqlx::query!(
         r#"
-        WITH user_balances AS (
+        WITH user_balances AS MATERIALIZED (
             SELECT
                 u.id as user_id,
                 COALESCE(c.balance, 0) + COALESCE(
@@ -553,6 +556,7 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                 ) as balance
             FROM users u
             LEFT JOIN user_balance_checkpoints c ON c.user_id = u.id
+            WHERE u.is_deleted = false
         )
         SELECT
             cm.id as composite_model_id,
@@ -561,7 +565,8 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
             ak.purpose as api_key_purpose,
             ak.requests_per_second,
             ak.burst_size,
-            ak.user_verified
+            ak.user_verified,
+            ak.user_zero_data_retention
         FROM deployed_models cm
         CROSS JOIN LATERAL (
             SELECT DISTINCT
@@ -570,7 +575,8 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                 ak.purpose,
                 ak.requests_per_second,
                 ak.burst_size,
-                u.verified as user_verified
+                u.verified as user_verified,
+                u.zero_data_retention as user_zero_data_retention
             FROM api_keys ak
             JOIN users u ON u.id = ak.user_id
             WHERE (
@@ -767,6 +773,7 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                     requests_per_second: row.requests_per_second,
                     burst_size: row.burst_size,
                     user_verified: row.user_verified,
+                    zero_data_retention: row.user_zero_data_retention,
                 });
             }
         }
@@ -805,7 +812,10 @@ fn convert_composite_to_target_spec(
             )
         };
 
-        let labels = HashMap::from([("purpose".to_string(), api_key.purpose.clone())]);
+        let mut labels = HashMap::from([("purpose".to_string(), api_key.purpose.clone())]);
+        // Surface the account's zero-data-retention flag to onwards as a label.
+        // Always emitted ("true"/"false"); onwards does not act on it yet.
+        labels.insert("zdr".to_string(), api_key.zero_data_retention.to_string());
 
         key_definitions.insert(
             api_key.id.to_string(),
@@ -1050,7 +1060,10 @@ fn convert_to_config_file(
                 };
 
                 // Build labels from API key purpose
-                let labels = HashMap::from([("purpose".to_string(), api_key.purpose.clone())]);
+                let mut labels = HashMap::from([("purpose".to_string(), api_key.purpose.clone())]);
+                // Surface the account's zero-data-retention flag as a label.
+                // Always emitted ("true"/"false"); onwards does not act on it yet.
+                labels.insert("zdr".to_string(), api_key.zero_data_retention.to_string());
 
                 key_definitions.insert(
                     api_key.id.to_string(),
@@ -1223,7 +1236,7 @@ pub async fn load_targets_from_db(
     // Note: We pass escalation_models to grant batch API keys access to escalation models
     let rows = sqlx::query!(
         r#"
-        WITH user_balances AS (
+        WITH user_balances AS MATERIALIZED (
             SELECT
                 u.id as user_id,
                 COALESCE(c.balance, 0) + COALESCE(
@@ -1238,6 +1251,7 @@ pub async fn load_targets_from_db(
                 ) as balance
             FROM users u
             LEFT JOIN user_balance_checkpoints c ON c.user_id = u.id
+            WHERE u.is_deleted = false
         )
         SELECT
             dm.id as deployment_id,
@@ -1271,7 +1285,8 @@ pub async fn load_targets_from_db(
             ak.purpose as "api_key_purpose?",
             ak.requests_per_second as api_key_requests_per_second,
             ak.burst_size as api_key_burst_size,
-            ak.user_verified as "api_key_user_verified?"
+            ak.user_verified as "api_key_user_verified?",
+            ak.user_zero_data_retention as "api_key_user_zero_data_retention?"
         FROM deployed_models dm
         INNER JOIN inference_endpoints ie ON dm.hosted_on = ie.id
         LEFT JOIN LATERAL (
@@ -1281,7 +1296,8 @@ pub async fn load_targets_from_db(
                 ak.purpose,
                 ak.requests_per_second,
                 ak.burst_size,
-                u.verified as user_verified
+                u.verified as user_verified,
+                u.zero_data_retention as user_zero_data_retention
             FROM api_keys ak
             JOIN users u ON u.id = ak.user_id
             WHERE (
@@ -1387,9 +1403,13 @@ pub async fn load_targets_from_db(
         // tie it to the same "row materialised" check as the other api_key columns
         // so a future schema/SQL change can't silently demote keys to the
         // unverified tier.
-        if let (Some(api_key_id), Some(api_key_secret), Some(api_key_purpose), Some(user_verified)) =
-            (row.api_key_id, row.api_key_secret, row.api_key_purpose, row.api_key_user_verified)
-        {
+        if let (Some(api_key_id), Some(api_key_secret), Some(api_key_purpose), Some(user_verified), Some(zero_data_retention)) = (
+            row.api_key_id,
+            row.api_key_secret,
+            row.api_key_purpose,
+            row.api_key_user_verified,
+            row.api_key_user_zero_data_retention,
+        ) {
             target.api_keys.push(OnwardsApiKey {
                 id: api_key_id,
                 secret: api_key_secret,
@@ -1397,6 +1417,7 @@ pub async fn load_targets_from_db(
                 requests_per_second: row.api_key_requests_per_second,
                 burst_size: row.api_key_burst_size,
                 user_verified,
+                zero_data_retention,
             });
         }
     }

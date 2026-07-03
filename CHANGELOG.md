@@ -1,5 +1,41 @@
 # Changelog
 
+## [8.68.3](https://github.com/doublewordai/control-layer/compare/v8.68.2...v8.68.3) (2026-07-01)
+
+
+### Bug Fixes
+
+* **db:** bound credits_transactions autovacuum + raise user_id stats target ([#1212](https://github.com/doublewordai/control-layer/issues/1212)) ([5cb550b](https://github.com/doublewordai/control-layer/commit/5cb550b1132764b08cf4cedd829163f1127d9ae2))
+
+## [8.68.2](https://github.com/doublewordai/control-layer/compare/v8.68.1...v8.68.2) (2026-07-01)
+
+
+### Bug Fixes
+
+* optimize onwards config balance queries ([#1210](https://github.com/doublewordai/control-layer/issues/1210)) ([0ad44f2](https://github.com/doublewordai/control-layer/commit/0ad44f2b4f1740d70ef36c827fac150efbcc3aff))
+* **perf:** defer cache classify-await into the SSE stream so it never holds the first token ([#1208](https://github.com/doublewordai/control-layer/issues/1208)) ([7316834](https://github.com/doublewordai/control-layer/commit/73168347509e293de018da0efe0bd37b1279a1b1))
+
+## [8.68.1](https://github.com/doublewordai/control-layer/compare/v8.68.0...v8.68.1) (2026-07-01)
+
+
+### Bug Fixes
+
+* stop logging tool response bodies and serde body fragments ([#1202](https://github.com/doublewordai/control-layer/issues/1202)) ([f21c29b](https://github.com/doublewordai/control-layer/commit/f21c29b82b232855365b9c8f12507b5c1895da50))
+
+## [8.68.0](https://github.com/doublewordai/control-layer/compare/v8.67.1...v8.68.0) (2026-06-30)
+
+
+### Features
+
+* global config for activated cache ttl's, and param errors surfacing t… ([#1206](https://github.com/doublewordai/control-layer/issues/1206)) ([1712a07](https://github.com/doublewordai/control-layer/commit/1712a077d4f53e940a9a7aca0069cb30725c4298))
+
+## [8.67.1](https://github.com/doublewordai/control-layer/compare/v8.67.0...v8.67.1) (2026-06-30)
+
+
+### Bug Fixes
+
+* extra prometheus markers for dashboard ([#1201](https://github.com/doublewordai/control-layer/issues/1201)) ([85c2a34](https://github.com/doublewordai/control-layer/commit/85c2a347a669d8cab0fb912c8b5a688a5a0ec79a))
+
 ## [8.67.0](https://github.com/doublewordai/control-layer/compare/v8.66.0...v8.67.0) (2026-06-30)
 
 

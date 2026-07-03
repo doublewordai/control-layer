@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use chrono::Utc;
 
-use super::index::{CacheEntry, CacheIndex, CacheResult, IndexScope, PrefixHash};
+use super::index::{CacheEntry, CacheIndex, CacheResult, IndexScope, PrefixHash, TierPolicy};
 use super::metrics as cache_metrics;
 use super::model_config::ModelConfigResolver;
 use super::parse::{ParseError, parse_chat_completions};
@@ -89,6 +89,9 @@ pub struct Classifier {
     index: Arc<dyn CacheIndex>,
     /// alias → tokenizer_version (from tokenizer-svc `/v1/models`); `None` = unmapped.
     versions: moka::future::Cache<String, Option<String>>,
+    /// Enabled TTL tiers + the default-ttl tier. Shared with the layer's request-path marker
+    /// validation, so a no-ttl marker resolves to the same tier here as it was validated against.
+    tier_policy: TierPolicy,
 }
 
 impl Classifier {
@@ -97,6 +100,7 @@ impl Classifier {
         model_config: ModelConfigResolver,
         tokenizer: TokenizerClient,
         index: Arc<dyn CacheIndex>,
+        tier_policy: TierPolicy,
     ) -> Self {
         let versions = moka::future::Cache::builder()
             .max_capacity(10_000)
@@ -108,7 +112,14 @@ impl Classifier {
             tokenizer,
             index,
             versions,
+            tier_policy,
         }
+    }
+
+    /// The configured TTL-tier policy (enabled tiers + default ttl), exposed for the cache
+    /// layer's synchronous request-path marker validation.
+    pub fn tier_policy(&self) -> &TierPolicy {
+        &self.tier_policy
     }
 
     /// Classify a request into its read/write split + the entries to commit on success.
@@ -137,14 +148,18 @@ impl Classifier {
         }
 
         // From here the model is cache-enabled: any bail is `zero_active`.
-        let parsed = match parse_chat_completions(req.body) {
+        // (The layer already 400-rejected disabled/malformed markers synchronously before the
+        // fork, so on the live path these errors won't fire — this stays a defensive fallback.)
+        let parsed = match parse_chat_completions(req.body, &self.tier_policy) {
             Ok(p) => p,
             Err(e) => {
                 // Marker validation rejections (anti-abuse) vs a genuine unparseable body.
                 match &e {
-                    ParseError::TooManyBreakpoints { .. } => cache_metrics::record_markers_rejected("too_many_breakpoints"),
+                    ParseError::TooManyBreakpoints => cache_metrics::record_markers_rejected("too_many_breakpoints"),
                     ParseError::InvalidTtl(_) => cache_metrics::record_markers_rejected("invalid_ttl"),
                     ParseError::UnsupportedType(_) => cache_metrics::record_markers_rejected("unsupported_type"),
+                    ParseError::DisabledTier(_) => cache_metrics::record_markers_rejected("tier_disabled"),
+                    ParseError::MalformedCacheControl => cache_metrics::record_markers_rejected("malformed_cache_control"),
                     ParseError::Json(_) => cache_metrics::record_skip("unparseable"),
                 }
                 // Best-effort: degrade to no caching (uniform zeros). Log at debug so the
@@ -312,7 +327,12 @@ impl Classifier {
                 }
             }
         }
-        let matches = self.index.lookup(scope, &candidates).await?;
+        let lookup_start = std::time::Instant::now();
+        let matches = self.index.lookup(scope, &candidates).await;
+        // Record before propagating so a slow-then-failing lookup (the unhealthy-DB case the
+        // metric most needs to surface) still lands in the histogram, not just successes.
+        cache_metrics::record_lookup_duration(lookup_start.elapsed().as_secs_f64());
+        let matches = matches?;
         if matches.is_empty() {
             return Ok(None);
         }
@@ -375,8 +395,12 @@ mod tests {
         .into_bytes()
     }
 
+    fn all_tiers() -> TierPolicy {
+        TierPolicy::from_config(&["5m".to_string(), "1h".to_string(), "24h".to_string()], "5m")
+    }
+
     fn prefix_hash() -> PrefixHash {
-        parse_chat_completions(&body()).unwrap().cumulative_hashes[0].clone()
+        parse_chat_completions(&body(), &all_tiers()).unwrap().cumulative_hashes[0].clone()
     }
 
     struct H {
@@ -428,6 +452,7 @@ mod tests {
             ModelConfigResolver::new(pool.clone()),
             TokenizerClient::new(server.uri()),
             Arc::new(PostgresIndex::new(pool.clone())),
+            all_tiers(),
         );
         H {
             classifier,
