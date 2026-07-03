@@ -142,15 +142,13 @@ pub async fn decrypt_response_body(
         return Ok(DecryptOutcome::Unchanged);
     }
     let response_key_id = key_id(request_id, KeyKind::Response);
-    match keystore.get(&response_key_id).await? {
+    // Shred on retrieval (plan: "Deleted on retrieval. TTL is the backstop.").
+    // `take` is an atomic GETDEL: the key is deleted in the same round trip it is
+    // read, so two concurrent retrievals cannot both observe it - only one sees
+    // the key and decrypts; the other gets `Gone`. TTL remains the backstop.
+    match keystore.take(&response_key_id).await? {
         Some(key) => {
             let plaintext = decrypt_body(&key, body)?;
-            // Shred on retrieval (plan: "Deleted on retrieval. TTL is the
-            // backstop."). Best-effort: a failed delete still returns the body
-            // and leans on the key's TTL to shred it later.
-            if let Err(e) = keystore.delete(&response_key_id).await {
-                tracing::warn!(error = %e, "ZDR response key delete-on-retrieval failed; relying on TTL");
-            }
             Ok(DecryptOutcome::Decrypted(plaintext))
         }
         None => Ok(DecryptOutcome::Gone),

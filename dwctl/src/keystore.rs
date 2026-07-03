@@ -258,6 +258,24 @@ impl Keystore {
         }
     }
 
+    /// Atomically fetch-and-delete a value (Redis `GETDEL`, 6.2+). Unwraps and
+    /// returns it if present, deleting it in the same round trip so a concurrent
+    /// reader cannot also observe it - the one-shot "destroyed on retrieval"
+    /// primitive. `Ok(None)` means already gone. On the crypto-shred path this
+    /// removes the get-then-delete race a separate [`Keystore::delete`] leaves.
+    pub async fn take(&self, id: &str) -> Result<Option<Vec<u8>>, KeystoreError> {
+        let mut conn = self.pool.get().await.map_err(|e| KeystoreError::Unreachable(e.to_string()))?;
+        let wrapped: Option<Vec<u8>> = deadpool_redis::redis::cmd("GETDEL")
+            .arg(id)
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| KeystoreError::Unreachable(e.to_string()))?;
+        match wrapped {
+            None => Ok(None),
+            Some(blob) => Ok(Some(self.keyring.unwrap(&blob)?)),
+        }
+    }
+
     /// Delete a value, crypto-shredding whatever it protected.
     pub async fn delete(&self, id: &str) -> Result<(), KeystoreError> {
         let mut conn = self.pool.get().await.map_err(|e| KeystoreError::Unreachable(e.to_string()))?;
