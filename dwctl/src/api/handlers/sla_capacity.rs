@@ -168,6 +168,7 @@ pub(crate) struct CapacityReservationInput<'a> {
     pub default_throughput: f32,
     pub relaxation_factor: f32,
     pub reservation_ttl_secs: i64,
+    pub include_pending_counts: bool,
 }
 
 /// Error type for capacity reservation operations.
@@ -222,32 +223,36 @@ pub(crate) async fn reserve_capacity<P: sqlx_pool_router::PoolProvider>(
         .await
         .map_err(|e| CapacityError::Internal(format!("sum active reservations: {e}")))?;
 
-    // Fetch pending counts AFTER locks to avoid stale snapshots
-    let windows = vec![(
-        input.completion_window.to_string(),
-        None,
-        parse_window_to_seconds(input.completion_window),
-    )];
-    let states = vec!["pending".to_string(), "claimed".to_string(), "processing".to_string()];
-    let model_filter: Vec<String> = input.file_model_counts.keys().cloned().collect();
-
-    // Exclude realtime (`priority`) requests: they're processed externally
-    // (not via the fusillade daemon) and should not consume batch capacity
-    // when admitting new batches.
-    let pending_counts: HashMap<String, HashMap<String, i64>> = request_manager
-        .get_pending_request_counts_by_model_and_window(
-            &windows,
-            &states,
-            &model_filter,
-            &ServiceTierFilter::Exclude(vec![Some("priority".to_string())]),
+    let pending_counts: HashMap<String, HashMap<String, i64>> = if input.include_pending_counts {
+        // Fetch pending counts AFTER locks to avoid stale snapshots.
+        let windows = vec![(
+            input.completion_window.to_string(),
             None,
-            true,
-        )
-        .await
-        .map_err(|e| CapacityError::Internal(format!("get pending counts: {e}")))?;
+            parse_window_to_seconds(input.completion_window),
+        )];
+        let states = vec!["pending".to_string(), "claimed".to_string(), "processing".to_string()];
+        let model_filter: Vec<String> = input.file_model_counts.keys().cloned().collect();
 
-    // Merge reservations into pending
-    let mut pending_with_reservations = pending_counts.clone();
+        // Exclude realtime (`priority`) requests: they're processed externally
+        // (not via the fusillade daemon) and should not consume batch capacity
+        // when admitting new batches.
+        request_manager
+            .get_pending_request_counts_by_model_and_window(
+                &windows,
+                &states,
+                &model_filter,
+                &ServiceTierFilter::Exclude(vec![Some("priority".to_string())]),
+                None,
+                true,
+            )
+            .await
+            .map_err(|e| CapacityError::Internal(format!("get pending counts: {e}")))?
+    } else {
+        HashMap::new()
+    };
+
+    // Active reservations are always counted; the pending-count query above is optional.
+    let mut pending_with_reservations = pending_counts;
     for (model_id, reserved) in reserved_rows {
         if let Some(alias) = id_to_alias.get(&model_id) {
             let windows = pending_with_reservations.entry(alias.clone()).or_default();
