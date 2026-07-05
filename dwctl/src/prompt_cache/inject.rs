@@ -46,6 +46,10 @@ fn remove_cache_control(body: &mut Value, telemetry: &TelemetryPolicy) -> (bool,
     // Message content blocks (array-form content only; string content carries no marker).
     if let Some(messages) = obj.get_mut("messages").and_then(Value::as_array_mut) {
         for msg in messages.iter_mut() {
+            // Read the role before the mutable content borrow — telemetry handling is scoped to the
+            // system role (matching `super::parse`), so a non-system block that coincidentally starts
+            // with a configured prefix is never mutated out of the forwarded prompt.
+            let role = msg.get("role").and_then(Value::as_str).unwrap_or("").to_string();
             if let Some(content) = msg.get_mut("content").and_then(Value::as_array_mut) {
                 // In strip mode, drop unmarked provider-telemetry blocks (e.g. the Claude Code
                 // SDK's `x-anthropic-billing-header` line) from the FORWARDED prompt — done BEFORE
@@ -55,7 +59,7 @@ fn remove_cache_control(body: &mut Value, telemetry: &TelemetryPolicy) -> (bool,
                 // KV/prefix cache see a stable prompt.
                 if telemetry.strip_from_prompt {
                     let before = content.len();
-                    content.retain(|block| !telemetry.excludes_block(block));
+                    content.retain(|block| !telemetry.excludes_block(&role, block));
                     rewrote |= content.len() != before;
                 }
                 for block in content.iter_mut() {
@@ -467,6 +471,22 @@ mod tests {
         assert_eq!(content.len(), 1, "telemetry block removed from the forwarded prompt");
         assert_eq!(content[0]["text"], "real system");
         assert!(content[0].get("cache_control").is_none(), "marker stripped from survivor");
+    }
+
+    #[test]
+    fn strip_mode_leaves_non_system_blocks_untouched() {
+        // strip_from_prompt=true, but the prefix appears in a USER block: telemetry handling is
+        // scoped to the system role, so the forwarded prompt must be left untouched.
+        let body = serde_json::json!({
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "x-anthropic-billing-header: cch=abc;"},
+                {"type": "text", "text": "actual question"}
+            ]}]
+        })
+        .to_string();
+        let tele = TelemetryPolicy::from_config(true, &["x-anthropic-billing-header:".to_string()]);
+        let (out, _) = strip_cache_control(body.as_bytes(), &tele);
+        assert!(out.is_none(), "non-system block is not stripped from the forwarded prompt");
     }
 
     #[test]

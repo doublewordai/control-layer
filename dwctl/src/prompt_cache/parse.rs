@@ -169,7 +169,7 @@ pub fn parse_chat_completions(body: &[u8], policy: &TierPolicy, telemetry: &Tele
                         // write-only caching. `excludes_block` only matches UNMARKED blocks, so a
                         // caller's `cache_control` breakpoint is never dropped. (In strip mode the
                         // outbound sanitiser also removes them from the forwarded request.)
-                        if telemetry.excludes_block(block) {
+                        if telemetry.excludes_block(&role, block) {
                             continue;
                         }
                         let ttl = match block.get("cache_control") {
@@ -327,11 +327,16 @@ impl TelemetryPolicy {
         }
     }
 
-    /// Whether `block` is an UNMARKED telemetry block to exclude from the cache prefix (and, in
-    /// strip mode, from the forwarded prompt). Only unmarked blocks match, so a caller's
-    /// `cache_control` breakpoint is never dropped. Always `false` when `prefixes` is empty.
-    pub fn excludes_block(&self, block: &serde_json::Value) -> bool {
-        if self.prefixes.is_empty() {
+    /// Whether a `role` message's `block` is an UNMARKED telemetry block to exclude from the cache
+    /// prefix (and, in strip mode, from the forwarded prompt). Constrained to the **system** role —
+    /// that's where providers inject these blocks (e.g. the Claude Code SDK prepends its
+    /// `x-anthropic-billing-header` to `system`) — so a user/assistant block that happens to start
+    /// with a configured prefix is never silently excluded from the cache or stripped from the
+    /// prompt. Only unmarked blocks match, so a caller's `cache_control` breakpoint is never dropped.
+    /// Always `false` when `prefixes` is empty. The same predicate is used by parsing and outbound
+    /// sanitisation, so the two stay consistent.
+    pub fn excludes_block(&self, role: &str, block: &serde_json::Value) -> bool {
+        if self.prefixes.is_empty() || role != TELEMETRY_ROLE {
             return false;
         }
         let unmarked = block.get("cache_control").map_or(true, |cc| cc.is_null());
@@ -343,6 +348,12 @@ impl TelemetryPolicy {
         self.prefixes.iter().any(|prefix| t.starts_with(prefix.as_str()))
     }
 }
+
+/// The one message role providers inject per-request telemetry blocks into. Telemetry handling is
+/// restricted to it so non-system content that coincidentally starts with a configured prefix is
+/// never excluded from the cache or stripped from the forwarded prompt. If a future provider injects
+/// elsewhere, promote this to a configurable set.
+const TELEMETRY_ROLE: &str = "system";
 
 /// `role` + canonical JSON of the marker-stripped block. The role is included so the
 /// same text under different roles hashes differently.
@@ -790,6 +801,22 @@ mod tests {
             ]}]
         }));
         assert_eq!(p.blocks.len(), 2, "feature off → telemetry block not excluded");
+    }
+
+    #[test]
+    fn telemetry_only_excluded_from_system_role() {
+        // The prefix in a non-system (user) block must NOT be excluded — telemetry lives in system,
+        // so coincidental user/assistant content is never silently dropped from the cache view.
+        let p = parse_with(
+            serde_json::json!({
+                "messages": [{"role": "user", "content": [
+                    {"type": "text", "text": "x-anthropic-billing-header: cch=abc;"},
+                    {"type": "text", "text": "actual question"}
+                ]}]
+            }),
+            &telemetry(),
+        );
+        assert_eq!(p.blocks.len(), 2, "user-role block starting with the prefix is not excluded");
     }
 
     #[test]
