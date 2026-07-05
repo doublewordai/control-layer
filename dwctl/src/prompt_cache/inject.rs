@@ -22,6 +22,7 @@ use bytes::Bytes;
 use serde_json::Value;
 use tracing::error;
 
+use super::parse::TelemetryPolicy;
 use super::stats::CacheStats;
 
 /// Remove `cache_control` markers from the request body at exactly the locations the parser
@@ -35,7 +36,7 @@ use super::stats::CacheStats;
 /// a function parameter literally named `cache_control`) is the caller's own data — deleting
 /// it would corrupt the tool the model sees, and it isn't a marker. Stripping only the marker
 /// locations also keeps the forwarded bytes identical to what [`super::parse`] hashes/tokenizes.
-fn remove_cache_control(body: &mut Value) -> (bool, bool) {
+fn remove_cache_control(body: &mut Value, telemetry: &TelemetryPolicy) -> (bool, bool) {
     let mut rewrote = false;
     let mut had_marker = false;
     let Some(obj) = body.as_object_mut() else {
@@ -46,6 +47,17 @@ fn remove_cache_control(body: &mut Value) -> (bool, bool) {
     if let Some(messages) = obj.get_mut("messages").and_then(Value::as_array_mut) {
         for msg in messages.iter_mut() {
             if let Some(content) = msg.get_mut("content").and_then(Value::as_array_mut) {
+                // In strip mode, drop unmarked provider-telemetry blocks (e.g. the Claude Code
+                // SDK's `x-anthropic-billing-header` line) from the FORWARDED prompt — done BEFORE
+                // stripping cache_control so `excludes_block` still sees the original marker state
+                // and never drops a caller-marked block. This keeps the forwarded bytes aligned
+                // with what `super::parse` excludes from the cache hash, and lets the upstream
+                // KV/prefix cache see a stable prompt.
+                if telemetry.strip_from_prompt {
+                    let before = content.len();
+                    content.retain(|block| !telemetry.excludes_block(block));
+                    rewrote |= content.len() != before;
+                }
                 for block in content.iter_mut() {
                     strip_block_marker(block, &mut rewrote, &mut had_marker);
                 }
@@ -80,11 +92,11 @@ fn strip_block_marker(value: &mut Value, rewrote: &mut bool, had_marker: &mut bo
 /// returns whether the client actually sent `cache_control` markers (`had_markers`) — the
 /// adoption signal, kept distinct from the body changing, since a stream gets
 /// `include_usage` injected even when no markers were present.
-pub fn strip_cache_control(body: &[u8]) -> (Option<Bytes>, bool) {
+pub fn strip_cache_control(body: &[u8], telemetry: &TelemetryPolicy) -> (Option<Bytes>, bool) {
     let Ok(mut json) = serde_json::from_slice::<Value>(body) else {
         return (None, false);
     };
-    let (rewrote, had_markers) = remove_cache_control(&mut json);
+    let (rewrote, had_markers) = remove_cache_control(&mut json, telemetry);
 
     let mut usage_set = false;
     if let Some(obj) = json.as_object_mut() {
@@ -353,7 +365,7 @@ mod tests {
             "messages": [{"role":"system","content":[{"type":"text","text":"x","cache_control":{"type":"ephemeral"}}]}]
         })
         .to_string();
-        let (out, had_markers) = strip_cache_control(body.as_bytes());
+        let (out, had_markers) = strip_cache_control(body.as_bytes(), &TelemetryPolicy::default());
         assert!(had_markers, "body had cache_control");
         let out = out.expect("changed");
         let v: Value = serde_json::from_slice(&out).unwrap();
@@ -364,7 +376,7 @@ mod tests {
     #[test]
     fn strip_none_when_nothing_to_do() {
         let body = serde_json::json!({"messages":[{"role":"user","content":"hi"}]}).to_string();
-        let (out, had_markers) = strip_cache_control(body.as_bytes());
+        let (out, had_markers) = strip_cache_control(body.as_bytes(), &TelemetryPolicy::default());
         assert!(out.is_none());
         assert!(!had_markers);
     }
@@ -374,7 +386,7 @@ mod tests {
         // The overcounting case: a stream with no cache_control still gets include_usage
         // injected (body changes), but had_markers must stay false.
         let body = serde_json::json!({"stream": true, "messages":[{"role":"user","content":"hi"}]}).to_string();
-        let (out, had_markers) = strip_cache_control(body.as_bytes());
+        let (out, had_markers) = strip_cache_control(body.as_bytes(), &TelemetryPolicy::default());
         assert!(out.is_some(), "include_usage injected");
         assert!(!had_markers, "no markers present");
     }
@@ -387,7 +399,7 @@ mod tests {
             "messages": [{"role":"system","content":[{"type":"text","text":"x","cache_control":null}]}]
         })
         .to_string();
-        let (out, had_markers) = strip_cache_control(body.as_bytes());
+        let (out, had_markers) = strip_cache_control(body.as_bytes(), &TelemetryPolicy::default());
         assert!(!had_markers, "null cache_control is not a marker");
         let out = out.expect("body rewritten to drop the null cache_control key");
         assert!(!out.windows(13).any(|w| w == b"cache_control"), "cache_control key removed");
@@ -412,7 +424,7 @@ mod tests {
             "messages": [{"role": "user", "content": "hi"}]
         })
         .to_string();
-        let (out, had_markers) = strip_cache_control(body.as_bytes());
+        let (out, had_markers) = strip_cache_control(body.as_bytes(), &TelemetryPolicy::default());
         assert!(had_markers, "the top-level tool marker is a marker");
         let v: Value = serde_json::from_slice(&out.expect("body rewritten")).unwrap();
         assert!(v["tools"][0].get("cache_control").is_none(), "tool marker stripped");
@@ -432,9 +444,45 @@ mod tests {
             "messages": [{"role": "user", "content": "hi"}]
         })
         .to_string();
-        let (out, had_markers) = strip_cache_control(body.as_bytes());
+        let (out, had_markers) = strip_cache_control(body.as_bytes(), &TelemetryPolicy::default());
         assert!(!had_markers, "a schema field is not a marker");
         assert!(out.is_none(), "nothing stripped, body unchanged");
+    }
+
+    #[test]
+    fn strip_mode_removes_telemetry_block_from_forwarded_body() {
+        // strip_from_prompt=true: the unmarked telemetry block is dropped from the forwarded body,
+        // and cache_control is still stripped from the surviving (marked) block.
+        let body = serde_json::json!({
+            "messages": [{"role": "system", "content": [
+                {"type": "text", "text": "x-anthropic-billing-header: cch=abc;"},
+                {"type": "text", "text": "real system", "cache_control": {"type": "ephemeral"}}
+            ]}]
+        })
+        .to_string();
+        let tele = TelemetryPolicy::from_config(true, &["x-anthropic-billing-header:".to_string()]);
+        let (out, _) = strip_cache_control(body.as_bytes(), &tele);
+        let v: Value = serde_json::from_slice(&out.expect("body rewritten")).unwrap();
+        let content = v["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 1, "telemetry block removed from the forwarded prompt");
+        assert_eq!(content[0]["text"], "real system");
+        assert!(content[0].get("cache_control").is_none(), "marker stripped from survivor");
+    }
+
+    #[test]
+    fn ignore_mode_keeps_telemetry_block_in_forwarded_body() {
+        // strip_from_prompt=false: the telemetry block stays in the forwarded body (only the cache
+        // hash excludes it). No marker + no strip → body untouched.
+        let body = serde_json::json!({
+            "messages": [{"role": "system", "content": [
+                {"type": "text", "text": "x-anthropic-billing-header: cch=abc;"},
+                {"type": "text", "text": "real system"}
+            ]}]
+        })
+        .to_string();
+        let tele = TelemetryPolicy::from_config(false, &["x-anthropic-billing-header:".to_string()]);
+        let (out, _) = strip_cache_control(body.as_bytes(), &tele);
+        assert!(out.is_none(), "ignore mode leaves the forwarded body untouched");
     }
 
     #[test]

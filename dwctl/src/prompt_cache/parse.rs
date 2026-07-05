@@ -20,6 +20,11 @@
 //! content-vs-rendered approximation already used for message text. Image-token caching is
 //! deferred — image blocks still contribute to the prefix hash but carry no text, so their
 //! tokens fall into the uncached tail.
+//!
+//! Provider-injected per-request *telemetry* blocks — e.g. the Claude Code SDK's
+//! `x-anthropic-billing-header` line, whose `cch=<nonce>` changes on every request — are
+//! excluded from this view (see [`TelemetryPolicy`]) so they don't poison the prefix hash and
+//! force write-only caching. In strip mode they're also removed from the forwarded request.
 
 use sha2::{Digest, Sha256};
 
@@ -99,7 +104,7 @@ impl ParsedPrompt {
 /// Parse a chat-completions body into its cache primitives. Callers decide what a `ParseError`
 /// means: the classifier degrades to "no cache" (the request is forwarded untouched), while the
 /// request-path [`validate_markers`] surfaces it to the client as a 400.
-pub fn parse_chat_completions(body: &[u8], policy: &TierPolicy) -> Result<ParsedPrompt, ParseError> {
+pub fn parse_chat_completions(body: &[u8], policy: &TierPolicy, telemetry: &TelemetryPolicy) -> Result<ParsedPrompt, ParseError> {
     let v: serde_json::Value = serde_json::from_slice(body)?;
 
     let mut blocks: Vec<Block> = Vec::new();
@@ -158,6 +163,15 @@ pub fn parse_chat_completions(body: &[u8], policy: &TierPolicy) -> Result<Parsed
                 // Array content: a sequence of blocks, each possibly marked.
                 Some(serde_json::Value::Array(arr)) => {
                     for block in arr {
+                        // Exclude provider-injected telemetry blocks (e.g. the Claude Code SDK's
+                        // `x-anthropic-billing-header` line with its per-request `cch` nonce) from the
+                        // cache prefix: left in, they'd change the prefix hash every turn and force
+                        // write-only caching. `excludes_block` only matches UNMARKED blocks, so a
+                        // caller's `cache_control` breakpoint is never dropped. (In strip mode the
+                        // outbound sanitiser also removes them from the forwarded request.)
+                        if telemetry.excludes_block(block) {
+                            continue;
+                        }
                         let ttl = match block.get("cache_control") {
                             // An explicit `null` (or absent) is "no marker"; anything else is
                             // validated by `parse_ttl` (which rejects non-object values).
@@ -286,6 +300,50 @@ fn strip_cache_control(block: &serde_json::Value) -> serde_json::Value {
     b
 }
 
+/// Runtime policy for provider-injected *telemetry* blocks, built from `cache.telemetry_blocks`.
+///
+/// A content block is "telemetry" when its text starts with one of `prefixes` (e.g. the Claude Code
+/// SDK's `x-anthropic-billing-header:` line, whose `cch=<nonce>` changes every request; real
+/// Anthropic strips it before caching). Such a block sits ahead of the caller's `cache_control`
+/// breakpoint, so left in the hashed prefix the cache can only ever WRITE, never READ (the write-only
+/// bug). Matched **unmarked** blocks are always excluded from the cache prefix ([`excludes_block`]);
+/// when `strip_from_prompt` is set the outbound sanitiser ([`super::inject::strip_cache_control`])
+/// also removes them from the forwarded request, which additionally lets the upstream KV/prefix cache
+/// see a stable prompt. An empty `prefixes` list disables the feature.
+///
+/// [`excludes_block`]: TelemetryPolicy::excludes_block
+#[derive(Debug, Clone, Default)]
+pub struct TelemetryPolicy {
+    /// Also remove matched blocks from the forwarded request, not just the cache prefix.
+    pub strip_from_prompt: bool,
+    prefixes: Vec<String>,
+}
+
+impl TelemetryPolicy {
+    pub fn from_config(strip_from_prompt: bool, prefixes: &[String]) -> Self {
+        Self {
+            strip_from_prompt,
+            prefixes: prefixes.to_vec(),
+        }
+    }
+
+    /// Whether `block` is an UNMARKED telemetry block to exclude from the cache prefix (and, in
+    /// strip mode, from the forwarded prompt). Only unmarked blocks match, so a caller's
+    /// `cache_control` breakpoint is never dropped. Always `false` when `prefixes` is empty.
+    pub fn excludes_block(&self, block: &serde_json::Value) -> bool {
+        if self.prefixes.is_empty() {
+            return false;
+        }
+        let unmarked = block.get("cache_control").map_or(true, |cc| cc.is_null());
+        if !unmarked {
+            return false;
+        }
+        let text = block.get("text").and_then(|v| v.as_str()).unwrap_or("");
+        let t = text.trim_start();
+        self.prefixes.iter().any(|prefix| t.starts_with(prefix.as_str()))
+    }
+}
+
 /// `role` + canonical JSON of the marker-stripped block. The role is included so the
 /// same text under different roles hashes differently.
 ///
@@ -310,8 +368,22 @@ mod tests {
         TierPolicy::from_config(&["5m".to_string(), "1h".to_string(), "24h".to_string()], "5m")
     }
 
+    /// Telemetry handling disabled (empty prefixes) — the default for tests unconcerned with it.
+    fn no_telemetry() -> TelemetryPolicy {
+        TelemetryPolicy::default()
+    }
+
+    /// Telemetry handling enabled with the Claude Code SDK prefix.
+    fn telemetry() -> TelemetryPolicy {
+        TelemetryPolicy::from_config(true, &["x-anthropic-billing-header:".to_string()])
+    }
+
     fn parse(body: serde_json::Value) -> ParsedPrompt {
-        parse_chat_completions(body.to_string().as_bytes(), &all_tiers()).unwrap()
+        parse_chat_completions(body.to_string().as_bytes(), &all_tiers(), &no_telemetry()).unwrap()
+    }
+
+    fn parse_with(body: serde_json::Value, tele: &TelemetryPolicy) -> ParsedPrompt {
+        parse_chat_completions(body.to_string().as_bytes(), &all_tiers(), tele).unwrap()
     }
 
     #[test]
@@ -371,6 +443,7 @@ mod tests {
             .to_string()
             .as_bytes(),
             &all_tiers(),
+            &no_telemetry(),
         )
         .unwrap_err();
         assert!(matches!(err, ParseError::InvalidTtl(t) if t == "2h"));
@@ -387,6 +460,7 @@ mod tests {
             .to_string()
             .as_bytes(),
             &all_tiers(),
+            &no_telemetry(),
         )
         .unwrap_err();
         assert!(matches!(err, ParseError::UnsupportedType(t) if t == "persistent"));
@@ -402,6 +476,7 @@ mod tests {
                 .to_string()
                 .as_bytes(),
             &all_tiers(),
+            &no_telemetry(),
         )
         .unwrap_err();
         assert!(matches!(err, ParseError::TooManyBreakpoints));
@@ -419,7 +494,7 @@ mod tests {
         let err = validate_markers(&body, &policy).unwrap_err();
         assert!(matches!(err, ParseError::DisabledTier(TtlTier::TwentyFourHours)));
         // The full parse rejects it identically (the two share parse_ttl, so they can't diverge).
-        let err2 = parse_chat_completions(body.to_string().as_bytes(), &policy).unwrap_err();
+        let err2 = parse_chat_completions(body.to_string().as_bytes(), &policy, &no_telemetry()).unwrap_err();
         assert!(matches!(err2, ParseError::DisabledTier(TtlTier::TwentyFourHours)));
     }
 
@@ -434,7 +509,7 @@ mod tests {
             ]}]
         });
         assert!(validate_markers(&body, &policy).is_ok());
-        let p = parse_chat_completions(body.to_string().as_bytes(), &policy).unwrap();
+        let p = parse_chat_completions(body.to_string().as_bytes(), &policy, &no_telemetry()).unwrap();
         assert_eq!(p.breakpoints[0].ttl_tier, TtlTier::OneHour);
     }
 
@@ -472,7 +547,7 @@ mod tests {
             ParseError::MalformedCacheControl
         ));
         assert!(matches!(
-            parse_chat_completions(body.to_string().as_bytes(), &all_tiers()).unwrap_err(),
+            parse_chat_completions(body.to_string().as_bytes(), &all_tiers(), &no_telemetry()).unwrap_err(),
             ParseError::MalformedCacheControl
         ));
     }
@@ -521,7 +596,7 @@ mod tests {
             ]}]
         });
         assert!(matches!(
-            parse_chat_completions(empty.to_string().as_bytes(), &all_tiers()).unwrap_err(),
+            parse_chat_completions(empty.to_string().as_bytes(), &all_tiers(), &no_telemetry()).unwrap_err(),
             ParseError::MalformedCacheControl
         ));
     }
@@ -535,7 +610,7 @@ mod tests {
             ]}]
         });
         assert!(validate_markers(&body, &all_tiers()).is_ok());
-        let p = parse_chat_completions(body.to_string().as_bytes(), &all_tiers()).unwrap();
+        let p = parse_chat_completions(body.to_string().as_bytes(), &all_tiers(), &no_telemetry()).unwrap();
         assert!(p.breakpoints.is_empty());
     }
 
@@ -663,7 +738,7 @@ mod tests {
             ParseError::TooManyBreakpoints
         ));
         assert!(matches!(
-            parse_chat_completions(body.to_string().as_bytes(), &all_tiers()).unwrap_err(),
+            parse_chat_completions(body.to_string().as_bytes(), &all_tiers(), &no_telemetry()).unwrap_err(),
             ParseError::TooManyBreakpoints
         ));
     }
@@ -676,6 +751,86 @@ mod tests {
             "messages": [{"role": "user", "content": "q"}]
         });
         assert!(validate_markers(&body, &all_tiers()).is_ok());
+    }
+
+    #[test]
+    fn provider_telemetry_block_excluded_from_cache_view() {
+        // A telemetry-only block (no marker) is invisible to the cache: the stable prefix hashes
+        // identically whether or not it's present, and it doesn't occupy a block slot.
+        let tele = telemetry();
+        let with = parse_with(
+            serde_json::json!({
+                "messages": [{"role": "system", "content": [
+                    {"type": "text", "text": "x-anthropic-billing-header: cc_version=2.1; cch=abc123;"},
+                    {"type": "text", "text": "stable system prompt"}
+                ]}]
+            }),
+            &tele,
+        );
+        let without = parse_with(
+            serde_json::json!({
+                "messages": [{"role": "system", "content": [
+                    {"type": "text", "text": "stable system prompt"}
+                ]}]
+            }),
+            &tele,
+        );
+        assert_eq!(with.blocks.len(), 1, "telemetry block is skipped");
+        assert_eq!(with.blocks[0].text, "stable system prompt");
+        assert_eq!(with.cumulative_hashes[0], without.cumulative_hashes[0]);
+    }
+
+    #[test]
+    fn telemetry_kept_when_feature_disabled() {
+        // Empty prefixes (default `TelemetryPolicy`) = feature off: the block is normal content.
+        let p = parse(serde_json::json!({
+            "messages": [{"role": "system", "content": [
+                {"type": "text", "text": "x-anthropic-billing-header: cch=abc;"},
+                {"type": "text", "text": "stable"}
+            ]}]
+        }));
+        assert_eq!(p.blocks.len(), 2, "feature off → telemetry block not excluded");
+    }
+
+    #[test]
+    fn telemetry_nonce_does_not_change_prefix_hash() {
+        // The Claude Code SDK write-only bug: the leading telemetry block's `cch` nonce changes
+        // every turn. Excluded, a marked stable prefix hashes the SAME across nonces → reads hit.
+        let mk = |nonce: &str| {
+            serde_json::json!({
+                "messages": [
+                    {"role": "system", "content": [
+                        {"type": "text", "text": format!("x-anthropic-billing-header: cc_entrypoint=sdk-py; cch={nonce};")},
+                        {"type": "text", "text": "long stable system prompt", "cache_control": {"type": "ephemeral", "ttl": "5m"}}
+                    ]},
+                    {"role": "user", "content": "hello"}
+                ]
+            })
+        };
+        let a = parse_with(mk("47d6f"), &telemetry());
+        let b = parse_with(mk("b1b38"), &telemetry());
+        // Blocks: [system(stable), user] — telemetry excluded; breakpoint on the stable block.
+        assert_eq!(a.blocks.len(), 2);
+        assert_eq!(a.breakpoints.len(), 1);
+        assert_eq!(a.breakpoints[0].block_index, 0);
+        // Different nonce, identical cached-prefix hash — the fix.
+        assert_eq!(a.cumulative_hashes[0], b.cumulative_hashes[0]);
+    }
+
+    #[test]
+    fn marked_block_is_not_treated_as_telemetry() {
+        // Defensive: a block starting with the telemetry prefix but carrying a real marker is NOT
+        // dropped — we never silently discard a caller's breakpoint.
+        let p = parse_with(
+            serde_json::json!({
+                "messages": [{"role": "system", "content": [
+                    {"type": "text", "text": "x-anthropic-billing-header: keep me", "cache_control": {"type": "ephemeral"}}
+                ]}]
+            }),
+            &telemetry(),
+        );
+        assert_eq!(p.blocks.len(), 1);
+        assert_eq!(p.breakpoints.len(), 1);
     }
 
     #[test]
