@@ -1061,6 +1061,14 @@ pub struct CacheConfig {
     ///
     /// Set via environment: `DWCTL_CACHE__DEFAULT_TTL=5m`
     pub default_ttl: String,
+
+    /// Handling of provider-injected per-request *telemetry* blocks (e.g. the Claude Code SDK's
+    /// `x-anthropic-billing-header` line, whose nonce changes every request). Such a block sits
+    /// ahead of the caller's `cache_control` breakpoint, so leaving it in would change the prefix
+    /// hash every turn — forcing write-only caching (no read discount) and defeating the upstream
+    /// KV/prefix cache. Matched blocks are always excluded from our cache prefix; see
+    /// [`TelemetryBlockConfig`] for whether they're also removed from the forwarded prompt.
+    pub telemetry_blocks: TelemetryBlockConfig,
 }
 
 impl Default for CacheConfig {
@@ -1071,6 +1079,47 @@ impl Default for CacheConfig {
             pricing: CachePricingConfig::default(),
             enabled_ttls: vec!["5m".to_string(), "1h".to_string()],
             default_ttl: "5m".to_string(),
+            telemetry_blocks: TelemetryBlockConfig::default(),
+        }
+    }
+}
+
+/// How provider-injected telemetry blocks are handled. A block counts as "telemetry" only when it
+/// is an **unmarked** (`cache_control`-free) **`system`** message content block whose text starts
+/// with one of `prefixes` — the role/marker constraints mean `prefixes` never applies to
+/// user/assistant content or to a block the caller has marked. Matched blocks are **always**
+/// excluded from our cache prefix (the fix for the write-only-caching bug); `strip_from_prompt`
+/// additionally controls whether they're removed from the request forwarded to the model.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TelemetryBlockConfig {
+    /// When true (the default), remove matched telemetry blocks from the forwarded request too —
+    /// not just from our cache prefix. This also lets the upstream (sglang/Dynamo) prefix-cache
+    /// the real prompt and drops noise the model would otherwise see.
+    ///
+    /// When false, the block is left in the forwarded request (still excluded from our cache
+    /// prefix). Our cache is billing-only — no KV reuse, every request still runs in full upstream
+    /// — so this can't produce wrong outputs, and the read discount stays correct because the
+    /// excluded prefix genuinely recurs. The only cost is that the per-request telemetry stays in
+    /// the model's prompt, defeating the upstream prefix cache and billing those tokens as uncached
+    /// each turn. Prefer the default.
+    ///
+    /// Set via environment: `DWCTL_CACHE__TELEMETRY_BLOCKS__STRIP_FROM_PROMPT=false`
+    pub strip_from_prompt: bool,
+
+    /// Leading text prefixes that identify a telemetry block (matched after trimming leading
+    /// whitespace). An **empty list disables the feature entirely** (nothing excluded or
+    /// stripped). Default: the Claude Code SDK's `x-anthropic-billing-header:` line.
+    ///
+    /// Set via environment: `DWCTL_CACHE__TELEMETRY_BLOCKS__PREFIXES=x-anthropic-billing-header:`
+    pub prefixes: Vec<String>,
+}
+
+impl Default for TelemetryBlockConfig {
+    fn default() -> Self {
+        Self {
+            strip_from_prompt: true,
+            prefixes: vec!["x-anthropic-billing-header:".to_string()],
         }
     }
 }
