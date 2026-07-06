@@ -265,16 +265,24 @@ enable_request_logging: true # Enable request/response logging to database
 # hours.
 batches:
   # Enable batches API endpoints (/ai/v1/files, /ai/v1/batches)
-  # When disabled, these endpoints will not be available (default: false).
-  enabled: false
+  # When disabled, these endpoints will not be available (default: true).
+  enabled: true
+  pending_capacity_counts_enabled: false # Include committed pending requests in batch submission capacity checks (default: false)
 
+  # Files configuration for batch file uploads/downloads
+  files:
+    max_file_size: 2147483648 # 2 GB - maximum size for file uploads
+    upload_buffer_size: 100 # Buffer size for file upload streams
+    download_buffer_size: 100 # Buffer size for file download streams
+
+background_services:
   # Daemon configuration for processing batch requests
-  daemon:
+  batch_daemon:
     # Controls when the batch processing daemon runs
-    # - "leader": Only run on the elected leader instance (default)
-    # - "always": Run on all instances (use for single-instance deployments)
-    # - "never": Never run the daemon (useful for testing or when using external processors)
-    enabled: leader
+    # - "always": Run on all instances (default)
+    # - "leader": Only run on the elected leader instance
+    # - "never": Never run the daemon
+    enabled: always
 
     # Performance & Concurrency Settings
     claim_batch_size: 100 # Maximum number of requests to claim in each iteration
@@ -282,10 +290,11 @@ batches:
     claim_interval_ms: 1000 # Milliseconds to sleep between claim iterations
 
     # Retry & Backoff Settings
-    # All retry parameters are optional - default behaviour is to retry indefinitely until deadline
-    # max_retries: 100 # stop retrying a request after 100 failed attempts
-    # stop_before_deadline_ms: 900000 # Stop 15 minutes before batch deadline
-    
+    # All retry parameters are optional and default to fusillade's built-in defaults
+    # min_retries: 3 - Minimum retries guaranteed regardless of other limits
+    # max_retries: None - No cap on retries (only limited by deadline if set)
+    stop_before_deadline_ms: 0 # When to stop retrying/escalating relative to the batch completion window
+
     backoff_ms: 1000 # Initial backoff duration in milliseconds
     backoff_factor: 2 # Exponential backoff multiplier
     max_backoff_ms: 10000 # Maximum backoff duration in milliseconds
@@ -297,15 +306,10 @@ batches:
     body_timeout_ms: 86400000 # Max total time for entire response body (24 hours)
     claim_timeout_ms: 60000 # Max time in "claimed" state before auto-unclaim (1 minute)
     processing_timeout_ms: 600000 # Max time in "processing" state before auto-unclaim (10 minutes)
+    pending_request_counts_timeout_ms: 60000 # Statement timeout for pending request count queries (1 minute)
 
     # Observability
     status_log_interval_ms: 2000 # Interval for logging daemon status (set to null to disable)
-
-  # Files configuration for batch file uploads/downloads
-  files:
-    max_file_size: 2147483648 # 2 GB - maximum size for file uploads
-    upload_buffer_size: 100 # Buffer size for file upload streams
-    download_buffer_size: 100 # Buffer size for file download streams
 ```
 
 ### Initial Credit Grant

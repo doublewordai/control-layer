@@ -133,6 +133,7 @@ async fn test_route_at_claim_time_escalation(pool: PgPool) {
         body_timeout_ms: 86_400_000,
         claim_timeout_ms: 5000,
         processing_timeout_ms: 10000,
+        pending_request_counts_timeout_ms: 60_000,
         status_log_interval_ms: Some(500),
         // Configure route-at-claim-time escalation
         // When batch is within 60 seconds of expiry, route to escalation model
@@ -397,6 +398,7 @@ async fn test_no_escalation_when_not_near_expiry(pool: PgPool) {
         body_timeout_ms: 86_400_000,
         claim_timeout_ms: 5000,
         processing_timeout_ms: 10000,
+        pending_request_counts_timeout_ms: 60_000,
         status_log_interval_ms: None,
         model_escalations: {
             let mut map = HashMap::new();

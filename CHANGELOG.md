@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.70.1](https://github.com/doublewordai/control-layer/compare/v8.70.0...v8.70.1) (2026-07-03)
+
+
+### Bug Fixes
+
+* disable batch capacity pending counts by default ([#1222](https://github.com/doublewordai/control-layer/issues/1222)) ([051c737](https://github.com/doublewordai/control-layer/commit/051c73777bca6c47d9abfca2c2cef2be09b37c63))
+
 ## [8.70.0](https://github.com/doublewordai/control-layer/compare/v8.69.0...v8.70.0) (2026-07-02)
 
 

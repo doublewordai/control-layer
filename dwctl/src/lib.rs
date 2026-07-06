@@ -1650,6 +1650,10 @@ pub async fn build_router(
                 crate::prompt_cache::TokenizerClient::new(cfg.cache.tokenizer_url.clone()),
                 Arc::new(crate::prompt_cache::PostgresIndex::new(pool)),
                 crate::prompt_cache::TierPolicy::from_config(&cfg.cache.enabled_ttls, &cfg.cache.default_ttl),
+                crate::prompt_cache::TelemetryPolicy::from_config(
+                    cfg.cache.telemetry_blocks.strip_from_prompt,
+                    &cfg.cache.telemetry_blocks.prefixes,
+                ),
             );
             // Bound the cache layer's body buffer by the same limit onwards uses (0 =
             // unlimited), so it's never more restrictive than the entry point.

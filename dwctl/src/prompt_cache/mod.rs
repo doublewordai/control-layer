@@ -28,7 +28,7 @@ pub use index::{CacheEntry, CacheError, CacheIndex, CacheMatch, CacheResult, Ind
 pub use inject::strip_cache_control;
 pub use layer::{CacheLayerState, cache_middleware};
 pub use model_config::{ModelCacheConfig, ModelConfigResolver};
-pub use parse::{Block, Breakpoint, ParseError, ParsedPrompt, parse_chat_completions, validate_markers};
+pub use parse::{Block, Breakpoint, ParseError, ParsedPrompt, TelemetryPolicy, parse_chat_completions, validate_markers};
 pub use postgres::PostgresIndex;
 pub use principal::PrincipalResolver;
 pub use stats::{CacheStats, PendingWrite};

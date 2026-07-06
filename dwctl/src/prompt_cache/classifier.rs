@@ -20,7 +20,7 @@ use chrono::Utc;
 use super::index::{CacheEntry, CacheIndex, CacheResult, IndexScope, PrefixHash, TierPolicy};
 use super::metrics as cache_metrics;
 use super::model_config::ModelConfigResolver;
-use super::parse::{ParseError, parse_chat_completions};
+use super::parse::{ParseError, TelemetryPolicy, parse_chat_completions};
 use super::principal::PrincipalResolver;
 use super::stats::{CacheStats, PendingWrite};
 use super::tokenizer::TokenizerClient;
@@ -92,6 +92,9 @@ pub struct Classifier {
     /// Enabled TTL tiers + the default-ttl tier. Shared with the layer's request-path marker
     /// validation, so a no-ttl marker resolves to the same tier here as it was validated against.
     tier_policy: TierPolicy,
+    /// Provider-telemetry-block handling. Used here to exclude telemetry from the cache prefix,
+    /// and exposed to the layer's outbound sanitiser to (in strip mode) drop it from the forward.
+    telemetry: TelemetryPolicy,
 }
 
 impl Classifier {
@@ -101,6 +104,7 @@ impl Classifier {
         tokenizer: TokenizerClient,
         index: Arc<dyn CacheIndex>,
         tier_policy: TierPolicy,
+        telemetry: TelemetryPolicy,
     ) -> Self {
         let versions = moka::future::Cache::builder()
             .max_capacity(10_000)
@@ -113,6 +117,7 @@ impl Classifier {
             index,
             versions,
             tier_policy,
+            telemetry,
         }
     }
 
@@ -120,6 +125,11 @@ impl Classifier {
     /// layer's synchronous request-path marker validation.
     pub fn tier_policy(&self) -> &TierPolicy {
         &self.tier_policy
+    }
+
+    /// The provider-telemetry policy, exposed for the layer's outbound sanitiser.
+    pub fn telemetry_policy(&self) -> &TelemetryPolicy {
+        &self.telemetry
     }
 
     /// Classify a request into its read/write split + the entries to commit on success.
@@ -150,7 +160,7 @@ impl Classifier {
         // From here the model is cache-enabled: any bail is `zero_active`.
         // (The layer already 400-rejected disabled/malformed markers synchronously before the
         // fork, so on the live path these errors won't fire — this stays a defensive fallback.)
-        let parsed = match parse_chat_completions(req.body, &self.tier_policy) {
+        let parsed = match parse_chat_completions(req.body, &self.tier_policy, &self.telemetry) {
             Ok(p) => p,
             Err(e) => {
                 // Marker validation rejections (anti-abuse) vs a genuine unparseable body.
@@ -400,7 +410,10 @@ mod tests {
     }
 
     fn prefix_hash() -> PrefixHash {
-        parse_chat_completions(&body(), &all_tiers()).unwrap().cumulative_hashes[0].clone()
+        parse_chat_completions(&body(), &all_tiers(), &TelemetryPolicy::default())
+            .unwrap()
+            .cumulative_hashes[0]
+            .clone()
     }
 
     struct H {
@@ -453,6 +466,7 @@ mod tests {
             TokenizerClient::new(server.uri()),
             Arc::new(PostgresIndex::new(pool.clone())),
             all_tiers(),
+            TelemetryPolicy::default(),
         );
         H {
             classifier,
