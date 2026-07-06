@@ -109,6 +109,8 @@ hickory-resolver = { version = "0.26", default-features = false, features = [
   "tokio",
 ] }
 aes-gcm = "0.10.3"
+# Redis-backed keystore for zero-data-retention flex request keys.
+deadpool-redis = "0.18"
 paste = "1.0"
 serde_with = "3.14.1"
 rust_decimal = { version = "1.38.0", features = ["serde"] }
