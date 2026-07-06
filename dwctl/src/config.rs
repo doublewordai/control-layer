@@ -1084,10 +1084,12 @@ impl Default for CacheConfig {
     }
 }
 
-/// How provider-injected telemetry blocks are handled. A content block is "telemetry" when its
-/// text starts with one of `prefixes`. Matched (unmarked) blocks are **always** excluded from our
-/// cache prefix — the fix for the write-only-caching bug — and `strip_from_prompt` additionally
-/// controls whether they're removed from the request forwarded to the model.
+/// How provider-injected telemetry blocks are handled. A block counts as "telemetry" only when it
+/// is an **unmarked** (`cache_control`-free) **`system`** message content block whose text starts
+/// with one of `prefixes` — the role/marker constraints mean `prefixes` never applies to
+/// user/assistant content or to a block the caller has marked. Matched blocks are **always**
+/// excluded from our cache prefix (the fix for the write-only-caching bug); `strip_from_prompt`
+/// additionally controls whether they're removed from the request forwarded to the model.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct TelemetryBlockConfig {
