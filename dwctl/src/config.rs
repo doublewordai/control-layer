@@ -1095,8 +1095,14 @@ impl Default for CacheConfig {
 pub struct TelemetryBlockConfig {
     /// When true (the default), remove matched telemetry blocks from the forwarded request too —
     /// not just from our cache prefix. This also lets the upstream (sglang/Dynamo) prefix-cache
-    /// the real prompt and drops noise the model would otherwise see. When false, the block is
-    /// left in the forwarded request (we still exclude it from our cache prefix).
+    /// the real prompt and drops noise the model would otherwise see.
+    ///
+    /// When false, the block is left in the forwarded request (still excluded from our cache
+    /// prefix). Our cache is billing-only — no KV reuse, every request still runs in full upstream
+    /// — so this can't produce wrong outputs, and the read discount stays correct because the
+    /// excluded prefix genuinely recurs. The only cost is that the per-request telemetry stays in
+    /// the model's prompt, defeating the upstream prefix cache and billing those tokens as uncached
+    /// each turn. Prefer the default.
     ///
     /// Set via environment: `DWCTL_CACHE__TELEMETRY_BLOCKS__STRIP_FROM_PROMPT=false`
     pub strip_from_prompt: bool,

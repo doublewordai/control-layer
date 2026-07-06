@@ -22,7 +22,7 @@ use bytes::Bytes;
 use serde_json::Value;
 use tracing::error;
 
-use super::parse::TelemetryPolicy;
+use super::parse::{TELEMETRY_ROLE, TelemetryPolicy};
 use super::stats::CacheStats;
 
 /// Remove `cache_control` markers from the request body at exactly the locations the parser
@@ -46,20 +46,20 @@ fn remove_cache_control(body: &mut Value, telemetry: &TelemetryPolicy) -> (bool,
     // Message content blocks (array-form content only; string content carries no marker).
     if let Some(messages) = obj.get_mut("messages").and_then(Value::as_array_mut) {
         for msg in messages.iter_mut() {
-            // Read the role before the mutable content borrow — telemetry handling is scoped to the
-            // system role (matching `super::parse`), so a non-system block that coincidentally starts
-            // with a configured prefix is never mutated out of the forwarded prompt.
-            let role = msg.get("role").and_then(Value::as_str).unwrap_or("").to_string();
+            // Whether to drop telemetry from THIS message's forwarded content: strip mode + the
+            // system role (matching `super::parse`). Evaluated from a borrowed `&str` BEFORE the
+            // mutable content borrow, so there's no per-message `String` allocation, and a
+            // non-system block that coincidentally starts with a prefix is never mutated out.
+            let strip_system_telemetry = telemetry.strip_from_prompt && msg.get("role").and_then(Value::as_str) == Some(TELEMETRY_ROLE);
             if let Some(content) = msg.get_mut("content").and_then(Value::as_array_mut) {
-                // In strip mode, drop unmarked provider-telemetry blocks (e.g. the Claude Code
-                // SDK's `x-anthropic-billing-header` line) from the FORWARDED prompt — done BEFORE
-                // stripping cache_control so `excludes_block` still sees the original marker state
-                // and never drops a caller-marked block. This keeps the forwarded bytes aligned
-                // with what `super::parse` excludes from the cache hash, and lets the upstream
-                // KV/prefix cache see a stable prompt.
-                if telemetry.strip_from_prompt {
+                // Drop the unmarked telemetry blocks from the FORWARDED prompt BEFORE stripping
+                // cache_control, so `excludes_block` still sees the original marker state and never
+                // drops a caller-marked block. Keeps the forwarded bytes aligned with what
+                // `super::parse` excludes from the hash, and lets the upstream KV/prefix cache see
+                // a stable prompt. (Role is already confirmed system, so pass the const.)
+                if strip_system_telemetry {
                     let before = content.len();
-                    content.retain(|block| !telemetry.excludes_block(&role, block));
+                    content.retain(|block| !telemetry.excludes_block(TELEMETRY_ROLE, block));
                     rewrote |= content.len() != before;
                 }
                 for block in content.iter_mut() {

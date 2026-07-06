@@ -355,7 +355,7 @@ impl TelemetryPolicy {
 /// restricted to it so non-system content that coincidentally starts with a configured prefix is
 /// never excluded from the cache or stripped from the forwarded prompt. If a future provider injects
 /// elsewhere, promote this to a configurable set.
-const TELEMETRY_ROLE: &str = "system";
+pub(crate) const TELEMETRY_ROLE: &str = "system";
 
 /// `role` + canonical JSON of the marker-stripped block. The role is included so the
 /// same text under different roles hashes differently.
