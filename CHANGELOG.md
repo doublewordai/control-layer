@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.71.0](https://github.com/doublewordai/control-layer/compare/v8.70.3...v8.71.0) (2026-07-06)
+
+
+### Features
+
+* zero-data-retention for flex (encryption) and realtime (non-persistence) ([#1218](https://github.com/doublewordai/control-layer/issues/1218)) ([7248f88](https://github.com/doublewordai/control-layer/commit/7248f880ab02228fef2ef58e17e89b294d873e11))
+
 ## [8.70.3](https://github.com/doublewordai/control-layer/compare/v8.70.2...v8.70.3) (2026-07-06)
 
 
