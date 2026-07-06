@@ -75,6 +75,8 @@ pub struct ResponseDetail {
     pub reasoning_tokens: Option<i64>,
     pub total_tokens: Option<i64>,
     pub total_cost: Option<f64>,
+    /// OpenAI-compatible API path the request was sent to, e.g. `/v1/responses`.
+    pub endpoint: Option<String>,
     pub body: String,
     pub response_body: Option<String>,
     pub error: Option<String>,
