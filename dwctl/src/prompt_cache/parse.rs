@@ -321,9 +321,11 @@ pub struct TelemetryPolicy {
 
 impl TelemetryPolicy {
     pub fn from_config(strip_from_prompt: bool, prefixes: &[String]) -> Self {
+        // Drop empty prefixes: `"".starts_with(..)` matches everything, so a stray empty entry
+        // would (catastrophically) treat every unmarked system block as telemetry.
         Self {
             strip_from_prompt,
-            prefixes: prefixes.to_vec(),
+            prefixes: prefixes.iter().filter(|p| !p.is_empty()).cloned().collect(),
         }
     }
 
@@ -339,7 +341,7 @@ impl TelemetryPolicy {
         if self.prefixes.is_empty() || role != TELEMETRY_ROLE {
             return false;
         }
-        let unmarked = block.get("cache_control").map_or(true, |cc| cc.is_null());
+        let unmarked = block.get("cache_control").is_none_or(|cc| cc.is_null());
         if !unmarked {
             return false;
         }
@@ -817,6 +819,19 @@ mod tests {
             &telemetry(),
         );
         assert_eq!(p.blocks.len(), 2, "user-role block starting with the prefix is not excluded");
+    }
+
+    #[test]
+    fn empty_prefix_is_dropped_not_match_all() {
+        // A stray empty-string prefix must NOT turn into "match every block" (`"".starts_with`).
+        let tele = TelemetryPolicy::from_config(true, &["".to_string()]);
+        let p = parse_with(
+            serde_json::json!({
+                "messages": [{"role": "system", "content": [{"type": "text", "text": "anything at all"}]}]
+            }),
+            &tele,
+        );
+        assert_eq!(p.blocks.len(), 1, "empty prefix must not exclude blocks");
     }
 
     #[test]
