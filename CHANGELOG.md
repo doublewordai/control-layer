@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.70.2](https://github.com/doublewordai/control-layer/compare/v8.70.1...v8.70.2) (2026-07-06)
+
+
+### Bug Fixes
+
+* some sdks inject extra blocks that invalidate cache, remove em ([#1224](https://github.com/doublewordai/control-layer/issues/1224)) ([064dbf7](https://github.com/doublewordai/control-layer/commit/064dbf70c5876e968310bead4c792f63518beafd))
+
 ## [8.70.1](https://github.com/doublewordai/control-layer/compare/v8.70.0...v8.70.1) (2026-07-03)
 
 
