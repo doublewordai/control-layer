@@ -1554,6 +1554,48 @@ pub struct DaemonConfig {
     /// deadline so earlier deadlines produce larger numbers. Default: false.
     #[serde(default)]
     pub inject_deadline_priority: bool,
+
+    /// Maximum request rows the batch claim daemon takes per iteration.
+    /// 0 inherits `claim_batch_size`, so an existing tuned cap carries over
+    /// to the split batch daemon unchanged. Default: 0 (inherit).
+    #[serde(default)]
+    pub batch_claim_size: usize,
+
+    /// Maximum batches selected per model per batch-claim iteration. Values
+    /// above 1 let a model's leftover capacity spill into the next-ranked
+    /// batches instead of idling when the top batch can't fill it.
+    /// Default: 4.
+    #[serde(default = "default_batch_claim_batch_size")]
+    pub batch_claim_batch_size: usize,
+
+    /// Sleep between batch-claim iterations in milliseconds.
+    /// 0 inherits `claim_interval_ms`. Default: 0 (inherit).
+    #[serde(default)]
+    pub batch_claim_interval_ms: u64,
+
+    /// Require an explicit `live` model_filters event before batch-claiming a
+    /// model. When false, models with NO filter events (external / always-on
+    /// providers that scouter does not manage) are treated as live — the
+    /// historical claim behaviour. Not-live (`coming`/`absent`) models remain
+    /// claimable only via the deadline ramp in either mode. Default: false.
+    #[serde(default)]
+    pub batch_claim_require_live: bool,
+
+    /// Exponent of the deadline-ramp curve: batches on not-live models become
+    /// claimable at full capacity within `window_minutes ^ exponent` minutes
+    /// of their deadline (~59 min for 24h windows, ~10 min for 1h at the
+    /// default). Values ≥ 1.0 make the ramp cover the whole window (batches
+    /// claimable immediately regardless of liveness). Default: 0.56.
+    #[serde(default = "default_claim_ramp_exponent", deserialize_with = "deserialize_claim_ramp_exponent")]
+    pub claim_ramp_exponent: f64,
+}
+
+fn default_batch_claim_batch_size() -> usize {
+    4
+}
+
+fn default_claim_ramp_exponent() -> f64 {
+    0.56
 }
 
 fn default_urgency_weight() -> f64 {
@@ -1576,6 +1618,27 @@ where
             "urgency_weight must be between 0.0 and 1.0, got {}",
             value
         ))),
+        Some(value) => Ok(value),
+    }
+}
+
+/// Custom deserializer that validates claim_ramp_exponent is finite and non-negative.
+/// (NaN/inf/negative exponents would make the deadline-ramp predicate undefined.)
+fn deserialize_claim_ramp_exponent<'de, D>(deserializer: D) -> Result<f64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+
+    let opt: Option<f64> = Option::deserialize(deserializer)?;
+
+    match opt {
+        None => Ok(default_claim_ramp_exponent()),
+        Some(value) if !value.is_finite() => Err(D::Error::custom(format!(
+            "claim_ramp_exponent must be a finite number, got {}",
+            value
+        ))),
+        Some(value) if value < 0.0 => Err(D::Error::custom(format!("claim_ramp_exponent must be non-negative, got {}", value))),
         Some(value) => Ok(value),
     }
 }
@@ -1618,6 +1681,11 @@ impl Default for DaemonConfig {
             streamable_endpoints: Vec::new(),
             urgency_weight: default_urgency_weight(),
             inject_deadline_priority: false,
+            batch_claim_size: 0,
+            batch_claim_batch_size: default_batch_claim_batch_size(),
+            batch_claim_interval_ms: 0,
+            batch_claim_require_live: false,
+            claim_ramp_exponent: default_claim_ramp_exponent(),
         }
     }
 }
@@ -1674,6 +1742,11 @@ impl DaemonConfig {
             streamable_endpoints: self.streamable_endpoints.clone(),
             urgency_weight: self.urgency_weight,
             inject_deadline_priority: self.inject_deadline_priority,
+            batch_claim_size: self.batch_claim_size,
+            batch_claim_batch_size: self.batch_claim_batch_size,
+            batch_claim_interval_ms: self.batch_claim_interval_ms,
+            batch_claim_require_live: self.batch_claim_require_live,
+            claim_ramp_exponent: self.claim_ramp_exponent,
             ..Default::default()
         }
     }
@@ -3625,6 +3698,91 @@ background_services:
             assert!(result.is_err());
             let err = result.unwrap_err().to_string();
             assert!(err.contains("urgency_weight must be between 0.0 and 1.0"));
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_claim_ramp_exponent_default_and_override() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+"#,
+            )?;
+            let args = Args {
+                config: "test.yaml".into(),
+                validate: false,
+            };
+            let config = Config::load(&args)?;
+            assert_eq!(config.background_services.batch_daemon.claim_ramp_exponent, 0.56);
+
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+background_services:
+  batch_daemon:
+    claim_ramp_exponent: 0.9
+"#,
+            )?;
+            let config = Config::load(&args)?;
+            assert_eq!(config.background_services.batch_daemon.claim_ramp_exponent, 0.9);
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_claim_ramp_exponent_negative_rejected() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+background_services:
+  batch_daemon:
+    claim_ramp_exponent: -0.5
+"#,
+            )?;
+            let args = Args {
+                config: "test.yaml".into(),
+                validate: false,
+            };
+            let result = Config::load(&args);
+            assert!(result.is_err());
+            let err = result.unwrap_err().to_string();
+            assert!(err.contains("claim_ramp_exponent must be non-negative"));
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_claim_ramp_exponent_non_finite_rejected() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+background_services:
+  batch_daemon:
+    claim_ramp_exponent: .nan
+"#,
+            )?;
+            let args = Args {
+                config: "test.yaml".into(),
+                validate: false,
+            };
+            let result = Config::load(&args);
+            assert!(result.is_err());
+            let err = result.unwrap_err().to_string();
+            assert!(
+                err.contains("claim_ramp_exponent must be a finite number") || err.contains("invalid"),
+                "unexpected error: {err}"
+            );
 
             Ok(())
         });

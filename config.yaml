@@ -491,6 +491,16 @@ background_services:
     default_model_concurrency: 10 # Default concurrent requests per model
     claim_interval_ms: 1000 # Milliseconds to sleep between claim iterations
 
+    # Split claim daemons (fusillade >= 20): batched and batchless (flex) rows
+    # are claimed by independent loops. All optional:
+    # batch_claim_size: 0            # Max rows per batch-claim iteration; 0 = inherit claim_batch_size
+    # batch_claim_batch_size: 4      # Max batches selected per model per iteration (spill-over pool)
+    # batch_claim_interval_ms: 0     # Batch-claim loop cadence; 0 = inherit claim_interval_ms
+    # batch_claim_require_live: false # Require an explicit `live` model_filters event to batch-claim;
+    #                                 # false treats no-event models (external providers) as live
+    # claim_ramp_exponent: 0.56      # Deadline-ramp curve: not-live batches become claimable within
+    #                                 # window_minutes^exponent minutes of deadline (~59m/24h, ~10m/1h)
+
     # Retry & Backoff Settings
     # All retry parameters are optional and default to fusillade's built-in defaults
     # min_retries: 3 - Minimum retries guaranteed regardless of other limits
