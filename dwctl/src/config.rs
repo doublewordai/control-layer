@@ -1554,6 +1554,47 @@ pub struct DaemonConfig {
     /// deadline so earlier deadlines produce larger numbers. Default: false.
     #[serde(default)]
     pub inject_deadline_priority: bool,
+
+    /// Maximum request rows the batch claim daemon takes per iteration.
+    /// 0 inherits `claim_batch_size`, so an existing tuned cap carries over
+    /// to the split batch daemon unchanged. Default: 0 (inherit).
+    #[serde(default)]
+    pub batch_claim_size: usize,
+
+    /// Maximum batches selected per model per batch-claim iteration. Values
+    /// above 1 let a model's leftover capacity spill into the next-ranked
+    /// batches instead of idling when the top batch can't fill it.
+    /// Default: 4.
+    #[serde(default = "default_batch_claim_batch_size")]
+    pub batch_claim_batch_size: usize,
+
+    /// Sleep between batch-claim iterations in milliseconds.
+    /// 0 inherits `claim_interval_ms`. Default: 0 (inherit).
+    #[serde(default)]
+    pub batch_claim_interval_ms: u64,
+
+    /// Require an explicit `live` model_filters event before batch-claiming a
+    /// model. When false, models with NO filter events (external / always-on
+    /// providers that scouter does not manage) are treated as live — the
+    /// historical claim behaviour. Not-live (`coming`/`absent`) models remain
+    /// claimable only via the deadline ramp in either mode. Default: false.
+    #[serde(default)]
+    pub batch_claim_require_live: bool,
+
+    /// Exponent of the deadline-ramp curve: batches on not-live models become
+    /// claimable at full capacity within `window_minutes ^ exponent` minutes
+    /// of their deadline (~59 min for 24h windows, ~10 min for 1h at the
+    /// default). Default: 0.56.
+    #[serde(default = "default_claim_ramp_exponent")]
+    pub claim_ramp_exponent: f64,
+}
+
+fn default_batch_claim_batch_size() -> usize {
+    4
+}
+
+fn default_claim_ramp_exponent() -> f64 {
+    0.56
 }
 
 fn default_urgency_weight() -> f64 {
@@ -1618,6 +1659,11 @@ impl Default for DaemonConfig {
             streamable_endpoints: Vec::new(),
             urgency_weight: default_urgency_weight(),
             inject_deadline_priority: false,
+            batch_claim_size: 0,
+            batch_claim_batch_size: default_batch_claim_batch_size(),
+            batch_claim_interval_ms: 0,
+            batch_claim_require_live: false,
+            claim_ramp_exponent: default_claim_ramp_exponent(),
         }
     }
 }
@@ -1674,6 +1720,11 @@ impl DaemonConfig {
             streamable_endpoints: self.streamable_endpoints.clone(),
             urgency_weight: self.urgency_weight,
             inject_deadline_priority: self.inject_deadline_priority,
+            batch_claim_size: self.batch_claim_size,
+            batch_claim_batch_size: self.batch_claim_batch_size,
+            batch_claim_interval_ms: self.batch_claim_interval_ms,
+            batch_claim_require_live: self.batch_claim_require_live,
+            claim_ramp_exponent: self.claim_ramp_exponent,
             ..Default::default()
         }
     }
