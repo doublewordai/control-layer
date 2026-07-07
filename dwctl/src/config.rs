@@ -1584,8 +1584,9 @@ pub struct DaemonConfig {
     /// Exponent of the deadline-ramp curve: batches on not-live models become
     /// claimable at full capacity within `window_minutes ^ exponent` minutes
     /// of their deadline (~59 min for 24h windows, ~10 min for 1h at the
-    /// default). Default: 0.56.
-    #[serde(default = "default_claim_ramp_exponent")]
+    /// default). Values ≥ 1.0 make the ramp cover the whole window (batches
+    /// claimable immediately regardless of liveness). Default: 0.56.
+    #[serde(default = "default_claim_ramp_exponent", deserialize_with = "deserialize_claim_ramp_exponent")]
     pub claim_ramp_exponent: f64,
 }
 
@@ -1615,6 +1616,30 @@ where
         Some(value) if !value.is_finite() => Err(D::Error::custom(format!("urgency_weight must be a finite number, got {}", value))),
         Some(value) if !(0.0..=1.0).contains(&value) => Err(D::Error::custom(format!(
             "urgency_weight must be between 0.0 and 1.0, got {}",
+            value
+        ))),
+        Some(value) => Ok(value),
+    }
+}
+
+/// Custom deserializer that validates claim_ramp_exponent is finite and non-negative.
+/// (NaN/inf/negative exponents would make the deadline-ramp predicate undefined.)
+fn deserialize_claim_ramp_exponent<'de, D>(deserializer: D) -> Result<f64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+
+    let opt: Option<f64> = Option::deserialize(deserializer)?;
+
+    match opt {
+        None => Ok(default_claim_ramp_exponent()),
+        Some(value) if !value.is_finite() => Err(D::Error::custom(format!(
+            "claim_ramp_exponent must be a finite number, got {}",
+            value
+        ))),
+        Some(value) if value < 0.0 => Err(D::Error::custom(format!(
+            "claim_ramp_exponent must be non-negative, got {}",
             value
         ))),
         Some(value) => Ok(value),
@@ -3676,6 +3701,92 @@ background_services:
             assert!(result.is_err());
             let err = result.unwrap_err().to_string();
             assert!(err.contains("urgency_weight must be between 0.0 and 1.0"));
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_claim_ramp_exponent_default_and_override() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+"#,
+            )?;
+            let args = Args {
+                config: "test.yaml".into(),
+                validate: false,
+            };
+            let config = Config::load(&args)?;
+            assert_eq!(config.background_services.batch_daemon.claim_ramp_exponent, 0.56);
+
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+background_services:
+  batch_daemon:
+    claim_ramp_exponent: 0.9
+"#,
+            )?;
+            let config = Config::load(&args)?;
+            assert_eq!(config.background_services.batch_daemon.claim_ramp_exponent, 0.9);
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_claim_ramp_exponent_negative_rejected() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+background_services:
+  batch_daemon:
+    claim_ramp_exponent: -0.5
+"#,
+            )?;
+            let args = Args {
+                config: "test.yaml".into(),
+                validate: false,
+            };
+            let result = Config::load(&args);
+            assert!(result.is_err());
+            let err = result.unwrap_err().to_string();
+            assert!(err.contains("claim_ramp_exponent must be non-negative"));
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_claim_ramp_exponent_non_finite_rejected() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+background_services:
+  batch_daemon:
+    claim_ramp_exponent: .nan
+"#,
+            )?;
+            let args = Args {
+                config: "test.yaml".into(),
+                validate: false,
+            };
+            let result = Config::load(&args);
+            assert!(result.is_err());
+            let err = result.unwrap_err().to_string();
+            assert!(
+                err.contains("claim_ramp_exponent must be a finite number")
+                    || err.contains("invalid"),
+                "unexpected error: {err}"
+            );
 
             Ok(())
         });
