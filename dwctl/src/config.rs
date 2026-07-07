@@ -1638,10 +1638,7 @@ where
             "claim_ramp_exponent must be a finite number, got {}",
             value
         ))),
-        Some(value) if value < 0.0 => Err(D::Error::custom(format!(
-            "claim_ramp_exponent must be non-negative, got {}",
-            value
-        ))),
+        Some(value) if value < 0.0 => Err(D::Error::custom(format!("claim_ramp_exponent must be non-negative, got {}", value))),
         Some(value) => Ok(value),
     }
 }
@@ -3783,8 +3780,7 @@ background_services:
             assert!(result.is_err());
             let err = result.unwrap_err().to_string();
             assert!(
-                err.contains("claim_ramp_exponent must be a finite number")
-                    || err.contains("invalid"),
+                err.contains("claim_ramp_exponent must be a finite number") || err.contains("invalid"),
                 "unexpected error: {err}"
             );
 
