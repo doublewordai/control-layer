@@ -83,6 +83,8 @@ fn marker_rejection_response(e: &ParseError, policy: &TierPolicy) -> Response {
         ParseError::UnsupportedType(_) => Some("unsupported_type"),
         ParseError::TooManyBreakpoints => Some("too_many_breakpoints"),
         ParseError::MalformedCacheControl => Some("malformed_cache_control"),
+        ParseError::AutomaticTtlConflict => Some("automatic_ttl_conflict"),
+        ParseError::NoAutomaticSlot => Some("automatic_no_slot"),
         // validate_markers takes an already-parsed Value, so a JSON error can't reach here.
         ParseError::Json(_) => None,
     };
@@ -139,7 +141,7 @@ pub async fn cache_middleware(State(state): State<CacheLayerState>, request: Req
     // — a 400 like a bad parameter, NOT a silent no-cache, so the client learns immediately and
     // isn't billed full price thinking it cached. Cheap: walks the already-parsed Value, no hashing.
     if let Some(body) = &parsed_body
-        && let Err(e) = validate_markers(body, state.classifier.tier_policy())
+        && let Err(e) = validate_markers(body, state.classifier.tier_policy(), state.classifier.telemetry_policy())
     {
         return marker_rejection_response(&e, state.classifier.tier_policy());
     }

@@ -227,7 +227,7 @@ mod tests {
     /// nested under `/ai/v1`. The `/messages` route stands in for the alias
     /// onwards will register to its chat-completions handler.
     fn test_app(inner: Router) -> axum_test::TestServer {
-        let registry = TranslationRegistry::new(vec![Arc::new(AnthropicMessages)]);
+        let registry = TranslationRegistry::new(vec![Arc::new(AnthropicMessages::new(true))]);
         let inner = inner.layer(axum::middleware::from_fn_with_state(registry, translation_middleware));
         let app = Router::new().nest("/ai/v1", inner);
         axum_test::TestServer::new(app).expect("test server")
@@ -267,7 +267,7 @@ mod tests {
     #[tokio::test]
     async fn oversized_request_body_is_rejected_as_anthropic_error() {
         let inner = Router::new().route("/messages", post(fake_onwards_chat_completions));
-        let registry = TranslationRegistry::new(vec![Arc::new(AnthropicMessages)]).with_max_body_size(16);
+        let registry = TranslationRegistry::new(vec![Arc::new(AnthropicMessages::new(true))]).with_max_body_size(16);
         let inner = inner.layer(axum::middleware::from_fn_with_state(registry, translation_middleware));
         let server = axum_test::TestServer::new(Router::new().nest("/ai/v1", inner)).expect("test server");
 
