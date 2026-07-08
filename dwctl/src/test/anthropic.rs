@@ -96,6 +96,37 @@ async fn wait_for_model(server: &TestServer, api_key: &str) {
 }
 
 #[sqlx::test]
+async fn anthropic_models_uses_control_layer_model_discovery(pool: PgPool) {
+    let mock = wiremock::MockServer::start().await;
+
+    let mut config = create_test_config();
+    config.onwards.strict_mode = true;
+    config.background_services.onwards_sync.enabled = true;
+    let app = crate::Application::new_with_pool(config, Some(pool.clone()), None)
+        .await
+        .expect("app");
+    let (server, _bg) = app.into_test_server();
+
+    let api_key = seed_model_and_key(&server, &pool, &mock.uri()).await;
+
+    let resp = server
+        .get("/ai/v1/models")
+        .add_header("x-api-key", &api_key)
+        .add_header("anthropic-version", "2023-06-01")
+        .await;
+
+    let status = resp.status_code();
+    let text = resp.text();
+    assert_eq!(status, 200, "got {status}: {text}");
+
+    let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(body["has_more"], false);
+    assert_eq!(body["data"][0]["type"], "model");
+    assert_eq!(body["data"][0]["id"], "gpt-4");
+    assert_eq!(body["data"][0]["display_name"], "gpt-4");
+}
+
+#[sqlx::test]
 async fn anthropic_messages_blocking_end_to_end(pool: PgPool) {
     let mock = wiremock::MockServer::start().await;
     wiremock::Mock::given(wiremock::matchers::method("POST"))

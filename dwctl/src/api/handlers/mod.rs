@@ -31,6 +31,7 @@
 //! appropriate HTTP status codes and JSON error responses. See [`crate::errors`]
 //! for details on error types and HTTP status mappings.
 
+pub mod ai_models;
 pub mod api_keys;
 pub mod auth;
 pub mod batch_requests;
