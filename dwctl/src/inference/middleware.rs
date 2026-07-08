@@ -583,7 +583,11 @@ async fn resolve_flex_batch_api_key(pool: &sqlx::PgPool, api_key: Option<&str>) 
         .get_or_create_hidden_key(key_owner_id, ApiKeyPurpose::Batch, created_by)
         .await?;
 
-    Ok(Some(FlexBatchApiKey { secret, key_owner_id, verified }))
+    Ok(Some(FlexBatchApiKey {
+        secret,
+        key_owner_id,
+        verified,
+    }))
 }
 
 impl std::fmt::Display for ServiceTier {

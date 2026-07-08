@@ -64,8 +64,10 @@ pub async fn enforce_unverified_volume_limit<S: Storage>(
     let window_seconds = parse_window_to_seconds(completion_window);
     // The cap scales with whole hours of the completion window. A sub-hour
     // window with a small per-hour value can floor to 0; treat that as no cap
-    // rather than rejecting everything.
-    let cap = (per_hour as i64).saturating_mul(window_seconds) / 3600;
+    // rather than rejecting everything. `try_from` clamps a pathologically large
+    // `per_hour` to i64::MAX rather than letting `as i64` wrap to a negative
+    // (which would silently disable the cap).
+    let cap = i64::try_from(per_hour).unwrap_or(i64::MAX).saturating_mul(window_seconds) / 3600;
     if cap <= 0 {
         return Ok(());
     }
