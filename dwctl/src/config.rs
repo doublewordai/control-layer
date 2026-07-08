@@ -3787,6 +3787,38 @@ background_services:
     }
 
     #[test]
+    fn test_claim_loop_max_consecutive_failures_default_and_override() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+"#,
+            )?;
+            let args = Args {
+                config: "test.yaml".into(),
+                validate: false,
+            };
+            let config = Config::load(&args)?;
+            assert_eq!(config.background_services.batch_daemon.claim_loop_max_consecutive_failures, 10);
+
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+background_services:
+  batch_daemon:
+    claim_loop_max_consecutive_failures: 3
+"#,
+            )?;
+            let config = Config::load(&args)?;
+            assert_eq!(config.background_services.batch_daemon.claim_loop_max_consecutive_failures, 3);
+
+            Ok(())
+        });
+    }
+
+    #[test]
     fn test_claim_ramp_exponent_negative_rejected() {
         Jail::expect_with(|jail| {
             jail.create_file(
