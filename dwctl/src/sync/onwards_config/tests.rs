@@ -12,11 +12,18 @@ use crate::config::RateLimitTiersConfig;
 use crate::sync::onwards_config::{OnwardsTarget, SyncConfig, convert_to_config_file, parse_notify_payload};
 
 #[test]
-fn test_user_balance_ctes_materialize_and_filter_deleted_users() {
+fn test_balance_eligibility_reads_read_model_and_filters_deleted_users() {
     let source = include_str!("mod.rs");
 
-    assert_eq!(source.matches("WITH user_balances AS MATERIALIZED").count(), 2);
-    assert_eq!(source.matches("WHERE u.is_deleted = false").count(), 2);
+    // Both eligibility queries (regular + composite models) read the total
+    // user_balance_checkpoints read model as a point lookup - never the
+    // credits_transactions ledger.
+    assert_eq!(source.matches("FROM user_balance_checkpoints ub").count(), 2);
+    assert_eq!(source.matches("credits_transactions").count(), 0);
+
+    // Key deletion is not implied by user deletion, so the deleted-user guard
+    // on the balance arm is load-bearing in both queries.
+    assert_eq!(source.matches("u.is_deleted = false AND EXISTS").count(), 2);
 }
 
 // Helper function to create a test target
@@ -234,6 +241,51 @@ async fn test_cache_shape_metered_model_requires_positive_balance(pool: sqlx::Pg
     assert!(pool_has_key(metered_pool, KEY_A_SECRET));
     assert!(!pool_has_key(metered_pool, KEY_B_SECRET));
     assert!(!pool_has_key(metered_pool, KEY_BATCH_SECRET));
+}
+
+#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base", "cache_tariff_metered", "cache_balance_user_a_positive")))]
+async fn test_balance_change_toggles_paid_access_on_reload(pool: sqlx::PgPool) {
+    let user_a: uuid::Uuid = "00000000-0000-0000-0000-0000000000a1".parse().unwrap();
+    let tiers = RateLimitTiersConfig::default();
+
+    // Baseline: user A has positive balance, so their key is in the metered pool.
+    let targets = super::load_targets_from_db(&pool, &[], false, &tiers).await.unwrap();
+    assert!(pool_has_key(targets.targets.get("metered-public").unwrap().value(), KEY_A_SECRET));
+
+    // Deplete user A in the read model, as a usage fold would; the next
+    // (crossing-triggered) reload drops their key from paid pools only.
+    sqlx::query("UPDATE user_balance_checkpoints SET balance = -1 WHERE user_id = $1")
+        .bind(user_a)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let targets = super::load_targets_from_db(&pool, &[], false, &tiers).await.unwrap();
+    assert!(
+        !pool_has_key(targets.targets.get("metered-public").unwrap().value(), KEY_A_SECRET),
+        "depleted user must lose paid-model access"
+    );
+    assert!(
+        pool_has_key(targets.targets.get("regular-public").unwrap().value(), KEY_A_SECRET),
+        "free-model access survives depletion"
+    );
+    assert!(
+        pool_has_key(targets.targets.get("composite-priority").unwrap().value(), KEY_A_SECRET),
+        "free composite access survives depletion"
+    );
+
+    // Restore the balance: paid access returns on the next reload.
+    sqlx::query("UPDATE user_balance_checkpoints SET balance = 50 WHERE user_id = $1")
+        .bind(user_a)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let targets = super::load_targets_from_db(&pool, &[], false, &tiers).await.unwrap();
+    assert!(
+        pool_has_key(targets.targets.get("metered-public").unwrap().value(), KEY_A_SECRET),
+        "restored user regains paid-model access"
+    );
 }
 
 #[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]

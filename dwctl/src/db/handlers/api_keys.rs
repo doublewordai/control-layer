@@ -585,24 +585,12 @@ impl<'c> ApiKeys<'c> {
             WHERE dg.deployment_id = $1
             AND (
                 ak.user_id = $2  -- System user always has access
-                OR (
-                    -- User has positive balance (checkpoint + delta calculation)
-                    SELECT COALESCE(
-                        (SELECT c.balance FROM user_balance_checkpoints c WHERE c.user_id = ak.user_id),
-                        0
-                    ) + COALESCE(
-                        (SELECT SUM(
-                            CASE WHEN ct.transaction_type IN ('purchase', 'admin_grant')
-                            THEN ct.amount ELSE -ct.amount END
-                        )
-                        FROM credits_transactions ct
-                        LEFT JOIN user_balance_checkpoints c ON c.user_id = ak.user_id
-                        WHERE ct.user_id = ak.user_id
-                        AND ct.seq > COALESCE(c.checkpoint_seq, 0)
-                        ),
-                        0
-                    )
-                ) > 0
+                OR EXISTS (
+                    -- User has positive balance: point read of the total,
+                    -- applier-maintained user_balance_checkpoints read model
+                    SELECT 1 FROM user_balance_checkpoints c
+                    WHERE c.user_id = ak.user_id AND c.balance > 0
+                )
                 OR (
                     -- Free models are accessible to all users (zero balance OK)
                     -- A model is free if it has no active tariffs or all active tariffs are zero-priced
@@ -638,24 +626,12 @@ impl<'c> ApiKeys<'c> {
             AND ak.user_id != '00000000-0000-0000-0000-000000000000'  -- Exclude system user (already covered above)
             AND (
                 ak.user_id = $2  -- System user always has access
-                OR (
-                    -- User has positive balance (checkpoint + delta calculation)
-                    SELECT COALESCE(
-                        (SELECT c.balance FROM user_balance_checkpoints c WHERE c.user_id = ak.user_id),
-                        0
-                    ) + COALESCE(
-                        (SELECT SUM(
-                            CASE WHEN ct.transaction_type IN ('purchase', 'admin_grant')
-                            THEN ct.amount ELSE -ct.amount END
-                        )
-                        FROM credits_transactions ct
-                        LEFT JOIN user_balance_checkpoints c ON c.user_id = ak.user_id
-                        WHERE ct.user_id = ak.user_id
-                        AND ct.seq > COALESCE(c.checkpoint_seq, 0)
-                        ),
-                        0
-                    )
-                ) > 0
+                OR EXISTS (
+                    -- User has positive balance: point read of the total,
+                    -- applier-maintained user_balance_checkpoints read model
+                    SELECT 1 FROM user_balance_checkpoints c
+                    WHERE c.user_id = ak.user_id AND c.balance > 0
+                )
                 OR (
                     -- Free models are accessible to all users (zero balance OK)
                     -- A model is free if it has no active tariffs or all active tariffs are zero-priced

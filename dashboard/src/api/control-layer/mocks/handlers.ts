@@ -2428,9 +2428,7 @@ export const handlers = [
     // Return new response format with page_start_balance
     return HttpResponse.json({
       data: paginatedTransactions,
-      total_count: filteredTransactions.length,
-      skip,
-      limit,
+      has_more: skip + limit < filteredTransactions.length,
       page_start_balance: currentBalance,
     });
   }),

@@ -1,0 +1,58 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO credits_transactions (user_id, transaction_type, amount, source_id, description, fusillade_batch_id, api_key_id, is_aggregated)\n            SELECT u.user_id, u.transaction_type, u.amount, u.source_id, u.description, u.fusillade_batch_id, u.api_key_id,\n                   u.fusillade_batch_id IS NOT NULL\n            FROM UNNEST(\n                $1::uuid[], $2::text[], $3::numeric[], $4::text[], $5::text[], $6::uuid[], $7::uuid[]\n            ) AS u(user_id, transaction_type, amount, source_id, description, fusillade_batch_id, api_key_id)\n            ON CONFLICT (source_id) DO NOTHING\n            RETURNING source_id, user_id, amount, seq, created_at, fusillade_batch_id\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "source_id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "user_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "amount",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 3,
+        "name": "seq",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 4,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 5,
+        "name": "fusillade_batch_id",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "UuidArray",
+        "TextArray",
+        "NumericArray",
+        "TextArray",
+        "TextArray",
+        "UuidArray",
+        "UuidArray"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "8c006a738e6f952e169bc93c4fc795ee62d7a2dd38ba895b2a30409e8550cde3"
+}

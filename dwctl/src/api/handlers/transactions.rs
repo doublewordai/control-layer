@@ -224,13 +224,13 @@ pub async fn list_transactions<P: PoolProvider>(
     // Batch grouping only works with a user filter (requires per-user batch_aggregates table)
     let grouping_enabled = query.group_batches.unwrap_or(false) && filter_user_id.is_some();
 
-    // Get transactions for this page
-    let (transactions, total_count) = if let (true, Some(user_id)) = (grouping_enabled, filter_user_id) {
-        let transactions_with_categories = repo.list_transactions_with_batches(user_id, skip, limit, &filters).await?;
-        let count = repo.count_transactions_with_batches(user_id, &filters).await?;
-
+    // Get transactions for this page, fetching one row beyond the page so we
+    // can report whether a next page exists without counting whole filtered
+    // histories.
+    let mut transactions: Vec<CreditTransactionResponse> = if let (true, Some(user_id)) = (grouping_enabled, filter_user_id) {
         // batch_sla and request_origin are now fetched directly from http_analytics via the SQL query
-        let txs: Vec<CreditTransactionResponse> = transactions_with_categories
+        repo.list_transactions_with_batches(user_id, skip, limit + 1, &filters)
+            .await?
             .into_iter()
             .map(|twc| {
                 CreditTransactionResponse::from_db_with_metadata(
@@ -241,17 +241,16 @@ pub async fn list_transactions<P: PoolProvider>(
                     twc.batch_count,
                 )
             })
-            .collect();
-        (txs, count)
+            .collect()
     } else if let Some(user_id) = filter_user_id {
-        let txs = repo.list_user_transactions(user_id, skip, limit, &filters).await?;
-        let count = repo.count_user_transactions(user_id, &filters).await?;
-        (txs.into_iter().map(CreditTransactionResponse::from).collect(), count)
+        let txs = repo.list_user_transactions(user_id, skip, limit + 1, &filters).await?;
+        txs.into_iter().map(CreditTransactionResponse::from).collect()
     } else {
-        let txs = repo.list_all_transactions(skip, limit, &filters).await?;
-        let count = repo.count_all_transactions(&filters).await?;
-        (txs.into_iter().map(CreditTransactionResponse::from).collect(), count)
+        let txs = repo.list_all_transactions(skip, limit + 1, &filters).await?;
+        txs.into_iter().map(CreditTransactionResponse::from).collect()
     };
+    let has_more = transactions.len() as i64 > limit;
+    transactions.truncate(limit as usize);
 
     // Calculate page_start_balance
     // For single-user queries: current balance when skip=0, or balance at the pagination
@@ -268,9 +267,7 @@ pub async fn list_transactions<P: PoolProvider>(
 
     Ok(Json(TransactionListResponse {
         data: transactions,
-        total_count,
-        skip,
-        limit,
+        has_more,
         page_start_balance,
     }))
 }
@@ -1859,8 +1856,9 @@ mod tests {
             "Initial grant amount should be $1000"
         );
 
-        // Verify total count is correct (5 grouped items)
-        assert_eq!(page1.total_count, 5, "Total count should be 5 grouped items");
+        // Pages before the end report more; the last page does not.
+        assert!(page1.has_more, "Page 1 should report more grouped items");
+        assert!(!page3.has_more, "Final page should report no more items");
     }
 
     // Test: page_start_balance is calculated correctly when filtering by date range
@@ -1947,6 +1945,25 @@ mod tests {
         .execute(&pool)
         .await
         .expect("Failed to create transaction");
+
+        // The raw inserts above bypass the folding writers (they need custom
+        // created_at values), so heal the checkpoint from the ledger the way
+        // scripts/backfill_balance_checkpoints.sql would.
+        sqlx::query!(
+            r#"
+            UPDATE user_balance_checkpoints c
+            SET balance = (
+                SELECT COALESCE(SUM(CASE WHEN transaction_type IN ('admin_grant', 'purchase') THEN amount ELSE -amount END), 0)
+                FROM credits_transactions
+                WHERE user_id = $1
+            )
+            WHERE c.user_id = $1
+            "#,
+            user.id
+        )
+        .execute(&pool)
+        .await
+        .expect("heal checkpoint from ledger");
 
         // Expected balances:
         // Initial: $1000
