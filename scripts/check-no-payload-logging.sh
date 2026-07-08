@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# ZDR no-payload-logging guard (COR-500, part of COR-479).
+# ZDR no-payload-logging guard.
 #
 # Fails if a Rust log/trace statement looks like it emits user prompt or model
 # response payload content. Production runs at RUST_LOG=debug with OTLP export
@@ -8,7 +8,7 @@
 # streamed chunk, or provider error body is live-exported to Loki/Tempo.
 #
 # This is a heuristic line scanner, not a Rust parser. It targets the exact
-# leak shapes the COR-479 cleanups removed so they cannot be reintroduced:
+# leak shapes the ZDR cleanups removed so they cannot be reintroduced:
 #   1. Debugging "sample" fields that snapshot a body/chunk.
 #   2. Logging raw bytes via `= ?String::from_utf8_lossy(..)` /  `= %..lossy`.
 #   3. Interpolating a whole payload-bearing variable as a tracing field, e.g.
@@ -61,7 +61,7 @@ done
 if [ -n "${violations//[$'\n']/}" ]; then
     echo "❌ ZDR no-payload-logging guard: potential prompt/response payload in a log statement." >&2
     echo "   Replace the payload with length/status metadata, or annotate a verified" >&2
-    echo "   false positive with '// zdr-allow: <reason>'. See COR-479." >&2
+    echo "   false positive with '// zdr-allow: <reason>'." >&2
     echo >&2
     printf '%s\n' "$violations" | sed '/^$/d' | sort -u >&2
     exit 1

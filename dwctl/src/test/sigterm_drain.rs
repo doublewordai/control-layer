@@ -1,8 +1,7 @@
 //! Test the SIGTERM drain protocol on the BackgroundServices shutdown
 //! path.
 //!
-//! Validates the two operational guarantees from the multi-step plan
-//! (COR-353):
+//! Validates the two operational guarantees from the multi-step plan:
 //!
 //! - The onwards-instance daemon row is marked `dead` on shutdown so
 //!   the next pod's claim cycle treats this instance as gone
