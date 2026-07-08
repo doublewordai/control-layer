@@ -248,7 +248,7 @@ async fn ai_models_lists_group_accessible_paid_models_without_credits(pool: PgPo
         .json(&serde_json::json!({
             "type": "standard",
             "model_name": "paid-model",
-            "alias": alias,
+            "alias": alias.clone(),
             "description": "Paid model visible with zero credits",
             "hosted_on": endpoint.id,
             "tariffs": [{
@@ -300,13 +300,14 @@ async fn ai_models_lists_group_accessible_paid_models_without_credits(pool: PgPo
         .post("/ai/v1/chat/completions")
         .add_header("authorization", format!("Bearer {}", api_key.key))
         .json(&serde_json::json!({
-            "model": alias,
+            "model": alias.clone(),
             "messages": [{"role": "user", "content": "hello"}]
         }))
         .await;
-    assert!(
-        !completion_response.status_code().is_success(),
-        "Zero-credit key should still be excluded from paid inference"
+    assert_eq!(
+        completion_response.status_code(),
+        404,
+        "Zero-credit key should remain absent from the dispatch target pool"
     );
 }
 

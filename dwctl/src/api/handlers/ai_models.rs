@@ -3,7 +3,7 @@
 use axum::{
     Json,
     extract::State,
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode, header},
     middleware::Next,
     response::{IntoResponse, Response},
 };
@@ -46,10 +46,22 @@ fn openai_error(status: StatusCode, message: &str, error_type: &str, code: &str)
 }
 
 fn bearer_token(headers: &HeaderMap) -> Option<&str> {
-    headers
-        .get("authorization")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
+    let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?.trim();
+    let (scheme, token) = value.split_once(char::is_whitespace)?;
+    scheme
+        .eq_ignore_ascii_case("bearer")
+        .then_some(token.trim())
+        .filter(|token| !token.is_empty())
+}
+
+fn database_error(operation: &str, error: impl std::fmt::Display) -> Response {
+    tracing::error!(%error, operation, "Failed to list AI models");
+    openai_error(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "Internal server error",
+        "server_error",
+        "database_error",
+    )
 }
 
 /// List active models that the presented inference API key has group access to.
@@ -65,19 +77,17 @@ pub async fn list_ai_models<P: PoolProvider>(
         return Err(openai_error(
             StatusCode::UNAUTHORIZED,
             "Missing Authorization header",
-            "invalid_request_error",
+            "authentication_error",
             "missing_authorization",
         ));
     };
 
-    let mut conn = state.db.read().acquire().await.map_err(|e| {
-        openai_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("Database error: {e}"),
-            "server_error",
-            "database_error",
-        )
-    })?;
+    let mut conn = state
+        .db
+        .read()
+        .acquire()
+        .await
+        .map_err(|e| database_error("acquire_read_connection", e))?;
 
     let user_id = sqlx::query_scalar::<_, uuid::Uuid>(
         r#"
@@ -94,20 +104,13 @@ pub async fn list_ai_models<P: PoolProvider>(
     .bind(token)
     .fetch_optional(&mut *conn)
     .await
-    .map_err(|e| {
-        openai_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("Database error: {e}"),
-            "server_error",
-            "database_error",
-        )
-    })?;
+    .map_err(|e| database_error("lookup_api_key", e))?;
 
     let Some(user_id) = user_id else {
         return Err(openai_error(
-            StatusCode::FORBIDDEN,
+            StatusCode::UNAUTHORIZED,
             "Invalid API key",
-            "invalid_request_error",
+            "authentication_error",
             "invalid_api_key",
         ));
     };
@@ -136,14 +139,7 @@ pub async fn list_ai_models<P: PoolProvider>(
     .bind(EVERYONE_GROUP_ID)
     .fetch_all(&mut *conn)
     .await
-    .map_err(|e| {
-        openai_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("Database error: {e}"),
-            "server_error",
-            "database_error",
-        )
-    })?;
+    .map_err(|e| database_error("list_accessible_models", e))?;
 
     Ok(Json(ModelsListResponse {
         object: "list".to_string(),
@@ -164,7 +160,10 @@ pub async fn list_ai_models_middleware<P: PoolProvider>(
     request: axum::extract::Request,
     next: Next,
 ) -> Response {
-    if request.method() == axum::http::Method::GET && request.uri().path() == "/models" {
+    let is_models_request = request.method() == axum::http::Method::GET && request.uri().path().ends_with("/models");
+    let is_anthropic_models_request = request.headers().contains_key("anthropic-version");
+
+    if is_models_request && !is_anthropic_models_request && request.headers().contains_key(header::AUTHORIZATION) {
         let headers = request.headers().clone();
         return match list_ai_models(State(state), headers).await {
             Ok(response) => response.into_response(),
