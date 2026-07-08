@@ -1,5 +1,14 @@
 # Changelog
 
+## [8.72.1](https://github.com/doublewordai/control-layer/compare/v8.72.0...v8.72.1) (2026-07-08)
+
+
+### Bug Fixes
+
+* bump onwards to 0.34.5 ([#1236](https://github.com/doublewordai/control-layer/issues/1236)) ([a7e11d4](https://github.com/doublewordai/control-layer/commit/a7e11d47e70472b0b208152f41eb7b1cf4129c81))
+* classify unsupported response payloads as non-retryable ([#1233](https://github.com/doublewordai/control-layer/issues/1233)) ([b454389](https://github.com/doublewordai/control-layer/commit/b454389ca6de0648a2273d386acdc92c2639eb40))
+* list accessible models without credit filtering ([#1237](https://github.com/doublewordai/control-layer/issues/1237)) ([0ea2834](https://github.com/doublewordai/control-layer/commit/0ea28343c5a1de840fcfd69e6b773975f7ad16e0))
+
 ## [8.72.0](https://github.com/doublewordai/control-layer/compare/v8.71.0...v8.72.0) (2026-07-07)
 
 
