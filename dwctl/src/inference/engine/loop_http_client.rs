@@ -90,10 +90,10 @@ fn loop_error_payload(error: &LoopError) -> (u16, serde_json::Value) {
     }
 }
 
-fn response_for_loop_error(error: &LoopError) -> HttpResponse {
+fn loop_error_response(error: &LoopError) -> (u16, serde_json::Value, String) {
     let (status, payload) = loop_error_payload(error);
     let body = serde_json::to_string(&payload).unwrap_or_default();
-    HttpResponse { status, body }
+    (status, payload, body)
 }
 
 fn is_unsupported_jsonb_payload_error(error: &LoopError) -> bool {
@@ -224,15 +224,11 @@ where
                 Ok(HttpResponse { status: 200, body })
             }
             Err(error) => {
-                let (status, payload) = loop_error_payload(&error);
-                if let Err(e) = self
-                    .response_store
-                    .finalize_head_request(&request_id, status, payload.clone())
-                    .await
-                {
+                let (status, payload, body) = loop_error_response(&error);
+                if let Err(e) = self.response_store.finalize_head_request(&request_id, status, payload).await {
                     tracing::warn!(error = %e, request_id = %request_id, "Failed to finalize head sub-request after loop error");
                 }
-                Ok(response_for_loop_error(&error))
+                Ok(HttpResponse { status, body })
             }
         }
     }
@@ -248,10 +244,10 @@ mod tests {
             "fusillade: Other error: Failed to insert response_step: error returned from database: unsupported Unicode escape sequence; DETAIL: \\u0000 cannot be converted to text.".to_string(),
         ));
 
-        let response = response_for_loop_error(&error);
+        let (status, _payload, body) = loop_error_response(&error);
 
-        assert_eq!(response.status, 400);
-        assert!(response.body.contains("unsupported_request_payload"));
+        assert_eq!(status, 400);
+        assert!(body.contains("unsupported_request_payload"));
     }
 
     #[test]
@@ -260,9 +256,9 @@ mod tests {
             "database connection temporarily unavailable".to_string(),
         ));
 
-        let response = response_for_loop_error(&error);
+        let (status, _payload, body) = loop_error_response(&error);
 
-        assert_eq!(response.status, 500);
-        assert!(response.body.contains("loop_error"));
+        assert_eq!(status, 500);
+        assert!(body.contains("loop_error"));
     }
 }
