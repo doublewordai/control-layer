@@ -1588,6 +1588,17 @@ pub struct DaemonConfig {
     /// claimable immediately regardless of liveness). Default: 0.56.
     #[serde(default = "default_claim_ramp_exponent", deserialize_with = "deserialize_claim_ramp_exponent")]
     pub claim_ramp_exponent: f64,
+
+    /// Consecutive claim-cycle failures a claim loop tolerates (retrying with
+    /// exponential backoff, capped at 30s) before it gives up and takes the
+    /// daemon down. Transient DB blips no longer kill the daemon outright.
+    /// Default: 10.
+    #[serde(default = "default_claim_loop_max_consecutive_failures")]
+    pub claim_loop_max_consecutive_failures: u32,
+}
+
+fn default_claim_loop_max_consecutive_failures() -> u32 {
+    10
 }
 
 fn default_batch_claim_batch_size() -> usize {
@@ -1686,6 +1697,7 @@ impl Default for DaemonConfig {
             batch_claim_interval_ms: 0,
             batch_claim_require_live: false,
             claim_ramp_exponent: default_claim_ramp_exponent(),
+            claim_loop_max_consecutive_failures: default_claim_loop_max_consecutive_failures(),
         }
     }
 }
@@ -1747,6 +1759,7 @@ impl DaemonConfig {
             batch_claim_interval_ms: self.batch_claim_interval_ms,
             batch_claim_require_live: self.batch_claim_require_live,
             claim_ramp_exponent: self.claim_ramp_exponent,
+            claim_loop_max_consecutive_failures: self.claim_loop_max_consecutive_failures,
             ..Default::default()
         }
     }
