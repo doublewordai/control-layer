@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE user_model_usage_daily_cursor SET last_processed_id = $1, updated_at = NOW() WHERE id = TRUE",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "e6b02e4eef95cea70080c2930a73f2acc8733239956c99c4ef44a95fcc402687"
+}

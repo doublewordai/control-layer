@@ -774,8 +774,8 @@ async fn test_realtime_zdr_rejects_server_side_tools(pool: PgPool) {
 // queued/in_progress assertions don't model current behavior. End-to-
 // end coverage of the warm path itself needs a real HTTP loopback
 // listener (the axum_test in-memory transport doesn't bind a port);
-// that integration suite is tracked under COR-349 (daemon-path
-// rewrite) and the loopback fixture follow-up. Bridge-primitive
+// that integration suite is tracked under the daemon-path
+// rewrite and the loopback fixture follow-up. Bridge-primitive
 // coverage for the multi-step path lives in
 // `test_multi_step_chain_assembles_and_is_retrievable_via_get` above
 // and `test::multi_step_executor::loop_drives_real_tool_and_model_calls_through_production_executor`.
