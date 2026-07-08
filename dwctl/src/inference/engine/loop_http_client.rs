@@ -9,9 +9,9 @@
 //! the would-be HTTP call.
 //!
 //! The synthesized response is the assembled `/v1/responses` JSON
-//! (status 200 on success; status 500 + structured error body on
-//! `LoopError`). `should_retry` decides the disposition like any other
-//! upstream response.
+//! (status 200 on success; structured error body on `LoopError`).
+//! `should_retry` decides the disposition like any other upstream
+//! response.
 //!
 //! See `docs/responses-processor-design.md` for the broader design.
 
@@ -64,6 +64,47 @@ where
             loop_config: self.loop_config,
         }
     }
+}
+
+fn loop_error_payload(error: &LoopError) -> (u16, serde_json::Value) {
+    match error {
+        LoopError::Failed(payload) => (500, payload.clone()),
+        _ if is_unsupported_jsonb_payload_error(error) => (
+            400,
+            serde_json::json!({
+                "error": {
+                    "message": "The request payload contains JSON content that cannot be stored for asynchronous response processing.",
+                    "type": "invalid_request_error",
+                    "param": null,
+                    "code": "unsupported_request_payload"
+                }
+            }),
+        ),
+        other => (
+            500,
+            serde_json::json!({
+                "type": "loop_error",
+                "message": other.to_string(),
+            }),
+        ),
+    }
+}
+
+fn response_for_loop_error(error: &LoopError) -> HttpResponse {
+    let (status, payload) = loop_error_payload(error);
+    let body = serde_json::to_string(&payload).unwrap_or_default();
+    HttpResponse { status, body }
+}
+
+fn is_unsupported_jsonb_payload_error(error: &LoopError) -> bool {
+    let message = match error {
+        LoopError::Store(onwards::StoreError::StorageError(message))
+        | LoopError::Store(onwards::StoreError::SerializationError(message)) => message,
+        _ => return false,
+    };
+    let lower = message.to_ascii_lowercase();
+
+    lower.contains("unsupported unicode escape sequence") && lower.contains("\\u0000") && lower.contains("cannot be converted to text")
 }
 
 #[async_trait]
@@ -182,24 +223,46 @@ where
                     .map_err(|e| FusilladeError::Other(anyhow::anyhow!("serialize assembled response: {e}")))?;
                 Ok(HttpResponse { status: 200, body })
             }
-            Err(LoopError::Failed(payload)) => {
-                if let Err(e) = self.response_store.finalize_head_request(&request_id, 500, payload.clone()).await {
-                    tracing::warn!(error = %e, request_id = %request_id, "Failed to finalize head sub-request after loop failure");
+            Err(error) => {
+                let (status, payload) = loop_error_payload(&error);
+                if let Err(e) = self
+                    .response_store
+                    .finalize_head_request(&request_id, status, payload.clone())
+                    .await
+                {
+                    tracing::warn!(error = %e, request_id = %request_id, "Failed to finalize head sub-request after loop error");
                 }
-                let body = serde_json::to_string(&payload).unwrap_or_default();
-                Ok(HttpResponse { status: 500, body })
-            }
-            Err(other) => {
-                let payload = serde_json::json!({
-                    "type": "loop_error",
-                    "message": other.to_string(),
-                });
-                if let Err(e) = self.response_store.finalize_head_request(&request_id, 500, payload.clone()).await {
-                    tracing::warn!(error = %e, request_id = %request_id, "Failed to finalize head sub-request after unexpected loop error");
-                }
-                let body = serde_json::to_string(&payload).unwrap_or_default();
-                Ok(HttpResponse { status: 500, body })
+                Ok(response_for_loop_error(&error))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unsupported_jsonb_payload_errors_are_non_retryable() {
+        let error = LoopError::Store(onwards::StoreError::StorageError(
+            "fusillade: Other error: Failed to insert response_step: error returned from database: unsupported Unicode escape sequence; DETAIL: \\u0000 cannot be converted to text.".to_string(),
+        ));
+
+        let response = response_for_loop_error(&error);
+
+        assert_eq!(response.status, 400);
+        assert!(response.body.contains("unsupported_request_payload"));
+    }
+
+    #[test]
+    fn generic_loop_errors_remain_retryable_server_errors() {
+        let error = LoopError::Store(onwards::StoreError::StorageError(
+            "database connection temporarily unavailable".to_string(),
+        ));
+
+        let response = response_for_loop_error(&error);
+
+        assert_eq!(response.status, 500);
+        assert!(response.body.contains("loop_error"));
     }
 }
