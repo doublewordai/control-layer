@@ -484,6 +484,20 @@ background_services:
     # Default: 300000 (5 min). Set to 0 to disable (not recommended).
     fallback_interval_milliseconds: 300000
 
+  # Usage-refresh daemon - incrementally folds new http_analytics rows into the
+  # user_model_usage_daily rollup. Woken in-process by the analytics batcher after each
+  # flush (no LISTEN/NOTIFY - emitter and consumer share the pod); the fallback tick only
+  # backstops a missed nudge or a restart. Cross-pod runs are deduped by an advisory lock.
+  usage_refresh:
+    enabled: true # Default: true
+    # Fallback tick (milliseconds). The batcher nudge drives refreshes under load; this only
+    # backstops missed nudges / drains after a restart. Cheap - a tick with no new rows no-ops.
+    # Default: 60000 (1 min). Set to 0 to disable.
+    fallback_interval_milliseconds: 60000
+    # Minimum spacing between refreshes (milliseconds): coalesces bursts of batcher nudges.
+    # Default: 30000 (30s).
+    min_interval_milliseconds: 30000
+
   # Probe scheduler - periodically checks inference endpoint health
   # When leader_election is enabled, only runs on the elected leader
   probe_scheduler:

@@ -1576,8 +1576,9 @@ pub async fn build_router(
     // wrapper: on a request it runs first; on the response it runs last. The stack below,
     // outermost → innermost (i.e. reverse of the code order), is:
     //
-    //   responses_mw  →  outlet (logging/billing)  →  cache  →  error_enrichment
-    //                 →  image_normalizer  →  tool_injection  →  onwards
+    //   translation  →  responses_mw  →  outlet (logging/billing)
+    //                →  cache  →  error_enrichment  →  image_normalizer
+    //                →  tool_injection  →  models_route  →  onwards
     //
     // Why this order:
     //   • outlet outermost (of the body editors): it logs the request **as the customer
@@ -1594,6 +1595,15 @@ pub async fn build_router(
     //   • tool_injection innermost: the body onwards forwards upstream is fully resolved.
     //
     // Each block below adds one layer; the inline notes cover that layer's specifics.
+
+    // Serve authenticated OpenAI-shaped model discovery from the control-layer
+    // database using a real exact route. Other AI paths fall through to the
+    // existing onwards router. Because this route is inserted before the shared
+    // onwards middleware stack is layered on, request logging and protocol
+    // translation still apply to `/models` just like other AI routes.
+    let onwards_router = Router::new()
+        .route("/models", get(api::handlers::ai_models::list_ai_models))
+        .fallback_service(onwards_router);
 
     // Apply tool injection middleware to the onwards router so that per-request tool
     // schemas are resolved and injected into the request body before onwards processes it.
@@ -1692,13 +1702,11 @@ pub async fn build_router(
 
     // Apply the generic edge protocol-translation middleware as the OUTERMOST
     // layer on the onwards router. On the request path it runs first, so any
-    // foreign-protocol request (today: Anthropic `/v1/messages`) is translated
-    // to Chat Completions and its URI rewritten BEFORE image_normalizer,
-    // tool_injection, and onwards see it. On the response path it runs last, so
-    // outlet logging, billing, and usage extraction all observe Chat
-    // Completions, and only the final client bytes are reframed back into the
-    // foreign protocol. Native `/chat/completions` requests match no translator
-    // and pass through untouched.
+    // foreign-protocol request (today: Anthropic `/v1/messages` and `/v1/models`)
+    // is translated before model discovery, image_normalizer, tool_injection,
+    // and onwards see it. On the response path it runs last, so only the final
+    // client bytes are reframed back into the foreign protocol. Native OpenAI
+    // requests match no translator and pass through untouched.
     let onwards_router = {
         // Bound the body the translation middleware buffers by the same cap as the
         // rest of the inference path (limits.requests.max_body_size, 0 = unlimited).
@@ -1733,26 +1741,15 @@ pub async fn build_router(
 
     // Add AI routes with appropriate nesting based on strict mode
     if strict_mode {
-        // Strict mode: nest onwards at /ai/v1, nest batches at /ai/v1
-        router = router.nest("/ai/v1", onwards_router);
-        if let Some(batches) = batches_routes {
-            // Add fallback to batches router to return 404 for unknown routes
-            // This prevents unknown /ai/v1/* requests from falling through to the
-            // global GET-only fallback which would return 405 for POST requests
-            let batches_with_fallback = batches.fallback(|| async {
-                (
-                    axum::http::StatusCode::NOT_FOUND,
-                    axum::Json(serde_json::json!({
-                        "error": {
-                            "message": "Unknown endpoint",
-                            "type": "invalid_request_error",
-                            "code": "not_found"
-                        }
-                    })),
-                )
-            });
-            router = router.nest("/ai/v1", batches_with_fallback);
-        }
+        // Strict mode: combine batches and onwards before nesting so the shared
+        // `/models` route wrapper can fall through to onwards without competing
+        // with a second `/ai/v1` fallback.
+        let ai_router = if let Some(batches) = batches_routes {
+            batches.merge(onwards_router)
+        } else {
+            onwards_router
+        };
+        router = router.nest("/ai/v1", ai_router);
     } else {
         // Non-strict mode: merge batches + onwards, nest at /ai/v1
         let ai_router = if let Some(batches) = batches_routes {
@@ -1808,7 +1805,8 @@ pub async fn build_router(
     let router = router
         .nest("/admin/api/v1", api_routes_with_state)
         .merge(openapi_router.with_state(state.clone()))
-        .fallback_service(fallback.with_state(state.clone()));
+        .fallback_service(fallback.with_state(state.clone()))
+        .with_state(state.clone());
 
     // Apply CORS to the main router (request logging already applied to
     // onwards_router above). When configured, this also opens uncredentialed
@@ -2125,7 +2123,7 @@ impl BackgroundServices {
     /// Gracefully shutdown all background tasks.
     ///
     /// Implements the SIGTERM drain protocol from
-    /// `fusillade/docs/plans/2026-04-28-multi-step-responses.md` (COR-353):
+    /// `fusillade/docs/plans/2026-04-28-multi-step-responses.md`:
     ///
     /// 1. Signal all in-process tasks to stop accepting new work
     ///    (`shutdown_token.cancel()`). The fusillade batch daemon stops
@@ -2805,9 +2803,25 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
         });
     }
 
+    // Start the usage-refresh daemon: incrementally folds new http_analytics rows into
+    // user_model_usage_daily. The analytics batcher (below) nudges it after every flush;
+    // this shares an in-process Notify with it rather than round-tripping through Postgres.
+    let usage_refresh_notify = std::sync::Arc::new(tokio::sync::Notify::new());
+    if config.enable_analytics && config.background_services.usage_refresh.enabled {
+        let daemon_pool = pool.clone();
+        let daemon_config = config.background_services.usage_refresh.clone();
+        let daemon_notify = usage_refresh_notify.clone();
+        let daemon_shutdown = shutdown_token.clone();
+        background_tasks.spawn("usage-refresh", async move {
+            sync::usage_refresh::run_usage_refresh_daemon(daemon_pool, daemon_config, daemon_notify, daemon_shutdown).await;
+            Ok(())
+        });
+    }
+
     // Start analytics batcher if enabled
     let analytics_sender = if config.enable_analytics {
         let (batcher, sender) = request_logging::AnalyticsBatcher::new(pool.clone(), config.clone(), metrics_recorder);
+        let batcher = batcher.with_usage_refresh_notify(usage_refresh_notify.clone());
 
         let batcher_shutdown = shutdown_token.clone();
         background_tasks.spawn("analytics-batcher", async move {

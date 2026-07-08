@@ -1,0 +1,155 @@
+//! OpenAI-compatible model listing for inference API keys.
+
+use axum::{
+    Json,
+    extract::State,
+    http::{HeaderMap, StatusCode, header},
+    response::{IntoResponse, Response},
+};
+use serde::Serialize;
+use serde_json::json;
+use sqlx::Row;
+use sqlx_pool_router::PoolProvider;
+
+use crate::AppState;
+
+const EVERYONE_GROUP_ID: uuid::Uuid = uuid::Uuid::nil();
+
+#[derive(Serialize)]
+pub struct ModelsListResponse {
+    object: String,
+    data: Vec<ModelObject>,
+}
+
+#[derive(Serialize)]
+struct ModelObject {
+    id: String,
+    object: String,
+    created: i64,
+    owned_by: String,
+}
+
+fn openai_error(status: StatusCode, message: &str, error_type: &str, code: &str) -> Response {
+    (
+        status,
+        Json(json!({
+            "error": {
+                "message": message,
+                "type": error_type,
+                "param": null,
+                "code": code
+            }
+        })),
+    )
+        .into_response()
+}
+
+fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?.trim();
+    let (scheme, token) = value.split_once(char::is_whitespace)?;
+    scheme
+        .eq_ignore_ascii_case("bearer")
+        .then_some(token.trim())
+        .filter(|token| !token.is_empty())
+}
+
+fn database_error(operation: &str, error: impl std::fmt::Display) -> Response {
+    tracing::error!(%error, operation, "Failed to list AI models");
+    openai_error(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "Internal server error",
+        "server_error",
+        "database_error",
+    )
+}
+
+/// List active models that the presented inference API key has group access to.
+///
+/// This intentionally does not filter by credit balance. Credit balance controls
+/// dispatch eligibility in the onwards key sync; model discovery should reflect
+/// access grants so users can still see what would be available after top-up.
+pub async fn list_ai_models<P: PoolProvider>(
+    State(state): State<AppState<P>>,
+    headers: HeaderMap,
+) -> Result<Json<ModelsListResponse>, Response> {
+    let Some(token) = bearer_token(&headers) else {
+        return Err(openai_error(
+            StatusCode::UNAUTHORIZED,
+            "Missing Authorization header",
+            "authentication_error",
+            "missing_authorization",
+        ));
+    };
+
+    let mut conn = state
+        .db
+        .read()
+        .acquire()
+        .await
+        .map_err(|e| database_error("acquire_read_connection", e))?;
+
+    let user_id = sqlx::query_scalar::<_, uuid::Uuid>(
+        r#"
+        SELECT ak.user_id
+        FROM api_keys ak
+        INNER JOIN users u ON u.id = ak.user_id
+        WHERE ak.secret = $1
+          AND ak.is_deleted = FALSE
+          AND u.is_deleted = FALSE
+          AND ak.purpose IN ('realtime', 'batch', 'playground')
+        LIMIT 1
+        "#,
+    )
+    .bind(token)
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(|e| database_error("lookup_api_key", e))?;
+
+    let Some(user_id) = user_id else {
+        return Err(openai_error(
+            StatusCode::UNAUTHORIZED,
+            "Invalid API key",
+            "authentication_error",
+            "invalid_api_key",
+        ));
+    };
+
+    let rows = sqlx::query(
+        r#"
+        SELECT DISTINCT
+            dm.alias,
+            EXTRACT(EPOCH FROM dm.created_at)::BIGINT AS created
+        FROM deployed_models dm
+        INNER JOIN deployment_groups dg ON dg.deployment_id = dm.id
+        WHERE dm.deleted = FALSE
+          AND dm.status = 'active'
+          AND (
+              dg.group_id = $2
+              OR dg.group_id IN (
+                  SELECT ug.group_id
+                  FROM user_groups ug
+                  WHERE ug.user_id = $1
+              )
+        )
+        ORDER BY dm.alias
+        "#,
+    )
+    .bind(user_id)
+    .bind(EVERYONE_GROUP_ID)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(|e| database_error("list_accessible_models", e))?;
+
+    Ok(Json(ModelsListResponse {
+        object: "list".to_string(),
+        data: rows
+            .into_iter()
+            .map(|row| ModelObject {
+                id: row.get("alias"),
+                object: "model".to_string(),
+                created: row.get::<Option<i64>, _>("created").unwrap_or_default(),
+                owned_by: "None".to_string(),
+            })
+            .collect(),
+    }))
+}
