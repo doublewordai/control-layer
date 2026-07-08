@@ -1576,9 +1576,9 @@ pub async fn build_router(
     // wrapper: on a request it runs first; on the response it runs last. The stack below,
     // outermost → innermost (i.e. reverse of the code order), is:
     //
-    //   translation  →  models_list  →  responses_mw  →  outlet (logging/billing)
+    //   translation  →  responses_mw  →  outlet (logging/billing)
     //                →  cache  →  error_enrichment  →  image_normalizer
-    //                →  tool_injection  →  onwards
+    //                →  tool_injection  →  models_route  →  onwards
     //
     // Why this order:
     //   • outlet outermost (of the body editors): it logs the request **as the customer
@@ -1595,6 +1595,15 @@ pub async fn build_router(
     //   • tool_injection innermost: the body onwards forwards upstream is fully resolved.
     //
     // Each block below adds one layer; the inline notes cover that layer's specifics.
+
+    // Serve authenticated OpenAI-shaped model discovery from the control-layer
+    // database using a real exact route. Other AI paths fall through to the
+    // existing onwards router. Because this route is inserted before the shared
+    // onwards middleware stack is layered on, request logging and protocol
+    // translation still apply to `/models` just like other AI routes.
+    let onwards_router = Router::new()
+        .route("/models", get(api::handlers::ai_models::list_ai_models))
+        .fallback_service(onwards_router);
 
     // Apply tool injection middleware to the onwards router so that per-request tool
     // schemas are resolved and injected into the request body before onwards processes it.
@@ -1691,16 +1700,6 @@ pub async fn build_router(
         onwards_router
     };
 
-    // Serve authenticated OpenAI-shaped model discovery from the control-layer
-    // database before falling through to onwards. This sits inside protocol
-    // translation so Anthropic `/v1/models` first normalizes `x-api-key` to
-    // `Authorization`, then this handler returns the OpenAI list, then the
-    // translator reshapes it back to Anthropic's response format.
-    let onwards_router = onwards_router.layer(middleware::from_fn_with_state(
-        state.clone(),
-        api::handlers::ai_models::list_ai_models_middleware,
-    ));
-
     // Apply the generic edge protocol-translation middleware as the OUTERMOST
     // layer on the onwards router. On the request path it runs first, so any
     // foreign-protocol request (today: Anthropic `/v1/messages` and `/v1/models`)
@@ -1742,26 +1741,15 @@ pub async fn build_router(
 
     // Add AI routes with appropriate nesting based on strict mode
     if strict_mode {
-        // Strict mode: nest onwards at /ai/v1, nest batches at /ai/v1
-        router = router.nest("/ai/v1", onwards_router);
-        if let Some(batches) = batches_routes {
-            // Add fallback to batches router to return 404 for unknown routes
-            // This prevents unknown /ai/v1/* requests from falling through to the
-            // global GET-only fallback which would return 405 for POST requests
-            let batches_with_fallback = batches.fallback(|| async {
-                (
-                    axum::http::StatusCode::NOT_FOUND,
-                    axum::Json(serde_json::json!({
-                        "error": {
-                            "message": "Unknown endpoint",
-                            "type": "invalid_request_error",
-                            "code": "not_found"
-                        }
-                    })),
-                )
-            });
-            router = router.nest("/ai/v1", batches_with_fallback);
-        }
+        // Strict mode: combine batches and onwards before nesting so the shared
+        // `/models` route wrapper can fall through to onwards without competing
+        // with a second `/ai/v1` fallback.
+        let ai_router = if let Some(batches) = batches_routes {
+            batches.merge(onwards_router)
+        } else {
+            onwards_router
+        };
+        router = router.nest("/ai/v1", ai_router);
     } else {
         // Non-strict mode: merge batches + onwards, nest at /ai/v1
         let ai_router = if let Some(batches) = batches_routes {
@@ -1817,7 +1805,8 @@ pub async fn build_router(
     let router = router
         .nest("/admin/api/v1", api_routes_with_state)
         .merge(openapi_router.with_state(state.clone()))
-        .fallback_service(fallback.with_state(state.clone()));
+        .fallback_service(fallback.with_state(state.clone()))
+        .with_state(state.clone());
 
     // Apply CORS to the main router (request logging already applied to
     // onwards_router above). When configured, this also opens uncredentialed

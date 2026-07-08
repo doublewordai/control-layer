@@ -4,7 +4,6 @@ use axum::{
     Json,
     extract::State,
     http::{HeaderMap, StatusCode, header},
-    middleware::Next,
     response::{IntoResponse, Response},
 };
 use serde::Serialize;
@@ -153,22 +152,4 @@ pub async fn list_ai_models<P: PoolProvider>(
             })
             .collect(),
     }))
-}
-
-pub async fn list_ai_models_middleware<P: PoolProvider>(
-    State(state): State<AppState<P>>,
-    request: axum::extract::Request,
-    next: Next,
-) -> Response {
-    let is_models_request = request.method() == axum::http::Method::GET && request.uri().path().ends_with("/models");
-
-    if is_models_request && request.headers().contains_key(header::AUTHORIZATION) {
-        let headers = request.headers().clone();
-        return match list_ai_models(State(state), headers).await {
-            Ok(response) => response.into_response(),
-            Err(response) => response,
-        };
-    }
-
-    next.run(request).await
 }
