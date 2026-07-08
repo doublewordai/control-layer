@@ -1,4 +1,4 @@
-//! ZDR sentinel verification harness (COR-501, part of COR-479).
+//! ZDR sentinel verification harness.
 //!
 //! These tests drive a real `/ai/v1` request whose prompt **and** the mocked
 //! upstream response carry unique sentinel strings, then assert the sentinels do
@@ -20,8 +20,8 @@
 //!   subscriber reliably captures the daemon's spawned-task logs — the test
 //!   includes a positive control that proves capture works. It is currently
 //!   `#[ignore]`d: it already caught a real leak — the *published* fusillade
-//!   logs the provider error body at WARN in `to_error_message()`, which COR-498
-//!   scrubs in fusillade — so it activates once control-layer bumps fusillade to
+//!   logs the provider error body at WARN in `to_error_message()`, which a
+//!   later fusillade release scrubs — so it activates once control-layer bumps fusillade to
 //!   the release containing that fix. (The prompt-sentinel half already passes.)
 //!
 //! ## What is covered elsewhere
@@ -30,14 +30,14 @@
 //!   is also enforced by focused capture tests in onwards (`strict/handlers.rs`),
 //!   fusillade (`request/types.rs`) and control-layer
 //!   (`request_logging::analytics_handler`), and regression-guarded in CI by
-//!   `scripts/check-no-payload-logging.sh` (COR-500).
+//!   `scripts/check-no-payload-logging.sh`.
 //!
 //! ## What this harness will cover once ZDR capture-gating lands
 //!
 //! The body-bearing durable stores — outlet's `http_requests` / `http_responses`
 //! and the fusillade `request_templates` / `requests` rows — still persist raw
 //! bodies today (request logging captures them by design). They become
-//! sentinel-checkable once the ZDR per-request capture gate (COR-479 Part 1/2)
+//! sentinel-checkable once the ZDR per-request capture gate
 //! is implemented. The scaffold for that assertion is
 //! `zdr_sentinel_realtime_request_not_in_request_logs`, marked `#[ignore]` until
 //! the gate exists; un-ignore it when ZDR request logging is gated.
@@ -264,12 +264,12 @@ async fn zdr_sentinel_realtime_request_does_not_persist_to_analytics(pool: PgPoo
     assert!(v["model"].is_string(), "model should be recorded: {success_row}");
 }
 
-/// Scaffold for the post-capture-gate world: once ZDR request logging is gated
-/// (COR-479 Part 1/2), a ZDR request must also leave no prompt/response body in
+/// Scaffold for the post-capture-gate world: once ZDR request logging is gated,
+/// a ZDR request must also leave no prompt/response body in
 /// outlet's `http_requests`. Today request logging stores bodies by design, so
 /// this assertion is expected to fail and is `#[ignore]`d. Un-ignore it (and
 /// enable `enable_request_logging`) when the capture gate exists.
-#[ignore = "ZDR request-logging capture gate not yet implemented (COR-479 Part 1/2)"]
+#[ignore = "ZDR request-logging capture gate not yet implemented"]
 #[sqlx::test]
 async fn zdr_sentinel_realtime_request_not_in_request_logs(pool: PgPool) {
     let fixture = setup_sentinel_fixture(&pool).await;
@@ -327,12 +327,12 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
 /// logs. A positive control (a marker logged from a spawned task) proves that.
 ///
 /// IGNORED until control-layer's `fusillade` dependency is bumped to a release
-/// containing COR-498. This test was written *first* and immediately caught the
+/// containing that fix. This test was written *first* and immediately caught the
 /// real leak: published fusillade (19.0.1) logs the provider error body verbatim
 /// at WARN in `FailureReason::to_error_message()` on terminal failure — live in
-/// prod. COR-498 scrubs it in fusillade; un-ignore once that lands here via the
+/// prod. A later fusillade release scrubs it; un-ignore once that lands here via the
 /// dependency bump. (The prompt-sentinel half of this test already passes.)
-#[ignore = "async/flex error-body leak fixed in fusillade (COR-498); un-ignore after the control-layer fusillade bump"]
+#[ignore = "async/flex error-body leak fixed in fusillade; un-ignore after the control-layer fusillade bump"]
 #[sqlx::test]
 async fn zdr_sentinel_async_batch_failure_does_not_log_payload(pool: PgPool) {
     // Capture every tracing event on this (single) test thread for the whole test.
@@ -478,7 +478,7 @@ async fn zdr_sentinel_async_batch_failure_does_not_log_payload(pool: PgPool) {
     assert!(
         !logs.contains(ASYNC_ERROR_SENTINEL),
         "provider error body leaked into async/flex logs (fusillade daemon \
-         terminal-failure log). Fixed by COR-498 (fusillade) — un-ignore this \
+         terminal-failure log). Fixed in fusillade — un-ignore this \
          test once control-layer's fusillade dependency is bumped to the release \
          containing that scrub."
     );

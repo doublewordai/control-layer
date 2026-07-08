@@ -1129,6 +1129,94 @@ pub async fn refresh_user_model_usage(pool: &PgPool) -> Result<()> {
     Ok(())
 }
 
+/// Advisory-lock key for the daily-usage refresh, so at most one refresh runs at a
+/// time across all pods. Ascii "DWCTUSGD" (dwctl usage daily); mirrors the lock-id
+/// encoding used for `LEADER_LOCK_ID` in `lib.rs`.
+const USAGE_DAILY_REFRESH_LOCK: i64 = 0x4457_4354_5553_4744;
+
+/// Incrementally aggregate new http_analytics rows into the `user_model_usage_daily`
+/// per-day rollup. Like [`refresh_user_model_usage`] but keyed by
+/// `(user_id, model, usage_date)`, driven off its own cursor.
+///
+/// Every pod runs the refresh daemon and a `?refresh=true` read can call this too, so it
+/// takes a transaction-scoped advisory lock first: if another refresh already holds it,
+/// this one no-ops immediately rather than queuing behind the cursor's `FOR UPDATE`.
+/// The lock auto-releases on commit/rollback.
+///
+/// The `WHERE id > last_processed_id` scan is disjoint from the one-off backfill's
+/// `WHERE id <= backfill_watermark`, so the two can run concurrently without double
+/// counting (a day straddling the boundary gets each side summed via the additive upsert).
+#[instrument(skip(pool), err)]
+pub async fn refresh_user_model_usage_daily(pool: &PgPool) -> Result<()> {
+    let mut tx = pool.begin().await?;
+
+    let got_lock: bool = sqlx::query_scalar!("SELECT pg_try_advisory_xact_lock($1)", USAGE_DAILY_REFRESH_LOCK)
+        .fetch_one(&mut *tx)
+        .await?
+        .unwrap_or(false);
+    if !got_lock {
+        // Another refresh is in flight; it will cover these rows.
+        return Ok(());
+    }
+
+    let cursor: i64 = sqlx::query_scalar!("SELECT last_processed_id FROM user_model_usage_daily_cursor WHERE id = TRUE FOR UPDATE")
+        .fetch_one(&mut *tx)
+        .await?;
+
+    let new_max: Option<i64> = sqlx::query_scalar!(
+        r#"
+        SELECT MAX(id) FROM http_analytics
+        WHERE id > $1 AND user_id IS NOT NULL AND model IS NOT NULL
+        "#,
+        cursor
+    )
+    .fetch_one(&mut *tx)
+    .await?;
+
+    let Some(new_max) = new_max else {
+        return Ok(());
+    };
+
+    sqlx::query!(
+        r#"
+        INSERT INTO user_model_usage_daily (user_id, model, usage_date, input_tokens, output_tokens, cost, request_count)
+        SELECT user_id,
+               model,
+               (timestamp AT TIME ZONE 'UTC')::date,
+               COALESCE(SUM(prompt_tokens), 0),
+               COALESCE(SUM(completion_tokens), 0),
+               COALESCE(SUM(total_cost), 0),
+               COUNT(*)
+        FROM http_analytics
+        WHERE id > $1 AND id <= $2
+              AND user_id IS NOT NULL AND model IS NOT NULL
+              AND status_code BETWEEN 200 AND 299
+        GROUP BY user_id, model, (timestamp AT TIME ZONE 'UTC')::date
+        ON CONFLICT (user_id, model, usage_date)
+        DO UPDATE SET
+            input_tokens = user_model_usage_daily.input_tokens + EXCLUDED.input_tokens,
+            output_tokens = user_model_usage_daily.output_tokens + EXCLUDED.output_tokens,
+            cost = user_model_usage_daily.cost + EXCLUDED.cost,
+            request_count = user_model_usage_daily.request_count + EXCLUDED.request_count,
+            updated_at = NOW()
+        "#,
+        cursor,
+        new_max
+    )
+    .execute(&mut *tx)
+    .await?;
+
+    sqlx::query!(
+        "UPDATE user_model_usage_daily_cursor SET last_processed_id = $1, updated_at = NOW() WHERE id = TRUE",
+        new_max
+    )
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+    Ok(())
+}
+
 /// Load current realtime tariff rates keyed by model alias.
 /// Returns a map of model alias → (input_price_per_token, output_price_per_token).
 /// This is a tiny table (~12 rows) so it's efficient to load entirely.
@@ -2305,6 +2393,124 @@ mod tests {
         assert_eq!(breakdown[0].request_count, 2);
         assert_eq!(breakdown[0].input_tokens, 300); // 100 + 200
         assert_eq!(breakdown[0].output_tokens, 150); // 50 + 100
+    }
+
+    #[sqlx::test]
+    async fn test_refresh_user_model_usage_daily_aggregates_per_day(pool: PgPool) {
+        let user_id = create_usage_test_user(&pool).await;
+        let day1_am = Utc.with_ymd_and_hms(2026, 1, 1, 10, 0, 0).unwrap();
+        let day1_pm = Utc.with_ymd_and_hms(2026, 1, 1, 20, 0, 0).unwrap();
+        let day2 = Utc.with_ymd_and_hms(2026, 1, 2, 9, 0, 0).unwrap();
+
+        // Two successful requests on day 1, one on day 2.
+        for (ts, prompt, completion) in [(day1_am, 100, 50), (day1_pm, 200, 100), (day2, 10, 5)] {
+            insert_usage_analytics(
+                &pool,
+                UsageAnalyticsParams {
+                    user_id,
+                    model: "gpt-4",
+                    prompt_tokens: prompt,
+                    completion_tokens: completion,
+                    total_cost: 0.0,
+                    timestamp: ts,
+                    fusillade_batch_id: None,
+                    status_code: 200,
+                },
+            )
+            .await;
+        }
+        // A non-2xx row on day 2 must be excluded from the rollup.
+        insert_usage_analytics_with_status(
+            &pool,
+            UsageAnalyticsParams {
+                user_id,
+                model: "gpt-4",
+                prompt_tokens: 999,
+                completion_tokens: 999,
+                total_cost: 0.0,
+                timestamp: day2,
+                fusillade_batch_id: None,
+                status_code: 500,
+            },
+        )
+        .await;
+
+        refresh_user_model_usage_daily(&pool).await.unwrap();
+
+        let rows = sqlx::query!(
+            r#"
+            SELECT usage_date, input_tokens, output_tokens, request_count
+            FROM user_model_usage_daily
+            WHERE user_id = $1 AND model = 'gpt-4'
+            ORDER BY usage_date
+            "#,
+            user_id
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(rows.len(), 2, "one row per distinct day");
+        // Day 1: both successful requests summed.
+        assert_eq!(rows[0].usage_date, day1_am.date_naive());
+        assert_eq!(rows[0].input_tokens, 300);
+        assert_eq!(rows[0].output_tokens, 150);
+        assert_eq!(rows[0].request_count, 2);
+        // Day 2: only the 2xx request; the 500 is excluded.
+        assert_eq!(rows[1].usage_date, day2.date_naive());
+        assert_eq!(rows[1].input_tokens, 10);
+        assert_eq!(rows[1].output_tokens, 5);
+        assert_eq!(rows[1].request_count, 1);
+    }
+
+    #[sqlx::test]
+    async fn test_refresh_user_model_usage_daily_is_additive_across_runs(pool: PgPool) {
+        let user_id = create_usage_test_user(&pool).await;
+        let day = Utc.with_ymd_and_hms(2026, 2, 3, 12, 0, 0).unwrap();
+
+        let insert = |prompt: i64, completion: i64| {
+            let pool = pool.clone();
+            async move {
+                insert_usage_analytics(
+                    &pool,
+                    UsageAnalyticsParams {
+                        user_id,
+                        model: "gpt-4",
+                        prompt_tokens: prompt,
+                        completion_tokens: completion,
+                        total_cost: 0.0,
+                        timestamp: day,
+                        fusillade_batch_id: None,
+                        status_code: 200,
+                    },
+                )
+                .await;
+            }
+        };
+
+        // First window.
+        insert(100, 50).await;
+        refresh_user_model_usage_daily(&pool).await.unwrap();
+        // Second window on the same day — must add to the existing row via the cursor, not replace it.
+        insert(20, 10).await;
+        refresh_user_model_usage_daily(&pool).await.unwrap();
+
+        let row = sqlx::query!(
+            r#"
+            SELECT input_tokens, output_tokens, request_count
+            FROM user_model_usage_daily
+            WHERE user_id = $1 AND model = 'gpt-4' AND usage_date = $2
+            "#,
+            user_id,
+            day.date_naive(),
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(row.input_tokens, 120); // 100 + 20
+        assert_eq!(row.output_tokens, 60); // 50 + 10
+        assert_eq!(row.request_count, 2);
     }
 
     #[sqlx::test]

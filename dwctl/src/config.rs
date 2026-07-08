@@ -1818,6 +1818,8 @@ impl Default for NotificationsConfig {
 pub struct BackgroundServicesConfig {
     /// Configuration for onwards config sync service
     pub onwards_sync: OnwardsSyncConfig,
+    /// Configuration for the usage-aggregate refresh daemon
+    pub usage_refresh: UsageRefreshConfig,
     /// Configuration for probe scheduler service
     pub probe_scheduler: ProbeSchedulerConfig,
     /// Configuration for batch processing daemon
@@ -1884,6 +1886,42 @@ impl Default for OnwardsSyncConfig {
         Self {
             enabled: true,
             fallback_interval_milliseconds: 300_000, // 5 minutes (NOTIFY handles real changes; this is only a missed-notification safety net)
+        }
+    }
+}
+
+/// Usage-aggregate refresh daemon configuration.
+///
+/// The daemon incrementally folds new `http_analytics` rows into the
+/// `user_model_usage_daily` rollup. It's woken by the analytics batcher after each
+/// flush (in-process, no LISTEN/NOTIFY — emitter and consumer share the pod) and, as a
+/// safety net, on a periodic fallback tick. Cross-pod duplicate runs are made cheap
+/// no-ops by an advisory lock in the refresh itself.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct UsageRefreshConfig {
+    /// Enable the usage-refresh daemon (default: true).
+    pub enabled: bool,
+    /// Fallback tick interval in milliseconds (default: 60000ms = 1 minute).
+    ///
+    /// The batcher nudge drives the refresh in real time whenever there's traffic; this
+    /// tick only backstops a missed nudge or drains the cursor after a restart. It is
+    /// cheap — a tick with no new rows finds `MAX(id)` unchanged and no-ops. Set to `0`
+    /// to disable the fallback entirely.
+    pub fallback_interval_milliseconds: u64,
+    /// Minimum interval between refreshes in milliseconds (default: 30000ms = 30s).
+    ///
+    /// Bounds refresh frequency and coalesces bursts of batcher nudges: after a refresh
+    /// the daemon waits at least this long before running again.
+    pub min_interval_milliseconds: u64,
+}
+
+impl Default for UsageRefreshConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            fallback_interval_milliseconds: 60_000,
+            min_interval_milliseconds: 30_000,
         }
     }
 }
