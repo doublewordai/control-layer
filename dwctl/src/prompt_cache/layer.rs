@@ -98,7 +98,7 @@ fn marker_rejection_response(e: &ParseError, policy: &TierPolicy) -> Response {
             "message": message,
             "type": "invalid_request_error",
             "code": "invalid_cache_control",
-            "param": "messages[].content[].cache_control",
+            "param": "cache_control",
         }
     });
     (StatusCode::BAD_REQUEST, axum::Json(body)).into_response()
@@ -182,7 +182,7 @@ pub async fn cache_middleware(State(state): State<CacheLayerState>, request: Req
     // recorded for all traffic) — NOT whether the body changed, since a stream gets
     // include_usage injected even with no markers. Re-frame: set Content-Length and drop any
     // stale Transfer-Encoding (sending both is invalid HTTP). `from(u64)` is the numeric ctor.
-    let (stripped, had_markers) = strip_cache_control(&body_bytes);
+    let (stripped, had_markers) = strip_cache_control(&body_bytes, state.classifier.telemetry_policy());
     cache_metrics::record_marker_request(had_markers);
     let forward = stripped.unwrap_or(body_bytes);
     parts.headers.remove(header::TRANSFER_ENCODING);
@@ -488,7 +488,8 @@ mod tests {
     use super::*;
     use crate::api::models::users::Role;
     use crate::prompt_cache::{
-        CacheIndex, IndexScope, ModelConfigResolver, PostgresIndex, PrincipalResolver, TokenizerClient, parse_chat_completions,
+        CacheIndex, IndexScope, ModelConfigResolver, PostgresIndex, PrincipalResolver, TelemetryPolicy, TokenizerClient,
+        parse_chat_completions,
     };
     use crate::test::utils::{create_test_api_key_for_user, create_test_endpoint, create_test_model, create_test_user};
     use axum::middleware::from_fn_with_state;
@@ -565,6 +566,7 @@ mod tests {
             TokenizerClient::new(tok.uri()),
             Arc::new(PostgresIndex::new(pool.clone())),
             all_tiers(),
+            TelemetryPolicy::default(),
         );
         let app = Router::new()
             .route("/v1/chat/completions", post(mock_upstream))
@@ -590,7 +592,7 @@ mod tests {
             virtual_model: ALIAS.into(),
             tokenizer_version: TOK_VER.into(),
         };
-        let hash = parse_chat_completions(&serde_json::to_vec(&body()).unwrap(), &all_tiers())
+        let hash = parse_chat_completions(&serde_json::to_vec(&body()).unwrap(), &all_tiers(), &TelemetryPolicy::default())
             .unwrap()
             .cumulative_hashes[0]
             .clone();
@@ -680,6 +682,7 @@ mod tests {
             TokenizerClient::new(tok.uri()),
             Arc::new(PostgresIndex::new(pool.clone())),
             all_tiers(),
+            TelemetryPolicy::default(),
         );
         let app = Router::new()
             .route("/v1/chat/completions", post(mock_upstream_streaming))
@@ -706,9 +709,13 @@ mod tests {
             virtual_model: ALIAS.into(),
             tokenizer_version: TOK_VER.into(),
         };
-        let hash = parse_chat_completions(&serde_json::to_vec(&body_streaming()).unwrap(), &all_tiers())
-            .unwrap()
-            .cumulative_hashes[0]
+        let hash = parse_chat_completions(
+            &serde_json::to_vec(&body_streaming()).unwrap(),
+            &all_tiers(),
+            &TelemetryPolicy::default(),
+        )
+        .unwrap()
+        .cumulative_hashes[0]
             .clone();
         let idx = PostgresIndex::new(pool.clone());
         let mut committed = false;
@@ -784,6 +791,7 @@ mod tests {
             TokenizerClient::new(tok.uri()),
             Arc::new(PostgresIndex::new(pool.clone())),
             all_tiers(),
+            TelemetryPolicy::default(),
         );
         let app = Router::new()
             .route("/v1/chat/completions", post(mock_upstream_streaming_error))
@@ -805,9 +813,13 @@ mod tests {
             virtual_model: ALIAS.into(),
             tokenizer_version: TOK_VER.into(),
         };
-        let hash = parse_chat_completions(&serde_json::to_vec(&body_streaming()).unwrap(), &all_tiers())
-            .unwrap()
-            .cumulative_hashes[0]
+        let hash = parse_chat_completions(
+            &serde_json::to_vec(&body_streaming()).unwrap(),
+            &all_tiers(),
+            &TelemetryPolicy::default(),
+        )
+        .unwrap()
+        .cumulative_hashes[0]
             .clone();
         let idx = PostgresIndex::new(pool.clone());
         for _ in 0..50 {
@@ -828,6 +840,7 @@ mod tests {
             TokenizerClient::new("http://127.0.0.1:1"),
             Arc::new(PostgresIndex::new(pool.clone())),
             all_tiers(),
+            TelemetryPolicy::default(),
         );
         let app = Router::new()
             .route("/v1/embeddings", post(mock_upstream))
@@ -851,6 +864,7 @@ mod tests {
             TokenizerClient::new("http://127.0.0.1:1"),
             Arc::new(PostgresIndex::new(pool.clone())),
             TierPolicy::from_config(&["5m".to_string()], "5m"),
+            TelemetryPolicy::default(),
         );
         let app = Router::new()
             .route("/v1/chat/completions", post(mock_upstream)) // must NOT be reached

@@ -936,6 +936,63 @@ db-stop *args="":
         echo "ℹ️  test-postgres container does not exist"
     fi
 
+# Start a local Redis for the ZDR keystore (append-only on, named volume for
+# durability). Mirrors the prod keystore shape (single instance, AOF). Point
+# config.yaml's keystore.redis_url at redis://localhost:6379 to use it.
+redis-start:
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    if docker ps -a --format '{{{{.Names}}' | grep -q "^dwctl-redis$"; then
+        if docker ps --format '{{{{.Names}}' | grep -q "^dwctl-redis$"; then
+            echo "✅ dwctl-redis container is already running"
+        else
+            echo "Starting existing dwctl-redis container..."
+            docker start dwctl-redis
+        fi
+    else
+        echo "Creating new dwctl-redis container (append-only on)..."
+        docker volume create dwctl-redis-data >/dev/null 2>&1 || true
+        docker run --name dwctl-redis \
+          -p 6379:6379 \
+          -v dwctl-redis-data:/data \
+          -d redis:7 \
+          redis-server --appendonly yes
+    fi
+
+    echo "✅ Redis is ready on localhost:6379"
+
+# Stop the local Redis keystore. Pass --remove to also drop the container and
+# its data volume (crypto-shreds every stored key).
+redis-stop *args="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    if docker ps --format '{{{{.Names}}' | grep -q "^dwctl-redis$"; then
+        echo "Stopping dwctl-redis container..."
+        docker stop dwctl-redis
+
+        if [[ "{{args}}" == *"--remove"* ]]; then
+            echo "Removing dwctl-redis container..."
+            docker rm dwctl-redis
+            echo "Removing dwctl-redis-data volume..."
+            docker volume rm dwctl-redis-data 2>/dev/null || echo "  (volume already removed)"
+        fi
+        echo "✅ Done"
+    elif docker ps -a --format '{{{{.Names}}' | grep -q "^dwctl-redis$"; then
+        if [[ "{{args}}" == *"--remove"* ]]; then
+            echo "Removing stopped dwctl-redis container..."
+            docker rm dwctl-redis
+            echo "Removing dwctl-redis-data volume..."
+            docker volume rm dwctl-redis-data 2>/dev/null || echo "  (volume already removed)"
+            echo "✅ Done"
+        else
+            echo "ℹ️  dwctl-redis container is already stopped"
+        fi
+    else
+        echo "ℹ️  dwctl-redis container does not exist"
+    fi
+
 # Hidden recipes for internal use
 _drop-test-users:
     @./scripts/drop-test-users.sh

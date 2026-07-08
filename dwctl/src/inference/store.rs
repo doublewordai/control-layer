@@ -81,6 +81,8 @@ pub struct FusilladeResponseStore<P: PoolProvider + Clone> {
     /// on every iteration; `record_step` reads to stamp api_key +
     /// created_by + base_url on per-step sub-request rows.
     pending_inputs: Arc<RwLock<HashMap<String, PendingResponseInput>>>,
+    /// Keystore for decrypting ZDR response bodies on retrieval. `None` = no ZDR.
+    keystore: Option<crate::keystore::Keystore>,
 }
 
 impl<P: PoolProvider + Clone> FusilladeResponseStore<P> {
@@ -89,6 +91,7 @@ impl<P: PoolProvider + Clone> FusilladeResponseStore<P> {
             request_manager,
             step_manager: None,
             pending_inputs: Arc::new(RwLock::new(HashMap::new())),
+            keystore: None,
         }
     }
 
@@ -99,6 +102,12 @@ impl<P: PoolProvider + Clone> FusilladeResponseStore<P> {
     /// "not implemented" default.
     pub fn with_step_manager(mut self, step_manager: Arc<PostgresResponseStepManager<P>>) -> Self {
         self.step_manager = Some(step_manager);
+        self
+    }
+
+    /// Wire in the keystore so ZDR response bodies are decrypted on retrieval.
+    pub fn with_keystore(mut self, keystore: Option<crate::keystore::Keystore>) -> Self {
+        self.keystore = keystore;
         self
     }
 
@@ -209,11 +218,17 @@ impl<P: PoolProvider + Clone> FusilladeResponseStore<P> {
     ///   retrievable via `GET /v1/responses/{id}` — the API surface
     ///   the dashboard depends on.
     ///
-    /// Returns `None` only when neither lookup matches.
-    pub async fn get_response(&self, response_id: &str) -> Result<Option<serde_json::Value>, StoreError> {
+    /// Returns [`ResponseLookup::NotFound`] only when neither lookup matches,
+    /// and [`ResponseLookup::Gone`] when the row exists but its ZDR response
+    /// body is an envelope whose key has been shredded (see the enum docs). The
+    /// gone decision is made from the same keystore lookup that would decrypt,
+    /// so there is no separate probe and no time-of-check/time-of-use gap.
+    pub async fn get_response(&self, response_id: &str) -> Result<ResponseLookup, StoreError> {
         let parsed_uuid = parse_response_id(response_id)?;
 
-        // Multi-step path: try head_step first.
+        // Multi-step path: try head_step first. Multi-step is the server-side
+        // tool loop, which ZDR rejects at submit, so these are never encrypted -
+        // no gone case here.
         if let Some(step_manager) = self.step_manager.as_deref()
             && let Some(head_step) = step_manager.get_step(StepId(parsed_uuid)).await.map_err(map_fusillade_err)?
         {
@@ -222,18 +237,18 @@ impl<P: PoolProvider + Clone> FusilladeResponseStore<P> {
             // request_id, so the unwrap below is well-defined for any
             // committed head step.
             let Some(sub_request_id) = head_step.request_id else {
-                return Ok(None);
+                return Ok(ResponseLookup::NotFound);
             };
             let detail = match self.request_manager.get_request_detail(sub_request_id).await {
                 Ok(d) => d,
-                Err(fusillade::FusilladeError::RequestNotFound(_)) => return Ok(None),
+                Err(fusillade::FusilladeError::RequestNotFound(_)) => return Ok(ResponseLookup::NotFound),
                 Err(e) => return Err(StoreError::StorageError(format!("fetch head sub-request: {e}"))),
             };
             let mut resp = detail_to_response_object(&detail);
             // Surface the user-facing id (head step uuid), not the
             // internal sub-request uuid.
             resp["id"] = serde_json::Value::String(format!("resp_{parsed_uuid}"));
-            return Ok(Some(resp));
+            return Ok(ResponseLookup::Found(resp));
         }
 
         // Single-step fallback: the id is itself a fusillade.requests
@@ -241,11 +256,39 @@ impl<P: PoolProvider + Clone> FusilladeResponseStore<P> {
         // GET a previously-issued non-multi-step request via the same
         // /v1/responses/{id} endpoint.
         match self.request_manager.get_request_detail(RequestId(parsed_uuid)).await {
-            Ok(detail) => Ok(Some(detail_to_response_object(&detail))),
-            Err(fusillade::FusilladeError::RequestNotFound(_)) => Ok(None),
+            Ok(mut detail) => {
+                if let Some(ks) = self.keystore.as_ref() {
+                    match crate::inference::zdr::decrypt_response_body(ks, &detail.id, detail.response_body.as_deref())
+                        .await
+                        .map_err(|e| StoreError::StorageError(format!("ZDR response decrypt: {e}")))?
+                    {
+                        crate::inference::zdr::DecryptOutcome::Unchanged => {}
+                        crate::inference::zdr::DecryptOutcome::Decrypted(plain) => detail.response_body = Some(plain),
+                        crate::inference::zdr::DecryptOutcome::Gone => return Ok(ResponseLookup::Gone),
+                    }
+                }
+                Ok(ResponseLookup::Found(detail_to_response_object(&detail)))
+            }
+            Err(fusillade::FusilladeError::RequestNotFound(_)) => Ok(ResponseLookup::NotFound),
             Err(e) => Err(StoreError::StorageError(format!("Failed to fetch request: {e}"))),
         }
     }
+}
+
+/// Outcome of [`FusilladeResponseStore::get_response`].
+///
+/// `Gone` is the ZDR crypto-shred case: the stored response is an encrypted
+/// envelope whose per-request key has been deleted (on a prior retrieval) or
+/// TTL-expired, so the plaintext is permanently unrecoverable. The retrieval
+/// handler maps it to HTTP 410; every other caller treats it like `NotFound`.
+#[derive(Debug)]
+pub enum ResponseLookup {
+    /// The response object, ready to return.
+    Found(serde_json::Value),
+    /// Neither the multi-step nor single-step lookup matched.
+    NotFound,
+    /// A ZDR response whose key is gone; permanently unavailable.
+    Gone,
 }
 
 fn parse_step_id(raw: &str) -> Result<StepId, StoreError> {
@@ -467,13 +510,31 @@ pub async fn poll_until_terminal<P: PoolProvider + Clone>(
     request_id: Uuid,
     poll_interval: std::time::Duration,
     timeout: std::time::Duration,
+    keystore: Option<&crate::keystore::Keystore>,
 ) -> Result<fusillade::RequestDetail, StoreError> {
     let start = std::time::Instant::now();
 
     loop {
         match request_manager.get_request_detail(RequestId(request_id)).await {
-            Ok(detail) => match detail.status.as_str() {
-                "completed" | "failed" | "canceled" => return Ok(detail),
+            Ok(mut detail) => match detail.status.as_str() {
+                "completed" | "failed" | "canceled" => {
+                    // ZDR: the daemon stored the body encrypted; decrypt before
+                    // it is rendered back to the (blocking or streaming) caller.
+                    if let Some(ks) = keystore {
+                        match crate::inference::zdr::decrypt_response_body(ks, &detail.id, detail.response_body.as_deref())
+                            .await
+                            .map_err(|e| StoreError::StorageError(format!("ZDR response decrypt: {e}")))?
+                        {
+                            crate::inference::zdr::DecryptOutcome::Unchanged => {}
+                            crate::inference::zdr::DecryptOutcome::Decrypted(plain) => detail.response_body = Some(plain),
+                            // Key gone (already retrieved, or expired). Blank the
+                            // inert ciphertext so the blocking/streaming caller
+                            // gets an empty body rather than the raw envelope.
+                            crate::inference::zdr::DecryptOutcome::Gone => detail.response_body = None,
+                        }
+                    }
+                    return Ok(detail);
+                }
                 _ => {}
             },
             Err(fusillade::FusilladeError::RequestNotFound(_)) => {}
@@ -498,62 +559,11 @@ pub async fn poll_until_complete<P: PoolProvider + Clone>(
     response_id: &str,
     poll_interval: std::time::Duration,
     timeout: std::time::Duration,
+    keystore: Option<&crate::keystore::Keystore>,
 ) -> Result<serde_json::Value, StoreError> {
     let id = parse_response_id(response_id)?;
-    let detail = poll_until_terminal(request_manager, id, poll_interval, timeout).await?;
+    let detail = poll_until_terminal(request_manager, id, poll_interval, timeout, keystore).await?;
     Ok(detail_to_response_object(&detail))
-}
-
-/// The creditor an API key bills to, plus their verification status.
-///
-/// `id` is `api_keys.user_id` — the organization for org-scoped keys, otherwise
-/// the individual (see migration 080). `verified` is that entity's
-/// `users.verified` flag (organizations are themselves `users` rows), defaulting
-/// to `false` when no matching row exists.
-pub struct KeyCreditor {
-    pub id: String,
-    pub verified: bool,
-}
-
-/// Resolve an API key's creditor and verification status in a single lookup.
-///
-/// Used on submission paths that need both the attribution id *and* the verified
-/// flag (e.g. the unverified upload-volume cap) so the flag rides along on the
-/// key lookup they already perform rather than costing a second round trip. The
-/// `LEFT JOIN` keeps `id` resolution identical to [`lookup_created_by`] even for
-/// keys whose `user_id` has no `users` row (e.g. the internal system key).
-pub async fn lookup_creditor(pool: &sqlx::PgPool, api_key: Option<&str>) -> Option<KeyCreditor> {
-    let key = api_key?;
-    match sqlx::query(
-        "SELECT ak.user_id, u.verified \
-         FROM public.api_keys ak \
-         LEFT JOIN public.users u ON u.id = ak.user_id \
-         WHERE ak.secret = $1 AND ak.is_deleted = false LIMIT 1",
-    )
-    .bind(key)
-    .fetch_optional(pool)
-    .await
-    {
-        Ok(Some(row)) => {
-            use sqlx::Row;
-            let id: Uuid = row.get("user_id");
-            // NULL when the LEFT JOIN found no user row; a missing row counts as
-            // unverified, matching `Users::is_verified`.
-            let verified: Option<bool> = row.get("verified");
-            Some(KeyCreditor {
-                id: id.to_string(),
-                verified: verified.unwrap_or(false),
-            })
-        }
-        Ok(None) => {
-            tracing::warn!(key_prefix = &key[..8.min(key.len())], "API key not found for attribution");
-            None
-        }
-        Err(e) => {
-            tracing::error!(error = %e, "Failed to look up API key creditor");
-            None
-        }
-    }
 }
 
 /// Look up the user ID from an API key for batch/response attribution.
@@ -1168,7 +1178,12 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> ResponseStore for Fusillad
     }
 
     async fn get_context(&self, response_id: &str) -> Result<Option<serde_json::Value>, StoreError> {
-        self.get_response(response_id).await
+        // Multi-step context lookups are never ZDR, so `Gone` cannot arise here;
+        // fold it into `None` alongside `NotFound` for a total mapping.
+        Ok(match self.get_response(response_id).await? {
+            ResponseLookup::Found(v) => Some(v),
+            ResponseLookup::NotFound | ResponseLookup::Gone => None,
+        })
     }
 }
 

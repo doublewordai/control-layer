@@ -1461,6 +1461,7 @@ export interface DaemonConfig {
   heartbeat_interval_ms: number;
   claim_timeout_ms: number;
   processing_timeout_ms: number;
+  pending_request_counts_timeout_ms: number;
 }
 
 export interface Daemon {
@@ -1619,6 +1620,7 @@ export interface OrganizationSummary {
   id: string;
   name: string;
   role: string;
+  zero_data_retention: boolean; // Whether the organization has zero data retention enabled
 }
 
 /** Organization response — flattened User with org-specific fields */

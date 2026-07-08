@@ -29,6 +29,7 @@ use sqlx_pool_router::PoolProvider;
 use super::image_normalizer_middleware::{normalize_error_response, normalize_value_to_tokens};
 use super::store::{self as response_store, ONWARDS_RESPONSE_ID_HEADER, OnwardsDaemonId};
 use super::streaming::{ReplayFrame, flex_stream_response};
+use crate::db::{errors::DbError, handlers::api_keys::ApiKeys, models::api_keys::ApiKeyPurpose};
 use crate::image_normalizer::ImageNormalizer;
 
 /// State for the inference middleware.
@@ -67,6 +68,13 @@ pub struct InferenceMiddlewareState<P: PoolProvider + Clone = sqlx_pool_router::
     /// (`config.batches.async_requests.completion_window`, e.g. "1h"). The
     /// unverified cap is measured over a rolling window of this length.
     pub flex_completion_window: String,
+    /// Encrypted key custody for ZDR flex bodies. `None` disables ZDR.
+    pub keystore: Option<crate::keystore::Keystore>,
+    /// Per-key ZDR policy map (api key secret to the owning account's
+    /// `zero_data_retention` flag), kept fresh by [`crate::sync::zdr_keys`].
+    /// Read by [`super::zdr::is_zdr_request`] on the submit path. Defaults to
+    /// empty (every key reads as non-ZDR) when the sync is not wired.
+    pub zdr_key_cache: crate::sync::zdr_keys::ZdrKeyCache,
 }
 
 /// Middleware that routes inference requests based on service_tier and background.
@@ -217,6 +225,23 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
     //   no tools, !flex                              → falls through to handle_realtime below
     //   any flex                                     → falls through to handle_flex below
     let stream_requested = is_responses_api && !background && request_value["stream"].as_bool().unwrap_or(false);
+
+    // ZDR + server-side tools (responses API) runs the multi-step tool loop —
+    // inline on the realtime warm path, async in the flex daemon — which
+    // scatters plaintext into response_steps / sub-request rows / per-step
+    // outlet logs that ZDR cannot cover. Reject at submit for both tiers, keyed
+    // on per-key policy alone (a keystore is irrelevant to whether we can
+    // safely serve the request).
+    if is_responses_api && has_tools && crate::inference::zdr::is_zdr_request(&state.zdr_key_cache, api_key.as_deref()) {
+        return Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({"error": {"message": "Zero-data-retention is not supported for requests that use server-side tools.", "type": "invalid_request_error"}}).to_string(),
+            ))
+            .unwrap();
+    }
+
     match warm_path_branch(is_responses_api, is_flex, background, stream_requested, has_tools) {
         WarmPathBranch::Stream => {
             if let Some(resp) = try_warm_path_stream(&state, &request_value, api_key.as_deref(), model).await {
@@ -278,31 +303,64 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
         }
     }
 
-    // Resolve the creditor upfront for background/flex (row must exist before
-    // returning 202). For realtime non-background, defer to the background task.
-    // The creditor lookup also carries the verified flag, reused by the flex
-    // volume cap below so it costs no extra query.
-    let needs_sync_attribution = background || matches!(service_tier, ServiceTier::Flex);
-    let creditor = if needs_sync_attribution {
-        response_store::lookup_creditor(&state.dwctl_pool, api_key.as_deref()).await
+    // Resolve created_by upfront for background realtime responses (row must
+    // exist before returning 202). Flex uses the key owner's hidden batch key
+    // below, so resolving it there also supplies the attribution target.
+    let created_by = if background && matches!(service_tier, ServiceTier::Realtime) {
+        response_store::lookup_created_by(&state.dwctl_pool, api_key.as_deref()).await
     } else {
         None
     };
-    let created_by = creditor.as_ref().map(|c| c.id.clone());
+    let flex_batch_key = if matches!(service_tier, ServiceTier::Flex) {
+        match resolve_flex_batch_api_key(&state.dwctl_pool, api_key.as_deref()).await {
+            Ok(Some(key)) => Some(key),
+            Ok(None) => {
+                tracing::warn!("Flex API key disappeared before hidden batch-key resolution");
+                return Response::builder()
+                    .status(StatusCode::FORBIDDEN)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"error": {"message": "Invalid API key", "type": "invalid_request_error"}}).to_string(),
+                    ))
+                    .unwrap();
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "Failed to resolve flex hidden batch key");
+                return Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "error": {
+                                "message": "Failed to prepare flex request",
+                                "type": "server_error",
+                                "code": 500,
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap();
+            }
+        }
+    } else {
+        None
+    };
 
     // Bound how much an unverified creditor can queue via flex. Flex requests are
     // persisted and dispatched later (they don't pass through onwards' rate
     // limiter), so without this an unverified user could enqueue unbounded
-    // volume. The creditor id and verified flag come from the lookup above.
-    // No-op for verified creditors or a disabled cap.
-    if matches!(service_tier, ServiceTier::Flex)
-        && let Some(creditor) = creditor.as_ref()
-        && let Ok(owner) = creditor.id.parse::<uuid::Uuid>()
+    // volume. The creditor id and verified flag ride along on the hidden
+    // batch-key resolution above (`key_owner_id` is `api_keys.user_id`), so this
+    // costs no extra query. `flex_batch_key` is `Some` only for the flex tier,
+    // and its resolution already failed closed (403/500) on lookup errors above,
+    // so an unresolved creditor never reaches enforcement. No-op for verified
+    // creditors or a disabled cap.
+    if let Some(key) = flex_batch_key.as_ref()
         && let Err(err) = crate::api::handlers::unverified_volume::enforce_unverified_volume_limit(
             &*state.request_manager,
             state.unverified_requests_per_completion_hour,
-            owner,
-            creditor.verified,
+            key.key_owner_id,
+            key.verified,
             &state.flex_completion_window,
             1,
             crate::api::handlers::unverified_volume::SubmissionKind::Flex,
@@ -320,9 +378,16 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
 
     match service_tier {
         ServiceTier::Realtime => {
+            // Realtime ZDR is non-persistence (no encryption): decided per-key
+            // from the same policy map as flex, but without a keystore since we
+            // suppress the stored copies rather than encrypt them.
+            let zdr = crate::inference::zdr::is_zdr_request(&state.zdr_key_cache, api_key.as_deref());
             let realtime_input = fusillade::CreateRealtimeInput {
                 request_id,
-                body: request_value.to_string(),
+                // ZDR: never persist the request body to `request_templates`
+                // (background path). The live upstream call runs from
+                // `body_bytes` below, independent of this stored copy.
+                body: if zdr { String::new() } else { request_value.to_string() },
                 model: model.to_string(),
                 endpoint: state.loopback_base_url.clone(),
                 method: "POST".to_string(),
@@ -330,9 +395,29 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                 api_key: api_key.clone().unwrap_or_default(),
                 created_by: created_by.unwrap_or_default(),
             };
-            handle_realtime(&state, realtime_input, &resp_id, model, background, parts, body_bytes, next).await
+            handle_realtime(&state, realtime_input, &resp_id, model, background, zdr, parts, body_bytes, next).await
         }
         ServiceTier::Flex => {
+            // ZDR is decided once here at submit (per-key policy); dispatch and
+            // retrieve key off the stored body's sentinel instead of re-checking.
+            // The tool-using case is already rejected above, before the warm-path
+            // branch, for both tiers.
+            let zdr = crate::inference::zdr::is_zdr_request(&state.zdr_key_cache, api_key.as_deref());
+            // Flex encrypts the body at rest, which requires a configured
+            // keystore. A ZDR account whose request cannot be encrypted must fail
+            // loudly - never silently fall back to plaintext, and bail before we
+            // even ingest its images below. Missing keystore is a server
+            // misconfiguration, hence 500.
+            if zdr && state.keystore.is_none() {
+                tracing::error!("ZDR flex request but no keystore configured; refusing to store plaintext");
+                return Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"error": {"message": "Zero-data-retention is enabled for this account but the server is not configured to store data securely; refusing to process the request.", "type": "server_error"}}).to_string(),
+                    ))
+                    .unwrap();
+            }
             // Flex is persisted now and dispatched later by the daemon, so —
             // unlike realtime — it does NOT pass through the image-normaliser
             // layer. Normalise image inputs to `dw-img://` tokens here so the
@@ -389,15 +474,51 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                 obj.remove("stream_options");
             }
 
+            // For ZDR, encrypt the body and store the per-request keys; any
+            // failure fails the request rather than falling back to plaintext.
+            let flex_body = if zdr {
+                let zdr_store_error = || {
+                    Response::builder()
+                        .status(StatusCode::INTERNAL_SERVER_ERROR)
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            serde_json::json!({"error": {"message": "Failed to securely store zero-data-retention request.", "type": "server_error"}}).to_string(),
+                        ))
+                        .unwrap()
+                };
+                let Some(keystore) = state.keystore.as_ref() else {
+                    tracing::error!("ZDR enabled but keystore missing; refusing to store plaintext");
+                    return zdr_store_error();
+                };
+                match crate::inference::zdr::prepare_flex_submit(keystore, &request_id, &mut request_value).await {
+                    Ok(body) => body,
+                    Err(e) => {
+                        tracing::error!(error = %e, "ZDR submit failed; refusing to store plaintext");
+                        return zdr_store_error();
+                    }
+                }
+            } else {
+                request_value.to_string()
+            };
+
+            let flex_api_key = flex_batch_key
+                .as_ref()
+                .map(|key| key.secret.clone())
+                .unwrap_or_else(|| api_key.clone().unwrap_or_default());
+            let flex_created_by = flex_batch_key
+                .as_ref()
+                .map(|key| key.key_owner_id.to_string())
+                .or_else(|| created_by.clone())
+                .unwrap_or_default();
             let flex_input = fusillade::CreateFlexInput {
                 request_id,
-                body: request_value.to_string(),
+                body: flex_body,
                 model: model.to_string(),
                 endpoint: state.loopback_base_url.clone(),
                 method: "POST".to_string(),
                 path: endpoint.clone(),
-                api_key: api_key.clone().unwrap_or_default(),
-                created_by: created_by.unwrap_or_default(),
+                api_key: flex_api_key,
+                created_by: flex_created_by,
             };
 
             match (is_chat_completions_api, flex_stream) {
@@ -417,6 +538,52 @@ enum ServiceTier {
     Realtime,
     /// Flex: batch of 1 with 1h completion window, processed by fusillade daemon.
     Flex,
+}
+
+#[derive(Debug, Clone)]
+struct FlexBatchApiKey {
+    secret: String,
+    key_owner_id: uuid::Uuid,
+    /// The key owner's `users.verified` flag (organizations are `users` rows
+    /// too). Rides along on this lookup so the unverified upload-volume cap on
+    /// the flex path needs no extra query. `false` when no user row matches.
+    verified: bool,
+}
+
+async fn resolve_flex_batch_api_key(pool: &sqlx::PgPool, api_key: Option<&str>) -> Result<Option<FlexBatchApiKey>, DbError> {
+    let Some(api_key) = api_key else {
+        return Ok(None);
+    };
+
+    let row = sqlx::query(
+        r#"
+        SELECT ak.user_id, ak.created_by, u.verified
+        FROM api_keys ak
+        LEFT JOIN users u ON u.id = ak.user_id
+        WHERE ak.secret = $1 AND ak.is_deleted = false
+        LIMIT 1
+        "#,
+    )
+    .bind(api_key)
+    .fetch_optional(pool)
+    .await?;
+
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let key_owner_id: uuid::Uuid = sqlx::Row::get(&row, "user_id");
+    let created_by: uuid::Uuid = sqlx::Row::get(&row, "created_by");
+    // NULL when the LEFT JOIN found no user row; a missing row counts as
+    // unverified, matching `Users::is_verified`.
+    let verified: bool = sqlx::Row::try_get(&row, "verified").ok().flatten().unwrap_or(false);
+
+    let mut conn = pool.acquire().await?;
+    let mut api_keys_repo = ApiKeys::new(&mut conn);
+    let secret = api_keys_repo
+        .get_or_create_hidden_key(key_owner_id, ApiKeyPurpose::Batch, created_by)
+        .await?;
+
+    Ok(Some(FlexBatchApiKey { secret, key_owner_id, verified }))
 }
 
 impl std::fmt::Display for ServiceTier {
@@ -508,6 +675,7 @@ async fn handle_realtime<P: PoolProvider + Clone + Send + Sync + 'static>(
     resp_id: &str,
     model: &str,
     background: bool,
+    zdr: bool,
     parts: axum::http::request::Parts,
     body_bytes: bytes::Bytes,
     next: Next,
@@ -549,6 +717,17 @@ async fn handle_realtime<P: PoolProvider + Clone + Send + Sync + 'static>(
     }
     if let Ok(value) = model.parse() {
         req.headers_mut().insert("x-onwards-model", value);
+    }
+    // ZDR realtime: mark the dispatch so outlet's `ZdrBodyScrubber` blanks the
+    // `http_requests`/`http_responses` bodies and `FusilladeOutletHandler`
+    // suppresses the request/response body it would persist. Reuses the flex
+    // marker header/channel; it is harmless if it reaches the provider, exactly
+    // like flex's other `x-fusillade-batch-*` metadata headers.
+    if zdr {
+        req.headers_mut().insert(
+            crate::inference::zdr::ZDR_MARKER_HEADER,
+            "1".parse().expect("static ZDR marker is a valid header value"),
+        );
     }
 
     if background {
@@ -622,7 +801,7 @@ async fn handle_flex<P: PoolProvider + Clone + Send + Sync + 'static>(
         let poll_interval = std::time::Duration::from_millis(500);
         let timeout = std::time::Duration::from_secs(3600);
 
-        match response_store::poll_until_complete(&state.request_manager, resp_id, poll_interval, timeout).await {
+        match response_store::poll_until_complete(&state.request_manager, resp_id, poll_interval, timeout, state.keystore.as_ref()).await {
             Ok(response_obj) => {
                 let status_code = if response_obj["status"].as_str() == Some("completed") {
                     StatusCode::OK
@@ -684,7 +863,7 @@ async fn handle_chat_completion_flex<P: PoolProvider + Clone + Send + Sync + 'st
     let poll_interval = std::time::Duration::from_millis(500);
     let timeout = std::time::Duration::from_secs(3600);
 
-    match response_store::poll_until_terminal(&state.request_manager, request_id, poll_interval, timeout).await {
+    match response_store::poll_until_terminal(&state.request_manager, request_id, poll_interval, timeout, state.keystore.as_ref()).await {
         Ok(detail) => {
             let (status, body) = response_store::detail_to_chat_completion_object(&detail);
             let status_code = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
@@ -737,6 +916,7 @@ async fn handle_chat_completion_flex_streaming<P: PoolProvider + Clone + Send + 
         flex_input,
         request_id,
         true,
+        state.keystore.clone(),
         move |result| match result {
             Ok(detail) => {
                 let (status, body) = response_store::detail_to_chat_completion_object(detail);
@@ -778,6 +958,7 @@ async fn handle_responses_flex_streaming<P: PoolProvider + Clone + Send + Sync +
         flex_input,
         request_id,
         false,
+        state.keystore.clone(),
         move |result| match result {
             Ok(detail) => {
                 let response = response_store::detail_to_response_object(detail);
@@ -1114,6 +1295,67 @@ mod tests {
     #[test]
     fn test_resolve_service_tier_flex() {
         assert!(matches!(resolve_service_tier(Some("flex")), ServiceTier::Flex));
+    }
+
+    #[sqlx::test]
+    async fn resolve_flex_batch_key_uses_hidden_batch_key_for_key_owner(pool: sqlx::PgPool) {
+        use crate::api::models::{api_keys::ApiKeyCreate, users::Role};
+        use crate::db::{
+            handlers::{Repository, api_keys::ApiKeys},
+            models::api_keys::{ApiKeyCreateDBRequest, ApiKeyPurpose},
+        };
+
+        let user = crate::test::utils::create_test_user(&pool, Role::BatchAPIUser).await;
+        let org = crate::test::utils::create_test_org(&pool, user.id).await;
+        let realtime_key = {
+            let mut conn = pool.acquire().await.expect("acquire connection");
+            let mut repo = ApiKeys::new(&mut conn);
+            repo.create(&ApiKeyCreateDBRequest::new(
+                org.id,
+                user.id,
+                ApiKeyCreate {
+                    name: "Org realtime key".to_string(),
+                    description: None,
+                    purpose: ApiKeyPurpose::Realtime,
+                    requests_per_second: None,
+                    burst_size: None,
+                    member_id: None,
+                },
+            ))
+            .await
+            .expect("create realtime key")
+            .secret
+        };
+
+        let flex_key = resolve_flex_batch_api_key(&pool, Some(&realtime_key))
+            .await
+            .expect("resolve flex key")
+            .expect("known realtime key should resolve");
+
+        assert_ne!(flex_key.secret, realtime_key);
+        assert_eq!(flex_key.key_owner_id, org.id);
+
+        let row = sqlx::query(
+            r#"
+            SELECT user_id, created_by, purpose, hidden
+            FROM api_keys
+            WHERE secret = $1
+            "#,
+        )
+        .bind(&flex_key.secret)
+        .fetch_one(&pool)
+        .await
+        .expect("hidden key row");
+
+        let row_user_id: uuid::Uuid = sqlx::Row::get(&row, "user_id");
+        let row_created_by: uuid::Uuid = sqlx::Row::get(&row, "created_by");
+        let row_purpose: String = sqlx::Row::get(&row, "purpose");
+        let row_hidden: bool = sqlx::Row::get(&row, "hidden");
+
+        assert_eq!(row_user_id, org.id);
+        assert_eq!(row_created_by, user.id);
+        assert_eq!(row_purpose, "batch");
+        assert!(row_hidden);
     }
 
     // Routing-decision tests for `warm_path_branch`. The whole point

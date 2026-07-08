@@ -4,8 +4,9 @@
 //! Two jobs, both run by the cache tower layer (only when a cacheable request is
 //! classified):
 //!
-//! 1. **Outbound request sanitisation** ([`strip_cache_control`]): recursively remove
-//!    every `cache_control` marker from the request body, and ensure
+//! 1. **Outbound request sanitisation** ([`strip_cache_control`]): remove `cache_control`
+//!    markers from the exact locations the parser reads them (message content blocks and
+//!    tool objects) — NOT recursively — and ensure
 //!    `stream_options.include_usage = true` so a streaming response carries a terminal
 //!    usage frame to edit. Markers are a billing signal consumed here, not forwarded.
 //! 2. **Response usage injection**: splice the neutral [`CacheStats`] into the OpenAI `usage`
@@ -21,38 +22,72 @@ use bytes::Bytes;
 use serde_json::Value;
 use tracing::error;
 
+use super::parse::{TELEMETRY_ROLE, TelemetryPolicy};
 use super::stats::CacheStats;
 
-/// Recursively remove every `cache_control` field from a JSON value. Returns
-/// `(rewrote, had_marker)`: `rewrote` = any key was removed (so the body changed and must be
-/// re-serialised before forwarding — a `cache_control` field would otherwise leak to the
-/// upstream); `had_marker` = any removed value was NON-NULL, the adoption signal. An explicit
-/// `cache_control: null` is "no marker" (matching parse/validation), but is still stripped.
-fn remove_cache_control(value: &mut Value) -> (bool, bool) {
+/// Remove `cache_control` markers from the request body at exactly the locations the parser
+/// reads them — each `messages[i].content[j]` block and each `tools[i]` object — and NOWHERE
+/// else. Returns `(rewrote, had_marker)`: `rewrote` = a marker was removed (so the body
+/// changed and must be re-serialised before forwarding — a marker would otherwise leak
+/// upstream); `had_marker` = a removed value was NON-NULL, the adoption signal. An explicit
+/// `cache_control: null` is "no marker" (matching parse/validation) but is still stripped.
+///
+/// Deliberately **not recursive**: a `cache_control` nested inside a tool's JSON Schema (e.g.
+/// a function parameter literally named `cache_control`) is the caller's own data — deleting
+/// it would corrupt the tool the model sees, and it isn't a marker. Stripping only the marker
+/// locations also keeps the forwarded bytes identical to what [`super::parse`] hashes/tokenizes.
+fn remove_cache_control(body: &mut Value, telemetry: &TelemetryPolicy) -> (bool, bool) {
     let mut rewrote = false;
     let mut had_marker = false;
-    match value {
-        Value::Object(map) => {
-            if let Some(removed) = map.remove("cache_control") {
-                rewrote = true;
-                had_marker |= !removed.is_null();
-            }
-            for v in map.values_mut() {
-                let (r, h) = remove_cache_control(v);
-                rewrote |= r;
-                had_marker |= h;
+    let Some(obj) = body.as_object_mut() else {
+        return (false, false);
+    };
+
+    // Message content blocks (array-form content only; string content carries no marker).
+    if let Some(messages) = obj.get_mut("messages").and_then(Value::as_array_mut) {
+        for msg in messages.iter_mut() {
+            // Whether to drop telemetry from THIS message's forwarded content: strip mode + the
+            // system role (matching `super::parse`). Evaluated from a borrowed `&str` BEFORE the
+            // mutable content borrow, so there's no per-message `String` allocation, and a
+            // non-system block that coincidentally starts with a prefix is never mutated out.
+            let strip_system_telemetry = telemetry.strip_from_prompt && msg.get("role").and_then(Value::as_str) == Some(TELEMETRY_ROLE);
+            if let Some(content) = msg.get_mut("content").and_then(Value::as_array_mut) {
+                // Drop the unmarked telemetry blocks from the FORWARDED prompt BEFORE stripping
+                // cache_control, so `excludes_block` still sees the original marker state and never
+                // drops a caller-marked block. Keeps the forwarded bytes aligned with what
+                // `super::parse` excludes from the hash, and lets the upstream KV/prefix cache see
+                // a stable prompt. (Role is already confirmed system, so pass the const.)
+                if strip_system_telemetry {
+                    let before = content.len();
+                    content.retain(|block| !telemetry.excludes_block(TELEMETRY_ROLE, block));
+                    rewrote |= content.len() != before;
+                }
+                for block in content.iter_mut() {
+                    strip_block_marker(block, &mut rewrote, &mut had_marker);
+                }
             }
         }
-        Value::Array(items) => {
-            for v in items.iter_mut() {
-                let (r, h) = remove_cache_control(v);
-                rewrote |= r;
-                had_marker |= h;
-            }
-        }
-        _ => {}
     }
+
+    // Tool definitions: the top-level of each tool object only — never into its schema.
+    if let Some(tools) = obj.get_mut("tools").and_then(Value::as_array_mut) {
+        for tool in tools.iter_mut() {
+            strip_block_marker(tool, &mut rewrote, &mut had_marker);
+        }
+    }
+
     (rewrote, had_marker)
+}
+
+/// Remove a single top-level `cache_control` marker from one block/tool object, recording
+/// whether the body changed and whether the marker was non-null.
+fn strip_block_marker(value: &mut Value, rewrote: &mut bool, had_marker: &mut bool) {
+    if let Some(obj) = value.as_object_mut()
+        && let Some(removed) = obj.remove("cache_control")
+    {
+        *rewrote = true;
+        *had_marker |= !removed.is_null();
+    }
 }
 
 /// Sanitise an outbound request body: strip every `cache_control` marker and, for
@@ -61,11 +96,11 @@ fn remove_cache_control(value: &mut Value) -> (bool, bool) {
 /// returns whether the client actually sent `cache_control` markers (`had_markers`) — the
 /// adoption signal, kept distinct from the body changing, since a stream gets
 /// `include_usage` injected even when no markers were present.
-pub fn strip_cache_control(body: &[u8]) -> (Option<Bytes>, bool) {
+pub fn strip_cache_control(body: &[u8], telemetry: &TelemetryPolicy) -> (Option<Bytes>, bool) {
     let Ok(mut json) = serde_json::from_slice::<Value>(body) else {
         return (None, false);
     };
-    let (rewrote, had_markers) = remove_cache_control(&mut json);
+    let (rewrote, had_markers) = remove_cache_control(&mut json, telemetry);
 
     let mut usage_set = false;
     if let Some(obj) = json.as_object_mut() {
@@ -334,7 +369,7 @@ mod tests {
             "messages": [{"role":"system","content":[{"type":"text","text":"x","cache_control":{"type":"ephemeral"}}]}]
         })
         .to_string();
-        let (out, had_markers) = strip_cache_control(body.as_bytes());
+        let (out, had_markers) = strip_cache_control(body.as_bytes(), &TelemetryPolicy::default());
         assert!(had_markers, "body had cache_control");
         let out = out.expect("changed");
         let v: Value = serde_json::from_slice(&out).unwrap();
@@ -345,7 +380,7 @@ mod tests {
     #[test]
     fn strip_none_when_nothing_to_do() {
         let body = serde_json::json!({"messages":[{"role":"user","content":"hi"}]}).to_string();
-        let (out, had_markers) = strip_cache_control(body.as_bytes());
+        let (out, had_markers) = strip_cache_control(body.as_bytes(), &TelemetryPolicy::default());
         assert!(out.is_none());
         assert!(!had_markers);
     }
@@ -355,7 +390,7 @@ mod tests {
         // The overcounting case: a stream with no cache_control still gets include_usage
         // injected (body changes), but had_markers must stay false.
         let body = serde_json::json!({"stream": true, "messages":[{"role":"user","content":"hi"}]}).to_string();
-        let (out, had_markers) = strip_cache_control(body.as_bytes());
+        let (out, had_markers) = strip_cache_control(body.as_bytes(), &TelemetryPolicy::default());
         assert!(out.is_some(), "include_usage injected");
         assert!(!had_markers, "no markers present");
     }
@@ -368,10 +403,106 @@ mod tests {
             "messages": [{"role":"system","content":[{"type":"text","text":"x","cache_control":null}]}]
         })
         .to_string();
-        let (out, had_markers) = strip_cache_control(body.as_bytes());
+        let (out, had_markers) = strip_cache_control(body.as_bytes(), &TelemetryPolicy::default());
         assert!(!had_markers, "null cache_control is not a marker");
         let out = out.expect("body rewritten to drop the null cache_control key");
         assert!(!out.windows(13).any(|w| w == b"cache_control"), "cache_control key removed");
+    }
+
+    #[test]
+    fn strip_removes_tool_marker_but_preserves_schema_field_named_cache_control() {
+        // The top-level tool marker is stripped, but a `cache_control` that is a legitimate
+        // JSON-Schema property inside the tool is the caller's data and must be forwarded
+        // untouched (the recursive strip used to delete it, corrupting the tool).
+        let body = serde_json::json!({
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "set_config",
+                    "parameters": {"type": "object", "properties": {
+                        "cache_control": {"type": "string", "description": "a real argument"}
+                    }}
+                },
+                "cache_control": {"type": "ephemeral", "ttl": "1h"}
+            }],
+            "messages": [{"role": "user", "content": "hi"}]
+        })
+        .to_string();
+        let (out, had_markers) = strip_cache_control(body.as_bytes(), &TelemetryPolicy::default());
+        assert!(had_markers, "the top-level tool marker is a marker");
+        let v: Value = serde_json::from_slice(&out.expect("body rewritten")).unwrap();
+        assert!(v["tools"][0].get("cache_control").is_none(), "tool marker stripped");
+        assert!(
+            v["tools"][0]["function"]["parameters"]["properties"]["cache_control"].is_object(),
+            "legitimate schema field preserved"
+        );
+    }
+
+    #[test]
+    fn strip_schema_field_named_cache_control_alone_is_not_a_marker() {
+        // A tool with NO top-level marker but a schema property named cache_control: nothing
+        // to strip, no adoption signal, body left untouched.
+        let body = serde_json::json!({
+            "tools": [{"type": "function", "function": {"name": "f", "parameters": {
+                "type": "object", "properties": {"cache_control": {"type": "string"}}}}}],
+            "messages": [{"role": "user", "content": "hi"}]
+        })
+        .to_string();
+        let (out, had_markers) = strip_cache_control(body.as_bytes(), &TelemetryPolicy::default());
+        assert!(!had_markers, "a schema field is not a marker");
+        assert!(out.is_none(), "nothing stripped, body unchanged");
+    }
+
+    #[test]
+    fn strip_mode_removes_telemetry_block_from_forwarded_body() {
+        // strip_from_prompt=true: the unmarked telemetry block is dropped from the forwarded body,
+        // and cache_control is still stripped from the surviving (marked) block.
+        let body = serde_json::json!({
+            "messages": [{"role": "system", "content": [
+                {"type": "text", "text": "x-anthropic-billing-header: cch=abc;"},
+                {"type": "text", "text": "real system", "cache_control": {"type": "ephemeral"}}
+            ]}]
+        })
+        .to_string();
+        let tele = TelemetryPolicy::from_config(true, &["x-anthropic-billing-header:".to_string()]);
+        let (out, _) = strip_cache_control(body.as_bytes(), &tele);
+        let v: Value = serde_json::from_slice(&out.expect("body rewritten")).unwrap();
+        let content = v["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 1, "telemetry block removed from the forwarded prompt");
+        assert_eq!(content[0]["text"], "real system");
+        assert!(content[0].get("cache_control").is_none(), "marker stripped from survivor");
+    }
+
+    #[test]
+    fn strip_mode_leaves_non_system_blocks_untouched() {
+        // strip_from_prompt=true, but the prefix appears in a USER block: telemetry handling is
+        // scoped to the system role, so the forwarded prompt must be left untouched.
+        let body = serde_json::json!({
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "x-anthropic-billing-header: cch=abc;"},
+                {"type": "text", "text": "actual question"}
+            ]}]
+        })
+        .to_string();
+        let tele = TelemetryPolicy::from_config(true, &["x-anthropic-billing-header:".to_string()]);
+        let (out, _) = strip_cache_control(body.as_bytes(), &tele);
+        assert!(out.is_none(), "non-system block is not stripped from the forwarded prompt");
+    }
+
+    #[test]
+    fn ignore_mode_keeps_telemetry_block_in_forwarded_body() {
+        // strip_from_prompt=false: the telemetry block stays in the forwarded body (only the cache
+        // hash excludes it). No marker + no strip → body untouched.
+        let body = serde_json::json!({
+            "messages": [{"role": "system", "content": [
+                {"type": "text", "text": "x-anthropic-billing-header: cch=abc;"},
+                {"type": "text", "text": "real system"}
+            ]}]
+        })
+        .to_string();
+        let tele = TelemetryPolicy::from_config(false, &["x-anthropic-billing-header:".to_string()]);
+        let (out, _) = strip_cache_control(body.as_bytes(), &tele);
+        assert!(out.is_none(), "ignore mode leaves the forwarded body untouched");
     }
 
     #[test]

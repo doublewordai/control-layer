@@ -274,6 +274,7 @@ pub async fn get_user<P: PoolProvider>(
                             id: m.organization_id,
                             name: org.display_name.clone().unwrap_or_else(|| org.username.clone()),
                             role: m.role.clone(),
+                            zero_data_retention: org.zero_data_retention,
                         })
                 })
                 .collect();

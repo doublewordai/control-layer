@@ -200,6 +200,11 @@ pub struct Config {
     /// shape and defaults.
     #[serde(default)]
     pub image_normalizer: crate::image_normalizer::ImageNormalizerConfig,
+    /// Encrypted key custody (Redis-backed wrapped-key store). Currently used by
+    /// zero-data-retention flex requests to hold per-request body keys; absent
+    /// (the default) leaves ZDR disabled.
+    #[serde(default)]
+    pub keystore: Option<crate::keystore::KeystoreConfig>,
     /// OpenAPI spec exposure controls. Defaults disable the Admin spec
     /// (which describes internal management endpoints) and enable the
     /// AI spec (which mirrors the publicly-documented OpenAI surface).
@@ -1061,6 +1066,14 @@ pub struct CacheConfig {
     ///
     /// Set via environment: `DWCTL_CACHE__DEFAULT_TTL=5m`
     pub default_ttl: String,
+
+    /// Handling of provider-injected per-request *telemetry* blocks (e.g. the Claude Code SDK's
+    /// `x-anthropic-billing-header` line, whose nonce changes every request). Such a block sits
+    /// ahead of the caller's `cache_control` breakpoint, so leaving it in would change the prefix
+    /// hash every turn — forcing write-only caching (no read discount) and defeating the upstream
+    /// KV/prefix cache. Matched blocks are always excluded from our cache prefix; see
+    /// [`TelemetryBlockConfig`] for whether they're also removed from the forwarded prompt.
+    pub telemetry_blocks: TelemetryBlockConfig,
 }
 
 impl Default for CacheConfig {
@@ -1071,6 +1084,47 @@ impl Default for CacheConfig {
             pricing: CachePricingConfig::default(),
             enabled_ttls: vec!["5m".to_string(), "1h".to_string()],
             default_ttl: "5m".to_string(),
+            telemetry_blocks: TelemetryBlockConfig::default(),
+        }
+    }
+}
+
+/// How provider-injected telemetry blocks are handled. A block counts as "telemetry" only when it
+/// is an **unmarked** (`cache_control`-free) **`system`** message content block whose text starts
+/// with one of `prefixes` — the role/marker constraints mean `prefixes` never applies to
+/// user/assistant content or to a block the caller has marked. Matched blocks are **always**
+/// excluded from our cache prefix (the fix for the write-only-caching bug); `strip_from_prompt`
+/// additionally controls whether they're removed from the request forwarded to the model.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TelemetryBlockConfig {
+    /// When true (the default), remove matched telemetry blocks from the forwarded request too —
+    /// not just from our cache prefix. This also lets the upstream (sglang/Dynamo) prefix-cache
+    /// the real prompt and drops noise the model would otherwise see.
+    ///
+    /// When false, the block is left in the forwarded request (still excluded from our cache
+    /// prefix). Our cache is billing-only — no KV reuse, every request still runs in full upstream
+    /// — so this can't produce wrong outputs, and the read discount stays correct because the
+    /// excluded prefix genuinely recurs. The only cost is that the per-request telemetry stays in
+    /// the model's prompt, defeating the upstream prefix cache and billing those tokens as uncached
+    /// each turn. Prefer the default.
+    ///
+    /// Set via environment: `DWCTL_CACHE__TELEMETRY_BLOCKS__STRIP_FROM_PROMPT=false`
+    pub strip_from_prompt: bool,
+
+    /// Leading text prefixes that identify a telemetry block (matched after trimming leading
+    /// whitespace). An **empty list disables the feature entirely** (nothing excluded or
+    /// stripped). Default: the Claude Code SDK's `x-anthropic-billing-header:` line.
+    ///
+    /// Set via environment: `DWCTL_CACHE__TELEMETRY_BLOCKS__PREFIXES=x-anthropic-billing-header:`
+    pub prefixes: Vec<String>,
+}
+
+impl Default for TelemetryBlockConfig {
+    fn default() -> Self {
+        Self {
+            strip_from_prompt: true,
+            prefixes: vec!["x-anthropic-billing-header:".to_string()],
         }
     }
 }
@@ -1217,6 +1271,12 @@ pub struct BatchConfig {
     /// Verified creditors are never limited. Set to 0 to disable the cap.
     /// Default: 1000.
     pub unverified_requests_per_completion_hour: usize,
+
+    /// Include committed pending/claimed/processing requests in batch admission capacity checks.
+    /// When false, admission capacity checks only include active in-flight reservations.
+    /// Default: false.
+    #[serde(default)]
+    pub pending_capacity_counts_enabled: bool,
 }
 
 /// Configuration for the async requests feature.
@@ -1355,6 +1415,7 @@ impl Default for BatchConfig {
             reservation_ttl_secs: default_reservation_ttl_secs(),
             priority_decay_window_secs: None,
             unverified_requests_per_completion_hour: 1000,
+            pending_capacity_counts_enabled: false,
         }
     }
 }
@@ -1444,6 +1505,11 @@ pub struct DaemonConfig {
     /// and returned to pending (milliseconds). This handles daemon crashes during execution. (default: 600000 = 10 minutes)
     pub processing_timeout_ms: u64,
 
+    /// PostgreSQL statement timeout for pending request count queries (milliseconds).
+    /// This bounds internal queue-depth monitoring work so a slow count query
+    /// fails without accumulating behind callers' poll cadence. (default: 60000 = 1 minute)
+    pub pending_request_counts_timeout_ms: u64,
+
     /// Per-model configurations for completion window escalation via route-at-claim-time.
     /// When a request is claimed with less than `escalation_threshold_seconds` remaining
     /// before batch expiry, it's routed to the `escalation_model` instead.
@@ -1501,6 +1567,48 @@ pub struct DaemonConfig {
     /// deadline so earlier deadlines produce larger numbers. Default: false.
     #[serde(default)]
     pub inject_deadline_priority: bool,
+
+    /// Maximum request rows the batch claim daemon takes per iteration.
+    /// 0 inherits `claim_batch_size`, so an existing tuned cap carries over
+    /// to the split batch daemon unchanged. Default: 0 (inherit).
+    #[serde(default)]
+    pub batch_claim_size: usize,
+
+    /// Maximum batches selected per model per batch-claim iteration. Values
+    /// above 1 let a model's leftover capacity spill into the next-ranked
+    /// batches instead of idling when the top batch can't fill it.
+    /// Default: 4.
+    #[serde(default = "default_batch_claim_batch_size")]
+    pub batch_claim_batch_size: usize,
+
+    /// Sleep between batch-claim iterations in milliseconds.
+    /// 0 inherits `claim_interval_ms`. Default: 0 (inherit).
+    #[serde(default)]
+    pub batch_claim_interval_ms: u64,
+
+    /// Require an explicit `live` model_filters event before batch-claiming a
+    /// model. When false, models with NO filter events (external / always-on
+    /// providers that scouter does not manage) are treated as live — the
+    /// historical claim behaviour. Not-live (`coming`/`absent`) models remain
+    /// claimable only via the deadline ramp in either mode. Default: false.
+    #[serde(default)]
+    pub batch_claim_require_live: bool,
+
+    /// Exponent of the deadline-ramp curve: batches on not-live models become
+    /// claimable at full capacity within `window_minutes ^ exponent` minutes
+    /// of their deadline (~59 min for 24h windows, ~10 min for 1h at the
+    /// default). Values ≥ 1.0 make the ramp cover the whole window (batches
+    /// claimable immediately regardless of liveness). Default: 0.56.
+    #[serde(default = "default_claim_ramp_exponent", deserialize_with = "deserialize_claim_ramp_exponent")]
+    pub claim_ramp_exponent: f64,
+}
+
+fn default_batch_claim_batch_size() -> usize {
+    4
+}
+
+fn default_claim_ramp_exponent() -> f64 {
+    0.56
 }
 
 fn default_urgency_weight() -> f64 {
@@ -1523,6 +1631,27 @@ where
             "urgency_weight must be between 0.0 and 1.0, got {}",
             value
         ))),
+        Some(value) => Ok(value),
+    }
+}
+
+/// Custom deserializer that validates claim_ramp_exponent is finite and non-negative.
+/// (NaN/inf/negative exponents would make the deadline-ramp predicate undefined.)
+fn deserialize_claim_ramp_exponent<'de, D>(deserializer: D) -> Result<f64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+
+    let opt: Option<f64> = Option::deserialize(deserializer)?;
+
+    match opt {
+        None => Ok(default_claim_ramp_exponent()),
+        Some(value) if !value.is_finite() => Err(D::Error::custom(format!(
+            "claim_ramp_exponent must be a finite number, got {}",
+            value
+        ))),
+        Some(value) if value < 0.0 => Err(D::Error::custom(format!("claim_ramp_exponent must be non-negative, got {}", value))),
         Some(value) => Ok(value),
     }
 }
@@ -1556,6 +1685,7 @@ impl Default for DaemonConfig {
             status_log_interval_ms: Some(2000),
             claim_timeout_ms: 60000,
             processing_timeout_ms: 600000,
+            pending_request_counts_timeout_ms: 60000,
             batch_metadata_fields: default_batch_metadata_fields_dwctl(),
             model_escalations: HashMap::new(),
             purge_interval_ms: 600_000,
@@ -1564,6 +1694,11 @@ impl Default for DaemonConfig {
             streamable_endpoints: Vec::new(),
             urgency_weight: default_urgency_weight(),
             inject_deadline_priority: false,
+            batch_claim_size: 0,
+            batch_claim_batch_size: default_batch_claim_batch_size(),
+            batch_claim_interval_ms: 0,
+            batch_claim_require_live: false,
+            claim_ramp_exponent: default_claim_ramp_exponent(),
         }
     }
 }
@@ -1612,6 +1747,7 @@ impl DaemonConfig {
             status_log_interval_ms: self.status_log_interval_ms,
             claim_timeout_ms: self.claim_timeout_ms,
             processing_timeout_ms: self.processing_timeout_ms,
+            pending_request_counts_timeout_ms: self.pending_request_counts_timeout_ms,
             batch_metadata_fields: self.batch_metadata_fields.clone(),
             purge_interval_ms: self.purge_interval_ms,
             purge_batch_size: self.purge_batch_size,
@@ -1619,6 +1755,11 @@ impl DaemonConfig {
             streamable_endpoints: self.streamable_endpoints.clone(),
             urgency_weight: self.urgency_weight,
             inject_deadline_priority: self.inject_deadline_priority,
+            batch_claim_size: self.batch_claim_size,
+            batch_claim_batch_size: self.batch_claim_batch_size,
+            batch_claim_interval_ms: self.batch_claim_interval_ms,
+            batch_claim_require_live: self.batch_claim_require_live,
+            claim_ramp_exponent: self.claim_ramp_exponent,
             ..Default::default()
         }
     }
@@ -2059,6 +2200,7 @@ impl Default for Config {
             connections: ConnectionsConfig::default(),
             responses: ResponsesConfig::default(),
             image_normalizer: crate::image_normalizer::ImageNormalizerConfig::default(),
+            keystore: None,
             openapi: OpenApiConfig::default(),
             cache: CacheConfig::default(),
         }
@@ -3266,6 +3408,12 @@ batches:
     }
 
     #[test]
+    fn test_pending_capacity_counts_default_disabled() {
+        let config = Config::default();
+        assert!(!config.batches.pending_capacity_counts_enabled);
+    }
+
+    #[test]
     fn test_priority_decay_window_explicit_value() {
         Jail::expect_with(|jail| {
             jail.create_file(
@@ -3563,6 +3711,91 @@ background_services:
             assert!(result.is_err());
             let err = result.unwrap_err().to_string();
             assert!(err.contains("urgency_weight must be between 0.0 and 1.0"));
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_claim_ramp_exponent_default_and_override() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+"#,
+            )?;
+            let args = Args {
+                config: "test.yaml".into(),
+                validate: false,
+            };
+            let config = Config::load(&args)?;
+            assert_eq!(config.background_services.batch_daemon.claim_ramp_exponent, 0.56);
+
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+background_services:
+  batch_daemon:
+    claim_ramp_exponent: 0.9
+"#,
+            )?;
+            let config = Config::load(&args)?;
+            assert_eq!(config.background_services.batch_daemon.claim_ramp_exponent, 0.9);
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_claim_ramp_exponent_negative_rejected() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+background_services:
+  batch_daemon:
+    claim_ramp_exponent: -0.5
+"#,
+            )?;
+            let args = Args {
+                config: "test.yaml".into(),
+                validate: false,
+            };
+            let result = Config::load(&args);
+            assert!(result.is_err());
+            let err = result.unwrap_err().to_string();
+            assert!(err.contains("claim_ramp_exponent must be non-negative"));
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_claim_ramp_exponent_non_finite_rejected() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+background_services:
+  batch_daemon:
+    claim_ramp_exponent: .nan
+"#,
+            )?;
+            let args = Args {
+                config: "test.yaml".into(),
+                validate: false,
+            };
+            let result = Config::load(&args);
+            assert!(result.is_err());
+            let err = result.unwrap_err().to_string();
+            assert!(
+                err.contains("claim_ramp_exponent must be a finite number") || err.contains("invalid"),
+                "unexpected error: {err}"
+            );
 
             Ok(())
         });

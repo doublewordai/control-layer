@@ -221,4 +221,7 @@ pub struct OrganizationSummary {
     pub id: UserId,
     pub name: String,
     pub role: String,
+    /// Whether the organization is flagged for zero data retention. Account-wide
+    /// flag on the org; surfaced here so a member can see their org's ZDR status.
+    pub zero_data_retention: bool,
 }

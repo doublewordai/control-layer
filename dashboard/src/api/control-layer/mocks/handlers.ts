@@ -2943,6 +2943,7 @@ export const handlers = [
             heartbeat_interval_ms: 5000,
             claim_timeout_ms: 60000,
             processing_timeout_ms: 600000,
+            pending_request_counts_timeout_ms: 60000,
           },
         },
         {
@@ -2977,6 +2978,7 @@ export const handlers = [
             heartbeat_interval_ms: 5000,
             claim_timeout_ms: 60000,
             processing_timeout_ms: 600000,
+            pending_request_counts_timeout_ms: 60000,
           },
         },
         {
@@ -3011,6 +3013,7 @@ export const handlers = [
             heartbeat_interval_ms: 5000,
             claim_timeout_ms: 60000,
             processing_timeout_ms: 600000,
+            pending_request_counts_timeout_ms: 60000,
           },
         },
       ],

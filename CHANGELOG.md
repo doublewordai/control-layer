@@ -1,5 +1,53 @@
 # Changelog
 
+## [8.71.0](https://github.com/doublewordai/control-layer/compare/v8.70.3...v8.71.0) (2026-07-06)
+
+
+### Features
+
+* zero-data-retention for flex (encryption) and realtime (non-persistence) ([#1218](https://github.com/doublewordai/control-layer/issues/1218)) ([7248f88](https://github.com/doublewordai/control-layer/commit/7248f880ab02228fef2ef58e17e89b294d873e11))
+
+## [8.70.3](https://github.com/doublewordai/control-layer/compare/v8.70.2...v8.70.3) (2026-07-06)
+
+
+### Bug Fixes
+
+* **deps:** bump onwards to 0.34.3 ([#1227](https://github.com/doublewordai/control-layer/issues/1227)) ([1c93378](https://github.com/doublewordai/control-layer/commit/1c93378fde99a139db62a1b2fa37523eab2119a3))
+
+## [8.70.2](https://github.com/doublewordai/control-layer/compare/v8.70.1...v8.70.2) (2026-07-06)
+
+
+### Bug Fixes
+
+* some sdks inject extra blocks that invalidate cache, remove em ([#1224](https://github.com/doublewordai/control-layer/issues/1224)) ([064dbf7](https://github.com/doublewordai/control-layer/commit/064dbf70c5876e968310bead4c792f63518beafd))
+
+## [8.70.1](https://github.com/doublewordai/control-layer/compare/v8.70.0...v8.70.1) (2026-07-03)
+
+
+### Bug Fixes
+
+* disable batch capacity pending counts by default ([#1222](https://github.com/doublewordai/control-layer/issues/1222)) ([051c737](https://github.com/doublewordai/control-layer/commit/051c73777bca6c47d9abfca2c2cef2be09b37c63))
+
+## [8.70.0](https://github.com/doublewordai/control-layer/compare/v8.69.0...v8.70.0) (2026-07-02)
+
+
+### Features
+
+* surface zero data retention to org members (summary + org/profile pages) ([#1217](https://github.com/doublewordai/control-layer/issues/1217)) ([db5f1e9](https://github.com/doublewordai/control-layer/commit/db5f1e92325c23d3da272d73e89c91436d7cafe7))
+* tool definitions included in inour caching ([#1220](https://github.com/doublewordai/control-layer/issues/1220)) ([c82fb39](https://github.com/doublewordai/control-layer/commit/c82fb39dba91709ff0b43aab10473167514bb5b6))
+
+## [8.69.0](https://github.com/doublewordai/control-layer/compare/v8.68.3...v8.69.0) (2026-07-02)
+
+
+### Features
+
+* account-wide zero data retention toggle for users and orgs ([#1214](https://github.com/doublewordai/control-layer/issues/1214)) ([67e9612](https://github.com/doublewordai/control-layer/commit/67e961224b3f36e8ada222e1c1450b834eadbeac))
+
+
+### Bug Fixes
+
+* route flex requests through hidden batch keys ([#1215](https://github.com/doublewordai/control-layer/issues/1215)) ([58580e1](https://github.com/doublewordai/control-layer/commit/58580e1b4e3ab97b180de7a950ffe4720c92c381))
+
 ## [8.68.3](https://github.com/doublewordai/control-layer/compare/v8.68.2...v8.68.3) (2026-07-01)
 
 

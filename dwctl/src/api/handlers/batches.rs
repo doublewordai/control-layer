@@ -847,6 +847,7 @@ async fn reserve_capacity_for_batch<P: PoolProvider>(
         default_throughput: config.batches.default_throughput,
         relaxation_factor,
         reservation_ttl_secs: config.batches.reservation_ttl_secs,
+        include_pending_counts: config.batches.pending_capacity_counts_enabled,
     };
 
     // Use the write pool for the reservation transaction
@@ -1905,6 +1906,7 @@ mod tests {
     use fusillade::Storage;
     use rust_decimal::Decimal;
     use sqlx::PgPool;
+    use sqlx_pool_router::TestDbPools;
     use std::collections::HashMap;
     use uuid::Uuid;
 
@@ -2967,6 +2969,102 @@ mod tests {
         .unwrap();
 
         assert_eq!(count.unwrap_or(0), 0);
+    }
+
+    async fn seed_pending_capacity_batch(state: &crate::AppState<TestDbPools>, alias: &str) {
+        let pending_templates = (0..3)
+            .map(|idx| fusillade::RequestTemplateInput {
+                custom_id: Some(format!("pending-{idx}")),
+                endpoint: "https://api.example.com".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/chat/completions".to_string(),
+                body: format!(r#"{{"model":"{alias}","messages":[{{"role":"user","content":"hello"}}]}}"#),
+                model: alias.to_string(),
+                api_key: "key".to_string(),
+            })
+            .collect();
+
+        let file_id = state
+            .request_manager
+            .create_file("pending-capacity-test".to_string(), None, pending_templates)
+            .await
+            .expect("create pending file");
+        let pending_batch = state
+            .request_manager
+            .create_batch(fusillade::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "1h".to_string(),
+                metadata: None,
+                created_by: None,
+                api_key_id: None,
+                api_key: None,
+                total_requests: None,
+            })
+            .await
+            .expect("create pending batch");
+
+        sqlx::query("UPDATE batches SET expires_at = NOW() + interval '30 minutes' WHERE id = $1")
+            .bind(pending_batch.id.0)
+            .execute(state.request_manager.pool())
+            .await
+            .expect("pin pending batch deadline");
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_reserve_capacity_for_batch_ignores_pending_counts_when_disabled(pool: PgPool) {
+        let mut config = create_test_config();
+        config.batches.pending_capacity_counts_enabled = false;
+        let state = create_test_app_state_with_fusillade(pool.clone(), config).await;
+
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        let endpoint_id = create_test_endpoint(&pool, &format!("test-{}", Uuid::new_v4()), user.id).await;
+
+        let alias = format!("alias-{}", Uuid::new_v4());
+        let model_id = create_test_model(&pool, "model-a", &alias, endpoint_id, user.id).await;
+
+        seed_pending_capacity_batch(&state, &alias).await;
+
+        // Capacity is 3 requests for 1h; the 3 pending requests would reject this
+        // extra request if pending counts were included. With the flag disabled,
+        // reserve_capacity uses an empty pending map and only considers reservations.
+        let file_model_counts = HashMap::from([(alias.clone(), 1_i64)]);
+        let model_throughputs = HashMap::from([(alias.clone(), 0.001_f32)]);
+        let model_ids_by_alias = HashMap::from([(alias.clone(), model_id)]);
+
+        let reservation_ids =
+            super::reserve_capacity_for_batch(&state, "1h", &file_model_counts, &model_throughputs, &model_ids_by_alias, 1.0)
+                .await
+                .expect("pending counts should be ignored when disabled");
+
+        assert_eq!(reservation_ids.len(), 1);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_reserve_capacity_for_batch_rejects_pending_counts_when_enabled(pool: PgPool) {
+        let mut config = create_test_config();
+        config.batches.pending_capacity_counts_enabled = true;
+        let state = create_test_app_state_with_fusillade(pool.clone(), config).await;
+
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        let endpoint_id = create_test_endpoint(&pool, &format!("test-{}", Uuid::new_v4()), user.id).await;
+
+        let alias = format!("alias-{}", Uuid::new_v4());
+        let model_id = create_test_model(&pool, "model-a", &alias, endpoint_id, user.id).await;
+
+        seed_pending_capacity_batch(&state, &alias).await;
+
+        let file_model_counts = HashMap::from([(alias.clone(), 1_i64)]);
+        let model_throughputs = HashMap::from([(alias.clone(), 0.001_f32)]);
+        let model_ids_by_alias = HashMap::from([(alias.clone(), model_id)]);
+
+        let err = super::reserve_capacity_for_batch(&state, "1h", &file_model_counts, &model_throughputs, &model_ids_by_alias, 1.0)
+            .await
+            .expect_err("pending counts should reject when enabled");
+
+        assert!(matches!(err, Error::TooManyRequests { .. }));
     }
 
     /// Test that create_batch API accepts "high" priority name
