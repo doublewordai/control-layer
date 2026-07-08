@@ -1130,8 +1130,8 @@ pub async fn refresh_user_model_usage(pool: &PgPool) -> Result<()> {
 }
 
 /// Advisory-lock key for the daily-usage refresh, so at most one refresh runs at a
-/// time across all pods. Ascii "DWCTUSGD" (dwctl usage daily); mirrors the documented
-/// `LEADER_LOCK_ID` convention in `leader_election.rs`.
+/// time across all pods. Ascii "DWCTUSGD" (dwctl usage daily); mirrors the lock-id
+/// encoding used for `LEADER_LOCK_ID` in `lib.rs`.
 const USAGE_DAILY_REFRESH_LOCK: i64 = 0x4457_4354_5553_4744;
 
 /// Incrementally aggregate new http_analytics rows into the `user_model_usage_daily`
