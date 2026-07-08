@@ -504,6 +504,58 @@ pub async fn poll_until_complete<P: PoolProvider + Clone>(
     Ok(detail_to_response_object(&detail))
 }
 
+/// The creditor an API key bills to, plus their verification status.
+///
+/// `id` is `api_keys.user_id` — the organization for org-scoped keys, otherwise
+/// the individual (see migration 080). `verified` is that entity's
+/// `users.verified` flag (organizations are themselves `users` rows), defaulting
+/// to `false` when no matching row exists.
+pub struct KeyCreditor {
+    pub id: String,
+    pub verified: bool,
+}
+
+/// Resolve an API key's creditor and verification status in a single lookup.
+///
+/// Used on submission paths that need both the attribution id *and* the verified
+/// flag (e.g. the unverified upload-volume cap) so the flag rides along on the
+/// key lookup they already perform rather than costing a second round trip. The
+/// `LEFT JOIN` keeps `id` resolution identical to [`lookup_created_by`] even for
+/// keys whose `user_id` has no `users` row (e.g. the internal system key).
+pub async fn lookup_creditor(pool: &sqlx::PgPool, api_key: Option<&str>) -> Option<KeyCreditor> {
+    let key = api_key?;
+    match sqlx::query(
+        "SELECT ak.user_id, u.verified \
+         FROM public.api_keys ak \
+         LEFT JOIN public.users u ON u.id = ak.user_id \
+         WHERE ak.secret = $1 AND ak.is_deleted = false LIMIT 1",
+    )
+    .bind(key)
+    .fetch_optional(pool)
+    .await
+    {
+        Ok(Some(row)) => {
+            use sqlx::Row;
+            let id: Uuid = row.get("user_id");
+            // NULL when the LEFT JOIN found no user row; a missing row counts as
+            // unverified, matching `Users::is_verified`.
+            let verified: Option<bool> = row.get("verified");
+            Some(KeyCreditor {
+                id: id.to_string(),
+                verified: verified.unwrap_or(false),
+            })
+        }
+        Ok(None) => {
+            tracing::warn!(key_prefix = &key[..8.min(key.len())], "API key not found for attribution");
+            None
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to look up API key creditor");
+            None
+        }
+    }
+}
+
 /// Look up the user ID from an API key for batch/response attribution.
 ///
 /// Returns `Some(user_id)` if the key is found, `None` otherwise.

@@ -619,14 +619,16 @@ pub async fn create_batch<P: PoolProvider>(
     // Get the hidden API key for batch execution and per-member attribution.
     // The secret is stored on the batch so the daemon uses the batch creator's
     // credentials, not the file uploader's key from request_templates.
-    let (batch_api_key, api_key_id) = {
+    let (batch_api_key, api_key_id, target_verified) = {
         let mut conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
-        let mut api_keys_repo = ApiKeys::new(&mut conn);
-        let (secret, key_id) = api_keys_repo
+        let (secret, key_id) = ApiKeys::new(&mut conn)
             .get_or_create_hidden_key_with_id(target_user_id, ApiKeyPurpose::Batch, current_user.id)
             .await
             .map_err(Error::Database)?;
-        (secret, key_id)
+        // Resolve the creditor's verified flag on the same connection (the org in
+        // org context, else the user) for the volume cap below — no extra acquire.
+        let verified = Users::new(&mut conn).is_verified(target_user_id).await?;
+        (secret, key_id, verified)
     };
 
     // Convert metadata to HashMap and inject request_source and user info.
@@ -643,14 +645,14 @@ pub async fn create_batch<P: PoolProvider>(
     // Create batch input — created_by uses org ID when in org context for ownership scoping
     let total_requests: i64 = file_model_counts.values().sum();
 
-    // COR-481: bound how much an unverified creditor can queue. Checked before
-    // reserving capacity / creating the batch so over-limit submissions are
-    // rejected up front. No-op for verified creditors or a disabled cap.
+    // Bound how much an unverified creditor can queue. Checked before reserving
+    // capacity / creating the batch so over-limit submissions are rejected up
+    // front. No-op for verified creditors or a disabled cap.
     crate::api::handlers::unverified_volume::enforce_unverified_volume_limit(
-        state.db.write(),
         &*state.request_manager,
         config.batches.unverified_requests_per_completion_hour,
         target_user_id,
+        target_verified,
         &req.completion_window,
         total_requests,
         crate::api::handlers::unverified_volume::SubmissionKind::Batch,

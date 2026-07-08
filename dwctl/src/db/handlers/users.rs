@@ -974,7 +974,7 @@ impl<'c> Users<'c> {
 
     /// Whether a user (or organization) is verified. A single-row primary-key
     /// lookup used on the submission path to gate the unverified upload-volume
-    /// cap (COR-481). A missing row counts as unverified.
+    /// cap. A missing row counts as unverified.
     #[instrument(skip(self), err)]
     pub async fn is_verified(&mut self, user_id: UserId) -> Result<bool> {
         let verified = sqlx::query_scalar!("SELECT verified FROM users WHERE id = $1", user_id)

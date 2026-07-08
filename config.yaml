@@ -224,7 +224,7 @@ auth:
   # Omit a tier (or the whole `rate_limits` block) to leave that tier
   # unlimited.
   #
-  # Both tiers are intentionally left unset (COR-481): unverified users get full
+  # Both tiers are intentionally left unset: unverified users get full
   # platform throughput — throttling it feels slow/unreliable — and are instead
   # bounded by an upload-*volume* cap until they verify. See
   # `batches.unverified_requests_per_completion_hour` below.
@@ -278,7 +278,7 @@ batches:
   reservation_ttl_secs: 600
 
   # Upload-volume cap for UNVERIFIED creditors, in requests per hour of
-  # completion window (COR-481). The effective cap for a submission scales with
+  # completion window. The effective cap for a submission scales with
   # its completion window: unverified_requests_per_completion_hour * window_hours
   # (e.g. 1000 for a 1h async window, 24000 for a 24h batch window), measured
   # over a rolling window equal to the completion window. Applies to both batch

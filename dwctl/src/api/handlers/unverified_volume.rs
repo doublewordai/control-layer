@@ -1,4 +1,4 @@
-//! Unverified upload-volume enforcement (COR-481).
+//! Unverified upload-volume enforcement.
 //!
 //! Unverified creditors — those who have never moved real money, see
 //! `users.verified` — get full platform throughput, but only a bounded *volume*
@@ -13,9 +13,7 @@
 //! creditors are never limited; a per-hour value of 0 disables the cap.
 
 use fusillade::Storage;
-use sqlx::PgPool;
 
-use crate::db::handlers::users::Users;
 use crate::errors::{Error, Result};
 use crate::types::UserId;
 
@@ -32,23 +30,34 @@ pub enum SubmissionKind {
 
 /// Enforce the unverified upload-volume cap for a submission of `requested`
 /// requests with `completion_window`, attributed to `owner` (the creditor: the
-/// active organization for org members, otherwise the user).
+/// active organization for org members, otherwise the user), whose verification
+/// status is `owner_verified`.
+///
+/// The caller passes `owner_verified` rather than having this function look it
+/// up: both submission paths already resolve the creditor from the API key /
+/// session, so the verified flag rides along on that existing lookup (`owner` is
+/// `api_keys.user_id`) instead of costing an extra round trip on the hot path.
 ///
 /// Returns `Ok(())` when allowed and `Err(Error::TooManyRequests)` (HTTP 429,
 /// with an actionable message) when the rolling-window count plus `requested`
 /// would exceed the cap. No-op when the cap is disabled (`per_hour == 0`) or the
-/// creditor is verified — the verified check runs first so verified users pay
-/// only a single primary-key lookup and never the count query.
+/// creditor is verified — the verified short-circuit runs before the count query.
 pub async fn enforce_unverified_volume_limit<S: Storage>(
-    dwctl_pool: &PgPool,
     request_manager: &S,
     per_hour: usize,
     owner: UserId,
+    owner_verified: bool,
     completion_window: &str,
     requested: i64,
     kind: SubmissionKind,
 ) -> Result<()> {
     if per_hour == 0 {
+        return Ok(());
+    }
+
+    // Verified creditors are never limited. Check this before the count query
+    // so verified users (the paying majority) never pay for it.
+    if owner_verified {
         return Ok(());
     }
 
@@ -58,15 +67,6 @@ pub async fn enforce_unverified_volume_limit<S: Storage>(
     // rather than rejecting everything.
     let cap = (per_hour as i64).saturating_mul(window_seconds) / 3600;
     if cap <= 0 {
-        return Ok(());
-    }
-
-    // Verified creditors are never limited. Check this first (single PK lookup)
-    // so the common case returns before touching the count query.
-    let mut conn = dwctl_pool.acquire().await.map_err(|e| Error::Database(e.into()))?;
-    let verified = Users::new(&mut conn).is_verified(owner).await?;
-    drop(conn);
-    if verified {
         return Ok(());
     }
 
