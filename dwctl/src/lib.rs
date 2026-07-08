@@ -1732,6 +1732,11 @@ pub async fn build_router(
         .merge(auth_routes);
 
     // Add AI routes with appropriate nesting based on strict mode
+    let onwards_router = onwards_router.layer(middleware::from_fn_with_state(
+        state.clone(),
+        api::handlers::ai_models::list_ai_models_middleware,
+    ));
+
     if strict_mode {
         // Strict mode: nest onwards at /ai/v1, nest batches at /ai/v1
         router = router.nest("/ai/v1", onwards_router);

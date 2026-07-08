@@ -192,6 +192,124 @@ async fn wait_for_model(server: &TestServer, api_key: &str, alias: &str) {
     assert_eq!(status, 200, "Model should be available in onwards config after polling");
 }
 
+#[sqlx::test]
+async fn ai_models_lists_group_accessible_paid_models_without_credits(pool: PgPool) {
+    let mut config = crate::test::utils::create_test_config();
+    config.background_services.onwards_sync.enabled = true;
+
+    let app = crate::Application::new_with_pool(config, Some(pool.clone()), None)
+        .await
+        .expect("Failed to create application");
+    let (server, bg_services) = app.into_test_server();
+
+    let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
+    let admin_headers = add_auth_headers(&admin_user);
+
+    let regular_user = create_test_user(&pool, Role::StandardUser).await;
+    let regular_headers = add_auth_headers(&regular_user);
+
+    let group_response = server
+        .post("/admin/api/v1/groups")
+        .add_header(&admin_headers[0].0, &admin_headers[0].1)
+        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+        .json(&serde_json::json!({
+            "name": format!("zero-balance-models-{}", Uuid::new_v4()),
+            "description": "Models list access for zero-balance users"
+        }))
+        .await;
+    assert_eq!(group_response.status_code(), 201, "Failed to create group");
+    let group: GroupResponse = group_response.json();
+
+    let add_user_response = server
+        .post(&format!("/admin/api/v1/groups/{}/users/{}", group.id, regular_user.id))
+        .add_header(&admin_headers[0].0, &admin_headers[0].1)
+        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+        .await;
+    assert_eq!(add_user_response.status_code(), 204, "Failed to add user to group");
+
+    let endpoint_response = server
+        .post("/admin/api/v1/endpoints")
+        .add_header(&admin_headers[0].0, &admin_headers[0].1)
+        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+        .json(&serde_json::json!({
+            "name": format!("Zero Balance Endpoint {}", Uuid::new_v4()),
+            "url": "https://example.invalid/v1/",
+            "description": "Endpoint for zero-balance model list test"
+        }))
+        .await;
+    assert_eq!(endpoint_response.status_code(), 201, "Failed to create endpoint");
+    let endpoint: crate::api::models::inference_endpoints::InferenceEndpointResponse = endpoint_response.json();
+
+    let alias = format!("paid-model-visible-{}", Uuid::new_v4());
+    let deployment_response = server
+        .post("/admin/api/v1/models")
+        .add_header(&admin_headers[0].0, &admin_headers[0].1)
+        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+        .json(&serde_json::json!({
+            "type": "standard",
+            "model_name": "paid-model",
+            "alias": alias,
+            "description": "Paid model visible with zero credits",
+            "hosted_on": endpoint.id,
+            "tariffs": [{
+                "name": "realtime",
+                "input_price_per_token": "0.001",
+                "output_price_per_token": "0.001",
+                "api_key_purpose": "realtime"
+            }]
+        }))
+        .await;
+    assert_eq!(deployment_response.status_code(), 200, "Failed to create deployment");
+    let deployment: crate::api::models::deployments::DeployedModelResponse = deployment_response.json();
+
+    let add_deployment_response = server
+        .post(&format!("/admin/api/v1/groups/{}/models/{}", group.id, deployment.id))
+        .add_header(&admin_headers[0].0, &admin_headers[0].1)
+        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+        .await;
+    assert_eq!(add_deployment_response.status_code(), 204, "Failed to add deployment to group");
+
+    let api_key_response = server
+        .post(&format!("/admin/api/v1/users/{}/api-keys", regular_user.id))
+        .add_header(&regular_headers[0].0, &regular_headers[0].1)
+        .add_header(&regular_headers[1].0, &regular_headers[1].1)
+        .json(&serde_json::json!({
+            "name": "Zero Balance Realtime Key",
+            "purpose": "realtime"
+        }))
+        .await;
+    assert_eq!(api_key_response.status_code(), 201, "Failed to create API key");
+    let api_key: crate::api::models::api_keys::ApiKeyResponse = api_key_response.json();
+
+    let models_response = server
+        .get("/ai/v1/models")
+        .add_header("authorization", format!("Bearer {}", api_key.key))
+        .await;
+    assert_eq!(models_response.status_code(), 200);
+    let models: serde_json::Value = models_response.json();
+    assert!(
+        models["data"]
+            .as_array()
+            .is_some_and(|data| data.iter().any(|model| model["id"].as_str() == Some(alias.as_str()))),
+        "Models list should include group-accessible paid models even without credits: {models}"
+    );
+
+    bg_services.sync_onwards_config(&pool).await.expect("Failed to sync onwards config");
+
+    let completion_response = server
+        .post("/ai/v1/chat/completions")
+        .add_header("authorization", format!("Bearer {}", api_key.key))
+        .json(&serde_json::json!({
+            "model": alias,
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .await;
+    assert!(
+        !completion_response.status_code().is_success(),
+        "Zero-credit key should still be excluded from paid inference"
+    );
+}
+
 async fn assert_usage_recorded(fixture: &StreamingFixture, expected_uri: &str, prompt_tokens: i64, completion_tokens: i64) {
     let mut tries = 0;
     let usage_tx = loop {
