@@ -597,8 +597,17 @@ export function TransactionHistory({
         {(transactions.length > 0 || pagination.page > 1) && (
           <div className="flex items-center justify-between border-t border-doubleword-neutral-200 pt-2">
             <div className="text-sm text-doubleword-neutral-600">
-              Showing {pagination.queryParams.skip + 1} to{" "}
-              {pagination.queryParams.skip + transactions.length} transactions
+              {transactions.length > 0 ? (
+                <>
+                  Showing {pagination.queryParams.skip + 1} to{" "}
+                  {pagination.queryParams.skip + transactions.length}{" "}
+                  transactions
+                </>
+              ) : (
+                // Reachable by paging past the end (e.g. filters changed on a
+                // deep page); the controls stay so the user can navigate back.
+                <>No transactions on this page</>
+              )}
             </div>
             <div className="flex items-center gap-2">
               <Button

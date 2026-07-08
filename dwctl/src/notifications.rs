@@ -311,9 +311,10 @@ pub async fn run_notification_poller(
             };
 
             if !candidates.is_empty() {
-                // 2. The balance read model is total and applier-maintained,
-                //    so the checkpoint balance is current within applier lag
-                //    (seconds) - fresh enough for threshold notifications.
+                // 2. The balance read model is total and folded
+                //    synchronously by every charging writer, so the
+                //    checkpoint balance is current as of the last committed
+                //    charge.
                 let balance_for = |u: &LowBalanceUser| -> Option<rust_decimal::Decimal> { u.checkpoint_balance };
 
                 // 3. Send notifications for users below threshold who haven't been notified
@@ -716,9 +717,9 @@ async fn process_auto_topups(
         return;
     }
 
-    // 2. The balance read model is total and applier-maintained, so the
-    //    checkpoint balance is current within applier lag (seconds). A charge
-    //    missed by one poll because of lag is picked up by the next poll.
+    // 2. The balance read model is total and folded synchronously by every
+    //    charging writer, so the checkpoint balance is current as of the
+    //    last committed charge.
     let balance_for = |u: &AutoTopupUser| -> Option<rust_decimal::Decimal> { u.checkpoint_balance };
 
     // 3. Filter to users below their threshold

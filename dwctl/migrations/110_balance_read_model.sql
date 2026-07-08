@@ -11,12 +11,12 @@
 --
 -- This migration is deliberately instant: dwctl applies migrations at pod
 -- startup, so anything slow here turns into a k8s crash loop that also
--- blocks writers while it holds locks. The ledger-sized work happens in the
--- balance reconciliation job instead: at leadership gain it baselines every
--- checkpoint from the ledger (until then, existing rows keep their
--- pre-migration cached values - the same staleness they had before this
--- deploy), and every interval thereafter it re-derives and heals as the
--- ongoing audit.
+-- blocks writers while it holds locks. The ledger-sized work is the one-off
+-- post-deploy script scripts/backfill_balance_checkpoints.sql, run manually
+-- once all pods are on this release: it baselines every checkpoint from the
+-- ledger and aggregates the historical batch backlog. Until it runs,
+-- existing rows keep their pre-migration cached values - the same staleness
+-- they had before this deploy. There is no background job.
 
 -- 1. Zero checkpoint for every user with no row yet (the bot-signup
 --    population): the read model is total from here on.

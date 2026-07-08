@@ -33,7 +33,7 @@
 //! - **Batch enrichment**: User and pricing lookups are batched using `IN` clauses,
 //!   reducing from O(N) queries to O(1) per batch.
 
-use crate::config::{CachePricingConfig, Config};
+use crate::config::{CachePricingConfig, Config, ONWARDS_CONFIG_CHANGED_CHANNEL};
 
 use crate::db::models::api_keys::ApiKeyPurpose;
 use crate::metrics::MetricsRecorder;
@@ -1286,7 +1286,8 @@ where
                 .unwrap_or_default()
                 .as_micros();
             let payload = format!("credits_transactions:{}", epoch_micros);
-            sqlx::query("SELECT pg_notify('auth_config_changed', $1)")
+            sqlx::query("SELECT pg_notify($1, $2)")
+                .bind(ONWARDS_CONFIG_CHANGED_CHANNEL)
                 .bind(&payload)
                 .execute(&mut **tx)
                 .await?;

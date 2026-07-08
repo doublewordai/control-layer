@@ -271,9 +271,9 @@ pub async fn get_usage<P: PoolProvider>(
         //    all-time has no fixed range — the cursor moves forward.
         //    `batch_aggregates` only contains completed batches (all rows
         //    written), so a simple COUNT(*) is safe.
-        // `batch_aggregates` is maintained by the background balance applier
-        // (within its idle tick of rows landing), so no read-time aggregation
-        // is needed here anymore.
+        // `batch_aggregates` is maintained synchronously by the charging
+        // writers (batcher flush and create_transaction), so no read-time
+        // aggregation is needed here anymore.
         refresh_user_model_usage(state.db.write()).await?;
         let (batch_stats, by_model, tariffs) = tokio::try_join!(
             get_user_batch_counts(state.db.read(), target_user_id),

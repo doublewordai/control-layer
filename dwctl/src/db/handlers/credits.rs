@@ -306,7 +306,8 @@ impl<'c> Credits<'c> {
 
         let payload = format!("credits_transactions:{}", epoch_micros);
 
-        sqlx::query("SELECT pg_notify('auth_config_changed', $1)")
+        sqlx::query("SELECT pg_notify($1, $2)")
+            .bind(crate::config::ONWARDS_CONFIG_CHANGED_CHANNEL)
             .bind(&payload)
             .execute(&mut *self.db)
             .await?;
@@ -317,9 +318,10 @@ impl<'c> Credits<'c> {
     /// Get current balance for a user: a point read of the
     /// user_balance_checkpoints read model.
     ///
-    /// The read model is total (a row is created with the user and maintained
-    /// by the inline credit path and the background applier); a missing row
-    /// can only mean a user that has never existed, so it reads as zero.
+    /// The read model is total (a row is created with the user, and every
+    /// writer folds its charges in synchronously, so it is current as of the
+    /// last committed write); a missing row can only mean a user that has
+    /// never existed, so it reads as zero.
     #[instrument(skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
     pub async fn get_user_balance(&mut self, user_id: UserId) -> Result<Decimal> {
         let balance = sqlx::query_scalar!(r#"SELECT balance FROM user_balance_checkpoints WHERE user_id = $1"#, user_id)

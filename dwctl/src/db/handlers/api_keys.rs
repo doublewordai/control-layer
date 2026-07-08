@@ -586,8 +586,9 @@ impl<'c> ApiKeys<'c> {
             AND (
                 ak.user_id = $2  -- System user always has access
                 OR EXISTS (
-                    -- User has positive balance: point read of the total,
-                    -- applier-maintained user_balance_checkpoints read model
+                    -- User has positive balance: point read of the total
+                    -- user_balance_checkpoints read model (kept current by
+                    -- writers folding synchronously with each charge)
                     SELECT 1 FROM user_balance_checkpoints c
                     WHERE c.user_id = ak.user_id AND c.balance > 0
                 )
@@ -627,8 +628,9 @@ impl<'c> ApiKeys<'c> {
             AND (
                 ak.user_id = $2  -- System user always has access
                 OR EXISTS (
-                    -- User has positive balance: point read of the total,
-                    -- applier-maintained user_balance_checkpoints read model
+                    -- User has positive balance: point read of the total
+                    -- user_balance_checkpoints read model (kept current by
+                    -- writers folding synchronously with each charge)
                     SELECT 1 FROM user_balance_checkpoints c
                     WHERE c.user_id = ak.user_id AND c.balance > 0
                 )
