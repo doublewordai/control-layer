@@ -41,7 +41,7 @@ CREATE TABLE user_model_usage_daily (
 --                         and never scans history on first run.
 --   backfill_watermark -- IMMUTABLE boundary captured atomically here. The one-off
 --                         backfill fills WHERE id <= backfill_watermark; the daemon
---                         only ever touches WHERE id > last_processed_id (>= this
+--                         only ever touches WHERE id > last_processed_id (> this
 --                         watermark). The two id-ranges are disjoint, so the backfill
 --                         and the live daemon can run concurrently with no double
 --                         count -- a day straddling the boundary gets each side's
