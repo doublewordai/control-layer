@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.72.0](https://github.com/doublewordai/control-layer/compare/v8.71.0...v8.72.0) (2026-07-07)
+
+
+### Features
+
+* fusillade 20.0.0 ([#1231](https://github.com/doublewordai/control-layer/issues/1231)) ([1cac7ce](https://github.com/doublewordai/control-layer/commit/1cac7ce2c365d0d6e721d484914adba067f64fe0))
+
 ## [8.71.0](https://github.com/doublewordai/control-layer/compare/v8.70.3...v8.71.0) (2026-07-06)
 
 
