@@ -1576,8 +1576,9 @@ pub async fn build_router(
     // wrapper: on a request it runs first; on the response it runs last. The stack below,
     // outermost → innermost (i.e. reverse of the code order), is:
     //
-    //   responses_mw  →  outlet (logging/billing)  →  cache  →  error_enrichment
-    //                 →  image_normalizer  →  tool_injection  →  onwards
+    //   translation  →  models_list  →  responses_mw  →  outlet (logging/billing)
+    //                →  cache  →  error_enrichment  →  image_normalizer
+    //                →  tool_injection  →  onwards
     //
     // Why this order:
     //   • outlet outermost (of the body editors): it logs the request **as the customer
@@ -1690,15 +1691,23 @@ pub async fn build_router(
         onwards_router
     };
 
+    // Serve authenticated OpenAI-shaped model discovery from the control-layer
+    // database before falling through to onwards. This sits inside protocol
+    // translation so Anthropic `/v1/models` first normalizes `x-api-key` to
+    // `Authorization`, then this handler returns the OpenAI list, then the
+    // translator reshapes it back to Anthropic's response format.
+    let onwards_router = onwards_router.layer(middleware::from_fn_with_state(
+        state.clone(),
+        api::handlers::ai_models::list_ai_models_middleware,
+    ));
+
     // Apply the generic edge protocol-translation middleware as the OUTERMOST
     // layer on the onwards router. On the request path it runs first, so any
-    // foreign-protocol request (today: Anthropic `/v1/messages`) is translated
-    // to Chat Completions and its URI rewritten BEFORE image_normalizer,
-    // tool_injection, and onwards see it. On the response path it runs last, so
-    // outlet logging, billing, and usage extraction all observe Chat
-    // Completions, and only the final client bytes are reframed back into the
-    // foreign protocol. Native `/chat/completions` requests match no translator
-    // and pass through untouched.
+    // foreign-protocol request (today: Anthropic `/v1/messages` and `/v1/models`)
+    // is translated before model discovery, image_normalizer, tool_injection,
+    // and onwards see it. On the response path it runs last, so only the final
+    // client bytes are reframed back into the foreign protocol. Native OpenAI
+    // requests match no translator and pass through untouched.
     let onwards_router = {
         // Bound the body the translation middleware buffers by the same cap as the
         // rest of the inference path (limits.requests.max_body_size, 0 = unlimited).
@@ -1732,11 +1741,6 @@ pub async fn build_router(
         .merge(auth_routes);
 
     // Add AI routes with appropriate nesting based on strict mode
-    let onwards_router = onwards_router.layer(middleware::from_fn_with_state(
-        state.clone(),
-        api::handlers::ai_models::list_ai_models_middleware,
-    ));
-
     if strict_mode {
         // Strict mode: nest onwards at /ai/v1, nest batches at /ai/v1
         router = router.nest("/ai/v1", onwards_router);

@@ -161,9 +161,8 @@ pub async fn list_ai_models_middleware<P: PoolProvider>(
     next: Next,
 ) -> Response {
     let is_models_request = request.method() == axum::http::Method::GET && request.uri().path().ends_with("/models");
-    let is_anthropic_models_request = request.headers().contains_key("anthropic-version");
 
-    if is_models_request && !is_anthropic_models_request && request.headers().contains_key(header::AUTHORIZATION) {
+    if is_models_request && request.headers().contains_key(header::AUTHORIZATION) {
         let headers = request.headers().clone();
         return match list_ai_models(State(state), headers).await {
             Ok(response) => response.into_response(),
