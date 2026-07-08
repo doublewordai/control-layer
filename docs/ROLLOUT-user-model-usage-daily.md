@@ -14,7 +14,7 @@ not drop the old table in the same release, and (b) the daily table must be full
 Migration 110 seeds `user_model_usage_daily_cursor` with `last_processed_id = MAX(id)` and
 an immutable `backfill_watermark = MAX(id)` (captured atomically at migration time).
 
-- The **refresh daemon** only folds rows with `id > last_processed_id` (≥ the watermark) —
+- The **refresh daemon** only folds rows with `id > last_processed_id` (i.e. > the watermark) —
   forward-fill, no historical scan.
 - The **backfill** only fills `id <= backfill_watermark` — history.
 
