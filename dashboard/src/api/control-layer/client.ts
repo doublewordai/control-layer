@@ -27,6 +27,7 @@ import type {
   ListRequestsQuery,
   RequestsAggregateResponse,
   PendingRequestCountsByModelAndWindow,
+  PendingRequestCountsQuery,
   ModelUserUsageResponse,
   AuthResponse,
   LoginRequest,
@@ -1772,9 +1773,15 @@ const daemonsApi = {
 };
 
 const monitoringApi = {
-  async getPendingRequestCounts(): Promise<PendingRequestCountsByModelAndWindow> {
+  async getPendingRequestCounts(
+    options?: PendingRequestCountsQuery,
+  ): Promise<PendingRequestCountsByModelAndWindow> {
+    const params = new URLSearchParams();
+    if (options?.service_tiers)
+      params.set("service_tiers", options.service_tiers);
+    const qs = params.toString() ? `?${params.toString()}` : "";
     const response = await fetch(
-      "/admin/api/v1/monitoring/pending-request-counts",
+      `/admin/api/v1/monitoring/pending-request-counts${qs}`,
     );
     if (!response.ok) {
       throw new Error(

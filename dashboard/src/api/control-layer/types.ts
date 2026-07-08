@@ -908,7 +908,11 @@ export interface RequestsAggregateResponse {
   time_series: TimeSeriesPoint[];
 }
 
-// Monitoring: pending request counts grouped by model and completion window (priority)
+export interface PendingRequestCountsQuery {
+  service_tiers?: string;
+}
+
+// Monitoring: pending request counts grouped by model and completion window
 export type PendingRequestCountsByModelAndWindow = Record<
   string,
   Record<string, number>
