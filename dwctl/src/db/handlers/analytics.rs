@@ -1182,7 +1182,7 @@ pub async fn refresh_user_model_usage_daily(pool: &PgPool) -> Result<()> {
         INSERT INTO user_model_usage_daily (user_id, model, usage_date, input_tokens, output_tokens, cost, request_count)
         SELECT user_id,
                model,
-               date_trunc('day', timestamp)::date,
+               (timestamp AT TIME ZONE 'UTC')::date,
                COALESCE(SUM(prompt_tokens), 0),
                COALESCE(SUM(completion_tokens), 0),
                COALESCE(SUM(total_cost), 0),
@@ -1191,7 +1191,7 @@ pub async fn refresh_user_model_usage_daily(pool: &PgPool) -> Result<()> {
         WHERE id > $1 AND id <= $2
               AND user_id IS NOT NULL AND model IS NOT NULL
               AND status_code BETWEEN 200 AND 299
-        GROUP BY user_id, model, date_trunc('day', timestamp)::date
+        GROUP BY user_id, model, (timestamp AT TIME ZONE 'UTC')::date
         ON CONFLICT (user_id, model, usage_date)
         DO UPDATE SET
             input_tokens = user_model_usage_daily.input_tokens + EXCLUDED.input_tokens,
