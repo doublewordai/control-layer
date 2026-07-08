@@ -5,8 +5,9 @@ use serde_json::{Value, json};
 use super::model::{Content, ContentBlock, ImageSource, InputMessage, MessagesRequest, System, Tool, ToolResultContent};
 use crate::inference::translation::TranslationError;
 
-/// Translate an Anthropic Messages request into a Chat Completions request body.
-pub fn to_chat_completions(req: MessagesRequest) -> Result<Value, TranslationError> {
+/// Translate an Anthropic Messages request into a Chat Completions request body. `cache_enabled`
+/// gates emission of the top-level automatic-caching marker (see below).
+pub fn to_chat_completions(req: MessagesRequest, cache_enabled: bool) -> Result<Value, TranslationError> {
     let mut messages: Vec<Value> = Vec::new();
 
     if let Some(system) = &req.system
@@ -65,11 +66,15 @@ pub fn to_chat_completions(req: MessagesRequest) -> Result<Value, TranslationErr
     if req.service_tier.as_deref() == Some("flex") {
         out.insert("service_tier".into(), json!("flex"));
     }
-    // Top-level automatic-caching marker: forward it verbatim so the cache layer can synthesize a
-    // breakpoint on the last block (it strips the field before the upstream call). A `null` is "no
-    // marker" — don't forward it. Explicit block-level `cache_control` on system/message content is
-    // already preserved by the content-part converters.
-    if let Some(cc) = &req.cache_control
+    // Top-level automatic-caching marker: an internal signal the cache middleware reads (to
+    // synthesize a breakpoint on the last block) AND strips before the upstream call. Emit it ONLY
+    // when caching is enabled — that middleware is wired on the same `cache.enabled` flag, so with
+    // caching off it wouldn't be there to strip the field, and emitting an unknown top-level field
+    // would leak to OpenAI-compatible upstreams (which may reject it) for no benefit. A `null` is
+    // "no marker". Explicit block-level `cache_control` is already preserved by the content-part
+    // converters (and behaves the same as today when caching is off).
+    if cache_enabled
+        && let Some(cc) = &req.cache_control
         && !cc.is_null()
     {
         out.insert("cache_control".into(), cc.clone());
@@ -278,14 +283,16 @@ fn tool_choice_to_openai(tc: &Value) -> Option<Value> {
 mod tests {
     use super::*;
 
+    // Translate with caching enabled (the prod configuration); pass `false` explicitly where the
+    // cache-disabled behaviour is under test.
     fn translate(v: Value) -> Value {
-        to_chat_completions(serde_json::from_value::<MessagesRequest>(v).unwrap()).unwrap()
+        to_chat_completions(serde_json::from_value::<MessagesRequest>(v).unwrap(), true).unwrap()
     }
 
     #[test]
     fn top_level_cache_control_forwarded_for_automatic_caching() {
-        // The automatic-caching marker must survive translation onto the Chat Completions body so the
-        // cache layer (which reads that body) can synthesize a breakpoint on the last block.
+        // With caching enabled, the automatic-caching marker must survive translation onto the Chat
+        // Completions body so the cache layer (which reads it) can synthesize a last-block breakpoint.
         let out = translate(json!({
             "model": "m",
             "max_tokens": 16,
@@ -309,5 +316,19 @@ mod tests {
             "messages": [{"role": "user", "content": "hi"}]
         }));
         assert!(null.get("cache_control").is_none(), "null marker → not emitted");
+    }
+
+    #[test]
+    fn top_level_cache_control_not_emitted_when_caching_disabled() {
+        // With caching OFF the middleware isn't in the stack to strip it, so the field must NOT be
+        // emitted — otherwise it leaks an unknown top-level field to the upstream.
+        let req = serde_json::from_value::<MessagesRequest>(json!({
+            "model": "m", "max_tokens": 16,
+            "cache_control": {"type": "ephemeral"},
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .unwrap();
+        let out = to_chat_completions(req, false).unwrap();
+        assert!(out.get("cache_control").is_none(), "caching disabled → top-level marker dropped");
     }
 }

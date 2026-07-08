@@ -577,7 +577,10 @@ mod tests {
         // The write is keyed at the synthesized breakpoint (the last block).
         let parsed = parse_chat_completions(&b, &all_tiers(), &TelemetryPolicy::default()).unwrap();
         assert_eq!(parsed.breakpoints.len(), 1);
-        assert_eq!(parsed.breakpoints[0].block_index, 0, "breakpoint synthesized on the (only) last block");
+        assert_eq!(
+            parsed.breakpoints[0].block_index, 0,
+            "breakpoint synthesized on the (only) last block"
+        );
         assert_eq!(pending.writes[0].prefix_hash, parsed.cumulative_hashes[0]);
     }
 

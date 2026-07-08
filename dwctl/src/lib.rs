@@ -1715,7 +1715,11 @@ pub async fn build_router(
             n => usize::try_from(n).unwrap_or(usize::MAX),
         };
         let translators: Vec<std::sync::Arc<dyn crate::inference::translation::ProtocolTranslator>> = vec![
-            std::sync::Arc::new(crate::inference::translation::anthropic::AnthropicMessages),
+            // Pass cache.enabled so the translator only emits the top-level automatic-caching marker
+            // when the cache middleware is present to consume + strip it (else it would leak upstream).
+            std::sync::Arc::new(crate::inference::translation::anthropic::AnthropicMessages::new(
+                config.cache.enabled,
+            )),
             std::sync::Arc::new(crate::inference::translation::anthropic::models::AnthropicModels),
         ];
         let translation_registry =
