@@ -170,6 +170,8 @@ impl Classifier {
                     ParseError::UnsupportedType(_) => cache_metrics::record_markers_rejected("unsupported_type"),
                     ParseError::DisabledTier(_) => cache_metrics::record_markers_rejected("tier_disabled"),
                     ParseError::MalformedCacheControl => cache_metrics::record_markers_rejected("malformed_cache_control"),
+                    ParseError::AutomaticTtlConflict => cache_metrics::record_markers_rejected("automatic_ttl_conflict"),
+                    ParseError::NoAutomaticSlot => cache_metrics::record_markers_rejected("automatic_no_slot"),
                     ParseError::Json(_) => cache_metrics::record_skip("unparseable"),
                 }
                 // Best-effort: degrade to no caching (uniform zeros). Log at debug so the
@@ -550,6 +552,33 @@ mod tests {
         assert!(!out.active, "a disabled model is inactive → response left untouched");
         assert!(out.stats.is_zero());
         assert!(out.pending.is_empty());
+    }
+
+    #[sqlx::test]
+    async fn automatic_marker_caches_on_last_block(pool: PgPool) {
+        // A top-level (automatic) cache_control with NO block markers synthesizes a breakpoint on the
+        // last block and writes the prefix at the marker's tier. (Single block so the write span is
+        // one segment, matching the harness's one-count tokenizer mock; multi-block last-block
+        // positioning is covered by the parse unit tests.)
+        let h = harness(&pool, true, 1500, 1024).await;
+        let b = serde_json::json!({
+            "model": ALIAS,
+            "cache_control": {"type": "ephemeral", "ttl": "1h"},
+            "messages": [{"role":"user","content":"a long static prompt plus the question"}]
+        })
+        .to_string()
+        .into_bytes();
+
+        let ClassifyOutcome { stats, pending, active } = h.classifier.classify(req(&h.secret, &b)).await.unwrap();
+        assert!(active);
+        assert_eq!(stats.read, 0);
+        assert_eq!(stats.creation_1h, 1500, "automatic marker writes the prefix at its tier");
+        assert_eq!(pending.writes.len(), 1);
+        // The write is keyed at the synthesized breakpoint (the last block).
+        let parsed = parse_chat_completions(&b, &all_tiers(), &TelemetryPolicy::default()).unwrap();
+        assert_eq!(parsed.breakpoints.len(), 1);
+        assert_eq!(parsed.breakpoints[0].block_index, 0, "breakpoint synthesized on the (only) last block");
+        assert_eq!(pending.writes[0].prefix_hash, parsed.cumulative_hashes[0]);
     }
 
     #[sqlx::test]

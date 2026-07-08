@@ -44,6 +44,12 @@ pub struct MessagesRequest {
     /// [`to_chat_completions`](super::request::to_chat_completions).
     #[serde(default)]
     pub service_tier: Option<String>,
+    /// Top-level automatic-caching marker (`cache_control: {"type":"ephemeral"[, "ttl":"1h"]}`).
+    /// Anthropic's opt-in that caches the last block and advances it as the conversation grows.
+    /// Forwarded verbatim onto the translated Chat Completions body, where the cache layer reads it
+    /// to synthesize a breakpoint on the last block (and strips it before the upstream call).
+    #[serde(default)]
+    pub cache_control: Option<Value>,
 }
 
 /// Top-level `system`: either a string or an array of content blocks.

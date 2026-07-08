@@ -65,6 +65,15 @@ pub fn to_chat_completions(req: MessagesRequest) -> Result<Value, TranslationErr
     if req.service_tier.as_deref() == Some("flex") {
         out.insert("service_tier".into(), json!("flex"));
     }
+    // Top-level automatic-caching marker: forward it verbatim so the cache layer can synthesize a
+    // breakpoint on the last block (it strips the field before the upstream call). A `null` is "no
+    // marker" — don't forward it. Explicit block-level `cache_control` on system/message content is
+    // already preserved by the content-part converters.
+    if let Some(cc) = &req.cache_control
+        && !cc.is_null()
+    {
+        out.insert("cache_control".into(), cc.clone());
+    }
 
     Ok(Value::Object(out))
 }
@@ -262,5 +271,43 @@ fn tool_choice_to_openai(tc: &Value) -> Option<Value> {
             .and_then(|n| n.as_str())
             .map(|name| json!({ "type": "function", "function": { "name": name } })),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn translate(v: Value) -> Value {
+        to_chat_completions(serde_json::from_value::<MessagesRequest>(v).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn top_level_cache_control_forwarded_for_automatic_caching() {
+        // The automatic-caching marker must survive translation onto the Chat Completions body so the
+        // cache layer (which reads that body) can synthesize a breakpoint on the last block.
+        let out = translate(json!({
+            "model": "m",
+            "max_tokens": 16,
+            "cache_control": {"type": "ephemeral", "ttl": "1h"},
+            "messages": [{"role": "user", "content": "hi"}]
+        }));
+        assert_eq!(out["cache_control"], json!({"type": "ephemeral", "ttl": "1h"}));
+    }
+
+    #[test]
+    fn top_level_cache_control_absent_or_null_not_forwarded() {
+        let absent = translate(json!({
+            "model": "m", "max_tokens": 16,
+            "messages": [{"role": "user", "content": "hi"}]
+        }));
+        assert!(absent.get("cache_control").is_none(), "no marker → not emitted");
+
+        let null = translate(json!({
+            "model": "m", "max_tokens": 16,
+            "cache_control": null,
+            "messages": [{"role": "user", "content": "hi"}]
+        }));
+        assert!(null.get("cache_control").is_none(), "null marker → not emitted");
     }
 }
