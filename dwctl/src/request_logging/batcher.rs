@@ -47,7 +47,7 @@ use sqlx::PgPool;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::{Notify, RwLock, mpsc};
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, error, info, info_span, trace, warn};
 use uuid::Uuid;
@@ -312,6 +312,10 @@ where
     last_onwards_sync_notification: Arc<RwLock<Instant>>,
     /// Minimum interval between onwards sync notifications (from config).
     onwards_sync_notification_interval: Duration,
+    /// In-process wake signal for the usage-refresh daemon. Nudged after every
+    /// successful batch write so the daemon folds the just-written rows into
+    /// `user_model_usage_daily`. `None` disables the nudge (tests, refresh daemon off).
+    usage_refresh_notify: Option<Arc<Notify>>,
 }
 
 impl<M> AnalyticsBatcher<M>
@@ -351,9 +355,19 @@ where
                     .unwrap_or_else(Instant::now),
             )),
             onwards_sync_notification_interval,
+            usage_refresh_notify: None,
         };
 
         (batcher, sender)
+    }
+
+    /// Attach the usage-refresh daemon's wake signal. After each successful batch
+    /// write the batcher calls `notify_one()` on it, so the daemon coalesces the
+    /// nudges and drains the `user_model_usage_daily` cursor. Off by default.
+    #[must_use]
+    pub fn with_usage_refresh_notify(mut self, notify: Arc<Notify>) -> Self {
+        self.usage_refresh_notify = Some(notify);
+        self
     }
 
     /// Runs the batcher's background write loop.
@@ -504,6 +518,13 @@ where
                 );
                 buffer.clear();
                 return;
+            }
+
+            // Write succeeded: nudge the usage-refresh daemon so the just-written rows
+            // get folded into user_model_usage_daily. In-memory and essentially free;
+            // the daemon coalesces bursts and rate-limits itself.
+            if let Some(notify) = &self.usage_refresh_notify {
+                notify.notify_one();
             }
 
             // Phase 3: Record per-record metrics

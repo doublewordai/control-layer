@@ -278,7 +278,7 @@ mod tests {
     use std::time::{Duration, SystemTime};
     use tokio::sync::mpsc;
 
-    /// ZDR (COR-499): the serialization-error descriptor used in the parse-failure
+    /// ZDR: the serialization-error descriptor used in the parse-failure
     /// logs must report only the JSON error's location/category, never a fragment
     /// of the offending body that serde's `Display` can echo.
     #[test]

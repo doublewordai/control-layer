@@ -16,7 +16,18 @@ use model::MessagesRequest;
 use streaming::AnthropicStreamReframer;
 
 /// Translator for the Anthropic Messages API.
-pub struct AnthropicMessages;
+pub struct AnthropicMessages {
+    /// Whether the prompt-cache middleware is wired (mirrors `config.cache.enabled`). Gates emission
+    /// of the top-level automatic-caching marker: the middleware both consumes and strips that field,
+    /// so with caching off it must not be emitted (it would leak an unknown top-level field upstream).
+    cache_enabled: bool,
+}
+
+impl AnthropicMessages {
+    pub fn new(cache_enabled: bool) -> Self {
+        Self { cache_enabled }
+    }
+}
 
 impl ProtocolTranslator for AnthropicMessages {
     fn name(&self) -> &'static str {
@@ -32,7 +43,7 @@ impl ProtocolTranslator for AnthropicMessages {
         let req: MessagesRequest =
             serde_json::from_slice(&body).map_err(|e| TranslationError::BadRequest(format!("invalid Anthropic Messages request: {e}")))?;
 
-        let chat = request::to_chat_completions(req)?;
+        let chat = request::to_chat_completions(req, self.cache_enabled)?;
         let new_body = serde_json::to_vec(&chat).map_err(|e| TranslationError::Internal(e.to_string()))?;
 
         // Normalise the path so downstream code (the non-strict upstream
@@ -107,7 +118,7 @@ mod tests {
 
     fn translate(body: Value) -> Value {
         let req: MessagesRequest = serde_json::from_value(body).expect("valid request");
-        request::to_chat_completions(req).expect("translates")
+        request::to_chat_completions(req, true).expect("translates")
     }
 
     #[test]
@@ -546,7 +557,7 @@ mod tests {
     #[test]
     fn detect_matches_messages_ignoring_headers() {
         use crate::inference::translation::ProtocolTranslator;
-        let t = AnthropicMessages;
+        let t = AnthropicMessages::new(true);
         let mut h = HeaderMap::new();
         h.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
         h.insert("anthropic-beta", HeaderValue::from_static("prompt-caching-2024-07-31"));

@@ -361,7 +361,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_execute_returns_error_on_4xx() {
-        // ZDR (COR-499): the tool response body must never appear in the error,
+        // ZDR: the tool response body must never appear in the error,
         // which `#[instrument(err)]` logs. Use a sentinel body and assert it is
         // absent while the status is still reported.
         const SENTINEL: &str = "ZDR-SENTINEL-TOOL-BODY-4a1f";

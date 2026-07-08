@@ -21,12 +21,15 @@ pub mod component {
     pub const PROBE_SCHEDULER: &str = "probe_scheduler";
     pub const TASK_WORKER: &str = "task_worker";
     pub const ONWARDS_SYNC: &str = "onwards_sync";
+    pub const ZDR_KEY_SYNC: &str = "zdr_key_sync";
+    pub const ZDR_DISPATCH: &str = "zdr_dispatch";
     pub const ONWARDS_HEARTBEAT: &str = "onwards_heartbeat";
     pub const ANALYTICS: &str = "analytics";
     pub const ANALYTICS_BATCHER: &str = "analytics_batcher";
     pub const RESPONSES_WRITER: &str = "responses_writer";
     pub const BATCH_POPULATE: &str = "batch_populate";
     pub const PAYMENTS: &str = "payments";
+    pub const USAGE_REFRESH: &str = "usage_refresh";
 }
 
 /// Increment `dwctl_background_errors_total`. `component`/`reason`/`severity` are `&'static str`

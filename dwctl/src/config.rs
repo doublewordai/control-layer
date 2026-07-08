@@ -200,6 +200,11 @@ pub struct Config {
     /// shape and defaults.
     #[serde(default)]
     pub image_normalizer: crate::image_normalizer::ImageNormalizerConfig,
+    /// Encrypted key custody (Redis-backed wrapped-key store). Currently used by
+    /// zero-data-retention flex requests to hold per-request body keys; absent
+    /// (the default) leaves ZDR disabled.
+    #[serde(default)]
+    pub keystore: Option<crate::keystore::KeystoreConfig>,
     /// OpenAPI spec exposure controls. Defaults disable the Admin spec
     /// (which describes internal management endpoints) and enable the
     /// AI spec (which mirrors the publicly-documented OpenAI surface).
@@ -1549,6 +1554,48 @@ pub struct DaemonConfig {
     /// deadline so earlier deadlines produce larger numbers. Default: false.
     #[serde(default)]
     pub inject_deadline_priority: bool,
+
+    /// Maximum request rows the batch claim daemon takes per iteration.
+    /// 0 inherits `claim_batch_size`, so an existing tuned cap carries over
+    /// to the split batch daemon unchanged. Default: 0 (inherit).
+    #[serde(default)]
+    pub batch_claim_size: usize,
+
+    /// Maximum batches selected per model per batch-claim iteration. Values
+    /// above 1 let a model's leftover capacity spill into the next-ranked
+    /// batches instead of idling when the top batch can't fill it.
+    /// Default: 4.
+    #[serde(default = "default_batch_claim_batch_size")]
+    pub batch_claim_batch_size: usize,
+
+    /// Sleep between batch-claim iterations in milliseconds.
+    /// 0 inherits `claim_interval_ms`. Default: 0 (inherit).
+    #[serde(default)]
+    pub batch_claim_interval_ms: u64,
+
+    /// Require an explicit `live` model_filters event before batch-claiming a
+    /// model. When false, models with NO filter events (external / always-on
+    /// providers that scouter does not manage) are treated as live — the
+    /// historical claim behaviour. Not-live (`coming`/`absent`) models remain
+    /// claimable only via the deadline ramp in either mode. Default: false.
+    #[serde(default)]
+    pub batch_claim_require_live: bool,
+
+    /// Exponent of the deadline-ramp curve: batches on not-live models become
+    /// claimable at full capacity within `window_minutes ^ exponent` minutes
+    /// of their deadline (~59 min for 24h windows, ~10 min for 1h at the
+    /// default). Values ≥ 1.0 make the ramp cover the whole window (batches
+    /// claimable immediately regardless of liveness). Default: 0.56.
+    #[serde(default = "default_claim_ramp_exponent", deserialize_with = "deserialize_claim_ramp_exponent")]
+    pub claim_ramp_exponent: f64,
+}
+
+fn default_batch_claim_batch_size() -> usize {
+    4
+}
+
+fn default_claim_ramp_exponent() -> f64 {
+    0.56
 }
 
 fn default_urgency_weight() -> f64 {
@@ -1571,6 +1618,27 @@ where
             "urgency_weight must be between 0.0 and 1.0, got {}",
             value
         ))),
+        Some(value) => Ok(value),
+    }
+}
+
+/// Custom deserializer that validates claim_ramp_exponent is finite and non-negative.
+/// (NaN/inf/negative exponents would make the deadline-ramp predicate undefined.)
+fn deserialize_claim_ramp_exponent<'de, D>(deserializer: D) -> Result<f64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+
+    let opt: Option<f64> = Option::deserialize(deserializer)?;
+
+    match opt {
+        None => Ok(default_claim_ramp_exponent()),
+        Some(value) if !value.is_finite() => Err(D::Error::custom(format!(
+            "claim_ramp_exponent must be a finite number, got {}",
+            value
+        ))),
+        Some(value) if value < 0.0 => Err(D::Error::custom(format!("claim_ramp_exponent must be non-negative, got {}", value))),
         Some(value) => Ok(value),
     }
 }
@@ -1613,6 +1681,11 @@ impl Default for DaemonConfig {
             streamable_endpoints: Vec::new(),
             urgency_weight: default_urgency_weight(),
             inject_deadline_priority: false,
+            batch_claim_size: 0,
+            batch_claim_batch_size: default_batch_claim_batch_size(),
+            batch_claim_interval_ms: 0,
+            batch_claim_require_live: false,
+            claim_ramp_exponent: default_claim_ramp_exponent(),
         }
     }
 }
@@ -1669,6 +1742,11 @@ impl DaemonConfig {
             streamable_endpoints: self.streamable_endpoints.clone(),
             urgency_weight: self.urgency_weight,
             inject_deadline_priority: self.inject_deadline_priority,
+            batch_claim_size: self.batch_claim_size,
+            batch_claim_batch_size: self.batch_claim_batch_size,
+            batch_claim_interval_ms: self.batch_claim_interval_ms,
+            batch_claim_require_live: self.batch_claim_require_live,
+            claim_ramp_exponent: self.claim_ramp_exponent,
             ..Default::default()
         }
     }
@@ -1740,6 +1818,8 @@ impl Default for NotificationsConfig {
 pub struct BackgroundServicesConfig {
     /// Configuration for onwards config sync service
     pub onwards_sync: OnwardsSyncConfig,
+    /// Configuration for the usage-aggregate refresh daemon
+    pub usage_refresh: UsageRefreshConfig,
     /// Configuration for probe scheduler service
     pub probe_scheduler: ProbeSchedulerConfig,
     /// Configuration for batch processing daemon
@@ -1806,6 +1886,42 @@ impl Default for OnwardsSyncConfig {
         Self {
             enabled: true,
             fallback_interval_milliseconds: 300_000, // 5 minutes (NOTIFY handles real changes; this is only a missed-notification safety net)
+        }
+    }
+}
+
+/// Usage-aggregate refresh daemon configuration.
+///
+/// The daemon incrementally folds new `http_analytics` rows into the
+/// `user_model_usage_daily` rollup. It's woken by the analytics batcher after each
+/// flush (in-process, no LISTEN/NOTIFY — emitter and consumer share the pod) and, as a
+/// safety net, on a periodic fallback tick. Cross-pod duplicate runs are made cheap
+/// no-ops by an advisory lock in the refresh itself.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct UsageRefreshConfig {
+    /// Enable the usage-refresh daemon (default: true).
+    pub enabled: bool,
+    /// Fallback tick interval in milliseconds (default: 60000ms = 1 minute).
+    ///
+    /// The batcher nudge drives the refresh in real time whenever there's traffic; this
+    /// tick only backstops a missed nudge or drains the cursor after a restart. It is
+    /// cheap — a tick with no new rows finds `MAX(id)` unchanged and no-ops. Set to `0`
+    /// to disable the fallback entirely.
+    pub fallback_interval_milliseconds: u64,
+    /// Minimum interval between refreshes in milliseconds (default: 30000ms = 30s).
+    ///
+    /// Bounds refresh frequency and coalesces bursts of batcher nudges: after a refresh
+    /// the daemon waits at least this long before running again.
+    pub min_interval_milliseconds: u64,
+}
+
+impl Default for UsageRefreshConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            fallback_interval_milliseconds: 60_000,
+            min_interval_milliseconds: 30_000,
         }
     }
 }
@@ -2109,6 +2225,7 @@ impl Default for Config {
             connections: ConnectionsConfig::default(),
             responses: ResponsesConfig::default(),
             image_normalizer: crate::image_normalizer::ImageNormalizerConfig::default(),
+            keystore: None,
             openapi: OpenApiConfig::default(),
             cache: CacheConfig::default(),
         }
@@ -3619,6 +3736,91 @@ background_services:
             assert!(result.is_err());
             let err = result.unwrap_err().to_string();
             assert!(err.contains("urgency_weight must be between 0.0 and 1.0"));
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_claim_ramp_exponent_default_and_override() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+"#,
+            )?;
+            let args = Args {
+                config: "test.yaml".into(),
+                validate: false,
+            };
+            let config = Config::load(&args)?;
+            assert_eq!(config.background_services.batch_daemon.claim_ramp_exponent, 0.56);
+
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+background_services:
+  batch_daemon:
+    claim_ramp_exponent: 0.9
+"#,
+            )?;
+            let config = Config::load(&args)?;
+            assert_eq!(config.background_services.batch_daemon.claim_ramp_exponent, 0.9);
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_claim_ramp_exponent_negative_rejected() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+background_services:
+  batch_daemon:
+    claim_ramp_exponent: -0.5
+"#,
+            )?;
+            let args = Args {
+                config: "test.yaml".into(),
+                validate: false,
+            };
+            let result = Config::load(&args);
+            assert!(result.is_err());
+            let err = result.unwrap_err().to_string();
+            assert!(err.contains("claim_ramp_exponent must be non-negative"));
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_claim_ramp_exponent_non_finite_rejected() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+background_services:
+  batch_daemon:
+    claim_ramp_exponent: .nan
+"#,
+            )?;
+            let args = Args {
+                config: "test.yaml".into(),
+                validate: false,
+            };
+            let result = Config::load(&args);
+            assert!(result.is_err());
+            let err = result.unwrap_err().to_string();
+            assert!(
+                err.contains("claim_ramp_exponent must be a finite number") || err.contains("invalid"),
+                "unexpected error: {err}"
+            );
 
             Ok(())
         });

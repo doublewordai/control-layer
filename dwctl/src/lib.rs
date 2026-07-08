@@ -153,6 +153,7 @@ mod error_enrichment;
 pub mod errors;
 pub mod image_normalizer;
 pub mod inference;
+pub mod keystore;
 mod leader_election;
 pub mod limits;
 mod metrics;
@@ -308,6 +309,9 @@ where
     /// dashboard `/images/:sha256` endpoint. Built once at startup so
     /// the GCS client + ADC signer are not re-initialised per request.
     pub image_normalizer: Arc<dyn crate::image_normalizer::ImageNormalizer>,
+    /// Encrypted key custody, built from `config.keystore`. `None` means it is
+    /// not configured (ZDR flex disabled).
+    pub keystore: Option<crate::keystore::Keystore>,
 }
 
 impl<P> AppState<P>
@@ -1150,6 +1154,11 @@ pub async fn build_router(
                 .expect("Failed to create PostgresHandler for request logging")
                 .with_request_serializer(parse_ai_request)
                 .with_response_serializer(parse_ai_response);
+            // TRANSITIONAL (dwctl ZDR): guard the analytics logger so plaintext
+            // ZDR bodies (decrypted for the upstream call, captured on the
+            // loopback) never land in http_requests / http_responses. The marker
+            // header rides on the dispatch; see ZdrBodyScrubber.
+            let postgres_handler = crate::inference::engine::outlet_handler::ZdrBodyScrubber::new(postgres_handler);
             multi_handler = multi_handler.with(postgres_handler);
         }
 
@@ -1567,8 +1576,9 @@ pub async fn build_router(
     // wrapper: on a request it runs first; on the response it runs last. The stack below,
     // outermost → innermost (i.e. reverse of the code order), is:
     //
-    //   responses_mw  →  outlet (logging/billing)  →  cache  →  error_enrichment
-    //                 →  image_normalizer  →  tool_injection  →  onwards
+    //   translation  →  responses_mw  →  outlet (logging/billing)
+    //                →  cache  →  error_enrichment  →  image_normalizer
+    //                →  tool_injection  →  models_route  →  onwards
     //
     // Why this order:
     //   • outlet outermost (of the body editors): it logs the request **as the customer
@@ -1585,6 +1595,15 @@ pub async fn build_router(
     //   • tool_injection innermost: the body onwards forwards upstream is fully resolved.
     //
     // Each block below adds one layer; the inline notes cover that layer's specifics.
+
+    // Serve authenticated OpenAI-shaped model discovery from the control-layer
+    // database using a real exact route. Other AI paths fall through to the
+    // existing onwards router. Because this route is inserted before the shared
+    // onwards middleware stack is layered on, request logging and protocol
+    // translation still apply to `/models` just like other AI routes.
+    let onwards_router = Router::new()
+        .route("/models", get(api::handlers::ai_models::list_ai_models))
+        .fallback_service(onwards_router);
 
     // Apply tool injection middleware to the onwards router so that per-request tool
     // schemas are resolved and injected into the request body before onwards processes it.
@@ -1683,13 +1702,11 @@ pub async fn build_router(
 
     // Apply the generic edge protocol-translation middleware as the OUTERMOST
     // layer on the onwards router. On the request path it runs first, so any
-    // foreign-protocol request (today: Anthropic `/v1/messages`) is translated
-    // to Chat Completions and its URI rewritten BEFORE image_normalizer,
-    // tool_injection, and onwards see it. On the response path it runs last, so
-    // outlet logging, billing, and usage extraction all observe Chat
-    // Completions, and only the final client bytes are reframed back into the
-    // foreign protocol. Native `/chat/completions` requests match no translator
-    // and pass through untouched.
+    // foreign-protocol request (today: Anthropic `/v1/messages` and `/v1/models`)
+    // is translated before model discovery, image_normalizer, tool_injection,
+    // and onwards see it. On the response path it runs last, so only the final
+    // client bytes are reframed back into the foreign protocol. Native OpenAI
+    // requests match no translator and pass through untouched.
     let onwards_router = {
         // Bound the body the translation middleware buffers by the same cap as the
         // rest of the inference path (limits.requests.max_body_size, 0 = unlimited).
@@ -1698,7 +1715,11 @@ pub async fn build_router(
             n => usize::try_from(n).unwrap_or(usize::MAX),
         };
         let translators: Vec<std::sync::Arc<dyn crate::inference::translation::ProtocolTranslator>> = vec![
-            std::sync::Arc::new(crate::inference::translation::anthropic::AnthropicMessages),
+            // Pass cache.enabled so the translator only emits the top-level automatic-caching marker
+            // when the cache middleware is present to consume + strip it (else it would leak upstream).
+            std::sync::Arc::new(crate::inference::translation::anthropic::AnthropicMessages::new(
+                config.cache.enabled,
+            )),
             std::sync::Arc::new(crate::inference::translation::anthropic::models::AnthropicModels),
         ];
         let translation_registry =
@@ -1724,26 +1745,15 @@ pub async fn build_router(
 
     // Add AI routes with appropriate nesting based on strict mode
     if strict_mode {
-        // Strict mode: nest onwards at /ai/v1, nest batches at /ai/v1
-        router = router.nest("/ai/v1", onwards_router);
-        if let Some(batches) = batches_routes {
-            // Add fallback to batches router to return 404 for unknown routes
-            // This prevents unknown /ai/v1/* requests from falling through to the
-            // global GET-only fallback which would return 405 for POST requests
-            let batches_with_fallback = batches.fallback(|| async {
-                (
-                    axum::http::StatusCode::NOT_FOUND,
-                    axum::Json(serde_json::json!({
-                        "error": {
-                            "message": "Unknown endpoint",
-                            "type": "invalid_request_error",
-                            "code": "not_found"
-                        }
-                    })),
-                )
-            });
-            router = router.nest("/ai/v1", batches_with_fallback);
-        }
+        // Strict mode: combine batches and onwards before nesting so the shared
+        // `/models` route wrapper can fall through to onwards without competing
+        // with a second `/ai/v1` fallback.
+        let ai_router = if let Some(batches) = batches_routes {
+            batches.merge(onwards_router)
+        } else {
+            onwards_router
+        };
+        router = router.nest("/ai/v1", ai_router);
     } else {
         // Non-strict mode: merge batches + onwards, nest at /ai/v1
         let ai_router = if let Some(batches) = batches_routes {
@@ -1799,7 +1809,8 @@ pub async fn build_router(
     let router = router
         .nest("/admin/api/v1", api_routes_with_state)
         .merge(openapi_router.with_state(state.clone()))
-        .fallback_service(fallback.with_state(state.clone()));
+        .fallback_service(fallback.with_state(state.clone()))
+        .with_state(state.clone());
 
     // Apply CORS to the main router (request logging already applied to
     // onwards_router above). When configured, this also opens uncredentialed
@@ -2021,6 +2032,10 @@ pub struct BackgroundServices {
     task_runner: Arc<tasks::TaskRunner>,
     is_leader: bool,
     onwards_targets: onwards::target::Targets,
+    /// Per-key ZDR policy map, initial-loaded and then refreshed by
+    /// [`crate::sync::zdr_keys`]. Handed to `AppState` so `is_zdr_request`
+    /// reads it on the request hot path.
+    zdr_key_cache: crate::sync::zdr_keys::ZdrKeyCache,
     #[cfg_attr(not(test), allow(dead_code))]
     onwards_sender: Option<tokio::sync::watch::Sender<onwards::target::Targets>>,
     #[allow(dead_code)] // Used in sync_onwards_config method
@@ -2041,6 +2056,8 @@ pub struct BackgroundServices {
     pub drop_guard: Option<tokio_util::sync::DropGuard>,
     /// Connections encryption key, derived once at startup.
     connections_encryption_key: Option<Vec<u8>>,
+    /// Encrypted key custody, built once at startup. `None` when unconfigured.
+    keystore: Option<crate::keystore::Keystore>,
 }
 
 impl BackgroundServices {
@@ -2110,7 +2127,7 @@ impl BackgroundServices {
     /// Gracefully shutdown all background tasks.
     ///
     /// Implements the SIGTERM drain protocol from
-    /// `fusillade/docs/plans/2026-04-28-multi-step-responses.md` (COR-353):
+    /// `fusillade/docs/plans/2026-04-28-multi-step-responses.md`:
     ///
     /// 1. Signal all in-process tasks to stop accepting new work
     ///    (`shutdown_token.cancel()`). The fusillade batch daemon stops
@@ -2236,6 +2253,17 @@ impl BackgroundServices {
 
         Ok(())
     }
+
+    /// Manually refresh the per-key ZDR cache from the database (for testing).
+    /// The cache handle is shared (same `ArcSwap`) with the inference
+    /// middleware, so this immediately changes what `is_zdr_request` sees -
+    /// letting a test flip an account to ZDR mid-run without spawning the
+    /// LISTEN/NOTIFY loop.
+    #[cfg(test)]
+    pub async fn sync_zdr_keys(&self, pool: &sqlx::PgPool) -> anyhow::Result<()> {
+        crate::sync::zdr_keys::refresh(pool, &self.zdr_key_cache).await?;
+        Ok(())
+    }
 }
 
 /// Helper for spawning named background tasks during setup
@@ -2340,6 +2368,8 @@ pub(crate) struct BackgroundServicesInput {
     pub shared_config: SharedConfig,
     pub shutdown_token: tokio_util::sync::CancellationToken,
     pub metrics_recorder: Option<GenAiMetrics>,
+    /// Shared ZDR keystore (built once by the caller). `None` = disabled.
+    pub keystore: Option<crate::keystore::Keystore>,
 }
 
 async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Result<BackgroundServices> {
@@ -2355,6 +2385,7 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
         shared_config,
         shutdown_token,
         metrics_recorder,
+        keystore,
     } = input;
 
     // Wire the multi-step processor onto the request manager *before*
@@ -2365,6 +2396,15 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
         && let Err(e) = request_manager.set_processor(processor)
     {
         tracing::warn!(error = e, "Multi-step processor was already set; skipping");
+    }
+
+    // `keystore` comes from the caller (built once and shared). Install the
+    // TRANSITIONAL ZDR response transformer on the manager before the daemon
+    // spawns below, so completed bodies are persisted encrypted.
+    if let Some(ks) = keystore.clone()
+        && let Err(e) = request_manager.set_response_transformer(std::sync::Arc::new(crate::inference::zdr::ZdrResponseEncryptor::new(ks)))
+    {
+        tracing::warn!(error = e, "ZDR response transformer was already set; skipping");
     }
 
     let drop_guard = shutdown_token.clone().drop_guard();
@@ -2438,6 +2478,26 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
         };
         (onwards::target::Targets::from_config(empty_config)?, None)
     };
+
+    // Per-key ZDR policy map: an initial synchronous load ALWAYS runs, so the
+    // map is never empty under live traffic (an empty map reads every key as
+    // non-ZDR and would silently leak a ZDR account's body). Only the
+    // LISTEN/NOTIFY refresh loop is gated on onwards config sync, with which it
+    // shares the `auth_config_changed` channel; with sync disabled the map is
+    // still correct at startup, it just does not pick up later policy changes.
+    let zdr_key_cache = crate::sync::zdr_keys::initial_cache(&pool).await?;
+    if config.background_services.onwards_sync.enabled {
+        let zdr_pool = pool.clone();
+        let zdr_cache = zdr_key_cache.clone();
+        let zdr_shutdown = shutdown_token.clone();
+        let zdr_fallback = config.background_services.onwards_sync.fallback_interval_milliseconds;
+        background_tasks.spawn("zdr-key-sync", async move {
+            crate::sync::zdr_keys::run(zdr_pool, zdr_cache, zdr_fallback, zdr_shutdown)
+                .await
+                .context("ZDR key sync failed")
+        });
+    }
+
     // Leader election lock ID: 0x44574354_50524F42 (DWCT_PROB in hex for "dwctl probes")
     const LEADER_LOCK_ID: i64 = 0x4457_4354_5052_4F42_i64;
 
@@ -2747,9 +2807,25 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
         });
     }
 
+    // Start the usage-refresh daemon: incrementally folds new http_analytics rows into
+    // user_model_usage_daily. The analytics batcher (below) nudges it after every flush;
+    // this shares an in-process Notify with it rather than round-tripping through Postgres.
+    let usage_refresh_notify = std::sync::Arc::new(tokio::sync::Notify::new());
+    if config.enable_analytics && config.background_services.usage_refresh.enabled {
+        let daemon_pool = pool.clone();
+        let daemon_config = config.background_services.usage_refresh.clone();
+        let daemon_notify = usage_refresh_notify.clone();
+        let daemon_shutdown = shutdown_token.clone();
+        background_tasks.spawn("usage-refresh", async move {
+            sync::usage_refresh::run_usage_refresh_daemon(daemon_pool, daemon_config, daemon_notify, daemon_shutdown).await;
+            Ok(())
+        });
+    }
+
     // Start analytics batcher if enabled
     let analytics_sender = if config.enable_analytics {
         let (batcher, sender) = request_logging::AnalyticsBatcher::new(pool.clone(), config.clone(), metrics_recorder);
+        let batcher = batcher.with_usage_refresh_notify(usage_refresh_notify.clone());
 
         let batcher_shutdown = shutdown_token.clone();
         background_tasks.spawn("analytics-batcher", async move {
@@ -2790,6 +2866,7 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
             None
         }
     };
+
     let task_state = tasks::TaskState {
         request_manager: request_manager.clone(),
         dwctl_pool: pool.clone(),
@@ -2817,6 +2894,7 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
         task_runner,
         is_leader,
         onwards_targets: initial_targets,
+        zdr_key_cache,
         onwards_sender,
         strict_mode: config.onwards.strict_mode,
         analytics_sender,
@@ -2826,6 +2904,7 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
         shutdown_token,
         drop_guard: Some(drop_guard),
         connections_encryption_key: encryption_key.clone(),
+        keystore,
         // Application::new_with_pool wires these once the onwards-
         // instance daemon row is registered. Kept Optional here so
         // tests that bypass that wiring still construct cleanly.
@@ -2959,8 +3038,18 @@ impl Application {
             }),
         );
         let step_manager = Arc::new(fusillade::PostgresResponseStepManager::new(fusillade_pools.clone()));
-        let response_store =
-            Arc::new(crate::inference::store::FusilladeResponseStore::new(request_manager.clone()).with_step_manager(step_manager.clone()));
+        // Build the ZDR keystore once and share it across the response store, the
+        // daemon processor, and background services (which install the response
+        // transformer). A misconfiguration is fatal.
+        let keystore = match config.keystore.as_ref() {
+            Some(c) => Some(crate::keystore::Keystore::from_config(c).map_err(|e| anyhow::anyhow!("failed to initialise keystore: {e}"))?),
+            None => None,
+        };
+        let response_store = Arc::new(
+            crate::inference::store::FusilladeResponseStore::new(request_manager.clone())
+                .with_step_manager(step_manager.clone())
+                .with_keystore(keystore.clone()),
+        );
 
         // Build the image normaliser ONCE — fail loud at startup if
         // `image_normalizer.enabled = true` but no backend is configured.
@@ -3033,6 +3122,7 @@ impl Application {
                 // GCS client / ADC signer init.
                 processor_builder = processor_builder.with_image_normalizer(image_normalizer.clone(), dispatch_ttl);
             }
+            processor_builder = processor_builder.with_keystore(keystore.clone());
             let processor = Arc::new(processor_builder);
             Some(
                 processor
@@ -3058,6 +3148,7 @@ impl Application {
             shared_config: shared_config.clone(),
             shutdown_token: shutdown_token.clone(),
             metrics_recorder: metrics_recorder.clone(),
+            keystore: keystore.clone(),
         })
         .await?;
 
@@ -3189,6 +3280,8 @@ impl Application {
             loop_config: multi_step_loop_config,
             image_normalizer: image_normalizer.clone(),
             image_normalizer_enabled: config.image_normalizer.enabled,
+            keystore: bg_services.keystore.clone(),
+            zdr_key_cache: bg_services.zdr_key_cache.clone(),
         };
 
         // Build onwards router from targets with body transform, response sanitization, and tool executor.
@@ -3231,6 +3324,7 @@ impl Application {
             .maybe_outlet_db(outlet_pools.clone())
             .limiters(limiters)
             .maybe_connections_encryption_key(bg_services.connections_encryption_key.clone())
+            .maybe_keystore(bg_services.keystore.clone())
             .response_store(response_store)
             .response_step_manager(bg_services.step_manager.clone())
             .image_normalizer(image_normalizer)

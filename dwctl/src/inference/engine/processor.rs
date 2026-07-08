@@ -35,7 +35,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use fusillade::request::{Canceled, Claimed, Request, RequestCompletionResult};
+use fusillade::request::{Canceled, Claimed, Failed, FailureReason, Request, RequestCompletionResult};
 use fusillade::{
     CancellationFuture, DefaultRequestProcessor, PoolProvider as FusilladePool, RequestProcessor, ReqwestHttpClient, ShouldRetry, Storage,
 };
@@ -89,6 +89,9 @@ where
     /// no state — declared as a field so the trait dispatch below has
     /// a stable receiver.
     pub default: DefaultRequestProcessor,
+    /// Encrypted key custody for ZDR flex bodies. `None` disables ZDR
+    /// decryption (bodies pass through unchanged).
+    pub keystore: Option<crate::keystore::Keystore>,
 }
 
 /// Resolve the tool set for a daemon-claimed request. Called once per
@@ -139,6 +142,7 @@ where
             // `config.image_normalizer.signing.dispatch_ttl()`.
             dispatch_ttl: std::time::Duration::from_secs(1800),
             default: DefaultRequestProcessor,
+            keystore: None,
         }
     }
 
@@ -152,6 +156,12 @@ where
     ) -> Self {
         self.image_normalizer = Some(normalizer);
         self.dispatch_ttl = ttl;
+        self
+    }
+
+    /// Wire in the keystore so ZDR request bodies are decrypted before dispatch.
+    pub fn with_keystore(mut self, keystore: Option<crate::keystore::Keystore>) -> Self {
+        self.keystore = keystore;
         self
     }
 
@@ -181,6 +191,144 @@ where
         should_retry: ShouldRetry,
         cancellation: CancellationFuture,
     ) -> fusillade::Result<RequestCompletionResult> {
+        // ZDR: the stored request body is a self-describing ciphertext envelope.
+        // Decrypt it here, before JIT signing and either dispatch branch, so the
+        // rest of the flow sees plaintext. The response is re-encrypted on its way
+        // back through the loopback layer.
+        if crate::inference::zdr::is_zdr_body(&request.data.body) {
+            let Some(keystore) = self.keystore.as_ref() else {
+                // A ZDR ciphertext was claimed but no keystore is configured, so the
+                // prompt can never be decrypted. Terminalize as a non-retriable
+                // failure (persist Failed, then return Ok(Failed)) rather than a bare
+                // Err, which would only log a task failure and leave the row stuck in
+                // `processing` ("running") until the batch window expires. The
+                // client-facing reason is deliberately generic - the real cause (a
+                // server misconfiguration) is logged for operators, never surfaced.
+                crate::background_error!(
+                    crate::metrics::errors::component::ZDR_DISPATCH,
+                    "keystore_missing",
+                    Error,
+                    request_id = %request.data.id.0,
+                    "ZDR request claimed but keystore is not configured; failing request"
+                );
+                let failed = Request {
+                    state: Failed {
+                        reason: FailureReason::RequestBuilderError {
+                            error: "Zero-data-retention request could not be processed".to_string(),
+                        },
+                        failed_at: chrono::Utc::now(),
+                        retry_attempt: request.state.retry_attempt,
+                        batch_expires_at: request.state.batch_expires_at,
+                        routed_model: request.data.model.clone(),
+                    },
+                    data: request.data,
+                };
+                storage.persist(&failed).await?;
+                return Ok(RequestCompletionResult::Failed(failed));
+            };
+            let key_id = crate::inference::zdr::key_id(&request.data.id.0, crate::inference::zdr::KeyKind::Request);
+            match keystore.get(&key_id).await {
+                Ok(Some(key)) => {
+                    match crate::inference::zdr::decrypt_body(&key, &request.data.body) {
+                        Ok(plaintext) => request.data.body = plaintext,
+                        Err(e) => {
+                            // Ciphertext present but undecryptable (corrupt envelope or
+                            // wrong wrap key) - never succeeds on retry. Terminalize as a
+                            // non-retriable failure instead of a bare Err that would strand
+                            // the row in `processing`. Client reason stays generic; the
+                            // crypto detail is logged for operators only.
+                            crate::background_error!(
+                                crate::metrics::errors::component::ZDR_DISPATCH,
+                                "decrypt_failed",
+                                Error,
+                                request_id = %request.data.id.0,
+                                error = %e,
+                                "ZDR request body could not be decrypted; failing request"
+                            );
+                            let failed = Request {
+                                state: Failed {
+                                    reason: FailureReason::RequestBuilderError {
+                                        error: "Zero-data-retention request could not be processed".to_string(),
+                                    },
+                                    failed_at: chrono::Utc::now(),
+                                    retry_attempt: request.state.retry_attempt,
+                                    batch_expires_at: request.state.batch_expires_at,
+                                    routed_model: request.data.model.clone(),
+                                },
+                                data: request.data,
+                            };
+                            storage.persist(&failed).await?;
+                            return Ok(RequestCompletionResult::Failed(failed));
+                        }
+                    }
+                    // TRANSITIONAL (dwctl ZDR): mark the dispatch so the loopback
+                    // analytics handler blanks the now-plaintext body instead of
+                    // logging it. fusillade forwards batch_metadata entries as
+                    // `x-fusillade-batch-<key>` headers, so this rides out as
+                    // `x-fusillade-batch-zdr: 1`; the outlet handler reads that.
+                    // Piggybacks the existing header channel to avoid a fusillade
+                    // API change - drop when reassembly moves into dwctl.
+                    request
+                        .data
+                        .batch_metadata
+                        .insert(crate::inference::zdr::ZDR_MARKER_KEY.to_string(), "1".to_string());
+                }
+                Ok(None) => {
+                    // Key expired/deleted before dispatch: the prompt is gone and
+                    // this request can never be processed. Terminalize it as a
+                    // non-retriable failure - persist the Failed state, then return
+                    // Ok(Failed) so the daemon records it as terminally failed.
+                    // Returning a bare Err would only log a task failure and leave
+                    // the row stuck in `processing` (shown as "running") until the
+                    // batch window eventually expires.
+                    let failed = Request {
+                        state: Failed {
+                            reason: FailureReason::RequestBuilderError {
+                                error: "ZDR request key expired before dispatch; cannot decrypt".to_string(),
+                            },
+                            failed_at: chrono::Utc::now(),
+                            retry_attempt: request.state.retry_attempt,
+                            batch_expires_at: request.state.batch_expires_at,
+                            routed_model: request.data.model.clone(),
+                        },
+                        data: request.data,
+                    };
+                    storage.persist(&failed).await?;
+                    return Ok(RequestCompletionResult::Failed(failed));
+                }
+                Err(e) => {
+                    // Keystore unreachable (transient - e.g. Redis restart). Return a
+                    // retriable failure so the daemon reschedules the still-`processing`
+                    // row back to `pending` and tries again, rather than a bare Err that
+                    // would strand it. Do NOT persist here: the daemon's retry path
+                    // re-pends the row itself, and a persisted Failed would look terminal
+                    // and lose the retry. Client reason stays generic; the infra detail
+                    // is logged for operators only.
+                    crate::background_error!(
+                        crate::metrics::errors::component::ZDR_DISPATCH,
+                        "keystore_unreachable",
+                        Warning,
+                        request_id = %request.data.id.0,
+                        error = %e,
+                        "ZDR keystore unreachable during dispatch; scheduling retry"
+                    );
+                    let failed = Request {
+                        state: Failed {
+                            reason: FailureReason::NetworkError {
+                                error: "Zero-data-retention request could not be processed".to_string(),
+                            },
+                            failed_at: chrono::Utc::now(),
+                            retry_attempt: request.state.retry_attempt,
+                            batch_expires_at: request.state.batch_expires_at,
+                            routed_model: request.data.model.clone(),
+                        },
+                        data: request.data,
+                    };
+                    return Ok(RequestCompletionResult::Failed(failed));
+                }
+            }
+        }
+
         // JIT signing: any `dw-img://{sha256}` token embedded in the body
         // (placed there by the file-ingest path) gets resolved to a fresh
         // short-lived signed URL right before dispatch. This means the

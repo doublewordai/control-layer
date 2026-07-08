@@ -267,6 +267,38 @@ enable_request_logging: true # Enable request/response logging to database
 # For arrays like model_sources, use environment-specific config files
 # (e.g., config.production.yaml) rather than env vars.
 
+# Zero-data-retention (ZDR) keystore.
+#
+# Holds the per-request keys that decrypt ZDR flex request/response bodies. The
+# bodies are stored encrypted in Postgres; the keys live here with a TTL, so a
+# body becomes permanently unreadable once its key is deleted (on retrieval) or
+# expires (crypto-shred). Absent (the default) means ZDR is off and flex bodies
+# are stored in plaintext as before. See zdr-flex-encryption-plan.md.
+#
+# REQUIRED to serve flex requests from zero-data-retention accounts
+# (users.zero_data_retention, synced per-key into memory): the flex body is
+# encrypted at rest with keys held here. If a ZDR account sends a flex request
+# while this section is absent, the request is REJECTED (500) rather than stored
+# in plaintext. Non-ZDR flex requests are unaffected. Realtime ZDR needs no
+# keystore - it is non-persistence (bodies are suppressed, not encrypted).
+#
+# Local dev: run `just redis-start`, then uncomment the block below.
+keystore:
+ # Redis holding the wrapped per-request keys (single instance, AOF on).
+ redis_url: "redis://localhost:6379"
+ # TTL applied to every stored key. Set it above the longest flex completion
+ # window plus a retrieval grace, or in-flight requests self-destruct before
+ # they are processed.
+ default_ttl_seconds: 7200
+ # Which wrap key seals new values; must be an id present in wrap_keys below.
+ current_wrap_key_id: "dev-1"
+ # Wrap keys by id (each passphrase is run through the KDF). In production
+ # these come from a Kubernetes secret; keep retired ids around for one TTL
+ # during rotation (see the plan's "Wrap-key rotation"). The dev value below
+ # is NOT a secret - never use it outside local dev.
+ wrap_keys:
+   dev-1: "local-dev-wrap-key-not-a-secret"
+
 # Batches API configuration
 batches:
   # Enable batches API endpoints (/files, /batches)
@@ -441,6 +473,20 @@ background_services:
     # Default: 300000 (5 min). Set to 0 to disable (not recommended).
     fallback_interval_milliseconds: 300000
 
+  # Usage-refresh daemon - incrementally folds new http_analytics rows into the
+  # user_model_usage_daily rollup. Woken in-process by the analytics batcher after each
+  # flush (no LISTEN/NOTIFY - emitter and consumer share the pod); the fallback tick only
+  # backstops a missed nudge or a restart. Cross-pod runs are deduped by an advisory lock.
+  usage_refresh:
+    enabled: true # Default: true
+    # Fallback tick (milliseconds). The batcher nudge drives refreshes under load; this only
+    # backstops missed nudges / drains after a restart. Cheap - a tick with no new rows no-ops.
+    # Default: 60000 (1 min). Set to 0 to disable.
+    fallback_interval_milliseconds: 60000
+    # Minimum spacing between refreshes (milliseconds): coalesces bursts of batcher nudges.
+    # Default: 30000 (30s).
+    min_interval_milliseconds: 30000
+
   # Probe scheduler - periodically checks inference endpoint health
   # When leader_election is enabled, only runs on the elected leader
   probe_scheduler:
@@ -458,6 +504,16 @@ background_services:
     claim_batch_size: 100 # Maximum number of requests to claim in each iteration
     default_model_concurrency: 10 # Default concurrent requests per model
     claim_interval_ms: 1000 # Milliseconds to sleep between claim iterations
+
+    # Split claim daemons (fusillade >= 20): batched and batchless (flex) rows
+    # are claimed by independent loops. All optional:
+    # batch_claim_size: 0            # Max rows per batch-claim iteration; 0 = inherit claim_batch_size
+    # batch_claim_batch_size: 4      # Max batches selected per model per iteration (spill-over pool)
+    # batch_claim_interval_ms: 0     # Batch-claim loop cadence; 0 = inherit claim_interval_ms
+    # batch_claim_require_live: false # Require an explicit `live` model_filters event to batch-claim;
+    #                                 # false treats no-event models (external providers) as live
+    # claim_ramp_exponent: 0.56      # Deadline-ramp curve: not-live batches become claimable within
+    #                                 # window_minutes^exponent minutes of deadline (~59m/24h, ~10m/1h)
 
     # Retry & Backoff Settings
     # All retry parameters are optional and default to fusillade's built-in defaults

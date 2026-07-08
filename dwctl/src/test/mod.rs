@@ -192,6 +192,125 @@ async fn wait_for_model(server: &TestServer, api_key: &str, alias: &str) {
     assert_eq!(status, 200, "Model should be available in onwards config after polling");
 }
 
+#[sqlx::test]
+async fn ai_models_lists_group_accessible_paid_models_without_credits(pool: PgPool) {
+    let mut config = crate::test::utils::create_test_config();
+    config.background_services.onwards_sync.enabled = true;
+
+    let app = crate::Application::new_with_pool(config, Some(pool.clone()), None)
+        .await
+        .expect("Failed to create application");
+    let (server, bg_services) = app.into_test_server();
+
+    let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
+    let admin_headers = add_auth_headers(&admin_user);
+
+    let regular_user = create_test_user(&pool, Role::StandardUser).await;
+    let regular_headers = add_auth_headers(&regular_user);
+
+    let group_response = server
+        .post("/admin/api/v1/groups")
+        .add_header(&admin_headers[0].0, &admin_headers[0].1)
+        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+        .json(&serde_json::json!({
+            "name": format!("zero-balance-models-{}", Uuid::new_v4()),
+            "description": "Models list access for zero-balance users"
+        }))
+        .await;
+    assert_eq!(group_response.status_code(), 201, "Failed to create group");
+    let group: GroupResponse = group_response.json();
+
+    let add_user_response = server
+        .post(&format!("/admin/api/v1/groups/{}/users/{}", group.id, regular_user.id))
+        .add_header(&admin_headers[0].0, &admin_headers[0].1)
+        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+        .await;
+    assert_eq!(add_user_response.status_code(), 204, "Failed to add user to group");
+
+    let endpoint_response = server
+        .post("/admin/api/v1/endpoints")
+        .add_header(&admin_headers[0].0, &admin_headers[0].1)
+        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+        .json(&serde_json::json!({
+            "name": format!("Zero Balance Endpoint {}", Uuid::new_v4()),
+            "url": "https://example.invalid/v1/",
+            "description": "Endpoint for zero-balance model list test"
+        }))
+        .await;
+    assert_eq!(endpoint_response.status_code(), 201, "Failed to create endpoint");
+    let endpoint: crate::api::models::inference_endpoints::InferenceEndpointResponse = endpoint_response.json();
+
+    let alias = format!("paid-model-visible-{}", Uuid::new_v4());
+    let deployment_response = server
+        .post("/admin/api/v1/models")
+        .add_header(&admin_headers[0].0, &admin_headers[0].1)
+        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+        .json(&serde_json::json!({
+            "type": "standard",
+            "model_name": "paid-model",
+            "alias": alias.clone(),
+            "description": "Paid model visible with zero credits",
+            "hosted_on": endpoint.id,
+            "tariffs": [{
+                "name": "realtime",
+                "input_price_per_token": "0.001",
+                "output_price_per_token": "0.001",
+                "api_key_purpose": "realtime"
+            }]
+        }))
+        .await;
+    assert_eq!(deployment_response.status_code(), 200, "Failed to create deployment");
+    let deployment: crate::api::models::deployments::DeployedModelResponse = deployment_response.json();
+
+    let add_deployment_response = server
+        .post(&format!("/admin/api/v1/groups/{}/models/{}", group.id, deployment.id))
+        .add_header(&admin_headers[0].0, &admin_headers[0].1)
+        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+        .await;
+    assert_eq!(add_deployment_response.status_code(), 204, "Failed to add deployment to group");
+
+    let api_key_response = server
+        .post(&format!("/admin/api/v1/users/{}/api-keys", regular_user.id))
+        .add_header(&regular_headers[0].0, &regular_headers[0].1)
+        .add_header(&regular_headers[1].0, &regular_headers[1].1)
+        .json(&serde_json::json!({
+            "name": "Zero Balance Realtime Key",
+            "purpose": "realtime"
+        }))
+        .await;
+    assert_eq!(api_key_response.status_code(), 201, "Failed to create API key");
+    let api_key: crate::api::models::api_keys::ApiKeyResponse = api_key_response.json();
+
+    let models_response = server
+        .get("/ai/v1/models")
+        .add_header("authorization", format!("Bearer {}", api_key.key))
+        .await;
+    assert_eq!(models_response.status_code(), 200);
+    let models: serde_json::Value = models_response.json();
+    assert!(
+        models["data"]
+            .as_array()
+            .is_some_and(|data| data.iter().any(|model| model["id"].as_str() == Some(alias.as_str()))),
+        "Models list should include group-accessible paid models even without credits: {models}"
+    );
+
+    bg_services.sync_onwards_config(&pool).await.expect("Failed to sync onwards config");
+
+    let completion_response = server
+        .post("/ai/v1/chat/completions")
+        .add_header("authorization", format!("Bearer {}", api_key.key))
+        .json(&serde_json::json!({
+            "model": alias.clone(),
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .await;
+    assert_eq!(
+        completion_response.status_code(),
+        404,
+        "Zero-credit key should remain absent from the dispatch target pool"
+    );
+}
+
 async fn assert_usage_recorded(fixture: &StreamingFixture, expected_uri: &str, prompt_tokens: i64, completion_tokens: i64) {
     let mut tries = 0;
     let usage_tx = loop {
@@ -815,6 +934,95 @@ async fn test_request_logging_enabled(pool: PgPool) {
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     };
     assert_eq!(result.len(), 1, "Request should be logged after async write-through completes");
+}
+
+/// TRANSITIONAL (dwctl ZDR): the analytics logger (outlet-postgres
+/// `PostgresHandler`), once wrapped by `ZdrBodyScrubber` the way `lib.rs` wires
+/// it, must write NULL bodies for ZDR-marked requests while logging ordinary
+/// ones normally. Drives the handler directly against the real outlet tables so
+/// the assertion is at the DB layer, no Redis or proxy needed. Remove with
+/// `ZdrBodyScrubber`.
+#[sqlx::test]
+#[test_log::test]
+async fn test_outlet_suppresses_zdr_bodies(pool: PgPool) {
+    use bytes::Bytes;
+    use outlet::{RequestData, RequestHandler, ResponseData};
+    use std::collections::HashMap;
+    use std::time::{Duration, SystemTime};
+
+    // Create the outlet logging tables (http_requests / http_responses). Apply
+    // the DDL directly rather than via `.run()`: `#[sqlx::test]` already ran
+    // dwctl's migrations into this database's shared `_sqlx_migrations`, and
+    // outlet's migrator would reject that unknown history (in production outlet
+    // gets its own schema/DB with its own migration table).
+    for migration in outlet_postgres::migrator().iter() {
+        sqlx::raw_sql(migration.sql.as_ref())
+            .execute(&pool)
+            .await
+            .expect("apply outlet migration");
+    }
+
+    // Real analytics handler wrapped in the scrubber, mirroring lib.rs wiring.
+    let handler =
+        outlet_postgres::PostgresHandler::<DbPools, serde_json::Value, serde_json::Value>::from_pool_provider(DbPools::new(pool.clone()))
+            .await
+            .expect("build PostgresHandler");
+    let handler = crate::inference::engine::outlet_handler::ZdrBodyScrubber::new(handler);
+
+    fn request(correlation_id: u64, zdr: bool) -> RequestData {
+        let mut headers = HashMap::new();
+        if zdr {
+            headers.insert(crate::inference::zdr::ZDR_MARKER_HEADER.to_string(), vec![Bytes::from_static(b"1")]);
+        }
+        RequestData {
+            correlation_id,
+            timestamp: SystemTime::now(),
+            method: axum::http::Method::POST,
+            uri: "/ai/v1/chat/completions".parse().unwrap(),
+            headers,
+            body: Some(Bytes::from_static(br#"{"secret":"prompt"}"#)),
+            trace_id: None,
+            span_id: None,
+        }
+    }
+    fn response(correlation_id: u64) -> ResponseData {
+        ResponseData {
+            correlation_id,
+            timestamp: SystemTime::now(),
+            status: axum::http::StatusCode::OK,
+            headers: HashMap::new(),
+            body: Some(Bytes::from_static(br#"{"secret":"reply"}"#)),
+            duration_to_first_byte: Duration::from_millis(1),
+            duration: Duration::from_millis(2),
+        }
+    }
+
+    // ZDR-marked (correlation_id 1): bodies must be suppressed.
+    handler.handle_request(request(1, true)).await;
+    handler.handle_response(request(1, true), response(1)).await;
+    // Ordinary (correlation_id 2): bodies logged as normal.
+    handler.handle_request(request(2, false)).await;
+    handler.handle_response(request(2, false), response(2)).await;
+
+    let body_of = |table: &str, id: i64| {
+        let sql = format!("SELECT body FROM {table} WHERE correlation_id = $1");
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, Option<serde_json::Value>>(&sql)
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .expect("query body")
+        }
+    };
+
+    assert!(body_of("http_requests", 1).await.is_none(), "ZDR request body must not be logged");
+    assert!(body_of("http_responses", 1).await.is_none(), "ZDR response body must not be logged");
+    assert!(body_of("http_requests", 2).await.is_some(), "non-ZDR request body should be logged");
+    assert!(
+        body_of("http_responses", 2).await.is_some(),
+        "non-ZDR response body should be logged"
+    );
 }
 
 #[sqlx::test]

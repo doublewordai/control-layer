@@ -1,5 +1,50 @@
 # Changelog
 
+## [8.73.0](https://github.com/doublewordai/control-layer/compare/v8.72.1...v8.73.0) (2026-07-08)
+
+
+### Features
+
+* analytics batcher notification for daily usage aggregations ([#1234](https://github.com/doublewordai/control-layer/issues/1234)) ([5eb8918](https://github.com/doublewordai/control-layer/commit/5eb891889198eb629c58d1dfe1a75341337aca37))
+* enable automatic prefix caching with top level cache control ma… ([#1239](https://github.com/doublewordai/control-layer/issues/1239)) ([7610bec](https://github.com/doublewordai/control-layer/commit/7610bec3d80f7de8f4cc4da8d5a93c62b6068a51))
+
+## [8.72.1](https://github.com/doublewordai/control-layer/compare/v8.72.0...v8.72.1) (2026-07-08)
+
+
+### Bug Fixes
+
+* bump onwards to 0.34.5 ([#1236](https://github.com/doublewordai/control-layer/issues/1236)) ([a7e11d4](https://github.com/doublewordai/control-layer/commit/a7e11d47e70472b0b208152f41eb7b1cf4129c81))
+* classify unsupported response payloads as non-retryable ([#1233](https://github.com/doublewordai/control-layer/issues/1233)) ([b454389](https://github.com/doublewordai/control-layer/commit/b454389ca6de0648a2273d386acdc92c2639eb40))
+* list accessible models without credit filtering ([#1237](https://github.com/doublewordai/control-layer/issues/1237)) ([0ea2834](https://github.com/doublewordai/control-layer/commit/0ea28343c5a1de840fcfd69e6b773975f7ad16e0))
+
+## [8.72.0](https://github.com/doublewordai/control-layer/compare/v8.71.0...v8.72.0) (2026-07-07)
+
+
+### Features
+
+* fusillade 20.0.0 ([#1231](https://github.com/doublewordai/control-layer/issues/1231)) ([1cac7ce](https://github.com/doublewordai/control-layer/commit/1cac7ce2c365d0d6e721d484914adba067f64fe0))
+
+## [8.71.0](https://github.com/doublewordai/control-layer/compare/v8.70.3...v8.71.0) (2026-07-06)
+
+
+### Features
+
+* zero-data-retention for flex (encryption) and realtime (non-persistence) ([#1218](https://github.com/doublewordai/control-layer/issues/1218)) ([7248f88](https://github.com/doublewordai/control-layer/commit/7248f880ab02228fef2ef58e17e89b294d873e11))
+
+## [8.70.3](https://github.com/doublewordai/control-layer/compare/v8.70.2...v8.70.3) (2026-07-06)
+
+
+### Bug Fixes
+
+* **deps:** bump onwards to 0.34.3 ([#1227](https://github.com/doublewordai/control-layer/issues/1227)) ([1c93378](https://github.com/doublewordai/control-layer/commit/1c93378fde99a139db62a1b2fa37523eab2119a3))
+
+## [8.70.2](https://github.com/doublewordai/control-layer/compare/v8.70.1...v8.70.2) (2026-07-06)
+
+
+### Bug Fixes
+
+* some sdks inject extra blocks that invalidate cache, remove em ([#1224](https://github.com/doublewordai/control-layer/issues/1224)) ([064dbf7](https://github.com/doublewordai/control-layer/commit/064dbf70c5876e968310bead4c792f63518beafd))
+
 ## [8.70.1](https://github.com/doublewordai/control-layer/compare/v8.70.0...v8.70.1) (2026-07-03)
 
 
