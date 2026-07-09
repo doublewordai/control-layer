@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.75.0](https://github.com/doublewordai/control-layer/compare/v8.74.1...v8.75.0) (2026-07-09)
+
+
+### Features
+
+* cap unverified users' upload volume instead of throttling throughput ([#1204](https://github.com/doublewordai/control-layer/issues/1204)) ([eaa7170](https://github.com/doublewordai/control-layer/commit/eaa717035dfecddd282b51ec8faaab7eeafa9875))
+
 ## [8.74.1](https://github.com/doublewordai/control-layer/compare/v8.74.0...v8.74.1) (2026-07-09)
 
 
