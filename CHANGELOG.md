@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.75.1](https://github.com/doublewordai/control-layer/compare/v8.75.0...v8.75.1) (2026-07-09)
+
+
+### Bug Fixes
+
+* dont flatten asst and tool result blocks in anthropic adapter ([#1247](https://github.com/doublewordai/control-layer/issues/1247)) ([9ec3d15](https://github.com/doublewordai/control-layer/commit/9ec3d1503c0f1489b2d6b236e74db562f2d2a92d))
+
 ## [8.75.0](https://github.com/doublewordai/control-layer/compare/v8.74.1...v8.75.0) (2026-07-09)
 
 
