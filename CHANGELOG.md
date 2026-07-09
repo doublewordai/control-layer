@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.76.0](https://github.com/doublewordai/control-layer/compare/v8.75.1...v8.76.0) (2026-07-09)
+
+
+### Features
+
+* make user balances a synchronously-maintained read model ([#1238](https://github.com/doublewordai/control-layer/issues/1238)) ([64483c0](https://github.com/doublewordai/control-layer/commit/64483c01b998cdbdd20abdab4ae37a2eba8f327a))
+
 ## [8.75.1](https://github.com/doublewordai/control-layer/compare/v8.75.0...v8.75.1) (2026-07-09)
 
 
