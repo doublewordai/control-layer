@@ -127,16 +127,31 @@ fn convert_message(m: &InputMessage, out: &mut Vec<Value>) -> Result<(), Transla
 }
 
 /// Assistant turn: text -> `content`, `tool_use` blocks -> `tool_calls`.
+///
+/// A `cache_control` marker on an assistant text block is PRESERVED: the SDK advances a breakpoint
+/// onto recent turns, so dropping it here (as we used to) meant the growing conversation never
+/// cached. We emit the marked message as a single-text-part array carrying the marker (the same
+/// shape a native OpenAI-ingress request may send; the cache layer reads it, then strips it before
+/// the upstream call). A single text part is deliberate: with the marker stripped it hashes
+/// identically to the plain-string form, so the prefix stays stable as the marker moves off this
+/// message on the next turn — the read chain keeps matching.
 fn convert_assistant(content: &Content) -> Value {
     let mut text = String::new();
     let mut tool_calls: Vec<Value> = Vec::new();
+    // The last `cache_control` seen on a text block (the breakpoint to preserve).
+    let mut marker: Option<Value> = None;
 
     match content {
         Content::Text(t) => text.push_str(t),
         Content::Blocks(blocks) => {
             for b in blocks {
                 match b {
-                    ContentBlock::Text { text: t, .. } => text.push_str(t),
+                    ContentBlock::Text { text: t, cache_control } => {
+                        text.push_str(t);
+                        if let Some(cc) = cache_control {
+                            marker = Some(cc.clone());
+                        }
+                    }
                     ContentBlock::ToolUse { id, name, input, .. } => {
                         tool_calls.push(json!({
                             "id": id,
@@ -159,6 +174,8 @@ fn convert_assistant(content: &Content) -> Value {
     // OpenAI permits null content when tool_calls are present.
     if text.is_empty() {
         msg.insert("content".into(), Value::Null);
+    } else if let Some(cc) = marker {
+        msg.insert("content".into(), json!([{ "type": "text", "text": text, "cache_control": cc }]));
     } else {
         msg.insert("content".into(), json!(text));
     }
@@ -196,11 +213,26 @@ fn convert_user(content: &Content, out: &mut Vec<Value>) {
                         }
                         user_parts.push(part);
                     }
-                    ContentBlock::ToolResult { tool_use_id, content, .. } => {
+                    ContentBlock::ToolResult {
+                        tool_use_id,
+                        content,
+                        cache_control,
+                        ..
+                    } => {
+                        // In an agent loop the newest block before a model call is usually the
+                        // tool_result, so this is where the SDK's advancing breakpoint most often
+                        // lands. Preserve a marker as a single-text-part array (same rationale as
+                        // convert_assistant: stripped, it hashes like the plain string, so the read
+                        // chain stays stable as the marker advances). Unmarked → plain string, as before.
+                        let result_text = tool_result_to_text(content);
+                        let content_val = match cache_control {
+                            Some(cc) => json!([{ "type": "text", "text": result_text, "cache_control": cc }]),
+                            None => json!(result_text),
+                        };
                         tool_messages.push(json!({
                             "role": "tool",
                             "tool_call_id": tool_use_id,
-                            "content": tool_result_to_text(content),
+                            "content": content_val,
                         }));
                     }
                     _ => {}
@@ -330,5 +362,68 @@ mod tests {
         .unwrap();
         let out = to_chat_completions(req, false).unwrap();
         assert!(out.get("cache_control").is_none(), "caching disabled → top-level marker dropped");
+    }
+
+    #[test]
+    fn assistant_cache_control_preserved_as_array_content() {
+        // An advancing marker on an assistant text block must survive translation (it used to be
+        // flattened away), carried on a single text part so the cache layer can read it.
+        let out = translate(json!({
+            "model": "m", "max_tokens": 16,
+            "messages": [
+                { "role": "user", "content": "hi" },
+                { "role": "assistant", "content": [
+                    { "type": "text", "text": "let me think", "cache_control": { "type": "ephemeral" } }
+                ]}
+            ]
+        }));
+        let asst = &out["messages"][1];
+        assert_eq!(asst["role"], "assistant");
+        assert_eq!(asst["content"][0]["type"], "text");
+        assert_eq!(asst["content"][0]["text"], "let me think");
+        assert_eq!(asst["content"][0]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn assistant_without_marker_stays_string() {
+        // No marker → byte-identical to today (plain string content), so unmarked turns are untouched.
+        let out = translate(json!({
+            "model": "m", "max_tokens": 16,
+            "messages": [ { "role": "assistant", "content": [ { "type": "text", "text": "plain" } ] } ]
+        }));
+        assert_eq!(out["messages"][0]["content"], "plain");
+    }
+
+    #[test]
+    fn tool_result_cache_control_preserved_as_array_content() {
+        // The agent-loop case: the marker rides the tool_result (the newest block before a model
+        // call). It must survive onto the translated tool message.
+        let out = translate(json!({
+            "model": "m", "max_tokens": 16,
+            "messages": [
+                { "role": "assistant", "content": [ { "type": "tool_use", "id": "tu_1", "name": "wx", "input": {} } ] },
+                { "role": "user", "content": [
+                    { "type": "tool_result", "tool_use_id": "tu_1", "content": "sunny",
+                      "cache_control": { "type": "ephemeral", "ttl": "1h" } }
+                ]}
+            ]
+        }));
+        let tool = &out["messages"][1];
+        assert_eq!(tool["role"], "tool");
+        assert_eq!(tool["tool_call_id"], "tu_1");
+        assert_eq!(tool["content"][0]["text"], "sunny");
+        assert_eq!(tool["content"][0]["cache_control"]["ttl"], "1h");
+    }
+
+    #[test]
+    fn tool_result_without_marker_stays_string() {
+        let out = translate(json!({
+            "model": "m", "max_tokens": 16,
+            "messages": [
+                { "role": "assistant", "content": [ { "type": "tool_use", "id": "tu_1", "name": "wx", "input": {} } ] },
+                { "role": "user", "content": [ { "type": "tool_result", "tool_use_id": "tu_1", "content": "sunny" } ] }
+            ]
+        }));
+        assert_eq!(out["messages"][1]["content"], "sunny", "unmarked tool_result stays a plain string");
     }
 }
