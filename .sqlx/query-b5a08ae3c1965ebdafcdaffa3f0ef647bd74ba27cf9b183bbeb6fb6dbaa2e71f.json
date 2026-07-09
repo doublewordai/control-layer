@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT\n                u.user_id as \"user_id!\",\n                COALESCE(c.balance, 0) as \"balance!\"\n            FROM unnest($1::uuid[]) AS u(user_id)\n            LEFT JOIN user_balance_checkpoints c ON c.user_id = u.user_id\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "user_id!",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "balance!",
+        "type_info": "Numeric"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "UuidArray"
+      ]
+    },
+    "nullable": [
+      null,
+      null
+    ]
+  },
+  "hash": "b5a08ae3c1965ebdafcdaffa3f0ef647bd74ba27cf9b183bbeb6fb6dbaa2e71f"
+}

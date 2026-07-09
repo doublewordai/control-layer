@@ -34,7 +34,7 @@
 //!   reducing from O(N) queries to O(1) per batch.
 
 use crate::config::{CachePricingConfig, Config, ONWARDS_CONFIG_CHANGED_CHANNEL};
-use crate::db::handlers::Credits;
+
 use crate::db::models::api_keys::ApiKeyPurpose;
 use crate::metrics::MetricsRecorder;
 use crate::metrics::errors::component::ANALYTICS_BATCHER;
@@ -46,8 +46,7 @@ use rust_decimal::prelude::ToPrimitive;
 use sqlx::PgPool;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
-use tokio::sync::{Notify, RwLock, mpsc};
+use tokio::sync::{Notify, mpsc};
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, error, info, info_span, trace, warn};
 use uuid::Uuid;
@@ -307,11 +306,6 @@ where
     batch_size: usize,
     max_retries: u32,
     retry_base_delay: std::time::Duration,
-    /// Global rate limiter for onwards sync notifications.
-    /// Tracks the last time we triggered an onwards sync to prevent storms.
-    last_onwards_sync_notification: Arc<RwLock<Instant>>,
-    /// Minimum interval between onwards sync notifications (from config).
-    onwards_sync_notification_interval: Duration,
     /// In-process wake signal for the usage-refresh daemon. Nudged after every
     /// successful batch write so the daemon folds the just-written rows into
     /// `user_model_usage_daily`. `None` disables the nudge (tests, refresh daemon off).
@@ -340,7 +334,6 @@ where
         let batch_size = config.analytics.batch_size;
         let max_retries = config.analytics.max_retries;
         let retry_base_delay = std::time::Duration::from_millis(config.analytics.retry_base_delay_ms);
-        let onwards_sync_notification_interval = Duration::from_millis(config.analytics.balance_notification_interval_milliseconds);
 
         let batcher = Self {
             pool,
@@ -349,12 +342,6 @@ where
             batch_size,
             max_retries,
             retry_base_delay,
-            last_onwards_sync_notification: Arc::new(RwLock::new(
-                Instant::now()
-                    .checked_sub(onwards_sync_notification_interval)
-                    .unwrap_or_else(Instant::now),
-            )),
-            onwards_sync_notification_interval,
             usage_refresh_notify: None,
         };
 
@@ -1199,15 +1186,21 @@ where
             .map(|(i, sid)| (sid.clone(), (i, user_ids[i], amounts[i], models[i].clone())))
             .collect();
 
-        // Batch INSERT with RETURNING source_id to know exactly which were inserted
-        let inserted_rows = sqlx::query_scalar!(
+        // Batch INSERT, folding into the read model in the same transaction.
+        // Batched rows are born is_aggregated = true (aggregated below). The
+        // RETURNING clause reports exactly which rows were inserted, so under
+        // retries (ON CONFLICT DO NOTHING) already-inserted rows are neither
+        // re-folded nor re-aggregated.
+        let inserted_rows = sqlx::query!(
             r#"
-            INSERT INTO credits_transactions (user_id, transaction_type, amount, source_id, description, fusillade_batch_id, api_key_id)
-            SELECT * FROM UNNEST(
+            INSERT INTO credits_transactions (user_id, transaction_type, amount, source_id, description, fusillade_batch_id, api_key_id, is_aggregated)
+            SELECT u.user_id, u.transaction_type, u.amount, u.source_id, u.description, u.fusillade_batch_id, u.api_key_id,
+                   u.fusillade_batch_id IS NOT NULL
+            FROM UNNEST(
                 $1::uuid[], $2::text[], $3::numeric[], $4::text[], $5::text[], $6::uuid[], $7::uuid[]
-            )
+            ) AS u(user_id, transaction_type, amount, source_id, description, fusillade_batch_id, api_key_id)
             ON CONFLICT (source_id) DO NOTHING
-            RETURNING source_id
+            RETURNING source_id, user_id, amount, seq, created_at, fusillade_batch_id
             "#,
             &user_ids,
             &vec!["usage".to_string(); user_ids.len()],
@@ -1223,39 +1216,143 @@ where
         let inserted_count = inserted_rows.len() as u64;
         let duplicates = expected_count.saturating_sub(inserted_count);
 
-        // Collect unique user IDs that had transactions inserted
-        let inserted_user_ids: Vec<Uuid> = inserted_rows
-            .iter()
-            .filter_map(|source_id| source_id_to_record.get(source_id).map(|(_, uid, _, _)| *uid))
-            .collect::<std::collections::HashSet<_>>()
-            .into_iter()
-            .collect();
+        // Fold the inserted usage amounts into the user_balance_checkpoints
+        // read model: one grouped update per distinct user per flush (NOT per
+        // request). Usage is always a debit. checkpoint_seq advances so old
+        // binaries reading checkpoint + delta stay exact during rolling
+        // deploys.
+        struct UserFold {
+            delta: Decimal,
+            max_seq: i64,
+        }
+        let mut folds: HashMap<Uuid, UserFold> = HashMap::new();
 
-        // Query balances AFTER insert, with probabilistic checkpoint refresh (1 in 1000)
-        // Notify onwards for any user with balance <= 0 (rate-limited to prevent storms)
-        if !inserted_user_ids.is_empty() {
-            let balances = {
-                let mut credits = Credits::new(&mut *tx);
-                credits
-                    .get_users_balances_bulk(&inserted_user_ids, Some(1000))
-                    .await
-                    .map_err(|e| sqlx::Error::Protocol(format!("Failed to get user balances: {e}")))?
-            };
+        struct BatchFold {
+            user_id: Uuid,
+            total: Decimal,
+            count: i32,
+            max_seq: i64,
+            min_created_at: chrono::DateTime<chrono::Utc>,
+        }
+        let mut batch_folds: HashMap<Uuid, BatchFold> = HashMap::new();
 
-            // Notify onwards if any user has depleted balance (globally rate-limited)
-            let depleted_users: Vec<Uuid> = balances
-                .iter()
-                .filter_map(|(user_id, balance)| if *balance <= Decimal::ZERO { Some(*user_id) } else { None })
-                .collect();
+        for row in &inserted_rows {
+            let fold = folds.entry(row.user_id).or_insert(UserFold {
+                delta: Decimal::ZERO,
+                max_seq: 0,
+            });
+            fold.delta -= row.amount;
+            fold.max_seq = fold.max_seq.max(row.seq);
 
-            if !depleted_users.is_empty() && self.should_notify_onwards_sync().await {
-                self.notify_onwards_sync(&mut *tx, &depleted_users).await?;
+            if let Some(batch_id) = row.fusillade_batch_id {
+                let bf = batch_folds.entry(batch_id).or_insert(BatchFold {
+                    user_id: row.user_id,
+                    total: Decimal::ZERO,
+                    count: 0,
+                    max_seq: 0,
+                    min_created_at: row.created_at,
+                });
+                bf.total += row.amount;
+                bf.count += 1;
+                bf.max_seq = bf.max_seq.max(row.seq);
+                bf.min_created_at = bf.min_created_at.min(row.created_at);
             }
         }
 
+        let mut crossed_down: Vec<Uuid> = Vec::new();
+        if !folds.is_empty() {
+            // Sorted by user id so concurrent flushes from other replicas
+            // lock overlapping user sets in the same order (deadlock
+            // avoidance).
+            let mut fold_users: Vec<Uuid> = folds.keys().copied().collect();
+            fold_users.sort_unstable();
+            let fold_seqs: Vec<i64> = fold_users.iter().map(|u| folds[u].max_seq).collect();
+            let fold_deltas: Vec<Decimal> = fold_users.iter().map(|u| folds[u].delta).collect();
+
+            let updated = sqlx::query!(
+                r#"
+                INSERT INTO user_balance_checkpoints (user_id, checkpoint_seq, balance)
+                SELECT u.user_id, u.checkpoint_seq, u.delta
+                FROM UNNEST($1::uuid[], $2::bigint[], $3::numeric[]) AS u(user_id, checkpoint_seq, delta)
+                ON CONFLICT (user_id) DO UPDATE SET
+                    balance = user_balance_checkpoints.balance + EXCLUDED.balance,
+                    checkpoint_seq = GREATEST(user_balance_checkpoints.checkpoint_seq, EXCLUDED.checkpoint_seq),
+                    updated_at = NOW()
+                RETURNING user_id, balance
+                "#,
+                &fold_users,
+                &fold_seqs,
+                &fold_deltas,
+            )
+            .fetch_all(&mut **tx)
+            .await?;
+
+            // Usage only debits, so the only crossing possible here is downward.
+            for row in &updated {
+                let old_balance = row.balance - folds[&row.user_id].delta;
+                if old_balance > Decimal::ZERO && row.balance <= Decimal::ZERO {
+                    crossed_down.push(row.user_id);
+                }
+            }
+        }
+
+        // Notify onwards to re-evaluate key eligibility. Edge-triggered (a
+        // user fires this once per depletion, not on every flush while
+        // negative), so the resulting full reloads are rare - one notify
+        // covers all crossings in this flush. pg_notify is transactional, so
+        // nothing fires if the flush aborts.
+        if !crossed_down.is_empty() {
+            let epoch_micros = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_micros();
+            let payload = format!("credits_transactions:{}", epoch_micros);
+            sqlx::query("SELECT pg_notify($1, $2)")
+                .bind(ONWARDS_CONFIG_CHANGED_CHANNEL)
+                .bind(&payload)
+                .execute(&mut **tx)
+                .await?;
+            counter!("dwctl_balance_crossings_total", "direction" => "down").increment(crossed_down.len() as u64);
+        }
+
+        // Aggregate this flush's batched rows into batch_aggregates (the
+        // grouped view the transactions UI reads). Sorted for the same
+        // deadlock-avoidance reason as above.
+        if !batch_folds.is_empty() {
+            let mut batch_ids: Vec<Uuid> = batch_folds.keys().copied().collect();
+            batch_ids.sort_unstable();
+            let batch_users: Vec<Uuid> = batch_ids.iter().map(|b| batch_folds[b].user_id).collect();
+            let totals: Vec<Decimal> = batch_ids.iter().map(|b| batch_folds[b].total).collect();
+            let counts: Vec<i32> = batch_ids.iter().map(|b| batch_folds[b].count).collect();
+            let batch_seqs: Vec<i64> = batch_ids.iter().map(|b| batch_folds[b].max_seq).collect();
+            let created_ats: Vec<chrono::DateTime<chrono::Utc>> = batch_ids.iter().map(|b| batch_folds[b].min_created_at).collect();
+
+            sqlx::query!(
+                r#"
+                INSERT INTO batch_aggregates (fusillade_batch_id, user_id, total_amount, transaction_count, max_seq, created_at, updated_at)
+                SELECT b.batch_id, b.user_id, b.total, b.cnt, b.max_seq, b.created_at, NOW()
+                FROM UNNEST($1::uuid[], $2::uuid[], $3::numeric[], $4::int[], $5::bigint[], $6::timestamptz[])
+                    AS b(batch_id, user_id, total, cnt, max_seq, created_at)
+                ON CONFLICT (fusillade_batch_id) DO UPDATE SET
+                    total_amount = batch_aggregates.total_amount + EXCLUDED.total_amount,
+                    transaction_count = batch_aggregates.transaction_count + EXCLUDED.transaction_count,
+                    max_seq = GREATEST(batch_aggregates.max_seq, EXCLUDED.max_seq),
+                    updated_at = NOW()
+                "#,
+                &batch_ids,
+                &batch_users,
+                &totals,
+                &counts,
+                &batch_seqs,
+                &created_ats,
+            )
+            .execute(&mut **tx)
+            .await?;
+        }
+
         // Record metrics only for successfully inserted credit transactions
-        for source_id in &inserted_rows {
-            if let Some((_, user_id, amount, model)) = source_id_to_record.get(source_id) {
+        for row in &inserted_rows {
+            if let Some((_, user_id, amount, model)) = source_id_to_record.get(&row.source_id) {
                 let cents = (amount.to_f64().unwrap_or(0.0) * 100.0).round() as u64;
                 counter!(
                     "dwctl_credits_deducted_total",
@@ -1272,52 +1369,6 @@ where
             "Batch inserted credit transactions"
         );
         Ok(duplicates)
-    }
-
-    /// Check if we should trigger an onwards sync notification (globally rate-limited).
-    ///
-    /// The onwards sync reloads ALL user data, so we rate-limit globally rather than per-user.
-    /// When users have depleted balances and continue making requests, we would otherwise
-    /// trigger a sync on every batch. This rate limiter ensures we only sync once per interval.
-    async fn should_notify_onwards_sync(&self) -> bool {
-        let now = Instant::now();
-        let mut last_notification = self.last_onwards_sync_notification.write().await;
-
-        if now.duration_since(*last_notification) >= self.onwards_sync_notification_interval {
-            *last_notification = now;
-            counter!("dwctl_onwards_sync_notifications_total", "action" => "allowed").increment(1);
-            true
-        } else {
-            trace!("Rate limiting onwards sync notification");
-            counter!("dwctl_onwards_sync_notifications_total", "action" => "rate_limited").increment(1);
-            false
-        }
-    }
-
-    /// Send pg_notify to trigger onwards sync when users have depleted balances.
-    /// Format: "credits_transactions:{epoch_micros}" to match other triggers and enable lag metrics.
-    async fn notify_onwards_sync(&self, conn: &mut sqlx::PgConnection, depleted_users: &[Uuid]) -> Result<(), sqlx::Error> {
-        debug!(
-            depleted_count = depleted_users.len(),
-            "Depleted balances detected, notifying onwards sync"
-        );
-
-        let epoch_micros = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_micros();
-
-        let payload = format!("credits_transactions:{}", epoch_micros);
-
-        sqlx::query("SELECT pg_notify($1, $2)")
-            .bind(ONWARDS_CONFIG_CHANGED_CHANNEL)
-            .bind(&payload)
-            .execute(conn)
-            .await?;
-
-        counter!("dwctl_onwards_sync_notifications_total", "action" => "sent").increment(1);
-
-        Ok(())
     }
 
     /// Convert enriched record back to HttpAnalyticsRow for metrics recording.
@@ -2503,13 +2554,13 @@ mod integration_tests {
 
     #[sqlx::test]
     #[test_log::test]
-    async fn test_batcher_rate_limits_balance_notifications(pool: PgPool) {
+    async fn test_flush_emits_single_notification_for_multiple_depletions(pool: PgPool) {
         use sqlx::postgres::PgListener;
         use std::time::Duration;
         use tokio::time::timeout;
 
         // Setup: Create model with tariff
-        let model_id = create_test_model(&pool, "gpt-4-rate-limit-test").await;
+        let model_id = create_test_model(&pool, "gpt-4-multi-notify-test").await;
         let input_price = Decimal::from_str("0.00001").unwrap();
         let output_price = Decimal::from_str("0.00003").unwrap();
         setup_tariff(&pool, model_id, input_price, output_price, ApiKeyPurpose::Realtime).await;
@@ -2534,39 +2585,28 @@ mod integration_tests {
         }
 
         // Create 3 records that will all deplete balances (cost = $0.025 each)
-        let record1 = create_raw_record("gpt-4-rate-limit-test", Some(api_key1), 1000, 500);
-        let record2 = create_raw_record("gpt-4-rate-limit-test", Some(api_key2), 1000, 500);
-        let record3 = create_raw_record("gpt-4-rate-limit-test", Some(api_key3), 1000, 500);
+        let record1 = create_raw_record("gpt-4-multi-notify-test", Some(api_key1), 1000, 500);
+        let record2 = create_raw_record("gpt-4-multi-notify-test", Some(api_key2), 1000, 500);
+        let record3 = create_raw_record("gpt-4-multi-notify-test", Some(api_key3), 1000, 500);
 
-        // Create custom config with 100ms rate limiting interval for fast testing
-        let mut config = crate::test::utils::create_test_config();
-        config.analytics.balance_notification_interval_milliseconds = 100;
+        // One flush folds all three depletions: one reload notification
+        // covers them all (edge-triggered crossings, so no storm to limit).
+        run_batcher_with_records(&pool, vec![record1, record2, record3]).await;
 
-        // Run batcher with all 3 records - should trigger 3 depletions but only 1 notification
-        // due to rate limiting (interval is 100ms)
-        let (batcher, sender) = AnalyticsBatcher::<crate::metrics::GenAiMetrics>::new(pool.clone(), config, None);
-        for record in [record1, record2, record3] {
-            sender.send(record).await.unwrap();
-        }
-        drop(sender);
-        let shutdown = tokio_util::sync::CancellationToken::new();
-        batcher.run(shutdown).await;
-
-        // Should receive ONLY ONE notification despite 3 balance depletions
-        let first_notification = timeout(Duration::from_secs(2), listener.recv())
+        let notification = timeout(Duration::from_secs(2), listener.recv())
             .await
-            .expect("Timeout waiting for first balance depletion notification")
+            .expect("Timeout waiting for depletion notification")
             .expect("Failed to receive notification");
-
-        assert_eq!(first_notification.channel(), "auth_config_changed");
-        println!("Received first notification: {}", first_notification.payload());
-
-        // Try to receive a second notification - should timeout because of rate limiting
-        let second_notification = timeout(Duration::from_millis(50), listener.recv()).await;
+        assert_eq!(notification.channel(), "auth_config_changed");
         assert!(
-            second_notification.is_err(),
-            "Should NOT receive second notification due to rate limiting (interval is 100ms, we only waited 50ms)"
+            notification.payload().starts_with("credits_transactions:"),
+            "Expected payload to start with 'credits_transactions:', got: {}",
+            notification.payload()
         );
+
+        // No further notifications: the three crossings shared one notify.
+        let second = timeout(Duration::from_millis(100), listener.recv()).await;
+        assert!(second.is_err(), "Expected exactly one notification for the flush");
 
         // Verify all 3 users have negative balances
         let mut conn = pool.acquire().await.unwrap();
@@ -2579,7 +2619,5 @@ mod integration_tests {
         assert!(balance1 < Decimal::ZERO, "User 1 balance should be negative, got: {}", balance1);
         assert!(balance2 < Decimal::ZERO, "User 2 balance should be negative, got: {}", balance2);
         assert!(balance3 < Decimal::ZERO, "User 3 balance should be negative, got: {}", balance3);
-
-        println!("✅ Rate limiting working: 3 depletions → 1 notification");
     }
 }

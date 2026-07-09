@@ -1,0 +1,30 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                INSERT INTO user_balance_checkpoints (user_id, checkpoint_seq, balance)\n                SELECT u.user_id, u.checkpoint_seq, u.delta\n                FROM UNNEST($1::uuid[], $2::bigint[], $3::numeric[]) AS u(user_id, checkpoint_seq, delta)\n                ON CONFLICT (user_id) DO UPDATE SET\n                    balance = user_balance_checkpoints.balance + EXCLUDED.balance,\n                    checkpoint_seq = GREATEST(user_balance_checkpoints.checkpoint_seq, EXCLUDED.checkpoint_seq),\n                    updated_at = NOW()\n                RETURNING user_id, balance\n                ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "user_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "balance",
+        "type_info": "Numeric"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "UuidArray",
+        "Int8Array",
+        "NumericArray"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "8d3b5e8d229b3c370f2627bc7f3256104e7ce943ead56ecd92d37df2f74ab7e3"
+}

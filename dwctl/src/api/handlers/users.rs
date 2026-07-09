@@ -99,7 +99,7 @@ pub async fn list_users<P: PoolProvider>(
     // If includes billing AND user has permission, create balances_map
     let balances_map = if includes.contains(&"billing") && can_view_billing {
         let mut credits_repo = Credits::new(&mut conn);
-        Some(credits_repo.get_users_balances_bulk(&user_ids, None).await?)
+        Some(credits_repo.get_users_balances_bulk(&user_ids).await?)
     } else {
         None
     };

@@ -311,32 +311,11 @@ pub async fn run_notification_poller(
             };
 
             if !candidates.is_empty() {
-                // 2. Refresh checkpoints only for users near their threshold or missing one.
-                //    Users well above threshold use the cached checkpoint balance directly.
-                const REFRESH_MARGIN: rust_decimal::Decimal = rust_decimal::Decimal::from_parts(30, 0, 0, false, 0);
-
-                let needs_refresh: Vec<Uuid> = candidates
-                    .iter()
-                    .filter(|u| match u.checkpoint_balance {
-                        Some(b) => (b - u.low_balance_threshold) < REFRESH_MARGIN,
-                        None => true,
-                    })
-                    .map(|u| u.id)
-                    .collect();
-
-                let refreshed = if !needs_refresh.is_empty() {
-                    let mut credits = Credits::new(&mut conn);
-                    credits.get_users_balances_bulk(&needs_refresh, Some(1)).await.unwrap_or_else(|e| {
-                        crate::background_error!(NOTIFICATIONS, "balance_refresh", Warning, error = %e, "Failed to refresh balances for low-balance users");
-                        Default::default()
-                    })
-                } else {
-                    Default::default()
-                };
-
-                // Look up balance: prefer refreshed, fall back to checkpoint
-                let balance_for =
-                    |u: &LowBalanceUser| -> Option<rust_decimal::Decimal> { refreshed.get(&u.id).copied().or(u.checkpoint_balance) };
+                // 2. The balance read model is total and folded
+                //    synchronously by every charging writer, so the
+                //    checkpoint balance is current as of the last committed
+                //    charge.
+                let balance_for = |u: &LowBalanceUser| -> Option<rust_decimal::Decimal> { u.checkpoint_balance };
 
                 // 3. Send notifications for users below threshold who haven't been notified
                 let to_notify: Vec<_> = candidates
@@ -738,21 +717,10 @@ async fn process_auto_topups(
         return;
     }
 
-    // 2. Always refresh balances for auto-topup candidates.
-    //    Unlike low-balance notifications (which use a margin-based heuristic), auto-topup
-    //    needs accurate balances because a stale checkpoint can cause us to miss charges entirely.
-    //    The candidate set is typically small, so the cost of refreshing all is negligible.
-    let all_ids: Vec<Uuid> = candidates.iter().map(|u| u.id).collect();
-
-    let refreshed = {
-        let mut credits = Credits::new(&mut *conn);
-        credits.get_users_balances_bulk(&all_ids, Some(1)).await.unwrap_or_else(|e| {
-            crate::background_error!(AUTO_TOPUP, "balance_refresh", Warning, error = %e, "Failed to refresh balances for auto-topup users");
-            Default::default()
-        })
-    };
-
-    let balance_for = |u: &AutoTopupUser| -> Option<rust_decimal::Decimal> { refreshed.get(&u.id).copied().or(u.checkpoint_balance) };
+    // 2. The balance read model is total and folded synchronously by every
+    //    charging writer, so the checkpoint balance is current as of the
+    //    last committed charge.
+    let balance_for = |u: &AutoTopupUser| -> Option<rust_decimal::Decimal> { u.checkpoint_balance };
 
     // 3. Filter to users below their threshold
     let to_charge: Vec<_> = candidates
