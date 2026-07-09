@@ -161,6 +161,7 @@ async fn test_route_at_claim_time_escalation(pool: PgPool) {
         batch_claim_require_live: false,
         claim_ramp_exponent: 0.56,
         claim_loop_max_consecutive_failures: 10,
+        claim_query_timeout_ms: 180_000,
     };
 
     config.background_services.onwards_sync.enabled = true;
@@ -430,6 +431,7 @@ async fn test_no_escalation_when_not_near_expiry(pool: PgPool) {
         batch_claim_require_live: false,
         claim_ramp_exponent: 0.56,
         claim_loop_max_consecutive_failures: 10,
+        claim_query_timeout_ms: 180_000,
     };
 
     config.background_services.onwards_sync.enabled = true;

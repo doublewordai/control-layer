@@ -1595,10 +1595,24 @@ pub struct DaemonConfig {
     /// Default: 10.
     #[serde(default = "default_claim_loop_max_consecutive_failures")]
     pub claim_loop_max_consecutive_failures: u32,
+
+    /// Upper bound on a single claim-cycle database query in milliseconds — a
+    /// deadness detector, not a performance guardrail. A connection severed
+    /// silently (nothing delivered to the client) otherwise blocks the claim
+    /// loop until TCP keepalive. On expiry the connection is dropped and the
+    /// attempt counts as a transient claim failure for the retry machinery.
+    /// Keep comfortably above any legitimate claim duration. Default: 180000
+    /// (3 minutes).
+    #[serde(default = "default_claim_query_timeout_ms")]
+    pub claim_query_timeout_ms: u64,
 }
 
 fn default_claim_loop_max_consecutive_failures() -> u32 {
     10
+}
+
+fn default_claim_query_timeout_ms() -> u64 {
+    180_000
 }
 
 fn default_batch_claim_batch_size() -> usize {
@@ -1698,6 +1712,7 @@ impl Default for DaemonConfig {
             batch_claim_require_live: false,
             claim_ramp_exponent: default_claim_ramp_exponent(),
             claim_loop_max_consecutive_failures: default_claim_loop_max_consecutive_failures(),
+            claim_query_timeout_ms: default_claim_query_timeout_ms(),
         }
     }
 }
@@ -1760,6 +1775,7 @@ impl DaemonConfig {
             batch_claim_require_live: self.batch_claim_require_live,
             claim_ramp_exponent: self.claim_ramp_exponent,
             claim_loop_max_consecutive_failures: self.claim_loop_max_consecutive_failures,
+            claim_query_timeout_ms: self.claim_query_timeout_ms,
             ..Default::default()
         }
     }
@@ -3813,6 +3829,38 @@ background_services:
             )?;
             let config = Config::load(&args)?;
             assert_eq!(config.background_services.batch_daemon.claim_loop_max_consecutive_failures, 3);
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_claim_query_timeout_default_and_override() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+"#,
+            )?;
+            let args = Args {
+                config: "test.yaml".into(),
+                validate: false,
+            };
+            let config = Config::load(&args)?;
+            assert_eq!(config.background_services.batch_daemon.claim_query_timeout_ms, 180_000);
+
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+background_services:
+  batch_daemon:
+    claim_query_timeout_ms: 60000
+"#,
+            )?;
+            let config = Config::load(&args)?;
+            assert_eq!(config.background_services.batch_daemon.claim_query_timeout_ms, 60_000);
 
             Ok(())
         });
