@@ -793,10 +793,18 @@ export function useRequestsAggregateByUser(
   });
 }
 
-export function usePendingRequestCounts(options?: { enabled?: boolean }) {
+export function usePendingRequestCounts(options?: {
+  enabled?: boolean;
+  service_tiers?: string;
+}) {
   return useQuery({
-    queryKey: queryKeys.monitoring.pendingRequestCounts(),
-    queryFn: () => dwctlApi.monitoring.getPendingRequestCounts(),
+    queryKey: queryKeys.monitoring.pendingRequestCounts(
+      options?.service_tiers,
+    ),
+    queryFn: () =>
+      dwctlApi.monitoring.getPendingRequestCounts({
+        service_tiers: options?.service_tiers,
+      }),
     enabled: options?.enabled ?? true,
     refetchInterval: 15000,
   });

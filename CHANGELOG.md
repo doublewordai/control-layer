@@ -1,5 +1,27 @@
 # Changelog
 
+## [8.74.1](https://github.com/doublewordai/control-layer/compare/v8.74.0...v8.74.1) (2026-07-09)
+
+
+### Bug Fixes
+
+* fusillade 20.0.2 ([#1241](https://github.com/doublewordai/control-layer/issues/1241)) ([d585d09](https://github.com/doublewordai/control-layer/commit/d585d09996d86101ec29ec0baf5d57180afa4190))
+
+## [8.74.0](https://github.com/doublewordai/control-layer/compare/v8.73.0...v8.74.0) (2026-07-08)
+
+
+### Features
+
+* default pending request counts to batch tier ([#1242](https://github.com/doublewordai/control-layer/issues/1242)) ([cdc6aae](https://github.com/doublewordai/control-layer/commit/cdc6aaee4e6d50bc62268bf50e3efdaca7c1aad8))
+
+## [8.73.0](https://github.com/doublewordai/control-layer/compare/v8.72.1...v8.73.0) (2026-07-08)
+
+
+### Features
+
+* analytics batcher notification for daily usage aggregations ([#1234](https://github.com/doublewordai/control-layer/issues/1234)) ([5eb8918](https://github.com/doublewordai/control-layer/commit/5eb891889198eb629c58d1dfe1a75341337aca37))
+* enable automatic prefix caching with top level cache control ma… ([#1239](https://github.com/doublewordai/control-layer/issues/1239)) ([7610bec](https://github.com/doublewordai/control-layer/commit/7610bec3d80f7de8f4cc4da8d5a93c62b6068a51))
+
 ## [8.72.1](https://github.com/doublewordai/control-layer/compare/v8.72.0...v8.72.1) (2026-07-08)
 
 

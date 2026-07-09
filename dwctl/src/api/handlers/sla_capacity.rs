@@ -233,15 +233,15 @@ pub(crate) async fn reserve_capacity<P: sqlx_pool_router::PoolProvider>(
         let states = vec!["pending".to_string(), "claimed".to_string(), "processing".to_string()];
         let model_filter: Vec<String> = input.file_model_counts.keys().cloned().collect();
 
-        // Exclude realtime (`priority`) requests: they're processed externally
-        // (not via the fusillade daemon) and should not consume batch capacity
-        // when admitting new batches.
+        // Only count normal batch rows when admitting new batches. Flex and
+        // realtime rows are batchless service tiers and should not consume
+        // batch capacity.
         request_manager
             .get_pending_request_counts_by_model_and_window(
                 &windows,
                 &states,
                 &model_filter,
-                &ServiceTierFilter::Exclude(vec![Some("priority".to_string())]),
+                &ServiceTierFilter::Include(vec![None]),
                 None,
                 true,
             )

@@ -2971,7 +2971,7 @@ mod tests {
         assert_eq!(count.unwrap_or(0), 0);
     }
 
-    async fn seed_pending_capacity_batch(state: &crate::AppState<TestDbPools>, alias: &str) {
+    async fn seed_pending_capacity_batch(state: &crate::AppState<TestDbPools>, alias: &str, completion_window: &str) {
         let pending_templates = (0..3)
             .map(|idx| fusillade::RequestTemplateInput {
                 custom_id: Some(format!("pending-{idx}")),
@@ -2994,7 +2994,7 @@ mod tests {
             .create_batch(fusillade::BatchInput {
                 file_id,
                 endpoint: "/v1/chat/completions".to_string(),
-                completion_window: "1h".to_string(),
+                completion_window: completion_window.to_string(),
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
@@ -3024,7 +3024,7 @@ mod tests {
         let alias = format!("alias-{}", Uuid::new_v4());
         let model_id = create_test_model(&pool, "model-a", &alias, endpoint_id, user.id).await;
 
-        seed_pending_capacity_batch(&state, &alias).await;
+        seed_pending_capacity_batch(&state, &alias, "24h").await;
 
         // Capacity is 3 requests for 1h; the 3 pending requests would reject this
         // extra request if pending counts were included. With the flag disabled,
@@ -3054,7 +3054,7 @@ mod tests {
         let alias = format!("alias-{}", Uuid::new_v4());
         let model_id = create_test_model(&pool, "model-a", &alias, endpoint_id, user.id).await;
 
-        seed_pending_capacity_batch(&state, &alias).await;
+        seed_pending_capacity_batch(&state, &alias, "24h").await;
 
         let file_model_counts = HashMap::from([(alias.clone(), 1_i64)]);
         let model_throughputs = HashMap::from([(alias.clone(), 0.001_f32)]);
@@ -3065,6 +3065,34 @@ mod tests {
             .expect_err("pending counts should reject when enabled");
 
         assert!(matches!(err, Error::TooManyRequests { .. }));
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_reserve_capacity_for_batch_ignores_flex_pending_counts_when_enabled(pool: PgPool) {
+        let mut config = create_test_config();
+        config.batches.pending_capacity_counts_enabled = true;
+        let state = create_test_app_state_with_fusillade(pool.clone(), config).await;
+
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        let endpoint_id = create_test_endpoint(&pool, &format!("test-{}", Uuid::new_v4()), user.id).await;
+
+        let alias = format!("alias-{}", Uuid::new_v4());
+        let model_id = create_test_model(&pool, "model-a", &alias, endpoint_id, user.id).await;
+
+        // Fusillade maps a 1h completion window to service_tier = 'flex'.
+        seed_pending_capacity_batch(&state, &alias, "1h").await;
+
+        let file_model_counts = HashMap::from([(alias.clone(), 1_i64)]);
+        let model_throughputs = HashMap::from([(alias.clone(), 0.001_f32)]);
+        let model_ids_by_alias = HashMap::from([(alias.clone(), model_id)]);
+
+        let reservation_ids =
+            super::reserve_capacity_for_batch(&state, "1h", &file_model_counts, &model_throughputs, &model_ids_by_alias, 1.0)
+                .await
+                .expect("flex pending counts should be ignored for batch capacity");
+
+        assert_eq!(reservation_ids.len(), 1);
     }
 
     /// Test that create_batch API accepts "high" priority name

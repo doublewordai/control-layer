@@ -43,6 +43,14 @@ fn remove_cache_control(body: &mut Value, telemetry: &TelemetryPolicy) -> (bool,
         return (false, false);
     };
 
+    // Automatic-caching marker: a top-level `cache_control` field (Anthropic-style). Strip it so it
+    // never leaks upstream — OpenAI-compatible backends reject unknown top-level fields — and count a
+    // non-null one as adoption, exactly like a block/tool marker.
+    if let Some(removed) = obj.remove("cache_control") {
+        rewrote = true;
+        had_marker |= !removed.is_null();
+    }
+
     // Message content blocks (array-form content only; string content carries no marker).
     if let Some(messages) = obj.get_mut("messages").and_then(Value::as_array_mut) {
         for msg in messages.iter_mut() {
@@ -451,6 +459,35 @@ mod tests {
         let (out, had_markers) = strip_cache_control(body.as_bytes(), &TelemetryPolicy::default());
         assert!(!had_markers, "a schema field is not a marker");
         assert!(out.is_none(), "nothing stripped, body unchanged");
+    }
+
+    #[test]
+    fn strip_removes_top_level_automatic_marker() {
+        // A top-level (automatic-caching) cache_control must be stripped before forwarding so it
+        // can't leak to an OpenAI-compatible upstream, and it counts as adoption.
+        let body = serde_json::json!({
+            "cache_control": {"type": "ephemeral"},
+            "messages": [{"role": "user", "content": "hi"}]
+        })
+        .to_string();
+        let (out, had_markers) = strip_cache_control(body.as_bytes(), &TelemetryPolicy::default());
+        assert!(had_markers, "top-level marker is adoption");
+        let v: Value = serde_json::from_slice(&out.expect("body rewritten")).unwrap();
+        assert!(v.get("cache_control").is_none(), "top-level marker stripped");
+    }
+
+    #[test]
+    fn strip_top_level_null_marker_removed_not_adoption() {
+        // `cache_control: null` at the top level is "no marker": stripped (can't leak) but not counted.
+        let body = serde_json::json!({
+            "cache_control": null,
+            "messages": [{"role": "user", "content": "hi"}]
+        })
+        .to_string();
+        let (out, had_markers) = strip_cache_control(body.as_bytes(), &TelemetryPolicy::default());
+        assert!(!had_markers, "null top-level cache_control is not a marker");
+        let v: Value = serde_json::from_slice(&out.expect("body rewritten to drop the null field")).unwrap();
+        assert!(v.get("cache_control").is_none(), "top-level field removed");
     }
 
     #[test]
