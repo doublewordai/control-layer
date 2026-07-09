@@ -23,7 +23,7 @@ use crate::{
     auth::permissions::{RequiresPermission, operation, resource},
     db::handlers::analytics::{
         get_model_user_usage, get_realtime_tariffs, get_requests_aggregate, get_user_batch_count_for_range, get_user_batch_counts,
-        get_user_model_breakdown, get_user_model_breakdown_for_range, list_http_analytics, refresh_user_model_usage,
+        get_user_model_breakdown, get_user_model_breakdown_for_range, list_http_analytics, refresh_user_model_usage_daily,
     },
     db::handlers::credits::Credits,
     errors::Error,
@@ -257,10 +257,12 @@ pub async fn get_usage<P: PoolProvider>(
     } else {
         // All-time usage combines two pre-aggregated tables:
         //
-        // 1. `user_model_usage` — incrementally updated from http_analytics
-        //    via a cursor (refresh_user_model_usage). Tokens, cost, and
-        //    request count are additive, so splitting rows across refresh
-        //    windows produces correct totals.
+        // 1. `user_model_usage_daily` — per-day rollup incrementally folded from
+        //    http_analytics by the usage-refresh daemon (cursor-based forward-fill).
+        //    Tokens, cost, and request count are additive across days, so the all-time
+        //    total is a SUM over every day for the user. Reads rely on the daemon's
+        //    forward-fill (eventually consistent, sub-second under load); only ?refresh=true
+        //    forces a synchronous fold before reading.
         //
         // 2. `batch_aggregates` — needed for batch *count* because counting
         //    distinct batches is NOT additive. A single batch's analytics
@@ -272,8 +274,8 @@ pub async fn get_usage<P: PoolProvider>(
         //    all-time has no fixed range — the cursor moves forward.
         //    `batch_aggregates` only contains completed batches (all rows
         //    written), so a simple COUNT(*) is safe.
-        refresh_user_model_usage(state.db.write()).await?;
         if refresh {
+            refresh_user_model_usage_daily(state.db.write()).await?;
             let mut conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
             Credits::new(&mut conn).aggregate_user_batches(target_user_id).await?;
         }

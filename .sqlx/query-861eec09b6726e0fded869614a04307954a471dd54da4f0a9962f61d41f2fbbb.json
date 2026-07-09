@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT model,\n               input_tokens,\n               output_tokens,\n               cost,\n               request_count\n        FROM user_model_usage\n        WHERE user_id = $1\n        ORDER BY request_count DESC\n        ",
+  "query": "\n        SELECT model,\n               SUM(input_tokens)::bigint  AS input_tokens,\n               SUM(output_tokens)::bigint AS output_tokens,\n               SUM(cost)                  AS cost,\n               SUM(request_count)::bigint AS request_count\n        FROM user_model_usage_daily\n        WHERE user_id = $1\n        GROUP BY model\n        ORDER BY SUM(request_count) DESC\n        ",
   "describe": {
     "columns": [
       {
@@ -36,11 +36,11 @@
     },
     "nullable": [
       false,
-      false,
-      false,
-      false,
-      false
+      null,
+      null,
+      null,
+      null
     ]
   },
-  "hash": "5b7ad0b0958ab03eb9e6fc52e10ee4e40114ba39acf418a8443d8069d4858b52"
+  "hash": "861eec09b6726e0fded869614a04307954a471dd54da4f0a9962f61d41f2fbbb"
 }

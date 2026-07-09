@@ -1066,69 +1066,6 @@ pub async fn get_user_batch_counts(pool: &PgPool, user_id: Uuid) -> Result<(i64,
     ))
 }
 
-/// Incrementally aggregate new http_analytics rows into the user_model_usage summary table.
-/// Uses a cursor to track the last processed id, so only new rows are scanned.
-#[instrument(skip(pool), err)]
-pub async fn refresh_user_model_usage(pool: &PgPool) -> Result<()> {
-    let mut tx = pool.begin().await?;
-
-    let cursor: i64 = sqlx::query_scalar!("SELECT last_processed_id FROM user_model_usage_cursor WHERE id = TRUE FOR UPDATE")
-        .fetch_one(&mut *tx)
-        .await?;
-
-    let new_max: Option<i64> = sqlx::query_scalar!(
-        r#"
-        SELECT MAX(id) FROM http_analytics
-        WHERE id > $1 AND user_id IS NOT NULL AND model IS NOT NULL
-        "#,
-        cursor
-    )
-    .fetch_one(&mut *tx)
-    .await?;
-
-    let Some(new_max) = new_max else {
-        return Ok(());
-    };
-
-    sqlx::query!(
-        r#"
-        INSERT INTO user_model_usage (user_id, model, input_tokens, output_tokens, cost, request_count)
-        SELECT user_id,
-               model,
-               COALESCE(SUM(prompt_tokens), 0),
-               COALESCE(SUM(completion_tokens), 0),
-               COALESCE(SUM(total_cost), 0),
-               COUNT(*)
-        FROM http_analytics
-        WHERE id > $1 AND id <= $2
-              AND user_id IS NOT NULL AND model IS NOT NULL
-              AND status_code BETWEEN 200 AND 299
-        GROUP BY user_id, model
-        ON CONFLICT (user_id, model)
-        DO UPDATE SET
-            input_tokens = user_model_usage.input_tokens + EXCLUDED.input_tokens,
-            output_tokens = user_model_usage.output_tokens + EXCLUDED.output_tokens,
-            cost = user_model_usage.cost + EXCLUDED.cost,
-            request_count = user_model_usage.request_count + EXCLUDED.request_count,
-            updated_at = NOW()
-        "#,
-        cursor,
-        new_max
-    )
-    .execute(&mut *tx)
-    .await?;
-
-    sqlx::query!(
-        "UPDATE user_model_usage_cursor SET last_processed_id = $1, updated_at = NOW() WHERE id = TRUE",
-        new_max
-    )
-    .execute(&mut *tx)
-    .await?;
-
-    tx.commit().await?;
-    Ok(())
-}
-
 /// Advisory-lock key for the daily-usage refresh, so at most one refresh runs at a
 /// time across all pods. Ascii "DWCTUSGD" (dwctl usage daily); mirrors the lock-id
 /// encoding used for `LEADER_LOCK_ID` in `lib.rs`.
@@ -1239,21 +1176,23 @@ pub async fn get_realtime_tariffs(pool: &PgPool) -> Result<HashMap<String, (Deci
         .collect())
 }
 
-/// Get per-model breakdown from the pre-aggregated user_model_usage table.
-/// Totals (tokens, cost, request count) are derived from these results by the handler.
+/// Get all-time per-model breakdown from the pre-aggregated `user_model_usage_daily`
+/// rollup, summed across every day. Totals (tokens, cost, request count) are derived from
+/// these results by the handler.
 #[instrument(skip(pool), err)]
 pub async fn get_user_model_breakdown(pool: &PgPool, user_id: Uuid) -> Result<Vec<ModelBreakdownEntry>> {
     let rows = sqlx::query_as!(
         ModelBreakdownRow,
         r#"
         SELECT model,
-               input_tokens,
-               output_tokens,
-               cost,
-               request_count
-        FROM user_model_usage
+               SUM(input_tokens)::bigint  AS input_tokens,
+               SUM(output_tokens)::bigint AS output_tokens,
+               SUM(cost)                  AS cost,
+               SUM(request_count)::bigint AS request_count
+        FROM user_model_usage_daily
         WHERE user_id = $1
-        ORDER BY request_count DESC
+        GROUP BY model
+        ORDER BY SUM(request_count) DESC
         "#,
         user_id
     )
@@ -1274,10 +1213,13 @@ pub async fn get_user_model_breakdown(pool: &PgPool, user_id: Uuid) -> Result<Ve
         .collect())
 }
 
-// ===== DATE-FILTERED USAGE QUERIES (bypass pre-aggregated tables) =====
+// ===== DATE-FILTERED USAGE QUERIES (served from the daily rollup, UTC-day-granular) =====
 
-/// Get per-model breakdown directly from http_analytics for a date range.
-/// Used when the user requests date-filtered usage data.
+/// Get per-model breakdown for a date range from the `user_model_usage_daily` rollup.
+///
+/// The rollup is keyed by UTC `usage_date`, so the range is matched at **day** granularity:
+/// the start/end timestamps are truncated to their UTC date. Sub-day ranges therefore
+/// collapse to whole days — callers (and the UI) present usage at day granularity.
 #[instrument(skip(pool), err)]
 pub async fn get_user_model_breakdown_for_range(
     pool: &PgPool,
@@ -1289,17 +1231,16 @@ pub async fn get_user_model_breakdown_for_range(
         ModelBreakdownRow,
         r#"
         SELECT model,
-               COALESCE(SUM(prompt_tokens), 0)::bigint as input_tokens,
-               COALESCE(SUM(completion_tokens), 0)::bigint as output_tokens,
-               COALESCE(SUM(total_cost), 0) as cost,
-               COUNT(*) as request_count
-        FROM http_analytics
+               SUM(input_tokens)::bigint  AS input_tokens,
+               SUM(output_tokens)::bigint AS output_tokens,
+               SUM(cost)                  AS cost,
+               SUM(request_count)::bigint AS request_count
+        FROM user_model_usage_daily
         WHERE user_id = $1
-          AND timestamp >= $2 AND timestamp <= $3
-          AND model IS NOT NULL
-          AND status_code BETWEEN 200 AND 299
+          AND usage_date >= ($2::timestamptz AT TIME ZONE 'UTC')::date
+          AND usage_date <= ($3::timestamptz AT TIME ZONE 'UTC')::date
         GROUP BY model
-        ORDER BY request_count DESC
+        ORDER BY SUM(request_count) DESC
         "#,
         user_id,
         start,
@@ -1322,17 +1263,17 @@ pub async fn get_user_model_breakdown_for_range(
         .collect())
 }
 
-/// Get distinct batch count directly from http_analytics for a date range.
+/// Get distinct batch count for a date range from `batch_aggregates` (one row per batch,
+/// filtered by `created_at`). Batch counts are not summable across day boundaries, so they
+/// come from `batch_aggregates` rather than the daily rollup.
 #[instrument(skip(pool), err)]
 pub async fn get_user_batch_count_for_range(pool: &PgPool, user_id: Uuid, start: DateTime<Utc>, end: DateTime<Utc>) -> Result<i64> {
     let row = sqlx::query_scalar!(
         r#"
-        SELECT COUNT(DISTINCT fusillade_batch_id) as "count!"
-        FROM http_analytics
+        SELECT COUNT(*) as "count!"
+        FROM batch_aggregates
         WHERE user_id = $1
-          AND timestamp >= $2 AND timestamp <= $3
-          AND fusillade_batch_id IS NOT NULL
-          AND status_code BETWEEN 200 AND 299
+          AND created_at >= $2 AND created_at <= $3
         "#,
         user_id,
         start,
@@ -2349,7 +2290,7 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn test_refresh_user_model_usage_includes_realtime_requests(pool: PgPool) {
+    async fn test_all_time_breakdown_includes_realtime_requests(pool: PgPool) {
         let user_id = create_usage_test_user(&pool).await;
         let now = Utc::now();
 
@@ -2384,7 +2325,7 @@ mod tests {
         )
         .await;
 
-        refresh_user_model_usage(&pool).await.unwrap();
+        refresh_user_model_usage_daily(&pool).await.unwrap();
 
         let breakdown = get_user_model_breakdown(&pool, user_id).await.unwrap();
         assert_eq!(breakdown.len(), 1);
@@ -2550,6 +2491,8 @@ mod tests {
         )
         .await;
 
+        refresh_user_model_usage_daily(&pool).await.unwrap();
+
         let breakdown = get_user_model_breakdown_for_range(&pool, user_id, one_hour_ago, now).await.unwrap();
         assert_eq!(breakdown.len(), 1);
         assert_eq!(breakdown[0].model, "claude-3");
@@ -2558,65 +2501,41 @@ mod tests {
         assert_eq!(breakdown[0].output_tokens, 100); // 40 + 60
     }
 
-    #[sqlx::test]
-    async fn test_batch_count_excludes_realtime_requests(pool: PgPool) {
-        let user_id = create_usage_test_user(&pool).await;
-        let now = Utc::now();
-        let one_hour_ago = now - Duration::hours(1);
-        let batch_id = Uuid::new_v4();
-
-        // Insert a realtime request (no batch id)
-        insert_usage_analytics(
-            &pool,
-            UsageAnalyticsParams {
-                user_id,
-                model: "gpt-4",
-                prompt_tokens: 100,
-                completion_tokens: 50,
-                total_cost: 0.0,
-                timestamp: now,
-                fusillade_batch_id: None,
-                status_code: 200,
-            },
+    /// Insert a completed batch into `batch_aggregates` (one row per batch), the source
+    /// the range batch-count now reads from.
+    async fn insert_batch_aggregate(pool: &PgPool, user_id: Uuid, created_at: DateTime<Utc>, max_seq: i64) {
+        sqlx::query!(
+            r#"
+            INSERT INTO batch_aggregates (fusillade_batch_id, user_id, total_amount, transaction_count, max_seq, created_at)
+            VALUES ($1, $2, 0, 1, $3, $4)
+            "#,
+            Uuid::new_v4(),
+            user_id,
+            max_seq,
+            created_at,
         )
-        .await;
-        // Insert two requests from the same batch
-        insert_usage_analytics(
-            &pool,
-            UsageAnalyticsParams {
-                user_id,
-                model: "gpt-4",
-                prompt_tokens: 200,
-                completion_tokens: 100,
-                total_cost: 0.0,
-                timestamp: now,
-                fusillade_batch_id: Some(batch_id),
-                status_code: 200,
-            },
-        )
-        .await;
-        insert_usage_analytics(
-            &pool,
-            UsageAnalyticsParams {
-                user_id,
-                model: "gpt-4",
-                prompt_tokens: 150,
-                completion_tokens: 75,
-                total_cost: 0.0,
-                timestamp: now,
-                fusillade_batch_id: Some(batch_id),
-                status_code: 200,
-            },
-        )
-        .await;
-
-        let count = get_user_batch_count_for_range(&pool, user_id, one_hour_ago, now).await.unwrap();
-        // Only 1 distinct batch, realtime requests not counted
-        assert_eq!(count, 1);
+        .execute(pool)
+        .await
+        .expect("Failed to insert batch_aggregate");
     }
 
     #[sqlx::test]
-    async fn test_refresh_user_model_usage_excludes_errors(pool: PgPool) {
+    async fn test_batch_count_for_range_counts_batches_in_window(pool: PgPool) {
+        let user_id = create_usage_test_user(&pool).await;
+        let now = Utc::now();
+        let one_hour_ago = now - Duration::hours(1);
+
+        // Batch count now comes from batch_aggregates (one row per completed batch),
+        // filtered by created_at. Two distinct batches inside the window.
+        insert_batch_aggregate(&pool, user_id, now, 1).await;
+        insert_batch_aggregate(&pool, user_id, now, 2).await;
+
+        let count = get_user_batch_count_for_range(&pool, user_id, one_hour_ago, now).await.unwrap();
+        assert_eq!(count, 2);
+    }
+
+    #[sqlx::test]
+    async fn test_all_time_breakdown_excludes_errors(pool: PgPool) {
         let user_id = create_usage_test_user(&pool).await;
         let now = Utc::now();
 
@@ -2693,7 +2612,7 @@ mod tests {
         )
         .await;
 
-        refresh_user_model_usage(&pool).await.unwrap();
+        refresh_user_model_usage_daily(&pool).await.unwrap();
 
         let breakdown = get_user_model_breakdown(&pool, user_id).await.unwrap();
         assert_eq!(breakdown.len(), 1);
@@ -2755,6 +2674,8 @@ mod tests {
         )
         .await;
 
+        refresh_user_model_usage_daily(&pool).await.unwrap();
+
         let breakdown = get_user_model_breakdown_for_range(&pool, user_id, one_hour_ago, now).await.unwrap();
         assert_eq!(breakdown.len(), 1);
         assert_eq!(breakdown[0].model, "claude-3");
@@ -2765,46 +2686,17 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn test_get_user_batch_count_for_range_excludes_errors(pool: PgPool) {
+    async fn test_batch_count_for_range_respects_window(pool: PgPool) {
         let user_id = create_usage_test_user(&pool).await;
         let now = Utc::now();
         let one_hour_ago = now - Duration::hours(1);
-        let batch_ok = Uuid::new_v4();
-        let batch_err = Uuid::new_v4();
 
-        // Successful batch request
-        insert_usage_analytics(
-            &pool,
-            UsageAnalyticsParams {
-                user_id,
-                model: "gpt-4",
-                prompt_tokens: 100,
-                completion_tokens: 50,
-                total_cost: 0.0,
-                timestamp: now,
-                fusillade_batch_id: Some(batch_ok),
-                status_code: 200,
-            },
-        )
-        .await;
-        // Failed batch request (different batch) - should be excluded
-        insert_usage_analytics_with_status(
-            &pool,
-            UsageAnalyticsParams {
-                user_id,
-                model: "gpt-4",
-                prompt_tokens: 80,
-                completion_tokens: 0,
-                total_cost: 0.0,
-                timestamp: now,
-                fusillade_batch_id: Some(batch_err),
-                status_code: 500,
-            },
-        )
-        .await;
+        // One batch inside the window, one well outside it (created two days ago).
+        insert_batch_aggregate(&pool, user_id, now, 1).await;
+        insert_batch_aggregate(&pool, user_id, now - Duration::days(2), 2).await;
 
         let count = get_user_batch_count_for_range(&pool, user_id, one_hour_ago, now).await.unwrap();
-        // Only the successful batch should be counted
+        // Only the in-window batch is counted.
         assert_eq!(count, 1);
     }
 }
