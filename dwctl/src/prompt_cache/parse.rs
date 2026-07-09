@@ -994,6 +994,31 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn single_text_array_hashes_like_string_content() {
+        // The Anthropic adapter preserves an advancing marker by emitting single-text-part ARRAY
+        // content on assistant/tool messages. With the marker stripped, that MUST hash identically
+        // to the plain-string form — otherwise, when the marker advances off this block next turn
+        // (and the block reverts to a plain string), the prefix hash would change and the read chain
+        // would break. This is the invariant the whole growing-conversation fix rests on.
+        let marked = parse(serde_json::json!({
+            "messages": [{"role": "tool", "content": [
+                {"type": "text", "text": "tool output", "cache_control": {"type": "ephemeral"}}
+            ]}]
+        }));
+        let unmarked = parse(serde_json::json!({
+            "messages": [{"role": "tool", "content": "tool output"}]
+        }));
+        assert_eq!(
+            marked.cumulative_hashes[0], unmarked.cumulative_hashes[0],
+            "marked single-part array must hash like the plain string"
+        );
+        // The marked form is a breakpoint (it WRITES this prefix); the later unmarked form has none
+        // and instead READS it back via the walk-back — same hash, so it matches.
+        assert_eq!(marked.breakpoints.len(), 1);
+        assert!(unmarked.breakpoints.is_empty());
+    }
+
     // ---- Automatic caching (top-level `cache_control`) ----
 
     #[test]
