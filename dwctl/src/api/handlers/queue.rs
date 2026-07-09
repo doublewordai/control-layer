@@ -2,11 +2,16 @@
 //!
 //! Endpoints for querying queue depth and pending request metrics from fusillade.
 
-use axum::{extract::State, response::Json};
+use axum::{
+    extract::{Query, State},
+    response::Json,
+};
 use fusillade::Storage;
 use fusillade::request::ServiceTierFilter;
+use serde::Deserialize;
 use sqlx_pool_router::PoolProvider;
 use std::collections::HashMap;
+use utoipa::IntoParams;
 
 use crate::api::handlers::sla_capacity::parse_window_to_seconds;
 
@@ -19,25 +24,57 @@ use crate::{
 /// Nested map of pending request counts: model -> completion_window -> count
 type PendingCountsByModelAndWindow = HashMap<String, HashMap<String, i64>>;
 
+/// Query params for pending request counts.
+#[derive(Debug, Default, Deserialize, IntoParams)]
+pub struct PendingRequestCountsQuery {
+    /// Comma-separated service tiers to include. Use `batch` for the null batch tier.
+    /// Defaults to `batch`. Examples: `batch`, `batch,flex`, `flex`.
+    pub service_tiers: Option<String>,
+}
+
+fn parse_service_tiers(raw: Option<&str>) -> Vec<Option<String>> {
+    let mut tiers = Vec::new();
+
+    if let Some(raw) = raw {
+        for tier in raw.split(',').map(str::trim).filter(|tier| !tier.is_empty()) {
+            if tier.eq_ignore_ascii_case("batch") || tier.eq_ignore_ascii_case("null") || tier.eq_ignore_ascii_case("none") {
+                tiers.push(None);
+            } else {
+                tiers.push(Some(tier.to_ascii_lowercase()));
+            }
+        }
+    }
+
+    if tiers.is_empty() {
+        tiers.push(None);
+    }
+
+    tiers
+}
+
+fn service_tiers_include_flex(tiers: &[Option<String>]) -> bool {
+    tiers.iter().any(|tier| tier.as_deref() == Some("flex"))
+}
+
 /// Get pending, claimed, and processing request counts grouped by model and completion window
 ///
 /// Returns a nested map showing how many pending requests are queued for each
-/// model and completion window combination. This excludes:
+/// model and completion window combination. By default it includes only the
+/// batch tier (`service_tier IS NULL`). Pass `service_tiers` to include other
+/// tiers, for example `service_tiers=batch,flex`. This always excludes:
 /// - Escalated requests (racing duplicate requests)
 /// - Requests without a template_id
 /// - Requests in batches being cancelled
-/// - Realtime requests (`service_tier = 'priority'`), which are managed
-///   externally rather than by the fusillade daemon and so should not drive
-///   GPU scheduling decisions.
 ///
 /// When `batches.priority_decay_window_secs` is configured, recently completed
-/// flex requests are added back into the `1h` count for their model for
-/// that many seconds.
+/// flex requests are added back into the `1h` count for their model for that
+/// many seconds only when `flex` is included in `service_tiers`.
 ///
 /// Useful for monitoring queue depth and load distribution across models.
 #[utoipa::path(
     get,
     path = "/admin/api/v1/monitoring/pending-request-counts",
+    params(PendingRequestCountsQuery),
     responses(
         (status = 200, description = "Pending request counts by model and completion window", body = HashMap<String, HashMap<String, i64>>),
         (status = 500, description = "Internal server error"),
@@ -47,6 +84,7 @@ type PendingCountsByModelAndWindow = HashMap<String, HashMap<String, i64>>;
 #[tracing::instrument(skip_all)]
 pub async fn get_pending_request_counts<P: PoolProvider>(
     State(state): State<AppState<P>>,
+    Query(query): Query<PendingRequestCountsQuery>,
     _: RequiresPermission<resource::System, operation::ReadAll>,
 ) -> Result<Json<PendingCountsByModelAndWindow>, Error> {
     let config = state.current_config();
@@ -60,7 +98,13 @@ pub async fn get_pending_request_counts<P: PoolProvider>(
         .collect::<Vec<_>>();
     let states = vec!["pending".to_string(), "claimed".to_string(), "processing".to_string()]; // Include claimed and processing to get a more complete picture of queue depth
     let model_filter: Vec<String> = Vec::new();
-    let service_tier_filter = ServiceTierFilter::Exclude(vec![Some("priority".to_string())]);
+    let service_tiers = parse_service_tiers(query.service_tiers.as_deref());
+    let priority_decay_window_secs = if service_tiers_include_flex(&service_tiers) {
+        config.batches.priority_decay_window_secs
+    } else {
+        None
+    };
+    let service_tier_filter = ServiceTierFilter::Include(service_tiers);
 
     let counts = state
         .request_manager
@@ -69,7 +113,7 @@ pub async fn get_pending_request_counts<P: PoolProvider>(
             &states,
             &model_filter,
             &service_tier_filter,
-            config.batches.priority_decay_window_secs,
+            priority_decay_window_secs,
             false,
         )
         .await
@@ -131,7 +175,7 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn test_pending_request_counts_excludes_priority_service_tier(pool: PgPool) {
+    async fn test_pending_request_counts_defaults_to_batch_tier_only(pool: PgPool) {
         use fusillade::{BatchInput, RequestTemplateInput, Storage};
         use sqlx::postgres::PgConnectOptions;
         use sqlx_pool_router::TestDbPools;
@@ -152,13 +196,8 @@ mod tests {
         let request_manager = fusillade::PostgresRequestManager::new(fusillade_pools, Default::default());
 
         // Create one batch per completion_window. The pending counts endpoint
-        // partitions by service_tier; we expect:
-        //   "24h" → service_tier IS NULL (batch tier — counted)
-        //   "1h"  → service_tier = 'flex'   (counted)
-        // "priority" (0s) is exercised separately via create_realtime; the
-        // handler's ServiceTierFilter::Exclude(["priority"]) is what drops
-        // those rows from the count — not their state (processing is included
-        // in the queried states alongside pending and claimed).
+        // partitions by service_tier; by default it should include only the
+        // batch tier (`service_tier IS NULL`) and exclude flex/priority.
         let model = "test-model";
         let mut batch_ids = Vec::new();
         for completion_window in ["24h", "1h"] {
@@ -227,20 +266,112 @@ mod tests {
         let counts: HashMap<String, HashMap<String, i64>> = response.json();
 
         // The default test config queries the "24h" window only. Both batches
-        // expire in 30 min so they fall inside it. Priority must be excluded;
-        // batch + flex remain.
+        // expire in 30 min so they fall inside it, but only the batch-tier row
+        // should count by default.
         let model_counts = counts
             .get(model)
             .unwrap_or_else(|| panic!("expected '{model}' in response, got {counts:?}"));
         let count_24h = *model_counts.get("24h").unwrap_or(&0);
         assert_eq!(
-            count_24h, 2,
-            "expected 2 (batch + flex) within 24h window — priority must be excluded; got {count_24h} ({model_counts:?})"
+            count_24h, 1,
+            "expected only the batch-tier request within 24h; got {count_24h} ({model_counts:?})"
         );
     }
 
     #[sqlx::test]
-    async fn test_pending_request_counts_priority_decay_window_includes_recent_flex(pool: PgPool) {
+    async fn test_pending_request_counts_service_tiers_query_includes_requested_tiers(pool: PgPool) {
+        use fusillade::{BatchInput, RequestTemplateInput, Storage};
+        use sqlx::postgres::PgConnectOptions;
+        use sqlx_pool_router::TestDbPools;
+
+        let (server, _bg): (TestServer, _) = create_test_app(pool.clone(), false).await;
+        let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
+
+        let base_opts: PgConnectOptions = pool.connect_options().as_ref().clone();
+        let fusillade_pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .min_connections(0)
+            .connect_with(base_opts.options([("search_path", "fusillade")]))
+            .await
+            .expect("Failed to create fusillade pool");
+        let fusillade_pools = TestDbPools::new(fusillade_pool.clone()).await.expect("TestDbPools");
+        let request_manager = fusillade::PostgresRequestManager::new(fusillade_pools, Default::default());
+
+        let model = "query-tier-model";
+        let mut batch_ids = Vec::new();
+        for completion_window in ["24h", "1h"] {
+            let template = RequestTemplateInput {
+                custom_id: None,
+                endpoint: "https://api.example.com".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/chat/completions".to_string(),
+                body: r#"{"input":"x"}"#.to_string(),
+                model: model.to_string(),
+                api_key: "key".to_string(),
+            };
+            let file_id = request_manager
+                .create_file(format!("queue-query-test-{completion_window}"), None, vec![template])
+                .await
+                .expect("create_file");
+            let batch = request_manager
+                .create_batch(BatchInput {
+                    file_id,
+                    endpoint: "/v1/chat/completions".to_string(),
+                    completion_window: completion_window.to_string(),
+                    metadata: None,
+                    created_by: None,
+                    api_key_id: None,
+                    api_key: None,
+                    total_requests: None,
+                })
+                .await
+                .expect("create_batch");
+            batch_ids.push(batch.id.0);
+        }
+
+        request_manager
+            .create_realtime(fusillade::CreateRealtimeInput {
+                request_id: uuid::Uuid::new_v4(),
+                body: r#"{"input":"x"}"#.to_string(),
+                model: model.to_string(),
+                endpoint: "http://localhost".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/responses".to_string(),
+                api_key: String::new(),
+                created_by: "queue-user".to_string(),
+            })
+            .await
+            .expect("create_realtime");
+
+        for batch_id in &batch_ids {
+            sqlx::query("UPDATE batches SET expires_at = NOW() + interval '30 minutes' WHERE id = $1")
+                .bind(batch_id)
+                .execute(&fusillade_pool)
+                .await
+                .expect("pin expires_at");
+        }
+
+        let response = server
+            .get("/admin/api/v1/monitoring/pending-request-counts?service_tiers=batch,flex")
+            .add_header(&add_auth_headers(&admin)[0].0, &add_auth_headers(&admin)[0].1)
+            .add_header(&add_auth_headers(&admin)[1].0, &add_auth_headers(&admin)[1].1)
+            .await;
+
+        response.assert_status_ok();
+        let counts: HashMap<String, HashMap<String, i64>> = response.json();
+        let model_counts = counts
+            .get(model)
+            .unwrap_or_else(|| panic!("expected '{model}' in response, got {counts:?}"));
+
+        assert_eq!(
+            *model_counts.get("24h").unwrap_or(&0),
+            2,
+            "batch + flex should count when explicitly requested, while priority remains excluded"
+        );
+    }
+
+    #[sqlx::test]
+    async fn test_pending_request_counts_priority_decay_window_requires_flex_tier(pool: PgPool) {
         use fusillade::{CreateFlexInput, RequestId, Storage};
         use sqlx::postgres::PgConnectOptions;
         use sqlx_pool_router::TestDbPools;
@@ -372,6 +503,18 @@ mod tests {
         response.assert_status_ok();
         let counts: HashMap<String, HashMap<String, i64>> = response.json();
 
+        assert!(
+            !counts.contains_key(model),
+            "default batch-tier counts should not include completed flex decay"
+        );
+
+        let response = server
+            .get("/admin/api/v1/monitoring/pending-request-counts?service_tiers=flex")
+            .add_header(&add_auth_headers(&admin)[0].0, &add_auth_headers(&admin)[0].1)
+            .add_header(&add_auth_headers(&admin)[1].0, &add_auth_headers(&admin)[1].1)
+            .await;
+        response.assert_status_ok();
+        let counts: HashMap<String, HashMap<String, i64>> = response.json();
         let model_counts = counts
             .get(model)
             .unwrap_or_else(|| panic!("expected '{model}' in response, got {counts:?}"));
@@ -380,6 +523,29 @@ mod tests {
             1,
             "only completed flex requests within the 10 minute decay window should count"
         );
+    }
+
+    #[test]
+    fn test_parse_service_tiers_defaults_to_batch_tier() {
+        assert_eq!(parse_service_tiers(None), vec![None]);
+        assert_eq!(parse_service_tiers(Some("")), vec![None]);
+        assert_eq!(parse_service_tiers(Some("   ")), vec![None]);
+    }
+
+    #[test]
+    fn test_parse_service_tiers_maps_batch_aliases_to_null_tier() {
+        assert_eq!(parse_service_tiers(Some("batch")), vec![None]);
+        assert_eq!(parse_service_tiers(Some("null,none")), vec![None, None]);
+    }
+
+    #[test]
+    fn test_parse_service_tiers_parses_named_tiers() {
+        assert_eq!(
+            parse_service_tiers(Some("batch, flex, PRIORITY")),
+            vec![None, Some("flex".to_string()), Some("priority".to_string())]
+        );
+        assert!(service_tiers_include_flex(&parse_service_tiers(Some("batch,flex"))));
+        assert!(!service_tiers_include_flex(&parse_service_tiers(Some("batch,priority"))));
     }
 
     async fn mark_fusillade_request_processing(pool: &PgPool, id: uuid::Uuid) -> sqlx::Result<()> {

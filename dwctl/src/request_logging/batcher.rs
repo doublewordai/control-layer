@@ -45,8 +45,8 @@ use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
 use sqlx::PgPool;
 use std::collections::HashMap;
-
-use tokio::sync::mpsc;
+use std::sync::Arc;
+use tokio::sync::{Notify, mpsc};
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, error, info, info_span, trace, warn};
 use uuid::Uuid;
@@ -306,6 +306,10 @@ where
     batch_size: usize,
     max_retries: u32,
     retry_base_delay: std::time::Duration,
+    /// In-process wake signal for the usage-refresh daemon. Nudged after every
+    /// successful batch write so the daemon folds the just-written rows into
+    /// `user_model_usage_daily`. `None` disables the nudge (tests, refresh daemon off).
+    usage_refresh_notify: Option<Arc<Notify>>,
 }
 
 impl<M> AnalyticsBatcher<M>
@@ -338,9 +342,19 @@ where
             batch_size,
             max_retries,
             retry_base_delay,
+            usage_refresh_notify: None,
         };
 
         (batcher, sender)
+    }
+
+    /// Attach the usage-refresh daemon's wake signal. After each successful batch
+    /// write the batcher calls `notify_one()` on it, so the daemon coalesces the
+    /// nudges and drains the `user_model_usage_daily` cursor. Off by default.
+    #[must_use]
+    pub fn with_usage_refresh_notify(mut self, notify: Arc<Notify>) -> Self {
+        self.usage_refresh_notify = Some(notify);
+        self
     }
 
     /// Runs the batcher's background write loop.
@@ -491,6 +505,13 @@ where
                 );
                 buffer.clear();
                 return;
+            }
+
+            // Write succeeded: nudge the usage-refresh daemon so the just-written rows
+            // get folded into user_model_usage_daily. In-memory and essentially free;
+            // the daemon coalesces bursts and rate-limits itself.
+            if let Some(notify) = &self.usage_refresh_notify {
+                notify.notify_one();
             }
 
             // Phase 3: Record per-record metrics

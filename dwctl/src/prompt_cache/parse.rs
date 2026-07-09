@@ -59,6 +59,15 @@ pub enum ParseError {
     DisabledTier(TtlTier),
     #[error("cache_control must be an object with a string \"type\": \"ephemeral\" (and an optional string \"ttl\")")]
     MalformedCacheControl,
+    /// Automatic caching (top-level `cache_control`) targets the last block, but that block already
+    /// carries an explicit `cache_control` with a *different* ttl. Anthropic rejects this rather than
+    /// silently picking one — the client must reconcile the two tiers.
+    #[error("top-level cache_control ttl conflicts with the explicit cache_control on the last block")]
+    AutomaticTtlConflict,
+    /// Automatic caching needs one of the {MAX_BREAKPOINTS} breakpoint slots, but the request already
+    /// spends them all on explicit markers with none landing on the last block.
+    #[error("no breakpoint slot left for automatic caching (all {MAX_BREAKPOINTS} used by explicit markers)")]
+    NoAutomaticSlot,
 }
 
 /// A single content block in canonical order.
@@ -201,11 +210,75 @@ pub fn parse_chat_completions(body: &[u8], policy: &TierPolicy, telemetry: &Tele
         return Err(ParseError::TooManyBreakpoints);
     }
 
+    // Automatic caching: a top-level `cache_control` marker (Anthropic-style) synthesizes a
+    // breakpoint on the last block, moving it forward as the conversation grows — no per-message
+    // marker management by the client. Resolved AFTER the explicit walk so it sees the final
+    // breakpoint set and the last block, and consumes one of the 4 slots (per Anthropic's rules).
+    if let Some(auto_ttl) = top_level_auto_ttl(&v, policy)? {
+        let last_index = blocks.len().saturating_sub(1);
+        let last_marker = breakpoints.iter().find(|bp| bp.block_index == last_index).map(|bp| bp.ttl_tier);
+        if let AutoAction::Synthesize(tier) = resolve_auto_action(auto_ttl, !blocks.is_empty(), last_marker, breakpoints.len())? {
+            breakpoints.push(Breakpoint {
+                block_index: last_index,
+                ttl_tier: tier,
+            });
+        }
+    }
+
     Ok(ParsedPrompt {
         blocks,
         cumulative_hashes,
         breakpoints,
     })
+}
+
+/// The tier of a top-level (automatic-caching) `cache_control` marker, if present. `None` when the
+/// field is absent or an explicit `null`; a malformed or disabled marker is a [`ParseError`],
+/// validated identically to a block-level marker (so automatic and explicit markers can't diverge
+/// on what a valid `cache_control` is).
+fn top_level_auto_ttl(body: &serde_json::Value, policy: &TierPolicy) -> Result<Option<TtlTier>, ParseError> {
+    match body.get("cache_control") {
+        Some(cc) if !cc.is_null() => Ok(Some(parse_ttl(cc, policy)?)),
+        _ => Ok(None),
+    }
+}
+
+/// What a top-level (automatic) marker does once the explicit walk is done.
+enum AutoAction {
+    /// Add a breakpoint on the last block with this tier.
+    Synthesize(TtlTier),
+    /// Do nothing (no eligible block, or the last block already carries a same-ttl explicit marker).
+    None,
+}
+
+/// Resolve the automatic-caching decision against Anthropic's documented edge cases
+/// (<https://platform.claude.com/docs/en/build-with-claude/prompt-caching#automatic-caching>). Shared
+/// by the full parse and the request-path [`validate_markers`] so the two always agree on whether a
+/// given request synthesizes, no-ops, or is a 400.
+///
+/// - `saw_block == false` (nothing eligible to cache) → no-op (Anthropic: "if none is found, caching
+///   is skipped").
+/// - last block already has an explicit marker of the **same** tier → no-op (the explicit breakpoint
+///   already covers it).
+/// - last block has an explicit marker of a **different** tier → [`ParseError::AutomaticTtlConflict`].
+/// - last block unmarked but all [`MAX_BREAKPOINTS`] slots are spent on explicit markers →
+///   [`ParseError::NoAutomaticSlot`].
+/// - otherwise synthesize a breakpoint on the last block.
+fn resolve_auto_action(
+    auto_ttl: TtlTier,
+    saw_block: bool,
+    last_block_marker: Option<TtlTier>,
+    explicit_count: usize,
+) -> Result<AutoAction, ParseError> {
+    if !saw_block {
+        return Ok(AutoAction::None);
+    }
+    match last_block_marker {
+        Some(tier) if tier == auto_ttl => Ok(AutoAction::None),
+        Some(_) => Err(ParseError::AutomaticTtlConflict),
+        None if explicit_count >= MAX_BREAKPOINTS => Err(ParseError::NoAutomaticSlot),
+        None => Ok(AutoAction::Synthesize(auto_ttl)),
+    }
 }
 
 /// `cache_control: { type: "ephemeral"[, ttl: "5m"|"1h"|"24h"] }`. `type` is required; a missing
@@ -248,46 +321,78 @@ fn parse_ttl(cache_control: &serde_json::Value, policy: &TierPolicy) -> Result<T
 /// (like a bad parameter) rather than silently un-cached, so the client learns immediately and
 /// isn't billed full price thinking it cached. Takes the body `Value` the layer already parses
 /// to extract `model` — no extra deserialization.
-pub fn validate_markers(body: &serde_json::Value, policy: &TierPolicy) -> Result<(), ParseError> {
+pub fn validate_markers(body: &serde_json::Value, policy: &TierPolicy, telemetry: &TelemetryPolicy) -> Result<(), ParseError> {
     let mut breakpoints = 0usize;
+    // Track the last eligible block and its explicit marker (in canonical tools → messages order),
+    // for the automatic-caching decision below. `saw_block` = any eligible block exists; `last_marker`
+    // = the explicit marker tier on the LAST eligible block (None = unmarked). Reset per block so the
+    // final assignment wins. Telemetry-excluded blocks are skipped so this matches what
+    // `parse_chat_completions` sees as the last block.
+    let mut saw_block = false;
+    let mut last_marker: Option<TtlTier> = None;
+
     // Tool-definition markers (`tools[i].cache_control`) count toward the same breakpoint cap
     // and are validated identically — a malformed/disabled marker on a tool is a 400, not a
-    // silent no-cache.
+    // silent no-cache. (Telemetry handling is system-role only, so it never applies to tools.)
     if let Some(tools) = body.get("tools").and_then(|t| t.as_array()) {
         for tool in tools {
+            saw_block = true;
             match tool.get("cache_control") {
                 Some(cc) if !cc.is_null() => {
-                    parse_ttl(cc, policy)?;
+                    let tier = parse_ttl(cc, policy)?;
                     breakpoints += 1;
                     if breakpoints > MAX_BREAKPOINTS {
                         return Err(ParseError::TooManyBreakpoints);
+                    }
+                    last_marker = Some(tier);
+                }
+                _ => last_marker = None,
+            }
+        }
+    }
+    if let Some(messages) = body.get("messages").and_then(|m| m.as_array()) {
+        for msg in messages {
+            let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
+            match msg.get("content") {
+                // String content is one implicit, unmarked block.
+                Some(serde_json::Value::String(_)) => {
+                    saw_block = true;
+                    last_marker = None;
+                }
+                Some(serde_json::Value::Array(arr)) => {
+                    for block in arr {
+                        // Skip provider telemetry blocks so the "last block" matches parse's view.
+                        if telemetry.excludes_block(role, block) {
+                            continue;
+                        }
+                        saw_block = true;
+                        match block.get("cache_control") {
+                            // Explicit `null` (or absent) is "no marker"; a non-object value is
+                            // rejected by parse_ttl as malformed.
+                            Some(cc) if !cc.is_null() => {
+                                let tier = parse_ttl(cc, policy)?;
+                                breakpoints += 1;
+                                // Short-circuit on the request path — stop the moment the cap is exceeded.
+                                // The error reports "max N", not an exact count (we don't keep scanning).
+                                if breakpoints > MAX_BREAKPOINTS {
+                                    return Err(ParseError::TooManyBreakpoints);
+                                }
+                                last_marker = Some(tier);
+                            }
+                            _ => last_marker = None,
+                        }
                     }
                 }
                 _ => {}
             }
         }
     }
-    if let Some(messages) = body.get("messages").and_then(|m| m.as_array()) {
-        for msg in messages {
-            if let Some(arr) = msg.get("content").and_then(|c| c.as_array()) {
-                for block in arr {
-                    match block.get("cache_control") {
-                        // Explicit `null` (or absent) is "no marker"; a non-object value is
-                        // rejected by parse_ttl as malformed.
-                        Some(cc) if !cc.is_null() => {
-                            parse_ttl(cc, policy)?;
-                            breakpoints += 1;
-                            // Short-circuit on the request path — stop the moment the cap is exceeded.
-                            // The error reports "max N", not an exact count (we don't keep scanning).
-                            if breakpoints > MAX_BREAKPOINTS {
-                                return Err(ParseError::TooManyBreakpoints);
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
+
+    // Automatic caching (top-level marker): validate it and apply the same edge-case rules the full
+    // parse does, so a request that would be a 400 there is rejected here up front (and one that
+    // synthesizes/no-ops passes) — the two share `resolve_auto_action`, so they can't diverge.
+    if let Some(auto_ttl) = top_level_auto_ttl(body, policy)? {
+        resolve_auto_action(auto_ttl, saw_block, last_marker, breakpoints)?;
     }
     Ok(())
 }
@@ -504,7 +609,7 @@ mod tests {
                 {"type": "text", "text": "x", "cache_control": {"type": "ephemeral", "ttl": "24h"}}
             ]}]
         });
-        let err = validate_markers(&body, &policy).unwrap_err();
+        let err = validate_markers(&body, &policy, &no_telemetry()).unwrap_err();
         assert!(matches!(err, ParseError::DisabledTier(TtlTier::TwentyFourHours)));
         // The full parse rejects it identically (the two share parse_ttl, so they can't diverge).
         let err2 = parse_chat_completions(body.to_string().as_bytes(), &policy, &no_telemetry()).unwrap_err();
@@ -521,7 +626,7 @@ mod tests {
                 {"type": "text", "text": "x", "cache_control": {"type": "ephemeral"}}
             ]}]
         });
-        assert!(validate_markers(&body, &policy).is_ok());
+        assert!(validate_markers(&body, &policy, &no_telemetry()).is_ok());
         let p = parse_chat_completions(body.to_string().as_bytes(), &policy, &no_telemetry()).unwrap();
         assert_eq!(p.breakpoints[0].ttl_tier, TtlTier::OneHour);
     }
@@ -534,7 +639,7 @@ mod tests {
                 {"type": "text", "text": "q"}
             ]}]
         });
-        assert!(validate_markers(&ok, &all_tiers()).is_ok());
+        assert!(validate_markers(&ok, &all_tiers(), &no_telemetry()).is_ok());
 
         // validate_markers enforces the breakpoint cap too (not just the full parse).
         let blocks: Vec<_> = (0..5)
@@ -542,7 +647,7 @@ mod tests {
             .collect();
         let too_many = serde_json::json!({ "messages": [{"role": "user", "content": blocks}] });
         assert!(matches!(
-            validate_markers(&too_many, &all_tiers()).unwrap_err(),
+            validate_markers(&too_many, &all_tiers(), &no_telemetry()).unwrap_err(),
             ParseError::TooManyBreakpoints
         ));
     }
@@ -556,7 +661,7 @@ mod tests {
             ]}]
         });
         assert!(matches!(
-            validate_markers(&body, &all_tiers()).unwrap_err(),
+            validate_markers(&body, &all_tiers(), &no_telemetry()).unwrap_err(),
             ParseError::MalformedCacheControl
         ));
         assert!(matches!(
@@ -575,7 +680,7 @@ mod tests {
             ]}]
         });
         assert!(matches!(
-            validate_markers(&bad_ttl, &all_tiers()).unwrap_err(),
+            validate_markers(&bad_ttl, &all_tiers(), &no_telemetry()).unwrap_err(),
             ParseError::MalformedCacheControl
         ));
 
@@ -585,7 +690,7 @@ mod tests {
             ]}]
         });
         assert!(matches!(
-            validate_markers(&bad_type, &all_tiers()).unwrap_err(),
+            validate_markers(&bad_type, &all_tiers(), &no_telemetry()).unwrap_err(),
             ParseError::MalformedCacheControl
         ));
     }
@@ -599,7 +704,7 @@ mod tests {
             ]}]
         });
         assert!(matches!(
-            validate_markers(&no_type, &all_tiers()).unwrap_err(),
+            validate_markers(&no_type, &all_tiers(), &no_telemetry()).unwrap_err(),
             ParseError::MalformedCacheControl
         ));
         // An empty cache_control object (no type) is malformed too.
@@ -622,7 +727,7 @@ mod tests {
                 {"type": "text", "text": "x", "cache_control": null}
             ]}]
         });
-        assert!(validate_markers(&body, &all_tiers()).is_ok());
+        assert!(validate_markers(&body, &all_tiers(), &no_telemetry()).is_ok());
         let p = parse_chat_completions(body.to_string().as_bytes(), &all_tiers(), &no_telemetry()).unwrap();
         assert!(p.breakpoints.is_empty());
     }
@@ -747,7 +852,7 @@ mod tests {
             ]}]
         });
         assert!(matches!(
-            validate_markers(&body, &all_tiers()).unwrap_err(),
+            validate_markers(&body, &all_tiers(), &no_telemetry()).unwrap_err(),
             ParseError::TooManyBreakpoints
         ));
         assert!(matches!(
@@ -763,7 +868,7 @@ mod tests {
                        "cache_control": {"type": "ephemeral", "ttl": "1h"}}],
             "messages": [{"role": "user", "content": "q"}]
         });
-        assert!(validate_markers(&body, &all_tiers()).is_ok());
+        assert!(validate_markers(&body, &all_tiers(), &no_telemetry()).is_ok());
     }
 
     #[test]
@@ -884,8 +989,212 @@ mod tests {
                        "cache_control": {"type": "ephemeral", "ttl": "24h"}}]
         });
         assert!(matches!(
-            validate_markers(&body, &policy).unwrap_err(),
+            validate_markers(&body, &policy, &no_telemetry()).unwrap_err(),
             ParseError::DisabledTier(TtlTier::TwentyFourHours)
         ));
+    }
+
+    // ---- Automatic caching (top-level `cache_control`) ----
+
+    #[test]
+    fn automatic_marker_synthesizes_breakpoint_on_last_block() {
+        // Top-level cache_control, no explicit markers → a breakpoint on the LAST block, so the whole
+        // conversation-so-far is the cached prefix. Default tier (5m).
+        let p = parse(serde_json::json!({
+            "cache_control": {"type": "ephemeral"},
+            "messages": [
+                {"role": "system", "content": "static system"},
+                {"role": "user", "content": "turn 1"},
+                {"role": "assistant", "content": "reply"},
+                {"role": "user", "content": "turn 2"}
+            ]
+        }));
+        assert_eq!(p.blocks.len(), 4);
+        assert_eq!(p.breakpoints.len(), 1);
+        assert_eq!(p.breakpoints[0].block_index, 3, "on the last block");
+        assert_eq!(p.breakpoints[0].ttl_tier, TtlTier::FiveMinutes);
+        assert!(
+            validate_markers(
+                &serde_json::json!({
+                    "cache_control": {"type": "ephemeral"},
+                    "messages": [{"role": "user", "content": "q"}]
+                }),
+                &all_tiers(),
+                &no_telemetry()
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn automatic_marker_honours_ttl() {
+        let p = parse(serde_json::json!({
+            "cache_control": {"type": "ephemeral", "ttl": "1h"},
+            "messages": [{"role": "user", "content": "q"}]
+        }));
+        assert_eq!(p.breakpoints.len(), 1);
+        assert_eq!(p.breakpoints[0].ttl_tier, TtlTier::OneHour);
+    }
+
+    #[test]
+    fn automatic_combines_with_explicit_breakpoint() {
+        // Explicit marker on the system block + top-level automatic → 2 breakpoints: the system
+        // layer (its own cadence) and the last block (the moving conversation frontier).
+        let p = parse(serde_json::json!({
+            "cache_control": {"type": "ephemeral"},
+            "messages": [
+                {"role": "system", "content": [
+                    {"type": "text", "text": "sys", "cache_control": {"type": "ephemeral"}}
+                ]},
+                {"role": "user", "content": "q"}
+            ]
+        }));
+        assert_eq!(p.breakpoints.len(), 2);
+        assert_eq!(p.breakpoints[0].block_index, 0, "explicit system breakpoint");
+        assert_eq!(p.breakpoints[1].block_index, 1, "synthesized on the last block");
+    }
+
+    #[test]
+    fn automatic_noop_when_last_block_already_marked_same_ttl() {
+        // The last block already carries an explicit marker of the same tier → automatic is a no-op
+        // (no duplicate breakpoint), per Anthropic's edge case.
+        let body = serde_json::json!({
+            "cache_control": {"type": "ephemeral", "ttl": "1h"},
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "q", "cache_control": {"type": "ephemeral", "ttl": "1h"}}
+            ]}]
+        });
+        let p = parse(body.clone());
+        assert_eq!(p.breakpoints.len(), 1, "no duplicate breakpoint");
+        assert_eq!(p.breakpoints[0].block_index, 0);
+        assert!(validate_markers(&body, &all_tiers(), &no_telemetry()).is_ok());
+    }
+
+    #[test]
+    fn automatic_conflicting_ttl_on_last_block_errors() {
+        // Last block explicitly marked 5m, but the top-level automatic marker asks for 1h → 400.
+        let body = serde_json::json!({
+            "cache_control": {"type": "ephemeral", "ttl": "1h"},
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "q", "cache_control": {"type": "ephemeral", "ttl": "5m"}}
+            ]}]
+        });
+        assert!(matches!(
+            parse_chat_completions(body.to_string().as_bytes(), &all_tiers(), &no_telemetry()).unwrap_err(),
+            ParseError::AutomaticTtlConflict
+        ));
+        assert!(matches!(
+            validate_markers(&body, &all_tiers(), &no_telemetry()).unwrap_err(),
+            ParseError::AutomaticTtlConflict
+        ));
+    }
+
+    #[test]
+    fn automatic_no_slot_when_four_explicit_and_last_block_unmarked() {
+        // 4 explicit markers on earlier blocks + an unmarked last block → no slot for automatic → 400.
+        let mut content = vec![];
+        for i in 0..4 {
+            content.push(serde_json::json!({"type": "text", "text": format!("b{i}"), "cache_control": {"type": "ephemeral"}}));
+        }
+        content.push(serde_json::json!({"type": "text", "text": "last, unmarked"}));
+        let body = serde_json::json!({
+            "cache_control": {"type": "ephemeral"},
+            "messages": [{"role": "user", "content": content}]
+        });
+        assert!(matches!(
+            parse_chat_completions(body.to_string().as_bytes(), &all_tiers(), &no_telemetry()).unwrap_err(),
+            ParseError::NoAutomaticSlot
+        ));
+        assert!(matches!(
+            validate_markers(&body, &all_tiers(), &no_telemetry()).unwrap_err(),
+            ParseError::NoAutomaticSlot
+        ));
+    }
+
+    #[test]
+    fn automatic_ok_when_four_explicit_but_last_block_is_one_of_them_same_ttl() {
+        // 4 explicit markers, the LAST of which is on the last block at the same tier → no-op, not a
+        // slot error (the same-ttl no-op rule wins over the slot check).
+        let mut content = vec![];
+        for i in 0..4 {
+            content.push(serde_json::json!({"type": "text", "text": format!("b{i}"), "cache_control": {"type": "ephemeral"}}));
+        }
+        let body = serde_json::json!({
+            "cache_control": {"type": "ephemeral"},
+            "messages": [{"role": "user", "content": content}]
+        });
+        let p = parse(body.clone());
+        assert_eq!(p.breakpoints.len(), 4, "no 5th breakpoint; automatic is a no-op");
+        assert!(validate_markers(&body, &all_tiers(), &no_telemetry()).is_ok());
+    }
+
+    #[test]
+    fn automatic_skipped_when_no_blocks() {
+        // Top-level marker but no eligible blocks → no breakpoint, no error (caching skipped).
+        let body = serde_json::json!({ "cache_control": {"type": "ephemeral"}, "messages": [] });
+        let p = parse(body.clone());
+        assert!(p.breakpoints.is_empty());
+        assert!(validate_markers(&body, &all_tiers(), &no_telemetry()).is_ok());
+    }
+
+    #[test]
+    fn automatic_null_is_no_marker() {
+        let body = serde_json::json!({
+            "cache_control": null,
+            "messages": [{"role": "user", "content": "q"}]
+        });
+        let p = parse(body.clone());
+        assert!(p.breakpoints.is_empty());
+        assert!(validate_markers(&body, &all_tiers(), &no_telemetry()).is_ok());
+    }
+
+    #[test]
+    fn automatic_malformed_and_disabled_rejected() {
+        // A malformed top-level marker is a 400 (validated like a block marker)...
+        let malformed = serde_json::json!({
+            "cache_control": "ephemeral",
+            "messages": [{"role": "user", "content": "q"}]
+        });
+        assert!(matches!(
+            validate_markers(&malformed, &all_tiers(), &no_telemetry()).unwrap_err(),
+            ParseError::MalformedCacheControl
+        ));
+        // ...and a disabled tier on the top-level marker is rejected too.
+        let policy = TierPolicy::from_config(&["5m".to_string(), "1h".to_string()], "5m");
+        let disabled = serde_json::json!({
+            "cache_control": {"type": "ephemeral", "ttl": "24h"},
+            "messages": [{"role": "user", "content": "q"}]
+        });
+        assert!(matches!(
+            validate_markers(&disabled, &policy, &no_telemetry()).unwrap_err(),
+            ParseError::DisabledTier(TtlTier::TwentyFourHours)
+        ));
+    }
+
+    #[test]
+    fn automatic_advances_prefix_hash_grows_but_shares_prior() {
+        // The growing-conversation property: turn 2's prefix at turn-1's last block equals turn-1's
+        // breakpoint hash — so turn 2 reads what turn 1 wrote (the reason automatic caching works).
+        let turn1 = parse(serde_json::json!({
+            "cache_control": {"type": "ephemeral"},
+            "messages": [
+                {"role": "system", "content": "sys"},
+                {"role": "user", "content": "turn 1"}
+            ]
+        }));
+        let turn2 = parse(serde_json::json!({
+            "cache_control": {"type": "ephemeral"},
+            "messages": [
+                {"role": "system", "content": "sys"},
+                {"role": "user", "content": "turn 1"},
+                {"role": "assistant", "content": "reply"},
+                {"role": "user", "content": "turn 2"}
+            ]
+        }));
+        // turn1 breakpoint is on block 1; turn2's cumulative hash at block 1 is identical.
+        assert_eq!(turn1.breakpoints[0].block_index, 1);
+        assert_eq!(turn1.cumulative_hashes[1], turn2.cumulative_hashes[1]);
+        // turn2's own breakpoint has moved forward to its last block.
+        assert_eq!(turn2.breakpoints[0].block_index, 3);
     }
 }

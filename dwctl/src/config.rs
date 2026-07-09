@@ -1260,6 +1260,18 @@ pub struct BatchConfig {
     /// count is applied.
     #[serde(default, deserialize_with = "deserialize_non_negative_optional_i64")]
     pub priority_decay_window_secs: Option<i64>,
+    /// Upload-volume cap for *unverified* creditors, expressed as requests per
+    /// hour of completion window. The effective cap for a submission scales with
+    /// its completion window: `unverified_requests_per_completion_hour *
+    /// window_hours` (e.g. 1000 for a 1h async window, 24000 for a 24h batch
+    /// window). It bounds how much an unverified user can queue before they
+    /// verify (add a payment method / make a payment), which removes the cap.
+    ///
+    /// Applies to both batch creation and flex/async request submission.
+    /// Verified creditors are never limited. Set to 0 to disable the cap.
+    /// Default: 1000.
+    pub unverified_requests_per_completion_hour: usize,
+
     /// Include committed pending/claimed/processing requests in batch admission capacity checks.
     /// When false, admission capacity checks only include active in-flight reservations.
     /// Default: false.
@@ -1402,6 +1414,7 @@ impl Default for BatchConfig {
             default_throughput: default_batch_throughput(),
             reservation_ttl_secs: default_reservation_ttl_secs(),
             priority_decay_window_secs: None,
+            unverified_requests_per_completion_hour: 1000,
             pending_capacity_counts_enabled: false,
         }
     }
@@ -1588,6 +1601,31 @@ pub struct DaemonConfig {
     /// claimable immediately regardless of liveness). Default: 0.56.
     #[serde(default = "default_claim_ramp_exponent", deserialize_with = "deserialize_claim_ramp_exponent")]
     pub claim_ramp_exponent: f64,
+
+    /// Consecutive claim-cycle failures a claim loop tolerates (retrying with
+    /// exponential backoff, capped at 30s) before it gives up and takes the
+    /// daemon down. Transient DB blips no longer kill the daemon outright.
+    /// Default: 10.
+    #[serde(default = "default_claim_loop_max_consecutive_failures")]
+    pub claim_loop_max_consecutive_failures: u32,
+
+    /// Upper bound on a single claim-cycle database query in milliseconds — a
+    /// deadness detector, not a performance guardrail. A connection severed
+    /// silently (nothing delivered to the client) otherwise blocks the claim
+    /// loop until TCP keepalive. On expiry the connection is dropped and the
+    /// attempt counts as a transient claim failure for the retry machinery.
+    /// Keep comfortably above any legitimate claim duration. Default: 180000
+    /// (3 minutes).
+    #[serde(default = "default_claim_query_timeout_ms")]
+    pub claim_query_timeout_ms: u64,
+}
+
+fn default_claim_loop_max_consecutive_failures() -> u32 {
+    10
+}
+
+fn default_claim_query_timeout_ms() -> u64 {
+    180_000
 }
 
 fn default_batch_claim_batch_size() -> usize {
@@ -1686,6 +1724,8 @@ impl Default for DaemonConfig {
             batch_claim_interval_ms: 0,
             batch_claim_require_live: false,
             claim_ramp_exponent: default_claim_ramp_exponent(),
+            claim_loop_max_consecutive_failures: default_claim_loop_max_consecutive_failures(),
+            claim_query_timeout_ms: default_claim_query_timeout_ms(),
         }
     }
 }
@@ -1747,6 +1787,8 @@ impl DaemonConfig {
             batch_claim_interval_ms: self.batch_claim_interval_ms,
             batch_claim_require_live: self.batch_claim_require_live,
             claim_ramp_exponent: self.claim_ramp_exponent,
+            claim_loop_max_consecutive_failures: self.claim_loop_max_consecutive_failures,
+            claim_query_timeout_ms: self.claim_query_timeout_ms,
             ..Default::default()
         }
     }
@@ -1818,6 +1860,8 @@ impl Default for NotificationsConfig {
 pub struct BackgroundServicesConfig {
     /// Configuration for onwards config sync service
     pub onwards_sync: OnwardsSyncConfig,
+    /// Configuration for the usage-aggregate refresh daemon
+    pub usage_refresh: UsageRefreshConfig,
     /// Configuration for probe scheduler service
     pub probe_scheduler: ProbeSchedulerConfig,
     /// Configuration for batch processing daemon
@@ -1884,6 +1928,42 @@ impl Default for OnwardsSyncConfig {
         Self {
             enabled: true,
             fallback_interval_milliseconds: 300_000, // 5 minutes (NOTIFY handles real changes; this is only a missed-notification safety net)
+        }
+    }
+}
+
+/// Usage-aggregate refresh daemon configuration.
+///
+/// The daemon incrementally folds new `http_analytics` rows into the
+/// `user_model_usage_daily` rollup. It's woken by the analytics batcher after each
+/// flush (in-process, no LISTEN/NOTIFY — emitter and consumer share the pod) and, as a
+/// safety net, on a periodic fallback tick. Cross-pod duplicate runs are made cheap
+/// no-ops by an advisory lock in the refresh itself.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct UsageRefreshConfig {
+    /// Enable the usage-refresh daemon (default: true).
+    pub enabled: bool,
+    /// Fallback tick interval in milliseconds (default: 60000ms = 1 minute).
+    ///
+    /// The batcher nudge drives the refresh in real time whenever there's traffic; this
+    /// tick only backstops a missed nudge or drains the cursor after a restart. It is
+    /// cheap — a tick with no new rows finds `MAX(id)` unchanged and no-ops. Set to `0`
+    /// to disable the fallback entirely.
+    pub fallback_interval_milliseconds: u64,
+    /// Minimum interval between refreshes in milliseconds (default: 30000ms = 30s).
+    ///
+    /// Bounds refresh frequency and coalesces bursts of batcher nudges: after a refresh
+    /// the daemon waits at least this long before running again.
+    pub min_interval_milliseconds: u64,
+}
+
+impl Default for UsageRefreshConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            fallback_interval_milliseconds: 60_000,
+            min_interval_milliseconds: 30_000,
         }
     }
 }
@@ -3726,6 +3806,70 @@ background_services:
             )?;
             let config = Config::load(&args)?;
             assert_eq!(config.background_services.batch_daemon.claim_ramp_exponent, 0.9);
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_claim_loop_max_consecutive_failures_default_and_override() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+"#,
+            )?;
+            let args = Args {
+                config: "test.yaml".into(),
+                validate: false,
+            };
+            let config = Config::load(&args)?;
+            assert_eq!(config.background_services.batch_daemon.claim_loop_max_consecutive_failures, 10);
+
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+background_services:
+  batch_daemon:
+    claim_loop_max_consecutive_failures: 3
+"#,
+            )?;
+            let config = Config::load(&args)?;
+            assert_eq!(config.background_services.batch_daemon.claim_loop_max_consecutive_failures, 3);
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_claim_query_timeout_default_and_override() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+"#,
+            )?;
+            let args = Args {
+                config: "test.yaml".into(),
+                validate: false,
+            };
+            let config = Config::load(&args)?;
+            assert_eq!(config.background_services.batch_daemon.claim_query_timeout_ms, 180_000);
+
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+background_services:
+  batch_daemon:
+    claim_query_timeout_ms: 60000
+"#,
+            )?;
+            let config = Config::load(&args)?;
+            assert_eq!(config.background_services.batch_daemon.claim_query_timeout_ms, 60_000);
 
             Ok(())
         });

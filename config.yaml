@@ -223,11 +223,12 @@ auth:
   # charge). Only used when the api_key has no explicit per-key override.
   # Omit a tier (or the whole `rate_limits` block) to leave that tier
   # unlimited.
-  rate_limits:
-    # verified tier left unset = no default limit for verified users
-    unverified:
-      requests_per_second: 5
-      burst_size: 10
+  #
+  # Both tiers are intentionally left unset: unverified users get full
+  # platform throughput — throttling it feels slow/unreliable — and are instead
+  # bounded by an upload-*volume* cap until they verify. See
+  # `batches.unverified_requests_per_completion_hour` below.
+  rate_limits: {}
 
 # Email configuration for password resets and notifications
 email:
@@ -307,6 +308,16 @@ batches:
 
   # TTL for batch capacity reservations (seconds)
   reservation_ttl_secs: 600
+
+  # Upload-volume cap for UNVERIFIED creditors, in requests per hour of
+  # completion window. The effective cap for a submission scales with
+  # its completion window: unverified_requests_per_completion_hour * window_hours
+  # (e.g. 1000 for a 1h async window, 24000 for a 24h batch window), measured
+  # over a rolling window equal to the completion window. Applies to both batch
+  # creation and flex/async submission. Verified creditors are never limited.
+  # Over-limit submissions get HTTP 429 with guidance to verify (add a payment
+  # method / make a payment). Set to 0 to disable. Default: 1000.
+  unverified_requests_per_completion_hour: 1000
 
   # Optional realtime priority decay window for queue monitoring (seconds).
   # When set, completed FLEX requests within this lookback are included in
@@ -472,6 +483,20 @@ background_services:
     # triggers a full routing-table reload (heavy DB egress), so keep it in minutes, not seconds.
     # Default: 300000 (5 min). Set to 0 to disable (not recommended).
     fallback_interval_milliseconds: 300000
+
+  # Usage-refresh daemon - incrementally folds new http_analytics rows into the
+  # user_model_usage_daily rollup. Woken in-process by the analytics batcher after each
+  # flush (no LISTEN/NOTIFY - emitter and consumer share the pod); the fallback tick only
+  # backstops a missed nudge or a restart. Cross-pod runs are deduped by an advisory lock.
+  usage_refresh:
+    enabled: true # Default: true
+    # Fallback tick (milliseconds). The batcher nudge drives refreshes under load; this only
+    # backstops missed nudges / drains after a restart. Cheap - a tick with no new rows no-ops.
+    # Default: 60000 (1 min). Set to 0 to disable.
+    fallback_interval_milliseconds: 60000
+    # Minimum spacing between refreshes (milliseconds): coalesces bursts of batcher nudges.
+    # Default: 30000 (30s).
+    min_interval_milliseconds: 30000
 
   # Probe scheduler - periodically checks inference endpoint health
   # When leader_election is enabled, only runs on the elected leader

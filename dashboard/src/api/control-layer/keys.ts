@@ -102,7 +102,8 @@ export const queryKeys = {
   // Monitoring
   monitoring: {
     all: ["monitoring"] as const,
-    pendingRequestCounts: () => ["monitoring", "pendingRequestCounts"] as const,
+    pendingRequestCounts: (serviceTiers?: string) =>
+      ["monitoring", "pendingRequestCounts", serviceTiers ?? null] as const,
   },
 
   // Files

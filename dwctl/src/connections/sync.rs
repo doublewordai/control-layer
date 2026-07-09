@@ -918,6 +918,70 @@ pub(crate) async fn run_activate_batch<P: PoolProvider + Clone + Send + Sync + '
     };
     let external_key = sync_entry.external_key.clone();
 
+    // 3b. Unverified upload-volume cap. Sync is a third batch-creation path
+    //     (alongside the /ai/v1/batches and flex handlers), so it must honour the
+    //     same cap for unverified creditors — otherwise an unverified user could
+    //     queue unbounded volume via a connection sync.
+    //
+    //     Only enforced on first activation: a retry that reuses an
+    //     already-created batch (`sync_entry.batch_id` set) was already counted
+    //     against the cap when that batch was first created. We check here,
+    //     before capacity reservation, so a rejected file does no wasted work.
+    //
+    //     Over-cap files are marked `skipped` (not `failed`): `skipped` is
+    //     terminal for this sync but is excluded from the re-sync dedup, so the
+    //     file is re-ingested and retried automatically on the next sync once the
+    //     creditor verifies or earlier volume drains. No batch row is created,
+    //     and the actionable message rides on the entry's `error` column.
+    if sync_entry.batch_id.is_none() {
+        use crate::db::handlers::users::Users;
+
+        let (owner_id, owner_verified) = {
+            let mut conn = dwctl.acquire().await?;
+            let owner_id = crate::db::handlers::connections::Connections::new(&mut conn)
+                .get_by_id(input.connection_id)
+                .await?
+                .ok_or_else(|| ActivateError::Fatal("connection not found".into()))?
+                .user_id;
+            let verified = Users::new(&mut conn).is_verified(owner_id).await?;
+            (owner_id, verified)
+        };
+
+        match crate::api::handlers::unverified_volume::enforce_unverified_volume_limit(
+            &*state.request_manager,
+            state.config.snapshot().batches.unverified_requests_per_completion_hour,
+            owner_id,
+            owner_verified,
+            &completion_window,
+            input.template_count as i64,
+            crate::api::handlers::unverified_volume::SubmissionKind::Batch,
+        )
+        .await
+        {
+            Ok(()) => {}
+            Err(crate::errors::Error::TooManyRequests { message }) => {
+                let entry_message = format!(
+                    "Skipped — this file wasn't batched because it would exceed your unverified \
+                     upload limit. It will be retried automatically on your next sync. {message}"
+                );
+                let mut conn = dwctl.acquire().await?;
+                SyncEntries::new(&mut conn)
+                    .update_status(input.sync_entry_id, "skipped", Some(&entry_message))
+                    .await?;
+                tracing::info!(
+                    sync_entry_id = %input.sync_entry_id,
+                    owner = %owner_id,
+                    requested = input.template_count,
+                    "Sync entry skipped: unverified upload-volume cap exceeded"
+                );
+                return Ok(());
+            }
+            // A transient failure of the count query is a real error — let the
+            // job retry rather than silently skipping enforcement.
+            Err(e) => return Err(anyhow::anyhow!("unverified upload-volume check: {e}")),
+        }
+    }
+
     // 4. Capacity check — reserve capacity before creating the batch.
     //    On retries where a previous attempt already created AND populated a batch,
     //    skip reservation since those requests are already counted in pending.
@@ -1638,5 +1702,61 @@ mod tests {
             .await
             .expect("fetch batch_id");
         assert!(batch_id.is_none(), "no batch should be created when capacity is insufficient");
+    }
+
+    /// An unverified creditor's connection sync must honour the upload-volume
+    /// cap: an over-cap file is marked `skipped` (re-attemptable on the next
+    /// sync) with an actionable message, and no batch row is created.
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_activate_batch_skips_over_unverified_cap(pool: PgPool) {
+        // cap = per_hour * window_hours; with a 1h window and per_hour = 1, cap = 1.
+        let mut config = create_test_config();
+        config.batches.unverified_requests_per_completion_hour = 1;
+        let state = setup_task_state_with_config(pool.clone(), config).await;
+
+        // create_test_user leaves users.verified at its default (false) — unverified.
+        let user = create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
+        let user_id = user.id;
+
+        let connection_id = insert_test_connection(&pool, user_id).await;
+        let sync_id = insert_test_sync_op(&pool, connection_id, user_id).await;
+        // Use a 1h completion window so the cap is small and deterministic.
+        sqlx::query!(
+            "UPDATE sync_operations SET sync_config = $2 WHERE id = $1",
+            sync_id,
+            serde_json::json!({"endpoint": "/v1/chat/completions", "completion_window": "1h"}),
+        )
+        .execute(&pool)
+        .await
+        .expect("set 1h window");
+        let entry_id = insert_test_sync_entry(&pool, sync_id, connection_id, "data/big.jsonl").await;
+
+        // 2 requests exceeds the cap of 1. The skip happens before any file or
+        // capacity work, so no real file/model is needed.
+        let input = ActivateBatchInput {
+            sync_id,
+            sync_entry_id: entry_id,
+            connection_id,
+            file_id: Uuid::new_v4(),
+            template_count: 2,
+        };
+
+        run_activate_batch(&state, &input)
+            .await
+            .expect("run_activate_batch should return Ok when skipping");
+
+        let (batch_id, status, error): (Option<Uuid>, String, Option<String>) =
+            sqlx::query_as("SELECT batch_id, status, error FROM sync_entries WHERE id = $1")
+                .bind(entry_id)
+                .fetch_one(&pool)
+                .await
+                .expect("fetch sync_entry");
+
+        assert_eq!(status, "skipped", "over-cap entry should be skipped, not failed/activated");
+        assert!(batch_id.is_none(), "no batch row should be created for a skipped entry");
+        let error = error.expect("an actionable error message should be stored");
+        assert!(error.contains("unverified upload limit"), "message should explain the cap: {error}");
+        assert!(error.contains("next sync"), "message should explain the auto-retry: {error}");
     }
 }

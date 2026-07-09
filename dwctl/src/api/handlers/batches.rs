@@ -619,14 +619,16 @@ pub async fn create_batch<P: PoolProvider>(
     // Get the hidden API key for batch execution and per-member attribution.
     // The secret is stored on the batch so the daemon uses the batch creator's
     // credentials, not the file uploader's key from request_templates.
-    let (batch_api_key, api_key_id) = {
+    let (batch_api_key, api_key_id, target_verified) = {
         let mut conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
-        let mut api_keys_repo = ApiKeys::new(&mut conn);
-        let (secret, key_id) = api_keys_repo
+        let (secret, key_id) = ApiKeys::new(&mut conn)
             .get_or_create_hidden_key_with_id(target_user_id, ApiKeyPurpose::Batch, current_user.id)
             .await
             .map_err(Error::Database)?;
-        (secret, key_id)
+        // Resolve the creditor's verified flag on the same connection (the org in
+        // org context, else the user) for the volume cap below — no extra acquire.
+        let verified = Users::new(&mut conn).is_verified(target_user_id).await?;
+        (secret, key_id, verified)
     };
 
     // Convert metadata to HashMap and inject request_source and user info.
@@ -642,6 +644,21 @@ pub async fn create_batch<P: PoolProvider>(
 
     // Create batch input — created_by uses org ID when in org context for ownership scoping
     let total_requests: i64 = file_model_counts.values().sum();
+
+    // Bound how much an unverified creditor can queue. Checked before reserving
+    // capacity / creating the batch so over-limit submissions are rejected up
+    // front. No-op for verified creditors or a disabled cap.
+    crate::api::handlers::unverified_volume::enforce_unverified_volume_limit(
+        &*state.request_manager,
+        config.batches.unverified_requests_per_completion_hour,
+        target_user_id,
+        target_verified,
+        &req.completion_window,
+        total_requests,
+        crate::api::handlers::unverified_volume::SubmissionKind::Batch,
+    )
+    .await?;
+
     let batch_input = fusillade::BatchInput {
         file_id: fusillade::FileId(file_id),
         endpoint: req.endpoint.clone(),
@@ -2954,7 +2971,7 @@ mod tests {
         assert_eq!(count.unwrap_or(0), 0);
     }
 
-    async fn seed_pending_capacity_batch(state: &crate::AppState<TestDbPools>, alias: &str) {
+    async fn seed_pending_capacity_batch(state: &crate::AppState<TestDbPools>, alias: &str, completion_window: &str) {
         let pending_templates = (0..3)
             .map(|idx| fusillade::RequestTemplateInput {
                 custom_id: Some(format!("pending-{idx}")),
@@ -2977,7 +2994,7 @@ mod tests {
             .create_batch(fusillade::BatchInput {
                 file_id,
                 endpoint: "/v1/chat/completions".to_string(),
-                completion_window: "1h".to_string(),
+                completion_window: completion_window.to_string(),
                 metadata: None,
                 created_by: None,
                 api_key_id: None,
@@ -3007,7 +3024,7 @@ mod tests {
         let alias = format!("alias-{}", Uuid::new_v4());
         let model_id = create_test_model(&pool, "model-a", &alias, endpoint_id, user.id).await;
 
-        seed_pending_capacity_batch(&state, &alias).await;
+        seed_pending_capacity_batch(&state, &alias, "24h").await;
 
         // Capacity is 3 requests for 1h; the 3 pending requests would reject this
         // extra request if pending counts were included. With the flag disabled,
@@ -3037,7 +3054,7 @@ mod tests {
         let alias = format!("alias-{}", Uuid::new_v4());
         let model_id = create_test_model(&pool, "model-a", &alias, endpoint_id, user.id).await;
 
-        seed_pending_capacity_batch(&state, &alias).await;
+        seed_pending_capacity_batch(&state, &alias, "24h").await;
 
         let file_model_counts = HashMap::from([(alias.clone(), 1_i64)]);
         let model_throughputs = HashMap::from([(alias.clone(), 0.001_f32)]);
@@ -3048,6 +3065,34 @@ mod tests {
             .expect_err("pending counts should reject when enabled");
 
         assert!(matches!(err, Error::TooManyRequests { .. }));
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_reserve_capacity_for_batch_ignores_flex_pending_counts_when_enabled(pool: PgPool) {
+        let mut config = create_test_config();
+        config.batches.pending_capacity_counts_enabled = true;
+        let state = create_test_app_state_with_fusillade(pool.clone(), config).await;
+
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        let endpoint_id = create_test_endpoint(&pool, &format!("test-{}", Uuid::new_v4()), user.id).await;
+
+        let alias = format!("alias-{}", Uuid::new_v4());
+        let model_id = create_test_model(&pool, "model-a", &alias, endpoint_id, user.id).await;
+
+        // Fusillade maps a 1h completion window to service_tier = 'flex'.
+        seed_pending_capacity_batch(&state, &alias, "1h").await;
+
+        let file_model_counts = HashMap::from([(alias.clone(), 1_i64)]);
+        let model_throughputs = HashMap::from([(alias.clone(), 0.001_f32)]);
+        let model_ids_by_alias = HashMap::from([(alias.clone(), model_id)]);
+
+        let reservation_ids =
+            super::reserve_capacity_for_batch(&state, "1h", &file_model_counts, &model_throughputs, &model_ids_by_alias, 1.0)
+                .await
+                .expect("flex pending counts should be ignored for batch capacity");
+
+        assert_eq!(reservation_ids.len(), 1);
     }
 
     /// Test that create_batch API accepts "high" priority name
@@ -3484,6 +3529,114 @@ mod tests {
 
         // Should be accepted because relaxation factor makes effective capacity > 0
         resp.assert_status(StatusCode::CREATED);
+    }
+
+    /// Set up an unverified user that can create batches: StandardUser +
+    /// BatchAPIUser, in a group with a deployment for the `gpt-4` alias.
+    async fn setup_batch_user(pool: &PgPool) -> crate::api::models::users::UserResponse {
+        let user = create_test_user_with_roles(pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(pool).await;
+        add_user_to_group(pool, user.id, group.id).await;
+        let deployment = create_test_deployment(pool, user.id, "gpt-4-model", "gpt-4").await;
+        add_deployment_to_group(pool, deployment.id, group.id, user.id).await;
+        user
+    }
+
+    /// Upload a single-request JSONL file and create a batch from it, returning
+    /// the batch-creation response.
+    async fn submit_one_request_batch(
+        app: &axum_test::TestServer,
+        user: &crate::api::models::users::UserResponse,
+        completion_window: &str,
+    ) -> axum_test::TestResponse {
+        let jsonl = r#"{"custom_id":"r1","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}}"#;
+        let file_part = axum_test::multipart::Part::bytes(jsonl.as_bytes()).file_name("test.jsonl");
+        let multipart = axum_test::multipart::MultipartForm::new()
+            .add_part("file", file_part)
+            .add_part("purpose", axum_test::multipart::Part::text("batch"));
+        let auth = add_auth_headers(user);
+        let upload = app
+            .post("/ai/v1/files")
+            .multipart(multipart)
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+        upload.assert_status(StatusCode::CREATED);
+        let file: serde_json::Value = upload.json();
+        let file_id = file["id"].as_str().unwrap().to_string();
+
+        let create_req = CreateBatchRequest {
+            input_file_id: file_id,
+            endpoint: "/v1/chat/completions".to_string(),
+            completion_window: completion_window.to_string(),
+            metadata: None,
+        };
+        app.post("/ai/v1/batches")
+            .json(&create_req)
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_create_batch_unverified_volume_limit_rejects_over_cap(pool: PgPool) {
+        let mut config = create_test_config();
+        // Cap for a 1h window = 1 (per hour) * 1 (hour) = 1 request.
+        config.batches.unverified_requests_per_completion_hour = 1;
+        config.batches.allowed_completion_windows = vec!["1h".to_string(), "24h".to_string()];
+        config.batches.default_throughput = 100.0; // ample capacity so the cap is what bites
+
+        let (app, _bg_services) = create_test_app_with_config(pool.clone(), config, false).await;
+        let user = setup_batch_user(&pool).await; // unverified by default
+
+        // First single-request batch fits the cap of 1.
+        submit_one_request_batch(&app, &user, "1h").await.assert_status(StatusCode::CREATED);
+
+        // Second pushes the rolling total to 2 > 1 → rejected with guidance to verify.
+        let resp = submit_one_request_batch(&app, &user, "1h").await;
+        resp.assert_status(StatusCode::TOO_MANY_REQUESTS);
+        let body = resp.text();
+        assert!(
+            body.contains("Unverified") && body.to_lowercase().contains("verify"),
+            "expected an actionable verify message, got: {body}"
+        );
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_create_batch_verified_user_bypasses_volume_limit(pool: PgPool) {
+        let mut config = create_test_config();
+        config.batches.unverified_requests_per_completion_hour = 1; // cap 1 for a 1h window
+        config.batches.allowed_completion_windows = vec!["1h".to_string(), "24h".to_string()];
+        config.batches.default_throughput = 100.0;
+
+        let (app, _bg_services) = create_test_app_with_config(pool.clone(), config, false).await;
+        let user = setup_batch_user(&pool).await;
+        sqlx::query!("UPDATE users SET verified = true WHERE id = $1", user.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // A verified creditor is never limited — both batches succeed despite cap 1.
+        submit_one_request_batch(&app, &user, "1h").await.assert_status(StatusCode::CREATED);
+        submit_one_request_batch(&app, &user, "1h").await.assert_status(StatusCode::CREATED);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_create_batch_unverified_limit_disabled_when_zero(pool: PgPool) {
+        let mut config = create_test_config();
+        config.batches.unverified_requests_per_completion_hour = 0; // disabled
+        config.batches.allowed_completion_windows = vec!["1h".to_string(), "24h".to_string()];
+        config.batches.default_throughput = 100.0;
+
+        let (app, _bg_services) = create_test_app_with_config(pool.clone(), config, false).await;
+        let user = setup_batch_user(&pool).await; // unverified
+
+        // With the cap disabled, an unverified user is unrestricted.
+        submit_one_request_batch(&app, &user, "1h").await.assert_status(StatusCode::CREATED);
+        submit_one_request_batch(&app, &user, "1h").await.assert_status(StatusCode::CREATED);
     }
 
     #[sqlx::test]

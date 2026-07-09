@@ -1715,7 +1715,11 @@ pub async fn build_router(
             n => usize::try_from(n).unwrap_or(usize::MAX),
         };
         let translators: Vec<std::sync::Arc<dyn crate::inference::translation::ProtocolTranslator>> = vec![
-            std::sync::Arc::new(crate::inference::translation::anthropic::AnthropicMessages),
+            // Pass cache.enabled so the translator only emits the top-level automatic-caching marker
+            // when the cache middleware is present to consume + strip it (else it would leak upstream).
+            std::sync::Arc::new(crate::inference::translation::anthropic::AnthropicMessages::new(
+                config.cache.enabled,
+            )),
             std::sync::Arc::new(crate::inference::translation::anthropic::models::AnthropicModels),
         ];
         let translation_registry =
@@ -2123,7 +2127,7 @@ impl BackgroundServices {
     /// Gracefully shutdown all background tasks.
     ///
     /// Implements the SIGTERM drain protocol from
-    /// `fusillade/docs/plans/2026-04-28-multi-step-responses.md` (COR-353):
+    /// `fusillade/docs/plans/2026-04-28-multi-step-responses.md`:
     ///
     /// 1. Signal all in-process tasks to stop accepting new work
     ///    (`shutdown_token.cancel()`). The fusillade batch daemon stops
@@ -2803,9 +2807,25 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
         });
     }
 
+    // Start the usage-refresh daemon: incrementally folds new http_analytics rows into
+    // user_model_usage_daily. The analytics batcher (below) nudges it after every flush;
+    // this shares an in-process Notify with it rather than round-tripping through Postgres.
+    let usage_refresh_notify = std::sync::Arc::new(tokio::sync::Notify::new());
+    if config.enable_analytics && config.background_services.usage_refresh.enabled {
+        let daemon_pool = pool.clone();
+        let daemon_config = config.background_services.usage_refresh.clone();
+        let daemon_notify = usage_refresh_notify.clone();
+        let daemon_shutdown = shutdown_token.clone();
+        background_tasks.spawn("usage-refresh", async move {
+            sync::usage_refresh::run_usage_refresh_daemon(daemon_pool, daemon_config, daemon_notify, daemon_shutdown).await;
+            Ok(())
+        });
+    }
+
     // Start analytics batcher if enabled
     let analytics_sender = if config.enable_analytics {
         let (batcher, sender) = request_logging::AnalyticsBatcher::new(pool.clone(), config.clone(), metrics_recorder);
+        let batcher = batcher.with_usage_refresh_notify(usage_refresh_notify.clone());
 
         let batcher_shutdown = shutdown_token.clone();
         background_tasks.spawn("analytics-batcher", async move {
@@ -3260,6 +3280,8 @@ impl Application {
             loop_config: multi_step_loop_config,
             image_normalizer: image_normalizer.clone(),
             image_normalizer_enabled: config.image_normalizer.enabled,
+            unverified_requests_per_completion_hour: config.batches.unverified_requests_per_completion_hour,
+            flex_completion_window: config.batches.async_requests.completion_window.clone(),
             keystore: bg_services.keystore.clone(),
             zdr_key_cache: bg_services.zdr_key_cache.clone(),
         };

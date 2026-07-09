@@ -29,6 +29,7 @@ pub mod component {
     pub const RESPONSES_WRITER: &str = "responses_writer";
     pub const BATCH_POPULATE: &str = "batch_populate";
     pub const PAYMENTS: &str = "payments";
+    pub const USAGE_REFRESH: &str = "usage_refresh";
 }
 
 /// Increment `dwctl_background_errors_total`. `component`/`reason`/`severity` are `&'static str`

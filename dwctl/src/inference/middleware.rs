@@ -60,6 +60,14 @@ pub struct InferenceMiddlewareState<P: PoolProvider + Clone = sqlx_pool_router::
     pub image_normalizer: Arc<dyn ImageNormalizer>,
     /// Whether image normalisation is enabled (`config.image_normalizer.enabled`).
     pub image_normalizer_enabled: bool,
+    /// Upload-volume cap for unverified creditors, in requests per hour
+    /// of completion window (`config.batches.unverified_requests_per_completion_hour`).
+    /// 0 disables the cap.
+    pub unverified_requests_per_completion_hour: usize,
+    /// Completion window that flex/async requests map to
+    /// (`config.batches.async_requests.completion_window`, e.g. "1h"). The
+    /// unverified cap is measured over a rolling window of this length.
+    pub flex_completion_window: String,
     /// Encrypted key custody for ZDR flex bodies. `None` disables ZDR.
     pub keystore: Option<crate::keystore::Keystore>,
     /// Per-key ZDR policy map (api key secret to the owning account's
@@ -338,6 +346,36 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
         None
     };
 
+    // Bound how much an unverified creditor can queue via flex. Flex requests are
+    // persisted and dispatched later (they don't pass through onwards' rate
+    // limiter), so without this an unverified user could enqueue unbounded
+    // volume. The creditor id and verified flag ride along on the hidden
+    // batch-key resolution above (`key_owner_id` is `api_keys.user_id`), so this
+    // costs no extra query. `flex_batch_key` is `Some` only for the flex tier,
+    // and its resolution already failed closed (403/500) on lookup errors above,
+    // so an unresolved creditor never reaches enforcement. No-op for verified
+    // creditors or a disabled cap.
+    if let Some(key) = flex_batch_key.as_ref()
+        && let Err(err) = crate::api::handlers::unverified_volume::enforce_unverified_volume_limit(
+            &*state.request_manager,
+            state.unverified_requests_per_completion_hour,
+            key.key_owner_id,
+            key.verified,
+            &state.flex_completion_window,
+            1,
+            crate::api::handlers::unverified_volume::SubmissionKind::Flex,
+        )
+        .await
+    {
+        return Response::builder()
+            .status(err.status_code())
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({"error": {"message": err.user_message(), "type": "invalid_request_error"}}).to_string(),
+            ))
+            .unwrap();
+    }
+
     match service_tier {
         ServiceTier::Realtime => {
             // Realtime ZDR is non-persistence (no encryption): decided per-key
@@ -506,6 +544,10 @@ enum ServiceTier {
 struct FlexBatchApiKey {
     secret: String,
     key_owner_id: uuid::Uuid,
+    /// The key owner's `users.verified` flag (organizations are `users` rows
+    /// too). Rides along on this lookup so the unverified upload-volume cap on
+    /// the flex path needs no extra query. `false` when no user row matches.
+    verified: bool,
 }
 
 async fn resolve_flex_batch_api_key(pool: &sqlx::PgPool, api_key: Option<&str>) -> Result<Option<FlexBatchApiKey>, DbError> {
@@ -515,9 +557,10 @@ async fn resolve_flex_batch_api_key(pool: &sqlx::PgPool, api_key: Option<&str>) 
 
     let row = sqlx::query(
         r#"
-        SELECT user_id, created_by
-        FROM api_keys
-        WHERE secret = $1 AND is_deleted = false
+        SELECT ak.user_id, ak.created_by, u.verified
+        FROM api_keys ak
+        LEFT JOIN users u ON u.id = ak.user_id
+        WHERE ak.secret = $1 AND ak.is_deleted = false
         LIMIT 1
         "#,
     )
@@ -530,6 +573,9 @@ async fn resolve_flex_batch_api_key(pool: &sqlx::PgPool, api_key: Option<&str>) 
     };
     let key_owner_id: uuid::Uuid = sqlx::Row::get(&row, "user_id");
     let created_by: uuid::Uuid = sqlx::Row::get(&row, "created_by");
+    // NULL when the LEFT JOIN found no user row; a missing row counts as
+    // unverified, matching `Users::is_verified`.
+    let verified: bool = sqlx::Row::try_get(&row, "verified").ok().flatten().unwrap_or(false);
 
     let mut conn = pool.acquire().await?;
     let mut api_keys_repo = ApiKeys::new(&mut conn);
@@ -537,7 +583,11 @@ async fn resolve_flex_batch_api_key(pool: &sqlx::PgPool, api_key: Option<&str>) 
         .get_or_create_hidden_key(key_owner_id, ApiKeyPurpose::Batch, created_by)
         .await?;
 
-    Ok(Some(FlexBatchApiKey { secret, key_owner_id }))
+    Ok(Some(FlexBatchApiKey {
+        secret,
+        key_owner_id,
+        verified,
+    }))
 }
 
 impl std::fmt::Display for ServiceTier {
