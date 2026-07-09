@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.74.0](https://github.com/doublewordai/control-layer/compare/v8.73.0...v8.74.0) (2026-07-08)
+
+
+### Features
+
+* default pending request counts to batch tier ([#1242](https://github.com/doublewordai/control-layer/issues/1242)) ([cdc6aae](https://github.com/doublewordai/control-layer/commit/cdc6aaee4e6d50bc62268bf50e3efdaca7c1aad8))
+
 ## [8.73.0](https://github.com/doublewordai/control-layer/compare/v8.72.1...v8.73.0) (2026-07-08)
 
 
