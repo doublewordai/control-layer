@@ -148,7 +148,11 @@ fn convert_assistant(content: &Content) -> Value {
                 match b {
                     ContentBlock::Text { text: t, cache_control } => {
                         text.push_str(t);
-                        if let Some(cc) = cache_control {
+                        // An explicit `null` is "no marker" (matching parse/strip) — don't let it
+                        // flip the message to array form.
+                        if let Some(cc) = cache_control
+                            && !cc.is_null()
+                        {
                             marker = Some(cc.clone());
                         }
                     }
@@ -225,9 +229,10 @@ fn convert_user(content: &Content, out: &mut Vec<Value>) {
                         // convert_assistant: stripped, it hashes like the plain string, so the read
                         // chain stays stable as the marker advances). Unmarked → plain string, as before.
                         let result_text = tool_result_to_text(content);
+                        // An explicit `null` is "no marker" (matching parse/strip) → plain string, as before.
                         let content_val = match cache_control {
-                            Some(cc) => json!([{ "type": "text", "text": result_text, "cache_control": cc }]),
-                            None => json!(result_text),
+                            Some(cc) if !cc.is_null() => json!([{ "type": "text", "text": result_text, "cache_control": cc }]),
+                            _ => json!(result_text),
                         };
                         tool_messages.push(json!({
                             "role": "tool",
@@ -413,6 +418,23 @@ mod tests {
         assert_eq!(tool["tool_call_id"], "tu_1");
         assert_eq!(tool["content"][0]["text"], "sunny");
         assert_eq!(tool["content"][0]["cache_control"]["ttl"], "1h");
+    }
+
+    #[test]
+    fn explicit_null_cache_control_is_not_a_marker() {
+        // `cache_control: null` is "no marker" everywhere else (parse/strip) — it must NOT flip the
+        // message to array form on assistant or tool_result.
+        let out = translate(json!({
+            "model": "m", "max_tokens": 16,
+            "messages": [
+                { "role": "assistant", "content": [ { "type": "text", "text": "hi", "cache_control": null } ] },
+                { "role": "user", "content": [
+                    { "type": "tool_result", "tool_use_id": "tu_1", "content": "sunny", "cache_control": null }
+                ]}
+            ]
+        }));
+        assert_eq!(out["messages"][0]["content"], "hi", "null marker → assistant stays a string");
+        assert_eq!(out["messages"][1]["content"], "sunny", "null marker → tool_result stays a string");
     }
 
     #[test]
