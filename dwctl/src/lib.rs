@@ -3280,6 +3280,8 @@ impl Application {
             loop_config: multi_step_loop_config,
             image_normalizer: image_normalizer.clone(),
             image_normalizer_enabled: config.image_normalizer.enabled,
+            unverified_requests_per_completion_hour: config.batches.unverified_requests_per_completion_hour,
+            flex_completion_window: config.batches.async_requests.completion_window.clone(),
             keystore: bg_services.keystore.clone(),
             zdr_key_cache: bg_services.zdr_key_cache.clone(),
         };

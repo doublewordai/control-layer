@@ -1260,6 +1260,18 @@ pub struct BatchConfig {
     /// count is applied.
     #[serde(default, deserialize_with = "deserialize_non_negative_optional_i64")]
     pub priority_decay_window_secs: Option<i64>,
+    /// Upload-volume cap for *unverified* creditors, expressed as requests per
+    /// hour of completion window. The effective cap for a submission scales with
+    /// its completion window: `unverified_requests_per_completion_hour *
+    /// window_hours` (e.g. 1000 for a 1h async window, 24000 for a 24h batch
+    /// window). It bounds how much an unverified user can queue before they
+    /// verify (add a payment method / make a payment), which removes the cap.
+    ///
+    /// Applies to both batch creation and flex/async request submission.
+    /// Verified creditors are never limited. Set to 0 to disable the cap.
+    /// Default: 1000.
+    pub unverified_requests_per_completion_hour: usize,
+
     /// Include committed pending/claimed/processing requests in batch admission capacity checks.
     /// When false, admission capacity checks only include active in-flight reservations.
     /// Default: false.
@@ -1402,6 +1414,7 @@ impl Default for BatchConfig {
             default_throughput: default_batch_throughput(),
             reservation_ttl_secs: default_reservation_ttl_secs(),
             priority_decay_window_secs: None,
+            unverified_requests_per_completion_hour: 1000,
             pending_capacity_counts_enabled: false,
         }
     }
