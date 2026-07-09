@@ -23,12 +23,23 @@ import {
   HoverCardContent,
   HoverCardTrigger,
 } from "../../../ui/hover-card";
+import { ToggleGroup, ToggleGroupItem } from "../../../ui/toggle-group";
 import {
   ChartContainer,
   ChartTooltip,
   ChartTooltipContent,
 } from "../../../ui/chart";
 import type { ChartConfig } from "../../../ui/chart";
+
+const pendingServiceTierOptions = [
+  { value: "batch", label: "Batch" },
+  { value: "flex", label: "Flex" },
+  { value: "priority", label: "Priority" },
+] as const;
+
+type PendingServiceTier = (typeof pendingServiceTierOptions)[number]["value"];
+
+const defaultPendingServiceTiers: PendingServiceTier[] = ["batch"];
 
 interface RequestsAnalyticsProps {
   selectedModel?: string;
@@ -47,11 +58,37 @@ export function RequestsAnalytics({
   const { data: allModelsData } = useRequestsAggregate(undefined, dateRange);
   const { data: modelsData } = useModels();
 
+  const [pendingServiceTiers, setPendingServiceTiers] = React.useState<
+    PendingServiceTier[]
+  >(() => [...defaultPendingServiceTiers]);
+  const pendingServiceTierFilter = React.useMemo(
+    () => pendingServiceTiers.join(","),
+    [pendingServiceTiers],
+  );
+  const handlePendingServiceTiersChange = React.useCallback(
+    (serviceTiers: string[]) => {
+      const selectedTiers = serviceTiers.filter(
+        (tier): tier is PendingServiceTier =>
+          pendingServiceTierOptions.some((option) => option.value === tier),
+      );
+
+      setPendingServiceTiers(
+        selectedTiers.length > 0
+          ? selectedTiers
+          : [...defaultPendingServiceTiers],
+      );
+    },
+    [],
+  );
+
   const {
     data: pendingCounts,
     isLoading: pendingCountsLoading,
     error: pendingCountsError,
-  } = usePendingRequestCounts({ enabled: !!selectedModel });
+  } = usePendingRequestCounts({
+    enabled: !!selectedModel,
+    service_tiers: pendingServiceTierFilter,
+  });
 
   // Initialize all React hooks at the top
   const [activeModel, setActiveModel] = React.useState("");
@@ -233,21 +270,43 @@ export function RequestsAnalytics({
       {/* Pending Queue Card - only show when a model is selected */}
       {selectedModel && (
         <Card>
-          <CardHeader>
-            <CardTitle className="text-sm flex items-center gap-1">
-              Pending Queue (Priority)
-              <HoverCard openDelay={100} closeDelay={100}>
-                <HoverCardTrigger asChild>
-                  <Info className="h-3 w-3 text-muted-foreground " />
-                </HoverCardTrigger>
-                <HoverCardContent className="w-80">
-                  <p className="text-sm">
-                    Shows how many batch requests are currently waiting for the
-                    selected model, grouped by priority.
-                  </p>
-                </HoverCardContent>
-              </HoverCard>
-            </CardTitle>
+          <CardHeader className="gap-3">
+            <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+              <CardTitle className="text-sm flex items-center gap-1">
+                Pending Queue
+                <HoverCard openDelay={100} closeDelay={100}>
+                  <HoverCardTrigger asChild>
+                    <Info className="h-3 w-3 text-muted-foreground " />
+                  </HoverCardTrigger>
+                  <HoverCardContent className="w-80">
+                    <p className="text-sm">
+                      Shows pending, claimed, and processing requests for the
+                      selected model. Use the service tier filter to choose
+                      which tiers feed this count.
+                    </p>
+                  </HoverCardContent>
+                </HoverCard>
+              </CardTitle>
+              <ToggleGroup
+                type="multiple"
+                value={pendingServiceTiers}
+                onValueChange={handlePendingServiceTiersChange}
+                className="flex-wrap"
+                variant="outline"
+                size="sm"
+                aria-label="Pending count service tiers"
+              >
+                {pendingServiceTierOptions.map((option) => (
+                  <ToggleGroupItem
+                    key={option.value}
+                    value={option.value}
+                    className="h-7 px-2 text-xs"
+                  >
+                    {option.label}
+                  </ToggleGroupItem>
+                ))}
+              </ToggleGroup>
+            </div>
           </CardHeader>
           <CardContent className="flex justify-center items-center min-h-32">
             {pendingCountsLoading ? (
