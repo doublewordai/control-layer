@@ -350,6 +350,7 @@ const UserUsageTable: React.FC<UserUsageTableProps> = ({
                 key={opt.value}
                 variant={rangeKey === opt.value ? "secondary" : "ghost"}
                 size="sm"
+                type="button"
                 className="h-7 px-3"
                 aria-pressed={rangeKey === opt.value}
                 onClick={() => setRangeKey(opt.value)}
