@@ -2,7 +2,6 @@ import React, { useState, useMemo } from "react";
 import { type ColumnDef } from "@tanstack/react-table";
 import { useRequestsAggregateByUser } from "../../../../api/control-layer";
 import { type UserUsage } from "../../../../api/control-layer";
-import { DateTimeRangeSelector } from "../../../ui/date-time-range-selector";
 import { DataTable } from "../../../ui/data-table";
 import { Button } from "../../../ui/button";
 import {
@@ -11,6 +10,18 @@ import {
   HoverCardTrigger,
 } from "../../../ui/hover-card";
 import { ArrowUpDown, Users, Download } from "lucide-react";
+
+// Usage is served from a per-UTC-day rollup (COR-516: get_model_user_usage reads
+// user_model_usage_daily), so this table offers whole-UTC-day ranges only — no
+// sub-day custom picker. Each value spans N whole UTC days (today inclusive),
+// mirroring the /usage page.
+const RANGE_DAYS: Record<string, number> = { "1d": 1, "7d": 7, "30d": 30, "90d": 90 };
+const RANGE_OPTIONS = [
+  { value: "1d", label: "Today" },
+  { value: "7d", label: "7d" },
+  { value: "30d", label: "30d" },
+  { value: "90d", label: "90d" },
+];
 
 interface UserUsageTableProps {
   modelAlias: string;
@@ -21,18 +32,26 @@ const UserUsageTable: React.FC<UserUsageTableProps> = ({
   modelAlias,
   showPricing = true,
 }) => {
-  const [dateRange, setDateRange] = useState<{ from: Date; to: Date }>({
-    from: new Date(new Date().getTime() - 24 * 60 * 60 * 1000), // 24 hours ago
-    to: new Date(), // now
-  });
+  const [rangeKey, setRangeKey] = useState("7d");
 
-  // Convert date range to ISO strings
+  // Align the window to whole UTC days (the rollup buckets by UTC usage_date):
+  // start at midnight UTC of (today - (days - 1)), end at "now". The backend
+  // truncates both bounds to their UTC date.
   const { startDate, endDate } = useMemo(() => {
+    const days = RANGE_DAYS[rangeKey] ?? 7;
+    const now = new Date();
+    const startUtcMidnight = new Date(
+      Date.UTC(
+        now.getUTCFullYear(),
+        now.getUTCMonth(),
+        now.getUTCDate() - (days - 1),
+      ),
+    );
     return {
-      startDate: dateRange.from.toISOString(),
-      endDate: dateRange.to.toISOString(),
+      startDate: startUtcMidnight.toISOString(),
+      endDate: now.toISOString(),
     };
-  }, [dateRange]);
+  }, [rangeKey]);
 
   const { data, isLoading, error } = useRequestsAggregateByUser(
     modelAlias,
@@ -54,13 +73,20 @@ const UserUsageTable: React.FC<UserUsageTableProps> = ({
     if (!dateStr) return "-";
     const date = new Date(dateStr);
     const now = new Date();
-    const diff = now.getTime() - date.getTime();
-    const hours = Math.floor(diff / (1000 * 60 * 60));
+    // last_active_at is day-granular — the UTC midnight of MAX(usage_date)
+    // (COR-516), not an exact timestamp — so compare by whole UTC day rather
+    // than elapsed hours. Otherwise same-day usage viewed just after UTC
+    // midnight reads "1d ago" instead of "Today".
+    const utcDay = (d: Date) =>
+      Math.floor(
+        Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()) /
+          86_400_000,
+      );
+    const dayDiff = utcDay(now) - utcDay(date);
 
-    if (hours < 1) return "Just now";
-    if (hours < 24) return `${hours}h ago`;
-    const days = Math.floor(hours / 24);
-    if (days < 30) return `${days}d ago`;
+    if (dayDiff <= 0) return "Today";
+    if (dayDiff === 1) return "Yesterday";
+    if (dayDiff < 30) return `${dayDiff}d ago`;
     return date.toLocaleDateString();
   };
 
@@ -318,15 +344,20 @@ const UserUsageTable: React.FC<UserUsageTableProps> = ({
             </div>
           )}
 
-          <DateTimeRangeSelector
-            value={dateRange}
-            onChange={(range) => {
-              if (range) {
-                setDateRange(range);
-              }
-            }}
-            className="w-auto"
-          />
+          <div className="flex items-center gap-1 rounded-md border bg-muted/50 p-1">
+            {RANGE_OPTIONS.map((opt) => (
+              <Button
+                key={opt.value}
+                variant={rangeKey === opt.value ? "secondary" : "ghost"}
+                size="sm"
+                className="h-7 px-3"
+                aria-pressed={rangeKey === opt.value}
+                onClick={() => setRangeKey(opt.value)}
+              >
+                {opt.label}
+              </Button>
+            ))}
+          </div>
         </div>
       </div>
 
