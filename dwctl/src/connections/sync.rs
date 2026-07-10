@@ -1333,12 +1333,18 @@ mod tests {
             .await
             .expect("fusillade pool");
 
-        fusillade::migrator().run(&fusillade_pool).await.expect("fusillade migrations");
+        fusillade_arsenal::migrator()
+            .run(&fusillade_pool)
+            .await
+            .expect("fusillade migrations");
 
         let fusillade_test_pools = sqlx_pool_router::TestDbPools::new(fusillade_pool)
             .await
             .expect("fusillade test pools");
-        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(fusillade_test_pools, Default::default()));
+        let request_manager = std::sync::Arc::new(fusillade_arsenal::PostgresRequestManager::new(
+            fusillade_test_pools,
+            Default::default(),
+        ));
 
         crate::tasks::TaskState {
             request_manager,

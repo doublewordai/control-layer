@@ -60,7 +60,8 @@ use crate::metrics::errors::component::RESPONSES_WRITER;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use fusillade::{PersistCompletedRealtimeInput, PostgresRequestManager, ReqwestHttpClient, Storage};
+use fusillade::{PersistCompletedRealtimeInput, Storage};
+use fusillade_arsenal::PostgresRequestManager;
 use metrics::{counter, gauge, histogram};
 use sqlx_pool_router::PoolProvider;
 use tokio::sync::mpsc;
@@ -119,7 +120,7 @@ pub type RequestsWriterSender = mpsc::Sender<RawCompletedRequest>;
 /// Generic over `PoolProvider` so the same struct works in production
 /// (`DbPools`) and tests (`TestDbPools`).
 pub struct RequestsWriter<P: PoolProvider + Clone + Send + Sync + 'static> {
-    request_manager: Arc<PostgresRequestManager<P, ReqwestHttpClient>>,
+    request_manager: Arc<PostgresRequestManager<P>>,
     receiver: mpsc::Receiver<RawCompletedRequest>,
     batch_size: usize,
     max_retries: u32,
@@ -130,7 +131,7 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> RequestsWriter<P> {
     /// Build the writer and return it alongside the sender handle. Spawn the
     /// returned future via `tokio::spawn(writer.run(token))`; pass the sender
     /// into `FusilladeOutletHandler::new`.
-    pub fn new(request_manager: Arc<PostgresRequestManager<P, ReqwestHttpClient>>, batch_size: usize) -> (Self, RequestsWriterSender) {
+    pub fn new(request_manager: Arc<PostgresRequestManager<P>>, batch_size: usize) -> (Self, RequestsWriterSender) {
         let (sender, receiver) = mpsc::channel(CHANNEL_BUFFER_SIZE);
         let writer = Self {
             request_manager,
@@ -317,7 +318,9 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> RequestsWriter<P> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fusillade::{PostgresRequestManager, RequestId};
+    use fusillade::RequestId;
+    use fusillade::ReqwestHttpClient;
+    use fusillade_arsenal::PostgresRequestManager;
     use sqlx_pool_router::TestDbPools;
     use std::time::Duration;
     use tokio::time::timeout;
@@ -325,7 +328,7 @@ mod tests {
     use uuid::Uuid;
 
     /// Builds a writer wired to a fresh `#[sqlx::test]` pool with the
-    /// fusillade schema installed via `fusillade::migrator()` (so we don't
+    /// fusillade schema installed via `fusillade_arsenal::migrator()` (so we don't
     /// reference the fusillade source directory, which doesn't exist in
     /// CI). The returned request manager runs against a pool scoped to
     /// the fusillade schema. Tests pass `created_by` directly on each
@@ -336,7 +339,7 @@ mod tests {
     ) -> (
         RequestsWriter<TestDbPools>,
         RequestsWriterSender,
-        Arc<PostgresRequestManager<TestDbPools, ReqwestHttpClient>>,
+        Arc<PostgresRequestManager<TestDbPools>>,
     ) {
         let fusillade_pool = crate::test::utils::setup_fusillade_pool(&pool).await;
         let pools = TestDbPools::new(fusillade_pool).await.unwrap();
@@ -350,7 +353,7 @@ mod tests {
     /// time out. Mirrors the polling-not-sleeping pattern fusillade uses
     /// (see fusillade/CLAUDE.md).
     async fn wait_until_completed(
-        manager: &PostgresRequestManager<TestDbPools, ReqwestHttpClient>,
+        manager: &PostgresRequestManager<TestDbPools>,
         request_id: Uuid,
         timeout_secs: u64,
     ) -> fusillade::RequestDetail {

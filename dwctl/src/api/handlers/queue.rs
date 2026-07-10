@@ -193,7 +193,7 @@ mod tests {
             .await
             .expect("Failed to create fusillade pool");
         let fusillade_pools = TestDbPools::new(fusillade_pool.clone()).await.expect("TestDbPools");
-        let request_manager = fusillade::PostgresRequestManager::new(fusillade_pools, Default::default());
+        let request_manager = fusillade_arsenal::PostgresRequestManager::new(fusillade_pools, Default::default());
 
         // Create one batch per completion_window. The pending counts endpoint
         // partitions by service_tier; by default it should include only the
@@ -295,7 +295,7 @@ mod tests {
             .await
             .expect("Failed to create fusillade pool");
         let fusillade_pools = TestDbPools::new(fusillade_pool.clone()).await.expect("TestDbPools");
-        let request_manager = fusillade::PostgresRequestManager::new(fusillade_pools, Default::default());
+        let request_manager = fusillade_arsenal::PostgresRequestManager::new(fusillade_pools, Default::default());
 
         let model = "query-tier-model";
         let mut batch_ids = Vec::new();
@@ -390,7 +390,7 @@ mod tests {
             .await
             .expect("Failed to create fusillade pool");
         let fusillade_pools = TestDbPools::new(fusillade_pool.clone()).await.expect("TestDbPools");
-        let request_manager = fusillade::PostgresRequestManager::new(fusillade_pools, Default::default());
+        let request_manager = fusillade_arsenal::PostgresRequestManager::new(fusillade_pools, Default::default());
 
         let model = "flex-decay-model";
         let recent_id = uuid::Uuid::new_v4();

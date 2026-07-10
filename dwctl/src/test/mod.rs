@@ -1036,7 +1036,7 @@ async fn test_request_logging_disabled(pool: PgPool) {
     config.enable_analytics = false; // Disable to avoid spawning background batcher task
 
     // Build router with request logging disabled
-    let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(
+    let request_manager = std::sync::Arc::new(fusillade_arsenal::PostgresRequestManager::new(
         DbPools::new(pool.clone()),
         Default::default(),
     ));
@@ -1604,7 +1604,7 @@ async fn test_build_router_with_metrics_disabled(pool: PgPool) {
     config.enable_metrics = false;
     config.enable_analytics = false; // Disable to avoid spawning background batcher task
 
-    let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(
+    let request_manager = std::sync::Arc::new(fusillade_arsenal::PostgresRequestManager::new(
         DbPools::new(pool.clone()),
         Default::default(),
     ));
@@ -1666,7 +1666,7 @@ async fn test_build_router_with_metrics_enabled(pool: PgPool) {
     config.enable_metrics = true;
     config.enable_analytics = false; // Disable to avoid spawning background batcher task
 
-    let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(
+    let request_manager = std::sync::Arc::new(fusillade_arsenal::PostgresRequestManager::new(
         DbPools::new(pool.clone()),
         Default::default(),
     ));

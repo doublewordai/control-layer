@@ -24,9 +24,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use fusillade::{
-    PoolProvider as FusilladePoolProvider, PostgresRequestManager, PostgresResponseStepManager, ReqwestHttpClient, TestDbPools,
-};
+use fusillade::ReqwestHttpClient;
+use fusillade_arsenal::{PoolProvider as FusilladePoolProvider, PostgresRequestManager, PostgresResponseStepManager, TestDbPools};
 use onwards::traits::RequestContext;
 use onwards::{
     ChainStep, LoopConfig, MultiStepStore, NextAction, RecordedStep, StepDescriptor, StepKind, StepState, StoreError, UpstreamTarget,
@@ -202,10 +201,7 @@ fn http_client_for_tests() -> Arc<ReqwestHttpClient> {
 
 async fn store_with_real_fusillade(pool: PgPool) -> FusilladeResponseStore<TestDbPools> {
     let pools = TestDbPools::new(pool).await.unwrap();
-    let request_manager = Arc::new(PostgresRequestManager::<_, ReqwestHttpClient>::new(
-        pools.clone(),
-        Default::default(),
-    ));
+    let request_manager = Arc::new(PostgresRequestManager::new(pools.clone(), Default::default()));
     let step_manager = Arc::new(PostgresResponseStepManager::new(pools));
     FusilladeResponseStore::new(request_manager).with_step_manager(step_manager)
 }

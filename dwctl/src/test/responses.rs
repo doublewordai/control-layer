@@ -296,17 +296,14 @@ async fn test_blocking_response_id_matches_fusillade_id(pool: PgPool) {
 async fn test_multi_step_chain_assembles_and_is_retrievable_via_get(pool: PgPool) {
     use crate::inference::store::{FusilladeResponseStore, PendingResponseInput};
     use crate::test::utils::setup_fusillade_pool;
-    use fusillade::{PostgresRequestManager, PostgresResponseStepManager, ReqwestHttpClient, TestDbPools};
+    use fusillade_arsenal::{PostgresRequestManager, PostgresResponseStepManager, TestDbPools};
     use onwards::{MultiStepStore, StepDescriptor, StepKind as OnwardsStepKind};
     use serde_json::json;
     use std::sync::Arc;
 
     let pool = setup_fusillade_pool(&pool).await;
     let test_pools = TestDbPools::new(pool).await.unwrap();
-    let request_manager = Arc::new(PostgresRequestManager::<_, ReqwestHttpClient>::new(
-        test_pools.clone(),
-        Default::default(),
-    ));
+    let request_manager = Arc::new(PostgresRequestManager::new(test_pools.clone(), Default::default()));
     let step_manager = Arc::new(PostgresResponseStepManager::new(test_pools));
     let store = FusilladeResponseStore::new(request_manager.clone()).with_step_manager(step_manager);
 
