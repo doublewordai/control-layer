@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.79.1](https://github.com/doublewordai/control-layer/compare/v8.79.0...v8.79.1) (2026-07-10)
+
+
+### Bug Fixes
+
+* index seq before credits backfill sweep + day-level model-usage ranges ([#1259](https://github.com/doublewordai/control-layer/issues/1259)) ([b7fc059](https://github.com/doublewordai/control-layer/commit/b7fc059fd4f81b4d5b429e1003ca7699c6135f31))
+
 ## [8.79.0](https://github.com/doublewordai/control-layer/compare/v8.78.0...v8.79.0) (2026-07-10)
 
 
