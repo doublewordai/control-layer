@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.77.0](https://github.com/doublewordai/control-layer/compare/v8.76.0...v8.77.0) (2026-07-10)
+
+
+### Features
+
+* serve /usage from user_model_usage_daily rollup (COR-506 cutover) ([#1248](https://github.com/doublewordai/control-layer/issues/1248)) ([48187a0](https://github.com/doublewordai/control-layer/commit/48187a054ce67db01ff8512590d53bc7df649df1))
+
 ## [8.76.0](https://github.com/doublewordai/control-layer/compare/v8.75.1...v8.76.0) (2026-07-09)
 
 
