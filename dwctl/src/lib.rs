@@ -288,7 +288,7 @@ where
     pub metrics_recorder: Option<GenAiMetrics>,
     #[builder(default = false)]
     pub is_leader: bool,
-    pub request_manager: Arc<fusillade::PostgresRequestManager<P, fusillade::ReqwestHttpClient>>,
+    pub request_manager: Arc<fusillade_arsenal::PostgresRequestManager<P>>,
     /// Background task runner for enqueuing deferred work (batch population, etc.)
     pub task_runner: Arc<tasks::TaskRunner<P>>,
     /// Resource limiters for protecting system capacity.
@@ -303,7 +303,7 @@ where
     /// don't use the multi-step Open Responses path can omit the
     /// wiring; the GET /v1/responses/{id} handler degrades to 404 in
     /// that case rather than panicking.
-    pub response_step_manager: Option<Arc<fusillade::PostgresResponseStepManager<P>>>,
+    pub response_step_manager: Option<Arc<fusillade_arsenal::PostgresResponseStepManager<P>>>,
     /// Singleton image normaliser used by the realtime middleware, the
     /// batch ingest path, the dispatcher's JIT-signing step, and the
     /// dashboard `/images/:sha256` endpoint. Built once at startup so
@@ -836,7 +836,7 @@ async fn setup_database(
             }
         }
     };
-    fusillade::migrator().run(&*fusillade_pools).await?;
+    fusillade_arsenal::migrator().run(&*fusillade_pools).await?;
 
     // Run underway migrations (background task queue)
     underway::run_migrations(&*db_pools).await?;
@@ -2014,12 +2014,12 @@ async fn inject_trace_id(request: axum::extract::Request, next: middleware::Next
 /// stop all background tasks. When dropped, the `drop_guard` will automatically cancel
 /// the shutdown token, signaling all tasks to stop.
 pub struct BackgroundServices {
-    request_manager: Arc<fusillade::PostgresRequestManager<DbPools, fusillade::ReqwestHttpClient>>,
+    request_manager: Arc<fusillade_arsenal::PostgresRequestManager<DbPools>>,
     /// Step storage for multi-step responses, sharing the same fusillade
     /// pool as the request manager. Constructed in
     /// `setup_background_services` so the manager's processor (which
     /// dwctl wires later in `Application::new_with_pool`) can use it.
-    step_manager: Arc<fusillade::PostgresResponseStepManager<DbPools>>,
+    step_manager: Arc<fusillade_arsenal::PostgresResponseStepManager<DbPools>>,
     /// The onwards-instance daemon id registered in the `daemons` table
     /// for realtime / inline-loop attribution. The graceful-shutdown
     /// drain (`shutdown()`) marks this row Dead and releases any
@@ -2329,25 +2329,23 @@ impl BackgroundTaskBuilder {
 /// cleanup (the cycle's only effect in production — where the app lives
 /// forever — is benign).
 pub(crate) struct BackgroundServicesInput {
-    /// Fusillade's HTTP request manager. The caller builds this so the
-    /// multi-step processor (which depends on it transitively via
-    /// `FusilladeResponseStore`) can be constructed and injected via
-    /// `set_processor` before any daemon spawn inside this function.
-    pub request_manager: Arc<fusillade::PostgresRequestManager<DbPools, fusillade::ReqwestHttpClient>>,
+    /// Fusillade's durable DB store. The caller builds this so the
+    /// multi-step processor can share the same storage instance as the
+    /// daemon runtime.
+    pub request_manager: Arc<fusillade_arsenal::PostgresRequestManager<DbPools>>,
+    /// Fusillade's scheduling daemon. Owns HTTP dispatch and runtime
+    /// lifecycle; durable data operations live on `request_manager`.
+    pub postgres_daemon: Arc<fusillade::PostgresDaemon<DbPools, fusillade::ReqwestHttpClient>>,
     /// Fusillade's response-step manager. Shares the same fusillade
     /// pool as the request manager.
-    pub step_manager: Arc<fusillade::PostgresResponseStepManager<DbPools>>,
+    pub step_manager: Arc<fusillade_arsenal::PostgresResponseStepManager<DbPools>>,
     /// Multi-step processor to inject onto the request manager. `None`
     /// in tests to avoid forming the `request_manager → processor →
     /// response_store → request_manager` Arc cycle that blocks
     /// `sqlx::test`'s `DROP DATABASE` cleanup.
     pub multi_step_processor: Option<
         Arc<
-            dyn fusillade::RequestProcessor<
-                    fusillade::PostgresRequestManager<DbPools, fusillade::ReqwestHttpClient>,
-                    fusillade::ReqwestHttpClient,
-                > + Send
-                + Sync,
+            dyn fusillade::RequestProcessor<fusillade_arsenal::PostgresRequestManager<DbPools>, fusillade::ReqwestHttpClient> + Send + Sync,
         >,
     >,
     /// Shared map between the fusillade daemon's concurrency control
@@ -2375,6 +2373,7 @@ pub(crate) struct BackgroundServicesInput {
 async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Result<BackgroundServices> {
     let BackgroundServicesInput {
         request_manager,
+        postgres_daemon,
         step_manager,
         multi_step_processor,
         model_capacity_limits,
@@ -2388,21 +2387,21 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
         keystore,
     } = input;
 
-    // Wire the multi-step processor onto the request manager *before*
+    // Wire the multi-step processor onto the daemon *before*
     // any daemon spawn below — this is the whole reason `setup_background_services`
     // accepts these as parameters rather than constructing them itself.
     // See the function-level doc comment.
     if let Some(processor) = multi_step_processor
-        && let Err(e) = request_manager.set_processor(processor)
+        && let Err(e) = postgres_daemon.set_processor(processor)
     {
         tracing::warn!(error = e, "Multi-step processor was already set; skipping");
     }
 
     // `keystore` comes from the caller (built once and shared). Install the
-    // TRANSITIONAL ZDR response transformer on the manager before the daemon
+    // TRANSITIONAL ZDR response transformer on the daemon before it
     // spawns below, so completed bodies are persisted encrypted.
     if let Some(ks) = keystore.clone()
-        && let Err(e) = request_manager.set_response_transformer(std::sync::Arc::new(crate::inference::zdr::ZdrResponseEncryptor::new(ks)))
+        && let Err(e) = postgres_daemon.set_response_transformer(std::sync::Arc::new(crate::inference::zdr::ZdrResponseEncryptor::new(ks)))
     {
         tracing::warn!(error = e, "ZDR response transformer was already set; skipping");
     }
@@ -2536,10 +2535,9 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
 
         // Start the fusillade batch processing daemon based on config
         use crate::config::DaemonEnabled;
-        use fusillade::DaemonExecutor;
         match config.background_services.batch_daemon.enabled {
             DaemonEnabled::Always | DaemonEnabled::Leader => {
-                let daemon_handle = request_manager.clone().run(shutdown_token.clone())?;
+                let daemon_handle = postgres_daemon.clone().run(shutdown_token.clone())?;
                 // Spawn task that propagates daemon errors
                 background_tasks.spawn("fusillade-daemon", async move {
                     match daemon_handle.await {
@@ -2593,8 +2591,7 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
         // If daemon is set to "Always", start it immediately regardless of leader election
         use crate::config::DaemonEnabled;
         if config.background_services.batch_daemon.enabled == DaemonEnabled::Always {
-            use fusillade::DaemonExecutor;
-            let daemon_handle = request_manager.clone().run(shutdown_token.clone())?;
+            let daemon_handle = postgres_daemon.clone().run(shutdown_token.clone())?;
             // Spawn task that propagates daemon errors
             background_tasks.spawn("fusillade-daemon", async move {
                 match daemon_handle.await {
@@ -2622,6 +2619,7 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
         let leader_election_scheduler_gain = probe_scheduler.clone();
         let leader_election_scheduler_lose = probe_scheduler.clone();
         let leader_election_request_manager_gain = request_manager.clone();
+        let leader_election_postgres_daemon_gain = postgres_daemon.clone();
         let leader_election_config = config.clone();
         let leader_election_flag = is_leader_flag.clone();
 
@@ -2649,6 +2647,7 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
                     // This closure is run when a replica becomes the leader
                     let scheduler = leader_election_scheduler_gain.clone();
                     let request_manager = leader_election_request_manager_gain.clone();
+                    let postgres_daemon = leader_election_postgres_daemon_gain.clone();
                     let daemon_handle = daemon_handle_gain.clone();
                     let leadership_shutdown = leadership_shutdown_gain.clone();
                     async move {
@@ -2681,10 +2680,9 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
 
                         // Start the fusillade batch processing daemon based on config
                         use crate::config::DaemonEnabled;
-                        use fusillade::DaemonExecutor;
                         match config.background_services.batch_daemon.enabled {
                             DaemonEnabled::Leader => {
-                                let handle = request_manager
+                                let handle = postgres_daemon
                                     .run(session_token.clone())
                                     .map_err(|e| anyhow::anyhow!("Failed to start fusillade daemon: {}", e))?;
 
@@ -3024,20 +3022,26 @@ impl Application {
         // we build it once here.
         let model_capacity_limits: Arc<dashmap::DashMap<String, usize>> = Arc::new(dashmap::DashMap::new());
 
+        let fusillade_daemon_config = config
+            .background_services
+            .batch_daemon
+            .to_fusillade_config_with_limits(Some(model_capacity_limits.clone()));
+
         let request_manager = Arc::new(
-            fusillade::PostgresRequestManager::new(
+            fusillade_arsenal::PostgresRequestManager::new(
                 fusillade_pools.clone(),
-                config
-                    .background_services
-                    .batch_daemon
-                    .to_fusillade_config_with_limits(Some(model_capacity_limits.clone())),
+                fusillade_arsenal::PostgresStorageConfig::from(&fusillade_daemon_config),
             )
             .with_download_buffer_size(config.batches.files.download_buffer_size)
-            .with_batch_insert_strategy(fusillade::manager::postgres::BatchInsertStrategy::Batched {
+            .with_batch_insert_strategy(fusillade_arsenal::BatchInsertStrategy::Batched {
                 batch_size: config.batches.files.batch_insert_size,
             }),
         );
-        let step_manager = Arc::new(fusillade::PostgresResponseStepManager::new(fusillade_pools.clone()));
+        let postgres_daemon = Arc::new(fusillade::PostgresDaemon::from_store(
+            request_manager.clone(),
+            fusillade_daemon_config.clone(),
+        ));
+        let step_manager = Arc::new(fusillade_arsenal::PostgresResponseStepManager::new(fusillade_pools.clone()));
         // Build the ZDR keystore once and share it across the response store, the
         // daemon processor, and background services (which install the response
         // transformer). A misconfiguration is fatal.
@@ -3076,13 +3080,11 @@ impl Application {
         // streamable-endpoint dispatch. Timeouts and the streamable list
         // come from the same config knobs the daemon respects, so warm
         // path and daemon path use identical streaming semantics.
-        let batch_daemon_cfg = &config.background_services.batch_daemon;
-        let batch_daemon_fusillade_cfg = batch_daemon_cfg.to_fusillade_config();
         let multi_step_http_client: Arc<fusillade::ReqwestHttpClient> = Arc::new(fusillade::ReqwestHttpClient::new(
-            std::time::Duration::from_millis(batch_daemon_fusillade_cfg.first_chunk_timeout_ms),
-            std::time::Duration::from_millis(batch_daemon_fusillade_cfg.chunk_timeout_ms),
-            std::time::Duration::from_millis(batch_daemon_fusillade_cfg.body_timeout_ms),
-            batch_daemon_fusillade_cfg.streamable_endpoints.clone(),
+            std::time::Duration::from_millis(fusillade_daemon_config.first_chunk_timeout_ms),
+            std::time::Duration::from_millis(fusillade_daemon_config.chunk_timeout_ms),
+            std::time::Duration::from_millis(fusillade_daemon_config.body_timeout_ms),
+            fusillade_daemon_config.streamable_endpoints.clone(),
         ));
         let multi_step_loop_config = onwards::LoopConfig {
             max_response_step_depth: config.responses.max_response_step_depth,
@@ -3127,10 +3129,8 @@ impl Application {
             Some(
                 processor
                     as Arc<
-                        dyn fusillade::RequestProcessor<
-                                fusillade::PostgresRequestManager<DbPools, fusillade::ReqwestHttpClient>,
-                                fusillade::ReqwestHttpClient,
-                            > + Send
+                        dyn fusillade::RequestProcessor<fusillade_arsenal::PostgresRequestManager<DbPools>, fusillade::ReqwestHttpClient>
+                            + Send
                             + Sync,
                     >,
             )
@@ -3138,6 +3138,7 @@ impl Application {
 
         let mut bg_services = setup_background_services(BackgroundServicesInput {
             request_manager: request_manager.clone(),
+            postgres_daemon: postgres_daemon.clone(),
             step_manager: step_manager.clone(),
             multi_step_processor: multi_step_processor_for_setup,
             model_capacity_limits,
@@ -3186,9 +3187,9 @@ impl Application {
              VALUES ($1, $2, $3, $4, $5, 'running', NOW(), NOW())",
         )
         .bind(onwards_daemon_id)
-        .bind(fusillade::daemon::types::get_hostname())
-        .bind(fusillade::daemon::types::get_pid())
-        .bind(fusillade::daemon::types::get_version())
+        .bind(std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown".to_string()))
+        .bind(std::process::id() as i32)
+        .bind(env!("CARGO_PKG_VERSION"))
         .bind(serde_json::json!({"type": "onwards"}))
         .execute(&fusillade_write_pool)
         .await;

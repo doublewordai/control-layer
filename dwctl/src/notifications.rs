@@ -25,7 +25,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use fusillade::manager::postgres::PostgresRequestManager;
+use fusillade_arsenal::PostgresRequestManager;
 use metrics::counter;
 use rust_decimal::prelude::ToPrimitive;
 use sqlx::PgPool;
@@ -134,7 +134,7 @@ impl BatchNotificationInfo {
 pub async fn run_notification_poller(
     config: NotificationsConfig,
     app_config: crate::config::Config,
-    request_manager: Arc<PostgresRequestManager<DbPools, fusillade::http::ReqwestHttpClient>>,
+    request_manager: Arc<PostgresRequestManager<DbPools>>,
     dwctl_pool: PgPool,
     shutdown: CancellationToken,
 ) {

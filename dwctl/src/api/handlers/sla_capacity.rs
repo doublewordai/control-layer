@@ -186,7 +186,7 @@ pub(crate) enum CapacityError {
 /// Used by both `POST /batches` (API) and `run_activate_batch` (sync pipeline).
 pub(crate) async fn reserve_capacity<P: sqlx_pool_router::PoolProvider>(
     dwctl_pool: &PgPool,
-    request_manager: &fusillade::PostgresRequestManager<P, fusillade::ReqwestHttpClient>,
+    request_manager: &fusillade_arsenal::PostgresRequestManager<P>,
     input: &CapacityReservationInput<'_>,
 ) -> Result<Vec<Uuid>, CapacityError> {
     use crate::db::handlers::BatchCapacityReservations;

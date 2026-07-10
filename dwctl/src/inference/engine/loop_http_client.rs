@@ -19,7 +19,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use fusillade::http::{HttpClient as FusilladeHttpClient, HttpResponse};
-use fusillade::{FusilladeError, PoolProvider as FusilladePool, RequestData, ReqwestHttpClient, Result as FusilladeResult};
+use fusillade::{FusilladeError, RequestData, ReqwestHttpClient, Result as FusilladeResult};
+use fusillade_arsenal::PoolProvider as FusilladePool;
 use onwards::traits::{RequestContext, ToolExecutor};
 use onwards::{LoopConfig, LoopError, MultiStepStore, UpstreamTarget};
 

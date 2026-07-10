@@ -23,7 +23,7 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Response},
 };
-use fusillade::{PostgresRequestManager, ReqwestHttpClient};
+use fusillade_arsenal::PostgresRequestManager;
 use sqlx_pool_router::PoolProvider;
 
 use super::image_normalizer_middleware::{normalize_error_response, normalize_value_to_tokens};
@@ -35,7 +35,7 @@ use crate::image_normalizer::ImageNormalizer;
 /// State for the inference middleware.
 #[derive(Clone)]
 pub struct InferenceMiddlewareState<P: PoolProvider + Clone = sqlx_pool_router::DbPools> {
-    pub request_manager: Arc<PostgresRequestManager<P, ReqwestHttpClient>>,
+    pub request_manager: Arc<PostgresRequestManager<P>>,
     pub daemon_id: OnwardsDaemonId,
     /// Base URL for loopback requests (e.g., "http://127.0.0.1:3001/ai").
     /// Flex batches are routed back through dwctl so onwards handles the

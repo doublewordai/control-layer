@@ -510,6 +510,11 @@ background_services:
     # - "leader": Only run on the elected leader instance
     # - "never": Never run the daemon
     enabled: always
+    # Which fusillade claim loops this daemon process runs:
+    # - "both": Run request and batch claim loops (default)
+    # - "request_only": Run only batchless request claims
+    # - "batch_only": Run only batch claims
+    mode: both
 
     # Performance & Concurrency Settings
     claim_batch_size: 100 # Maximum number of requests to claim in each iteration

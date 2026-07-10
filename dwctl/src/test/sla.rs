@@ -10,7 +10,7 @@ use crate::test::utils::{
 };
 use crate::{
     api::models::users::Role,
-    config::{DaemonConfig, DaemonEnabled, ModelSource},
+    config::{DaemonConfig, DaemonEnabled, DaemonMode, ModelSource},
     db::handlers::api_keys::ApiKeys,
     db::models::api_keys::ApiKeyPurpose,
 };
@@ -119,6 +119,7 @@ async fn test_route_at_claim_time_escalation(pool: PgPool) {
 
     config.background_services.batch_daemon = DaemonConfig {
         enabled: DaemonEnabled::Always,
+        mode: DaemonMode::Both,
         claim_batch_size: 10,
         default_model_concurrency: 5,
         claim_interval_ms: 100,
@@ -391,6 +392,7 @@ async fn test_no_escalation_when_not_near_expiry(pool: PgPool) {
     let mut config = create_test_config();
     config.background_services.batch_daemon = DaemonConfig {
         enabled: DaemonEnabled::Always,
+        mode: DaemonMode::Both,
         claim_batch_size: 10,
         default_model_concurrency: 5,
         claim_interval_ms: 100,

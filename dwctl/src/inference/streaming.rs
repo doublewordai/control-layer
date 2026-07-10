@@ -132,7 +132,7 @@ impl ReplayFrame {
 /// terminator); the Responses surface ends on `response.completed`/`.failed`
 /// and passes `false`.
 pub async fn flex_stream_response<P, F>(
-    request_manager: Arc<fusillade::PostgresRequestManager<P, ReqwestHttpClient>>,
+    request_manager: Arc<fusillade_arsenal::PostgresRequestManager<P>>,
     flex_input: fusillade::CreateFlexInput,
     request_id: uuid::Uuid,
     done_sentinel: bool,
@@ -140,7 +140,7 @@ pub async fn flex_stream_response<P, F>(
     render: F,
 ) -> axum::response::Response
 where
-    P: fusillade::PoolProvider + Clone + Send + Sync + 'static,
+    P: fusillade_arsenal::PoolProvider + Clone + Send + Sync + 'static,
     F: FnOnce(Result<&fusillade::RequestDetail, &str>) -> Vec<ReplayFrame> + Send + 'static,
 {
     use axum::response::IntoResponse;
@@ -219,7 +219,7 @@ pub fn run_inline_streaming<P>(
     model_alias: String,
 ) -> Sse<impl Stream<Item = Result<Event, axum::Error>>>
 where
-    P: fusillade::PoolProvider + Clone + Send + Sync + 'static,
+    P: fusillade_arsenal::PoolProvider + Clone + Send + Sync + 'static,
 {
     let (tx, rx) = mpsc::channel::<Result<Event, axum::Error>>(SSE_CHANNEL_BUFFER);
 
@@ -294,7 +294,7 @@ where
 
 async fn persist_terminal_completed<P>(response_store: &FusilladeResponseStore<P>, request_id: &str) -> Result<(), String>
 where
-    P: fusillade::PoolProvider + Clone + Send + Sync + 'static,
+    P: fusillade_arsenal::PoolProvider + Clone + Send + Sync + 'static,
 {
     // Assemble the final response JSON from the chain (same path the
     // daemon processor uses), then write it onto the head step's
@@ -335,7 +335,7 @@ pub async fn run_inline_blocking<P>(
     model_alias: String,
 ) -> Result<Value, Value>
 where
-    P: fusillade::PoolProvider + Clone + Send + Sync + 'static,
+    P: fusillade_arsenal::PoolProvider + Clone + Send + Sync + 'static,
 {
     let tool_ctx = RequestContext::new()
         .with_model(model_alias)
@@ -392,7 +392,7 @@ where
 
 async fn persist_terminal_failed<P>(response_store: &FusilladeResponseStore<P>, request_id: &str, error: &Value) -> Result<(), String>
 where
-    P: fusillade::PoolProvider + Clone + Send + Sync + 'static,
+    P: fusillade_arsenal::PoolProvider + Clone + Send + Sync + 'static,
 {
     response_store
         .finalize_head_request(request_id, 500, error.clone())
