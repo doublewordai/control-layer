@@ -1130,6 +1130,10 @@ where
         let mut fusillade_batch_ids: Vec<Option<Uuid>> = Vec::new();
         let mut models: Vec<String> = Vec::new();
         let mut api_key_ids_credit: Vec<Option<Uuid>> = Vec::new();
+        // Service tier, computed in memory from the fusillade metadata, so the
+        // transactions list can label each row (realtime / flex / async / batch)
+        // without joining http_analytics.
+        let mut service_tiers: Vec<String> = Vec::new();
 
         for record in records {
             // Skip if no user or no pricing
@@ -1171,6 +1175,7 @@ where
             fusillade_batch_ids.push(record.raw.fusillade_batch_id);
             models.push(model);
             api_key_ids_credit.push(record.api_key_id);
+            service_tiers.push(compute_service_tier(record.raw.fusillade_batch_id, record.raw.batch_completion_window.as_deref()).to_string());
         }
 
         if user_ids.is_empty() {
@@ -1193,12 +1198,12 @@ where
         // re-folded nor re-aggregated.
         let inserted_rows = sqlx::query!(
             r#"
-            INSERT INTO credits_transactions (user_id, transaction_type, amount, source_id, description, fusillade_batch_id, api_key_id, is_aggregated)
+            INSERT INTO credits_transactions (user_id, transaction_type, amount, source_id, description, fusillade_batch_id, api_key_id, is_aggregated, service_tier)
             SELECT u.user_id, u.transaction_type, u.amount, u.source_id, u.description, u.fusillade_batch_id, u.api_key_id,
-                   u.fusillade_batch_id IS NOT NULL
+                   u.fusillade_batch_id IS NOT NULL, u.service_tier
             FROM UNNEST(
-                $1::uuid[], $2::text[], $3::numeric[], $4::text[], $5::text[], $6::uuid[], $7::uuid[]
-            ) AS u(user_id, transaction_type, amount, source_id, description, fusillade_batch_id, api_key_id)
+                $1::uuid[], $2::text[], $3::numeric[], $4::text[], $5::text[], $6::uuid[], $7::uuid[], $8::text[]
+            ) AS u(user_id, transaction_type, amount, source_id, description, fusillade_batch_id, api_key_id, service_tier)
             ON CONFLICT (source_id) DO NOTHING
             RETURNING source_id, user_id, amount, seq, created_at, fusillade_batch_id
             "#,
@@ -1209,6 +1214,7 @@ where
             &descriptions as &[Option<String>],
             &fusillade_batch_ids as &[Option<Uuid>],
             &api_key_ids_credit as &[Option<Uuid>],
+            &service_tiers,
         )
         .fetch_all(&mut **tx)
         .await?;
@@ -1453,9 +1459,37 @@ fn compute_request_origin(api_key_purpose: Option<&ApiKeyPurpose>, fusillade_bat
     }
 }
 
+/// Compute the billing service tier from the fusillade metadata.
+///
+/// Distinguished by whether the request was queued through fusillade (has a
+/// `fusillade_batch_id`) and its SLA (`completion_window`):
+/// - `realtime` — synchronous: no batch id, no SLA window
+/// - `flex`     — 1h SLA, no batch id (async single request)
+/// - `async`    — 1h SLA with a batch id
+/// - `batch`    — 24h SLA with a batch id (the /v1/batches API)
+fn compute_service_tier(fusillade_batch_id: Option<Uuid>, completion_window: Option<&str>) -> &'static str {
+    let window = completion_window.filter(|w| !w.is_empty());
+    match (fusillade_batch_id.is_some(), window) {
+        (false, None) => "realtime",
+        (false, _) => "flex",
+        (true, Some("24h")) => "batch",
+        (true, _) => "async",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_compute_service_tier() {
+        let batch_id = Uuid::new_v4();
+        assert_eq!(compute_service_tier(None, None), "realtime");
+        assert_eq!(compute_service_tier(None, Some("")), "realtime");
+        assert_eq!(compute_service_tier(None, Some("1h")), "flex");
+        assert_eq!(compute_service_tier(Some(batch_id), Some("1h")), "async");
+        assert_eq!(compute_service_tier(Some(batch_id), Some("24h")), "batch");
+    }
 
     #[test]
     fn test_raw_analytics_record_creation() {
