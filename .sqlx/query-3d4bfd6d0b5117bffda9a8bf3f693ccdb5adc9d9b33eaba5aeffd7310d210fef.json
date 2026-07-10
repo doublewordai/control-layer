@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT model,\n               COALESCE(SUM(prompt_tokens), 0)::bigint as input_tokens,\n               COALESCE(SUM(completion_tokens), 0)::bigint as output_tokens,\n               COALESCE(SUM(total_cost), 0) as cost,\n               COUNT(*) as request_count\n        FROM http_analytics\n        WHERE user_id = $1\n          AND timestamp >= $2 AND timestamp <= $3\n          AND model IS NOT NULL\n          AND status_code BETWEEN 200 AND 299\n        GROUP BY model\n        ORDER BY request_count DESC\n        ",
+  "query": "\n        SELECT model,\n               SUM(input_tokens)::bigint  AS input_tokens,\n               SUM(output_tokens)::bigint AS output_tokens,\n               SUM(cost)                  AS cost,\n               SUM(request_count)::bigint AS request_count\n        FROM user_model_usage_daily\n        WHERE user_id = $1\n          AND usage_date >= ($2::timestamptz AT TIME ZONE 'UTC')::date\n          AND usage_date <= ($3::timestamptz AT TIME ZONE 'UTC')::date\n        GROUP BY model\n        ORDER BY SUM(request_count) DESC\n        ",
   "describe": {
     "columns": [
       {
@@ -37,12 +37,12 @@
       ]
     },
     "nullable": [
-      true,
+      false,
       null,
       null,
       null,
       null
     ]
   },
-  "hash": "4c204f7a4617b9c313b2a50e08bd6eca15b4e727759f94815d9b318fdde42d55"
+  "hash": "3d4bfd6d0b5117bffda9a8bf3f693ccdb5adc9d9b33eaba5aeffd7310d210fef"
 }

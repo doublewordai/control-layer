@@ -23,7 +23,7 @@ use crate::{
     auth::permissions::{RequiresPermission, operation, resource},
     db::handlers::analytics::{
         get_model_user_usage, get_realtime_tariffs, get_requests_aggregate, get_user_batch_count_for_range, get_user_batch_counts,
-        get_user_model_breakdown, get_user_model_breakdown_for_range, list_http_analytics, refresh_user_model_usage,
+        get_user_model_breakdown, get_user_model_breakdown_for_range, list_http_analytics, refresh_user_model_usage_daily,
     },
     errors::Error,
 };
@@ -256,10 +256,12 @@ pub async fn get_usage<P: PoolProvider>(
     } else {
         // All-time usage combines two pre-aggregated tables:
         //
-        // 1. `user_model_usage` — incrementally updated from http_analytics
-        //    via a cursor (refresh_user_model_usage). Tokens, cost, and
-        //    request count are additive, so splitting rows across refresh
-        //    windows produces correct totals.
+        // 1. `user_model_usage_daily` — per-day rollup incrementally folded from
+        //    http_analytics by the usage-refresh daemon (cursor-based forward-fill).
+        //    Tokens, cost, and request count are additive across days, so the all-time
+        //    total is a SUM over every day for the user. Reads rely on the daemon's
+        //    forward-fill (eventually consistent, sub-second under load); only ?refresh=true
+        //    forces a synchronous fold before reading.
         //
         // 2. `batch_aggregates` — needed for batch *count* because counting
         //    distinct batches is NOT additive. A single batch's analytics
@@ -273,8 +275,12 @@ pub async fn get_usage<P: PoolProvider>(
         //    written), so a simple COUNT(*) is safe.
         // `batch_aggregates` is maintained synchronously by the charging
         // writers (batcher flush and create_transaction), so no read-time
-        // aggregation is needed here anymore.
-        refresh_user_model_usage(state.db.write()).await?;
+        // aggregation is needed here anymore. Only the daily rollup needs a
+        // synchronous fold, and only when the caller explicitly asks via
+        // ?refresh=true (otherwise the usage-refresh daemon keeps it current).
+        if refresh {
+            refresh_user_model_usage_daily(state.db.write()).await?;
+        }
         let (batch_stats, by_model, tariffs) = tokio::try_join!(
             get_user_batch_counts(state.db.read(), target_user_id),
             get_user_model_breakdown(state.db.read(), target_user_id),
@@ -884,6 +890,15 @@ mod tests {
         .execute(pool)
         .await
         .expect("Failed to insert test analytics row");
+
+        // Fold the freshly-seeded http_analytics row into the daily rollup, mirroring
+        // the usage-refresh daemon in prod. `/usage` now reads token/cost breakdowns
+        // from `user_model_usage_daily`, so tests must populate it or every read is 0.
+        // The fold is cursor-based and additive, so calling it after each insert
+        // accumulates correctly across multiple seeded rows.
+        refresh_user_model_usage_daily(pool)
+            .await
+            .expect("Failed to refresh user_model_usage_daily rollup");
     }
 
     /// Build a `/usage` URL with the standard one-hour-ago window and an
@@ -1096,6 +1111,14 @@ mod tests {
         .execute(pool)
         .await
         .expect("Failed to insert test analytics data with user_id");
+
+        // The date-filtered usage path reads token/cost breakdowns from the
+        // `user_model_usage_daily` rollup (COR-506 cutover), so fold the seeded
+        // row in — mirroring the usage-refresh daemon. The fold is cursor-based
+        // and additive, so it composes across multiple seeded rows.
+        refresh_user_model_usage_daily(pool)
+            .await
+            .expect("Failed to refresh user_model_usage_daily rollup");
     }
 
     /// Regression test for org-context scoping in the `/admin/api/v1/usage`
@@ -1103,12 +1126,12 @@ mod tests {
     /// every query and cache key, so usage figures never changed when the
     /// user switched into an org — they always saw their personal numbers.
     ///
-    /// We exercise the date-filtered path because it reads `http_analytics`
-    /// directly (with `WHERE user_id = $1`), avoiding the need to run the
-    /// background `refresh_user_model_usage` / `aggregate_user_batches`
-    /// jobs against the test pool. Two analytics rows are seeded — one for
-    /// the PM, one for the org — and the test asserts the response only
-    /// contains the model attributed to the active context.
+    /// We exercise the date-filtered path, which reads the per-day
+    /// `user_model_usage_daily` rollup scoped `WHERE user_id = $1`. The seed
+    /// helper folds each row into that rollup, so no background job needs to
+    /// run against the test pool. Two analytics rows are seeded — one for the
+    /// PM, one for the org — and the test asserts the response only contains
+    /// the model attributed to the active context.
     #[sqlx::test]
     #[test_log::test]
     async fn test_get_usage_pm_in_org_context_scopes_to_org(pool: PgPool) {

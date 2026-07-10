@@ -46,21 +46,49 @@ DATABASE_URL=<prod>  ./scripts/backfill_user_model_usage_daily.sh
 Chunked PK id-sweep bounded by the watermark, each batch its own transaction, throttled,
 idempotent + resumable (durable progress cursor). Safe to run while the app is live.
 
-Then validate — daily sums must match the old rollup per (user, model):
+Then validate — daily must match **raw `http_analytics`**, the source of truth, per
+(user, model):
 ```bash
 psql "$DATABASE_URL" -f scripts/validate_user_model_usage_daily.sql
 ```
-Expect zero rows, or a few tiny diffs on active users (the in-flight tail between the two
-cursors). Large diffs ⇒ investigate; do **not** cut over.
+Expect zero rows, or a few tiny diffs on active users (the in-flight tail between the daemon
+cursor and the scan). Large diffs ⇒ investigate; do **not** cut over.
+
+> **Do not validate against the old `user_model_usage` table.** It is a long-lived
+> accumulator (since migration 069) that has drifted *upward* from what `http_analytics`
+> actually contains — measured ~13% high in aggregate, and up to ~25× on individual
+> (user, model) pairs — from historical double-counting. The daily rollup, rebuilt from raw,
+> is the *more correct* number; the old table is not a trustworthy baseline. (This drift is
+> also why the cutover lowers displayed all-time usage — see Deploy 2.)
+
+> **Scope the raw comparison to the retention window.** Once `http_analytics` retention is
+> cut (COR-509), raw only covers recent days, so daily-vs-raw can only be validated for
+> `usage_date >= now() - <retention window>`. History before that is validated at backfill
+> time (while raw is still complete) and thereafter trusted as immutable. The validate
+> script bounds its raw scan to this window.
 
 ### Deploy 2 — cutover
 - Repoint all reads (all-time `get_user_model_breakdown`, range
   `get_user_model_breakdown_for_range`) to `user_model_usage_daily`; repoint
   `get_user_batch_count_for_range` to `batch_aggregates`.
 - Remove the inline `refresh_user_model_usage` call; gate any inline daily refresh behind
-  `?refresh=true`.
+  `?refresh=true`. Reads otherwise rely on the daemon's forward-fill (eventually consistent,
+  sub-second under load).
+- **Summable usage** (tokens, cost, request/batch counts) comes from the rollups. **Non-summable
+  stats stay on raw `http_analytics`** within the retention window: latency p95/p99, status-code
+  breakdowns, and the intra-day time series. These are already retention-bounded and are not
+  part of this cutover.
+- **Granularity change:** the rollup is keyed by UTC `usage_date`, so date-range usage reads
+  become **UTC-day-granular** (a range is `usage_date BETWEEN start::date AND end::date`).
+  Sub-day ranges collapse to whole days — the UI is updated to present day-level granularity
+  (control-layer `dashboard/` and `app-doubleword-private/`).
 - **Keep** the `user_model_usage` table (still read by not-yet-replaced old pods during the
   rolling deploy; harmless once they're gone).
+
+> **Billing sign-off required before merge.** Moving the all-time read off the (inflated) old
+> table onto the (correct) daily rollup **lowers displayed all-time usage ~13% in aggregate**,
+> concentrated on specific (user, model) pairs. It is more accurate, but it is user-visible and
+> billing-adjacent — get explicit sign-off and decide whether to notify affected accounts.
 
 ### Deploy 3 — contract
 - Migration 111: `DROP TABLE user_model_usage; DROP TABLE user_model_usage_cursor;` — only
