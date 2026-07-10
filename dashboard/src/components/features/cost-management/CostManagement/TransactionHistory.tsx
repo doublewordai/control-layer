@@ -122,7 +122,9 @@ export function TransactionHistory({
     return transactionsResponse?.data || [];
   }, [transactionsResponse]);
 
-  const totalCount = transactionsResponse?.total_count ?? 0;
+  // No total count from the server (computing one would scan whole filtered
+  // histories); pagination is driven by whether a next page exists.
+  const hasMore = transactionsResponse?.has_more ?? false;
   const pageStartBalance = transactionsResponse?.page_start_balance ?? 0;
 
   // Compute balance_after for each transaction
@@ -208,9 +210,6 @@ export function TransactionHistory({
 
     return `${category}: ${details}`;
   };
-
-  // Calculate total pages from server response
-  const totalPages = Math.ceil(totalCount / pagination.pageSize);
 
   const hasActiveFilters =
     transactionType !== "all" || dateRange !== undefined || searchTerm !== "";
@@ -460,9 +459,7 @@ export function TransactionHistory({
           {/* Filter Status */}
           {hasActiveFilters && (
             <div className="text-sm text-doubleword-neutral-600">
-              Showing {totalCount} filtered transaction
-              {totalCount !== 1 ? "s" : ""} (page {pagination.page} of{" "}
-              {totalPages || 1})
+              Showing filtered transactions (page {pagination.page})
             </div>
           )}
         </div>
@@ -597,15 +594,20 @@ export function TransactionHistory({
         )}
 
         {/* Pagination Controls */}
-        {totalCount > 0 && (
+        {(transactions.length > 0 || pagination.page > 1) && (
           <div className="flex items-center justify-between border-t border-doubleword-neutral-200 pt-2">
             <div className="text-sm text-doubleword-neutral-600">
-              Showing {pagination.queryParams.skip + 1} to{" "}
-              {Math.min(
-                pagination.queryParams.skip + pagination.pageSize,
-                totalCount,
-              )}{" "}
-              of {totalCount} transactions
+              {transactions.length > 0 ? (
+                <>
+                  Showing {pagination.queryParams.skip + 1} to{" "}
+                  {pagination.queryParams.skip + transactions.length}{" "}
+                  transactions
+                </>
+              ) : (
+                // Reachable by paging past the end (e.g. filters changed on a
+                // deep page); the controls stay so the user can navigate back.
+                <>No transactions on this page</>
+              )}
             </div>
             <div className="flex items-center gap-2">
               <Button
@@ -626,13 +628,13 @@ export function TransactionHistory({
                 Previous
               </Button>
               <div className="text-sm text-doubleword-neutral-600">
-                Page {pagination.page} of {totalPages}
+                Page {pagination.page}
               </div>
               <Button
                 variant="outline"
                 size="sm"
                 onClick={() => pagination.handlePageChange(pagination.page + 1)}
-                disabled={pagination.page >= totalPages}
+                disabled={!hasMore}
               >
                 Next
                 <ChevronRight className="w-4 h-4" />

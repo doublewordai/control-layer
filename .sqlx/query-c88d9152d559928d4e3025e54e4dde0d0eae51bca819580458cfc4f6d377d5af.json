@@ -1,0 +1,83 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            WITH inserted AS (\n                INSERT INTO credits_transactions (user_id, transaction_type, amount, source_id, description, fusillade_batch_id, api_key_id, is_aggregated)\n                VALUES ($1, $2, $3, $4, $5, $6::uuid, $7, $6::uuid IS NOT NULL)\n                RETURNING id, user_id, transaction_type, amount, source_id, description, created_at, seq, api_key_id\n            ),\n            bumped AS (\n                INSERT INTO user_balance_checkpoints (user_id, checkpoint_seq, balance)\n                SELECT user_id, seq, $8 FROM inserted\n                ON CONFLICT (user_id) DO UPDATE SET\n                    balance = user_balance_checkpoints.balance + EXCLUDED.balance,\n                    checkpoint_seq = GREATEST(user_balance_checkpoints.checkpoint_seq, EXCLUDED.checkpoint_seq),\n                    updated_at = NOW()\n                RETURNING balance\n            ),\n            aggregated AS (\n                INSERT INTO batch_aggregates (fusillade_batch_id, user_id, total_amount, transaction_count, max_seq, created_at, updated_at)\n                SELECT $6::uuid, user_id, amount, 1, seq, created_at, NOW()\n                FROM inserted\n                WHERE $6::uuid IS NOT NULL\n                ON CONFLICT (fusillade_batch_id) DO UPDATE SET\n                    total_amount = batch_aggregates.total_amount + EXCLUDED.total_amount,\n                    transaction_count = batch_aggregates.transaction_count + EXCLUDED.transaction_count,\n                    max_seq = GREATEST(batch_aggregates.max_seq, EXCLUDED.max_seq),\n                    updated_at = NOW()\n            )\n            SELECT\n                i.id AS \"id!\",\n                i.user_id AS \"user_id!\",\n                i.transaction_type AS \"transaction_type!: CreditTransactionType\",\n                i.amount AS \"amount!\",\n                i.source_id AS \"source_id!\",\n                i.description,\n                i.created_at AS \"created_at!\",\n                i.seq AS \"seq!\",\n                i.api_key_id,\n                b.balance AS \"new_balance!\"\n            FROM inserted i, bumped b\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id!",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "user_id!",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "transaction_type!: CreditTransactionType",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "amount!",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 4,
+        "name": "source_id!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "description",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "created_at!",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 7,
+        "name": "seq!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 8,
+        "name": "api_key_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 9,
+        "name": "new_balance!",
+        "type_info": "Numeric"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Numeric",
+        "Text",
+        "Text",
+        "Uuid",
+        "Uuid",
+        "Numeric"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      true,
+      false
+    ]
+  },
+  "hash": "c88d9152d559928d4e3025e54e4dde0d0eae51bca819580458cfc4f6d377d5af"
+}

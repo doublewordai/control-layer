@@ -25,7 +25,6 @@ use crate::{
         get_model_user_usage, get_realtime_tariffs, get_requests_aggregate, get_user_batch_count_for_range, get_user_batch_counts,
         get_user_model_breakdown, get_user_model_breakdown_for_range, list_http_analytics, refresh_user_model_usage_daily,
     },
-    db::handlers::credits::Credits,
     errors::Error,
 };
 use chrono::{DateTime, Duration, Utc};
@@ -274,10 +273,13 @@ pub async fn get_usage<P: PoolProvider>(
         //    all-time has no fixed range — the cursor moves forward.
         //    `batch_aggregates` only contains completed batches (all rows
         //    written), so a simple COUNT(*) is safe.
+        // `batch_aggregates` is maintained synchronously by the charging
+        // writers (batcher flush and create_transaction), so no read-time
+        // aggregation is needed here anymore. Only the daily rollup needs a
+        // synchronous fold, and only when the caller explicitly asks via
+        // ?refresh=true (otherwise the usage-refresh daemon keeps it current).
         if refresh {
             refresh_user_model_usage_daily(state.db.write()).await?;
-            let mut conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
-            Credits::new(&mut conn).aggregate_user_batches(target_user_id).await?;
         }
         let (batch_stats, by_model, tariffs) = tokio::try_join!(
             get_user_batch_counts(state.db.read(), target_user_id),

@@ -1044,9 +1044,8 @@ export interface BalanceResponse {
 
 export interface TransactionsListResponse {
   data: Transaction[];
-  total_count: number;
-  limit: number;
-  skip: number;
+  /** Whether more transactions exist beyond this page (there is no total count). */
+  has_more: boolean;
   /** Current user balance when skip=0, or balance at the pagination point when skip>0.
    * Frontend can compute each row's balance by subtracting signed amounts from this value. */
   page_start_balance: number;

@@ -87,12 +87,10 @@ pub struct CreditTransactionResponse {
 pub struct TransactionListResponse {
     /// The transactions for the current page
     pub data: Vec<CreditTransactionResponse>,
-    /// Total number of transactions matching the query (before pagination)
-    pub total_count: i64,
-    /// Number of items skipped
-    pub skip: i64,
-    /// Maximum items returned per page
-    pub limit: i64,
+    /// Whether more transactions exist beyond this page. There is no total
+    /// count: computing one would scan the whole filtered history for a
+    /// pager widget.
+    pub has_more: bool,
     /// Current user balance when skip=0, or balance at the pagination point (before the
     /// first transaction on this page) when skip>0. Frontend can compute each row's balance
     /// by subtracting signed amounts from this value.

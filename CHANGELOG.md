@@ -1,5 +1,26 @@
 # Changelog
 
+## [8.76.0](https://github.com/doublewordai/control-layer/compare/v8.75.1...v8.76.0) (2026-07-09)
+
+
+### Features
+
+* make user balances a synchronously-maintained read model ([#1238](https://github.com/doublewordai/control-layer/issues/1238)) ([64483c0](https://github.com/doublewordai/control-layer/commit/64483c01b998cdbdd20abdab4ae37a2eba8f327a))
+
+## [8.75.1](https://github.com/doublewordai/control-layer/compare/v8.75.0...v8.75.1) (2026-07-09)
+
+
+### Bug Fixes
+
+* dont flatten asst and tool result blocks in anthropic adapter ([#1247](https://github.com/doublewordai/control-layer/issues/1247)) ([9ec3d15](https://github.com/doublewordai/control-layer/commit/9ec3d1503c0f1489b2d6b236e74db562f2d2a92d))
+
+## [8.75.0](https://github.com/doublewordai/control-layer/compare/v8.74.1...v8.75.0) (2026-07-09)
+
+
+### Features
+
+* cap unverified users' upload volume instead of throttling throughput ([#1204](https://github.com/doublewordai/control-layer/issues/1204)) ([eaa7170](https://github.com/doublewordai/control-layer/commit/eaa717035dfecddd282b51ec8faaab7eeafa9875))
+
 ## [8.74.1](https://github.com/doublewordai/control-layer/compare/v8.74.0...v8.74.1) (2026-07-09)
 
 

@@ -1319,8 +1319,8 @@ packages:
   '@rolldown/pluginutils@1.0.0-rc.3':
     resolution: {integrity: sha512-eybk3TjzzzV97Dlj5c+XrBFW57eTNhzod66y9HrBlzJ6NsCrWCp/2kaPS3K9wJmurBC0Tdw4yPjXKZqlznim3Q==}
 
-  '@rollup/wasm-node@4.62.0':
-    resolution: {integrity: sha512-TW5f2b5d8Y1DwilaxaXhPkYI1a+i1Am2+eDEf6Tu/QrPxt6kdh/4HT6y460MmzE1im71rudvEs5zLLFr7qBAtQ==}
+  '@rollup/wasm-node@4.62.2':
+    resolution: {integrity: sha512-LseVv64SSO6S7eyc+LFGUnH36NMMFbtKN28vTUHFinRVzFKH4cVQ/BB22JfXM9Ei5l7x46AIQp+n2QzzJ9kxHg==}
     engines: {node: '>=18.0.0', npm: '>=8.0.0'}
     hasBin: true
 
@@ -3551,8 +3551,8 @@ packages:
   undici-types@7.16.0:
     resolution: {integrity: sha512-Zz+aZWSj8LE6zoxD+xrjh4VfkIG8Ya6LvYkZqtUQGJPZjYl53ypCaUwWqo7eI0x66KBGeRo+mlBEkMSeSZ38Nw==}
 
-  undici@7.24.7:
-    resolution: {integrity: sha512-H/nlJ/h0ggGC+uRL3ovD+G0i4bqhvsDOpbDv7At5eFLlj2b41L8QliGbnl2H7SnDiYhENphh1tQFJZf+MyfLsQ==}
+  undici@7.28.0:
+    resolution: {integrity: sha512-cRZYrTDwWznlnRiPjggAGxZXanty6M8RV1ff8Wm4LWXBp7/IG8v5DnOm74DtUBp9OONpK75YlPnIjQqX0dBDtA==}
     engines: {node: '>=20.18.1'}
 
   unified@11.0.5:
@@ -4822,7 +4822,7 @@ snapshots:
 
   '@rolldown/pluginutils@1.0.0-rc.3': {}
 
-  '@rollup/wasm-node@4.62.0':
+  '@rollup/wasm-node@4.62.2':
     dependencies:
       '@types/estree': 1.0.9
     optionalDependencies:
@@ -6266,7 +6266,7 @@ snapshots:
       saxes: 6.0.0
       symbol-tree: 3.2.4
       tough-cookie: 6.0.1
-      undici: 7.24.7
+      undici: 7.28.0
       w3c-xmlserializer: 5.0.0
       webidl-conversions: 8.0.1
       whatwg-mimetype: 5.0.0
@@ -7480,7 +7480,7 @@ snapshots:
 
   undici-types@7.16.0: {}
 
-  undici@7.24.7: {}
+  undici@7.28.0: {}
 
   unified@11.0.5:
     dependencies:
@@ -7579,7 +7579,7 @@ snapshots:
       fdir: 6.5.0(picomatch@4.0.4)
       picomatch: 4.0.4
       postcss: 8.5.14
-      rollup: '@rollup/wasm-node@4.62.0'
+      rollup: '@rollup/wasm-node@4.62.2'
       tinyglobby: 0.2.16
     optionalDependencies:
       '@types/node': 24.12.2

@@ -313,7 +313,10 @@ async fn ai_models_lists_group_accessible_paid_models_without_credits(pool: PgPo
 
 async fn assert_usage_recorded(fixture: &StreamingFixture, expected_uri: &str, prompt_tokens: i64, completion_tokens: i64) {
     let mut tries = 0;
-    let usage_tx = loop {
+    // The batcher flush folds the balance in the same transaction that
+    // writes the usage row, so as soon as the transaction is visible the
+    // page_start_balance in the same response already reflects it.
+    let (usage_tx, balance) = loop {
         let transactions_response = fixture
             .server
             .get(&format!("/admin/api/v1/transactions?user_id={}", fixture.regular_user_id))
@@ -341,9 +344,8 @@ async fn assert_usage_recorded(fixture: &StreamingFixture, expected_uri: &str, p
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
     };
 
-    assert_eq!(usage_tx.0["transaction_type"], "usage", "Should be usage transaction");
-    let amount: f64 = usage_tx.0["amount"].as_str().unwrap().parse().unwrap();
-    let balance = usage_tx.1;
+    assert_eq!(usage_tx["transaction_type"], "usage", "Should be usage transaction");
+    let amount: f64 = usage_tx["amount"].as_str().unwrap().parse().unwrap();
     assert!(amount > 0.0, "Usage amount should be positive (absolute value), got: {}", amount);
     assert!(
         balance < 1000.0,

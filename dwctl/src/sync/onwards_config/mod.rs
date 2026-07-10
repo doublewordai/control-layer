@@ -212,9 +212,13 @@ impl OnwardsConfigSync {
     /// Starts the background task that listens for database changes and updates the configuration
     #[instrument(skip(self, config, shutdown_token), err)]
     pub async fn start(mut self, config: SyncConfig, shutdown_token: CancellationToken) -> Result<(), anyhow::Error> {
-        // Debouncing: prevent rapid-fire reloads
+        // Debouncing for reloads. Notifications arriving inside the window
+        // are COALESCED into one trailing reload (pending_reload) rather than
+        // dropped - a dropped notification used to wait for the fallback
+        // timer, which is minutes in production.
         let mut last_reload_time = std::time::Instant::now();
         const MIN_RELOAD_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+        let mut pending_reload: Option<tokio::time::Instant> = None;
 
         // Fallback sync interval (0 = disabled)
         let fallback_interval = if config.fallback_interval_milliseconds > 0 {
@@ -278,64 +282,35 @@ impl OnwardsConfigSync {
                                 // Parse the notification timestamp for lag measurement
                                 let notify_info = parse_notify_payload(notification.payload());
 
-                                // Debounce: skip if we just reloaded recently
+                                // Inside the debounce window: coalesce into
+                                // one trailing reload instead of dropping the
+                                // notification.
                                 if last_reload_time.elapsed() < MIN_RELOAD_INTERVAL {
-                                    debug!("Skipping reload due to debouncing (last reload was {:?} ago)",
-                                           last_reload_time.elapsed());
+                                    if pending_reload.is_none() {
+                                        let deadline = tokio::time::Instant::now()
+                                            + MIN_RELOAD_INTERVAL.saturating_sub(last_reload_time.elapsed());
+                                        pending_reload = Some(deadline);
+                                        debug!("Coalescing reload: trailing reload scheduled (last reload was {:?} ago)",
+                                               last_reload_time.elapsed());
+                                    }
                                     continue;
                                 }
 
-                                // Reload configuration from database (including composite models)
                                 last_reload_time = std::time::Instant::now();
-                                match load_targets_from_db(&self.db, &self.escalation_models, self.strict_mode, &self.rate_limit_tiers).await {
-                                    Ok(new_targets) => {
-                                        debug!("Loaded {} targets from database", new_targets.targets.len());
-                                        for entry in new_targets.targets.iter() {
-                                            let alias = entry.key();
-                                            debug!("Target '{}' loaded", alias);
-                                        }
+                                pending_reload = None;
+                                if !self.full_reload("listen_notify").await? {
+                                    break;
+                                }
 
-                                        // Update daemon capacity limits if configured
-                                        if let Some(ref limits) = self.daemon_capacity_limits
-                                            && let Err(e) = update_daemon_capacity_limits(&self.db, limits, self.default_batch_capacity).await {
-                                                crate::background_error!(ONWARDS_SYNC, "capacity_limits", Error, "Failed to update daemon capacity limits: {}", e);
-                                            }
-
-                                        // Update cache info metrics
-                                        if let Err(e) = crate::metrics::update_cache_info_metrics(&self.db, &new_targets, &mut self.cache_info_state).await {
-                                            crate::background_error!(ONWARDS_SYNC, "cache_info_metrics", Error, "Failed to update cache info metrics: {}", e);
-                                        }
-
-                                        // Send update through watch channel
-                                        if let Err(e) = self.sender.send(new_targets) {
-                                            error!("Failed to send targets update: {}", e);
-                                            // If all receivers are dropped, we can exit
-                                            break;
-                                        }
-
-                                        // Record metric for LISTEN/NOTIFY sync
-                                        metrics::counter!("dwctl_cache_sync_total", "source" => "listen_notify").increment(1);
-
-                                        // Record cache sync lag metric (time from DB change to cache update)
-                                        if let Some((table_name, lag)) = notify_info {
-                                            let lag_seconds = lag.as_secs_f64();
-                                            histogram!("dwctl_cache_sync_lag_seconds", "table" => table_name.to_string())
-                                                .record(lag_seconds);
-                                            info!("Updated onwards configuration successfully (sync lag: {:.3}ms from {})",
-                                                  lag_seconds * 1000.0, table_name);
-                                        } else {
-                                            info!("Updated onwards configuration successfully");
-                                        }
-                                    }
-                                    Err(e) => {
-                                        crate::background_error!(ONWARDS_SYNC, "load_targets", Error, "Failed to load targets from database: {}", e);
-                                        // Return error if database operations fail consistently
-                                        if e.to_string().contains("closed pool") || e.to_string().contains("connection closed") {
-                                            error!("Database pool closed, exiting sync task");
-                                            return Err(e);
-                                        }
-                                        // Continue listening for other types of errors
-                                    }
+                                // Record cache sync lag metric (time from DB change to cache update)
+                                if let Some((table_name, lag)) = notify_info {
+                                    let lag_seconds = lag.as_secs_f64();
+                                    histogram!("dwctl_cache_sync_lag_seconds", "table" => table_name.to_string())
+                                        .record(lag_seconds);
+                                    info!("Updated onwards configuration successfully (sync lag: {:.3}ms from {})",
+                                          lag_seconds * 1000.0, table_name);
+                                } else {
+                                    info!("Updated onwards configuration successfully");
                                 }
                             }
                             Err(e) => {
@@ -358,6 +333,21 @@ impl OnwardsConfigSync {
                         }
                     }
 
+                    // Coalesced trailing reload from a debounced notification
+                    _ = async {
+                        match pending_reload {
+                            Some(deadline) => tokio::time::sleep_until(deadline).await,
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        debug!("Coalesced trailing reload triggered");
+                        pending_reload = None;
+                        last_reload_time = std::time::Instant::now();
+                        if !self.full_reload("coalesced").await? {
+                            break;
+                        }
+                    }
+
                     // Fallback periodic sync (if enabled)
                     _ = async {
                         match &mut fallback_timer {
@@ -367,43 +357,16 @@ impl OnwardsConfigSync {
                     } => {
                         debug!("Fallback periodic sync triggered");
 
-                        // Skip if we just reloaded via notification (debounce)
+                        // Skip if we just reloaded via notification (debounce);
+                        // the fallback timer fires again on its own.
                         if last_reload_time.elapsed() < MIN_RELOAD_INTERVAL {
                             debug!("Skipping fallback sync due to recent notification-triggered reload");
                             continue;
                         }
 
                         last_reload_time = std::time::Instant::now();
-                        match load_targets_from_db(&self.db, &self.escalation_models, self.strict_mode, &self.rate_limit_tiers).await {
-                            Ok(new_targets) => {
-                                debug!("Fallback sync: loaded {} targets from database", new_targets.targets.len());
-
-                                // Update daemon capacity limits if configured
-                                if let Some(ref limits) = self.daemon_capacity_limits
-                                    && let Err(e) = update_daemon_capacity_limits(&self.db, limits, self.default_batch_capacity).await {
-                                        crate::background_error!(ONWARDS_SYNC, "capacity_limits", Error, "Failed to update daemon capacity limits: {}", e);
-                                    }
-
-                                // Update cache info metrics
-                                if let Err(e) = crate::metrics::update_cache_info_metrics(&self.db, &new_targets, &mut self.cache_info_state).await {
-                                    crate::background_error!(ONWARDS_SYNC, "cache_info_metrics", Error, "Failed to update cache info metrics: {}", e);
-                                }
-
-                                // Send update through watch channel
-                                if let Err(e) = self.sender.send(new_targets) {
-                                    error!("Failed to send targets update: {}", e);
-                                    // If all receivers are dropped, we can exit
-                                    break;
-                                }
-
-                                // Record metric for fallback sync
-                                metrics::counter!("dwctl_cache_sync_total", "source" => "fallback").increment(1);
-                                debug!("Fallback sync: updated onwards configuration successfully");
-                            }
-                            Err(e) => {
-                                crate::background_error!(ONWARDS_SYNC, "load_targets_fallback", Error, "Fallback sync: failed to load targets from database: {}", e);
-                                // Continue - fallback sync errors shouldn't crash the service
-                            }
+                        if !self.full_reload("fallback").await? {
+                            break;
                         }
                     }
                 }
@@ -412,6 +375,60 @@ impl OnwardsConfigSync {
 
         info!("Onwards configuration listener stopped gracefully");
         Ok(())
+    }
+
+    /// Full config rebuild from the database: updates capacity limits and
+    /// cache metrics, and sends the new Targets. Returns Ok(false) if the
+    /// watch channel is closed (all receivers dropped); Err only for fatal
+    /// DB errors (closed pool / connection).
+    async fn full_reload(&mut self, source: &'static str) -> Result<bool, anyhow::Error> {
+        let new_targets = match load_targets_from_db(&self.db, &self.escalation_models, self.strict_mode, &self.rate_limit_tiers).await {
+            Ok(targets) => targets,
+            Err(e) => {
+                crate::background_error!(ONWARDS_SYNC, "load_targets", Error, "Failed to load targets from database: {}", e);
+                if e.to_string().contains("closed pool") || e.to_string().contains("connection closed") {
+                    error!("Database pool closed, exiting sync task");
+                    return Err(e);
+                }
+                // Continue listening for other types of errors
+                return Ok(true);
+            }
+        };
+        debug!("Loaded {} targets from database", new_targets.targets.len());
+
+        // Update daemon capacity limits if configured
+        if let Some(ref limits) = self.daemon_capacity_limits
+            && let Err(e) = update_daemon_capacity_limits(&self.db, limits, self.default_batch_capacity).await
+        {
+            crate::background_error!(
+                ONWARDS_SYNC,
+                "capacity_limits",
+                Error,
+                "Failed to update daemon capacity limits: {}",
+                e
+            );
+        }
+
+        // Update cache info metrics
+        if let Err(e) = crate::metrics::update_cache_info_metrics(&self.db, &new_targets, &mut self.cache_info_state).await {
+            crate::background_error!(
+                ONWARDS_SYNC,
+                "cache_info_metrics",
+                Error,
+                "Failed to update cache info metrics: {}",
+                e
+            );
+        }
+
+        // Send update through watch channel
+        if let Err(e) = self.sender.send(new_targets) {
+            error!("Failed to send targets update: {}", e);
+            // If all receivers are dropped, we can exit
+            return Ok(false);
+        }
+
+        metrics::counter!("dwctl_cache_sync_total", "source" => source).increment(1);
+        Ok(true)
     }
 }
 
@@ -541,23 +558,6 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
     // Query API keys with access to composite models (uses deployment_groups since composites are in deployed_models)
     let api_key_rows = sqlx::query!(
         r#"
-        WITH user_balances AS MATERIALIZED (
-            SELECT
-                u.id as user_id,
-                COALESCE(c.balance, 0) + COALESCE(
-                    (SELECT SUM(
-                        CASE WHEN ct.transaction_type IN ('purchase', 'admin_grant')
-                        THEN ct.amount ELSE -ct.amount END
-                    )
-                    FROM credits_transactions ct
-                    WHERE ct.user_id = u.id
-                    AND ct.seq > COALESCE(c.checkpoint_seq, 0)),
-                    0
-                ) as balance
-            FROM users u
-            LEFT JOIN user_balance_checkpoints c ON c.user_id = u.id
-            WHERE u.is_deleted = false
-        )
         SELECT
             cm.id as composite_model_id,
             ak.id as api_key_id,
@@ -604,10 +604,16 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
             -- Require positive balance OR free model (system user always passes)
             AND (
                 ak.user_id = '00000000-0000-0000-0000-000000000000'
-                OR EXISTS (
-                    SELECT 1 FROM user_balances ub
+                -- Positive balance read directly from the total
+                -- user_balance_checkpoints read model (kept current by the
+                -- writers folding synchronously with each charge). The
+                -- is_deleted guard mirrors the old balance CTE, which only
+                -- contained non-deleted users; key deletion is not implied by
+                -- user deletion, so this check is load-bearing.
+                OR (u.is_deleted = false AND EXISTS (
+                    SELECT 1 FROM user_balance_checkpoints ub
                     WHERE ub.user_id = ak.user_id AND ub.balance > 0
-                )
+                ))
                 OR (
                     NOT EXISTS (
                         SELECT 1 FROM model_tariffs mt
@@ -1236,23 +1242,6 @@ pub async fn load_targets_from_db(
     // Note: We pass escalation_models to grant batch API keys access to escalation models
     let rows = sqlx::query!(
         r#"
-        WITH user_balances AS MATERIALIZED (
-            SELECT
-                u.id as user_id,
-                COALESCE(c.balance, 0) + COALESCE(
-                    (SELECT SUM(
-                        CASE WHEN ct.transaction_type IN ('purchase', 'admin_grant')
-                        THEN ct.amount ELSE -ct.amount END
-                    )
-                    FROM credits_transactions ct
-                    WHERE ct.user_id = u.id
-                    AND ct.seq > COALESCE(c.checkpoint_seq, 0)),
-                    0
-                ) as balance
-            FROM users u
-            LEFT JOIN user_balance_checkpoints c ON c.user_id = u.id
-            WHERE u.is_deleted = false
-        )
         SELECT
             dm.id as deployment_id,
             dm.model_name,
@@ -1324,10 +1313,16 @@ pub async fn load_targets_from_db(
             )
             AND (
                 ak.user_id = '00000000-0000-0000-0000-000000000000'
-                OR EXISTS (
-                    SELECT 1 FROM user_balances ub
+                -- Positive balance read directly from the total
+                -- user_balance_checkpoints read model (kept current by the
+                -- writers folding synchronously with each charge). The
+                -- is_deleted guard mirrors the old balance CTE, which only
+                -- contained non-deleted users; key deletion is not implied by
+                -- user deletion, so this check is load-bearing.
+                OR (u.is_deleted = false AND EXISTS (
+                    SELECT 1 FROM user_balance_checkpoints ub
                     WHERE ub.user_id = ak.user_id AND ub.balance > 0
-                )
+                ))
                 OR (
                     NOT EXISTS (
                         SELECT 1 FROM model_tariffs mt

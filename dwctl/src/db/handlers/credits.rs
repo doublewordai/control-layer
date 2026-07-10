@@ -9,18 +9,13 @@ use crate::{
     types::{UserId, abbrev_uuid},
 };
 use chrono::{DateTime, Utc};
-use rand::random;
+
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, PgConnection};
 use std::collections::HashMap;
-use tracing::{error, instrument, trace};
+use tracing::{instrument, trace};
 use uuid::Uuid;
-
-/// Probability of refreshing checkpoint on each transaction (1 in N).
-/// With N=1000, checkpoint lags by ~1000 transactions on average,
-/// meaning balance reads aggregate ~500 rows on average.
-const CHECKPOINT_REFRESH_PROBABILITY: u32 = 1000;
 
 // Database entity model for credit transaction
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
@@ -100,24 +95,73 @@ impl<'c> Credits<'c> {
         Self { db }
     }
 
-    /// Create a new credit transaction
+    /// Create a new credit transaction.
     ///
-    /// This is a lock-free append-only INSERT. Balance is calculated on read via checkpoints.
-    /// Probabilistically refreshes the checkpoint (1 in CHECKPOINT_REFRESH_PROBABILITY chance).
+    /// The row is folded into the user_balance_checkpoints read model in the
+    /// same statement, so callers observe the new balance immediately (a user
+    /// who just paid must not wait for anything asynchronous). Batched rows
+    /// are also aggregated into batch_aggregates in the same statement. This
+    /// path is low-volume by construction - purchases, admin adjustments,
+    /// promo grants; high-volume usage charging goes through the
+    /// request-logging batcher, which folds the same way per flush.
     ///
-    /// For admin_grant and purchase transactions that bring a user's balance from <= 0 to > 0,
-    /// sends a pg_notify to trigger onwards cache reload (re-enabling the user's API access).
+    /// If the balance crosses zero in either direction, sends a pg_notify so
+    /// onwards re-evaluates key eligibility.
+    ///
+    /// Locking: this takes a row lock on the user's checkpoint row, which the
+    /// analytics batcher's flush fold also updates. When calling inside an
+    /// enclosing transaction, keep that transaction short and DB-local -
+    /// holding it across external I/O would stall flushes for its duration.
     #[instrument(skip(self, request), fields(user_id = %abbrev_uuid(&request.user_id), transaction_type = ?request.transaction_type, amount = %request.amount), err)]
     pub async fn create_transaction(&mut self, request: &CreditTransactionCreateDBRequest) -> Result<CreditTransactionDBResponse> {
-        // Lock-free INSERT - no advisory lock, no balance calculation
-        // Balance is calculated on read via checkpoints
-        let transaction = sqlx::query_as!(
-            CreditTransaction,
+        let signed_amount = match request.transaction_type {
+            CreditTransactionType::AdminGrant | CreditTransactionType::Purchase => request.amount,
+            CreditTransactionType::Usage | CreditTransactionType::AdminRemoval => -request.amount,
+        };
+
+        // Insert + read-model fold + batch aggregation in one atomic
+        // statement (callers may or may not be inside an enclosing
+        // transaction). The checkpoint INSERT arm only fires if the user's
+        // row is missing, which the user-creation trigger normally prevents.
+        let row = sqlx::query!(
             r#"
-            INSERT INTO credits_transactions (user_id, transaction_type, amount, source_id, description, fusillade_batch_id, api_key_id)
-            VALUES ($1, $2, $3, $4, $5, $6, $7)
-            RETURNING id, user_id, transaction_type as "transaction_type: CreditTransactionType", amount, source_id,
-                      description, created_at, seq, api_key_id
+            WITH inserted AS (
+                INSERT INTO credits_transactions (user_id, transaction_type, amount, source_id, description, fusillade_batch_id, api_key_id, is_aggregated)
+                VALUES ($1, $2, $3, $4, $5, $6::uuid, $7, $6::uuid IS NOT NULL)
+                RETURNING id, user_id, transaction_type, amount, source_id, description, created_at, seq, api_key_id
+            ),
+            bumped AS (
+                INSERT INTO user_balance_checkpoints (user_id, checkpoint_seq, balance)
+                SELECT user_id, seq, $8 FROM inserted
+                ON CONFLICT (user_id) DO UPDATE SET
+                    balance = user_balance_checkpoints.balance + EXCLUDED.balance,
+                    checkpoint_seq = GREATEST(user_balance_checkpoints.checkpoint_seq, EXCLUDED.checkpoint_seq),
+                    updated_at = NOW()
+                RETURNING balance
+            ),
+            aggregated AS (
+                INSERT INTO batch_aggregates (fusillade_batch_id, user_id, total_amount, transaction_count, max_seq, created_at, updated_at)
+                SELECT $6::uuid, user_id, amount, 1, seq, created_at, NOW()
+                FROM inserted
+                WHERE $6::uuid IS NOT NULL
+                ON CONFLICT (fusillade_batch_id) DO UPDATE SET
+                    total_amount = batch_aggregates.total_amount + EXCLUDED.total_amount,
+                    transaction_count = batch_aggregates.transaction_count + EXCLUDED.transaction_count,
+                    max_seq = GREATEST(batch_aggregates.max_seq, EXCLUDED.max_seq),
+                    updated_at = NOW()
+            )
+            SELECT
+                i.id AS "id!",
+                i.user_id AS "user_id!",
+                i.transaction_type AS "transaction_type!: CreditTransactionType",
+                i.amount AS "amount!",
+                i.source_id AS "source_id!",
+                i.description,
+                i.created_at AS "created_at!",
+                i.seq AS "seq!",
+                i.api_key_id,
+                b.balance AS "new_balance!"
+            FROM inserted i, bumped b
             "#,
             request.user_id,
             &request.transaction_type as &CreditTransactionType,
@@ -125,39 +169,34 @@ impl<'c> Credits<'c> {
             request.source_id,
             request.description,
             request.fusillade_batch_id,
-            request.api_key_id
+            request.api_key_id,
+            signed_amount,
         )
         .fetch_one(&mut *self.db)
         .await?;
 
-        trace!("Created transaction {} for user_id {}", transaction.id, request.user_id);
+        trace!("Created transaction {} for user_id {}", row.id, request.user_id);
 
-        // For credit-adding transactions (admin_grant, purchase), check if we crossed zero upward
-        // This re-enables users who were blocked due to depleted balance
-        if matches!(
-            request.transaction_type,
-            CreditTransactionType::AdminGrant | CreditTransactionType::Purchase
-        ) {
-            let (balance_after, _) = self.calculate_balance_with_seq(request.user_id).await?;
-            let balance_before = balance_after - request.amount;
-
-            if balance_before <= Decimal::ZERO && balance_after > Decimal::ZERO {
-                trace!("Balance crossed zero upward for user_id {}, notifying onwards", request.user_id);
-                self.notify_balance_restored(request.user_id).await?;
-            }
+        let new_balance = row.new_balance;
+        let old_balance = new_balance - signed_amount;
+        if old_balance <= Decimal::ZERO && new_balance > Decimal::ZERO {
+            trace!("Balance crossed zero upward for user_id {}, notifying onwards", request.user_id);
+            self.notify_balance_crossing().await?;
+        } else if old_balance > Decimal::ZERO && new_balance <= Decimal::ZERO {
+            trace!("Balance crossed zero downward for user_id {}, notifying onwards", request.user_id);
+            self.notify_balance_crossing().await?;
         }
 
-        // Probabilistically refresh checkpoint (1 in N chance)
-        // This amortizes checkpoint maintenance across writes
-        if random::<u32>().is_multiple_of(CHECKPOINT_REFRESH_PROBABILITY) {
-            trace!("Refreshing checkpoint for user_id {}", request.user_id);
-            if let Err(e) = self.refresh_checkpoint(request.user_id).await {
-                // Log but don't fail the transaction - checkpoint refresh is best-effort
-                error!("Failed to refresh checkpoint for user_id {}: {}", request.user_id, e);
-            }
-        }
-
-        Ok(CreditTransactionDBResponse::from(transaction))
+        Ok(CreditTransactionDBResponse {
+            id: row.id,
+            user_id: row.user_id,
+            transaction_type: row.transaction_type,
+            amount: row.amount,
+            description: row.description,
+            source_id: row.source_id,
+            created_at: row.created_at,
+            api_key_id: row.api_key_id,
+        })
     }
 
     /// Grant a first-payment match bonus to `payee` if eligible.
@@ -254,11 +293,12 @@ impl<'c> Credits<'c> {
         }
     }
 
-    /// Send pg_notify when a user's balance is restored (crosses zero upward).
-    /// Format: "credits_transactions:{epoch_micros}" to match other triggers and enable lag metrics.
-    async fn notify_balance_restored(&mut self, user_id: UserId) -> Result<()> {
-        trace!("Balance restored for user_id {}, notifying onwards", user_id);
-
+    /// Send a pg_notify so the onwards config sync re-evaluates key
+    /// eligibility. Only called on zero crossings (edge-triggered), so the
+    /// resulting full reloads are rare.
+    /// Format: "credits_transactions:{epoch_micros}" to match other triggers
+    /// and enable lag metrics.
+    async fn notify_balance_crossing(&mut self) -> Result<()> {
         let epoch_micros = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -266,7 +306,8 @@ impl<'c> Credits<'c> {
 
         let payload = format!("credits_transactions:{}", epoch_micros);
 
-        sqlx::query("SELECT pg_notify('auth_config_changed', $1)")
+        sqlx::query("SELECT pg_notify($1, $2)")
+            .bind(crate::config::ONWARDS_CONFIG_CHANGED_CHANNEL)
             .bind(&payload)
             .execute(&mut *self.db)
             .await?;
@@ -274,185 +315,48 @@ impl<'c> Credits<'c> {
         Ok(())
     }
 
-    /// Calculate balance using checkpoint + delta, returning both balance and latest transaction seq.
+    /// Get current balance for a user: a point read of the
+    /// user_balance_checkpoints read model.
     ///
-    /// This is the core calculation used by both `get_user_balance` and `refresh_checkpoint`.
-    /// Returns (balance, latest_seq). If no transactions exist, returns (0, None).
-    async fn calculate_balance_with_seq(&mut self, user_id: UserId) -> Result<(Decimal, Option<i64>)> {
-        let result = sqlx::query!(
-            r#"
-            WITH user_checkpoint AS (
-                SELECT checkpoint_seq, balance
-                FROM user_balance_checkpoints
-                WHERE user_id = $1
-            )
-            SELECT
-                COALESCE((SELECT balance FROM user_checkpoint), 0) +
-                COALESCE((
-                    SELECT SUM(
-                        CASE WHEN transaction_type IN ('admin_grant', 'purchase') THEN amount ELSE -amount END
-                    )
-                    FROM credits_transactions
-                    WHERE user_id = $1
-                    AND seq > COALESCE((SELECT checkpoint_seq FROM user_checkpoint), 0)
-                ), 0) as "balance!",
-                (SELECT MAX(seq) FROM credits_transactions WHERE user_id = $1) as latest_seq
-            "#,
-            user_id
-        )
-        .fetch_one(&mut *self.db)
-        .await?;
-
-        Ok((result.balance, result.latest_seq))
-    }
-
-    /// Refresh the balance checkpoint for a user.
-    ///
-    /// This is called probabilistically during writes to keep checkpoints fresh.
-    /// Uses the existing checkpoint as a base (if present) - only aggregates delta transactions.
-    #[instrument(skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
-    pub async fn refresh_checkpoint(&mut self, user_id: UserId) -> Result<()> {
-        let (balance, latest_seq) = self.calculate_balance_with_seq(user_id).await?;
-
-        // Only update checkpoint if there are transactions
-        if let Some(checkpoint_seq) = latest_seq {
-            sqlx::query!(
-                r#"
-                INSERT INTO user_balance_checkpoints (user_id, checkpoint_seq, balance)
-                VALUES ($1, $2, $3)
-                ON CONFLICT (user_id) DO UPDATE SET
-                    checkpoint_seq = EXCLUDED.checkpoint_seq,
-                    balance = EXCLUDED.balance,
-                    updated_at = NOW()
-                "#,
-                user_id,
-                checkpoint_seq,
-                balance
-            )
-            .execute(&mut *self.db)
-            .await?;
-        }
-
-        Ok(())
-    }
-
-    /// Get current balance for a user using checkpoint + delta calculation.
-    ///
-    /// This reads the cached checkpoint balance and adds any transactions since the checkpoint.
-    /// If no checkpoint exists, it falls back to aggregating all transactions.
+    /// The read model is total (a row is created with the user, and every
+    /// writer folds its charges in synchronously, so it is current as of the
+    /// last committed write); a missing row can only mean a user that has
+    /// never existed, so it reads as zero.
     #[instrument(skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
     pub async fn get_user_balance(&mut self, user_id: UserId) -> Result<Decimal> {
-        let (balance, _) = self.calculate_balance_with_seq(user_id).await?;
-        Ok(balance)
-    }
-
-    /// Get balances for multiple users using checkpoint + delta calculation.
-    ///
-    /// Optionally refreshes checkpoints probabilistically (1 in `checkpoint_refresh_probability`
-    /// chance per user). Pass `None` to skip checkpoint refresh.
-    #[instrument(skip(self, user_ids), fields(count = user_ids.len()), err)]
-    pub async fn get_users_balances_bulk(
-        &mut self,
-        user_ids: &[UserId],
-        checkpoint_refresh_probability: Option<u32>,
-    ) -> Result<HashMap<UserId, Decimal>> {
-        if user_ids.is_empty() {
-            return Ok(HashMap::new());
-        }
-
-        // Probabilistically select users for checkpoint refresh
-        let users_to_refresh: Vec<UserId> = match checkpoint_refresh_probability {
-            Some(prob) if prob > 0 => user_ids.iter().filter(|_| random::<u32>().is_multiple_of(prob)).copied().collect(),
-            _ => Vec::new(),
-        };
-
-        let mut balances_map = HashMap::with_capacity(user_ids.len());
-
-        // Refresh checkpoints for selected users - this also returns their balances
-        if !users_to_refresh.is_empty() {
-            let refreshed_balances = self.refresh_checkpoints_bulk(&users_to_refresh).await?;
-            balances_map.extend(refreshed_balances);
-        }
-
-        // Query balances for remaining users (those not refreshed)
-        let remaining_users: Vec<UserId> = user_ids.iter().filter(|id| !balances_map.contains_key(id)).copied().collect();
-
-        if !remaining_users.is_empty() {
-            let rows = sqlx::query!(
-                r#"
-                SELECT
-                    u.user_id as "user_id!",
-                    COALESCE(c.balance, 0) + COALESCE(delta.sum, 0) as "balance!"
-                FROM unnest($1::uuid[]) AS u(user_id)
-                LEFT JOIN user_balance_checkpoints c ON c.user_id = u.user_id
-                LEFT JOIN LATERAL (
-                    SELECT SUM(
-                        CASE WHEN transaction_type IN ('admin_grant', 'purchase') THEN amount ELSE -amount END
-                    ) as sum
-                    FROM credits_transactions t
-                    WHERE t.user_id = u.user_id
-                    AND t.seq > COALESCE(c.checkpoint_seq, 0)
-                ) delta ON true
-                "#,
-                &remaining_users
-            )
-            .fetch_all(&mut *self.db)
+        let balance = sqlx::query_scalar!(r#"SELECT balance FROM user_balance_checkpoints WHERE user_id = $1"#, user_id)
+            .fetch_optional(&mut *self.db)
             .await?;
 
-            for row in rows {
-                balances_map.insert(row.user_id, row.balance);
-            }
-        }
-
-        Ok(balances_map)
+        Ok(balance.unwrap_or(Decimal::ZERO))
     }
 
-    /// Refresh checkpoints for multiple users and return their balances.
-    async fn refresh_checkpoints_bulk(&mut self, user_ids: &[UserId]) -> Result<HashMap<UserId, Decimal>> {
+    /// Get balances for multiple users: point reads of the read model.
+    #[instrument(skip(self, user_ids), fields(count = user_ids.len()), err)]
+    pub async fn get_users_balances_bulk(&mut self, user_ids: &[UserId]) -> Result<HashMap<UserId, Decimal>> {
         if user_ids.is_empty() {
             return Ok(HashMap::new());
         }
 
         let rows = sqlx::query!(
             r#"
-            INSERT INTO user_balance_checkpoints (user_id, checkpoint_seq, balance)
             SELECT
-                u.user_id,
-                latest.seq,
-                COALESCE(c.balance, 0) + COALESCE(delta.sum, 0)
+                u.user_id as "user_id!",
+                COALESCE(c.balance, 0) as "balance!"
             FROM unnest($1::uuid[]) AS u(user_id)
             LEFT JOIN user_balance_checkpoints c ON c.user_id = u.user_id
-            LEFT JOIN LATERAL (
-                SELECT SUM(
-                    CASE WHEN transaction_type IN ('admin_grant', 'purchase') THEN amount ELSE -amount END
-                ) as sum
-                FROM credits_transactions t
-                WHERE t.user_id = u.user_id
-                AND t.seq > COALESCE(c.checkpoint_seq, 0)
-            ) delta ON true
-            LEFT JOIN LATERAL (
-                SELECT MAX(seq) as seq
-                FROM credits_transactions t
-                WHERE t.user_id = u.user_id
-            ) latest ON true
-            WHERE latest.seq IS NOT NULL
-            ON CONFLICT (user_id) DO UPDATE SET
-                checkpoint_seq = EXCLUDED.checkpoint_seq,
-                balance = EXCLUDED.balance,
-                updated_at = NOW()
-            RETURNING user_id, balance
             "#,
             user_ids
         )
         .fetch_all(&mut *self.db)
         .await?;
 
-        let mut balances = HashMap::with_capacity(rows.len());
+        let mut balances_map = HashMap::with_capacity(rows.len());
         for row in rows {
-            balances.insert(row.user_id, row.balance);
+            balances_map.insert(row.user_id, row.balance);
         }
 
-        Ok(balances)
+        Ok(balances_map)
     }
 
     /// List transactions for a specific user with pagination and optional filters
@@ -621,121 +525,6 @@ impl<'c> Credits<'c> {
         Ok(map)
     }
 
-    /// Count total transactions for a specific user with optional filters
-    #[instrument(skip(self, filters), fields(user_id = %abbrev_uuid(&user_id)), err)]
-    pub async fn count_user_transactions(&mut self, user_id: UserId, filters: &TransactionFilters) -> Result<i64> {
-        let transaction_types: Option<Vec<String>> = filters
-            .transaction_types
-            .as_ref()
-            .map(|types| types.iter().map(transaction_type_to_string).collect());
-
-        let result = sqlx::query!(
-            r#"
-            SELECT COUNT(*) as count
-            FROM credits_transactions
-            WHERE user_id = $1
-              AND ($2::text IS NULL OR description ILIKE '%' || $2 || '%')
-              AND ($3::text[] IS NULL OR transaction_type::text = ANY($3))
-              AND ($4::timestamptz IS NULL OR created_at >= $4)
-              AND ($5::timestamptz IS NULL OR created_at <= $5)
-            "#,
-            user_id,
-            filters.search.as_deref(),
-            transaction_types.as_deref(),
-            filters.start_date,
-            filters.end_date,
-        )
-        .fetch_one(&mut *self.db)
-        .await?;
-
-        Ok(result.count.unwrap_or(0))
-    }
-
-    /// Count total transactions across all users with optional filters
-    #[instrument(skip(self, filters), err)]
-    pub async fn count_all_transactions(&mut self, filters: &TransactionFilters) -> Result<i64> {
-        let transaction_types: Option<Vec<String>> = filters
-            .transaction_types
-            .as_ref()
-            .map(|types| types.iter().map(transaction_type_to_string).collect());
-
-        let result = sqlx::query!(
-            r#"
-            SELECT COUNT(*) as count
-            FROM credits_transactions
-            WHERE ($1::text IS NULL OR description ILIKE '%' || $1 || '%')
-              AND ($2::text[] IS NULL OR transaction_type::text = ANY($2))
-              AND ($3::timestamptz IS NULL OR created_at >= $3)
-              AND ($4::timestamptz IS NULL OR created_at <= $4)
-            "#,
-            filters.search.as_deref(),
-            transaction_types.as_deref(),
-            filters.start_date,
-            filters.end_date,
-        )
-        .fetch_one(&mut *self.db)
-        .await?;
-
-        Ok(result.count.unwrap_or(0))
-    }
-
-    /// Count transactions with batch grouping applied for a specific user.
-    /// Returns the count of aggregated results (batches count as 1, not N).
-    /// Uses pre-aggregated batch_aggregates table for O(1) batch counting.
-    #[instrument(skip(self, filters), fields(user_id = %abbrev_uuid(&user_id)), err)]
-    pub async fn count_transactions_with_batches(&mut self, user_id: UserId, filters: &TransactionFilters) -> Result<i64> {
-        let transaction_types: Option<Vec<String>> = filters
-            .transaction_types
-            .as_ref()
-            .map(|types| types.iter().map(transaction_type_to_string).collect());
-
-        // Check if we should include batch aggregates (they're always type 'usage')
-        let include_batches = filters
-            .transaction_types
-            .as_ref()
-            .map(|types| types.iter().any(|t| matches!(t, CreditTransactionType::Usage)))
-            .unwrap_or(true);
-
-        // Check if search term would match "Batch" description
-        let search_matches_batch = filters
-            .search
-            .as_ref()
-            .map(|s| "batch".contains(&s.to_lowercase()) || s.to_lowercase().contains("batch"))
-            .unwrap_or(true);
-
-        let result = sqlx::query!(
-            r#"
-            SELECT
-                (CASE WHEN $4::bool AND $5::bool THEN
-                    (SELECT COUNT(*) FROM batch_aggregates
-                     WHERE user_id = $1
-                       AND ($2::timestamptz IS NULL OR created_at >= $2)
-                       AND ($3::timestamptz IS NULL OR created_at <= $3))
-                ELSE 0 END)
-                +
-                (SELECT COUNT(*) FROM credits_transactions
-                 WHERE user_id = $1
-                   AND fusillade_batch_id IS NULL
-                   AND ($6::text IS NULL OR description ILIKE '%' || $6 || '%')
-                   AND ($7::text[] IS NULL OR transaction_type::text = ANY($7))
-                   AND ($2::timestamptz IS NULL OR created_at >= $2)
-                   AND ($3::timestamptz IS NULL OR created_at <= $3))
-            as "count!"
-            "#,
-            user_id,
-            filters.start_date,
-            filters.end_date,
-            include_batches,
-            search_matches_batch,
-            filters.search.as_deref(),
-            transaction_types.as_deref(),
-        )
-        .fetch_one(&mut *self.db)
-        .await?;
-
-        Ok(result.count)
-    }
-
     /// Sum the signed amounts of the most recent N transactions for a user within the date-filtered set.
     /// Positive transactions (admin_grant, purchase) are positive, negative (usage, admin_removal) are negative.
     /// This is used to calculate the balance at a specific point in the transaction history.
@@ -795,9 +584,6 @@ impl<'c> Credits<'c> {
     /// This operates on the same grouped view as `list_transactions_with_batches`.
     #[instrument(skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
     pub async fn sum_transactions_after_date_grouped(&mut self, user_id: UserId, after_date: DateTime<Utc>) -> Result<Decimal> {
-        // First ensure any pending batch transactions are aggregated
-        self.aggregate_user_batches(user_id).await?;
-
         let result = sqlx::query!(
             r#"
             SELECT COALESCE(SUM(signed_amount), 0) as "sum!"
@@ -840,9 +626,6 @@ impl<'c> Credits<'c> {
     /// chronological ordering which the frontend relies on for running balance calculation.
     #[instrument(skip(self, filters), fields(user_id = %abbrev_uuid(&user_id), count = count), err)]
     pub async fn sum_recent_transactions_grouped(&mut self, user_id: UserId, count: i64, filters: &TransactionFilters) -> Result<Decimal> {
-        // First ensure any pending batch transactions are aggregated
-        self.aggregate_user_batches(user_id).await?;
-
         // Sum from the same UNION view used by list_transactions_with_batches
         // All batch aggregates are usage type (negative), non-batched follow normal signing rules
         // Only date filters are applied to maintain chronological ordering for balance calculation.
@@ -893,55 +676,6 @@ impl<'c> Credits<'c> {
         Ok(result.sum)
     }
 
-    /// Perform lazy aggregation for a user's unaggregated batched transactions.
-    /// This aggregates new transactions into batch_aggregates and marks them as aggregated.
-    /// Uses a single atomic UPDATE + aggregate approach to handle concurrent reads safely.
-    #[instrument(skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
-    pub async fn aggregate_user_batches(&mut self, user_id: UserId) -> Result<()> {
-        // Atomically mark transactions as aggregated and aggregate them in one query
-        // This uses UPDATE ... RETURNING with aggregation via CTE to avoid race conditions
-        let result = sqlx::query!(
-            r#"
-            WITH marked AS (
-                UPDATE credits_transactions
-                SET is_aggregated = true
-                WHERE user_id = $1
-                  AND fusillade_batch_id IS NOT NULL
-                  AND is_aggregated = false
-                RETURNING fusillade_batch_id, amount, seq, created_at
-            ),
-            aggregated AS (
-                SELECT
-                    fusillade_batch_id,
-                    SUM(amount) as total_amount,
-                    COUNT(*) as tx_count,
-                    MAX(seq) as max_seq,
-                    MIN(created_at) as created_at
-                FROM marked
-                GROUP BY fusillade_batch_id
-            )
-            INSERT INTO batch_aggregates (fusillade_batch_id, user_id, total_amount, transaction_count, max_seq, created_at, updated_at)
-            SELECT fusillade_batch_id, $1, total_amount, tx_count::int, max_seq, created_at, NOW()
-            FROM aggregated
-            ON CONFLICT (fusillade_batch_id) DO UPDATE SET
-                total_amount = batch_aggregates.total_amount + EXCLUDED.total_amount,
-                transaction_count = batch_aggregates.transaction_count + EXCLUDED.transaction_count,
-                max_seq = GREATEST(batch_aggregates.max_seq, EXCLUDED.max_seq),
-                updated_at = NOW()
-            RETURNING fusillade_batch_id
-            "#,
-            user_id
-        )
-        .fetch_all(&mut *self.db)
-        .await?;
-
-        if !result.is_empty() {
-            trace!("Aggregated {} batches for user {}", result.len(), user_id);
-        }
-
-        Ok(())
-    }
-
     /// List transactions with batch grouping applied using pre-aggregated batch_aggregates table.
     /// Uses optimized query with pre-limited UNION branches for O(limit) performance.
     #[instrument(skip(self, filters), fields(user_id = %abbrev_uuid(&user_id), skip = skip, limit = limit), err)]
@@ -952,9 +686,6 @@ impl<'c> Credits<'c> {
         limit: i64,
         filters: &TransactionFilters,
     ) -> Result<Vec<TransactionWithCategory>> {
-        // Perform lazy aggregation for any new unaggregated transactions
-        self.aggregate_user_batches(user_id).await?;
-
         let transaction_types: Option<Vec<String>> = filters
             .transaction_types
             .as_ref()
@@ -1138,6 +869,14 @@ mod tests {
 
         let balance = credits.get_user_balance(user_id).await.expect("Failed to get balance");
         assert_eq!(balance, Decimal::ZERO);
+
+        // The read model is total: user creation itself (DB trigger) must
+        // have created the zero checkpoint row, not just a zero fallback.
+        let row_balance = sqlx::query_scalar!("SELECT balance FROM user_balance_checkpoints WHERE user_id = $1", user_id)
+            .fetch_one(&pool)
+            .await
+            .expect("checkpoint row must exist from the user-creation trigger");
+        assert_eq!(row_balance, Decimal::ZERO);
     }
 
     #[sqlx::test]
@@ -1517,11 +1256,11 @@ mod tests {
         assert_eq!(transactions.len(), 2);
 
         // Test skip
-        let transactions = credits
+        let skip_page = credits
             .list_all_transactions(2, 2, &TransactionFilters::default())
             .await
             .expect("Failed to list transactions");
-        assert!(transactions.len() >= 2);
+        assert!(skip_page.len() >= 2);
     }
 
     #[sqlx::test]
@@ -1924,13 +1663,6 @@ mod tests {
 
         assert_eq!(filtered_txs.len(), 2, "Should return 2 transactions within date range");
 
-        let count = credits
-            .count_user_transactions(user_id, &filters)
-            .await
-            .expect("Failed to count filtered transactions");
-
-        assert_eq!(count, 2, "Count should match filtered transactions");
-
         // Test: Filter with no dates (should get all 3)
         let all_txs = credits
             .list_user_transactions(user_id, 0, 10, &TransactionFilters::default())
@@ -1990,13 +1722,6 @@ mod tests {
             .expect("Failed to list transactions with start_date");
 
         assert_eq!(filtered_txs.len(), 2, "Should return 2 transactions after cutoff");
-
-        let count = credits
-            .count_user_transactions(user_id, &filters)
-            .await
-            .expect("Failed to count transactions");
-
-        assert_eq!(count as usize, filtered_txs.len(), "Count should match filtered results");
     }
 
     #[sqlx::test]
@@ -2049,13 +1774,6 @@ mod tests {
             .expect("Failed to list transactions with end_date");
 
         assert_eq!(filtered_txs.len(), 2, "Should return 2 transactions before cutoff");
-
-        let count = credits
-            .count_user_transactions(user_id, &filters)
-            .await
-            .expect("Failed to count transactions");
-
-        assert_eq!(count as usize, filtered_txs.len(), "Count should match filtered results");
     }
 
     #[sqlx::test]
@@ -2100,13 +1818,6 @@ mod tests {
             .expect("Failed to list all transactions with filter");
 
         assert_eq!(filtered_txs.len(), 1, "Should have 1 transaction after cutoff");
-
-        let count = credits
-            .count_all_transactions(&filters)
-            .await
-            .expect("Failed to count all transactions");
-
-        assert_eq!(count as usize, filtered_txs.len(), "Count should match filtered results");
     }
 
     #[sqlx::test]
@@ -2167,13 +1878,6 @@ mod tests {
             .expect("Failed to list batched transactions with filter");
 
         assert_eq!(filtered_txs.len(), 1, "Should have only non-batch transaction");
-
-        let count = credits
-            .count_transactions_with_batches(user_id, &filters)
-            .await
-            .expect("Failed to count batched transactions");
-
-        assert_eq!(count as usize, filtered_txs.len(), "Count should match filtered grouped results");
     }
 
     #[sqlx::test]
@@ -2205,13 +1909,6 @@ mod tests {
             .expect("Failed to list transactions");
 
         assert_eq!(filtered_txs.len(), 0, "Should return no transactions outside date range");
-
-        let count = credits
-            .count_user_transactions(user_id, &filters)
-            .await
-            .expect("Failed to count transactions");
-
-        assert_eq!(count, 0, "Count should be 0 for empty results");
     }
 
     #[sqlx::test]

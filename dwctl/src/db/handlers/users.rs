@@ -1228,7 +1228,6 @@ mod tests {
             let mut credits = Credits::new(&mut conn);
             let grant = CreditTransactionCreateDBRequest::admin_grant(user.id, user.id, amount, None);
             credits.create_transaction(&grant).await.unwrap();
-            credits.refresh_checkpoint(user.id).await.unwrap();
         }
 
         user.id
@@ -1262,8 +1261,9 @@ mod tests {
 
     #[sqlx::test]
     #[test_log::test]
-    async fn test_users_with_threshold_returns_user_without_checkpoint(pool: PgPool) {
-        // Create user with threshold but no credits (so no checkpoint)
+    async fn test_users_with_threshold_returns_user_without_credits(pool: PgPool) {
+        // Create user with threshold but no credits: the read model is total,
+        // so even a zero-transaction user has a checkpoint row at balance 0.
         let user_id = create_user_with_balance(&pool, "0", Some(2.0)).await;
 
         let mut conn = pool.acquire().await.unwrap();
@@ -1271,7 +1271,7 @@ mod tests {
         let result = users.users_with_low_balance_threshold().await.unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].id, user_id);
-        assert!(result[0].checkpoint_balance.is_none());
+        assert_eq!(result[0].checkpoint_balance, Some(Decimal::ZERO));
     }
 
     #[sqlx::test]
@@ -1323,7 +1323,6 @@ mod tests {
         let mut credits = Credits::new(&mut conn);
         let grant = CreditTransactionCreateDBRequest::admin_grant(user_id, user_id, Decimal::from_str("10.00").unwrap(), None);
         credits.create_transaction(&grant).await.unwrap();
-        credits.refresh_checkpoint(user_id).await.unwrap();
         drop(conn);
 
         // Poll again: the clear_recovered CTE should reset the flag,
@@ -1363,7 +1362,6 @@ mod tests {
             api_key_id: None,
         };
         credits.create_transaction(&deduct).await.unwrap();
-        credits.refresh_checkpoint(user_id).await.unwrap();
         drop(conn);
 
         // 3. Poll: user should appear
@@ -1384,7 +1382,6 @@ mod tests {
         let mut credits = Credits::new(&mut conn);
         let grant = CreditTransactionCreateDBRequest::admin_grant(user_id, user_id, Decimal::from_str("50.00").unwrap(), None);
         credits.create_transaction(&grant).await.unwrap();
-        credits.refresh_checkpoint(user_id).await.unwrap();
         drop(conn);
 
         // 6. Poll: clear_recovered CTE resets the flag, user above threshold → not returned
@@ -1407,7 +1404,6 @@ mod tests {
             api_key_id: None,
         };
         credits.create_transaction(&deduct2).await.unwrap();
-        credits.refresh_checkpoint(user_id).await.unwrap();
         drop(conn);
 
         // 8. Poll: user should appear again (flag was cleared by step 6)
@@ -1437,7 +1433,6 @@ mod tests {
             api_key_id: None,
         };
         credits.create_transaction(&deduct).await.unwrap();
-        credits.refresh_checkpoint(user_id).await.unwrap();
         drop(conn);
 
         let mut conn = pool.acquire().await.unwrap();
