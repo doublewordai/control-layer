@@ -1206,7 +1206,7 @@ where
                 $1::uuid[], $2::text[], $3::numeric[], $4::text[], $5::text[], $6::uuid[], $7::uuid[], $8::text[]
             ) AS u(user_id, transaction_type, amount, source_id, description, fusillade_batch_id, api_key_id, service_tier)
             ON CONFLICT (source_id) DO NOTHING
-            RETURNING source_id, user_id, amount, seq, created_at, fusillade_batch_id
+            RETURNING source_id, user_id, amount, seq, created_at, fusillade_batch_id, service_tier
             "#,
             &user_ids,
             &vec!["usage".to_string(); user_ids.len()],
@@ -1240,6 +1240,9 @@ where
             count: i32,
             max_seq: i64,
             min_created_at: chrono::DateTime<chrono::Utc>,
+            // Constant per batch (async or batch); captured from the first folded row
+            // and denormalized onto batch_aggregates so the list needn't join http_analytics.
+            service_tier: String,
         }
         let mut batch_folds: HashMap<Uuid, BatchFold> = HashMap::new();
 
@@ -1258,6 +1261,7 @@ where
                     count: 0,
                     max_seq: 0,
                     min_created_at: row.created_at,
+                    service_tier: row.service_tier.clone().unwrap_or_default(),
                 });
                 bf.total += row.amount;
                 bf.count += 1;
@@ -1333,17 +1337,19 @@ where
             let counts: Vec<i32> = batch_ids.iter().map(|b| batch_folds[b].count).collect();
             let batch_seqs: Vec<i64> = batch_ids.iter().map(|b| batch_folds[b].max_seq).collect();
             let created_ats: Vec<chrono::DateTime<chrono::Utc>> = batch_ids.iter().map(|b| batch_folds[b].min_created_at).collect();
+            let service_tiers_agg: Vec<String> = batch_ids.iter().map(|b| batch_folds[b].service_tier.clone()).collect();
 
             sqlx::query!(
                 r#"
-                INSERT INTO batch_aggregates (fusillade_batch_id, user_id, total_amount, transaction_count, max_seq, created_at, updated_at)
-                SELECT b.batch_id, b.user_id, b.total, b.cnt, b.max_seq, b.created_at, NOW()
-                FROM UNNEST($1::uuid[], $2::uuid[], $3::numeric[], $4::int[], $5::bigint[], $6::timestamptz[])
-                    AS b(batch_id, user_id, total, cnt, max_seq, created_at)
+                INSERT INTO batch_aggregates (fusillade_batch_id, user_id, total_amount, transaction_count, max_seq, created_at, updated_at, service_tier)
+                SELECT b.batch_id, b.user_id, b.total, b.cnt, b.max_seq, b.created_at, NOW(), b.service_tier
+                FROM UNNEST($1::uuid[], $2::uuid[], $3::numeric[], $4::int[], $5::bigint[], $6::timestamptz[], $7::text[])
+                    AS b(batch_id, user_id, total, cnt, max_seq, created_at, service_tier)
                 ON CONFLICT (fusillade_batch_id) DO UPDATE SET
                     total_amount = batch_aggregates.total_amount + EXCLUDED.total_amount,
                     transaction_count = batch_aggregates.transaction_count + EXCLUDED.transaction_count,
                     max_seq = GREATEST(batch_aggregates.max_seq, EXCLUDED.max_seq),
+                    service_tier = COALESCE(batch_aggregates.service_tier, EXCLUDED.service_tier),
                     updated_at = NOW()
                 "#,
                 &batch_ids,
@@ -1352,6 +1358,7 @@ where
                 &counts,
                 &batch_seqs,
                 &created_ats,
+                &service_tiers_agg,
             )
             .execute(&mut **tx)
             .await?;

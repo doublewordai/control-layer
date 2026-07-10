@@ -68,14 +68,10 @@ pub struct CreditTransactionResponse {
     pub description: Option<String>,
     /// When the transaction was created
     pub created_at: DateTime<Utc>,
-    /// Request origin: "api" (direct API), "frontend" (playground), or "fusillade" (batch)
+    /// Service tier: "realtime", "flex", "async", or "batch".
     /// Only present for usage transactions
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub request_origin: Option<String>,
-    /// Batch completion window: "24h", "1h", or empty string for non-batch
-    /// Only present for usage transactions
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub batch_sla: Option<String>,
+    pub service_tier: Option<String>,
     /// Number of requests in this batch (only present for batch transactions, always > 1)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub batch_request_count: Option<i32>,
@@ -181,8 +177,7 @@ impl CreditTransactionResponse {
             source_id: db.source_id,
             description: db.description,
             created_at: db.created_at,
-            request_origin: None,
-            batch_sla: None,
+            service_tier: None,
             batch_request_count: None,
         }
     }
@@ -191,8 +186,7 @@ impl CreditTransactionResponse {
     pub fn from_db_with_metadata(
         db: CreditTransactionDBResponse,
         batch_id: Option<Uuid>,
-        request_origin: Option<String>,
-        batch_sla: Option<String>,
+        service_tier: Option<String>,
         batch_count: i32,
     ) -> Self {
         // Only include batch_request_count for actual batches (count > 1)
@@ -207,8 +201,7 @@ impl CreditTransactionResponse {
             source_id: db.source_id,
             description: db.description,
             created_at: db.created_at,
-            request_origin,
-            batch_sla,
+            service_tier,
             batch_request_count,
         }
     }
