@@ -36,9 +36,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use fusillade::request::{Canceled, Claimed, Failed, FailureReason, Request, RequestCompletionResult};
-use fusillade::{
-    CancellationFuture, DefaultRequestProcessor, PoolProvider as FusilladePool, RequestProcessor, ReqwestHttpClient, ShouldRetry, Storage,
-};
+use fusillade::{CancellationFuture, DefaultRequestProcessor, HttpClient, RequestProcessor, ReqwestHttpClient, ShouldRetry, Storage};
+use fusillade_arsenal::PoolProvider as FusilladePool;
 use onwards::LoopConfig;
 use onwards::traits::ToolExecutor;
 
@@ -432,7 +431,9 @@ where
             loop_config: self.loop_config,
         };
 
-        let processing = request.process(loop_client, storage).await?;
+        let request_data = request.data.clone();
+        let response_fut = async move { loop_client.execute(&request_data, &request_data.api_key).await };
+        let processing = request.process(storage, response_fut).await?;
         // `ShouldRetry` is an `Arc<dyn Fn>`; `complete` wants a bare `Fn`,
         // so deref through the Arc.
         processing.complete(storage, |resp| should_retry(resp), cancellation).await

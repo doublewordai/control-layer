@@ -1916,6 +1916,7 @@ dependencies = [
  "figment",
  "flate2",
  "fusillade",
+ "fusillade-arsenal",
  "futures",
  "google-cloud-auth",
  "google-cloud-storage",
@@ -2353,15 +2354,17 @@ checksum = "e6d5a32815ae3f33302d95fdcb2ce17862f8c65363dcfd29360480ba1001fc9c"
 
 [[package]]
 name = "fusillade"
-version = "20.0.2"
+version = "21.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d4c5aaac2eb541b427edf1f90735e35d118491974fc83a64858bdbfb972b7475"
+checksum = "d5d04f5b7ddafc991a80fd3e5d4988efaf6af791e3b8ea5557232f462eafdf35"
 dependencies = [
  "anyhow",
  "async-trait",
  "chrono",
  "dashmap",
  "eventsource-stream",
+ "fusillade-arsenal",
+ "fusillade-core",
  "futures",
  "hostname",
  "humantime",
@@ -2374,14 +2377,59 @@ dependencies = [
  "scopeguard",
  "serde",
  "serde_json",
- "sqlx",
- "sqlx-pool-router",
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
  "tokio-util",
  "tracing",
  "tracing-opentelemetry",
+ "uuid",
+]
+
+[[package]]
+name = "fusillade-arsenal"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "06df8fb12fcaa31fd34880a656abf9292dbb98ee8d9109164f9295e2f1ffcc6a"
+dependencies = [
+ "anyhow",
+ "async-stream",
+ "async-trait",
+ "chrono",
+ "dashmap",
+ "either",
+ "fusillade-core",
+ "futures",
+ "humantime",
+ "metrics",
+ "rand 0.10.1",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "sqlx-pool-router",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "fusillade-core"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "523273ae988756dd1260bba667af3f078df2e1171d798f3c06655d91052127b8"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "futures",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
  "uuid",
 ]
 
@@ -4215,9 +4263,9 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "onwards"
-version = "0.34.5"
+version = "0.34.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3d98db4d5ffc90c989cb6cf94f17fc4ba4e6dc0b5ab116752e2d826ffca21b64"
+checksum = "1df68efd08162f124ab0d9891e05e8585d32f844b10a9baf6e121d49477d616b"
 dependencies = [
  "anyhow",
  "async-stream",

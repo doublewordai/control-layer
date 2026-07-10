@@ -1433,6 +1433,29 @@ impl BatchConfig {
     }
 }
 
+/// Which fusillade claim loops should run inside this daemon process.
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DaemonMode {
+    /// Run both batchless request claims and batch claims.
+    #[default]
+    Both,
+    /// Run only the batchless request claim loop.
+    RequestOnly,
+    /// Run only the batch claim loop.
+    BatchOnly,
+}
+
+impl From<DaemonMode> for fusillade::DaemonMode {
+    fn from(mode: DaemonMode) -> Self {
+        match mode {
+            DaemonMode::Both => fusillade::DaemonMode::Both,
+            DaemonMode::RequestOnly => fusillade::DaemonMode::RequestOnly,
+            DaemonMode::BatchOnly => fusillade::DaemonMode::BatchOnly,
+        }
+    }
+}
+
 /// The daemon processes batch requests asynchronously in the background.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
@@ -1442,6 +1465,13 @@ pub struct DaemonConfig {
     /// - "never": Never run the daemon
     /// - "leader": Only run if this instance is the leader
     pub enabled: DaemonEnabled,
+
+    /// Which claim loops this daemon process should run (default: "both").
+    /// - "both": Run request and batch claim loops
+    /// - "request_only": Run only batchless request claims
+    /// - "batch_only": Run only batch claims
+    #[serde(default)]
+    pub mode: DaemonMode,
 
     /// Maximum number of requests to claim in each iteration (default: 100)
     pub claim_batch_size: usize,
@@ -1695,6 +1725,7 @@ impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
             enabled: DaemonEnabled::Leader,
+            mode: DaemonMode::Both,
             claim_batch_size: 100,
             default_model_concurrency: 10,
             claim_interval_ms: 1000,
@@ -1759,6 +1790,7 @@ impl DaemonConfig {
         };
 
         fusillade::daemon::DaemonConfig {
+            mode: self.mode.into(),
             claim_batch_size: self.claim_batch_size,
             model_concurrency_limits: model_capacity_limits.unwrap_or_else(|| std::sync::Arc::new(dashmap::DashMap::new())),
             model_escalations: Arc::new(DashMap::from_iter(self.model_escalations.clone())),
@@ -3774,6 +3806,62 @@ background_services:
             assert!(result.is_err());
             let err = result.unwrap_err().to_string();
             assert!(err.contains("urgency_weight must be between 0.0 and 1.0"));
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_daemon_mode_default_and_override() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+"#,
+            )?;
+            let args = Args {
+                config: "test.yaml".into(),
+                validate: false,
+            };
+            let config = Config::load(&args)?;
+            assert_eq!(config.background_services.batch_daemon.mode, DaemonMode::Both);
+            assert_eq!(
+                fusillade::DaemonMode::from(config.background_services.batch_daemon.mode),
+                fusillade::DaemonMode::Both
+            );
+
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+background_services:
+  batch_daemon:
+    mode: request_only
+"#,
+            )?;
+            let config = Config::load(&args)?;
+            assert_eq!(config.background_services.batch_daemon.mode, DaemonMode::RequestOnly);
+            assert_eq!(
+                fusillade::DaemonMode::from(config.background_services.batch_daemon.mode),
+                fusillade::DaemonMode::RequestOnly
+            );
+
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+background_services:
+  batch_daemon:
+    mode: batch_only
+"#,
+            )?;
+            let config = Config::load(&args)?;
+            assert_eq!(config.background_services.batch_daemon.mode, DaemonMode::BatchOnly);
+            assert_eq!(
+                fusillade::DaemonMode::from(config.background_services.batch_daemon.mode),
+                fusillade::DaemonMode::BatchOnly
+            );
 
             Ok(())
         });

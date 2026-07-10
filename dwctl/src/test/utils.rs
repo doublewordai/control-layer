@@ -36,7 +36,7 @@ pub async fn create_test_app_state_with_config(pool: PgPool, config: crate::conf
         .await
         .expect("Failed to create fusillade TestDbPools");
 
-    let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(fusillade_pools, Default::default()));
+    let request_manager = std::sync::Arc::new(fusillade_arsenal::PostgresRequestManager::new(fusillade_pools, Default::default()));
     let limiters = crate::limits::Limiters::new(&config.limits);
     let shared_config = crate::SharedConfig::new(config);
 
@@ -102,7 +102,7 @@ pub async fn setup_fusillade_pool(pool: &PgPool) -> PgPool {
         .await
         .expect("Failed to create fusillade pool");
 
-    fusillade::migrator()
+    fusillade_arsenal::migrator()
         .run(&fusillade_pool)
         .await
         .expect("Failed to run fusillade migrations");
@@ -119,7 +119,10 @@ pub async fn create_test_app_state_with_fusillade(pool: PgPool, config: crate::c
     let fusillade_test_pools = TestDbPools::new(fusillade_pool)
         .await
         .expect("Failed to create fusillade TestDbPools");
-    let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(fusillade_test_pools, Default::default()));
+    let request_manager = std::sync::Arc::new(fusillade_arsenal::PostgresRequestManager::new(
+        fusillade_test_pools,
+        Default::default(),
+    ));
     let limiters = crate::limits::Limiters::new(&config.limits);
     let shared_config = crate::SharedConfig::new(config);
 

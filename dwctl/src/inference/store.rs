@@ -9,9 +9,10 @@ use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
 use fusillade::{
-    BatchInput, CreateRealtimeInput, CreateStepInput, PostgresRequestManager, PostgresResponseStepManager, RequestId, RequestTemplateInput,
-    ReqwestHttpClient, ResponseStep, ResponseStepStore, StepId, StepKind as FusilladeStepKind, StepState as FusilladeStepState, Storage,
+    BatchInput, CreateRealtimeInput, CreateStepInput, RequestId, RequestTemplateInput, ResponseStep, ResponseStepStore, StepId,
+    StepKind as FusilladeStepKind, StepState as FusilladeStepState, Storage,
 };
+use fusillade_arsenal::{PostgresRequestManager, PostgresResponseStepManager};
 use onwards::{
     ChainStep, MultiStepStore, RecordedStep, ResponseStore, StepDescriptor, StepKind as OnwardsStepKind, StepState as OnwardsStepState,
     StoreError,
@@ -68,7 +69,7 @@ pub struct OnwardsDaemonId(pub Uuid);
 
 /// ResponseStore implementation backed by fusillade's `Storage` trait.
 pub struct FusilladeResponseStore<P: PoolProvider + Clone> {
-    request_manager: Arc<PostgresRequestManager<P, ReqwestHttpClient>>,
+    request_manager: Arc<PostgresRequestManager<P>>,
     /// Step storage for multi-step responses. Optional so existing callers
     /// that only need the legacy single-step `ResponseStore` surface (e.g.
     /// the `previous_response_id` flow) can construct a store without
@@ -86,7 +87,7 @@ pub struct FusilladeResponseStore<P: PoolProvider + Clone> {
 }
 
 impl<P: PoolProvider + Clone> FusilladeResponseStore<P> {
-    pub fn new(request_manager: Arc<PostgresRequestManager<P, ReqwestHttpClient>>) -> Self {
+    pub fn new(request_manager: Arc<PostgresRequestManager<P>>) -> Self {
         Self {
             request_manager,
             step_manager: None,
@@ -188,7 +189,7 @@ impl<P: PoolProvider + Clone> FusilladeResponseStore<P> {
     /// Borrow the inner request_manager. Used by the warm-path SSE
     /// handler to call `complete_request` / `fail_request` directly
     /// after running the loop inline.
-    pub fn request_manager(&self) -> &PostgresRequestManager<P, ReqwestHttpClient> {
+    pub fn request_manager(&self) -> &PostgresRequestManager<P> {
         &self.request_manager
     }
 
@@ -340,7 +341,7 @@ fn map_fusillade_err(e: fusillade::FusilladeError) -> StoreError {
 
 /// Mark a response as failed.
 pub async fn fail_response<P: PoolProvider + Clone>(
-    request_manager: &PostgresRequestManager<P, ReqwestHttpClient>,
+    request_manager: &PostgresRequestManager<P>,
     response_id: &str,
     error: &str,
 ) -> Result<(), StoreError> {
@@ -361,7 +362,7 @@ pub async fn fail_response<P: PoolProvider + Clone>(
 /// Used by `create-response` to skip work when `complete-response` has already
 /// raced ahead and inserted the row itself.
 pub async fn request_exists<P: PoolProvider + Clone>(
-    request_manager: &PostgresRequestManager<P, ReqwestHttpClient>,
+    request_manager: &PostgresRequestManager<P>,
     request_id: Uuid,
 ) -> Result<bool, StoreError> {
     match request_manager.get_request_detail(RequestId(request_id)).await {
@@ -400,7 +401,7 @@ pub struct CreateContext<'a> {
 ///    enqueue — has already done our work)
 ///  - row in `processing` → straight UPDATE
 pub async fn complete_response_idempotent<P: PoolProvider + Clone>(
-    request_manager: &PostgresRequestManager<P, ReqwestHttpClient>,
+    request_manager: &PostgresRequestManager<P>,
     dwctl_pool: &sqlx::PgPool,
     response_id: &str,
     response_body: &str,
@@ -506,7 +507,7 @@ fn is_terminal(state: &str) -> bool {
 /// `detail_to_response_object` for the Responses API, `detail_to_chat_completion_object`
 /// for chat completions.
 pub async fn poll_until_terminal<P: PoolProvider + Clone>(
-    request_manager: &PostgresRequestManager<P, ReqwestHttpClient>,
+    request_manager: &PostgresRequestManager<P>,
     request_id: Uuid,
     poll_interval: std::time::Duration,
     timeout: std::time::Duration,
@@ -555,7 +556,7 @@ pub async fn poll_until_terminal<P: PoolProvider + Clone>(
 
 /// Poll a fusillade request until it reaches a terminal state and return a Responses-API-shaped object.
 pub async fn poll_until_complete<P: PoolProvider + Clone>(
-    request_manager: &PostgresRequestManager<P, ReqwestHttpClient>,
+    request_manager: &PostgresRequestManager<P>,
     response_id: &str,
     poll_interval: std::time::Duration,
     timeout: std::time::Duration,
@@ -599,7 +600,7 @@ pub async fn lookup_created_by(pool: &sqlx::PgPool, api_key: Option<&str>) -> Op
 ///
 /// Returns `(response_id, request_id)` where response_id is `resp_<uuid>`.
 pub async fn create_batch_of_1<P: PoolProvider + Clone>(
-    request_manager: &PostgresRequestManager<P, ReqwestHttpClient>,
+    request_manager: &PostgresRequestManager<P>,
     request: &serde_json::Value,
     model: &str,
     base_url: &str,
