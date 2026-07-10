@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.79.0](https://github.com/doublewordai/control-layer/compare/v8.78.0...v8.79.0) (2026-07-10)
+
+
+### Features
+
+* denormalize billing cols onto credits_transactions + drop legacy usage tables ([#1254](https://github.com/doublewordai/control-layer/issues/1254)) ([0d38ef4](https://github.com/doublewordai/control-layer/commit/0d38ef422e8a1a425c2d6cff00cea34f78559745))
+
 ## [8.78.0](https://github.com/doublewordai/control-layer/compare/v8.77.0...v8.78.0) (2026-07-10)
 
 
