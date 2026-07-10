@@ -1,0 +1,20 @@
+-- no-transaction
+--
+-- Migration 115 (COR-514 follow-up): drop idx_http_analytics_id_text (~8 GB).
+--
+-- This expression index on http_analytics((id::text)) existed only to back the
+-- transactions list's non-batch join `http_analytics.id::text = ct.source_id`
+-- (migration 048). PR #1256 rewrote that query to read service_tier from the
+-- denormalized ledger column, removing the join — this is its only reader. Ships
+-- as a separate release *after* #1256 is fully rolled out, so no pod still runs the
+-- old join (dropping it earlier would seq-scan 131M rows on the user-facing
+-- transactions page).
+--
+-- CONCURRENTLY (outside a transaction, hence `-- no-transaction`, per migration
+-- 048's CREATE) so it can't block the batcher's writes.
+--
+-- NOTE: idx_analytics_fusillade_batch_id is deliberately NOT dropped here — it
+-- still backs get_batch_analytics (/batches/{id}/analytics) and the bulk
+-- batch-analytics queries, which read tokens/latency that batch_aggregates does
+-- not carry. That drop waits on COR-524.
+DROP INDEX CONCURRENTLY IF EXISTS idx_http_analytics_id_text;
