@@ -1175,7 +1175,8 @@ where
             fusillade_batch_ids.push(record.raw.fusillade_batch_id);
             models.push(model);
             api_key_ids_credit.push(record.api_key_id);
-            service_tiers.push(compute_service_tier(record.raw.fusillade_batch_id, record.raw.batch_completion_window.as_deref()).to_string());
+            service_tiers
+                .push(compute_service_tier(record.raw.fusillade_batch_id, record.raw.batch_completion_window.as_deref()).to_string());
         }
 
         if user_ids.is_empty() {
