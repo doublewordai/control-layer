@@ -61,9 +61,10 @@ echo "backfill_credits_denorm: sweeping seq (0, ${MAX_SEQ}]  batch=${BATCH_SIZE}
 # and DROP run CONCURRENTLY, each as its own autocommit statement (never inside a
 # txn), so they never block live writes. Not counted in the sweep duration below.
 echo "backfill_credits_denorm: (re)building helper index ${HELPER_IDX} CONCURRENTLY (may take a few minutes)…"
+# Best-effort cleanup on errors/interrupts; DROP INDEX CONCURRENTLY must run outside a txn.
+trap 'psql_q "DROP INDEX CONCURRENTLY IF EXISTS ${HELPER_IDX};" >/dev/null 2>&1 || true' EXIT INT TERM
 psql_q "DROP INDEX CONCURRENTLY IF EXISTS ${HELPER_IDX};"
 psql_q "CREATE INDEX CONCURRENTLY ${HELPER_IDX} ON credits_transactions (seq) WHERE service_tier IS NULL;"
-
 CURSOR=0
 total_rows=0
 batches=0
