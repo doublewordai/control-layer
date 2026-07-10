@@ -888,6 +888,15 @@ mod tests {
         .execute(pool)
         .await
         .expect("Failed to insert test analytics row");
+
+        // Fold the freshly-seeded http_analytics row into the daily rollup, mirroring
+        // the usage-refresh daemon in prod. `/usage` now reads token/cost breakdowns
+        // from `user_model_usage_daily`, so tests must populate it or every read is 0.
+        // The fold is cursor-based and additive, so calling it after each insert
+        // accumulates correctly across multiple seeded rows.
+        refresh_user_model_usage_daily(pool)
+            .await
+            .expect("Failed to refresh user_model_usage_daily rollup");
     }
 
     /// Build a `/usage` URL with the standard one-hour-ago window and an
