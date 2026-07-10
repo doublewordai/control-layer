@@ -1111,6 +1111,14 @@ mod tests {
         .execute(pool)
         .await
         .expect("Failed to insert test analytics data with user_id");
+
+        // The date-filtered usage path reads token/cost breakdowns from the
+        // `user_model_usage_daily` rollup (COR-506 cutover), so fold the seeded
+        // row in — mirroring the usage-refresh daemon. The fold is cursor-based
+        // and additive, so it composes across multiple seeded rows.
+        refresh_user_model_usage_daily(pool)
+            .await
+            .expect("Failed to refresh user_model_usage_daily rollup");
     }
 
     /// Regression test for org-context scoping in the `/admin/api/v1/usage`
@@ -1118,12 +1126,12 @@ mod tests {
     /// every query and cache key, so usage figures never changed when the
     /// user switched into an org — they always saw their personal numbers.
     ///
-    /// We exercise the date-filtered path because it reads `http_analytics`
-    /// directly (with `WHERE user_id = $1`), avoiding the need to run the
-    /// background `refresh_user_model_usage` / `aggregate_user_batches`
-    /// jobs against the test pool. Two analytics rows are seeded — one for
-    /// the PM, one for the org — and the test asserts the response only
-    /// contains the model attributed to the active context.
+    /// We exercise the date-filtered path, which reads the per-day
+    /// `user_model_usage_daily` rollup scoped `WHERE user_id = $1`. The seed
+    /// helper folds each row into that rollup, so no background job needs to
+    /// run against the test pool. Two analytics rows are seeded — one for the
+    /// PM, one for the org — and the test asserts the response only contains
+    /// the model attributed to the active context.
     #[sqlx::test]
     #[test_log::test]
     async fn test_get_usage_pm_in_org_context_scopes_to_org(pool: PgPool) {

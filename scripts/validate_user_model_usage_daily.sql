@@ -23,8 +23,12 @@
 \set window_days 35
 
 WITH bounds AS (
-    SELECT (CURRENT_DATE - (:window_days)::int)                         AS min_date,
-           (SELECT last_processed_id FROM user_model_usage_daily_cursor) AS max_id
+    -- Both sides compare on UTC dates (usage_date is UTC; the raw side extracts
+    -- (timestamp AT TIME ZONE 'UTC')::date), so anchor the window to the UTC
+    -- current date too — CURRENT_DATE follows the session timezone and would
+    -- shift the window by a day on a non-UTC psql session.
+    SELECT ((now() AT TIME ZONE 'UTC')::date - (:window_days)::int)                    AS min_date,
+           (SELECT last_processed_id FROM user_model_usage_daily_cursor WHERE id = TRUE) AS max_id
 ),
 daily AS (
     SELECT user_id, model,

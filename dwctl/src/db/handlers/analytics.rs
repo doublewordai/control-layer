@@ -2501,6 +2501,45 @@ mod tests {
         assert_eq!(breakdown[0].output_tokens, 100); // 40 + 60
     }
 
+    #[sqlx::test]
+    async fn test_get_user_model_breakdown_for_range_spans_utc_midnight(pool: PgPool) {
+        // The range is matched at UTC-day granularity, so a window straddling UTC
+        // midnight must include BOTH days it touches. Seed one request just before
+        // midnight and one just after; a range from 23:00 to 01:00 UTC truncates to
+        // the two dates and should sum both rows.
+        let user_id = create_usage_test_user(&pool).await;
+        let before_midnight = DateTime::parse_from_rfc3339("2025-03-10T23:30:00Z").unwrap().with_timezone(&Utc);
+        let after_midnight = DateTime::parse_from_rfc3339("2025-03-11T00:30:00Z").unwrap().with_timezone(&Utc);
+
+        for (ts, prompt, completion) in [(before_midnight, 10, 5), (after_midnight, 20, 7)] {
+            insert_usage_analytics(
+                &pool,
+                UsageAnalyticsParams {
+                    user_id,
+                    model: "claude-3",
+                    prompt_tokens: prompt,
+                    completion_tokens: completion,
+                    total_cost: 0.0,
+                    timestamp: ts,
+                    fusillade_batch_id: None,
+                    status_code: 200,
+                },
+            )
+            .await;
+        }
+
+        refresh_user_model_usage_daily(&pool).await.unwrap();
+
+        let start = DateTime::parse_from_rfc3339("2025-03-10T23:00:00Z").unwrap().with_timezone(&Utc);
+        let end = DateTime::parse_from_rfc3339("2025-03-11T01:00:00Z").unwrap().with_timezone(&Utc);
+        let breakdown = get_user_model_breakdown_for_range(&pool, user_id, start, end).await.unwrap();
+
+        assert_eq!(breakdown.len(), 1);
+        assert_eq!(breakdown[0].request_count, 2, "both sides of UTC midnight must be counted");
+        assert_eq!(breakdown[0].input_tokens, 30); // 10 + 20
+        assert_eq!(breakdown[0].output_tokens, 12); // 5 + 7
+    }
+
     /// Insert a completed batch into `batch_aggregates` (one row per batch), the source
     /// the range batch-count now reads from.
     async fn insert_batch_aggregate(pool: &PgPool, user_id: Uuid, created_at: DateTime<Utc>, max_seq: i64) {
