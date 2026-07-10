@@ -66,7 +66,30 @@ START_SEQ="${START_SEQ:-0}"
 FLEX_CUTOFF="${FLEX_CUTOFF:-2026-01-01}"
 HELPER_IDX=idx_credits_tx_seq_backfill
 
-psql_q() { psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -X -qtAc "$1"; }
+# TCP keepalives so a silently-dropped connection (common on long jobs over a
+# flaky link to a managed PG) surfaces as a fast libpq error instead of hanging
+# the client forever; the retry loop then just re-runs the chunk (idempotent
+# overwrite). Without this a dead connection stalls the whole sweep.
+case "$DATABASE_URL" in
+  *\?*) CONN="${DATABASE_URL}&keepalives=1&keepalives_idle=30&keepalives_interval=10&keepalives_count=3&connect_timeout=15" ;;
+  *)    CONN="${DATABASE_URL}?keepalives=1&keepalives_idle=30&keepalives_interval=10&keepalives_count=3&connect_timeout=15" ;;
+esac
+
+psql_q() {
+  local out tries=0
+  while :; do
+    if out=$(psql "$CONN" -v ON_ERROR_STOP=1 -X -qtAc "$1"); then
+      printf '%s' "$out"; return 0
+    fi
+    tries=$(( tries + 1 ))
+    if [ "$tries" -ge 5 ]; then
+      echo "backfill_credits_denorm: psql failed after ${tries} attempts" >&2
+      return 1
+    fi
+    echo "backfill_credits_denorm: psql error; retry ${tries}/5 in 5s…" >&2
+    sleep 5
+  done
+}
 
 MAX_SEQ=$(psql_q "SELECT COALESCE(MAX(seq), 0) FROM credits_transactions;")
 if [ -z "$MAX_SEQ" ] || [ "$MAX_SEQ" -eq 0 ]; then
@@ -79,12 +102,18 @@ echo "backfill_credits_denorm: sweeping seq (${START_SEQ}, ${MAX_SEQ}]  batch=${
 # credits_transactions has NO standalone index on seq (PK is id; every index
 # carrying seq leads with user_id), so the seq-range sweep would seq-scan the
 # whole table each batch. Build a plain btree on seq first (CONCURRENTLY, never
-# locks writes) and drop it when done. Drop any leftover first so an aborted
-# CONCURRENTLY build can't leave an INVALID index that CREATE would keep.
-echo "backfill_credits_denorm: (re)building helper index ${HELPER_IDX} CONCURRENTLY (may take a few minutes)…"
-trap 'psql_q "DROP INDEX CONCURRENTLY IF EXISTS ${HELPER_IDX};" >/dev/null 2>&1 || true' EXIT INT TERM
-psql_q "DROP INDEX CONCURRENTLY IF EXISTS ${HELPER_IDX};"
-psql_q "CREATE INDEX CONCURRENTLY ${HELPER_IDX} ON credits_transactions (seq);"
+# locks writes). Reuse an existing VALID index (so a resumed run skips the
+# multi-minute rebuild); only (re)build when it is missing or INVALID (an
+# aborted CONCURRENTLY build leaves an INVALID index that CREATE would keep).
+# NOT dropped on interrupt (only on clean completion below) so resume is fast.
+idx_state=$(psql_q "SELECT COALESCE((SELECT i.indisvalid::text FROM pg_class c JOIN pg_index i ON i.indexrelid = c.oid WHERE c.relname = '${HELPER_IDX}'), 'missing');")
+if [ "$idx_state" = "t" ]; then
+  echo "backfill_credits_denorm: reusing existing valid helper index ${HELPER_IDX}"
+else
+  echo "backfill_credits_denorm: building helper index ${HELPER_IDX} CONCURRENTLY (may take a few minutes)…"
+  psql_q "DROP INDEX CONCURRENTLY IF EXISTS ${HELPER_IDX};"
+  psql_q "CREATE INDEX CONCURRENTLY ${HELPER_IDX} ON credits_transactions (seq);"
+fi
 
 # --- Phase 1: batch/async/realtime from fusillade.batches (no http_analytics) ---
 CURSOR="$START_SEQ"
