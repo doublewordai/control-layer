@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.78.0](https://github.com/doublewordai/control-layer/compare/v8.77.0...v8.78.0) (2026-07-10)
+
+
+### Features
+
+* upgrade fusillade split daemon runtime ([#1252](https://github.com/doublewordai/control-layer/issues/1252)) ([6c0607c](https://github.com/doublewordai/control-layer/commit/6c0607cdac1d7b0daafe65d209fbd6587405e6a6))
+
 ## [8.77.0](https://github.com/doublewordai/control-layer/compare/v8.76.0...v8.77.0) (2026-07-10)
 
 
