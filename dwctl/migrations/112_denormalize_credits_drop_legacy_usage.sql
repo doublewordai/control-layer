@@ -1,5 +1,5 @@
 -- Migration 112: contract the A-rollout (drop legacy usage tables) + expand B
--- (denormalize the three presentational fields onto the credits ledger).
+-- (denormalize `service_tier` onto the credits ledger).
 --
 -- Gated on PR #1248 (COR-506 Deploy 2 cutover) being fully rolled out in prod,
 -- which is satisfied: every pod now serves /usage from user_model_usage_daily and
