@@ -698,11 +698,12 @@ struct UserUsageRow {
 
 /// Get usage data grouped by user for a specific model.
 ///
-/// Only counts successful (2xx) requests, matching the `/usage` page
-/// (`get_user_model_breakdown_for_range` / `refresh_user_model_usage`). Without
-/// the status filter, request counts are inflated by failed requests — chiefly
-/// 429 rate-limit responses and 5xx errors from batch retries, which carry no
-/// tokens or cost but still create `http_analytics` rows.
+/// Reads the `user_model_usage_daily` rollup (COR-516) instead of scanning raw
+/// `http_analytics`, mirroring the `/usage` page. The rollup already folds only
+/// successful (2xx) requests (see `refresh_user_model_usage_daily`), so failed
+/// requests don't inflate the counts. Because it is keyed by UTC `usage_date`,
+/// the range is whole-UTC-day and `last_active_at` is day-granular
+/// (`MAX(usage_date)`), not the exact last-request timestamp.
 #[instrument(skip(db), err)]
 pub async fn get_model_user_usage(
     db: &PgPool,
@@ -715,22 +716,20 @@ pub async fn get_model_user_usage(
         UserUsageRow,
         r#"
         SELECT
-            ha.user_id,
+            umu.user_id,
             u.email as "user_email?",
-            COUNT(*) as request_count,
-            COALESCE(SUM(ha.prompt_tokens), 0)::bigint as total_input_tokens,
-            COALESCE(SUM(ha.completion_tokens), 0)::bigint as total_output_tokens,
-            COALESCE(SUM(ha.total_tokens), 0)::bigint as total_tokens,
-            SUM(ha.total_cost)::float8 as total_cost,
-            MAX(ha.timestamp) as last_active_at
-        FROM http_analytics ha
-        LEFT JOIN users u ON u.id = ha.user_id
-        WHERE ha.model = $1
-            AND ha.timestamp >= $2
-            AND ha.timestamp <= $3
-            AND ha.user_id IS NOT NULL
-            AND ha.status_code BETWEEN 200 AND 299
-        GROUP BY ha.user_id, u.email
+            COALESCE(SUM(umu.request_count), 0)::bigint as request_count,
+            COALESCE(SUM(umu.input_tokens), 0)::bigint as total_input_tokens,
+            COALESCE(SUM(umu.output_tokens), 0)::bigint as total_output_tokens,
+            COALESCE(SUM(umu.input_tokens + umu.output_tokens), 0)::bigint as total_tokens,
+            SUM(umu.cost)::float8 as total_cost,
+            (MAX(umu.usage_date)::timestamp AT TIME ZONE 'UTC') as last_active_at
+        FROM user_model_usage_daily umu
+        LEFT JOIN users u ON u.id = umu.user_id
+        WHERE umu.model = $1
+            AND umu.usage_date >= ($2::timestamptz AT TIME ZONE 'UTC')::date
+            AND umu.usage_date <= ($3::timestamptz AT TIME ZONE 'UTC')::date
+        GROUP BY umu.user_id, u.email
         ORDER BY request_count DESC
         "#,
         model_alias,
@@ -744,15 +743,13 @@ pub async fn get_model_user_usage(
     let totals_row = sqlx::query!(
         r#"
         SELECT
-            COUNT(*) as total_requests,
-            COALESCE(SUM(total_tokens), 0)::bigint as total_tokens,
-            SUM(total_cost)::float8 as total_cost
-        FROM http_analytics
+            SUM(request_count)::bigint as total_requests,
+            COALESCE(SUM(input_tokens + output_tokens), 0)::bigint as total_tokens,
+            SUM(cost)::float8 as total_cost
+        FROM user_model_usage_daily
         WHERE model = $1
-            AND timestamp >= $2
-            AND timestamp <= $3
-            AND user_id IS NOT NULL
-            AND status_code BETWEEN 200 AND 299
+            AND usage_date >= ($2::timestamptz AT TIME ZONE 'UTC')::date
+            AND usage_date <= ($3::timestamptz AT TIME ZONE 'UTC')::date
         "#,
         model_alias,
         start_date,
