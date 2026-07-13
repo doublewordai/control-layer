@@ -16,6 +16,25 @@ export type LoadBalancingStrategy = "weighted_random" | "priority";
 
 export type JitterStrategy = "none" | "full";
 
+export type ReasoningEffort =
+  | "none"
+  | "minimal"
+  | "low"
+  | "medium"
+  | "high"
+  | "xhigh"
+  | "max";
+
+export interface ReasoningTranslation {
+  target_path: string;
+  values: Partial<Record<ReasoningEffort, unknown>>;
+}
+
+export interface ReasoningTranslationConfig {
+  chat_completions?: ReasoningTranslation;
+  responses?: ReasoningTranslation;
+}
+
 export interface BackoffConfig {
   initial_ms: number;
   max_ms: number;
@@ -294,6 +313,7 @@ export interface Model {
   sanitize_responses?: boolean | null; // only present for virtual models
   trusted?: boolean; // Mark provider as trusted in strict mode (bypasses error sanitization)
   open_responses_adapter?: boolean; // Enable adapter that converts /v1/responses to /v1/chat/completions
+  reasoning_translation?: ReasoningTranslationConfig | null;
   traffic_routing_rules?: TrafficRoutingRule[] | null;
   allowed_batch_completion_windows?: string[] | null;
   metadata?: ModelMetadata | null;
@@ -316,6 +336,7 @@ export interface StandardModelCreate {
   throughput?: number;
   trusted?: boolean;
   open_responses_adapter?: boolean;
+  reasoning_translation?: ReasoningTranslationConfig;
   traffic_routing_rules?: TrafficRoutingRule[];
   allowed_batch_completion_windows?: string[];
 }
@@ -370,6 +391,7 @@ export interface Endpoint {
   model_filter?: string[] | null; // Optional list of models to sync
   auth_header_name: string;
   auth_header_prefix: string;
+  reasoning_translation?: ReasoningTranslationConfig | null;
 }
 
 export interface EndpointSyncResponse {
@@ -590,6 +612,7 @@ export interface ModelUpdateRequest {
   sanitize_responses?: boolean | null;
   trusted?: boolean | null;
   open_responses_adapter?: boolean | null;
+  reasoning_translation?: ReasoningTranslationConfig | null;
   traffic_routing_rules?: TrafficRoutingRule[] | null;
   allowed_batch_completion_windows?: string[] | null;
   metadata?: ModelMetadata | null;
@@ -607,6 +630,7 @@ export interface EndpointCreateRequest {
   auth_header_prefix?: string; // Prefix for authorization header value (defaults to "Bearer ")
   sync?: boolean; // Whether to sync models during creation (defaults to true)
   skip_fetch?: boolean; // Create deployments directly from model_filter without fetching (defaults to false)
+  reasoning_translation?: ReasoningTranslationConfig;
 }
 
 export interface EndpointUpdateRequest {
@@ -618,6 +642,7 @@ export interface EndpointUpdateRequest {
   alias_mapping?: Record<string, string>;
   auth_header_name?: string;
   auth_header_prefix?: string;
+  reasoning_translation?: ReasoningTranslationConfig | null;
 }
 
 export type EndpointValidateRequest =

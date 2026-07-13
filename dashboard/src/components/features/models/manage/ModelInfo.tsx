@@ -30,6 +30,7 @@ import type {
   ModelMetadata,
   ModelDisplayCategory,
   TrafficRoutingRule,
+  ReasoningTranslationConfig,
 } from "../../../../api/control-layer";
 import {
   useAuthorization,
@@ -81,6 +82,7 @@ import {
   PopoverContent,
   PopoverTrigger,
 } from "../../../ui/popover";
+import { ReasoningTranslationEditor } from "../../reasoning";
 
 // Form schema for alias editing
 const aliasFormSchema = z.object({
@@ -162,6 +164,7 @@ const ModelInfo: React.FC = () => {
     sanitize_responses: false,
     trusted: false,
     open_responses_adapter: true,
+    reasoning_translation: null as ReasoningTranslationConfig | null,
     requests_per_second: null as number | null,
     burst_size: null as number | null,
     capacity: null as number | null,
@@ -290,6 +293,7 @@ const ModelInfo: React.FC = () => {
         sanitize_responses: model.sanitize_responses ?? false,
         trusted: model.trusted ?? false,
         open_responses_adapter: model.open_responses_adapter ?? true,
+        reasoning_translation: model.reasoning_translation ?? null,
         requests_per_second: model.requests_per_second || null,
         burst_size: model.burst_size || null,
         capacity: model.capacity || null,
@@ -378,6 +382,7 @@ const ModelInfo: React.FC = () => {
           sanitize_responses: updateData.sanitize_responses,
           trusted: updateData.trusted,
           open_responses_adapter: updateData.open_responses_adapter,
+          reasoning_translation: updateData.reasoning_translation,
           // Always include rate limiting and capacity fields to handle clearing properly
           // Send null as the actual value when clearing (not undefined)
           requests_per_second: updateData.requests_per_second,
@@ -423,6 +428,7 @@ const ModelInfo: React.FC = () => {
         sanitize_responses: model.sanitize_responses ?? false,
         trusted: model.trusted ?? false,
         open_responses_adapter: model.open_responses_adapter ?? true,
+        reasoning_translation: model.reasoning_translation ?? null,
         requests_per_second: model.requests_per_second || null,
         burst_size: model.burst_size || null,
         capacity: model.capacity || null,
@@ -1323,6 +1329,21 @@ const ModelInfo: React.FC = () => {
                           )}
                         </div>
                       </div>
+
+                      {!model.is_composite && (
+                        <div className="border-t pt-4">
+                          <ReasoningTranslationEditor
+                            allowInherit
+                            value={updateData.reasoning_translation}
+                            onChange={(reasoning_translation) =>
+                              setUpdateData((previous) => ({
+                                ...previous,
+                                reasoning_translation,
+                              }))
+                            }
+                          />
+                        </div>
+                      )}
 
                       {/* Batch Completion Windows Section */}
                       <div className="border-t pt-4">

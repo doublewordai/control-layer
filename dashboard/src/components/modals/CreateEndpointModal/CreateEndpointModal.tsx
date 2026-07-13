@@ -49,7 +49,9 @@ import type {
   EndpointValidateRequest,
   AvailableModel,
   EndpointCreateRequest,
+  ReasoningTranslationConfig,
 } from "../../../api/control-layer/types";
+import { ReasoningTranslationEditor } from "../../features/reasoning";
 import { AddModelPalette } from "../EditEndpointModal/AddModelPalette";
 import { ImportedModelsTable } from "../EditEndpointModal/ImportedModelsTable";
 import { useEndpointModelsState } from "../EditEndpointModal/useEndpointModelsState";
@@ -283,6 +285,8 @@ export const CreateEndpointModal: React.FC<CreateEndpointModalProps> = ({
   const [showApiKey, setShowApiKey] = useState(false);
   const [quoteApiKey, setQuoteApiKey] = useState(false);
   const [currentStep, setCurrentStep] = useState<1 | 2>(1);
+  const [reasoningTranslation, setReasoningTranslation] =
+    useState<ReasoningTranslationConfig | null>(null);
 
   // ----- Step 2 (Models) state -----
   // catalog feeds the AddModelPalette and seeds the staged-state hook so all
@@ -326,6 +330,7 @@ export const CreateEndpointModal: React.FC<CreateEndpointModalProps> = ({
     setQuoteApiKey(false);
     setCurrentStep(1);
     setSubmitError(null);
+    setReasoningTranslation(null);
   }, [isOpen, form]);
 
   const initialDeployments = useMemo(
@@ -560,6 +565,9 @@ export const CreateEndpointModal: React.FC<CreateEndpointModalProps> = ({
         auth_header_prefix: data.authHeaderPrefix.trim(),
       }),
       ...(skipFetch && { skip_fetch: true }),
+      ...(reasoningTranslation && {
+        reasoning_translation: reasoningTranslation,
+      }),
     };
 
     try {
@@ -626,20 +634,26 @@ export const CreateEndpointModal: React.FC<CreateEndpointModalProps> = ({
           >
             <div className="space-y-6 overflow-y-auto flex-1 pr-1">
               {currentStep === 1 && (
-                <ConnectionStep
-                  form={form}
-                  validationState={validationState}
-                  validationError={validationError}
-                  urlPopoverOpen={urlPopoverOpen}
-                  setUrlPopoverOpen={setUrlPopoverOpen}
-                  advancedPopoverOpen={advancedPopoverOpen}
-                  setAdvancedPopoverOpen={setAdvancedPopoverOpen}
-                  showApiKey={showApiKey}
-                  setShowApiKey={setShowApiKey}
-                  quoteApiKey={quoteApiKey}
-                  setQuoteApiKey={setQuoteApiKey}
-                  onUrlChange={handleUrlChange}
-                />
+                <>
+                  <ConnectionStep
+                    form={form}
+                    validationState={validationState}
+                    validationError={validationError}
+                    urlPopoverOpen={urlPopoverOpen}
+                    setUrlPopoverOpen={setUrlPopoverOpen}
+                    advancedPopoverOpen={advancedPopoverOpen}
+                    setAdvancedPopoverOpen={setAdvancedPopoverOpen}
+                    showApiKey={showApiKey}
+                    setShowApiKey={setShowApiKey}
+                    quoteApiKey={quoteApiKey}
+                    setQuoteApiKey={setQuoteApiKey}
+                    onUrlChange={handleUrlChange}
+                  />
+                  <ReasoningTranslationEditor
+                    value={reasoningTranslation}
+                    onChange={setReasoningTranslation}
+                  />
+                </>
               )}
 
               {currentStep === 2 && (

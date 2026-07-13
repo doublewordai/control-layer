@@ -45,7 +45,9 @@ import type {
   EndpointUpdateRequest,
   Endpoint,
   Model,
+  ReasoningTranslationConfig,
 } from "../../../api/control-layer/types";
+import { ReasoningTranslationEditor } from "../../features/reasoning";
 import { AddModelPalette } from "./AddModelPalette";
 import { ImportedModelsTable } from "./ImportedModelsTable";
 import { RemoveModelDialog } from "./RemoveModelDialog";
@@ -95,6 +97,8 @@ export const EditEndpointModal: React.FC<EditEndpointModalProps> = ({
   const [advancedPopoverOpen, setAdvancedPopoverOpen] = useState(false);
   const [showApiKey, setShowApiKey] = useState(false);
   const [currentStep, setCurrentStep] = useState<1 | 2>(1);
+  const [reasoningTranslation, setReasoningTranslation] =
+    useState<ReasoningTranslationConfig | null>(endpoint.reasoning_translation ?? null);
 
   // ----- Step 2 (Models) state -----
   const [catalog, setCatalog] = useState<AvailableModel[]>([]);
@@ -189,6 +193,7 @@ export const EditEndpointModal: React.FC<EditEndpointModalProps> = ({
     setSubmitError(null);
     setPendingRemoval(null);
     setIsBuildingFilter(false);
+    setReasoningTranslation(endpoint.reasoning_translation ?? null);
   }, [isOpen, endpoint, form]);
 
   // Strip the pagination URL params when the modal closes. Cancel/X/ESC
@@ -467,6 +472,7 @@ export const EditEndpointModal: React.FC<EditEndpointModalProps> = ({
       ...(data.authHeaderPrefix?.trim() && {
         auth_header_prefix: data.authHeaderPrefix.trim(),
       }),
+      reasoning_translation: reasoningTranslation,
     };
 
     try {
@@ -537,18 +543,24 @@ export const EditEndpointModal: React.FC<EditEndpointModalProps> = ({
         <Form {...form}>
           <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-6">
             {currentStep === 1 && (
-              <ConnectionStep
-                form={form}
-                endpoint={endpoint}
-                urlChanged={urlChanged}
-                showApiKey={showApiKey}
-                setShowApiKey={setShowApiKey}
-                advancedPopoverOpen={advancedPopoverOpen}
-                setAdvancedPopoverOpen={setAdvancedPopoverOpen}
-                handleUrlChange={handleUrlChange}
-                validationState={validationState}
-                validationError={validationError}
-              />
+              <>
+                <ConnectionStep
+                  form={form}
+                  endpoint={endpoint}
+                  urlChanged={urlChanged}
+                  showApiKey={showApiKey}
+                  setShowApiKey={setShowApiKey}
+                  advancedPopoverOpen={advancedPopoverOpen}
+                  setAdvancedPopoverOpen={setAdvancedPopoverOpen}
+                  handleUrlChange={handleUrlChange}
+                  validationState={validationState}
+                  validationError={validationError}
+                />
+                <ReasoningTranslationEditor
+                  value={reasoningTranslation}
+                  onChange={setReasoningTranslation}
+                />
+              </>
             )}
 
             {currentStep === 2 && (
