@@ -4277,10 +4277,10 @@ mod tests {
             r#"
             INSERT INTO batch_aggregates (
                 fusillade_batch_id, user_id, total_amount, transaction_count, max_seq,
-                created_at, updated_at, service_tier,
+                created_at, updated_at, service_tier, total_requests,
                 total_prompt_tokens, total_completion_tokens, total_reasoning_tokens, total_tokens,
                 sum_duration_ms, count_duration_ms, sum_ttfb_ms, count_ttfb_ms, total_list_cost
-            ) VALUES ($1, $2, 0, 3, 0, NOW(), NOW(), 'batch',
+            ) VALUES ($1, $2, 0, 3, 0, NOW(), NOW(), 'batch', 3,
                 60, 4805, 3880, 4865, 300, 3, 0, 0, 0)
             "#,
         )

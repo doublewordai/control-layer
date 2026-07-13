@@ -801,7 +801,7 @@ pub async fn get_batch_analytics(pool: &PgPool, batch_id: &Uuid) -> Result<Optio
     let row = sqlx::query!(
         r#"
         SELECT
-            transaction_count,
+            total_requests,
             total_prompt_tokens,
             total_completion_tokens,
             total_reasoning_tokens,
@@ -821,7 +821,7 @@ pub async fn get_batch_analytics(pool: &PgPool, batch_id: &Uuid) -> Result<Optio
 
     Ok(row.map(|r| {
         batch_analytics_from_row(
-            r.transaction_count,
+            r.total_requests,
             r.total_prompt_tokens,
             r.total_completion_tokens,
             r.total_reasoning_tokens,
@@ -841,7 +841,7 @@ pub async fn get_batch_analytics(pool: &PgPool, batch_id: &Uuid) -> Result<Optio
 /// so both the single- and bulk-read queries (whose row types differ) can share it.
 #[allow(clippy::too_many_arguments)]
 fn batch_analytics_from_row(
-    total_requests: i32,
+    total_requests: i64,
     total_prompt_tokens: i64,
     total_completion_tokens: i64,
     total_reasoning_tokens: i64,
@@ -854,7 +854,7 @@ fn batch_analytics_from_row(
 ) -> BatchAnalytics {
     let avg = |sum: i64, count: i64| (count > 0).then(|| sum as f64 / count as f64);
     BatchAnalytics {
-        total_requests: total_requests as i64,
+        total_requests,
         total_prompt_tokens,
         total_completion_tokens,
         total_reasoning_tokens: (total_reasoning_tokens > 0).then_some(total_reasoning_tokens),
@@ -877,7 +877,7 @@ pub async fn get_batches_analytics_bulk(pool: &PgPool, batch_ids: &[Uuid]) -> Re
         r#"
         SELECT
             fusillade_batch_id,
-            transaction_count,
+            total_requests,
             total_prompt_tokens,
             total_completion_tokens,
             total_reasoning_tokens,
@@ -901,7 +901,7 @@ pub async fn get_batches_analytics_bulk(pool: &PgPool, batch_ids: &[Uuid]) -> Re
         result.insert(
             row.fusillade_batch_id,
             batch_analytics_from_row(
-                row.transaction_count,
+                row.total_requests,
                 row.total_prompt_tokens,
                 row.total_completion_tokens,
                 row.total_reasoning_tokens,
@@ -1810,14 +1810,15 @@ mod tests {
         sqlx::query!(
             r#"
             INSERT INTO batch_aggregates (
-                fusillade_batch_id, user_id, total_amount, transaction_count, max_seq, service_tier,
+                fusillade_batch_id, user_id, total_amount, transaction_count, max_seq, service_tier, total_requests,
                 total_prompt_tokens, total_completion_tokens, total_reasoning_tokens, total_tokens,
                 sum_duration_ms, count_duration_ms, sum_ttfb_ms, count_ttfb_ms, total_list_cost
             )
-            VALUES ($1, $2, $3, 1, 1, 'batch', $4, $5, $6, $7, $8, 1, $9, $10, $3)
+            VALUES ($1, $2, $3, 1, 1, 'batch', 1, $4, $5, $6, $7, $8, 1, $9, $10, $3)
             ON CONFLICT (fusillade_batch_id) DO UPDATE SET
                 total_amount = batch_aggregates.total_amount + EXCLUDED.total_amount,
                 transaction_count = batch_aggregates.transaction_count + EXCLUDED.transaction_count,
+                total_requests = batch_aggregates.total_requests + EXCLUDED.total_requests,
                 total_prompt_tokens = batch_aggregates.total_prompt_tokens + EXCLUDED.total_prompt_tokens,
                 total_completion_tokens = batch_aggregates.total_completion_tokens + EXCLUDED.total_completion_tokens,
                 total_reasoning_tokens = batch_aggregates.total_reasoning_tokens + EXCLUDED.total_reasoning_tokens,
