@@ -45,6 +45,12 @@ pub const WALK_BACK: usize = 20;
 /// in the block hash like any other role.
 const TOOL_DEFINITION_ROLE: &str = "tool_definition";
 
+/// Synthetic role for an assistant `tool_calls[]` entry — the OpenAI-native shape of Anthropic's
+/// `tool_use` content block. Hashed as its own block so a tool-calling assistant turn contributes to
+/// the prefix (a null-content assistant would otherwise be invisible), and so a `cache_control` on
+/// the call is an honoured breakpoint. A distinct role keeps it from colliding with a text block.
+const TOOL_CALL_ROLE: &str = "tool_call";
+
 #[derive(Debug, thiserror::Error)]
 pub enum ParseError {
     #[error("request body is not valid JSON: {0}")]
@@ -202,6 +208,35 @@ pub fn parse_chat_completions(body: &[u8], policy: &TierPolicy, telemetry: &Tele
                     }
                 }
                 _ => {}
+            }
+
+            // Assistant `tool_calls[]` are cache blocks too — the OpenAI shape of Anthropic's
+            // `tool_use` content blocks. Hash each (after this message's content, mirroring
+            // `[text, tool_use]` order) so a tool-calling turn isn't invisible to the cache, and
+            // honour a `cache_control` on the call itself as a breakpoint. The call's JSON is the
+            // write-side text, tokenized as an estimate (like a tool definition). The marker is
+            // stripped before hashing, so a marked and an unmarked call still match.
+            if let Some(tool_calls) = msg.get("tool_calls").and_then(|t| t.as_array()) {
+                for call in tool_calls {
+                    let ttl = match call.get("cache_control") {
+                        Some(cc) if !cc.is_null() => Some(parse_ttl(cc, policy)?),
+                        _ => None,
+                    };
+                    let stripped = strip_cache_control(call);
+                    let text = serde_json::to_string(&stripped)?;
+                    let canonical = canonical_block_bytes(TOOL_CALL_ROLE, &stripped);
+                    hasher.update(&canonical);
+                    cumulative_hashes.push(hasher.clone().finalize().to_vec());
+
+                    let block_index = blocks.len();
+                    blocks.push(Block {
+                        role: TOOL_CALL_ROLE.to_string(),
+                        text,
+                    });
+                    if let Some(ttl_tier) = ttl {
+                        breakpoints.push(Breakpoint { block_index, ttl_tier });
+                    }
+                }
             }
         }
     }
@@ -384,6 +419,25 @@ pub fn validate_markers(body: &serde_json::Value, policy: &TierPolicy, telemetry
                     }
                 }
                 _ => {}
+            }
+
+            // Assistant `tool_calls[]` count toward the same cap and are validated identically (see
+            // parse_chat_completions) — the last call is the message's final block.
+            if let Some(tool_calls) = msg.get("tool_calls").and_then(|t| t.as_array()) {
+                for call in tool_calls {
+                    saw_block = true;
+                    match call.get("cache_control") {
+                        Some(cc) if !cc.is_null() => {
+                            let tier = parse_ttl(cc, policy)?;
+                            breakpoints += 1;
+                            if breakpoints > MAX_BREAKPOINTS {
+                                return Err(ParseError::TooManyBreakpoints);
+                            }
+                            last_marker = Some(tier);
+                        }
+                        _ => last_marker = None,
+                    }
+                }
             }
         }
     }
@@ -1017,6 +1071,92 @@ mod tests {
         // and instead READS it back via the walk-back — same hash, so it matches.
         assert_eq!(marked.breakpoints.len(), 1);
         assert!(unmarked.breakpoints.is_empty());
+    }
+
+    // ---- Assistant tool_calls (the OpenAI shape of Anthropic tool_use blocks) ----
+
+    #[test]
+    fn tool_call_is_hashed_and_marker_is_a_breakpoint() {
+        // A null-content assistant with a marked tool_call: the call is a block (hashed) and its
+        // marker is a breakpoint. Without this the turn is invisible to the cache.
+        let p = parse(serde_json::json!({
+            "messages": [
+                {"role": "user", "content": "q"},
+                {"role": "assistant", "content": null, "tool_calls": [
+                    {"id": "tu1", "type": "function", "function": {"name": "lookup", "arguments": "{}"},
+                     "cache_control": {"type": "ephemeral", "ttl": "1h"}}
+                ]}
+            ]
+        }));
+        assert_eq!(p.blocks.len(), 2, "user block + the tool_call block (null content adds none)");
+        assert_eq!(p.blocks[1].role, "tool_call");
+        assert_eq!(p.breakpoints.len(), 1);
+        assert_eq!(p.breakpoints[0].block_index, 1);
+        assert_eq!(p.breakpoints[0].ttl_tier, TtlTier::OneHour);
+        assert!(p.blocks[1].text.contains("lookup"), "the call JSON is the write-side text");
+    }
+
+    #[test]
+    fn tool_call_after_text_preserves_order() {
+        // assistant [text, tool_use] → content text block THEN the tool_call block, mirroring order.
+        let p = parse(serde_json::json!({
+            "messages": [{"role": "assistant", "content": [{"type": "text", "text": "calling"}],
+                          "tool_calls": [{"id": "t", "type": "function", "function": {"name": "f", "arguments": "{}"}}]}]
+        }));
+        assert_eq!(p.blocks.len(), 2);
+        assert_eq!(p.blocks[0].role, "assistant");
+        assert_eq!(p.blocks[1].role, "tool_call");
+    }
+
+    #[test]
+    fn tool_call_marker_excluded_from_hash() {
+        // Marker stripped before hashing → a marked call and an unmarked one match (so the read chain
+        // holds as the SDK's marker advances off this call next turn).
+        let marked = parse(serde_json::json!({
+            "messages": [{"role": "assistant", "content": null, "tool_calls": [
+                {"id": "tu1", "type": "function", "function": {"name": "f", "arguments": "{}"}, "cache_control": {"type": "ephemeral"}}
+            ]}]
+        }));
+        let unmarked = parse(serde_json::json!({
+            "messages": [{"role": "assistant", "content": null, "tool_calls": [
+                {"id": "tu1", "type": "function", "function": {"name": "f", "arguments": "{}"}}
+            ]}]
+        }));
+        assert_eq!(marked.cumulative_hashes[0], unmarked.cumulative_hashes[0]);
+        assert_eq!(marked.breakpoints.len(), 1);
+        assert!(unmarked.breakpoints.is_empty());
+    }
+
+    #[test]
+    fn distinct_tool_calls_hash_differently() {
+        // Same assistant text, different tool call → different prefix hash (faithful to Anthropic:
+        // the tool_use block is part of the cache key, not just the text).
+        let a = parse(serde_json::json!({
+            "messages": [{"role": "assistant", "content": null, "tool_calls": [
+                {"id": "t", "type": "function", "function": {"name": "f", "arguments": "{\"x\":1}"}}
+            ]}]
+        }));
+        let b = parse(serde_json::json!({
+            "messages": [{"role": "assistant", "content": null, "tool_calls": [
+                {"id": "t", "type": "function", "function": {"name": "f", "arguments": "{\"x\":2}"}}
+            ]}]
+        }));
+        assert_ne!(a.cumulative_hashes[0], b.cumulative_hashes[0]);
+    }
+
+    #[test]
+    fn tool_call_markers_validate_and_count() {
+        // A disabled tier on a tool_call is a 400, like any other marker.
+        let policy = TierPolicy::from_config(&["5m".to_string(), "1h".to_string()], "5m");
+        let body = serde_json::json!({
+            "messages": [{"role": "assistant", "content": null, "tool_calls": [
+                {"id": "t", "type": "function", "function": {"name": "f", "arguments": "{}"}, "cache_control": {"type": "ephemeral", "ttl": "24h"}}
+            ]}]
+        });
+        assert!(matches!(
+            validate_markers(&body, &policy, &no_telemetry()).unwrap_err(),
+            ParseError::DisabledTier(TtlTier::TwentyFourHours)
+        ));
     }
 
     // ---- Automatic caching (top-level `cache_control`) ----

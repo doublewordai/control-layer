@@ -156,15 +156,32 @@ fn convert_assistant(content: &Content) -> Value {
                             marker = Some(cc.clone());
                         }
                     }
-                    ContentBlock::ToolUse { id, name, input, .. } => {
-                        tool_calls.push(json!({
+                    ContentBlock::ToolUse {
+                        id,
+                        name,
+                        input,
+                        cache_control,
+                    } => {
+                        let mut call = json!({
                             "id": id,
                             "type": "function",
                             "function": {
                                 "name": name,
                                 "arguments": serde_json::to_string(input).unwrap_or_else(|_| "{}".into()),
                             }
-                        }));
+                        });
+                        // Preserve a marker on the tool call itself — the OpenAI-native mirror of
+                        // Anthropic's `tool_use.cache_control`. The cache reads it as a breakpoint and
+                        // strips it before upstream. Dropping it (as we used to) lost the SDK's
+                        // advancing breakpoint whenever it landed on a tool_use block, breaking the
+                        // read chain and leaving the growing conversation uncached. A `null` is "no
+                        // marker".
+                        if let Some(cc) = cache_control
+                            && !cc.is_null()
+                        {
+                            call["cache_control"] = cc.clone();
+                        }
+                        tool_calls.push(call);
                     }
                     // Images / tool_results are not expected on an assistant turn.
                     _ => {}
@@ -447,5 +464,37 @@ mod tests {
             ]
         }));
         assert_eq!(out["messages"][1]["content"], "sunny", "unmarked tool_result stays a plain string");
+    }
+
+    #[test]
+    fn assistant_tool_use_cache_control_preserved_on_tool_call() {
+        // The SDK's advancing breakpoint often lands on a tool_use block — it must survive onto the
+        // OpenAI tool_call (1b: mirror of Anthropic's tool_use.cache_control), not be dropped.
+        let out = translate(json!({
+            "model": "m", "max_tokens": 16,
+            "messages": [{ "role": "assistant", "content": [
+                { "type": "text", "text": "calling" },
+                { "type": "tool_use", "id": "tu_1", "name": "lookup", "input": {"q": "x"},
+                  "cache_control": { "type": "ephemeral", "ttl": "1h" } }
+            ]}]
+        }));
+        let call = &out["messages"][0]["tool_calls"][0];
+        assert_eq!(call["id"], "tu_1");
+        assert_eq!(call["function"]["name"], "lookup");
+        assert_eq!(call["cache_control"]["ttl"], "1h", "marker preserved on the tool_call");
+    }
+
+    #[test]
+    fn assistant_tool_use_without_marker_has_no_cache_control() {
+        let out = translate(json!({
+            "model": "m", "max_tokens": 16,
+            "messages": [{ "role": "assistant", "content": [
+                { "type": "tool_use", "id": "tu_1", "name": "lookup", "input": {} }
+            ]}]
+        }));
+        assert!(
+            out["messages"][0]["tool_calls"][0].get("cache_control").is_none(),
+            "no marker → clean tool_call"
+        );
     }
 }
