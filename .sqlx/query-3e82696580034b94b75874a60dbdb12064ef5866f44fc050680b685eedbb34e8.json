@@ -1,0 +1,160 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT\n                r.id, r.batch_id as \"batch_id!\", r.template_id as \"template_id?\", r.state,\n                t.custom_id as \"custom_id?\", t.endpoint as \"endpoint?\", t.method as \"method?\",\n                t.path as \"path?\", t.body as \"body?\", t.model as \"model?\", t.api_key as \"api_key?\",\n                r.retry_attempt, r.not_before, r.daemon_id, r.claimed_at, r.started_at,\n                r.response_status, r.response_body, r.completed_at, r.error, r.failed_at, r.canceled_at,\n                b.expires_at as batch_expires_at, r.routed_model\n            FROM requests r\n            LEFT JOIN active_request_templates t ON r.template_id = t.id\n            JOIN batches b ON r.batch_id = b.id\n            WHERE r.id = ANY($1)\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "batch_id!",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "template_id?",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 3,
+        "name": "state",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "custom_id?",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "endpoint?",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "method?",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 7,
+        "name": "path?",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 8,
+        "name": "body?",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 9,
+        "name": "model?",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 10,
+        "name": "api_key?",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 11,
+        "name": "retry_attempt",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 12,
+        "name": "not_before",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 13,
+        "name": "daemon_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 14,
+        "name": "claimed_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 15,
+        "name": "started_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 16,
+        "name": "response_status",
+        "type_info": "Int2"
+      },
+      {
+        "ordinal": 17,
+        "name": "response_body",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 18,
+        "name": "completed_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 19,
+        "name": "error",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 20,
+        "name": "failed_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 21,
+        "name": "canceled_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 22,
+        "name": "batch_expires_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 23,
+        "name": "routed_model",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "UuidArray"
+      ]
+    },
+    "nullable": [
+      false,
+      true,
+      true,
+      false,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      false,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      false,
+      true
+    ]
+  },
+  "hash": "3e82696580034b94b75874a60dbdb12064ef5866f44fc050680b685eedbb34e8"
+}

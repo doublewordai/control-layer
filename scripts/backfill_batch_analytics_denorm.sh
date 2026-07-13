@@ -1,19 +1,20 @@
 #!/usr/bin/env bash
 #
 # Backfill batch_aggregates per-batch analytics (tokens / latency / cost) from
-# http_analytics history (COR-524, migration 116).
+# http_analytics history (COR-524, migration 117).
 #
 # get_batch_analytics is repointed off raw http_analytics onto these columns (the contract
 # PR). Going forward the analytics batcher folds each flush's batched requests into them in
 # the same transaction it writes total_amount; this script fills historical batches.
 #
-# What it computes, per batch, over its *billed* successful requests (the same set the
-# batcher folds: user resolved, priced, total_cost > 0 — equivalently status 2xx for real
-# batch traffic):
+# What it computes, per batch, over its *successful (status 2xx)* requests — INCLUDING free /
+# zero-priced ones, matching the go-forward fold and get_batch_analytics's historical set (NOT
+# just the billed rows; a free-model batch still reports tokens/latency):
+#   total_requests                                  = COUNT(*)             -- the 2xx request count
 #   total_prompt/completion/reasoning/total_tokens  = SUM(tokens)
 #   sum_duration_ms  / count_duration_ms            = SUM / COUNT(duration_ms)
 #   sum_ttfb_ms      / count_ttfb_ms                = SUM / COUNT(duration_to_first_byte_ms)
-#   total_list_cost                                 = SUM(uncached_cost)   -- the list price
+#   total_list_cost                                 = SUM(uncached_cost)   -- the list price (0 for free)
 # The per-batch aggregate rides idx_analytics_fusillade_batch_id, so run this BEFORE that
 # index is dropped (the contract PR) and after migration 116 + the batcher change are
 # deployed to every pod.
@@ -65,7 +66,8 @@ while [ "$CURSOR" -lt "$MAX_SEQ" ]; do
   affected=$(psql_q "
     WITH upd AS (
       UPDATE batch_aggregates ba
-         SET total_prompt_tokens     = s.prompt_tokens,
+         SET total_requests          = s.total_requests,
+             total_prompt_tokens     = s.prompt_tokens,
              total_completion_tokens = s.completion_tokens,
              total_reasoning_tokens  = s.reasoning_tokens,
              total_tokens            = s.total_tokens,
@@ -77,6 +79,7 @@ while [ "$CURSOR" -lt "$MAX_SEQ" ]; do
              analytics_backfilled_at = NOW()
         FROM LATERAL (
                SELECT
+                 COUNT(*)                                            AS total_requests,
                  COALESCE(SUM(ha.prompt_tokens), 0)                   AS prompt_tokens,
                  COALESCE(SUM(ha.completion_tokens), 0)               AS completion_tokens,
                  COALESCE(SUM(ha.reasoning_tokens), 0)                AS reasoning_tokens,
@@ -89,8 +92,7 @@ while [ "$CURSOR" -lt "$MAX_SEQ" ]; do
                FROM http_analytics ha
                WHERE ha.fusillade_batch_id = ba.fusillade_batch_id
                  AND ha.user_id IS NOT NULL
-                 AND ha.total_cost IS NOT NULL
-                 AND ha.total_cost > 0
+                 AND ha.status_code BETWEEN 200 AND 299
              ) s
        WHERE ba.max_seq > ${CURSOR} AND ba.max_seq <= ${hi}
              AND ba.analytics_backfilled_at IS NULL

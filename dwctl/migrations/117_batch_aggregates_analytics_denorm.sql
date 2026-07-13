@@ -15,16 +15,22 @@
 -- Latency is stored as sum + count (not an average) precisely because AVG is not foldable;
 -- the endpoint divides at read time.
 --
--- Aggregated set = the batch's *billed* successful requests (the credit-transaction set the
--- batcher already folds: user resolved, priced, cost > 0). This is the set that folds
--- idempotently under retries (credits_transactions ON CONFLICT DO NOTHING is the only
--- deduped signal in a flush — the http_analytics upsert is DO UPDATE and returns every row).
--- For real batch traffic (priced models, cost > 0) this equals the endpoint's current
--- "status 2xx" set; the backfill uses the same billed filter so historical and go-forward
--- rows share one definition.
+-- Aggregated set = the batch's *successful (status 2xx)* requests — including free /
+-- zero-priced ones, matching what get_batch_analytics historically COUNT/SUM'd off raw
+-- http_analytics. This is deliberately BROADER than the billed set the credit fold uses
+-- (priced, cost > 0): a free-model batch has no credit rows but must still report its
+-- tokens/latency. Idempotency therefore cannot ride the credits dedup; the go-forward fold
+-- rides the http_analytics upsert's newly-inserted rows (xmax = 0) instead, and the backfill
+-- SETs absolute aggregates over quiescent batches — so historical and go-forward rows share
+-- the same "all 2xx" definition. `total_requests` is that 2xx count (distinct from
+-- transaction_count, which stays the billed-row count).
 
 ALTER TABLE batch_aggregates
-    -- Token totals (SUM over the batch's billed requests).
+    -- Count of successful (2xx) requests folded — the analytics request count, distinct from
+    -- transaction_count (billed rows). Equal for priced batches; larger for batches with free
+    -- requests. Read as `total_requests` by get_batch_analytics.
+    ADD COLUMN total_requests           BIGINT NOT NULL DEFAULT 0,
+    -- Token totals (SUM over the batch's successful requests).
     ADD COLUMN total_prompt_tokens     BIGINT NOT NULL DEFAULT 0,
     ADD COLUMN total_completion_tokens  BIGINT NOT NULL DEFAULT 0,
     ADD COLUMN total_reasoning_tokens   BIGINT NOT NULL DEFAULT 0,
