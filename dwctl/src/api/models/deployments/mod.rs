@@ -102,6 +102,8 @@ pub struct ListModelsQuery {
     pub model_type: Option<ModelType>,
     /// Filter by capability (returns models that have this capability)
     pub capability: Option<String>,
+    /// Filter by realtime availability (true = no realtime deny rule, false = realtime deny rule)
+    pub available_for_realtime: Option<bool>,
     /// Sort field (default: created_at)
     pub sort: Option<ModelSortField>,
     /// Sort direction (default depends on sort field)
