@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.80.0](https://github.com/doublewordai/control-layer/compare/v8.79.1...v8.80.0) (2026-07-13)
+
+
+### Features
+
+* filter model discovery by group and realtime availability ([#1264](https://github.com/doublewordai/control-layer/issues/1264)) ([49ccb54](https://github.com/doublewordai/control-layer/commit/49ccb54405490b22fca85f950b01294c5e1c64d6))
+
 ## [8.79.1](https://github.com/doublewordai/control-layer/compare/v8.79.0...v8.79.1) (2026-07-10)
 
 
