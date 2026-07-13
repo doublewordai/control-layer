@@ -1050,7 +1050,7 @@ version = "3.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "519bd3116aeeb42d5372c29d982d16d0170d3d4a5ed85fc7dd91642ffff3c67c"
 dependencies = [
- "darling 0.23.0",
+ "darling 0.20.11",
  "ident_case",
  "prettyplease",
  "proc-macro2",
@@ -4264,7 +4264,7 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 [[package]]
 name = "onwards"
 version = "0.34.6"
-source = "git+https://github.com/doublewordai/onwards?rev=2db84b4fc1df1392b399ca6aa52214579db51d2c#2db84b4fc1df1392b399ca6aa52214579db51d2c"
+source = "git+https://github.com/doublewordai/onwards?rev=bf573afd9ad54f04383f2624804062c17d48a50b#bf573afd9ad54f04383f2624804062c17d48a50b"
 dependencies = [
  "anyhow",
  "async-stream",
