@@ -44,6 +44,8 @@ impl From<CreditTransaction> for CreditTransactionDBResponse {
             source_id: tx.source_id,
             created_at: tx.created_at,
             api_key_id: tx.api_key_id,
+            // CreditTransaction doesn't carry the tier; callers that need it select it directly.
+            service_tier: None,
         }
     }
 }
@@ -196,6 +198,8 @@ impl<'c> Credits<'c> {
             source_id: row.source_id,
             created_at: row.created_at,
             api_key_id: row.api_key_id,
+            // Freshly created transaction; the tier isn't needed on this return path.
+            service_tier: None,
         })
     }
 
@@ -374,9 +378,9 @@ impl<'c> Credits<'c> {
             .map(|types| types.iter().map(transaction_type_to_string).collect());
 
         let transactions = sqlx::query_as!(
-            CreditTransaction,
+            CreditTransactionDBResponse,
             r#"
-            SELECT id, user_id, transaction_type as "transaction_type: CreditTransactionType", amount, source_id, description, created_at, seq, api_key_id
+            SELECT id, user_id, transaction_type as "transaction_type: CreditTransactionType", amount, source_id, description, created_at, api_key_id, service_tier
             FROM credits_transactions
             WHERE user_id = $1
               AND ($4::text IS NULL OR description ILIKE '%' || $4 || '%')
@@ -398,7 +402,7 @@ impl<'c> Credits<'c> {
         .fetch_all(&mut *self.db)
         .await?;
 
-        Ok(transactions.into_iter().map(CreditTransactionDBResponse::from).collect())
+        Ok(transactions)
     }
 
     /// List all transactions across all users (admin view) with optional filters
@@ -415,9 +419,9 @@ impl<'c> Credits<'c> {
             .map(|types| types.iter().map(transaction_type_to_string).collect());
 
         let transactions = sqlx::query_as!(
-            CreditTransaction,
+            CreditTransactionDBResponse,
             r#"
-            SELECT id, user_id, transaction_type as "transaction_type: CreditTransactionType", amount, source_id, description, created_at, seq, api_key_id
+            SELECT id, user_id, transaction_type as "transaction_type: CreditTransactionType", amount, source_id, description, created_at, api_key_id, service_tier
             FROM credits_transactions
             WHERE ($3::text IS NULL OR description ILIKE '%' || $3 || '%')
               AND ($4::text[] IS NULL OR transaction_type::text = ANY($4))
@@ -437,7 +441,7 @@ impl<'c> Credits<'c> {
         .fetch_all(&mut *self.db)
         .await?;
 
-        Ok(transactions.into_iter().map(CreditTransactionDBResponse::from).collect())
+        Ok(transactions)
     }
 
     /// Get a single transaction by its ID
@@ -807,6 +811,7 @@ impl<'c> Credits<'c> {
                 source_id,
                 created_at,
                 api_key_id: None,
+                service_tier: row.service_tier.clone(),
             };
             results.push(TransactionWithCategory {
                 transaction,

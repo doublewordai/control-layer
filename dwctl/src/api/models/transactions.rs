@@ -166,7 +166,9 @@ impl ListTransactionsQuery {
 
 // Conversions
 impl CreditTransactionResponse {
-    /// Convert from DB response with optional batch_id (legacy, without category info)
+    /// Convert from DB response with optional batch_id (without batch-grouping metadata).
+    /// Carries the denormalized `service_tier` from the ledger row so the non-grouped
+    /// transactions lists expose the tier just like the grouped path (COR-514).
     pub fn from_db_with_batch_id(db: CreditTransactionDBResponse, batch_id: Option<Uuid>) -> Self {
         Self {
             id: db.id,
@@ -177,7 +179,7 @@ impl CreditTransactionResponse {
             source_id: db.source_id,
             description: db.description,
             created_at: db.created_at,
-            service_tier: None,
+            service_tier: db.service_tier,
             batch_request_count: None,
         }
     }
