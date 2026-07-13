@@ -915,7 +915,9 @@ pub async fn get_batches_analytics_bulk(pool: &PgPool, batch_ids: &[Uuid]) -> Re
         );
     }
 
-    // For batch IDs with no aggregates row (no billed requests), insert empty analytics
+    // For batch IDs with no aggregates row, insert empty analytics. A missing row means the
+    // batch had no successful (2xx) requests folded, or it predates the read model / aged out
+    // of retention — not specifically "no billed requests" (the fold covers all 2xx, incl. free).
     for batch_id in batch_ids {
         result.entry(*batch_id).or_default();
     }
