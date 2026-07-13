@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            INSERT INTO deployed_models (\n                model_name, alias, display_name, description, type, capabilities, created_by, hosted_on, created_at, updated_at,\n                requests_per_second, burst_size, capacity, batch_capacity, throughput,\n                downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token,\n                downstream_hourly_rate, downstream_input_token_cost_ratio,\n                is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status,\n                fallback_with_replacement, fallback_max_attempts,\n                sanitize_responses, trusted, open_responses_adapter, allowed_batch_completion_windows,\n                metadata,\n                backoff_enabled, backoff_initial_ms, backoff_max_ms, backoff_factor, backoff_jitter, backoff_max_total_ms\n            )\n            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38)\n            RETURNING *\n            ",
+  "query": "\n            INSERT INTO deployed_models (\n                model_name, alias, display_name, description, type, capabilities, created_by, hosted_on, created_at, updated_at,\n                requests_per_second, burst_size, capacity, batch_capacity, throughput,\n                downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token,\n                downstream_hourly_rate, downstream_input_token_cost_ratio,\n                is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status,\n                fallback_with_replacement, fallback_max_attempts,\n                sanitize_responses, trusted, open_responses_adapter, allowed_batch_completion_windows,\n                metadata,\n                backoff_enabled, backoff_initial_ms, backoff_max_ms, backoff_factor, backoff_jitter, backoff_max_total_ms,\n                reasoning_translation\n            )\n            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39)\n            RETURNING *\n            ",
   "describe": {
     "columns": [
       {
@@ -212,6 +212,11 @@
         "ordinal": 41,
         "name": "backoff_max_total_ms",
         "type_info": "Int4"
+      },
+      {
+        "ordinal": 42,
+        "name": "reasoning_translation",
+        "type_info": "Jsonb"
       }
     ],
     "parameters": {
@@ -253,7 +258,8 @@
         "Int4",
         "Float8",
         "Text",
-        "Int4"
+        "Int4",
+        "Jsonb"
       ]
     },
     "nullable": [
@@ -298,8 +304,9 @@
       false,
       false,
       false,
+      true,
       true
     ]
   },
-  "hash": "2e206d1220602e3b54db21d7c5b5415819d2a543ab46df6e80699442704aac4f"
+  "hash": "14fb6ab41a95a117a72b900e2e66176ac5309ffcc4d132796d703cc879fccbab"
 }

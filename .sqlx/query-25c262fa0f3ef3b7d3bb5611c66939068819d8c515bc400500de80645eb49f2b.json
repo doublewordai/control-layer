@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            INSERT INTO inference_endpoints (name, description, url, api_key, model_filter, auth_header_name, auth_header_prefix, created_by)\n            VALUES ($1, $2, $3, $4, $5, COALESCE($6, 'Authorization'), COALESCE($7, 'Bearer '), $8)\n            RETURNING *\n            ",
+  "query": "\n            INSERT INTO inference_endpoints (name, description, url, api_key, model_filter, auth_header_name, auth_header_prefix, created_by, reasoning_translation)\n            VALUES ($1, $2, $3, $4, $5, COALESCE($6, 'Authorization'), COALESCE($7, 'Bearer '), $8, $9)\n            RETURNING *\n            ",
   "describe": {
     "columns": [
       {
@@ -57,6 +57,11 @@
         "ordinal": 10,
         "name": "auth_header_prefix",
         "type_info": "Varchar"
+      },
+      {
+        "ordinal": 11,
+        "name": "reasoning_translation",
+        "type_info": "Jsonb"
       }
     ],
     "parameters": {
@@ -68,7 +73,8 @@
         "TextArray",
         "Text",
         "Text",
-        "Uuid"
+        "Uuid",
+        "Jsonb"
       ]
     },
     "nullable": [
@@ -82,8 +88,9 @@
       true,
       false,
       false,
-      false
+      false,
+      true
     ]
   },
-  "hash": "db0884e544b51277f9c834762a4925c46cb5f747ccd3e78d037df725ab5280b1"
+  "hash": "25c262fa0f3ef3b7d3bb5611c66939068819d8c515bc400500de80645eb49f2b"
 }

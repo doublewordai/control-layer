@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT id, model_name, alias, display_name, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, requests_per_second, burst_size, capacity, batch_capacity, throughput, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, fallback_with_replacement, fallback_max_attempts, backoff_enabled, backoff_initial_ms, backoff_max_ms, backoff_factor, backoff_jitter, backoff_max_total_ms, sanitize_responses, trusted, open_responses_adapter, allowed_batch_completion_windows, metadata FROM deployed_models WHERE id = $1",
+  "query": "SELECT id, model_name, alias, display_name, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, requests_per_second, burst_size, capacity, batch_capacity, throughput, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, fallback_with_replacement, fallback_max_attempts, backoff_enabled, backoff_initial_ms, backoff_max_ms, backoff_factor, backoff_jitter, backoff_max_total_ms, sanitize_responses, trusted, open_responses_adapter, allowed_batch_completion_windows, metadata, reasoning_translation FROM deployed_models WHERE id = ANY($1)",
   "describe": {
     "columns": [
       {
@@ -212,11 +212,16 @@
         "ordinal": 41,
         "name": "metadata",
         "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 42,
+        "name": "reasoning_translation",
+        "type_info": "Jsonb"
       }
     ],
     "parameters": {
       "Left": [
-        "Uuid"
+        "UuidArray"
       ]
     },
     "nullable": [
@@ -261,8 +266,9 @@
       false,
       true,
       true,
-      false
+      false,
+      true
     ]
   },
-  "hash": "b6e4f128475fb6e568adf1284c26ec1dc11ea27150ac927aa058e1d3c359cc62"
+  "hash": "63e777fa680441dc3b5023a82eae4bd599cee7c192ffa3637394f71d2232be00"
 }

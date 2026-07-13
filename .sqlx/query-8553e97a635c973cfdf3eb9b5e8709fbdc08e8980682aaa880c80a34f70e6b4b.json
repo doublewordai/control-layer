@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            UPDATE inference_endpoints SET\n                name = COALESCE($2, name),\n                description = CASE\n                    WHEN $3::text IS NOT NULL THEN $3\n                    ELSE description\n                END,\n                url = COALESCE($4, url),\n                api_key = CASE\n                    WHEN $5::text IS NOT NULL THEN $5\n                    ELSE api_key\n                END,\n                model_filter = CASE\n                    WHEN $6::text[] IS NOT NULL THEN $6\n                    ELSE model_filter\n                END,\n                auth_header_name = COALESCE($7, auth_header_name),\n                auth_header_prefix = COALESCE($8, auth_header_prefix),\n                updated_at = NOW()\n            WHERE id = $1\n            RETURNING *\n            ",
+  "query": "\n            UPDATE inference_endpoints SET\n                name = COALESCE($2, name),\n                description = CASE\n                    WHEN $3::text IS NOT NULL THEN $3\n                    ELSE description\n                END,\n                url = COALESCE($4, url),\n                api_key = CASE\n                    WHEN $5::text IS NOT NULL THEN $5\n                    ELSE api_key\n                END,\n                model_filter = CASE\n                    WHEN $6::text[] IS NOT NULL THEN $6\n                    ELSE model_filter\n                END,\n                auth_header_name = COALESCE($7, auth_header_name),\n                auth_header_prefix = COALESCE($8, auth_header_prefix),\n                reasoning_translation = CASE\n                    WHEN $9 THEN $10\n                    ELSE reasoning_translation\n                END,\n                updated_at = NOW()\n            WHERE id = $1\n            RETURNING *\n            ",
   "describe": {
     "columns": [
       {
@@ -57,6 +57,11 @@
         "ordinal": 10,
         "name": "auth_header_prefix",
         "type_info": "Varchar"
+      },
+      {
+        "ordinal": 11,
+        "name": "reasoning_translation",
+        "type_info": "Jsonb"
       }
     ],
     "parameters": {
@@ -68,7 +73,9 @@
         "Text",
         "TextArray",
         "Varchar",
-        "Varchar"
+        "Varchar",
+        "Bool",
+        "Jsonb"
       ]
     },
     "nullable": [
@@ -82,8 +89,9 @@
       true,
       false,
       false,
-      false
+      false,
+      true
     ]
   },
-  "hash": "b147b70f037aa3d26ba840c1661c31a52086325398bf6b7d492497b6df07bff9"
+  "hash": "8553e97a635c973cfdf3eb9b5e8709fbdc08e8980682aaa880c80a34f70e6b4b"
 }
