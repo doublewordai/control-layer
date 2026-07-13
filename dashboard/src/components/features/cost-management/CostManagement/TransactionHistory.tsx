@@ -181,11 +181,11 @@ export function TransactionHistory({
     }
 
     // Human label for the service tier (realtime / flex / async / batch)
+    const tierKey = tx.service_tier ?? (tx.batch_id ? "batch" : "realtime");
     const tierLabel =
       { realtime: "Realtime", flex: "Flex", async: "Async", batch: "Batch" }[
-        tx.service_tier ?? ""
-      ] ?? "Realtime";
-
+        tierKey
+      ] ?? (tx.batch_id ? "Batch" : "Realtime");
     // Aggregated tiers (async / batch) have a batch_id — show the request count
     // rather than a single model name.
     if (tx.batch_id) {
