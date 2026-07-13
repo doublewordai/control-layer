@@ -77,6 +77,12 @@ fn remove_cache_control(body: &mut Value, telemetry: &TelemetryPolicy) -> (bool,
             // Assistant `tool_calls[]` can carry a marker too (the OpenAI shape of a marked
             // `tool_use` block). Strip it off each call so it never leaks upstream. Non-recursive:
             // only the top-level of each call object, never into its `function.arguments`.
+            //
+            // Deliberately role-agnostic (unlike `parse`, which only hashes `tool_calls` on an
+            // assistant message): this is the last-line leak guard, so it mirrors how content-block
+            // and tool-definition markers are stripped everywhere they can appear. Stripping a marker
+            // off a malformed non-assistant `tool_calls` is harmless; forwarding one upstream (an
+            // unknown field an OpenAI-compatible backend may reject) is not.
             if let Some(tool_calls) = msg.get_mut("tool_calls").and_then(Value::as_array_mut) {
                 for call in tool_calls.iter_mut() {
                     strip_block_marker(call, &mut rewrote, &mut had_marker);

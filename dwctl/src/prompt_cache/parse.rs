@@ -216,7 +216,15 @@ pub fn parse_chat_completions(body: &[u8], policy: &TierPolicy, telemetry: &Tele
             // honour a `cache_control` on the call itself as a breakpoint. The call's JSON is the
             // write-side text, tokenized as an estimate (like a tool definition). The marker is
             // stripped before hashing, so a marked and an unmarked call still match.
-            if let Some(tool_calls) = msg.get("tool_calls").and_then(|t| t.as_array()) {
+            //
+            // Gated to `assistant`: `tool_calls` is an assistant-only field in the OpenAI-compatible
+            // API, so a `tool_calls` on any other role is a malformed shape. Ignoring it here keeps
+            // it out of the cache key and out of the breakpoint budget rather than letting garbage
+            // input perturb either. (The outbound sanitiser is deliberately role-agnostic instead —
+            // it strips defensively so nothing leaks upstream; see `inject::remove_cache_control`.)
+            if role == "assistant"
+                && let Some(tool_calls) = msg.get("tool_calls").and_then(|t| t.as_array())
+            {
                 for call in tool_calls {
                     let ttl = match call.get("cache_control") {
                         Some(cc) if !cc.is_null() => Some(parse_ttl(cc, policy)?),
@@ -422,8 +430,12 @@ pub fn validate_markers(body: &serde_json::Value, policy: &TierPolicy, telemetry
             }
 
             // Assistant `tool_calls[]` count toward the same cap and are validated identically (see
-            // parse_chat_completions) — the last call is the message's final block.
-            if let Some(tool_calls) = msg.get("tool_calls").and_then(|t| t.as_array()) {
+            // parse_chat_completions) — the last call is the message's final block. Gated to
+            // `assistant` to match parse_chat_completions exactly (tool_calls is assistant-only);
+            // validation and hashing must agree on what counts as a block/breakpoint.
+            if role == "assistant"
+                && let Some(tool_calls) = msg.get("tool_calls").and_then(|t| t.as_array())
+            {
                 for call in tool_calls {
                     saw_block = true;
                     match call.get("cache_control") {
@@ -1157,6 +1169,32 @@ mod tests {
             validate_markers(&body, &policy, &no_telemetry()).unwrap_err(),
             ParseError::DisabledTier(TtlTier::TwentyFourHours)
         ));
+    }
+
+    #[test]
+    fn tool_calls_on_non_assistant_message_are_ignored() {
+        // `tool_calls` is an assistant-only field. A `tool_calls` on any other role is malformed, and
+        // must not add a block, consume a breakpoint, or count during validation — otherwise garbage
+        // input could perturb the cache key or the breakpoint budget.
+        let p = parse(serde_json::json!({
+            "messages": [{"role": "user", "content": "q", "tool_calls": [
+                {"id": "t", "type": "function", "function": {"name": "f", "arguments": "{}"},
+                 "cache_control": {"type": "ephemeral"}}
+            ]}]
+        }));
+        assert_eq!(p.blocks.len(), 1, "only the user content block; the stray tool_calls is ignored");
+        assert_eq!(p.blocks[0].role, "user");
+        assert!(p.breakpoints.is_empty(), "the stray tool_call marker is not a breakpoint");
+
+        // validate_markers agrees: a disabled tier on a non-assistant tool_call is NOT counted (no
+        // error), because the field is ignored there too — keeping validation and hashing aligned.
+        let policy = TierPolicy::from_config(&["5m".to_string()], "5m");
+        let body = serde_json::json!({
+            "messages": [{"role": "user", "content": "q", "tool_calls": [
+                {"id": "t", "type": "function", "function": {"name": "f", "arguments": "{}"}, "cache_control": {"type": "ephemeral", "ttl": "24h"}}
+            ]}]
+        });
+        assert!(validate_markers(&body, &policy, &no_telemetry()).is_ok());
     }
 
     // ---- Automatic caching (top-level `cache_control`) ----
