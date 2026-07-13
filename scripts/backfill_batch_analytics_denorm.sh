@@ -16,7 +16,7 @@
 #   sum_ttfb_ms      / count_ttfb_ms                = SUM / COUNT(duration_to_first_byte_ms)
 #   total_list_cost                                 = SUM(uncached_cost)   -- the list price (0 for free)
 # The per-batch aggregate rides idx_analytics_fusillade_batch_id, so run this BEFORE that
-# index is dropped (the contract PR) and after migration 116 + the batcher change are
+# index is dropped (the contract PR) and after migration 117 + the batcher change are
 # deployed to every pod.
 #
 # Safety (absolute SET, not +=): the batcher fold is additive, so this script only touches
@@ -92,6 +92,8 @@ while [ "$CURSOR" -lt "$MAX_SEQ" ]; do
                FROM http_analytics ha
                WHERE ha.fusillade_batch_id = ba.fusillade_batch_id
                  AND ha.user_id IS NOT NULL
+                 -- Exclude the system user, matching the live fold which skips Uuid::nil().
+                 AND ha.user_id <> '00000000-0000-0000-0000-000000000000'
                  AND ha.status_code BETWEEN 200 AND 299
              ) s
        WHERE ba.max_seq > ${CURSOR} AND ba.max_seq <= ${hi}
