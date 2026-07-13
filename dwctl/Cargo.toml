@@ -81,7 +81,7 @@ jsonwebtoken = { version = "10", features = ["rust_crypto"] }
 argon2 = "0.5"
 base64 = "0.22"
 bytes = "1.5"
-onwards = { version = "0.34.6", features = ["multi-step"] }
+onwards = { git = "https://github.com/doublewordai/onwards", rev = "2db84b4fc1df1392b399ca6aa52214579db51d2c", features = ["multi-step"] }
 thiserror = "2.0.14"
 axum-prometheus = "0.10"
 # Metrics facade and exporter (same versions as axum-prometheus uses)

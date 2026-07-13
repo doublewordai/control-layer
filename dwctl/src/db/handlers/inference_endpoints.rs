@@ -35,6 +35,7 @@ struct InferenceEndpoint {
     pub model_filter: Option<Vec<String>>,
     pub auth_header_name: String,
     pub auth_header_prefix: String,
+    pub reasoning_translation: Option<serde_json::Value>,
     pub created_by: UserId,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -53,6 +54,7 @@ impl TryFrom<InferenceEndpoint> for InferenceEndpointDBResponse {
             model_filter: src.model_filter,
             auth_header_name: src.auth_header_name,
             auth_header_prefix: src.auth_header_prefix,
+            reasoning_translation: src.reasoning_translation.map(serde_json::from_value).transpose()?,
             created_by: src.created_by,
             created_at: src.created_at,
             updated_at: src.updated_at,
@@ -74,12 +76,18 @@ impl<'c> Repository for InferenceEndpoints<'c> {
 
     #[instrument(skip(self, request), fields(name = %request.name, url = %request.url), err)]
     async fn create(&mut self, request: &Self::CreateRequest) -> Result<Self::Response> {
+        let reasoning_translation = request
+            .reasoning_translation
+            .as_ref()
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(anyhow::Error::from)?;
         // created_at and updated_at use database DEFAULT NOW() for consistency
         let endpoint = sqlx::query_as!(
             InferenceEndpoint,
             r#"
-            INSERT INTO inference_endpoints (name, description, url, api_key, model_filter, auth_header_name, auth_header_prefix, created_by)
-            VALUES ($1, $2, $3, $4, $5, COALESCE($6, 'Authorization'), COALESCE($7, 'Bearer '), $8)
+            INSERT INTO inference_endpoints (name, description, url, api_key, model_filter, auth_header_name, auth_header_prefix, created_by, reasoning_translation)
+            VALUES ($1, $2, $3, $4, $5, COALESCE($6, 'Authorization'), COALESCE($7, 'Bearer '), $8, $9)
             RETURNING *
             "#,
             request.name,
@@ -89,7 +97,8 @@ impl<'c> Repository for InferenceEndpoints<'c> {
             request.model_filter.as_deref(),
             request.auth_header_name,
             request.auth_header_prefix,
-            request.created_by
+            request.created_by,
+            reasoning_translation
         )
         .fetch_one(&mut *self.db)
         .await?;
@@ -130,6 +139,7 @@ impl<'c> Repository for InferenceEndpoints<'c> {
                 model_filter: row.model_filter,
                 auth_header_name: row.auth_header_name,
                 auth_header_prefix: row.auth_header_prefix,
+                reasoning_translation: row.reasoning_translation,
                 created_by: row.created_by,
                 created_at: row.created_at,
                 updated_at: row.updated_at,
@@ -155,6 +165,13 @@ impl<'c> Repository for InferenceEndpoints<'c> {
 
     #[instrument(skip(self, request), fields(endpoint_id = %abbrev_uuid(&id)), err)]
     async fn update(&mut self, id: Self::Id, request: &Self::UpdateRequest) -> Result<Self::Response> {
+        let reasoning_translation = request
+            .reasoning_translation
+            .as_ref()
+            .and_then(Option::as_ref)
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(anyhow::Error::from)?;
         // Atomic update with conditional field updates
         let endpoint = sqlx::query_as!(
             InferenceEndpoint,
@@ -176,6 +193,10 @@ impl<'c> Repository for InferenceEndpoints<'c> {
                 END,
                 auth_header_name = COALESCE($7, auth_header_name),
                 auth_header_prefix = COALESCE($8, auth_header_prefix),
+                reasoning_translation = CASE
+                    WHEN $9 THEN $10
+                    ELSE reasoning_translation
+                END,
                 updated_at = NOW()
             WHERE id = $1
             RETURNING *
@@ -187,7 +208,9 @@ impl<'c> Repository for InferenceEndpoints<'c> {
             request.api_key.as_ref().and_then(|opt| opt.as_deref()),
             request.model_filter.as_ref().and_then(|opt| opt.as_ref().map(|v| v.as_slice())),
             request.auth_header_name,
-            request.auth_header_prefix
+            request.auth_header_prefix,
+            request.reasoning_translation.is_some(),
+            reasoning_translation
         )
         .fetch_optional(&mut *self.db)
         .await?
@@ -235,8 +258,11 @@ mod tests {
                 users::UserCreateDBRequest,
             },
         },
+        reasoning::{ReasoningEffort, ReasoningTranslation, ReasoningTranslationConfig},
     };
+    use serde_json::json;
     use sqlx::PgPool;
+    use std::collections::BTreeMap;
 
     async fn create_test_user(pool: &PgPool) -> crate::api::models::users::UserResponse {
         let mut user_conn = pool.acquire().await.unwrap();
@@ -260,8 +286,52 @@ mod tests {
             model_filter: Some(vec!["gpt-4".to_string(), "gpt-3.5-turbo".to_string()]),
             auth_header_name: None,
             auth_header_prefix: None,
+            reasoning_translation: None,
             created_by,
         }
+    }
+
+    fn reasoning_translation() -> ReasoningTranslationConfig {
+        ReasoningTranslationConfig {
+            chat_completions: Some(ReasoningTranslation {
+                target_path: "/chat_template_kwargs/thinking".to_string(),
+                values: BTreeMap::from([(ReasoningEffort::None, json!(false))]),
+            }),
+            responses: None,
+        }
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn persists_and_clears_reasoning_translation(pool: PgPool) {
+        let user = create_test_user(&pool).await;
+        let mut conn = pool.acquire().await.unwrap();
+        let mut repo = InferenceEndpoints::new(&mut conn);
+        let config = reasoning_translation();
+        let mut create = create_test_endpoint_request(user.id, "reasoning-endpoint");
+        create.reasoning_translation = Some(config.clone());
+
+        let created = repo.create(&create).await.unwrap();
+        assert_eq!(created.reasoning_translation, Some(config));
+
+        let cleared = repo
+            .update(
+                created.id,
+                &InferenceEndpointUpdateDBRequest {
+                    name: None,
+                    description: None,
+                    url: None,
+                    api_key: None,
+                    model_filter: None,
+                    auth_header_name: None,
+                    auth_header_prefix: None,
+                    reasoning_translation: Some(None),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(cleared.reasoning_translation, None);
     }
 
     #[sqlx::test]
@@ -409,6 +479,7 @@ mod tests {
             model_filter: Some(Some(vec!["claude-3".to_string(), "gpt-4-turbo".to_string()])),
             auth_header_name: None,
             auth_header_prefix: None,
+            reasoning_translation: None,
         };
 
         // Apply update
@@ -453,6 +524,7 @@ mod tests {
             model_filter: None,
             auth_header_name: None,
             auth_header_prefix: None,
+            reasoning_translation: None,
         };
 
         // Apply update
@@ -498,6 +570,9 @@ mod tests {
         if let Some(auth_header_prefix) = update_request.auth_header_prefix {
             original.auth_header_prefix = auth_header_prefix;
         }
+        if let Some(reasoning_translation) = update_request.reasoning_translation {
+            original.reasoning_translation = reasoning_translation;
+        }
 
         // Always update the timestamp like COALESCE would with NOW()
         original.updated_at = chrono::Utc::now();
@@ -517,6 +592,7 @@ mod tests {
             model_filter: Some(vec!["gpt-3.5".to_string()]),
             auth_header_name: "Authorization".to_string(),
             auth_header_prefix: "Bearer ".to_string(),
+            reasoning_translation: None,
             created_by: uuid::Uuid::new_v4(),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
@@ -531,6 +607,7 @@ mod tests {
             model_filter: Some(Some(vec!["claude-3".to_string(), "gpt-4".to_string()])),
             auth_header_name: None,
             auth_header_prefix: None,
+            reasoning_translation: None,
         };
 
         let updated_response = mock_coalesce_update(update_request, original_response.clone());
@@ -566,6 +643,7 @@ mod tests {
             model_filter: Some(vec!["gpt-3.5".to_string()]),
             auth_header_name: "Authorization".to_string(),
             auth_header_prefix: "Bearer ".to_string(),
+            reasoning_translation: None,
             created_by: uuid::Uuid::new_v4(),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now() - chrono::Duration::seconds(1),
@@ -580,6 +658,7 @@ mod tests {
             model_filter: None,
             auth_header_name: None,
             auth_header_prefix: None,
+            reasoning_translation: None,
         };
 
         let updated_response = mock_coalesce_update(update_request, original_response.clone());
@@ -613,6 +692,7 @@ mod tests {
             model_filter: None,
             auth_header_name: None,
             auth_header_prefix: None,
+            reasoning_translation: None,
         };
 
         let result = repo.update(fake_id, &update_request).await;

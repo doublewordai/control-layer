@@ -25,6 +25,7 @@ use crate::{
         },
     },
     errors::{Error, Result},
+    reasoning::ReasoningTranslationConfig,
     types::{DeploymentId, Resource},
 };
 use axum::{
@@ -32,6 +33,15 @@ use axum::{
     response::Json,
 };
 use sqlx::Acquire;
+
+fn validate_reasoning_translation(config: Option<&ReasoningTranslationConfig>) -> Result<()> {
+    if let Some(config) = config {
+        config.validate().map_err(|error| Error::BadRequest {
+            message: error.to_string(),
+        })?;
+    }
+    Ok(())
+}
 
 /// Validate the inter-attempt backoff shape. The values argument carries
 /// whatever the request is about to write (which may be the values from a
@@ -546,6 +556,10 @@ pub async fn create_deployed_model<P: PoolProvider>(
         validate_metadata(m)?;
     }
 
+    if let DeployedModelCreate::Standard(standard) = &create {
+        validate_reasoning_translation(standard.reasoning_translation.as_ref())?;
+    }
+
     // Validate backoff shape. Both standard and composite models surface
     // backoff config to onwards, so both carry the knobs and both need
     // validating — otherwise a bad value slips past the API and trips the
@@ -684,6 +698,7 @@ pub async fn update_deployed_model<P: PoolProvider>(
     if let Some(m) = &update.metadata {
         validate_metadata(m)?;
     }
+    validate_reasoning_translation(update.reasoning_translation.as_ref().and_then(Option::as_ref))?;
 
     let mut tx = state.db.write().begin().await.map_err(|e| Error::Database(e.into()))?;
 

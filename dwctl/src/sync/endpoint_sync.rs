@@ -758,6 +758,7 @@ mod tests {
                 sanitize_responses: true,
                 trusted: false,
                 open_responses_adapter: true,
+                reasoning_translation: None,
                 allowed_batch_completion_windows: None,
                 metadata: serde_json::Value::Object(serde_json::Map::new()),
             }
@@ -940,6 +941,7 @@ mod tests {
             model_filter: None, // No filter by default - sync all models
             auth_header_name: "Authorization".to_string(),
             auth_header_prefix: "Bearer ".to_string(),
+            reasoning_translation: None,
             created_by: uuid::Uuid::nil(),
             created_at: Utc::now(),
             updated_at: Utc::now(),

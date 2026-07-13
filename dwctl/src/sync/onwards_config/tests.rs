@@ -37,6 +37,7 @@ fn create_test_target(model_name: &str, alias: &str, endpoint_url: &str) -> Onwa
         sanitize_responses: true,
         trusted: false,
         open_responses_adapter: true,
+        reasoning_translation: None,
         endpoint_url: url::Url::parse(endpoint_url).unwrap(),
         routing_rules: Vec::new(),
         fallback_enabled: false,
@@ -192,6 +193,118 @@ async fn test_cache_shape_regular_public_and_private_access(pool: sqlx::PgPool) 
         provider.target.sanitize_response,
         "sanitize flag should be propagated to regular target"
     );
+}
+
+#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
+async fn test_reasoning_translation_inherits_endpoint_and_model_override_wins(pool: sqlx::PgPool) {
+    let endpoint_config = serde_json::json!({
+        "chat_completions": {
+            "target_path": "/chat_template_kwargs/thinking",
+            "values": {"none": false}
+        }
+    });
+    sqlx::query!(
+        "UPDATE inference_endpoints SET reasoning_translation = $1 WHERE id = '30000000-0000-0000-0000-000000000002'",
+        endpoint_config
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let targets = super::load_targets_from_db(&pool, &[], false, &RateLimitTiersConfig::default())
+        .await
+        .unwrap();
+    let target = targets.targets.get("regular-private").unwrap();
+    let provider = &target.value().providers()[0];
+    assert_eq!(
+        provider
+            .target
+            .reasoning_translation
+            .as_ref()
+            .unwrap()
+            .chat_completions
+            .as_ref()
+            .unwrap()
+            .target_path,
+        "/chat_template_kwargs/thinking"
+    );
+
+    let model_override = serde_json::json!({
+        "chat_completions": {
+            "target_path": "/thinking/type",
+            "values": {"none": "disabled"}
+        }
+    });
+    sqlx::query!(
+        "UPDATE deployed_models SET reasoning_translation = $1 WHERE alias = 'regular-private'",
+        model_override
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let targets = super::load_targets_from_db(&pool, &[], false, &RateLimitTiersConfig::default())
+        .await
+        .unwrap();
+    let target = targets.targets.get("regular-private").unwrap();
+    let provider = &target.value().providers()[0];
+    assert_eq!(
+        provider
+            .target
+            .reasoning_translation
+            .as_ref()
+            .unwrap()
+            .chat_completions
+            .as_ref()
+            .unwrap()
+            .target_path,
+        "/thinking/type"
+    );
+}
+
+#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
+async fn test_composite_providers_keep_distinct_reasoning_translations(pool: sqlx::PgPool) {
+    let config_a = serde_json::json!({
+        "chat_completions": {"target_path": "/chat_template_kwargs/thinking", "values": {"none": false}}
+    });
+    let config_b = serde_json::json!({
+        "chat_completions": {"target_path": "/thinking/type", "values": {"none": "disabled"}}
+    });
+    sqlx::query!(
+        "UPDATE deployed_models SET reasoning_translation = CASE alias WHEN 'component-a' THEN $1::jsonb ELSE $2::jsonb END WHERE alias IN ('component-a', 'component-b')",
+        config_a,
+        config_b
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let targets = super::load_targets_from_db(&pool, &[], false, &RateLimitTiersConfig::default())
+        .await
+        .unwrap();
+    let target = targets.targets.get("composite-priority").unwrap();
+    let providers = target.value().providers();
+    let paths = providers
+        .iter()
+        .map(|provider| {
+            (
+                provider.target.onwards_model.as_deref().unwrap(),
+                provider
+                    .target
+                    .reasoning_translation
+                    .as_ref()
+                    .unwrap()
+                    .chat_completions
+                    .as_ref()
+                    .unwrap()
+                    .target_path
+                    .as_str(),
+            )
+        })
+        .collect::<std::collections::HashMap<_, _>>();
+
+    assert_eq!(paths["component-a-model"], "/chat_template_kwargs/thinking");
+    assert_eq!(paths["component-b-model"], "/thinking/type");
 }
 
 #[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
@@ -674,6 +787,7 @@ async fn test_onwards_config_reloads_on_tariff_change(pool: sqlx::PgPool) {
             model_filter: None,
             auth_header_name: Some("Authorization".to_string()),
             auth_header_prefix: Some("Bearer ".to_string()),
+            reasoning_translation: None,
         })
         .await
         .unwrap();
@@ -715,6 +829,7 @@ async fn test_onwards_config_reloads_on_tariff_change(pool: sqlx::PgPool) {
             sanitize_responses: true,
             trusted: false,
             open_responses_adapter: true,
+            reasoning_translation: None,
             allowed_batch_completion_windows: None,
             metadata: None,
         })
@@ -895,6 +1010,7 @@ async fn test_batch_api_key_access_to_composite_escalation_target(pool: sqlx::Pg
             model_filter: None,
             auth_header_name: Some("Authorization".to_string()),
             auth_header_prefix: Some("Bearer ".to_string()),
+            reasoning_translation: None,
         })
         .await
         .unwrap();
@@ -937,6 +1053,7 @@ async fn test_batch_api_key_access_to_composite_escalation_target(pool: sqlx::Pg
             sanitize_responses: true,
             trusted: false,
             open_responses_adapter: true,
+            reasoning_translation: None,
         })
         .await
         .unwrap();
@@ -980,6 +1097,7 @@ async fn test_batch_api_key_access_to_composite_escalation_target(pool: sqlx::Pg
             sanitize_responses: true,
             trusted: false,
             open_responses_adapter: true,
+            reasoning_translation: None,
         })
         .await
         .unwrap();

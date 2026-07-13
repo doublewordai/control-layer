@@ -14,12 +14,22 @@ use crate::{
         models::inference_endpoints::{InferenceEndpointCreateDBRequest, InferenceEndpointUpdateDBRequest},
     },
     errors::{Error, Result},
+    reasoning::ReasoningTranslationConfig,
     sync::{
         deployments::fetch_models::{FetchModels, FetchModelsReqwest, SyncConfig},
         endpoint_sync::{self, sync_endpoint_models_with_aliases, update_endpoint_aliases},
     },
     types::InferenceEndpointId,
 };
+
+fn validate_reasoning_translation(config: Option<&ReasoningTranslationConfig>) -> Result<()> {
+    if let Some(config) = config {
+        config.validate().map_err(|error| Error::BadRequest {
+            message: error.to_string(),
+        })?;
+    }
+    Ok(())
+}
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
@@ -167,6 +177,8 @@ pub async fn update_inference_endpoint<P: PoolProvider>(
     _: RequiresPermission<resource::Endpoints, operation::UpdateAll>,
     Json(update): Json<InferenceEndpointUpdate>,
 ) -> Result<Json<InferenceEndpointResponse>> {
+    validate_reasoning_translation(update.reasoning_translation.as_ref().and_then(Option::as_ref))?;
+
     // Use a transaction if alias mapping is being updated
     if let Some(alias_mapping) = update.alias_mapping {
         let mut tx = state.db.write().begin().await.map_err(|e| Error::Database(e.into()))?;
@@ -184,6 +196,7 @@ pub async fn update_inference_endpoint<P: PoolProvider>(
             model_filter: update.model_filter.clone(),
             auth_header_name: update.auth_header_name.clone(),
             auth_header_prefix: update.auth_header_prefix.clone(),
+            reasoning_translation: update.reasoning_translation.clone(),
         };
 
         let endpoint = repo.update(id, &db_request).await?;
@@ -239,6 +252,7 @@ pub async fn update_inference_endpoint<P: PoolProvider>(
             model_filter: update.model_filter,
             auth_header_name: update.auth_header_name,
             auth_header_prefix: update.auth_header_prefix,
+            reasoning_translation: update.reasoning_translation,
         };
 
         let endpoint = repo.update(id, &db_request).await?;
@@ -363,6 +377,7 @@ pub async fn create_inference_endpoint<P: PoolProvider>(
     current_user: RequiresPermission<resource::Endpoints, operation::CreateAll>,
     Json(create_request): Json<InferenceEndpointCreate>,
 ) -> Result<(StatusCode, Json<InferenceEndpointResponse>)> {
+    validate_reasoning_translation(create_request.reasoning_translation.as_ref())?;
     let url = create_request.url.parse().map_err(|_| Error::BadRequest {
         message: "Invalid URL format".to_string(),
     })?;
@@ -381,6 +396,7 @@ pub async fn create_inference_endpoint<P: PoolProvider>(
         model_filter: create_request.model_filter.clone(),
         auth_header_name: create_request.auth_header_name,
         auth_header_prefix: create_request.auth_header_prefix,
+        reasoning_translation: create_request.reasoning_translation,
     };
 
     let endpoint = repo.create(&db_request).await?;

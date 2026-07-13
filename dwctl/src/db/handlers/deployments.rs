@@ -193,6 +193,7 @@ struct DeployedModel {
     pub sanitize_responses: bool,
     pub trusted: bool,
     pub open_responses_adapter: Option<bool>,
+    pub reasoning_translation: Option<serde_json::Value>,
     // Traffic routing
     pub allowed_batch_completion_windows: Option<Vec<String>>,
     // Catalog metadata
@@ -258,6 +259,11 @@ impl From<(Option<ModelType>, DeployedModel)> for DeploymentDBResponse {
             sanitize_responses: m.sanitize_responses,
             trusted: m.trusted,
             open_responses_adapter: m.open_responses_adapter.unwrap_or(true),
+            reasoning_translation: m.reasoning_translation.and_then(|value| {
+                serde_json::from_value(value)
+                    .inspect_err(|error| tracing::warn!(%error, "failed to deserialize reasoning translation"))
+                    .ok()
+            }),
             allowed_batch_completion_windows: m.allowed_batch_completion_windows,
             metadata: m.metadata,
         }
@@ -297,6 +303,12 @@ impl<'c> Repository for Deployments<'c> {
 
         // Extract composite model fields
         let lb_strategy_str = request.lb_strategy.map(|s| s.as_str().to_string());
+        let reasoning_translation = request
+            .reasoning_translation
+            .as_ref()
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(anyhow::Error::from)?;
 
         let model = sqlx::query_as!(
             DeployedModel,
@@ -310,9 +322,10 @@ impl<'c> Repository for Deployments<'c> {
                 fallback_with_replacement, fallback_max_attempts,
                 sanitize_responses, trusted, open_responses_adapter, allowed_batch_completion_windows,
                 metadata,
-                backoff_enabled, backoff_initial_ms, backoff_max_ms, backoff_factor, backoff_jitter, backoff_max_total_ms
+                backoff_enabled, backoff_initial_ms, backoff_max_ms, backoff_factor, backoff_jitter, backoff_max_total_ms,
+                reasoning_translation
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39)
             RETURNING *
             "#,
             request.model_name.trim(),
@@ -353,6 +366,7 @@ impl<'c> Repository for Deployments<'c> {
             request.backoff_factor,                   // $36
             request.backoff_jitter.as_str(),          // $37
             request.backoff_max_total_ms,             // $38
+            reasoning_translation,                    // $39
         )
         .fetch_one(&mut *self.db)
         .await?;
@@ -371,7 +385,7 @@ impl<'c> Repository for Deployments<'c> {
     async fn get_by_id(&mut self, id: Self::Id) -> Result<Option<Self::Response>> {
         let model = sqlx::query_as!(
             DeployedModel,
-            "SELECT id, model_name, alias, display_name, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, requests_per_second, burst_size, capacity, batch_capacity, throughput, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, fallback_with_replacement, fallback_max_attempts, backoff_enabled, backoff_initial_ms, backoff_max_ms, backoff_factor, backoff_jitter, backoff_max_total_ms, sanitize_responses, trusted, open_responses_adapter, allowed_batch_completion_windows, metadata FROM deployed_models WHERE id = $1",
+            "SELECT id, model_name, alias, display_name, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, requests_per_second, burst_size, capacity, batch_capacity, throughput, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, fallback_with_replacement, fallback_max_attempts, backoff_enabled, backoff_initial_ms, backoff_max_ms, backoff_factor, backoff_jitter, backoff_max_total_ms, sanitize_responses, trusted, open_responses_adapter, allowed_batch_completion_windows, metadata, reasoning_translation FROM deployed_models WHERE id = $1",
             id
         )
             .fetch_optional(&mut *self.db)
@@ -396,7 +410,7 @@ impl<'c> Repository for Deployments<'c> {
 
         let deployments = sqlx::query_as!(
             DeployedModel,
-            "SELECT id, model_name, alias, display_name, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, requests_per_second, burst_size, capacity, batch_capacity, throughput, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, fallback_with_replacement, fallback_max_attempts, backoff_enabled, backoff_initial_ms, backoff_max_ms, backoff_factor, backoff_jitter, backoff_max_total_ms, sanitize_responses, trusted, open_responses_adapter, allowed_batch_completion_windows, metadata FROM deployed_models WHERE id = ANY($1)",
+            "SELECT id, model_name, alias, display_name, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, requests_per_second, burst_size, capacity, batch_capacity, throughput, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, fallback_with_replacement, fallback_max_attempts, backoff_enabled, backoff_initial_ms, backoff_max_ms, backoff_factor, backoff_jitter, backoff_max_total_ms, sanitize_responses, trusted, open_responses_adapter, allowed_batch_completion_windows, metadata, reasoning_translation FROM deployed_models WHERE id = ANY($1)",
             ids.as_slice()
         )
             .fetch_all(&mut *self.db)
@@ -458,6 +472,13 @@ impl<'c> Repository for Deployments<'c> {
 
         // Extract composite model update fields
         let lb_strategy_str = request.lb_strategy.map(|s| s.as_str().to_string());
+        let reasoning_translation = request
+            .reasoning_translation
+            .as_ref()
+            .and_then(Option::as_ref)
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(anyhow::Error::from)?;
 
         // Info logging for rate limiting
         tracing::info!(
@@ -584,6 +605,11 @@ impl<'c> Repository for Deployments<'c> {
                 ELSE backoff_max_total_ms
             END,
 
+            reasoning_translation = CASE
+                WHEN $56 THEN $57
+                ELSE reasoning_translation
+            END,
+
             updated_at = NOW()
         WHERE id = $1
         RETURNING *
@@ -658,6 +684,8 @@ impl<'c> Repository for Deployments<'c> {
             request.backoff_jitter.as_deref(),                                      // $53
             request.backoff_max_total_ms.is_some() as bool,                         // $54
             request.backoff_max_total_ms.as_ref().and_then(|inner| inner.as_ref()), // $55
+            request.reasoning_translation.is_some(),                                // $56
+            reasoning_translation,                                                  // $57
         )
         .fetch_one(&mut *self.db)
         .await?;
@@ -1585,11 +1613,14 @@ mod tests {
                 users::UserCreateDBRequest,
             },
         },
+        reasoning::{ReasoningEffort, ReasoningTranslation, ReasoningTranslationConfig},
         test::utils::get_test_endpoint_id,
     };
 
     use rust_decimal::Decimal;
+    use serde_json::json;
     use sqlx::{Acquire, PgPool};
+    use std::collections::BTreeMap;
     use std::str::FromStr;
 
     async fn create_test_user(pool: &PgPool) -> UserResponse {
@@ -1603,6 +1634,62 @@ mod tests {
             roles: vec![Role::StandardUser],
         });
         user_repo.create(&user_create).await.unwrap().into()
+    }
+
+    fn reasoning_translation() -> ReasoningTranslationConfig {
+        ReasoningTranslationConfig {
+            chat_completions: Some(ReasoningTranslation {
+                target_path: "/thinking/type".to_string(),
+                values: BTreeMap::from([(ReasoningEffort::None, json!("disabled"))]),
+            }),
+            responses: None,
+        }
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn persists_and_clears_reasoning_translation_override(pool: PgPool) {
+        let base_url = url::Url::parse("http://localhost:8080").unwrap();
+        crate::seed_database(
+            &[crate::config::ModelSource {
+                name: "test".to_string(),
+                url: base_url,
+                api_key: None,
+                sync_interval: std::time::Duration::from_secs(3600),
+                default_models: None,
+            }],
+            &pool,
+        )
+        .await
+        .unwrap();
+        let user = create_test_user(&pool).await;
+        let endpoint_id = get_test_endpoint_id(&pool).await;
+        let config = reasoning_translation();
+        let mut conn = pool.acquire().await.unwrap();
+        let mut repo = Deployments::new(&mut conn);
+
+        let created = repo
+            .create(
+                &DeploymentCreateDBRequest::builder()
+                    .created_by(user.id)
+                    .model_name("reasoning-model".to_string())
+                    .alias("reasoning-model".to_string())
+                    .hosted_on(endpoint_id)
+                    .reasoning_translation(config.clone())
+                    .build(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.reasoning_translation, Some(config));
+
+        let cleared = repo
+            .update(
+                created.id,
+                &DeploymentUpdateDBRequest::builder().reasoning_translation(None).build(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cleared.reasoning_translation, None);
     }
 
     #[sqlx::test]
@@ -3023,6 +3110,7 @@ mod tests {
             model_filter: None,
             auth_header_name: None,
             auth_header_prefix: None,
+            reasoning_translation: None,
             created_by: user.id,
         };
         let endpoint = endpoints_repo.create(&endpoint_create).await.unwrap();
@@ -3069,6 +3157,7 @@ mod tests {
             model_filter: None,
             auth_header_name: None,
             auth_header_prefix: None,
+            reasoning_translation: None,
             created_by: user.id,
         };
         let endpoint = endpoints_repo.create(&endpoint_create).await.unwrap();
