@@ -171,14 +171,16 @@ fn db_component_to_response(c: DeploymentComponentDBResponse) -> ModelComponentR
     path = "/models",
     tag = "models",
     summary = "List deployed models",
-    description = "List all deployed models, optionally filtered by endpoint",
+    description = "List all deployed models, optionally filtered by endpoint, group, or availability",
     params(
         ("endpoint" = Option<i32>, Query, description = "Filter by inference endpoint ID"),
+        ("group" = Option<String>, Query, description = "Filter by group IDs (comma-separated UUIDs)"),
         ("accessible" = Option<bool>, Query, description = "Filter to only models the current user can access (defaults to false for admins, true for users)"),
         ("include" = Option<String>, Query, description = "Include additional data (comma-separated: 'groups', 'metrics', 'status', 'pricing', 'endpoints', 'facets'). Only platform managers can include groups. Status shows probe monitoring information. Pricing shows simple customer rates for regular users, full pricing structure including current active tariffs for users with Pricing::ReadAll permission. Endpoints includes full inference endpoint details. Facets returns distinct providers, capabilities, and model types for filter dropdowns."),
         ("provider" = Option<String>, Query, description = "Filter by provider name (case-insensitive exact match against metadata.provider)"),
         ("model_type" = Option<String>, Query, description = "Filter by model type (CHAT, EMBEDDINGS, RERANKER)"),
         ("capability" = Option<String>, Query, description = "Filter by capability (returns models that have this capability)"),
+        ("available_for_realtime" = Option<bool>, Query, description = "Filter by realtime availability. true returns models without a realtime deny rule; false returns models with one."),
         ("sort" = Option<String>, Query, description = "Sort field: created_at (default), alias, intelligence_index, released_at, context_window, provider, price_from"),
         ("sort_direction" = Option<String>, Query, description = "Sort direction: asc or desc (default depends on sort field)"),
         ("deleted" = Option<bool>, Query, description = "Show deleted models when true (admin only), non-deleted models when false, and all models when not specified"),
@@ -328,6 +330,10 @@ pub async fn list_deployed_models<P: PoolProvider>(
         && !capability.trim().is_empty()
     {
         filter = filter.with_capability(capability.trim().to_string());
+    }
+
+    if let Some(available_for_realtime) = query.available_for_realtime {
+        filter = filter.with_realtime_availability(available_for_realtime);
     }
 
     // Apply sort if specified
@@ -1335,8 +1341,8 @@ mod tests {
             models::{pagination::PaginatedResponse, users::Role},
         },
         db::{
-            handlers::{Groups, Repository},
-            models::groups::GroupCreateDBRequest,
+            handlers::{Deployments, Groups, Repository},
+            models::{api_keys::ApiKeyPurpose, deployments::TrafficRuleAction, groups::GroupCreateDBRequest},
         },
         test::utils::*,
         types::DeploymentId,
@@ -3063,6 +3069,72 @@ mod tests {
         response.assert_status_ok();
         let all_models: PaginatedResponse<DeployedModelResponse> = response.json();
         assert!(all_models.data.len() >= 3, "Empty group list should return all models");
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_list_models_with_available_for_realtime_filter(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
+
+        let allowed_deployment = create_test_deployment(&pool, admin_user.id, "realtime-allowed-model", "realtime-allowed-alias").await;
+        let denied_deployment = create_test_deployment(&pool, admin_user.id, "realtime-denied-model", "realtime-denied-alias").await;
+        let redirected_deployment =
+            create_test_deployment(&pool, admin_user.id, "realtime-redirected-model", "realtime-redirected-alias").await;
+        let redirect_target = create_test_deployment(&pool, admin_user.id, "realtime-target-model", "realtime-target-alias").await;
+        let other_group_deployment = create_test_deployment(&pool, admin_user.id, "other-group-model", "other-group-alias").await;
+
+        let mut conn = pool.acquire().await.unwrap();
+
+        let group = {
+            let mut group_repo = Groups::new(&mut conn);
+            let group = group_repo
+                .create(&GroupCreateDBRequest {
+                    name: "Realtime Test Group".to_string(),
+                    description: Some("Models used for realtime availability filtering".to_string()),
+                    created_by: admin_user.id,
+                })
+                .await
+                .unwrap();
+
+            for deployment_id in [allowed_deployment.id, denied_deployment.id, redirected_deployment.id] {
+                group_repo
+                    .add_deployment_to_group(deployment_id, group.id, admin_user.id)
+                    .await
+                    .unwrap();
+            }
+
+            group
+        };
+
+        {
+            let mut deployment_repo = Deployments::new(&mut conn);
+            deployment_repo
+                .set_traffic_rules(denied_deployment.id, &[(ApiKeyPurpose::Realtime, TrafficRuleAction::Deny)])
+                .await
+                .unwrap();
+            deployment_repo
+                .set_traffic_rules(
+                    redirected_deployment.id,
+                    &[(ApiKeyPurpose::Realtime, TrafficRuleAction::Redirect(redirect_target.id))],
+                )
+                .await
+                .unwrap();
+        }
+
+        let response = app
+            .get(&format!("/admin/api/v1/models?group={}&available_for_realtime=true", group.id))
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
+            .await;
+        response.assert_status_ok();
+
+        let realtime_models: PaginatedResponse<DeployedModelResponse> = response.json();
+        assert_eq!(realtime_models.total_count, 2);
+        assert!(get_model_by_id(allowed_deployment.id, &realtime_models).is_some());
+        assert!(get_model_by_id(redirected_deployment.id, &realtime_models).is_some());
+        assert!(get_model_by_id(denied_deployment.id, &realtime_models).is_none());
+        assert!(get_model_by_id(other_group_deployment.id, &realtime_models).is_none());
     }
 
     // ===== Traffic Routing Rules Tests =====

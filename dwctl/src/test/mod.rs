@@ -192,6 +192,34 @@ async fn wait_for_model(server: &TestServer, api_key: &str, alias: &str) {
     assert_eq!(status, 200, "Model should be available in onwards config after polling");
 }
 
+async fn create_standard_model_for_test(
+    server: &TestServer,
+    admin_headers: &[(String, String)],
+    endpoint_id: Uuid,
+    alias: &str,
+    traffic_routing_rules: Option<serde_json::Value>,
+) -> crate::api::models::deployments::DeployedModelResponse {
+    let mut body = serde_json::json!({
+        "type": "standard",
+        "model_name": alias,
+        "alias": alias,
+        "hosted_on": endpoint_id
+    });
+
+    if let Some(traffic_routing_rules) = traffic_routing_rules {
+        body["traffic_routing_rules"] = traffic_routing_rules;
+    }
+
+    let response = server
+        .post("/admin/api/v1/models")
+        .add_header(&admin_headers[0].0, &admin_headers[0].1)
+        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+        .json(&body)
+        .await;
+    assert_eq!(response.status_code(), 200, "Failed to create model: {body}");
+    response.json()
+}
+
 #[sqlx::test]
 async fn ai_models_lists_group_accessible_paid_models_without_credits(pool: PgPool) {
     let mut config = crate::test::utils::create_test_config();
@@ -309,6 +337,167 @@ async fn ai_models_lists_group_accessible_paid_models_without_credits(pool: PgPo
         404,
         "Zero-credit key should remain absent from the dispatch target pool"
     );
+}
+
+#[sqlx::test]
+async fn ai_models_supports_optional_group_and_realtime_filters(pool: PgPool) {
+    let config = crate::test::utils::create_test_config();
+
+    let app = crate::Application::new_with_pool(config, Some(pool.clone()), None)
+        .await
+        .expect("Failed to create application");
+    let (server, _bg_services) = app.into_test_server();
+
+    let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
+    let admin_headers = add_auth_headers(&admin_user);
+
+    let regular_user = create_test_user(&pool, Role::StandardUser).await;
+    let regular_headers = add_auth_headers(&regular_user);
+
+    let group_one_response = server
+        .post("/admin/api/v1/groups")
+        .add_header(&admin_headers[0].0, &admin_headers[0].1)
+        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+        .json(&serde_json::json!({
+            "name": format!("ai-model-filter-one-{}", Uuid::new_v4()),
+            "description": "First AI models filter group"
+        }))
+        .await;
+    assert_eq!(group_one_response.status_code(), 201, "Failed to create first group");
+    let group_one: GroupResponse = group_one_response.json();
+
+    let group_two_response = server
+        .post("/admin/api/v1/groups")
+        .add_header(&admin_headers[0].0, &admin_headers[0].1)
+        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+        .json(&serde_json::json!({
+            "name": format!("ai-model-filter-two-{}", Uuid::new_v4()),
+            "description": "Second AI models filter group"
+        }))
+        .await;
+    assert_eq!(group_two_response.status_code(), 201, "Failed to create second group");
+    let group_two: GroupResponse = group_two_response.json();
+
+    for group_id in [group_one.id, group_two.id] {
+        let add_user_response = server
+            .post(&format!("/admin/api/v1/groups/{}/users/{}", group_id, regular_user.id))
+            .add_header(&admin_headers[0].0, &admin_headers[0].1)
+            .add_header(&admin_headers[1].0, &admin_headers[1].1)
+            .await;
+        assert_eq!(add_user_response.status_code(), 204, "Failed to add user to group");
+    }
+
+    let endpoint_response = server
+        .post("/admin/api/v1/endpoints")
+        .add_header(&admin_headers[0].0, &admin_headers[0].1)
+        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+        .json(&serde_json::json!({
+            "name": format!("AI Model Filters Endpoint {}", Uuid::new_v4()),
+            "url": "https://example.invalid/v1/",
+            "description": "Endpoint for AI model filter tests"
+        }))
+        .await;
+    assert_eq!(endpoint_response.status_code(), 201, "Failed to create endpoint");
+    let endpoint: crate::api::models::inference_endpoints::InferenceEndpointResponse = endpoint_response.json();
+
+    let allowed_alias = format!("ai-filter-allowed-{}", Uuid::new_v4());
+    let denied_alias = format!("ai-filter-denied-{}", Uuid::new_v4());
+    let redirected_alias = format!("ai-filter-redirected-{}", Uuid::new_v4());
+    let redirect_target_alias = format!("ai-filter-target-{}", Uuid::new_v4());
+    let other_group_alias = format!("ai-filter-other-{}", Uuid::new_v4());
+
+    create_standard_model_for_test(&server, &admin_headers, endpoint.id, &redirect_target_alias, None).await;
+    let allowed_model = create_standard_model_for_test(&server, &admin_headers, endpoint.id, &allowed_alias, None).await;
+    let denied_model = create_standard_model_for_test(
+        &server,
+        &admin_headers,
+        endpoint.id,
+        &denied_alias,
+        Some(serde_json::json!([{ "api_key_purpose": "realtime", "action": { "type": "deny" } }])),
+    )
+    .await;
+    let redirected_model = create_standard_model_for_test(
+        &server,
+        &admin_headers,
+        endpoint.id,
+        &redirected_alias,
+        Some(serde_json::json!([{
+            "api_key_purpose": "realtime",
+            "action": { "type": "redirect", "target": redirect_target_alias }
+        }])),
+    )
+    .await;
+    let other_group_model = create_standard_model_for_test(&server, &admin_headers, endpoint.id, &other_group_alias, None).await;
+
+    for deployment_id in [allowed_model.id, denied_model.id, redirected_model.id] {
+        let add_model_response = server
+            .post(&format!("/admin/api/v1/groups/{}/models/{}", group_one.id, deployment_id))
+            .add_header(&admin_headers[0].0, &admin_headers[0].1)
+            .add_header(&admin_headers[1].0, &admin_headers[1].1)
+            .await;
+        assert_eq!(add_model_response.status_code(), 204, "Failed to add model to first group");
+    }
+
+    let add_other_model_response = server
+        .post(&format!("/admin/api/v1/groups/{}/models/{}", group_two.id, other_group_model.id))
+        .add_header(&admin_headers[0].0, &admin_headers[0].1)
+        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+        .await;
+    assert_eq!(add_other_model_response.status_code(), 204, "Failed to add model to second group");
+
+    let api_key_response = server
+        .post(&format!("/admin/api/v1/users/{}/api-keys", regular_user.id))
+        .add_header(&regular_headers[0].0, &regular_headers[0].1)
+        .add_header(&regular_headers[1].0, &regular_headers[1].1)
+        .json(&serde_json::json!({
+            "name": "AI Models Filter Key",
+            "purpose": "realtime"
+        }))
+        .await;
+    assert_eq!(api_key_response.status_code(), 201, "Failed to create API key");
+    let api_key: crate::api::models::api_keys::ApiKeyResponse = api_key_response.json();
+
+    let extract_ids = |models: serde_json::Value| -> Vec<String> {
+        models["data"]
+            .as_array()
+            .expect("models response data should be an array")
+            .iter()
+            .map(|model| model["id"].as_str().expect("model id should be a string").to_string())
+            .collect()
+    };
+
+    let default_response = server
+        .get("/ai/v1/models")
+        .add_header("authorization", format!("Bearer {}", api_key.key))
+        .await;
+    assert_eq!(default_response.status_code(), 200);
+    let default_ids = extract_ids(default_response.json());
+    assert!(default_ids.contains(&allowed_alias));
+    assert!(default_ids.contains(&denied_alias));
+    assert!(default_ids.contains(&redirected_alias));
+    assert!(default_ids.contains(&other_group_alias));
+
+    let group_response = server
+        .get(&format!("/ai/v1/models?group={}", group_one.id))
+        .add_header("authorization", format!("Bearer {}", api_key.key))
+        .await;
+    assert_eq!(group_response.status_code(), 200);
+    let group_ids = extract_ids(group_response.json());
+    assert!(group_ids.contains(&allowed_alias));
+    assert!(group_ids.contains(&denied_alias));
+    assert!(group_ids.contains(&redirected_alias));
+    assert!(!group_ids.contains(&other_group_alias));
+
+    let realtime_response = server
+        .get(&format!("/ai/v1/models?group={}&available_for_realtime=true", group_one.id))
+        .add_header("authorization", format!("Bearer {}", api_key.key))
+        .await;
+    assert_eq!(realtime_response.status_code(), 200);
+    let realtime_ids = extract_ids(realtime_response.json());
+    assert!(realtime_ids.contains(&allowed_alias));
+    assert!(realtime_ids.contains(&redirected_alias));
+    assert!(!realtime_ids.contains(&denied_alias));
+    assert!(!realtime_ids.contains(&other_group_alias));
 }
 
 async fn assert_usage_recorded(fixture: &StreamingFixture, expected_uri: &str, prompt_tokens: i64, completion_tokens: i64) {

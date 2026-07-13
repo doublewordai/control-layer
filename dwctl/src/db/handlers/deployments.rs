@@ -45,6 +45,7 @@ pub struct DeploymentFilter {
     pub provider: Option<String>,              // Filter by metadata provider (case-insensitive exact match)
     pub model_type: Option<ModelType>,         // Filter by model type column
     pub capability: Option<String>,            // Filter to models that have this capability
+    pub available_for_realtime: Option<bool>,  // Filter by whether realtime traffic is denied
     pub sort_field: Option<ModelSortField>,    // Sort field (default: created_at)
     pub sort_direction: Option<SortDirection>, // Sort direction (default depends on field)
 }
@@ -61,12 +62,13 @@ impl DeploymentFilter {
             group_ids: None,     // Default: show all groups
             aliases: None,
             search: None,
-            is_composite: None,   // Default: show all models
-            provider: None,       // Default: no provider filter
-            model_type: None,     // Default: no type filter
-            capability: None,     // Default: no capability filter
-            sort_field: None,     // Default: created_at
-            sort_direction: None, // Default: depends on field
+            is_composite: None,           // Default: show all models
+            provider: None,               // Default: no provider filter
+            model_type: None,             // Default: no type filter
+            capability: None,             // Default: no capability filter
+            available_for_realtime: None, // Default: no realtime availability filter
+            sort_field: None,             // Default: created_at
+            sort_direction: None,         // Default: depends on field
         }
     }
 
@@ -122,6 +124,11 @@ impl DeploymentFilter {
 
     pub fn with_capability(mut self, capability: String) -> Self {
         self.capability = Some(capability);
+        self
+    }
+
+    pub fn with_realtime_availability(mut self, available: bool) -> Self {
+        self.available_for_realtime = Some(available);
         self
     }
 
@@ -810,6 +817,28 @@ impl<'c> Deployments<'c> {
             query.push(" AND ");
             query.push_bind(capability.clone());
             query.push(" = ANY(dm.capabilities)");
+        }
+
+        if let Some(available_for_realtime) = filter.available_for_realtime {
+            if available_for_realtime {
+                query.push(
+                    " AND NOT EXISTS (
+                        SELECT 1 FROM model_traffic_rules mtr
+                        WHERE mtr.deployed_model_id = dm.id
+                        AND mtr.api_key_purpose = 'realtime'
+                        AND mtr.action = 'deny'
+                    )",
+                );
+            } else {
+                query.push(
+                    " AND EXISTS (
+                        SELECT 1 FROM model_traffic_rules mtr
+                        WHERE mtr.deployed_model_id = dm.id
+                        AND mtr.api_key_purpose = 'realtime'
+                        AND mtr.action = 'deny'
+                    )",
+                );
+            }
         }
     }
 

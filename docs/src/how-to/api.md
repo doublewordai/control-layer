@@ -73,6 +73,18 @@ Use model names exactly as shown on the Models page. The Control Layer routes re
 
 If your admin configured model aliases, you can use either the original name or the alias.
 
+You can list models with the OpenAI-compatible `GET /ai/v1/models` endpoint. By default it returns every active model your API key can access, using the standard OpenAI response shape.
+
+Doubleword also supports optional query-string filters for discovery:
+
+```bash
+curl "https://your-control-layer/ai/v1/models?group=<group-id>&available_for_realtime=true" \
+  -H "Authorization: Bearer your-api-key"
+```
+
+- `group`: comma-separated group UUIDs. Results are still limited to models your API key can access.
+- `available_for_realtime`: `true` returns models without a realtime deny rule; `false` returns models with one.
+
 ## Streaming responses
 
 Streaming works the same as with OpenAI directly:
