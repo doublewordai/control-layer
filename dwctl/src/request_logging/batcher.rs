@@ -1135,6 +1135,24 @@ where
         // without joining http_analytics.
         let mut service_tiers: Vec<String> = Vec::new();
 
+        // Per-request analytics for batched requests, keyed by source_id (the analytics
+        // row id, as a string). Folded into batch_aggregates below (COR-524) so
+        // GET /batches/{id}/analytics is served from the read model instead of scanning
+        // http_analytics. Only batched requests are captured — non-batch requests never
+        // reach batch_aggregates.
+        struct BatchReqMetrics {
+            prompt_tokens: i64,
+            completion_tokens: i64,
+            reasoning_tokens: i64,
+            total_tokens: i64,
+            duration_ms: i64,
+            ttfb_ms: Option<i64>,
+            /// Un-discounted list price (prompt·input + completion·output) — what the
+            /// analytics endpoint reports as cost; mirrors http_analytics.uncached_cost.
+            list_cost: Decimal,
+        }
+        let mut batch_req_metrics: HashMap<String, BatchReqMetrics> = HashMap::new();
+
         for record in records {
             // Skip if no user or no pricing
             let Some(user_id) = record.user_id else { continue };
@@ -1177,6 +1195,26 @@ where
             api_key_ids_credit.push(record.api_key_id);
             service_tiers
                 .push(compute_service_tier(record.raw.fusillade_batch_id, record.raw.batch_completion_window.as_deref()).to_string());
+
+            // Capture per-request analytics for batched requests so the batch's
+            // token/latency/cost aggregates fold below. Keyed by the same source_id used
+            // for the credit row, so the fold rides the credit insert's dedup. `list_cost`
+            // is the list price the endpoint reports (uncached_cost); it is Some here
+            // because a None total_cost already `continue`d above.
+            if record.raw.fusillade_batch_id.is_some() {
+                batch_req_metrics.insert(
+                    analytics_id.to_string(),
+                    BatchReqMetrics {
+                        prompt_tokens: record.raw.prompt_tokens,
+                        completion_tokens: record.raw.completion_tokens,
+                        reasoning_tokens: record.raw.reasoning_tokens,
+                        total_tokens: record.raw.total_tokens,
+                        duration_ms: record.raw.duration_ms,
+                        ttfb_ms: record.raw.duration_to_first_byte_ms,
+                        list_cost: record.uncached_cost.unwrap_or(Decimal::ZERO),
+                    },
+                );
+            }
         }
 
         if user_ids.is_empty() {
@@ -1243,6 +1281,18 @@ where
             // Constant per batch (async or batch); captured from the first folded row
             // and denormalized onto batch_aggregates so the list needn't join http_analytics.
             service_tier: String,
+            // Per-batch analytics aggregates (COR-524), folded from batch_req_metrics so
+            // GET /batches/{id}/analytics reads batch_aggregates, not http_analytics.
+            // Latency is sum + count (AVG is not foldable; the endpoint divides at read).
+            prompt_tokens: i64,
+            completion_tokens: i64,
+            reasoning_tokens: i64,
+            total_tokens: i64,
+            sum_duration_ms: i64,
+            count_duration_ms: i64,
+            sum_ttfb_ms: i64,
+            count_ttfb_ms: i64,
+            list_cost: Decimal,
         }
         let mut batch_folds: HashMap<Uuid, BatchFold> = HashMap::new();
 
@@ -1262,11 +1312,39 @@ where
                     max_seq: 0,
                     min_created_at: row.created_at,
                     service_tier: row.service_tier.clone().unwrap_or_default(),
+                    prompt_tokens: 0,
+                    completion_tokens: 0,
+                    reasoning_tokens: 0,
+                    total_tokens: 0,
+                    sum_duration_ms: 0,
+                    count_duration_ms: 0,
+                    sum_ttfb_ms: 0,
+                    count_ttfb_ms: 0,
+                    list_cost: Decimal::ZERO,
                 });
                 bf.total += row.amount;
                 bf.count += 1;
                 bf.max_seq = bf.max_seq.max(row.seq);
                 bf.min_created_at = bf.min_created_at.min(row.created_at);
+
+                // Fold this request's analytics into the batch aggregate. Keyed by
+                // source_id so it rides the same ON CONFLICT DO NOTHING dedup as the credit
+                // row above — a retried flush re-folds nothing. count_duration_ms /
+                // count_ttfb_ms count only requests that reported the metric, so the
+                // endpoint's AVG (which ignores NULLs) is reproduced exactly.
+                if let Some(m) = batch_req_metrics.get(&row.source_id) {
+                    bf.prompt_tokens += m.prompt_tokens;
+                    bf.completion_tokens += m.completion_tokens;
+                    bf.reasoning_tokens += m.reasoning_tokens;
+                    bf.total_tokens += m.total_tokens;
+                    bf.sum_duration_ms += m.duration_ms;
+                    bf.count_duration_ms += 1;
+                    if let Some(ttfb) = m.ttfb_ms {
+                        bf.sum_ttfb_ms += ttfb;
+                        bf.count_ttfb_ms += 1;
+                    }
+                    bf.list_cost += m.list_cost;
+                }
             }
         }
 
@@ -1338,18 +1416,49 @@ where
             let batch_seqs: Vec<i64> = batch_ids.iter().map(|b| batch_folds[b].max_seq).collect();
             let created_ats: Vec<chrono::DateTime<chrono::Utc>> = batch_ids.iter().map(|b| batch_folds[b].min_created_at).collect();
             let service_tiers_agg: Vec<String> = batch_ids.iter().map(|b| batch_folds[b].service_tier.clone()).collect();
+            // Per-batch analytics aggregates (COR-524), folded in the same upsert.
+            let prompt_tokens_agg: Vec<i64> = batch_ids.iter().map(|b| batch_folds[b].prompt_tokens).collect();
+            let completion_tokens_agg: Vec<i64> = batch_ids.iter().map(|b| batch_folds[b].completion_tokens).collect();
+            let reasoning_tokens_agg: Vec<i64> = batch_ids.iter().map(|b| batch_folds[b].reasoning_tokens).collect();
+            let total_tokens_agg: Vec<i64> = batch_ids.iter().map(|b| batch_folds[b].total_tokens).collect();
+            let sum_duration_agg: Vec<i64> = batch_ids.iter().map(|b| batch_folds[b].sum_duration_ms).collect();
+            let count_duration_agg: Vec<i64> = batch_ids.iter().map(|b| batch_folds[b].count_duration_ms).collect();
+            let sum_ttfb_agg: Vec<i64> = batch_ids.iter().map(|b| batch_folds[b].sum_ttfb_ms).collect();
+            let count_ttfb_agg: Vec<i64> = batch_ids.iter().map(|b| batch_folds[b].count_ttfb_ms).collect();
+            let list_cost_agg: Vec<Decimal> = batch_ids.iter().map(|b| batch_folds[b].list_cost).collect();
 
             sqlx::query!(
                 r#"
-                INSERT INTO batch_aggregates (fusillade_batch_id, user_id, total_amount, transaction_count, max_seq, created_at, updated_at, service_tier)
-                SELECT b.batch_id, b.user_id, b.total, b.cnt, b.max_seq, b.created_at, NOW(), b.service_tier
-                FROM UNNEST($1::uuid[], $2::uuid[], $3::numeric[], $4::int[], $5::bigint[], $6::timestamptz[], $7::text[])
-                    AS b(batch_id, user_id, total, cnt, max_seq, created_at, service_tier)
+                INSERT INTO batch_aggregates (
+                    fusillade_batch_id, user_id, total_amount, transaction_count, max_seq, created_at, updated_at, service_tier,
+                    total_prompt_tokens, total_completion_tokens, total_reasoning_tokens, total_tokens,
+                    sum_duration_ms, count_duration_ms, sum_ttfb_ms, count_ttfb_ms, total_list_cost
+                )
+                SELECT b.batch_id, b.user_id, b.total, b.cnt, b.max_seq, b.created_at, NOW(), b.service_tier,
+                    b.prompt_tokens, b.completion_tokens, b.reasoning_tokens, b.total_tokens,
+                    b.sum_duration, b.count_duration, b.sum_ttfb, b.count_ttfb, b.list_cost
+                FROM UNNEST(
+                    $1::uuid[], $2::uuid[], $3::numeric[], $4::int[], $5::bigint[], $6::timestamptz[], $7::text[],
+                    $8::bigint[], $9::bigint[], $10::bigint[], $11::bigint[],
+                    $12::bigint[], $13::bigint[], $14::bigint[], $15::bigint[], $16::numeric[]
+                )
+                    AS b(batch_id, user_id, total, cnt, max_seq, created_at, service_tier,
+                         prompt_tokens, completion_tokens, reasoning_tokens, total_tokens,
+                         sum_duration, count_duration, sum_ttfb, count_ttfb, list_cost)
                 ON CONFLICT (fusillade_batch_id) DO UPDATE SET
                     total_amount = batch_aggregates.total_amount + EXCLUDED.total_amount,
                     transaction_count = batch_aggregates.transaction_count + EXCLUDED.transaction_count,
                     max_seq = GREATEST(batch_aggregates.max_seq, EXCLUDED.max_seq),
                     service_tier = COALESCE(batch_aggregates.service_tier, EXCLUDED.service_tier),
+                    total_prompt_tokens = batch_aggregates.total_prompt_tokens + EXCLUDED.total_prompt_tokens,
+                    total_completion_tokens = batch_aggregates.total_completion_tokens + EXCLUDED.total_completion_tokens,
+                    total_reasoning_tokens = batch_aggregates.total_reasoning_tokens + EXCLUDED.total_reasoning_tokens,
+                    total_tokens = batch_aggregates.total_tokens + EXCLUDED.total_tokens,
+                    sum_duration_ms = batch_aggregates.sum_duration_ms + EXCLUDED.sum_duration_ms,
+                    count_duration_ms = batch_aggregates.count_duration_ms + EXCLUDED.count_duration_ms,
+                    sum_ttfb_ms = batch_aggregates.sum_ttfb_ms + EXCLUDED.sum_ttfb_ms,
+                    count_ttfb_ms = batch_aggregates.count_ttfb_ms + EXCLUDED.count_ttfb_ms,
+                    total_list_cost = batch_aggregates.total_list_cost + EXCLUDED.total_list_cost,
                     updated_at = NOW()
                 "#,
                 &batch_ids,
@@ -1359,6 +1468,15 @@ where
                 &batch_seqs,
                 &created_ats,
                 &service_tiers_agg,
+                &prompt_tokens_agg,
+                &completion_tokens_agg,
+                &reasoning_tokens_agg,
+                &total_tokens_agg,
+                &sum_duration_agg,
+                &count_duration_agg,
+                &sum_ttfb_agg,
+                &count_ttfb_agg,
+                &list_cost_agg,
             )
             .execute(&mut **tx)
             .await?;
@@ -2423,6 +2541,71 @@ mod integration_tests {
         let amounts: Vec<_> = usage_txs.iter().map(|tx| tx.amount).collect();
         assert!(amounts.contains(&expected_batch_cost), "Should have batch cost transaction");
         assert!(amounts.contains(&expected_realtime_cost), "Should have realtime cost transaction");
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_batcher_folds_batch_analytics_into_aggregates(pool: PgPool) {
+        // Two requests of one batch fold their tokens / latency / list-cost into
+        // batch_aggregates (COR-524), so get_batch_analytics can read the row instead of
+        // scanning http_analytics.
+        let model_id = create_test_model(&pool, "batch-analytics-test").await;
+        let input_price = Decimal::from_str("0.00005").unwrap();
+        let output_price = Decimal::from_str("0.00010").unwrap();
+        setup_tariff(&pool, model_id, input_price, output_price, ApiKeyPurpose::Batch).await;
+
+        let user_id = setup_user_with_balance(&pool, Decimal::from_str("100.00").unwrap()).await;
+        let batch_key = create_api_key_for_user(&pool, user_id, ApiKeyPurpose::Batch).await;
+        let batch_id = Uuid::new_v4();
+
+        // Request A: 1000/500 tokens, 0 reasoning, duration 100, ttfb 50.
+        let mut a = create_raw_record("batch-analytics-test", Some(batch_key.clone()), 1000, 500);
+        a.batch_completion_window = Some("24h".to_string());
+        a.fusillade_batch_id = Some(batch_id);
+        a.duration_ms = 100;
+        a.duration_to_first_byte_ms = Some(50);
+
+        // Request B: 2000/800 tokens, 100 reasoning, duration 200, NO ttfb (streaming
+        // metric absent) — exercises count_ttfb_ms counting only reported values.
+        let mut b = create_raw_record("batch-analytics-test", Some(batch_key), 2000, 800);
+        b.batch_completion_window = Some("24h".to_string());
+        b.fusillade_batch_id = Some(batch_id);
+        b.reasoning_tokens = 100;
+        b.total_tokens = 2900;
+        b.duration_ms = 200;
+        b.duration_to_first_byte_ms = None;
+
+        run_batcher_with_records(&pool, vec![a, b]).await;
+
+        // List cost = list price (no cache) = billed cost here.
+        // A: 1000*5e-5 + 500*1e-4 = 0.05 + 0.05 = 0.10
+        // B: 2000*5e-5 + 800*1e-4 = 0.10 + 0.08 = 0.18  → 0.28 total
+        let agg = sqlx::query!(
+            r#"
+            SELECT transaction_count, total_amount,
+                   total_prompt_tokens, total_completion_tokens, total_reasoning_tokens, total_tokens,
+                   sum_duration_ms, count_duration_ms, sum_ttfb_ms, count_ttfb_ms,
+                   total_list_cost, analytics_backfilled_at
+            FROM batch_aggregates WHERE fusillade_batch_id = $1
+            "#,
+            batch_id
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(agg.transaction_count, 2, "both requests folded");
+        assert_eq!(agg.total_prompt_tokens, 3000);
+        assert_eq!(agg.total_completion_tokens, 1300);
+        assert_eq!(agg.total_reasoning_tokens, 100);
+        assert_eq!(agg.total_tokens, 4400, "1500 (A) + 2900 (B)");
+        assert_eq!(agg.sum_duration_ms, 300, "100 + 200");
+        assert_eq!(agg.count_duration_ms, 2, "both reported duration");
+        assert_eq!(agg.sum_ttfb_ms, 50, "only A reported ttfb");
+        assert_eq!(agg.count_ttfb_ms, 1, "only A counted for the AVG denominator");
+        assert_eq!(agg.total_list_cost, Decimal::from_str("0.28").unwrap());
+        assert_eq!(agg.total_amount, Decimal::from_str("0.28").unwrap(), "no cache → billed == list");
+        assert!(agg.analytics_backfilled_at.is_none(), "live fold leaves the backfill marker null");
     }
 
     #[sqlx::test]
