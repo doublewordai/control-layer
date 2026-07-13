@@ -1870,7 +1870,10 @@ mod tests {
         )
         .await;
 
-        let result = get_batch_analytics(&pool, &batch_id).await.unwrap().expect("batch has batch_aggregates analytics");
+        let result = get_batch_analytics(&pool, &batch_id)
+            .await
+            .unwrap()
+            .expect("batch has batch_aggregates analytics");
 
         assert_eq!(result.total_requests, 1);
         assert_eq!(result.total_prompt_tokens, 100);
@@ -1949,7 +1952,10 @@ mod tests {
         )
         .await;
 
-        let result = get_batch_analytics(&pool, &batch_id).await.unwrap().expect("batch has batch_aggregates analytics");
+        let result = get_batch_analytics(&pool, &batch_id)
+            .await
+            .unwrap()
+            .expect("batch has batch_aggregates analytics");
 
         assert_eq!(result.total_requests, 3);
         assert_eq!(result.total_prompt_tokens, 225); // 50 + 100 + 75
@@ -2032,7 +2038,10 @@ mod tests {
         .await;
 
         // Query only for batch 1
-        let result = get_batch_analytics(&pool, &batch_id_1).await.unwrap().expect("batch has batch_aggregates analytics");
+        let result = get_batch_analytics(&pool, &batch_id_1)
+            .await
+            .unwrap()
+            .expect("batch has batch_aggregates analytics");
 
         // Should only return data for batch 1
         assert_eq!(result.total_requests, 1);
@@ -2067,7 +2076,10 @@ mod tests {
         )
         .await;
 
-        let result = get_batch_analytics(&pool, &batch_id).await.unwrap().expect("batch has batch_aggregates analytics");
+        let result = get_batch_analytics(&pool, &batch_id)
+            .await
+            .unwrap()
+            .expect("batch has batch_aggregates analytics");
 
         assert_eq!(result.total_requests, 1);
         assert_eq!(result.total_prompt_tokens, 50);
@@ -2148,7 +2160,10 @@ mod tests {
         .await;
 
         // Query only for the first batch
-        let result = get_batch_analytics(&pool, &batch_id).await.unwrap().expect("batch has batch_aggregates analytics");
+        let result = get_batch_analytics(&pool, &batch_id)
+            .await
+            .unwrap()
+            .expect("batch has batch_aggregates analytics");
 
         // Should only include the two requests from the first batch, not the other batch
         assert_eq!(result.total_requests, 2);

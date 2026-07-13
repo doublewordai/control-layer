@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT\n            fusillade_batch_id,\n            transaction_count,\n            total_prompt_tokens,\n            total_completion_tokens,\n            total_reasoning_tokens,\n            total_tokens,\n            sum_duration_ms,\n            count_duration_ms,\n            sum_ttfb_ms,\n            count_ttfb_ms,\n            total_list_cost\n        FROM batch_aggregates\n        WHERE fusillade_batch_id = ANY($1)\n        ",
+  "query": "\n        SELECT\n            fusillade_batch_id,\n            total_requests,\n            total_prompt_tokens,\n            total_completion_tokens,\n            total_reasoning_tokens,\n            total_tokens,\n            sum_duration_ms,\n            count_duration_ms,\n            sum_ttfb_ms,\n            count_ttfb_ms,\n            total_list_cost\n        FROM batch_aggregates\n        WHERE fusillade_batch_id = ANY($1)\n        ",
   "describe": {
     "columns": [
       {
@@ -10,8 +10,8 @@
       },
       {
         "ordinal": 1,
-        "name": "transaction_count",
-        "type_info": "Int4"
+        "name": "total_requests",
+        "type_info": "Int8"
       },
       {
         "ordinal": 2,
@@ -78,5 +78,5 @@
       false
     ]
   },
-  "hash": "21c37adf22c2d80990b5b30d1ab4e4d33223c8c74bb73e1f24b0b72fba44d7d3"
+  "hash": "b9fb08957fda5a89de545bca7aee90a85809761835fbdecae2873bc21b31c136"
 }
