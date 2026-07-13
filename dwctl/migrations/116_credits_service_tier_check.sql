@@ -8,9 +8,10 @@
 -- scripts/backfill_credits_denorm.sh. Both only ever produce one of four literals:
 --   realtime | flex | async | batch
 -- (verified on the staging DB: 0 rows outside that set, 0 empty strings). NULL is
--- retained — non-usage rows (grants/purchases) never carry a tier, and freshly
--- inserted usage rows are NULL until backfilled. `IN (...)` passes NULL by SQL
--- three-valued logic, so no explicit `IS NULL` disjunct is needed.
+-- retained — non-usage rows (grants/purchases) never carry a tier, and historical usage
+-- rows are NULL until the backfill runs (go-forward usage rows are written WITH a tier at
+-- INSERT by the batcher). `IN (...)` passes NULL by SQL three-valued logic, so no explicit
+-- `IS NULL` disjunct is needed.
 --
 -- credits_transactions is large (~49M rows) and hot (the batcher inserts
 -- continuously). A plain `ADD CONSTRAINT ... CHECK` would hold ACCESS EXCLUSIVE
