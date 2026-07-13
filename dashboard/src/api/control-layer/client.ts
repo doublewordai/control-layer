@@ -1703,7 +1703,14 @@ const batchesApi = {
   async getAnalytics(id: string): Promise<BatchAnalytics> {
     const response = await fetchAiApi(`/ai/v1/batches/${id}/analytics`);
     if (!response.ok) {
-      throw new Error(`Failed to fetch batch analytics: ${response.status}`);
+      // Attach the status so callers can distinguish 404 ("analytics no longer
+      // available" — the batch's read-model row has aged out of retention) from
+      // transient failures. See COR-524.
+      const error = new Error(
+        `Failed to fetch batch analytics: ${response.status}`,
+      ) as Error & { status?: number };
+      error.status = response.status;
+      throw error;
     }
     return response.json();
   },

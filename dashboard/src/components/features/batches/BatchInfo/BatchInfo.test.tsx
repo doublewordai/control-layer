@@ -107,6 +107,20 @@ describe("BatchInfo", () => {
     expect(screen.queryByText("Reasoning")).not.toBeInTheDocument();
   });
 
+  it("shows a 'no longer available' message when analytics have aged out (404)", () => {
+    vi.mocked(hooks.useBatchAnalytics).mockReturnValue({
+      data: undefined,
+      isLoading: false,
+      error: { status: 404 },
+    } as never);
+
+    renderBatchInfo();
+
+    expect(
+      screen.getByText("Analytics for this batch are no longer available."),
+    ).toBeInTheDocument();
+  });
+
   it("hides the reasoning token card when the total is undefined", () => {
     vi.mocked(hooks.useBatchAnalytics).mockReturnValue({
       data: {
