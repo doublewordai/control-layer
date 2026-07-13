@@ -1034,7 +1034,7 @@ pub async fn get_batch<P: PoolProvider>(
 Analytics update in real-time as requests complete.",
     responses(
         (status = 200, description = "Batch analytics with token counts, costs, and performance metrics.", body = BatchAnalytics),
-        (status = 404, description = "Batch not found or you don't have access to it."),
+        (status = 404, description = "Batch not found, you don't have access to it, or its analytics are no longer available (aged out of retention)."),
         (status = 500, description = "An unexpected error occurred. Retry the request or contact support if the issue persists.")
     ),
     params(
@@ -1070,11 +1070,19 @@ pub async fn get_batch_analytics<P: PoolProvider>(
         });
     }
 
-    // Fetch aggregated analytics metrics for this batch
+    // Fetch aggregated analytics metrics for this batch from the batch_aggregates read model.
+    // A missing row means the batch predates the read model and its raw http_analytics rows
+    // have aged out of retention — surface that as 404 ("no longer available") rather than a
+    // misleading all-zero payload (COR-524). The dashboard only requests analytics for
+    // completed batches, so an in-flight batch never lands here with a genuinely-empty row.
     let analytics = crate::db::handlers::analytics::get_batch_analytics(state.db.read(), &batch_id)
         .await
         .map_err(|e| Error::Internal {
             operation: format!("fetch batch analytics: {}", e),
+        })?
+        .ok_or_else(|| Error::NotFound {
+            resource: "Batch analytics".to_string(),
+            id: batch_id_str.clone(),
         })?;
 
     Ok(Json(analytics))
@@ -4213,7 +4221,8 @@ mod tests {
         assert_eq!(total_tokens, 4865, "Total tokens should be 4865");
     }
 
-    /// Test that batch analytics correctly aggregates reasoning tokens from http_analytics
+    /// Test that batch analytics surfaces folded reasoning tokens from the batch_aggregates
+    /// read model (COR-524) — both on the direct endpoint and via include=analytics.
     #[sqlx::test]
     #[test_log::test]
     async fn test_batch_analytics_with_reasoning_tokens(pool: PgPool) {
@@ -4260,31 +4269,26 @@ mod tests {
         let batch_id = batch["id"].as_str().unwrap();
         let batch_uuid = Uuid::parse_str(batch_id).unwrap();
 
-        // Insert analytics rows with reasoning tokens directly into http_analytics
-        let analytics_data = vec![(22i64, 891i64, 733i64, 913i64), (20, 2101, 1412, 2121), (18, 1813, 1735, 1831)];
-
-        for (prompt, completion, reasoning, total) in &analytics_data {
-            sqlx::query!(
-                r#"
-                INSERT INTO http_analytics (
-                    instance_id, correlation_id, timestamp, uri, method, status_code,
-                    duration_ms, model, prompt_tokens, completion_tokens, reasoning_tokens,
-                    total_tokens, fusillade_batch_id
-                ) VALUES ($1, $2, NOW(), '/ai/v1/chat/completions', 'POST', 200,
-                    100, 'thinking-model', $3, $4, $5, $6, $7)
-                "#,
-                Uuid::new_v4(),
-                (rand::random::<u64>() >> 1) as i64,
-                prompt,
-                completion,
-                reasoning,
-                total,
-                batch_uuid,
-            )
-            .execute(&pool)
-            .await
-            .expect("Failed to insert analytics data");
-        }
+        // The analytics endpoint now reads the batch_aggregates read model (COR-524), not raw
+        // http_analytics — so seed it with the batch's folded per-batch totals the way the
+        // batcher would (prompt 22+20+18=60, completion 891+2101+1813=4805,
+        // reasoning 733+1412+1735=3880, total 913+2121+1831=4865 over 3 requests).
+        sqlx::query(
+            r#"
+            INSERT INTO batch_aggregates (
+                fusillade_batch_id, user_id, total_amount, transaction_count, max_seq,
+                created_at, updated_at, service_tier,
+                total_prompt_tokens, total_completion_tokens, total_reasoning_tokens, total_tokens,
+                sum_duration_ms, count_duration_ms, sum_ttfb_ms, count_ttfb_ms, total_list_cost
+            ) VALUES ($1, $2, 0, 3, 0, NOW(), NOW(), 'batch',
+                60, 4805, 3880, 4865, 300, 3, 0, 0, 0)
+            "#,
+        )
+        .bind(batch_uuid)
+        .bind(user.id)
+        .execute(&pool)
+        .await
+        .expect("Failed to seed batch_aggregates read model");
 
         let auth = add_auth_headers(&user);
 
@@ -4340,6 +4344,29 @@ mod tests {
             3880,
             "Reasoning tokens should match in list analytics"
         );
+    }
+
+    /// A batch that exists in fusillade but has no `batch_aggregates` row (predates the read
+    /// model, or its raw http_analytics rows aged out of retention) returns 404 from
+    /// GET /batches/{id}/analytics — the "analytics no longer available" case — rather than a
+    /// misleading all-zero payload (COR-524).
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_batch_analytics_missing_read_model_row_returns_404(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let auth = add_auth_headers(&user);
+
+        // Batch exists (fusillade) but nothing folded it into the batch_aggregates read model.
+        let (batch_id, _request_ids) = insert_batch_with_pending_requests(&pool, user.id, 3).await;
+
+        let resp = app
+            .get(&format!("/ai/v1/batches/{batch_id}/analytics"))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+
+        resp.assert_status(StatusCode::NOT_FOUND);
     }
 
     /// Helper: insert a batch with `n` pending requests directly into fusillade tables.

@@ -789,10 +789,15 @@ pub async fn get_model_user_usage(
 /// Reads the denormalized per-batch aggregates from `batch_aggregates` (COR-524) — folded
 /// by the analytics batcher and backfilled from raw — rather than scanning `http_analytics`
 /// by `fusillade_batch_id`. Latency is reconstructed from the stored sum + count (the AVG
-/// the old query computed directly). A missing row means no billed requests for the batch
-/// (equivalently the old empty result), so return zeroes.
+/// the old query computed directly).
+///
+/// Returns `None` when the batch has no `batch_aggregates` row. Because `batch_aggregates`
+/// is the durable read model (not subject to `http_analytics` retention), a missing row now
+/// means the batch predates the read model and its raw analytics have aged out — the caller
+/// surfaces this as a 404 ("analytics no longer available") rather than a misleading all-zero
+/// result. (It also covers a batch that never had a foldable request, e.g. all-non-2xx.)
 #[instrument(skip(pool))]
-pub async fn get_batch_analytics(pool: &PgPool, batch_id: &Uuid) -> Result<BatchAnalytics> {
+pub async fn get_batch_analytics(pool: &PgPool, batch_id: &Uuid) -> Result<Option<BatchAnalytics>> {
     let row = sqlx::query!(
         r#"
         SELECT
@@ -814,8 +819,8 @@ pub async fn get_batch_analytics(pool: &PgPool, batch_id: &Uuid) -> Result<Batch
     .fetch_optional(pool)
     .await?;
 
-    Ok(match row {
-        Some(r) => batch_analytics_from_row(
+    Ok(row.map(|r| {
+        batch_analytics_from_row(
             r.transaction_count,
             r.total_prompt_tokens,
             r.total_completion_tokens,
@@ -826,10 +831,8 @@ pub async fn get_batch_analytics(pool: &PgPool, batch_id: &Uuid) -> Result<Batch
             r.sum_ttfb_ms,
             r.count_ttfb_ms,
             r.total_list_cost,
-        ),
-        // No row = no billed requests for the batch (the old empty-result case).
-        None => BatchAnalytics::default(),
-    })
+        )
+    }))
 }
 
 /// Build a [`BatchAnalytics`] from a `batch_aggregates` row's denormalized aggregates,
@@ -1866,7 +1869,7 @@ mod tests {
         )
         .await;
 
-        let result = get_batch_analytics(&pool, &batch_id).await.unwrap();
+        let result = get_batch_analytics(&pool, &batch_id).await.unwrap().expect("batch has batch_aggregates analytics");
 
         assert_eq!(result.total_requests, 1);
         assert_eq!(result.total_prompt_tokens, 100);
@@ -1945,7 +1948,7 @@ mod tests {
         )
         .await;
 
-        let result = get_batch_analytics(&pool, &batch_id).await.unwrap();
+        let result = get_batch_analytics(&pool, &batch_id).await.unwrap().expect("batch has batch_aggregates analytics");
 
         assert_eq!(result.total_requests, 3);
         assert_eq!(result.total_prompt_tokens, 225); // 50 + 100 + 75
@@ -1974,15 +1977,11 @@ mod tests {
     async fn test_get_batch_analytics_nonexistent_batch_id(pool: PgPool) {
         let nonexistent_batch_id = Uuid::new_v4();
 
+        // No batch_aggregates row → None, which the handler surfaces as 404
+        // ("analytics no longer available") rather than a misleading all-zero payload (COR-524).
         let result = get_batch_analytics(&pool, &nonexistent_batch_id).await.unwrap();
 
-        assert_eq!(result.total_requests, 0);
-        assert_eq!(result.total_prompt_tokens, 0);
-        assert_eq!(result.total_completion_tokens, 0);
-        assert_eq!(result.total_tokens, 0);
-        assert_eq!(result.avg_duration_ms, None);
-        assert_eq!(result.avg_ttfb_ms, None);
-        assert_eq!(result.total_cost, None);
+        assert!(result.is_none());
     }
 
     #[sqlx::test]
@@ -2032,7 +2031,7 @@ mod tests {
         .await;
 
         // Query only for batch 1
-        let result = get_batch_analytics(&pool, &batch_id_1).await.unwrap();
+        let result = get_batch_analytics(&pool, &batch_id_1).await.unwrap().expect("batch has batch_aggregates analytics");
 
         // Should only return data for batch 1
         assert_eq!(result.total_requests, 1);
@@ -2067,7 +2066,7 @@ mod tests {
         )
         .await;
 
-        let result = get_batch_analytics(&pool, &batch_id).await.unwrap();
+        let result = get_batch_analytics(&pool, &batch_id).await.unwrap().expect("batch has batch_aggregates analytics");
 
         assert_eq!(result.total_requests, 1);
         assert_eq!(result.total_prompt_tokens, 50);
@@ -2148,7 +2147,7 @@ mod tests {
         .await;
 
         // Query only for the first batch
-        let result = get_batch_analytics(&pool, &batch_id).await.unwrap();
+        let result = get_batch_analytics(&pool, &batch_id).await.unwrap().expect("batch has batch_aggregates analytics");
 
         // Should only include the two requests from the first batch, not the other batch
         assert_eq!(result.total_requests, 2);
