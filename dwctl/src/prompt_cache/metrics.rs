@@ -4,12 +4,15 @@
 //! Conventions:
 //! - Every metric name is `dwctl_cache_*`.
 //! - Low-cardinality labels are `&'static str` literals (`outcome`/`reason`/`tier`/`result`/`marked`).
-//!   The one dynamic label is `model` (owned `String`), attached **only** by `record_token_volumes`,
-//!   which is emitted solely for cache-ENABLED models — a small, validated, bounded set (the alias
-//!   has a tariff). The all-traffic metrics (`marker_requests`, `requests`) carry **no `model` label**,
-//!   because the raw request `model` is unvalidated there (unknown/typo strings) and would be
-//!   unbounded cardinality. Never label `model` from unvalidated input, nor by principal / api-key /
-//!   correlation-id / prefix-hash.
+//!   The dynamic label is `model` (owned `String`), attached in exactly TWO places, each with its
+//!   own bounding guarantee: `record_token_volumes` (emitted solely for cache-ENABLED models — the
+//!   alias has a tariff) and `record_tokenizer_duration` (the caller labels by model only for a name
+//!   tokenizer-svc ACCEPTED — its baked map is the bound; every error path is clamped to a fixed
+//!   value, see `TokenizerClient::tokenize`). The all-traffic metrics (`marker_requests`,
+//!   `requests`) carry **no `model` label**, because the raw request `model` is unvalidated there
+//!   (unknown/typo strings) and would be unbounded cardinality. Never label `model` from
+//!   unvalidated input, nor by principal / api-key / correlation-id / prefix-hash — a new
+//!   model-labelled metric needs a bounding argument like the two above.
 //! - Counters created lazily on first emission (no pre-registration needed, as in
 //!   `errors.rs`); histograms use the recorder's default buckets unless tuned in the
 //!   recorder builder.
@@ -100,15 +103,16 @@ pub fn record_tokenizer_request(outcome: &'static str) {
 ///
 /// Labels (added after the 2026-07 deadline-miss investigation, where the unlabelled series
 /// couldn't answer "which model / how big"): `model` is the virtual-model alias — bounded by
-/// the tokenizer-svc map (callers clamp unvetted names, e.g. the unmapped path, to a fixed
-/// value); `size` is a coarse payload bucket (see [`tokenize_size_bucket`]) so slow-call
-/// attribution (big cold prefixes vs service-wide slowness) is a single query.
+/// the tokenizer-svc map (the caller labels by model only on an svc-accepted name and clamps
+/// every error path to `unmapped`/`error`, see `TokenizerClient::tokenize`); `size` is a coarse
+/// payload bucket (see [`tokenize_size_bucket`]) so slow-call attribution (big cold prefixes
+/// vs service-wide slowness) is a single query.
 ///
 /// Existing `sum by (le)` dashboard/alert queries aggregate across these labels unchanged.
 /// Deliberately NOT also recording an unlabelled twin under the same name: every observation
 /// would then be counted twice in any label-agnostic aggregation, corrupting the quantiles.
 pub fn record_tokenizer_duration(model: &str, size: &'static str, seconds: f64) {
-    histogram!("dwctl_cache_tokenizer_duration_seconds", "model" => model.to_string(), "size" => size).record(seconds);
+    histogram!("dwctl_cache_tokenizer_duration_seconds", "model" => model.to_owned(), "size" => size).record(seconds);
 }
 
 /// Coarse request-payload bucket for [`record_tokenizer_duration`]: total bytes across the
