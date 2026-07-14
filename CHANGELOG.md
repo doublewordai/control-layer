@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.82.0](https://github.com/doublewordai/control-layer/compare/v8.81.2...v8.82.0) (2026-07-14)
+
+
+### Features
+
+* configure provider reasoning translation ([#1267](https://github.com/doublewordai/control-layer/issues/1267)) ([61de3ab](https://github.com/doublewordai/control-layer/commit/61de3ab91ba20fc3278eb546d20a5ed25ca3bce4))
+
 ## [8.81.2](https://github.com/doublewordai/control-layer/compare/v8.81.1...v8.81.2) (2026-07-14)
 
 

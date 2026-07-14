@@ -57,6 +57,11 @@
         "ordinal": 10,
         "name": "auth_header_prefix",
         "type_info": "Varchar"
+      },
+      {
+        "ordinal": 11,
+        "name": "reasoning_translation",
+        "type_info": "Jsonb"
       }
     ],
     "parameters": {
@@ -75,7 +80,8 @@
       true,
       false,
       false,
-      false
+      false,
+      true
     ]
   },
   "hash": "4f924d33f4b62f5bede2770b010183bb9f249ade795f8196fa74dc4c5ddc19e1"

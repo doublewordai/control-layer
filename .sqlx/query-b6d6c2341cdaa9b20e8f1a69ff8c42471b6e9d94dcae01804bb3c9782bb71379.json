@@ -1,0 +1,226 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT\n            dm.id as deployment_id,\n            dm.model_name,\n            dm.alias,\n            dm.hosted_on,\n            dm.requests_per_second as deployment_requests_per_second,\n            dm.burst_size as deployment_burst_size,\n            dm.capacity,\n            dm.sanitize_responses,\n            dm.trusted,\n            dm.open_responses_adapter,\n            ie.reasoning_translation as endpoint_reasoning_translation,\n            dm.reasoning_translation_overrides as model_reasoning_translation_overrides,\n            dm.fallback_enabled,\n            dm.fallback_on_rate_limit,\n            dm.fallback_on_status,\n            dm.fallback_with_replacement,\n            dm.fallback_max_attempts,\n            dm.backoff_enabled,\n            dm.backoff_initial_ms,\n            dm.backoff_max_ms,\n            dm.backoff_factor,\n            dm.backoff_jitter,\n            dm.backoff_max_total_ms,\n            ie.id as endpoint_id,\n            ie.url as \"endpoint_url!\",\n            ie.api_key as endpoint_api_key,\n            ie.auth_header_name,\n            ie.auth_header_prefix,\n            ak.id as \"api_key_id?\",\n            ak.secret as \"api_key_secret?\",\n            ak.purpose as \"api_key_purpose?\",\n            ak.requests_per_second as api_key_requests_per_second,\n            ak.burst_size as api_key_burst_size,\n            ak.user_verified as \"api_key_user_verified?\",\n            ak.user_zero_data_retention as \"api_key_user_zero_data_retention?\"\n        FROM deployed_models dm\n        INNER JOIN inference_endpoints ie ON dm.hosted_on = ie.id\n        LEFT JOIN LATERAL (\n            SELECT DISTINCT\n                ak.id,\n                ak.secret,\n                ak.purpose,\n                ak.requests_per_second,\n                ak.burst_size,\n                u.verified as user_verified,\n                u.zero_data_retention as user_zero_data_retention\n            FROM api_keys ak\n            JOIN users u ON u.id = ak.user_id\n            WHERE (\n                -- System user always has access\n                ak.user_id = '00000000-0000-0000-0000-000000000000'\n                -- OR user is in a group assigned to this model\n                OR EXISTS (\n                    SELECT 1 FROM user_groups ug\n                    INNER JOIN deployment_groups dg ON ug.group_id = dg.group_id\n                    WHERE dg.deployment_id = dm.id\n                      AND ug.user_id = ak.user_id\n                )\n                -- OR model is in public group\n                OR EXISTS (\n                    SELECT 1 FROM deployment_groups dg\n                    WHERE dg.deployment_id = dm.id\n                      AND dg.group_id = '00000000-0000-0000-0000-000000000000'\n                )\n                -- OR this is a batch API key and model is an escalation target\n                OR (\n                    ak.purpose = 'batch'\n                    AND dm.alias = ANY($1::text[])\n                )\n            )\n            AND (\n                ak.user_id = '00000000-0000-0000-0000-000000000000'\n                -- Positive balance read directly from the total\n                -- user_balance_checkpoints read model (kept current by the\n                -- writers folding synchronously with each charge). The\n                -- is_deleted guard mirrors the old balance CTE, which only\n                -- contained non-deleted users; key deletion is not implied by\n                -- user deletion, so this check is load-bearing.\n                OR (u.is_deleted = false AND EXISTS (\n                    SELECT 1 FROM user_balance_checkpoints ub\n                    WHERE ub.user_id = ak.user_id AND ub.balance > 0\n                ))\n                OR (\n                    NOT EXISTS (\n                        SELECT 1 FROM model_tariffs mt\n                        WHERE mt.deployed_model_id = dm.id\n                          AND mt.valid_until IS NULL\n                          AND (mt.input_price_per_token > 0 OR mt.output_price_per_token > 0)\n                    )\n                )\n            )\n            AND ak.is_deleted = false\n            -- Inference data plane only: platform (management) keys must never\n            -- enter onwards' key set. Mirrors is_inference_purpose in\n            -- db::models::api_keys (SQL cannot call it). The system key is\n            -- purpose 'platform' (it calls admin endpoints, see migration 071)\n            -- but is used internally for onwards inference, so it is exempt.\n            AND (\n                ak.user_id = '00000000-0000-0000-0000-000000000000'\n                OR ak.purpose IN ('realtime', 'batch', 'playground')\n            )\n        ) ak ON true\n        WHERE dm.deleted = FALSE\n          AND dm.is_composite = FALSE\n        ORDER BY dm.id, ak.id\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "deployment_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "model_name",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "alias",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 3,
+        "name": "hosted_on",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 4,
+        "name": "deployment_requests_per_second",
+        "type_info": "Float4"
+      },
+      {
+        "ordinal": 5,
+        "name": "deployment_burst_size",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 6,
+        "name": "capacity",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 7,
+        "name": "sanitize_responses",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 8,
+        "name": "trusted",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 9,
+        "name": "open_responses_adapter",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 10,
+        "name": "endpoint_reasoning_translation",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 11,
+        "name": "model_reasoning_translation_overrides",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 12,
+        "name": "fallback_enabled",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 13,
+        "name": "fallback_on_rate_limit",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 14,
+        "name": "fallback_on_status",
+        "type_info": "Int4Array"
+      },
+      {
+        "ordinal": 15,
+        "name": "fallback_with_replacement",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 16,
+        "name": "fallback_max_attempts",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 17,
+        "name": "backoff_enabled",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 18,
+        "name": "backoff_initial_ms",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 19,
+        "name": "backoff_max_ms",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 20,
+        "name": "backoff_factor",
+        "type_info": "Float8"
+      },
+      {
+        "ordinal": 21,
+        "name": "backoff_jitter",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 22,
+        "name": "backoff_max_total_ms",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 23,
+        "name": "endpoint_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 24,
+        "name": "endpoint_url!",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 25,
+        "name": "endpoint_api_key",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 26,
+        "name": "auth_header_name",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 27,
+        "name": "auth_header_prefix",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 28,
+        "name": "api_key_id?",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 29,
+        "name": "api_key_secret?",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 30,
+        "name": "api_key_purpose?",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 31,
+        "name": "api_key_requests_per_second",
+        "type_info": "Float4"
+      },
+      {
+        "ordinal": 32,
+        "name": "api_key_burst_size",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 33,
+        "name": "api_key_user_verified?",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 34,
+        "name": "api_key_user_zero_data_retention?",
+        "type_info": "Bool"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "TextArray"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      true,
+      false,
+      false,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      true,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "b6d6c2341cdaa9b20e8f1a69ff8c42471b6e9d94dcae01804bb3c9782bb71379"
+}

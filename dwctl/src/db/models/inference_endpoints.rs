@@ -1,5 +1,6 @@
 //! Database models for inference endpoints.
 
+use crate::reasoning::ReasoningTranslationConfig;
 use crate::types::{InferenceEndpointId, UserId};
 use chrono::{DateTime, Utc};
 use url::Url;
@@ -15,6 +16,7 @@ pub struct InferenceEndpointCreateDBRequest {
     pub model_filter: Option<Vec<String>>,
     pub auth_header_name: Option<String>,
     pub auth_header_prefix: Option<String>,
+    pub reasoning_translation: Option<ReasoningTranslationConfig>,
 }
 
 /// Database request for updating an inference endpoint
@@ -27,6 +29,8 @@ pub struct InferenceEndpointUpdateDBRequest {
     pub model_filter: Option<Option<Vec<String>>>,
     pub auth_header_name: Option<String>,
     pub auth_header_prefix: Option<String>,
+    /// None leaves the value unchanged; Some(None) clears it.
+    pub reasoning_translation: Option<Option<ReasoningTranslationConfig>>,
 }
 
 /// Database response for an inference endpoint
@@ -40,6 +44,7 @@ pub struct InferenceEndpointDBResponse {
     pub model_filter: Option<Vec<String>>,
     pub auth_header_name: String,
     pub auth_header_prefix: String,
+    pub reasoning_translation: Option<ReasoningTranslationConfig>,
     pub created_by: UserId,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,

@@ -149,6 +149,7 @@ mod tests {
                 model_filter: None,
                 auth_header_name: None,
                 auth_header_prefix: None,
+                reasoning_translation: None,
                 created_by: user.id,
             })
             .await
@@ -204,6 +205,7 @@ mod tests {
                 model_filter: None,
                 auth_header_name: None,
                 auth_header_prefix: None,
+                reasoning_translation: None,
                 created_by: user.id,
             })
             .await
@@ -371,6 +373,7 @@ mod tests {
                 model_filter: None,
                 auth_header_name: None,
                 auth_header_prefix: None,
+                reasoning_translation: None,
                 created_by: user.id,
             })
             .await
@@ -439,6 +442,7 @@ mod tests {
                 model_filter: None,
                 auth_header_name: None,
                 auth_header_prefix: None,
+                reasoning_translation: None,
                 created_by: user.id,
             })
             .await
@@ -550,6 +554,7 @@ mod tests {
                 model_filter: None,
                 auth_header_name: None,
                 auth_header_prefix: None,
+                reasoning_translation: None,
                 created_by: jwt_user.id,
             })
             .await
@@ -665,6 +670,7 @@ mod tests {
                 model_filter: None,
                 auth_header_name: None,
                 auth_header_prefix: None,
+                reasoning_translation: None,
                 created_by: user.id,
             })
             .await
@@ -778,6 +784,7 @@ mod tests {
                 model_filter: None,
                 auth_header_name: None,
                 auth_header_prefix: None,
+                reasoning_translation: None,
                 created_by: Uuid::nil(), // Use nil for system creation
             })
             .await
@@ -861,6 +868,7 @@ mod tests {
                 model_filter: None,
                 auth_header_name: None,
                 auth_header_prefix: None,
+                reasoning_translation: None,
                 created_by: user.id,
             })
             .await
@@ -960,6 +968,7 @@ mod tests {
                 model_filter: None,
                 auth_header_name: None,
                 auth_header_prefix: None,
+                reasoning_translation: None,
                 created_by: user.id,
             })
             .await
