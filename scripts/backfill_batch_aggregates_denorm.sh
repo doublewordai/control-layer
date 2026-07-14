@@ -1,13 +1,20 @@
 #!/usr/bin/env bash
 #
-# Backfill batch_aggregates.service_tier from http_analytics history
-# (COR-514, migration 113).
+# Backfill batch_aggregates.service_tier from fusillade.batches (COR-514, migration 113).
 #
 # batch_aggregates is one row per batch (small). Every batch has a fusillade_batch_id,
-# so its tier is `async` (1h SLA) or `batch` (24h SLA) — read the SLA from any
-# http_analytics row of that batch (constant per batch). The per-batch lookup rides
-# idx_analytics_fusillade_batch_id, so run this BEFORE that index is dropped and after
-# migration 113 + the batcher change are deployed (new batches are set at fold time).
+# so its tier is `async` (1h SLA) or `batch` (24h SLA). We read the SLA from the
+# AUTHORITATIVE source, fusillade.batches.completion_window ('24h' -> batch, else ->
+# async), matching compute_service_tier in the batcher AND the credits backfill. We do
+# NOT read http_analytics.batch_sla: it was unpopulated before ~Feb 2026, so it would
+# mislabel old 24h batches as async and disagree with credits_transactions.service_tier
+# for the same batch. A deleted batch (no fusillade.batches row) has no SLA to resolve
+# and defaults to async, as in the credits backfill.
+#
+# fusillade.batches.id is the PK, so the per-batch lookup is an index probe on a small
+# table — this backfill does NOT ride idx_analytics_fusillade_batch_id (unlike the
+# analytics backfill). Run after migration 113 + the batcher change are deployed (new
+# batches are set at fold time).
 #
 # Idempotent + resumable: per-row UPDATE guarded by `service_tier IS NULL`, swept by
 # max_seq in fixed ranges, each its own committed transaction.
@@ -44,13 +51,11 @@ while [ "$CURSOR" -lt "$MAX_SEQ" ]; do
   affected=$(psql_q "
     WITH upd AS (
       UPDATE batch_aggregates ba
-         SET service_tier = CASE WHEN s.batch_sla = '24h' THEN 'batch' ELSE 'async' END
-        FROM LATERAL (
-               SELECT batch_sla
-               FROM http_analytics ha
-               WHERE ha.fusillade_batch_id = ba.fusillade_batch_id
-               LIMIT 1
-             ) s
+         SET service_tier = CASE
+               WHEN (SELECT b.completion_window
+                       FROM fusillade.batches b
+                      WHERE b.id = ba.fusillade_batch_id) = '24h'
+               THEN 'batch' ELSE 'async' END
        WHERE ba.max_seq > ${CURSOR} AND ba.max_seq <= ${hi}
              AND ba.service_tier IS NULL
       RETURNING 1
