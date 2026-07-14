@@ -1,0 +1,72 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO http_analytics (\n                instance_id, correlation_id, timestamp, method, uri, model,\n                status_code, duration_ms, duration_to_first_byte_ms, prompt_tokens, completion_tokens,\n                reasoning_tokens, total_tokens, response_type, user_id, access_source,\n                input_price_per_token, output_price_per_token, fusillade_batch_id, fusillade_request_id, custom_id,\n                request_origin, batch_sla, batch_request_source, api_key_id, trace_id,\n                cache_read_input_tokens, cache_creation_input_tokens,\n                cache_creation_5m_input_tokens, cache_creation_1h_input_tokens, cache_creation_24h_input_tokens,\n                total_cost, uncached_cost\n            )\n            SELECT * FROM UNNEST(\n                $1::uuid[], $2::bigint[], $3::timestamptz[], $4::text[], $5::text[], $6::text[],\n                $7::int[], $8::bigint[], $9::bigint[], $10::bigint[], $11::bigint[],\n                $12::bigint[], $13::bigint[], $14::text[], $15::uuid[], $16::text[],\n                $17::numeric[], $18::numeric[], $19::uuid[], $20::uuid[], $21::text[],\n                $22::text[], $23::text[], $24::text[], $25::uuid[], $26::text[],\n                $27::bigint[], $28::bigint[],\n                $29::bigint[], $30::bigint[], $31::bigint[],\n                $32::numeric[], $33::numeric[]\n            )\n            ON CONFLICT (instance_id, correlation_id)\n            DO UPDATE SET\n                status_code = EXCLUDED.status_code,\n                duration_ms = EXCLUDED.duration_ms,\n                duration_to_first_byte_ms = EXCLUDED.duration_to_first_byte_ms,\n                prompt_tokens = EXCLUDED.prompt_tokens,\n                completion_tokens = EXCLUDED.completion_tokens,\n                reasoning_tokens = EXCLUDED.reasoning_tokens,\n                total_tokens = EXCLUDED.total_tokens,\n                response_type = EXCLUDED.response_type,\n                user_id = EXCLUDED.user_id,\n                access_source = EXCLUDED.access_source,\n                input_price_per_token = EXCLUDED.input_price_per_token,\n                output_price_per_token = EXCLUDED.output_price_per_token,\n                fusillade_batch_id = EXCLUDED.fusillade_batch_id,\n                fusillade_request_id = EXCLUDED.fusillade_request_id,\n                custom_id = EXCLUDED.custom_id,\n                request_origin = EXCLUDED.request_origin,\n                batch_sla = EXCLUDED.batch_sla,\n                batch_request_source = EXCLUDED.batch_request_source,\n                api_key_id = EXCLUDED.api_key_id,\n                trace_id = EXCLUDED.trace_id,\n                cache_read_input_tokens = EXCLUDED.cache_read_input_tokens,\n                cache_creation_input_tokens = EXCLUDED.cache_creation_input_tokens,\n                cache_creation_5m_input_tokens = EXCLUDED.cache_creation_5m_input_tokens,\n                cache_creation_1h_input_tokens = EXCLUDED.cache_creation_1h_input_tokens,\n                cache_creation_24h_input_tokens = EXCLUDED.cache_creation_24h_input_tokens,\n                total_cost = EXCLUDED.total_cost,\n                uncached_cost = EXCLUDED.uncached_cost\n            RETURNING id, instance_id, correlation_id, (xmax = 0) AS \"newly_inserted!\"\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "instance_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "correlation_id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 3,
+        "name": "newly_inserted!",
+        "type_info": "Bool"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "UuidArray",
+        "Int8Array",
+        "TimestamptzArray",
+        "TextArray",
+        "TextArray",
+        "TextArray",
+        "Int4Array",
+        "Int8Array",
+        "Int8Array",
+        "Int8Array",
+        "Int8Array",
+        "Int8Array",
+        "Int8Array",
+        "TextArray",
+        "UuidArray",
+        "TextArray",
+        "NumericArray",
+        "NumericArray",
+        "UuidArray",
+        "UuidArray",
+        "TextArray",
+        "TextArray",
+        "TextArray",
+        "TextArray",
+        "UuidArray",
+        "TextArray",
+        "Int8Array",
+        "Int8Array",
+        "Int8Array",
+        "Int8Array",
+        "Int8Array",
+        "NumericArray",
+        "NumericArray"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      null
+    ]
+  },
+  "hash": "36dcd77aafd3237dc35b0f9e08f378d16ac7b6ef2b47568de097d496d638d3df"
+}

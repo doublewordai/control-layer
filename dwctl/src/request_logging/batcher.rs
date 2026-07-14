@@ -44,7 +44,7 @@ use metrics::{counter, histogram};
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
 use sqlx::PgPool;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::{Notify, mpsc};
 use tokio_util::sync::CancellationToken;
@@ -905,10 +905,10 @@ where
         let mut tx = self.pool.begin().await?;
 
         // Phase 1: Batch INSERT http_analytics
-        let analytics_ids = self.batch_insert_analytics(&mut tx, records).await?;
+        let (analytics_ids, newly_inserted) = self.batch_insert_analytics(&mut tx, records).await?;
 
-        // Phase 2: Batch INSERT credit_transactions
-        let duplicates = self.batch_insert_credits(&mut tx, records, &analytics_ids).await?;
+        // Phase 2: Batch INSERT credit_transactions (+ fold batch_aggregates)
+        let duplicates = self.batch_insert_credits(&mut tx, records, &analytics_ids, &newly_inserted).await?;
         if duplicates > 0 {
             warn!(duplicates = duplicates, "Some credit transactions were duplicates");
             counter!("dwctl_credits_duplicates_total").increment(duplicates);
@@ -919,13 +919,20 @@ where
     }
 
     /// Batch INSERT http_analytics records within a transaction.
+    ///
+    /// Returns `(id_map, newly_inserted)`: the analytics id for each
+    /// `(instance_id, correlation_id)`, and the subset of those ids that were freshly
+    /// INSERTed this call (`xmax = 0`) rather than updated on conflict. The batch-analytics
+    /// fold in `batch_insert_credits` uses `newly_inserted` as its idempotency anchor so that
+    /// free / zero-priced batched requests (which never produce a credit row to ride) are
+    /// still folded exactly once under retries.
     async fn batch_insert_analytics(
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         records: &[EnrichedRecord],
-    ) -> Result<HashMap<(Uuid, i64), i64>, sqlx::Error> {
+    ) -> Result<(HashMap<(Uuid, i64), i64>, HashSet<i64>), sqlx::Error> {
         if records.is_empty() {
-            return Ok(HashMap::new());
+            return Ok((HashMap::new(), HashSet::new()));
         }
 
         // Build arrays for UNNEST
@@ -1060,7 +1067,7 @@ where
                 cache_creation_24h_input_tokens = EXCLUDED.cache_creation_24h_input_tokens,
                 total_cost = EXCLUDED.total_cost,
                 uncached_cost = EXCLUDED.uncached_cost
-            RETURNING id, instance_id, correlation_id
+            RETURNING id, instance_id, correlation_id, (xmax = 0) AS "newly_inserted!"
             "#,
             &instance_ids,
             &correlation_ids,
@@ -1100,12 +1107,20 @@ where
         .await?;
 
         let mut id_map = HashMap::with_capacity(rows.len());
+        let mut newly_inserted: HashSet<i64> = HashSet::new();
         for row in rows {
             id_map.insert((row.instance_id, row.correlation_id), row.id);
+            if row.newly_inserted {
+                newly_inserted.insert(row.id);
+            }
         }
 
-        trace!(count = id_map.len(), "Batch inserted analytics records");
-        Ok(id_map)
+        trace!(
+            count = id_map.len(),
+            newly = newly_inserted.len(),
+            "Batch inserted analytics records"
+        );
+        Ok((id_map, newly_inserted))
     }
 
     /// Batch INSERT credit_transactions within a transaction.
@@ -1121,6 +1136,7 @@ where
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         records: &[EnrichedRecord],
         analytics_ids: &HashMap<(Uuid, i64), i64>,
+        newly_inserted: &HashSet<i64>,
     ) -> Result<u64, sqlx::Error> {
         // Collect records that need credit transactions
         let mut user_ids: Vec<Uuid> = Vec::new();
@@ -1234,6 +1250,9 @@ where
         }
         let mut folds: HashMap<Uuid, UserFold> = HashMap::new();
 
+        // Billing fold: total_amount / transaction_count per batch, over the *billed* rows
+        // (the credit set). The per-batch analytics aggregates (tokens/latency/cost) are folded
+        // separately below over ALL 2xx requests, so free-model batches are counted too.
         struct BatchFold {
             user_id: Uuid,
             total: Decimal,
@@ -1341,7 +1360,9 @@ where
 
             sqlx::query!(
                 r#"
-                INSERT INTO batch_aggregates (fusillade_batch_id, user_id, total_amount, transaction_count, max_seq, created_at, updated_at, service_tier)
+                INSERT INTO batch_aggregates (
+                    fusillade_batch_id, user_id, total_amount, transaction_count, max_seq, created_at, updated_at, service_tier
+                )
                 SELECT b.batch_id, b.user_id, b.total, b.cnt, b.max_seq, b.created_at, NOW(), b.service_tier
                 FROM UNNEST($1::uuid[], $2::uuid[], $3::numeric[], $4::int[], $5::bigint[], $6::timestamptz[], $7::text[])
                     AS b(batch_id, user_id, total, cnt, max_seq, created_at, service_tier)
@@ -1359,6 +1380,153 @@ where
                 &batch_seqs,
                 &created_ats,
                 &service_tiers_agg,
+            )
+            .execute(&mut **tx)
+            .await?;
+        }
+
+        // Fold this flush's newly-inserted, successful (2xx) batched requests into the
+        // batch_aggregates *analytics* columns (COR-524). Unlike the billing fold above — which
+        // rides the credit set and so excludes free / zero-priced requests — this covers ALL
+        // 2xx batched requests, matching get_batch_analytics's historical "status 2xx" set, so
+        // free-model batches still report tokens/latency/cost. Idempotency rides the
+        // http_analytics upsert's newly-inserted flag (`xmax = 0`): a retried flush re-folds
+        // nothing. count_duration_ms / count_ttfb_ms count only requests that reported the
+        // metric so the endpoint's AVG (which ignores NULLs) is reproduced; total_requests is
+        // the plain 2xx count (distinct from transaction_count, the billed-row count).
+        struct AnalyticsFold {
+            user_id: Uuid,
+            service_tier: String,
+            min_created_at: chrono::DateTime<chrono::Utc>,
+            total_requests: i64,
+            prompt_tokens: i64,
+            completion_tokens: i64,
+            reasoning_tokens: i64,
+            total_tokens: i64,
+            sum_duration_ms: i64,
+            count_duration_ms: i64,
+            sum_ttfb_ms: i64,
+            count_ttfb_ms: i64,
+            list_cost: Decimal,
+        }
+        let mut analytics_folds: HashMap<Uuid, AnalyticsFold> = HashMap::new();
+        for record in records {
+            let Some(batch_id) = record.raw.fusillade_batch_id else { continue };
+            if !(200..=299).contains(&record.raw.status_code) {
+                continue;
+            }
+            let Some(user_id) = record.user_id else { continue };
+            if user_id == Uuid::nil() {
+                continue;
+            }
+            // Idempotency anchor: only rows this flush actually INSERTed (xmax = 0) contribute,
+            // so a retried flush re-folds nothing even for free requests (which have no credit
+            // row to ride the ON CONFLICT DO NOTHING dedup).
+            let Some(&analytics_id) = analytics_ids.get(&(record.raw.instance_id, record.raw.correlation_id)) else {
+                continue;
+            };
+            if !newly_inserted.contains(&analytics_id) {
+                continue;
+            }
+
+            let af = analytics_folds.entry(batch_id).or_insert_with(|| AnalyticsFold {
+                user_id,
+                service_tier: compute_service_tier(record.raw.fusillade_batch_id, record.raw.batch_completion_window.as_deref())
+                    .to_string(),
+                min_created_at: record.raw.timestamp,
+                total_requests: 0,
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                reasoning_tokens: 0,
+                total_tokens: 0,
+                sum_duration_ms: 0,
+                count_duration_ms: 0,
+                sum_ttfb_ms: 0,
+                count_ttfb_ms: 0,
+                list_cost: Decimal::ZERO,
+            });
+            af.total_requests += 1;
+            af.prompt_tokens += record.raw.prompt_tokens;
+            af.completion_tokens += record.raw.completion_tokens;
+            af.reasoning_tokens += record.raw.reasoning_tokens;
+            af.total_tokens += record.raw.total_tokens;
+            af.sum_duration_ms += record.raw.duration_ms;
+            af.count_duration_ms += 1;
+            if let Some(ttfb) = record.raw.duration_to_first_byte_ms {
+                af.sum_ttfb_ms += ttfb;
+                af.count_ttfb_ms += 1;
+            }
+            // List price the analytics endpoint reports (uncached_cost); 0 for free models.
+            af.list_cost += record.uncached_cost.unwrap_or(Decimal::ZERO);
+            af.min_created_at = af.min_created_at.min(record.raw.timestamp);
+        }
+
+        if !analytics_folds.is_empty() {
+            let mut a_ids: Vec<Uuid> = analytics_folds.keys().copied().collect();
+            a_ids.sort_unstable();
+            let a_users: Vec<Uuid> = a_ids.iter().map(|b| analytics_folds[b].user_id).collect();
+            let a_created: Vec<chrono::DateTime<chrono::Utc>> = a_ids.iter().map(|b| analytics_folds[b].min_created_at).collect();
+            let a_tiers: Vec<String> = a_ids.iter().map(|b| analytics_folds[b].service_tier.clone()).collect();
+            let a_total_requests: Vec<i64> = a_ids.iter().map(|b| analytics_folds[b].total_requests).collect();
+            let a_prompt: Vec<i64> = a_ids.iter().map(|b| analytics_folds[b].prompt_tokens).collect();
+            let a_completion: Vec<i64> = a_ids.iter().map(|b| analytics_folds[b].completion_tokens).collect();
+            let a_reasoning: Vec<i64> = a_ids.iter().map(|b| analytics_folds[b].reasoning_tokens).collect();
+            let a_total_tokens: Vec<i64> = a_ids.iter().map(|b| analytics_folds[b].total_tokens).collect();
+            let a_sum_duration: Vec<i64> = a_ids.iter().map(|b| analytics_folds[b].sum_duration_ms).collect();
+            let a_count_duration: Vec<i64> = a_ids.iter().map(|b| analytics_folds[b].count_duration_ms).collect();
+            let a_sum_ttfb: Vec<i64> = a_ids.iter().map(|b| analytics_folds[b].sum_ttfb_ms).collect();
+            let a_count_ttfb: Vec<i64> = a_ids.iter().map(|b| analytics_folds[b].count_ttfb_ms).collect();
+            let a_list_cost: Vec<Decimal> = a_ids.iter().map(|b| analytics_folds[b].list_cost).collect();
+
+            // total_amount / transaction_count are left at 0 here (the billing fold owns them);
+            // for a free-only batch this INSERTs a row with billing 0 but real analytics, which
+            // is correct — get_batch_analytics reads total_requests, not transaction_count.
+            sqlx::query!(
+                r#"
+                INSERT INTO batch_aggregates (
+                    fusillade_batch_id, user_id, total_amount, transaction_count, max_seq, created_at, updated_at, service_tier,
+                    total_requests, total_prompt_tokens, total_completion_tokens, total_reasoning_tokens, total_tokens,
+                    sum_duration_ms, count_duration_ms, sum_ttfb_ms, count_ttfb_ms, total_list_cost
+                )
+                SELECT b.batch_id, b.user_id, 0, 0, 0, b.created_at, NOW(), b.service_tier,
+                    b.total_requests, b.prompt_tokens, b.completion_tokens, b.reasoning_tokens, b.total_tokens,
+                    b.sum_duration, b.count_duration, b.sum_ttfb, b.count_ttfb, b.list_cost
+                FROM UNNEST(
+                    $1::uuid[], $2::uuid[], $3::timestamptz[], $4::text[], $5::bigint[],
+                    $6::bigint[], $7::bigint[], $8::bigint[], $9::bigint[],
+                    $10::bigint[], $11::bigint[], $12::bigint[], $13::bigint[], $14::numeric[]
+                )
+                    AS b(batch_id, user_id, created_at, service_tier, total_requests,
+                         prompt_tokens, completion_tokens, reasoning_tokens, total_tokens,
+                         sum_duration, count_duration, sum_ttfb, count_ttfb, list_cost)
+                ON CONFLICT (fusillade_batch_id) DO UPDATE SET
+                    total_requests = batch_aggregates.total_requests + EXCLUDED.total_requests,
+                    total_prompt_tokens = batch_aggregates.total_prompt_tokens + EXCLUDED.total_prompt_tokens,
+                    total_completion_tokens = batch_aggregates.total_completion_tokens + EXCLUDED.total_completion_tokens,
+                    total_reasoning_tokens = batch_aggregates.total_reasoning_tokens + EXCLUDED.total_reasoning_tokens,
+                    total_tokens = batch_aggregates.total_tokens + EXCLUDED.total_tokens,
+                    sum_duration_ms = batch_aggregates.sum_duration_ms + EXCLUDED.sum_duration_ms,
+                    count_duration_ms = batch_aggregates.count_duration_ms + EXCLUDED.count_duration_ms,
+                    sum_ttfb_ms = batch_aggregates.sum_ttfb_ms + EXCLUDED.sum_ttfb_ms,
+                    count_ttfb_ms = batch_aggregates.count_ttfb_ms + EXCLUDED.count_ttfb_ms,
+                    total_list_cost = batch_aggregates.total_list_cost + EXCLUDED.total_list_cost,
+                    service_tier = COALESCE(batch_aggregates.service_tier, EXCLUDED.service_tier),
+                    updated_at = NOW()
+                "#,
+                &a_ids,
+                &a_users,
+                &a_created,
+                &a_tiers,
+                &a_total_requests,
+                &a_prompt,
+                &a_completion,
+                &a_reasoning,
+                &a_total_tokens,
+                &a_sum_duration,
+                &a_count_duration,
+                &a_sum_ttfb,
+                &a_count_ttfb,
+                &a_list_cost,
             )
             .execute(&mut **tx)
             .await?;
@@ -2423,6 +2591,89 @@ mod integration_tests {
         let amounts: Vec<_> = usage_txs.iter().map(|tx| tx.amount).collect();
         assert!(amounts.contains(&expected_batch_cost), "Should have batch cost transaction");
         assert!(amounts.contains(&expected_realtime_cost), "Should have realtime cost transaction");
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_batcher_folds_batch_analytics_into_aggregates(pool: PgPool) {
+        // Three requests of one batch fold their tokens / latency / list-cost into
+        // batch_aggregates (COR-524), so get_batch_analytics can read the row instead of
+        // scanning http_analytics. The third is on an UNPRICED model (free): it is not billed
+        // (no credit row) but must still be counted in the analytics aggregates — proving the
+        // fold rides the newly-inserted http_analytics rows, not the billed set.
+        let model_id = create_test_model(&pool, "batch-analytics-test").await;
+        let input_price = Decimal::from_str("0.00005").unwrap();
+        let output_price = Decimal::from_str("0.00010").unwrap();
+        setup_tariff(&pool, model_id, input_price, output_price, ApiKeyPurpose::Batch).await;
+        // Free model — no tariff, so its requests get total_cost = None and are skipped by billing.
+        create_test_model(&pool, "batch-free-test").await;
+
+        let user_id = setup_user_with_balance(&pool, Decimal::from_str("100.00").unwrap()).await;
+        let batch_key = create_api_key_for_user(&pool, user_id, ApiKeyPurpose::Batch).await;
+        let batch_id = Uuid::new_v4();
+
+        // Request A: 1000/500 tokens, 0 reasoning, duration 100, ttfb 50.
+        let mut a = create_raw_record("batch-analytics-test", Some(batch_key.clone()), 1000, 500);
+        a.batch_completion_window = Some("24h".to_string());
+        a.fusillade_batch_id = Some(batch_id);
+        a.duration_ms = 100;
+        a.duration_to_first_byte_ms = Some(50);
+
+        // Request B: 2000/800 tokens, 100 reasoning, duration 200, NO ttfb (streaming
+        // metric absent) — exercises count_ttfb_ms counting only reported values.
+        let mut b = create_raw_record("batch-analytics-test", Some(batch_key.clone()), 2000, 800);
+        b.batch_completion_window = Some("24h".to_string());
+        b.fusillade_batch_id = Some(batch_id);
+        b.reasoning_tokens = 100;
+        b.total_tokens = 2900;
+        b.duration_ms = 200;
+        b.duration_to_first_byte_ms = None;
+
+        // Request C: FREE model (no tariff) → not billed, but must still fold into analytics.
+        // 500/100 tokens (total 600), duration 50, no ttfb.
+        let mut c = create_raw_record("batch-free-test", Some(batch_key), 500, 100);
+        c.batch_completion_window = Some("24h".to_string());
+        c.fusillade_batch_id = Some(batch_id);
+        c.duration_ms = 50;
+        c.duration_to_first_byte_ms = None;
+
+        run_batcher_with_records(&pool, vec![a, b, c]).await;
+
+        // List cost = list price (no cache) = billed cost here. C is free (no tariff → 0).
+        // A: 1000*5e-5 + 500*1e-4 = 0.05 + 0.05 = 0.10
+        // B: 2000*5e-5 + 800*1e-4 = 0.10 + 0.08 = 0.18  → 0.28 total (C adds 0)
+        let agg = sqlx::query!(
+            r#"
+            SELECT transaction_count, total_requests, total_amount,
+                   total_prompt_tokens, total_completion_tokens, total_reasoning_tokens, total_tokens,
+                   sum_duration_ms, count_duration_ms, sum_ttfb_ms, count_ttfb_ms,
+                   total_list_cost, analytics_backfilled_at
+            FROM batch_aggregates WHERE fusillade_batch_id = $1
+            "#,
+            batch_id
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        // Billing counts only the two PRICED requests; analytics counts all three 2xx requests.
+        assert_eq!(agg.transaction_count, 2, "only the two priced requests are billed");
+        assert_eq!(agg.total_requests, 3, "all three 2xx requests counted in analytics (incl. free C)");
+        assert_eq!(agg.total_prompt_tokens, 3500, "1000 (A) + 2000 (B) + 500 (C)");
+        assert_eq!(agg.total_completion_tokens, 1400, "500 (A) + 800 (B) + 100 (C)");
+        assert_eq!(agg.total_reasoning_tokens, 100);
+        assert_eq!(agg.total_tokens, 5000, "1500 (A) + 2900 (B) + 600 (C)");
+        assert_eq!(agg.sum_duration_ms, 350, "100 + 200 + 50");
+        assert_eq!(agg.count_duration_ms, 3, "all three reported duration");
+        assert_eq!(agg.sum_ttfb_ms, 50, "only A reported ttfb");
+        assert_eq!(agg.count_ttfb_ms, 1, "only A counted for the AVG denominator");
+        assert_eq!(agg.total_list_cost, Decimal::from_str("0.28").unwrap(), "free C contributes 0 cost");
+        assert_eq!(
+            agg.total_amount,
+            Decimal::from_str("0.28").unwrap(),
+            "no cache → billed == list; C not billed"
+        );
+        assert!(agg.analytics_backfilled_at.is_none(), "live fold leaves the backfill marker null");
     }
 
     #[sqlx::test]

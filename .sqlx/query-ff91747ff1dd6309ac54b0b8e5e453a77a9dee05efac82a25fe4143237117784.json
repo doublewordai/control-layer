@@ -1,0 +1,20 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                INSERT INTO batch_aggregates (\n                    fusillade_batch_id, user_id, total_amount, transaction_count, max_seq, created_at, updated_at, service_tier\n                )\n                SELECT b.batch_id, b.user_id, b.total, b.cnt, b.max_seq, b.created_at, NOW(), b.service_tier\n                FROM UNNEST($1::uuid[], $2::uuid[], $3::numeric[], $4::int[], $5::bigint[], $6::timestamptz[], $7::text[])\n                    AS b(batch_id, user_id, total, cnt, max_seq, created_at, service_tier)\n                ON CONFLICT (fusillade_batch_id) DO UPDATE SET\n                    total_amount = batch_aggregates.total_amount + EXCLUDED.total_amount,\n                    transaction_count = batch_aggregates.transaction_count + EXCLUDED.transaction_count,\n                    max_seq = GREATEST(batch_aggregates.max_seq, EXCLUDED.max_seq),\n                    service_tier = COALESCE(batch_aggregates.service_tier, EXCLUDED.service_tier),\n                    updated_at = NOW()\n                ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "UuidArray",
+        "UuidArray",
+        "NumericArray",
+        "Int4Array",
+        "Int8Array",
+        "TimestamptzArray",
+        "TextArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "ff91747ff1dd6309ac54b0b8e5e453a77a9dee05efac82a25fe4143237117784"
+}
