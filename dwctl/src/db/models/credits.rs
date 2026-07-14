@@ -59,4 +59,9 @@ pub struct CreditTransactionDBResponse {
     pub created_at: DateTime<Utc>,
     /// The API key used for this transaction
     pub api_key_id: Option<Uuid>,
+    /// Denormalized billing tier (realtime / flex / async / batch), read from
+    /// `credits_transactions.service_tier` (migration 112). `None` for the paths that
+    /// don't select it (e.g. single-transaction lookups) or for rows written before it
+    /// was backfilled.
+    pub service_tier: Option<String>,
 }
