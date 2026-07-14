@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.81.1](https://github.com/doublewordai/control-layer/compare/v8.81.0...v8.81.1) (2026-07-14)
+
+
+### Bug Fixes
+
+* tool use needs to be cacheable ([#1266](https://github.com/doublewordai/control-layer/issues/1266)) ([e6d3c4a](https://github.com/doublewordai/control-layer/commit/e6d3c4ab70b9a08f9327ff7d83bd9f1e643538e7))
+
 ## [8.81.0](https://github.com/doublewordai/control-layer/compare/v8.80.0...v8.81.0) (2026-07-14)
 
 
