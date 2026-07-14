@@ -228,19 +228,12 @@ pub async fn list_transactions<P: PoolProvider>(
     // can report whether a next page exists without counting whole filtered
     // histories.
     let mut transactions: Vec<CreditTransactionResponse> = if let (true, Some(user_id)) = (grouping_enabled, filter_user_id) {
-        // batch_sla and request_origin are now fetched directly from http_analytics via the SQL query
+        // service_tier is read from the denormalized columns on batch_aggregates /
+        // credits_transactions (COR-514), not http_analytics.
         repo.list_transactions_with_batches(user_id, skip, limit + 1, &filters)
             .await?
             .into_iter()
-            .map(|twc| {
-                CreditTransactionResponse::from_db_with_metadata(
-                    twc.transaction,
-                    twc.batch_id,
-                    twc.request_origin,
-                    twc.batch_sla,
-                    twc.batch_count,
-                )
-            })
+            .map(|twc| CreditTransactionResponse::from_db_with_metadata(twc.transaction, twc.batch_id, twc.service_tier, twc.batch_count))
             .collect()
     } else if let Some(user_id) = filter_user_id {
         let txs = repo.list_user_transactions(user_id, skip, limit + 1, &filters).await?;

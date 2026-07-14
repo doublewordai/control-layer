@@ -44,6 +44,8 @@ impl From<CreditTransaction> for CreditTransactionDBResponse {
             source_id: tx.source_id,
             created_at: tx.created_at,
             api_key_id: tx.api_key_id,
+            // CreditTransaction doesn't carry the tier; callers that need it select it directly.
+            service_tier: None,
         }
     }
 }
@@ -70,8 +72,8 @@ pub struct AggregatedBatches {
 pub struct TransactionWithCategory {
     pub transaction: CreditTransactionDBResponse,
     pub batch_id: Option<Uuid>,
-    pub request_origin: Option<String>,
-    pub batch_sla: Option<String>,
+    /// Service tier: "realtime" / "flex" / "async" / "batch" (usage rows only).
+    pub service_tier: Option<String>,
     /// Number of requests in this batch (1 for non-batch transactions)
     pub batch_count: i32,
 }
@@ -196,6 +198,8 @@ impl<'c> Credits<'c> {
             source_id: row.source_id,
             created_at: row.created_at,
             api_key_id: row.api_key_id,
+            // Freshly created transaction; the tier isn't needed on this return path.
+            service_tier: None,
         })
     }
 
@@ -374,9 +378,9 @@ impl<'c> Credits<'c> {
             .map(|types| types.iter().map(transaction_type_to_string).collect());
 
         let transactions = sqlx::query_as!(
-            CreditTransaction,
+            CreditTransactionDBResponse,
             r#"
-            SELECT id, user_id, transaction_type as "transaction_type: CreditTransactionType", amount, source_id, description, created_at, seq, api_key_id
+            SELECT id, user_id, transaction_type as "transaction_type: CreditTransactionType", amount, source_id, description, created_at, api_key_id, service_tier
             FROM credits_transactions
             WHERE user_id = $1
               AND ($4::text IS NULL OR description ILIKE '%' || $4 || '%')
@@ -398,7 +402,7 @@ impl<'c> Credits<'c> {
         .fetch_all(&mut *self.db)
         .await?;
 
-        Ok(transactions.into_iter().map(CreditTransactionDBResponse::from).collect())
+        Ok(transactions)
     }
 
     /// List all transactions across all users (admin view) with optional filters
@@ -415,9 +419,9 @@ impl<'c> Credits<'c> {
             .map(|types| types.iter().map(transaction_type_to_string).collect());
 
         let transactions = sqlx::query_as!(
-            CreditTransaction,
+            CreditTransactionDBResponse,
             r#"
-            SELECT id, user_id, transaction_type as "transaction_type: CreditTransactionType", amount, source_id, description, created_at, seq, api_key_id
+            SELECT id, user_id, transaction_type as "transaction_type: CreditTransactionType", amount, source_id, description, created_at, api_key_id, service_tier
             FROM credits_transactions
             WHERE ($3::text IS NULL OR description ILIKE '%' || $3 || '%')
               AND ($4::text[] IS NULL OR transaction_type::text = ANY($4))
@@ -437,7 +441,7 @@ impl<'c> Credits<'c> {
         .fetch_all(&mut *self.db)
         .await?;
 
-        Ok(transactions.into_iter().map(CreditTransactionDBResponse::from).collect())
+        Ok(transactions)
     }
 
     /// Get a single transaction by its ID
@@ -707,7 +711,8 @@ impl<'c> Credits<'c> {
 
         // Optimized query using pre-limited UNION branches for Merge Append
         // Each branch fetches skip+limit rows, then pagination applies to combined result
-        // For batches: join with http_analytics to get batch_request_source and batch_sla
+        // service_tier is read from the denormalized columns on batch_aggregates and
+        // credits_transactions (COR-514) — no http_analytics join.
         let fetch_limit = skip + limit;
         let rows = sqlx::query!(
             r#"
@@ -715,7 +720,7 @@ impl<'c> Credits<'c> {
                 -- Top N from batch_aggregates (index scan on idx_batch_agg_user_seq)
                 -- Only included if transaction_types filter includes 'usage' or is not set
                 -- and search term matches "Batch" description
-                -- JOIN with http_analytics to get batch_request_source and batch_sla
+                -- service_tier read from batch_aggregates (async / batch).
                 (SELECT
                     ba.fusillade_batch_id as id,
                     ba.user_id,
@@ -727,15 +732,8 @@ impl<'c> Credits<'c> {
                     ba.max_seq,
                     ba.fusillade_batch_id as batch_id,
                     ba.transaction_count as batch_count,
-                    COALESCE(NULLIF(sample_ha.batch_request_source, ''), 'fusillade') as request_origin,
-                    COALESCE(sample_ha.batch_sla, '') as batch_sla
+                    ba.service_tier as service_tier
                 FROM batch_aggregates ba
-                LEFT JOIN LATERAL (
-                    SELECT batch_request_source, batch_sla
-                    FROM http_analytics ha
-                    WHERE ha.fusillade_batch_id = ba.fusillade_batch_id
-                    LIMIT 1
-                ) sample_ha ON true
                 WHERE ba.user_id = $1
                   AND $7::bool = true
                   AND $10::bool = true
@@ -748,7 +746,7 @@ impl<'c> Credits<'c> {
                 UNION ALL
 
                 -- Top N from non-batched transactions (index scan on idx_credits_tx_non_batched)
-                -- JOIN with http_analytics to get request_origin for non-batch usage transactions
+                -- service_tier read from the ledger (realtime / flex).
                 (SELECT
                     ct.id,
                     ct.user_id,
@@ -760,10 +758,8 @@ impl<'c> Credits<'c> {
                     ct.seq as max_seq,
                     NULL::uuid as batch_id,
                     1::int as batch_count,
-                    ha.request_origin as request_origin,
-                    ha.batch_sla as batch_sla
+                    ct.service_tier as service_tier
                 FROM credits_transactions ct
-                LEFT JOIN http_analytics ha ON ha.id::text = ct.source_id
                 WHERE ct.user_id = $1
                   AND ct.fusillade_batch_id IS NULL
                   AND ($5::text IS NULL OR ct.description ILIKE '%' || $5 || '%')
@@ -815,12 +811,12 @@ impl<'c> Credits<'c> {
                 source_id,
                 created_at,
                 api_key_id: None,
+                service_tier: row.service_tier.clone(),
             };
             results.push(TransactionWithCategory {
                 transaction,
                 batch_id: row.batch_id,
-                request_origin: row.request_origin,
-                batch_sla: row.batch_sla,
+                service_tier: row.service_tier,
                 batch_count: row.batch_count.unwrap_or(1),
             });
         }
