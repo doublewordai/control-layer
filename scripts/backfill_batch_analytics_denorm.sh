@@ -15,137 +15,97 @@
 #   sum_duration_ms  / count_duration_ms            = SUM / COUNT(duration_ms)
 #   sum_ttfb_ms      / count_ttfb_ms                = SUM / COUNT(duration_to_first_byte_ms)
 #   total_list_cost                                 = SUM(uncached_cost)   -- the list price (0 for free)
-# The per-batch aggregate rides idx_analytics_fusillade_batch_id, so run this BEFORE that
-# index is dropped (the contract PR) and after migration 117 + the batcher change are
-# deployed to every pod.
 #
-# Safety (absolute SET, not +=): the batcher fold is additive, so this script only touches
-# QUIESCENT batches — `updated_at` older than QUIESCENT_INTERVAL — for which no fold can be
-# running concurrently. Those are exactly the batches whose totals are final (a batch is a
-# bounded, short-lived unit of work). A batch still active at deploy is skipped now and
-# backfilled on a later pass once it quiesces; re-running is safe (see idempotency).
+# --- Why one scan, not a per-batch sweep ---
+# An earlier version swept batch_aggregates by max_seq ranges and aggregated http_analytics
+# per batch. At prod scale that is ~500k random index probes into a 156M-row table — cold
+# Neon pageserver reads at ~1.5s/batch => days, and it saturates PS_ReadIO against live
+# traffic. Instead, aggregate ALL batches in ONE parallel sequential scan of http_analytics
+# grouped by fusillade_batch_id (~13s / 500k batches on prod), then two bulk UPDATEs. The
+# whole job runs in well under a minute.
 #
-# Idempotent + resumable: guarded by `analytics_backfilled_at IS NULL`, swept by max_seq in
-# fixed ranges, each its own committed transaction. Re-run until it reports 0 rows to catch
-# batches that were still hot on earlier passes.
+# Aggregated set = the batch's successful (2xx) requests, excluding the system user
+# (Uuid::nil()) and NULL user_id — matching the live fold. A batch with no retained
+# http_analytics (aged out / all-non-2xx) is zero-stamped so get_batch_analytics reports
+# zeros rather than a misleading absent value.
+#
+# Safety: only touches QUIESCENT batches — batch_aggregates.updated_at older than
+# QUIESCENT_INTERVAL — so no live fold can be writing them concurrently (absolute SET, not
+# +=). Idempotent + resumable: guarded by analytics_backfilled_at IS NULL, one committed
+# transaction. Re-run to pick up batches that have quiesced since the last pass.
 #
 # Usage:
 #   DATABASE_URL=postgres://...  ./scripts/backfill_batch_analytics_denorm.sh
 # Optional env:
-#   BATCH_SIZE          max_seq-range width swept per transaction (default 50000)
-#   SLEEP_SECONDS       pause between ranges (default 0.1)
-#   QUIESCENT_INTERVAL  only backfill batches idle at least this long (default '2 hours').
-#                       Must exceed the longest possible gap between folds of one batch;
-#                       raise it (e.g. '25 hours' > the 24h batch SLA) for a single
-#                       guaranteed-final pass.
+#   QUIESCENT_INTERVAL  only backfill batches idle at least this long (default '25 hours',
+#                       > the 24h batch SLA, so a single pass is guaranteed-final per batch).
 
 set -euo pipefail
 
 : "${DATABASE_URL:?set DATABASE_URL to the credits/http_analytics database}"
-BATCH_SIZE="${BATCH_SIZE:-50000}"
-SLEEP_SECONDS="${SLEEP_SECONDS:-0.1}"
-QUIESCENT_INTERVAL="${QUIESCENT_INTERVAL:-2 hours}"
+QUIESCENT_INTERVAL="${QUIESCENT_INTERVAL:-25 hours}"
 
-psql_q() { psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -X -qtAc "$1"; }
+echo "backfill_batch_analytics_denorm: set-based backfill  quiescent='${QUIESCENT_INTERVAL}'"
 
-MAX_SEQ=$(psql_q "SELECT COALESCE(MAX(max_seq), 0) FROM batch_aggregates;")
-if [ -z "$MAX_SEQ" ] || [ "$MAX_SEQ" -eq 0 ]; then
-  echo "backfill_batch_analytics_denorm: no batch_aggregates rows; nothing to do" >&2
-  exit 0
-fi
+# One transaction: aggregate http_analytics once into a temp table, then bulk-update the
+# eligible batches (with data) and zero-stamp the eligible batches with no retained data.
+# DROP IF EXISTS + ON COMMIT DROP guard against a temp-table name lingering on a reused
+# pooled backend (Neon PgBouncer keeps server connections across sessions).
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -X <<SQL
+\timing on
+BEGIN;
 
-# batch_aggregates has no standalone index on max_seq (its pkey is fusillade_batch_id and
-# idx_batch_agg_user_seq leads with user_id), so the per-range `max_seq > .. AND max_seq
-# <= ..` sweep would scan the whole table every range — O(ranges × rows), which on prod
-# ran ~4s/range and tripped connection timeouts. Build a partial btree on max_seq over just
-# the un-backfilled rows first (CONCURRENTLY, so it never blocks the fold's writes; it
-# self-shrinks as rows are stamped) and drop it when done. Drop any leftover first so an
-# aborted CONCURRENTLY build can't leave an INVALID index that CREATE would keep. (The
-# http_analytics aggregation itself already rides idx_analytics_fusillade_batch_id.)
-HELPER_IDX=idx_batch_agg_analytics_backfill
-echo "backfill_batch_analytics_denorm: (re)building helper index ${HELPER_IDX} CONCURRENTLY…"
-trap 'psql_q "DROP INDEX CONCURRENTLY IF EXISTS ${HELPER_IDX};" >/dev/null 2>&1 || true' EXIT INT TERM
-psql_q "DROP INDEX CONCURRENTLY IF EXISTS ${HELPER_IDX};"
-psql_q "CREATE INDEX CONCURRENTLY ${HELPER_IDX} ON batch_aggregates (max_seq) WHERE analytics_backfilled_at IS NULL;"
+DROP TABLE IF EXISTS _bf_analytics;
+CREATE TEMP TABLE _bf_analytics ON COMMIT DROP AS
+  SELECT fusillade_batch_id                             AS fbid,
+         COUNT(id)                                       AS total_requests,
+         COALESCE(SUM(prompt_tokens), 0)                 AS prompt_tokens,
+         COALESCE(SUM(completion_tokens), 0)             AS completion_tokens,
+         COALESCE(SUM(reasoning_tokens), 0)              AS reasoning_tokens,
+         COALESCE(SUM(total_tokens), 0)                  AS total_tokens,
+         COALESCE(SUM(duration_ms), 0)                   AS sum_duration_ms,
+         COUNT(duration_ms)                              AS count_duration_ms,
+         COALESCE(SUM(duration_to_first_byte_ms), 0)     AS sum_ttfb_ms,
+         COUNT(duration_to_first_byte_ms)                AS count_ttfb_ms,
+         COALESCE(SUM(uncached_cost), 0)                 AS total_list_cost
+  FROM http_analytics
+  WHERE fusillade_batch_id IS NOT NULL
+    AND user_id IS NOT NULL
+    -- Exclude the system user, matching the live fold which skips Uuid::nil().
+    AND user_id <> '00000000-0000-0000-0000-000000000000'
+    AND status_code BETWEEN 200 AND 299
+  GROUP BY fusillade_batch_id;
+CREATE INDEX ON _bf_analytics (fbid);
 
-echo "backfill_batch_analytics_denorm: sweeping max_seq (0, ${MAX_SEQ}]  batch=${BATCH_SIZE}  sleep=${SLEEP_SECONDS}s  quiescent='${QUIESCENT_INTERVAL}'"
+-- Batches WITH retained data.
+UPDATE batch_aggregates ba
+   SET total_requests          = b.total_requests,
+       total_prompt_tokens     = b.prompt_tokens,
+       total_completion_tokens = b.completion_tokens,
+       total_reasoning_tokens  = b.reasoning_tokens,
+       total_tokens            = b.total_tokens,
+       sum_duration_ms         = b.sum_duration_ms,
+       count_duration_ms       = b.count_duration_ms,
+       sum_ttfb_ms             = b.sum_ttfb_ms,
+       count_ttfb_ms           = b.count_ttfb_ms,
+       total_list_cost         = b.total_list_cost,
+       analytics_backfilled_at = NOW()
+  FROM _bf_analytics b
+ WHERE b.fbid = ba.fusillade_batch_id
+   AND ba.analytics_backfilled_at IS NULL
+   AND ba.updated_at < NOW() - INTERVAL '${QUIESCENT_INTERVAL}';
 
-CURSOR=0
-total_rows=0
-batches=0
-SECONDS=0
-while [ "$CURSOR" -lt "$MAX_SEQ" ]; do
-  hi=$(( CURSOR + BATCH_SIZE ))
-  if [ "$hi" -gt "$MAX_SEQ" ]; then hi="$MAX_SEQ"; fi
-  affected=$(psql_q "
-    WITH elig AS (
-      -- The batches this pass owns: in-range, not yet backfilled, and quiescent.
-      SELECT ba.fusillade_batch_id
-      FROM batch_aggregates ba
-      WHERE ba.max_seq > ${CURSOR} AND ba.max_seq <= ${hi}
-            AND ba.analytics_backfilled_at IS NULL
-            AND ba.updated_at < NOW() - INTERVAL '${QUIESCENT_INTERVAL}'
-    ),
-    agg AS (
-      -- LEFT JOIN so a batch with zero successful (2xx) rows still yields one row of
-      -- zeros and gets stamped (matching the old aggregate-over-empty-set, so the
-      -- 'run until 0 rows' loop converges). Filters live in the ON clause to preserve
-      -- those zero rows. COUNT(ha.id) counts only matched rows (not the LEFT-join NULL).
-      -- Rides idx_analytics_fusillade_batch_id.
-      SELECT e.fusillade_batch_id,
-             COUNT(ha.id)                                        AS total_requests,
-             COALESCE(SUM(ha.prompt_tokens), 0)                   AS prompt_tokens,
-             COALESCE(SUM(ha.completion_tokens), 0)               AS completion_tokens,
-             COALESCE(SUM(ha.reasoning_tokens), 0)                AS reasoning_tokens,
-             COALESCE(SUM(ha.total_tokens), 0)                    AS total_tokens,
-             COALESCE(SUM(ha.duration_ms), 0)                     AS sum_duration_ms,
-             COUNT(ha.duration_ms)                                AS count_duration_ms,
-             COALESCE(SUM(ha.duration_to_first_byte_ms), 0)       AS sum_ttfb_ms,
-             COUNT(ha.duration_to_first_byte_ms)                  AS count_ttfb_ms,
-             COALESCE(SUM(ha.uncached_cost), 0)                   AS list_cost
-      FROM elig e
-      LEFT JOIN http_analytics ha
-             ON ha.fusillade_batch_id = e.fusillade_batch_id
-            AND ha.user_id IS NOT NULL
-            -- Exclude the system user, matching the live fold which skips Uuid::nil().
-            AND ha.user_id <> '00000000-0000-0000-0000-000000000000'
-            AND ha.status_code BETWEEN 200 AND 299
-      GROUP BY e.fusillade_batch_id
-    ),
-    upd AS (
-      UPDATE batch_aggregates ba
-         SET total_requests          = s.total_requests,
-             total_prompt_tokens     = s.prompt_tokens,
-             total_completion_tokens = s.completion_tokens,
-             total_reasoning_tokens  = s.reasoning_tokens,
-             total_tokens            = s.total_tokens,
-             sum_duration_ms         = s.sum_duration_ms,
-             count_duration_ms       = s.count_duration_ms,
-             sum_ttfb_ms             = s.sum_ttfb_ms,
-             count_ttfb_ms           = s.count_ttfb_ms,
-             total_list_cost         = s.list_cost,
-             analytics_backfilled_at = NOW()
-        FROM agg s
-       WHERE ba.fusillade_batch_id = s.fusillade_batch_id
-             AND ba.max_seq > ${CURSOR} AND ba.max_seq <= ${hi}
-             AND ba.analytics_backfilled_at IS NULL
-      RETURNING 1
-    )
-    SELECT count(*) FROM upd;")
-  total_rows=$(( total_rows + affected ))
-  batches=$(( batches + 1 ))
-  CURSOR="$hi"
-  printf '  max_seq<=%-12s  rows +%-6s  (total %s)\n' "$hi" "$affected" "$total_rows"
-  sleep "${SLEEP_SECONDS}"
-done
+-- Eligible batches with NO retained http_analytics (aged out / all-non-2xx) -> zeros.
+UPDATE batch_aggregates ba
+   SET total_requests = 0, total_prompt_tokens = 0, total_completion_tokens = 0,
+       total_reasoning_tokens = 0, total_tokens = 0, sum_duration_ms = 0,
+       count_duration_ms = 0, sum_ttfb_ms = 0, count_ttfb_ms = 0, total_list_cost = 0,
+       analytics_backfilled_at = NOW()
+ WHERE ba.analytics_backfilled_at IS NULL
+   AND ba.updated_at < NOW() - INTERVAL '${QUIESCENT_INTERVAL}'
+   AND NOT EXISTS (SELECT 1 FROM _bf_analytics b WHERE b.fbid = ba.fusillade_batch_id);
 
-elapsed=$SECONDS
-echo "backfill_batch_analytics_denorm: DONE"
-printf '  batch rows updated : %s\n' "$total_rows"
-printf '  duration           : %dm %02ds\n' $(( elapsed / 60 )) $(( elapsed % 60 ))
-printf '  ranges             : %s  (BATCH_SIZE=%s, SLEEP_SECONDS=%s)\n' "$batches" "$BATCH_SIZE" "$SLEEP_SECONDS"
+COMMIT;
+SQL
 
-echo "backfill_batch_analytics_denorm: dropping helper index ${HELPER_IDX} CONCURRENTLY…"
-psql_q "DROP INDEX CONCURRENTLY IF EXISTS ${HELPER_IDX};"
-
-echo "  re-run until 'rows +0' throughout to catch batches that were hot on this pass" >&2
+echo "backfill_batch_analytics_denorm: DONE (re-run to pick up batches that have since quiesced)"
