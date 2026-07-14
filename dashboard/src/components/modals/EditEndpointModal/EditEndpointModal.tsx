@@ -99,6 +99,8 @@ export const EditEndpointModal: React.FC<EditEndpointModalProps> = ({
   const [currentStep, setCurrentStep] = useState<1 | 2>(1);
   const [reasoningTranslation, setReasoningTranslation] =
     useState<ReasoningTranslationConfig | null>(endpoint.reasoning_translation ?? null);
+  const [reasoningTranslationValid, setReasoningTranslationValid] =
+    useState(true);
 
   // ----- Step 2 (Models) state -----
   const [catalog, setCatalog] = useState<AvailableModel[]>([]);
@@ -194,6 +196,7 @@ export const EditEndpointModal: React.FC<EditEndpointModalProps> = ({
     setPendingRemoval(null);
     setIsBuildingFilter(false);
     setReasoningTranslation(endpoint.reasoning_translation ?? null);
+    setReasoningTranslationValid(true);
   }, [isOpen, endpoint, form]);
 
   // Strip the pagination URL params when the modal closes. Cancel/X/ESC
@@ -273,6 +276,8 @@ export const EditEndpointModal: React.FC<EditEndpointModalProps> = ({
   };
 
   const handleDiscoverModels = async () => {
+    if (!reasoningTranslationValid) return;
+
     const url = form.getValues("url");
 
     if (!url.trim()) {
@@ -312,6 +317,8 @@ export const EditEndpointModal: React.FC<EditEndpointModalProps> = ({
   };
 
   const handleContinueWithoutDiscovery = () => {
+    if (!reasoningTranslationValid) return;
+
     setCatalog([]);
     setValidationError(null);
     setValidationState("idle");
@@ -373,6 +380,11 @@ export const EditEndpointModal: React.FC<EditEndpointModalProps> = ({
   };
 
   const onSubmit = async (data: FormData) => {
+    if (!reasoningTranslationValid) {
+      setSubmitError("Finish the reasoning translation before updating the endpoint.");
+      return;
+    }
+
     if (urlChanged && validationState !== "success") {
       setSubmitError(
         "Please test the endpoint connection after changing the URL",
@@ -522,6 +534,7 @@ export const EditEndpointModal: React.FC<EditEndpointModalProps> = ({
   // still uses authoritative server state.
   const canSave =
     !!form.watch("name")?.trim() &&
+    reasoningTranslationValid &&
     !updateEndpointMutation.isPending &&
     !isBuildingFilter &&
     validationState !== "testing" &&
@@ -559,6 +572,7 @@ export const EditEndpointModal: React.FC<EditEndpointModalProps> = ({
                 <ReasoningTranslationEditor
                   value={reasoningTranslation}
                   onChange={setReasoningTranslation}
+                  onValidityChange={setReasoningTranslationValid}
                 />
               </>
             )}
@@ -599,6 +613,7 @@ export const EditEndpointModal: React.FC<EditEndpointModalProps> = ({
                   type="button"
                   variant="ghost"
                   onClick={handleContinueWithoutDiscovery}
+                  disabled={!reasoningTranslationValid}
                 >
                   Continue without discovery
                 </Button>
@@ -608,6 +623,7 @@ export const EditEndpointModal: React.FC<EditEndpointModalProps> = ({
                 onClick={handleDiscoverModels}
                 disabled={
                   !form.watch("url")?.trim() ||
+                  !reasoningTranslationValid ||
                   validationState === "testing"
                 }
               >

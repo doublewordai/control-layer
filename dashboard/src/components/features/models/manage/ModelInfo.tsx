@@ -30,7 +30,7 @@ import type {
   ModelMetadata,
   ModelDisplayCategory,
   TrafficRoutingRule,
-  ReasoningTranslationConfig,
+  ReasoningTranslationOverrides,
 } from "../../../../api/control-layer";
 import {
   useAuthorization,
@@ -82,7 +82,7 @@ import {
   PopoverContent,
   PopoverTrigger,
 } from "../../../ui/popover";
-import { ReasoningTranslationEditor } from "../../reasoning";
+import { ReasoningTranslationOverridesEditor } from "../../reasoning";
 
 // Form schema for alias editing
 const aliasFormSchema = z.object({
@@ -164,7 +164,7 @@ const ModelInfo: React.FC = () => {
     sanitize_responses: false,
     trusted: false,
     open_responses_adapter: true,
-    reasoning_translation: null as ReasoningTranslationConfig | null,
+    reasoning_translation_overrides: null as ReasoningTranslationOverrides | null,
     requests_per_second: null as number | null,
     burst_size: null as number | null,
     capacity: null as number | null,
@@ -189,6 +189,8 @@ const ModelInfo: React.FC = () => {
     backoff_max_attempts: 3 as number | null,
   });
   const [settingsError, setSettingsError] = useState<string | null>(null);
+  const [reasoningTranslationValid, setReasoningTranslationValid] =
+    useState(true);
   const [showApiExamples, setShowApiExamples] = useState(false);
   const [isEditingAlias, setIsEditingAlias] = useState(false);
   const [aliasTruncated, setAliasTruncated] = useState(false);
@@ -293,7 +295,8 @@ const ModelInfo: React.FC = () => {
         sanitize_responses: model.sanitize_responses ?? false,
         trusted: model.trusted ?? false,
         open_responses_adapter: model.open_responses_adapter ?? true,
-        reasoning_translation: model.reasoning_translation ?? null,
+        reasoning_translation_overrides:
+          model.reasoning_translation_overrides ?? null,
         requests_per_second: model.requests_per_second || null,
         burst_size: model.burst_size || null,
         capacity: model.capacity || null,
@@ -317,6 +320,7 @@ const ModelInfo: React.FC = () => {
       setIsEditingAlias(false);
       setIsEditingModelDetails(false);
       setSettingsError(null);
+      setReasoningTranslationValid(true);
     }
   }, [model, aliasForm]);
 
@@ -324,6 +328,11 @@ const ModelInfo: React.FC = () => {
   const handleSave = async () => {
     if (!model) return;
     setSettingsError(null);
+
+    if (!reasoningTranslationValid) {
+      setSettingsError("Finish the reasoning translation override before saving.");
+      return;
+    }
 
     const normalizedTrafficRules = updateData.traffic_routing_rules.map((rule) => {
       if (rule.action.type === "redirect") {
@@ -382,7 +391,8 @@ const ModelInfo: React.FC = () => {
           sanitize_responses: updateData.sanitize_responses,
           trusted: updateData.trusted,
           open_responses_adapter: updateData.open_responses_adapter,
-          reasoning_translation: updateData.reasoning_translation,
+          reasoning_translation_overrides:
+            updateData.reasoning_translation_overrides,
           // Always include rate limiting and capacity fields to handle clearing properly
           // Send null as the actual value when clearing (not undefined)
           requests_per_second: updateData.requests_per_second,
@@ -428,7 +438,8 @@ const ModelInfo: React.FC = () => {
         sanitize_responses: model.sanitize_responses ?? false,
         trusted: model.trusted ?? false,
         open_responses_adapter: model.open_responses_adapter ?? true,
-        reasoning_translation: model.reasoning_translation ?? null,
+        reasoning_translation_overrides:
+          model.reasoning_translation_overrides ?? null,
         requests_per_second: model.requests_per_second || null,
         burst_size: model.burst_size || null,
         capacity: model.capacity || null,
@@ -449,6 +460,7 @@ const ModelInfo: React.FC = () => {
     }
     setIsEditingModelDetails(false);
     setSettingsError(null);
+    setReasoningTranslationValid(true);
   };
 
   // Alias inline editing handlers
@@ -1332,13 +1344,14 @@ const ModelInfo: React.FC = () => {
 
                       {!model.is_composite && (
                         <div className="border-t pt-4">
-                          <ReasoningTranslationEditor
-                            allowInherit
-                            value={updateData.reasoning_translation}
-                            onChange={(reasoning_translation) =>
+                          <ReasoningTranslationOverridesEditor
+                            value={updateData.reasoning_translation_overrides}
+                            endpointDefault={endpoint?.reasoning_translation}
+                            onValidityChange={setReasoningTranslationValid}
+                            onChange={(reasoning_translation_overrides) =>
                               setUpdateData((previous) => ({
                                 ...previous,
-                                reasoning_translation,
+                                reasoning_translation_overrides,
                               }))
                             }
                           />
@@ -2121,7 +2134,10 @@ const ModelInfo: React.FC = () => {
                       <div className="flex items-center gap-3 pt-4 border-t justify-end">
                         <Button
                           onClick={handleSave}
-                          disabled={updateModelMutation.isPending}
+                          disabled={
+                            updateModelMutation.isPending ||
+                            !reasoningTranslationValid
+                          }
                           size="sm"
                         >
                           {updateModelMutation.isPending ? (

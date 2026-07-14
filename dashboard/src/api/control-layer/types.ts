@@ -25,14 +25,29 @@ export type ReasoningEffort =
   | "xhigh"
   | "max";
 
-export interface ReasoningTranslation {
+export interface ReasoningWrite {
   target_path: string;
   values: Partial<Record<ReasoningEffort, unknown>>;
+}
+
+export interface ReasoningTranslation {
+  unsupported_efforts: ReasoningEffort[];
+  writes: ReasoningWrite[];
 }
 
 export interface ReasoningTranslationConfig {
   chat_completions?: ReasoningTranslation;
   responses?: ReasoningTranslation;
+}
+
+export type ReasoningSurfaceOverride =
+  | { mode: "inherit" }
+  | { mode: "disabled" }
+  | { mode: "override"; translation: ReasoningTranslation };
+
+export interface ReasoningTranslationOverrides {
+  chat_completions: ReasoningSurfaceOverride;
+  responses: ReasoningSurfaceOverride;
 }
 
 export interface BackoffConfig {
@@ -313,7 +328,7 @@ export interface Model {
   sanitize_responses?: boolean | null; // only present for virtual models
   trusted?: boolean; // Mark provider as trusted in strict mode (bypasses error sanitization)
   open_responses_adapter?: boolean; // Enable adapter that converts /v1/responses to /v1/chat/completions
-  reasoning_translation?: ReasoningTranslationConfig | null;
+  reasoning_translation_overrides?: ReasoningTranslationOverrides | null;
   traffic_routing_rules?: TrafficRoutingRule[] | null;
   allowed_batch_completion_windows?: string[] | null;
   metadata?: ModelMetadata | null;
@@ -336,7 +351,7 @@ export interface StandardModelCreate {
   throughput?: number;
   trusted?: boolean;
   open_responses_adapter?: boolean;
-  reasoning_translation?: ReasoningTranslationConfig;
+  reasoning_translation_overrides?: ReasoningTranslationOverrides;
   traffic_routing_rules?: TrafficRoutingRule[];
   allowed_batch_completion_windows?: string[];
 }
@@ -612,7 +627,7 @@ export interface ModelUpdateRequest {
   sanitize_responses?: boolean | null;
   trusted?: boolean | null;
   open_responses_adapter?: boolean | null;
-  reasoning_translation?: ReasoningTranslationConfig | null;
+  reasoning_translation_overrides?: ReasoningTranslationOverrides | null;
   traffic_routing_rules?: TrafficRoutingRule[] | null;
   allowed_batch_completion_windows?: string[] | null;
   metadata?: ModelMetadata | null;
