@@ -55,11 +55,14 @@ while [ "$CURSOR" -lt "$MAX_SEQ" ]; do
       UPDATE credits_transactions ct
          SET fusillade_request_id = ha.fusillade_request_id
         FROM http_analytics ha
-       WHERE ha.id = ct.source_id::bigint          -- http_analytics PK lookup (cheap)
+       -- Cast source_id -> bigint (http_analytics PK) only when it is numeric. The CASE
+       -- guarantees the cast is evaluated after the regex regardless of WHERE-clause
+       -- reordering; non-numeric source_ids (grant/purchase rows use a UUID) yield NULL,
+       -- which never matches ha.id and so is skipped.
+       WHERE ha.id = CASE WHEN ct.source_id ~ '^[0-9]+\$' THEN ct.source_id::bigint END
          AND ct.seq > ${CURSOR} AND ct.seq <= ${hi}
          AND ct.fusillade_request_id IS NULL
          AND ct.transaction_type = 'usage'
-         AND ct.source_id ~ '^[0-9]+\$'            -- guard the ::bigint cast (grants use a UUID)
          AND ha.fusillade_request_id IS NOT NULL
       RETURNING 1
     )
