@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.82.1](https://github.com/doublewordai/control-layer/compare/v8.82.0...v8.82.1) (2026-07-14)
+
+
+### Bug Fixes
+
+* add some extra model labels for metrics to tokenizer svc ([#1276](https://github.com/doublewordai/control-layer/issues/1276)) ([3bd3496](https://github.com/doublewordai/control-layer/commit/3bd3496021a6886b019b616279d79a1dd2a76a28))
+
 ## [8.82.0](https://github.com/doublewordai/control-layer/compare/v8.81.2...v8.82.0) (2026-07-14)
 
 
