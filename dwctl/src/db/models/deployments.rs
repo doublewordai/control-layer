@@ -5,7 +5,7 @@
 //! across multiple underlying models based on configurable weights).
 
 use crate::api::models::deployments::{DeployedModelCreate, DeployedModelUpdate};
-use crate::reasoning::ReasoningTranslationConfig;
+use crate::reasoning::ReasoningTranslationOverrides;
 use crate::types::{DeploymentId, InferenceEndpointId, UserId};
 use bon::Builder;
 use chrono::{DateTime, NaiveDate, Utc};
@@ -515,8 +515,8 @@ pub struct DeploymentCreateDBRequest {
     /// Whether to enable the open_responses adapter (converts /v1/responses to /v1/chat/completions)
     #[builder(default = true)]
     pub open_responses_adapter: bool,
-    /// Optional per-model override for the endpoint reasoning translation.
-    pub reasoning_translation: Option<ReasoningTranslationConfig>,
+    /// Optional per-model overrides for endpoint reasoning translations.
+    pub reasoning_translation_overrides: Option<ReasoningTranslationOverrides>,
     /// Per-model allowed batch completion windows (overrides global config when set)
     pub allowed_batch_completion_windows: Option<Vec<String>>,
     /// Catalog metadata for display purposes (stored as JSONB)
@@ -567,7 +567,7 @@ impl DeploymentCreateDBRequest {
                     .sanitize_responses(standard.sanitize_responses.unwrap_or(false))
                     .trusted(standard.trusted.unwrap_or(false))
                     .open_responses_adapter(standard.open_responses_adapter.unwrap_or(true))
-                    .maybe_reasoning_translation(standard.reasoning_translation)
+                    .maybe_reasoning_translation_overrides(standard.reasoning_translation_overrides)
                     .maybe_allowed_batch_completion_windows(standard.allowed_batch_completion_windows)
                     .maybe_metadata(standard.metadata)
                     .build()
@@ -650,8 +650,8 @@ pub struct DeploymentUpdateDBRequest {
     pub trusted: Option<bool>,
     /// Whether to enable the open_responses adapter (converts /v1/responses to /v1/chat/completions)
     pub open_responses_adapter: Option<bool>,
-    /// None leaves the override unchanged; Some(None) inherits the endpoint default.
-    pub reasoning_translation: Option<Option<ReasoningTranslationConfig>>,
+    /// None leaves overrides unchanged; Some(None) inherits both endpoint defaults.
+    pub reasoning_translation_overrides: Option<Option<ReasoningTranslationOverrides>>,
     /// Per-model allowed batch completion windows (None = no change, Some(None) = clear, Some(windows) = set)
     pub allowed_batch_completion_windows: Option<Option<Vec<String>>>,
     /// Catalog metadata (None = no change, Some(metadata) = replace)
@@ -687,7 +687,7 @@ impl From<DeployedModelUpdate> for DeploymentUpdateDBRequest {
             .maybe_sanitize_responses(update.sanitize_responses)
             .maybe_trusted(update.trusted)
             .maybe_open_responses_adapter(update.open_responses_adapter)
-            .maybe_reasoning_translation(update.reasoning_translation)
+            .maybe_reasoning_translation_overrides(update.reasoning_translation_overrides)
             .maybe_allowed_batch_completion_windows(update.allowed_batch_completion_windows)
             .maybe_metadata(update.metadata)
             .build()
@@ -763,7 +763,7 @@ pub struct DeploymentDBResponse {
     pub trusted: bool,
     /// Whether the open_responses adapter is enabled (converts /v1/responses to /v1/chat/completions)
     pub open_responses_adapter: bool,
-    pub reasoning_translation: Option<ReasoningTranslationConfig>,
+    pub reasoning_translation_overrides: Option<ReasoningTranslationOverrides>,
     /// Per-model allowed batch completion windows (overrides global config when set)
     pub allowed_batch_completion_windows: Option<Vec<String>>,
     /// Catalog metadata (JSONB)

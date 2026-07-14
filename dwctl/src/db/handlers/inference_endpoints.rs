@@ -258,11 +258,11 @@ mod tests {
                 users::UserCreateDBRequest,
             },
         },
-        reasoning::{ReasoningEffort, ReasoningTranslation, ReasoningTranslationConfig},
+        reasoning::{ReasoningEffort, ReasoningTranslation, ReasoningTranslationConfig, ReasoningWrite},
     };
     use serde_json::json;
     use sqlx::PgPool;
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
 
     async fn create_test_user(pool: &PgPool) -> crate::api::models::users::UserResponse {
         let mut user_conn = pool.acquire().await.unwrap();
@@ -294,8 +294,24 @@ mod tests {
     fn reasoning_translation() -> ReasoningTranslationConfig {
         ReasoningTranslationConfig {
             chat_completions: Some(ReasoningTranslation {
-                target_path: "/chat_template_kwargs/thinking".to_string(),
-                values: BTreeMap::from([(ReasoningEffort::None, json!(false))]),
+                unsupported_efforts: BTreeSet::from([
+                    ReasoningEffort::None,
+                    ReasoningEffort::Minimal,
+                    ReasoningEffort::Low,
+                    ReasoningEffort::Medium,
+                    ReasoningEffort::Xhigh,
+                    ReasoningEffort::Max,
+                ]),
+                writes: vec![
+                    ReasoningWrite {
+                        target_path: "/reasoning_effort".to_string(),
+                        values: BTreeMap::from([(ReasoningEffort::High, json!("high"))]),
+                    },
+                    ReasoningWrite {
+                        target_path: "/thinking_token_budget".to_string(),
+                        values: BTreeMap::from([(ReasoningEffort::High, json!(8192))]),
+                    },
+                ],
             }),
             responses: None,
         }
@@ -312,7 +328,19 @@ mod tests {
         create.reasoning_translation = Some(config.clone());
 
         let created = repo.create(&create).await.unwrap();
-        assert_eq!(created.reasoning_translation, Some(config));
+        assert_eq!(created.reasoning_translation, Some(config.clone()));
+        assert_eq!(
+            created
+                .reasoning_translation
+                .as_ref()
+                .unwrap()
+                .chat_completions
+                .as_ref()
+                .unwrap()
+                .writes
+                .len(),
+            2
+        );
 
         let cleared = repo
             .update(

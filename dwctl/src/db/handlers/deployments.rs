@@ -193,7 +193,7 @@ struct DeployedModel {
     pub sanitize_responses: bool,
     pub trusted: bool,
     pub open_responses_adapter: Option<bool>,
-    pub reasoning_translation: Option<serde_json::Value>,
+    pub reasoning_translation_overrides: Option<serde_json::Value>,
     // Traffic routing
     pub allowed_batch_completion_windows: Option<Vec<String>>,
     // Catalog metadata
@@ -259,9 +259,9 @@ impl From<(Option<ModelType>, DeployedModel)> for DeploymentDBResponse {
             sanitize_responses: m.sanitize_responses,
             trusted: m.trusted,
             open_responses_adapter: m.open_responses_adapter.unwrap_or(true),
-            reasoning_translation: m.reasoning_translation.and_then(|value| {
+            reasoning_translation_overrides: m.reasoning_translation_overrides.and_then(|value| {
                 serde_json::from_value(value)
-                    .inspect_err(|error| tracing::warn!(%error, "failed to deserialize reasoning translation"))
+                    .inspect_err(|error| tracing::warn!(%error, "failed to deserialize reasoning translation overrides"))
                     .ok()
             }),
             allowed_batch_completion_windows: m.allowed_batch_completion_windows,
@@ -303,8 +303,8 @@ impl<'c> Repository for Deployments<'c> {
 
         // Extract composite model fields
         let lb_strategy_str = request.lb_strategy.map(|s| s.as_str().to_string());
-        let reasoning_translation = request
-            .reasoning_translation
+        let reasoning_translation_overrides = request
+            .reasoning_translation_overrides
             .as_ref()
             .map(serde_json::to_value)
             .transpose()
@@ -323,7 +323,7 @@ impl<'c> Repository for Deployments<'c> {
                 sanitize_responses, trusted, open_responses_adapter, allowed_batch_completion_windows,
                 metadata,
                 backoff_enabled, backoff_initial_ms, backoff_max_ms, backoff_factor, backoff_jitter, backoff_max_total_ms,
-                reasoning_translation
+                reasoning_translation_overrides
             )
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39)
             RETURNING *
@@ -366,7 +366,7 @@ impl<'c> Repository for Deployments<'c> {
             request.backoff_factor,                   // $36
             request.backoff_jitter.as_str(),          // $37
             request.backoff_max_total_ms,             // $38
-            reasoning_translation,                    // $39
+            reasoning_translation_overrides,          // $39
         )
         .fetch_one(&mut *self.db)
         .await?;
@@ -385,7 +385,7 @@ impl<'c> Repository for Deployments<'c> {
     async fn get_by_id(&mut self, id: Self::Id) -> Result<Option<Self::Response>> {
         let model = sqlx::query_as!(
             DeployedModel,
-            "SELECT id, model_name, alias, display_name, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, requests_per_second, burst_size, capacity, batch_capacity, throughput, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, fallback_with_replacement, fallback_max_attempts, backoff_enabled, backoff_initial_ms, backoff_max_ms, backoff_factor, backoff_jitter, backoff_max_total_ms, sanitize_responses, trusted, open_responses_adapter, allowed_batch_completion_windows, metadata, reasoning_translation FROM deployed_models WHERE id = $1",
+            "SELECT id, model_name, alias, display_name, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, requests_per_second, burst_size, capacity, batch_capacity, throughput, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, fallback_with_replacement, fallback_max_attempts, backoff_enabled, backoff_initial_ms, backoff_max_ms, backoff_factor, backoff_jitter, backoff_max_total_ms, sanitize_responses, trusted, open_responses_adapter, allowed_batch_completion_windows, metadata, reasoning_translation_overrides FROM deployed_models WHERE id = $1",
             id
         )
             .fetch_optional(&mut *self.db)
@@ -410,7 +410,7 @@ impl<'c> Repository for Deployments<'c> {
 
         let deployments = sqlx::query_as!(
             DeployedModel,
-            "SELECT id, model_name, alias, display_name, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, requests_per_second, burst_size, capacity, batch_capacity, throughput, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, fallback_with_replacement, fallback_max_attempts, backoff_enabled, backoff_initial_ms, backoff_max_ms, backoff_factor, backoff_jitter, backoff_max_total_ms, sanitize_responses, trusted, open_responses_adapter, allowed_batch_completion_windows, metadata, reasoning_translation FROM deployed_models WHERE id = ANY($1)",
+            "SELECT id, model_name, alias, display_name, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, requests_per_second, burst_size, capacity, batch_capacity, throughput, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, fallback_with_replacement, fallback_max_attempts, backoff_enabled, backoff_initial_ms, backoff_max_ms, backoff_factor, backoff_jitter, backoff_max_total_ms, sanitize_responses, trusted, open_responses_adapter, allowed_batch_completion_windows, metadata, reasoning_translation_overrides FROM deployed_models WHERE id = ANY($1)",
             ids.as_slice()
         )
             .fetch_all(&mut *self.db)
@@ -472,8 +472,8 @@ impl<'c> Repository for Deployments<'c> {
 
         // Extract composite model update fields
         let lb_strategy_str = request.lb_strategy.map(|s| s.as_str().to_string());
-        let reasoning_translation = request
-            .reasoning_translation
+        let reasoning_translation_overrides = request
+            .reasoning_translation_overrides
             .as_ref()
             .and_then(Option::as_ref)
             .map(serde_json::to_value)
@@ -605,9 +605,9 @@ impl<'c> Repository for Deployments<'c> {
                 ELSE backoff_max_total_ms
             END,
 
-            reasoning_translation = CASE
+            reasoning_translation_overrides = CASE
                 WHEN $56 THEN $57
-                ELSE reasoning_translation
+                ELSE reasoning_translation_overrides
             END,
 
             updated_at = NOW()
@@ -684,8 +684,8 @@ impl<'c> Repository for Deployments<'c> {
             request.backoff_jitter.as_deref(),                                      // $53
             request.backoff_max_total_ms.is_some() as bool,                         // $54
             request.backoff_max_total_ms.as_ref().and_then(|inner| inner.as_ref()), // $55
-            request.reasoning_translation.is_some(),                                // $56
-            reasoning_translation,                                                  // $57
+            request.reasoning_translation_overrides.is_some(),                      // $56
+            reasoning_translation_overrides,                                        // $57
         )
         .fetch_one(&mut *self.db)
         .await?;
@@ -1613,14 +1613,14 @@ mod tests {
                 users::UserCreateDBRequest,
             },
         },
-        reasoning::{ReasoningEffort, ReasoningTranslation, ReasoningTranslationConfig},
+        reasoning::{ReasoningEffort, ReasoningSurfaceOverride, ReasoningTranslation, ReasoningTranslationOverrides, ReasoningWrite},
         test::utils::get_test_endpoint_id,
     };
 
     use rust_decimal::Decimal;
     use serde_json::json;
     use sqlx::{Acquire, PgPool};
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::str::FromStr;
 
     async fn create_test_user(pool: &PgPool) -> UserResponse {
@@ -1636,19 +1636,27 @@ mod tests {
         user_repo.create(&user_create).await.unwrap().into()
     }
 
-    fn reasoning_translation() -> ReasoningTranslationConfig {
-        ReasoningTranslationConfig {
-            chat_completions: Some(ReasoningTranslation {
-                target_path: "/thinking/type".to_string(),
-                values: BTreeMap::from([(ReasoningEffort::None, json!("disabled"))]),
+    fn reasoning_translation_overrides() -> ReasoningTranslationOverrides {
+        ReasoningTranslationOverrides {
+            chat_completions: ReasoningSurfaceOverride::Override(ReasoningTranslation {
+                unsupported_efforts: BTreeSet::from([ReasoningEffort::Minimal, ReasoningEffort::Xhigh, ReasoningEffort::Max]),
+                writes: vec![ReasoningWrite {
+                    target_path: "/chat_template_kwargs/thinking".to_string(),
+                    values: BTreeMap::from([
+                        (ReasoningEffort::None, json!(false)),
+                        (ReasoningEffort::Low, json!(true)),
+                        (ReasoningEffort::Medium, json!(true)),
+                        (ReasoningEffort::High, json!(true)),
+                    ]),
+                }],
             }),
-            responses: None,
+            responses: ReasoningSurfaceOverride::Disabled,
         }
     }
 
     #[sqlx::test]
     #[test_log::test]
-    async fn persists_and_clears_reasoning_translation_override(pool: PgPool) {
+    async fn persists_and_clears_mixed_reasoning_translation_overrides(pool: PgPool) {
         let base_url = url::Url::parse("http://localhost:8080").unwrap();
         crate::seed_database(
             &[crate::config::ModelSource {
@@ -1664,7 +1672,7 @@ mod tests {
         .unwrap();
         let user = create_test_user(&pool).await;
         let endpoint_id = get_test_endpoint_id(&pool).await;
-        let config = reasoning_translation();
+        let overrides = reasoning_translation_overrides();
         let mut conn = pool.acquire().await.unwrap();
         let mut repo = Deployments::new(&mut conn);
 
@@ -1675,21 +1683,21 @@ mod tests {
                     .model_name("reasoning-model".to_string())
                     .alias("reasoning-model".to_string())
                     .hosted_on(endpoint_id)
-                    .reasoning_translation(config.clone())
+                    .reasoning_translation_overrides(overrides.clone())
                     .build(),
             )
             .await
             .unwrap();
-        assert_eq!(created.reasoning_translation, Some(config));
+        assert_eq!(created.reasoning_translation_overrides, Some(overrides));
 
         let cleared = repo
             .update(
                 created.id,
-                &DeploymentUpdateDBRequest::builder().reasoning_translation(None).build(),
+                &DeploymentUpdateDBRequest::builder().reasoning_translation_overrides(None).build(),
             )
             .await
             .unwrap();
-        assert_eq!(cleared.reasoning_translation, None);
+        assert_eq!(cleared.reasoning_translation_overrides, None);
     }
 
     #[sqlx::test]

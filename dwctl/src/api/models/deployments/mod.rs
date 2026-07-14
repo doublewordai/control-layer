@@ -9,7 +9,7 @@ use crate::db::models::deployments::{
     BackoffConfig, DeploymentDBResponse, FallbackConfig, JitterStrategy, LoadBalancingStrategy, ModelCatalogMetadata, ModelType,
     ProviderPricing, ProviderPricingUpdate, TrafficRuleDBRow,
 };
-use crate::reasoning::ReasoningTranslationConfig;
+use crate::reasoning::ReasoningTranslationOverrides;
 use crate::types::{DeploymentId, InferenceEndpointId, UserId};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -239,9 +239,9 @@ pub struct StandardModelCreate {
     /// Whether to enable the open_responses adapter that converts /v1/responses to /v1/chat/completions (defaults to true)
     #[serde(default)]
     pub open_responses_adapter: Option<bool>,
-    /// Override the endpoint's provider reasoning translation for this model.
+    /// Per-surface overrides for the endpoint's provider reasoning translations.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reasoning_translation: Option<ReasoningTranslationConfig>,
+    pub reasoning_translation_overrides: Option<ReasoningTranslationOverrides>,
     /// Insert an exponential backoff between retry attempts. For a standard
     /// (single-provider) model, enabling this implicitly also turns on
     /// fallback + with_replacement so that the same provider can be retried
@@ -456,9 +456,9 @@ pub struct DeployedModelUpdate {
     /// Whether to enable the open_responses adapter (null = no change)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub open_responses_adapter: Option<bool>,
-    /// Reasoning translation override (omitted = unchanged, null = inherit endpoint default).
+    /// Reasoning translation overrides (omitted = unchanged, null = inherit both endpoint defaults).
     #[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]
-    pub reasoning_translation: Option<Option<ReasoningTranslationConfig>>,
+    pub reasoning_translation_overrides: Option<Option<ReasoningTranslationOverrides>>,
     /// Traffic routing rules (null = no change, Some(None) = clear, Some(rules) = set)
     #[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]
     pub traffic_routing_rules: Option<Option<Vec<TrafficRoutingRule>>>,
@@ -571,9 +571,9 @@ pub struct DeployedModelResponse {
     /// Whether the open_responses adapter is enabled (converts /v1/responses to /v1/chat/completions)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub open_responses_adapter: Option<bool>,
-    /// Provider reasoning translation override. Null means inherit from the endpoint.
+    /// Provider reasoning translation overrides. Omitted for composite models.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub reasoning_translation: Option<ReasoningTranslationConfig>,
+    pub reasoning_translation_overrides: Option<ReasoningTranslationOverrides>,
     /// Traffic routing rules evaluated against API key labels
     #[serde(skip_serializing_if = "Option::is_none")]
     pub traffic_routing_rules: Option<Vec<TrafficRoutingRule>>,
@@ -640,7 +640,11 @@ impl From<DeploymentDBResponse> for DeployedModelResponse {
             sanitize_responses: Some(db.sanitize_responses),
             trusted: Some(db.trusted),
             open_responses_adapter: Some(db.open_responses_adapter),
-            reasoning_translation: db.reasoning_translation,
+            reasoning_translation_overrides: if db.is_composite {
+                None
+            } else {
+                Some(db.reasoning_translation_overrides.unwrap_or_default())
+            },
             traffic_routing_rules: None, // Populated via enrichment (with_traffic_rules)
             allowed_batch_completion_windows: db.allowed_batch_completion_windows,
             metadata: serde_json::from_value::<ModelCatalogMetadata>(db.metadata)
@@ -711,7 +715,7 @@ impl DeployedModelResponse {
         self.sanitize_responses = None;
         self.trusted = None;
         self.open_responses_adapter = None;
-        self.reasoning_translation = None;
+        self.reasoning_translation_overrides = None;
         self
     }
 
