@@ -96,9 +96,27 @@ pub fn record_tokenizer_request(outcome: &'static str) {
     counter!("dwctl_cache_tokenizer_requests_total", "outcome" => outcome).increment(1);
 }
 
-/// tokenizer-svc round-trip latency.
-pub fn record_tokenizer_duration(seconds: f64) {
-    histogram!("dwctl_cache_tokenizer_duration_seconds").record(seconds);
+/// tokenizer-svc round-trip latency, attributable per model and payload size.
+///
+/// Labels (added after the 2026-07 deadline-miss investigation, where the unlabelled series
+/// couldn't answer "which model / how big"): `model` is the virtual-model alias — bounded by
+/// the tokenizer-svc map, same cardinality as the token-volume metrics; `size` is a coarse
+/// payload bucket (see [`tokenize_size_bucket`]) so slow-call attribution (big cold prefixes
+/// vs service-wide slowness) is a single query.
+pub fn record_tokenizer_duration(model: &str, size: &'static str, seconds: f64) {
+    histogram!("dwctl_cache_tokenizer_duration_seconds", "model" => model.to_string(), "size" => size).record(seconds);
+}
+
+/// Coarse request-payload bucket for [`record_tokenizer_duration`]: total bytes across the
+/// tokenized segments. Buckets chosen around observed traffic: chat turns land ≤16k, agentic
+/// cold prefixes (the deadline-miss shape) 64k+.
+pub fn tokenize_size_bucket(total_bytes: usize) -> &'static str {
+    match total_bytes {
+        0..=16_383 => "lt16k",
+        16_384..=65_535 => "16k_64k",
+        65_536..=262_143 => "64k_256k",
+        _ => "gte256k",
+    }
 }
 
 /// alias→version moka cache. `result` ∈ `hit` | `miss`.
