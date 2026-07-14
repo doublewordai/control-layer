@@ -74,6 +74,20 @@ fn remove_cache_control(body: &mut Value, telemetry: &TelemetryPolicy) -> (bool,
                     strip_block_marker(block, &mut rewrote, &mut had_marker);
                 }
             }
+            // Assistant `tool_calls[]` can carry a marker too (the OpenAI shape of a marked
+            // `tool_use` block). Strip it off each call so it never leaks upstream. Non-recursive:
+            // only the top-level of each call object, never into its `function.arguments`.
+            //
+            // Deliberately role-agnostic (unlike `parse`, which only hashes `tool_calls` on an
+            // assistant message): this is the last-line leak guard, so it mirrors how content-block
+            // and tool-definition markers are stripped everywhere they can appear. Stripping a marker
+            // off a malformed non-assistant `tool_calls` is harmless; forwarding one upstream (an
+            // unknown field an OpenAI-compatible backend may reject) is not.
+            if let Some(tool_calls) = msg.get_mut("tool_calls").and_then(Value::as_array_mut) {
+                for call in tool_calls.iter_mut() {
+                    strip_block_marker(call, &mut rewrote, &mut had_marker);
+                }
+            }
         }
     }
 
@@ -488,6 +502,27 @@ mod tests {
         assert!(!had_markers, "null top-level cache_control is not a marker");
         let v: Value = serde_json::from_slice(&out.expect("body rewritten to drop the null field")).unwrap();
         assert!(v.get("cache_control").is_none(), "top-level field removed");
+    }
+
+    #[test]
+    fn strip_removes_tool_call_marker_but_keeps_arguments() {
+        // A marker on an assistant tool_call is stripped before upstream; the function/arguments the
+        // model needs are untouched (non-recursive — never into the call's own JSON).
+        let body = serde_json::json!({
+            "messages": [{"role": "assistant", "content": null, "tool_calls": [
+                {"id": "tu1", "type": "function",
+                 "function": {"name": "f", "arguments": "{\"x\":1}"},
+                 "cache_control": {"type": "ephemeral"}}
+            ]}]
+        })
+        .to_string();
+        let (out, had) = strip_cache_control(body.as_bytes(), &TelemetryPolicy::default());
+        assert!(had, "a tool_call marker is a marker");
+        let v: Value = serde_json::from_slice(&out.expect("rewritten")).unwrap();
+        let call = &v["messages"][0]["tool_calls"][0];
+        assert!(call.get("cache_control").is_none(), "marker stripped");
+        assert_eq!(call["function"]["name"], "f", "call preserved");
+        assert_eq!(call["function"]["arguments"], "{\"x\":1}", "arguments untouched");
     }
 
     #[test]
