@@ -141,6 +141,15 @@ export function inferReasoningStrategy(
       sameKeys(
         sortedEffortKeys(effortWrite.values),
         sortedEffortKeys(budgetWrite.values),
+      ) &&
+      Object.values(effortWrite.values).every(
+        (value) => typeof value === "string",
+      ) &&
+      Object.values(budgetWrite.values).every(
+        (value) =>
+          typeof value === "number" &&
+          Number.isSafeInteger(value) &&
+          value >= 0,
       )
     ) {
       return "token_budget";
@@ -297,8 +306,14 @@ export function validateReasoningTranslation(
 
     if (write.target_path === "/thinking_token_budget") {
       for (const budget of Object.values(write.values)) {
-        if (typeof budget !== "number" || !Number.isInteger(budget) || budget < 0) {
-          errors.push("Token budget values must be non-negative integers.");
+        if (
+          typeof budget !== "number" ||
+          !Number.isSafeInteger(budget) ||
+          budget < 0
+        ) {
+          errors.push(
+            "Token budget values must be non-negative safe integers.",
+          );
           break;
         }
       }
@@ -366,11 +381,28 @@ function writePreviewValue(
 
   let cursor = root;
   for (const segment of segments.slice(0, -1)) {
-    const existing = cursor[segment];
-    if (!isRecord(existing)) cursor[segment] = {};
-    cursor = cursor[segment] as Record<string, unknown>;
+    const existing = Object.prototype.hasOwnProperty.call(cursor, segment)
+      ? cursor[segment]
+      : undefined;
+    if (isRecord(existing)) {
+      cursor = existing;
+      continue;
+    }
+    const next: Record<string, unknown> = {};
+    Object.defineProperty(cursor, segment, {
+      value: next,
+      enumerable: true,
+      configurable: true,
+      writable: true,
+    });
+    cursor = next;
   }
-  cursor[segments.at(-1)!] = write.values[effort];
+  Object.defineProperty(cursor, segments.at(-1)!, {
+    value: write.values[effort],
+    enumerable: true,
+    configurable: true,
+    writable: true,
+  });
 }
 
 export function buildUpstreamPreview(

@@ -203,27 +203,11 @@ function resolveDraft(draft: TranslationDraft): DraftResolution {
   }
 
   if (draft.strategy === "native") {
-    const mapped = REASONING_EFFORTS.filter(
-      (effort) => draft.decisions[effort].mode === "map",
-    );
     if (!draft.targetPath.trim()) {
       return {
         valid: false,
         translation: null,
         error: "Enter a provider target path.",
-      };
-    }
-    if (
-      mapped.some(
-        (effort) =>
-          draft.decisions[effort].mode === "map" &&
-          !draft.decisions[effort].value.trim(),
-      )
-    ) {
-      return {
-        valid: false,
-        translation: null,
-        error: "Every mapped effort needs a provider effort string.",
       };
     }
     return validateBuiltTranslation(
@@ -245,13 +229,6 @@ function resolveDraft(draft: TranslationDraft): DraftResolution {
     for (const effort of mapped) {
       const decision = draft.decisions[effort];
       if (decision.mode !== "map") continue;
-      if (!decision.effort.trim()) {
-        return {
-          valid: false,
-          translation: null,
-          error: "Every mapped effort needs a provider effort string.",
-        };
-      }
       if (!/^\d+$/.test(decision.budget)) {
         return {
           valid: false,

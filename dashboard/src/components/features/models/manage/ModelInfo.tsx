@@ -82,7 +82,10 @@ import {
   PopoverContent,
   PopoverTrigger,
 } from "../../../ui/popover";
-import { ReasoningTranslationOverridesEditor } from "../../reasoning";
+import {
+  ReasoningTranslationOverridesEditor,
+  normalizeReasoningTranslationOverrides,
+} from "../../reasoning";
 
 // Form schema for alias editing
 const aliasFormSchema = z.object({
@@ -296,7 +299,9 @@ const ModelInfo: React.FC = () => {
         trusted: model.trusted ?? false,
         open_responses_adapter: model.open_responses_adapter ?? true,
         reasoning_translation_overrides:
-          model.reasoning_translation_overrides ?? null,
+          normalizeReasoningTranslationOverrides(
+            model.reasoning_translation_overrides ?? null,
+          ),
         requests_per_second: model.requests_per_second || null,
         burst_size: model.burst_size || null,
         capacity: model.capacity || null,
@@ -392,7 +397,9 @@ const ModelInfo: React.FC = () => {
           trusted: updateData.trusted,
           open_responses_adapter: updateData.open_responses_adapter,
           reasoning_translation_overrides:
-            updateData.reasoning_translation_overrides,
+            normalizeReasoningTranslationOverrides(
+              updateData.reasoning_translation_overrides,
+            ),
           // Always include rate limiting and capacity fields to handle clearing properly
           // Send null as the actual value when clearing (not undefined)
           requests_per_second: updateData.requests_per_second,
@@ -439,7 +446,9 @@ const ModelInfo: React.FC = () => {
         trusted: model.trusted ?? false,
         open_responses_adapter: model.open_responses_adapter ?? true,
         reasoning_translation_overrides:
-          model.reasoning_translation_overrides ?? null,
+          normalizeReasoningTranslationOverrides(
+            model.reasoning_translation_overrides ?? null,
+          ),
         requests_per_second: model.requests_per_second || null,
         burst_size: model.burst_size || null,
         capacity: model.capacity || null,

@@ -119,6 +119,73 @@ describe("ReasoningTranslationEditor", () => {
     expect(editor.getByText(/"thinking_token_budget": 2048/)).toBeInTheDocument();
   });
 
+  it("keeps non-string token effort values in custom JSON when editing a budget", () => {
+    const onChange = vi.fn();
+    const initialValue: ReasoningTranslationConfig = {
+      chat_completions: {
+        unsupported_efforts: ["none", "minimal", "medium", "high", "xhigh", "max"],
+        writes: [
+          { target_path: "/reasoning_effort", values: { low: { level: 1 } } },
+          { target_path: "/thinking_token_budget", values: { low: 1024 } },
+        ],
+      },
+    };
+    const { container } = render(
+      <EndpointHarness initialValue={initialValue} onChange={onChange} />,
+    );
+    const editor = within(container);
+
+    expect(editor.getByLabelText("Strategy")).toHaveValue("custom");
+    const json = editor.getByLabelText("Custom translation JSON");
+    const editedJson = (json as HTMLTextAreaElement).value.replace("1024", "2048");
+    fireEvent.change(json, {
+      target: { value: editedJson },
+    });
+
+    expect(onChange.mock.lastCall?.[0]?.chat_completions?.writes).toEqual([
+      { target_path: "/reasoning_effort", values: { low: { level: 1 } } },
+      { target_path: "/thinking_token_budget", values: { low: 2048 } },
+    ]);
+  });
+
+  it.each([
+    [
+      "native",
+      {
+        chat_completions: {
+          unsupported_efforts: ["none", "minimal", "medium", "high", "xhigh", "max"],
+          writes: [{ target_path: "/reasoning_effort", values: { low: "   " } }],
+        },
+      } satisfies ReasoningTranslationConfig,
+      "native",
+    ],
+    [
+      "token budget",
+      {
+        chat_completions: {
+          unsupported_efforts: ["none", "minimal", "medium", "high", "xhigh", "max"],
+          writes: [
+            { target_path: "/reasoning_effort", values: { low: "" } },
+            { target_path: "/thinking_token_budget", values: { low: 1024 } },
+          ],
+        },
+      } satisfies ReasoningTranslationConfig,
+      "token_budget",
+    ],
+  ])("accepts empty provider strings in the %s graphical draft", (_, initialValue, strategy) => {
+    const onValidityChange = vi.fn();
+    const { container } = render(
+      <EndpointHarness
+        initialValue={initialValue}
+        onValidityChange={onValidityChange}
+      />,
+    );
+    const editor = within(container);
+
+    expect(editor.getByLabelText("Strategy")).toHaveValue(strategy);
+    expect(onValidityChange).toHaveBeenLastCalledWith(true);
+  });
+
   it("maps binary On, Off, and Reject decisions at the selected path", async () => {
     const user = userEvent.setup();
     const onChange = vi.fn();
