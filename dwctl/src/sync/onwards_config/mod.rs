@@ -26,6 +26,7 @@ pub enum SyncStatus {
 use crate::{
     config::{ONWARDS_CONFIG_CHANGED_CHANNEL, RateLimitTiersConfig},
     db::models::deployments::LoadBalancingStrategy,
+    reasoning::{ReasoningTranslationConfig, ReasoningTranslationOverrides},
     types::{ApiKeyId, DeploymentId},
 };
 
@@ -59,6 +60,7 @@ struct OnwardsTarget {
     sanitize_responses: bool,
     trusted: bool,
     open_responses_adapter: bool,
+    reasoning_translation: Option<ReasoningTranslationConfig>,
     /// Traffic routing rules from the model_traffic_rules table
     routing_rules: Vec<RoutingRule>,
 
@@ -86,6 +88,51 @@ struct OnwardsTarget {
 
     // API keys that have access to this deployment
     api_keys: Vec<OnwardsApiKey>,
+}
+
+fn parse_endpoint_reasoning_translation(value: Option<serde_json::Value>, model_alias: &str) -> Option<ReasoningTranslationConfig> {
+    let value = value?;
+    match serde_json::from_value::<ReasoningTranslationConfig>(value) {
+        Ok(config) => match config.validate() {
+            Ok(()) => Some(config),
+            Err(error) => {
+                warn!(model_alias, %error, "ignoring invalid endpoint reasoning translation");
+                None
+            }
+        },
+        Err(error) => {
+            warn!(model_alias, %error, "ignoring malformed endpoint reasoning translation");
+            None
+        }
+    }
+}
+
+fn parse_model_reasoning_overrides(value: Option<serde_json::Value>, model_alias: &str) -> ReasoningTranslationOverrides {
+    let Some(value) = value else {
+        return ReasoningTranslationOverrides::default();
+    };
+    match serde_json::from_value::<ReasoningTranslationOverrides>(value) {
+        Ok(overrides) => match overrides.validate() {
+            Ok(()) => overrides,
+            Err(error) => {
+                warn!(model_alias, %error, "ignoring invalid model reasoning translation overrides");
+                ReasoningTranslationOverrides::default()
+            }
+        },
+        Err(error) => {
+            warn!(model_alias, %error, "ignoring malformed model reasoning translation overrides");
+            ReasoningTranslationOverrides::default()
+        }
+    }
+}
+
+fn resolve_reasoning_translation(
+    endpoint_value: Option<serde_json::Value>,
+    model_value: Option<serde_json::Value>,
+    model_alias: &str,
+) -> Option<ReasoningTranslationConfig> {
+    let endpoint_default = parse_endpoint_reasoning_translation(endpoint_value, model_alias);
+    parse_model_reasoning_overrides(model_value, model_alias).resolve(endpoint_default.as_ref())
 }
 
 /// Minimal API key data needed for onwards config
@@ -531,6 +578,8 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
             dm.sanitize_responses as deployment_sanitize_responses,
             dm.trusted as deployment_trusted,
             dm.open_responses_adapter as "deployment_open_responses_adapter?",
+            ie.reasoning_translation as endpoint_reasoning_translation,
+            dm.reasoning_translation_overrides as model_reasoning_translation_overrides,
             -- Endpoint info
             ie.url as "endpoint_url!",
             ie.api_key as endpoint_api_key,
@@ -742,6 +791,11 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                     sanitize_responses: row.deployment_sanitize_responses,
                     trusted: row.deployment_trusted,
                     open_responses_adapter: row.deployment_open_responses_adapter.unwrap_or(true),
+                    reasoning_translation: resolve_reasoning_translation(
+                        row.endpoint_reasoning_translation,
+                        row.model_reasoning_translation_overrides,
+                        &row.deployment_alias,
+                    ),
                     routing_rules: Vec::new(), // Components don't have their own routing rules
                     // Components don't surface their own fallback/backoff —
                     // the composite's PoolSpec.fallback drives retries across
@@ -970,6 +1024,7 @@ fn convert_composite_to_target_spec(
                     // (third-party) providers do not, so our trace IDs aren't
                     // leaked to them.
                     propagate_trace_context: None,
+                    reasoning_translation: target.reasoning_translation.clone().map(Into::into),
                 }
             }
         })
@@ -1136,6 +1191,7 @@ fn convert_to_config_file(
                 // site above): self-hosted providers propagate W3C trace
                 // context, third-party providers do not.
                 propagate_trace_context: None,
+                reasoning_translation: target.reasoning_translation.clone().map(Into::into),
             };
 
             // Build fallback configuration. For single-provider (standard)
@@ -1253,6 +1309,8 @@ pub async fn load_targets_from_db(
             dm.sanitize_responses,
             dm.trusted,
             dm.open_responses_adapter,
+            ie.reasoning_translation as endpoint_reasoning_translation,
+            dm.reasoning_translation_overrides as model_reasoning_translation_overrides,
             dm.fallback_enabled,
             dm.fallback_on_rate_limit,
             dm.fallback_on_status,
@@ -1373,6 +1431,11 @@ pub async fn load_targets_from_db(
                 sanitize_responses: row.sanitize_responses,
                 trusted: row.trusted,
                 open_responses_adapter: row.open_responses_adapter.unwrap_or(true),
+                reasoning_translation: resolve_reasoning_translation(
+                    row.endpoint_reasoning_translation.clone(),
+                    row.model_reasoning_translation_overrides.clone(),
+                    &row.alias,
+                ),
                 routing_rules: Vec::new(), // Populated from separate query below
                 fallback_enabled: row.fallback_enabled.unwrap_or(true),
                 fallback_on_rate_limit: row.fallback_on_rate_limit.unwrap_or(true),

@@ -45,7 +45,9 @@ import type {
   EndpointUpdateRequest,
   Endpoint,
   Model,
+  ReasoningTranslationConfig,
 } from "../../../api/control-layer/types";
+import { ReasoningTranslationEditor } from "../../features/reasoning";
 import { AddModelPalette } from "./AddModelPalette";
 import { ImportedModelsTable } from "./ImportedModelsTable";
 import { RemoveModelDialog } from "./RemoveModelDialog";
@@ -95,6 +97,10 @@ export const EditEndpointModal: React.FC<EditEndpointModalProps> = ({
   const [advancedPopoverOpen, setAdvancedPopoverOpen] = useState(false);
   const [showApiKey, setShowApiKey] = useState(false);
   const [currentStep, setCurrentStep] = useState<1 | 2>(1);
+  const [reasoningTranslation, setReasoningTranslation] =
+    useState<ReasoningTranslationConfig | null>(endpoint.reasoning_translation ?? null);
+  const [reasoningTranslationValid, setReasoningTranslationValid] =
+    useState(true);
 
   // ----- Step 2 (Models) state -----
   const [catalog, setCatalog] = useState<AvailableModel[]>([]);
@@ -189,6 +195,8 @@ export const EditEndpointModal: React.FC<EditEndpointModalProps> = ({
     setSubmitError(null);
     setPendingRemoval(null);
     setIsBuildingFilter(false);
+    setReasoningTranslation(endpoint.reasoning_translation ?? null);
+    setReasoningTranslationValid(true);
   }, [isOpen, endpoint, form]);
 
   // Strip the pagination URL params when the modal closes. Cancel/X/ESC
@@ -268,6 +276,8 @@ export const EditEndpointModal: React.FC<EditEndpointModalProps> = ({
   };
 
   const handleDiscoverModels = async () => {
+    if (!reasoningTranslationValid) return;
+
     const url = form.getValues("url");
 
     if (!url.trim()) {
@@ -307,6 +317,8 @@ export const EditEndpointModal: React.FC<EditEndpointModalProps> = ({
   };
 
   const handleContinueWithoutDiscovery = () => {
+    if (!reasoningTranslationValid) return;
+
     setCatalog([]);
     setValidationError(null);
     setValidationState("idle");
@@ -368,6 +380,11 @@ export const EditEndpointModal: React.FC<EditEndpointModalProps> = ({
   };
 
   const onSubmit = async (data: FormData) => {
+    if (!reasoningTranslationValid) {
+      setSubmitError("Finish the reasoning translation before updating the endpoint.");
+      return;
+    }
+
     if (urlChanged && validationState !== "success") {
       setSubmitError(
         "Please test the endpoint connection after changing the URL",
@@ -467,6 +484,7 @@ export const EditEndpointModal: React.FC<EditEndpointModalProps> = ({
       ...(data.authHeaderPrefix?.trim() && {
         auth_header_prefix: data.authHeaderPrefix.trim(),
       }),
+      reasoning_translation: reasoningTranslation,
     };
 
     try {
@@ -516,6 +534,7 @@ export const EditEndpointModal: React.FC<EditEndpointModalProps> = ({
   // still uses authoritative server state.
   const canSave =
     !!form.watch("name")?.trim() &&
+    reasoningTranslationValid &&
     !updateEndpointMutation.isPending &&
     !isBuildingFilter &&
     validationState !== "testing" &&
@@ -537,18 +556,25 @@ export const EditEndpointModal: React.FC<EditEndpointModalProps> = ({
         <Form {...form}>
           <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-6">
             {currentStep === 1 && (
-              <ConnectionStep
-                form={form}
-                endpoint={endpoint}
-                urlChanged={urlChanged}
-                showApiKey={showApiKey}
-                setShowApiKey={setShowApiKey}
-                advancedPopoverOpen={advancedPopoverOpen}
-                setAdvancedPopoverOpen={setAdvancedPopoverOpen}
-                handleUrlChange={handleUrlChange}
-                validationState={validationState}
-                validationError={validationError}
-              />
+              <>
+                <ConnectionStep
+                  form={form}
+                  endpoint={endpoint}
+                  urlChanged={urlChanged}
+                  showApiKey={showApiKey}
+                  setShowApiKey={setShowApiKey}
+                  advancedPopoverOpen={advancedPopoverOpen}
+                  setAdvancedPopoverOpen={setAdvancedPopoverOpen}
+                  handleUrlChange={handleUrlChange}
+                  validationState={validationState}
+                  validationError={validationError}
+                />
+                <ReasoningTranslationEditor
+                  value={reasoningTranslation}
+                  onChange={setReasoningTranslation}
+                  onValidityChange={setReasoningTranslationValid}
+                />
+              </>
             )}
 
             {currentStep === 2 && (
@@ -587,6 +613,7 @@ export const EditEndpointModal: React.FC<EditEndpointModalProps> = ({
                   type="button"
                   variant="ghost"
                   onClick={handleContinueWithoutDiscovery}
+                  disabled={!reasoningTranslationValid}
                 >
                   Continue without discovery
                 </Button>
@@ -596,6 +623,7 @@ export const EditEndpointModal: React.FC<EditEndpointModalProps> = ({
                 onClick={handleDiscoverModels}
                 disabled={
                   !form.watch("url")?.trim() ||
+                  !reasoningTranslationValid ||
                   validationState === "testing"
                 }
               >
