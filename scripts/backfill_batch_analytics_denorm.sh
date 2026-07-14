@@ -64,7 +64,41 @@ while [ "$CURSOR" -lt "$MAX_SEQ" ]; do
   hi=$(( CURSOR + BATCH_SIZE ))
   if [ "$hi" -gt "$MAX_SEQ" ]; then hi="$MAX_SEQ"; fi
   affected=$(psql_q "
-    WITH upd AS (
+    WITH elig AS (
+      -- The batches this pass owns: in-range, not yet backfilled, and quiescent.
+      SELECT ba.fusillade_batch_id
+      FROM batch_aggregates ba
+      WHERE ba.max_seq > ${CURSOR} AND ba.max_seq <= ${hi}
+            AND ba.analytics_backfilled_at IS NULL
+            AND ba.updated_at < NOW() - INTERVAL '${QUIESCENT_INTERVAL}'
+    ),
+    agg AS (
+      -- LEFT JOIN so a batch with zero successful (2xx) rows still yields one row of
+      -- zeros and gets stamped (matching the old aggregate-over-empty-set, so the
+      -- 'run until 0 rows' loop converges). Filters live in the ON clause to preserve
+      -- those zero rows. COUNT(ha.id) counts only matched rows (not the LEFT-join NULL).
+      -- Rides idx_analytics_fusillade_batch_id.
+      SELECT e.fusillade_batch_id,
+             COUNT(ha.id)                                        AS total_requests,
+             COALESCE(SUM(ha.prompt_tokens), 0)                   AS prompt_tokens,
+             COALESCE(SUM(ha.completion_tokens), 0)               AS completion_tokens,
+             COALESCE(SUM(ha.reasoning_tokens), 0)                AS reasoning_tokens,
+             COALESCE(SUM(ha.total_tokens), 0)                    AS total_tokens,
+             COALESCE(SUM(ha.duration_ms), 0)                     AS sum_duration_ms,
+             COUNT(ha.duration_ms)                                AS count_duration_ms,
+             COALESCE(SUM(ha.duration_to_first_byte_ms), 0)       AS sum_ttfb_ms,
+             COUNT(ha.duration_to_first_byte_ms)                  AS count_ttfb_ms,
+             COALESCE(SUM(ha.uncached_cost), 0)                   AS list_cost
+      FROM elig e
+      LEFT JOIN http_analytics ha
+             ON ha.fusillade_batch_id = e.fusillade_batch_id
+            AND ha.user_id IS NOT NULL
+            -- Exclude the system user, matching the live fold which skips Uuid::nil().
+            AND ha.user_id <> '00000000-0000-0000-0000-000000000000'
+            AND ha.status_code BETWEEN 200 AND 299
+      GROUP BY e.fusillade_batch_id
+    ),
+    upd AS (
       UPDATE batch_aggregates ba
          SET total_requests          = s.total_requests,
              total_prompt_tokens     = s.prompt_tokens,
@@ -77,28 +111,10 @@ while [ "$CURSOR" -lt "$MAX_SEQ" ]; do
              count_ttfb_ms           = s.count_ttfb_ms,
              total_list_cost         = s.list_cost,
              analytics_backfilled_at = NOW()
-        FROM LATERAL (
-               SELECT
-                 COUNT(*)                                            AS total_requests,
-                 COALESCE(SUM(ha.prompt_tokens), 0)                   AS prompt_tokens,
-                 COALESCE(SUM(ha.completion_tokens), 0)               AS completion_tokens,
-                 COALESCE(SUM(ha.reasoning_tokens), 0)                AS reasoning_tokens,
-                 COALESCE(SUM(ha.total_tokens), 0)                    AS total_tokens,
-                 COALESCE(SUM(ha.duration_ms), 0)                     AS sum_duration_ms,
-                 COUNT(ha.duration_ms)                                AS count_duration_ms,
-                 COALESCE(SUM(ha.duration_to_first_byte_ms), 0)       AS sum_ttfb_ms,
-                 COUNT(ha.duration_to_first_byte_ms)                  AS count_ttfb_ms,
-                 COALESCE(SUM(ha.uncached_cost), 0)                   AS list_cost
-               FROM http_analytics ha
-               WHERE ha.fusillade_batch_id = ba.fusillade_batch_id
-                 AND ha.user_id IS NOT NULL
-                 -- Exclude the system user, matching the live fold which skips Uuid::nil().
-                 AND ha.user_id <> '00000000-0000-0000-0000-000000000000'
-                 AND ha.status_code BETWEEN 200 AND 299
-             ) s
-       WHERE ba.max_seq > ${CURSOR} AND ba.max_seq <= ${hi}
+        FROM agg s
+       WHERE ba.fusillade_batch_id = s.fusillade_batch_id
+             AND ba.max_seq > ${CURSOR} AND ba.max_seq <= ${hi}
              AND ba.analytics_backfilled_at IS NULL
-             AND ba.updated_at < NOW() - INTERVAL '${QUIESCENT_INTERVAL}'
       RETURNING 1
     )
     SELECT count(*) FROM upd;")
