@@ -1,5 +1,13 @@
 # Changelog
 
+## [8.81.0](https://github.com/doublewordai/control-layer/compare/v8.80.0...v8.81.0) (2026-07-14)
+
+
+### Features
+
+* denormalize per-batch analytics onto batch_aggregates (COR-524 expand) ([#1262](https://github.com/doublewordai/control-layer/issues/1262)) ([861f5d9](https://github.com/doublewordai/control-layer/commit/861f5d9e3f094ec0ff9614384a43feee70e3a529))
+* read billing fields off denormalized columns + drop 23 GB usage index (COR-514/516) ([#1256](https://github.com/doublewordai/control-layer/issues/1256)) ([887b1cc](https://github.com/doublewordai/control-layer/commit/887b1cc119dcdbc14a10bb9db7495832731a834e))
+
 ## [8.80.0](https://github.com/doublewordai/control-layer/compare/v8.79.1...v8.80.0) (2026-07-13)
 
 
