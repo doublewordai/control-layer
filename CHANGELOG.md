@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.83.0](https://github.com/doublewordai/control-layer/compare/v8.82.1...v8.83.0) (2026-07-14)
+
+
+### Features
+
+* set realtime priority value to 0 ([#1225](https://github.com/doublewordai/control-layer/issues/1225)) ([9d20aa1](https://github.com/doublewordai/control-layer/commit/9d20aa1fd7d99d20798769525d7af4742e4de69e))
+
 ## [8.82.1](https://github.com/doublewordai/control-layer/compare/v8.82.0...v8.82.1) (2026-07-14)
 
 
