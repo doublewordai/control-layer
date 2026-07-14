@@ -26,7 +26,7 @@ pub enum SyncStatus {
 use crate::{
     config::{ONWARDS_CONFIG_CHANGED_CHANNEL, RateLimitTiersConfig},
     db::models::deployments::LoadBalancingStrategy,
-    reasoning::{ReasoningTranslationConfig, ReasoningTranslationOverrides},
+    reasoning::{ReasoningTranslationConfig, resolve_reasoning_translation},
     types::{ApiKeyId, DeploymentId},
 };
 
@@ -88,51 +88,6 @@ struct OnwardsTarget {
 
     // API keys that have access to this deployment
     api_keys: Vec<OnwardsApiKey>,
-}
-
-fn parse_endpoint_reasoning_translation(value: Option<serde_json::Value>, model_alias: &str) -> Option<ReasoningTranslationConfig> {
-    let value = value?;
-    match serde_json::from_value::<ReasoningTranslationConfig>(value) {
-        Ok(config) => match config.validate() {
-            Ok(()) => Some(config),
-            Err(error) => {
-                warn!(model_alias, %error, "ignoring invalid endpoint reasoning translation");
-                None
-            }
-        },
-        Err(error) => {
-            warn!(model_alias, %error, "ignoring malformed endpoint reasoning translation");
-            None
-        }
-    }
-}
-
-fn parse_model_reasoning_overrides(value: Option<serde_json::Value>, model_alias: &str) -> ReasoningTranslationOverrides {
-    let Some(value) = value else {
-        return ReasoningTranslationOverrides::default();
-    };
-    match serde_json::from_value::<ReasoningTranslationOverrides>(value) {
-        Ok(overrides) => match overrides.validate() {
-            Ok(()) => overrides,
-            Err(error) => {
-                warn!(model_alias, %error, "ignoring invalid model reasoning translation overrides");
-                ReasoningTranslationOverrides::default()
-            }
-        },
-        Err(error) => {
-            warn!(model_alias, %error, "ignoring malformed model reasoning translation overrides");
-            ReasoningTranslationOverrides::default()
-        }
-    }
-}
-
-fn resolve_reasoning_translation(
-    endpoint_value: Option<serde_json::Value>,
-    model_value: Option<serde_json::Value>,
-    model_alias: &str,
-) -> Option<ReasoningTranslationConfig> {
-    let endpoint_default = parse_endpoint_reasoning_translation(endpoint_value, model_alias);
-    parse_model_reasoning_overrides(model_value, model_alias).resolve(endpoint_default.as_ref())
 }
 
 /// Minimal API key data needed for onwards config

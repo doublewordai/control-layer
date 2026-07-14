@@ -84,6 +84,7 @@ curl "https://your-control-layer/ai/v1/models?group=<group-id>&available_for_rea
 
 - `group`: comma-separated group UUIDs. Results are still limited to models your API key can access.
 - `available_for_realtime`: `true` returns models without a realtime deny rule; `false` returns models with one.
+- `include_reasoning_capabilities`: disabled by default to preserve the standard OpenAI model object. Set it to `true` to add `supported_reasoning_efforts` for models whose support can be determined across every configured provider. Composite models report the intersection supported by all enabled providers.
 
 ## Streaming responses
 

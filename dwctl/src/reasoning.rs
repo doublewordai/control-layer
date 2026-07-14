@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tracing::warn;
 use utoipa::ToSchema;
 
 /// Canonical OpenAI reasoning effort values.
@@ -68,10 +69,77 @@ pub struct ReasoningTranslationOverrides {
     pub responses: ReasoningSurfaceOverride,
 }
 
+/// Canonical efforts that every provider behind a model can accept.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct SupportedReasoningEfforts {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chat_completions: Option<Vec<ReasoningEffort>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub responses: Option<Vec<ReasoningEffort>>,
+}
+
+/// Effective reasoning mappings for every provider behind a model alias.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ModelReasoningPolicy {
+    providers: Vec<Option<ReasoningTranslationConfig>>,
+}
+
 impl ReasoningTranslationConfig {
     /// Validate using the same implementation that applies mappings at runtime.
     pub fn validate(&self) -> Result<(), onwards::reasoning::ReasoningError> {
         onwards::reasoning::ReasoningTranslationConfig::from(self.clone()).validate()
+    }
+}
+
+impl ModelReasoningPolicy {
+    pub fn new(providers: Vec<Option<ReasoningTranslationConfig>>) -> Self {
+        Self { providers }
+    }
+
+    /// Return capabilities only when support is known for every provider.
+    pub fn supported_efforts(&self) -> Option<SupportedReasoningEfforts> {
+        let chat_completions = self.intersect_surface(|config| config.chat_completions.as_ref());
+        let responses = self.intersect_surface(|config| config.responses.as_ref());
+
+        if chat_completions.is_none() && responses.is_none() {
+            None
+        } else {
+            Some(SupportedReasoningEfforts {
+                chat_completions,
+                responses,
+            })
+        }
+    }
+
+    /// Validate canonical controls and then every configured provider, exactly
+    /// as the realtime Onwards request path does before selecting a provider.
+    pub fn validate_request(&self, path: &str, body: &Value) -> Result<(), onwards::reasoning::ReasoningError> {
+        let Some(request) = onwards::reasoning::validate_canonical_reasoning(path, body)? else {
+            return Ok(());
+        };
+
+        for config in self.providers.iter().flatten() {
+            onwards::reasoning::ReasoningTranslationConfig::from(config.clone()).validate_request(path, &request)?;
+        }
+
+        Ok(())
+    }
+
+    fn intersect_surface<'a>(
+        &'a self,
+        surface: impl Fn(&'a ReasoningTranslationConfig) -> Option<&'a ReasoningTranslation>,
+    ) -> Option<Vec<ReasoningEffort>> {
+        let mut providers = self.providers.iter();
+        let first = providers.next()?.as_ref()?;
+        let mut supported: BTreeSet<_> = surface(first)?.writes.first()?.values.keys().copied().collect();
+
+        for provider in providers {
+            let translation = surface(provider.as_ref()?)?;
+            let provider_efforts: BTreeSet<_> = translation.writes.first()?.values.keys().copied().collect();
+            supported.retain(|effort| provider_efforts.contains(effort));
+        }
+
+        Some(supported.into_iter().collect())
     }
 }
 
@@ -123,6 +191,52 @@ fn resolve_surface(
         ReasoningSurfaceOverride::Disabled => None,
         ReasoningSurfaceOverride::Override(translation) => Some(translation.clone()),
     }
+}
+
+fn parse_endpoint_reasoning_translation(value: Option<Value>, model_alias: &str) -> Option<ReasoningTranslationConfig> {
+    let value = value?;
+    match serde_json::from_value::<ReasoningTranslationConfig>(value) {
+        Ok(config) => match config.validate() {
+            Ok(()) => Some(config),
+            Err(error) => {
+                warn!(model_alias, %error, "ignoring invalid endpoint reasoning translation");
+                None
+            }
+        },
+        Err(error) => {
+            warn!(model_alias, %error, "ignoring malformed endpoint reasoning translation");
+            None
+        }
+    }
+}
+
+fn parse_model_reasoning_overrides(value: Option<Value>, model_alias: &str) -> ReasoningTranslationOverrides {
+    let Some(value) = value else {
+        return ReasoningTranslationOverrides::default();
+    };
+    match serde_json::from_value::<ReasoningTranslationOverrides>(value) {
+        Ok(overrides) => match overrides.validate() {
+            Ok(()) => overrides,
+            Err(error) => {
+                warn!(model_alias, %error, "ignoring invalid model reasoning translation overrides");
+                ReasoningTranslationOverrides::default()
+            }
+        },
+        Err(error) => {
+            warn!(model_alias, %error, "ignoring malformed model reasoning translation overrides");
+            ReasoningTranslationOverrides::default()
+        }
+    }
+}
+
+/// Resolve raw database JSON using the same fallback behavior as the Onwards sync.
+pub(crate) fn resolve_reasoning_translation(
+    endpoint_value: Option<Value>,
+    model_value: Option<Value>,
+    model_alias: &str,
+) -> Option<ReasoningTranslationConfig> {
+    let endpoint_default = parse_endpoint_reasoning_translation(endpoint_value, model_alias);
+    parse_model_reasoning_overrides(model_value, model_alias).resolve(endpoint_default.as_ref())
 }
 
 impl From<ReasoningEffort> for onwards::reasoning::ReasoningEffort {
@@ -335,5 +449,99 @@ mod tests {
         };
 
         assert_eq!(overrides.resolve(Some(&defaults)), None);
+    }
+
+    #[test]
+    fn model_policy_intersects_supported_efforts_across_providers() {
+        let first: ReasoningTranslationConfig = serde_json::from_value(json!({
+            "chat_completions": {
+                "unsupported_efforts": ["minimal", "xhigh", "max"],
+                "writes": [{
+                    "target_path": "/reasoning_effort",
+                    "values": {"none": "none", "low": "low", "medium": "medium", "high": "high"}
+                }]
+            }
+        }))
+        .unwrap();
+        let second: ReasoningTranslationConfig = serde_json::from_value(json!({
+            "chat_completions": {
+                "unsupported_efforts": ["none", "minimal", "low", "xhigh", "max"],
+                "writes": [{
+                    "target_path": "/thinking",
+                    "values": {"medium": {"type": "enabled"}, "high": {"type": "enabled"}}
+                }]
+            }
+        }))
+        .unwrap();
+        let policy = ModelReasoningPolicy::new(vec![Some(first), Some(second)]);
+
+        let supported = policy.supported_efforts().unwrap();
+
+        assert_eq!(
+            supported.chat_completions,
+            Some(vec![ReasoningEffort::Medium, ReasoningEffort::High])
+        );
+        assert_eq!(supported.responses, None);
+    }
+
+    #[test]
+    fn model_policy_omits_indeterminate_surfaces() {
+        let policy = ModelReasoningPolicy::new(vec![
+            Some(ReasoningTranslationConfig {
+                chat_completions: Some(native_translation()),
+                responses: None,
+            }),
+            None,
+        ]);
+
+        assert_eq!(policy.supported_efforts(), None);
+    }
+
+    #[test]
+    fn model_policy_uses_onwards_canonical_validation() {
+        let policy = ModelReasoningPolicy::default();
+        let body = json!({"thinking": {"type": "enabled"}});
+
+        let error = policy.validate_request("/v1/chat/completions", &body).unwrap_err();
+
+        assert_eq!(error.status_code(), 400);
+        assert_eq!(error.param(), Some("thinking"));
+        assert!(error.message().contains("use 'reasoning_effort'"));
+    }
+
+    #[test]
+    fn model_policy_validates_every_provider_mapping() {
+        let supported = ReasoningTranslationConfig {
+            chat_completions: Some(native_translation()),
+            responses: None,
+        };
+        let unsupported: ReasoningTranslationConfig = serde_json::from_value(json!({
+            "chat_completions": {
+                "unsupported_efforts": ["none", "minimal", "low", "high", "xhigh", "max"],
+                "writes": [{
+                    "target_path": "/reasoning_effort",
+                    "values": {"medium": "medium"}
+                }]
+            }
+        }))
+        .unwrap();
+        let policy = ModelReasoningPolicy::new(vec![Some(supported), Some(unsupported)]);
+
+        let error = policy
+            .validate_request("/v1/chat/completions", &json!({"reasoning_effort": "high"}))
+            .unwrap_err();
+
+        assert_eq!(error.status_code(), 400);
+        assert!(error.message().contains("Reasoning effort 'high' is not supported"));
+    }
+
+    #[test]
+    fn model_policy_preserves_provider_default_when_effort_is_omitted() {
+        let policy = ModelReasoningPolicy::new(vec![Some(ReasoningTranslationConfig {
+            chat_completions: Some(native_translation()),
+            responses: None,
+        })]);
+
+        policy.validate_request("/v1/chat/completions", &json!({"messages": []})).unwrap();
     }
 }

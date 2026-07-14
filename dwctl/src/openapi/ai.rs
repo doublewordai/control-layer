@@ -105,10 +105,11 @@ fn embeddings() {}
 
 The response includes model IDs that can be used in chat completion and embedding requests.
 
-By default, this endpoint follows the OpenAI-compatible models-list shape. Doubleword also supports optional query-string extensions for model discovery: `group` filters to comma-separated group UUIDs, and `available_for_realtime` filters by whether realtime traffic is allowed for the model.",
+By default, this endpoint follows the OpenAI-compatible models-list shape. Doubleword also supports optional query-string extensions for model discovery: `group` filters to comma-separated group UUIDs, `available_for_realtime` filters by whether realtime traffic is allowed for the model, and `include_reasoning_capabilities=true` adds the reasoning efforts supported by every provider behind each model.",
     params(
         ("group" = Option<String>, Query, description = "Doubleword extension. Filter to models in one or more groups (comma-separated UUIDs). This is intersected with the API key's normal model access."),
         ("available_for_realtime" = Option<bool>, Query, description = "Doubleword extension. true returns models without a realtime deny rule; false returns models with one."),
+        ("include_reasoning_capabilities" = Option<bool>, Query, description = "Doubleword extension, disabled by default. true adds supported_reasoning_efforts when reasoning support is known for every provider behind a model."),
     ),
     responses(
         (status = 200, description = "List of models your API key can access.", body = extra_types::ModelsListResponse),
