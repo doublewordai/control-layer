@@ -749,8 +749,10 @@ async fn handle_realtime<P: PoolProvider + Clone + Send + Sync + 'static>(
     // truncate or reject the request.
     let content_length = body_bytes.len();
     let mut req = Request::from_parts(parts, Body::from(body_bytes));
-    req.headers_mut()
-        .insert(axum::http::header::CONTENT_LENGTH, axum::http::HeaderValue::from(content_length as u64));
+    req.headers_mut().insert(
+        axum::http::header::CONTENT_LENGTH,
+        axum::http::HeaderValue::from(content_length as u64),
+    );
     req.headers_mut()
         .insert("x-fusillade-request-id", raw_id.parse().expect("response_id is valid header value"));
     req.headers_mut().insert(
