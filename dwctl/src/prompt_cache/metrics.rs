@@ -100,9 +100,13 @@ pub fn record_tokenizer_request(outcome: &'static str) {
 ///
 /// Labels (added after the 2026-07 deadline-miss investigation, where the unlabelled series
 /// couldn't answer "which model / how big"): `model` is the virtual-model alias — bounded by
-/// the tokenizer-svc map, same cardinality as the token-volume metrics; `size` is a coarse
-/// payload bucket (see [`tokenize_size_bucket`]) so slow-call attribution (big cold prefixes
-/// vs service-wide slowness) is a single query.
+/// the tokenizer-svc map (callers clamp unvetted names, e.g. the unmapped path, to a fixed
+/// value); `size` is a coarse payload bucket (see [`tokenize_size_bucket`]) so slow-call
+/// attribution (big cold prefixes vs service-wide slowness) is a single query.
+///
+/// Existing `sum by (le)` dashboard/alert queries aggregate across these labels unchanged.
+/// Deliberately NOT also recording an unlabelled twin under the same name: every observation
+/// would then be counted twice in any label-agnostic aggregation, corrupting the quantiles.
 pub fn record_tokenizer_duration(model: &str, size: &'static str, seconds: f64) {
     histogram!("dwctl_cache_tokenizer_duration_seconds", "model" => model.to_string(), "size" => size).record(seconds);
 }

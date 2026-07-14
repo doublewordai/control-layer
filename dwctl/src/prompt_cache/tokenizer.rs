@@ -91,7 +91,14 @@ impl TokenizerClient {
         let start = std::time::Instant::now();
         let size = cache_metrics::tokenize_size_bucket(segments.iter().map(String::len).sum());
         let result = self.tokenize_inner(virtual_model, segments).await;
-        cache_metrics::record_tokenizer_duration(virtual_model, size, start.elapsed().as_secs_f64());
+        // Label cardinality guard: classify only calls this for models on the tokenizer map
+        // (a bounded, admin-controlled set), but this method can't assume its caller — clamp
+        // the label on the unmapped path so an unvetted model name never mints a new series.
+        let model_label = match &result {
+            Err(TokenizerError::Unmapped(_)) => "unmapped",
+            _ => virtual_model,
+        };
+        cache_metrics::record_tokenizer_duration(model_label, size, start.elapsed().as_secs_f64());
         cache_metrics::record_tokenizer_request(match &result {
             Ok(_) => "ok",
             Err(TokenizerError::Unmapped(_)) => "unmapped_422",
