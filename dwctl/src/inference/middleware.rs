@@ -383,8 +383,20 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
             // suppress the stored copies rather than encrypt them.
             let zdr = crate::inference::zdr::is_zdr_request(&state.zdr_key_cache, api_key.as_deref());
 
-            // first we attach a priority hint to the request
+            // Tag realtime traffic with the priority hint (`nvext.agent_hints.
+            // priority = 0`) so the backend scheduler ranks it above deadline-
+            // prioritised batch work, which fusillade stamps with large
+            // *negative* priorities (`-batch_expires_at`). Without this, an
+            // unprioritised realtime request can be starved behind the batch
+            // queue on backends that don't default a missing priority above
+            // those negatives.
             attach_realtime_priority(&mut request_value);
+
+            // Forward the *mutated* body downstream. The live upstream call in
+            // `handle_realtime` is built from `body_bytes`, so rebuild those
+            // bytes from `request_value` — otherwise the hint only reaches the
+            // stored tracking row below and never the scheduler.
+            let body_bytes = bytes::Bytes::from(request_value.to_string());
 
             let realtime_input = fusillade::CreateRealtimeInput {
                 request_id,
@@ -731,7 +743,14 @@ async fn handle_realtime<P: PoolProvider + Clone + Send + Sync + 'static>(
     // it as the response object's `id` field (configured via response_id_header).
     // Strip the "resp_" prefix — onwards re-adds it.
     let raw_id = resp_id.strip_prefix("resp_").unwrap_or(resp_id);
+    // The realtime priority hint rewrites the body upstream of here, so the
+    // Content-Length inherited from the client request in `parts` is stale.
+    // Set it to the actual forwarded length so onwards/the backend don't
+    // truncate or reject the request.
+    let content_length = body_bytes.len();
     let mut req = Request::from_parts(parts, Body::from(body_bytes));
+    req.headers_mut()
+        .insert(axum::http::header::CONTENT_LENGTH, axum::http::HeaderValue::from(content_length as u64));
     req.headers_mut()
         .insert("x-fusillade-request-id", raw_id.parse().expect("response_id is valid header value"));
     req.headers_mut().insert(
