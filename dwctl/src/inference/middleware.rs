@@ -1495,6 +1495,17 @@ mod tests {
     }
 
     #[test]
+    fn attach_realtime_priority_replaces_non_object_agent_hints() {
+        let mut body = serde_json::json!({
+            "model": "m",
+            "nvext": { "guided_json": { "x": 1 }, "agent_hints": "surprise" },
+        });
+        attach_realtime_priority(&mut body);
+        assert_eq!(body["nvext"]["guided_json"], serde_json::json!({ "x": 1 }));
+        assert_eq!(body["nvext"]["agent_hints"], serde_json::json!({ "priority": 0 }));
+    }
+
+    #[test]
     fn attach_realtime_priority_coerces_non_object_nvext() {
         // A hostile/odd client sending a non-object nvext must not panic
         // and must still end up with priority 0.
