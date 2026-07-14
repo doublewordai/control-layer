@@ -1150,6 +1150,10 @@ where
         // transactions list can label each row (realtime / flex / async / batch)
         // without joining http_analytics.
         let mut service_tiers: Vec<String> = Vec::new();
+        // Denormalized per-request id so the responses view can read cost off the ledger
+        // durably (by fusillade_request_id) instead of joining http_analytics, which ages
+        // out of retention. NULL for non-fusillade (realtime) usage.
+        let mut fusillade_request_ids_credit: Vec<Option<Uuid>> = Vec::new();
 
         for record in records {
             // Skip if no user or no pricing
@@ -1193,6 +1197,7 @@ where
             api_key_ids_credit.push(record.api_key_id);
             service_tiers
                 .push(compute_service_tier(record.raw.fusillade_batch_id, record.raw.batch_completion_window.as_deref()).to_string());
+            fusillade_request_ids_credit.push(record.raw.fusillade_request_id);
         }
 
         if user_ids.is_empty() {
@@ -1215,12 +1220,12 @@ where
         // re-folded nor re-aggregated.
         let inserted_rows = sqlx::query!(
             r#"
-            INSERT INTO credits_transactions (user_id, transaction_type, amount, source_id, description, fusillade_batch_id, api_key_id, is_aggregated, service_tier)
+            INSERT INTO credits_transactions (user_id, transaction_type, amount, source_id, description, fusillade_batch_id, api_key_id, is_aggregated, service_tier, fusillade_request_id)
             SELECT u.user_id, u.transaction_type, u.amount, u.source_id, u.description, u.fusillade_batch_id, u.api_key_id,
-                   u.fusillade_batch_id IS NOT NULL, u.service_tier
+                   u.fusillade_batch_id IS NOT NULL, u.service_tier, u.fusillade_request_id
             FROM UNNEST(
-                $1::uuid[], $2::text[], $3::numeric[], $4::text[], $5::text[], $6::uuid[], $7::uuid[], $8::text[]
-            ) AS u(user_id, transaction_type, amount, source_id, description, fusillade_batch_id, api_key_id, service_tier)
+                $1::uuid[], $2::text[], $3::numeric[], $4::text[], $5::text[], $6::uuid[], $7::uuid[], $8::text[], $9::uuid[]
+            ) AS u(user_id, transaction_type, amount, source_id, description, fusillade_batch_id, api_key_id, service_tier, fusillade_request_id)
             ON CONFLICT (source_id) DO NOTHING
             RETURNING source_id, user_id, amount, seq, created_at, fusillade_batch_id, service_tier
             "#,
@@ -1232,6 +1237,7 @@ where
             &fusillade_batch_ids as &[Option<Uuid>],
             &api_key_ids_credit as &[Option<Uuid>],
             &service_tiers,
+            &fusillade_request_ids_credit as &[Option<Uuid>],
         )
         .fetch_all(&mut **tx)
         .await?;
@@ -2674,6 +2680,45 @@ mod integration_tests {
             "no cache → billed == list; C not billed"
         );
         assert!(agg.analytics_backfilled_at.is_none(), "live fold leaves the backfill marker null");
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_batcher_denormalizes_fusillade_request_id_onto_credits(pool: PgPool) {
+        // A batched request's credit row carries its fusillade_request_id (migration 119), so the
+        // responses view can read per-request cost off the ledger durably instead of joining
+        // http_analytics (COR-524 follow-up / Usage E).
+        let model_id = create_test_model(&pool, "req-id-credits-test").await;
+        setup_tariff(
+            &pool,
+            model_id,
+            Decimal::from_str("0.00005").unwrap(),
+            Decimal::from_str("0.00010").unwrap(),
+            ApiKeyPurpose::Batch,
+        )
+        .await;
+        let user_id = setup_user_with_balance(&pool, Decimal::from_str("100.00").unwrap()).await;
+        let batch_key = create_api_key_for_user(&pool, user_id, ApiKeyPurpose::Batch).await;
+
+        let request_id = Uuid::new_v4();
+        let mut rec = create_raw_record("req-id-credits-test", Some(batch_key), 1000, 500);
+        rec.batch_completion_window = Some("24h".to_string());
+        rec.fusillade_batch_id = Some(Uuid::new_v4());
+        rec.fusillade_request_id = Some(request_id);
+
+        run_batcher_with_records(&pool, vec![rec]).await;
+
+        // The credit is keyed to the request durably (no http_analytics needed).
+        let row = sqlx::query!(
+            "SELECT fusillade_request_id, amount FROM credits_transactions \
+             WHERE fusillade_request_id = $1 AND transaction_type = 'usage'",
+            request_id
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.fusillade_request_id, Some(request_id));
+        assert_eq!(row.amount, Decimal::from_str("0.10").unwrap(), "1000*5e-5 + 500*1e-4");
     }
 
     #[sqlx::test]

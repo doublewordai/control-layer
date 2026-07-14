@@ -120,7 +120,9 @@ pub async fn list_batch_requests<P: PoolProvider>(
             operation: format!("list responses: {}", e),
         })?;
 
-    // Enrich with http_analytics data (tokens, cost) and user emails
+    // Enrich with per-request token counts (best-effort, from http_analytics) and cost
+    // (durable, from the credits ledger by fusillade_request_id — COR-524 follow-up) plus
+    // creator emails.
     let request_ids: Vec<Uuid> = result.data.iter().map(|r| r.id).collect();
 
     let analytics = if !request_ids.is_empty() {
@@ -131,8 +133,7 @@ pub async fn list_batch_requests<P: PoolProvider>(
                 prompt_tokens,
                 completion_tokens,
                 reasoning_tokens,
-                total_tokens,
-                total_cost::float8 as total_cost
+                total_tokens
             FROM http_analytics
             WHERE fusillade_request_id = ANY($1)
             ORDER BY fusillade_request_id, timestamp DESC
@@ -147,6 +148,28 @@ pub async fn list_batch_requests<P: PoolProvider>(
     };
 
     let analytics_map: std::collections::HashMap<Uuid, AnalyticsRow> = analytics.into_iter().map(|a| (a.request_id, a)).collect();
+
+    // Cost from the durable credits ledger, keyed by the denormalized fusillade_request_id.
+    let costs = if !request_ids.is_empty() {
+        sqlx::query_as::<_, CostRow>(
+            r#"
+            SELECT DISTINCT ON (fusillade_request_id)
+                fusillade_request_id as request_id,
+                amount::float8 as total_cost
+            FROM credits_transactions
+            WHERE fusillade_request_id = ANY($1) AND transaction_type = 'usage'
+            ORDER BY fusillade_request_id, seq DESC
+            "#,
+        )
+        .bind(&request_ids)
+        .fetch_all(state.db.read())
+        .await
+        .map_err(|e| Error::Database(e.into()))?
+    } else {
+        vec![]
+    };
+    let cost_map: std::collections::HashMap<Uuid, f64> =
+        costs.into_iter().filter_map(|c| c.total_cost.map(|v| (c.request_id, v))).collect();
 
     // Fetch creator emails
     let unique_creator_ids: Vec<String> = result
@@ -194,7 +217,7 @@ pub async fn list_batch_requests<P: PoolProvider>(
                 completion_tokens: a.and_then(|a| a.completion_tokens),
                 reasoning_tokens: a.and_then(|a| a.reasoning_tokens),
                 total_tokens: a.and_then(|a| a.total_tokens),
-                total_cost: a.and_then(|a| a.total_cost),
+                total_cost: cost_map.get(&r.id).copied(),
                 created_by_email: email,
             }
         })
@@ -262,7 +285,7 @@ pub async fn get_batch_request<P: PoolProvider>(
         });
     }
 
-    // Enrich with analytics from http_analytics (dwctl-owned table)
+    // Token counts from http_analytics (best-effort; age out with retention).
     let analytics = sqlx::query_as::<_, AnalyticsRow>(
         r#"
         SELECT DISTINCT ON (fusillade_request_id)
@@ -270,8 +293,7 @@ pub async fn get_batch_request<P: PoolProvider>(
             prompt_tokens,
             completion_tokens,
             reasoning_tokens,
-            total_tokens,
-            total_cost::float8 as total_cost
+            total_tokens
         FROM http_analytics
         WHERE fusillade_request_id = $1
         ORDER BY fusillade_request_id, timestamp DESC
@@ -281,6 +303,23 @@ pub async fn get_batch_request<P: PoolProvider>(
     .fetch_optional(state.db.read())
     .await
     .map_err(|e| Error::Database(e.into()))?;
+
+    // Cost from the durable credits ledger (by denormalized fusillade_request_id).
+    let cost = sqlx::query_as::<_, CostRow>(
+        r#"
+        SELECT DISTINCT ON (fusillade_request_id)
+            fusillade_request_id as request_id,
+            amount::float8 as total_cost
+        FROM credits_transactions
+        WHERE fusillade_request_id = $1 AND transaction_type = 'usage'
+        ORDER BY fusillade_request_id, seq DESC
+        "#,
+    )
+    .bind(request_id)
+    .fetch_optional(state.db.read())
+    .await
+    .map_err(|e| Error::Database(e.into()))?
+    .and_then(|c| c.total_cost);
 
     // Look up the creator's email via UUID primary-key lookup (org IDs and unparseable
     // values return None without a query). Uses the primary pool to avoid replica lag
@@ -322,7 +361,7 @@ pub async fn get_batch_request<P: PoolProvider>(
         completion_tokens: analytics.as_ref().and_then(|a| a.completion_tokens),
         reasoning_tokens: analytics.as_ref().and_then(|a| a.reasoning_tokens),
         total_tokens: analytics.as_ref().and_then(|a| a.total_tokens),
-        total_cost: analytics.as_ref().and_then(|a| a.total_cost),
+        total_cost: cost,
         body: if is_zdr { String::new() } else { detail.body.unwrap_or_default() },
         response_body: if is_zdr { None } else { detail.response_body },
         error: if is_zdr { None } else { detail.error },
@@ -415,7 +454,9 @@ pub async fn delete_batch_request<P: PoolProvider>(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Analytics data from http_analytics (dwctl-owned, not fusillade schema)
+/// Per-request token counts from http_analytics (dwctl-owned, not fusillade schema).
+/// Best-effort: these age out with http_analytics retention, so a response older than the
+/// retention window shows empty token counts. Cost is read separately off the durable ledger.
 #[derive(sqlx::FromRow)]
 struct AnalyticsRow {
     #[allow(dead_code)]
@@ -424,6 +465,13 @@ struct AnalyticsRow {
     completion_tokens: Option<i64>,
     reasoning_tokens: Option<i64>,
     total_tokens: Option<i64>,
+}
+
+/// Per-request cost from the credits ledger, keyed by the denormalized fusillade_request_id
+/// (migration 119). Durable — survives http_analytics retention, unlike the token counts above.
+#[derive(sqlx::FromRow)]
+struct CostRow {
+    request_id: Uuid,
     total_cost: Option<f64>,
 }
 
