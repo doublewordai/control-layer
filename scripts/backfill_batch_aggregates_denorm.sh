@@ -39,6 +39,17 @@ if [ -z "$MAX_SEQ" ] || [ "$MAX_SEQ" -eq 0 ]; then
   exit 0
 fi
 
+# batch_aggregates has no standalone index on max_seq (its pkey is fusillade_batch_id and
+# idx_batch_agg_user_seq leads with user_id), so the per-range max_seq sweep would scan the
+# whole table every range. Build a partial btree on max_seq over just the un-classified rows
+# first (CONCURRENTLY, never blocks the fold; self-shrinks as rows are set) and drop it when
+# done. Drop any leftover first so an aborted CONCURRENTLY build can't leave an INVALID index.
+HELPER_IDX=idx_batch_agg_svctier_backfill
+echo "backfill_batch_aggregates_denorm: (re)building helper index ${HELPER_IDX} CONCURRENTLY…"
+trap 'psql_q "DROP INDEX CONCURRENTLY IF EXISTS ${HELPER_IDX};" >/dev/null 2>&1 || true' EXIT INT TERM
+psql_q "DROP INDEX CONCURRENTLY IF EXISTS ${HELPER_IDX};"
+psql_q "CREATE INDEX CONCURRENTLY ${HELPER_IDX} ON batch_aggregates (max_seq) WHERE service_tier IS NULL;"
+
 echo "backfill_batch_aggregates_denorm: sweeping max_seq (0, ${MAX_SEQ}]  batch=${BATCH_SIZE}  sleep=${SLEEP_SECONDS}s"
 
 CURSOR=0
@@ -73,3 +84,6 @@ echo "backfill_batch_aggregates_denorm: DONE"
 printf '  batch rows updated : %s\n' "$total_rows"
 printf '  duration           : %dm %02ds\n' $(( elapsed / 60 )) $(( elapsed % 60 ))
 printf '  batches            : %s  (BATCH_SIZE=%s, SLEEP_SECONDS=%s)\n' "$batches" "$BATCH_SIZE" "$SLEEP_SECONDS"
+
+echo "backfill_batch_aggregates_denorm: dropping helper index ${HELPER_IDX} CONCURRENTLY…"
+psql_q "DROP INDEX CONCURRENTLY IF EXISTS ${HELPER_IDX};"

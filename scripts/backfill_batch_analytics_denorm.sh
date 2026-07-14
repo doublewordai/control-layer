@@ -54,6 +54,20 @@ if [ -z "$MAX_SEQ" ] || [ "$MAX_SEQ" -eq 0 ]; then
   exit 0
 fi
 
+# batch_aggregates has no standalone index on max_seq (its pkey is fusillade_batch_id and
+# idx_batch_agg_user_seq leads with user_id), so the per-range `max_seq > .. AND max_seq
+# <= ..` sweep would scan the whole table every range — O(ranges × rows), which on prod
+# ran ~4s/range and tripped connection timeouts. Build a partial btree on max_seq over just
+# the un-backfilled rows first (CONCURRENTLY, so it never blocks the fold's writes; it
+# self-shrinks as rows are stamped) and drop it when done. Drop any leftover first so an
+# aborted CONCURRENTLY build can't leave an INVALID index that CREATE would keep. (The
+# http_analytics aggregation itself already rides idx_analytics_fusillade_batch_id.)
+HELPER_IDX=idx_batch_agg_analytics_backfill
+echo "backfill_batch_analytics_denorm: (re)building helper index ${HELPER_IDX} CONCURRENTLY…"
+trap 'psql_q "DROP INDEX CONCURRENTLY IF EXISTS ${HELPER_IDX};" >/dev/null 2>&1 || true' EXIT INT TERM
+psql_q "DROP INDEX CONCURRENTLY IF EXISTS ${HELPER_IDX};"
+psql_q "CREATE INDEX CONCURRENTLY ${HELPER_IDX} ON batch_aggregates (max_seq) WHERE analytics_backfilled_at IS NULL;"
+
 echo "backfill_batch_analytics_denorm: sweeping max_seq (0, ${MAX_SEQ}]  batch=${BATCH_SIZE}  sleep=${SLEEP_SECONDS}s  quiescent='${QUIESCENT_INTERVAL}'"
 
 CURSOR=0
@@ -130,4 +144,8 @@ echo "backfill_batch_analytics_denorm: DONE"
 printf '  batch rows updated : %s\n' "$total_rows"
 printf '  duration           : %dm %02ds\n' $(( elapsed / 60 )) $(( elapsed % 60 ))
 printf '  ranges             : %s  (BATCH_SIZE=%s, SLEEP_SECONDS=%s)\n' "$batches" "$BATCH_SIZE" "$SLEEP_SECONDS"
+
+echo "backfill_batch_analytics_denorm: dropping helper index ${HELPER_IDX} CONCURRENTLY…"
+psql_q "DROP INDEX CONCURRENTLY IF EXISTS ${HELPER_IDX};"
+
 echo "  re-run until 'rows +0' throughout to catch batches that were hot on this pass" >&2
