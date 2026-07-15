@@ -4550,7 +4550,11 @@ mod tests {
 
         resp.assert_status(StatusCode::OK);
         let body: serde_json::Value = resp.json();
-        assert_eq!(body["total_requests"], serde_json::json!(0), "unfolded batch reports zero requests, not 404");
+        assert_eq!(
+            body["total_requests"],
+            serde_json::json!(0),
+            "unfolded batch reports zero requests, not 404"
+        );
     }
 
     /// Helper: insert a batch with `n` pending requests directly into fusillade tables.
