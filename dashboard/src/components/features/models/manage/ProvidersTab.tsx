@@ -85,7 +85,7 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from "../../../ui/tooltip";
-import { buildFallbackStatusCodes } from "../../../../utils/fallbackStatusCodes";
+import { buildFallbackUpdatePayload } from "../../../../utils/fallbackStatusCodes";
 
 interface ProvidersTabProps {
   model: Model;
@@ -786,11 +786,16 @@ const EditRoutingModal: React.FC<{
   }, [model]);
 
   const handleSubmit = async () => {
-    const onStatus = buildFallbackStatusCodes({
+    const fallbackUpdate = buildFallbackUpdatePayload({
+      fallbackEnabled,
+      fallbackOnRateLimit,
+      originalStatuses: model.fallback?.on_status ?? [],
       on429: fallbackOn429,
       on499: fallbackOn499,
       on404: fallbackOn404,
       on5xx: fallbackOn5xx,
+      withReplacement,
+      maxAttempts,
     });
 
     try {
@@ -798,11 +803,7 @@ const EditRoutingModal: React.FC<{
         id: model.id,
         data: {
           lb_strategy: strategy,
-          fallback_enabled: fallbackEnabled,
-          fallback_on_rate_limit: fallbackEnabled ? fallbackOnRateLimit : false,
-          fallback_on_status: fallbackEnabled ? onStatus : [],
-          fallback_with_replacement: fallbackEnabled ? withReplacement : false,
-          fallback_max_attempts: fallbackEnabled ? maxAttempts : null,
+          ...fallbackUpdate,
         },
       });
       onClose();
