@@ -1198,10 +1198,6 @@ export function useBatchAnalytics(id: string) {
     queryKey: queryKeys.batches.analytics(id),
     queryFn: () => dwctlApi.batches.getAnalytics(id),
     enabled: !!id,
-    // A 404 is terminal ("analytics no longer available" — the read-model row aged out of
-    // retention, COR-524); don't retry it. Other failures retry as normal.
-    retry: (failureCount, error) =>
-      (error as { status?: number })?.status === 404 ? false : failureCount < 3,
     // Only fetch analytics for completed batches, or refetch periodically for in-progress batches
     refetchInterval: (query) => {
       // We need to get the batch status - we can use the batch query cache

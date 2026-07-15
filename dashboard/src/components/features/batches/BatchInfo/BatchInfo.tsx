@@ -46,15 +46,9 @@ const BatchInfo: React.FC = () => {
   const fromUrl = searchParams.get("from");
 
   const { data: batch, isLoading, error } = useBatch(batchId!);
-  const {
-    data: analytics,
-    isLoading: analyticsLoading,
-    error: analyticsError,
-  } = useBatchAnalytics(batchId!);
-  // 404 = the batch's analytics read-model row has aged out of retention (COR-524).
-  // Show an explicit "no longer available" message instead of silently hiding the card.
-  const analyticsGone =
-    (analyticsError as { status?: number } | null)?.status === 404;
+  const { data: analytics, isLoading: analyticsLoading } = useBatchAnalytics(
+    batchId!,
+  );
   const retryMutation = useRetryBatch();
 
   // TODO: this role check is inconsistent with other components
@@ -720,7 +714,7 @@ const BatchInfo: React.FC = () => {
               </Card>
 
               {/* Metrics Card — compact inline format */}
-              {(analytics || analyticsGone) &&
+              {analytics &&
                 (batch.request_counts.completed > 0 ||
                   batch.request_counts.failed > 0) && (
                   <Card className="p-0 gap-0 rounded-lg">
@@ -748,11 +742,7 @@ const BatchInfo: React.FC = () => {
                           <Skeleton className="h-5 w-full" />
                           <Skeleton className="h-5 w-full" />
                         </div>
-                      ) : analyticsGone ? (
-                        <p className="text-sm text-gray-500">
-                          Analytics for this batch are no longer available.
-                        </p>
-                      ) : analytics && analytics.total_requests > 0 ? (
+                      ) : analytics.total_requests > 0 ? (
                         <div className="space-y-2">
                           <div className="flex justify-between text-sm">
                             <span className="text-gray-600">Prompt</span>

@@ -1079,7 +1079,7 @@ pub async fn get_batch<P: PoolProvider>(
 Analytics update in real-time as requests complete.",
     responses(
         (status = 200, description = "Batch analytics with token counts, costs, and performance metrics.", body = BatchAnalytics),
-        (status = 404, description = "Batch not found, you don't have access to it, or its analytics are no longer available (aged out of retention)."),
+        (status = 404, description = "Batch not found or you don't have access to it."),
         (status = 500, description = "An unexpected error occurred. Retry the request or contact support if the issue persists.")
     ),
     params(
@@ -1115,20 +1115,18 @@ pub async fn get_batch_analytics<P: PoolProvider>(
         });
     }
 
-    // Fetch aggregated analytics metrics for this batch from the batch_aggregates read model.
-    // A missing row means the batch predates the read model and its raw http_analytics rows
-    // have aged out of retention — surface that as 404 ("no longer available") rather than a
-    // misleading all-zero payload (COR-524). The dashboard only requests analytics for
-    // completed batches, so an in-flight batch never lands here with a genuinely-empty row.
+    // Read this batch's aggregated metrics from the batch_aggregates read model. That model is
+    // durable — it replaces raw http_analytics, which COR-509 prunes — so a batch that has been
+    // folded keeps its metrics indefinitely. A missing row therefore means the batch simply
+    // hasn't been folded yet (brand new / no completed requests), not that data aged out, so
+    // return a zero-valued payload rather than 404. Ownership/existence is already enforced
+    // above, and platform managers expect to see metrics for any batch they can access.
     let analytics = crate::db::handlers::analytics::get_batch_analytics(state.db.read(), &batch_id)
         .await
         .map_err(|e| Error::Internal {
             operation: format!("fetch batch analytics: {}", e),
         })?
-        .ok_or_else(|| Error::NotFound {
-            resource: "Batch analytics".to_string(),
-            id: batch_id_str.clone(),
-        })?;
+        .unwrap_or_default();
 
     Ok(Json(analytics))
 }
@@ -4530,13 +4528,13 @@ mod tests {
         );
     }
 
-    /// A batch that exists in fusillade but has no `batch_aggregates` row (predates the read
-    /// model, or its raw http_analytics rows aged out of retention) returns 404 from
-    /// GET /batches/{id}/analytics — the "analytics no longer available" case — rather than a
-    /// misleading all-zero payload (COR-524).
+    /// A batch that exists in fusillade but has no `batch_aggregates` row (brand new / not yet
+    /// folded) returns 200 with a zero-valued payload from GET /batches/{id}/analytics. The read
+    /// model is durable, so a missing row means "nothing folded yet", not "aged out" (COR-524) —
+    /// platform managers still see (empty) metrics for any batch they can access.
     #[sqlx::test]
     #[test_log::test]
-    async fn test_batch_analytics_missing_read_model_row_returns_404(pool: PgPool) {
+    async fn test_batch_analytics_missing_read_model_row_returns_zeros(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
         let auth = add_auth_headers(&user);
@@ -4550,7 +4548,9 @@ mod tests {
             .add_header(&auth[1].0, &auth[1].1)
             .await;
 
-        resp.assert_status(StatusCode::NOT_FOUND);
+        resp.assert_status(StatusCode::OK);
+        let body: serde_json::Value = resp.json();
+        assert_eq!(body["total_requests"], serde_json::json!(0), "unfolded batch reports zero requests, not 404");
     }
 
     /// Helper: insert a batch with `n` pending requests directly into fusillade tables.
