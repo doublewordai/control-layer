@@ -4263,9 +4263,8 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "onwards"
-version = "0.34.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1df68efd08162f124ab0d9891e05e8585d32f844b10a9baf6e121d49477d616b"
+version = "0.35.0"
+source = "git+https://github.com/doublewordai/onwards?rev=84120bc8790dc77da916e01bde6543a010317091#84120bc8790dc77da916e01bde6543a010317091"
 dependencies = [
  "anyhow",
  "async-stream",

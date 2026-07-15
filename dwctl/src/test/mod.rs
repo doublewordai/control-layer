@@ -1645,7 +1645,9 @@ fn ai_models_openapi_includes_reasoning_capabilities_query_parameter() {
 
     assert!(
         parameters.iter().any(|parameter| {
-            parameter["name"] == "include_reasoning_capabilities" && parameter["in"] == "query" && parameter["required"] == false
+            parameter["name"] == "include_reasoning_capabilities"
+                && parameter["in"] == "query"
+                && !parameter.get("required").and_then(serde_json::Value::as_bool).unwrap_or(false)
         }),
         "GET /models must document include_reasoning_capabilities as an optional query parameter"
     );
