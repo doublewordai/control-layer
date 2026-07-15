@@ -186,7 +186,7 @@ fn db_component_to_response(c: DeploymentComponentDBResponse) -> ModelComponentR
         ("endpoint" = Option<i32>, Query, description = "Filter by inference endpoint ID"),
         ("group" = Option<String>, Query, description = "Filter by group IDs (comma-separated UUIDs)"),
         ("accessible" = Option<bool>, Query, description = "Filter to only models the current user can access (defaults to false for admins, true for users)"),
-        ("include" = Option<String>, Query, description = "Include additional data (comma-separated: 'groups', 'metrics', 'status', 'pricing', 'endpoints', 'facets'). Only platform managers can include groups. Status shows probe monitoring information. Pricing shows simple customer rates for regular users, full pricing structure including current active tariffs for users with Pricing::ReadAll permission. Endpoints includes full inference endpoint details. Facets returns distinct providers, capabilities, and model types for filter dropdowns."),
+        ("include" = Option<String>, Query, description = "Include additional data (comma-separated: 'groups', 'metrics', 'status', 'pricing', 'endpoints', 'facets', 'reasoning_capabilities'). Only platform managers can include groups. Status shows probe monitoring information. Pricing shows simple customer rates for regular users, full pricing structure including current active tariffs for users with Pricing::ReadAll permission. Endpoints includes full inference endpoint details. Facets returns distinct providers, capabilities, and model types for filter dropdowns. Reasoning capabilities shows efforts supported by every provider behind each model."),
         ("provider" = Option<String>, Query, description = "Filter by provider name (case-insensitive exact match against metadata.provider)"),
         ("model_type" = Option<String>, Query, description = "Filter by model type (CHAT, EMBEDDINGS, RERANKER)"),
         ("capability" = Option<String>, Query, description = "Filter by capability (returns models that have this capability)"),
@@ -423,6 +423,14 @@ pub async fn list_deployed_models<P: PoolProvider>(
     let include_pricing = includes.contains(&"pricing");
     let include_endpoints = includes.contains(&"endpoints");
     let include_components = includes.contains(&"components");
+    let include_reasoning_capabilities = includes.contains(&"reasoning_capabilities");
+
+    let reasoning_policies = if include_reasoning_capabilities {
+        let aliases = models.iter().map(|model| model.alias.clone()).collect::<Vec<_>>();
+        repo.get_reasoning_policies(&aliases).await?
+    } else {
+        Default::default()
+    };
 
     // Use ModelEnricher to add requested data
     let enricher = DeployedModelEnricher {
@@ -440,6 +448,17 @@ pub async fn list_deployed_models<P: PoolProvider>(
     };
 
     let response = enricher.enrich_many(models).await?;
+    let response = if include_reasoning_capabilities {
+        response
+            .into_iter()
+            .map(|model| {
+                let supported_efforts = reasoning_policies.get(&model.alias).and_then(|policy| policy.supported_efforts());
+                model.with_supported_reasoning_efforts(supported_efforts)
+            })
+            .collect()
+    } else {
+        response
+    };
 
     // Fetch facets if requested (reuse existing repo/connection to avoid
     // acquiring a second read connection which could self-deadlock under pool
@@ -1597,6 +1616,69 @@ mod tests {
                 .data
                 .iter()
                 .any(|it| { it.id == deployment.id && it.groups.as_deref().is_some_and(|gs| gs.iter().any(|g| g.id == group.id)) })
+        );
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_list_deployments_with_reasoning_capabilities_include(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let test_endpoint_id = get_test_endpoint_id(&pool).await;
+
+        sqlx::query("UPDATE inference_endpoints SET reasoning_translation = $1 WHERE id = $2")
+            .bind(json!({
+                "chat_completions": {
+                    "unsupported_efforts": ["minimal", "xhigh", "max"],
+                    "writes": [{
+                        "target_path": "/reasoning_effort",
+                        "values": {
+                            "none": "none",
+                            "low": "low",
+                            "medium": "medium",
+                            "high": "high"
+                        }
+                    }]
+                }
+            }))
+            .bind(test_endpoint_id)
+            .execute(&pool)
+            .await
+            .expect("Failed to configure reasoning translation");
+
+        let deployment = create_test_deployment(&pool, admin_user.id, "reasoning-model", "reasoning-alias").await;
+
+        let response = app
+            .get("/admin/api/v1/models")
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
+            .await;
+
+        response.assert_status_ok();
+        let body: serde_json::Value = response.json();
+        let model = body["data"]
+            .as_array()
+            .and_then(|models| models.iter().find(|model| model["id"] == deployment.id.to_string()))
+            .expect("Created model should be listed");
+        assert!(model.get("supported_reasoning_efforts").is_none());
+
+        let response = app
+            .get("/admin/api/v1/models?include=pricing,reasoning_capabilities")
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
+            .await;
+
+        response.assert_status_ok();
+        let body: serde_json::Value = response.json();
+        let model = body["data"]
+            .as_array()
+            .and_then(|models| models.iter().find(|model| model["id"] == deployment.id.to_string()))
+            .expect("Created model should be listed");
+        assert_eq!(
+            model["supported_reasoning_efforts"],
+            json!({
+                "chat_completions": ["none", "low", "medium", "high"]
+            })
         );
     }
 
