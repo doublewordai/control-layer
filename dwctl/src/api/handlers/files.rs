@@ -2226,6 +2226,20 @@ mod tests {
         unsupported.assert_status(axum::http::StatusCode::BAD_REQUEST);
         assert!(unsupported.text().contains("not supported by this provider"));
 
+        let malformed_responses = upload_batch_jsonl(
+            &app,
+            &user,
+            r#"{"custom_id":"malformed-responses","method":"POST","url":"/v1/responses","body":{"model":"reasoning-model","input":"Hello","reasoning":"high"}}"#,
+        )
+        .await;
+        malformed_responses.assert_status(axum::http::StatusCode::BAD_REQUEST);
+        let malformed_body = malformed_responses.text();
+        assert!(malformed_body.contains("Line 1:"), "unexpected response: {malformed_body}");
+        assert!(
+            malformed_body.contains("Invalid type for 'reasoning'. Expected an object."),
+            "unexpected response: {malformed_body}"
+        );
+
         let missing_budget_limit = upload_batch_jsonl(
             &app,
             &user,

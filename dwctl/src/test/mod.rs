@@ -1633,6 +1633,24 @@ async fn test_openapi_specs_serialize() {
     assert!(ai_spec.contains("/embeddings"));
 }
 
+#[test]
+fn ai_models_openapi_includes_reasoning_capabilities_query_parameter() {
+    use utoipa::OpenApi;
+
+    let spec = serde_json::to_value(AiApiDoc::openapi()).expect("AI spec serializes");
+    let parameters = spec
+        .pointer("/paths/~1models/get/parameters")
+        .and_then(serde_json::Value::as_array)
+        .expect("GET /models exposes query parameters");
+
+    assert!(
+        parameters.iter().any(|parameter| {
+            parameter["name"] == "include_reasoning_capabilities" && parameter["in"] == "query" && parameter["required"] == false
+        }),
+        "GET /models must document include_reasoning_capabilities as an optional query parameter"
+    );
+}
+
 /// Access-control tests for `/admin/openapi.json`, `/admin/docs`,
 /// `/ai/openapi.json`, and `/ai/docs`. These exist because a pentest
 /// found the Admin spec was world-readable, leaking the full internal

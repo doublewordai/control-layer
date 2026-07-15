@@ -2136,6 +2136,71 @@ mod tests {
 
     #[sqlx::test]
     #[test_log::test]
+    async fn rejects_malformed_responses_reasoning_before_batch_creation(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+        let deployment = create_test_deployment(&pool, user.id, "reasoning-model", "reasoning-model").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
+
+        let valid_jsonl = r#"{"custom_id":"malformed-responses","method":"POST","url":"/v1/responses","body":{"model":"reasoning-model","input":"Hello"}}"#;
+        let upload = app
+            .post("/ai/v1/files")
+            .multipart(
+                axum_test::multipart::MultipartForm::new()
+                    .add_part(
+                        "file",
+                        axum_test::multipart::Part::bytes(valid_jsonl.as_bytes()).file_name("reasoning-batch.jsonl"),
+                    )
+                    .add_part("purpose", axum_test::multipart::Part::text("batch")),
+            )
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        upload.assert_status(StatusCode::CREATED);
+        let file: serde_json::Value = upload.json();
+        let file_id = Uuid::parse_str(file["id"].as_str().unwrap()).unwrap();
+
+        sqlx::query("UPDATE fusillade.request_templates SET body = $1 WHERE file_id = $2")
+            .bind(r#"{"model":"reasoning-model","input":"Hello","reasoning":"high"}"#)
+            .bind(file_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let response = app
+            .post("/ai/v1/batches")
+            .json(&CreateBatchRequest {
+                input_file_id: file_id.to_string(),
+                endpoint: "/v1/responses".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+            })
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+
+        response.assert_status(StatusCode::BAD_REQUEST);
+        let body = response.text();
+        assert!(
+            body.contains("Line 1 (custom_id 'malformed-responses')"),
+            "unexpected response: {body}"
+        );
+        assert!(
+            body.contains("Invalid type for 'reasoning'. Expected an object."),
+            "unexpected response: {body}"
+        );
+
+        let batch_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM fusillade.batches")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(batch_count, 0, "validation must happen before creating a batch record");
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
     async fn test_create_batch_with_default_24h_sla(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
