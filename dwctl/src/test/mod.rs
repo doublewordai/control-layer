@@ -1634,6 +1634,28 @@ async fn test_openapi_specs_serialize() {
 }
 
 #[test]
+fn ai_models_openapi_documents_reasoning_capabilities_query_parameter() {
+    use utoipa::OpenApi;
+
+    let spec = serde_json::to_value(AiApiDoc::openapi()).expect("AI spec serializes");
+    let parameter = spec["paths"]["/models"]["get"]["parameters"]
+        .as_array()
+        .and_then(|parameters| {
+            parameters
+                .iter()
+                .find(|parameter| parameter["name"] == "include_reasoning_capabilities")
+        })
+        .expect("GET /models should document include_reasoning_capabilities");
+
+    assert_eq!(parameter["in"], "query");
+    assert_eq!(parameter["schema"]["type"], "boolean");
+    assert!(
+        spec["components"]["schemas"]["ModelObject"]["properties"]["supported_reasoning_efforts"].is_object(),
+        "ModelObject should document supported_reasoning_efforts"
+    );
+}
+
+#[test]
 fn admin_models_openapi_documents_reasoning_capabilities_include() {
     use utoipa::OpenApi;
 
