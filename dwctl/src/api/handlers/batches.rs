@@ -725,13 +725,15 @@ async fn load_and_validate_batch_models<P: PoolProvider>(
     state: &AppState<P>,
     file_id: Uuid,
 ) -> Result<(HashMap<String, i64>, BatchModelInfo)> {
-    let mut templates_conn = state.request_manager.pool().acquire().await.map_err(|e| Error::Internal {
-        operation: format!("get primary Fusillade connection for batch validation: {e}"),
-    })?;
-    let file_model_counts = BatchTemplates::new(&mut templates_conn)
-        .get_model_counts(file_id)
-        .await
-        .map_err(Error::Database)?;
+    let file_model_counts = {
+        let mut templates_conn = state.request_manager.pool().acquire().await.map_err(|e| Error::Internal {
+            operation: format!("get primary Fusillade connection for batch model counts: {e}"),
+        })?;
+        BatchTemplates::new(&mut templates_conn)
+            .get_model_counts(file_id)
+            .await
+            .map_err(Error::Database)?
+    };
     let model_aliases = file_model_counts.keys().cloned().collect::<Vec<_>>();
 
     let (batch_model_info, reasoning_policies) = {
@@ -749,6 +751,9 @@ async fn load_and_validate_batch_models<P: PoolProvider>(
         (batch_model_info, reasoning_policies)
     };
 
+    let mut templates_conn = state.request_manager.pool().acquire().await.map_err(|e| Error::Internal {
+        operation: format!("get primary Fusillade connection for batch request validation: {e}"),
+    })?;
     let mut templates = BatchTemplates::new(&mut templates_conn);
     let mut stream = templates.stream_reasoning_requests(file_id);
     while let Some(template) = stream.next().await {
@@ -1935,7 +1940,7 @@ pub async fn list_batches<P: PoolProvider>(
 
 #[cfg(test)]
 mod tests {
-    use super::parse_completion_window_filter;
+    use super::{load_and_validate_batch_models, parse_completion_window_filter};
     use crate::api::models::batches::CreateBatchRequest;
     use crate::api::models::users::Role;
     use crate::db::handlers::Credits;
@@ -1946,8 +1951,10 @@ mod tests {
     use fusillade::Storage;
     use rust_decimal::Decimal;
     use sqlx::PgPool;
-    use sqlx_pool_router::TestDbPools;
+    use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+    use sqlx_pool_router::{PoolProvider, TestDbPools};
     use std::collections::HashMap;
+    use std::time::Duration;
     use uuid::Uuid;
 
     // -------------------------------------------------------------------------
@@ -1987,6 +1994,54 @@ mod tests {
         assert_eq!(
             parse_completion_window_filter(Some(" 24h , , 1h ,   ")),
             Some(vec!["24h".to_string(), "1h".to_string()])
+        );
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn batch_validation_releases_fusillade_before_waiting_for_control(pool: PgPool) {
+        let migrated_fusillade_pool = setup_fusillade_pool(&pool).await;
+        migrated_fusillade_pool.close().await;
+
+        let base_options: PgConnectOptions = pool.connect_options().as_ref().clone();
+        let control_pool = PgPoolOptions::new()
+            .max_connections(1)
+            .min_connections(0)
+            .connect_with(base_options.clone())
+            .await
+            .unwrap();
+        let fusillade_pool = PgPoolOptions::new()
+            .max_connections(1)
+            .min_connections(0)
+            .connect_with(base_options.options([("search_path", "fusillade")]))
+            .await
+            .unwrap();
+        let state = create_test_app_state_with_database_pools(control_pool.clone(), fusillade_pool.clone(), create_test_config()).await;
+
+        let held_control = state.db.write().acquire().await.unwrap();
+        let held_fusillade = fusillade_pool.acquire().await.unwrap();
+        let validation_state = state.clone();
+        let validation = tokio::spawn(async move { load_and_validate_batch_models(&validation_state, Uuid::new_v4()).await });
+
+        // Let validation queue first for the only Fusillade connection, then
+        // release it. A second acquisition can complete only if validation
+        // releases Fusillade before it waits for the held control connection.
+        tokio::task::yield_now().await;
+        drop(held_fusillade);
+        let fusillade_is_available = tokio::time::timeout(Duration::from_millis(250), fusillade_pool.acquire()).await;
+        let released_before_control_wait = fusillade_is_available.is_ok();
+
+        drop(fusillade_is_available);
+        drop(held_control);
+        let validation_result = tokio::time::timeout(Duration::from_secs(1), validation)
+            .await
+            .expect("batch validation should finish after the control connection is released")
+            .expect("batch validation task should not panic");
+        validation_result.expect("empty batch validation should succeed");
+
+        assert!(
+            released_before_control_wait,
+            "batch validation held the Fusillade connection while waiting for the control pool"
         );
     }
 
