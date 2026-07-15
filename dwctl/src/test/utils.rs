@@ -115,6 +115,16 @@ pub async fn setup_fusillade_pool(pool: &PgPool) -> PgPool {
 pub async fn create_test_app_state_with_fusillade(pool: PgPool, config: crate::config::Config) -> crate::AppState<TestDbPools> {
     let fusillade_pool = setup_fusillade_pool(&pool).await;
 
+    create_test_app_state_with_database_pools(pool, fusillade_pool, config).await
+}
+
+/// Create an AppState backed by distinct control-layer and Fusillade pools.
+/// This is useful for tests that need to exercise cross-database pool ordering.
+pub async fn create_test_app_state_with_database_pools(
+    pool: PgPool,
+    fusillade_pool: PgPool,
+    config: crate::config::Config,
+) -> crate::AppState<TestDbPools> {
     let test_pools = TestDbPools::new(pool.clone()).await.expect("Failed to create TestDbPools");
     let fusillade_test_pools = TestDbPools::new(fusillade_pool)
         .await

@@ -14,7 +14,8 @@ use crate::api::models::batches::{
 };
 use crate::api::models::users::CurrentUser;
 use crate::auth::permissions::{RequiresPermission, can_read_all_resources, has_permission, operation, resource};
-use crate::db::handlers::{Connections, Credits, Users, api_keys::ApiKeys, repository::Repository};
+use crate::db::handlers::deployments::BatchModelInfo;
+use crate::db::handlers::{BatchTemplates, Connections, Credits, Deployments, Users, api_keys::ApiKeys, repository::Repository};
 use crate::db::models::api_keys::ApiKeyPurpose;
 use crate::errors::{Error, Result};
 use crate::types::{Operation, Resource};
@@ -428,6 +429,7 @@ The batch will begin processing immediately. Use `GET /batches/{batch_id}` to mo
         (status = 400, description = "Invalid request — check that the endpoint and completion_window are valid."),
         (status = 402, description = "Insufficient credits — account balance is below zero."),
         (status = 404, description = "Input file not found or you don't have access to it."),
+        (status = 422, description = "A reasoning effort maps to an absolute token budget but the request does not provide a sufficient output-token limit."),
         (status = 500, description = "An unexpected error occurred. Retry the request or contact support if the issue persists.")
     )
 )]
@@ -557,32 +559,13 @@ pub async fn create_batch<P: PoolProvider>(
         }
     }
 
-    // Get per-model request counts from the file
-    let file_stats = state
-        .request_manager
-        .get_file_template_stats(fusillade::FileId(file_id))
-        .await
-        .map_err(|e| Error::Internal {
-            operation: format!("get file template stats: {}", e),
-        })?;
-
-    let file_model_counts: HashMap<String, i64> = file_stats.iter().map(|s| (s.model.clone(), s.request_count)).collect();
+    // Read templates and model configuration from their respective primary
+    // pools. Besides avoiding upload-to-submit replica lag, this revalidates
+    // against any reasoning mapping or composite membership changes made
+    // since upload.
+    let (file_model_counts, batch_model_info) = load_and_validate_batch_models(&state, file_id).await?;
 
     let model_aliases: Vec<String> = file_model_counts.keys().cloned().collect();
-
-    // Get per-model batch info (throughputs + allowed windows) in one query
-    let batch_model_info = {
-        use crate::db::handlers::deployments::Deployments;
-        let mut conn = state.db.read().acquire().await.map_err(|e| Error::Internal {
-            operation: format!("get db connection: {}", e),
-        })?;
-        Deployments::new(&mut conn)
-            .get_batch_model_info(&model_aliases)
-            .await
-            .map_err(|e| Error::Internal {
-                operation: format!("get batch model info: {}", e),
-            })?
-    };
 
     // Check per-model batch completion window restrictions (skipped for elevated users)
     if !can_use_any_window {
@@ -736,6 +719,68 @@ pub async fn create_batch<P: PoolProvider>(
         StatusCode::CREATED,
         Json(to_batch_response_with_email(batch, Some(&current_user.email))),
     ))
+}
+
+async fn load_and_validate_batch_models<P: PoolProvider>(
+    state: &AppState<P>,
+    file_id: Uuid,
+) -> Result<(HashMap<String, i64>, BatchModelInfo)> {
+    let file_model_counts = {
+        let mut templates_conn = state.request_manager.pool().acquire().await.map_err(|e| Error::Internal {
+            operation: format!("get primary Fusillade connection for batch model counts: {e}"),
+        })?;
+        BatchTemplates::new(&mut templates_conn)
+            .get_model_counts(file_id)
+            .await
+            .map_err(Error::Database)?
+    };
+    let model_aliases = file_model_counts.keys().cloned().collect::<Vec<_>>();
+
+    let (batch_model_info, reasoning_policies) = {
+        let mut control_conn = state.db.write().acquire().await.map_err(|e| Error::Internal {
+            operation: format!("get primary control database connection for batch validation: {e}"),
+        })?;
+        let batch_model_info = Deployments::new(&mut control_conn)
+            .get_batch_model_info(&model_aliases)
+            .await
+            .map_err(Error::Database)?;
+        let reasoning_policies = Deployments::new(&mut control_conn)
+            .get_reasoning_policies(&model_aliases)
+            .await
+            .map_err(Error::Database)?;
+        (batch_model_info, reasoning_policies)
+    };
+
+    let mut templates_conn = state.request_manager.pool().acquire().await.map_err(|e| Error::Internal {
+        operation: format!("get primary Fusillade connection for batch request validation: {e}"),
+    })?;
+    let mut templates = BatchTemplates::new(&mut templates_conn);
+    let mut stream = templates.stream_reasoning_requests(file_id);
+    while let Some(template) = stream.next().await {
+        let template = template.map_err(Error::Database)?;
+        let line = i64::from(template.line_number) + 1;
+        let context = match template.custom_id.as_deref() {
+            Some(custom_id) => format!("Line {line} (custom_id '{custom_id}')"),
+            None => format!("Line {line}"),
+        };
+        let body: serde_json::Value = serde_json::from_str(&template.body).map_err(|error| Error::BadRequest {
+            message: format!("{context}: stored request body is not valid JSON: {error}"),
+        })?;
+        let validation = reasoning_policies
+            .get(&template.model)
+            .cloned()
+            .unwrap_or_default()
+            .validate_request(&template.path, &body);
+        if let Err(error) = validation {
+            let message = format!("{context}: {}", error.message());
+            return Err(match error.status_code() {
+                422 => Error::UnprocessableEntity { message },
+                _ => Error::BadRequest { message },
+            });
+        }
+    }
+
+    Ok((file_model_counts, batch_model_info))
 }
 
 async fn get_model_ids_by_aliases<P: PoolProvider>(state: &AppState<P>, model_aliases: &[String]) -> Result<HashMap<String, Uuid>> {
@@ -1895,7 +1940,7 @@ pub async fn list_batches<P: PoolProvider>(
 
 #[cfg(test)]
 mod tests {
-    use super::parse_completion_window_filter;
+    use super::{load_and_validate_batch_models, parse_completion_window_filter};
     use crate::api::models::batches::CreateBatchRequest;
     use crate::api::models::users::Role;
     use crate::db::handlers::Credits;
@@ -1906,8 +1951,10 @@ mod tests {
     use fusillade::Storage;
     use rust_decimal::Decimal;
     use sqlx::PgPool;
-    use sqlx_pool_router::TestDbPools;
+    use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+    use sqlx_pool_router::{PoolProvider, TestDbPools};
     use std::collections::HashMap;
+    use std::time::Duration;
     use uuid::Uuid;
 
     // -------------------------------------------------------------------------
@@ -1948,6 +1995,143 @@ mod tests {
             parse_completion_window_filter(Some(" 24h , , 1h ,   ")),
             Some(vec!["24h".to_string(), "1h".to_string()])
         );
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn batch_validation_releases_fusillade_before_waiting_for_control(pool: PgPool) {
+        let migrated_fusillade_pool = setup_fusillade_pool(&pool).await;
+        migrated_fusillade_pool.close().await;
+
+        let base_options: PgConnectOptions = pool.connect_options().as_ref().clone();
+        let control_pool = PgPoolOptions::new()
+            .max_connections(1)
+            .min_connections(0)
+            .connect_with(base_options.clone())
+            .await
+            .unwrap();
+        let fusillade_pool = PgPoolOptions::new()
+            .max_connections(1)
+            .min_connections(0)
+            .connect_with(base_options.options([("search_path", "fusillade")]))
+            .await
+            .unwrap();
+        let state = create_test_app_state_with_database_pools(control_pool.clone(), fusillade_pool.clone(), create_test_config()).await;
+
+        let held_control = state.db.write().acquire().await.unwrap();
+        let held_fusillade = fusillade_pool.acquire().await.unwrap();
+        let validation_state = state.clone();
+        let validation = tokio::spawn(async move { load_and_validate_batch_models(&validation_state, Uuid::new_v4()).await });
+
+        // Let validation queue first for the only Fusillade connection, then
+        // release it. A second acquisition can complete only if validation
+        // releases Fusillade before it waits for the held control connection.
+        tokio::task::yield_now().await;
+        drop(held_fusillade);
+        let fusillade_is_available = tokio::time::timeout(Duration::from_millis(250), fusillade_pool.acquire()).await;
+        let released_before_control_wait = fusillade_is_available.is_ok();
+
+        drop(fusillade_is_available);
+        drop(held_control);
+        let validation_result = tokio::time::timeout(Duration::from_secs(1), validation)
+            .await
+            .expect("batch validation should finish after the control connection is released")
+            .expect("batch validation task should not panic");
+        validation_result.expect("empty batch validation should succeed");
+
+        assert!(
+            released_before_control_wait,
+            "batch validation held the Fusillade connection while waiting for the control pool"
+        );
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn revalidates_reasoning_against_current_mapping_before_batch_creation(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+        let deployment = create_test_deployment(&pool, user.id, "reasoning-model", "reasoning-model").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
+
+        let configure_effort = |effort: &'static str| {
+            let pool = pool.clone();
+            async move {
+                let all_efforts = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
+                let unsupported = all_efforts.into_iter().filter(|candidate| *candidate != effort).collect::<Vec<_>>();
+                let values = serde_json::Map::from_iter([(effort.to_string(), serde_json::json!(effort))]);
+                sqlx::query(
+                    r#"
+                    UPDATE deployed_models
+                    SET reasoning_translation_overrides = $1
+                    WHERE id = $2
+                    "#,
+                )
+                .bind(serde_json::json!({
+                    "chat_completions": {
+                        "mode": "override",
+                        "translation": {
+                            "unsupported_efforts": unsupported,
+                            "writes": [{
+                                "target_path": "/reasoning_effort",
+                                "values": values
+                            }]
+                        }
+                    },
+                    "responses": {"mode": "disabled"}
+                }))
+                .bind(deployment.id)
+                .execute(&pool)
+                .await
+                .unwrap();
+            }
+        };
+
+        configure_effort("high").await;
+        let jsonl = r#"{"custom_id":"reasoning-request","method":"POST","url":"/v1/chat/completions","body":{"model":"reasoning-model","messages":[],"reasoning_effort":"high"}}"#;
+        let upload = app
+            .post("/ai/v1/files")
+            .multipart(
+                axum_test::multipart::MultipartForm::new()
+                    .add_part(
+                        "file",
+                        axum_test::multipart::Part::bytes(jsonl.as_bytes()).file_name("reasoning-batch.jsonl"),
+                    )
+                    .add_part("purpose", axum_test::multipart::Part::text("batch")),
+            )
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        upload.assert_status(StatusCode::CREATED);
+        let file: serde_json::Value = upload.json();
+
+        configure_effort("medium").await;
+        let response = app
+            .post("/ai/v1/batches")
+            .json(&CreateBatchRequest {
+                input_file_id: file["id"].as_str().unwrap().to_string(),
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+            })
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+
+        response.assert_status(StatusCode::BAD_REQUEST);
+        let body = response.text();
+        assert!(
+            body.contains("Line 1 (custom_id 'reasoning-request')"),
+            "unexpected response: {body}"
+        );
+        assert!(body.contains("not supported by this provider"), "unexpected response: {body}");
+
+        let batch_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM fusillade.batches")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(batch_count, 0, "validation must happen before creating a batch record");
     }
 
     #[sqlx::test]
@@ -4226,7 +4410,7 @@ mod tests {
         add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
 
         // Upload a batch file
-        let jsonl_content = r#"{"custom_id":"request-1","method":"POST","url":"/v1/chat/completions","body":{"model":"thinking-model","messages":[{"role":"user","content":"Hello"}],"thinking":{"type":"enabled","budget_tokens":4096}}}"#;
+        let jsonl_content = r#"{"custom_id":"request-1","method":"POST","url":"/v1/chat/completions","body":{"model":"thinking-model","messages":[{"role":"user","content":"Hello"}],"reasoning_effort":"high"}}"#;
         let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("thinking-test.jsonl");
         let multipart = axum_test::multipart::MultipartForm::new()
             .add_part("file", file_part)

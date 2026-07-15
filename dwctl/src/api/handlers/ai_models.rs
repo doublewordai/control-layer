@@ -11,7 +11,7 @@ use serde_json::json;
 use sqlx::{QueryBuilder, Row};
 use sqlx_pool_router::PoolProvider;
 
-use crate::AppState;
+use crate::{AppState, db::handlers::Deployments, reasoning::SupportedReasoningEfforts};
 
 const EVERYONE_GROUP_ID: uuid::Uuid = uuid::Uuid::nil();
 
@@ -25,6 +25,7 @@ pub struct ModelsListResponse {
 pub struct ModelsListQuery {
     group: Option<String>,
     available_for_realtime: Option<String>,
+    include_reasoning_capabilities: Option<String>,
 }
 
 enum ModelsListQueryError {
@@ -57,6 +58,8 @@ struct ModelObject {
     object: String,
     created: i64,
     owned_by: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    supported_reasoning_efforts: Option<SupportedReasoningEfforts>,
 }
 
 fn openai_error(status: StatusCode, message: &str, error_type: &str, code: &str) -> Response {
@@ -140,6 +143,10 @@ pub async fn list_ai_models<P: PoolProvider>(
     let group_ids = parse_group_filter(query.group.as_deref()).map_err(ModelsListQueryError::into_response)?;
     let available_for_realtime = parse_optional_bool("available_for_realtime", query.available_for_realtime.as_deref())
         .map_err(ModelsListQueryError::into_response)?;
+    let include_reasoning_capabilities =
+        parse_optional_bool("include_reasoning_capabilities", query.include_reasoning_capabilities.as_deref())
+            .map_err(ModelsListQueryError::into_response)?
+            .unwrap_or(false);
 
     let mut conn = state
         .db
@@ -238,15 +245,32 @@ pub async fn list_ai_models<P: PoolProvider>(
         .await
         .map_err(|e| database_error("list_accessible_models", e))?;
 
+    let reasoning_policies = if include_reasoning_capabilities {
+        let aliases = rows.iter().map(|row| row.get("alias")).collect::<Vec<String>>();
+        Deployments::new(&mut conn)
+            .get_reasoning_policies(&aliases)
+            .await
+            .map_err(|e| database_error("load_reasoning_capabilities", e))?
+    } else {
+        Default::default()
+    };
+
     Ok(Json(ModelsListResponse {
         object: "list".to_string(),
         data: rows
             .into_iter()
-            .map(|row| ModelObject {
-                id: row.get("alias"),
-                object: "model".to_string(),
-                created: row.get::<Option<i64>, _>("created").unwrap_or_default(),
-                owned_by: "None".to_string(),
+            .map(|row| {
+                let id: String = row.get("alias");
+                let supported_reasoning_efforts = include_reasoning_capabilities
+                    .then(|| reasoning_policies.get(&id).and_then(|policy| policy.supported_efforts()))
+                    .flatten();
+                ModelObject {
+                    id,
+                    object: "model".to_string(),
+                    created: row.get::<Option<i64>, _>("created").unwrap_or_default(),
+                    owned_by: "None".to_string(),
+                    supported_reasoning_efforts,
+                }
             })
             .collect(),
     }))
