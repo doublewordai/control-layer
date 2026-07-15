@@ -382,22 +382,6 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
             // from the same policy map as flex, but without a keystore since we
             // suppress the stored copies rather than encrypt them.
             let zdr = crate::inference::zdr::is_zdr_request(&state.zdr_key_cache, api_key.as_deref());
-
-            // Tag realtime traffic with the priority hint (`nvext.agent_hints.
-            // priority = 0`) so the backend scheduler ranks it above deadline-
-            // prioritised batch work, which fusillade stamps with large
-            // *negative* priorities (`-batch_expires_at`). Without this, an
-            // unprioritised realtime request can be starved behind the batch
-            // queue on backends that don't default a missing priority above
-            // those negatives.
-            attach_realtime_priority(&mut request_value);
-
-            // Forward the *mutated* body downstream. The live upstream call in
-            // `handle_realtime` is built from `body_bytes`, so rebuild those
-            // bytes from `request_value` — otherwise the hint only reaches the
-            // stored tracking row below and never the scheduler.
-            let body_bytes = bytes::Bytes::from(request_value.to_string());
-
             let realtime_input = fusillade::CreateRealtimeInput {
                 request_id,
                 // ZDR: never persist the request body to `request_templates`
@@ -625,26 +609,6 @@ fn resolve_service_tier(tier: Option<&str>) -> ServiceTier {
     }
 }
 
-/// Attach the realtime priority hint (`nvext.agent_hints.priority = 0`)
-/// to an inference request body. All realtime traffic carries this hint
-/// so downstream scheduling can distinguish it from async/flex work.
-///
-/// Sets only `nvext.agent_hints`, preserving any other `nvext` fields the
-/// client sent, and coerces `nvext` to an object if it arrived as some
-/// other type (rather than panicking on `serde_json`'s indexing). A no-op
-/// if the body isn't a JSON object.
-fn attach_realtime_priority(request_value: &mut serde_json::Value) {
-    if let Some(obj) = request_value.as_object_mut() {
-        let nvext = obj.entry("nvext").or_insert_with(|| serde_json::json!({}));
-        if !nvext.is_object() {
-            *nvext = serde_json::json!({});
-        }
-        if let Some(nvext) = nvext.as_object_mut() {
-            nvext.insert("agent_hints".to_string(), serde_json::json!({ "priority": 0 }));
-        }
-    }
-}
-
 /// Which warm-path branch (if any) should handle a request, given
 /// the orthogonal flags `(is_responses_api, is_flex, background,
 /// stream_requested)`. `FallThrough` means the request continues to
@@ -743,16 +707,7 @@ async fn handle_realtime<P: PoolProvider + Clone + Send + Sync + 'static>(
     // it as the response object's `id` field (configured via response_id_header).
     // Strip the "resp_" prefix — onwards re-adds it.
     let raw_id = resp_id.strip_prefix("resp_").unwrap_or(resp_id);
-    // The realtime priority hint rewrites the body upstream of here, so the
-    // Content-Length inherited from the client request in `parts` is stale.
-    // Set it to the actual forwarded length so onwards/the backend don't
-    // truncate or reject the request.
-    let content_length = body_bytes.len();
     let mut req = Request::from_parts(parts, Body::from(body_bytes));
-    req.headers_mut().insert(
-        axum::http::header::CONTENT_LENGTH,
-        axum::http::HeaderValue::from(content_length as u64),
-    );
     req.headers_mut()
         .insert("x-fusillade-request-id", raw_id.parse().expect("response_id is valid header value"));
     req.headers_mut().insert(
@@ -1468,79 +1423,5 @@ mod tests {
             assert_eq!(warm_path_branch(false, true, false, false, has_tools), WarmPathBranch::FallThrough);
             assert_eq!(warm_path_branch(false, false, false, true, has_tools), WarmPathBranch::FallThrough);
         }
-    }
-
-    /// The realtime priority hint every realtime request must carry.
-    fn priority(v: &serde_json::Value) -> Option<&serde_json::Value> {
-        v.get("nvext")?.get("agent_hints")?.get("priority")
-    }
-
-    #[test]
-    fn attach_realtime_priority_sets_zero_on_bare_body() {
-        let mut body = serde_json::json!({ "model": "gpt-4", "input": "hi" });
-        attach_realtime_priority(&mut body);
-        assert_eq!(priority(&body), Some(&serde_json::json!(0)));
-    }
-
-    #[test]
-    fn attach_realtime_priority_covers_representative_realtime_bodies() {
-        // Every shape of realtime traffic must come out with priority 0:
-        // responses, chat completions, embeddings; with and without an
-        // existing (unrelated) nvext, and with pre-existing tools.
-        let bodies = [
-            serde_json::json!({ "model": "m", "input": "hi" }),
-            serde_json::json!({ "model": "m", "messages": [{ "role": "user", "content": "hi" }] }),
-            serde_json::json!({ "model": "m", "input": ["a", "b"] }),
-            serde_json::json!({ "model": "m", "tools": [{ "type": "function" }] }),
-            serde_json::json!({ "model": "m", "nvext": { "guided_json": { "x": 1 } } }),
-            serde_json::json!({}),
-        ];
-        for body in bodies {
-            let mut body = body;
-            attach_realtime_priority(&mut body);
-            assert_eq!(priority(&body), Some(&serde_json::json!(0)), "missing priority for body: {body}");
-        }
-    }
-
-    #[test]
-    fn attach_realtime_priority_preserves_other_nvext_fields() {
-        let mut body = serde_json::json!({
-            "model": "m",
-            "nvext": { "guided_json": { "type": "object" }, "agent_hints": { "other": true } },
-        });
-        attach_realtime_priority(&mut body);
-        // Sibling nvext field is untouched...
-        assert_eq!(body["nvext"]["guided_json"], serde_json::json!({ "type": "object" }));
-        // ...and agent_hints is replaced with exactly the priority hint.
-        assert_eq!(body["nvext"]["agent_hints"], serde_json::json!({ "priority": 0 }));
-    }
-
-    #[test]
-    fn attach_realtime_priority_replaces_non_object_agent_hints() {
-        let mut body = serde_json::json!({
-            "model": "m",
-            "nvext": { "guided_json": { "x": 1 }, "agent_hints": "surprise" },
-        });
-        attach_realtime_priority(&mut body);
-        assert_eq!(body["nvext"]["guided_json"], serde_json::json!({ "x": 1 }));
-        assert_eq!(body["nvext"]["agent_hints"], serde_json::json!({ "priority": 0 }));
-    }
-
-    #[test]
-    fn attach_realtime_priority_coerces_non_object_nvext() {
-        // A hostile/odd client sending a non-object nvext must not panic
-        // and must still end up with priority 0.
-        let mut body = serde_json::json!({ "model": "m", "nvext": "surprise" });
-        attach_realtime_priority(&mut body);
-        assert_eq!(priority(&body), Some(&serde_json::json!(0)));
-    }
-
-    #[test]
-    fn attach_realtime_priority_noop_on_non_object_body() {
-        // Non-object bodies aren't valid inference requests; the helper
-        // leaves them untouched rather than panicking.
-        let mut body = serde_json::json!("not a request");
-        attach_realtime_priority(&mut body);
-        assert_eq!(body, serde_json::json!("not a request"));
     }
 }
