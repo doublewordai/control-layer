@@ -1,5 +1,17 @@
 # Changelog
 
+## [8.85.0](https://github.com/doublewordai/control-layer/compare/v8.84.0...v8.85.0) (2026-07-15)
+
+
+### Features
+
+* expose reasoning capabilities on admin models ([#1286](https://github.com/doublewordai/control-layer/issues/1286)) ([d239fe9](https://github.com/doublewordai/control-layer/commit/d239fe926f1d74a54c6ada5581dbaecabca2a831))
+
+
+### Reverts
+
+* set realtime priority value to 0 ([#1225](https://github.com/doublewordai/control-layer/issues/1225)) ([#1284](https://github.com/doublewordai/control-layer/issues/1284)) ([d9218a1](https://github.com/doublewordai/control-layer/commit/d9218a182b36b9e747b4cce5c6c36952fe90d09e))
+
 ## [8.84.0](https://github.com/doublewordai/control-layer/compare/v8.83.0...v8.84.0) (2026-07-15)
 
 
