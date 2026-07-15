@@ -1,6 +1,6 @@
 -- no-transaction
 --
--- Migration 118 (COR-524): drop idx_analytics_fusillade_batch_id (~1.6 GB) — the last
+-- Migration 119 (COR-524): drop idx_analytics_fusillade_batch_id (~1.6 GB) — the last
 -- index on http_analytics that exists solely to filter by fusillade_batch_id.
 --
 -- Its only readers were get_batch_analytics + get_batches_analytics_bulk
@@ -15,7 +15,7 @@
 -- would seq-scan ~130M rows on /batches/{id}/analytics. Do NOT let this migration apply
 -- until the reader-removal in this PR is deployed to EVERY pod. Options:
 --   * hold this migration file back to a follow-up release (preferred for strict safety), or
---   * gate the deploy so migration 118 (this drop) only runs after the fleet is fully on this build.
+--   * gate the deploy so migration 119 (this drop) only runs after the fleet is fully on this build.
 -- (Confirm via prod pg_stat_user_indexes that idx_analytics_fusillade_batch_id has no recent
 -- scans before/at drop time.) See the PR description for the agreed sequencing.
 DROP INDEX CONCURRENTLY IF EXISTS idx_analytics_fusillade_batch_id;
