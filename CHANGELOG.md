@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.84.0](https://github.com/doublewordai/control-layer/compare/v8.83.0...v8.84.0) (2026-07-15)
+
+
+### Features
+
+* expose and validate reasoning capabilities ([#1279](https://github.com/doublewordai/control-layer/issues/1279)) ([40a3452](https://github.com/doublewordai/control-layer/commit/40a3452ade751cf198deea072b0bd8e6fdb08485))
+
 ## [8.83.0](https://github.com/doublewordai/control-layer/compare/v8.82.1...v8.83.0) (2026-07-14)
 
 
