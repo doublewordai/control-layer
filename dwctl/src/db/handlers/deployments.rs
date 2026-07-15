@@ -247,7 +247,7 @@ impl From<(Option<ModelType>, DeployedModel)> for DeploymentDBResponse {
             lb_strategy,
             fallback_enabled: m.fallback_enabled.unwrap_or(true),
             fallback_on_rate_limit: m.fallback_on_rate_limit.unwrap_or(true),
-            fallback_on_status: m.fallback_on_status.unwrap_or_else(|| vec![429, 500, 502, 503, 504]),
+            fallback_on_status: m.fallback_on_status.unwrap_or_else(|| vec![429, 499, 500, 502, 503, 504]),
             fallback_with_replacement: m.fallback_with_replacement.unwrap_or(false),
             fallback_max_attempts: m.fallback_max_attempts,
             backoff_enabled: m.backoff_enabled,
@@ -4584,6 +4584,48 @@ mod tests {
         };
         tx.commit().await.unwrap();
         result
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn migration_adds_499_to_existing_virtual_models_once(pool: PgPool) {
+        let user = create_test_user(&pool).await;
+        let (composite_id, _) = create_composite_and_components(&pool, user.id, 0).await;
+
+        let migration = include_str!("../../../migrations/119_add_499_virtual_model_fallback.sql");
+
+        sqlx::query("UPDATE deployed_models SET fallback_on_status = NULL WHERE id = $1")
+            .bind(composite_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        sqlx::raw_sql(migration).execute(&pool).await.unwrap();
+
+        let statuses: Vec<i32> = sqlx::query_scalar("SELECT fallback_on_status FROM deployed_models WHERE id = $1")
+            .bind(composite_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(statuses, vec![429, 499, 500, 502, 503, 504]);
+
+        sqlx::query("UPDATE deployed_models SET fallback_on_status = ARRAY[404, 503] WHERE id = $1")
+            .bind(composite_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        sqlx::raw_sql(migration).execute(&pool).await.unwrap();
+        sqlx::raw_sql(migration).execute(&pool).await.unwrap();
+
+        let statuses: Vec<i32> = sqlx::query_scalar("SELECT fallback_on_status FROM deployed_models WHERE id = $1")
+            .bind(composite_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(statuses, vec![404, 503, 499]);
     }
 
     #[sqlx::test]

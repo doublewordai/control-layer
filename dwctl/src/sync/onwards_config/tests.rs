@@ -651,6 +651,7 @@ async fn test_cache_shape_composite_pool_strategy_and_fallback(pool: sqlx::PgPoo
     assert!(composite_pool.fallback_enabled());
     assert!(!composite_pool.should_fallback_on_rate_limit());
     assert!(composite_pool.should_fallback_on_status(429));
+    assert!(composite_pool.should_fallback_on_status(499));
     assert!(composite_pool.should_fallback_on_status(503));
     assert!(!composite_pool.should_fallback_on_status(500));
 
@@ -1332,7 +1333,7 @@ async fn test_batch_api_key_access_to_composite_escalation_target(pool: sqlx::Pg
             lb_strategy: Some(LoadBalancingStrategy::WeightedRandom),
             fallback_enabled: Some(true),
             fallback_on_rate_limit: Some(true),
-            fallback_on_status: Some(vec![429, 500, 502, 503, 504]),
+            fallback_on_status: Some(vec![429, 499, 500, 502, 503, 504]),
             fallback_with_replacement: None,
             allowed_batch_completion_windows: None,
             fallback_max_attempts: None,

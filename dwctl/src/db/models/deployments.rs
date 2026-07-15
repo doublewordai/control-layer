@@ -334,7 +334,7 @@ fn default_true() -> bool {
 }
 
 fn default_fallback_status_codes() -> Vec<i32> {
-    vec![429, 500, 502, 503, 504]
+    vec![429, 499, 500, 502, 503, 504]
 }
 
 /// Fallback configuration for composite models
@@ -346,7 +346,7 @@ pub struct FallbackConfig {
     /// Fall back when provider is rate limited (default: true)
     #[serde(default = "default_true")]
     pub on_rate_limit: bool,
-    /// HTTP status codes that trigger fallback (default: [429, 500, 502, 503, 504])
+    /// HTTP status codes that trigger fallback (default: [429, 499, 500, 502, 503, 504])
     #[serde(default = "default_fallback_status_codes")]
     pub on_status: Vec<i32>,
     /// When true, weighted random failover samples with replacement (default: false)

@@ -246,7 +246,7 @@ VALUES
         'priority',
         true,
         false,
-        '{429,503}',
+        '{429,499,503}',
         true,
         NULL,
         true,
