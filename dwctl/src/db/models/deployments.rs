@@ -806,6 +806,19 @@ mod backoff_derivation_tests {
         .expect("valid StandardModelCreate JSON")
     }
 
+    #[test]
+    fn composite_create_defaults_to_499_fallback_in_application() {
+        let create = serde_json::from_value(serde_json::json!({
+            "type": "composite",
+            "model_name": "m",
+        }))
+        .expect("valid CompositeModelCreate JSON");
+
+        let request = DeploymentCreateDBRequest::from_api_create(uuid::Uuid::nil(), create);
+
+        assert_eq!(request.fallback_on_status, Some(vec![499, 500, 502, 503, 504]));
+    }
+
     // Regression guard for the headline invariant: a single-provider model
     // only retries when fallback + with_replacement + max_attempts>1 are all
     // set. Enabling backoff must derive all three, or onwards' SelectIter

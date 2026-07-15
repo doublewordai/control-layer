@@ -4588,44 +4588,21 @@ mod tests {
 
     #[sqlx::test]
     #[test_log::test]
-    async fn migration_adds_499_to_existing_virtual_models_once(pool: PgPool) {
-        let user = create_test_user(&pool).await;
-        let (composite_id, _) = create_composite_and_components(&pool, user.id, 0).await;
+    async fn database_fallback_status_default_remains_historical(pool: PgPool) {
+        let column_default: String = sqlx::query_scalar(
+            r#"
+            SELECT column_default
+            FROM information_schema.columns
+            WHERE table_schema = 'public'
+              AND table_name = 'deployed_models'
+              AND column_name = 'fallback_on_status'
+            "#,
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
 
-        let migration = include_str!("../../../migrations/119_add_499_virtual_model_fallback.sql");
-
-        sqlx::query("UPDATE deployed_models SET fallback_on_status = NULL WHERE id = $1")
-            .bind(composite_id)
-            .execute(&pool)
-            .await
-            .unwrap();
-
-        sqlx::raw_sql(migration).execute(&pool).await.unwrap();
-
-        let statuses: Vec<i32> = sqlx::query_scalar("SELECT fallback_on_status FROM deployed_models WHERE id = $1")
-            .bind(composite_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-
-        assert_eq!(statuses, vec![429, 499, 500, 502, 503, 504]);
-
-        sqlx::query("UPDATE deployed_models SET fallback_on_status = ARRAY[404, 503] WHERE id = $1")
-            .bind(composite_id)
-            .execute(&pool)
-            .await
-            .unwrap();
-
-        sqlx::raw_sql(migration).execute(&pool).await.unwrap();
-        sqlx::raw_sql(migration).execute(&pool).await.unwrap();
-
-        let statuses: Vec<i32> = sqlx::query_scalar("SELECT fallback_on_status FROM deployed_models WHERE id = $1")
-            .bind(composite_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-
-        assert_eq!(statuses, vec![404, 503, 499]);
+        assert_eq!(column_default, "'{429,500,502,503,504}'::integer[]");
     }
 
     #[sqlx::test]
