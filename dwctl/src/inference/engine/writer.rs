@@ -392,8 +392,11 @@ mod tests {
         let request_id = Uuid::new_v4();
         // Real timing measured by the outlet handler: arrival, then completion
         // 2s later. The writer must carry it through so the persisted row's
-        // duration is the true latency, not zero.
-        let started_at = Utc::now() - chrono::Duration::seconds(10);
+        // duration is the true latency, not zero. Fixed, microsecond-aligned
+        // instants: Postgres timestamptz is microsecond-precision, so a
+        // nanosecond Utc::now() would not round-trip byte-for-byte and the
+        // completed_at equality assert below would be flaky.
+        let started_at = DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
         let completed_at = started_at + chrono::Duration::seconds(2);
         sender
             .send(RawCompletedRequest {
