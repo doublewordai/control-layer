@@ -394,7 +394,21 @@ async fn ai_models_supports_optional_group_and_realtime_filters(pool: PgPool) {
         .json(&serde_json::json!({
             "name": format!("AI Model Filters Endpoint {}", Uuid::new_v4()),
             "url": "https://example.invalid/v1/",
-            "description": "Endpoint for AI model filter tests"
+            "description": "Endpoint for AI model filter tests",
+            "reasoning_translation": {
+                "chat_completions": {
+                    "unsupported_efforts": ["minimal", "xhigh", "max"],
+                    "writes": [{
+                        "target_path": "/reasoning_effort",
+                        "values": {
+                            "none": "none",
+                            "low": "low",
+                            "medium": "medium",
+                            "high": "high"
+                        }
+                    }]
+                }
+            }
         }))
         .await;
     assert_eq!(endpoint_response.status_code(), 201, "Failed to create endpoint");
@@ -471,7 +485,16 @@ async fn ai_models_supports_optional_group_and_realtime_filters(pool: PgPool) {
         .add_header("authorization", format!("Bearer {}", api_key.key))
         .await;
     assert_eq!(default_response.status_code(), 200);
-    let default_ids = extract_ids(default_response.json());
+    let default_models: serde_json::Value = default_response.json();
+    assert!(
+        default_models["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|model| model.get("supported_reasoning_efforts").is_none()),
+        "default model objects must retain the OpenAI schema: {default_models}"
+    );
+    let default_ids = extract_ids(default_models);
     assert!(default_ids.contains(&allowed_alias));
     assert!(default_ids.contains(&denied_alias));
     assert!(default_ids.contains(&redirected_alias));
@@ -498,6 +521,30 @@ async fn ai_models_supports_optional_group_and_realtime_filters(pool: PgPool) {
     assert!(realtime_ids.contains(&redirected_alias));
     assert!(!realtime_ids.contains(&denied_alias));
     assert!(!realtime_ids.contains(&other_group_alias));
+
+    let capabilities_response = server
+        .get("/ai/v1/models?include_reasoning_capabilities=true")
+        .add_header("authorization", format!("Bearer {}", api_key.key))
+        .await;
+    assert_eq!(capabilities_response.status_code(), 200);
+    let capabilities: serde_json::Value = capabilities_response.json();
+    let allowed = capabilities["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|model| model["id"] == allowed_alias)
+        .unwrap();
+    assert_eq!(
+        allowed["supported_reasoning_efforts"]["chat_completions"],
+        serde_json::json!(["none", "low", "medium", "high"])
+    );
+    assert!(allowed["supported_reasoning_efforts"].get("responses").is_none());
+
+    let invalid_capabilities_response = server
+        .get("/ai/v1/models?include_reasoning_capabilities=sometimes")
+        .add_header("authorization", format!("Bearer {}", api_key.key))
+        .await;
+    assert_eq!(invalid_capabilities_response.status_code(), 400);
 }
 
 async fn assert_usage_recorded(fixture: &StreamingFixture, expected_uri: &str, prompt_tokens: i64, completion_tokens: i64) {

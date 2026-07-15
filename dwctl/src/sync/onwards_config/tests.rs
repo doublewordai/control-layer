@@ -37,6 +37,7 @@ fn create_test_target(model_name: &str, alias: &str, endpoint_url: &str) -> Onwa
         sanitize_responses: true,
         trusted: false,
         open_responses_adapter: true,
+        reasoning_translation: None,
         endpoint_url: url::Url::parse(endpoint_url).unwrap(),
         routing_rules: Vec::new(),
         fallback_enabled: false,
@@ -192,6 +193,330 @@ async fn test_cache_shape_regular_public_and_private_access(pool: sqlx::PgPool) 
         provider.target.sanitize_response,
         "sanitize flag should be propagated to regular target"
     );
+}
+
+#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
+async fn test_endpoint_reasoning_default_reaches_standard_provider(pool: sqlx::PgPool) {
+    let endpoint_config = serde_json::json!({
+        "chat_completions": {
+            "unsupported_efforts": ["minimal", "xhigh", "max"],
+            "writes": [{
+                "target_path": "/chat_template_kwargs/thinking",
+                "values": {"none": false, "low": true, "medium": true, "high": true}
+            }]
+        }
+    });
+    sqlx::query("UPDATE inference_endpoints SET reasoning_translation = $1 WHERE id = '30000000-0000-0000-0000-000000000002'")
+        .bind(endpoint_config)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let targets = super::load_targets_from_db(&pool, &[], false, &RateLimitTiersConfig::default())
+        .await
+        .unwrap();
+    let target = targets.targets.get("regular-private").unwrap();
+    let provider = &target.value().providers()[0];
+    assert_eq!(
+        provider
+            .target
+            .reasoning_translation
+            .as_ref()
+            .unwrap()
+            .chat_completions
+            .as_ref()
+            .unwrap()
+            .writes[0]
+            .target_path,
+        "/chat_template_kwargs/thinking"
+    );
+}
+
+#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
+async fn test_chat_override_preserves_endpoint_responses_default(pool: sqlx::PgPool) {
+    let endpoint_config = serde_json::json!({
+        "chat_completions": {
+            "unsupported_efforts": ["minimal", "xhigh", "max"],
+            "writes": [{
+                "target_path": "/chat_template_kwargs/thinking",
+                "values": {"none": false, "low": true, "medium": true, "high": true}
+            }]
+        },
+        "responses": {
+            "unsupported_efforts": [],
+            "writes": [{
+                "target_path": "/reasoning/effort",
+                "values": {
+                    "none": "none", "minimal": "minimal", "low": "low", "medium": "medium",
+                    "high": "high", "xhigh": "xhigh", "max": "max"
+                }
+            }]
+        }
+    });
+    sqlx::query("UPDATE inference_endpoints SET reasoning_translation = $1 WHERE id = '30000000-0000-0000-0000-000000000002'")
+        .bind(endpoint_config)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let model_override = serde_json::json!({
+        "chat_completions": {
+            "mode": "override",
+            "translation": {
+                "unsupported_efforts": ["minimal", "xhigh", "max"],
+                "writes": [{
+                    "target_path": "/thinking/type",
+                    "values": {"none": "disabled", "low": "enabled", "medium": "enabled", "high": "enabled"}
+                }]
+            }
+        },
+        "responses": {"mode": "inherit"}
+    });
+    sqlx::query("UPDATE deployed_models SET reasoning_translation_overrides = $1 WHERE alias = 'regular-private'")
+        .bind(model_override)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let targets = super::load_targets_from_db(&pool, &[], false, &RateLimitTiersConfig::default())
+        .await
+        .unwrap();
+    let target = targets.targets.get("regular-private").unwrap();
+    let provider = &target.value().providers()[0];
+    assert_eq!(
+        provider
+            .target
+            .reasoning_translation
+            .as_ref()
+            .unwrap()
+            .chat_completions
+            .as_ref()
+            .unwrap()
+            .writes[0]
+            .target_path,
+        "/thinking/type"
+    );
+    assert_eq!(
+        provider
+            .target
+            .reasoning_translation
+            .as_ref()
+            .unwrap()
+            .responses
+            .as_ref()
+            .unwrap()
+            .writes[0]
+            .target_path,
+        "/reasoning/effort"
+    );
+}
+
+#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
+async fn test_disabling_one_reasoning_surface_preserves_the_other(pool: sqlx::PgPool) {
+    let endpoint_config = serde_json::json!({
+        "chat_completions": {
+            "unsupported_efforts": ["minimal", "xhigh", "max"],
+            "writes": [{
+                "target_path": "/chat_template_kwargs/thinking",
+                "values": {"none": false, "low": true, "medium": true, "high": true}
+            }]
+        },
+        "responses": {
+            "unsupported_efforts": [],
+            "writes": [{
+                "target_path": "/reasoning/effort",
+                "values": {
+                    "none": "none", "minimal": "minimal", "low": "low", "medium": "medium",
+                    "high": "high", "xhigh": "xhigh", "max": "max"
+                }
+            }]
+        }
+    });
+    sqlx::query("UPDATE inference_endpoints SET reasoning_translation = $1 WHERE id = '30000000-0000-0000-0000-000000000002'")
+        .bind(endpoint_config)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let model_overrides = serde_json::json!({
+        "chat_completions": {"mode": "disabled"},
+        "responses": {"mode": "inherit"}
+    });
+    sqlx::query("UPDATE deployed_models SET reasoning_translation_overrides = $1 WHERE alias = 'regular-private'")
+        .bind(model_overrides)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let targets = super::load_targets_from_db(&pool, &[], false, &RateLimitTiersConfig::default())
+        .await
+        .unwrap();
+    let target = targets.targets.get("regular-private").unwrap();
+    let pool = target.value();
+    let provider = &pool.providers()[0];
+    let config = provider.target.reasoning_translation.as_ref().unwrap();
+    assert!(config.chat_completions.is_none());
+    assert!(config.responses.is_some());
+}
+
+#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
+async fn test_disabling_both_reasoning_surfaces_removes_provider_config(pool: sqlx::PgPool) {
+    let endpoint_config = serde_json::json!({
+        "chat_completions": {
+            "unsupported_efforts": ["minimal", "xhigh", "max"],
+            "writes": [{
+                "target_path": "/chat_template_kwargs/thinking",
+                "values": {"none": false, "low": true, "medium": true, "high": true}
+            }]
+        },
+        "responses": {
+            "unsupported_efforts": [],
+            "writes": [{
+                "target_path": "/reasoning/effort",
+                "values": {
+                    "none": "none", "minimal": "minimal", "low": "low", "medium": "medium",
+                    "high": "high", "xhigh": "xhigh", "max": "max"
+                }
+            }]
+        }
+    });
+    sqlx::query("UPDATE inference_endpoints SET reasoning_translation = $1 WHERE id = '30000000-0000-0000-0000-000000000002'")
+        .bind(endpoint_config)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let model_overrides = serde_json::json!({
+        "chat_completions": {"mode": "disabled"},
+        "responses": {"mode": "disabled"}
+    });
+    sqlx::query("UPDATE deployed_models SET reasoning_translation_overrides = $1 WHERE alias = 'regular-private'")
+        .bind(model_overrides)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let targets = super::load_targets_from_db(&pool, &[], false, &RateLimitTiersConfig::default())
+        .await
+        .unwrap();
+    let target = targets.targets.get("regular-private").unwrap();
+    let pool = target.value();
+    let provider = &pool.providers()[0];
+    assert!(provider.target.reasoning_translation.is_none());
+}
+
+#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
+async fn test_token_budget_multi_write_survives_provider_sync(pool: sqlx::PgPool) {
+    let endpoint_config = serde_json::json!({
+        "chat_completions": {
+            "unsupported_efforts": ["none", "minimal", "low", "medium", "xhigh", "max"],
+            "writes": [
+                {"target_path": "/reasoning_effort", "values": {"high": "high"}},
+                {"target_path": "/thinking_token_budget", "values": {"high": 8192}}
+            ]
+        }
+    });
+    sqlx::query("UPDATE inference_endpoints SET reasoning_translation = $1 WHERE id = '30000000-0000-0000-0000-000000000002'")
+        .bind(endpoint_config)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let targets = super::load_targets_from_db(&pool, &[], false, &RateLimitTiersConfig::default())
+        .await
+        .unwrap();
+    let target = targets.targets.get("regular-private").unwrap();
+    let pool = target.value();
+    let provider = &pool.providers()[0];
+    let writes = &provider
+        .target
+        .reasoning_translation
+        .as_ref()
+        .unwrap()
+        .chat_completions
+        .as_ref()
+        .unwrap()
+        .writes;
+    assert_eq!(writes.len(), 2);
+    assert_eq!(writes[0].target_path, "/reasoning_effort");
+    assert_eq!(writes[1].target_path, "/thinking_token_budget");
+    assert_eq!(
+        writes[1].values[&onwards::reasoning::ReasoningEffort::High],
+        serde_json::json!(8192)
+    );
+}
+
+#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
+async fn test_composite_components_keep_distinct_effective_reasoning_translations(pool: sqlx::PgPool) {
+    let endpoint_a = serde_json::json!({
+        "chat_completions": {
+            "unsupported_efforts": ["minimal", "xhigh", "max"],
+            "writes": [{
+                "target_path": "/chat_template_kwargs/thinking",
+                "values": {"none": false, "low": true, "medium": true, "high": true}
+            }]
+        }
+    });
+    let endpoint_b = serde_json::json!({
+        "chat_completions": {
+            "unsupported_efforts": [],
+            "writes": [{
+                "target_path": "/reasoning_effort",
+                "values": {
+                    "none": "none", "minimal": "minimal", "low": "low", "medium": "medium",
+                    "high": "high", "xhigh": "xhigh", "max": "max"
+                }
+            }]
+        }
+    });
+    sqlx::query("UPDATE inference_endpoints SET reasoning_translation = CASE id WHEN '30000000-0000-0000-0000-000000000001' THEN $1::jsonb ELSE $2::jsonb END WHERE id IN ('30000000-0000-0000-0000-000000000001', '30000000-0000-0000-0000-000000000002')")
+        .bind(endpoint_a)
+        .bind(endpoint_b)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let component_b_override = serde_json::json!({
+        "chat_completions": {
+            "mode": "override",
+            "translation": {
+                "unsupported_efforts": ["minimal", "xhigh", "max"],
+                "writes": [{
+                    "target_path": "/thinking/type",
+                    "values": {"none": "disabled", "low": "enabled", "medium": "enabled", "high": "enabled"}
+                }]
+            }
+        }
+    });
+    sqlx::query("UPDATE deployed_models SET reasoning_translation_overrides = $1 WHERE alias = 'component-b'")
+        .bind(component_b_override)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let targets = super::load_targets_from_db(&pool, &[], false, &RateLimitTiersConfig::default())
+        .await
+        .unwrap();
+    let target = targets.targets.get("composite-priority").unwrap();
+    let pool = target.value();
+    let providers = pool.providers();
+    let paths = providers
+        .iter()
+        .map(|provider| {
+            let path = provider
+                .target
+                .reasoning_translation
+                .as_ref()
+                .unwrap()
+                .chat_completions
+                .as_ref()
+                .unwrap()
+                .writes[0]
+                .target_path
+                .as_str();
+            (provider.target.onwards_model.as_deref().unwrap(), path)
+        })
+        .collect::<std::collections::HashMap<_, _>>();
+
+    assert_eq!(paths["component-a-model"], "/chat_template_kwargs/thinking");
+    assert_eq!(paths["component-b-model"], "/thinking/type");
 }
 
 #[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
@@ -643,6 +968,43 @@ async fn test_system_key_is_immune_to_rate_limit_tiers(pool: sqlx::PgPool) {
     );
 }
 
+/// Endpoint defaults are consumed directly by the Onwards provider cache, so
+/// changing one must wake the listener even when no deployment row changes.
+#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
+async fn test_endpoint_reasoning_update_notifies_onwards_config_listener(pool: sqlx::PgPool) {
+    use crate::config::ONWARDS_CONFIG_CHANGED_CHANNEL;
+    use sqlx::postgres::PgListener;
+
+    let mut listener = PgListener::connect_with(&pool).await.unwrap();
+    listener.listen(ONWARDS_CONFIG_CHANGED_CHANNEL).await.unwrap();
+
+    let endpoint_id = uuid::Uuid::parse_str("30000000-0000-0000-0000-000000000002").unwrap();
+    let reasoning_translation = serde_json::json!({
+        "chat_completions": {
+            "unsupported_efforts": ["minimal", "xhigh", "max"],
+            "writes": [{
+                "target_path": "/chat_template_kwargs/thinking",
+                "values": {"none": false, "low": true, "medium": true, "high": true}
+            }]
+        }
+    });
+    let result = sqlx::query("UPDATE inference_endpoints SET reasoning_translation = $1 WHERE id = $2")
+        .bind(reasoning_translation)
+        .bind(endpoint_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(result.rows_affected(), 1);
+
+    let notification = timeout(Duration::from_secs(1), listener.recv())
+        .await
+        .expect("endpoint reasoning update should notify Onwards")
+        .unwrap();
+    assert_eq!(notification.channel(), ONWARDS_CONFIG_CHANGED_CHANNEL);
+    let (table, _) = parse_notify_payload(notification.payload()).expect("timestamped notify payload");
+    assert_eq!(table, "inference_endpoints");
+}
+
 /// Test that tariff changes trigger onwards config reload via Postgres NOTIFY
 #[sqlx::test]
 async fn test_onwards_config_reloads_on_tariff_change(pool: sqlx::PgPool) {
@@ -674,6 +1036,7 @@ async fn test_onwards_config_reloads_on_tariff_change(pool: sqlx::PgPool) {
             model_filter: None,
             auth_header_name: Some("Authorization".to_string()),
             auth_header_prefix: Some("Bearer ".to_string()),
+            reasoning_translation: None,
         })
         .await
         .unwrap();
@@ -715,6 +1078,7 @@ async fn test_onwards_config_reloads_on_tariff_change(pool: sqlx::PgPool) {
             sanitize_responses: true,
             trusted: false,
             open_responses_adapter: true,
+            reasoning_translation_overrides: None,
             allowed_batch_completion_windows: None,
             metadata: None,
         })
@@ -895,6 +1259,7 @@ async fn test_batch_api_key_access_to_composite_escalation_target(pool: sqlx::Pg
             model_filter: None,
             auth_header_name: Some("Authorization".to_string()),
             auth_header_prefix: Some("Bearer ".to_string()),
+            reasoning_translation: None,
         })
         .await
         .unwrap();
@@ -937,6 +1302,7 @@ async fn test_batch_api_key_access_to_composite_escalation_target(pool: sqlx::Pg
             sanitize_responses: true,
             trusted: false,
             open_responses_adapter: true,
+            reasoning_translation_overrides: None,
         })
         .await
         .unwrap();
@@ -980,6 +1346,7 @@ async fn test_batch_api_key_access_to_composite_escalation_target(pool: sqlx::Pg
             sanitize_responses: true,
             trusted: false,
             open_responses_adapter: true,
+            reasoning_translation_overrides: None,
         })
         .await
         .unwrap();

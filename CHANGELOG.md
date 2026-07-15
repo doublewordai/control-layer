@@ -1,5 +1,40 @@
 # Changelog
 
+## [8.84.0](https://github.com/doublewordai/control-layer/compare/v8.83.0...v8.84.0) (2026-07-15)
+
+
+### Features
+
+* expose and validate reasoning capabilities ([#1279](https://github.com/doublewordai/control-layer/issues/1279)) ([40a3452](https://github.com/doublewordai/control-layer/commit/40a3452ade751cf198deea072b0bd8e6fdb08485))
+
+## [8.83.0](https://github.com/doublewordai/control-layer/compare/v8.82.1...v8.83.0) (2026-07-14)
+
+
+### Features
+
+* set realtime priority value to 0 ([#1225](https://github.com/doublewordai/control-layer/issues/1225)) ([9d20aa1](https://github.com/doublewordai/control-layer/commit/9d20aa1fd7d99d20798769525d7af4742e4de69e))
+
+## [8.82.1](https://github.com/doublewordai/control-layer/compare/v8.82.0...v8.82.1) (2026-07-14)
+
+
+### Bug Fixes
+
+* add some extra model labels for metrics to tokenizer svc ([#1276](https://github.com/doublewordai/control-layer/issues/1276)) ([3bd3496](https://github.com/doublewordai/control-layer/commit/3bd3496021a6886b019b616279d79a1dd2a76a28))
+
+## [8.82.0](https://github.com/doublewordai/control-layer/compare/v8.81.2...v8.82.0) (2026-07-14)
+
+
+### Features
+
+* configure provider reasoning translation ([#1267](https://github.com/doublewordai/control-layer/issues/1267)) ([61de3ab](https://github.com/doublewordai/control-layer/commit/61de3ab91ba20fc3278eb546d20a5ed25ca3bce4))
+
+## [8.81.2](https://github.com/doublewordai/control-layer/compare/v8.81.1...v8.81.2) (2026-07-14)
+
+
+### Bug Fixes
+
+* bump fusillade to 21.1.0 / fusillade-arsenal 1.1.0 ([#1269](https://github.com/doublewordai/control-layer/issues/1269)) ([7f32926](https://github.com/doublewordai/control-layer/commit/7f329260c02618806bbffe4f492aba06cf8a43f4))
+
 ## [8.81.1](https://github.com/doublewordai/control-layer/compare/v8.81.0...v8.81.1) (2026-07-14)
 
 

@@ -2,9 +2,11 @@
 
 use super::pagination::Pagination;
 use crate::db::models::inference_endpoints::InferenceEndpointDBResponse;
+use crate::reasoning::ReasoningTranslationConfig;
 use crate::types::{InferenceEndpointId, UserId};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use serde_with::rust::double_option;
 use std::collections::HashMap;
 use utoipa::{IntoParams, ToSchema};
 
@@ -130,6 +132,9 @@ pub struct InferenceEndpointCreate {
     /// Create deployments directly from model_filter without fetching from endpoint (defaults to false)
     #[serde(default)]
     pub skip_fetch: bool,
+    /// Default provider mapping for canonical reasoning controls.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_translation: Option<ReasoningTranslationConfig>,
 }
 
 fn default_sync() -> bool {
@@ -149,6 +154,9 @@ pub struct InferenceEndpointUpdate {
     pub auth_header_name: Option<String>,
     /// The prefix for the authorization header value (include trailing space if needed)
     pub auth_header_prefix: Option<String>,
+    /// Endpoint reasoning default (omitted = unchanged, null = clear).
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]
+    pub reasoning_translation: Option<Option<ReasoningTranslationConfig>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -187,6 +195,8 @@ pub struct InferenceEndpointResponse {
     pub requires_api_key: bool,
     pub auth_header_name: String,
     pub auth_header_prefix: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_translation: Option<ReasoningTranslationConfig>,
     #[schema(value_type = String, format = "uuid")]
     pub created_by: UserId,
     pub created_at: DateTime<Utc>,
@@ -204,6 +214,7 @@ impl From<InferenceEndpointDBResponse> for InferenceEndpointResponse {
             requires_api_key: db.api_key.is_some() && !db.api_key.as_ref().unwrap().is_empty(),
             auth_header_name: db.auth_header_name,
             auth_header_prefix: db.auth_header_prefix,
+            reasoning_translation: db.reasoning_translation,
             created_by: db.created_by,
             created_at: db.created_at,
             updated_at: db.updated_at,

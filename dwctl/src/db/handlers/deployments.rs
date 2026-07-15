@@ -11,12 +11,12 @@ use crate::db::{
         TrafficRuleAction, TrafficRuleDBRow,
     },
 };
+use crate::reasoning::{ModelReasoningPolicy, resolve_reasoning_translation};
 use crate::types::{DeploymentId, InferenceEndpointId, UserId, abbrev_uuid};
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
-use sqlx::PgConnection;
-use sqlx::{FromRow, query_builder::QueryBuilder};
+use sqlx::{FromRow, PgConnection, Row, query_builder::QueryBuilder};
 use std::collections::HashMap;
 use tracing::instrument;
 
@@ -193,6 +193,7 @@ struct DeployedModel {
     pub sanitize_responses: bool,
     pub trusted: bool,
     pub open_responses_adapter: Option<bool>,
+    pub reasoning_translation_overrides: Option<serde_json::Value>,
     // Traffic routing
     pub allowed_batch_completion_windows: Option<Vec<String>>,
     // Catalog metadata
@@ -258,6 +259,11 @@ impl From<(Option<ModelType>, DeployedModel)> for DeploymentDBResponse {
             sanitize_responses: m.sanitize_responses,
             trusted: m.trusted,
             open_responses_adapter: m.open_responses_adapter.unwrap_or(true),
+            reasoning_translation_overrides: m.reasoning_translation_overrides.and_then(|value| {
+                serde_json::from_value(value)
+                    .inspect_err(|error| tracing::warn!(%error, "failed to deserialize reasoning translation overrides"))
+                    .ok()
+            }),
             allowed_batch_completion_windows: m.allowed_batch_completion_windows,
             metadata: m.metadata,
         }
@@ -297,6 +303,12 @@ impl<'c> Repository for Deployments<'c> {
 
         // Extract composite model fields
         let lb_strategy_str = request.lb_strategy.map(|s| s.as_str().to_string());
+        let reasoning_translation_overrides = request
+            .reasoning_translation_overrides
+            .as_ref()
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(anyhow::Error::from)?;
 
         let model = sqlx::query_as!(
             DeployedModel,
@@ -310,9 +322,10 @@ impl<'c> Repository for Deployments<'c> {
                 fallback_with_replacement, fallback_max_attempts,
                 sanitize_responses, trusted, open_responses_adapter, allowed_batch_completion_windows,
                 metadata,
-                backoff_enabled, backoff_initial_ms, backoff_max_ms, backoff_factor, backoff_jitter, backoff_max_total_ms
+                backoff_enabled, backoff_initial_ms, backoff_max_ms, backoff_factor, backoff_jitter, backoff_max_total_ms,
+                reasoning_translation_overrides
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39)
             RETURNING *
             "#,
             request.model_name.trim(),
@@ -353,6 +366,7 @@ impl<'c> Repository for Deployments<'c> {
             request.backoff_factor,                   // $36
             request.backoff_jitter.as_str(),          // $37
             request.backoff_max_total_ms,             // $38
+            reasoning_translation_overrides,          // $39
         )
         .fetch_one(&mut *self.db)
         .await?;
@@ -371,7 +385,7 @@ impl<'c> Repository for Deployments<'c> {
     async fn get_by_id(&mut self, id: Self::Id) -> Result<Option<Self::Response>> {
         let model = sqlx::query_as!(
             DeployedModel,
-            "SELECT id, model_name, alias, display_name, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, requests_per_second, burst_size, capacity, batch_capacity, throughput, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, fallback_with_replacement, fallback_max_attempts, backoff_enabled, backoff_initial_ms, backoff_max_ms, backoff_factor, backoff_jitter, backoff_max_total_ms, sanitize_responses, trusted, open_responses_adapter, allowed_batch_completion_windows, metadata FROM deployed_models WHERE id = $1",
+            "SELECT id, model_name, alias, display_name, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, requests_per_second, burst_size, capacity, batch_capacity, throughput, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, fallback_with_replacement, fallback_max_attempts, backoff_enabled, backoff_initial_ms, backoff_max_ms, backoff_factor, backoff_jitter, backoff_max_total_ms, sanitize_responses, trusted, open_responses_adapter, allowed_batch_completion_windows, metadata, reasoning_translation_overrides FROM deployed_models WHERE id = $1",
             id
         )
             .fetch_optional(&mut *self.db)
@@ -396,7 +410,7 @@ impl<'c> Repository for Deployments<'c> {
 
         let deployments = sqlx::query_as!(
             DeployedModel,
-            "SELECT id, model_name, alias, display_name, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, requests_per_second, burst_size, capacity, batch_capacity, throughput, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, fallback_with_replacement, fallback_max_attempts, backoff_enabled, backoff_initial_ms, backoff_max_ms, backoff_factor, backoff_jitter, backoff_max_total_ms, sanitize_responses, trusted, open_responses_adapter, allowed_batch_completion_windows, metadata FROM deployed_models WHERE id = ANY($1)",
+            "SELECT id, model_name, alias, display_name, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, requests_per_second, burst_size, capacity, batch_capacity, throughput, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, fallback_with_replacement, fallback_max_attempts, backoff_enabled, backoff_initial_ms, backoff_max_ms, backoff_factor, backoff_jitter, backoff_max_total_ms, sanitize_responses, trusted, open_responses_adapter, allowed_batch_completion_windows, metadata, reasoning_translation_overrides FROM deployed_models WHERE id = ANY($1)",
             ids.as_slice()
         )
             .fetch_all(&mut *self.db)
@@ -458,6 +472,13 @@ impl<'c> Repository for Deployments<'c> {
 
         // Extract composite model update fields
         let lb_strategy_str = request.lb_strategy.map(|s| s.as_str().to_string());
+        let reasoning_translation_overrides = request
+            .reasoning_translation_overrides
+            .as_ref()
+            .and_then(Option::as_ref)
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(anyhow::Error::from)?;
 
         // Info logging for rate limiting
         tracing::info!(
@@ -584,6 +605,11 @@ impl<'c> Repository for Deployments<'c> {
                 ELSE backoff_max_total_ms
             END,
 
+            reasoning_translation_overrides = CASE
+                WHEN $56 THEN $57
+                ELSE reasoning_translation_overrides
+            END,
+
             updated_at = NOW()
         WHERE id = $1
         RETURNING *
@@ -658,6 +684,8 @@ impl<'c> Repository for Deployments<'c> {
             request.backoff_jitter.as_deref(),                                      // $53
             request.backoff_max_total_ms.is_some() as bool,                         // $54
             request.backoff_max_total_ms.as_ref().and_then(|inner| inner.as_ref()), // $55
+            request.reasoning_translation_overrides.is_some(),                      // $56
+            reasoning_translation_overrides,                                        // $57
         )
         .fetch_one(&mut *self.db)
         .await?;
@@ -1422,6 +1450,65 @@ impl<'c> Deployments<'c> {
         Ok(info)
     }
 
+    /// Load the same effective reasoning mappings that Onwards uses for every
+    /// provider behind each requested model alias.
+    #[instrument(skip(self, aliases), fields(count = aliases.len()), err)]
+    pub async fn get_reasoning_policies(&mut self, aliases: &[String]) -> Result<HashMap<String, ModelReasoningPolicy>> {
+        if aliases.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                requested.alias AS routing_alias,
+                endpoint.reasoning_translation AS endpoint_reasoning_translation,
+                provider.reasoning_translation_overrides AS model_reasoning_translation_overrides
+            FROM deployed_models requested
+            JOIN LATERAL (
+                SELECT
+                    requested.hosted_on,
+                    requested.reasoning_translation_overrides
+                WHERE requested.is_composite = FALSE
+
+                UNION ALL
+
+                SELECT
+                    component.hosted_on,
+                    component.reasoning_translation_overrides
+                FROM deployed_model_components link
+                INNER JOIN deployed_models component ON component.id = link.deployed_model_id
+                WHERE requested.is_composite = TRUE
+                  AND link.composite_model_id = requested.id
+                  AND link.enabled = TRUE
+                  AND component.deleted = FALSE
+            ) provider ON TRUE
+            INNER JOIN inference_endpoints endpoint ON endpoint.id = provider.hosted_on
+            WHERE requested.alias = ANY($1)
+              AND requested.deleted = FALSE
+            ORDER BY requested.alias
+            "#,
+        )
+        .bind(aliases)
+        .fetch_all(&mut *self.db)
+        .await?;
+
+        let mut providers: HashMap<String, Vec<Option<crate::reasoning::ReasoningTranslationConfig>>> =
+            aliases.iter().cloned().map(|alias| (alias, Vec::new())).collect();
+        for row in rows {
+            let alias: String = row.try_get("routing_alias")?;
+            let endpoint_value: Option<serde_json::Value> = row.try_get("endpoint_reasoning_translation")?;
+            let model_value: Option<serde_json::Value> = row.try_get("model_reasoning_translation_overrides")?;
+            let resolved = resolve_reasoning_translation(endpoint_value, model_value, &alias);
+            providers.entry(alias).or_default().push(resolved);
+        }
+
+        Ok(providers
+            .into_iter()
+            .map(|(alias, providers)| (alias, ModelReasoningPolicy::new(providers)))
+            .collect())
+    }
+
     /// Resolve a model alias to its deployment ID. Returns None if not found or deleted.
     #[instrument(skip(self), fields(alias = %alias), err)]
     pub async fn resolve_alias_to_id(&mut self, alias: &str) -> Result<Option<DeploymentId>> {
@@ -1585,11 +1672,14 @@ mod tests {
                 users::UserCreateDBRequest,
             },
         },
+        reasoning::{ReasoningEffort, ReasoningSurfaceOverride, ReasoningTranslation, ReasoningTranslationOverrides, ReasoningWrite},
         test::utils::get_test_endpoint_id,
     };
 
     use rust_decimal::Decimal;
+    use serde_json::json;
     use sqlx::{Acquire, PgPool};
+    use std::collections::{BTreeMap, BTreeSet};
     use std::str::FromStr;
 
     async fn create_test_user(pool: &PgPool) -> UserResponse {
@@ -1603,6 +1693,117 @@ mod tests {
             roles: vec![Role::StandardUser],
         });
         user_repo.create(&user_create).await.unwrap().into()
+    }
+
+    fn reasoning_translation_overrides() -> ReasoningTranslationOverrides {
+        ReasoningTranslationOverrides {
+            chat_completions: ReasoningSurfaceOverride::Override(ReasoningTranslation {
+                unsupported_efforts: BTreeSet::from([ReasoningEffort::Minimal, ReasoningEffort::Xhigh, ReasoningEffort::Max]),
+                writes: vec![ReasoningWrite {
+                    target_path: "/chat_template_kwargs/thinking".to_string(),
+                    values: BTreeMap::from([
+                        (ReasoningEffort::None, json!(false)),
+                        (ReasoningEffort::Low, json!(true)),
+                        (ReasoningEffort::Medium, json!(true)),
+                        (ReasoningEffort::High, json!(true)),
+                    ]),
+                }],
+            }),
+            responses: ReasoningSurfaceOverride::Disabled,
+        }
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn persists_and_clears_mixed_reasoning_translation_overrides(pool: PgPool) {
+        let base_url = url::Url::parse("http://localhost:8080").unwrap();
+        crate::seed_database(
+            &[crate::config::ModelSource {
+                name: "test".to_string(),
+                url: base_url,
+                api_key: None,
+                sync_interval: std::time::Duration::from_secs(3600),
+                default_models: None,
+            }],
+            &pool,
+        )
+        .await
+        .unwrap();
+        let user = create_test_user(&pool).await;
+        let endpoint_id = get_test_endpoint_id(&pool).await;
+        let overrides = reasoning_translation_overrides();
+        let mut conn = pool.acquire().await.unwrap();
+        let mut repo = Deployments::new(&mut conn);
+
+        let created = repo
+            .create(
+                &DeploymentCreateDBRequest::builder()
+                    .created_by(user.id)
+                    .model_name("reasoning-model".to_string())
+                    .alias("reasoning-model".to_string())
+                    .hosted_on(endpoint_id)
+                    .reasoning_translation_overrides(overrides.clone())
+                    .build(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.reasoning_translation_overrides, Some(overrides));
+
+        let cleared = repo
+            .update(
+                created.id,
+                &DeploymentUpdateDBRequest::builder().reasoning_translation_overrides(None).build(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cleared.reasoning_translation_overrides, None);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn loads_effective_reasoning_policy_for_standard_model(pool: PgPool) {
+        let base_url = url::Url::parse("http://localhost:8080").unwrap();
+        crate::seed_database(
+            &[crate::config::ModelSource {
+                name: "test".to_string(),
+                url: base_url,
+                api_key: None,
+                sync_interval: std::time::Duration::from_secs(3600),
+                default_models: None,
+            }],
+            &pool,
+        )
+        .await
+        .unwrap();
+        let user = create_test_user(&pool).await;
+        let endpoint_id = get_test_endpoint_id(&pool).await;
+        let mut conn = pool.acquire().await.unwrap();
+        let mut repo = Deployments::new(&mut conn);
+        repo.create(
+            &DeploymentCreateDBRequest::builder()
+                .created_by(user.id)
+                .model_name("reasoning-policy".to_string())
+                .alias("reasoning-policy".to_string())
+                .hosted_on(endpoint_id)
+                .reasoning_translation_overrides(reasoning_translation_overrides())
+                .build(),
+        )
+        .await
+        .unwrap();
+
+        let policies = repo.get_reasoning_policies(&["reasoning-policy".to_string()]).await.unwrap();
+        let supported = policies["reasoning-policy"].supported_efforts().unwrap();
+
+        assert_eq!(
+            supported.chat_completions,
+            Some(vec![
+                ReasoningEffort::None,
+                ReasoningEffort::Low,
+                ReasoningEffort::Medium,
+                ReasoningEffort::High,
+            ])
+        );
+        assert_eq!(supported.responses, None);
     }
 
     #[sqlx::test]
@@ -3023,6 +3224,7 @@ mod tests {
             model_filter: None,
             auth_header_name: None,
             auth_header_prefix: None,
+            reasoning_translation: None,
             created_by: user.id,
         };
         let endpoint = endpoints_repo.create(&endpoint_create).await.unwrap();
@@ -3069,6 +3271,7 @@ mod tests {
             model_filter: None,
             auth_header_name: None,
             auth_header_prefix: None,
+            reasoning_translation: None,
             created_by: user.id,
         };
         let endpoint = endpoints_repo.create(&endpoint_create).await.unwrap();
@@ -4381,6 +4584,74 @@ mod tests {
         };
         tx.commit().await.unwrap();
         result
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn reasoning_policy_includes_every_enabled_composite_provider(pool: PgPool) {
+        let user = create_test_user(&pool).await;
+        let (composite_id, component_ids) = create_composite_and_components(&pool, user.id, 2).await;
+        let composite_alias: String = sqlx::query_scalar("SELECT alias FROM deployed_models WHERE id = $1")
+            .bind(composite_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        let first = serde_json::json!({
+            "chat_completions": {
+                "mode": "override",
+                "translation": {
+                    "unsupported_efforts": ["minimal", "xhigh", "max"],
+                    "writes": [{
+                        "target_path": "/reasoning_effort",
+                        "values": {"none": "none", "low": "low", "medium": "medium", "high": "high"}
+                    }]
+                }
+            },
+            "responses": {"mode": "disabled"}
+        });
+        let second = serde_json::json!({
+            "chat_completions": {
+                "mode": "override",
+                "translation": {
+                    "unsupported_efforts": ["none", "minimal", "low", "xhigh", "max"],
+                    "writes": [{
+                        "target_path": "/reasoning_effort",
+                        "values": {"medium": "medium", "high": "high"}
+                    }]
+                }
+            },
+            "responses": {"mode": "disabled"}
+        });
+        for (component_id, overrides) in component_ids.iter().zip([first, second]) {
+            sqlx::query("UPDATE deployed_models SET reasoning_translation_overrides = $1 WHERE id = $2")
+                .bind(overrides)
+                .bind(component_id)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+
+        let mut conn = pool.acquire().await.unwrap();
+        let mut repo = Deployments::new(&mut conn);
+        repo.set_components(
+            composite_id,
+            component_ids
+                .iter()
+                .enumerate()
+                .map(|(index, id)| (*id, 50, true, index as i32))
+                .collect(),
+        )
+        .await
+        .unwrap();
+
+        let policies = repo.get_reasoning_policies(std::slice::from_ref(&composite_alias)).await.unwrap();
+        let supported = policies[&composite_alias].supported_efforts().unwrap();
+
+        assert_eq!(
+            supported.chat_completions,
+            Some(vec![ReasoningEffort::Medium, ReasoningEffort::High])
+        );
     }
 
     /// (deployed_model_id, sort_order) pairs in priority order.

@@ -162,6 +162,7 @@ mod openapi;
 mod payment_providers;
 mod probes;
 pub mod prompt_cache;
+pub mod reasoning;
 mod request_logging;
 pub mod sample_files;
 mod static_assets;
@@ -566,6 +567,7 @@ pub async fn seed_database(sources: &[config::ModelSource], db: &PgPool) -> Resu
                             sanitize_responses: None,
                             trusted: None,
                             open_responses_adapter: None,
+                            reasoning_translation_overrides: None,
                             backoff_enabled: false,
                             backoff_initial_ms: 100,
                             backoff_max_ms: 5_000,

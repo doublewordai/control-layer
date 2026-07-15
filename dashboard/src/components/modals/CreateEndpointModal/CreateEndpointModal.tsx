@@ -49,7 +49,9 @@ import type {
   EndpointValidateRequest,
   AvailableModel,
   EndpointCreateRequest,
+  ReasoningTranslationConfig,
 } from "../../../api/control-layer/types";
+import { ReasoningTranslationEditor } from "../../features/reasoning";
 import { AddModelPalette } from "../EditEndpointModal/AddModelPalette";
 import { ImportedModelsTable } from "../EditEndpointModal/ImportedModelsTable";
 import { useEndpointModelsState } from "../EditEndpointModal/useEndpointModelsState";
@@ -283,6 +285,10 @@ export const CreateEndpointModal: React.FC<CreateEndpointModalProps> = ({
   const [showApiKey, setShowApiKey] = useState(false);
   const [quoteApiKey, setQuoteApiKey] = useState(false);
   const [currentStep, setCurrentStep] = useState<1 | 2>(1);
+  const [reasoningTranslation, setReasoningTranslation] =
+    useState<ReasoningTranslationConfig | null>(null);
+  const [reasoningTranslationValid, setReasoningTranslationValid] =
+    useState(true);
 
   // ----- Step 2 (Models) state -----
   // catalog feeds the AddModelPalette and seeds the staged-state hook so all
@@ -326,6 +332,8 @@ export const CreateEndpointModal: React.FC<CreateEndpointModalProps> = ({
     setQuoteApiKey(false);
     setCurrentStep(1);
     setSubmitError(null);
+    setReasoningTranslation(null);
+    setReasoningTranslationValid(true);
   }, [isOpen, form]);
 
   const initialDeployments = useMemo(
@@ -427,6 +435,8 @@ export const CreateEndpointModal: React.FC<CreateEndpointModalProps> = ({
   };
 
   const handleDiscoverModels = async () => {
+    if (!reasoningTranslationValid) return;
+
     const url = form.getValues("url");
     const apiKey = form.getValues("apiKey");
     const authHeaderName = form.getValues("authHeaderName");
@@ -485,6 +495,8 @@ export const CreateEndpointModal: React.FC<CreateEndpointModalProps> = ({
   };
 
   const handleContinueWithoutDiscovery = () => {
+    if (!reasoningTranslationValid) return;
+
     const url = form.getValues("url");
     if (!url) {
       form.setError("url", { message: "Please enter a URL" });
@@ -508,6 +520,11 @@ export const CreateEndpointModal: React.FC<CreateEndpointModalProps> = ({
   const onSubmit = async (data: FormData) => {
     setSubmitError(null);
     setBackendConflicts(new Set());
+
+    if (!reasoningTranslationValid) {
+      setSubmitError("Finish the reasoning translation before creating the endpoint.");
+      return;
+    }
 
     if (modelsState.deployments.length === 0) {
       setSubmitError(
@@ -560,6 +577,9 @@ export const CreateEndpointModal: React.FC<CreateEndpointModalProps> = ({
         auth_header_prefix: data.authHeaderPrefix.trim(),
       }),
       ...(skipFetch && { skip_fetch: true }),
+      ...(reasoningTranslation && {
+        reasoning_translation: reasoningTranslation,
+      }),
     };
 
     try {
@@ -601,6 +621,7 @@ export const CreateEndpointModal: React.FC<CreateEndpointModalProps> = ({
 
   const canCreate =
     !!form.watch("name")?.trim() &&
+    reasoningTranslationValid &&
     !createEndpointMutation.isPending &&
     modelsState.deployments.length > 0 &&
     backendConflicts.size === 0 &&
@@ -626,20 +647,27 @@ export const CreateEndpointModal: React.FC<CreateEndpointModalProps> = ({
           >
             <div className="space-y-6 overflow-y-auto flex-1 pr-1">
               {currentStep === 1 && (
-                <ConnectionStep
-                  form={form}
-                  validationState={validationState}
-                  validationError={validationError}
-                  urlPopoverOpen={urlPopoverOpen}
-                  setUrlPopoverOpen={setUrlPopoverOpen}
-                  advancedPopoverOpen={advancedPopoverOpen}
-                  setAdvancedPopoverOpen={setAdvancedPopoverOpen}
-                  showApiKey={showApiKey}
-                  setShowApiKey={setShowApiKey}
-                  quoteApiKey={quoteApiKey}
-                  setQuoteApiKey={setQuoteApiKey}
-                  onUrlChange={handleUrlChange}
-                />
+                <>
+                  <ConnectionStep
+                    form={form}
+                    validationState={validationState}
+                    validationError={validationError}
+                    urlPopoverOpen={urlPopoverOpen}
+                    setUrlPopoverOpen={setUrlPopoverOpen}
+                    advancedPopoverOpen={advancedPopoverOpen}
+                    setAdvancedPopoverOpen={setAdvancedPopoverOpen}
+                    showApiKey={showApiKey}
+                    setShowApiKey={setShowApiKey}
+                    quoteApiKey={quoteApiKey}
+                    setQuoteApiKey={setQuoteApiKey}
+                    onUrlChange={handleUrlChange}
+                  />
+                  <ReasoningTranslationEditor
+                    value={reasoningTranslation}
+                    onChange={setReasoningTranslation}
+                    onValidityChange={setReasoningTranslationValid}
+                  />
+                </>
               )}
 
               {currentStep === 2 && (
@@ -672,6 +700,7 @@ export const CreateEndpointModal: React.FC<CreateEndpointModalProps> = ({
                   type="button"
                   variant="ghost"
                   onClick={handleContinueWithoutDiscovery}
+                  disabled={!reasoningTranslationValid}
                 >
                   Continue without discovery
                 </Button>
@@ -681,6 +710,7 @@ export const CreateEndpointModal: React.FC<CreateEndpointModalProps> = ({
                 onClick={handleDiscoverModels}
                 disabled={
                   !form.watch("url") ||
+                  !reasoningTranslationValid ||
                   validationState === "testing" ||
                   validateEndpointMutation.isPending
                 }
