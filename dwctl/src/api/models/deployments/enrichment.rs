@@ -466,6 +466,7 @@ mod tests {
             trusted: None,
             open_responses_adapter: None,
             reasoning_translation_overrides: None,
+            supported_reasoning_efforts: None,
             traffic_routing_rules: None,
             allowed_batch_completion_windows: None,
             metadata: None,
