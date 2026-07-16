@@ -247,7 +247,7 @@ impl From<(Option<ModelType>, DeployedModel)> for DeploymentDBResponse {
             lb_strategy,
             fallback_enabled: m.fallback_enabled.unwrap_or(true),
             fallback_on_rate_limit: m.fallback_on_rate_limit.unwrap_or(true),
-            fallback_on_status: m.fallback_on_status.unwrap_or_else(|| vec![429, 500, 502, 503, 504]),
+            fallback_on_status: m.fallback_on_status.unwrap_or_else(|| vec![429, 499, 500, 502, 503, 504]),
             fallback_with_replacement: m.fallback_with_replacement.unwrap_or(false),
             fallback_max_attempts: m.fallback_max_attempts,
             backoff_enabled: m.backoff_enabled,
@@ -4584,6 +4584,25 @@ mod tests {
         };
         tx.commit().await.unwrap();
         result
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn database_fallback_status_default_remains_historical(pool: PgPool) {
+        let column_default: String = sqlx::query_scalar(
+            r#"
+            SELECT column_default
+            FROM information_schema.columns
+            WHERE table_schema = 'public'
+              AND table_name = 'deployed_models'
+              AND column_name = 'fallback_on_status'
+            "#,
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(column_default, "'{429,500,502,503,504}'::integer[]");
     }
 
     #[sqlx::test]

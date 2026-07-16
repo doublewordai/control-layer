@@ -1501,6 +1501,11 @@ pub struct DaemonConfig {
     /// Maximum backoff time in milliseconds (default: 10000)
     pub max_backoff_ms: u64,
 
+    /// HTTP error statuses retried in addition to Fusillade's built-in predicate.
+    /// Defaults to `[499]`; use `[]` to disable additional status retries.
+    #[serde(default = "default_additional_retryable_statuses")]
+    pub additional_retryable_statuses: Vec<u16>,
+
     /// Deprecated: use first_chunk_timeout_ms, chunk_timeout_ms, and body_timeout_ms instead.
     /// If set, splits into 90% first_chunk_timeout_ms and 10% body_timeout_ms.
     /// Ignored when the granular timeout fields are explicitly set.
@@ -1654,6 +1659,10 @@ fn default_claim_loop_max_consecutive_failures() -> u32 {
     10
 }
 
+fn default_additional_retryable_statuses() -> Vec<u16> {
+    vec![499]
+}
+
 fn default_claim_query_timeout_ms() -> u64 {
     180_000
 }
@@ -1734,6 +1743,7 @@ impl Default for DaemonConfig {
             backoff_ms: 1000,
             backoff_factor: 2,
             max_backoff_ms: 10000,
+            additional_retryable_statuses: default_additional_retryable_statuses(),
             timeout_ms: None,
             first_chunk_timeout_ms: 86_400_000,
             chunk_timeout_ms: 86_400_000,
@@ -1800,6 +1810,7 @@ impl DaemonConfig {
             backoff_ms: self.backoff_ms,
             backoff_factor: self.backoff_factor,
             max_backoff_ms: self.max_backoff_ms,
+            additional_retryable_statuses: self.additional_retryable_statuses.clone(),
             first_chunk_timeout_ms,
             chunk_timeout_ms,
             body_timeout_ms,
@@ -3705,6 +3716,50 @@ auth:
 
             let config = Config::load(&args)?;
             assert_eq!(config.auth.native.session.cookie_domain, None);
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_additional_retryable_statuses_default_override_and_mapping() {
+        Jail::expect_with(|jail| {
+            jail.create_file("test.yaml", "secret_key: test-secret-key\n")?;
+            let args = Args {
+                config: "test.yaml".into(),
+                validate: false,
+            };
+
+            let config = Config::load(&args)?;
+            assert_eq!(config.background_services.batch_daemon.additional_retryable_statuses, vec![499]);
+            assert_eq!(
+                config
+                    .background_services
+                    .batch_daemon
+                    .to_fusillade_config()
+                    .additional_retryable_statuses,
+                vec![499]
+            );
+
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: test-secret-key
+background_services:
+  batch_daemon:
+    additional_retryable_statuses: []
+"#,
+            )?;
+            let config = Config::load(&args)?;
+            assert!(config.background_services.batch_daemon.additional_retryable_statuses.is_empty());
+            assert!(
+                config
+                    .background_services
+                    .batch_daemon
+                    .to_fusillade_config()
+                    .additional_retryable_statuses
+                    .is_empty()
+            );
 
             Ok(())
         });

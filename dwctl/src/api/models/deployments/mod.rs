@@ -307,7 +307,9 @@ pub struct CompositeModelCreate {
     /// Whether to trigger fallback on rate limit responses (defaults to true)
     #[serde(default = "default_true")]
     pub fallback_on_rate_limit: bool,
-    /// HTTP status codes that trigger fallback (defaults to [500, 502, 503, 504])
+    /// HTTP status codes that trigger fallback (defaults to [499, 500, 502, 503, 504]).
+    /// Rate-limit responses are controlled separately by `fallback_on_rate_limit`,
+    /// which defaults to true.
     #[serde(default = "default_fallback_statuses")]
     pub fallback_on_status: Vec<i32>,
     /// Sample with replacement during weighted random failover (defaults to false)
@@ -364,7 +366,7 @@ fn default_true() -> bool {
 }
 
 fn default_fallback_statuses() -> Vec<i32> {
-    vec![500, 502, 503, 504]
+    vec![499, 500, 502, 503, 504]
 }
 
 fn default_backoff_initial_ms() -> i32 {
