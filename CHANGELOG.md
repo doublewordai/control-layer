@@ -1,5 +1,45 @@
 # Changelog
 
+## [8.85.0](https://github.com/doublewordai/control-layer/compare/v8.84.0...v8.85.0) (2026-07-15)
+
+
+### Features
+
+* expose reasoning capabilities on admin models ([#1286](https://github.com/doublewordai/control-layer/issues/1286)) ([d239fe9](https://github.com/doublewordai/control-layer/commit/d239fe926f1d74a54c6ada5581dbaecabca2a831))
+
+
+### Reverts
+
+* set realtime priority value to 0 ([#1225](https://github.com/doublewordai/control-layer/issues/1225)) ([#1284](https://github.com/doublewordai/control-layer/issues/1284)) ([d9218a1](https://github.com/doublewordai/control-layer/commit/d9218a182b36b9e747b4cce5c6c36952fe90d09e))
+
+## [8.84.0](https://github.com/doublewordai/control-layer/compare/v8.83.0...v8.84.0) (2026-07-15)
+
+
+### Features
+
+* expose and validate reasoning capabilities ([#1279](https://github.com/doublewordai/control-layer/issues/1279)) ([40a3452](https://github.com/doublewordai/control-layer/commit/40a3452ade751cf198deea072b0bd8e6fdb08485))
+
+## [8.83.0](https://github.com/doublewordai/control-layer/compare/v8.82.1...v8.83.0) (2026-07-14)
+
+
+### Features
+
+* set realtime priority value to 0 ([#1225](https://github.com/doublewordai/control-layer/issues/1225)) ([9d20aa1](https://github.com/doublewordai/control-layer/commit/9d20aa1fd7d99d20798769525d7af4742e4de69e))
+
+## [8.82.1](https://github.com/doublewordai/control-layer/compare/v8.82.0...v8.82.1) (2026-07-14)
+
+
+### Bug Fixes
+
+* add some extra model labels for metrics to tokenizer svc ([#1276](https://github.com/doublewordai/control-layer/issues/1276)) ([3bd3496](https://github.com/doublewordai/control-layer/commit/3bd3496021a6886b019b616279d79a1dd2a76a28))
+
+## [8.82.0](https://github.com/doublewordai/control-layer/compare/v8.81.2...v8.82.0) (2026-07-14)
+
+
+### Features
+
+* configure provider reasoning translation ([#1267](https://github.com/doublewordai/control-layer/issues/1267)) ([61de3ab](https://github.com/doublewordai/control-layer/commit/61de3ab91ba20fc3278eb546d20a5ed25ca3bce4))
+
 ## [8.81.2](https://github.com/doublewordai/control-layer/compare/v8.81.1...v8.81.2) (2026-07-14)
 
 

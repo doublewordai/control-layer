@@ -89,8 +89,20 @@ impl TokenizerClient {
     /// segments and the totals reconcile.
     pub async fn tokenize(&self, virtual_model: &str, segments: &[String]) -> TokenizerResult<TokenizeResponse> {
         let start = std::time::Instant::now();
+        let size = cache_metrics::tokenize_size_bucket(segments.iter().map(String::len).sum());
         let result = self.tokenize_inner(virtual_model, segments).await;
-        cache_metrics::record_tokenizer_duration(start.elapsed().as_secs_f64());
+        // Label cardinality guard: only a name tokenizer-svc actually ACCEPTED becomes a
+        // `model` label — an Ok response proves the alias is on the svc's baked map (a bounded,
+        // admin-controlled set), regardless of what this method was called with. Every error
+        // path gets a fixed label: `unmapped` (svc rejected the name) or `error` (timeout /
+        // connection / HTTP — the name was never validated, and error latency is service-wide,
+        // not model-specific). So an unvetted name can never mint a new series, even mid-outage.
+        let model_label = match &result {
+            Ok(_) => virtual_model,
+            Err(TokenizerError::Unmapped(_)) => "unmapped",
+            Err(_) => "error",
+        };
+        cache_metrics::record_tokenizer_duration(model_label, size, start.elapsed().as_secs_f64());
         cache_metrics::record_tokenizer_request(match &result {
             Ok(_) => "ok",
             Err(TokenizerError::Unmapped(_)) => "unmapped_422",

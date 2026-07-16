@@ -2239,6 +2239,7 @@ mod integration_tests {
                 model_filter: None,
                 auth_header_name: Some("Authorization".to_string()),
                 auth_header_prefix: Some("Bearer ".to_string()),
+                reasoning_translation: None,
             })
             .await
             .unwrap();
@@ -2278,6 +2279,7 @@ mod integration_tests {
                 sanitize_responses: true,
                 trusted: false,
                 open_responses_adapter: true,
+                reasoning_translation_overrides: None,
                 allowed_batch_completion_windows: None,
                 metadata: None,
             })
