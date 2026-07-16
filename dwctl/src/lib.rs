@@ -1716,7 +1716,7 @@ pub async fn build_router(
             0 => usize::MAX,
             n => usize::try_from(n).unwrap_or(usize::MAX),
         };
-        let translators: Vec<std::sync::Arc<dyn crate::inference::translation::ProtocolTranslator>> = vec![
+        let mut translators: Vec<std::sync::Arc<dyn crate::inference::translation::ProtocolTranslator>> = vec![
             // Pass cache.enabled so the translator only emits the top-level automatic-caching marker
             // when the cache middleware is present to consume + strip it (else it would leak upstream).
             std::sync::Arc::new(crate::inference::translation::anthropic::AnthropicMessages::new(
@@ -1724,6 +1724,18 @@ pub async fn build_router(
             )),
             std::sync::Arc::new(crate::inference::translation::anthropic::models::AnthropicModels),
         ];
+        // Edge Responses translation. The OpenResponses translator owns
+        // Responses->Chat translation, previous_response_id hydration, and
+        // response persistence at the edge; it rewrites `/responses` to
+        // `/chat/completions`, and onwards' strict `/responses` route is an
+        // unconditional alias to its chat-completions handler. Only meaningful
+        // under strict mode, where that route exists.
+        if strict_mode {
+            let response_store = state.response_store.clone() as std::sync::Arc<dyn onwards::traits::ResponseStore>;
+            translators.push(std::sync::Arc::new(crate::inference::translation::responses::OpenResponses::new(
+                response_store,
+            )));
+        }
         let translation_registry =
             crate::inference::translation::TranslationRegistry::new(translators).with_max_body_size(translation_body_limit);
         onwards_router.layer(middleware::from_fn_with_state(

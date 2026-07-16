@@ -48,7 +48,7 @@ impl ProtocolTranslator for AnthropicModels {
         })
     }
 
-    fn translate_response(&self, body: Bytes) -> Result<Bytes, TranslationError> {
+    fn translate_response(&self, _request: &Bytes, body: Bytes) -> Result<Bytes, TranslationError> {
         from_openai_models(body)
     }
 
@@ -60,7 +60,7 @@ impl ProtocolTranslator for AnthropicModels {
         response::anthropic_error(status, message.to_string())
     }
 
-    fn stream_reframer(&self) -> Box<dyn StreamReframer> {
+    fn stream_reframer(&self, _request: &Bytes) -> Box<dyn StreamReframer> {
         // The models list is never streamed (the response is application/json, so
         // the middleware never reaches the SSE path); a no-op satisfies the trait.
         Box::new(NoopReframer)

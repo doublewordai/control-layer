@@ -1,3 +1,9 @@
 [workspace]
 members = ["dwctl"]
 resolver = "2"
+
+# TEMPORARY (COR-519): test the local onwards edge-Responses changes together
+# with dwctl before either PR lands. Remove before opening the dwctl PR; the
+# onwards change ships as its own release and dwctl bumps the version dep.
+[patch.crates-io]
+onwards = { path = "../onwards" }

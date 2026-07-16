@@ -37,6 +37,28 @@ pub async fn translation_middleware(State(registry): State<TranslationRegistry>,
         }
     };
 
+    // Snapshot the original inbound foreign request for the response side: the
+    // foreign response can echo request fields (e.g. Responses echoes model /
+    // tools / previous_response_id). We capture BEFORE pre_request so echoed
+    // fields reflect what the client actually sent (the original
+    // previous_response_id, not the hydrated request). A `Bytes` clone is a cheap
+    // refcount bump, so the no-op (Anthropic) path pays nothing meaningful.
+    let original_request = body_bytes.clone();
+
+    // Opt-in async pre-request stage (default no-op). A store-backed translator
+    // does its stateful pre-work here (e.g. Responses hydration, in the foreign
+    // domain, before translation); pure translators return the body unchanged.
+    let body_bytes = match translator.pre_request(&parts, body_bytes).await {
+        Ok(b) => b,
+        Err(TranslationError::BadRequest(msg)) => {
+            return error_response(translator.as_ref(), StatusCode::BAD_REQUEST, &msg);
+        }
+        Err(TranslationError::Internal(msg)) => {
+            warn!(error = %msg, translator = translator.name(), "edge translation: pre-request stage failed");
+            return error_response(translator.as_ref(), StatusCode::INTERNAL_SERVER_ERROR, &msg);
+        }
+    };
+
     let translated = match translator.translate_request(&parts, body_bytes) {
         Ok(t) => t,
         Err(TranslationError::BadRequest(msg)) => {
@@ -56,11 +78,13 @@ pub async fn translation_middleware(State(registry): State<TranslationRegistry>,
 
     let response = next.run(downstream_req).await;
 
-    translate_response_back(translator.as_ref(), response).await
+    translate_response_back(translator.as_ref(), &original_request, response).await
 }
 
-/// Translate the downstream response back into the foreign protocol.
-async fn translate_response_back(translator: &dyn ProtocolTranslator, response: Response) -> Response {
+/// Translate the downstream response back into the foreign protocol. `request`
+/// is the original inbound foreign request body, forwarded to the translator's
+/// response side for protocols whose response echoes request fields.
+async fn translate_response_back(translator: &dyn ProtocolTranslator, request: &Bytes, response: Response) -> Response {
     let (parts, body) = response.into_parts();
     let status = parts.status;
 
@@ -77,7 +101,7 @@ async fn translate_response_back(translator: &dyn ProtocolTranslator, response: 
         .unwrap_or(false);
 
     if is_sse {
-        return reframe_sse(translator, status, body);
+        return reframe_sse(translator, request, status, body);
     }
 
     let body_bytes = match axum::body::to_bytes(body, usize::MAX).await {
@@ -89,8 +113,19 @@ async fn translate_response_back(translator: &dyn ProtocolTranslator, response: 
     };
 
     if status.is_success() {
-        match translator.translate_response(body_bytes) {
-            Ok(new_body) => json_response(status, new_body),
+        match translator.translate_response(request, body_bytes) {
+            Ok(new_body) => {
+                // Opt-in async post-response stage (default no-op). A store-backed
+                // translator persists the produced object here (e.g. Responses);
+                // pure translators return the body unchanged.
+                match translator.post_response(new_body).await {
+                    Ok(final_body) => json_response(status, final_body),
+                    Err(e) => {
+                        warn!(error = %e, translator = translator.name(), "edge translation: post-response stage failed");
+                        error_response(translator, StatusCode::BAD_GATEWAY, "response persistence failed")
+                    }
+                }
+            }
             Err(e) => {
                 warn!(error = %e, translator = translator.name(), "edge translation: response translate failed");
                 error_response(translator, StatusCode::BAD_GATEWAY, "response translation failed")
@@ -122,8 +157,8 @@ fn error_response(translator: &dyn ProtocolTranslator, status: StatusCode, messa
 /// stream the foreign-protocol events out. Stays streaming (no buffering): each
 /// complete `\n\n`-delimited SSE event is parsed and fed to the reframer as it
 /// arrives.
-fn reframe_sse(translator: &dyn ProtocolTranslator, status: StatusCode, body: Body) -> Response {
-    let mut reframer = translator.stream_reframer();
+fn reframe_sse(translator: &dyn ProtocolTranslator, request: &Bytes, status: StatusCode, body: Body) -> Response {
+    let mut reframer = translator.stream_reframer(request);
     let mut data = body.into_data_stream();
 
     let out = async_stream::stream! {
@@ -190,7 +225,9 @@ fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::inference::translation::{TranslationRegistry, anthropic::AnthropicMessages};
+    use crate::inference::translation::{StreamReframer, TranslatedRequest, TranslationRegistry, anthropic::AnthropicMessages};
+    use async_trait::async_trait;
+    use axum::http::{HeaderMap, request::Parts};
     use axum::{Router, extract::Request, routing::post};
     use std::sync::Arc;
 
@@ -518,5 +555,94 @@ mod tests {
         let body: serde_json::Value = response.json();
         // Echoed back verbatim — proof the middleware did not touch it.
         assert_eq!(body["model"], "gpt-x");
+    }
+
+    /// A translator that overrides both opt-in stateful hooks, to prove the
+    /// middleware runs them around the pure sync translation: `pre_request`
+    /// rewrites the request body (foreign domain) before `translate_request`,
+    /// and `post_response` tags the response (foreign domain) after
+    /// `translate_response`.
+    struct StatefulProbe;
+
+    #[async_trait]
+    impl ProtocolTranslator for StatefulProbe {
+        fn name(&self) -> &'static str {
+            "stateful_probe"
+        }
+        fn detect(&self, path: &str, _headers: &HeaderMap) -> bool {
+            path.ends_with("/probe")
+        }
+        fn translate_request(&self, parts: &Parts, body: Bytes) -> Result<TranslatedRequest, TranslationError> {
+            // Pass the (already pre_request-rewritten) body through, normalising
+            // the path so it reaches the `/probe` route standing in for onwards.
+            let path = parts.uri.path();
+            let base = path.strip_suffix("/probe").unwrap_or(path);
+            let uri = format!("{base}/chat/completions")
+                .parse()
+                .map_err(|e| TranslationError::Internal(format!("{e}")))?;
+            Ok(TranslatedRequest {
+                uri,
+                headers: parts.headers.clone(),
+                body,
+            })
+        }
+        fn translate_response(&self, _request: &Bytes, body: Bytes) -> Result<Bytes, TranslationError> {
+            Ok(body)
+        }
+        fn translate_error(&self, status: StatusCode, body: Bytes) -> (StatusCode, Bytes) {
+            (status, body)
+        }
+        fn error_from_message(&self, status: StatusCode, message: &str) -> (StatusCode, Bytes) {
+            (status, Bytes::from(format!(r#"{{"error":"{message}"}}"#)))
+        }
+        fn stream_reframer(&self, _request: &Bytes) -> Box<dyn StreamReframer> {
+            unreachable!("this probe is blocking-only")
+        }
+
+        async fn pre_request(&self, _parts: &Parts, _body: Bytes) -> Result<Bytes, TranslationError> {
+            // Replace the body so the downstream handler can prove the pre stage
+            // ran before translate_request forwarded it.
+            Ok(Bytes::from_static(br#"{"model":"m","pre":"ran"}"#))
+        }
+        async fn post_response(&self, body: Bytes) -> Result<Bytes, TranslationError> {
+            // Tag the response so the client can prove the post stage ran after
+            // translate_response.
+            let mut v: serde_json::Value = serde_json::from_slice(&body).map_err(|e| TranslationError::Internal(format!("{e}")))?;
+            v["post"] = serde_json::Value::String("ran".into());
+            Ok(Bytes::from(
+                serde_json::to_vec(&v).map_err(|e| TranslationError::Internal(format!("{e}")))?,
+            ))
+        }
+    }
+
+    /// The two opt-in stateful hooks bracket the pure translation: `pre_request`
+    /// rewrites the outbound body before it reaches the handler, and
+    /// `post_response` rewrites the returned one before it reaches the client.
+    #[tokio::test]
+    async fn stateful_hooks_bracket_the_pure_translation() {
+        async fn echo_ok(req: Request) -> Response {
+            let body = axum::body::to_bytes(req.into_body(), usize::MAX).await.unwrap();
+            let received: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            // pre_request rewrote the body before it reached the handler.
+            assert_eq!(received["pre"], "ran", "pre_request should run before translate_request");
+            json_response(
+                StatusCode::OK,
+                Bytes::from(serde_json::to_vec(&serde_json::json!({ "ok": true })).unwrap()),
+            )
+        }
+
+        let registry = TranslationRegistry::new(vec![Arc::new(StatefulProbe)]);
+        let inner = Router::new()
+            .route("/probe", post(echo_ok))
+            .layer(axum::middleware::from_fn_with_state(registry, translation_middleware));
+        let server = axum_test::TestServer::new(Router::new().nest("/ai/v1", inner)).expect("test server");
+
+        let response = server.post("/ai/v1/probe").json(&serde_json::json!({ "orig": true })).await;
+
+        assert_eq!(response.status_code().as_u16(), 200);
+        let body: serde_json::Value = response.json();
+        assert_eq!(body["ok"], true);
+        // post_response tagged the response after translate_response.
+        assert_eq!(body["post"], "ran", "post_response should run after translate_response");
     }
 }

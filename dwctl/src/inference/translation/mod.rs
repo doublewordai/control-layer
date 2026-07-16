@@ -26,15 +26,21 @@
 //! request back through the router - a nested router fixes its sub-path at match
 //! time, so a post-match URI change never re-dispatches.
 //!
-//! Anthropic Messages (`/v1/messages`) is the first and currently only
-//! implementation. A stateless OpenAI Responses translator is the planned
-//! second implementation that would later absorb the translation half of the
-//! onwards adapter. Stateful orchestration (tool loops, `previous_response_id`)
-//! is deliberately NOT part of this layer.
+//! Anthropic Messages (`/v1/messages`) is the first implementation and is purely
+//! synchronous. The core transform stays sync and pure; a translator that needs
+//! async, stateful work opts in via the [`ProtocolTranslator::pre_request`] /
+//! [`ProtocolTranslator::post_response`] hooks, which the middleware awaits
+//! around the pure translation. These brackets are how the planned OpenAI
+//! Responses translator will resolve `previous_response_id` (hydration) and
+//! persist the produced object, absorbing the translation half of the onwards
+//! adapter. Multi-step tool-loop orchestration is still deliberately NOT part of
+//! this layer.
 
 pub mod anthropic;
 pub mod middleware;
+pub mod responses;
 
+use async_trait::async_trait;
 use axum::http::{HeaderMap, StatusCode, Uri, request::Parts};
 use bytes::Bytes;
 use std::sync::Arc;
@@ -71,8 +77,13 @@ pub struct TranslatedRequest {
     pub body: Bytes,
 }
 
-/// A single foreign-protocol translator. Implementations are stateless and
-/// request-scoped; they hold no `ResponseStore` and do no orchestration.
+/// A single foreign-protocol translator. The core transform - `translate_request`
+/// and `translate_response` - is pure and synchronous. A translator that needs
+/// async, stateful work (e.g. OpenAI Responses reading a prior turn or persisting
+/// the produced object) overrides the opt-in [`pre_request`](Self::pre_request) /
+/// [`post_response`](Self::post_response) hooks; pure translators (Anthropic)
+/// leave them as the default no-ops and hold no state.
+#[async_trait]
 pub trait ProtocolTranslator: Send + Sync {
     /// Stable name for logging/metrics.
     fn name(&self) -> &'static str;
@@ -85,8 +96,13 @@ pub trait ProtocolTranslator: Send + Sync {
     fn translate_request(&self, parts: &Parts, body: Bytes) -> Result<TranslatedRequest, TranslationError>;
 
     /// Translate a successful (blocking) Chat Completions response body back
-    /// into the foreign protocol.
-    fn translate_response(&self, body: Bytes) -> Result<Bytes, TranslationError>;
+    /// into the foreign protocol. `request` is the original inbound foreign
+    /// request body, for protocols whose response echoes request fields (e.g.
+    /// OpenAI Responses echoes `model` / `tools` / `instructions`); protocols
+    /// that don't need it (Anthropic) ignore it. This is a transitional argument:
+    /// Phase 2's single parse-once pipeline (COR-520) will make the request
+    /// available from shared pipeline state instead of re-passing its bytes.
+    fn translate_response(&self, request: &Bytes, body: Bytes) -> Result<Bytes, TranslationError>;
 
     /// Translate an error response (any non-2xx) into the foreign error shape.
     fn translate_error(&self, status: StatusCode, body: Bytes) -> (StatusCode, Bytes);
@@ -98,8 +114,28 @@ pub trait ProtocolTranslator: Send + Sync {
 
     /// Create a fresh, stateful reframer for one streaming (SSE) response. The
     /// middleware feeds it each upstream Chat Completions chunk and forwards the
-    /// foreign-protocol SSE bytes it emits.
-    fn stream_reframer(&self) -> Box<dyn StreamReframer>;
+    /// foreign-protocol SSE bytes it emits. `request` is the original inbound
+    /// foreign request body, for protocols whose streamed response echoes request
+    /// fields (e.g. OpenAI Responses); protocols that don't need it ignore it.
+    fn stream_reframer(&self, request: &Bytes) -> Box<dyn StreamReframer>;
+
+    /// Opt-in async stage run BEFORE `translate_request`, on the foreign request
+    /// body, returning the (possibly rewritten) foreign body the translator then
+    /// converts. A store-backed translator does its stateful pre-work here - e.g.
+    /// OpenAI Responses inlines a prior turn's items when `previous_response_id`
+    /// is set, producing a self-contained request. Default: no-op.
+    async fn pre_request(&self, _parts: &Parts, body: Bytes) -> Result<Bytes, TranslationError> {
+        Ok(body)
+    }
+
+    /// Opt-in async stage run AFTER `translate_response`, on the foreign
+    /// (blocking) response body, returning the body sent to the client. A
+    /// store-backed translator persists here - e.g. OpenAI Responses stores the
+    /// produced object and surfaces its id. Streaming persistence is the
+    /// reframer's job, not this hook. Default: no-op.
+    async fn post_response(&self, body: Bytes) -> Result<Bytes, TranslationError> {
+        Ok(body)
+    }
 }
 
 /// Stateful transformer that turns an OpenAI Chat Completions SSE stream into a
