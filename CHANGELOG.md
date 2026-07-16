@@ -1,5 +1,19 @@
 # Changelog
 
+## [8.86.0](https://github.com/doublewordai/control-layer/compare/v8.85.0...v8.86.0) (2026-07-16)
+
+
+### Features
+
+* repoint batch analytics ([#1291](https://github.com/doublewordai/control-layer/issues/1291)) ([e8ae677](https://github.com/doublewordai/control-layer/commit/e8ae67790bbaa06427f76f66addce02b10152da7))
+* serve batch analytics from batch_aggregates + drop http_analytics index (COR-524 contract) ([#1263](https://github.com/doublewordai/control-layer/issues/1263)) ([83968fa](https://github.com/doublewordai/control-layer/commit/83968fa1ca1caa286419fd7f6a999b73f0bfb710))
+
+
+### Bug Fixes
+
+* enable HTTP 499 retries and virtual model failover ([#1283](https://github.com/doublewordai/control-layer/issues/1283)) ([2c4757c](https://github.com/doublewordai/control-layer/commit/2c4757ccd49732ad7ab9c9ddfeab607a1c041f57))
+* **revert:** "serve batch analytics from batch_aggregates + drop http_analytics index (COR-524 contract)" ([#1290](https://github.com/doublewordai/control-layer/issues/1290)) ([a1e266b](https://github.com/doublewordai/control-layer/commit/a1e266be07b3907dc16cdde037fe5b2c33550547))
+
 ## [8.85.0](https://github.com/doublewordai/control-layer/compare/v8.84.0...v8.85.0) (2026-07-15)
 
 

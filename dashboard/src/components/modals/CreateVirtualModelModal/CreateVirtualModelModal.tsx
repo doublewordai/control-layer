@@ -26,14 +26,13 @@ import {
   SelectValue,
 } from "../../ui/select";
 import { Checkbox } from "../../ui/checkbox";
+import { DEFAULT_FALLBACK_STATUS_CODES } from "../../../utils/fallbackStatusCodes";
 
 interface CreateVirtualModelModalProps {
   isOpen: boolean;
   onClose: () => void;
   onSuccess?: () => void;
 }
-
-const DEFAULT_FALLBACK_STATUS_CODES = [429, 500, 502, 503, 504];
 
 export const CreateVirtualModelModal: React.FC<
   CreateVirtualModelModalProps
@@ -47,7 +46,7 @@ export const CreateVirtualModelModal: React.FC<
     lb_strategy: "weighted_random" as LoadBalancingStrategy,
     fallback_enabled: true,
     fallback_on_rate_limit: true,
-    fallback_on_status: DEFAULT_FALLBACK_STATUS_CODES,
+    fallback_on_status: [...DEFAULT_FALLBACK_STATUS_CODES],
     fallback_with_replacement: false,
     fallback_max_attempts: null as number | null,
     sanitize_responses: false,
@@ -67,7 +66,7 @@ export const CreateVirtualModelModal: React.FC<
         lb_strategy: "weighted_random",
         fallback_enabled: true,
         fallback_on_rate_limit: true,
-        fallback_on_status: DEFAULT_FALLBACK_STATUS_CODES,
+        fallback_on_status: [...DEFAULT_FALLBACK_STATUS_CODES],
         fallback_with_replacement: false,
         fallback_max_attempts: null,
         sanitize_responses: false,
@@ -306,7 +305,7 @@ export const CreateVirtualModelModal: React.FC<
                     .filter((n) => !isNaN(n) && n >= 100 && n < 600);
                   setFormData({ ...formData, fallback_on_status: codes });
                 }}
-                placeholder="429, 500, 502, 503, 504"
+                placeholder={DEFAULT_FALLBACK_STATUS_CODES.join(", ")}
                 disabled={
                   createModelMutation.isPending || !formData.fallback_enabled
                 }
