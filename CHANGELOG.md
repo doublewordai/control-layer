@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.87.2](https://github.com/doublewordai/control-layer/compare/v8.87.1...v8.87.2) (2026-07-16)
+
+
+### Bug Fixes
+
+* advertise reasoning capabilities for disabled virtual backends ([#1297](https://github.com/doublewordai/control-layer/issues/1297)) ([f98a576](https://github.com/doublewordai/control-layer/commit/f98a576f660d60ba37302b80e28b14707f2162fa))
+
 ## [8.87.1](https://github.com/doublewordai/control-layer/compare/v8.87.0...v8.87.1) (2026-07-16)
 
 
