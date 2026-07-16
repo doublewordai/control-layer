@@ -1,5 +1,19 @@
 # Changelog
 
+## [8.87.2](https://github.com/doublewordai/control-layer/compare/v8.87.1...v8.87.2) (2026-07-16)
+
+
+### Bug Fixes
+
+* advertise reasoning capabilities for disabled virtual backends ([#1297](https://github.com/doublewordai/control-layer/issues/1297)) ([f98a576](https://github.com/doublewordai/control-layer/commit/f98a576f660d60ba37302b80e28b14707f2162fa))
+
+## [8.87.1](https://github.com/doublewordai/control-layer/compare/v8.87.0...v8.87.1) (2026-07-16)
+
+
+### Bug Fixes
+
+* bump fusillade to 21.2.0 / fusillade-arsenal 1.2.0 ([#1295](https://github.com/doublewordai/control-layer/issues/1295)) ([0a539cd](https://github.com/doublewordai/control-layer/commit/0a539cdb07285c430fb74c43008e36ac9bb8175c))
+
 ## [8.87.0](https://github.com/doublewordai/control-layer/compare/v8.86.1...v8.87.0) (2026-07-16)
 
 
