@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.86.1](https://github.com/doublewordai/control-layer/compare/v8.86.0...v8.86.1) (2026-07-16)
+
+
+### Bug Fixes
+
+* bump fusillade to 21.1.3 / fusillade-arsenal 1.1.1 ([#1292](https://github.com/doublewordai/control-layer/issues/1292)) ([a1077f8](https://github.com/doublewordai/control-layer/commit/a1077f8bbe59b03a5a554a71a178499287f1cbae))
+
 ## [8.86.0](https://github.com/doublewordai/control-layer/compare/v8.85.0...v8.86.0) (2026-07-16)
 
 
