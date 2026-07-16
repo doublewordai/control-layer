@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.87.0](https://github.com/doublewordai/control-layer/compare/v8.86.1...v8.87.0) (2026-07-16)
+
+
+### Features
+
+* **usage-e:** denormalize fusillade_request_id onto credits + backfill (expand) ([#1275](https://github.com/doublewordai/control-layer/issues/1275)) ([f56984b](https://github.com/doublewordai/control-layer/commit/f56984beff6d49b72045cac2c6510588e39dbc5c))
+
 ## [8.86.1](https://github.com/doublewordai/control-layer/compare/v8.86.0...v8.86.1) (2026-07-16)
 
 
