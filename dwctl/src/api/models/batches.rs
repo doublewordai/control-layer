@@ -175,7 +175,7 @@ pub struct BatchResponse {
 }
 
 /// Aggregated analytics metrics for batch requests
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 #[schema(example = json!({
     "total_requests": 100,
     "total_prompt_tokens": 50000,
