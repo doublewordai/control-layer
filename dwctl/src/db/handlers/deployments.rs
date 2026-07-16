@@ -1450,8 +1450,8 @@ impl<'c> Deployments<'c> {
         Ok(info)
     }
 
-    /// Load the same effective reasoning mappings that Onwards uses for every
-    /// provider behind each requested model alias.
+    /// Load effective reasoning mappings for every configured provider behind
+    /// each requested model alias, including disabled components.
     #[instrument(skip(self, aliases), fields(count = aliases.len()), err)]
     pub async fn get_reasoning_policies(&mut self, aliases: &[String]) -> Result<HashMap<String, ModelReasoningPolicy>> {
         if aliases.is_empty() {
@@ -1480,7 +1480,6 @@ impl<'c> Deployments<'c> {
                 INNER JOIN deployed_models component ON component.id = link.deployed_model_id
                 WHERE requested.is_composite = TRUE
                   AND link.composite_model_id = requested.id
-                  AND link.enabled = TRUE
                   AND component.deleted = FALSE
             ) provider ON TRUE
             INNER JOIN inference_endpoints endpoint ON endpoint.id = provider.hosted_on
@@ -4607,7 +4606,7 @@ mod tests {
 
     #[sqlx::test]
     #[test_log::test]
-    async fn reasoning_policy_includes_every_enabled_composite_provider(pool: PgPool) {
+    async fn reasoning_policy_includes_every_configured_composite_provider(pool: PgPool) {
         let user = create_test_user(&pool).await;
         let (composite_id, component_ids) = create_composite_and_components(&pool, user.id, 2).await;
         let composite_alias: String = sqlx::query_scalar("SELECT alias FROM deployed_models WHERE id = $1")
@@ -4658,7 +4657,7 @@ mod tests {
             component_ids
                 .iter()
                 .enumerate()
-                .map(|(index, id)| (*id, 50, true, index as i32))
+                .map(|(index, id)| (*id, 50, false, index as i32))
                 .collect(),
         )
         .await
