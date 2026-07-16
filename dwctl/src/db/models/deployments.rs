@@ -807,7 +807,7 @@ mod backoff_derivation_tests {
     }
 
     #[test]
-    fn composite_create_defaults_to_499_fallback_in_application() {
+    fn composite_create_defaults_to_499_and_separate_rate_limit_fallback() {
         let create = serde_json::from_value(serde_json::json!({
             "type": "composite",
             "model_name": "m",
@@ -816,6 +816,7 @@ mod backoff_derivation_tests {
 
         let request = DeploymentCreateDBRequest::from_api_create(uuid::Uuid::nil(), create);
 
+        assert_eq!(request.fallback_on_rate_limit, Some(true));
         assert_eq!(request.fallback_on_status, Some(vec![499, 500, 502, 503, 504]));
     }
 
