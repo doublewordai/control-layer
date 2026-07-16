@@ -2687,7 +2687,7 @@ mod integration_tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_batcher_denormalizes_fusillade_request_id_onto_credits(pool: PgPool) {
-        // A batched request's credit row carries its fusillade_request_id (migration 119), so the
+        // A batched request's credit row carries its fusillade_request_id (migration 120), so the
         // responses view can read per-request cost off the ledger durably instead of joining
         // http_analytics (COR-524 follow-up / Usage E).
         let model_id = create_test_model(&pool, "req-id-credits-test").await;

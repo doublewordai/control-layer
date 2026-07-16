@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # Backfill credits_transactions.fusillade_request_id from http_analytics
-# (COR-524 follow-up / "Usage E", migration 119).
+# (COR-524 follow-up / "Usage E", migration 120).
 #
 # Purpose: the responses view (GET /admin/api/v1/batches/requests[/{id}]) reads per-request
 # COST off the credits ledger by fusillade_request_id, durably (survives http_analytics
