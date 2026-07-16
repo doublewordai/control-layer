@@ -1115,18 +1115,12 @@ pub async fn get_batch_analytics<P: PoolProvider>(
         });
     }
 
-    // Read this batch's aggregated metrics from the batch_aggregates read model. That model is
-    // durable — it replaces raw http_analytics, which COR-509 prunes — so a batch that has been
-    // folded keeps its metrics indefinitely. A missing row therefore means the batch simply
-    // hasn't been folded yet (brand new / no completed requests), not that data aged out, so
-    // return a zero-valued payload rather than 404. Ownership/existence is already enforced
-    // above, and platform managers expect to see metrics for any batch they can access.
+    // Fetch aggregated analytics metrics for this batch
     let analytics = crate::db::handlers::analytics::get_batch_analytics(state.db.read(), &batch_id)
         .await
         .map_err(|e| Error::Internal {
             operation: format!("fetch batch analytics: {}", e),
-        })?
-        .unwrap_or_default();
+        })?;
 
     Ok(Json(analytics))
 }
@@ -4403,8 +4397,7 @@ mod tests {
         assert_eq!(total_tokens, 4865, "Total tokens should be 4865");
     }
 
-    /// Test that batch analytics surfaces folded reasoning tokens from the batch_aggregates
-    /// read model (COR-524) — both on the direct endpoint and via include=analytics.
+    /// Test that batch analytics correctly aggregates reasoning tokens from http_analytics
     #[sqlx::test]
     #[test_log::test]
     async fn test_batch_analytics_with_reasoning_tokens(pool: PgPool) {
@@ -4451,26 +4444,31 @@ mod tests {
         let batch_id = batch["id"].as_str().unwrap();
         let batch_uuid = Uuid::parse_str(batch_id).unwrap();
 
-        // The analytics endpoint now reads the batch_aggregates read model (COR-524), not raw
-        // http_analytics — so seed it with the batch's folded per-batch totals the way the
-        // batcher would (prompt 22+20+18=60, completion 891+2101+1813=4805,
-        // reasoning 733+1412+1735=3880, total 913+2121+1831=4865 over 3 requests).
-        sqlx::query(
-            r#"
-            INSERT INTO batch_aggregates (
-                fusillade_batch_id, user_id, total_amount, transaction_count, max_seq,
-                created_at, updated_at, service_tier, total_requests,
-                total_prompt_tokens, total_completion_tokens, total_reasoning_tokens, total_tokens,
-                sum_duration_ms, count_duration_ms, sum_ttfb_ms, count_ttfb_ms, total_list_cost
-            ) VALUES ($1, $2, 0, 3, 0, NOW(), NOW(), 'batch', 3,
-                60, 4805, 3880, 4865, 300, 3, 0, 0, 0)
-            "#,
-        )
-        .bind(batch_uuid)
-        .bind(user.id)
-        .execute(&pool)
-        .await
-        .expect("Failed to seed batch_aggregates read model");
+        // Insert analytics rows with reasoning tokens directly into http_analytics
+        let analytics_data = vec![(22i64, 891i64, 733i64, 913i64), (20, 2101, 1412, 2121), (18, 1813, 1735, 1831)];
+
+        for (prompt, completion, reasoning, total) in &analytics_data {
+            sqlx::query!(
+                r#"
+                INSERT INTO http_analytics (
+                    instance_id, correlation_id, timestamp, uri, method, status_code,
+                    duration_ms, model, prompt_tokens, completion_tokens, reasoning_tokens,
+                    total_tokens, fusillade_batch_id
+                ) VALUES ($1, $2, NOW(), '/ai/v1/chat/completions', 'POST', 200,
+                    100, 'thinking-model', $3, $4, $5, $6, $7)
+                "#,
+                Uuid::new_v4(),
+                (rand::random::<u64>() >> 1) as i64,
+                prompt,
+                completion,
+                reasoning,
+                total,
+                batch_uuid,
+            )
+            .execute(&pool)
+            .await
+            .expect("Failed to insert analytics data");
+        }
 
         let auth = add_auth_headers(&user);
 
@@ -4525,35 +4523,6 @@ mod tests {
             list_analytics["total_reasoning_tokens"].as_i64().unwrap(),
             3880,
             "Reasoning tokens should match in list analytics"
-        );
-    }
-
-    /// A batch that exists in fusillade but has no `batch_aggregates` row (brand new / not yet
-    /// folded) returns 200 with a zero-valued payload from GET /batches/{id}/analytics. The read
-    /// model is durable, so a missing row means "nothing folded yet", not "aged out" (COR-524) —
-    /// platform managers still see (empty) metrics for any batch they can access.
-    #[sqlx::test]
-    #[test_log::test]
-    async fn test_batch_analytics_missing_read_model_row_returns_zeros(pool: PgPool) {
-        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
-        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
-        let auth = add_auth_headers(&user);
-
-        // Batch exists (fusillade) but nothing folded it into the batch_aggregates read model.
-        let (batch_id, _request_ids) = insert_batch_with_pending_requests(&pool, user.id, 3).await;
-
-        let resp = app
-            .get(&format!("/ai/v1/batches/{batch_id}/analytics"))
-            .add_header(&auth[0].0, &auth[0].1)
-            .add_header(&auth[1].0, &auth[1].1)
-            .await;
-
-        resp.assert_status(StatusCode::OK);
-        let body: serde_json::Value = resp.json();
-        assert_eq!(
-            body["total_requests"],
-            serde_json::json!(0),
-            "unfolded batch reports zero requests, not 404"
         );
     }
 
