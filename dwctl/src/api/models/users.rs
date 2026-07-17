@@ -80,8 +80,9 @@ pub struct UserUpdate {
     /// auto top-up charges, set to null to remove the limit. Omit entirely to leave unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]
     pub auto_topup_monthly_limit: Option<Option<f32>>,
-    /// Account-wide zero-data-retention flag. Admin-only: only callers with
-    /// UpdateAll on users may set this. Omit to leave unchanged.
+    /// Account-wide zero-data-retention flag. Users may set this on their own
+    /// account; callers with UpdateAll on users may set it for any account.
+    /// Omit to leave unchanged.
     pub zero_data_retention: Option<bool>,
 }
 

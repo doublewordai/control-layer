@@ -191,6 +191,16 @@ fn modality_label(purpose: &str) -> String {
     }
 }
 
+/// The modality a Flex request is dispatched as.
+///
+/// Flex bodies are queued and later dispatched through `onwards` using the key
+/// owner's hidden **batch** key (see `resolve_flex_batch_api_key`), so the
+/// modality a Flex request must be checked against is `batch` — NOT the caller's
+/// own key purpose. A `realtime` deny rule is intended to push users onto the
+/// async/Flex path, so it must not block Flex; only a `batch` deny rule (which
+/// `onwards` would itself enforce once the daemon dispatches the request) should.
+const FLEX_DISPATCH_PURPOSE: &str = "batch";
+
 /// Check whether a traffic routing rule denies this API key's purpose for the given model.
 ///
 /// Returns `Ok(Some(purpose))` if a matching `deny` rule exists, where `purpose` is the
@@ -219,6 +229,38 @@ pub async fn check_modality_blocked(pool: PgPool, api_key: &str, model_alias: &s
     .await?;
 
     Ok(purpose)
+}
+
+/// Check whether a `deny` traffic routing rule exists for a specific `purpose` on
+/// the given model, independent of any API key.
+///
+/// Returns `Ok(Some(purpose))` if a matching rule exists, `Ok(None)` otherwise.
+/// Unlike [`check_modality_blocked`], the purpose to enforce is supplied by the
+/// caller rather than derived from the presented key's own `purpose`. The Flex
+/// path uses this with [`FLEX_DISPATCH_PURPOSE`], because a Flex request executes
+/// as `batch` regardless of the purpose of the key that submitted it.
+#[instrument(skip(pool), name = "dwctl.check_modality_blocked_for_purpose")]
+pub async fn check_modality_blocked_for_purpose(pool: PgPool, model_alias: &str, purpose: &str) -> Result<Option<String>, DbError> {
+    let mut conn = pool.acquire().await?;
+
+    let found = sqlx::query_scalar!(
+        r#"
+        SELECT mtr.api_key_purpose
+        FROM model_traffic_rules mtr
+        JOIN deployed_models dm ON dm.id = mtr.deployed_model_id
+        WHERE dm.alias = $1
+          AND dm.deleted = false
+          AND mtr.api_key_purpose = $2
+          AND mtr.action = 'deny'
+        LIMIT 1
+        "#,
+        model_alias,
+        purpose,
+    )
+    .fetch_optional(&mut *conn)
+    .await?;
+
+    Ok(found)
 }
 
 #[instrument(skip_all, name = "dwctl.get_user_id_of_api_key")]
@@ -328,7 +370,12 @@ pub async fn validate_api_key_model_access(pool: PgPool, api_key: &str, model: &
         ));
     }
 
-    if let Some(purpose) = check_modality_blocked(pool, api_key, model)
+    // Enforce the modality the Flex request will actually run as (`batch`), not
+    // the caller's key purpose. Flex is dispatched via the owner's hidden batch
+    // key, so a `realtime` deny rule (which exists to force traffic onto async)
+    // must not block it — only a `batch` deny rule should, mirroring what
+    // `onwards` enforces when the daemon later dispatches the request.
+    if let Some(purpose) = check_modality_blocked_for_purpose(pool, model, FLEX_DISPATCH_PURPOSE)
         .await
         .map_err(|e| format!("Failed to check modality routing rules: {e}"))?
     {
@@ -739,10 +786,11 @@ mod tests {
         );
     }
 
-    /// Direct unit test: `validate_api_key_model_access` rejects requests when a routing
-    /// rule denies the API key's purpose. Flex requests on `/v1/responses` bypass onwards
-    /// and use this function to enforce auth, so it must reject modality-blocked keys
-    /// — otherwise a Batch key could reach a model where Batch is denied.
+    /// Direct unit test: `validate_api_key_model_access` rejects a Flex request when a
+    /// `batch` deny rule exists on the model. Flex requests on `/v1/responses` bypass
+    /// onwards and execute as `batch` (via the owner's hidden batch key), so this
+    /// function must fail them fast — otherwise a Flex request could reach a model where
+    /// batch/async access is denied, which onwards would have blocked on dispatch.
     #[sqlx::test]
     #[test_log::test]
     async fn test_validate_api_key_model_access_rejects_modality_blocked(pool: PgPool) {
@@ -792,6 +840,104 @@ mod tests {
         validate_api_key_model_access(pool.clone(), &api_key.secret, "open-model")
             .await
             .expect("expected access to be granted on a model without a deny rule");
+    }
+
+    /// Regression test for the reported bug: a Flex (`service_tier:"flex"`) request
+    /// submitted with a **realtime** key must NOT be blocked by a **realtime** deny
+    /// rule. Such a rule exists to push traffic onto the async/Flex path, and Flex
+    /// executes as `batch` — so `validate_api_key_model_access` (the Flex pre-dispatch
+    /// gate) must allow it. Previously the check matched the caller's own key purpose
+    /// and wrongly returned "Real-time access ... is blocked by a routing rule".
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_validate_flex_allowed_despite_realtime_deny_rule(pool: PgPool) {
+        use crate::test::utils::{add_deployment_to_group, add_user_to_group, create_test_group};
+
+        let user = create_test_user(&pool, Role::StandardUser).await;
+
+        let mut api_key_conn = pool.acquire().await.unwrap();
+        let mut api_keys_repo = ApiKeys::new(&mut api_key_conn);
+        let api_key = api_keys_repo
+            .create(&ApiKeyCreateDBRequest {
+                user_id: user.id,
+                name: "Realtime Key".to_string(),
+                description: None,
+                purpose: ApiKeyPurpose::Realtime,
+                requests_per_second: None,
+                burst_size: None,
+                created_by: user.id,
+            })
+            .await
+            .unwrap();
+        drop(api_key_conn);
+
+        let endpoint_id = crate::test::utils::create_test_endpoint(&pool, "test-endpoint", user.id).await;
+        let deployment_id = crate::test::utils::create_test_model(&pool, "async-only-name", "async-only", endpoint_id, user.id).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+        add_deployment_to_group(&pool, deployment_id, group.id, user.id).await;
+
+        // Model denies realtime access (intended to force users onto async/Flex).
+        sqlx::query!(
+            "INSERT INTO model_traffic_rules (deployed_model_id, api_key_purpose, action) VALUES ($1, 'realtime', 'deny')",
+            deployment_id
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        validate_api_key_model_access(pool.clone(), &api_key.secret, "async-only")
+            .await
+            .expect("Flex request must be allowed despite a realtime-only deny rule");
+    }
+
+    /// Companion to the regression test: a Flex request submitted with a **realtime**
+    /// key IS blocked when the model carries a **batch** deny rule, because Flex runs
+    /// as `batch`. This mirrors what onwards would enforce on daemon dispatch.
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_validate_flex_blocked_by_batch_deny_rule_with_realtime_key(pool: PgPool) {
+        use crate::test::utils::{add_deployment_to_group, add_user_to_group, create_test_group};
+
+        let user = create_test_user(&pool, Role::StandardUser).await;
+
+        let mut api_key_conn = pool.acquire().await.unwrap();
+        let mut api_keys_repo = ApiKeys::new(&mut api_key_conn);
+        let api_key = api_keys_repo
+            .create(&ApiKeyCreateDBRequest {
+                user_id: user.id,
+                name: "Realtime Key".to_string(),
+                description: None,
+                purpose: ApiKeyPurpose::Realtime,
+                requests_per_second: None,
+                burst_size: None,
+                created_by: user.id,
+            })
+            .await
+            .unwrap();
+        drop(api_key_conn);
+
+        let endpoint_id = crate::test::utils::create_test_endpoint(&pool, "test-endpoint", user.id).await;
+        let deployment_id = crate::test::utils::create_test_model(&pool, "no-batch-name", "no-batch", endpoint_id, user.id).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+        add_deployment_to_group(&pool, deployment_id, group.id, user.id).await;
+
+        sqlx::query!(
+            "INSERT INTO model_traffic_rules (deployed_model_id, api_key_purpose, action) VALUES ($1, 'batch', 'deny')",
+            deployment_id
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let err = validate_api_key_model_access(pool.clone(), &api_key.secret, "no-batch")
+            .await
+            .expect_err("Flex request must be blocked by a batch deny rule (Flex runs as batch)");
+        assert!(
+            err.contains("Batch") && err.contains("no-batch") && err.contains("administrator"),
+            "expected batch modality-blocked message, got: {err}"
+        );
     }
 
     /// Direct unit test: `validate_api_key_model_access` rejects a non-inference

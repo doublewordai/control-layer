@@ -784,42 +784,85 @@ pub async fn get_model_user_usage(
     })
 }
 
-/// Get aggregated analytics metrics for a batch given a list of request IDs
+/// Get aggregated analytics metrics for a batch.
+///
+/// Reads the denormalized per-batch aggregates from `batch_aggregates` (COR-524) — folded
+/// by the analytics batcher and backfilled from raw — rather than scanning `http_analytics`
+/// by `fusillade_batch_id`. Latency is reconstructed from the stored sum + count (the AVG
+/// the old query computed directly).
+///
+/// Returns `None` when the batch has no `batch_aggregates` row. Because `batch_aggregates`
+/// is the durable read model (not subject to `http_analytics` retention), a missing row now
+/// means the batch predates the read model and its raw analytics have aged out — the caller
+/// surfaces this as a 404 ("analytics no longer available") rather than a misleading all-zero
+/// result. (It also covers a batch that never had a foldable request, e.g. all-non-2xx.)
 #[instrument(skip(pool))]
-pub async fn get_batch_analytics(pool: &PgPool, batch_id: &Uuid) -> Result<BatchAnalytics> {
-    // Query analytics for these specific request IDs
-    let metrics = sqlx::query!(
+pub async fn get_batch_analytics(pool: &PgPool, batch_id: &Uuid) -> Result<Option<BatchAnalytics>> {
+    let row = sqlx::query!(
         r#"
         SELECT
-            COUNT(*) as "total_requests!",
-            COALESCE(SUM(prompt_tokens), 0) as "total_prompt_tokens!",
-            COALESCE(SUM(completion_tokens), 0) as "total_completion_tokens!",
-            COALESCE(SUM(reasoning_tokens), 0) as "total_reasoning_tokens!",
-            COALESCE(SUM(total_tokens), 0) as "total_tokens!",
-            AVG(duration_ms) as "avg_duration_ms",
-            AVG(duration_to_first_byte_ms) as "avg_ttfb_ms",
-            SUM((prompt_tokens * COALESCE(input_price_per_token, 0)) +
-                (completion_tokens * COALESCE(output_price_per_token, 0))) as "total_cost"
-        FROM http_analytics
+            total_requests,
+            total_prompt_tokens,
+            total_completion_tokens,
+            total_reasoning_tokens,
+            total_tokens,
+            sum_duration_ms,
+            count_duration_ms,
+            sum_ttfb_ms,
+            count_ttfb_ms,
+            total_list_cost
+        FROM batch_aggregates
         WHERE fusillade_batch_id = $1
-          AND status_code BETWEEN 200 AND 299
         "#,
         batch_id
     )
-    .fetch_one(pool)
+    .fetch_optional(pool)
     .await?;
 
-    let reasoning = metrics.total_reasoning_tokens.to_i64().unwrap_or(0);
-    Ok(BatchAnalytics {
-        total_requests: metrics.total_requests,
-        total_prompt_tokens: metrics.total_prompt_tokens.to_i64().unwrap_or(0),
-        total_completion_tokens: metrics.total_completion_tokens.to_i64().unwrap_or(0),
-        total_reasoning_tokens: if reasoning > 0 { Some(reasoning) } else { None },
-        total_tokens: metrics.total_tokens.to_i64().unwrap_or(0),
-        avg_duration_ms: metrics.avg_duration_ms.and_then(|d| d.to_f64()),
-        avg_ttfb_ms: metrics.avg_ttfb_ms.and_then(|d| d.to_f64()),
-        total_cost: metrics.total_cost.map(|d| d.to_string()),
-    })
+    Ok(row.map(|r| {
+        batch_analytics_from_row(
+            r.total_requests,
+            r.total_prompt_tokens,
+            r.total_completion_tokens,
+            r.total_reasoning_tokens,
+            r.total_tokens,
+            r.sum_duration_ms,
+            r.count_duration_ms,
+            r.sum_ttfb_ms,
+            r.count_ttfb_ms,
+            r.total_list_cost,
+        )
+    }))
+}
+
+/// Build a [`BatchAnalytics`] from a `batch_aggregates` row's denormalized aggregates,
+/// dividing the stored latency sum/count back into an average (NULL when nothing reported
+/// the metric — reproducing SQL `AVG`, which ignores NULLs). Takes the columns positionally
+/// so both the single- and bulk-read queries (whose row types differ) can share it.
+#[allow(clippy::too_many_arguments)]
+fn batch_analytics_from_row(
+    total_requests: i64,
+    total_prompt_tokens: i64,
+    total_completion_tokens: i64,
+    total_reasoning_tokens: i64,
+    total_tokens: i64,
+    sum_duration_ms: i64,
+    count_duration_ms: i64,
+    sum_ttfb_ms: i64,
+    count_ttfb_ms: i64,
+    total_list_cost: Decimal,
+) -> BatchAnalytics {
+    let avg = |sum: i64, count: i64| (count > 0).then(|| sum as f64 / count as f64);
+    BatchAnalytics {
+        total_requests,
+        total_prompt_tokens,
+        total_completion_tokens,
+        total_reasoning_tokens: (total_reasoning_tokens > 0).then_some(total_reasoning_tokens),
+        total_tokens,
+        avg_duration_ms: avg(sum_duration_ms, count_duration_ms),
+        avg_ttfb_ms: avg(sum_ttfb_ms, count_ttfb_ms),
+        total_cost: Some(total_list_cost.to_string()),
+    }
 }
 
 /// Get aggregated analytics metrics for multiple batches in a single query
@@ -829,24 +872,23 @@ pub async fn get_batches_analytics_bulk(pool: &PgPool, batch_ids: &[Uuid]) -> Re
         return Ok(HashMap::new());
     }
 
-    // Query analytics for all batch IDs at once, grouped by batch ID
+    // Read the denormalized per-batch aggregates (COR-524), one row per batch.
     let rows = sqlx::query!(
         r#"
         SELECT
             fusillade_batch_id,
-            COUNT(*) as "total_requests!",
-            COALESCE(SUM(prompt_tokens), 0) as "total_prompt_tokens!",
-            COALESCE(SUM(completion_tokens), 0) as "total_completion_tokens!",
-            COALESCE(SUM(reasoning_tokens), 0) as "total_reasoning_tokens!",
-            COALESCE(SUM(total_tokens), 0) as "total_tokens!",
-            AVG(duration_ms) as "avg_duration_ms",
-            AVG(duration_to_first_byte_ms) as "avg_ttfb_ms",
-            SUM((prompt_tokens * COALESCE(input_price_per_token, 0)) +
-                (completion_tokens * COALESCE(output_price_per_token, 0))) as "total_cost"
-        FROM http_analytics
+            total_requests,
+            total_prompt_tokens,
+            total_completion_tokens,
+            total_reasoning_tokens,
+            total_tokens,
+            sum_duration_ms,
+            count_duration_ms,
+            sum_ttfb_ms,
+            count_ttfb_ms,
+            total_list_cost
+        FROM batch_aggregates
         WHERE fusillade_batch_id = ANY($1)
-          AND status_code BETWEEN 200 AND 299
-        GROUP BY fusillade_batch_id
         "#,
         batch_ids
     )
@@ -856,36 +898,28 @@ pub async fn get_batches_analytics_bulk(pool: &PgPool, batch_ids: &[Uuid]) -> Re
     // Convert rows to HashMap
     let mut result = HashMap::new();
     for row in rows {
-        if let Some(batch_id) = row.fusillade_batch_id {
-            let reasoning = row.total_reasoning_tokens.to_i64().unwrap_or(0);
-            result.insert(
-                batch_id,
-                BatchAnalytics {
-                    total_requests: row.total_requests,
-                    total_prompt_tokens: row.total_prompt_tokens.to_i64().unwrap_or(0),
-                    total_completion_tokens: row.total_completion_tokens.to_i64().unwrap_or(0),
-                    total_reasoning_tokens: if reasoning > 0 { Some(reasoning) } else { None },
-                    total_tokens: row.total_tokens.to_i64().unwrap_or(0),
-                    avg_duration_ms: row.avg_duration_ms.and_then(|d: Decimal| d.to_f64()),
-                    avg_ttfb_ms: row.avg_ttfb_ms.and_then(|d: Decimal| d.to_f64()),
-                    total_cost: row.total_cost.map(|d: Decimal| d.to_string()),
-                },
-            );
-        }
+        result.insert(
+            row.fusillade_batch_id,
+            batch_analytics_from_row(
+                row.total_requests,
+                row.total_prompt_tokens,
+                row.total_completion_tokens,
+                row.total_reasoning_tokens,
+                row.total_tokens,
+                row.sum_duration_ms,
+                row.count_duration_ms,
+                row.sum_ttfb_ms,
+                row.count_ttfb_ms,
+                row.total_list_cost,
+            ),
+        );
     }
 
-    // For batch IDs with no analytics data, insert empty analytics
+    // For batch IDs with no aggregates row, insert empty analytics. A missing row means the
+    // batch had no successful (2xx) requests folded, or it predates the read model / aged out
+    // of retention — not specifically "no billed requests" (the fold covers all 2xx, incl. free).
     for batch_id in batch_ids {
-        result.entry(*batch_id).or_insert(BatchAnalytics {
-            total_requests: 0,
-            total_prompt_tokens: 0,
-            total_completion_tokens: 0,
-            total_reasoning_tokens: None,
-            total_tokens: 0,
-            avg_duration_ms: None,
-            avg_ttfb_ms: None,
-            total_cost: None,
-        });
+        result.entry(*batch_id).or_default();
     }
 
     Ok(result)
@@ -1721,18 +1755,25 @@ mod tests {
         output_price_per_token: Option<f64>,
     }
 
-    // Helper function to insert analytics data with fusillade_request_id
+    // Helper: record one batch request. Since COR-524 repointed get_batch_analytics onto
+    // batch_aggregates, this writes the http_analytics row (still the source of truth other
+    // code reads) AND folds the request into batch_aggregates the same way the batcher does,
+    // so the read-model these tests exercise is populated. Each call = one folded request;
+    // repeated calls for a batch accumulate.
     async fn insert_test_analytics_with_batch_id(pool: &PgPool, data: TestBatchAnalyticsData<'_>) {
+        use crate::api::models::users::Role;
         use crate::request_logging::batcher::list_price;
+        use crate::test::utils::create_test_user;
         use rust_decimal::Decimal;
         use uuid::Uuid;
 
         let input_price = data.input_price_per_token.and_then(Decimal::from_f64_retain);
         let output_price = data.output_price_per_token.and_then(Decimal::from_f64_retain);
-        // Derive total_cost with the same function the batcher bills with. These rows carry no
-        // cache split (the cache_* columns default to 0), so this is the plain no-cache billed
-        // cost — these tests don't exercise cache pricing.
-        let total_cost = list_price(data.prompt_tokens, data.completion_tokens, input_price, output_price);
+        // Derive the list cost with the same function the batcher bills with. These rows carry
+        // no cache split (the cache_* columns default to 0), so this is the plain no-cache
+        // cost — these tests don't exercise cache pricing. None (no pricing) folds as 0.
+        let list_cost = list_price(data.prompt_tokens, data.completion_tokens, input_price, output_price);
+        let list_cost = list_cost.unwrap_or(Decimal::ZERO);
 
         sqlx::query!(
             r#"
@@ -1758,11 +1799,52 @@ mod tests {
             data.fusillade_request_id,
             input_price,
             output_price,
-            total_cost,
+            Some(list_cost),
         )
         .execute(pool)
         .await
         .expect("Failed to insert test analytics data with batch ID");
+
+        // Fold into batch_aggregates (the read model get_batch_analytics now reads). Mirrors
+        // the batcher's per-flush fold; user_id satisfies the FK (value is not asserted).
+        let user_id = create_test_user(pool, Role::StandardUser).await.id;
+        let ttfb = data.duration_to_first_byte_ms.map(|d| d as i64);
+        sqlx::query!(
+            r#"
+            INSERT INTO batch_aggregates (
+                fusillade_batch_id, user_id, total_amount, transaction_count, max_seq, service_tier, total_requests,
+                total_prompt_tokens, total_completion_tokens, total_reasoning_tokens, total_tokens,
+                sum_duration_ms, count_duration_ms, sum_ttfb_ms, count_ttfb_ms, total_list_cost
+            )
+            VALUES ($1, $2, $3, 1, 1, 'batch', 1, $4, $5, $6, $7, $8, 1, $9, $10, $3)
+            ON CONFLICT (fusillade_batch_id) DO UPDATE SET
+                total_amount = batch_aggregates.total_amount + EXCLUDED.total_amount,
+                transaction_count = batch_aggregates.transaction_count + EXCLUDED.transaction_count,
+                total_requests = batch_aggregates.total_requests + EXCLUDED.total_requests,
+                total_prompt_tokens = batch_aggregates.total_prompt_tokens + EXCLUDED.total_prompt_tokens,
+                total_completion_tokens = batch_aggregates.total_completion_tokens + EXCLUDED.total_completion_tokens,
+                total_reasoning_tokens = batch_aggregates.total_reasoning_tokens + EXCLUDED.total_reasoning_tokens,
+                total_tokens = batch_aggregates.total_tokens + EXCLUDED.total_tokens,
+                sum_duration_ms = batch_aggregates.sum_duration_ms + EXCLUDED.sum_duration_ms,
+                count_duration_ms = batch_aggregates.count_duration_ms + EXCLUDED.count_duration_ms,
+                sum_ttfb_ms = batch_aggregates.sum_ttfb_ms + EXCLUDED.sum_ttfb_ms,
+                count_ttfb_ms = batch_aggregates.count_ttfb_ms + EXCLUDED.count_ttfb_ms,
+                total_list_cost = batch_aggregates.total_list_cost + EXCLUDED.total_list_cost
+            "#,
+            data.fusillade_batch_id,
+            user_id,
+            list_cost,
+            data.prompt_tokens,
+            data.completion_tokens,
+            data.reasoning_tokens,
+            data.prompt_tokens + data.completion_tokens,
+            data.duration_ms as i64,
+            ttfb.unwrap_or(0),
+            i64::from(ttfb.is_some()),
+        )
+        .execute(pool)
+        .await
+        .expect("Failed to fold test batch_aggregates row");
     }
 
     #[sqlx::test]
@@ -1790,7 +1872,10 @@ mod tests {
         )
         .await;
 
-        let result = get_batch_analytics(&pool, &batch_id).await.unwrap();
+        let result = get_batch_analytics(&pool, &batch_id)
+            .await
+            .unwrap()
+            .expect("batch has batch_aggregates analytics");
 
         assert_eq!(result.total_requests, 1);
         assert_eq!(result.total_prompt_tokens, 100);
@@ -1869,7 +1954,10 @@ mod tests {
         )
         .await;
 
-        let result = get_batch_analytics(&pool, &batch_id).await.unwrap();
+        let result = get_batch_analytics(&pool, &batch_id)
+            .await
+            .unwrap()
+            .expect("batch has batch_aggregates analytics");
 
         assert_eq!(result.total_requests, 3);
         assert_eq!(result.total_prompt_tokens, 225); // 50 + 100 + 75
@@ -1898,15 +1986,11 @@ mod tests {
     async fn test_get_batch_analytics_nonexistent_batch_id(pool: PgPool) {
         let nonexistent_batch_id = Uuid::new_v4();
 
+        // No batch_aggregates row → None, which the handler surfaces as 404
+        // ("analytics no longer available") rather than a misleading all-zero payload (COR-524).
         let result = get_batch_analytics(&pool, &nonexistent_batch_id).await.unwrap();
 
-        assert_eq!(result.total_requests, 0);
-        assert_eq!(result.total_prompt_tokens, 0);
-        assert_eq!(result.total_completion_tokens, 0);
-        assert_eq!(result.total_tokens, 0);
-        assert_eq!(result.avg_duration_ms, None);
-        assert_eq!(result.avg_ttfb_ms, None);
-        assert_eq!(result.total_cost, None);
+        assert!(result.is_none());
     }
 
     #[sqlx::test]
@@ -1956,7 +2040,10 @@ mod tests {
         .await;
 
         // Query only for batch 1
-        let result = get_batch_analytics(&pool, &batch_id_1).await.unwrap();
+        let result = get_batch_analytics(&pool, &batch_id_1)
+            .await
+            .unwrap()
+            .expect("batch has batch_aggregates analytics");
 
         // Should only return data for batch 1
         assert_eq!(result.total_requests, 1);
@@ -1991,7 +2078,10 @@ mod tests {
         )
         .await;
 
-        let result = get_batch_analytics(&pool, &batch_id).await.unwrap();
+        let result = get_batch_analytics(&pool, &batch_id)
+            .await
+            .unwrap()
+            .expect("batch has batch_aggregates analytics");
 
         assert_eq!(result.total_requests, 1);
         assert_eq!(result.total_prompt_tokens, 50);
@@ -2072,7 +2162,10 @@ mod tests {
         .await;
 
         // Query only for the first batch
-        let result = get_batch_analytics(&pool, &batch_id).await.unwrap();
+        let result = get_batch_analytics(&pool, &batch_id)
+            .await
+            .unwrap()
+            .expect("batch has batch_aggregates analytics");
 
         // Should only include the two requests from the first batch, not the other batch
         assert_eq!(result.total_requests, 2);

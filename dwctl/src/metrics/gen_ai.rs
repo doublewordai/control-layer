@@ -47,6 +47,7 @@ impl GenAiMetrics {
                 "error_type",
                 "request_origin",
                 "batch_sla",
+                "served_by",
             ],
         )?;
         registry.register(Box::new(request_duration.clone()))?;
@@ -71,6 +72,7 @@ impl GenAiMetrics {
                 "server_port",
                 "request_origin",
                 "batch_sla",
+                "served_by",
             ],
         )?;
         registry.register(Box::new(time_to_first_token.clone()))?;
@@ -93,6 +95,7 @@ impl GenAiMetrics {
                 "server_port",
                 "request_origin",
                 "batch_sla",
+                "served_by",
             ],
         )?;
         registry.register(Box::new(time_per_output_token.clone()))?;
@@ -114,6 +117,7 @@ impl GenAiMetrics {
                 "server_port",
                 "request_origin",
                 "batch_sla",
+                "served_by",
             ],
         )?;
         registry.register(Box::new(token_usage.clone()))?;
@@ -180,6 +184,7 @@ impl MetricsRecorder for GenAiMetrics {
         let server_port = &row.server_port.to_string();
 
         let provider_name = row.provider_name.as_deref().unwrap_or("");
+        let served_by = served_by_host(row.served_by.as_deref());
         let request_model = row.request_model.as_deref().unwrap_or("");
         let response_model = row.response_model.as_deref().unwrap_or("");
         let request_origin = &row.request_origin;
@@ -196,6 +201,7 @@ impl MetricsRecorder for GenAiMetrics {
             &error_type,
             request_origin,
             batch_sla,
+            &served_by,
         ];
         self.record_request_duration(row.duration_ms as f64 / 1000.0, &duration_labels);
 
@@ -210,6 +216,7 @@ impl MetricsRecorder for GenAiMetrics {
                 server_port,
                 request_origin,
                 batch_sla,
+                &served_by,
             ];
             self.record_time_to_first_token(ttfb_ms as f64 / 1000.0, &ttft_labels);
         }
@@ -229,6 +236,7 @@ impl MetricsRecorder for GenAiMetrics {
                 server_port,
                 request_origin,
                 batch_sla,
+                &served_by,
             ];
             self.record_time_per_output_token(time_per_token, &tpot_labels);
         }
@@ -245,6 +253,7 @@ impl MetricsRecorder for GenAiMetrics {
                 server_port,
                 request_origin,
                 batch_sla,
+                &served_by,
             ];
             self.record_token_usage(row.prompt_tokens as f64, &input_labels);
         }
@@ -261,9 +270,41 @@ impl MetricsRecorder for GenAiMetrics {
                 server_port,
                 request_origin,
                 batch_sla,
+                &served_by,
             ];
             self.record_token_usage(row.completion_tokens as f64, &output_labels);
         }
+    }
+}
+
+/// Label value for `served_by`: the host of the upstream URL recorded by the
+/// onwards `ServedBy` extension (e.g. "onwards.dynamo", "router.requesty.ai").
+/// Host rather than full URL keeps label cardinality at one value per endpoint
+/// while remaining directly classifiable (owned vs external provider). Empty
+/// string when the request never reached an upstream; falls back to the raw
+/// value if it doesn't parse as a URL.
+pub(crate) fn served_by_host(served_by: Option<&str>) -> String {
+    let Some(raw) = served_by else {
+        return String::new();
+    };
+    url::Url::parse(raw)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_owned))
+        .unwrap_or_else(|| raw.to_string())
+}
+
+#[cfg(test)]
+mod served_by_host_tests {
+    use super::served_by_host;
+
+    #[test]
+    fn maps_url_to_host_and_handles_edge_cases() {
+        assert_eq!(served_by_host(Some("http://onwards.dynamo:3000/v1")), "onwards.dynamo");
+        assert_eq!(served_by_host(Some("https://router.requesty.ai/v1")), "router.requesty.ai");
+        assert_eq!(served_by_host(Some("https://openrouter.ai/api/v1")), "openrouter.ai");
+        // Unparseable values fall back to the raw string rather than hiding data.
+        assert_eq!(served_by_host(Some("not a url")), "not a url");
+        assert_eq!(served_by_host(None), "");
     }
 }
 
@@ -286,6 +327,7 @@ mod tests {
 
         // Create test fixture for a streaming chat completion
         let row = HttpAnalyticsRow {
+            served_by: None,
             instance_id: Uuid::new_v4(),
             correlation_id: 123,
             timestamp: chrono::Utc::now(),
@@ -402,6 +444,7 @@ mod tests {
         let metrics = GenAiMetrics::new(&registry).expect("Failed to create metrics");
 
         let row = HttpAnalyticsRow {
+            served_by: None,
             instance_id: Uuid::new_v4(),
             correlation_id: 456,
             timestamp: chrono::Utc::now(),
@@ -466,6 +509,7 @@ mod tests {
         let metrics = GenAiMetrics::new(&registry).expect("Failed to create metrics");
 
         let row = HttpAnalyticsRow {
+            served_by: None,
             instance_id: Uuid::new_v4(),
             correlation_id: 789,
             timestamp: chrono::Utc::now(),
@@ -541,6 +585,7 @@ mod tests {
         let metrics = GenAiMetrics::new(&registry).expect("Failed to create metrics");
 
         let row = HttpAnalyticsRow {
+            served_by: None,
             instance_id: Uuid::new_v4(),
             correlation_id: 999,
             timestamp: chrono::Utc::now(),
@@ -602,6 +647,7 @@ mod tests {
         let metrics = GenAiMetrics::new(&registry).expect("Failed to create metrics");
 
         let row = HttpAnalyticsRow {
+            served_by: None,
             instance_id: Uuid::new_v4(),
             correlation_id: 111,
             timestamp: chrono::Utc::now(),
@@ -666,6 +712,7 @@ mod tests {
         let metrics = GenAiMetrics::new(&registry).expect("Failed to create metrics");
 
         let row = HttpAnalyticsRow {
+            served_by: None,
             instance_id: Uuid::new_v4(),
             correlation_id: 222,
             timestamp: chrono::Utc::now(),
@@ -727,6 +774,7 @@ mod tests {
         let metrics = GenAiMetrics::new(&registry).expect("Failed to create metrics");
 
         let row = HttpAnalyticsRow {
+            served_by: None,
             instance_id: Uuid::new_v4(),
             correlation_id: 333,
             timestamp: chrono::Utc::now(),
@@ -783,6 +831,7 @@ mod tests {
         // Test various error codes
         for status_code in [400, 401, 500, 503] {
             let row = HttpAnalyticsRow {
+                served_by: None,
                 instance_id: Uuid::new_v4(),
                 correlation_id: 444,
                 timestamp: chrono::Utc::now(),
@@ -837,6 +886,7 @@ mod tests {
         let metrics = GenAiMetrics::new(&registry).expect("Failed to create metrics");
 
         let row = HttpAnalyticsRow {
+            served_by: None,
             instance_id: Uuid::new_v4(),
             correlation_id: 555,
             timestamp: chrono::Utc::now(),

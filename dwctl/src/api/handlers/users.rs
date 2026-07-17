@@ -407,16 +407,6 @@ pub async fn update_user<P: PoolProvider>(
         });
     }
 
-    // SECURITY: zero-data-retention is a compliance setting an account holder
-    // must not be able to flip on themselves - only admins (UpdateAll) may set it.
-    if !can_update_all_users && user_data.zero_data_retention.is_some() {
-        return Err(Error::InsufficientPermissions {
-            required: Permission::Allow(Resource::Users, Operation::UpdateAll),
-            action: Operation::UpdateAll,
-            resource: "user zero data retention".to_string(),
-        });
-    }
-
     // Validate auto-topup fields if provided
     if let Some(Some(amount)) = &user_data.auto_topup_amount
         && *amount <= 0.0
@@ -1770,35 +1760,29 @@ mod tests {
 
     #[sqlx::test]
     #[test_log::test]
-    async fn test_standard_user_cannot_set_own_zero_data_retention(pool: PgPool) {
+    async fn test_standard_user_can_toggle_own_zero_data_retention(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user = create_test_user(&pool, Role::StandardUser).await;
-
-        // A standard user may edit their own profile, but ZDR is admin-only:
-        // attempting to set it on themselves must be rejected.
-        let update_data = json!({
-            "display_name": "New Name",
-            "zero_data_retention": true
-        });
 
         let response = app
             .patch(&format!("/admin/api/v1/users/{}", user.id))
             .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
             .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
-            .json(&update_data)
+            .json(&json!({ "zero_data_retention": true }))
             .await;
 
-        response.assert_status_forbidden();
+        response.assert_status_ok();
+        assert!(response.json::<UserResponse>().zero_data_retention);
 
-        // The rejected request must not have persisted ANY of its changes: the
-        // 403 rejects the whole update, so neither ZDR nor display_name changes.
-        let mut conn = pool.acquire().await.unwrap();
-        let persisted = Users::new(&mut conn).get_by_id(user.id).await.unwrap().unwrap();
-        assert!(!persisted.zero_data_retention);
-        assert_eq!(
-            persisted.display_name, user.display_name,
-            "rejected request must not persist the display_name change"
-        );
+        let response = app
+            .patch(&format!("/admin/api/v1/users/{}", user.id))
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .json(&json!({ "zero_data_retention": false }))
+            .await;
+
+        response.assert_status_ok();
+        assert!(!response.json::<UserResponse>().zero_data_retention);
     }
 
     async fn create_initial_credit_transaction(pool: &PgPool, user_id: UserId, amount: &str) -> Uuid {
