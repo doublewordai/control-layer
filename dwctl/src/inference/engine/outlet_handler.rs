@@ -12,6 +12,7 @@
 //! slowing outlet to dropping rows, since the `requests` table is the only
 //! place the responses listing reads from.
 
+use chrono::{DateTime, Utc};
 use outlet::{RequestData, RequestHandler, ResponseData};
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -194,6 +195,13 @@ impl RequestHandler for FusilladeOutletHandler {
                 (response_body, request_body)
             };
 
+            // Real request timing measured by outlet: arrival (request
+            // timestamp) → arrival + total duration. Carried through so the
+            // synthesized fusillade row records the true latency instead of
+            // started_at == completed_at == NOW() (which read as duration 0).
+            let started_at: DateTime<Utc> = request_data.timestamp.into();
+            let completed_at = started_at + response_duration(&response_data);
+
             if let Err(e) = sender
                 .send(RawCompletedRequest {
                     request_id: ctx.request_id,
@@ -204,6 +212,8 @@ impl RequestHandler for FusilladeOutletHandler {
                     endpoint: ctx.endpoint,
                     api_key,
                     created_by,
+                    started_at,
+                    completed_at,
                 })
                 .await
             {
@@ -252,6 +262,11 @@ impl RequestHandler for FusilladeOutletHandler {
             })
             .to_string();
 
+            // Client cancelled before any upstream response, so there is no
+            // measured duration. Record arrival for both endpoints (duration 0
+            // is truthful here — no round-trip completed).
+            let started_at: DateTime<Utc> = request_data.timestamp.into();
+
             if let Err(e) = sender
                 .send(RawCompletedRequest {
                     request_id: ctx.request_id,
@@ -262,6 +277,8 @@ impl RequestHandler for FusilladeOutletHandler {
                     endpoint: ctx.endpoint,
                     api_key,
                     created_by,
+                    started_at,
+                    completed_at: started_at,
                 })
                 .await
             {
@@ -285,6 +302,13 @@ impl RequestHandler for FusilladeOutletHandler {
 /// outlet captures the loopback dispatch the body is already-decrypted plaintext,
 /// so the header is the only signal that it must not be logged. Remove once
 /// response reassembly moves into dwctl.
+/// Outlet's total request duration as a `chrono::Duration`. Falls back to zero
+/// if the (always-positive) `std::time::Duration` somehow overflows the chrono
+/// range, so a completion timestamp is always produced.
+fn response_duration(response: &ResponseData) -> chrono::Duration {
+    chrono::Duration::from_std(response.duration).unwrap_or_else(|_| chrono::Duration::zero())
+}
+
 fn request_is_zdr(request: &RequestData) -> bool {
     request
         .headers

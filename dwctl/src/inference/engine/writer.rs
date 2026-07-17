@@ -60,6 +60,7 @@ use crate::metrics::errors::component::RESPONSES_WRITER;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use chrono::{DateTime, Utc};
 use fusillade::{PersistCompletedRealtimeInput, Storage};
 use fusillade_arsenal::PostgresRequestManager;
 use metrics::{counter, gauge, histogram};
@@ -109,6 +110,15 @@ pub struct RawCompletedRequest {
     /// Resolved user/org ID for the request (XOR-paired with batch_id on
     /// the fusillade row; required non-empty for batchless rows).
     pub created_by: String,
+    /// Wall-clock instant the request arrived, from outlet's request
+    /// timestamp. Consulted on the INSERT path only, where it becomes the
+    /// synthesized row's `created_at`/`claimed_at`/`started_at`.
+    pub started_at: DateTime<Utc>,
+    /// Wall-clock instant the response completed (`started_at +` outlet's
+    /// measured request duration). Consulted on the INSERT path only, where it
+    /// becomes `completed_at`/`failed_at` — so the row's duration reflects the
+    /// real latency instead of zero.
+    pub completed_at: DateTime<Utc>,
 }
 
 /// Sender handle handed to the outlet handler.
@@ -257,6 +267,8 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> RequestsWriter<P> {
                     path: record.endpoint.clone(),
                     api_key: record.api_key.clone(),
                     created_by: record.created_by.clone(),
+                    started_at: record.started_at,
+                    completed_at: record.completed_at,
                 })
                 .collect();
 
@@ -378,6 +390,14 @@ mod tests {
         let handle = tokio::spawn(writer.run(shutdown.clone()));
 
         let request_id = Uuid::new_v4();
+        // Real timing measured by the outlet handler: arrival, then completion
+        // 2s later. The writer must carry it through so the persisted row's
+        // duration is the true latency, not zero. Fixed, microsecond-aligned
+        // instants: Postgres timestamptz is microsecond-precision, so a
+        // nanosecond Utc::now() would not round-trip byte-for-byte and the
+        // completed_at equality assert below would be flaky.
+        let started_at = DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
+        let completed_at = started_at + chrono::Duration::seconds(2);
         sender
             .send(RawCompletedRequest {
                 request_id,
@@ -388,6 +408,8 @@ mod tests {
                 endpoint: "/v1/responses".to_string(),
                 api_key: String::new(),
                 created_by: "user-test".to_string(),
+                started_at,
+                completed_at,
             })
             .await
             .expect("send should succeed");
@@ -397,6 +419,13 @@ mod tests {
         assert_eq!(detail.service_tier, Some("priority".to_string()));
         assert_eq!(detail.response_body, Some(r#"{"output":"done"}"#.to_string()));
         assert_eq!(detail.response_status, Some(200));
+        // Regression: the outlet-measured duration survives the writer round-trip.
+        assert_eq!(detail.completed_at, Some(completed_at));
+        let duration_ms = detail.duration_ms.expect("duration_ms should be populated");
+        assert!(
+            (duration_ms - 2000.0).abs() < 1.0,
+            "duration_ms should be ~2000 (real latency), got {duration_ms}"
+        );
 
         shutdown.cancel();
         timeout(Duration::from_secs(5), handle)
@@ -426,6 +455,8 @@ mod tests {
                     endpoint: "/v1/responses".to_string(),
                     api_key: String::new(),
                     created_by: "user-test".to_string(),
+                    started_at: Utc::now(),
+                    completed_at: Utc::now(),
                 })
                 .await
                 .expect("send should succeed");
@@ -465,6 +496,8 @@ mod tests {
                 endpoint: "/v1/responses".to_string(),
                 api_key: String::new(),
                 created_by: "user-test".to_string(),
+                started_at: Utc::now(),
+                completed_at: Utc::now(),
             })
             .await
             .expect("send should succeed");
