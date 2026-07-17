@@ -86,6 +86,9 @@ pub struct RawAnalyticsRecord {
     pub response_type: String,
     pub server_address: String,
     pub server_port: u16,
+    /// URL of the upstream that served the request (onwards `ServedBy`
+    /// extension) — per-component attribution for composite models.
+    pub served_by: Option<String>,
 
     // === Auth (unresolved - just the token) ===
     /// The bearer token from the Authorization header (not yet resolved to user_id)
@@ -970,6 +973,7 @@ where
         let mut cache_24h_vec: Vec<i64> = Vec::with_capacity(records.len());
         let mut total_cost_vec: Vec<Option<Decimal>> = Vec::with_capacity(records.len());
         let mut uncached_cost_vec: Vec<Option<Decimal>> = Vec::with_capacity(records.len());
+        let mut served_by_vec: Vec<Option<String>> = Vec::with_capacity(records.len());
 
         for record in records {
             instance_ids.push(record.raw.instance_id);
@@ -1014,6 +1018,7 @@ where
             cache_24h_vec.push(c24);
             total_cost_vec.push(record.total_cost);
             uncached_cost_vec.push(record.uncached_cost);
+            served_by_vec.push(record.raw.served_by.clone());
         }
 
         let rows = sqlx::query!(
@@ -1026,7 +1031,7 @@ where
                 request_origin, batch_sla, batch_request_source, api_key_id, trace_id,
                 cache_read_input_tokens, cache_creation_input_tokens,
                 cache_creation_5m_input_tokens, cache_creation_1h_input_tokens, cache_creation_24h_input_tokens,
-                total_cost, uncached_cost
+                total_cost, uncached_cost, served_by
             )
             SELECT * FROM UNNEST(
                 $1::uuid[], $2::bigint[], $3::timestamptz[], $4::text[], $5::text[], $6::text[],
@@ -1036,7 +1041,7 @@ where
                 $22::text[], $23::text[], $24::text[], $25::uuid[], $26::text[],
                 $27::bigint[], $28::bigint[],
                 $29::bigint[], $30::bigint[], $31::bigint[],
-                $32::numeric[], $33::numeric[]
+                $32::numeric[], $33::numeric[], $34::text[]
             )
             ON CONFLICT (instance_id, correlation_id)
             DO UPDATE SET
@@ -1066,7 +1071,8 @@ where
                 cache_creation_1h_input_tokens = EXCLUDED.cache_creation_1h_input_tokens,
                 cache_creation_24h_input_tokens = EXCLUDED.cache_creation_24h_input_tokens,
                 total_cost = EXCLUDED.total_cost,
-                uncached_cost = EXCLUDED.uncached_cost
+                uncached_cost = EXCLUDED.uncached_cost,
+                served_by = EXCLUDED.served_by
             RETURNING id, instance_id, correlation_id, (xmax = 0) AS "newly_inserted!"
             "#,
             &instance_ids,
@@ -1102,6 +1108,7 @@ where
             &cache_24h_vec,
             &total_cost_vec as &[Option<Decimal>],
             &uncached_cost_vec as &[Option<Decimal>],
+            &served_by_vec as &[Option<String>],
         )
         .fetch_all(&mut **tx)
         .await?;
@@ -1145,6 +1152,7 @@ where
         let mut descriptions: Vec<Option<String>> = Vec::new();
         let mut fusillade_batch_ids: Vec<Option<Uuid>> = Vec::new();
         let mut models: Vec<String> = Vec::new();
+        let mut served_bys: Vec<String> = Vec::new();
         let mut api_key_ids_credit: Vec<Option<Uuid>> = Vec::new();
         // Service tier, computed in memory from the fusillade metadata, so the
         // transactions list can label each row (realtime / flex / async / batch)
@@ -1194,6 +1202,7 @@ where
             )));
             fusillade_batch_ids.push(record.raw.fusillade_batch_id);
             models.push(model);
+            served_bys.push(crate::metrics::served_by_host(record.raw.served_by.as_deref()));
             api_key_ids_credit.push(record.api_key_id);
             service_tiers
                 .push(compute_service_tier(record.raw.fusillade_batch_id, record.raw.batch_completion_window.as_deref()).to_string());
@@ -1206,11 +1215,11 @@ where
 
         let expected_count = user_ids.len() as u64;
 
-        // Build a map from source_id to (index, user_id, amount, model) for metric recording
-        let source_id_to_record: HashMap<String, (usize, Uuid, Decimal, String)> = source_ids
+        // Build a map from source_id to (index, user_id, amount, model, served_by) for metric recording
+        let source_id_to_record: HashMap<String, (usize, Uuid, Decimal, String, String)> = source_ids
             .iter()
             .enumerate()
-            .map(|(i, sid)| (sid.clone(), (i, user_ids[i], amounts[i], models[i].clone())))
+            .map(|(i, sid)| (sid.clone(), (i, user_ids[i], amounts[i], models[i].clone(), served_bys[i].clone())))
             .collect();
 
         // Batch INSERT, folding into the read model in the same transaction.
@@ -1540,12 +1549,13 @@ where
 
         // Record metrics only for successfully inserted credit transactions
         for row in &inserted_rows {
-            if let Some((_, user_id, amount, model)) = source_id_to_record.get(&row.source_id) {
+            if let Some((_, user_id, amount, model, served_by)) = source_id_to_record.get(&row.source_id) {
                 let cents = (amount.to_f64().unwrap_or(0.0) * 100.0).round() as u64;
                 counter!(
                     "dwctl_credits_deducted_total",
                     "user_id" => user_id.to_string(),
-                    "model" => model.clone()
+                    "model" => model.clone(),
+                    "served_by" => served_by.clone()
                 )
                 .increment(cents);
             }
@@ -1590,6 +1600,7 @@ where
             request_origin: compute_request_origin(record.api_key_purpose.as_ref(), record.raw.fusillade_batch_id).to_string(),
             batch_sla: record.raw.batch_completion_window.clone().unwrap_or_default(),
             batch_request_source: record.raw.batch_request_source.clone(),
+            served_by: record.raw.served_by.clone(),
         }
     }
 }
@@ -1676,6 +1687,7 @@ mod tests {
     #[test]
     fn test_raw_analytics_record_creation() {
         let record = RawAnalyticsRecord {
+            served_by: None,
             instance_id: Uuid::new_v4(),
             correlation_id: 123,
             timestamp: chrono::Utc::now(),
@@ -1723,6 +1735,7 @@ mod tests {
     /// A minimal record carrying just the token fields the cost arithmetic reads.
     fn cost_record(prompt: i64, completion: i64, read: i64, c5: i64, c1: i64, c24: i64) -> RawAnalyticsRecord {
         RawAnalyticsRecord {
+            served_by: None,
             instance_id: Uuid::new_v4(),
             correlation_id: 1,
             timestamp: chrono::Utc::now(),
@@ -2378,6 +2391,7 @@ mod integration_tests {
     /// Helper: Create a raw analytics record for testing
     fn create_raw_record(model: &str, bearer_token: Option<String>, prompt_tokens: i64, completion_tokens: i64) -> RawAnalyticsRecord {
         RawAnalyticsRecord {
+            served_by: None,
             instance_id: Uuid::new_v4(),
             correlation_id: rand::random::<i64>().abs(),
             timestamp: chrono::Utc::now(),

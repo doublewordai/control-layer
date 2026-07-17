@@ -1225,6 +1225,7 @@ async fn test_outlet_suppresses_zdr_bodies(pool: PgPool) {
     }
     fn response(correlation_id: u64) -> ResponseData {
         ResponseData {
+            extensions: Default::default(),
             correlation_id,
             timestamp: SystemTime::now(),
             status: axum::http::StatusCode::OK,

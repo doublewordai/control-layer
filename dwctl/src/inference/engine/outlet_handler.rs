@@ -575,6 +575,7 @@ mod tests {
 
     fn body_response() -> ResponseData {
         ResponseData {
+            extensions: Default::default(),
             correlation_id: 1,
             timestamp: SystemTime::now(),
             status: axum::http::StatusCode::OK,
