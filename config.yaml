@@ -552,6 +552,27 @@ background_services:
     processing_timeout_ms: 600000 # Max time in "processing" state before auto-unclaim (10 minutes)
     pending_request_counts_timeout_ms: 60000 # Statement timeout for pending request count queries (1 minute)
 
+    # Batch archive (fusillade phase 3): moves frozen terminal batches' rows
+    # from fusillade.requests into the partitioned batch_requests_archive.
+    # BOTH movers ship DISABLED — deploys never move data, only these flags
+    # do. Sequencing (load-bearing): flip only once every pod runs
+    # location-routing-aware code AND the dwctl version that introduced
+    # these keys is the rollback floor (deny_unknown_fields: an older pod
+    # parsing a config containing them crash-loops). The daily
+    # partition-runway tick always runs on batch-mode daemons regardless of
+    # these flags (fusillade_archive_partitions_ahead gauges it).
+    # batch_archive_sweep_enabled: false      # Steady-state sweeper: archive newly-frozen batches (oldest-first)
+    # batch_archive_sweep_interval_ms: 5000   # Sweep tick cadence (0 disables the worker)
+    # batch_archive_sweep_moves_per_tick: 4   # Bounded batch moves per tick, never drain-until-empty
+    # batch_archive_sweep_dwell_secs: 0       # Post-freeze dwell before archiving (0 = move immediately)
+    # batch_archive_cancel_grace_secs: 600    # Hold batches with in-flight-canceled rows this long so late
+    #                                         # billed results can still supersede the cancel on the live row
+    # batch_archive_backfill_enabled: false   # Historical drain: same mover, own pacing, oldest-first;
+    #                                         # flip off to pause instantly (resumable by construction)
+    # batch_archive_backfill_interval_ms: 1000
+    # batch_archive_backfill_moves_per_tick: 4
+    # batch_archive_partitions_weeks_ahead: 4 # Weekly-partition runway maintained by the daily tick
+
     # Observability
     status_log_interval_ms: 2000 # Interval for logging daemon status (set to null to disable)
 
