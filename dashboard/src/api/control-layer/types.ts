@@ -454,7 +454,7 @@ export interface User {
   auto_topup_threshold: number | null; // Balance threshold that triggers auto top-up (null = disabled)
   has_auto_topup_payment_method: boolean; // Whether user has a saved payment method for auto top-up
   auto_topup_monthly_limit: number | null; // Monthly spending limit for auto top-ups (null = no limit)
-  zero_data_retention: boolean; // Account-wide zero-data-retention flag (admin-set)
+  zero_data_retention: boolean; // Account-wide zero-data-retention flag
   user_type?: "individual" | "organization"; // User type
   organizations?: OrganizationSummary[]; // only present when include=organizations or for current user
   active_organization_id?: string; // only present for /users/current
@@ -589,7 +589,7 @@ export interface UserUpdateRequest {
   auto_topup_amount?: number | null; // Set an amount to enable, null to disable
   auto_topup_threshold?: number | null; // Set a threshold to enable, null to disable
   auto_topup_monthly_limit?: number | null; // Set a limit to cap, null to remove limit
-  zero_data_retention?: boolean; // Account-wide zero-data-retention flag (admin-only)
+  zero_data_retention?: boolean; // Users may update this for their own account
 }
 
 export interface GroupUpdateRequest {
