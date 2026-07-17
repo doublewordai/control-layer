@@ -162,7 +162,7 @@ pub async fn list_batch_requests<P: PoolProvider>(
             "#,
         )
         .bind(&request_ids)
-        .fetch_all(state.db.read())
+        .fetch_all(state.db.write())
         .await
         .map_err(|e| Error::Database(e.into()))?
     } else {
