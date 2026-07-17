@@ -1,5 +1,18 @@
 # Changelog
 
+## [8.90.0](https://github.com/doublewordai/control-layer/compare/v8.89.0...v8.90.0) (2026-07-17)
+
+
+### Features
+
+* **usage-e:** repoint responses-view cost to credits ledger (contract, after backfill) ([#1278](https://github.com/doublewordai/control-layer/issues/1278)) ([7d0c2d3](https://github.com/doublewordai/control-layer/commit/7d0c2d3113f755f5664946df7144737cdeb188dd))
+
+
+### Bug Fixes
+
+* don't block flex requests with realtime deny rules ([#1303](https://github.com/doublewordai/control-layer/issues/1303)) ([efa2824](https://github.com/doublewordai/control-layer/commit/efa2824ab71041967344751e28a8940b2df3c20f))
+* record real realtime response duration instead of zero ([#1287](https://github.com/doublewordai/control-layer/issues/1287)) ([c4a8a80](https://github.com/doublewordai/control-layer/commit/c4a8a80b7933afa1458327c32fcd584d4f3fdf27))
+
 ## [8.89.0](https://github.com/doublewordai/control-layer/compare/v8.88.0...v8.89.0) (2026-07-17)
 
 
