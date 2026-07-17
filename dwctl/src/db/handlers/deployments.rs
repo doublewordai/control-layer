@@ -247,7 +247,7 @@ impl From<(Option<ModelType>, DeployedModel)> for DeploymentDBResponse {
             lb_strategy,
             fallback_enabled: m.fallback_enabled.unwrap_or(true),
             fallback_on_rate_limit: m.fallback_on_rate_limit.unwrap_or(true),
-            fallback_on_status: m.fallback_on_status.unwrap_or_else(|| vec![429, 500, 502, 503, 504]),
+            fallback_on_status: m.fallback_on_status.unwrap_or_else(|| vec![429, 499, 500, 502, 503, 504]),
             fallback_with_replacement: m.fallback_with_replacement.unwrap_or(false),
             fallback_max_attempts: m.fallback_max_attempts,
             backoff_enabled: m.backoff_enabled,
@@ -1450,8 +1450,8 @@ impl<'c> Deployments<'c> {
         Ok(info)
     }
 
-    /// Load the same effective reasoning mappings that Onwards uses for every
-    /// provider behind each requested model alias.
+    /// Load effective reasoning mappings for every configured provider behind
+    /// each requested model alias, including disabled components.
     #[instrument(skip(self, aliases), fields(count = aliases.len()), err)]
     pub async fn get_reasoning_policies(&mut self, aliases: &[String]) -> Result<HashMap<String, ModelReasoningPolicy>> {
         if aliases.is_empty() {
@@ -1480,7 +1480,6 @@ impl<'c> Deployments<'c> {
                 INNER JOIN deployed_models component ON component.id = link.deployed_model_id
                 WHERE requested.is_composite = TRUE
                   AND link.composite_model_id = requested.id
-                  AND link.enabled = TRUE
                   AND component.deleted = FALSE
             ) provider ON TRUE
             INNER JOIN inference_endpoints endpoint ON endpoint.id = provider.hosted_on
@@ -4588,7 +4587,26 @@ mod tests {
 
     #[sqlx::test]
     #[test_log::test]
-    async fn reasoning_policy_includes_every_enabled_composite_provider(pool: PgPool) {
+    async fn database_fallback_status_default_remains_historical(pool: PgPool) {
+        let column_default: String = sqlx::query_scalar(
+            r#"
+            SELECT column_default
+            FROM information_schema.columns
+            WHERE table_schema = 'public'
+              AND table_name = 'deployed_models'
+              AND column_name = 'fallback_on_status'
+            "#,
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(column_default, "'{429,500,502,503,504}'::integer[]");
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn reasoning_policy_includes_every_configured_composite_provider(pool: PgPool) {
         let user = create_test_user(&pool).await;
         let (composite_id, component_ids) = create_composite_and_components(&pool, user.id, 2).await;
         let composite_alias: String = sqlx::query_scalar("SELECT alias FROM deployed_models WHERE id = $1")
@@ -4639,7 +4657,7 @@ mod tests {
             component_ids
                 .iter()
                 .enumerate()
-                .map(|(index, id)| (*id, 50, true, index as i32))
+                .map(|(index, id)| (*id, 50, false, index as i32))
                 .collect(),
         )
         .await

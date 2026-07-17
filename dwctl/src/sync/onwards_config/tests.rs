@@ -651,8 +651,16 @@ async fn test_cache_shape_composite_pool_strategy_and_fallback(pool: sqlx::PgPoo
     assert!(composite_pool.fallback_enabled());
     assert!(!composite_pool.should_fallback_on_rate_limit());
     assert!(composite_pool.should_fallback_on_status(429));
+    assert!(!composite_pool.should_fallback_on_status(499));
     assert!(composite_pool.should_fallback_on_status(503));
     assert!(!composite_pool.should_fallback_on_status(500));
+
+    let fallback = composite_pool.fallback().expect("fallback should be set");
+    assert_eq!(
+        fallback.on_status,
+        vec![429, 503],
+        "explicit stored statuses must remain authoritative"
+    );
 
     // Composite model has no tariff in this fixture, so it's free.
     // Free models allow group-authorized keys regardless of balance.
@@ -678,9 +686,24 @@ async fn test_cache_shape_composite_pool_strategy_and_fallback(pool: sqlx::PgPoo
     // Default migration state: no backoff configured. The fallback config
     // surfaces to onwards with `backoff: None`, which preserves the legacy
     // zero-delay retry behavior for composites that haven't opted in.
-    let fallback = composite_pool.fallback().expect("fallback should be set");
     assert!(fallback.backoff.is_none(), "backoff should default to None");
     assert!(fallback.max_total_backoff_ms.is_none());
+}
+
+#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
+async fn test_cache_shape_null_composite_uses_application_fallback_status_default(pool: sqlx::PgPool) {
+    sqlx::query("UPDATE deployed_models SET fallback_on_status = NULL WHERE alias = 'composite-priority'")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let targets = super::load_targets_from_db(&pool, &[], false, &RateLimitTiersConfig::default())
+        .await
+        .unwrap();
+    let composite = targets.targets.get("composite-priority").expect("composite-priority should exist");
+    let fallback = composite.value().fallback().expect("fallback should be set");
+
+    assert_eq!(fallback.on_status, vec![429, 499, 500, 502, 503, 504]);
 }
 
 /// When an admin sets the per-model backoff knobs on a composite, the values
@@ -1332,7 +1355,7 @@ async fn test_batch_api_key_access_to_composite_escalation_target(pool: sqlx::Pg
             lb_strategy: Some(LoadBalancingStrategy::WeightedRandom),
             fallback_enabled: Some(true),
             fallback_on_rate_limit: Some(true),
-            fallback_on_status: Some(vec![429, 500, 502, 503, 504]),
+            fallback_on_status: Some(vec![429, 499, 500, 502, 503, 504]),
             fallback_with_replacement: None,
             allowed_batch_completion_windows: None,
             fallback_max_attempts: None,

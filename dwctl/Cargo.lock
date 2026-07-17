@@ -1882,7 +1882,7 @@ checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
 
 [[package]]
 name = "dwctl"
-version = "8.84.0"
+version = "8.89.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -2354,9 +2354,9 @@ checksum = "e6d5a32815ae3f33302d95fdcb2ce17862f8c65363dcfd29360480ba1001fc9c"
 
 [[package]]
 name = "fusillade"
-version = "21.1.0"
+version = "21.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e8d7bb96b70a14854f3c4546617e79082982076e3bc893eb2ae641b8d95bcdc0"
+checksum = "26462d1306ea4b2477524213dfedead4f45638b8c94eb700f03e97c65487db29"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2388,9 +2388,9 @@ dependencies = [
 
 [[package]]
 name = "fusillade-arsenal"
-version = "1.1.0"
+version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fd6134665439150be151dce6dc68809a84d40a879b3ce2da919ba42719a35c6b"
+checksum = "36d7768bf2e064266c19eb5973fc57f171bd710310d53c0572ceb70b47420b2f"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -2416,9 +2416,9 @@ dependencies = [
 
 [[package]]
 name = "fusillade-core"
-version = "1.1.0"
+version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9bca601bb1d43f7420f94e979f00c40b4b84b28f8a9dacaf6b637106cc5c6dfa"
+checksum = "c20b75532c2af93adc1c369fe475186fdb2a66720f27b1fe4d8de350da1bf291"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4264,7 +4264,8 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 [[package]]
 name = "onwards"
 version = "0.35.0"
-source = "git+https://github.com/doublewordai/onwards?rev=84120bc8790dc77da916e01bde6543a010317091#84120bc8790dc77da916e01bde6543a010317091"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3ff1beb0c406ae25d8446cfcbcdc0a4772b77449bcb65a9d64395dabfd7489f9"
 dependencies = [
  "anyhow",
  "async-stream",

@@ -540,6 +540,8 @@ background_services:
     backoff_ms: 1000 # Initial backoff duration in milliseconds
     backoff_factor: 2 # Exponential backoff multiplier
     max_backoff_ms: 10000 # Maximum backoff duration in milliseconds
+    additional_retryable_statuses:
+      - 499
 
     # Timeout Settings
     # timeout_ms: 600000 # DEPRECATED: splits into 90% first_chunk_timeout_ms, 10% body_timeout_ms

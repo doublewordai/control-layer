@@ -9,7 +9,7 @@ use crate::db::models::deployments::{
     BackoffConfig, DeploymentDBResponse, FallbackConfig, JitterStrategy, LoadBalancingStrategy, ModelCatalogMetadata, ModelType,
     ProviderPricing, ProviderPricingUpdate, TrafficRuleDBRow,
 };
-use crate::reasoning::ReasoningTranslationOverrides;
+use crate::reasoning::{ReasoningTranslationOverrides, SupportedReasoningEfforts};
 use crate::types::{DeploymentId, InferenceEndpointId, UserId};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -85,7 +85,7 @@ pub struct ListModelsQuery {
     pub endpoint: Option<InferenceEndpointId>,
     /// Filter by group IDs (comma-separated UUIDs)
     pub group: Option<String>,
-    /// Include related data (comma-separated: "groups", "metrics", "status", "pricing", "endpoints", "facets")
+    /// Include related data (comma-separated: "groups", "metrics", "status", "pricing", "endpoints", "facets", "reasoning_capabilities")
     pub include: Option<String>,
     /// Show deleted models when true, non-deleted when false, all when not specified (admin only for deleted=true)
     pub deleted: Option<bool>,
@@ -307,7 +307,9 @@ pub struct CompositeModelCreate {
     /// Whether to trigger fallback on rate limit responses (defaults to true)
     #[serde(default = "default_true")]
     pub fallback_on_rate_limit: bool,
-    /// HTTP status codes that trigger fallback (defaults to [500, 502, 503, 504])
+    /// HTTP status codes that trigger fallback (defaults to [499, 500, 502, 503, 504]).
+    /// Rate-limit responses are controlled separately by `fallback_on_rate_limit`,
+    /// which defaults to true.
     #[serde(default = "default_fallback_statuses")]
     pub fallback_on_status: Vec<i32>,
     /// Sample with replacement during weighted random failover (defaults to false)
@@ -364,7 +366,7 @@ fn default_true() -> bool {
 }
 
 fn default_fallback_statuses() -> Vec<i32> {
-    vec![500, 502, 503, 504]
+    vec![499, 500, 502, 503, 504]
 }
 
 fn default_backoff_initial_ms() -> i32 {
@@ -574,6 +576,9 @@ pub struct DeployedModelResponse {
     /// Provider reasoning translation overrides. Omitted for composite models.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_translation_overrides: Option<ReasoningTranslationOverrides>,
+    /// Reasoning efforts supported by every provider behind this model (only included if requested)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supported_reasoning_efforts: Option<SupportedReasoningEfforts>,
     /// Traffic routing rules evaluated against API key labels
     #[serde(skip_serializing_if = "Option::is_none")]
     pub traffic_routing_rules: Option<Vec<TrafficRoutingRule>>,
@@ -645,6 +650,7 @@ impl From<DeploymentDBResponse> for DeployedModelResponse {
             } else {
                 Some(db.reasoning_translation_overrides.unwrap_or_default())
             },
+            supported_reasoning_efforts: None,
             traffic_routing_rules: None, // Populated via enrichment (with_traffic_rules)
             allowed_batch_completion_windows: db.allowed_batch_completion_windows,
             metadata: serde_json::from_value::<ModelCatalogMetadata>(db.metadata)
@@ -677,6 +683,12 @@ impl DeployedModelResponse {
     /// Create a response with provider pricing included (admin only)
     pub fn with_provider_pricing(mut self, provider_pricing: Option<ProviderPricing>) -> Self {
         self.provider_pricing = provider_pricing;
+        self
+    }
+
+    /// Create a response with supported reasoning efforts included
+    pub fn with_supported_reasoning_efforts(mut self, supported_reasoning_efforts: Option<SupportedReasoningEfforts>) -> Self {
+        self.supported_reasoning_efforts = supported_reasoning_efforts;
         self
     }
 

@@ -1225,6 +1225,7 @@ async fn test_outlet_suppresses_zdr_bodies(pool: PgPool) {
     }
     fn response(correlation_id: u64) -> ResponseData {
         ResponseData {
+            extensions: Default::default(),
             correlation_id,
             timestamp: SystemTime::now(),
             status: axum::http::StatusCode::OK,
@@ -1634,22 +1635,45 @@ async fn test_openapi_specs_serialize() {
 }
 
 #[test]
-fn ai_models_openapi_includes_reasoning_capabilities_query_parameter() {
+fn ai_models_openapi_documents_reasoning_capabilities_query_parameter() {
     use utoipa::OpenApi;
 
     let spec = serde_json::to_value(AiApiDoc::openapi()).expect("AI spec serializes");
-    let parameters = spec
-        .pointer("/paths/~1models/get/parameters")
-        .and_then(serde_json::Value::as_array)
-        .expect("GET /models exposes query parameters");
+    let parameter = spec["paths"]["/models"]["get"]["parameters"]
+        .as_array()
+        .and_then(|parameters| {
+            parameters
+                .iter()
+                .find(|parameter| parameter["name"] == "include_reasoning_capabilities")
+        })
+        .expect("GET /models should document include_reasoning_capabilities");
+
+    assert_eq!(parameter["in"], "query");
+    assert_eq!(parameter["schema"]["type"], "boolean");
+    assert!(
+        spec["components"]["schemas"]["ModelObject"]["properties"]["supported_reasoning_efforts"].is_object(),
+        "ModelObject should document supported_reasoning_efforts"
+    );
+}
+
+#[test]
+fn admin_models_openapi_documents_reasoning_capabilities_include() {
+    use utoipa::OpenApi;
+
+    let spec = serde_json::to_value(AdminApiDoc::openapi()).expect("admin spec serializes");
+    let include = spec["paths"]["/models"]["get"]["parameters"]
+        .as_array()
+        .and_then(|parameters| parameters.iter().find(|parameter| parameter["name"] == "include"))
+        .expect("GET /models should document the include query parameter");
+    let description = include["description"].as_str().expect("include should have a description");
 
     assert!(
-        parameters.iter().any(|parameter| {
-            parameter["name"] == "include_reasoning_capabilities"
-                && parameter["in"] == "query"
-                && !parameter.get("required").and_then(serde_json::Value::as_bool).unwrap_or(false)
-        }),
-        "GET /models must document include_reasoning_capabilities as an optional query parameter"
+        description.contains("reasoning_capabilities"),
+        "include description should advertise reasoning_capabilities: {description}"
+    );
+    assert!(
+        spec["components"]["schemas"]["DeployedModelResponse"]["properties"]["supported_reasoning_efforts"].is_object(),
+        "DeployedModelResponse should document supported_reasoning_efforts"
     );
 }
 

@@ -245,6 +245,7 @@ impl RequestHandler for AnalyticsHandler {
                 response_type: metrics.response_type,
                 server_address: metrics.server_address,
                 server_port: metrics.server_port,
+                served_by: metrics.served_by,
                 bearer_token,
                 fusillade_batch_id,
                 fusillade_request_id,
@@ -312,6 +313,7 @@ mod tests {
 
     fn create_test_response_data() -> ResponseData {
         ResponseData {
+            extensions: Default::default(),
             correlation_id: 123,
             timestamp: SystemTime::now(),
             status: StatusCode::OK,
