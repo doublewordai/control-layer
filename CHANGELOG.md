@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.91.0](https://github.com/doublewordai/control-layer/compare/v8.90.0...v8.91.0) (2026-07-17)
+
+
+### Features
+
+* export dwctl_model_tariff gauge from active tariff rows ([#1308](https://github.com/doublewordai/control-layer/issues/1308)) ([2c30f90](https://github.com/doublewordai/control-layer/commit/2c30f90f7efa91018b08b188362436026e8c271b))
+
 ## [8.90.0](https://github.com/doublewordai/control-layer/compare/v8.89.0...v8.90.0) (2026-07-17)
 
 
