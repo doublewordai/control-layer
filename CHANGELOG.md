@@ -1,5 +1,17 @@
 # Changelog
 
+## [8.89.0](https://github.com/doublewordai/control-layer/compare/v8.88.0...v8.89.0) (2026-07-17)
+
+
+### Features
+
+* allow users to update their own ZDR setting ([#1296](https://github.com/doublewordai/control-layer/issues/1296)) ([34f0cea](https://github.com/doublewordai/control-layer/commit/34f0ceaf9bbea6ded67cdb23e592f4ee836f6753))
+
+
+### Bug Fixes
+
+* emit credits metric in nanocredits, not rounded cents ([#1304](https://github.com/doublewordai/control-layer/issues/1304)) ([e849359](https://github.com/doublewordai/control-layer/commit/e849359ec14e9c5e711e3db2ba79760b56416efb))
+
 ## [8.88.0](https://github.com/doublewordai/control-layer/compare/v8.87.2...v8.88.0) (2026-07-17)
 
 
