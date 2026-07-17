@@ -926,7 +926,7 @@ dependencies = [
  "pin-project-lite",
  "tokio",
  "tower",
- "tower-http",
+ "tower-http 0.6.10",
 ]
 
 [[package]]
@@ -1968,7 +1968,7 @@ dependencies = [
  "tokio-test",
  "tokio-util",
  "tower",
- "tower-http",
+ "tower-http 0.6.10",
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
@@ -4263,9 +4263,9 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "onwards"
-version = "0.35.0"
+version = "0.35.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3ff1beb0c406ae25d8446cfcbcdc0a4772b77449bcb65a9d64395dabfd7489f9"
+checksum = "b297ca5a02fd7b0bb1f05e35786095c38a2f9a290fa8f2780e62ed725f874e22"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -4452,9 +4452,9 @@ dependencies = [
 
 [[package]]
 name = "outlet"
-version = "0.8.1"
+version = "0.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "058ce12aaf808056347c45d87d8943514895b6ca9ec01bf597ec56078e54f3d5"
+checksum = "105438f773ecf29bc835501af0d89220f6ae3f7a98a3da14ad58cf2c45d3fdb4"
 dependencies = [
  "anyhow",
  "axum",
@@ -4468,7 +4468,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tower",
- "tower-http",
+ "tower-http 0.7.0",
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
@@ -4476,9 +4476,9 @@ dependencies = [
 
 [[package]]
 name = "outlet-postgres"
-version = "0.5.1"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bbad5c8c879e6f2450ccd8bc02a7ad6003c43c00159ca77ad00d7df86c67ada6"
+checksum = "c0744e251cac20a4be6e9e762b740785397827de54f6fae0e057f4e67e1ea9fb"
 dependencies = [
  "base64",
  "bytes",
@@ -5352,7 +5352,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tower",
- "tower-http",
+ "tower-http 0.6.10",
  "tower-service",
  "url",
  "wasm-bindgen",
@@ -5399,7 +5399,7 @@ dependencies = [
  "tokio-rustls",
  "tokio-util",
  "tower",
- "tower-http",
+ "tower-http 0.6.10",
  "tower-service",
  "url",
  "wasm-bindgen",
@@ -6884,6 +6884,23 @@ dependencies = [
  "tower-service",
  "tracing",
  "url",
+]
+
+[[package]]
+name = "tower-http"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b11f75e912b0c2be01b63d8cf8057b8c3f97cf34abb3d431a3a4c8675498e233"
+dependencies = [
+ "bitflags",
+ "bytes",
+ "http 1.4.0",
+ "http-body 1.0.1",
+ "percent-encoding",
+ "pin-project-lite",
+ "tower-layer",
+ "tower-service",
+ "tracing",
 ]
 
 [[package]]
