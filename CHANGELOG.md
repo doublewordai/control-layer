@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.92.0](https://github.com/doublewordai/control-layer/compare/v8.91.0...v8.92.0) (2026-07-17)
+
+
+### Features
+
+* let organization owners manage ZDR ([#1310](https://github.com/doublewordai/control-layer/issues/1310)) ([28bc540](https://github.com/doublewordai/control-layer/commit/28bc540ca68e57e3316f0d8eedaccb2a784f893b))
+
 ## [8.91.0](https://github.com/doublewordai/control-layer/compare/v8.90.0...v8.91.0) (2026-07-17)
 
 
