@@ -1550,14 +1550,21 @@ where
         // Record metrics only for successfully inserted credit transactions
         for row in &inserted_rows {
             if let Some((_, user_id, amount, model, served_by)) = source_id_to_record.get(&row.source_id) {
-                let cents = (amount.to_f64().unwrap_or(0.0) * 100.0).round() as u64;
+                // Nanocredits (1 credit = 1e9). Tariffs price tokens at
+                // DECIMAL(12,8), so a single token can cost 1e-8 credits; nano
+                // is the coarsest power of ten that represents every
+                // token-priced amount exactly. The predecessor counted whole
+                // rounded cents per transaction, which floored the (typical)
+                // sub-cent flex/batch deductions to zero and hid entire
+                // revenue tiers from the metric.
+                let nanocredits = (amount.to_f64().unwrap_or(0.0) * 1_000_000_000.0).round() as u64;
                 counter!(
-                    "dwctl_credits_deducted_total",
+                    "dwctl_credits_deducted_nanocredits_total",
                     "user_id" => user_id.to_string(),
                     "model" => model.clone(),
                     "served_by" => served_by.clone()
                 )
-                .increment(cents);
+                .increment(nanocredits);
             }
         }
 
