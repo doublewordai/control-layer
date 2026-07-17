@@ -115,6 +115,9 @@ pub struct HttpAnalyticsRow {
     /// The request_source from batch metadata (e.g., "api", "frontend").
     /// Empty string for non-batch requests or when not provided.
     pub batch_request_source: String,
+    /// URL of the upstream that served the request (onwards `ServedBy`
+    /// extension), for per-component attribution of composite models.
+    pub served_by: Option<String>,
 }
 
 /// Usage metrics extracted from AI responses (subset of HttpAnalyticsRow)
@@ -146,6 +149,12 @@ pub struct UsageMetrics {
     pub response_type: String,
     pub server_address: String,
     pub server_port: u16,
+    /// URL of the upstream that actually served the request, read from the
+    /// onwards `ServedBy` response extension. For composite models this is the
+    /// selected component's endpoint (after any fallback), which is the only
+    /// place per-request routing attribution is knowable. `None` when the
+    /// request never reached an upstream (or predates the extension).
+    pub served_by: Option<String>,
 }
 
 /// Parses HTTP request body data into structured AI request types.
@@ -411,6 +420,7 @@ impl UsageMetrics {
             response_type: response_metrics.response_type,
             server_address: config.host.clone(),
             server_port: config.port,
+            served_by: response_data.extensions.get::<onwards::ServedBy>().map(|s| s.url.clone()),
         }
     }
 }
@@ -942,6 +952,7 @@ mod tests {
         };
 
         let response_data = ResponseData {
+            extensions: Default::default(),
             correlation_id: 123,
             timestamp: SystemTime::now(),
             status: StatusCode::OK,
@@ -973,6 +984,7 @@ mod tests {
         };
 
         let response_data = ResponseData {
+            extensions: Default::default(),
             correlation_id: 123,
             timestamp: SystemTime::now(),
             status: StatusCode::OK,
@@ -1013,6 +1025,7 @@ mod tests {
         }"#;
 
         let response_data = ResponseData {
+            extensions: Default::default(),
             correlation_id: 123,
             timestamp: SystemTime::now(),
             status: StatusCode::OK,
@@ -1052,6 +1065,7 @@ mod tests {
         let sse_response = "data: {\"id\":\"chatcmpl-123\",\"object\":\"chat.completion.chunk\",\"created\":1677652288,\"model\":\"gpt-4\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"}}]}\n\ndata: [DONE]\n\n";
 
         let response_data = ResponseData {
+            extensions: Default::default(),
             correlation_id: 123,
             timestamp: SystemTime::now(),
             status: StatusCode::OK,
@@ -1093,6 +1107,7 @@ mod tests {
         let sse_response = "data: {\"id\":\"chatcmpl-123\",\"object\":\"chat.completion.chunk\",\"created\":1677652288,\"model\":\"gpt-4\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"}}],\"usage\":null}\n\ndata: {\"id\":\"chatcmpl-123\",\"object\":\"chat.completion.chunk\",\"created\":1677652288,\"model\":\"gpt-4\",\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"total_tokens\":15}}\n\ndata: [DONE]\n\n";
 
         let response_data = ResponseData {
+            extensions: Default::default(),
             correlation_id: 123,
             timestamp: SystemTime::now(),
             status: StatusCode::OK,
@@ -1148,6 +1163,7 @@ mod tests {
         );
 
         let response_data = ResponseData {
+            extensions: Default::default(),
             correlation_id: 999,
             timestamp: SystemTime::now(),
             status: StatusCode::OK,
@@ -1177,6 +1193,71 @@ mod tests {
     }
 
     #[test]
+    fn test_served_by_extension_flows_into_usage_metrics() {
+        // The onwards ServedBy response extension (set at final load-balancer
+        // selection) must reach the analytics record, so composite-model
+        // traffic can be attributed to the component that actually served it.
+        let request_json = r#"{"model": "zai-org/GLM-5.2-FP8", "messages": [{"role": "user", "content": "hi"}]}"#;
+        let request_data = RequestData {
+            correlation_id: 42,
+            timestamp: SystemTime::now(),
+            method: Method::POST,
+            uri: "/v1/chat/completions".parse::<Uri>().unwrap(),
+            headers: HashMap::new(),
+            body: Some(Bytes::from(request_json)),
+            trace_id: None,
+            span_id: None,
+        };
+
+        let mut extensions = axum::http::Extensions::new();
+        extensions.insert(onwards::ServedBy {
+            url: "https://router.requesty.ai/v1".to_string(),
+            onwards_model: Some("policy/glm-5.2".to_string()),
+        });
+        let response_data = ResponseData {
+            extensions,
+            correlation_id: 42,
+            timestamp: SystemTime::now(),
+            status: StatusCode::OK,
+            headers: HashMap::new(),
+            body: None,
+            duration: Duration::from_millis(100),
+            duration_to_first_byte: Duration::from_millis(50),
+        };
+
+        let parsed = parse_ai_response(&request_data, &response_data).unwrap();
+        let metrics = UsageMetrics::extract(
+            uuid::Uuid::nil(),
+            &request_data,
+            &response_data,
+            &parsed,
+            &crate::config::Config::default(),
+        );
+        assert_eq!(metrics.served_by.as_deref(), Some("https://router.requesty.ai/v1"));
+
+        // Absent extension → None (request never reached an upstream).
+        let response_data_no_ext = ResponseData {
+            extensions: Default::default(),
+            correlation_id: 42,
+            timestamp: SystemTime::now(),
+            status: StatusCode::BAD_GATEWAY,
+            headers: HashMap::new(),
+            body: None,
+            duration: Duration::from_millis(100),
+            duration_to_first_byte: Duration::from_millis(50),
+        };
+        let parsed = parse_ai_response(&request_data, &response_data_no_ext).unwrap();
+        let metrics = UsageMetrics::extract(
+            uuid::Uuid::nil(),
+            &request_data,
+            &response_data_no_ext,
+            &parsed,
+            &crate::config::Config::default(),
+        );
+        assert_eq!(metrics.served_by, None);
+    }
+
+    #[test]
     fn test_fusillade_stream_with_real_error_status_is_preserved() {
         // If upstream returns a real non-2xx status (no SSE body to scan), we must NOT
         // override it to 500. The real status code is more informative.
@@ -1194,6 +1275,7 @@ mod tests {
             span_id: None,
         };
         let response_data = ResponseData {
+            extensions: Default::default(),
             correlation_id: 7,
             timestamp: SystemTime::now(),
             status: StatusCode::TOO_MANY_REQUESTS,
@@ -1234,6 +1316,7 @@ mod tests {
         let sse_response = "data: {\"id\":\"cmpl-123\",\"object\":\"text_completion\",\"created\":1677652288,\"model\":\"gpt-3.5-turbo-instruct\",\"choices\":[{\"text\":\" world\",\"index\":0}]}\n\ndata: {\"id\":\"cmpl-123\",\"object\":\"text_completion\",\"created\":1677652288,\"model\":\"gpt-3.5-turbo-instruct\",\"choices\":[],\"usage\":{\"prompt_tokens\":8,\"completion_tokens\":12,\"total_tokens\":20}}\n\ndata: [DONE]\n\n";
 
         let response_data = ResponseData {
+            extensions: Default::default(),
             correlation_id: 123,
             timestamp: SystemTime::now(),
             status: StatusCode::OK,
@@ -1284,6 +1367,7 @@ mod tests {
         }"#;
 
         let response_data = ResponseData {
+            extensions: Default::default(),
             correlation_id: 123,
             timestamp: SystemTime::now(),
             status: StatusCode::OK,
@@ -1318,6 +1402,7 @@ mod tests {
         };
 
         let response_data = ResponseData {
+            extensions: Default::default(),
             correlation_id: 123,
             timestamp: SystemTime::now(),
             status: StatusCode::OK,
@@ -1350,6 +1435,7 @@ mod tests {
         };
 
         let response_data = ResponseData {
+            extensions: Default::default(),
             correlation_id: 12345,
             timestamp: SystemTime::now(),
             status: StatusCode::OK,
@@ -1402,6 +1488,7 @@ mod tests {
         };
 
         let response_data = ResponseData {
+            extensions: Default::default(),
             correlation_id: 12345,
             timestamp: SystemTime::now(),
             status: StatusCode::OK,
@@ -1471,6 +1558,7 @@ mod tests {
         };
 
         let response_data = ResponseData {
+            extensions: Default::default(),
             correlation_id: 12345,
             timestamp: SystemTime::now(),
             status: StatusCode::OK,
@@ -1533,6 +1621,7 @@ mod tests {
         };
 
         let response_data = ResponseData {
+            extensions: Default::default(),
             correlation_id: 12345,
             timestamp: SystemTime::now(),
             status: StatusCode::OK,
@@ -1589,6 +1678,7 @@ mod tests {
         };
 
         let response_data = ResponseData {
+            extensions: Default::default(),
             correlation_id: 12345,
             timestamp: SystemTime::now(),
             status: StatusCode::OK,
@@ -1640,6 +1730,7 @@ mod tests {
         };
 
         let response_data = ResponseData {
+            extensions: Default::default(),
             correlation_id: 12345,
             timestamp: SystemTime::now(),
             status: StatusCode::OK,
@@ -1698,6 +1789,7 @@ mod tests {
         };
 
         let response_data = ResponseData {
+            extensions: Default::default(),
             correlation_id: 12345,
             timestamp: SystemTime::now(),
             status: StatusCode::OK,
@@ -1766,6 +1858,7 @@ mod tests {
 
     fn responses_response_data(body: String) -> ResponseData {
         ResponseData {
+            extensions: Default::default(),
             correlation_id: 1,
             timestamp: SystemTime::now(),
             status: StatusCode::OK,
@@ -1850,6 +1943,7 @@ mod tests {
         let request_data = responses_request_data(None);
         let error_json = r#"{"error":{"message":"invalid request","type":"invalid_request_error","code":"model_not_found"}}"#;
         let response_data = ResponseData {
+            extensions: Default::default(),
             correlation_id: 1,
             timestamp: SystemTime::now(),
             status: StatusCode::BAD_REQUEST,
@@ -1944,6 +2038,7 @@ mod tests {
 
     fn response_with_body(body: impl Into<Bytes>) -> ResponseData {
         ResponseData {
+            extensions: Default::default(),
             correlation_id: 1,
             timestamp: SystemTime::now(),
             status: StatusCode::OK,
