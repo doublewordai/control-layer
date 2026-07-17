@@ -1434,13 +1434,11 @@ pub async fn delete_batch<P: PoolProvider>(
     post,
     path = "/batches/{batch_id}/retry",
     tag = "batches",
-    summary = "Retry failed requests",
-    description = "Retry all failed requests in a batch.
-
-Failed requests are reset to pending and will be processed again. Use this after fixing transient issues or increasing rate limits.",
+    summary = "Retry failed and canceled requests",
+    description = "Retry a batch: failed AND canceled requests are reset to pending and will be processed again; completed work is never redone. Retrying a cancelled batch overturns the cancellation (cancel-then-retry acts as pause/resume), so this also succeeds on a just-cancelled batch whose requests had not yet settled. Use it after fixing transient issues, increasing rate limits, or to resume a cancelled batch.",
     responses(
-        (status = 200, description = "Failed requests queued for retry.", body = BatchResponse),
-        (status = 400, description = "No failed requests to retry in this batch."),
+        (status = 200, description = "Requests queued for retry (or a cancellation was overturned and the batch resumed).", body = BatchResponse),
+        (status = 400, description = "Nothing to retry: no failed or canceled requests, and the batch was not cancelled."),
         (status = 404, description = "Batch not found or you don't have access to it."),
         (status = 500, description = "An unexpected error occurred. Retry the request or contact support if the issue persists.")
     ),
@@ -1486,9 +1484,18 @@ pub async fn retry_failed_batch_requests<P: PoolProvider>(
             operation: format!("retry failed requests: {}", e),
         })?;
 
-    if retried_count == 0 {
+    // retried_count == 0 is still SUCCESS when the retry overturned a
+    // cancellation: the fast-resume flow (cancel + near-instant retry)
+    // re-pends nothing — no rows had settled to failed/canceled yet — but
+    // fusillade's batch reset fires on `count > 0 OR cancelling_at IS NOT
+    // NULL`, un-cancelling the batch so its rows become claimable again.
+    // Returning 400 here used to tell resuming users their successful
+    // resume had failed. Only a retry that neither re-pended rows nor
+    // overturned a cancellation is a true no-op.
+    if retried_count == 0 && batch.cancelling_at.is_none() {
         return Err(Error::BadRequest {
-            message: "No failed requests to retry in this batch".to_string(),
+            message: "Nothing to retry: no failed or canceled requests, and the batch is not cancelled"
+                .to_string(),
         });
     }
 
