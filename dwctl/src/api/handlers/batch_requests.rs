@@ -316,7 +316,7 @@ pub async fn get_batch_request<P: PoolProvider>(
         "#,
     )
     .bind(request_id)
-    .fetch_optional(state.db.read())
+    .fetch_optional(state.db.write())
     .await
     .map_err(|e| Error::Database(e.into()))?
     .and_then(|c| c.total_cost);
