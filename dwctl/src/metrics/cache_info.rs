@@ -35,6 +35,8 @@ pub struct CacheInfoState {
     prev_models: HashSet<ModelLabels>,
     prev_groups: HashSet<(String, String, String)>,
     prev_components: HashSet<(String, String, String, String, String)>,
+    /// (model, purpose, completion_window) combos that emitted tariff gauges.
+    prev_tariffs: HashSet<(String, String, String)>,
     /// Whether at least one cycle has run (skip zeroing on the first call).
     initialized: bool,
 }
@@ -45,6 +47,7 @@ impl CacheInfoState {
             prev_models: HashSet::new(),
             prev_groups: HashSet::new(),
             prev_components: HashSet::new(),
+            prev_tariffs: HashSet::new(),
             initialized: false,
         }
     }
@@ -63,6 +66,16 @@ struct ComponentInfo {
     weight: i32,
     sort_order: i32,
     enabled: bool,
+}
+
+#[derive(Deserialize)]
+struct TariffInfo {
+    /// NULL in the DB means the tariff applies regardless of key purpose;
+    /// rendered as an empty label value.
+    purpose: Option<String>,
+    completion_window: Option<String>,
+    input_price: f64,
+    output_price: f64,
 }
 
 /// Update Prometheus gauges reflecting the current cache state.
@@ -113,7 +126,17 @@ pub async fn update_cache_info_metrics(pool: &PgPool, targets: &Targets, state: 
                 INNER JOIN deployed_models comp ON dmc.deployed_model_id = comp.id
                 LEFT JOIN inference_endpoints ie2 ON comp.hosted_on = ie2.id
                 WHERE dmc.composite_model_id = dm.id AND comp.deleted = FALSE
-            ) as "components_json?"
+            ) as "components_json?",
+            (
+                SELECT json_agg(json_build_object(
+                    'purpose', mt.api_key_purpose::text,
+                    'completion_window', mt.completion_window,
+                    'input_price', mt.input_price_per_token::float8,
+                    'output_price', mt.output_price_per_token::float8
+                ))::text
+                FROM model_tariffs mt
+                WHERE mt.deployed_model_id = dm.id AND mt.valid_until IS NULL
+            ) as "tariffs_json?"
         FROM deployed_models dm
         LEFT JOIN inference_endpoints ie ON dm.hosted_on = ie.id
         WHERE dm.deleted = FALSE
@@ -125,6 +148,7 @@ pub async fn update_cache_info_metrics(pool: &PgPool, targets: &Targets, state: 
     let mut current_models: HashSet<ModelLabels> = HashSet::new();
     let mut current_groups: HashSet<(String, String, String)> = HashSet::new();
     let mut current_components: HashSet<(String, String, String, String, String)> = HashSet::new();
+    let mut current_tariffs: HashSet<(String, String, String)> = HashSet::new();
 
     for row in &rows {
         let alias = &row.alias;
@@ -230,6 +254,39 @@ pub async fn update_cache_info_metrics(pool: &PgPool, targets: &Targets, state: 
                 Err(e) => warn!("Failed to parse components JSON for model '{}': {}", alias, e),
             }
         }
+
+        // Tariff gauges — price per token in credits for each active tariff row,
+        // one series per (model, purpose, completion_window, direction). This is
+        // what lets PromQL price spilled tokens at the realtime tariff
+        // (`purpose="realtime"`) without a cross-datasource join.
+        if let Some(ref json) = row.tariffs_json {
+            match serde_json::from_str::<Vec<TariffInfo>>(json) {
+                Ok(tariffs) => {
+                    for t in &tariffs {
+                        let purpose = t.purpose.clone().unwrap_or_default();
+                        let window = t.completion_window.clone().unwrap_or_default();
+                        current_tariffs.insert((alias.clone(), purpose.clone(), window.clone()));
+                        gauge!(
+                            "dwctl_model_tariff",
+                            "model" => alias.clone(),
+                            "purpose" => purpose.clone(),
+                            "completion_window" => window.clone(),
+                            "direction" => "input",
+                        )
+                        .set(t.input_price);
+                        gauge!(
+                            "dwctl_model_tariff",
+                            "model" => alias.clone(),
+                            "purpose" => purpose,
+                            "completion_window" => window,
+                            "direction" => "output",
+                        )
+                        .set(t.output_price);
+                    }
+                }
+                Err(e) => warn!("Failed to parse tariffs JSON for model '{}': {}", alias, e),
+            }
+        }
     }
 
     // Zero stale gauges by diffing against previous cycle's state.
@@ -273,11 +330,25 @@ pub async fn update_cache_info_metrics(pool: &PgPool, targets: &Targets, state: 
         for (composite, component, component_endpoint, sort_order, enabled) in state.prev_components.difference(&current_components) {
             gauge!("dwctl_model_component_weight", "composite" => composite.clone(), "component" => component.clone(), "component_endpoint" => component_endpoint.clone(), "sort_order" => sort_order.clone(), "enabled" => enabled.clone()).set(0.0);
         }
+
+        for (model, purpose, window) in state.prev_tariffs.difference(&current_tariffs) {
+            for direction in ["input", "output"] {
+                gauge!(
+                    "dwctl_model_tariff",
+                    "model" => model.clone(),
+                    "purpose" => purpose.clone(),
+                    "completion_window" => window.clone(),
+                    "direction" => direction,
+                )
+                .set(0.0);
+            }
+        }
     }
 
     state.prev_models = current_models;
     state.prev_groups = current_groups;
     state.prev_components = current_components;
+    state.prev_tariffs = current_tariffs;
     state.initialized = true;
 
     // API key counts — from the Targets DashMap (no SQL needed)
@@ -444,6 +515,23 @@ mod tests {
 
         // Verify group info gauge
         assert!(output.contains("dwctl_model_group_info{"), "Should emit group info gauge");
+
+        // Verify tariff gauges: one series per direction with the created prices
+        // (input 1e-6, output 2e-6 credits/token; NULL purpose/window → empty labels)
+        assert!(output.contains("dwctl_model_tariff{"), "Should emit tariff gauge");
+        let tariff_lines: Vec<&str> = output.lines().filter(|l| l.starts_with("dwctl_model_tariff{")).collect();
+        assert!(
+            tariff_lines
+                .iter()
+                .any(|l| l.contains(r#"direction="input""#) && l.contains("0.000001")),
+            "input tariff price should be emitted: {tariff_lines:?}"
+        );
+        assert!(
+            tariff_lines
+                .iter()
+                .any(|l| l.contains(r#"direction="output""#) && l.contains("0.000002")),
+            "output tariff price should be emitted: {tariff_lines:?}"
+        );
         assert!(
             output.contains(r#"group_name="cache-info-test-group""#),
             "Should have group name label"
