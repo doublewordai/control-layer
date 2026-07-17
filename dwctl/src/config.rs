@@ -1653,6 +1653,66 @@ pub struct DaemonConfig {
     /// (3 minutes).
     #[serde(default = "default_claim_query_timeout_ms")]
     pub claim_query_timeout_ms: u64,
+
+    /// Batch-archive sweeper (fusillade phase 3): moves frozen terminal
+    /// batches' request rows from `fusillade.requests` into the partitioned
+    /// `batch_requests_archive`. OFF by default. The blue/green invariant:
+    /// deploys never move data — only flipping this flag does, and only once
+    /// every pod in the fleet runs location-routing-aware code AND this
+    /// dwctl version is the rollback floor (deny_unknown_fields: an older
+    /// pod parsing a config that contains these keys crash-loops).
+    #[serde(default)]
+    pub batch_archive_sweep_enabled: bool,
+    /// Sweep tick interval. 0 disables the worker (guarded in fusillade).
+    #[serde(default = "default_batch_archive_sweep_interval_ms")]
+    pub batch_archive_sweep_interval_ms: u64,
+    /// Bounded moves per sweep tick (never drain-until-empty).
+    #[serde(default = "default_batch_archive_moves_per_tick")]
+    pub batch_archive_sweep_moves_per_tick: i64,
+    /// Post-freeze dwell before a batch becomes a sweep candidate. Default 0
+    /// (move immediately — reads are mid-move safe by construction).
+    #[serde(default)]
+    pub batch_archive_sweep_dwell_secs: f64,
+    /// Cancellation grace: batches with canceled rows that were in flight at
+    /// cancel are not archived while those rows are younger than this, so
+    /// late billed results can still supersede the cancel on the live row.
+    /// Default 600s, mirroring processing_timeout_ms.
+    #[serde(default = "default_batch_archive_cancel_grace_secs")]
+    pub batch_archive_cancel_grace_secs: f64,
+    /// Historical backfill worker: same mover as the sweeper on its own
+    /// pacing, oldest-first. Enable after the sweeper is live and steady;
+    /// flip off to pause instantly (resumable by construction).
+    #[serde(default)]
+    pub batch_archive_backfill_enabled: bool,
+    #[serde(default = "default_batch_archive_backfill_interval_ms")]
+    pub batch_archive_backfill_interval_ms: u64,
+    #[serde(default = "default_batch_archive_moves_per_tick")]
+    pub batch_archive_backfill_moves_per_tick: i64,
+    /// Weekly archive-partition runway maintained by the daemon's daily tick
+    /// (runs regardless of the flags above so partitions exist before any
+    /// flip; fusillade_archive_partitions_ahead gauges it).
+    #[serde(default = "default_batch_archive_partitions_weeks_ahead")]
+    pub batch_archive_partitions_weeks_ahead: i32,
+}
+
+fn default_batch_archive_sweep_interval_ms() -> u64 {
+    5_000
+}
+
+fn default_batch_archive_moves_per_tick() -> i64 {
+    4
+}
+
+fn default_batch_archive_cancel_grace_secs() -> f64 {
+    600.0
+}
+
+fn default_batch_archive_backfill_interval_ms() -> u64 {
+    1_000
+}
+
+fn default_batch_archive_partitions_weeks_ahead() -> i32 {
+    4
 }
 
 fn default_claim_loop_max_consecutive_failures() -> u32 {
@@ -1767,6 +1827,15 @@ impl Default for DaemonConfig {
             claim_ramp_exponent: default_claim_ramp_exponent(),
             claim_loop_max_consecutive_failures: default_claim_loop_max_consecutive_failures(),
             claim_query_timeout_ms: default_claim_query_timeout_ms(),
+            batch_archive_sweep_enabled: false,
+            batch_archive_sweep_interval_ms: default_batch_archive_sweep_interval_ms(),
+            batch_archive_sweep_moves_per_tick: default_batch_archive_moves_per_tick(),
+            batch_archive_sweep_dwell_secs: 0.0,
+            batch_archive_cancel_grace_secs: default_batch_archive_cancel_grace_secs(),
+            batch_archive_backfill_enabled: false,
+            batch_archive_backfill_interval_ms: default_batch_archive_backfill_interval_ms(),
+            batch_archive_backfill_moves_per_tick: default_batch_archive_moves_per_tick(),
+            batch_archive_partitions_weeks_ahead: default_batch_archive_partitions_weeks_ahead(),
         }
     }
 }
@@ -1832,6 +1901,15 @@ impl DaemonConfig {
             claim_ramp_exponent: self.claim_ramp_exponent,
             claim_loop_max_consecutive_failures: self.claim_loop_max_consecutive_failures,
             claim_query_timeout_ms: self.claim_query_timeout_ms,
+            batch_archive_sweep_enabled: self.batch_archive_sweep_enabled,
+            batch_archive_sweep_interval_ms: self.batch_archive_sweep_interval_ms,
+            batch_archive_sweep_moves_per_tick: self.batch_archive_sweep_moves_per_tick,
+            batch_archive_sweep_dwell_secs: self.batch_archive_sweep_dwell_secs,
+            batch_archive_cancel_grace_secs: self.batch_archive_cancel_grace_secs,
+            batch_archive_backfill_enabled: self.batch_archive_backfill_enabled,
+            batch_archive_backfill_interval_ms: self.batch_archive_backfill_interval_ms,
+            batch_archive_backfill_moves_per_tick: self.batch_archive_backfill_moves_per_tick,
+            batch_archive_partitions_weeks_ahead: self.batch_archive_partitions_weeks_ahead,
             ..Default::default()
         }
     }
