@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.88.0](https://github.com/doublewordai/control-layer/compare/v8.87.2...v8.88.0) (2026-07-17)
+
+
+### Features
+
+* attribute served upstream on analytics, token and credits metrics ([#1300](https://github.com/doublewordai/control-layer/issues/1300)) ([baa6931](https://github.com/doublewordai/control-layer/commit/baa693130d5534f560fe65f651707e8200136eaa))
+
 ## [8.87.2](https://github.com/doublewordai/control-layer/compare/v8.87.1...v8.87.2) (2026-07-16)
 
 
