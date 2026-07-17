@@ -1671,13 +1671,16 @@ pub struct DaemonConfig {
     pub batch_archive_sweep_moves_per_tick: i64,
     /// Post-freeze dwell before a batch becomes a sweep candidate. Default 0
     /// (move immediately — reads are mid-move safe by construction).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_non_negative_secs")]
     pub batch_archive_sweep_dwell_secs: f64,
     /// Cancellation grace: batches with canceled rows that were in flight at
     /// cancel are not archived while those rows are younger than this, so
     /// late billed results can still supersede the cancel on the live row.
     /// Default 600s, mirroring processing_timeout_ms.
-    #[serde(default = "default_batch_archive_cancel_grace_secs")]
+    #[serde(
+        default = "default_batch_archive_cancel_grace_secs",
+        deserialize_with = "deserialize_cancel_grace_secs"
+    )]
     pub batch_archive_cancel_grace_secs: f64,
     /// Historical backfill worker: same mover as the sweeper on its own
     /// pacing, oldest-first. Enable after the sweeper is live and steady;
@@ -1776,6 +1779,46 @@ where
             value
         ))),
         Some(value) if value < 0.0 => Err(D::Error::custom(format!("claim_ramp_exponent must be non-negative, got {}", value))),
+        Some(value) => Ok(value),
+    }
+}
+
+/// Seconds knobs (archive dwell): finite and non-negative — NaN/inf/negative
+/// values would make the SQL interval predicates undefined.
+fn deserialize_non_negative_secs<'de, D>(deserializer: D) -> Result<f64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+
+    let opt: Option<f64> = Option::deserialize(deserializer)?;
+    match opt {
+        None => Ok(0.0),
+        Some(value) if !value.is_finite() => Err(D::Error::custom(format!("seconds value must be a finite number, got {}", value))),
+        Some(value) if value < 0.0 => Err(D::Error::custom(format!("seconds value must be non-negative, got {}", value))),
+        Some(value) => Ok(value),
+    }
+}
+
+/// Same validation as [`deserialize_non_negative_secs`] but defaulting to the
+/// cancellation-grace default when the key is absent.
+fn deserialize_cancel_grace_secs<'de, D>(deserializer: D) -> Result<f64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+
+    let opt: Option<f64> = Option::deserialize(deserializer)?;
+    match opt {
+        None => Ok(default_batch_archive_cancel_grace_secs()),
+        Some(value) if !value.is_finite() => Err(D::Error::custom(format!(
+            "batch_archive_cancel_grace_secs must be a finite number, got {}",
+            value
+        ))),
+        Some(value) if value < 0.0 => Err(D::Error::custom(format!(
+            "batch_archive_cancel_grace_secs must be non-negative, got {}",
+            value
+        ))),
         Some(value) => Ok(value),
     }
 }
@@ -4169,6 +4212,138 @@ background_services:
 
             let config = Config::load(&args)?;
             assert_eq!(config.background_services.batch_daemon.urgency_weight, 0.5);
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_batch_archive_cancel_grace_secs_negative_rejected() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+background_services:
+  batch_daemon:
+    batch_archive_cancel_grace_secs: -1.0
+"#,
+            )?;
+            let args = Args {
+                config: "test.yaml".into(),
+                validate: false,
+            };
+            let result = Config::load(&args);
+            assert!(result.is_err());
+            let err = result.unwrap_err().to_string();
+            assert!(
+                err.contains("batch_archive_cancel_grace_secs must be non-negative"),
+                "unexpected error: {err}"
+            );
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_batch_archive_cancel_grace_secs_non_finite_rejected() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+background_services:
+  batch_daemon:
+    batch_archive_cancel_grace_secs: .inf
+"#,
+            )?;
+            let args = Args {
+                config: "test.yaml".into(),
+                validate: false,
+            };
+            let result = Config::load(&args);
+            assert!(result.is_err());
+            let err = result.unwrap_err().to_string();
+            assert!(
+                err.contains("batch_archive_cancel_grace_secs must be a finite number") || err.contains("invalid"),
+                "unexpected error: {err}"
+            );
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_batch_archive_cancel_grace_secs_null_uses_default() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+background_services:
+  batch_daemon:
+    batch_archive_cancel_grace_secs: null
+"#,
+            )?;
+            let args = Args {
+                config: "test.yaml".into(),
+                validate: false,
+            };
+            let config = Config::load(&args)?;
+            assert_eq!(config.background_services.batch_daemon.batch_archive_cancel_grace_secs, 600.0);
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_batch_archive_sweep_dwell_secs_negative_rejected() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+background_services:
+  batch_daemon:
+    batch_archive_sweep_dwell_secs: -0.001
+"#,
+            )?;
+            let args = Args {
+                config: "test.yaml".into(),
+                validate: false,
+            };
+            let result = Config::load(&args);
+            assert!(result.is_err());
+            let err = result.unwrap_err().to_string();
+            assert!(err.contains("seconds value must be non-negative"), "unexpected error: {err}");
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_batch_archive_sweep_dwell_secs_non_finite_rejected() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+background_services:
+  batch_daemon:
+    batch_archive_sweep_dwell_secs: .nan
+"#,
+            )?;
+            let args = Args {
+                config: "test.yaml".into(),
+                validate: false,
+            };
+            let result = Config::load(&args);
+            assert!(result.is_err());
+            let err = result.unwrap_err().to_string();
+            assert!(
+                err.contains("seconds value must be a finite number") || err.contains("invalid"),
+                "unexpected error: {err}"
+            );
 
             Ok(())
         });
