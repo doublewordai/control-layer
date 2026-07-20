@@ -7,13 +7,13 @@
 //! Ownership is verified by checking the batch's `created_by` against the
 //! API key's `user_id` (which is the org ID for org-scoped keys).
 
+use crate::inference::response_store::StoreError;
 use axum::{
     Json,
     extract::{Path, State},
     http::HeaderMap,
 };
 use fusillade::{ResponseStepStore, Storage};
-use onwards::StoreError;
 use serde::{Deserialize, Serialize};
 use sqlx_pool_router::PoolProvider;
 use std::collections::HashSet;

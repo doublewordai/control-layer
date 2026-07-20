@@ -9,7 +9,7 @@
 
 use serde_json::Value;
 
-use onwards::traits::ResponseStore;
+use crate::inference::response_store::ResponseStore;
 
 use super::types::{Input, Item, MessageContent, MessageItem, ResponsesRequest, ResponsesResponse};
 

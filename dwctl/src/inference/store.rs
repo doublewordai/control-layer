@@ -4,60 +4,15 @@
 //! All fusillade operations go through the `Storage` trait via `request_manager`.
 //! The only raw SQL is the `api_keys` lookup which queries a dwctl-owned table.
 
-use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use async_trait::async_trait;
-use fusillade::{
-    BatchInput, CreateRealtimeInput, CreateStepInput, RequestId, RequestTemplateInput, ResponseStep, ResponseStepStore, StepId,
-    StepKind as FusilladeStepKind, StepState as FusilladeStepState, Storage,
-};
+use fusillade::{BatchInput, RequestId, RequestTemplateInput, ResponseStepStore, StepId, Storage};
 use fusillade_arsenal::{PostgresRequestManager, PostgresResponseStepManager};
-use onwards::{
-    ChainStep, MultiStepStore, RecordedStep, ResponseStore, StepDescriptor, StepKind as OnwardsStepKind, StepState as OnwardsStepState,
-    StoreError,
-};
 use sqlx_pool_router::PoolProvider;
 use uuid::Uuid;
 
-/// Per-response context the warm path stashes before kicking off the
-/// multi-step loop so the bridge's `next_action_for` / `record_step`
-/// can build chat-completions payloads + create per-step sub-request
-/// fusillade rows without round-tripping a "parent /v1/responses"
-/// fusillade row that no longer exists.
-///
-/// Keyed by `head_step_uuid.to_string()` (the response_id minus its
-/// `resp_` prefix), populated by the warm path before the loop starts,
-/// removed when the loop returns.
-#[derive(Debug, Clone)]
-pub struct PendingResponseInput {
-    /// Raw user-submitted `/v1/responses` body. Re-parsed by
-    /// `next_action_for` on each iteration to extract model, initial
-    /// messages, tools, and the `stream` flag.
-    pub body: String,
-    /// User's API key. Stamped onto each per-step sub-request row's
-    /// `api_key` column for downstream attribution + auth.
-    pub api_key: Option<String>,
-    /// Resolved `created_by` (user id) for the response's batches /
-    /// requests rows.
-    pub created_by: Option<String>,
-    /// Loopback base URL: the per-step model_call sub-request rows'
-    /// `base_url` column points at the dwctl loopback so onwards can
-    /// pick a target / honor strict mode at fire time.
-    pub base_url: String,
-    /// Names of server-side tools registered for this request (resolved
-    /// from `tool_sources` joined with the user's groups + the deployment).
-    /// The transition function uses this to decide which tool_calls
-    /// returned by the model can be auto-dispatched server-side and which
-    /// must be passed through to the client as `function_call` output items.
-    ///
-    /// When a tool_call's name is missing from this set, it's treated as a
-    /// client-side tool: the loop completes with the model's response, and
-    /// `assemble_response` surfaces the call as a `function_call` item per
-    /// the OpenAI Responses contract — the client is expected to execute
-    /// it and submit the result via a follow-up request.
-    pub resolved_tool_names: HashSet<String>,
-}
+use crate::inference::response_store::{ResponseStore, StoreError};
 
 /// Header set by the inference middleware so the outlet handler knows which
 /// fusillade row to update with the response body.
@@ -70,18 +25,10 @@ pub struct OnwardsDaemonId(pub Uuid);
 /// ResponseStore implementation backed by fusillade's `Storage` trait.
 pub struct FusilladeResponseStore<P: PoolProvider + Clone> {
     request_manager: Arc<PostgresRequestManager<P>>,
-    /// Step storage for multi-step responses. Optional so existing callers
-    /// that only need the legacy single-step `ResponseStore` surface (e.g.
-    /// the `previous_response_id` flow) can construct a store without
-    /// wiring the multi-step manager.
+    /// Step manager, used by `get_response` to resolve responses stored as a
+    /// head step (produced before the multi-step loop was retired) back into a
+    /// Responses object. Optional: single-step callers construct without it.
     step_manager: Option<Arc<PostgresResponseStepManager<P>>>,
-    /// In-memory side-channel: response_id (head_step_uuid.to_string())
-    /// → original `/v1/responses` body + per-response context. The warm
-    /// path inserts before kicking off the loop and removes when the
-    /// loop returns. `next_action_for` reads to re-parse the user input
-    /// on every iteration; `record_step` reads to stamp api_key +
-    /// created_by + base_url on per-step sub-request rows.
-    pending_inputs: Arc<RwLock<HashMap<String, PendingResponseInput>>>,
     /// Keystore for decrypting ZDR response bodies on retrieval. `None` = no ZDR.
     keystore: Option<crate::keystore::Keystore>,
 }
@@ -91,16 +38,12 @@ impl<P: PoolProvider + Clone> FusilladeResponseStore<P> {
         Self {
             request_manager,
             step_manager: None,
-            pending_inputs: Arc::new(RwLock::new(HashMap::new())),
             keystore: None,
         }
     }
 
-    /// Wire in the multi-step step manager so the new
-    /// [`ResponseStore::record_step`] / `mark_step_processing` /
-    /// `complete_step` / `fail_step` / `next_sequence` methods are
-    /// backed by real persistence rather than the trait's
-    /// "not implemented" default.
+    /// Wire in the step manager so `get_response` can resolve head-step-backed
+    /// responses (retained from before the multi-step loop was retired).
     pub fn with_step_manager(mut self, step_manager: Arc<PostgresResponseStepManager<P>>) -> Self {
         self.step_manager = Some(step_manager);
         self
@@ -110,97 +53,6 @@ impl<P: PoolProvider + Clone> FusilladeResponseStore<P> {
     pub fn with_keystore(mut self, keystore: Option<crate::keystore::Keystore>) -> Self {
         self.keystore = keystore;
         self
-    }
-
-    /// Stash per-response context for the multi-step loop. Called by
-    /// the warm path before `run_response_loop` starts. Returns the
-    /// generated head step UUID — the warm path uses its string form
-    /// as both the user-visible `resp_<id>` value and the loop's
-    /// `request_id` parameter.
-    ///
-    /// On lock-poison, logs at error level and still returns a UUID;
-    /// the warm path can't easily fail-fast on this without
-    /// restructuring its `Option`-returning helpers, and the
-    /// downstream `next_action_for` will surface a "no pending input
-    /// registered" error with the same UUID, making the two log
-    /// lines correlatable. Daemon callers that *can* propagate
-    /// errors should use [`register_pending_with_id`] directly.
-    pub fn register_pending(&self, input: PendingResponseInput) -> Uuid {
-        let head_step_uuid = Uuid::new_v4();
-        if let Err(e) = self.register_pending_with_id(head_step_uuid, input) {
-            tracing::error!(
-                error = %e,
-                request_id = %head_step_uuid,
-                "warm-path register_pending continuing after lock-poison; loop will fail downstream",
-            );
-        }
-        head_step_uuid
-    }
-
-    /// Variant of [`register_pending`] for callers that already have a
-    /// stable response id and need the side-channel keyed by it. The
-    /// daemon path uses this: when a fusillade row is claimed for
-    /// `/v1/responses`, its `request_id` *is* the head step UUID
-    /// (`record_step` reuses `request_id` as the head step's id), so
-    /// the loop's `next_action_for(request_id)` lookup must match.
-    /// Without this, daemon-driven multi-step requests fail at the
-    /// first iteration with "no pending input registered".
-    ///
-    /// Returns `Err` on lock poisoning so the daemon can fail the
-    /// request immediately with the real cause rather than letting
-    /// the loop surface a downstream "no pending input registered"
-    /// error that doesn't mention the lock at all.
-    pub fn register_pending_with_id(&self, head_step_uuid: Uuid, input: PendingResponseInput) -> Result<(), StoreError> {
-        let key = head_step_uuid.to_string();
-        let mut guard = self
-            .pending_inputs
-            .write()
-            .map_err(|e| StoreError::StorageError(format!("pending_inputs lock poisoned: {e}")))?;
-        guard.insert(key, input);
-        Ok(())
-    }
-
-    /// Remove the side-channel entry for a completed (or failed)
-    /// response. Idempotent — safe to call from both Ok and Err arms
-    /// of the warm path's run-loop wrapper.
-    pub fn unregister_pending(&self, request_id: &str) {
-        let key = parse_response_id(request_id)
-            .map(|u| u.to_string())
-            .unwrap_or_else(|_| request_id.to_string());
-        if let Ok(mut guard) = self.pending_inputs.write() {
-            guard.remove(&key);
-        }
-    }
-
-    fn pending_input(&self, request_id: &str) -> Result<PendingResponseInput, StoreError> {
-        let key = parse_response_id(request_id)?.to_string();
-        self.pending_inputs
-            .read()
-            .map_err(|_| StoreError::StorageError("pending_inputs lock poisoned".into()))?
-            .get(&key)
-            .cloned()
-            .ok_or_else(|| {
-                StoreError::StorageError(format!(
-                    "no pending input registered for response {request_id} — warm path didn't stash it (or it was unregistered)"
-                ))
-            })
-    }
-
-    /// Borrow the inner request_manager. Used by the warm-path SSE
-    /// handler to call `complete_request` / `fail_request` directly
-    /// after running the loop inline.
-    pub fn request_manager(&self) -> &PostgresRequestManager<P> {
-        &self.request_manager
-    }
-
-    fn require_step_manager(&self) -> Result<&PostgresResponseStepManager<P>, StoreError> {
-        self.step_manager.as_deref().ok_or_else(|| {
-            StoreError::StorageError(
-                "FusilladeResponseStore was constructed without a step manager — multi-step \
-                 orchestration methods require with_step_manager(...) at construction time"
-                    .into(),
-            )
-        })
     }
 
     /// Retrieve a response by ID. Used by the GET /v1/responses/{id} handler.
@@ -290,49 +142,6 @@ pub enum ResponseLookup {
     NotFound,
     /// A ZDR response whose key is gone; permanently unavailable.
     Gone,
-}
-
-fn parse_step_id(raw: &str) -> Result<StepId, StoreError> {
-    Uuid::parse_str(raw)
-        .map(StepId::from)
-        .map_err(|_| StoreError::NotFound(raw.to_string()))
-}
-
-fn map_step_kind(kind: OnwardsStepKind) -> FusilladeStepKind {
-    match kind {
-        OnwardsStepKind::ModelCall => FusilladeStepKind::ModelCall,
-        OnwardsStepKind::ToolCall => FusilladeStepKind::ToolCall,
-    }
-}
-
-fn map_kind_back(kind: FusilladeStepKind) -> OnwardsStepKind {
-    match kind {
-        FusilladeStepKind::ModelCall => OnwardsStepKind::ModelCall,
-        FusilladeStepKind::ToolCall => OnwardsStepKind::ToolCall,
-    }
-}
-
-fn map_state_back(state: FusilladeStepState) -> OnwardsStepState {
-    match state {
-        FusilladeStepState::Pending => OnwardsStepState::Pending,
-        FusilladeStepState::Processing => OnwardsStepState::Processing,
-        FusilladeStepState::Completed => OnwardsStepState::Completed,
-        FusilladeStepState::Failed => OnwardsStepState::Failed,
-        FusilladeStepState::Canceled => OnwardsStepState::Canceled,
-    }
-}
-
-fn step_to_chain(step: ResponseStep) -> ChainStep {
-    ChainStep {
-        id: step.id.0.to_string(),
-        kind: map_kind_back(step.step_kind),
-        state: map_state_back(step.state),
-        sequence: step.step_sequence,
-        prev_step_id: step.prev_step_id.map(|s| s.0.to_string()),
-        parent_step_id: step.parent_step_id.map(|s| s.0.to_string()),
-        response_payload: step.response_payload,
-        error: step.error,
-    }
 }
 
 fn map_fusillade_err(e: fusillade::FusilladeError) -> StoreError {
@@ -1185,251 +994,6 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> ResponseStore for Fusillad
             ResponseLookup::Found(v) => Some(v),
             ResponseLookup::NotFound | ResponseLookup::Gone => None,
         })
-    }
-}
-
-// MultiStepStore implementation: storage primitives + chain walk backed
-// by fusillade's PostgresResponseStepManager, plus the Open Responses
-// transition function (next_action_for) and assembly (assemble_response)
-// living in the sibling `transition` and `assembly` modules.
-//
-// Identity model after the response_steps re-anchoring (fusillade 16.8):
-//   * `request_id` from onwards == "resp_<head_step_uuid>" (or just
-//     <head_step_uuid>) — the head step's id is the response identity.
-//   * No parent /v1/responses fusillade row exists. Every model_call
-//     step (including the head) gets its own per-step sub-request
-//     fusillade row created synchronously inside `record_step`.
-//   * `parent_step_id` is the chain identifier — NULL on the head,
-//     head's id on every descendant. `scope_parent` from onwards is
-//     not threaded through to fusillade's parent_step_id (it would
-//     break listing's anti-join); sub-agent recursion, when wired,
-//     will be modeled via `prev_step_id` branching instead.
-#[async_trait]
-impl<P: PoolProvider + Clone + Send + Sync + 'static> MultiStepStore for FusilladeResponseStore<P> {
-    async fn next_action_for(&self, request_id: &str, scope_parent: Option<&str>) -> Result<onwards::NextAction, StoreError> {
-        // The original /v1/responses body lives in the side-channel
-        // populated by the warm path. There is no longer a parent
-        // fusillade row to fetch it from.
-        let pending = self.pending_input(request_id)?;
-        let parsed = super::engine::transition::parse_parent_request(&pending.body).map_err(StoreError::StorageError)?;
-        let chain = <Self as MultiStepStore>::list_chain(self, request_id, scope_parent).await?;
-        Ok(super::engine::transition::decide_next_action(
-            &parsed,
-            &chain,
-            &pending.resolved_tool_names,
-        ))
-    }
-
-    async fn record_step(
-        &self,
-        request_id: &str,
-        scope_parent: Option<&str>,
-        prev_step: Option<&str>,
-        descriptor: &StepDescriptor,
-    ) -> Result<RecordedStep, StoreError> {
-        let step_manager = self.require_step_manager()?;
-        let head_step_uuid = parse_response_id(request_id)?;
-        let prev_step_id = prev_step.map(parse_step_id).transpose()?;
-
-        // Chain-walk to figure out: is this the very first step (the
-        // head)? and what sequence number to assign?
-        //
-        // Idempotency under crash recovery is the caller's
-        // responsibility — fusillade dropped the chain-uniqueness
-        // constraint because parallel tool_calls share
-        // (parent, prev, kind) by design.
-        let chain = step_manager.list_chain(StepId(head_step_uuid)).await.map_err(map_fusillade_err)?;
-
-        // The very first record_step on a top-level chain (no
-        // scope_parent, empty chain) becomes the head. We pre-allocate
-        // its id from the request_id so the warm path's "resp_<id>"
-        // matches the head step row that's about to be inserted.
-        let is_head = chain.is_empty() && scope_parent.is_none();
-        let new_step_id = if is_head { Some(head_step_uuid) } else { None };
-        // Every non-head step shares parent_step_id = head id. This is
-        // what makes the listing-query anti-join work and what the
-        // chain_walk index is keyed on.
-        let parent_step_id = if is_head { None } else { Some(StepId(head_step_uuid)) };
-        let sequence = chain.iter().map(|s| s.step_sequence).max().unwrap_or(0) + 1;
-
-        // model_call steps require a sub-request fusillade row (CHECK
-        // constraint: model_call ⇒ request_id IS NOT NULL). tool_call
-        // steps have request_id = NULL — analytics for them live in
-        // tool_call_analytics (keyed on response_step_id).
-        //
-        // The head model_call reuses the up-front /v1/responses row
-        // (created by `handle_flex` for flex, `warm_path_setup` for the
-        // realtime warm path) — its id is `head_step_uuid` by
-        // construction. That collapses what used to be "parent row +
-        // head sub-request row" into a single tracking row per
-        // response: 1 row for a single-step tool-using chain,
-        // N rows for an N-model_call chain.
-        //
-        // Descendant model_calls (followups after tool dispatch) still
-        // mint their own sub-request rows via `create_sub_request_row`.
-        let req_id = match descriptor.kind {
-            OnwardsStepKind::ModelCall if is_head => Some(RequestId(head_step_uuid)),
-            OnwardsStepKind::ModelCall => Some(RequestId(self.create_sub_request_row(request_id, descriptor).await?)),
-            OnwardsStepKind::ToolCall => None,
-        };
-
-        let id = step_manager
-            .create_step(CreateStepInput {
-                id: new_step_id,
-                request_id: req_id,
-                prev_step_id,
-                parent_step_id,
-                step_kind: map_step_kind(descriptor.kind),
-                step_sequence: sequence,
-                request_payload: descriptor.request_payload.clone(),
-            })
-            .await
-            .map_err(map_fusillade_err)?;
-
-        Ok(RecordedStep {
-            id: id.0.to_string(),
-            sequence,
-            // Hand the sub-request fusillade row id back to onwards so
-            // its loop can stamp it as `X-Fusillade-Request-Id` on the
-            // outgoing HTTP fire — that's how the resulting
-            // `http_analytics` row gets attributed to the right row in
-            // `fusillade.requests`. `tool_call` steps don't get a
-            // sub-request row (analytics live in `tool_call_analytics`
-            // keyed on response_step_id), so this stays `None` for
-            // them per the DB CHECK constraint.
-            sub_request_id: req_id,
-        })
-    }
-
-    async fn mark_step_processing(&self, step_id: &str) -> Result<(), StoreError> {
-        let step_manager = self.require_step_manager()?;
-        step_manager
-            .mark_step_processing(parse_step_id(step_id)?)
-            .await
-            .map_err(map_fusillade_err)
-    }
-
-    async fn complete_step(&self, step_id: &str, payload: &serde_json::Value) -> Result<(), StoreError> {
-        let step_manager = self.require_step_manager()?;
-        step_manager
-            .complete_step(parse_step_id(step_id)?, payload.clone())
-            .await
-            .map_err(map_fusillade_err)
-    }
-
-    async fn fail_step(&self, step_id: &str, error: &serde_json::Value) -> Result<(), StoreError> {
-        let step_manager = self.require_step_manager()?;
-        step_manager
-            .fail_step(parse_step_id(step_id)?, error.clone())
-            .await
-            .map_err(map_fusillade_err)
-    }
-
-    async fn list_chain(&self, request_id: &str, _scope_parent: Option<&str>) -> Result<Vec<ChainStep>, StoreError> {
-        // `scope_parent` is intentionally ignored: in the new schema,
-        // every step in a response (including any future sub-agent
-        // descendants) shares parent_step_id = head id, so a single
-        // chain walk covers what list_scope used to serve. When
-        // sub-agent dispatch is wired in the loop, scope filtering
-        // will move to a client-side prev_step_id traversal of the
-        // returned chain rather than a different storage call.
-        let step_manager = self.require_step_manager()?;
-        let head_step_uuid = parse_response_id(request_id)?;
-
-        let steps = step_manager.list_chain(StepId(head_step_uuid)).await.map_err(map_fusillade_err)?;
-
-        Ok(steps.into_iter().map(step_to_chain).collect())
-    }
-
-    async fn assemble_response(&self, request_id: &str) -> Result<serde_json::Value, StoreError> {
-        let chain = <Self as MultiStepStore>::list_chain(self, request_id, None).await?;
-        Ok(super::engine::assembly::assemble_from_chain(request_id, &chain))
-    }
-}
-
-impl<P: PoolProvider + Clone + Send + Sync + 'static> FusilladeResponseStore<P> {
-    /// Mark the head step's sub-request fusillade row as completed
-    /// (status 200) or failed (any other status) with the assembled
-    /// response (or error payload) as the row's `response_body`.
-    ///
-    /// This is what makes the dashboard's responses listing show the
-    /// response as completed and surfaces a useful response_body for
-    /// retrieval. The head step's sub-request row is the one row in
-    /// `requests` that survives the listing-query anti-join (its
-    /// `response_step.parent_step_id` is NULL); every other model_call
-    /// row in the chain is filtered out. Status_code 200 → `complete_request`,
-    /// otherwise `fail_request`.
-    ///
-    /// No-op if the head step or its sub-request row can't be found
-    /// (e.g., the loop crashed before the first record_step) — the
-    /// caller has already handled that path via the assembled fail
-    /// payload returned from the loop.
-    pub async fn finalize_head_request(&self, request_id: &str, status_code: u16, body: serde_json::Value) -> Result<(), StoreError> {
-        let step_manager = self.require_step_manager()?;
-        let head_step_uuid = parse_response_id(request_id)?;
-        let head_step = step_manager.get_step(StepId(head_step_uuid)).await.map_err(map_fusillade_err)?;
-        let Some(head_step) = head_step else {
-            return Ok(());
-        };
-        let Some(sub_request_id) = head_step.request_id else {
-            return Ok(());
-        };
-        let body_str = serde_json::to_string(&body).map_err(|e| StoreError::StorageError(format!("serialize finalized body: {e}")))?;
-        if status_code == 200 {
-            self.request_manager
-                .complete_request(sub_request_id, &body_str, status_code)
-                .await
-                .map_err(|e| StoreError::StorageError(format!("complete head sub-request row: {e}")))
-        } else {
-            self.request_manager
-                .fail_request(sub_request_id, &body_str, status_code)
-                .await
-                .map_err(|e| StoreError::StorageError(format!("fail head sub-request row: {e}")))
-        }
-    }
-
-    /// Create a fusillade `requests` row for a single model_call step.
-    /// Returns the new row's id, which the caller writes into the
-    /// `response_steps.request_id` column to wire the 1:1 link.
-    ///
-    /// Uses `create_realtime` to insert the request row directly with no
-    /// parent batch. The listing query is scoped to head-step rows so
-    /// non-head sub-request rows don't surface in the dashboard view.
-    async fn create_sub_request_row(&self, request_id: &str, descriptor: &StepDescriptor) -> Result<Uuid, StoreError> {
-        let pending = self.pending_input(request_id)?;
-        let model = descriptor
-            .request_payload
-            .get("model")
-            .and_then(|m| m.as_str())
-            .unwrap_or("")
-            .to_string();
-        let body = serde_json::to_string(&descriptor.request_payload)
-            .map_err(|e| StoreError::StorageError(format!("serialize step request_payload: {e}")))?;
-
-        let sub_request_id = Uuid::new_v4();
-        // Sub-request rows are owned by the warm-path loop running in this
-        // onwards instance — created in `processing` state so the daemon
-        // doesn't claim them. The loop UPDATEs via complete_request /
-        // fail_request when each step terminates.
-        let input = CreateRealtimeInput {
-            request_id: sub_request_id,
-            body,
-            model,
-            endpoint: pending.base_url,
-            method: "POST".to_string(),
-            // The actual upstream HTTP fire happens via onwards' loopback
-            // to /v1/chat/completions. Storing that as the row's path
-            // makes analytics + the responses-listing dashboard show the
-            // right URL for each step.
-            path: "/v1/chat/completions".to_string(),
-            api_key: pending.api_key.unwrap_or_default(),
-            created_by: pending.created_by.unwrap_or_default(),
-        };
-        self.request_manager
-            .create_realtime(input)
-            .await
-            .map_err(|e| StoreError::StorageError(format!("create sub-request row: {e}")))?;
-        Ok(sub_request_id)
     }
 }
 

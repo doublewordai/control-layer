@@ -2330,40 +2330,12 @@ impl BackgroundTaskBuilder {
     }
 }
 
-/// Setup background services (probe scheduler, batch daemon, leader election, onwards integration)
-/// Wire the fusillade request manager, step manager, and (optionally)
-/// the multi-step [`DwctlRequestProcessor`] into the daemon and start
-/// the background-services stack.
-///
-/// The caller owns construction of `request_manager`, `step_manager`,
-/// and `multi_step_processor` — and must build them in that order —
-/// because the multi-step processor depends on a `FusilladeResponseStore`,
-/// which itself depends on the request manager and step manager. That
-/// ordering is enforced at the type level (you cannot construct the
-/// processor without first constructing the others), which is why we
-/// take them as parameters rather than constructing them here: it
-/// guarantees that `set_processor` runs *before* any daemon spawn
-/// inside this function, including the leader-election callback's
-/// daemon spawn.
-///
-/// Pre-PR #1064 this function used to construct the request manager
-/// itself and spawn the daemon *before* the caller had a chance to
-/// build and wire the multi-step processor — which meant fusillade's
-/// `OnceLock`-snapshot in `PostgresRequestManager::run` captured a
-/// `None` processor and the daemon fell back to `DefaultRequestProcessor`
-/// for every `/v1/responses + service_tier=flex` claim, looping the
-/// request body back to ourselves and producing the
-/// `{"choices":[],"usage":null}` terminal failure observed in prod.
-///
-/// `multi_step_processor` is `Option<...>` so the test path can pass
-/// `None` to avoid forming the `request_manager → processor → response_store
-/// → request_manager` Arc cycle that blocks `sqlx::test`'s `DROP DATABASE`
-/// cleanup (the cycle's only effect in production — where the app lives
-/// forever — is benign).
+/// Setup background services (probe scheduler, batch daemon, leader election,
+/// onwards integration). The caller owns construction of `request_manager` and
+/// `step_manager` and passes them in, so they exist before any daemon spawn
+/// inside this function.
 pub(crate) struct BackgroundServicesInput {
-    /// Fusillade's durable DB store. The caller builds this so the
-    /// multi-step processor can share the same storage instance as the
-    /// daemon runtime.
+    /// Fusillade's durable DB store, shared with the daemon runtime.
     pub request_manager: Arc<fusillade_arsenal::PostgresRequestManager<DbPools>>,
     /// Fusillade's scheduling daemon. Owns HTTP dispatch and runtime
     /// lifecycle; durable data operations live on `request_manager`.
@@ -2371,15 +2343,6 @@ pub(crate) struct BackgroundServicesInput {
     /// Fusillade's response-step manager. Shares the same fusillade
     /// pool as the request manager.
     pub step_manager: Arc<fusillade_arsenal::PostgresResponseStepManager<DbPools>>,
-    /// Multi-step processor to inject onto the request manager. `None`
-    /// in tests to avoid forming the `request_manager → processor →
-    /// response_store → request_manager` Arc cycle that blocks
-    /// `sqlx::test`'s `DROP DATABASE` cleanup.
-    pub multi_step_processor: Option<
-        Arc<
-            dyn fusillade::RequestProcessor<fusillade_arsenal::PostgresRequestManager<DbPools>, fusillade::ReqwestHttpClient> + Send + Sync,
-        >,
-    >,
     /// Shared map between the fusillade daemon's concurrency control
     /// and the onwards config-sync writer. Built once by the caller and
     /// passed in by-clone here.
@@ -2407,7 +2370,6 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
         request_manager,
         postgres_daemon,
         step_manager,
-        multi_step_processor,
         model_capacity_limits,
         pool,
         fusillade_pools,
@@ -2418,16 +2380,6 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
         metrics_recorder,
         keystore,
     } = input;
-
-    // Wire the multi-step processor onto the daemon *before*
-    // any daemon spawn below — this is the whole reason `setup_background_services`
-    // accepts these as parameters rather than constructing them itself.
-    // See the function-level doc comment.
-    if let Some(processor) = multi_step_processor
-        && let Err(e) = postgres_daemon.set_processor(processor)
-    {
-        tracing::warn!(error = e, "Multi-step processor was already set; skipping");
-    }
 
     // `keystore` comes from the caller (built once and shared). Install the
     // TRANSITIONAL ZDR response transformer on the daemon before it
@@ -3096,83 +3048,10 @@ impl Application {
         let image_normalizer =
             crate::image_normalizer::from_config(&config.image_normalizer).map_err(|e| anyhow::anyhow!("image normaliser config: {e}"))?;
 
-        // Build the multi-step processor's dependencies. These also end
-        // up wired into the inference middleware state below; cloning
-        // them is cheap (Arc + reqwest::Client share their internal
-        // connection pool / TLS root-cert cache across clones).
-        let multi_step_reqwest_client = reqwest::Client::new();
-        let multi_step_tool_executor_pool = Arc::new(db_pools.write().clone());
-        let multi_step_tool_executor = Arc::new(crate::inference::tools::HttpToolExecutor::new(
-            multi_step_reqwest_client.clone(),
-            Some(multi_step_tool_executor_pool.clone()),
-        ));
-        // Same `ReqwestHttpClient` shape the batch daemon uses internally,
-        // so per-step model fires inherit fusillade's header stamping
-        // (`X-Fusillade-Request-Id` for analytics correlation) and
-        // streamable-endpoint dispatch. Timeouts and the streamable list
-        // come from the same config knobs the daemon respects, so warm
-        // path and daemon path use identical streaming semantics.
-        let multi_step_http_client: Arc<fusillade::ReqwestHttpClient> = Arc::new(fusillade::ReqwestHttpClient::new(
-            std::time::Duration::from_millis(fusillade_daemon_config.first_chunk_timeout_ms),
-            std::time::Duration::from_millis(fusillade_daemon_config.chunk_timeout_ms),
-            std::time::Duration::from_millis(fusillade_daemon_config.body_timeout_ms),
-            fusillade_daemon_config.streamable_endpoints.clone(),
-        ));
-        let multi_step_loop_config = onwards::LoopConfig {
-            max_response_step_depth: config.responses.max_response_step_depth,
-            max_response_iterations: config.responses.max_response_iterations,
-        };
-
-        // Build the processor itself only outside test mode: the
-        // `request_manager → processor.OnceLock → response_store →
-        // request_manager` Arc cycle is harmless in production (the app
-        // lives forever) but in `#[sqlx::test]` it keeps each test's
-        // pool clones alive past test teardown, blocking sqlx's
-        // `DROP DATABASE` cleanup. Tests run with `DefaultRequestProcessor`
-        // — their multi-step coverage lives in dedicated
-        // `test/multi_step_*` modules that bypass the daemon path
-        // anyway.
-        let multi_step_processor_for_setup = if cfg!(test) {
-            None
-        } else {
-            let tool_resolver: Arc<dyn crate::inference::engine::processor::DaemonToolResolver> =
-                Arc::new(crate::inference::engine::processor::DbToolResolver {
-                    pool: (*db_pools).write().clone(),
-                });
-            // Derive dispatch TTL from the batch daemon's processing timeout so
-            // the signed URL is always valid for at least one full dispatch
-            // attempt — never the cause of a batch failure on its own.
-            let processing_timeout = std::time::Duration::from_millis(config.background_services.batch_daemon.processing_timeout_ms);
-            let dispatch_ttl = config.image_normalizer.signing.dispatch_ttl(processing_timeout);
-            let mut processor_builder = crate::inference::engine::processor::DwctlRequestProcessor::new(
-                response_store.clone(),
-                multi_step_tool_executor.clone(),
-                multi_step_http_client.clone(),
-                multi_step_loop_config,
-            )
-            .with_tool_resolver(tool_resolver);
-            if config.image_normalizer.enabled {
-                // Re-use the AppState-bound singleton built above; no second
-                // GCS client / ADC signer init.
-                processor_builder = processor_builder.with_image_normalizer(image_normalizer.clone(), dispatch_ttl);
-            }
-            processor_builder = processor_builder.with_keystore(keystore.clone());
-            let processor = Arc::new(processor_builder);
-            Some(
-                processor
-                    as Arc<
-                        dyn fusillade::RequestProcessor<fusillade_arsenal::PostgresRequestManager<DbPools>, fusillade::ReqwestHttpClient>
-                            + Send
-                            + Sync,
-                    >,
-            )
-        };
-
         let mut bg_services = setup_background_services(BackgroundServicesInput {
             request_manager: request_manager.clone(),
             postgres_daemon: postgres_daemon.clone(),
             step_manager: step_manager.clone(),
-            multi_step_processor: multi_step_processor_for_setup,
             model_capacity_limits,
             pool: (*db_pools).clone(),
             fusillade_pools: fusillade_pools.clone(),
@@ -3198,18 +3077,6 @@ impl Application {
         // in its response object regardless of streaming, so no transform is needed there.
         // Embeddings don't support streaming.
         let body_transform: onwards::BodyTransformFn = Arc::new(request_logging::stream_usage::stream_usage_transform);
-
-        // Create the HTTP tool executor used by the single-step
-        // (non-multi-step) realtime tool-injection path. Re-uses the
-        // same reqwest::Client and dwctl pool clones the multi-step
-        // executor (built earlier, before `setup_background_services`)
-        // does — cloning a reqwest::Client shares its connection pool /
-        // TLS root cert cache, and the PgPool clone shares the
-        // underlying connection pool. Building separate
-        // clients/pools would double TLS init cost per test and add
-        // unnecessary parallelism pressure.
-        let tool_executor =
-            crate::inference::tools::HttpToolExecutor::new(multi_step_reqwest_client.clone(), Some(multi_step_tool_executor_pool.clone()));
 
         // Register onwards as a fusillade daemon so realtime requests get a valid daemon_id.
         let onwards_daemon_id = uuid::Uuid::new_v4();
@@ -3308,9 +3175,6 @@ impl Application {
             },
             dwctl_pool: (*db_pools).write().clone(),
             response_store: response_store.clone(),
-            multi_step_tool_executor,
-            multi_step_http_client,
-            loop_config: multi_step_loop_config,
             image_normalizer: image_normalizer.clone(),
             image_normalizer_enabled: config.image_normalizer.enabled,
             unverified_requests_per_completion_hour: config.batches.unverified_requests_per_completion_hour,
@@ -3319,7 +3183,7 @@ impl Application {
             zdr_key_cache: bg_services.zdr_key_cache.clone(),
         };
 
-        // Build onwards router from targets with body transform, response sanitization, and tool executor.
+        // Build onwards router from targets with body transform + response sanitization.
         // Realtime request bodies share the same configurable cap as batch
         // file requests (limits.requests.max_body_size, 0 = unlimited);
         // without an explicit limit onwards' strict mode would fall back to
@@ -3335,8 +3199,6 @@ impl Application {
             .with_response_transform(onwards::create_openai_sanitizer())
             .with_streaming_header("x-fusillade-stream")
             .with_response_id_header("x-fusillade-request-id")
-            .with_tool_executor(Arc::new(tool_executor))
-            .with_response_store(response_store.clone() as Arc<dyn onwards::ResponseStore>)
             .with_body_limit(onwards_body_limit);
 
         let onwards_router = if bg_services.onwards_targets.strict_mode {
