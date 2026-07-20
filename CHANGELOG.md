@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.93.1](https://github.com/doublewordai/control-layer/compare/v8.93.0...v8.93.1) (2026-07-20)
+
+
+### Bug Fixes
+
+* bump fusillade to 22.1.2 (archive migration checksum restore) ([#1315](https://github.com/doublewordai/control-layer/issues/1315)) ([3aa7d7e](https://github.com/doublewordai/control-layer/commit/3aa7d7ec88acc68006f2d99b8c997cf62ddcbdf4))
+
 ## [8.93.0](https://github.com/doublewordai/control-layer/compare/v8.92.0...v8.93.0) (2026-07-20)
 
 
