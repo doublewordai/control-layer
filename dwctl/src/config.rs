@@ -2787,6 +2787,18 @@ impl Config {
             });
         }
 
+        if self.background_services.batch_daemon.upload_chunk_bytes == 0 {
+            return Err(Error::Internal {
+                operation: "Config validation: upload_chunk_bytes cannot be 0. Set a positive integer value (default: 65536).".to_string(),
+            });
+        }
+
+        if self.background_services.batch_daemon.upload_stall_poll_ms == 0 {
+            return Err(Error::Internal {
+                operation: "Config validation: upload_stall_poll_ms cannot be 0. Set a positive integer value (default: 100).".to_string(),
+            });
+        }
+
         // Validate batch file configuration whenever the request manager could be used.
         // The PostgresRequestManager is always constructed and uses these values for its batch
         // insert strategy and buffer sizes. These settings are required when:
@@ -4102,6 +4114,22 @@ background_services:
 
             Ok(())
         });
+    }
+
+    #[test]
+    fn test_upload_watchdog_zero_values_rejected() {
+        let mut config = Config::default();
+        config.auth.native.enabled = true;
+        config.secret_key = Some("test-secret-key".to_string());
+
+        config.background_services.batch_daemon.upload_chunk_bytes = 0;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("upload_chunk_bytes cannot be 0"), "{err}");
+
+        config.background_services.batch_daemon.upload_chunk_bytes = 64 * 1024;
+        config.background_services.batch_daemon.upload_stall_poll_ms = 0;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("upload_stall_poll_ms cannot be 0"), "{err}");
     }
 
     #[test]
