@@ -157,6 +157,38 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
         }
     }
 
+    // `previous_response_id` hydration (Responses control plane). Inline the prior
+    // turn's output items ahead of the current input, in the Responses domain,
+    // BEFORE the edge translation (one layer inside this one) converts the request
+    // to Chat Completions. Runs here rather than in the translator so the pure
+    // translator stays stateless. Gated on the field's presence so the common path
+    // pays nothing. The hydrated body flows to every downstream path because it is
+    // re-serialised from `request_value` below.
+    if is_responses_api && request_value.get("previous_response_id").is_some() {
+        use crate::inference::translation::responses::hydrate::{HydrationError, hydrate_previous_response};
+        if let Err(e) = hydrate_previous_response(&*state.response_store, &mut request_value).await {
+            let (status, message) = match e {
+                HydrationError::NotFound(id) => (StatusCode::BAD_REQUEST, format!("previous response not found: {id}")),
+                HydrationError::Internal(msg) => {
+                    tracing::error!(error = %msg, "responses hydration failed");
+                    (StatusCode::INTERNAL_SERVER_ERROR, "failed to load previous response".to_string())
+                }
+            };
+            let err_type = if status == StatusCode::BAD_REQUEST {
+                "invalid_request_error"
+            } else {
+                "server_error"
+            };
+            return Response::builder()
+                .status(status)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"error": {"message": message, "type": err_type}}).to_string(),
+                ))
+                .unwrap();
+        }
+    }
+
     // Parse `service_tier` and `background` from the body.
     //
     // Both `/v1/responses` and `/v1/chat/completions` support
@@ -526,6 +558,16 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                 .map(|key| key.key_owner_id.to_string())
                 .or_else(|| created_by.clone())
                 .unwrap_or_default();
+            // INVARIANT: the daemon dispatches this job back through the loopback
+            // (`endpoint` = `.../ai`), so it re-enters the FULL dwctl stack,
+            // including the edge translation layer. That is load-bearing for
+            // Responses: this middleware runs OUTER to translation, so `flex_body`
+            // and `path` are still the RAW `/responses` request here (untranslated).
+            // Translation converts it on the daemon's loopback in both directions
+            // (request -> chat for the model call, chat -> Responses for the stored
+            // result), which is what lets `GET /v1/responses/{id}` return a
+            // Responses object. Do not "optimise" the loopback to hit onwards
+            // directly - that would bypass translation and break Responses flex.
             let flex_input = fusillade::CreateFlexInput {
                 request_id,
                 body: flex_body,
@@ -1055,9 +1097,18 @@ async fn handle_responses_flex_streaming<P: PoolProvider + Clone + Send + Sync +
 }
 
 /// Check if a request should be intercepted by this middleware.
+///
+/// `/messages` is included because this middleware now runs OUTER to the edge
+/// translation (so it sees the raw foreign path). Anthropic `/messages` still
+/// needs a tracking row and realtime/flex routing, exactly like `/chat/completions`
+/// it would otherwise be translated into; translation happens on the layer just
+/// inside this one.
 pub(crate) fn should_intercept(method: &axum::http::Method, path: &str) -> bool {
     method == axum::http::Method::POST
-        && (path.ends_with("/responses") || path.ends_with("/chat/completions") || path.ends_with("/embeddings"))
+        && (path.ends_with("/responses")
+            || path.ends_with("/chat/completions")
+            || path.ends_with("/messages")
+            || path.ends_with("/embeddings"))
 }
 
 /// Attempt to dispatch a `/v1/responses` request through the warm-path

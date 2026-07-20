@@ -22,7 +22,11 @@ use super::util::{chat_usage_to_response_usage, merge_reasoning_text};
 /// Convert a Chat Completions response to a Responses response, echoing request
 /// parameters as the Open Responses spec requires. `request` is the original
 /// inbound Responses request (the response carries many request-only fields).
-pub fn to_responses_response(chat_response: &ChatCompletionResponse, request: &ResponsesRequest) -> ResponsesResponse {
+pub fn to_responses_response(
+    chat_response: &ChatCompletionResponse,
+    request: &ResponsesRequest,
+    response_id: Option<&str>,
+) -> ResponsesResponse {
     let output = chat_response
         .choices
         .iter()
@@ -44,7 +48,9 @@ pub fn to_responses_response(chat_response: &ChatCompletionResponse, request: &R
         .unwrap_or(serde_json::Value::String("auto".to_string()));
 
     ResponsesResponse {
-        id: format!("resp_{}", &chat_response.id),
+        // The platform tracking id (so `GET /v1/responses/{id}` matches the stored
+        // row); when absent (unit tests / native paths) fall back to the upstream id.
+        id: format!("resp_{}", response_id.unwrap_or(&chat_response.id)),
         object: "response".to_string(),
         created_at: chat_response.created,
         completed_at,
@@ -313,7 +319,7 @@ mod tests {
             completion_tokens_details: Some(serde_json::json!({ "reasoning_tokens": 30 })),
         });
 
-        let response = to_responses_response(&chat, &minimal_request());
+        let response = to_responses_response(&chat, &minimal_request(), None);
 
         assert_eq!(response.object, "response");
         assert_eq!(response.model, "gpt-4o");

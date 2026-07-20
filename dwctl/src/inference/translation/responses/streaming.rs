@@ -102,12 +102,18 @@ fn generate_response_id() -> String {
 }
 
 impl StreamingState {
-    /// Create a new streaming state for a response
-    pub fn new(request: &ResponsesRequest) -> Self {
+    /// Create a new streaming state for a response. `response_id` is the platform
+    /// tracking id (from the inference middleware); when present the stream's
+    /// `response.created` id is `resp_<response_id>` so it matches the stored row
+    /// and a later `GET /v1/responses/{id}` resolves. `None` self-generates.
+    pub fn new(request: &ResponsesRequest, response_id: Option<&str>) -> Self {
         let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
 
         Self {
-            response_id: generate_response_id(),
+            response_id: match response_id {
+                Some(id) => format!("resp_{id}"),
+                None => generate_response_id(),
+            },
             model: request.model.clone(),
             created_at: timestamp,
             items: Vec::new(),
@@ -951,7 +957,7 @@ mod tests {
 
     #[test]
     fn test_streaming_state_initial_events() {
-        let mut state = StreamingState::new(&test_request("gpt-4"));
+        let mut state = StreamingState::new(&test_request("gpt-4"), None);
 
         // Role-only delta should only emit response.created (message item
         // is deferred until content arrives to avoid empty items)
@@ -968,7 +974,7 @@ mod tests {
 
     #[test]
     fn test_streaming_state_content_events() {
-        let mut state = StreamingState::new(&test_request("gpt-4"));
+        let mut state = StreamingState::new(&test_request("gpt-4"), None);
 
         // First chunk with role only — deferred, no message item yet
         let chunk1 = create_test_chunk("chunk_1", None, Some("assistant"), None);
@@ -986,7 +992,7 @@ mod tests {
 
     #[test]
     fn test_streaming_state_completion_events() {
-        let mut state = StreamingState::new(&test_request("gpt-4"));
+        let mut state = StreamingState::new(&test_request("gpt-4"), None);
 
         // First chunk
         let chunk1 = create_test_chunk("chunk_1", Some("Hi"), Some("assistant"), None);
@@ -1005,7 +1011,7 @@ mod tests {
     fn test_streaming_state_preserves_usage_token_details() {
         use onwards::strict::schemas::chat_completions::Usage;
 
-        let mut state = StreamingState::new(&test_request("gpt-4"));
+        let mut state = StreamingState::new(&test_request("gpt-4"), None);
 
         // Content delta (no usage yet).
         let chunk1 = create_test_chunk("chunk_1", Some("Hi"), Some("assistant"), None);
@@ -1039,7 +1045,7 @@ mod tests {
 
     #[test]
     fn test_streaming_state_finalize() {
-        let mut state = StreamingState::new(&test_request("gpt-4"));
+        let mut state = StreamingState::new(&test_request("gpt-4"), None);
 
         let chunk = create_test_chunk("chunk_1", Some("Hello"), Some("assistant"), Some("stop"));
         state.process_chunk(&chunk);
@@ -1088,7 +1094,7 @@ mod tests {
 
     #[test]
     fn test_sequence_numbers_increase() {
-        let mut state = StreamingState::new(&test_request("gpt-4"));
+        let mut state = StreamingState::new(&test_request("gpt-4"), None);
 
         let chunk1 = create_test_chunk("chunk_1", Some("Hello"), Some("assistant"), None);
         let events1 = state.process_chunk(&chunk1);
@@ -1156,7 +1162,7 @@ mod tests {
 
     #[test]
     fn test_extract_tool_calls() {
-        let mut state = StreamingState::new(&test_request("gpt-4"));
+        let mut state = StreamingState::new(&test_request("gpt-4"), None);
 
         // Stream a tool call: role, then tool call start, then arguments, then finish
         state.process_chunk(&create_tool_call_chunk("c1", Some("assistant"), None, None, None, None));
@@ -1180,7 +1186,7 @@ mod tests {
 
     #[test]
     fn test_extract_tool_calls_empty_when_no_tools() {
-        let mut state = StreamingState::new(&test_request("gpt-4"));
+        let mut state = StreamingState::new(&test_request("gpt-4"), None);
 
         // Plain text stream with no tool calls
         state.process_chunk(&create_test_chunk("c1", Some("Hi"), Some("assistant"), None));
@@ -1192,7 +1198,7 @@ mod tests {
 
     #[test]
     fn test_prepare_next_iteration() {
-        let mut state = StreamingState::new(&test_request("gpt-4"));
+        let mut state = StreamingState::new(&test_request("gpt-4"), None);
 
         // First iteration: one item
         state.process_chunk(&create_test_chunk("c1", Some("Hi"), Some("assistant"), Some("stop")));
@@ -1210,7 +1216,7 @@ mod tests {
 
     #[test]
     fn test_multi_iteration_item_ids_are_unique() {
-        let mut state = StreamingState::new(&test_request("gpt-4"));
+        let mut state = StreamingState::new(&test_request("gpt-4"), None);
 
         // First iteration
         state.process_chunk(&create_test_chunk("c1", Some("call result"), Some("assistant"), Some("tool_calls")));
@@ -1237,7 +1243,7 @@ mod tests {
 
     #[test]
     fn test_multi_iteration_output_indices() {
-        let mut state = StreamingState::new(&test_request("gpt-4"));
+        let mut state = StreamingState::new(&test_request("gpt-4"), None);
 
         // First iteration
         let events1 = state.process_chunk(&create_test_chunk("c1", Some("Hi"), Some("assistant"), None));
@@ -1266,7 +1272,7 @@ mod tests {
 
     #[test]
     fn test_multi_iteration_final_response_includes_all_items() {
-        let mut state = StreamingState::new(&test_request("gpt-4"));
+        let mut state = StreamingState::new(&test_request("gpt-4"), None);
 
         // First iteration
         state.process_chunk(&create_test_chunk("c1", Some("thinking..."), Some("assistant"), Some("tool_calls")));
@@ -1324,7 +1330,7 @@ mod tests {
 
     #[test]
     fn test_reasoning_only_stream_produces_reasoning_item() {
-        let mut state = StreamingState::new(&test_request("deepseek-r1"));
+        let mut state = StreamingState::new(&test_request("deepseek-r1"), None);
 
         // Stream reasoning deltas
         let events1 = state.process_chunk(&create_reasoning_chunk(
@@ -1368,7 +1374,7 @@ mod tests {
 
     #[test]
     fn test_reasoning_plus_content_stream() {
-        let mut state = StreamingState::new(&test_request("deepseek-r1"));
+        let mut state = StreamingState::new(&test_request("deepseek-r1"), None);
 
         // Reasoning phase (using reasoning_content field for vLLM)
         state.process_chunk(&create_reasoning_chunk(
@@ -1400,7 +1406,7 @@ mod tests {
 
     #[test]
     fn test_reasoning_stream_event_sequence() {
-        let mut state = StreamingState::new(&test_request("deepseek-r1"));
+        let mut state = StreamingState::new(&test_request("deepseek-r1"), None);
 
         // First reasoning chunk
         let events = state.process_chunk(&create_reasoning_chunk("c1", Some("step 1"), None, None, Some("assistant"), None));

@@ -1578,11 +1578,19 @@ pub async fn build_router(
     // wrapper: on a request it runs first; on the response it runs last. The stack below,
     // outermost → innermost (i.e. reverse of the code order), is:
     //
-    //   translation  →  responses_mw  →  outlet (logging/billing)
+    //   inference_mw  →  outlet (logging/billing)  →  translation
     //                →  cache  →  error_enrichment  →  image_normalizer
     //                →  tool_injection  →  models_route  →  onwards
     //
     // Why this order:
+    //   • inference_mw outermost: it must see the RAW foreign request (e.g. `/responses`
+    //     with `background`/`service_tier`) to route the Responses control plane, mint the
+    //     tracking id, and hydrate `previous_response_id` before translation flattens the
+    //     request to Chat Completions.
+    //   • translation inner to outlet: on the response path (inner runs first) it reframes
+    //     chat → Responses BEFORE outlet captures it, so the persisted row — which
+    //     `GET /v1/responses/{id}` reads — is a Responses object. Everything inner to
+    //     translation only ever sees Chat Completions.
     //   • outlet outermost (of the body editors): it logs the request **as the customer
     //     sent it** (cache_control markers intact, original image URLs, pre tool-injection)
     //     and captures the response **after** cache injection, so billing sees cache_* usage.
@@ -1683,32 +1691,22 @@ pub async fn build_router(
         }
     };
 
-    // Apply request logging layer only to onwards router
-    let onwards_router = if let Some(outlet_layer) = outlet_layer.clone() {
-        onwards_router.layer(outlet_layer)
-    } else {
-        onwards_router
-    };
-
-    // Apply inference middleware to create pending fusillade rows for inference requests.
-    // This runs BEFORE outlet (outer layer executes first), so the X-Onwards-Response-Id
-    // header is set before outlet captures the request and passes it to FusilladeOutletHandler.
-    let onwards_router = if let Some(rms) = inference_middleware_state {
-        onwards_router.layer(middleware::from_fn_with_state(
-            rms,
-            crate::inference::middleware::inference_middleware,
-        ))
-    } else {
-        onwards_router
-    };
-
-    // Apply the generic edge protocol-translation middleware as the OUTERMOST
-    // layer on the onwards router. On the request path it runs first, so any
-    // foreign-protocol request (today: Anthropic `/v1/messages` and `/v1/models`)
-    // is translated before model discovery, image_normalizer, tool_injection,
-    // and onwards see it. On the response path it runs last, so only the final
-    // client bytes are reframed back into the foreign protocol. Native OpenAI
-    // requests match no translator and pass through untouched.
+    // Apply the edge protocol-translation middleware. Placement is deliberate: it
+    // sits INNER to the outlet and the inference middleware, but OUTER to cache /
+    // image-normalisation / tool-injection / onwards.
+    //
+    // Why here rather than outermost:
+    //   - inference_mw (outer) must see the RAW foreign request. The Responses API
+    //     carries control-plane fields (`background`, `service_tier`) and a stored-
+    //     object lifecycle that inference_mw routes on `/responses`; translating
+    //     first would rewrite `/responses` -> `/chat/completions` and hide them.
+    //   - outlet (outer) must capture the TRANSLATED response, because the row it
+    //     writes is what `GET /v1/responses/{id}` reads back. On the response path
+    //     inner layers run first, so translation reframes chat -> Responses before
+    //     outlet persists it (matching the old onwards-side placement).
+    //   - cache / image_normalizer / tool_injection / onwards (inner) still only
+    //     ever see Chat Completions.
+    // Native OpenAI requests match no translator and pass through untouched.
     let onwards_router = {
         // Bound the body the translation middleware buffers by the same cap as the
         // rest of the inference path (limits.requests.max_body_size, 0 = unlimited).
@@ -1724,17 +1722,13 @@ pub async fn build_router(
             )),
             std::sync::Arc::new(crate::inference::translation::anthropic::models::AnthropicModels),
         ];
-        // Edge Responses translation. The OpenResponses translator owns
-        // Responses->Chat translation, previous_response_id hydration, and
-        // response persistence at the edge; it rewrites `/responses` to
-        // `/chat/completions`, and onwards' strict `/responses` route is an
-        // unconditional alias to its chat-completions handler. Only meaningful
-        // under strict mode, where that route exists.
+        // Edge Responses translation. The OpenResponses translator is a pure
+        // Responses<->Chat converter; the Responses control plane (id minting,
+        // previous_response_id hydration, background routing) lives in the outer
+        // inference middleware, and persistence lives in the outlet just above.
+        // onwards' strict `/responses` route is an alias to its chat handler.
         if strict_mode {
-            let response_store = state.response_store.clone() as std::sync::Arc<dyn onwards::traits::ResponseStore>;
-            translators.push(std::sync::Arc::new(crate::inference::translation::responses::OpenResponses::new(
-                response_store,
-            )));
+            translators.push(std::sync::Arc::new(crate::inference::translation::responses::OpenResponses::new()));
         }
         let translation_registry =
             crate::inference::translation::TranslationRegistry::new(translators).with_max_body_size(translation_body_limit);
@@ -1742,6 +1736,30 @@ pub async fn build_router(
             translation_registry,
             crate::inference::translation::middleware::translation_middleware,
         ))
+    };
+
+    // Apply request logging (outlet). OUTER to translation, so on the response path
+    // it captures the translated Responses object (the row `GET /v1/responses/{id}`
+    // reads); INNER to inference_mw, so the correlation headers it relies on
+    // (`x-onwards-response-id` / `x-fusillade-request-id`) are already set.
+    let onwards_router = if let Some(outlet_layer) = outlet_layer.clone() {
+        onwards_router.layer(outlet_layer)
+    } else {
+        onwards_router
+    };
+
+    // Apply the inference middleware as the OUTERMOST layer. It sees the raw
+    // foreign request (before translation), so it can read Responses-only fields
+    // (`background`, `service_tier`), mint the response/tracking id, run
+    // previous_response_id hydration, and set the correlation headers before
+    // anything downstream runs.
+    let onwards_router = if let Some(rms) = inference_middleware_state {
+        onwards_router.layer(middleware::from_fn_with_state(
+            rms,
+            crate::inference::middleware::inference_middleware,
+        ))
+    } else {
+        onwards_router
     };
 
     // Build the app with admin API and onwards proxy nested. serve the (restricted) openai spec.

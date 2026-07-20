@@ -279,6 +279,68 @@ async fn test_blocking_response_id_matches_fusillade_id(pool: PgPool) {
     assert!(found, "Response should be retrievable by the client-facing ID");
 }
 
+/// POST `/ai/v1/responses` (realtime) then GET it back by the client-facing id.
+///
+/// Exercises the whole edge path with the translation layer sitting inner to the
+/// outlet: the request is translated to Chat Completions, the upstream
+/// completion is translated back into a Responses object stamped with the
+/// tracking id, the outlet persists that Responses object, and the client's own
+/// id resolves via GET. This is the POST-then-GET coverage the id/placement fix
+/// turns on - at the broken placement the client received `resp_<upstream chat
+/// id>` while the row was keyed by `resp_<uuid>`, so this GET 404'd.
+#[sqlx::test]
+#[test_log::test]
+async fn test_responses_post_then_get_by_client_id(pool: PgPool) {
+    let mock_server = wiremock::MockServer::start().await;
+    mount_chat_completions_mock(&mock_server).await;
+
+    let (server, api_key, _bg) = setup_ai_test(pool.clone(), &mock_server, true).await;
+
+    let response = server
+        .post("/ai/v1/responses")
+        .add_header("Authorization", &format!("Bearer {}", api_key))
+        .add_header("Content-Type", "application/json")
+        .json(&serde_json::json!({
+            "model": "gpt-4o",
+            "input": "Hello"
+        }))
+        .await;
+
+    assert_eq!(response.status_code(), 200, "POST /responses should succeed");
+    let body: serde_json::Value = response.json();
+    // The client got a Responses object, not a chat completion.
+    assert_eq!(
+        body["object"].as_str(),
+        Some("response"),
+        "expected a Responses object, got: {body}"
+    );
+    assert_eq!(body["status"].as_str(), Some("completed"));
+    assert_eq!(body["output"][0]["content"][0]["text"].as_str(), Some("Hello from the test!"));
+    let client_id = body["id"].as_str().unwrap().to_string();
+    assert!(client_id.starts_with("resp_"), "id should be a resp_ tracking id, got: {client_id}");
+
+    // The client's OWN id must resolve (poll until the outlet writes the row).
+    let start = std::time::Instant::now();
+    let mut found = false;
+    while start.elapsed() < std::time::Duration::from_secs(5) {
+        let retrieve = server
+            .get(&format!("/ai/v1/responses/{}", client_id))
+            .add_header("Authorization", &format!("Bearer {}", api_key))
+            .await;
+        if retrieve.status_code() == 200 {
+            let r: serde_json::Value = retrieve.json();
+            if r["status"].as_str() == Some("completed") {
+                assert_eq!(r["object"].as_str(), Some("response"), "GET must return a Responses object");
+                assert_eq!(r["id"].as_str(), Some(client_id.as_str()), "GET id must equal the client-facing id");
+                found = true;
+                break;
+            }
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    }
+    assert!(found, "the client-facing /responses id must resolve via GET");
+}
+
 /// A multi-step `/v1/responses` chain — head model_call, server-side
 /// tool_call, summarizing model_call — assembles into the OpenAI
 /// Response shape and retrieves cleanly via GET /v1/responses/{id}.

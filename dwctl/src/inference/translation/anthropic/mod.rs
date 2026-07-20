@@ -63,7 +63,7 @@ impl ProtocolTranslator for AnthropicMessages {
         })
     }
 
-    fn translate_response(&self, _request: &Bytes, body: Bytes) -> Result<Bytes, TranslationError> {
+    fn translate_response(&self, _request: &Bytes, _response_id: Option<&str>, body: Bytes) -> Result<Bytes, TranslationError> {
         response::from_chat_completions(body)
     }
 
@@ -75,7 +75,7 @@ impl ProtocolTranslator for AnthropicMessages {
         response::anthropic_error(status, message.to_string())
     }
 
-    fn stream_reframer(&self, _request: &Bytes) -> Box<dyn StreamReframer> {
+    fn stream_reframer(&self, _request: &Bytes, _response_id: Option<&str>) -> Box<dyn StreamReframer> {
         Box::new(AnthropicStreamReframer::new())
     }
 }

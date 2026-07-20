@@ -2,11 +2,14 @@
 //!
 //! Mirrors the [`super::anthropic`] module: it converts a Responses request into
 //! canonical Chat Completions, hands off to the unchanged proxy path, and
-//! converts the response back into a Responses object. The stateless converters
-//! are ported from onwards' `OpenResponsesAdapter`; the stateful pieces
-//! (`previous_response_id` hydration, response persistence) run in the async
-//! `pre_request` / `post_response` bracket, not in the pure converters.
+//! converts the response back into a Responses object. It is a PURE, stateless
+//! converter - the ported version of onwards' `OpenResponsesAdapter` transforms.
+//! The Responses control plane lives outside it: `previous_response_id` hydration
+//! and id minting run in the inference middleware (outer), and persistence in the
+//! outlet. The translator only stamps the tracking id (passed in by the
+//! middleware) onto the response so `GET /v1/responses/{id}` resolves.
 
+pub mod hydrate;
 pub mod request;
 pub mod response;
 pub mod streaming;
@@ -17,34 +20,27 @@ use axum::http::{HeaderMap, StatusCode, Uri, header, request::Parts};
 use bytes::Bytes;
 use serde_json::Value;
 
-use std::sync::Arc;
-
-use async_trait::async_trait;
 use onwards::strict::schemas::chat_completions::{ChatCompletionChunk, ChatCompletionResponse};
-use onwards::traits::ResponseStore;
 
-use self::types::{Input, Item, MessageContent as ResponseMessageContent, MessageItem, ResponsesRequest, ResponsesResponse};
+use self::types::ResponsesRequest;
 
 use super::{ProtocolTranslator, StreamReframer, TranslatedRequest, TranslationError};
 
-/// Translator for the OpenAI Responses API.
-///
-/// The pure request/response transforms live in [`request`] and [`response`]. The
-/// stateful pieces run in the async bracket: `pre_request` hydrates
-/// `previous_response_id` (reading the prior turn from the store and inlining its
-/// items ahead of the current input), and `post_response` persists the produced
-/// object. Both are ported from onwards' `OpenResponsesAdapter`.
-pub struct OpenResponses {
-    store: Arc<dyn ResponseStore>,
-}
+/// Translator for the OpenAI Responses API. Pure and stateless; see module docs.
+pub struct OpenResponses;
 
 impl OpenResponses {
-    pub fn new(store: Arc<dyn ResponseStore>) -> Self {
-        Self { store }
+    pub fn new() -> Self {
+        Self
     }
 }
 
-#[async_trait]
+impl Default for OpenResponses {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ProtocolTranslator for OpenResponses {
     fn name(&self) -> &'static str {
         "openai_responses"
@@ -78,7 +74,7 @@ impl ProtocolTranslator for OpenResponses {
         })
     }
 
-    fn translate_response(&self, request: &Bytes, body: Bytes) -> Result<Bytes, TranslationError> {
+    fn translate_response(&self, request: &Bytes, response_id: Option<&str>, body: Bytes) -> Result<Bytes, TranslationError> {
         // Re-parse the original inbound request: the Responses object echoes many
         // request-only fields (model, tools, instructions, previous_response_id).
         let req: ResponsesRequest =
@@ -86,7 +82,9 @@ impl ProtocolTranslator for OpenResponses {
         let chat: ChatCompletionResponse = serde_json::from_slice(&body)
             .map_err(|e| TranslationError::Internal(format!("upstream response was not Chat Completions: {e}")))?;
 
-        let out = response::to_responses_response(&chat, &req);
+        // Stamp the platform tracking id so `GET /v1/responses/{id}` resolves; fall
+        // back to the upstream completion id when there's no tracking row.
+        let out = response::to_responses_response(&chat, &req, response_id);
         serde_json::to_vec(&out)
             .map(Bytes::from)
             .map_err(|e| TranslationError::Internal(e.to_string()))
@@ -102,62 +100,8 @@ impl ProtocolTranslator for OpenResponses {
         (status, openai_error(status, message))
     }
 
-    fn stream_reframer(&self, request: &Bytes) -> Box<dyn StreamReframer> {
-        Box::new(ResponsesStreamReframer::new(request))
-    }
-
-    async fn pre_request(&self, _parts: &Parts, body: Bytes) -> Result<Bytes, TranslationError> {
-        let mut req: ResponsesRequest =
-            serde_json::from_slice(&body).map_err(|e| TranslationError::BadRequest(format!("invalid OpenAI Responses request: {e}")))?;
-
-        // No prior turn to fold in - pass the request through untouched.
-        let Some(prev_id) = req.previous_response_id.clone() else {
-            return Ok(body);
-        };
-
-        // Read the prior response and inline its output items ahead of the current
-        // input, producing a self-contained request (a Responses-domain concat).
-        // The pure translator then converts it as if there were no prior turns.
-        // Ported from `OpenResponsesAdapter::to_chat_request`'s prev-response block.
-        let context = self
-            .store
-            .get_context(&prev_id)
-            .await
-            .map_err(|e| TranslationError::Internal(format!("reading previous response {prev_id}: {e}")))?
-            .ok_or_else(|| TranslationError::BadRequest(format!("previous response not found: {prev_id}")))?;
-
-        let prior: ResponsesResponse =
-            serde_json::from_value(context).map_err(|e| TranslationError::Internal(format!("deserialising previous response: {e}")))?;
-
-        let current_items = match std::mem::replace(&mut req.input, Input::Items(Vec::new())) {
-            Input::Text(text) => vec![Item::Message(MessageItem {
-                id: None,
-                role: "user".to_string(),
-                content: ResponseMessageContent::Text(text),
-                status: None,
-            })],
-            Input::Items(items) => items,
-        };
-
-        let mut items = prior.output;
-        items.extend(current_items);
-        req.input = Input::Items(items);
-
-        let new_body = serde_json::to_vec(&req).map_err(|e| TranslationError::Internal(e.to_string()))?;
-        Ok(Bytes::from(new_body))
-    }
-
-    async fn post_response(&self, body: Bytes) -> Result<Bytes, TranslationError> {
-        // Persist the produced Responses object so `GET /v1/responses/{id}` and a
-        // later turn's `previous_response_id` can resolve it. The object already
-        // carries its own id. Ported from `OpenResponsesAdapter::store_response`.
-        let value: Value =
-            serde_json::from_slice(&body).map_err(|e| TranslationError::Internal(format!("re-parsing produced Responses object: {e}")))?;
-        self.store
-            .store(&value)
-            .await
-            .map_err(|e| TranslationError::Internal(format!("persisting response: {e}")))?;
-        Ok(body)
+    fn stream_reframer(&self, request: &Bytes, response_id: Option<&str>) -> Box<dyn StreamReframer> {
+        Box::new(ResponsesStreamReframer::new(request, response_id))
     }
 }
 
@@ -208,10 +152,10 @@ struct ResponsesStreamReframer {
 }
 
 impl ResponsesStreamReframer {
-    fn new(request: &Bytes) -> Self {
+    fn new(request: &Bytes, response_id: Option<&str>) -> Self {
         let state = serde_json::from_slice::<ResponsesRequest>(request)
             .ok()
-            .map(|req| streaming::StreamingState::new(&req));
+            .map(|req| streaming::StreamingState::new(&req, response_id));
         Self { state, errored: false }
     }
 
@@ -264,12 +208,11 @@ mod tests {
     use axum::body::Body;
     use axum::response::Response;
     use axum::{Router, extract::Request, routing::post};
-    use onwards::traits::NoOpResponseStore;
     use std::sync::Arc;
 
     #[test]
     fn detect_claims_responses_ignoring_headers() {
-        let t = OpenResponses::new(Arc::new(NoOpResponseStore));
+        let t = OpenResponses::new();
         assert!(t.detect("/v1/responses", &HeaderMap::new()));
         assert!(t.detect("/ai/v1/responses", &HeaderMap::new()));
         // Native chat completions and messages are not ours.
@@ -283,9 +226,7 @@ mod tests {
         let (parts, ()) = req.into_parts();
         let body = Bytes::from(serde_json::to_vec(&serde_json::json!({ "model": "gpt-4o", "input": "hi" })).unwrap());
 
-        let out = OpenResponses::new(Arc::new(NoOpResponseStore))
-            .translate_request(&parts, body)
-            .unwrap();
+        let out = OpenResponses::new().translate_request(&parts, body).unwrap();
 
         assert_eq!(out.uri.path(), "/ai/v1/chat/completions");
         let chat: serde_json::Value = serde_json::from_slice(&out.body).unwrap();
@@ -325,7 +266,7 @@ mod tests {
     /// Responses object.
     #[tokio::test]
     async fn responses_round_trips_via_alias_route() {
-        let registry = TranslationRegistry::new(vec![Arc::new(OpenResponses::new(Arc::new(NoOpResponseStore)))]);
+        let registry = TranslationRegistry::new(vec![Arc::new(OpenResponses::new())]);
         let inner = Router::new()
             .route("/responses", post(fake_onwards_chat_completions))
             .layer(axum::middleware::from_fn_with_state(registry, translation_middleware));
@@ -369,7 +310,7 @@ mod tests {
             r
         }
 
-        let registry = TranslationRegistry::new(vec![Arc::new(OpenResponses::new(Arc::new(NoOpResponseStore)))]);
+        let registry = TranslationRegistry::new(vec![Arc::new(OpenResponses::new())]);
         let inner = Router::new()
             .route("/responses", post(fake_chat_sse))
             .layer(axum::middleware::from_fn_with_state(registry, translation_middleware));

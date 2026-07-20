@@ -40,7 +40,6 @@ pub mod anthropic;
 pub mod middleware;
 pub mod responses;
 
-use async_trait::async_trait;
 use axum::http::{HeaderMap, StatusCode, Uri, request::Parts};
 use bytes::Bytes;
 use std::sync::Arc;
@@ -77,13 +76,12 @@ pub struct TranslatedRequest {
     pub body: Bytes,
 }
 
-/// A single foreign-protocol translator. The core transform - `translate_request`
-/// and `translate_response` - is pure and synchronous. A translator that needs
-/// async, stateful work (e.g. OpenAI Responses reading a prior turn or persisting
-/// the produced object) overrides the opt-in [`pre_request`](Self::pre_request) /
-/// [`post_response`](Self::post_response) hooks; pure translators (Anthropic)
-/// leave them as the default no-ops and hold no state.
-#[async_trait]
+/// A single foreign-protocol translator. Every translator is pure and stateless:
+/// a synchronous request/response conversion with no I/O and no stored handles.
+/// Stateful work for an API that has a control plane (e.g. OpenAI Responses'
+/// `previous_response_id` hydration, id minting, and persistence) lives OUTSIDE
+/// the translator - in the inference middleware (routing / id / hydration) and
+/// the outlet (persistence) - so the translator stays a pure protocol converter.
 pub trait ProtocolTranslator: Send + Sync {
     /// Stable name for logging/metrics.
     fn name(&self) -> &'static str;
@@ -99,10 +97,13 @@ pub trait ProtocolTranslator: Send + Sync {
     /// into the foreign protocol. `request` is the original inbound foreign
     /// request body, for protocols whose response echoes request fields (e.g.
     /// OpenAI Responses echoes `model` / `tools` / `instructions`); protocols
-    /// that don't need it (Anthropic) ignore it. This is a transitional argument:
-    /// Phase 2's single parse-once pipeline (COR-520) will make the request
-    /// available from shared pipeline state instead of re-passing its bytes.
-    fn translate_response(&self, request: &Bytes, body: Bytes) -> Result<Bytes, TranslationError>;
+    /// that don't need it (Anthropic) ignore it. `response_id` is the platform's
+    /// tracking id for this request (from `x-fusillade-request-id`, set by the
+    /// inference middleware): protocols whose response carries a retrievable id
+    /// that must match the stored record (OpenAI Responses) stamp it, so a later
+    /// `GET /v1/responses/{id}` resolves; `None` when absent (unit tests, or a
+    /// native path with no tracking row) - the translator then self-generates.
+    fn translate_response(&self, request: &Bytes, response_id: Option<&str>, body: Bytes) -> Result<Bytes, TranslationError>;
 
     /// Translate an error response (any non-2xx) into the foreign error shape.
     fn translate_error(&self, status: StatusCode, body: Bytes) -> (StatusCode, Bytes);
@@ -117,25 +118,9 @@ pub trait ProtocolTranslator: Send + Sync {
     /// foreign-protocol SSE bytes it emits. `request` is the original inbound
     /// foreign request body, for protocols whose streamed response echoes request
     /// fields (e.g. OpenAI Responses); protocols that don't need it ignore it.
-    fn stream_reframer(&self, request: &Bytes) -> Box<dyn StreamReframer>;
-
-    /// Opt-in async stage run BEFORE `translate_request`, on the foreign request
-    /// body, returning the (possibly rewritten) foreign body the translator then
-    /// converts. A store-backed translator does its stateful pre-work here - e.g.
-    /// OpenAI Responses inlines a prior turn's items when `previous_response_id`
-    /// is set, producing a self-contained request. Default: no-op.
-    async fn pre_request(&self, _parts: &Parts, body: Bytes) -> Result<Bytes, TranslationError> {
-        Ok(body)
-    }
-
-    /// Opt-in async stage run AFTER `translate_response`, on the foreign
-    /// (blocking) response body, returning the body sent to the client. A
-    /// store-backed translator persists here - e.g. OpenAI Responses stores the
-    /// produced object and surfaces its id. Streaming persistence is the
-    /// reframer's job, not this hook. Default: no-op.
-    async fn post_response(&self, body: Bytes) -> Result<Bytes, TranslationError> {
-        Ok(body)
-    }
+    /// `response_id` is the platform tracking id (see `translate_response`), which
+    /// a streamed foreign response stamps on its opening event's id.
+    fn stream_reframer(&self, request: &Bytes, response_id: Option<&str>) -> Box<dyn StreamReframer>;
 }
 
 /// Stateful transformer that turns an OpenAI Chat Completions SSE stream into a
