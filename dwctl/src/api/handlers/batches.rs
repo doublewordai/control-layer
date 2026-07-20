@@ -1434,13 +1434,11 @@ pub async fn delete_batch<P: PoolProvider>(
     post,
     path = "/batches/{batch_id}/retry",
     tag = "batches",
-    summary = "Retry failed requests",
-    description = "Retry all failed requests in a batch.
-
-Failed requests are reset to pending and will be processed again. Use this after fixing transient issues or increasing rate limits.",
+    summary = "Retry failed and canceled requests",
+    description = "Retry a batch: failed AND canceled requests are reset to pending and will be processed again; completed work is never redone. Retrying a cancelled batch overturns the cancellation (cancel-then-retry acts as pause/resume), so this also succeeds on a just-cancelled batch whose requests had not yet settled. Use it after fixing transient issues, increasing rate limits, or to resume a cancelled batch.",
     responses(
-        (status = 200, description = "Failed requests queued for retry.", body = BatchResponse),
-        (status = 400, description = "No failed requests to retry in this batch."),
+        (status = 200, description = "Requests queued for retry (or a cancellation was overturned and the batch resumed).", body = BatchResponse),
+        (status = 400, description = "Nothing to retry: no failed or canceled requests, and the batch was not cancelled."),
         (status = 404, description = "Batch not found or you don't have access to it."),
         (status = 500, description = "An unexpected error occurred. Retry the request or contact support if the issue persists.")
     ),
@@ -1486,9 +1484,17 @@ pub async fn retry_failed_batch_requests<P: PoolProvider>(
             operation: format!("retry failed requests: {}", e),
         })?;
 
-    if retried_count == 0 {
+    // retried_count == 0 is still SUCCESS when the retry overturned a
+    // cancellation: the fast-resume flow (cancel + near-instant retry)
+    // re-pends nothing — no rows had settled to failed/canceled yet — but
+    // fusillade's batch reset fires on `count > 0 OR cancelling_at IS NOT
+    // NULL`, un-cancelling the batch so its rows become claimable again.
+    // Returning 400 here used to tell resuming users their successful
+    // resume had failed. Only a retry that neither re-pended rows nor
+    // overturned a cancellation is a true no-op.
+    if retried_count == 0 && batch.cancelling_at.is_none() {
         return Err(Error::BadRequest {
-            message: "No failed requests to retry in this batch".to_string(),
+            message: "Nothing to retry: no failed or canceled requests, and the batch is not cancelled".to_string(),
         });
     }
 
@@ -4697,5 +4703,96 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(canceled_count, 5, "all requests should now be canceled");
+    }
+
+    /// Fast-resume regression test: cancel followed by an immediate retry must
+    /// succeed and un-cancel the batch. In this window the cancel has stamped
+    /// `cancelling_at` on the batch but the async cascade job has not yet
+    /// settled any requests to `canceled` (the cascade worker does not run in
+    /// tests — see `test_cancel_batch_cascades_state_to_child_requests`), so
+    /// the retry re-pends zero rows. Before the `cancelling_at` guard, that
+    /// zero count was treated as "nothing to retry" and returned 400 even
+    /// though the retry had overturned the cancellation.
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_retry_immediately_after_cancel_resumes_batch(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let auth = add_auth_headers(&user);
+
+        let (batch_id, request_ids) = insert_batch_with_pending_requests(&pool, user.id, 3).await;
+
+        let resp = app
+            .post(&format!("/ai/v1/batches/{batch_id}/cancel"))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+        resp.assert_status_ok();
+
+        // Confirm the fast-resume premise: batch is cancelling but no request
+        // has settled yet.
+        let cancelling_at: Option<chrono::DateTime<chrono::Utc>> =
+            sqlx::query_scalar("SELECT cancelling_at FROM fusillade.batches WHERE id = $1")
+                .bind(batch_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(cancelling_at.is_some(), "cancel should stamp cancelling_at");
+        let pending_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*)::bigint FROM fusillade.requests WHERE id = ANY($1) AND state = 'pending'")
+                .bind(&request_ids)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(pending_count, 3, "no requests should have settled to canceled yet");
+
+        // Immediate retry: re-pends zero rows but must still overturn the
+        // cancellation and return 200 (was 400 before the guard).
+        let resp = app
+            .post(&format!("/ai/v1/batches/{batch_id}/retry"))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+        resp.assert_status_ok();
+        let batch: serde_json::Value = resp.json();
+        assert_ne!(batch["status"], "cancelling", "resumed batch must not report cancelling");
+        assert_ne!(batch["status"], "cancelled", "resumed batch must not report cancelled");
+
+        let (cancelling_at, cancelled_at): (Option<chrono::DateTime<chrono::Utc>>, Option<chrono::DateTime<chrono::Utc>>) =
+            sqlx::query_as("SELECT cancelling_at, cancelled_at FROM fusillade.batches WHERE id = $1")
+                .bind(batch_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(cancelling_at.is_none(), "retry should clear cancelling_at");
+        assert!(cancelled_at.is_none(), "retry should clear cancelled_at");
+
+        let pending_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*)::bigint FROM fusillade.requests WHERE id = ANY($1) AND state = 'pending'")
+                .bind(&request_ids)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(pending_count, 3, "requests should remain pending and claimable after resume");
+    }
+
+    /// The true no-op retry still fails: nothing failed, nothing canceled,
+    /// and the batch is not being cancelled — the `cancelling_at` guard must
+    /// not turn every zero-count retry into a success.
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_retry_with_nothing_to_retry_returns_400(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let auth = add_auth_headers(&user);
+
+        let (batch_id, _request_ids) = insert_batch_with_pending_requests(&pool, user.id, 3).await;
+
+        let resp = app
+            .post(&format!("/ai/v1/batches/{batch_id}/retry"))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+        resp.assert_status(StatusCode::BAD_REQUEST);
     }
 }
