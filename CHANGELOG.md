@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.93.0](https://github.com/doublewordai/control-layer/compare/v8.92.0...v8.93.0) (2026-07-20)
+
+
+### Features
+
+* fusillade archive knobs ([#1312](https://github.com/doublewordai/control-layer/issues/1312)) ([520a52f](https://github.com/doublewordai/control-layer/commit/520a52f58777733cb66002b17195e3fecdfe5f8f))
+
 ## [8.92.0](https://github.com/doublewordai/control-layer/compare/v8.91.0...v8.92.0) (2026-07-17)
 
 
