@@ -25,22 +25,6 @@ pub(crate) fn ensure_field(object: &mut Map<String, Value>, key: &str, default: 
     }
 }
 
-/// Remove caller-supplied completion/response identifiers captured by
-/// `#[serde(flatten)]` request extras before forwarding upstream.
-pub(crate) fn scrub_request_id_fields_from_extra(extra: &mut Option<Value>) {
-    let Some(Value::Object(object)) = extra.as_mut() else {
-        return;
-    };
-
-    for key in ["id", "completion_id", "completionId", "response_id", "responseId"] {
-        object.remove(key);
-    }
-
-    if object.is_empty() {
-        *extra = None;
-    }
-}
-
 /// Merge the provider-specific reasoning fields into one string, de-duplicating
 /// identical content.
 pub(crate) fn merge_reasoning_text(

@@ -107,6 +107,13 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
         }
     };
 
+    // Strip client-supplied completion/response id fields before the request is
+    // re-serialised and forwarded. dwctl owns the single parse-and-shape now, so
+    // onwards forwards the bytes verbatim (COR-522); this preserves the guarantee
+    // from onwards PR #240 that these ids never reach upstream. Exact-key removal:
+    // extension fields and a legitimate `previous_response_id` are left intact.
+    scrub_request_id_fields(&mut request_value);
+
     let model = request_value["model"].as_str().unwrap_or("unknown").to_string();
     let model = model.as_str();
     let nested_path = parts.uri.path();
@@ -988,6 +995,23 @@ pub(crate) fn should_intercept(method: &axum::http::Method, path: &str) -> bool 
             || path.ends_with("/embeddings"))
 }
 
+/// Client-supplied completion/response id keys to strip from a request body
+/// before forwarding upstream (ported from onwards PR #240). Not legitimate
+/// request fields, so removing them never drops real input.
+const SCRUB_ID_KEYS: [&str; 5] = ["id", "completion_id", "completionId", "response_id", "responseId"];
+
+/// Remove the [`SCRUB_ID_KEYS`] from a request body's top-level object, in place.
+///
+/// Exact-key removal only: every other extension field is preserved, and a
+/// legitimate `previous_response_id` (a different key) is untouched.
+fn scrub_request_id_fields(value: &mut serde_json::Value) {
+    if let Some(obj) = value.as_object_mut() {
+        for key in SCRUB_ID_KEYS {
+            obj.remove(key);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1027,6 +1051,30 @@ mod tests {
     #[test]
     fn test_should_not_intercept_files() {
         assert!(!should_intercept(&axum::http::Method::POST, "/v1/files"));
+    }
+
+    #[test]
+    fn scrub_strips_id_keys_and_preserves_extensions_and_previous_response_id() {
+        let mut v = serde_json::json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "hi"}],
+            "id": "gone",
+            "completion_id": "gone",
+            "completionId": "gone",
+            "response_id": "gone",
+            "responseId": "gone",
+            "previous_response_id": "resp_keep",
+            "x_custom_extension": "keep",
+        });
+        scrub_request_id_fields(&mut v);
+        let obj = v.as_object().unwrap();
+        for k in super::SCRUB_ID_KEYS {
+            assert!(!obj.contains_key(k), "{k} should have been scrubbed");
+        }
+        // previous_response_id (a superstring of a scrub key) and other extensions survive.
+        assert_eq!(obj["previous_response_id"], "resp_keep");
+        assert_eq!(obj["x_custom_extension"], "keep");
+        assert_eq!(obj["model"], "gpt-4o");
     }
 
     #[test]

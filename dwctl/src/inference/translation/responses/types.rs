@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
-use super::util::{ensure_field, scrub_request_id_fields_from_extra};
+use super::util::ensure_field;
 
 pub(crate) fn generated_response_id() -> String {
     format!("resp_{}", Uuid::new_v4())
@@ -211,13 +211,6 @@ pub struct ResponsesRequest {
     /// Additional fields not explicitly modeled
     #[serde(flatten)]
     pub extra: Option<serde_json::Value>,
-}
-
-impl ResponsesRequest {
-    /// Remove caller-controlled request identifier fields before proxying.
-    pub(crate) fn scrub_request_id_fields(&mut self) {
-        scrub_request_id_fields_from_extra(&mut self.extra);
-    }
 }
 
 /// Input to the model - either a string or array of items
