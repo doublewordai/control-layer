@@ -1,5 +1,119 @@
 # Changelog
 
+## [8.93.1](https://github.com/doublewordai/control-layer/compare/v8.93.0...v8.93.1) (2026-07-20)
+
+
+### Bug Fixes
+
+* bump fusillade to 22.1.2 (archive migration checksum restore) ([#1315](https://github.com/doublewordai/control-layer/issues/1315)) ([3aa7d7e](https://github.com/doublewordai/control-layer/commit/3aa7d7ec88acc68006f2d99b8c997cf62ddcbdf4))
+
+## [8.93.0](https://github.com/doublewordai/control-layer/compare/v8.92.0...v8.93.0) (2026-07-20)
+
+
+### Features
+
+* fusillade archive knobs ([#1312](https://github.com/doublewordai/control-layer/issues/1312)) ([520a52f](https://github.com/doublewordai/control-layer/commit/520a52f58777733cb66002b17195e3fecdfe5f8f))
+
+## [8.92.0](https://github.com/doublewordai/control-layer/compare/v8.91.0...v8.92.0) (2026-07-17)
+
+
+### Features
+
+* let organization owners manage ZDR ([#1310](https://github.com/doublewordai/control-layer/issues/1310)) ([28bc540](https://github.com/doublewordai/control-layer/commit/28bc540ca68e57e3316f0d8eedaccb2a784f893b))
+
+## [8.91.0](https://github.com/doublewordai/control-layer/compare/v8.90.0...v8.91.0) (2026-07-17)
+
+
+### Features
+
+* export dwctl_model_tariff gauge from active tariff rows ([#1308](https://github.com/doublewordai/control-layer/issues/1308)) ([2c30f90](https://github.com/doublewordai/control-layer/commit/2c30f90f7efa91018b08b188362436026e8c271b))
+
+## [8.90.0](https://github.com/doublewordai/control-layer/compare/v8.89.0...v8.90.0) (2026-07-17)
+
+
+### Features
+
+* **usage-e:** repoint responses-view cost to credits ledger (contract, after backfill) ([#1278](https://github.com/doublewordai/control-layer/issues/1278)) ([7d0c2d3](https://github.com/doublewordai/control-layer/commit/7d0c2d3113f755f5664946df7144737cdeb188dd))
+
+
+### Bug Fixes
+
+* don't block flex requests with realtime deny rules ([#1303](https://github.com/doublewordai/control-layer/issues/1303)) ([efa2824](https://github.com/doublewordai/control-layer/commit/efa2824ab71041967344751e28a8940b2df3c20f))
+* record real realtime response duration instead of zero ([#1287](https://github.com/doublewordai/control-layer/issues/1287)) ([c4a8a80](https://github.com/doublewordai/control-layer/commit/c4a8a80b7933afa1458327c32fcd584d4f3fdf27))
+
+## [8.89.0](https://github.com/doublewordai/control-layer/compare/v8.88.0...v8.89.0) (2026-07-17)
+
+
+### Features
+
+* allow users to update their own ZDR setting ([#1296](https://github.com/doublewordai/control-layer/issues/1296)) ([34f0cea](https://github.com/doublewordai/control-layer/commit/34f0ceaf9bbea6ded67cdb23e592f4ee836f6753))
+
+
+### Bug Fixes
+
+* emit credits metric in nanocredits, not rounded cents ([#1304](https://github.com/doublewordai/control-layer/issues/1304)) ([e849359](https://github.com/doublewordai/control-layer/commit/e849359ec14e9c5e711e3db2ba79760b56416efb))
+
+## [8.88.0](https://github.com/doublewordai/control-layer/compare/v8.87.2...v8.88.0) (2026-07-17)
+
+
+### Features
+
+* attribute served upstream on analytics, token and credits metrics ([#1300](https://github.com/doublewordai/control-layer/issues/1300)) ([baa6931](https://github.com/doublewordai/control-layer/commit/baa693130d5534f560fe65f651707e8200136eaa))
+
+## [8.87.2](https://github.com/doublewordai/control-layer/compare/v8.87.1...v8.87.2) (2026-07-16)
+
+
+### Bug Fixes
+
+* advertise reasoning capabilities for disabled virtual backends ([#1297](https://github.com/doublewordai/control-layer/issues/1297)) ([f98a576](https://github.com/doublewordai/control-layer/commit/f98a576f660d60ba37302b80e28b14707f2162fa))
+
+## [8.87.1](https://github.com/doublewordai/control-layer/compare/v8.87.0...v8.87.1) (2026-07-16)
+
+
+### Bug Fixes
+
+* bump fusillade to 21.2.0 / fusillade-arsenal 1.2.0 ([#1295](https://github.com/doublewordai/control-layer/issues/1295)) ([0a539cd](https://github.com/doublewordai/control-layer/commit/0a539cdb07285c430fb74c43008e36ac9bb8175c))
+
+## [8.87.0](https://github.com/doublewordai/control-layer/compare/v8.86.1...v8.87.0) (2026-07-16)
+
+
+### Features
+
+* **usage-e:** denormalize fusillade_request_id onto credits + backfill (expand) ([#1275](https://github.com/doublewordai/control-layer/issues/1275)) ([f56984b](https://github.com/doublewordai/control-layer/commit/f56984beff6d49b72045cac2c6510588e39dbc5c))
+
+## [8.86.1](https://github.com/doublewordai/control-layer/compare/v8.86.0...v8.86.1) (2026-07-16)
+
+
+### Bug Fixes
+
+* bump fusillade to 21.1.3 / fusillade-arsenal 1.1.1 ([#1292](https://github.com/doublewordai/control-layer/issues/1292)) ([a1077f8](https://github.com/doublewordai/control-layer/commit/a1077f8bbe59b03a5a554a71a178499287f1cbae))
+
+## [8.86.0](https://github.com/doublewordai/control-layer/compare/v8.85.0...v8.86.0) (2026-07-16)
+
+
+### Features
+
+* repoint batch analytics ([#1291](https://github.com/doublewordai/control-layer/issues/1291)) ([e8ae677](https://github.com/doublewordai/control-layer/commit/e8ae67790bbaa06427f76f66addce02b10152da7))
+* serve batch analytics from batch_aggregates + drop http_analytics index (COR-524 contract) ([#1263](https://github.com/doublewordai/control-layer/issues/1263)) ([83968fa](https://github.com/doublewordai/control-layer/commit/83968fa1ca1caa286419fd7f6a999b73f0bfb710))
+
+
+### Bug Fixes
+
+* enable HTTP 499 retries and virtual model failover ([#1283](https://github.com/doublewordai/control-layer/issues/1283)) ([2c4757c](https://github.com/doublewordai/control-layer/commit/2c4757ccd49732ad7ab9c9ddfeab607a1c041f57))
+* **revert:** "serve batch analytics from batch_aggregates + drop http_analytics index (COR-524 contract)" ([#1290](https://github.com/doublewordai/control-layer/issues/1290)) ([a1e266b](https://github.com/doublewordai/control-layer/commit/a1e266be07b3907dc16cdde037fe5b2c33550547))
+
+## [8.85.0](https://github.com/doublewordai/control-layer/compare/v8.84.0...v8.85.0) (2026-07-15)
+
+
+### Features
+
+* expose reasoning capabilities on admin models ([#1286](https://github.com/doublewordai/control-layer/issues/1286)) ([d239fe9](https://github.com/doublewordai/control-layer/commit/d239fe926f1d74a54c6ada5581dbaecabca2a831))
+
+
+### Reverts
+
+* set realtime priority value to 0 ([#1225](https://github.com/doublewordai/control-layer/issues/1225)) ([#1284](https://github.com/doublewordai/control-layer/issues/1284)) ([d9218a1](https://github.com/doublewordai/control-layer/commit/d9218a182b36b9e747b4cce5c6c36952fe90d09e))
+
 ## [8.84.0](https://github.com/doublewordai/control-layer/compare/v8.83.0...v8.84.0) (2026-07-15)
 
 

@@ -431,12 +431,13 @@ pub async fn get_organization<P: PoolProvider>(
 }
 
 /// Update an organization. Must be an owner or admin of the org, or platform manager.
+/// Zero data retention is restricted to organization owners and platform managers.
 #[utoipa::path(
     patch,
     path = "/organizations/{id}",
     tag = "organizations",
     summary = "Update organization",
-    description = "Update organization details. Requires owner/admin role or platform manager access.",
+    description = "Update organization details. Requires owner/admin role or platform manager access. Zero data retention can only be changed by an organization owner or platform manager.",
     params(
         ("id" = String, Path, description = "Organization ID (UUID)"),
     ),
@@ -463,24 +464,28 @@ pub async fn update_organization<P: PoolProvider>(
 
     let mut pool_conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
 
-    if !can_all {
-        let can_org = can_manage_org_resource(&current_user, id, &mut pool_conn).await?;
-        if !can_org {
+    let caller_org_role = if can_all {
+        None
+    } else {
+        let mut org_repo = Organizations::new(&mut pool_conn);
+        let role = org_repo.get_user_org_role(current_user.id, id).await?;
+        if !matches!(role.as_deref(), Some("owner" | "admin")) {
             return Err(Error::InsufficientPermissions {
                 required: Permission::Allow(Resource::Organizations, Operation::UpdateOwn),
                 action: Operation::UpdateOwn,
                 resource: format!("Organization {id}"),
             });
         }
-    }
+        role
+    };
 
-    // SECURITY: zero-data-retention is a compliance setting only platform
-    // admins (UpdateAll) may flip - an org's own manager must not be able to
-    // opt the org out of data retention on their own.
-    if !can_all && data.zero_data_retention.is_some() {
+    // SECURITY: Organization admins can manage ordinary org fields, but only
+    // owners (or platform managers via UpdateAll) may change this compliance
+    // setting.
+    if !can_all && data.zero_data_retention.is_some() && caller_org_role.as_deref() != Some("owner") {
         return Err(Error::InsufficientPermissions {
-            required: Permission::Allow(Resource::Organizations, Operation::UpdateAll),
-            action: Operation::UpdateAll,
+            required: Permission::Allow(Resource::Organizations, Operation::UpdateOwn),
+            action: Operation::UpdateOwn,
             resource: format!("zero data retention for organization {id}"),
         });
     }
@@ -1928,6 +1933,95 @@ mod tests {
         resp.assert_status(axum::http::StatusCode::OK);
         let orgs = resp.json::<Vec<serde_json::Value>>();
         assert_eq!(orgs[0]["zero_data_retention"].as_bool(), Some(true));
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_organization_owner_can_update_zero_data_retention(pool: PgPool) {
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let owner = create_test_user(&pool, Role::StandardUser).await;
+        let owner_headers = add_auth_headers(&owner);
+
+        let resp = server
+            .post("/admin/api/v1/organizations")
+            .add_header(&owner_headers[0].0, &owner_headers[0].1)
+            .add_header(&owner_headers[1].0, &owner_headers[1].1)
+            .json(&json!({ "name": "owner-zdr-org", "email": "contact@owner-zdr-org.com" }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::CREATED);
+        let org_id = resp.json::<serde_json::Value>()["id"].as_str().unwrap().to_string();
+
+        let resp = server
+            .patch(&format!("/admin/api/v1/organizations/{org_id}"))
+            .add_header(&owner_headers[0].0, &owner_headers[0].1)
+            .add_header(&owner_headers[1].0, &owner_headers[1].1)
+            .json(&json!({ "zero_data_retention": true }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::OK);
+        assert_eq!(resp.json::<serde_json::Value>()["zero_data_retention"].as_bool(), Some(true));
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_organization_non_owners_cannot_update_zero_data_retention(pool: PgPool) {
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let pm = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let pm_headers = add_auth_headers(&pm);
+        let owner = create_test_user(&pool, Role::StandardUser).await;
+        let org_admin = create_test_user(&pool, Role::StandardUser).await;
+        let member = create_test_user(&pool, Role::StandardUser).await;
+        let other_owner = create_test_user(&pool, Role::StandardUser).await;
+        let other_owner_headers = add_auth_headers(&other_owner);
+
+        let resp = server
+            .post("/admin/api/v1/organizations")
+            .add_header(&other_owner_headers[0].0, &other_owner_headers[0].1)
+            .add_header(&other_owner_headers[1].0, &other_owner_headers[1].1)
+            .json(&json!({ "name": "other-owner-org", "email": "contact@other-owner-org.com" }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::CREATED);
+
+        let resp = server
+            .post("/admin/api/v1/organizations")
+            .add_header(&pm_headers[0].0, &pm_headers[0].1)
+            .add_header(&pm_headers[1].0, &pm_headers[1].1)
+            .json(&json!({
+                "name": "non-owner-zdr-org",
+                "email": "contact@non-owner-zdr-org.com",
+                "owner_id": owner.id,
+            }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::CREATED);
+        let org_id = resp.json::<serde_json::Value>()["id"].as_str().unwrap().to_string();
+
+        for (user_id, role) in [(org_admin.id, "admin"), (member.id, "member")] {
+            let resp = server
+                .post(&format!("/admin/api/v1/organizations/{org_id}/members"))
+                .add_header(&pm_headers[0].0, &pm_headers[0].1)
+                .add_header(&pm_headers[1].0, &pm_headers[1].1)
+                .json(&json!({ "user_id": user_id, "role": role }))
+                .await;
+            resp.assert_status(axum::http::StatusCode::CREATED);
+        }
+
+        for user in [&org_admin, &member, &other_owner] {
+            let headers = add_auth_headers(user);
+            let resp = server
+                .patch(&format!("/admin/api/v1/organizations/{org_id}"))
+                .add_header(&headers[0].0, &headers[0].1)
+                .add_header(&headers[1].0, &headers[1].1)
+                .json(&json!({ "zero_data_retention": true }))
+                .await;
+            resp.assert_status(axum::http::StatusCode::FORBIDDEN);
+        }
+
+        let resp = server
+            .get(&format!("/admin/api/v1/organizations/{org_id}"))
+            .add_header(&pm_headers[0].0, &pm_headers[0].1)
+            .add_header(&pm_headers[1].0, &pm_headers[1].1)
+            .await;
+        resp.assert_status(axum::http::StatusCode::OK);
+        assert_eq!(resp.json::<serde_json::Value>()["zero_data_retention"].as_bool(), Some(false));
     }
 
     #[sqlx::test]

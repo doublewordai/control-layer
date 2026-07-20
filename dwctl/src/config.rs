@@ -1501,6 +1501,11 @@ pub struct DaemonConfig {
     /// Maximum backoff time in milliseconds (default: 10000)
     pub max_backoff_ms: u64,
 
+    /// HTTP error statuses retried in addition to Fusillade's built-in predicate.
+    /// Defaults to `[499]`; use `[]` to disable additional status retries.
+    #[serde(default = "default_additional_retryable_statuses")]
+    pub additional_retryable_statuses: Vec<u16>,
+
     /// Deprecated: use first_chunk_timeout_ms, chunk_timeout_ms, and body_timeout_ms instead.
     /// If set, splits into 90% first_chunk_timeout_ms and 10% body_timeout_ms.
     /// Ignored when the granular timeout fields are explicitly set.
@@ -1648,10 +1653,77 @@ pub struct DaemonConfig {
     /// (3 minutes).
     #[serde(default = "default_claim_query_timeout_ms")]
     pub claim_query_timeout_ms: u64,
+
+    /// Batch-archive sweeper (fusillade phase 3): moves frozen terminal
+    /// batches' request rows from `fusillade.requests` into the partitioned
+    /// `batch_requests_archive`. OFF by default. The blue/green invariant:
+    /// deploys never move data — only flipping this flag does, and only once
+    /// every pod in the fleet runs location-routing-aware code AND this
+    /// dwctl version is the rollback floor (deny_unknown_fields: an older
+    /// pod parsing a config that contains these keys crash-loops).
+    #[serde(default)]
+    pub batch_archive_sweep_enabled: bool,
+    /// Sweep tick interval. 0 disables the worker (guarded in fusillade).
+    #[serde(default = "default_batch_archive_sweep_interval_ms")]
+    pub batch_archive_sweep_interval_ms: u64,
+    /// Bounded moves per sweep tick (never drain-until-empty).
+    #[serde(default = "default_batch_archive_moves_per_tick")]
+    pub batch_archive_sweep_moves_per_tick: i64,
+    /// Post-freeze dwell before a batch becomes a sweep candidate. Default 0
+    /// (move immediately — reads are mid-move safe by construction).
+    #[serde(default, deserialize_with = "deserialize_non_negative_secs")]
+    pub batch_archive_sweep_dwell_secs: f64,
+    /// Cancellation grace: batches with canceled rows that were in flight at
+    /// cancel are not archived while those rows are younger than this, so
+    /// late billed results can still supersede the cancel on the live row.
+    /// Default 600s, mirroring processing_timeout_ms.
+    #[serde(
+        default = "default_batch_archive_cancel_grace_secs",
+        deserialize_with = "deserialize_cancel_grace_secs"
+    )]
+    pub batch_archive_cancel_grace_secs: f64,
+    /// Historical backfill worker: same mover as the sweeper on its own
+    /// pacing, oldest-first. Enable after the sweeper is live and steady;
+    /// flip off to pause instantly (resumable by construction).
+    #[serde(default)]
+    pub batch_archive_backfill_enabled: bool,
+    #[serde(default = "default_batch_archive_backfill_interval_ms")]
+    pub batch_archive_backfill_interval_ms: u64,
+    #[serde(default = "default_batch_archive_moves_per_tick")]
+    pub batch_archive_backfill_moves_per_tick: i64,
+    /// Weekly archive-partition runway maintained by the daemon's daily tick
+    /// (runs regardless of the flags above so partitions exist before any
+    /// flip; fusillade_archive_partitions_ahead gauges it).
+    #[serde(default = "default_batch_archive_partitions_weeks_ahead")]
+    pub batch_archive_partitions_weeks_ahead: i32,
+}
+
+fn default_batch_archive_sweep_interval_ms() -> u64 {
+    5_000
+}
+
+fn default_batch_archive_moves_per_tick() -> i64 {
+    4
+}
+
+fn default_batch_archive_cancel_grace_secs() -> f64 {
+    600.0
+}
+
+fn default_batch_archive_backfill_interval_ms() -> u64 {
+    1_000
+}
+
+fn default_batch_archive_partitions_weeks_ahead() -> i32 {
+    4
 }
 
 fn default_claim_loop_max_consecutive_failures() -> u32 {
     10
+}
+
+fn default_additional_retryable_statuses() -> Vec<u16> {
+    vec![499]
 }
 
 fn default_claim_query_timeout_ms() -> u64 {
@@ -1711,6 +1783,46 @@ where
     }
 }
 
+/// Seconds knobs (archive dwell): finite and non-negative — NaN/inf/negative
+/// values would make the SQL interval predicates undefined.
+fn deserialize_non_negative_secs<'de, D>(deserializer: D) -> Result<f64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+
+    let opt: Option<f64> = Option::deserialize(deserializer)?;
+    match opt {
+        None => Ok(0.0),
+        Some(value) if !value.is_finite() => Err(D::Error::custom(format!("seconds value must be a finite number, got {}", value))),
+        Some(value) if value < 0.0 => Err(D::Error::custom(format!("seconds value must be non-negative, got {}", value))),
+        Some(value) => Ok(value),
+    }
+}
+
+/// Same validation as [`deserialize_non_negative_secs`] but defaulting to the
+/// cancellation-grace default when the key is absent.
+fn deserialize_cancel_grace_secs<'de, D>(deserializer: D) -> Result<f64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+
+    let opt: Option<f64> = Option::deserialize(deserializer)?;
+    match opt {
+        None => Ok(default_batch_archive_cancel_grace_secs()),
+        Some(value) if !value.is_finite() => Err(D::Error::custom(format!(
+            "batch_archive_cancel_grace_secs must be a finite number, got {}",
+            value
+        ))),
+        Some(value) if value < 0.0 => Err(D::Error::custom(format!(
+            "batch_archive_cancel_grace_secs must be non-negative, got {}",
+            value
+        ))),
+        Some(value) => Ok(value),
+    }
+}
+
 fn default_batch_metadata_fields_dwctl() -> Vec<String> {
     vec![
         "id".to_string(),
@@ -1734,6 +1846,7 @@ impl Default for DaemonConfig {
             backoff_ms: 1000,
             backoff_factor: 2,
             max_backoff_ms: 10000,
+            additional_retryable_statuses: default_additional_retryable_statuses(),
             timeout_ms: None,
             first_chunk_timeout_ms: 86_400_000,
             chunk_timeout_ms: 86_400_000,
@@ -1757,6 +1870,15 @@ impl Default for DaemonConfig {
             claim_ramp_exponent: default_claim_ramp_exponent(),
             claim_loop_max_consecutive_failures: default_claim_loop_max_consecutive_failures(),
             claim_query_timeout_ms: default_claim_query_timeout_ms(),
+            batch_archive_sweep_enabled: false,
+            batch_archive_sweep_interval_ms: default_batch_archive_sweep_interval_ms(),
+            batch_archive_sweep_moves_per_tick: default_batch_archive_moves_per_tick(),
+            batch_archive_sweep_dwell_secs: 0.0,
+            batch_archive_cancel_grace_secs: default_batch_archive_cancel_grace_secs(),
+            batch_archive_backfill_enabled: false,
+            batch_archive_backfill_interval_ms: default_batch_archive_backfill_interval_ms(),
+            batch_archive_backfill_moves_per_tick: default_batch_archive_moves_per_tick(),
+            batch_archive_partitions_weeks_ahead: default_batch_archive_partitions_weeks_ahead(),
         }
     }
 }
@@ -1800,6 +1922,7 @@ impl DaemonConfig {
             backoff_ms: self.backoff_ms,
             backoff_factor: self.backoff_factor,
             max_backoff_ms: self.max_backoff_ms,
+            additional_retryable_statuses: self.additional_retryable_statuses.clone(),
             first_chunk_timeout_ms,
             chunk_timeout_ms,
             body_timeout_ms,
@@ -1821,6 +1944,15 @@ impl DaemonConfig {
             claim_ramp_exponent: self.claim_ramp_exponent,
             claim_loop_max_consecutive_failures: self.claim_loop_max_consecutive_failures,
             claim_query_timeout_ms: self.claim_query_timeout_ms,
+            batch_archive_sweep_enabled: self.batch_archive_sweep_enabled,
+            batch_archive_sweep_interval_ms: self.batch_archive_sweep_interval_ms,
+            batch_archive_sweep_moves_per_tick: self.batch_archive_sweep_moves_per_tick,
+            batch_archive_sweep_dwell_secs: self.batch_archive_sweep_dwell_secs,
+            batch_archive_cancel_grace_secs: self.batch_archive_cancel_grace_secs,
+            batch_archive_backfill_enabled: self.batch_archive_backfill_enabled,
+            batch_archive_backfill_interval_ms: self.batch_archive_backfill_interval_ms,
+            batch_archive_backfill_moves_per_tick: self.batch_archive_backfill_moves_per_tick,
+            batch_archive_partitions_weeks_ahead: self.batch_archive_partitions_weeks_ahead,
             ..Default::default()
         }
     }
@@ -3711,6 +3843,50 @@ auth:
     }
 
     #[test]
+    fn test_additional_retryable_statuses_default_override_and_mapping() {
+        Jail::expect_with(|jail| {
+            jail.create_file("test.yaml", "secret_key: test-secret-key\n")?;
+            let args = Args {
+                config: "test.yaml".into(),
+                validate: false,
+            };
+
+            let config = Config::load(&args)?;
+            assert_eq!(config.background_services.batch_daemon.additional_retryable_statuses, vec![499]);
+            assert_eq!(
+                config
+                    .background_services
+                    .batch_daemon
+                    .to_fusillade_config()
+                    .additional_retryable_statuses,
+                vec![499]
+            );
+
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: test-secret-key
+background_services:
+  batch_daemon:
+    additional_retryable_statuses: []
+"#,
+            )?;
+            let config = Config::load(&args)?;
+            assert!(config.background_services.batch_daemon.additional_retryable_statuses.is_empty());
+            assert!(
+                config
+                    .background_services
+                    .batch_daemon
+                    .to_fusillade_config()
+                    .additional_retryable_statuses
+                    .is_empty()
+            );
+
+            Ok(())
+        });
+    }
+
+    #[test]
     fn test_urgency_weight_default() {
         Jail::expect_with(|jail| {
             jail.create_file(
@@ -4036,6 +4212,138 @@ background_services:
 
             let config = Config::load(&args)?;
             assert_eq!(config.background_services.batch_daemon.urgency_weight, 0.5);
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_batch_archive_cancel_grace_secs_negative_rejected() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+background_services:
+  batch_daemon:
+    batch_archive_cancel_grace_secs: -1.0
+"#,
+            )?;
+            let args = Args {
+                config: "test.yaml".into(),
+                validate: false,
+            };
+            let result = Config::load(&args);
+            assert!(result.is_err());
+            let err = result.unwrap_err().to_string();
+            assert!(
+                err.contains("batch_archive_cancel_grace_secs must be non-negative"),
+                "unexpected error: {err}"
+            );
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_batch_archive_cancel_grace_secs_non_finite_rejected() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+background_services:
+  batch_daemon:
+    batch_archive_cancel_grace_secs: .inf
+"#,
+            )?;
+            let args = Args {
+                config: "test.yaml".into(),
+                validate: false,
+            };
+            let result = Config::load(&args);
+            assert!(result.is_err());
+            let err = result.unwrap_err().to_string();
+            assert!(
+                err.contains("batch_archive_cancel_grace_secs must be a finite number") || err.contains("invalid"),
+                "unexpected error: {err}"
+            );
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_batch_archive_cancel_grace_secs_null_uses_default() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+background_services:
+  batch_daemon:
+    batch_archive_cancel_grace_secs: null
+"#,
+            )?;
+            let args = Args {
+                config: "test.yaml".into(),
+                validate: false,
+            };
+            let config = Config::load(&args)?;
+            assert_eq!(config.background_services.batch_daemon.batch_archive_cancel_grace_secs, 600.0);
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_batch_archive_sweep_dwell_secs_negative_rejected() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+background_services:
+  batch_daemon:
+    batch_archive_sweep_dwell_secs: -0.001
+"#,
+            )?;
+            let args = Args {
+                config: "test.yaml".into(),
+                validate: false,
+            };
+            let result = Config::load(&args);
+            assert!(result.is_err());
+            let err = result.unwrap_err().to_string();
+            assert!(err.contains("seconds value must be non-negative"), "unexpected error: {err}");
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_batch_archive_sweep_dwell_secs_non_finite_rejected() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+background_services:
+  batch_daemon:
+    batch_archive_sweep_dwell_secs: .nan
+"#,
+            )?;
+            let args = Args {
+                config: "test.yaml".into(),
+                validate: false,
+            };
+            let result = Config::load(&args);
+            assert!(result.is_err());
+            let err = result.unwrap_err().to_string();
+            assert!(
+                err.contains("seconds value must be a finite number") || err.contains("invalid"),
+                "unexpected error: {err}"
+            );
 
             Ok(())
         });

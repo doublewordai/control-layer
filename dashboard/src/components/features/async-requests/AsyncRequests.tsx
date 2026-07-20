@@ -244,11 +244,10 @@ function createColumns(
     id: "cost",
     header: "Cost",
     cell: ({ row }) => {
-      const { prompt_tokens, completion_tokens, total_cost } = row.original;
-      const noTokens =
-        (prompt_tokens == null && completion_tokens == null) ||
-        (prompt_tokens === 0 && completion_tokens === 0);
-      if (total_cost == null || noTokens) {
+      const { total_cost } = row.original;
+      // Cost is sourced from the durable credits ledger (COR-524 follow-up), so show it
+      // whenever present — independent of token counts, which age out of http_analytics.
+      if (total_cost == null) {
         return <span className="text-sm text-doubleword-neutral-600">-</span>;
       }
       return (

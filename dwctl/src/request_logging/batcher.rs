@@ -86,6 +86,9 @@ pub struct RawAnalyticsRecord {
     pub response_type: String,
     pub server_address: String,
     pub server_port: u16,
+    /// URL of the upstream that served the request (onwards `ServedBy`
+    /// extension) — per-component attribution for composite models.
+    pub served_by: Option<String>,
 
     // === Auth (unresolved - just the token) ===
     /// The bearer token from the Authorization header (not yet resolved to user_id)
@@ -970,6 +973,7 @@ where
         let mut cache_24h_vec: Vec<i64> = Vec::with_capacity(records.len());
         let mut total_cost_vec: Vec<Option<Decimal>> = Vec::with_capacity(records.len());
         let mut uncached_cost_vec: Vec<Option<Decimal>> = Vec::with_capacity(records.len());
+        let mut served_by_vec: Vec<Option<String>> = Vec::with_capacity(records.len());
 
         for record in records {
             instance_ids.push(record.raw.instance_id);
@@ -1014,6 +1018,7 @@ where
             cache_24h_vec.push(c24);
             total_cost_vec.push(record.total_cost);
             uncached_cost_vec.push(record.uncached_cost);
+            served_by_vec.push(record.raw.served_by.clone());
         }
 
         let rows = sqlx::query!(
@@ -1026,7 +1031,7 @@ where
                 request_origin, batch_sla, batch_request_source, api_key_id, trace_id,
                 cache_read_input_tokens, cache_creation_input_tokens,
                 cache_creation_5m_input_tokens, cache_creation_1h_input_tokens, cache_creation_24h_input_tokens,
-                total_cost, uncached_cost
+                total_cost, uncached_cost, served_by
             )
             SELECT * FROM UNNEST(
                 $1::uuid[], $2::bigint[], $3::timestamptz[], $4::text[], $5::text[], $6::text[],
@@ -1036,7 +1041,7 @@ where
                 $22::text[], $23::text[], $24::text[], $25::uuid[], $26::text[],
                 $27::bigint[], $28::bigint[],
                 $29::bigint[], $30::bigint[], $31::bigint[],
-                $32::numeric[], $33::numeric[]
+                $32::numeric[], $33::numeric[], $34::text[]
             )
             ON CONFLICT (instance_id, correlation_id)
             DO UPDATE SET
@@ -1066,7 +1071,8 @@ where
                 cache_creation_1h_input_tokens = EXCLUDED.cache_creation_1h_input_tokens,
                 cache_creation_24h_input_tokens = EXCLUDED.cache_creation_24h_input_tokens,
                 total_cost = EXCLUDED.total_cost,
-                uncached_cost = EXCLUDED.uncached_cost
+                uncached_cost = EXCLUDED.uncached_cost,
+                served_by = EXCLUDED.served_by
             RETURNING id, instance_id, correlation_id, (xmax = 0) AS "newly_inserted!"
             "#,
             &instance_ids,
@@ -1102,6 +1108,7 @@ where
             &cache_24h_vec,
             &total_cost_vec as &[Option<Decimal>],
             &uncached_cost_vec as &[Option<Decimal>],
+            &served_by_vec as &[Option<String>],
         )
         .fetch_all(&mut **tx)
         .await?;
@@ -1145,11 +1152,16 @@ where
         let mut descriptions: Vec<Option<String>> = Vec::new();
         let mut fusillade_batch_ids: Vec<Option<Uuid>> = Vec::new();
         let mut models: Vec<String> = Vec::new();
+        let mut served_bys: Vec<String> = Vec::new();
         let mut api_key_ids_credit: Vec<Option<Uuid>> = Vec::new();
         // Service tier, computed in memory from the fusillade metadata, so the
         // transactions list can label each row (realtime / flex / async / batch)
         // without joining http_analytics.
         let mut service_tiers: Vec<String> = Vec::new();
+        // Denormalized per-request id so the responses view can read cost off the ledger
+        // durably (by fusillade_request_id) instead of joining http_analytics, which ages
+        // out of retention. NULL for non-fusillade (realtime) usage.
+        let mut fusillade_request_ids_credit: Vec<Option<Uuid>> = Vec::new();
 
         for record in records {
             // Skip if no user or no pricing
@@ -1190,9 +1202,11 @@ where
             )));
             fusillade_batch_ids.push(record.raw.fusillade_batch_id);
             models.push(model);
+            served_bys.push(crate::metrics::served_by_host(record.raw.served_by.as_deref()));
             api_key_ids_credit.push(record.api_key_id);
             service_tiers
                 .push(compute_service_tier(record.raw.fusillade_batch_id, record.raw.batch_completion_window.as_deref()).to_string());
+            fusillade_request_ids_credit.push(record.raw.fusillade_request_id);
         }
 
         if user_ids.is_empty() {
@@ -1201,11 +1215,11 @@ where
 
         let expected_count = user_ids.len() as u64;
 
-        // Build a map from source_id to (index, user_id, amount, model) for metric recording
-        let source_id_to_record: HashMap<String, (usize, Uuid, Decimal, String)> = source_ids
+        // Build a map from source_id to (index, user_id, amount, model, served_by) for metric recording
+        let source_id_to_record: HashMap<String, (usize, Uuid, Decimal, String, String)> = source_ids
             .iter()
             .enumerate()
-            .map(|(i, sid)| (sid.clone(), (i, user_ids[i], amounts[i], models[i].clone())))
+            .map(|(i, sid)| (sid.clone(), (i, user_ids[i], amounts[i], models[i].clone(), served_bys[i].clone())))
             .collect();
 
         // Batch INSERT, folding into the read model in the same transaction.
@@ -1215,12 +1229,12 @@ where
         // re-folded nor re-aggregated.
         let inserted_rows = sqlx::query!(
             r#"
-            INSERT INTO credits_transactions (user_id, transaction_type, amount, source_id, description, fusillade_batch_id, api_key_id, is_aggregated, service_tier)
+            INSERT INTO credits_transactions (user_id, transaction_type, amount, source_id, description, fusillade_batch_id, api_key_id, is_aggregated, service_tier, fusillade_request_id)
             SELECT u.user_id, u.transaction_type, u.amount, u.source_id, u.description, u.fusillade_batch_id, u.api_key_id,
-                   u.fusillade_batch_id IS NOT NULL, u.service_tier
+                   u.fusillade_batch_id IS NOT NULL, u.service_tier, u.fusillade_request_id
             FROM UNNEST(
-                $1::uuid[], $2::text[], $3::numeric[], $4::text[], $5::text[], $6::uuid[], $7::uuid[], $8::text[]
-            ) AS u(user_id, transaction_type, amount, source_id, description, fusillade_batch_id, api_key_id, service_tier)
+                $1::uuid[], $2::text[], $3::numeric[], $4::text[], $5::text[], $6::uuid[], $7::uuid[], $8::text[], $9::uuid[]
+            ) AS u(user_id, transaction_type, amount, source_id, description, fusillade_batch_id, api_key_id, service_tier, fusillade_request_id)
             ON CONFLICT (source_id) DO NOTHING
             RETURNING source_id, user_id, amount, seq, created_at, fusillade_batch_id, service_tier
             "#,
@@ -1232,6 +1246,7 @@ where
             &fusillade_batch_ids as &[Option<Uuid>],
             &api_key_ids_credit as &[Option<Uuid>],
             &service_tiers,
+            &fusillade_request_ids_credit as &[Option<Uuid>],
         )
         .fetch_all(&mut **tx)
         .await?;
@@ -1534,14 +1549,22 @@ where
 
         // Record metrics only for successfully inserted credit transactions
         for row in &inserted_rows {
-            if let Some((_, user_id, amount, model)) = source_id_to_record.get(&row.source_id) {
-                let cents = (amount.to_f64().unwrap_or(0.0) * 100.0).round() as u64;
+            if let Some((_, user_id, amount, model, served_by)) = source_id_to_record.get(&row.source_id) {
+                // Nanocredits (1 credit = 1e9). Tariffs price tokens at
+                // DECIMAL(12,8), so a single token can cost 1e-8 credits; nano
+                // is the coarsest power of ten that represents every
+                // token-priced amount exactly. The predecessor counted whole
+                // rounded cents per transaction, which floored the (typical)
+                // sub-cent flex/batch deductions to zero and hid entire
+                // revenue tiers from the metric.
+                let nanocredits = (amount.to_f64().unwrap_or(0.0) * 1_000_000_000.0).round() as u64;
                 counter!(
-                    "dwctl_credits_deducted_total",
+                    "dwctl_credits_deducted_nanocredits_total",
                     "user_id" => user_id.to_string(),
-                    "model" => model.clone()
+                    "model" => model.clone(),
+                    "served_by" => served_by.clone()
                 )
-                .increment(cents);
+                .increment(nanocredits);
             }
         }
 
@@ -1584,6 +1607,7 @@ where
             request_origin: compute_request_origin(record.api_key_purpose.as_ref(), record.raw.fusillade_batch_id).to_string(),
             batch_sla: record.raw.batch_completion_window.clone().unwrap_or_default(),
             batch_request_source: record.raw.batch_request_source.clone(),
+            served_by: record.raw.served_by.clone(),
         }
     }
 }
@@ -1670,6 +1694,7 @@ mod tests {
     #[test]
     fn test_raw_analytics_record_creation() {
         let record = RawAnalyticsRecord {
+            served_by: None,
             instance_id: Uuid::new_v4(),
             correlation_id: 123,
             timestamp: chrono::Utc::now(),
@@ -1717,6 +1742,7 @@ mod tests {
     /// A minimal record carrying just the token fields the cost arithmetic reads.
     fn cost_record(prompt: i64, completion: i64, read: i64, c5: i64, c1: i64, c24: i64) -> RawAnalyticsRecord {
         RawAnalyticsRecord {
+            served_by: None,
             instance_id: Uuid::new_v4(),
             correlation_id: 1,
             timestamp: chrono::Utc::now(),
@@ -2372,6 +2398,7 @@ mod integration_tests {
     /// Helper: Create a raw analytics record for testing
     fn create_raw_record(model: &str, bearer_token: Option<String>, prompt_tokens: i64, completion_tokens: i64) -> RawAnalyticsRecord {
         RawAnalyticsRecord {
+            served_by: None,
             instance_id: Uuid::new_v4(),
             correlation_id: rand::random::<i64>().abs(),
             timestamp: chrono::Utc::now(),
@@ -2676,6 +2703,45 @@ mod integration_tests {
             "no cache → billed == list; C not billed"
         );
         assert!(agg.analytics_backfilled_at.is_none(), "live fold leaves the backfill marker null");
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_batcher_denormalizes_fusillade_request_id_onto_credits(pool: PgPool) {
+        // A batched request's credit row carries its fusillade_request_id (migration 120), so the
+        // responses view can read per-request cost off the ledger durably instead of joining
+        // http_analytics (COR-524 follow-up / Usage E).
+        let model_id = create_test_model(&pool, "req-id-credits-test").await;
+        setup_tariff(
+            &pool,
+            model_id,
+            Decimal::from_str("0.00005").unwrap(),
+            Decimal::from_str("0.00010").unwrap(),
+            ApiKeyPurpose::Batch,
+        )
+        .await;
+        let user_id = setup_user_with_balance(&pool, Decimal::from_str("100.00").unwrap()).await;
+        let batch_key = create_api_key_for_user(&pool, user_id, ApiKeyPurpose::Batch).await;
+
+        let request_id = Uuid::new_v4();
+        let mut rec = create_raw_record("req-id-credits-test", Some(batch_key), 1000, 500);
+        rec.batch_completion_window = Some("24h".to_string());
+        rec.fusillade_batch_id = Some(Uuid::new_v4());
+        rec.fusillade_request_id = Some(request_id);
+
+        run_batcher_with_records(&pool, vec![rec]).await;
+
+        // The credit is keyed to the request durably (no http_analytics needed).
+        let row = sqlx::query!(
+            "SELECT fusillade_request_id, amount FROM credits_transactions \
+             WHERE fusillade_request_id = $1 AND transaction_type = 'usage'",
+            request_id
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.fusillade_request_id, Some(request_id));
+        assert_eq!(row.amount, Decimal::from_str("0.10").unwrap(), "1000*5e-5 + 500*1e-4");
     }
 
     #[sqlx::test]

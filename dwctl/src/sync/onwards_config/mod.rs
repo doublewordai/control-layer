@@ -701,7 +701,7 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                 lb_strategy,
                 fallback_enabled: row.fallback_enabled.unwrap_or(true),
                 fallback_on_rate_limit: row.fallback_on_rate_limit.unwrap_or(true),
-                fallback_on_status: row.fallback_on_status.unwrap_or_else(|| vec![429, 500, 502, 503, 504]),
+                fallback_on_status: row.fallback_on_status.unwrap_or_else(|| vec![429, 499, 500, 502, 503, 504]),
                 fallback_with_replacement: row.fallback_with_replacement.unwrap_or(false),
                 fallback_max_attempts: row.fallback_max_attempts,
                 backoff_enabled: row.backoff_enabled,
@@ -1394,7 +1394,7 @@ pub async fn load_targets_from_db(
                 routing_rules: Vec::new(), // Populated from separate query below
                 fallback_enabled: row.fallback_enabled.unwrap_or(true),
                 fallback_on_rate_limit: row.fallback_on_rate_limit.unwrap_or(true),
-                fallback_on_status: row.fallback_on_status.clone().unwrap_or_else(|| vec![429, 500, 502, 503, 504]),
+                fallback_on_status: row.fallback_on_status.clone().unwrap_or_else(|| vec![429, 499, 500, 502, 503, 504]),
                 fallback_with_replacement: row.fallback_with_replacement.unwrap_or(false),
                 fallback_max_attempts: row.fallback_max_attempts,
                 backoff_enabled: row.backoff_enabled,
