@@ -2354,12 +2354,13 @@ checksum = "e6d5a32815ae3f33302d95fdcb2ce17862f8c65363dcfd29360480ba1001fc9c"
 
 [[package]]
 name = "fusillade"
-version = "22.1.2"
+version = "23.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0c4739eb7815c57086176c4c6764a5c68732f4327de1f38bde8f6144c0b26278"
+checksum = "7b650ac6823f234ab771fae06742830a7ff4d2f02e473a83474a750c89436595"
 dependencies = [
  "anyhow",
  "async-trait",
+ "bytes",
  "chrono",
  "dashmap",
  "eventsource-stream",
@@ -2367,6 +2368,7 @@ dependencies = [
  "fusillade-core",
  "futures",
  "hostname",
+ "http-body 1.0.1",
  "humantime",
  "metrics",
  "openai-reassembler",
@@ -2388,9 +2390,9 @@ dependencies = [
 
 [[package]]
 name = "fusillade-arsenal"
-version = "2.1.2"
+version = "2.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5eb445349754b9866893e98e16c8a41ef35e5c13ce2be81b4912c0af855ef7ca"
+checksum = "eb2a8f1fe5984d118df81a1cde3521f5ae506531957a2d0af53bf67fbeae2bde"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -2416,9 +2418,9 @@ dependencies = [
 
 [[package]]
 name = "fusillade-core"
-version = "2.1.0"
+version = "3.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c4281cab927baff1e2f41ac6da9d77486e90a85da523e375115e9539f0d330f2"
+checksum = "0636f2967b04f6c761189d3aa5709c8306b280758dbd2751630cf04e7f0a6096"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4263,9 +4265,9 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "onwards"
-version = "0.35.3"
+version = "0.35.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0cadbe82d7efb76209562f3ae8fafa804d9852873455cd061cad3a756c2d58ec"
+checksum = "1e532da390fee12ba972cdd7ad125fa53afe058df74d9bf282e60bd3fd9c474e"
 dependencies = [
  "anyhow",
  "async-stream",
