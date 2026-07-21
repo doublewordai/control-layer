@@ -3,6 +3,8 @@
 ## Overview
 The Doubleword Control Layer (dwctl) is a high-performance AI model gateway providing unified routing, management, and security for LLM inference. It's a Rust/TypeScript monorepo with:
 - **dwctl** (Rust): Core API server at `dwctl/`
+- **onwards** (Rust): Embedded AI proxy and routing layer at `onwards/`
+- **fusillade**, **fusillade-core**, **fusillade-arsenal** (Rust): Embedded batch processing workspace crates
 - **dashboard** (React/TypeScript): Web frontend at `dashboard/`
 
 ## Build Requirements
@@ -24,7 +26,7 @@ just db-start
 just db-setup
 ```
 
-**Offline mode alternative**: Set `SQLX_OFFLINE=true` to use the workspace query metadata in `.sqlx/` for builds without database access. `fusillade-arsenal/.sqlx/` is also kept current because it ships with that standalone crate.
+**Offline mode alternative**: Set `SQLX_OFFLINE=true` to use the workspace query metadata in `.sqlx/` for builds without database access.
 
 ## Build Commands
 
@@ -66,9 +68,8 @@ cd dashboard && npm test -- --run # Direct vitest execution
 ```bash
 just lint rust                    # Full lint (fmt + clippy + sqlx prepare check)
 cargo fmt --check                 # Check formatting only
-cargo clippy                      # Clippy only
+cargo clippy --workspace --all-features # Clippy only
 cargo sqlx prepare --check --workspace
-(cd fusillade-arsenal && cargo sqlx prepare --check)
 ```
 
 ### TypeScript
@@ -99,7 +100,6 @@ just ci ts
 - `config.yaml` - Application configuration
 - `docker-compose.yml` - Production container setup
 - `.sqlx/` - shared workspace SQLx query cache used by local and container builds
-- `fusillade-arsenal/.sqlx/` - standalone crate cache included in its published package
 
 ### Rust Backend (`dwctl/`)
 - `src/main.rs` - Entry point
@@ -140,7 +140,7 @@ cd dwctl && sqlx migrate run
 **Never** run `sqlx migrate run --source ... --database-url ...` from root.
 
 ### SQLx prepared queries out of sync
-If queries change, regenerate the workspace cache with `cargo sqlx prepare --workspace` from the repository root. If Arsenal queries change, also run `cargo sqlx prepare` from `fusillade-arsenal/` so its published package remains self-contained.
+If queries change, regenerate the workspace cache with `cargo sqlx prepare --workspace` from the repository root.
 
 ## Configuration
 - Environment variables: Prefix with `DWCTL_`, use `__` for nested keys (e.g., `DWCTL_AUTH__NATIVE__ENABLED=false`)

@@ -18,9 +18,11 @@ require_text 'backend-crate-test:' 'define a per-crate test job'
 require_text 'name: backend-test (${{ matrix.package }})' 'give every crate test its own check name'
 require_text 'fail-fast: false' 'allow every crate result to complete'
 
-for package in dwctl fusillade fusillade-core fusillade-arsenal; do
+for package in dwctl fusillade fusillade-core fusillade-arsenal onwards; do
   require_text "- package: ${package}" "test ${package} in the matrix"
 done
+
+require_text 'cargo_args: --all-features' 'exercise Onwards optional Fusillade integration'
 
 require_text 'runs-on: ${{ matrix.runner }}' 'run matrix entries independently'
 require_text 'cargo llvm-cov --package "${{ matrix.package }}"' 'compile and test one package per runner'
@@ -31,6 +33,10 @@ require_text 'name: backend-test' 'preserve the required backend check name'
 require_text 'pattern: rust-coverage-*' 'download all per-package coverage artifacts'
 require_text 'MINIMUM_COVERAGE: "60"' 'preserve the aggregate line coverage threshold'
 require_text '.github/scripts/aggregate-rust-coverage.py' 'merge duplicate source lines before checking coverage'
+require_text 'Expected 5 coverage files' 'aggregate every workspace crate coverage artifact'
+require_text 'cargo package --locked --package onwards --all-features' 'validate the publishable Onwards package'
+require_text 'onwards-openresponses-compliance:' 'define standalone Onwards compliance'
+require_text 'mode: [adapter, passthrough]' 'test Onwards adapter and passthrough modes'
 
 setup_just_count="$(grep -Fc 'uses: extractions/setup-just@v3' "$workflow")"
 pinned_just_count="$(grep -Fc 'just-version: "1.46.0"' "$workflow")"

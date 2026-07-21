@@ -1,7 +1,8 @@
 [package]
 name = "fusillade"
 edition = "2024"
-version = "23.0.2" # x-release-please-version
+version = "23.0.2"
+publish = false
 description = "A daemon implementation for sending batched LLM requests with efficient request coalescing"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/doublewordai/control-layer"
@@ -16,8 +17,8 @@ name = "fusillade"
 path = "src/lib.rs"
 
 [dependencies]
-fusillade-core = { version = "3.0.0", path = "../fusillade-core" }
-fusillade-arsenal = { version = "2.1.0", path = "../fusillade-arsenal", optional = true }
+fusillade-core = { path = "../fusillade-core" }
+fusillade-arsenal = { path = "../fusillade-arsenal", optional = true }
 tokio-stream = { version = "0.1", features = ["sync"] }
 tokio-util = "0.7"
 tracing = "0.1"

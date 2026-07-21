@@ -6,8 +6,8 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: Fusillade release tag to republish
-        required: false
+        description: Onwards release tag to retry
+        required: true
         type: string
 
 jobs:
@@ -94,52 +94,22 @@ jobs:
             })
             console.log(`Triggered deployment for version ${{ github.event.release.tag_name }}`)
 
-  publish-dwctl:
-    if: ${{ !github.event.release.prerelease && startsWith(github.event.release.tag_name, 'v') }}
-    runs-on: depot-ubuntu-24.04
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v6
-
-      - name: Install pnpm
-        uses: pnpm/action-setup@v5
-        with:
-          version: 10
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v6
-        with:
-          node-version: "24"
-          cache: "pnpm"
-          cache-dependency-path: dashboard/pnpm-lock.yaml
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Install just
-        uses: extractions/setup-just@v3
-
-      - name: Publish to crates.io
-        run: just release
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-
-  publish-fusillade:
+  publish-onwards:
     if: >-
       ${{
         (github.event_name == 'release' &&
           !github.event.release.prerelease &&
-          startsWith(github.event.release.tag_name, 'fusillade-')) ||
+          startsWith(github.event.release.tag_name, 'onwards-v')) ||
         (github.event_name == 'workflow_dispatch' &&
-          startsWith(inputs.release_tag, 'fusillade-'))
+          startsWith(inputs.release_tag, 'onwards-v'))
       }}
     runs-on: depot-ubuntu-24.04
 
+    permissions:
+      contents: write
+
     steps:
-      - name: Checkout release
+      - name: Checkout Onwards release
         uses: actions/checkout@v6
         with:
           ref: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.release_tag }}
@@ -150,13 +120,98 @@ jobs:
           ref: ${{ github.event.repository.default_branch }}
           path: .release-tools
 
+      - name: Keep the application release marked latest
+        uses: actions/github-script@v9
+        env:
+          RELEASE_TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.release_tag }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const {data: release} = await github.rest.repos.getReleaseByTag({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              tag: process.env.RELEASE_TAG
+            })
+            await github.rest.repos.updateRelease({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              release_id: release.id,
+              make_latest: 'false'
+            })
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Publish Fusillade crate
+      - name: Publish Onwards to crates.io
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
           RELEASE_TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.release_tag }}
-        run: bash .release-tools/.github/scripts/publish-fusillade-crate.sh "$RELEASE_TAG"
+        run: .release-tools/.github/scripts/publish-onwards-crate.sh "$RELEASE_TAG"
+
+  onwards-image:
+    if: >-
+      ${{
+        (github.event_name == 'release' &&
+          !github.event.release.prerelease &&
+          startsWith(github.event.release.tag_name, 'onwards-v')) ||
+        (github.event_name == 'workflow_dispatch' &&
+          startsWith(inputs.release_tag, 'onwards-v'))
+      }}
+    needs: [publish-onwards]
+    runs-on: depot-ubuntu-24.04
+
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+
+    steps:
+      - name: Checkout Onwards release
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.release_tag }}
+
+      - name: Resolve Onwards version
+        id: version
+        env:
+          RELEASE_TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.release_tag }}
+        run: |
+          VERSION="${RELEASE_TAG#onwards-v}"
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Invalid Onwards release tag: $RELEASE_TAG" >&2
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Onwards image metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/doublewordai/onwards
+          sep-tags: "\n"
+          tags: |
+            type=raw,value=v${{ steps.version.outputs.version }}
+            type=semver,pattern={{version}},value=${{ steps.version.outputs.version }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ steps.version.outputs.version }},enable=${{ github.event_name == 'release' }}
+            type=raw,value=latest,enable=${{ github.event_name == 'release' }}
+
+      - name: Build and push Onwards image
+        uses: depot/build-push-action@v1
+        with:
+          context: .
+          file: ./onwards/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          sbom: true
+          provenance: true

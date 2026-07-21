@@ -44,18 +44,17 @@ jobs:
         if: steps.release-pr.outputs.branch != ''
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Synchronize workspace release dependencies
+      - name: Refresh workspace lockfile
         if: steps.release-pr.outputs.branch != ''
         run: |
-          python3 .github/scripts/sync-fusillade-release-dependencies.py
           cargo metadata --format-version 1 > /dev/null
 
-          if git diff --quiet -- Cargo.lock dwctl/Cargo.toml fusillade/Cargo.toml fusillade-arsenal/Cargo.toml; then
+          if git diff --quiet -- Cargo.lock; then
             exit 0
           fi
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add Cargo.lock dwctl/Cargo.toml fusillade/Cargo.toml fusillade-arsenal/Cargo.toml
-          git commit -m "chore: sync Fusillade release dependencies"
+          git add Cargo.lock
+          git commit -m "chore: refresh workspace lockfile"
           git push origin HEAD:${{ steps.release-pr.outputs.branch }}

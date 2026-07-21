@@ -8,7 +8,7 @@ on:
 
 jobs:
   frontend-test:
-    if: (github.event_name == 'pull_request' && !startsWith(github.head_ref, 'release-please--')) || github.event_name == 'merge_group'
+    if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
     runs-on: depot-ubuntu-24.04-8
 
     steps:
@@ -100,7 +100,7 @@ jobs:
           curl -X POST "https://charts.somnial.co/doubleword-control-layer/gzipped-bundle-size?value=${GZIPPED_SIZE}" || true
 
   backend-crate-test:
-    if: (github.event_name == 'pull_request' && !startsWith(github.head_ref, 'release-please--')) || github.event_name == 'merge_group'
+    if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
     name: backend-test (${{ matrix.package }})
     strategy:
       fail-fast: false
@@ -118,6 +118,10 @@ jobs:
           - package: fusillade-arsenal
             runner: depot-ubuntu-24.04-8
             database: true
+          - package: onwards
+            runner: depot-ubuntu-24.04-8
+            database: false
+            cargo_args: --all-features
     runs-on: ${{ matrix.runner }}
 
     # Postgres is started manually below (not via `services:`) so we can pass
@@ -177,6 +181,7 @@ jobs:
         run: |
           START_TIME=$(date +%s)
           cargo llvm-cov --package "${{ matrix.package }}" \
+            ${{ matrix.cargo_args }} \
             --lcov \
             --output-path "lcov-${{ matrix.package }}.info"
           END_TIME=$(date +%s)
@@ -194,7 +199,7 @@ jobs:
           retention-days: 1
 
   backend-lint:
-    if: (github.event_name == 'pull_request' && !startsWith(github.head_ref, 'release-please--')) || github.event_name == 'merge_group'
+    if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
     runs-on: depot-ubuntu-24.04-16
 
     steps:
@@ -240,8 +245,11 @@ jobs:
       - name: Lint Rust workspace
         run: just lint rust -- -D warnings
 
+      - name: Validate publishable Onwards package
+        run: cargo package --locked --package onwards --all-features
+
   backend-test:
-    if: always() && ((github.event_name == 'pull_request' && !startsWith(github.head_ref, 'release-please--')) || github.event_name == 'merge_group')
+    if: always() && (github.event_name == 'pull_request' || github.event_name == 'merge_group')
     needs: [backend-crate-test, backend-lint]
     runs-on: ubuntu-latest
     name: backend-test
@@ -278,8 +286,8 @@ jobs:
         run: |
           shopt -s nullglob
           coverage_files=(rust-coverage/*.info)
-          if (( ${#coverage_files[@]} != 4 )); then
-            echo "Expected 4 coverage files, found ${#coverage_files[@]}" >&2
+          if (( ${#coverage_files[@]} != 5 )); then
+            echo "Expected 5 coverage files, found ${#coverage_files[@]}" >&2
             exit 1
           fi
 
@@ -293,8 +301,176 @@ jobs:
           curl -X POST \
             "https://charts.somnial.co/doubleword-control-layer/backend-code-coverage?value=${COVERAGE}" || true
 
+  onwards-pr-image:
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+    needs: [backend-crate-test]
+    runs-on: depot-ubuntu-24.04
+
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push Onwards image
+        uses: depot/build-push-action@v1
+        with:
+          context: .
+          file: ./onwards/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ghcr.io/doublewordai/onwards:sha-${{ github.event.pull_request.head.sha }}
+          sbom: true
+          provenance: true
+
+  onwards-compliance-changes:
+    if: github.event_name == 'pull_request' || github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    outputs:
+      strict: ${{ steps.changes.outputs.strict }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Detect Onwards strict-mode changes
+        id: changes
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PULL_REQUEST_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PULL_REQUEST_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          MERGE_GROUP_BASE_SHA: ${{ github.event.merge_group.base_sha }}
+          MERGE_GROUP_HEAD_SHA: ${{ github.event.merge_group.head_sha }}
+        run: |
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            echo "strict=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            BASE_SHA="$PULL_REQUEST_BASE_SHA"
+            HEAD_SHA="$PULL_REQUEST_HEAD_SHA"
+          else
+            BASE_SHA="$MERGE_GROUP_BASE_SHA"
+            HEAD_SHA="$MERGE_GROUP_HEAD_SHA"
+          fi
+
+          if [[ -z "$BASE_SHA" || -z "$HEAD_SHA" ]]; then
+            echo "Unable to determine the commit range for $EVENT_NAME" >&2
+            exit 1
+          fi
+
+          if git diff --quiet "$BASE_SHA" "$HEAD_SHA" -- 'onwards/src/strict/**'; then
+            echo "strict=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "strict=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  onwards-openresponses-compliance:
+    if: needs.onwards-compliance-changes.outputs.strict == 'true'
+    needs: onwards-compliance-changes
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [adapter, passthrough]
+    name: onwards-compliance (${{ matrix.mode }})
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Require OpenAI API key
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          if [[ -z "$OPENAI_API_KEY" ]]; then
+            echo "OPENAI_API_KEY repository secret is required for Onwards Open Responses compliance" >&2
+            exit 1
+          fi
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build Onwards
+        run: cargo build --release --package onwards
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Clone Open Responses
+        # Pinned before WebSocket/compact tests were added (PR #71).
+        # Update this once Onwards supports WebSocket transport.
+        run: |
+          git clone https://github.com/openresponses/openresponses /tmp/openresponses
+          cd /tmp/openresponses && git checkout fa29df5
+
+      - name: Install Open Responses dependencies
+        run: cd /tmp/openresponses && bun install
+
+      - name: Write config
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          ADAPTER_FLAG: ${{ matrix.mode == 'adapter' && 'true' || 'false' }}
+        run: |
+          cat > /tmp/onwards-openresponses-config.json <<EOF
+          {
+            "strict_mode": true,
+            "targets": {
+              "gpt-4o-mini": {
+                "url": "https://api.openai.com/v1",
+                "onwards_key": "$OPENAI_API_KEY",
+                "open_responses": {
+                  "adapter": $ADAPTER_FLAG
+                }
+              }
+            }
+          }
+          EOF
+
+      - name: Start Onwards
+        run: |
+          ./target/release/onwards \
+            -f /tmp/onwards-openresponses-config.json \
+            > /tmp/onwards.log 2>&1 &
+          for attempt in $(seq 1 30); do
+            if curl -sf http://localhost:3000/v1/models > /dev/null 2>&1; then
+              echo "Server is ready"
+              exit 0
+            fi
+            echo "Waiting for Onwards (${attempt}/30)"
+            sleep 1
+          done
+          echo "Server failed to start" >&2
+          cat /tmp/onwards.log
+          exit 1
+
+      - name: Run compliance tests
+        run: |
+          cd /tmp/openresponses
+          bun run bin/compliance-test.ts \
+            --base-url http://localhost:3000/v1 \
+            --api-key test \
+            --model gpt-4o-mini
+
+      - name: Show Onwards logs
+        if: always()
+        run: cat /tmp/onwards.log || echo "No log file found"
+
   build:
-    if: (github.event_name == 'pull_request' && !startsWith(github.head_ref, 'release-please--')) || github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'pull_request' || github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch'
     runs-on: depot-ubuntu-24.04
 
     permissions:
@@ -358,7 +534,7 @@ jobs:
       image-tag: ${{ steps.meta.outputs.tags }}
 
   openresponses-compliance:
-    if: (github.event_name == 'pull_request' && !startsWith(github.head_ref, 'release-please--')) || github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'pull_request' || github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     needs: build
     name: Open Responses Compliance
@@ -847,7 +1023,7 @@ jobs:
         run: docker rm -f dwctl-openresponses-compliance || true
 
   security-scan:
-    if: (github.event_name == 'pull_request' && !startsWith(github.head_ref, 'release-please--')) || github.event_name == 'merge_group'
+    if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
     runs-on: depot-ubuntu-24.04
     needs: build
 
@@ -922,7 +1098,7 @@ jobs:
           curl -X POST "https://charts.somnial.co/doubleword-control-layer/high-vulnerabilities?value=${HIGH}" || echo "Failed to report high vulnerabilities"
 
   e2e-test-docker:
-    if: (github.event_name == 'pull_request' && !startsWith(github.head_ref, 'release-please--')) || github.event_name == 'merge_group'
+    if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
     runs-on: depot-ubuntu-24.04
     needs: build
 
