@@ -36,6 +36,28 @@ class PreviewWorkflowTest < Minitest::Test
     refute_includes workflow, "doubleword.ai"
   end
 
+  def test_preview_workflows_pin_reusable_actions
+    ci_workflow = File.read(File.join(ROOT, ".github", "workflows", "ci.yaml"))
+    close_workflow = File.read(File.join(ROOT, ".github", "workflows", "preview-close.yml"))
+    workflow_contract = ci_workflow[/^  workflow-contract:\n.*?(?=^  \S)/m]
+    preview_publish = ci_workflow[/^  preview:\n.*?(?=^  \S)/m]
+
+    refute_nil workflow_contract
+    refute_nil preview_publish
+    assert_includes workflow_contract,
+                    "actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6"
+
+    github_script = "actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9"
+    assert_includes preview_publish, github_script
+    assert_includes close_workflow, github_script
+
+    [workflow_contract, preview_publish, close_workflow].each do |workflow|
+      workflow.scan(/uses:\s+\S+@(\S+)/).each do |(reference)|
+        assert_match(/\A[0-9a-f]{40}\z/, reference)
+      end
+    end
+  end
+
   def test_comment_driven_staging_build_is_removed
     refute File.exist?(File.join(ROOT, ".github", "workflows", "build-staging.yml"))
   end

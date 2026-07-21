@@ -10,7 +10,7 @@ jobs:
   workflow-contract:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
       - run: ruby scripts/tests/preview_workflow_test.rb
 
   frontend-test:
@@ -278,7 +278,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Publish preview artifact
-        uses: actions/github-script@v9
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
         env:
           ARTIFACT_DIGEST: ${{ needs.build.outputs.image-digest }}
         with:
