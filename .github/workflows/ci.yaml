@@ -140,21 +140,11 @@ jobs:
         with:
           components: rustfmt, clippy, llvm-tools-preview
 
-      # Cache Cargo binaries and dependency artifacts. Workspace target
-      # artifacts are invalidated by fresh checkout timestamps, so compiler
-      # outputs are cached separately with sccache below.
+      # Cache Cargo binaries and dependency artifacts.
       - uses: Swatinem/rust-cache@v2
         with:
           # Keep valid compilation artifacts when a later database test flakes.
           cache-on-failure: true
-
-      - name: Set up compiler cache
-        uses: mozilla-actions/sccache-action@v0.0.10
-
-      - name: Enable compiler cache
-        run: |
-          echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
-          echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
 
       - name: Install just
         uses: extractions/setup-just@v3
