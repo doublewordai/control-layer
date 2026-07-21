@@ -1,0 +1,38 @@
+name: Preview
+
+on:
+  pull_request:
+    branches: [main]
+    types: [closed]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: preview-close-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  close:
+    name: Preview
+    if: >-
+      startsWith(github.head_ref, 'preview/') &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - name: Publish preview closure
+        uses: actions/github-script@v9
+        with:
+          github-token: ${{ secrets.PREVIEW_DISPATCH_TOKEN }}
+          script: |
+            await github.rest.repos.createDispatchEvent({
+              owner: '${{ secrets.PREVIEW_DISPATCH_OWNER }}',
+              repo: '${{ secrets.PREVIEW_DISPATCH_REPOSITORY }}',
+              event_type: 'preview-closed',
+              client_payload: {
+                repository: context.repo.owner + '/' + context.repo.repo,
+                pull_request: context.payload.pull_request.number,
+                branch: context.payload.pull_request.head.ref,
+                sha: context.payload.pull_request.head.sha
+              }
+            })
