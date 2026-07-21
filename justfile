@@ -563,6 +563,8 @@ lint target *args="":
             echo "Checking Fusillade release routing and package metadata..."
             .github/scripts/test-sync-fusillade-release-dependencies.sh
             .github/scripts/test-fusillade-publish.sh
+            .github/scripts/test-rust-ci-matrix.sh
+            .github/scripts/test-aggregate-rust-coverage.sh
             cargo package --package fusillade-arsenal --allow-dirty --list | grep -q '^\.sqlx/query-.*\.json$'
             ;;
         *)

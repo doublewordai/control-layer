@@ -97,14 +97,101 @@ jobs:
           curl -X POST "https://charts.somnial.co/doubleword-control-layer/total-bundle-size?value=${TOTAL_SIZE}" || true
           curl -X POST "https://charts.somnial.co/doubleword-control-layer/gzipped-bundle-size?value=${GZIPPED_SIZE}" || true
 
-  backend-test:
+  backend-crate-test:
     if: (github.event_name == 'pull_request' && !startsWith(github.head_ref, 'release-please--')) || github.event_name == 'merge_group'
-    runs-on: depot-ubuntu-24.04-16
+    name: backend-test (${{ matrix.package }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - package: dwctl
+            runner: depot-ubuntu-24.04-16
+            database: true
+          - package: fusillade
+            runner: depot-ubuntu-24.04-8
+            database: true
+          - package: fusillade-core
+            runner: depot-ubuntu-24.04-8
+            database: false
+          - package: fusillade-arsenal
+            runner: depot-ubuntu-24.04-8
+            database: true
+    runs-on: ${{ matrix.runner }}
 
     # Postgres is started manually below (not via `services:`) so we can pass
-    # `-c max_connections=300` — the 16-core runner runs `#[sqlx::test]`
-    # tests with high parallelism, and each one opens its own pools + underway
+    # `-c max_connections=300`. SQLx tests open their own pools and underway
     # PgListener connections, so the default 100 is insufficient.
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Start Postgres
+        if: matrix.database
+        run: |
+          docker run -d --name postgres \
+            -e POSTGRES_DB=test \
+            -e POSTGRES_USER=postgres \
+            -e POSTGRES_PASSWORD=postgres \
+            -e POSTGRES_HOST_AUTH_METHOD=trust \
+            -p 5432:5432 \
+            postgres:latest \
+            -c max_connections=300
+          for _ in $(seq 1 30); do
+            docker exec postgres pg_isready -U postgres && break
+            sleep 1
+          done
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: backend-test-${{ matrix.package }}
+
+      - name: Install just
+        uses: extractions/setup-just@v3
+
+      - name: Install sqlx-cli and cargo-llvm-cov
+        run: |
+          cargo install cargo-llvm-cov --locked
+          if [[ "${{ matrix.database }}" == "true" ]]; then
+            # Pin sqlx-cli to the 0.8.x line to match the library version.
+            cargo install sqlx-cli --version '^0.8' --no-default-features --features native-tls,postgres --locked
+          fi
+
+      - name: Set up test databases
+        if: matrix.database
+        env:
+          DB_PASS: postgres
+        run: just db-setup
+
+      - name: Compile and test ${{ matrix.package }}
+        run: |
+          START_TIME=$(date +%s)
+          cargo llvm-cov --package "${{ matrix.package }}" \
+            --lcov \
+            --output-path "lcov-${{ matrix.package }}.info"
+          END_TIME=$(date +%s)
+          CI_DURATION=$((END_TIME - START_TIME))
+          echo "${{ matrix.package }} tests completed in ${CI_DURATION}s"
+          curl -X POST \
+            "https://charts.somnial.co/doubleword-control-layer/backend-${{ matrix.package }}-ci-duration?value=${CI_DURATION}" || true
+
+      - name: Upload ${{ matrix.package }} coverage
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-coverage-${{ matrix.package }}
+          path: lcov-${{ matrix.package }}.info
+          if-no-files-found: error
+          retention-days: 1
+
+  backend-lint:
+    if: (github.event_name == 'pull_request' && !startsWith(github.head_ref, 'release-please--')) || github.event_name == 'merge_group'
+    runs-on: depot-ubuntu-24.04-16
 
     steps:
       - name: Checkout code
@@ -127,71 +214,78 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
-        with:
-          components: llvm-tools-preview
 
-      # used only for caching binary installs
-      - uses: Swatinem/rust-cache@v2
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: backend-lint
 
       - name: Install just
         uses: extractions/setup-just@v3
 
-      - name: Install sqlx-cli and cargo-llvm-cov
-        run: |
-          # Pin sqlx-cli to the 0.8.x line to match the `sqlx` library version.
-          # sqlx-cli 0.9.0 stopped auto-loading the per-crate `.env`, so an
-          # unpinned install made `cargo sqlx prepare --check` fail to find
-          # DATABASE_URL. Keep the CLI and library majors in lockstep.
-          cargo install sqlx-cli --version '^0.8' --no-default-features --features native-tls,postgres --locked
-          cargo install cargo-llvm-cov --locked
+      - name: Install sqlx-cli
+        run: cargo install sqlx-cli --version '^0.8' --no-default-features --features native-tls,postgres --locked
 
-      - name: Run backend CI pipeline
-        id: ci-step
+      - name: Set up test databases
         env:
           DB_PASS: postgres
+        run: just db-setup
+
+      - name: Lint Rust workspace
+        run: just lint rust -- -D warnings
+
+  backend-test:
+    if: always() && ((github.event_name == 'pull_request' && !startsWith(github.head_ref, 'release-please--')) || github.event_name == 'merge_group')
+    needs: [backend-crate-test, backend-lint]
+    runs-on: ubuntu-latest
+    name: backend-test
+    env:
+      MINIMUM_COVERAGE: "60"
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Require crate tests and lint
+        env:
+          CRATE_TEST_RESULT: ${{ needs.backend-crate-test.result }}
+          LINT_RESULT: ${{ needs.backend-lint.result }}
         run: |
-          START_TIME=$(date +%s)
-          just ci rust -- -D warnings
-          END_TIME=$(date +%s)
-          CI_DURATION=$((END_TIME - START_TIME))
-          echo "ci_duration=$CI_DURATION" >> $GITHUB_OUTPUT
-          echo "Rust CI pipeline completed in ${CI_DURATION}s"
-
-          # Report metrics to Somnial
-          curl -X POST "https://charts.somnial.co/doubleword-control-layer/backend-ci-duration?value=${CI_DURATION}" || true
-
-      - name: Extract backend coverage metrics
-        id: coverage-step
-        working-directory: ./dwctl
-        run: |
-          # Extract coverage from already generated lcov.info file (from 'just ci rust')
-          echo "Checking for coverage files..."
-          ls -la lcov.info || echo "lcov.info not found"
-
-          if [ -f lcov.info ]; then
-            echo "Found lcov.info, parsing coverage data..."
-
-            # Parse lcov.info using awk (clean and always available)
-            COVERAGE=$(awk '
-              /^LF:/ { lf += $2 }
-              /^LH:/ { lh += $2 }
-              END {
-                if (lf > 0)
-                  printf "%.2f", (lh * 100) / lf
-                else
-                  print "0"
-              }
-            ' FS=: lcov.info)
-
-            echo "coverage=$COVERAGE" >> $GITHUB_OUTPUT
-            echo "Backend code coverage: ${COVERAGE}%"
-
-            # Report coverage to Somnial
-            curl -X POST "https://charts.somnial.co/doubleword-control-layer/backend-code-coverage?value=${COVERAGE}" || true
-          else
-            echo "No coverage report found at lcov.info - coverage may not have been generated"
-            echo "coverage=0" >> $GITHUB_OUTPUT
+          if [[ "$CRATE_TEST_RESULT" != "success" ]]; then
+            echo "One or more crate test jobs failed: $CRATE_TEST_RESULT" >&2
+            exit 1
           fi
+          if [[ "$LINT_RESULT" != "success" ]]; then
+            echo "Rust workspace lint failed: $LINT_RESULT" >&2
+            exit 1
+          fi
+
+      - name: Download per-crate coverage
+        uses: actions/download-artifact@v4
+        with:
+          pattern: rust-coverage-*
+          path: rust-coverage
+          merge-multiple: true
+
+      - name: Aggregate backend coverage
+        id: coverage-step
+        run: |
+          shopt -s nullglob
+          coverage_files=(rust-coverage/*.info)
+          if (( ${#coverage_files[@]} != 4 )); then
+            echo "Expected 4 coverage files, found ${#coverage_files[@]}" >&2
+            exit 1
+          fi
+
+          .github/scripts/aggregate-rust-coverage.py \
+            --minimum "$MINIMUM_COVERAGE" \
+            "${coverage_files[@]}" | tee coverage-summary.txt
+
+          COVERAGE=$(awk -F= '/^coverage=/ { print $2 }' coverage-summary.txt)
+          echo "coverage=$COVERAGE" >> "$GITHUB_OUTPUT"
+          echo "Backend code coverage: ${COVERAGE}%"
+          curl -X POST \
+            "https://charts.somnial.co/doubleword-control-layer/backend-code-coverage?value=${COVERAGE}" || true
 
   build:
     if: (github.event_name == 'pull_request' && !startsWith(github.head_ref, 'release-please--')) || github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch'
