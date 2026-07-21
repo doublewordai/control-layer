@@ -14,7 +14,7 @@ concurrency:
 
 jobs:
   close:
-    name: Preview
+    name: Close preview
     if: >-
       startsWith(github.head_ref, 'preview/') &&
       github.event.pull_request.head.repo.full_name == github.repository

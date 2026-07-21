@@ -269,12 +269,12 @@ jobs:
       image-digest: ${{ steps.preview-image.outputs.digest }}
 
   preview:
-    name: Preview
+    name: Publish preview artifact
     if: >-
       github.event_name == 'pull_request' &&
       startsWith(github.head_ref, 'preview/') &&
       github.event.pull_request.head.repo.full_name == github.repository
-    needs: build
+    needs: [workflow-contract, frontend-test, backend-test, build]
     runs-on: ubuntu-latest
     steps:
       - name: Publish preview artifact

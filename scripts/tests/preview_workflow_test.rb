@@ -11,6 +11,8 @@ class PreviewWorkflowTest < Minitest::Test
     assert_includes workflow, "github.event.pull_request.head.sha"
     assert_includes workflow, "DOCKER_METADATA_SHORT_SHA_LENGTH: 40"
     assert_includes workflow, "steps.preview-image.outputs.digest"
+    assert_includes workflow, "needs: [workflow-contract, frontend-test, backend-test, build]"
+    assert_includes workflow, "name: Publish preview artifact"
     assert_includes workflow, "startsWith(github.head_ref, 'preview/')"
     assert_includes workflow, "github.event.pull_request.head.repo.full_name == github.repository"
     assert_includes workflow, "preview-artifact-published"
