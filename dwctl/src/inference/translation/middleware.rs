@@ -22,18 +22,21 @@ use super::{ProtocolTranslator, TranslationError, TranslationRegistry};
 pub async fn translation_middleware(State(registry): State<TranslationRegistry>, request: Request<Body>, next: Next) -> Response {
     let path = request.uri().path().to_string();
 
-    // Only POST carries a translatable body. Without this gate a GET/DELETE to a
-    // matching path (say `/v1/responses`) would be claimed by a translator and
-    // then rejected with 400 by the body parse, instead of falling through to the
-    // real routing and its 404/405. Mirrors `should_intercept` in the inference
-    // middleware, which is POST-gated for the same reason.
-    if request.method() != Method::POST {
-        return next.run(request).await;
-    }
-
     let Some(translator) = registry.detect(&path, request.headers()) else {
         return next.run(request).await;
     };
+
+    // A translator that parses a request body can only act on a POST. Without
+    // this gate a GET/DELETE to a body-translating path (say `/v1/responses`)
+    // would be claimed and then rejected with a 400 from the body parse, instead
+    // of falling through to the real routing and its 404/405.
+    //
+    // Gated per-translator rather than up front, because not every translator
+    // consumes a body: `AnthropicModels` deliberately claims `GET /models` to
+    // normalise auth, and a blanket POST check here would silently break it.
+    if translator.translates_request_body() && request.method() != Method::POST {
+        return next.run(request).await;
+    }
     debug!(translator = translator.name(), path = %path, "edge translation: request matched");
 
     let (mut parts, body) = request.into_parts();
@@ -389,9 +392,13 @@ mod tests {
         assert!(!seen.contains("/messages"), "downstream saw: {seen}");
     }
 
-    /// Only POST carries a translatable body. A GET to a path a translator would
-    /// otherwise claim must pass straight through to the real routing, rather than
-    /// being intercepted and rejected with a 400 from the body parse.
+    /// A GET to a path claimed by a BODY-translating translator must pass straight
+    /// through to the real routing, rather than being intercepted and rejected
+    /// with a 400 from the body parse.
+    ///
+    /// The gate is per-translator, not blanket: see
+    /// `get_is_still_translated_for_header_only_translator` below, which pins the
+    /// case this must not break.
     #[tokio::test]
     async fn non_post_request_is_not_intercepted() {
         async fn marker(_req: Request) -> Response {
@@ -410,6 +417,50 @@ mod tests {
         );
         let body: serde_json::Value = response.json();
         assert_eq!(body["handler"], "reached");
+    }
+
+    /// The POST gate must NOT be blanket. `AnthropicModels` claims `GET /models`
+    /// purely to normalise `x-api-key` into `Authorization`; gating every
+    /// translator to POST silently broke that and 401'd Anthropic model
+    /// discovery. Assert a header-only translator still claims a GET.
+    #[tokio::test]
+    async fn get_is_still_translated_for_header_only_translator() {
+        // Echo the Authorization header the handler saw back as a model id: the
+        // translator rewrites the response into Anthropic's shape, so a custom
+        // top-level field would be dropped, but a model id survives.
+        async fn echo_auth(req: Request) -> Response {
+            let seen = req
+                .headers()
+                .get(header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("<none>")
+                .to_string();
+            let body = serde_json::json!({
+                "object": "list",
+                "data": [ { "id": seen, "object": "model", "created": 0, "owned_by": "test" } ]
+            });
+            json_response(StatusCode::OK, Bytes::from(serde_json::to_vec(&body).unwrap()))
+        }
+
+        let registry = TranslationRegistry::new(vec![Arc::new(crate::inference::translation::anthropic::models::AnthropicModels)]);
+        let inner = Router::new()
+            .route("/models", axum::routing::get(echo_auth))
+            .layer(axum::middleware::from_fn_with_state(registry, translation_middleware));
+        let app = Router::new().nest("/ai/v1", inner);
+        let server = axum_test::TestServer::new(app).expect("test server");
+
+        let response = server
+            .get("/ai/v1/models")
+            .add_header("x-api-key", "sk-test")
+            .add_header("anthropic-version", "2023-06-01")
+            .await;
+
+        assert_eq!(response.status_code().as_u16(), 200);
+        let body: serde_json::Value = response.json();
+        assert_eq!(
+            body["data"][0]["id"], "Bearer sk-test",
+            "a header-only translator must still normalise auth on a GET"
+        );
     }
 
     /// A streaming `/messages` request: the handler returns an OpenAI SSE

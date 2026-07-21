@@ -97,6 +97,18 @@ pub trait ProtocolTranslator: Send + Sync {
     /// deserialise the body, so the fast path for native requests stays fast.
     fn detect(&self, path: &str, headers: &HeaderMap) -> bool;
 
+    /// Whether [`translate_request`](Self::translate_request) deserialises the
+    /// request body. When true the middleware only claims POSTs, so a GET or
+    /// DELETE to the same path falls through to the real routing (and its
+    /// 404/405) instead of being rejected by the body parse.
+    ///
+    /// Defaults to true, since that is the common case. Translators that only
+    /// rewrite headers or the path - `AnthropicModels`, which claims
+    /// `GET /models` purely to normalise auth - must override this to false.
+    fn translates_request_body(&self) -> bool {
+        true
+    }
+
     /// Translate the foreign request into a canonical Chat Completions request.
     fn translate_request(&self, parts: &Parts, body: Bytes) -> Result<TranslatedRequest, TranslationError>;
 

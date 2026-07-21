@@ -36,6 +36,12 @@ impl ProtocolTranslator for AnthropicModels {
         path.ends_with("/models") && headers.contains_key("anthropic-version")
     }
 
+    /// This translator claims `GET /models` and never reads a body, so it must
+    /// not be gated to POST.
+    fn translates_request_body(&self) -> bool {
+        false
+    }
+
     fn translate_request(&self, parts: &Parts, body: Bytes) -> Result<TranslatedRequest, TranslationError> {
         // A GET with no body to translate. The path already targets onwards'
         // models handler, so we leave it as-is and only normalise auth.

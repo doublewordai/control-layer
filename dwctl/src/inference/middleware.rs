@@ -1117,5 +1117,4 @@ mod tests {
         assert_eq!(row_purpose, "batch");
         assert!(row_hidden);
     }
-
 }
