@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.94.0](https://github.com/doublewordai/control-layer/compare/v8.93.1...v8.94.0) (2026-07-20)
+
+
+### Features
+
+* expose upload watchdog configuration ([#1318](https://github.com/doublewordai/control-layer/issues/1318)) ([d797258](https://github.com/doublewordai/control-layer/commit/d797258c0759e3a54bf63d4c8aa3e57c7f0ce489))
+
 ## [8.93.1](https://github.com/doublewordai/control-layer/compare/v8.93.0...v8.93.1) (2026-07-20)
 
 

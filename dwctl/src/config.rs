@@ -1528,6 +1528,20 @@ pub struct DaemonConfig {
     /// Default: 86,400,000 (24 hours).
     pub body_timeout_ms: u64,
 
+    /// Maximum time without progress while sending the request body, in milliseconds.
+    /// This only covers upload; keep it below first_chunk_timeout_ms so an upload
+    /// stall is reported before the broader first-response timeout. Default: 60,000.
+    pub upload_stall_timeout_ms: u64,
+
+    /// Request-body bytes per upload progress unit. Smaller values detect progress
+    /// more finely at the cost of more body frames. Must be greater than zero.
+    /// Default: 65,536 (64 KiB).
+    pub upload_chunk_bytes: usize,
+
+    /// How often the upload watchdog checks progress, in milliseconds. Keep this
+    /// well below upload_stall_timeout_ms. Must be greater than zero. Default: 100.
+    pub upload_stall_poll_ms: u64,
+
     /// Interval for logging daemon status (requests in flight) in milliseconds
     /// Set to None to disable periodic status logging (default: Some(2000))
     pub status_log_interval_ms: Option<u64>,
@@ -1851,6 +1865,9 @@ impl Default for DaemonConfig {
             first_chunk_timeout_ms: 86_400_000,
             chunk_timeout_ms: 86_400_000,
             body_timeout_ms: 86_400_000,
+            upload_stall_timeout_ms: 60_000,
+            upload_chunk_bytes: 64 * 1024,
+            upload_stall_poll_ms: 100,
             status_log_interval_ms: Some(2000),
             claim_timeout_ms: 60000,
             processing_timeout_ms: 600000,
@@ -1926,6 +1943,9 @@ impl DaemonConfig {
             first_chunk_timeout_ms,
             chunk_timeout_ms,
             body_timeout_ms,
+            upload_stall_timeout_ms: self.upload_stall_timeout_ms,
+            upload_chunk_bytes: self.upload_chunk_bytes,
+            upload_stall_poll_ms: self.upload_stall_poll_ms,
             status_log_interval_ms: self.status_log_interval_ms,
             claim_timeout_ms: self.claim_timeout_ms,
             processing_timeout_ms: self.processing_timeout_ms,
@@ -2764,6 +2784,18 @@ impl Config {
             return Err(Error::Internal {
                 operation: "Config validation: CORS cannot use wildcard origin '*' with allow_credentials=true. Specify explicit origins."
                     .to_string(),
+            });
+        }
+
+        if self.background_services.batch_daemon.upload_chunk_bytes == 0 {
+            return Err(Error::Internal {
+                operation: "Config validation: upload_chunk_bytes cannot be 0. Set a positive integer value (default: 65536).".to_string(),
+            });
+        }
+
+        if self.background_services.batch_daemon.upload_stall_poll_ms == 0 {
+            return Err(Error::Internal {
+                operation: "Config validation: upload_stall_poll_ms cannot be 0. Set a positive integer value (default: 100).".to_string(),
             });
         }
 
@@ -4041,6 +4073,63 @@ background_services:
 
             Ok(())
         });
+    }
+
+    #[test]
+    fn test_upload_watchdog_defaults_override_and_mapping() {
+        Jail::expect_with(|jail| {
+            jail.create_file("test.yaml", "secret_key: test-secret-key\n")?;
+            let args = Args {
+                config: "test.yaml".into(),
+                validate: false,
+            };
+
+            let config = Config::load(&args)?;
+            let daemon = &config.background_services.batch_daemon;
+            assert_eq!(daemon.upload_stall_timeout_ms, 60_000);
+            assert_eq!(daemon.upload_chunk_bytes, 64 * 1024);
+            assert_eq!(daemon.upload_stall_poll_ms, 100);
+
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: test-secret-key
+background_services:
+  batch_daemon:
+    upload_stall_timeout_ms: 30000
+    upload_chunk_bytes: 8192
+    upload_stall_poll_ms: 25
+"#,
+            )?;
+            let config = Config::load(&args)?;
+            let daemon = &config.background_services.batch_daemon;
+            assert_eq!(daemon.upload_stall_timeout_ms, 30_000);
+            assert_eq!(daemon.upload_chunk_bytes, 8 * 1024);
+            assert_eq!(daemon.upload_stall_poll_ms, 25);
+
+            let fusillade = daemon.to_fusillade_config();
+            assert_eq!(fusillade.upload_stall_timeout_ms, 30_000);
+            assert_eq!(fusillade.upload_chunk_bytes, 8 * 1024);
+            assert_eq!(fusillade.upload_stall_poll_ms, 25);
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_upload_watchdog_zero_values_rejected() {
+        let mut config = Config::default();
+        config.auth.native.enabled = true;
+        config.secret_key = Some("test-secret-key".to_string());
+
+        config.background_services.batch_daemon.upload_chunk_bytes = 0;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("upload_chunk_bytes cannot be 0"), "{err}");
+
+        config.background_services.batch_daemon.upload_chunk_bytes = 64 * 1024;
+        config.background_services.batch_daemon.upload_stall_poll_ms = 0;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("upload_stall_poll_ms cannot be 0"), "{err}");
     }
 
     #[test]
