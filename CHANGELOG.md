@@ -1,5 +1,13 @@
 # Changelog
 
+## [8.94.1](https://github.com/doublewordai/control-layer/compare/v8.94.0...v8.94.1) (2026-07-21)
+
+
+### Bug Fixes
+
+* bump fusillade 24.0.0 ([#1326](https://github.com/doublewordai/control-layer/issues/1326)) ([cd2b5a0](https://github.com/doublewordai/control-layer/commit/cd2b5a038226265986426bed0c24090074da8ae9))
+* reject zero upload watchdog settings ([#1320](https://github.com/doublewordai/control-layer/issues/1320)) ([ea03e16](https://github.com/doublewordai/control-layer/commit/ea03e16b2f259768de1cf86e7580c2839d55b212))
+
 ## [8.94.0](https://github.com/doublewordai/control-layer/compare/v8.93.1...v8.94.0) (2026-07-20)
 
 
