@@ -63,14 +63,17 @@ require_literal .github/workflows/ci.yaml \
     'components: rustfmt, clippy, llvm-tools-preview' \
     'the pinned backend toolchain must include lint and coverage components'
 require_literal .github/workflows/ci.yaml \
-    'shared-key: workspace-crates-v1' \
-    'the workspace-inclusive cache must not reuse the immutable dependency-only key'
-require_literal .github/workflows/ci.yaml \
-    'cache-workspace-crates: true' \
-    'the backend cache must preserve the expensive workspace test crate'
-require_literal .github/workflows/ci.yaml \
     'cache-on-failure: true' \
     'successful compilation artifacts must survive later test failures'
+require_literal .github/workflows/ci.yaml \
+    'uses: mozilla-actions/sccache-action@v0.0.10' \
+    'workspace compiler outputs must use the pinned compiler cache action'
+require_literal .github/workflows/ci.yaml \
+    'SCCACHE_GHA_ENABLED=true' \
+    'the compiler cache must use the GitHub Actions backend'
+require_literal .github/workflows/ci.yaml \
+    'RUSTC_WRAPPER=sccache' \
+    'Rust compilation must be routed through the compiler cache'
 require_literal .github/workflows/ci.yaml \
     "cargo install sqlx-cli --version '0.8.6'" \
     'sqlx-cli must be pinned to the workspace SQLx version'
