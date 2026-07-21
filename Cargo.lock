@@ -4281,6 +4281,7 @@ dependencies = [
  "dashmap",
  "eventsource-stream",
  "flate2",
+ "fusillade",
  "futures-util",
  "governor",
  "http-body-util",
