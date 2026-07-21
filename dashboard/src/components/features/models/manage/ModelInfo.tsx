@@ -396,10 +396,14 @@ const ModelInfo: React.FC = () => {
           sanitize_responses: updateData.sanitize_responses,
           trusted: updateData.trusted,
           open_responses_adapter: updateData.open_responses_adapter,
-          reasoning_translation_overrides:
-            normalizeReasoningTranslationOverrides(
-              updateData.reasoning_translation_overrides,
-            ),
+          ...(isStandard
+            ? {
+                reasoning_translation_overrides:
+                  normalizeReasoningTranslationOverrides(
+                    updateData.reasoning_translation_overrides,
+                  ),
+              }
+            : {}),
           // Always include rate limiting and capacity fields to handle clearing properly
           // Send null as the actual value when clearing (not undefined)
           requests_per_second: updateData.requests_per_second,
