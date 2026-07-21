@@ -63,6 +63,9 @@ require_literal .github/workflows/ci.yaml \
     'components: rustfmt, clippy, llvm-tools-preview' \
     'the pinned backend toolchain must include lint and coverage components'
 require_literal .github/workflows/ci.yaml \
+    'shared-key: workspace-crates-v1' \
+    'the workspace-inclusive cache must not reuse the immutable dependency-only key'
+require_literal .github/workflows/ci.yaml \
     'cache-workspace-crates: true' \
     'the backend cache must preserve the expensive workspace test crate'
 require_literal .github/workflows/ci.yaml \

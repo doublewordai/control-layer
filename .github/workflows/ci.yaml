@@ -143,6 +143,9 @@ jobs:
       # Cache Cargo binaries and the profile-specific coverage target.
       - uses: Swatinem/rust-cache@v2
         with:
+          # GitHub cache entries are immutable. Version the namespace so the
+          # former dependency-only entry cannot block this larger cache.
+          shared-key: workspace-crates-v1
           # The workspace is one large crate, so preserving only dependencies
           # still leaves a multi-minute compile on every run.
           cache-workspace-crates: true
