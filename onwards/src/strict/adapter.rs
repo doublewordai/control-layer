@@ -173,7 +173,7 @@ impl OpenResponsesAdapter {
             .unwrap_or(serde_json::Value::String("auto".to_string()));
 
         ResponsesResponse {
-            id: format!("resp_{}", &chat_response.id),
+            id: format!("resp_{}", chat_response.id),
             object: "response".to_string(),
             created_at: chat_response.created,
             completed_at,
