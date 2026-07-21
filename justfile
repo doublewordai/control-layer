@@ -460,7 +460,7 @@ test target="" *args="":
                     echo "  cargo binstall cargo-llvm-cov"
                     exit 1
                 fi
-                cargo llvm-cov --fail-under-lines 60 --lcov --output-path lcov.info
+                cargo llvm-cov --profile ci --no-clean --fail-under-lines 60 --lcov --output-path lcov.info
             else
                 cargo test {{args}}
             fi
@@ -521,6 +521,8 @@ lint target *args="":
             pnpm exec eslint . --max-warnings 0 {{args}}
             ;;
         rust)
+            echo "Running CI performance guard..."
+            ./scripts/check-ci-performance.sh
             echo "Checking Cargo.lock sync..."
             cargo metadata --locked > /dev/null
             echo "Running cargo fmt --check..."
@@ -642,10 +644,8 @@ ci target *args="":
             # Setup databases using db-setup target
             just db-setup
 
-            echo "📋 Setting up llvm-cov environment for consistent compilation..."
             echo "🧪 Step 1/2: Running tests with coverage..."
             just test rust --coverage {{args}}
-            eval "$(cargo llvm-cov show-env --export-prefix)"
             echo "📋 Step 2/2: Linting"
             just lint rust {{args}}
             echo "✅ Rust CI pipeline completed successfully!"

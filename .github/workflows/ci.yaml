@@ -101,10 +101,10 @@ jobs:
     if: (github.event_name == 'pull_request' && !startsWith(github.head_ref, 'release-please--')) || github.event_name == 'merge_group'
     runs-on: depot-ubuntu-24.04-16
 
-    # Postgres is started manually below (not via `services:`) so we can pass
-    # `-c max_connections=300` — the 16-core runner runs `#[sqlx::test]`
-    # tests with high parallelism, and each one opens its own pools + underway
-    # PgListener connections, so the default 100 is insufficient.
+    # Postgres is started manually below (not via `services:`) so the test-only
+    # durability settings match `just db-start`. Eight test threads avoid the
+    # database contention measured at the 16-core runner's default parallelism,
+    # while max_connections=300 leaves room for per-test pools and listeners.
 
     steps:
       - name: Checkout code
@@ -119,6 +119,16 @@ jobs:
             -e POSTGRES_HOST_AUTH_METHOD=trust \
             -p 5432:5432 \
             postgres:latest \
+            -c fsync=off \
+            -c full_page_writes=off \
+            -c synchronous_commit=off \
+            -c wal_level=minimal \
+            -c max_wal_senders=0 \
+            -c checkpoint_timeout=1h \
+            -c max_wal_size=4GB \
+            -c shared_buffers=256MB \
+            -c work_mem=16MB \
+            -c maintenance_work_mem=128MB \
             -c max_connections=300
           for _ in $(seq 1 30); do
             docker exec postgres pg_isready -U postgres && break
@@ -126,11 +136,11 @@ jobs:
           done
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.93.0
         with:
           components: llvm-tools-preview
 
-      # used only for caching binary installs
+      # Cache Cargo binaries and the profile-specific coverage target.
       - uses: Swatinem/rust-cache@v2
 
       - name: Install just
@@ -138,17 +148,16 @@ jobs:
 
       - name: Install sqlx-cli and cargo-llvm-cov
         run: |
-          # Pin sqlx-cli to the 0.8.x line to match the `sqlx` library version.
-          # sqlx-cli 0.9.0 stopped auto-loading the per-crate `.env`, so an
-          # unpinned install made `cargo sqlx prepare --check` fail to find
-          # DATABASE_URL. Keep the CLI and library majors in lockstep.
-          cargo install sqlx-cli --version '^0.8' --no-default-features --features native-tls,postgres --locked
-          cargo install cargo-llvm-cov --locked
+          # Exact versions keep the restored compiler cache stable. sqlx-cli
+          # must match the SQLx library used by the workspace.
+          cargo install sqlx-cli --version '0.8.6' --no-default-features --features native-tls,postgres --locked
+          cargo install cargo-llvm-cov --version '0.6.21' --locked
 
       - name: Run backend CI pipeline
         id: ci-step
         env:
           DB_PASS: postgres
+          RUST_TEST_THREADS: 8
         run: |
           START_TIME=$(date +%s)
           just ci rust -- -D warnings
@@ -162,7 +171,6 @@ jobs:
 
       - name: Extract backend coverage metrics
         id: coverage-step
-        working-directory: ./dwctl
         run: |
           # Extract coverage from already generated lcov.info file (from 'just ci rust')
           echo "Checking for coverage files..."
@@ -237,7 +245,9 @@ jobs:
         with:
           context: .
           file: ./Dockerfile
-          platforms: linux/amd64,linux/arm64
+          # Downstream PR checks run on amd64. Manual builds retain the
+          # multi-architecture behavior used for published images.
+          platforms: ${{ github.event_name == 'workflow_dispatch' && 'linux/amd64,linux/arm64' || 'linux/amd64' }}
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           sbom: true
