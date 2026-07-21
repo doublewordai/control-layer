@@ -1906,6 +1906,7 @@ impl Default for DaemonConfig {
             batch_archive_backfill_enabled: false,
             batch_archive_backfill_interval_ms: default_batch_archive_backfill_interval_ms(),
             batch_archive_backfill_moves_per_tick: default_batch_archive_moves_per_tick(),
+            batch_archive_backfill_concurrency: default_batch_archive_backfill_concurrency(),
             batch_archive_partitions_weeks_ahead: default_batch_archive_partitions_weeks_ahead(),
         }
     }
