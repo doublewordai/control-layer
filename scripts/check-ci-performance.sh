@@ -60,6 +60,9 @@ require_literal .github/workflows/ci.yaml \
     'uses: dtolnay/rust-toolchain@1.93.0' \
     'the backend CI Rust toolchain must be pinned'
 require_literal .github/workflows/ci.yaml \
+    'components: rustfmt, clippy, llvm-tools-preview' \
+    'the pinned backend toolchain must include lint and coverage components'
+require_literal .github/workflows/ci.yaml \
     "cargo install sqlx-cli --version '0.8.6'" \
     'sqlx-cli must be pinned to the workspace SQLx version'
 require_literal .github/workflows/ci.yaml \
@@ -101,10 +104,10 @@ require_literal Dockerfile \
     'target=/usr/local/cargo/git' \
     'Docker builds must preserve the Cargo git cache'
 require_literal Dockerfile \
-    'cp target/release/dwctl /app/dwctl' \
+    'cp target/release/dwctl /app/dwctl-bin' \
     'the cached release binary must be preserved outside the mount'
 require_literal Dockerfile \
-    'COPY --from=builder /app/dwctl /app/dwctl' \
+    'COPY --from=builder /app/dwctl-bin /app/dwctl' \
     'the runtime image must copy the preserved binary'
 
 if ((failures > 0)); then

@@ -48,7 +48,7 @@ RUN --mount=type=cache,id=dwctl-cargo-registry,target=/usr/local/cargo/registry 
     --mount=type=cache,id=dwctl-cargo-git,target=/usr/local/cargo/git \
     --mount=type=cache,id=dwctl-cargo-target-${TARGETARCH},target=/app/target \
     cargo build --release -p dwctl \
-    && cp target/release/dwctl /app/dwctl
+    && cp target/release/dwctl /app/dwctl-bin
 
 # Runtime stage
 FROM ubuntu:24.04
@@ -65,7 +65,7 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /app
 
 # Copy the binary from builder stage (frontend is already embedded in the binary)
-COPY --from=builder /app/dwctl /app/dwctl
+COPY --from=builder /app/dwctl-bin /app/dwctl
 
 # Copy default email templates (can be overridden via volume mount)
 COPY dwctl/default_templates/ /app/default_templates/
