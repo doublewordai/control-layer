@@ -2985,19 +2985,18 @@ impl Application {
         // which requires direct database connection to primary (not through PgBouncer transaction pooling)
         let shared_config = SharedConfig::new(config.clone());
 
-        // Build the fusillade request manager, step manager, response
-        // store, and multi-step processor *before* spawning any daemons.
-        // Order is enforced at the type level (processor depends on
-        // response_store depends on (request_manager, step_manager)),
-        // so by the time we hand all four to `setup_background_services`,
-        // it can safely call `request_manager.set_processor(...)` before
-        // any daemon spawn. Fusillade's daemon snapshots the processor
-        // via `OnceLock::get()` at `run()` time, so anything spawned
-        // afterward (synchronous fusillade daemon AND the leader-gained
-        // closure) sees the multi-step processor — that's what fixes
-        // the `/v1/responses + service_tier=flex` regression where the
-        // daemon kept using `DefaultRequestProcessor` and looped the
-        // request body back to ourselves.
+        // Build the fusillade request manager, step manager, and response
+        // store before spawning any daemons.
+        //
+        // The daemon runs fusillade's `DefaultRequestProcessor`: every flex
+        // and background claim is dispatched as an HTTP call back through the
+        // loopback (`loopback_base_url`, `.../ai`), so it re-enters the full
+        // dwctl stack and edge translation converts `/responses` to Chat
+        // Completions on the way in and back to a Responses object on the way
+        // out. There is no dwctl-side request processor: the server-side
+        // multi-step tool loop was retired in COR-536, and with it the
+        // `DwctlRequestProcessor` that used to intercept `/v1/responses`
+        // claims and run that loop in-process instead of looping back.
         //
         // Shared `model_capacity_limits` map: the fusillade daemon's
         // per-model concurrency controller reads it; the onwards
@@ -3150,13 +3149,10 @@ impl Application {
             });
         } // daemon_registered
 
-        // `response_store`, `multi_step_tool_executor`,
-        // `multi_step_http_client`, `multi_step_loop_config` and the
-        // multi-step processor were built upfront before
-        // `setup_background_services` — `set_processor` ran inside
-        // setup, before any daemon spawn (synchronous fusillade daemon
-        // OR the leader-gained closure). All daemons see the
-        // multi-step processor at claim time.
+        // `response_store` was built upfront (above) so AppState can share it
+        // between the GET `/responses/{id}` handler and `previous_response_id`
+        // hydration. No request processor is installed on the daemon; see the
+        // `DefaultRequestProcessor` note above.
 
         // Inference middleware state. Non-background realtime no longer
         // does any DB work up front; the completion path goes through

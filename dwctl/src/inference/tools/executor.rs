@@ -4,8 +4,9 @@
 //! joined with the user's groups + deployment) and renders them into the OpenAI
 //! Chat Completions `tools` array that the tool-injection middleware splices into
 //! the request body. [`ResolvedTools`] is the request-extension wrapper the
-//! middleware inserts. The tool primitives are retained so server-side tool
-//! execution can be re-introduced inside dwctl later (COR-517).
+//! middleware inserts. The server-side tool loop these fed was removed in
+//! COR-517, leaving this injection path non-functional (it advertises tools
+//! nothing executes); it is slated for removal with the rest of #878 in COR-548.
 
 use serde_json::Value;
 use std::collections::HashMap;
@@ -28,8 +29,8 @@ pub struct ToolDefinition {
     /// Foreign key into `tool_sources` for analytics.
     pub tool_source_id: Uuid,
     /// Tool dispatch kind from `tool_sources.kind` (`"http"` / `"agent"`).
-    /// Retained for when server-side tool execution is re-introduced in dwctl
-    /// (COR-517); the current inject-only path forwards tools to the model.
+    /// Only meaningful for server-side execution, which COR-517 removed; the
+    /// inject-only path never reads it. Slated for removal with #878 (COR-548).
     pub kind: String,
 }
 
