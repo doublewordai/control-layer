@@ -63,6 +63,12 @@ require_literal .github/workflows/ci.yaml \
     'components: rustfmt, clippy, llvm-tools-preview' \
     'the pinned backend toolchain must include lint and coverage components'
 require_literal .github/workflows/ci.yaml \
+    'cache-workspace-crates: true' \
+    'the backend cache must preserve the expensive workspace test crate'
+require_literal .github/workflows/ci.yaml \
+    'cache-on-failure: true' \
+    'successful compilation artifacts must survive later test failures'
+require_literal .github/workflows/ci.yaml \
     "cargo install sqlx-cli --version '0.8.6'" \
     'sqlx-cli must be pinned to the workspace SQLx version'
 require_literal .github/workflows/ci.yaml \

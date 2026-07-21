@@ -183,7 +183,8 @@ async fn setup_sentinel_fixture(pool: &PgPool) -> SentinelFixture {
 }
 
 /// Send the sentinel-bearing realtime request, polling until onwards has the
-/// model (sync is asynchronous). Returns once a 200 is observed.
+/// API key and its model access (sync is asynchronous). Returns once a 200 is
+/// observed.
 async fn send_sentinel_request(fixture: &SentinelFixture) {
     let body = serde_json::json!({
         "model": MODEL_ALIAS,
@@ -196,17 +197,18 @@ async fn send_sentinel_request(fixture: &SentinelFixture) {
             .add_header("authorization", format!("Bearer {}", fixture.realtime_key))
             .json(&body)
             .await;
-        if resp.status_code().as_u16() != 404 {
-            assert_eq!(
-                resp.status_code().as_u16(),
-                200,
-                "realtime request should succeed; body: {}",
-                resp.text()
-            );
-            return;
+        let status = resp.status_code().as_u16();
+        match status {
+            200 => return,
+            // Onwards can observe the key/model notification before the group
+            // access notification. Both states are transient while sync
+            // converges: 404 means the model is absent, 403 means it is present
+            // but the key's access map is not ready yet.
+            403 | 404 if attempt < 99 => {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            _ => panic!("realtime request should succeed; status: {status}; body: {}", resp.text()),
         }
-        assert!(attempt < 99, "model never became routable after polling");
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
 }
 
