@@ -31,3 +31,10 @@ require_text 'name: backend-test' 'preserve the required backend check name'
 require_text 'pattern: rust-coverage-*' 'download all per-package coverage artifacts'
 require_text 'MINIMUM_COVERAGE: "60"' 'preserve the aggregate line coverage threshold'
 require_text '.github/scripts/aggregate-rust-coverage.py' 'merge duplicate source lines before checking coverage'
+
+setup_just_count="$(grep -Fc 'uses: extractions/setup-just@v3' "$workflow")"
+pinned_just_count="$(grep -Fc 'just-version: "1.46.0"' "$workflow")"
+if [[ "$setup_just_count" != "$pinned_just_count" ]]; then
+  echo "Every setup-just invocation must pin just-version 1.46.0" >&2
+  exit 1
+fi

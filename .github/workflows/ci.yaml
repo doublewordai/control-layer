@@ -33,6 +33,8 @@ jobs:
 
       - name: Install just
         uses: extractions/setup-just@v3
+        with:
+          just-version: "1.46.0"
 
       - name: Run frontend CI pipeline
         id: ci-step
@@ -154,6 +156,8 @@ jobs:
 
       - name: Install just
         uses: extractions/setup-just@v3
+        with:
+          just-version: "1.46.0"
 
       - name: Install sqlx-cli and cargo-llvm-cov
         run: |
@@ -222,6 +226,8 @@ jobs:
 
       - name: Install just
         uses: extractions/setup-just@v3
+        with:
+          just-version: "1.46.0"
 
       - name: Install sqlx-cli
         run: cargo install sqlx-cli --version '^0.8' --no-default-features --features native-tls,postgres --locked
@@ -930,6 +936,8 @@ jobs:
 
       - name: Install just
         uses: extractions/setup-just@v3
+        with:
+          just-version: "1.46.0"
 
       - name: Install pnpm
         uses: pnpm/action-setup@v5
