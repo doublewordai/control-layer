@@ -227,7 +227,13 @@ fn convert_tools(tools: &[ResponseTool]) -> Vec<ChatTool> {
                 parameters,
                 strict,
             } => {
-                // OpenAI requires `additionalProperties: false` in strict mode.
+                // OpenAI requires `additionalProperties: false` for strict tools,
+                // and `strict` defaults to true, so fill it in when the caller
+                // omitted it. Applied regardless of the `strict` value: this is a
+                // verbatim port of the onwards adapter's behaviour, and narrowing
+                // it to `strict == true` would change the schema we send for
+                // explicitly non-strict tools. Deliberately left as-is so this
+                // move is behaviour-preserving; revisit separately.
                 let mut params = parameters.clone();
                 if let Some(obj) = params.as_object_mut()
                     && !obj.contains_key("additionalProperties")

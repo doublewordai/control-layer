@@ -1,7 +1,8 @@
 //! Generic edge protocol-translation layer.
 //!
-//! A single Axum middleware (see [`middleware`]) is layered as the OUTERMOST
-//! Tower layer on the onwards router. For each request it asks a registry of
+//! A single Axum middleware (see [`middleware`]) is layered on the onwards
+//! router, inside the inference middleware and the outlet (see the stack comment
+//! in `lib.rs`). For each request it asks a registry of
 //! [`ProtocolTranslator`]s whether any of them claims the request (by route +
 //! headers, cheaply, with no body deserialisation). If one matches, the
 //! middleware:
@@ -26,15 +27,21 @@
 //! request back through the router - a nested router fixes its sub-path at match
 //! time, so a post-match URI change never re-dispatches.
 //!
-//! Anthropic Messages (`/v1/messages`) is the first implementation and is purely
-//! synchronous. The core transform stays sync and pure; a translator that needs
-//! async, stateful work opts in via the [`ProtocolTranslator::pre_request`] /
-//! [`ProtocolTranslator::post_response`] hooks, which the middleware awaits
-//! around the pure translation. These brackets are how the planned OpenAI
-//! Responses translator will resolve `previous_response_id` (hydration) and
-//! persist the produced object, absorbing the translation half of the onwards
-//! adapter. Multi-step tool-loop orchestration is still deliberately NOT part of
-//! this layer.
+//! Every translator is pure and synchronous - a body-in/body-out conversion with
+//! no I/O and no stored handles. There is deliberately no async hook on the
+//! trait. Anything stateful an API needs lives OUTSIDE this layer, in the
+//! components that own that state:
+//!
+//! - the inference middleware (outer to this one) does control-plane work on the
+//!   raw foreign request: `background` / `service_tier` routing, minting the
+//!   tracking id, and `previous_response_id` hydration for OpenAI Responses,
+//! - the outlet (also outer) persists the produced object, which is what
+//!   `GET /v1/responses/{id}` later reads.
+//!
+//! Keeping the translator pure is what lets it sit inside those layers: the
+//! response it produces is the one the outlet stores, and the id it stamps is
+//! the one the client can retrieve. Multi-step tool-loop orchestration is not
+//! part of this layer either.
 
 pub mod anthropic;
 pub mod middleware;

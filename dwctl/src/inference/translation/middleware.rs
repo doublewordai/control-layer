@@ -8,7 +8,7 @@
 use axum::{
     body::Body,
     extract::State,
-    http::{Request, StatusCode, header},
+    http::{Method, Request, StatusCode, header},
     middleware::Next,
     response::Response,
 };
@@ -21,6 +21,15 @@ use super::{ProtocolTranslator, TranslationError, TranslationRegistry};
 /// Generic edge translation middleware. See module docs.
 pub async fn translation_middleware(State(registry): State<TranslationRegistry>, request: Request<Body>, next: Next) -> Response {
     let path = request.uri().path().to_string();
+
+    // Only POST carries a translatable body. Without this gate a GET/DELETE to a
+    // matching path (say `/v1/responses`) would be claimed by a translator and
+    // then rejected with 400 by the body parse, instead of falling through to the
+    // real routing and its 404/405. Mirrors `should_intercept` in the inference
+    // middleware, which is POST-gated for the same reason.
+    if request.method() != Method::POST {
+        return next.run(request).await;
+    }
 
     let Some(translator) = registry.detect(&path, request.headers()) else {
         return next.run(request).await;
@@ -378,6 +387,29 @@ mod tests {
         // onwards' upstream-path join lands on the chat-completions endpoint.
         assert!(seen.ends_with("/chat/completions"), "downstream saw: {seen}");
         assert!(!seen.contains("/messages"), "downstream saw: {seen}");
+    }
+
+    /// Only POST carries a translatable body. A GET to a path a translator would
+    /// otherwise claim must pass straight through to the real routing, rather than
+    /// being intercepted and rejected with a 400 from the body parse.
+    #[tokio::test]
+    async fn non_post_request_is_not_intercepted() {
+        async fn marker(_req: Request) -> Response {
+            json_response(StatusCode::OK, Bytes::from_static(b"{\"handler\":\"reached\"}"))
+        }
+
+        let inner = Router::new().route("/messages", axum::routing::get(marker));
+        let server = test_app(inner);
+
+        let response = server.get("/ai/v1/messages").add_header("x-api-key", "sk-test").await;
+
+        assert_eq!(
+            response.status_code().as_u16(),
+            200,
+            "a GET must reach the route, not be claimed by the translator"
+        );
+        let body: serde_json::Value = response.json();
+        assert_eq!(body["handler"], "reached");
     }
 
     /// A streaming `/messages` request: the handler returns an OpenAI SSE
