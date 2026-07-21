@@ -107,7 +107,18 @@ db-setup:
 
     # Write .env files for sqlx compile-time verification
     echo "Writing .env files..."
-    echo "DATABASE_URL=postgres://$DB_USER:$DB_PASS@$DB_HOST:$DB_PORT/dwctl?options=-c%20search_path%3Dpublic" > dwctl/.env
+    DWCTL_DATABASE_URL="postgres://$DB_USER:$DB_PASS@$DB_HOST:$DB_PORT/dwctl?options=-c%20search_path%3Dpublic%2Cfusillade"
+    DWCTL_FUSILLADE_DATABASE_URL="postgres://$DB_USER:$DB_PASS@$DB_HOST:$DB_PORT/dwctl?options=-c%20search_path%3Dfusillade"
+    FUSILLADE_DATABASE_URL="postgres://$DB_USER:$DB_PASS@$DB_HOST:$DB_PORT/fusillade"
+
+    echo "Creating fusillade schema in dwctl database..."
+    PGPASSWORD="$DB_PASS" psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d dwctl \
+        -c "CREATE SCHEMA IF NOT EXISTS fusillade" >/dev/null
+
+    echo "DATABASE_URL=$DWCTL_DATABASE_URL" > .env
+    echo "DATABASE_URL=$DWCTL_DATABASE_URL" > dwctl/.env
+    echo "DATABASE_URL=$FUSILLADE_DATABASE_URL" > fusillade/.env
+    echo "DATABASE_URL=$FUSILLADE_DATABASE_URL" > fusillade-arsenal/.env
 
     # Run migrations
     echo "Running migrations..."
@@ -119,11 +130,28 @@ db-setup:
         exit 1
     fi
 
+    echo "Running fusillade migrations..."
+    if (cd fusillade-arsenal && sqlx migrate run); then
+        echo "  ✅ fusillade migrations complete"
+    else
+        echo "  ❌ fusillade migrations failed"
+        exit 1
+    fi
+
+    echo "Running fusillade schema-mode migrations..."
+    if (cd fusillade-arsenal && DATABASE_URL="$DWCTL_FUSILLADE_DATABASE_URL" sqlx migrate run); then
+        echo "  ✅ fusillade schema-mode migrations complete"
+    else
+        echo "  ❌ fusillade schema-mode migrations failed"
+        exit 1
+    fi
+
     echo ""
     echo "✅ Database setup complete!"
     echo ""
     echo "Database URLs configured:"
-    echo "  dwctl:     postgres://$DB_USER:$DB_PASS@$DB_HOST:$DB_PORT/dwctl?options=-c%20search_path%3Dpublic"
+    echo "  dwctl:     postgres://$DB_USER:$DB_PASS@$DB_HOST:$DB_PORT/dwctl?options=-c%20search_path%3Dpublic%2Cfusillade"
+    echo "  fusillade: postgres://$DB_USER:$DB_PASS@$DB_HOST:$DB_PORT/fusillade"
 
 # Start the full development stack with hot reload
 #
@@ -531,6 +559,11 @@ lint target *args="":
             ./scripts/check-no-payload-logging.sh
             echo "Checking SQLx prepared queries..."
             cargo sqlx prepare --check --workspace
+            (cd fusillade-arsenal && cargo sqlx prepare --check)
+            echo "Checking Fusillade release routing and package metadata..."
+            .github/scripts/test-sync-fusillade-release-dependencies.sh
+            .github/scripts/test-fusillade-publish.sh
+            cargo package --package fusillade-arsenal --allow-dirty --list | grep -q '^\.sqlx/query-.*\.json$'
             ;;
         *)
             echo "Usage: just lint [ts|rust]"
@@ -770,7 +803,7 @@ security-scan target="latest" *args="":
 
 # Publish packages to crates.io: 'just release'
 #
-# Publishes both fusillade and dwctl packages to crates.io in an idempotent way.
+# Publishes dwctl to crates.io after its Fusillade dependencies are available.
 # If a version is already published, it will be skipped gracefully.
 #
 # Prerequisites:
@@ -778,7 +811,7 @@ security-scan target="latest" *args="":
 # - Node.js and pnpm installed (for building dwctl frontend)
 #
 # The release process:
-# 1. Attempts to publish fusillade (skips if version already exists)
+# 1. Waits for the workspace's Fusillade versions on crates.io
 # 2. Builds frontend and bundles it into dwctl/static
 # 3. Attempts to publish dwctl (skips if version already exists)
 #
@@ -823,6 +856,8 @@ release:
             fi
         fi
     }
+
+    .github/scripts/wait-for-fusillade-crates.sh
 
     # Build frontend for dwctl
     echo "Building frontend and publishing dwctl..."

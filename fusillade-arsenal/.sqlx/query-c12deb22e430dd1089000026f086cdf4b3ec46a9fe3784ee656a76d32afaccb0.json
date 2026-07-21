@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT COALESCE(SUM(total_requests), 0)::BIGINT AS \"total!\"\n            FROM batches\n            WHERE created_by = $1\n              AND completion_window = $2\n              AND created_at >= $3\n              AND deleted_at IS NULL\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "total!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Timestamptz"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "c12deb22e430dd1089000026f086cdf4b3ec46a9fe3784ee656a76d32afaccb0"
+}

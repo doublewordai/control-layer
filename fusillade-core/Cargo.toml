@@ -1,0 +1,31 @@
+[package]
+name = "fusillade-core"
+edition = "2024"
+version = "3.0.0"
+description = "Core domain types and storage traits for Fusillade"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/doublewordai/control-layer"
+
+[lib]
+name = "fusillade_core"
+path = "src/lib.rs"
+
+[features]
+default = []
+sqlx-postgres = ["dep:sqlx"]
+
+[dependencies]
+tracing = "0.1"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["serde", "v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+anyhow = "1"
+thiserror = "2"
+async-trait = "0.1"
+futures = "0.3"
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "uuid", "chrono", "json", "tls-rustls"], optional = true }
+
+[dev-dependencies]
+axum = "0.8"

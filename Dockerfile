@@ -5,6 +5,9 @@ WORKDIR /app
 FROM chef AS planner
 COPY Cargo.toml Cargo.lock ./
 COPY dwctl/ dwctl/
+COPY fusillade/ fusillade/
+COPY fusillade-core/ fusillade-core/
+COPY fusillade-arsenal/ fusillade-arsenal/
 RUN cargo chef prepare --recipe-path recipe.json
 
 # Backend build stage
@@ -33,9 +36,12 @@ RUN pnpm run build
 WORKDIR /app
 
 # Copy source and build
-COPY .sqlx/ .sqlx/
 COPY Cargo.toml Cargo.lock ./
+COPY .sqlx/ .sqlx/
 COPY dwctl/ dwctl/
+COPY fusillade/ fusillade/
+COPY fusillade-core/ fusillade-core/
+COPY fusillade-arsenal/ fusillade-arsenal/
 RUN rm -rf dwctl/static && cp -r dashboard/dist dwctl/static
 ENV SQLX_OFFLINE=true
 RUN cargo build --release -p dwctl

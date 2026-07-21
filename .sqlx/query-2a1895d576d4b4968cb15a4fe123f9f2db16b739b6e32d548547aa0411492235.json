@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT id,\n                   COALESCE(\n                       archive_bucket,\n                       date_trunc('week', created_at AT TIME ZONE 'UTC')::date\n                   ) AS \"bucket!\"\n            FROM batches\n            WHERE output_file_id = $1\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "bucket!",
+        "type_info": "Date"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      null
+    ]
+  },
+  "hash": "2a1895d576d4b4968cb15a4fe123f9f2db16b739b6e32d548547aa0411492235"
+}

@@ -24,7 +24,7 @@ just db-start
 just db-setup
 ```
 
-**Offline mode alternative**: Set `SQLX_OFFLINE=true` to use cached query metadata from `.sqlx/` directory for builds without database access.
+**Offline mode alternative**: Set `SQLX_OFFLINE=true` to use the workspace query metadata in `.sqlx/` for builds without database access. `fusillade-arsenal/.sqlx/` is also kept current because it ships with that standalone crate.
 
 ## Build Commands
 
@@ -67,7 +67,8 @@ cd dashboard && npm test -- --run # Direct vitest execution
 just lint rust                    # Full lint (fmt + clippy + sqlx prepare check)
 cargo fmt --check                 # Check formatting only
 cargo clippy                      # Clippy only
-cargo sqlx prepare --check --workspace  # Verify SQLx offline metadata
+cargo sqlx prepare --check --workspace
+(cd fusillade-arsenal && cargo sqlx prepare --check)
 ```
 
 ### TypeScript
@@ -97,7 +98,8 @@ just ci ts
 - `Cargo.toml` - Rust workspace config
 - `config.yaml` - Application configuration
 - `docker-compose.yml` - Production container setup
-- `.sqlx/` - SQLx offline query cache (required for offline builds)
+- `.sqlx/` - shared workspace SQLx query cache used by local and container builds
+- `fusillade-arsenal/.sqlx/` - standalone crate cache included in its published package
 
 ### Rust Backend (`dwctl/`)
 - `src/main.rs` - Entry point
@@ -138,7 +140,7 @@ cd dwctl && sqlx migrate run
 **Never** run `sqlx migrate run --source ... --database-url ...` from root.
 
 ### SQLx prepared queries out of sync
-If queries change, regenerate: `cargo sqlx prepare --workspace`
+If queries change, regenerate the workspace cache with `cargo sqlx prepare --workspace` from the repository root. If Arsenal queries change, also run `cargo sqlx prepare` from `fusillade-arsenal/` so its published package remains self-contained.
 
 ## Configuration
 - Environment variables: Prefix with `DWCTL_`, use `__` for nested keys (e.g., `DWCTL_AUTH__NATIVE__ENABLED=false`)

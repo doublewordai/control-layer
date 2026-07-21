@@ -1,3 +1,6 @@
 {
-  "dwctl": "8.94.0"
+  "dwctl": "8.94.0",
+  "fusillade": "23.0.2",
+  "fusillade-core": "3.0.0",
+  "fusillade-arsenal": "2.1.4"
 }

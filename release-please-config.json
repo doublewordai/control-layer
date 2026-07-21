@@ -1,10 +1,32 @@
 {
+  "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
+  "release-type": "rust",
+  "include-component-in-tag": true,
+  "tag-separator": "-",
   "packages": {
     "dwctl": {
-      "release-type": "rust",
+      "component": "dwctl",
+      "include-component-in-tag": false,
       "changelog-path": "/CHANGELOG.md"
+    },
+    "fusillade": {
+      "component": "fusillade",
+      "package-name": "fusillade",
+      "release-type": "simple",
+      "extra-files": [
+        {
+          "type": "generic",
+          "path": "Cargo.toml"
+        }
+      ]
+    },
+    "fusillade-core": {
+      "component": "fusillade-core",
+      "package-name": "fusillade-core"
+    },
+    "fusillade-arsenal": {
+      "component": "fusillade-arsenal",
+      "package-name": "fusillade-arsenal"
     }
-  },
-  "plugins": ["cargo-workspace"],
-  "include-component-in-tag": false
+  }
 }

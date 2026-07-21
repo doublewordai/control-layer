@@ -3,10 +3,16 @@ name: Release
 on:
   release:
     types: [published]
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Fusillade release tag to republish
+        required: false
+        type: string
 
 jobs:
   build:
-    if: ${{ !github.event.release.prerelease }}
+    if: ${{ !github.event.release.prerelease && startsWith(github.event.release.tag_name, 'v') }}
     runs-on: depot-ubuntu-24.04
 
     permissions:
@@ -67,7 +73,7 @@ jobs:
           curl -X POST "https://charts.somnial.co/doubleword-control-layer/docker-build-duration?value=${BUILD_DURATION}" || true
 
   notify-deploy:
-    if: ${{ !github.event.release.prerelease }}
+    if: ${{ !github.event.release.prerelease && startsWith(github.event.release.tag_name, 'v') }}
     needs: [build]
     runs-on: ubuntu-latest
 
@@ -88,8 +94,8 @@ jobs:
             })
             console.log(`Triggered deployment for version ${{ github.event.release.tag_name }}`)
 
-  publish-crates:
-    if: ${{ !github.event.release.prerelease }}
+  publish-dwctl:
+    if: ${{ !github.event.release.prerelease && startsWith(github.event.release.tag_name, 'v') }}
     runs-on: depot-ubuntu-24.04
 
     steps:
@@ -116,13 +122,41 @@ jobs:
       - name: Install just
         uses: extractions/setup-just@v3
 
-      - name: Copy SQLx metadata to dwctl package
-        run: |
-          echo "Copying .sqlx/ from workspace root to dwctl/"
-          cp -r .sqlx/ dwctl/.sqlx/
-          echo "SQLx metadata copied successfully"
-
       - name: Publish to crates.io
         run: just release
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+  publish-fusillade:
+    if: >-
+      ${{
+        (github.event_name == 'release' &&
+          !github.event.release.prerelease &&
+          startsWith(github.event.release.tag_name, 'fusillade-')) ||
+        (github.event_name == 'workflow_dispatch' &&
+          startsWith(inputs.release_tag, 'fusillade-'))
+      }}
+    runs-on: depot-ubuntu-24.04
+
+    steps:
+      - name: Checkout release
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.release_tag }}
+
+      - name: Checkout current release tooling
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          path: .release-tools
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Publish Fusillade crate
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          RELEASE_TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.release_tag }}
+        run: bash .release-tools/.github/scripts/publish-fusillade-crate.sh "$RELEASE_TAG"

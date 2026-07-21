@@ -1,0 +1,36 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO batches (file_id, endpoint, completion_window, metadata, created_by, expires_at, api_key_id, api_key, total_requests)\n            VALUES ($1, $2, $3, $4, COALESCE($5, ''), $6, $7, NULLIF(TRIM($8), ''), $9)\n            RETURNING id, created_at\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text",
+        "Jsonb",
+        "Text",
+        "Timestamptz",
+        "Uuid",
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "b23108d8ac4546045b38ef63bc9b7142b7a2bfc588b69cc16043c06bdb2ed9cc"
+}

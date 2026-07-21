@@ -1,0 +1,51 @@
+[package]
+name = "fusillade"
+edition = "2024"
+version = "23.0.2" # x-release-please-version
+description = "A daemon implementation for sending batched LLM requests with efficient request coalescing"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/doublewordai/control-layer"
+
+[features]
+default = ["postgres"]
+postgres = ["dep:fusillade-arsenal"]
+sqlx-postgres = ["fusillade-core/sqlx-postgres"]
+
+[lib]
+name = "fusillade"
+path = "src/lib.rs"
+
+[dependencies]
+fusillade-core = { version = "3.0.0", path = "../fusillade-core" }
+fusillade-arsenal = { version = "2.1.0", path = "../fusillade-arsenal", optional = true }
+tokio-stream = { version = "0.1", features = ["sync"] }
+tokio-util = "0.7"
+tracing = "0.1"
+tracing-opentelemetry = "0.32.1"
+opentelemetry = "0.31.0"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.13", features = ["json", "stream"] }
+bytes = "1"
+http-body = "1"
+uuid = { version = "1", features = ["serde", "v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+anyhow = "1"
+thiserror = "2"
+async-trait = "0.1"
+futures = "0.3"
+eventsource-stream = "0.2"
+openai-reassembler = "0.3.0"
+parking_lot = "0.12"
+scopeguard = "1"
+humantime = "2"
+hostname = "0.4"
+dashmap = { version = "6", features = ["serde"] }
+metrics = "0.24"
+rand = "0.10"
+
+[dev-dependencies]
+axum = "0.8"
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "uuid", "chrono", "json", "tls-rustls"] }
+test-log = "0.2.18"

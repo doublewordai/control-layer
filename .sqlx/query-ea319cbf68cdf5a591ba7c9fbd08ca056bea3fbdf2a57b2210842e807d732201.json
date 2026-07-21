@@ -1,0 +1,40 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT retry_version,\n                   location,\n                   counts_frozen_at,\n                   COALESCE(\n                       archive_bucket,\n                       date_trunc('week', created_at AT TIME ZONE 'UTC')::date\n                   ) AS \"bucket!\"\n            FROM batches\n            WHERE id = $1 AND deleted_at IS NULL\n            FOR UPDATE\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "retry_version",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "location",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "counts_frozen_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 3,
+        "name": "bucket!",
+        "type_info": "Date"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      null
+    ]
+  },
+  "hash": "ea319cbf68cdf5a591ba7c9fbd08ca056bea3fbdf2a57b2210842e807d732201"
+}

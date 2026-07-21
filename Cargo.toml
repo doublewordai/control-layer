@@ -1,3 +1,13 @@
 [workspace]
-members = ["dwctl"]
+members = [
+  "dwctl",
+  "fusillade",
+  "fusillade-arsenal",
+  "fusillade-core",
+]
 resolver = "2"
+
+[patch.crates-io]
+fusillade = { path = "fusillade" }
+fusillade-arsenal = { path = "fusillade-arsenal" }
+fusillade-core = { path = "fusillade-core" }

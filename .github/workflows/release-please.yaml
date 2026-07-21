@@ -15,7 +15,47 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: googleapis/release-please-action@v4
+        id: release
         with:
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
           token: ${{ secrets.RELEASE_TOKEN }}
+
+      - name: Resolve release PR branch
+        id: release-pr
+        env:
+          RELEASE_PRS: ${{ steps.release.outputs.prs }}
+        run: |
+          if [[ -z "$RELEASE_PRS" ]]; then
+            echo "branch=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "branch=$(jq -r '.[0].headBranchName // empty' <<<"$RELEASE_PRS")" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout release PR
+        if: steps.release-pr.outputs.branch != ''
+        uses: actions/checkout@v6
+        with:
+          token: ${{ secrets.RELEASE_TOKEN }}
+          ref: ${{ steps.release-pr.outputs.branch }}
+
+      - name: Install Rust
+        if: steps.release-pr.outputs.branch != ''
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Synchronize workspace release dependencies
+        if: steps.release-pr.outputs.branch != ''
+        run: |
+          python3 .github/scripts/sync-fusillade-release-dependencies.py
+          cargo metadata --format-version 1 > /dev/null
+
+          if git diff --quiet -- Cargo.lock dwctl/Cargo.toml fusillade/Cargo.toml fusillade-arsenal/Cargo.toml; then
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.lock dwctl/Cargo.toml fusillade/Cargo.toml fusillade-arsenal/Cargo.toml
+          git commit -m "chore: sync Fusillade release dependencies"
+          git push origin HEAD:${{ steps.release-pr.outputs.branch }}
