@@ -1882,7 +1882,7 @@ checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
 
 [[package]]
 name = "dwctl"
-version = "8.94.2"
+version = "8.95.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -4271,7 +4271,7 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "onwards"
-version = "0.35.6"
+version = "0.36.0"
 dependencies = [
  "anyhow",
  "async-stream",

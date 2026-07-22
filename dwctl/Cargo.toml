@@ -1,6 +1,6 @@
 [package]
 name = "dwctl"
-version = "8.94.2" # x-release-please-version
+version = "8.95.0" # x-release-please-version
 edition = "2024"
 publish = false
 description = "The Doubleword Control Layer - A self-hostable observability and analytics platform for LLM applications"
