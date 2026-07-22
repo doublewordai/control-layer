@@ -49,6 +49,28 @@ struct ChatRequest {
     model: String,
 }
 
+/// State for the enrichment middleware: the DB pool plus the advertised
+/// Retry-After for `spend_cap_reset_pending` responses. The retry hint tracks
+/// the config sync's **fallback interval** because that periodic sync is what
+/// readmits a capped key whose cap window has rolled over — nothing writes at
+/// a calendar boundary, so no NOTIFY fires and the worst-case wait for
+/// reinstatement is one full fallback period (prod default: minutes, not the
+/// 10s test default). Hard-coding a number here would drift from deployment
+/// config and mislead clients into premature retries.
+#[derive(Clone)]
+pub struct ErrorEnrichmentState {
+    pub pool: PgPool,
+    pub cap_reset_retry_after_secs: u64,
+    /// Pre-boundary readmission grace in seconds (see
+    /// `api_key_cap_near_boundary`, migration 123): an exhausted windowed cap
+    /// within this many seconds of its calendar boundary is treated as
+    /// "reinstatement pending" (retriable 429) rather than "cap exceeded"
+    /// (hard 402), matching the sync predicate readmitting such scopes early.
+    /// Wired to max(300, fallback interval) in prod; overridden in tests to
+    /// pin time-dependent behavior.
+    pub cap_boundary_grace_secs: i32,
+}
+
 /// Middleware that enriches error responses from the AI proxy with helpful context
 ///
 /// Currently handles:
@@ -56,7 +78,12 @@ struct ChatRequest {
 /// - 403 Forbidden errors (likely model access denied) → enriched with model name
 /// - 403 Forbidden errors (likely modality blocked by routing rule) → enriched with modality + model
 #[instrument(name = "dwctl.error_enrichment", skip_all, fields(http.request.method = %request.method(), url.path = %request.uri().path(), url.query = request.uri().query().unwrap_or("")))]
-pub async fn error_enrichment_middleware(State(pool): State<PgPool>, request: Request<Body>, next: Next) -> Response<Body> {
+pub async fn error_enrichment_middleware(State(state): State<ErrorEnrichmentState>, request: Request<Body>, next: Next) -> Response<Body> {
+    let ErrorEnrichmentState {
+        pool,
+        cap_reset_retry_after_secs,
+        cap_boundary_grace_secs,
+    } = state;
     // Extract API key from request headers before passing to onwards
     let api_key = request
         .headers()
@@ -172,11 +199,11 @@ pub async fn error_enrichment_middleware(State(pool): State<PgPool>, request: Re
         }
 
         // 4. Spending cap. Read-only against the same checkpoint state and
-        //    window function the sync eligibility predicate uses.
-        if let Ok(Some(cap)) = get_spend_cap_state(pool.clone(), &key).await
+        //    window functions the sync eligibility predicate uses.
+        if let Ok(Some(cap)) = get_spend_cap_state(pool.clone(), &key, cap_boundary_grace_secs).await
             && cap.window_spend >= cap.limit
         {
-            if cap.window_current {
+            if cap.window_current && !cap.near_boundary {
                 let resets = match cap.resets_at {
                     Some(at) => format!("; resets {}", at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
                     None => String::new(),
@@ -200,14 +227,20 @@ pub async fn error_enrichment_middleware(State(pool): State<PgPool>, request: Re
                     .unwrap_or_else(|_| StatusCode::PAYMENT_REQUIRED.into_response());
             }
 
-            // Reset-pending race: the key was yanked for its cap, but the
-            // calendar window has since rolled over — the periodic fallback
-            // sync (~10s) just hasn't readmitted the key yet. This request
-            // SHOULD succeed and only hit unfortunate timing, so return a
-            // retriable 429 + Retry-After: both fusillade's daemon and client
-            // SDKs retry 429s, and the retry lands after readmission.
-            // Deliberately not a 5xx — that would page the proxy-errors alert
-            // for a benign, self-healing race.
+            // Reinstatement pending, two flavors of the same race:
+            //  (a) the calendar window has ROLLED but the fallback sync hasn't
+            //      readmitted the key yet (sync stalled longer than the
+            //      pre-boundary grace — rare safety-net case), or
+            //  (b) we're inside the pre-boundary GRACE window: the sync
+            //      predicate already treats this scope as eligible and some
+            //      imminent reload will readmit it before the boundary.
+            // Either way this request SHOULD succeed shortly and only hit
+            // unfortunate timing, so return a retriable 429 + Retry-After
+            // (sized to the configured fallback interval, the worst-case
+            // wait): both fusillade's daemon and client SDKs retry 429s, and
+            // the retry lands after readmission. Deliberately not a 5xx —
+            // that would page the proxy-errors alert for a benign,
+            // self-healing race.
             let body = serde_json::json!({
                 "error": {
                     "message": "Spending cap window has reset; the key is being reinstated. Retry shortly.",
@@ -219,7 +252,7 @@ pub async fn error_enrichment_middleware(State(pool): State<PgPool>, request: Re
             return Response::builder()
                 .status(StatusCode::TOO_MANY_REQUESTS)
                 .header("content-type", "application/json")
-                .header("retry-after", "10")
+                .header("retry-after", cap_reset_retry_after_secs.to_string())
                 .body(Body::from(body.to_string()))
                 .unwrap_or_else(|_| StatusCode::TOO_MANY_REQUESTS.into_response());
         }
@@ -237,24 +270,30 @@ struct SpendCapState {
     /// Whether `window_started_at` falls in the current calendar window (UTC).
     /// False for an exhausted-but-rolled window = reinstatement pending.
     window_current: bool,
+    /// Whether the cap window is within the pre-boundary readmission grace
+    /// (see `api_key_cap_near_boundary`) — exhausted-but-near-boundary is
+    /// also treated as reinstatement pending.
+    near_boundary: bool,
     /// Next calendar boundary for windowed caps; `None` for one-off caps.
     resets_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[instrument(skip_all, name = "dwctl.get_spend_cap_state")]
-async fn get_spend_cap_state(pool: PgPool, api_key: &str) -> Result<Option<SpendCapState>, DbError> {
+async fn get_spend_cap_state(pool: PgPool, api_key: &str, grace_secs: i32) -> Result<Option<SpendCapState>, DbError> {
     let row = sqlx::query!(
         r#"
         SELECT root.spend_limit AS "spend_limit!",
                COALESCE(ck.window_spend, 0) AS "window_spend!",
                api_key_cap_window_current(ck.window_started_at, root.spend_limit_interval) AS "window_current!",
+               api_key_cap_near_boundary(root.spend_limit_interval, $2) AS "near_boundary!",
                api_key_cap_window_resets_at(root.spend_limit_interval) AS resets_at
         FROM api_keys ak
         JOIN api_keys root ON root.id = COALESCE(ak.parent_api_key_id, ak.id)
         LEFT JOIN api_key_spend_checkpoints ck ON ck.api_key_id = root.id
         WHERE ak.secret = $1 AND ak.is_deleted = false AND root.spend_limit IS NOT NULL
         "#,
-        api_key
+        api_key,
+        grace_secs
     )
     .fetch_optional(&pool)
     .await?;
@@ -263,6 +302,7 @@ async fn get_spend_cap_state(pool: PgPool, api_key: &str) -> Result<Option<Spend
         limit: r.spend_limit,
         window_spend: r.window_spend,
         window_current: r.window_current,
+        near_boundary: r.near_boundary,
         resets_at: r.resets_at,
     }))
 }
@@ -577,7 +617,11 @@ mod tests {
                 }),
             )
             .layer(axum::middleware::from_fn_with_state(
-                pool.clone(),
+                crate::error_enrichment::ErrorEnrichmentState {
+                    pool: pool.clone(),
+                    cap_reset_retry_after_secs: 10,
+                    cap_boundary_grace_secs: 0,
+                },
                 crate::error_enrichment::error_enrichment_middleware,
             ));
 
@@ -714,7 +758,11 @@ mod tests {
                 }),
             )
             .layer(axum::middleware::from_fn_with_state(
-                pool.clone(),
+                crate::error_enrichment::ErrorEnrichmentState {
+                    pool: pool.clone(),
+                    cap_reset_retry_after_secs: 10,
+                    cap_boundary_grace_secs: 0,
+                },
                 crate::error_enrichment::error_enrichment_middleware,
             ));
         let server = axum_test::TestServer::new(router).expect("Failed to create test server");
@@ -797,6 +845,50 @@ mod tests {
         );
         let body = response.text();
         assert!(body.contains("spend_cap_reset_pending"), "expected reset-pending code, got: {body}");
+
+        // 4. Pre-boundary grace: current (un-rolled) exhausted window, but a
+        //    grace larger than the period puts us "near the boundary" — the
+        //    enricher must return the retriable 429, not a hard 402, matching
+        //    the sync predicate's early readmission.
+        sqlx::query("UPDATE api_key_spend_checkpoints SET window_started_at = now() WHERE api_key_id = $1")
+            .bind(api_key.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let grace_router = axum::Router::new()
+            .route(
+                "/ai/v1/chat/completions",
+                axum::routing::post(|| async {
+                    axum::response::Response::builder()
+                        .status(StatusCode::FORBIDDEN)
+                        .body(axum::body::Body::from("Forbidden"))
+                        .unwrap()
+                }),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                crate::error_enrichment::ErrorEnrichmentState {
+                    pool: pool.clone(),
+                    cap_reset_retry_after_secs: 10,
+                    cap_boundary_grace_secs: 3_000_000, // > any period: always in grace
+                },
+                crate::error_enrichment::error_enrichment_middleware,
+            ));
+        let grace_server = axum_test::TestServer::new(grace_router).expect("Failed to create test server");
+        let response = grace_server
+            .post("/ai/v1/chat/completions")
+            .add_header("authorization", &format!("Bearer {}", api_key.secret))
+            .json(&serde_json::json!({
+                "model": "cap-model",
+                "messages": [{"role": "user", "content": "Hello"}]
+            }))
+            .await;
+        assert_eq!(
+            response.status_code().as_u16(),
+            429,
+            "grace window must be retriable, not a hard 402"
+        );
+        let body = response.text();
+        assert!(body.contains("spend_cap_reset_pending"), "expected reset-pending code, got: {body}");
     }
 
     /// Integration test: Error enrichment middleware passes through 403 when user has access
@@ -865,7 +957,11 @@ mod tests {
                 }),
             )
             .layer(axum::middleware::from_fn_with_state(
-                pool.clone(),
+                crate::error_enrichment::ErrorEnrichmentState {
+                    pool: pool.clone(),
+                    cap_reset_retry_after_secs: 10,
+                    cap_boundary_grace_secs: 0,
+                },
                 crate::error_enrichment::error_enrichment_middleware,
             ));
 
@@ -905,7 +1001,11 @@ mod tests {
                 }),
             )
             .layer(axum::middleware::from_fn_with_state(
-                pool.clone(),
+                crate::error_enrichment::ErrorEnrichmentState {
+                    pool: pool.clone(),
+                    cap_reset_retry_after_secs: 10,
+                    cap_boundary_grace_secs: 0,
+                },
                 crate::error_enrichment::error_enrichment_middleware,
             ));
 
@@ -934,7 +1034,11 @@ mod tests {
                 }),
             )
             .layer(axum::middleware::from_fn_with_state(
-                pool.clone(),
+                crate::error_enrichment::ErrorEnrichmentState {
+                    pool: pool.clone(),
+                    cap_reset_retry_after_secs: 10,
+                    cap_boundary_grace_secs: 0,
+                },
                 crate::error_enrichment::error_enrichment_middleware,
             ));
 
@@ -1018,7 +1122,11 @@ mod tests {
                 }),
             )
             .layer(axum::middleware::from_fn_with_state(
-                pool.clone(),
+                crate::error_enrichment::ErrorEnrichmentState {
+                    pool: pool.clone(),
+                    cap_reset_retry_after_secs: 10,
+                    cap_boundary_grace_secs: 0,
+                },
                 crate::error_enrichment::error_enrichment_middleware,
             ));
 
@@ -1271,7 +1379,11 @@ mod tests {
                 }),
             )
             .layer(axum::middleware::from_fn_with_state(
-                pool.clone(),
+                crate::error_enrichment::ErrorEnrichmentState {
+                    pool: pool.clone(),
+                    cap_reset_retry_after_secs: 10,
+                    cap_boundary_grace_secs: 0,
+                },
                 crate::error_enrichment::error_enrichment_middleware,
             ));
 

@@ -1640,9 +1640,21 @@ pub async fn build_router(
         ))
     };
 
-    // Apply error enrichment middleware to onwards router (before outlet logging)
+    // Apply error enrichment middleware to onwards router (before outlet logging).
+    // The reset-pending Retry-After tracks the sync fallback interval: that
+    // periodic sync is what readmits a capped key after its window rolls (no
+    // NOTIFY fires at a calendar boundary), so it is the worst-case wait.
+    // 0 (fallback disabled) falls back to a 60s hint.
+    let fallback_ms = config.background_services.onwards_sync.fallback_interval_milliseconds;
     let onwards_router = onwards_router.layer(middleware::from_fn_with_state(
-        state.db.write().clone(),
+        error_enrichment::ErrorEnrichmentState {
+            pool: state.db.write().clone(),
+            cap_reset_retry_after_secs: if fallback_ms == 0 { 60 } else { fallback_ms.div_ceil(1000).max(1) },
+            // Matches the sync predicate's grace (SQL default 300s) but never
+            // less than the fallback interval, upholding the grace >= fallback
+            // invariant on the error path even if the interval is raised.
+            cap_boundary_grace_secs: (fallback_ms.div_ceil(1000).max(300)).min(i32::MAX as u64) as i32,
+        },
         error_enrichment::error_enrichment_middleware,
     ));
 

@@ -687,6 +687,42 @@ async fn test_spend_cap_toggles_scope_access_on_reload(pool: sqlx::PgPool) {
     assert!(pool_has_key(metered.value(), &child_secret), "rolled window readmits the child");
 }
 
+/// Semantics of `api_key_cap_near_boundary` (migration 123), the pre-boundary
+/// readmission grace used by the sync predicate and the error enricher. Tested
+/// with injected grace values because `now()` cannot be mocked in SQL: grace 0
+/// is never near a boundary, a grace longer than the period always is, and
+/// one-off caps (NULL interval) have no boundary at all.
+#[sqlx::test]
+async fn test_cap_near_boundary_function_semantics(pool: sqlx::PgPool) {
+    let check = |interval: Option<&'static str>, grace: i32| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, bool>("SELECT api_key_cap_near_boundary($1, $2)")
+                .bind(interval)
+                .bind(grace)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+        }
+    };
+
+    // Grace longer than the whole period: always inside it.
+    assert!(check(Some("daily"), 90_000).await); // > 24h
+    assert!(check(Some("weekly"), 700_000).await); // > 7d
+    assert!(check(Some("monthly"), 3_000_000).await); // > 31d
+
+    // Zero grace: never near (now() is strictly before the boundary).
+    assert!(!check(Some("daily"), 0).await);
+    assert!(!check(Some("weekly"), 0).await);
+    assert!(!check(Some("monthly"), 0).await);
+
+    // One-off caps have no boundary regardless of grace.
+    assert!(!check(None, 3_000_000).await);
+
+    // Unknown intervals (prevented by CHECK constraint) fail safe to "not near".
+    assert!(!check(Some("hourly"), 3_000_000).await);
+}
+
 #[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
 async fn test_cache_shape_batch_escalation_access_for_private_alias(pool: sqlx::PgPool) {
     let alias = "escalation-private".to_string();

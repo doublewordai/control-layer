@@ -1,0 +1,47 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT root.spend_limit AS \"spend_limit!\",\n               COALESCE(ck.window_spend, 0) AS \"window_spend!\",\n               api_key_cap_window_current(ck.window_started_at, root.spend_limit_interval) AS \"window_current!\",\n               api_key_cap_near_boundary(root.spend_limit_interval, $2) AS \"near_boundary!\",\n               api_key_cap_window_resets_at(root.spend_limit_interval) AS resets_at\n        FROM api_keys ak\n        JOIN api_keys root ON root.id = COALESCE(ak.parent_api_key_id, ak.id)\n        LEFT JOIN api_key_spend_checkpoints ck ON ck.api_key_id = root.id\n        WHERE ak.secret = $1 AND ak.is_deleted = false AND root.spend_limit IS NOT NULL\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "spend_limit!",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 1,
+        "name": "window_spend!",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 2,
+        "name": "window_current!",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 3,
+        "name": "near_boundary!",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 4,
+        "name": "resets_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Int4"
+      ]
+    },
+    "nullable": [
+      true,
+      null,
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "a206da3492db248f68cf5394c1931f729ffccf551e2885411d268b4f9948ea02"
+}

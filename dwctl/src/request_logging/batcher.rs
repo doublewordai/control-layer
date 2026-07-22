@@ -3157,7 +3157,7 @@ mod integration_tests {
         };
 
         let mut listener = PgListener::connect_with(&pool).await.expect("Failed to create listener");
-        listener.listen("auth_config_changed").await.expect("Failed to listen");
+        listener.listen(ONWARDS_CONFIG_CHANGED_CHANNEL).await.expect("Failed to listen");
         while timeout(Duration::from_millis(10), listener.try_recv()).await.is_ok() {}
 
         // Parent realtime + child batch + uncapped key, one flush. Each row
@@ -3253,7 +3253,7 @@ mod integration_tests {
         .unwrap();
 
         let mut listener = PgListener::connect_with(&pool).await.expect("Failed to create listener");
-        listener.listen("auth_config_changed").await.expect("Failed to listen");
+        listener.listen(ONWARDS_CONFIG_CHANGED_CHANNEL).await.expect("Failed to listen");
         while timeout(Duration::from_millis(10), listener.try_recv()).await.is_ok() {}
 
         run_batcher_with_records(&pool, vec![create_raw_record("gpt-4-cap-rollover-test", Some(secret), 1000, 500)]).await;
