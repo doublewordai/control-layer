@@ -53,10 +53,10 @@ fn is_transient_connection_error(e: &sqlx::Error) -> bool {
 }
 
 /// Run `op` up to `1 + $retries` times: retry iff an attempt failed with a connection-class
-/// error, backing off 100ms·2^n between attempts (100ms, 200ms, 400ms…) so a herd of
-/// simultaneous failures — the observed burst shape — doesn't re-storm connection setup in
-/// lockstep. Each retry is recorded so dashboards see the underlying churn even when the
-/// retry succeeds. The classify deadline still bounds the caller regardless of retries.
+/// error, backing off 100ms·2^n + 0..20% jitter between attempts so a herd of simultaneous
+/// failures — the observed burst shape — doesn't re-storm connection setup in lockstep.
+/// Each retry is recorded so dashboards see the underlying churn even when the retry
+/// succeeds. The classify deadline still bounds the caller regardless of retries.
 macro_rules! with_conn_retry {
     ($op_name:literal, $retries:expr, $op:expr) => {{
         let mut attempt: u32 = 0;
@@ -65,7 +65,13 @@ macro_rules! with_conn_retry {
                 Err(e) if is_transient_connection_error(&e) && attempt < $retries => {
                     cache_metrics::record_index_conn_retry($op_name);
                     tracing::debug!(op = $op_name, attempt, error = %e, "cache index connection error — retrying with a fresh connection");
-                    tokio::time::sleep(std::time::Duration::from_millis(100u64 << attempt.min(4))).await;
+                    // 0..20% positive jitter (same scheme as image_normalizer's fetch retry):
+                    // the observed failure shape is a ~100-request herd failing in the same
+                    // instant, so identical deterministic sleeps would re-storm connection
+                    // setup in lockstep.
+                    let base_ms = 100u64 << attempt.min(4);
+                    let jitter_ms = rand::prelude::RngExt::random_range(&mut rand::rng(), 0..(base_ms / 5 + 1));
+                    tokio::time::sleep(std::time::Duration::from_millis(base_ms + jitter_ms)).await;
                     attempt += 1;
                 }
                 other => break other,
