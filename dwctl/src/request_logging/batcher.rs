@@ -1511,8 +1511,12 @@ where
                     .fetch_all(&mut **tx)
                     .await?;
                 let limit_map: HashMap<Uuid, Option<Decimal>> = limits.into_iter().map(|r| (r.id, r.spend_limit)).collect();
+                let delta_map: HashMap<Uuid, Decimal> = missing_ids.iter().copied().zip(missing_deltas.iter().copied()).collect();
                 for row in &inserted {
-                    let delta = scope_deltas[scope_ids.iter().position(|id| *id == row.api_key_id).unwrap_or_default()];
+                    // Total lookup: a scope id absent from the map (cannot
+                    // happen — `inserted` is a subset of `missing_ids`) counts
+                    // as zero delta, which can never mis-fire a crossing.
+                    let delta = delta_map.get(&row.api_key_id).copied().unwrap_or(Decimal::ZERO);
                     if let Some(Some(limit)) = limit_map.get(&row.api_key_id)
                         && row.window_spend >= *limit
                         && row.window_spend - delta < *limit
