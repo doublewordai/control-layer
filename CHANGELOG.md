@@ -1,5 +1,18 @@
 # Changelog
 
+## [8.97.0](https://github.com/doublewordai/control-layer/compare/v8.96.0...v8.97.0) (2026-07-22)
+
+
+### Features
+
+* add service_tier label to gen_ai metrics and extend TTFT/TPOT buckets ([#1332](https://github.com/doublewordai/control-layer/issues/1332)) ([6c6d459](https://github.com/doublewordai/control-layer/commit/6c6d4598eac3dd89071646ce579b46d2e43376d3))
+* **docs:** link Onwards from mdBook sidebar ([#1340](https://github.com/doublewordai/control-layer/issues/1340)) ([8628fdd](https://github.com/doublewordai/control-layer/commit/8628fddb70f5db2027ef217bbd61daa323e1e544))
+
+
+### Bug Fixes
+
+* **ci:** parallelize dwctl tests ([#1323](https://github.com/doublewordai/control-layer/issues/1323)) ([5191586](https://github.com/doublewordai/control-layer/commit/5191586c16cc54fb8142239618dc927989fbd387))
+
 ## [8.96.0](https://github.com/doublewordai/control-layer/compare/v8.95.1...v8.96.0) (2026-07-22)
 
 
