@@ -58,13 +58,7 @@ class PreviewWorkflowTest < Minitest::Test
     end
   end
 
-  def test_comment_driven_staging_build_is_preserved
-    workflow_path = File.join(ROOT, ".github", "workflows", "build-staging.yml")
-
-    assert File.exist?(workflow_path)
-
-    workflow = File.read(workflow_path)
-    assert_includes workflow, "contains(github.event.comment.body, '/build-staging')"
-    assert_includes workflow, "event_type: 'control-layer-staging-override'"
+  def test_comment_driven_staging_build_is_removed
+    refute File.exist?(File.join(ROOT, ".github", "workflows", "build-staging.yml"))
   end
 end
