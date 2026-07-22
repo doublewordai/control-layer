@@ -12,8 +12,12 @@ use tracing::instrument;
 
 use crate::{
     metrics::MetricsRecorder,
-    request_logging::{batcher::compute_service_tier, serializers::HttpAnalyticsRow},
+    request_logging::{batcher::compute_billing_tier, serializers::HttpAnalyticsRow},
 };
+
+// The metric label is `billing_tier` (not `service_tier`) to keep the
+// Doubleword product classification visually distinct from the
+// OpenAI-compatible `service_tier` request parameter.
 
 /// GenAI metrics instruments using Prometheus
 #[derive(Clone)]
@@ -50,7 +54,7 @@ impl GenAiMetrics {
                 "error_type",
                 "request_origin",
                 "batch_sla",
-                "service_tier",
+                "billing_tier",
                 "served_by",
             ],
         )?;
@@ -79,7 +83,7 @@ impl GenAiMetrics {
                 "server_port",
                 "request_origin",
                 "batch_sla",
-                "service_tier",
+                "billing_tier",
                 "served_by",
             ],
         )?;
@@ -104,7 +108,7 @@ impl GenAiMetrics {
                 "server_port",
                 "request_origin",
                 "batch_sla",
-                "service_tier",
+                "billing_tier",
                 "served_by",
             ],
         )?;
@@ -127,7 +131,7 @@ impl GenAiMetrics {
                 "server_port",
                 "request_origin",
                 "batch_sla",
-                "service_tier",
+                "billing_tier",
                 "served_by",
             ],
         )?;
@@ -202,7 +206,7 @@ impl MetricsRecorder for GenAiMetrics {
         let batch_sla = &row.batch_sla;
         // `batch_sla` holds the completion window ("" for non-batch), matching the
         // ledger's service_tier derivation in the batcher.
-        let service_tier = compute_service_tier(row.fusillade_batch_id, Some(batch_sla));
+        let billing_tier = compute_billing_tier(row.fusillade_batch_id, Some(batch_sla));
 
         // Record request duration (always)
         let duration_labels = vec![
@@ -215,7 +219,7 @@ impl MetricsRecorder for GenAiMetrics {
             &error_type,
             request_origin,
             batch_sla,
-            service_tier,
+            billing_tier,
             &served_by,
         ];
         self.record_request_duration(row.duration_ms as f64 / 1000.0, &duration_labels);
@@ -231,7 +235,7 @@ impl MetricsRecorder for GenAiMetrics {
                 server_port,
                 request_origin,
                 batch_sla,
-                service_tier,
+                billing_tier,
                 &served_by,
             ];
             self.record_time_to_first_token(ttfb_ms as f64 / 1000.0, &ttft_labels);
@@ -252,7 +256,7 @@ impl MetricsRecorder for GenAiMetrics {
                 server_port,
                 request_origin,
                 batch_sla,
-                service_tier,
+                billing_tier,
                 &served_by,
             ];
             self.record_time_per_output_token(time_per_token, &tpot_labels);
@@ -270,7 +274,7 @@ impl MetricsRecorder for GenAiMetrics {
                 server_port,
                 request_origin,
                 batch_sla,
-                service_tier,
+                billing_tier,
                 &served_by,
             ];
             self.record_token_usage(row.prompt_tokens as f64, &input_labels);
@@ -288,7 +292,7 @@ impl MetricsRecorder for GenAiMetrics {
                 server_port,
                 request_origin,
                 batch_sla,
-                service_tier,
+                billing_tier,
                 &served_by,
             ];
             self.record_token_usage(row.completion_tokens as f64, &output_labels);
@@ -402,7 +406,7 @@ mod tests {
         assert_eq!(find_label(duration_labels, "server_address"), Some("api.openai.com".to_string()));
         assert_eq!(find_label(duration_labels, "server_port"), Some("443".to_string()));
         assert_eq!(find_label(duration_labels, "error_type"), Some("".to_string()));
-        assert_eq!(find_label(duration_labels, "service_tier"), Some("realtime".to_string()));
+        assert_eq!(find_label(duration_labels, "billing_tier"), Some("realtime".to_string()));
 
         // Verify time to first token metric (only for streaming)
         let ttft_metric = metric_families
@@ -459,20 +463,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_service_tier_label_covers_all_tiers() {
+    async fn test_billing_tier_label_maps_each_case() {
         let registry = Registry::new();
         let metrics = GenAiMetrics::new(&registry).expect("Failed to create metrics");
         let batch_id = Uuid::new_v4();
 
-        // (fusillade_batch_id, batch_sla) → expected service_tier
+        // (fusillade_batch_id, batch_sla, request_origin) → expected billing_tier,
+        // with the origin each combination actually produces in analytics rows.
+        // The per-case model name is the join key for the assertions below.
         let cases = [
-            (None, "", "realtime"),
-            (None, "1h", "flex"),
-            (Some(batch_id), "1h", "async"),
-            (Some(batch_id), "24h", "batch"),
+            (None, "", "api", "realtime"),
+            (None, "1h", "fusillade", "flex"),
+            (Some(batch_id), "1h", "fusillade", "async"),
+            (Some(batch_id), "24h", "fusillade", "batch"),
         ];
 
-        for (i, (fusillade_batch_id, batch_sla, _)) in cases.iter().enumerate() {
+        for (i, (fusillade_batch_id, batch_sla, request_origin, expected_tier)) in cases.iter().enumerate() {
+            let model = format!("tier-case-{expected_tier}");
             let row = HttpAnalyticsRow {
                 served_by: None,
                 instance_id: Uuid::new_v4(),
@@ -480,8 +487,8 @@ mod tests {
                 timestamp: chrono::Utc::now(),
                 method: "POST".to_string(),
                 uri: "/v1/chat/completions".to_string(),
-                request_model: Some("gpt-4".to_string()),
-                response_model: Some("gpt-4".to_string()),
+                request_model: Some(model.clone()),
+                response_model: Some(model),
                 status_code: 200,
                 duration_ms: 1000,
                 duration_to_first_byte_ms: Some(100),
@@ -500,7 +507,7 @@ mod tests {
                 fusillade_batch_id: *fusillade_batch_id,
                 fusillade_request_id: None,
                 custom_id: None,
-                request_origin: "api".to_string(),
+                request_origin: request_origin.to_string(),
                 batch_sla: batch_sla.to_string(),
                 batch_request_source: String::new(),
             };
@@ -513,15 +520,21 @@ mod tests {
             .find(|m| m.name() == "gen_ai_server_request_duration_seconds")
             .expect("Should have request duration metric");
 
-        let mut seen: Vec<String> = duration_metric
-            .get_metric()
-            .iter()
-            .filter_map(|m| find_label(m.get_label(), "service_tier"))
-            .collect();
-        seen.sort();
-        let mut expected: Vec<String> = cases.iter().map(|(_, _, tier)| tier.to_string()).collect();
-        expected.sort();
-        assert_eq!(seen, expected, "each (batch_id, sla) combination maps to its tier");
+        // Each case's series (found by its unique model name) must carry
+        // exactly its expected tier — not merely "all tiers appear somewhere".
+        for (_, _, _, expected_tier) in &cases {
+            let model = format!("tier-case-{expected_tier}");
+            let series = duration_metric
+                .get_metric()
+                .iter()
+                .find(|m| find_label(m.get_label(), "gen_ai_request_model") == Some(model.clone()))
+                .unwrap_or_else(|| panic!("no series for {model}"));
+            assert_eq!(
+                find_label(series.get_label(), "billing_tier"),
+                Some(expected_tier.to_string()),
+                "wrong billing_tier for {model}"
+            );
+        }
     }
 
     #[tokio::test]
