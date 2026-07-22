@@ -6949,8 +6949,8 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
         // First, get the file_id and expires_at from the batch
         // This allows us to query by file_id to avoid duplicates from SLA escalation
         // and to check if we should filter retriable errors
-        let (file_id, _expires_at) = match sqlx::query!(
-            r#"SELECT file_id, expires_at FROM batches WHERE id = $1 AND deleted_at IS NULL"#,
+        let (file_id, _expires_at, archive_bucket) = match sqlx::query!(
+            r#"SELECT file_id, expires_at, archive_bucket FROM batches WHERE id = $1 AND deleted_at IS NULL"#,
             *batch_id as Uuid,
         )
         .fetch_optional(crate::db::RetryingPgPool::new(&pool, &retry_config))
@@ -6958,7 +6958,7 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
         {
             Ok(Some(row)) => {
                 if let Some(fid) = row.file_id {
-                    (fid, row.expires_at)
+                    (fid, row.expires_at, row.archive_bucket)
                 } else {
                     let _ = tx
                         .send(Err(FusilladeError::Other(anyhow!(
@@ -7008,6 +7008,12 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
 
             // Build dynamic query with error filter
             // The error filter only applies to failed requests
+            // The requests side is a union of the live table and the
+            // batch archive: a frozen batch's rows may have been moved (or
+            // be mid-move — the move txn is atomic, so under one snapshot
+            // every row is in exactly one arm and the union is exact). The
+            // archive arm is NULL-gated on the stamped bucket so unarchived
+            // batches pay nothing and archived ones prune to one partition.
             let mut query_builder = QueryBuilder::new(
                 r#"
                 SELECT
@@ -7020,9 +7026,31 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
                     r.error,
                     t.line_number
                 FROM request_templates t
-                JOIN requests r ON r.template_id = t.id AND r.batch_id = "#,
+                JOIN (
+                    SELECT id, custom_id, model, state, response_body, error, template_id
+                    FROM requests
+                    WHERE batch_id = "#,
             );
             query_builder.push_bind(*batch_id as Uuid);
+            query_builder.push(
+                r#"
+                    UNION ALL
+                    SELECT id, custom_id, model, state, response_body, error, template_id
+                    FROM batch_requests_archive
+                    WHERE "#,
+            );
+            query_builder.push_bind(archive_bucket);
+            query_builder.push(
+                r#"::date IS NOT NULL
+                      AND archive_bucket = "#,
+            );
+            query_builder.push_bind(archive_bucket);
+            query_builder.push(" AND batch_id = ");
+            query_builder.push_bind(*batch_id as Uuid);
+            query_builder.push(
+                r#"
+                ) r ON r.template_id = t.id"#,
+            );
             query_builder.push(" WHERE t.file_id = ");
             query_builder.push_bind(file_id);
             query_builder.push(" AND (");
@@ -11559,6 +11587,54 @@ mod tests {
     /// Downloads must serve archived batches transparently: the page query
     /// is an always-union over live + bucket-pruned archive, so a fully
     /// archived batch streams byte-identically to a live one.
+    #[sqlx::test]
+    async fn test_batch_results_stream_serves_archived_batches(pool: sqlx::PgPool) {
+        // Regression: the merged-results stream (templates JOIN requests)
+        // must read the archive arm too — an archived batch previously
+        // returned an empty stream with no error.
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+        let batch_id = setup_freeze_test_batch(&manager, "results-arch", 3).await;
+        sqlx::query!(
+            "UPDATE requests SET state = 'completed', completed_at = NOW(), response_status = 200,
+             response_body = '{\"ok\":true}' WHERE batch_id = $1",
+            *batch_id as Uuid
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        manager.get_batch(batch_id).await.unwrap(); // freeze
+
+        let live: Vec<_> = manager
+            .get_batch_results_stream(batch_id, 0, None, None)
+            .collect()
+            .await;
+        assert_eq!(live.len(), 3, "pre-archive stream serves all rows");
+        for item in live {
+            item.expect("live result item must be Ok");
+        }
+
+        assert_eq!(
+            manager.archive_batch(batch_id).await.unwrap(),
+            ArchiveOutcome::Archived { rows: 3 }
+        );
+
+        let archived: Vec<_> = manager
+            .get_batch_results_stream(batch_id, 0, None, None)
+            .collect()
+            .await;
+        assert_eq!(
+            archived.len(),
+            3,
+            "post-archive stream must serve the same rows from the archive"
+        );
+        for item in archived {
+            item.expect("archived result item must be Ok");
+        }
+    }
+
     #[sqlx::test]
     async fn test_download_streams_serve_archived_batches(pool: sqlx::PgPool) {
         let manager = PostgresRequestManager::with_client(
