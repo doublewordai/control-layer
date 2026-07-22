@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2016 # GitHub expressions below are literal patterns.
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -221,10 +222,28 @@ if ! grep -Fq 'cargo package --locked --package onwards --all-features' \
   exit 1
 fi
 
-if ! grep -Fq 'onwards-openresponses-compliance:' .github/workflows/ci.yaml || \
-   ! grep -Fq 'mode: [adapter, passthrough]' .github/workflows/ci.yaml || \
-   ! grep -Fq 'git checkout fa29df5' .github/workflows/ci.yaml; then
-  echo "CI must retain standalone Onwards adapter and passthrough compliance" >&2
+onwards_compliance_job="$(
+  sed -n '/^  onwards-openresponses-compliance:/,/^  build:/p' .github/workflows/ci.yaml
+)"
+
+if ! grep -Fq 'onwards-openresponses-compliance:' <<< "$onwards_compliance_job" || \
+   ! grep -Fq 'mode: [adapter, passthrough]' <<< "$onwards_compliance_job" || \
+   ! grep -Fq 'GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}' <<< "$onwards_compliance_job" || \
+   ! grep -Fq 'https://generativelanguage.googleapis.com/v1beta/openai/' <<< "$onwards_compliance_job" || \
+   ! grep -Fq 'TEST_MODEL: gemini-2.5-flash' <<< "$onwards_compliance_job" || \
+   ! grep -Fq 'OPENRESPONSES_COMPLIANCE_FILTER:' <<< "$onwards_compliance_job" || \
+   ! grep -Fq -- '--port 3001' <<< "$onwards_compliance_job" || \
+   ! grep -Fq 'http://127.0.0.1:3001/v1' <<< "$onwards_compliance_job" || \
+   ! grep -Fq 'git clone --depth 1 https://github.com/openresponses/openresponses /tmp/openresponses' <<< "$onwards_compliance_job" || \
+   ! grep -Fq 'onwards-openresponses-${MODE}-retry.json' <<< "$onwards_compliance_job" || \
+   ! grep -Fq 'Malformed compliance output is always a failure.' <<< "$onwards_compliance_job"; then
+  echo "CI must run standalone Onwards adapter and passthrough compliance through the Gemini-backed local adapter" >&2
+  exit 1
+fi
+
+if grep -Fq 'OPENAI_API_KEY' <<< "$onwards_compliance_job" || \
+   grep -Fq 'git checkout fa29df5' <<< "$onwards_compliance_job"; then
+  echo "CI must reuse the existing current Gemini compliance harness for standalone Onwards" >&2
   exit 1
 fi
 

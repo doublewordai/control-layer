@@ -388,16 +388,21 @@ jobs:
         mode: [adapter, passthrough]
     name: onwards-compliance (${{ matrix.mode }})
 
+    env:
+      TEST_MODEL: gemini-2.5-flash
+      # Match the supported HTTP /responses coverage exercised through dwctl below.
+      OPENRESPONSES_COMPLIANCE_FILTER: basic-response,assistant-phase,response-output-phase-schema,streaming-response,system-prompt,tool-calling,image-input,multi-turn
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
 
-      - name: Require OpenAI API key
+      - name: Require Gemini API key
         env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
-          if [[ -z "$OPENAI_API_KEY" ]]; then
-            echo "OPENAI_API_KEY repository secret is required for Onwards Open Responses compliance" >&2
+          if [[ -z "$GEMINI_API_KEY" ]]; then
+            echo "GEMINI_API_KEY repository secret is required for Onwards Open Responses compliance" >&2
             exit 1
           fi
 
@@ -405,33 +410,77 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Build Onwards
+        working-directory: onwards
         run: cargo build --release --package onwards
 
       - name: Install Bun
         uses: oven-sh/setup-bun@v2
 
       - name: Clone Open Responses
-        # Pinned before WebSocket/compact tests were added (PR #71).
-        # Update this once Onwards supports WebSocket transport.
         run: |
-          git clone https://github.com/openresponses/openresponses /tmp/openresponses
-          cd /tmp/openresponses && git checkout fa29df5
+          git clone --depth 1 https://github.com/openresponses/openresponses /tmp/openresponses
+          cd /tmp/openresponses
+          echo "Open Responses commit: $(git rev-parse HEAD)"
+          git log -1 --oneline
 
       - name: Install Open Responses dependencies
         run: cd /tmp/openresponses && bun install
 
-      - name: Write config
+      - name: Write Gemini adapter config
         env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          cat > /tmp/onwards-gemini-adapter-config.json <<EOF
+          {
+            "strict_mode": true,
+            "targets": {
+              "$TEST_MODEL": {
+                "url": "https://generativelanguage.googleapis.com/v1beta/openai/",
+                "onwards_key": "$GEMINI_API_KEY",
+                "onwards_model": "$TEST_MODEL",
+                "trusted": true,
+                "open_responses": {
+                  "adapter": true
+                }
+              }
+            }
+          }
+          EOF
+
+      - name: Start Gemini adapter upstream
+        run: |
+          ./target/release/onwards \
+            --port 3001 \
+            --metrics-port 9091 \
+            -f /tmp/onwards-gemini-adapter-config.json \
+            > /tmp/onwards-gemini-adapter.log 2>&1 &
+          echo "$!" > /tmp/onwards-gemini-adapter.pid
+
+          for attempt in $(seq 1 30); do
+            if curl -sf http://localhost:3001/v1/models > /dev/null 2>&1; then
+              echo "Gemini adapter upstream is ready"
+              exit 0
+            fi
+            echo "Waiting for Gemini adapter upstream (${attempt}/30)"
+            sleep 1
+          done
+
+          echo "Gemini adapter upstream failed to start" >&2
+          cat /tmp/onwards-gemini-adapter.log
+          exit 1
+
+      - name: Write Onwards config
+        env:
           ADAPTER_FLAG: ${{ matrix.mode == 'adapter' && 'true' || 'false' }}
         run: |
           cat > /tmp/onwards-openresponses-config.json <<EOF
           {
             "strict_mode": true,
             "targets": {
-              "gpt-4o-mini": {
-                "url": "https://api.openai.com/v1",
-                "onwards_key": "$OPENAI_API_KEY",
+              "$TEST_MODEL": {
+                "url": "http://127.0.0.1:3001/v1/",
+                "onwards_model": "$TEST_MODEL",
+                "trusted": true,
                 "open_responses": {
                   "adapter": $ADAPTER_FLAG
                 }
@@ -445,6 +494,8 @@ jobs:
           ./target/release/onwards \
             -f /tmp/onwards-openresponses-config.json \
             > /tmp/onwards.log 2>&1 &
+          echo "$!" > /tmp/onwards.pid
+
           for attempt in $(seq 1 30); do
             if curl -sf http://localhost:3000/v1/models > /dev/null 2>&1; then
               echo "Server is ready"
@@ -458,16 +509,130 @@ jobs:
           exit 1
 
       - name: Run compliance tests
+        env:
+          MODE: ${{ matrix.mode }}
         run: |
           cd /tmp/openresponses
+          echo "Open Responses commit: $(git rev-parse HEAD)"
+          echo "Mode: ${MODE}"
+          echo "Base URL: http://localhost:3000/v1"
+          echo "Model: ${TEST_MODEL}"
+          echo "Filter: ${OPENRESPONSES_COMPLIANCE_FILTER}"
+          echo
+
+          set +e
           bun run bin/compliance-test.ts \
             --base-url http://localhost:3000/v1 \
             --api-key test \
-            --model gpt-4o-mini
+            --model "$TEST_MODEL" \
+            --filter "$OPENRESPONSES_COMPLIANCE_FILTER" \
+            --json > "/tmp/onwards-openresponses-${MODE}.json"
+          status=$?
+          set -e
+
+          if ! jq -e . "/tmp/onwards-openresponses-${MODE}.json" > /dev/null; then
+            echo "Compliance runner did not emit valid JSON. Raw output:"
+            cat "/tmp/onwards-openresponses-${MODE}.json"
+            # Malformed compliance output is always a failure.
+            exit 1
+          fi
+
+          jq -r '.results[] | "\(.status | ascii_upcase): \(.name)"' \
+            "/tmp/onwards-openresponses-${MODE}.json"
+          jq -r '
+            .results[]
+            | select(.status == "failed")
+            | "\n\(.name):\n" + ((.errors // []) | map("  - " + .) | join("\n"))
+          ' "/tmp/onwards-openresponses-${MODE}.json"
+          jq -r '
+            "Results: \(.summary.passed) passed, \(.summary.failed) failed, \(.summary.skipped) skipped, \(.summary.total) total"
+          ' "/tmp/onwards-openresponses-${MODE}.json"
+
+          if [[ "$status" -ne 0 ]]; then
+            failed_filters=$(
+              jq -r '
+                .results[]
+                | select(.status == "failed")
+                | .id
+              ' "/tmp/onwards-openresponses-${MODE}.json" | paste -sd, -
+            )
+
+            if [[ -n "$failed_filters" ]]; then
+              echo
+              echo "=== Retry failed test(s): ${failed_filters} ==="
+              set +e
+              bun run bin/compliance-test.ts \
+                --base-url http://localhost:3000/v1 \
+                --api-key test \
+                --model "$TEST_MODEL" \
+                --filter "$failed_filters" \
+                --json > "/tmp/onwards-openresponses-${MODE}-retry.json"
+              retry_status=$?
+              set -e
+
+              if jq -e . "/tmp/onwards-openresponses-${MODE}-retry.json" > /dev/null; then
+                jq -r '.results[] | "RETRY \(.status | ascii_upcase): \(.name)"' \
+                  "/tmp/onwards-openresponses-${MODE}-retry.json"
+                jq -r '
+                  .results[]
+                  | select(.status == "failed")
+                  | "\nRetry \(.name):\n" + ((.errors // []) | map("  - " + .) | join("\n"))
+                ' "/tmp/onwards-openresponses-${MODE}-retry.json"
+              else
+                echo "Compliance retry did not emit valid JSON. Raw output:"
+                cat "/tmp/onwards-openresponses-${MODE}-retry.json"
+                retry_status=1
+              fi
+
+              if [[ "$retry_status" -eq 0 ]]; then
+                echo
+                echo "Failed test(s) passed on retry; treating as a transient provider failure."
+                status=0
+              else
+                echo
+                echo "=== Verbose rerun of failed test(s): ${failed_filters} ==="
+                bun run bin/compliance-test.ts \
+                  --base-url http://localhost:3000/v1 \
+                  --api-key test \
+                  --model "$TEST_MODEL" \
+                  --filter "$failed_filters" \
+                  --verbose || true
+              fi
+            fi
+          fi
+
+          exit "$status"
 
       - name: Show Onwards logs
         if: always()
-        run: cat /tmp/onwards.log || echo "No log file found"
+        run: |
+          echo "=== Onwards under test ==="
+          cat /tmp/onwards.log || echo "No Onwards log file found"
+          echo
+          echo "=== Gemini adapter upstream ==="
+          cat /tmp/onwards-gemini-adapter.log || echo "No upstream log file found"
+
+      - name: Upload Onwards compliance artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: onwards-openresponses-${{ matrix.mode }}
+          path: |
+            /tmp/onwards-openresponses-${{ matrix.mode }}.json
+            /tmp/onwards-openresponses-${{ matrix.mode }}-retry.json
+            /tmp/onwards.log
+            /tmp/onwards-gemini-adapter.log
+          if-no-files-found: ignore
+
+      - name: Stop Onwards processes
+        if: always()
+        run: |
+          if [[ -f /tmp/onwards.pid ]]; then
+            kill "$(cat /tmp/onwards.pid)" || true
+          fi
+          if [[ -f /tmp/onwards-gemini-adapter.pid ]]; then
+            kill "$(cat /tmp/onwards-gemini-adapter.pid)" || true
+          fi
 
   build:
     if: github.event_name == 'pull_request' || github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch'

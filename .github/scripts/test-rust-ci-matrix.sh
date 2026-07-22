@@ -37,6 +37,29 @@ require_text 'Expected 5 coverage files' 'aggregate every workspace crate covera
 require_text 'cargo package --locked --package onwards --all-features' 'validate the publishable Onwards package'
 require_text 'onwards-openresponses-compliance:' 'define standalone Onwards compliance'
 require_text 'mode: [adapter, passthrough]' 'test Onwards adapter and passthrough modes'
+require_text 'GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}' 'reuse the control-layer Gemini compliance provider'
+require_text 'https://generativelanguage.googleapis.com/v1beta/openai/' 'target the proven Gemini OpenAI-compatible endpoint'
+require_text 'TEST_MODEL: gemini-2.5-flash' 'reuse the control-layer compliance model'
+require_text 'OPENRESPONSES_COMPLIANCE_FILTER:' 'reuse the supported Open Responses compliance filter'
+require_text '--port 3001' 'run a local adapter upstream for passthrough compliance'
+require_text 'http://127.0.0.1:3001/v1' 'route standalone passthrough compliance through the local adapter upstream'
+require_text 'git clone --depth 1 https://github.com/openresponses/openresponses /tmp/openresponses' 'track the current Open Responses compliance suite'
+require_text 'onwards-openresponses-${MODE}-retry.json' 'retry only transiently failing Open Responses filters'
+require_text 'Malformed compliance output is always a failure.' 'reject malformed compliance runner output'
+
+onwards_compliance_job="$(
+  sed -n '/^  onwards-openresponses-compliance:/,/^  build:/p' "$workflow"
+)"
+
+if grep -Fq 'OPENAI_API_KEY' <<< "$onwards_compliance_job"; then
+  echo "Standalone Onwards compliance must reuse the existing Gemini provider" >&2
+  exit 1
+fi
+
+if grep -Fq 'git checkout fa29df5' <<< "$onwards_compliance_job"; then
+  echo "Standalone Onwards compliance must track the same current suite as control-layer compliance" >&2
+  exit 1
+fi
 
 setup_just_count="$(grep -Fc 'uses: extractions/setup-just@v3' "$workflow")"
 pinned_just_count="$(grep -Fc 'just-version: "1.46.0"' "$workflow")"
