@@ -9,6 +9,7 @@ on:
 jobs:
   frontend-test:
     if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
+    name: dashboard / test
     runs-on: depot-ubuntu-24.04-8
 
     steps:
@@ -101,7 +102,7 @@ jobs:
 
   backend-crate-test:
     if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
-    name: backend-test (${{ matrix.package }})
+    name: ${{ matrix.package }} / test
     strategy:
       fail-fast: false
       matrix:
@@ -200,6 +201,7 @@ jobs:
 
   backend-lint:
     if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
+    name: workspace / rust lint
     runs-on: depot-ubuntu-24.04-16
 
     steps:
@@ -252,7 +254,7 @@ jobs:
     if: always() && (github.event_name == 'pull_request' || github.event_name == 'merge_group')
     needs: [backend-crate-test, backend-lint]
     runs-on: ubuntu-latest
-    name: backend-test
+    name: workspace / rust gate
     env:
       MINIMUM_COVERAGE: "60"
 
@@ -301,9 +303,11 @@ jobs:
           curl -X POST \
             "https://charts.somnial.co/doubleword-control-layer/backend-code-coverage?value=${COVERAGE}" || true
 
+  # Image builds are first-wave jobs. Keep this and `build` free of `needs` so
+  # the independently published Onwards and dwctl images build in parallel.
   onwards-pr-image:
     if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
-    needs: [backend-crate-test]
+    name: onwards / image
     runs-on: depot-ubuntu-24.04
 
     permissions:
@@ -335,6 +339,7 @@ jobs:
 
   onwards-compliance-changes:
     if: github.event_name == 'pull_request' || github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch'
+    name: onwards / compliance changes
     runs-on: ubuntu-latest
     outputs:
       strict: ${{ steps.changes.outputs.strict }}
@@ -386,7 +391,7 @@ jobs:
       fail-fast: false
       matrix:
         mode: [adapter, passthrough]
-    name: onwards-compliance (${{ matrix.mode }})
+    name: onwards / open responses (${{ matrix.mode }})
 
     env:
       TEST_MODEL: gemini-2.5-flash
@@ -634,8 +639,10 @@ jobs:
             kill "$(cat /tmp/onwards-gemini-adapter.pid)" || true
           fi
 
+  # Sibling image build to `onwards-pr-image`; both start as soon as CI begins.
   build:
     if: github.event_name == 'pull_request' || github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch'
+    name: dwctl / image
     runs-on: depot-ubuntu-24.04
 
     permissions:
@@ -702,7 +709,7 @@ jobs:
     if: github.event_name == 'pull_request' || github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     needs: build
-    name: Open Responses Compliance
+    name: dwctl / open responses
 
     permissions:
       contents: read
@@ -1189,6 +1196,7 @@ jobs:
 
   security-scan:
     if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
+    name: dwctl / security
     runs-on: depot-ubuntu-24.04
     needs: build
 
@@ -1264,6 +1272,7 @@ jobs:
 
   e2e-test-docker:
     if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
+    name: workspace / e2e
     runs-on: depot-ubuntu-24.04
     needs: build
 

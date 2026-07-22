@@ -209,9 +209,46 @@ if ! grep -Fq 'USER ubuntu' onwards/Dockerfile; then
   exit 1
 fi
 
-if ! grep -Fq 'onwards-pr-image:' .github/workflows/ci.yaml || \
-   ! grep -Fq 'ghcr.io/doublewordai/onwards:sha-' .github/workflows/ci.yaml; then
+onwards_image_job="$(
+  sed -n '/^  onwards-pr-image:/,/^  onwards-compliance-changes:/p' .github/workflows/ci.yaml
+)"
+
+dwctl_image_job="$(
+  sed -n '/^  build:/,/^  openresponses-compliance:/p' .github/workflows/ci.yaml
+)"
+
+if ! grep -Fq 'onwards-pr-image:' <<< "$onwards_image_job" || \
+   ! grep -Fq 'name: onwards / image' <<< "$onwards_image_job" || \
+   ! grep -Fq 'ghcr.io/doublewordai/onwards:sha-' <<< "$onwards_image_job"; then
   echo "Onwards pull requests must retain SHA image publication" >&2
+  exit 1
+fi
+
+if grep -Eq '^[[:space:]]+needs:' <<< "$onwards_image_job" || \
+   grep -Eq '^[[:space:]]+needs:' <<< "$dwctl_image_job"; then
+  echo "Onwards and dwctl image builds must start together before tests finish" >&2
+  exit 1
+fi
+
+for scoped_check in \
+  '    name: dashboard / test' \
+  '    name: ${{ matrix.package }} / test' \
+  '    name: workspace / rust lint' \
+  '    name: workspace / rust gate' \
+  '    name: onwards / compliance changes' \
+  '    name: onwards / open responses (${{ matrix.mode }})' \
+  '    name: dwctl / image' \
+  '    name: dwctl / open responses' \
+  '    name: dwctl / security' \
+  '    name: workspace / e2e'; do
+  if ! grep -Fxq "$scoped_check" .github/workflows/ci.yaml; then
+    echo "CI check names must follow the '<scope> / <purpose>' convention: missing $scoped_check" >&2
+    exit 1
+  fi
+done
+
+if ! grep -Fxq '    name: workspace / pull request title' .github/workflows/pr-title-check.yml; then
+  echo "The pull request title check must use the workspace naming convention" >&2
   exit 1
 fi
 
