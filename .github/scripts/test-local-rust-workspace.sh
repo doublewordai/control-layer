@@ -309,6 +309,13 @@ if grep -Fq 'workflow_dispatch' .github/workflows/ci.yaml; then
   exit 1
 fi
 
+merge_group_trigger="$(sed -n '/^  merge_group:/,/^jobs:/p' .github/workflows/ci.yaml)"
+if ! grep -Fxq '  merge_group:' <<< "$merge_group_trigger" || \
+   ! grep -Fxq '    types: [checks_requested]' <<< "$merge_group_trigger"; then
+  echo "Main CI must listen only for requested merge-group checks" >&2
+  exit 1
+fi
+
 extract_workflow_job() {
   local workflow_path="$1"
   local job_name="$2"
@@ -356,7 +363,12 @@ require_scoped_line "$merge_group_title_step" "        if: github.event_name == 
 
 onwards_compliance_job="$(extract_workflow_job .github/workflows/ci.yaml onwards-openresponses-compliance)"
 require_scoped_line "$onwards_compliance_job" '    if: always()' 'Onwards compliance matrix must always expand'
-require_scoped_line "$onwards_compliance_job" "      RUN_STRICT_COMPLIANCE: \${{ needs.onwards-compliance-changes.outputs.strict == 'true' && (github.event_name == 'merge_group' || (github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]')) }}" 'Onwards strict compliance must gate secret use to trusted events'
+trusted_pull_request_condition="github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]'"
+require_scoped_line "$onwards_compliance_job" "      RUN_STRICT_COMPLIANCE: \${{ needs.onwards-compliance-changes.outputs.strict == 'true' && ${trusted_pull_request_condition} }}" 'Onwards strict compliance must gate secret use to trusted pull requests'
+if grep -Fq "github.event_name == 'merge_group'" <<< "$onwards_compliance_job"; then
+  echo "Onwards compliance must not trust merge-group commits with repository secrets" >&2
+  exit 1
+fi
 
 for step_name in \
   'Checkout code' \
@@ -383,15 +395,16 @@ for step_name in \
   require_scoped_line "$compliance_step" "        if: always() && env.RUN_STRICT_COMPLIANCE == 'true'" "Onwards compliance diagnostic step '${step_name}' must use the trust gate"
 done
 
-trusted_event_condition="github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]')"
 onwards_image_job="$(extract_workflow_job .github/workflows/ci.yaml onwards-pr-image)"
 dwctl_image_job="$(extract_workflow_job .github/workflows/ci.yaml build)"
-if ! grep -Fxq "    if: ${trusted_event_condition}" <<< "$onwards_image_job" || \
-   ! grep -Fxq "    if: ${trusted_event_condition}" <<< "$dwctl_image_job" || \
+if ! grep -Fxq "    if: ${trusted_pull_request_condition}" <<< "$onwards_image_job" || \
+   ! grep -Fxq "    if: ${trusted_pull_request_condition}" <<< "$dwctl_image_job" || \
    ! grep -Fxq '          DOCKER_METADATA_PR_HEAD_SHA: true' <<< "$dwctl_image_job" || \
    ! grep -Fxq '            type=sha,prefix=sha-' <<< "$dwctl_image_job" || \
-   grep -Fq 'type=raw,value=sha-' <<< "$dwctl_image_job"; then
-  echo "Image publishing must be first-wave work limited to trusted PRs and merge groups" >&2
+   grep -Fq 'type=raw,value=sha-' <<< "$dwctl_image_job" || \
+   grep -Fq "github.event_name == 'merge_group'" <<< "$onwards_image_job" || \
+   grep -Fq "github.event_name == 'merge_group'" <<< "$dwctl_image_job"; then
+  echo "Image publishing must be first-wave work limited to trusted pull requests" >&2
   exit 1
 fi
 

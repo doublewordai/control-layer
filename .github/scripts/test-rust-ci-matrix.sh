@@ -101,6 +101,10 @@ if grep -Fq 'workflow_dispatch' "$workflow"; then
   exit 1
 fi
 
+merge_group_trigger="$(sed -n '/^  merge_group:/,/^jobs:/p' "$workflow")"
+require_block_line "$merge_group_trigger" '  merge_group:' 'listen for merge-group checks'
+require_block_line "$merge_group_trigger" '    types: [checks_requested]' 'only run CI for requested merge-group checks'
+
 onwards_compliance_job="$(extract_job onwards-openresponses-compliance)"
 onwards_image_job="$(extract_job onwards-pr-image)"
 dwctl_image_job="$(extract_job build)"
@@ -123,7 +127,12 @@ fi
 
 require_block_line "$onwards_compliance_job" "    if: always()" 'always expand the Onwards compliance matrix after the change detector'
 require_block_line "$onwards_compliance_job" "    needs: onwards-compliance-changes" 'wait for the Onwards compliance change detector'
-require_block_line "$onwards_compliance_job" "      RUN_STRICT_COMPLIANCE: \${{ needs.onwards-compliance-changes.outputs.strict == 'true' && (github.event_name == 'merge_group' || (github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]')) }}" 'only run strict compliance for trusted events'
+trusted_pull_request_condition="github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]'"
+require_block_line "$onwards_compliance_job" "      RUN_STRICT_COMPLIANCE: \${{ needs.onwards-compliance-changes.outputs.strict == 'true' && ${trusted_pull_request_condition} }}" 'only run strict compliance for trusted pull requests'
+if grep -Fq "github.event_name == 'merge_group'" <<< "$onwards_compliance_job"; then
+  echo "Onwards compliance must not trust merge-group commits with repository secrets" >&2
+  exit 1
+fi
 
 skip_step="$(extract_step "$onwards_compliance_job" 'Skip strict compliance for untrusted or unchanged events')"
 require_block_line "$skip_step" "        if: env.RUN_STRICT_COMPLIANCE != 'true'" 'declare the no-op strict compliance path'
@@ -153,13 +162,18 @@ for step_name in \
   require_block_line "$compliance_step" "        if: always() && env.RUN_STRICT_COMPLIANCE == 'true'" "guard Onwards compliance diagnostic step '${step_name}' with the trust gate"
 done
 
-trusted_event_condition="github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]')"
-require_block_line "$onwards_image_job" "    if: ${trusted_event_condition}" 'run Onwards image publishing only for trusted PRs and merge groups'
+require_block_line "$onwards_image_job" "    if: ${trusted_pull_request_condition}" 'run Onwards image publishing only for trusted pull requests'
 require_block_line "$onwards_image_job" "          tags: ghcr.io/doublewordai/onwards:sha-\${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}" 'tag Onwards images with the PR head or merge-group SHA'
+require_block_line "$dwctl_image_job" "    if: ${trusted_pull_request_condition}" 'run dwctl image publishing only for trusted pull requests'
 require_block_line "$dwctl_image_job" '          DOCKER_METADATA_PR_HEAD_SHA: true' 'preserve PR-head metadata tagging for dwctl images'
 require_block_line "$dwctl_image_job" '            type=sha,prefix=sha-' 'preserve SHA metadata tagging for dwctl images'
 if grep -Fq 'type=raw,value=sha-' <<< "$dwctl_image_job"; then
   echo "dwctl image tags must use docker metadata SHA handling, not a raw full SHA" >&2
+  exit 1
+fi
+if grep -Fq "github.event_name == 'merge_group'" <<< "$onwards_image_job" || \
+   grep -Fq "github.event_name == 'merge_group'" <<< "$dwctl_image_job"; then
+  echo "Image publishing must not trust merge-group commits" >&2
   exit 1
 fi
 

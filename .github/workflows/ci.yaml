@@ -4,6 +4,7 @@ on:
   pull_request:
     branches: [main]
   merge_group:
+    types: [checks_requested]
 
 jobs:
   frontend-test:
@@ -305,7 +306,7 @@ jobs:
   # Image builds are first-wave jobs. Keep this and `build` free of `needs` so
   # the independently published Onwards and dwctl images build in parallel.
   onwards-pr-image:
-    if: github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]')
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]'
     name: onwards / image
     runs-on: depot-ubuntu-24.04
 
@@ -388,7 +389,7 @@ jobs:
     name: onwards / open responses (${{ matrix.mode }})
 
     env:
-      RUN_STRICT_COMPLIANCE: ${{ needs.onwards-compliance-changes.outputs.strict == 'true' && (github.event_name == 'merge_group' || (github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]')) }}
+      RUN_STRICT_COMPLIANCE: ${{ needs.onwards-compliance-changes.outputs.strict == 'true' && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]' }}
       TEST_MODEL: gemini-2.5-flash
       # Match the supported HTTP /responses coverage exercised through dwctl below.
       OPENRESPONSES_COMPLIANCE_FILTER: basic-response,assistant-phase,response-output-phase-schema,streaming-response,system-prompt,tool-calling,image-input,multi-turn
@@ -652,7 +653,7 @@ jobs:
 
   # Sibling image build to `onwards-pr-image`; both start as soon as CI begins.
   build:
-    if: github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]')
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]'
     name: dwctl / image
     runs-on: depot-ubuntu-24.04
 
