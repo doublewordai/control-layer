@@ -461,6 +461,19 @@ cache:
   # "5m"). Must be one of enabled_ttls.
   # Set via environment: DWCTL_CACHE__DEFAULT_TTL=5m
   default_ttl: 5m
+  # Deadline (seconds) for joining the classify fork at response time. classify races the
+  # (slower) model call, so this only bites when classification is still unresolved as the
+  # response completes — in which case the request bills un-cached (fail-safe). Keep tight on
+  # latency-sensitive realtime pods; raise on the fusillade-batch pod (no first-token
+  # pressure) so index retries have room to land. Default 5.
+  # Set via environment: DWCTL_CACHE__CLASSIFY_DEADLINE_SECS=10
+  # classify_deadline_secs: 5
+  # Retries per cache-index DB op (lookup/write/refresh) after a connection-class failure
+  # (severed idle conn / TLS EOF / auth timeout — the burst-churn family; other errors never
+  # retry). Backed off 100ms*2^n; the classify deadline still bounds the caller. Raise on the
+  # bursty batch pod (e.g. 3); default 1.
+  # Set via environment: DWCTL_CACHE__INDEX_CONN_RETRIES=3
+  # index_conn_retries: 1
   # Default pricing multipliers — pre-fill values when enabling caching on a model without
   # explicit per-tier rates. The model_cache_tariffs row is the source of truth, so these
   # only matter at enable-time. Defaults shown; uncomment to override.

@@ -1,36 +1,92 @@
 //! Postgres baseline for the [`CacheIndex`]: always correct, the single
 //! source of truth. A Redis accelerator (later) write-behinds to this and reads
 //! through it; nothing is ever *reliant* on Redis.
+//!
+//! ## Connection-error retry
+//!
+//! Every op retries up to `cache.index_conn_retries` times (default 1, backed off
+//! 100ms·2^n) on a connection-class failure. Evidence (2026-07): 100% of the
+//! ~500-1000/day classify errors occur on the fusillade-batch pod, which idles between
+//! batches then fires ~100 concurrent loopback requests in a second. Neon's proxy reaps
+//! idle connections sooner than the pool's `idle_timeout`, so the burst is handed
+//! already-severed conns ("expected to read 5 bytes, got 0") while simultaneously
+//! cold-starting new ones (TLS EOF / auth timeout) — instant-fail errors, not slow queries.
+//! A retry acquires a fresh connection and typically succeeds in milliseconds, well
+//! inside the classify deadline (which still bounds the caller — a retry never extends it).
+//! Non-connection errors (constraint violations, bad data) are NOT retried. This mirrors
+//! the fix the batch daemon's own queries received for the same severed-conn failure mode.
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use rand::RngExt;
 use sqlx::PgPool;
 use tracing::instrument;
 
 use super::index::{CacheEntry, CacheError, CacheIndex, CacheMatch, CacheResult, IndexScope, PrefixHash, TtlTier};
+use super::metrics as cache_metrics;
 
 /// Postgres-backed prefix index over `prompt_cache_entries`.
 #[derive(Clone)]
 pub struct PostgresIndex {
     pool: PgPool,
+    /// Connection-error retries per op (`cache.index_conn_retries`; 0 = never retry).
+    conn_retries: u32,
 }
 
 impl PostgresIndex {
-    pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+    pub fn new(pool: PgPool, conn_retries: u32) -> Self {
+        Self { pool, conn_retries }
     }
 }
 
-#[async_trait]
-impl CacheIndex for PostgresIndex {
-    #[instrument(skip_all, fields(model = %scope.virtual_model, candidates = candidate_hashes.len()), err)]
-    async fn lookup(&self, scope: &IndexScope, candidate_hashes: &[PrefixHash]) -> CacheResult<Vec<CacheMatch>> {
-        if candidate_hashes.is_empty() {
-            return Ok(Vec::new());
+/// A failure of the CONNECTION, not the query: a severed pooled conn (Io/Protocol), a
+/// TLS handshake killed mid-setup (Tls), or the upstream proxy timing out authentication
+/// on a fresh conn (surfaces as a database error with this message on Neon). These are
+/// instant-fail and safe to retry; `PoolTimedOut` is deliberately excluded — by the time
+/// the acquire timeout fires, the classify deadline has long passed and a retry would
+/// just burn another acquire cycle.
+fn is_transient_connection_error(e: &sqlx::Error) -> bool {
+    match e {
+        sqlx::Error::Io(_) | sqlx::Error::Tls(_) | sqlx::Error::Protocol(_) => true,
+        sqlx::Error::Database(db) => db.message().contains("Authentication timed out"),
+        _ => false,
+    }
+}
+
+/// Run `op` up to `1 + $retries` times: retry iff an attempt failed with a connection-class
+/// error, backing off 100ms·2^n + 0..20% jitter between attempts so a herd of simultaneous
+/// failures — the observed burst shape — doesn't re-storm connection setup in lockstep.
+/// Each retry is recorded so dashboards see the underlying churn even when the retry
+/// succeeds. The classify deadline still bounds the caller regardless of retries.
+macro_rules! with_conn_retry {
+    ($op_name:literal, $retries:expr, $op:expr) => {{
+        let mut attempt: u32 = 0;
+        loop {
+            match $op.await {
+                Err(e) if is_transient_connection_error(&e) && attempt < $retries => {
+                    cache_metrics::record_index_conn_retry($op_name);
+                    tracing::debug!(op = $op_name, attempt, error = %e, "cache index connection error — retrying with a fresh connection");
+                    // 0..20% positive jitter (same scheme as image_normalizer's fetch retry):
+                    // the observed failure shape is a ~100-request herd failing in the same
+                    // instant, so identical deterministic sleeps would re-storm connection
+                    // setup in lockstep.
+                    let base_ms = 100u64 << attempt.min(4);
+                    let jitter_ms = rand::rng().random_range(0..(base_ms / 5 + 1));
+                    tokio::time::sleep(std::time::Duration::from_millis(base_ms + jitter_ms)).await;
+                    attempt += 1;
+                }
+                other => break other,
+            }
         }
+    }};
+}
+
+impl PostgresIndex {
+    async fn lookup_once(&self, scope: &IndexScope, candidate_hashes: &[PrefixHash]) -> Result<Vec<LookupRow>, sqlx::Error> {
         // Point lookup on the (org, model, tok, hash) unique btree, filtered to live
         // entries. now() is applied here (it can't sit in a partial-index predicate).
-        let rows = sqlx::query!(
+        sqlx::query_as!(
+            LookupRow,
             r#"
             SELECT prefix_hash, cumulative_token_count, ttl_tier, expires_at
             FROM prompt_cache_entries
@@ -43,24 +99,10 @@ impl CacheIndex for PostgresIndex {
             candidate_hashes,
         )
         .fetch_all(&self.pool)
-        .await?;
-
-        rows.into_iter()
-            .map(|r| {
-                let ttl_tier =
-                    TtlTier::parse(&r.ttl_tier).ok_or_else(|| CacheError::Invalid(format!("unknown ttl_tier {:?}", r.ttl_tier)))?;
-                Ok(CacheMatch {
-                    prefix_hash: r.prefix_hash,
-                    cumulative_token_count: r.cumulative_token_count.max(0) as u32,
-                    ttl_tier,
-                    expires_at: r.expires_at,
-                })
-            })
-            .collect()
+        .await
     }
 
-    #[instrument(skip_all, fields(model = %entry.scope.virtual_model, ttl = entry.ttl_tier.as_str()), err)]
-    async fn write(&self, entry: &CacheEntry) -> CacheResult<()> {
+    async fn write_once(&self, entry: &CacheEntry) -> Result<(), sqlx::Error> {
         // Upsert: a re-write of the same prefix refreshes its count/tier/expiry.
         sqlx::query!(
             r#"
@@ -83,12 +125,11 @@ impl CacheIndex for PostgresIndex {
             entry.expires_at,
         )
         .execute(&self.pool)
-        .await?;
-        Ok(())
+        .await
+        .map(|_| ())
     }
 
-    #[instrument(skip_all, fields(model = %scope.virtual_model), err)]
-    async fn refresh(&self, scope: &IndexScope, prefix_hash: &PrefixHash, new_expires_at: DateTime<Utc>) -> CacheResult<()> {
+    async fn refresh_once(&self, scope: &IndexScope, prefix_hash: &PrefixHash, new_expires_at: DateTime<Utc>) -> Result<(), sqlx::Error> {
         // Slide the window forward (the sliding-TTL refresh). In pure Postgres this
         // is a direct UPDATE per read; the Redis accelerator debounces it.
         sqlx::query!(
@@ -105,11 +146,54 @@ impl CacheIndex for PostgresIndex {
             new_expires_at,
         )
         .execute(&self.pool)
-        .await?;
-        Ok(())
+        .await
+        .map(|_| ())
     }
 }
 
+/// Row shape shared by the lookup attempts.
+struct LookupRow {
+    prefix_hash: Vec<u8>,
+    cumulative_token_count: i32,
+    ttl_tier: String,
+    expires_at: DateTime<Utc>,
+}
+
+#[async_trait]
+impl CacheIndex for PostgresIndex {
+    #[instrument(skip_all, fields(model = %scope.virtual_model, candidates = candidate_hashes.len()), err)]
+    async fn lookup(&self, scope: &IndexScope, candidate_hashes: &[PrefixHash]) -> CacheResult<Vec<CacheMatch>> {
+        if candidate_hashes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = with_conn_retry!("lookup", self.conn_retries, self.lookup_once(scope, candidate_hashes))?;
+
+        rows.into_iter()
+            .map(|r| {
+                let ttl_tier =
+                    TtlTier::parse(&r.ttl_tier).ok_or_else(|| CacheError::Invalid(format!("unknown ttl_tier {:?}", r.ttl_tier)))?;
+                Ok(CacheMatch {
+                    prefix_hash: r.prefix_hash,
+                    cumulative_token_count: r.cumulative_token_count.max(0) as u32,
+                    ttl_tier,
+                    expires_at: r.expires_at,
+                })
+            })
+            .collect()
+    }
+
+    #[instrument(skip_all, fields(model = %entry.scope.virtual_model, ttl = entry.ttl_tier.as_str()), err)]
+    async fn write(&self, entry: &CacheEntry) -> CacheResult<()> {
+        with_conn_retry!("write", self.conn_retries, self.write_once(entry))?;
+        Ok(())
+    }
+
+    #[instrument(skip_all, fields(model = %scope.virtual_model), err)]
+    async fn refresh(&self, scope: &IndexScope, prefix_hash: &PrefixHash, new_expires_at: DateTime<Utc>) -> CacheResult<()> {
+        with_conn_retry!("refresh", self.conn_retries, self.refresh_once(scope, prefix_hash, new_expires_at))?;
+        Ok(())
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -135,7 +219,7 @@ mod tests {
 
     #[sqlx::test]
     async fn write_then_lookup_returns_match(pool: PgPool) {
-        let idx = PostgresIndex::new(pool);
+        let idx = PostgresIndex::new(pool, 1);
         let s = scope();
         idx.write(&entry(&s, b"hash-a", 1024, TtlTier::OneHour)).await.unwrap();
 
@@ -148,7 +232,7 @@ mod tests {
 
     #[sqlx::test]
     async fn lookup_excludes_expired_and_other_scopes(pool: PgPool) {
-        let idx = PostgresIndex::new(pool);
+        let idx = PostgresIndex::new(pool, 1);
         let s = scope();
 
         // Expired entry must not match.
@@ -168,7 +252,7 @@ mod tests {
 
     #[sqlx::test]
     async fn refresh_slides_expiry(pool: PgPool) {
-        let idx = PostgresIndex::new(pool);
+        let idx = PostgresIndex::new(pool, 1);
         let s = scope();
         let mut e = entry(&s, b"refreshable", 7, TtlTier::FiveMinutes);
         e.expires_at = Utc::now() + chrono::Duration::seconds(2);
@@ -185,7 +269,7 @@ mod tests {
 
     #[sqlx::test]
     async fn write_upserts_on_conflict(pool: PgPool) {
-        let idx = PostgresIndex::new(pool);
+        let idx = PostgresIndex::new(pool, 1);
         let s = scope();
         idx.write(&entry(&s, b"dup", 100, TtlTier::FiveMinutes)).await.unwrap();
         idx.write(&entry(&s, b"dup", 200, TtlTier::OneHour)).await.unwrap();
@@ -194,5 +278,19 @@ mod tests {
         assert_eq!(hits.len(), 1, "upsert must not create a duplicate row");
         assert_eq!(hits[0].cumulative_token_count, 200);
         assert_eq!(hits[0].ttl_tier, TtlTier::OneHour);
+    }
+
+    #[test]
+    fn transient_connection_errors_are_classified_for_retry() {
+        // The three flavors observed in prod (severed idle conn, TLS handshake EOF, Neon auth
+        // timeout) must retry; query-level and pool-exhaustion errors must NOT.
+        use std::io;
+        assert!(is_transient_connection_error(&sqlx::Error::Io(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "expected to read 5 bytes, got 0 bytes at EOF"
+        ))));
+        assert!(is_transient_connection_error(&sqlx::Error::Protocol("unexpected EOF".into())));
+        assert!(!is_transient_connection_error(&sqlx::Error::PoolTimedOut));
+        assert!(!is_transient_connection_error(&sqlx::Error::RowNotFound));
     }
 }
