@@ -7,12 +7,6 @@ on:
     types: [checks_requested]
 
 jobs:
-  workflow-contract:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-      - run: ruby scripts/tests/preview_workflow_test.rb
-
   frontend-test:
     if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
     name: dashboard / test
@@ -258,7 +252,7 @@ jobs:
 
   backend-test:
     if: always() && (github.event_name == 'pull_request' || github.event_name == 'merge_group')
-    needs: [backend-crate-test, backend-lint]
+    needs: [backend-crate-test, backend-lint, frontend-test, build]
     runs-on: ubuntu-latest
     name: workspace / rust gate
     env:
@@ -267,6 +261,9 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
+
+      - name: Validate preview workflow contract
+        run: ruby scripts/tests/preview_workflow_test.rb
 
       - name: Require crate tests and lint
         env:
@@ -308,6 +305,41 @@ jobs:
           echo "Backend code coverage: ${COVERAGE}%"
           curl -X POST \
             "https://charts.somnial.co/doubleword-control-layer/backend-code-coverage?value=${COVERAGE}" || true
+
+      - name: Publish preview artifact
+        if: >-
+          github.event_name == 'pull_request' &&
+          startsWith(github.head_ref, 'preview/') &&
+          github.event.pull_request.head.repo.full_name == github.repository &&
+          needs.frontend-test.result == 'success' &&
+          needs.build.result == 'success'
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        env:
+          ARTIFACT_DIGEST: ${{ needs.build.outputs.image-digest }}
+        with:
+          github-token: ${{ secrets.PREVIEW_DISPATCH_TOKEN }}
+          script: |
+            const sha = context.payload.pull_request.head.sha
+            const digest = process.env.ARTIFACT_DIGEST
+            if (!/^[0-9a-f]{40}$/.test(sha) || !/^sha256:[0-9a-f]{64}$/.test(digest)) {
+              core.setFailed('Preview artifact identity is invalid')
+              return
+            }
+            await github.rest.repos.createDispatchEvent({
+              owner: '${{ secrets.PREVIEW_DISPATCH_OWNER }}',
+              repo: '${{ secrets.PREVIEW_DISPATCH_REPOSITORY }}',
+              event_type: 'preview-artifact-published',
+              client_payload: {
+                repository: context.repo.owner + '/' + context.repo.repo,
+                pull_request: context.payload.pull_request.number,
+                branch: context.payload.pull_request.head.ref,
+                sha,
+                artifact_kind: 'image',
+                artifact_repository: 'ghcr.io/doublewordai/control-layer',
+                version: `sha-${sha}`,
+                digest
+              }
+            })
 
   # Image builds are first-wave jobs. Keep this and `build` free of `needs` so
   # the independently published Onwards and dwctl images build in parallel.
@@ -726,44 +758,6 @@ jobs:
     outputs:
       image-tag: ${{ steps.meta.outputs.tags }}
       image-digest: ${{ steps.preview-image.outputs.digest }}
-
-  preview:
-    name: Publish preview artifact
-    if: >-
-      github.event_name == 'pull_request' &&
-      startsWith(github.head_ref, 'preview/') &&
-      github.event.pull_request.head.repo.full_name == github.repository
-    needs: [workflow-contract, frontend-test, backend-test, build]
-    runs-on: ubuntu-latest
-    steps:
-      - name: Publish preview artifact
-        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
-        env:
-          ARTIFACT_DIGEST: ${{ needs.build.outputs.image-digest }}
-        with:
-          github-token: ${{ secrets.PREVIEW_DISPATCH_TOKEN }}
-          script: |
-            const sha = context.payload.pull_request.head.sha
-            const digest = process.env.ARTIFACT_DIGEST
-            if (!/^[0-9a-f]{40}$/.test(sha) || !/^sha256:[0-9a-f]{64}$/.test(digest)) {
-              core.setFailed('Preview artifact identity is invalid')
-              return
-            }
-            await github.rest.repos.createDispatchEvent({
-              owner: '${{ secrets.PREVIEW_DISPATCH_OWNER }}',
-              repo: '${{ secrets.PREVIEW_DISPATCH_REPOSITORY }}',
-              event_type: 'preview-artifact-published',
-              client_payload: {
-                repository: context.repo.owner + '/' + context.repo.repo,
-                pull_request: context.payload.pull_request.number,
-                branch: context.payload.pull_request.head.ref,
-                sha,
-                artifact_kind: 'image',
-                artifact_repository: 'ghcr.io/doublewordai/control-layer',
-                version: `sha-${sha}`,
-                digest
-              }
-            })
 
   openresponses-compliance:
     if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
