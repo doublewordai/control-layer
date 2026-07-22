@@ -55,12 +55,15 @@ pub struct CacheLayerState {
 }
 
 impl CacheLayerState {
-    pub fn new(classifier: Classifier, body_limit: usize) -> Self {
+    /// `deadline` comes from `cache.classify_deadline_secs` (default 5s — onwards' old
+    /// `DEFAULT_CLASSIFY_DEADLINE`); it only bites on an index/tokenizer outage (classify
+    /// normally finishes during generation). Latency-insensitive deployments (the
+    /// fusillade-batch pod, where the join is inline post-response with no first-token
+    /// pressure) set it higher so index retries have room to land.
+    pub fn new(classifier: Classifier, body_limit: usize, deadline: Duration) -> Self {
         Self {
             classifier,
-            // Mirrors onwards' old `DEFAULT_CLASSIFY_DEADLINE`; only bites on an
-            // index/tokenizer outage (classify normally finishes during generation).
-            deadline: Duration::from_secs(5),
+            deadline,
             body_limit,
         }
     }
@@ -566,13 +569,16 @@ mod tests {
             PrincipalResolver::new(pool.clone()),
             ModelConfigResolver::new(pool.clone()),
             TokenizerClient::new(tok.uri()),
-            Arc::new(PostgresIndex::new(pool.clone())),
+            Arc::new(PostgresIndex::new(pool.clone(), 1)),
             all_tiers(),
             TelemetryPolicy::default(),
         );
         let app = Router::new()
             .route("/v1/chat/completions", post(mock_upstream))
-            .layer(from_fn_with_state(CacheLayerState::new(classifier, usize::MAX), cache_middleware));
+            .layer(from_fn_with_state(
+                CacheLayerState::new(classifier, usize::MAX, Duration::from_secs(5)),
+                cache_middleware,
+            ));
         let server = axum_test::TestServer::new(app).unwrap();
 
         // First request: nothing cached yet → all-creation, response carries zeroed read.
@@ -598,7 +604,7 @@ mod tests {
             .unwrap()
             .cumulative_hashes[0]
             .clone();
-        let idx = PostgresIndex::new(pool.clone());
+        let idx = PostgresIndex::new(pool.clone(), 1);
         let mut committed = false;
         for _ in 0..100 {
             if !idx.lookup(&scope, std::slice::from_ref(&hash)).await.unwrap().is_empty() {
@@ -682,13 +688,16 @@ mod tests {
             PrincipalResolver::new(pool.clone()),
             ModelConfigResolver::new(pool.clone()),
             TokenizerClient::new(tok.uri()),
-            Arc::new(PostgresIndex::new(pool.clone())),
+            Arc::new(PostgresIndex::new(pool.clone(), 1)),
             all_tiers(),
             TelemetryPolicy::default(),
         );
         let app = Router::new()
             .route("/v1/chat/completions", post(mock_upstream_streaming))
-            .layer(from_fn_with_state(CacheLayerState::new(classifier, usize::MAX), cache_middleware));
+            .layer(from_fn_with_state(
+                CacheLayerState::new(classifier, usize::MAX, Duration::from_secs(5)),
+                cache_middleware,
+            ));
         let server = axum_test::TestServer::new(app).unwrap();
 
         // First stream: the deferred classify resolves at the terminal usage frame, which is then
@@ -719,7 +728,7 @@ mod tests {
         .unwrap()
         .cumulative_hashes[0]
             .clone();
-        let idx = PostgresIndex::new(pool.clone());
+        let idx = PostgresIndex::new(pool.clone(), 1);
         let mut committed = false;
         for _ in 0..100 {
             if !idx.lookup(&scope, std::slice::from_ref(&hash)).await.unwrap().is_empty() {
@@ -791,13 +800,16 @@ mod tests {
             PrincipalResolver::new(pool.clone()),
             ModelConfigResolver::new(pool.clone()),
             TokenizerClient::new(tok.uri()),
-            Arc::new(PostgresIndex::new(pool.clone())),
+            Arc::new(PostgresIndex::new(pool.clone(), 1)),
             all_tiers(),
             TelemetryPolicy::default(),
         );
         let app = Router::new()
             .route("/v1/chat/completions", post(mock_upstream_streaming_error))
-            .layer(from_fn_with_state(CacheLayerState::new(classifier, usize::MAX), cache_middleware));
+            .layer(from_fn_with_state(
+                CacheLayerState::new(classifier, usize::MAX, Duration::from_secs(5)),
+                cache_middleware,
+            ));
         let server = axum_test::TestServer::new(app).unwrap();
 
         // Drain the stream: a mid-stream error frame and no usage frame → veto.
@@ -823,7 +835,7 @@ mod tests {
         .unwrap()
         .cumulative_hashes[0]
             .clone();
-        let idx = PostgresIndex::new(pool.clone());
+        let idx = PostgresIndex::new(pool.clone(), 1);
         for _ in 0..50 {
             tokio::task::yield_now().await;
         }
@@ -840,13 +852,14 @@ mod tests {
             PrincipalResolver::new(pool.clone()),
             ModelConfigResolver::new(pool.clone()),
             TokenizerClient::new("http://127.0.0.1:1"),
-            Arc::new(PostgresIndex::new(pool.clone())),
+            Arc::new(PostgresIndex::new(pool.clone(), 1)),
             all_tiers(),
             TelemetryPolicy::default(),
         );
-        let app = Router::new()
-            .route("/v1/embeddings", post(mock_upstream))
-            .layer(from_fn_with_state(CacheLayerState::new(classifier, usize::MAX), cache_middleware));
+        let app = Router::new().route("/v1/embeddings", post(mock_upstream)).layer(from_fn_with_state(
+            CacheLayerState::new(classifier, usize::MAX, Duration::from_secs(5)),
+            cache_middleware,
+        ));
         let server = axum_test::TestServer::new(app).unwrap();
         let r = server
             .post("/v1/embeddings")
@@ -864,13 +877,16 @@ mod tests {
             PrincipalResolver::new(pool.clone()),
             ModelConfigResolver::new(pool.clone()),
             TokenizerClient::new("http://127.0.0.1:1"),
-            Arc::new(PostgresIndex::new(pool.clone())),
+            Arc::new(PostgresIndex::new(pool.clone(), 1)),
             TierPolicy::from_config(&["5m".to_string()], "5m"),
             TelemetryPolicy::default(),
         );
         let app = Router::new()
             .route("/v1/chat/completions", post(mock_upstream)) // must NOT be reached
-            .layer(from_fn_with_state(CacheLayerState::new(classifier, usize::MAX), cache_middleware));
+            .layer(from_fn_with_state(
+                CacheLayerState::new(classifier, usize::MAX, Duration::from_secs(5)),
+                cache_middleware,
+            ));
         let server = axum_test::TestServer::new(app).unwrap();
 
         let r = server

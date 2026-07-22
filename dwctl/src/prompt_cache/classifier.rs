@@ -466,7 +466,7 @@ mod tests {
             PrincipalResolver::new(pool.clone()),
             ModelConfigResolver::new(pool.clone()),
             TokenizerClient::new(server.uri()),
-            Arc::new(PostgresIndex::new(pool.clone())),
+            Arc::new(PostgresIndex::new(pool.clone(), 0)),
             all_tiers(),
             TelemetryPolicy::default(),
         );
@@ -513,7 +513,7 @@ mod tests {
             virtual_model: ALIAS.to_string(),
             tokenizer_version: TOK_VER.to_string(),
         };
-        PostgresIndex::new(h.pool.clone())
+        PostgresIndex::new(h.pool.clone(), 0)
             .write(&CacheEntry {
                 scope: scope.clone(),
                 prefix_hash: prefix_hash(),

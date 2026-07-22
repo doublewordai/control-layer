@@ -1660,7 +1660,7 @@ pub async fn build_router(
                 crate::prompt_cache::PrincipalResolver::new(pool.clone()),
                 crate::prompt_cache::ModelConfigResolver::new(pool.clone()),
                 crate::prompt_cache::TokenizerClient::new(cfg.cache.tokenizer_url.clone()),
-                Arc::new(crate::prompt_cache::PostgresIndex::new(pool)),
+                Arc::new(crate::prompt_cache::PostgresIndex::new(pool, cfg.cache.index_conn_retries)),
                 crate::prompt_cache::TierPolicy::from_config(&cfg.cache.enabled_ttls, &cfg.cache.default_ttl),
                 crate::prompt_cache::TelemetryPolicy::from_config(
                     cfg.cache.telemetry_blocks.strip_from_prompt,
@@ -1675,7 +1675,11 @@ pub async fn build_router(
             };
             tracing::info!("Cached-input pricing enabled - wiring cache layer into onwards stack");
             onwards_router.layer(middleware::from_fn_with_state(
-                crate::prompt_cache::CacheLayerState::new(classifier, body_limit),
+                crate::prompt_cache::CacheLayerState::new(
+                    classifier,
+                    body_limit,
+                    std::time::Duration::from_secs(cfg.cache.classify_deadline_secs),
+                ),
                 crate::prompt_cache::cache_middleware,
             ))
         } else {

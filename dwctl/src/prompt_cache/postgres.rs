@@ -27,11 +27,13 @@ use super::metrics as cache_metrics;
 #[derive(Clone)]
 pub struct PostgresIndex {
     pool: PgPool,
+    /// Connection-error retries per op (`cache.index_conn_retries`; 0 = never retry).
+    conn_retries: u32,
 }
 
 impl PostgresIndex {
-    pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+    pub fn new(pool: PgPool, conn_retries: u32) -> Self {
+        Self { pool, conn_retries }
     }
 }
 
@@ -49,17 +51,24 @@ fn is_transient_connection_error(e: &sqlx::Error) -> bool {
     }
 }
 
-/// Run `op` (twice at most): retry once iff the first attempt failed with a
-/// connection-class error, recording the retry so dashboards can see the churn.
+/// Run `op` up to `1 + $retries` times: retry iff an attempt failed with a connection-class
+/// error, backing off 100ms·2^n between attempts (100ms, 200ms, 400ms…) so a herd of
+/// simultaneous failures — the observed burst shape — doesn't re-storm connection setup in
+/// lockstep. Each retry is recorded so dashboards see the underlying churn even when the
+/// retry succeeds. The classify deadline still bounds the caller regardless of retries.
 macro_rules! with_conn_retry {
-    ($op_name:literal, $op:expr) => {{
-        match $op.await {
-            Err(e) if is_transient_connection_error(&e) => {
-                cache_metrics::record_index_conn_retry($op_name);
-                tracing::debug!(op = $op_name, error = %e, "cache index connection error — retrying once with a fresh connection");
-                $op.await
+    ($op_name:literal, $retries:expr, $op:expr) => {{
+        let mut attempt: u32 = 0;
+        loop {
+            match $op.await {
+                Err(e) if is_transient_connection_error(&e) && attempt < $retries => {
+                    cache_metrics::record_index_conn_retry($op_name);
+                    tracing::debug!(op = $op_name, attempt, error = %e, "cache index connection error — retrying with a fresh connection");
+                    tokio::time::sleep(std::time::Duration::from_millis(100u64 << attempt.min(4))).await;
+                    attempt += 1;
+                }
+                other => break other,
             }
-            other => other,
         }
     }};
 }
@@ -149,7 +158,7 @@ impl CacheIndex for PostgresIndex {
         if candidate_hashes.is_empty() {
             return Ok(Vec::new());
         }
-        let rows = with_conn_retry!("lookup", self.lookup_once(scope, candidate_hashes))?;
+        let rows = with_conn_retry!("lookup", self.conn_retries, self.lookup_once(scope, candidate_hashes))?;
 
         rows.into_iter()
             .map(|r| {
@@ -167,13 +176,13 @@ impl CacheIndex for PostgresIndex {
 
     #[instrument(skip_all, fields(model = %entry.scope.virtual_model, ttl = entry.ttl_tier.as_str()), err)]
     async fn write(&self, entry: &CacheEntry) -> CacheResult<()> {
-        with_conn_retry!("write", self.write_once(entry))?;
+        with_conn_retry!("write", self.conn_retries, self.write_once(entry))?;
         Ok(())
     }
 
     #[instrument(skip_all, fields(model = %scope.virtual_model), err)]
     async fn refresh(&self, scope: &IndexScope, prefix_hash: &PrefixHash, new_expires_at: DateTime<Utc>) -> CacheResult<()> {
-        with_conn_retry!("refresh", self.refresh_once(scope, prefix_hash, new_expires_at))?;
+        with_conn_retry!("refresh", self.conn_retries, self.refresh_once(scope, prefix_hash, new_expires_at))?;
         Ok(())
     }
 }
@@ -202,7 +211,7 @@ mod tests {
 
     #[sqlx::test]
     async fn write_then_lookup_returns_match(pool: PgPool) {
-        let idx = PostgresIndex::new(pool);
+        let idx = PostgresIndex::new(pool, 1);
         let s = scope();
         idx.write(&entry(&s, b"hash-a", 1024, TtlTier::OneHour)).await.unwrap();
 
@@ -215,7 +224,7 @@ mod tests {
 
     #[sqlx::test]
     async fn lookup_excludes_expired_and_other_scopes(pool: PgPool) {
-        let idx = PostgresIndex::new(pool);
+        let idx = PostgresIndex::new(pool, 1);
         let s = scope();
 
         // Expired entry must not match.
@@ -235,7 +244,7 @@ mod tests {
 
     #[sqlx::test]
     async fn refresh_slides_expiry(pool: PgPool) {
-        let idx = PostgresIndex::new(pool);
+        let idx = PostgresIndex::new(pool, 1);
         let s = scope();
         let mut e = entry(&s, b"refreshable", 7, TtlTier::FiveMinutes);
         e.expires_at = Utc::now() + chrono::Duration::seconds(2);
@@ -252,7 +261,7 @@ mod tests {
 
     #[sqlx::test]
     async fn write_upserts_on_conflict(pool: PgPool) {
-        let idx = PostgresIndex::new(pool);
+        let idx = PostgresIndex::new(pool, 1);
         let s = scope();
         idx.write(&entry(&s, b"dup", 100, TtlTier::FiveMinutes)).await.unwrap();
         idx.write(&entry(&s, b"dup", 200, TtlTier::OneHour)).await.unwrap();
