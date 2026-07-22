@@ -3316,6 +3316,7 @@ impl Application {
             keystore: bg_services.keystore.clone(),
             api_key_cache: bg_services.api_key_cache.clone(),
             flex_batch_key_resolver: bg_services.flex_batch_key_resolver.clone(),
+            onwards_targets: bg_services.onwards_targets.clone(),
         };
 
         // Build onwards router from targets with body transform, response sanitization, and tool executor.

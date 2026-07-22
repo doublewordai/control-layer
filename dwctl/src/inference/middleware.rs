@@ -30,6 +30,99 @@ use super::image_normalizer_middleware::{normalize_error_response, normalize_val
 use super::store::{self as response_store, ONWARDS_RESPONSE_ID_HEADER, OnwardsDaemonId};
 use super::streaming::{ReplayFrame, flex_stream_response};
 use crate::image_normalizer::ImageNormalizer;
+use crate::sync::api_key_cache::ApiKeyMetadata;
+
+#[derive(Debug, thiserror::Error)]
+enum FlexAccessError {
+    #[error("Invalid API key")]
+    InvalidApiKey,
+    #[error("API keys with purpose '{purpose}' cannot be used for inference requests.")]
+    NonInferencePurpose { purpose: &'static str },
+    #[error("You do not have access to '{model}'. Please contact your administrator to request access.")]
+    ModelAccess { model: String },
+    #[error("Batch access to '{model}' is blocked by a routing rule. Please contact your administrator to request access.")]
+    BatchRoutingDenied { model: String },
+}
+
+fn api_key_purpose_name(purpose: &crate::db::models::api_keys::ApiKeyPurpose) -> &'static str {
+    use crate::db::models::api_keys::ApiKeyPurpose;
+
+    match purpose {
+        ApiKeyPurpose::Platform => "platform",
+        ApiKeyPurpose::Realtime => "realtime",
+        ApiKeyPurpose::Batch => "batch",
+        ApiKeyPurpose::Playground => "playground",
+    }
+}
+
+fn flex_api_key_metadata(
+    cache: &crate::sync::api_key_cache::ApiKeyMetadataCache,
+    presented_key: &str,
+) -> Result<ApiKeyMetadata, FlexAccessError> {
+    cache.get(presented_key).ok_or(FlexAccessError::InvalidApiKey)
+}
+
+fn key_is_in_model_pool(targets: &onwards::target::Targets, presented_key: &str, model: &str) -> bool {
+    targets.targets.get(model).is_some_and(|pool| {
+        pool.keys()
+            .is_none_or(|keys| onwards::auth::validate_bearer_token(keys, presented_key))
+    })
+}
+
+async fn wait_for_model_key(targets: &onwards::target::Targets, key: &str, model: &str, timeout: std::time::Duration) -> bool {
+    if key_is_in_model_pool(targets, key, model) {
+        return true;
+    }
+    if timeout.is_zero() {
+        return false;
+    }
+
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        if key_is_in_model_pool(targets, key, model) {
+            return true;
+        }
+    }
+}
+
+fn validate_flex_access(
+    targets: &onwards::target::Targets,
+    metadata: &ApiKeyMetadata,
+    presented_key: &str,
+    model: &str,
+) -> Result<(), FlexAccessError> {
+    let purpose = api_key_purpose_name(&metadata.purpose);
+    if metadata.owner_id != uuid::Uuid::nil() && !crate::db::models::api_keys::is_inference_purpose(purpose) {
+        return Err(FlexAccessError::NonInferencePurpose { purpose });
+    }
+
+    let pool = targets
+        .targets
+        .get(model)
+        .ok_or_else(|| FlexAccessError::ModelAccess { model: model.to_string() })?;
+    if pool
+        .keys()
+        .is_some_and(|keys| !onwards::auth::validate_bearer_token(keys, presented_key))
+    {
+        return Err(FlexAccessError::ModelAccess { model: model.to_string() });
+    }
+
+    let mut labels = targets
+        .key_labels
+        .get(presented_key)
+        .map(|labels| labels.value().clone())
+        .unwrap_or_default();
+    labels.insert("purpose".to_string(), "batch".to_string());
+    if matches!(pool.evaluate_routing_rules(&labels), Some(onwards::target::RoutingAction::Deny)) {
+        return Err(FlexAccessError::BatchRoutingDenied { model: model.to_string() });
+    }
+
+    Ok(())
+}
 
 /// State for the inference middleware.
 #[derive(Clone)]
@@ -74,6 +167,8 @@ pub struct InferenceMiddlewareState<P: PoolProvider + Clone = sqlx_pool_router::
     pub api_key_cache: crate::sync::api_key_cache::ApiKeyMetadataCache,
     /// Shared cold-path resolver for a presented key's hidden batch identity.
     pub flex_batch_key_resolver: crate::sync::api_key_cache::FlexBatchKeyResolver,
+    /// Live routing snapshot used by onwards for authentication and routing.
+    pub onwards_targets: onwards::target::Targets,
 }
 
 /// Middleware that routes inference requests based on service_tier and background.
@@ -289,12 +384,24 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                     .unwrap();
             }
             Some(key) => {
-                if let Err(msg) = crate::error_enrichment::validate_api_key_model_access(state.dwctl_pool.clone(), key, model).await {
+                let metadata = match flex_api_key_metadata(&state.api_key_cache, key) {
+                    Ok(metadata) => metadata,
+                    Err(error) => {
+                        return Response::builder()
+                            .status(StatusCode::FORBIDDEN)
+                            .header("content-type", "application/json")
+                            .body(Body::from(
+                                serde_json::json!({"error": {"message": error.to_string(), "type": "invalid_request_error"}}).to_string(),
+                            ))
+                            .unwrap();
+                    }
+                };
+                if let Err(error) = validate_flex_access(&state.onwards_targets, &metadata, key, model) {
                     return Response::builder()
                         .status(StatusCode::FORBIDDEN)
                         .header("content-type", "application/json")
                         .body(Body::from(
-                            serde_json::json!({"error": {"message": msg, "type": "invalid_request_error"}}).to_string(),
+                            serde_json::json!({"error": {"message": error.to_string(), "type": "invalid_request_error"}}).to_string(),
                         ))
                         .unwrap();
                 }
@@ -306,14 +413,47 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
     // exist before returning 202). Flex uses the key owner's hidden batch key
     // below, so resolving it there also supplies the attribution target.
     let created_by = if background && matches!(service_tier, ServiceTier::Realtime) {
-        response_store::lookup_created_by(&state.dwctl_pool, api_key.as_deref()).await
+        api_key
+            .as_deref()
+            .and_then(|key| state.api_key_cache.get(key))
+            .map(|metadata| metadata.owner_id.to_string())
     } else {
         None
     };
+    let flex_batch_key_was_cold = matches!(service_tier, ServiceTier::Flex)
+        && api_key
+            .as_deref()
+            .and_then(|key| state.api_key_cache.get(key))
+            .is_some_and(|metadata| metadata.hidden_batch_key.is_none());
     let flex_batch_key = if matches!(service_tier, ServiceTier::Flex) {
         match api_key.as_deref() {
             Some(key) => match state.flex_batch_key_resolver.resolve_hidden_batch_key(key).await {
-                Ok(Some(key)) => Some(key),
+                Ok(Some(resolved)) => {
+                    let wait = if flex_batch_key_was_cold {
+                        std::time::Duration::from_secs(1)
+                    } else {
+                        std::time::Duration::ZERO
+                    };
+                    if !wait_for_model_key(&state.onwards_targets, &resolved.secret, model, wait).await {
+                        tracing::warn!(model, "Flex hidden batch key is absent from the live routing snapshot");
+                        return Response::builder()
+                            .status(StatusCode::SERVICE_UNAVAILABLE)
+                            .header("content-type", "application/json")
+                            .header("retry-after", "1")
+                            .body(Body::from(
+                                serde_json::json!({
+                                    "error": {
+                                        "message": "Flex routing configuration is not ready. Please retry.",
+                                        "type": "server_error",
+                                        "code": 503,
+                                    }
+                                })
+                                .to_string(),
+                            ))
+                            .unwrap();
+                    }
+                    Some(resolved)
+                }
                 Ok(None) => {
                     tracing::warn!("Flex API key disappeared before hidden batch-key resolution");
                     return Response::builder()
@@ -1104,7 +1244,7 @@ async fn warm_path_setup<P: PoolProvider + Clone + Send + Sync + 'static>(
     api_key: &str,
     model: &str,
 ) -> Option<(uuid::Uuid, Arc<crate::inference::tools::ResolvedToolSet>, onwards::UpstreamTarget)> {
-    let created_by = response_store::lookup_created_by(&state.dwctl_pool, Some(api_key)).await;
+    let created_by = state.api_key_cache.get(api_key).map(|metadata| metadata.owner_id.to_string());
 
     let resolved = match crate::inference::tools::resolve_tools_for_request(&state.dwctl_pool, api_key, Some(model)).await {
         Ok(Some(set)) => Arc::new(set),
@@ -1189,7 +1329,469 @@ async fn warm_path_setup<P: PoolProvider + Clone + Send + Sync + 'static>(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{HashMap, HashSet};
+
+    use dashmap::DashMap;
+    use onwards::{
+        auth::ConstantTimeString,
+        load_balancer::ProviderPool,
+        target::{LoadBalanceStrategy, RoutingAction, RoutingRule, Targets},
+    };
+    use uuid::Uuid;
+
     use super::*;
+    use crate::{db::models::api_keys::ApiKeyPurpose, sync::api_key_cache::ApiKeyMetadata};
+
+    const FLEX_TEST_KEY: &str = "sk-flex-presented";
+    const FLEX_TEST_MODEL: &str = "test-model";
+
+    fn flex_access_metadata(owner_id: Uuid, purpose: ApiKeyPurpose) -> ApiKeyMetadata {
+        ApiKeyMetadata {
+            owner_id,
+            created_by: Uuid::new_v4(),
+            purpose,
+            verified: true,
+            zero_data_retention: false,
+            hidden_batch_key: Some("sk-flex-hidden".to_string()),
+        }
+    }
+
+    fn flex_access_targets(keys: &[&str], labels: HashMap<String, String>, rules: Vec<RoutingRule>) -> Targets {
+        let keys = keys
+            .iter()
+            .map(|key| ConstantTimeString::from((*key).to_string()))
+            .collect::<HashSet<_>>();
+        let pool = ProviderPool::with_config(
+            Vec::new(),
+            Some(keys),
+            None,
+            None,
+            None,
+            LoadBalanceStrategy::default(),
+            false,
+            rules,
+        );
+        let targets = Targets {
+            targets: Arc::new(DashMap::new()),
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels: Arc::new(DashMap::new()),
+            strict_mode: false,
+            http_pool_config: None,
+        };
+        targets.targets.insert(FLEX_TEST_MODEL.to_string(), pool);
+        targets.key_labels.insert(FLEX_TEST_KEY.to_string(), labels);
+        targets
+    }
+
+    #[test]
+    fn flex_access_unknown_key_uses_invalid_api_key_error() {
+        let cache = crate::sync::api_key_cache::ApiKeyMetadataCache::empty();
+
+        let error = flex_api_key_metadata(&cache, "sk-unknown").unwrap_err();
+
+        assert_eq!(error.to_string(), "Invalid API key");
+    }
+
+    #[test]
+    fn flex_access_rejects_non_system_platform_key() {
+        let targets = flex_access_targets(&[FLEX_TEST_KEY], HashMap::new(), Vec::new());
+        let metadata = flex_access_metadata(Uuid::new_v4(), ApiKeyPurpose::Platform);
+
+        let error = validate_flex_access(&targets, &metadata, FLEX_TEST_KEY, FLEX_TEST_MODEL).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "API keys with purpose 'platform' cannot be used for inference requests."
+        );
+    }
+
+    #[test]
+    fn flex_access_allows_system_platform_key() {
+        let targets = flex_access_targets(&[FLEX_TEST_KEY], HashMap::new(), Vec::new());
+        let metadata = flex_access_metadata(Uuid::nil(), ApiKeyPurpose::Platform);
+
+        assert!(validate_flex_access(&targets, &metadata, FLEX_TEST_KEY, FLEX_TEST_MODEL).is_ok());
+    }
+
+    #[test]
+    fn flex_access_rejects_key_absent_from_model_pool() {
+        let targets = flex_access_targets(&["sk-other"], HashMap::new(), Vec::new());
+        let metadata = flex_access_metadata(Uuid::new_v4(), ApiKeyPurpose::Realtime);
+
+        let error = validate_flex_access(&targets, &metadata, FLEX_TEST_KEY, FLEX_TEST_MODEL).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "You do not have access to 'test-model'. Please contact your administrator to request access."
+        );
+    }
+
+    #[test]
+    fn flex_access_rejects_batch_routing_deny() {
+        let rules = vec![RoutingRule {
+            match_labels: HashMap::from([
+                ("purpose".to_string(), "batch".to_string()),
+                ("tenant".to_string(), "test".to_string()),
+            ]),
+            action: RoutingAction::Deny,
+        }];
+        let targets = flex_access_targets(
+            &[FLEX_TEST_KEY],
+            HashMap::from([
+                ("purpose".to_string(), "realtime".to_string()),
+                ("tenant".to_string(), "test".to_string()),
+            ]),
+            rules,
+        );
+        let metadata = flex_access_metadata(Uuid::new_v4(), ApiKeyPurpose::Realtime);
+
+        let error = validate_flex_access(&targets, &metadata, FLEX_TEST_KEY, FLEX_TEST_MODEL).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Batch access to 'test-model' is blocked by a routing rule. Please contact your administrator to request access."
+        );
+    }
+
+    #[test]
+    fn flex_access_ignores_realtime_routing_deny() {
+        let rules = vec![RoutingRule {
+            match_labels: HashMap::from([("purpose".to_string(), "realtime".to_string())]),
+            action: RoutingAction::Deny,
+        }];
+        let targets = flex_access_targets(&[FLEX_TEST_KEY], HashMap::new(), rules);
+        let metadata = flex_access_metadata(Uuid::new_v4(), ApiKeyPurpose::Realtime);
+
+        assert!(validate_flex_access(&targets, &metadata, FLEX_TEST_KEY, FLEX_TEST_MODEL).is_ok());
+    }
+
+    #[test]
+    fn flex_access_allows_key_in_model_pool() {
+        let targets = flex_access_targets(&[FLEX_TEST_KEY], HashMap::new(), Vec::new());
+        let metadata = flex_access_metadata(Uuid::new_v4(), ApiKeyPurpose::Realtime);
+
+        assert!(validate_flex_access(&targets, &metadata, FLEX_TEST_KEY, FLEX_TEST_MODEL).is_ok());
+    }
+
+    #[tokio::test]
+    async fn flex_access_waits_for_hidden_key_in_live_snapshot() {
+        let targets = flex_access_targets(&[FLEX_TEST_KEY], HashMap::new(), Vec::new());
+        let updated_targets = flex_access_targets(&[FLEX_TEST_KEY, "sk-flex-hidden"], HashMap::new(), Vec::new());
+        let updated_pool = updated_targets.targets.get(FLEX_TEST_MODEL).unwrap().clone();
+        let targets_for_update = targets.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            targets_for_update.targets.insert(FLEX_TEST_MODEL.to_string(), updated_pool);
+        });
+
+        assert!(wait_for_model_key(&targets, "sk-flex-hidden", FLEX_TEST_MODEL, std::time::Duration::from_millis(200),).await);
+    }
+
+    #[tokio::test]
+    async fn flex_access_hidden_key_wait_is_bounded() {
+        let targets = flex_access_targets(&[FLEX_TEST_KEY], HashMap::new(), Vec::new());
+
+        assert!(!wait_for_model_key(&targets, "sk-flex-hidden", FLEX_TEST_MODEL, std::time::Duration::from_millis(25),).await);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn flex_access_rejects_hidden_key_that_appears_after_deadline() {
+        let targets = flex_access_targets(&[FLEX_TEST_KEY], HashMap::new(), Vec::new());
+        let updated_targets = flex_access_targets(&[FLEX_TEST_KEY, "sk-flex-hidden"], HashMap::new(), Vec::new());
+        let updated_pool = updated_targets.targets.get(FLEX_TEST_MODEL).unwrap().clone();
+        let waiter_targets = targets.clone();
+        let waiter = tokio::spawn(async move {
+            wait_for_model_key(
+                &waiter_targets,
+                "sk-flex-hidden",
+                FLEX_TEST_MODEL,
+                std::time::Duration::from_secs(1),
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+
+        tokio::time::advance(std::time::Duration::from_millis(1_001)).await;
+        targets.targets.insert(FLEX_TEST_MODEL.to_string(), updated_pool);
+
+        assert!(!waiter.await.unwrap());
+    }
+
+    #[sqlx::test]
+    async fn flex_access_hot_path_enqueues_while_main_pool_is_unavailable(pool: sqlx::PgPool) {
+        use std::time::Duration;
+
+        use axum::{Router, middleware, routing::post};
+        use sqlx::postgres::PgPoolOptions;
+        use sqlx_pool_router::TestDbPools;
+        use tower::ServiceExt;
+
+        let fusillade_pool = crate::test::utils::setup_fusillade_pool(&pool).await;
+        let fusillade_pools = TestDbPools::new(fusillade_pool.clone()).await.unwrap();
+        let request_manager = Arc::new(fusillade_arsenal::PostgresRequestManager::new(fusillade_pools, Default::default()));
+        let response_store = Arc::new(response_store::FusilladeResponseStore::new(request_manager.clone()));
+
+        let main_pool = PgPoolOptions::new()
+            .max_connections(1)
+            .min_connections(0)
+            .connect_with(pool.connect_options().as_ref().clone())
+            .await
+            .unwrap();
+
+        let owner_id = Uuid::new_v4();
+        let hidden_key = "sk-flex-hidden";
+        let api_key_cache = crate::sync::api_key_cache::ApiKeyMetadataCache::empty();
+        api_key_cache.replace(HashMap::from([(
+            FLEX_TEST_KEY.to_string(),
+            ApiKeyMetadata {
+                owner_id,
+                created_by: owner_id,
+                purpose: ApiKeyPurpose::Realtime,
+                verified: true,
+                zero_data_retention: false,
+                hidden_batch_key: Some(hidden_key.to_string()),
+            },
+        )]));
+        let flex_batch_key_resolver = crate::sync::api_key_cache::FlexBatchKeyResolver::new(main_pool.clone(), api_key_cache.clone());
+        let onwards_targets = flex_access_targets(&[FLEX_TEST_KEY, hidden_key], HashMap::new(), Vec::new());
+
+        let state = InferenceMiddlewareState {
+            request_manager,
+            daemon_id: OnwardsDaemonId(Uuid::new_v4()),
+            loopback_base_url: "http://127.0.0.1:3001/ai".to_string(),
+            dwctl_pool: main_pool.clone(),
+            response_store,
+            multi_step_tool_executor: Arc::new(crate::inference::tools::HttpToolExecutor::new(reqwest::Client::new(), None)),
+            multi_step_http_client: Arc::new(fusillade::ReqwestHttpClient::new(
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+                Vec::new(),
+            )),
+            loop_config: onwards::LoopConfig::default(),
+            image_normalizer: Arc::new(crate::image_normalizer::DisabledNormalizer),
+            image_normalizer_enabled: false,
+            unverified_requests_per_completion_hour: 0,
+            flex_completion_window: "1h".to_string(),
+            keystore: None,
+            api_key_cache,
+            flex_batch_key_resolver,
+            onwards_targets,
+        };
+
+        let app = Router::new()
+            .route("/v1/responses", post(|| async { StatusCode::IM_A_TEAPOT }))
+            .layer(middleware::from_fn_with_state(state, inference_middleware));
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("authorization", format!("Bearer {FLEX_TEST_KEY}"))
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "model": FLEX_TEST_MODEL,
+                    "service_tier": "flex",
+                    "background": true,
+                    "tools": [],
+                    "input": "hello",
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let _held_connection = main_pool.acquire().await.unwrap();
+        let response = tokio::time::timeout(Duration::from_millis(250), app.oneshot(request))
+            .await
+            .expect("cached Flex validation must not acquire the unavailable main pool")
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let (stored_key, created_by): (String, Option<String>) =
+            sqlx::query_as("SELECT t.api_key, r.created_by FROM requests r JOIN request_templates t ON t.id = r.template_id")
+                .fetch_one(&fusillade_pool)
+                .await
+                .unwrap();
+        assert_eq!(stored_key, hidden_key);
+        assert_eq!(created_by.as_deref(), Some(owner_id.to_string().as_str()));
+    }
+
+    #[sqlx::test]
+    async fn warm_background_persists_cached_owner_while_main_pool_is_unavailable(pool: sqlx::PgPool) {
+        use std::time::Duration;
+
+        use sqlx::postgres::PgPoolOptions;
+        use sqlx_pool_router::TestDbPools;
+
+        let fusillade_pool = crate::test::utils::setup_fusillade_pool(&pool).await;
+        let fusillade_pools = TestDbPools::new(fusillade_pool.clone()).await.unwrap();
+        let request_manager = Arc::new(fusillade_arsenal::PostgresRequestManager::new(fusillade_pools, Default::default()));
+        let response_store = Arc::new(response_store::FusilladeResponseStore::new(request_manager.clone()));
+
+        let main_pool = PgPoolOptions::new()
+            .max_connections(1)
+            .min_connections(0)
+            .acquire_timeout(Duration::from_millis(25))
+            .connect_with(pool.connect_options().as_ref().clone())
+            .await
+            .unwrap();
+
+        let owner_id = Uuid::new_v4();
+        let created_by = Uuid::new_v4();
+        let api_key_cache = crate::sync::api_key_cache::ApiKeyMetadataCache::empty();
+        api_key_cache.replace(HashMap::from([(
+            FLEX_TEST_KEY.to_string(),
+            ApiKeyMetadata {
+                owner_id,
+                created_by,
+                purpose: ApiKeyPurpose::Realtime,
+                verified: true,
+                zero_data_retention: false,
+                hidden_batch_key: Some("sk-flex-hidden".to_string()),
+            },
+        )]));
+        let flex_batch_key_resolver = crate::sync::api_key_cache::FlexBatchKeyResolver::new(main_pool.clone(), api_key_cache.clone());
+        let state = InferenceMiddlewareState {
+            request_manager,
+            daemon_id: OnwardsDaemonId(Uuid::new_v4()),
+            loopback_base_url: "http://127.0.0.1:3001/ai".to_string(),
+            dwctl_pool: main_pool.clone(),
+            response_store,
+            multi_step_tool_executor: Arc::new(crate::inference::tools::HttpToolExecutor::new(reqwest::Client::new(), None)),
+            multi_step_http_client: Arc::new(fusillade::ReqwestHttpClient::new(
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+                Vec::new(),
+            )),
+            loop_config: onwards::LoopConfig::default(),
+            image_normalizer: Arc::new(crate::image_normalizer::DisabledNormalizer),
+            image_normalizer_enabled: false,
+            unverified_requests_per_completion_hour: 0,
+            flex_completion_window: "1h".to_string(),
+            keystore: None,
+            api_key_cache,
+            flex_batch_key_resolver,
+            onwards_targets: flex_access_targets(&[FLEX_TEST_KEY], HashMap::new(), Vec::new()),
+        };
+        let request_value = serde_json::json!({
+            "model": FLEX_TEST_MODEL,
+            "background": true,
+            "tools": [{
+                "type": "function",
+                "name": "client_tool",
+                "description": "client-side test tool",
+                "parameters": {"type": "object"},
+            }],
+            "input": "hello",
+        });
+
+        let _held_connection = main_pool.acquire().await.unwrap();
+        let response = tokio::time::timeout(
+            Duration::from_millis(250),
+            try_warm_path_background(&state, &request_value, Some(FLEX_TEST_KEY), FLEX_TEST_MODEL),
+        )
+        .await
+        .expect("warm background attribution must not wait on the unavailable main pool")
+        .expect("warm background setup must retain cached attribution");
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let stored_created_by: Option<String> = sqlx::query_scalar("SELECT created_by FROM requests")
+            .fetch_one(&fusillade_pool)
+            .await
+            .unwrap();
+        assert_eq!(stored_created_by.as_deref(), Some(owner_id.to_string().as_str()));
+    }
+
+    #[sqlx::test]
+    async fn background_realtime_persists_cached_owner_while_main_pool_is_unavailable(pool: sqlx::PgPool) {
+        use std::time::Duration;
+
+        use axum::{Router, middleware, routing::post};
+        use sqlx::postgres::PgPoolOptions;
+        use sqlx_pool_router::TestDbPools;
+        use tower::ServiceExt;
+
+        let fusillade_pool = crate::test::utils::setup_fusillade_pool(&pool).await;
+        let fusillade_pools = TestDbPools::new(fusillade_pool.clone()).await.unwrap();
+        let request_manager = Arc::new(fusillade_arsenal::PostgresRequestManager::new(fusillade_pools, Default::default()));
+        let response_store = Arc::new(response_store::FusilladeResponseStore::new(request_manager.clone()));
+        let main_pool = PgPoolOptions::new()
+            .max_connections(1)
+            .min_connections(0)
+            .connect_with(pool.connect_options().as_ref().clone())
+            .await
+            .unwrap();
+
+        let owner_id = Uuid::new_v4();
+        let created_by = Uuid::new_v4();
+        let api_key_cache = crate::sync::api_key_cache::ApiKeyMetadataCache::empty();
+        api_key_cache.replace(HashMap::from([(
+            FLEX_TEST_KEY.to_string(),
+            ApiKeyMetadata {
+                owner_id,
+                created_by,
+                purpose: ApiKeyPurpose::Realtime,
+                verified: true,
+                zero_data_retention: false,
+                hidden_batch_key: Some("sk-flex-hidden".to_string()),
+            },
+        )]));
+        let state = InferenceMiddlewareState {
+            request_manager,
+            daemon_id: OnwardsDaemonId(Uuid::new_v4()),
+            loopback_base_url: "http://127.0.0.1:3001/ai".to_string(),
+            dwctl_pool: main_pool.clone(),
+            response_store,
+            multi_step_tool_executor: Arc::new(crate::inference::tools::HttpToolExecutor::new(reqwest::Client::new(), None)),
+            multi_step_http_client: Arc::new(fusillade::ReqwestHttpClient::new(
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+                Vec::new(),
+            )),
+            loop_config: onwards::LoopConfig::default(),
+            image_normalizer: Arc::new(crate::image_normalizer::DisabledNormalizer),
+            image_normalizer_enabled: false,
+            unverified_requests_per_completion_hour: 0,
+            flex_completion_window: "1h".to_string(),
+            keystore: None,
+            api_key_cache: api_key_cache.clone(),
+            flex_batch_key_resolver: crate::sync::api_key_cache::FlexBatchKeyResolver::new(main_pool.clone(), api_key_cache),
+            onwards_targets: flex_access_targets(&[FLEX_TEST_KEY], HashMap::new(), Vec::new()),
+        };
+        let app = Router::new()
+            .route("/v1/responses", post(|| async { StatusCode::IM_A_TEAPOT }))
+            .layer(middleware::from_fn_with_state(state, inference_middleware));
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("authorization", format!("Bearer {FLEX_TEST_KEY}"))
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "model": FLEX_TEST_MODEL,
+                    "background": true,
+                    "tools": [],
+                    "input": "hello",
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let _held_connection = main_pool.acquire().await.unwrap();
+        let response = tokio::time::timeout(Duration::from_millis(250), app.oneshot(request))
+            .await
+            .expect("background realtime attribution must not wait on the unavailable main pool")
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let stored_created_by: Option<String> = sqlx::query_scalar("SELECT created_by FROM requests")
+            .fetch_one(&fusillade_pool)
+            .await
+            .unwrap();
+        assert_eq!(stored_created_by.as_deref(), Some(owner_id.to_string().as_str()));
+    }
 
     #[test]
     fn test_should_intercept_responses() {
