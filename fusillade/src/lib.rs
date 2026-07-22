@@ -16,7 +16,7 @@ pub mod transform;
 pub use fusillade_core::{batch, error, request, response_step};
 
 // Re-export commonly used types
-pub use daemon::{BackgroundDaemon, Daemon, DaemonConfig, DaemonMode, ModelEscalationConfig};
+pub use daemon::{Daemon, DaemonConfig, DaemonMode, ModelEscalationConfig};
 pub use fusillade_core::batch::*;
 pub use fusillade_core::error::{FusilladeError, Result};
 pub use fusillade_core::request::*;

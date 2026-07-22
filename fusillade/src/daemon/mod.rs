@@ -246,7 +246,7 @@ where
 
 /// Daemon responsible for spare-capacity background requests from both
 /// file-backed batches and the batchless queue.
-pub struct BackgroundDaemon<S, H>
+struct BackgroundDaemon<S, H>
 where
     S: Storage + DaemonStorage,
     H: HttpClient,

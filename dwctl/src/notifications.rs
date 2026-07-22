@@ -109,6 +109,15 @@ impl BatchNotificationInfo {
             BatchOutcome::PartiallyCompleted
         };
 
+        let completion_window = if batch.service_tier.as_deref() == Some("background") {
+            "background".to_string()
+        } else {
+            batch
+                .completion_window
+                .clone()
+                .expect("non-background batch must have a completion window")
+        };
+
         Some(Self {
             batch_id: format!("{}", *batch.id),
             batch_uuid: *batch.id,
@@ -122,7 +131,7 @@ impl BatchNotificationInfo {
             completed_requests: batch.completed_requests,
             failed_requests: batch.failed_requests,
             cancelled_requests: batch.canceled_requests,
-            completion_window: batch.completion_window.clone().unwrap_or_else(|| "background".to_string()),
+            completion_window,
             filename: notif.input_file_name.clone(),
             description: notif.input_file_description.clone(),
             output_file_id: batch.output_file_id.map(|f| f.0),
@@ -1012,10 +1021,9 @@ mod tests {
     use rust_decimal::Decimal;
     use sqlx::PgPool;
 
-    #[test]
-    fn background_batch_notification_uses_the_tier_as_its_window_label() {
+    fn background_batch_notification() -> fusillade::batch::BatchNotification {
         let now = Utc::now();
-        let notification = fusillade::batch::BatchNotification {
+        fusillade::batch::BatchNotification {
             batch: fusillade::Batch {
                 id: fusillade::BatchId(Uuid::new_v4()),
                 file_id: Some(fusillade::FileId(Uuid::new_v4())),
@@ -1048,10 +1056,25 @@ mod tests {
             model: "model".to_string(),
             input_file_name: None,
             input_file_description: None,
-        };
+        }
+    }
+
+    #[test]
+    fn background_batch_notification_uses_the_tier_as_its_window_label() {
+        let notification = background_batch_notification();
 
         let info = BatchNotificationInfo::try_from_batch(&notification).unwrap();
         assert_eq!(info.completion_window, "background");
+    }
+
+    #[test]
+    #[should_panic(expected = "non-background batch must have a completion window")]
+    fn sla_batch_notification_requires_a_completion_window() {
+        let mut notification = background_batch_notification();
+        notification.batch.service_tier = None;
+        notification.batch.expires_at = Some(Utc::now());
+
+        let _ = BatchNotificationInfo::try_from_batch(&notification);
     }
 
     #[sqlx::test]

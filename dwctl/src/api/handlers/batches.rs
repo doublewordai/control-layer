@@ -369,11 +369,30 @@ fn to_batch_response_enriched(batch: fusillade::Batch, creator_email: Option<&st
     // The OpenAI-shaped response predates no-SLA batches. Preserve the SLA
     // window for ordinary batches and use the explicit tier name for
     // background batches so callers never receive a fabricated deadline.
-    let completion_window = batch.completion_window.clone().unwrap_or_else(|| "background".to_string());
-    let expires_at = batch.expires_at.map(|expires_at| expires_at.timestamp());
+    let is_background = batch.service_tier.as_deref() == Some("background");
+    let completion_window = if is_background {
+        "background".to_string()
+    } else {
+        batch
+            .completion_window
+            .clone()
+            .expect("non-background batch must have a completion window")
+    };
+    let expires_at = if is_background {
+        None
+    } else {
+        Some(
+            batch
+                .expires_at
+                .as_ref()
+                .expect("non-background batch must have an expiry")
+                .timestamp(),
+        )
+    };
     let expired_at = batch
         .expires_at
-        .filter(|expires_at| chrono::Utc::now() > *expires_at)
+        .as_ref()
+        .filter(|expires_at| !is_background && chrono::Utc::now() > **expires_at)
         .map(|expires_at| expires_at.timestamp());
 
     BatchResponse {
@@ -2013,6 +2032,25 @@ mod tests {
         assert_eq!(response.completion_window, "background");
         assert!(response.expires_at.is_none());
         assert!(response.expired_at.is_none());
+    }
+
+    #[test]
+    #[should_panic(expected = "non-background batch must have a completion window")]
+    fn sla_batch_response_requires_a_completion_window() {
+        let mut batch = background_batch();
+        batch.service_tier = None;
+
+        let _ = to_batch_response_with_email(batch, None);
+    }
+
+    #[test]
+    #[should_panic(expected = "non-background batch must have an expiry")]
+    fn sla_batch_response_requires_an_expiry() {
+        let mut batch = background_batch();
+        batch.service_tier = None;
+        batch.completion_window = Some("24h".to_string());
+
+        let _ = to_batch_response_with_email(batch, None);
     }
 
     // -------------------------------------------------------------------------
