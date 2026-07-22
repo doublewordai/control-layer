@@ -1667,7 +1667,7 @@ fn compute_request_origin(api_key_purpose: Option<&ApiKeyPurpose>, fusillade_bat
 /// - `flex`     — 1h SLA, no batch id (async single request)
 /// - `async`    — 1h SLA with a batch id
 /// - `batch`    — 24h SLA with a batch id (the /v1/batches API)
-fn compute_service_tier(fusillade_batch_id: Option<Uuid>, completion_window: Option<&str>) -> &'static str {
+pub(crate) fn compute_service_tier(fusillade_batch_id: Option<Uuid>, completion_window: Option<&str>) -> &'static str {
     let window = completion_window.filter(|w| !w.is_empty());
     match (fusillade_batch_id.is_some(), window) {
         (false, None) => "realtime",

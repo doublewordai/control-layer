@@ -10,7 +10,10 @@ use async_trait::async_trait;
 use prometheus::{HistogramOpts, HistogramVec, Registry};
 use tracing::instrument;
 
-use crate::{metrics::MetricsRecorder, request_logging::serializers::HttpAnalyticsRow};
+use crate::{
+    metrics::MetricsRecorder,
+    request_logging::{batcher::compute_service_tier, serializers::HttpAnalyticsRow},
+};
 
 /// GenAI metrics instruments using Prometheus
 #[derive(Clone)]
@@ -47,15 +50,19 @@ impl GenAiMetrics {
                 "error_type",
                 "request_origin",
                 "batch_sla",
+                "service_tier",
                 "served_by",
             ],
         )?;
         registry.register(Box::new(request_duration.clone()))?;
 
         // Time to first token histogram (recommended)
-        // Buckets from OTel spec: 0.001s to 10.0s
+        // OTel-spec buckets (0.001s to 10s) plus a tail to 120s. SLO thresholds
+        // must stay exact bucket edges (10 = realtime TTFT bound, 60 = async):
+        // compliance ratios are only exact when computed at an edge.
         let ttft_buckets = vec![
-            0.001, 0.005, 0.01, 0.02, 0.04, 0.06, 0.08, 0.1, 0.25, 0.5, 0.75, 1.0, 2.5, 5.0, 7.5, 10.0,
+            0.001, 0.005, 0.01, 0.02, 0.04, 0.06, 0.08, 0.1, 0.25, 0.5, 0.75, 1.0, 2.5, 5.0, 7.5, 10.0, 15.0, 20.0, 30.0, 45.0, 60.0, 90.0,
+            120.0,
         ];
         let time_to_first_token = HistogramVec::new(
             HistogramOpts::new(
@@ -72,14 +79,16 @@ impl GenAiMetrics {
                 "server_port",
                 "request_origin",
                 "batch_sla",
+                "service_tier",
                 "served_by",
             ],
         )?;
         registry.register(Box::new(time_to_first_token.clone()))?;
 
         // Time per output token histogram (recommended)
-        // Buckets from OTel spec: 0.01s to 2.5s (exponential with factor 2)
-        let tpot_buckets = vec![0.01, 0.025, 0.05, 0.075, 0.1, 0.15, 0.2, 0.3, 0.4, 0.5, 0.75, 1.0, 2.5];
+        // OTel-spec buckets (0.01s to 2.5s) plus a tail; 0.05 and 1.0 are the
+        // per-tier inter-token SLO bounds and must stay exact bucket edges.
+        let tpot_buckets = vec![0.01, 0.025, 0.05, 0.075, 0.1, 0.15, 0.2, 0.3, 0.4, 0.5, 0.75, 1.0, 2.5, 5.0, 10.0];
         let time_per_output_token = HistogramVec::new(
             HistogramOpts::new(
                 "gen_ai_server_time_per_output_token_seconds",
@@ -95,6 +104,7 @@ impl GenAiMetrics {
                 "server_port",
                 "request_origin",
                 "batch_sla",
+                "service_tier",
                 "served_by",
             ],
         )?;
@@ -117,6 +127,7 @@ impl GenAiMetrics {
                 "server_port",
                 "request_origin",
                 "batch_sla",
+                "service_tier",
                 "served_by",
             ],
         )?;
@@ -189,6 +200,9 @@ impl MetricsRecorder for GenAiMetrics {
         let response_model = row.response_model.as_deref().unwrap_or("");
         let request_origin = &row.request_origin;
         let batch_sla = &row.batch_sla;
+        // `batch_sla` holds the completion window ("" for non-batch), matching the
+        // ledger's service_tier derivation in the batcher.
+        let service_tier = compute_service_tier(row.fusillade_batch_id, Some(batch_sla));
 
         // Record request duration (always)
         let duration_labels = vec![
@@ -201,6 +215,7 @@ impl MetricsRecorder for GenAiMetrics {
             &error_type,
             request_origin,
             batch_sla,
+            service_tier,
             &served_by,
         ];
         self.record_request_duration(row.duration_ms as f64 / 1000.0, &duration_labels);
@@ -216,6 +231,7 @@ impl MetricsRecorder for GenAiMetrics {
                 server_port,
                 request_origin,
                 batch_sla,
+                service_tier,
                 &served_by,
             ];
             self.record_time_to_first_token(ttfb_ms as f64 / 1000.0, &ttft_labels);
@@ -236,6 +252,7 @@ impl MetricsRecorder for GenAiMetrics {
                 server_port,
                 request_origin,
                 batch_sla,
+                service_tier,
                 &served_by,
             ];
             self.record_time_per_output_token(time_per_token, &tpot_labels);
@@ -253,6 +270,7 @@ impl MetricsRecorder for GenAiMetrics {
                 server_port,
                 request_origin,
                 batch_sla,
+                service_tier,
                 &served_by,
             ];
             self.record_token_usage(row.prompt_tokens as f64, &input_labels);
@@ -270,6 +288,7 @@ impl MetricsRecorder for GenAiMetrics {
                 server_port,
                 request_origin,
                 batch_sla,
+                service_tier,
                 &served_by,
             ];
             self.record_token_usage(row.completion_tokens as f64, &output_labels);
@@ -383,6 +402,7 @@ mod tests {
         assert_eq!(find_label(duration_labels, "server_address"), Some("api.openai.com".to_string()));
         assert_eq!(find_label(duration_labels, "server_port"), Some("443".to_string()));
         assert_eq!(find_label(duration_labels, "error_type"), Some("".to_string()));
+        assert_eq!(find_label(duration_labels, "service_tier"), Some("realtime".to_string()));
 
         // Verify time to first token metric (only for streaming)
         let ttft_metric = metric_families
@@ -436,6 +456,72 @@ mod tests {
             50.0,
             "Should record 50 output tokens"
         );
+    }
+
+    #[tokio::test]
+    async fn test_service_tier_label_covers_all_tiers() {
+        let registry = Registry::new();
+        let metrics = GenAiMetrics::new(&registry).expect("Failed to create metrics");
+        let batch_id = Uuid::new_v4();
+
+        // (fusillade_batch_id, batch_sla) → expected service_tier
+        let cases = [
+            (None, "", "realtime"),
+            (None, "1h", "flex"),
+            (Some(batch_id), "1h", "async"),
+            (Some(batch_id), "24h", "batch"),
+        ];
+
+        for (i, (fusillade_batch_id, batch_sla, _)) in cases.iter().enumerate() {
+            let row = HttpAnalyticsRow {
+                served_by: None,
+                instance_id: Uuid::new_v4(),
+                correlation_id: i as i64,
+                timestamp: chrono::Utc::now(),
+                method: "POST".to_string(),
+                uri: "/v1/chat/completions".to_string(),
+                request_model: Some("gpt-4".to_string()),
+                response_model: Some("gpt-4".to_string()),
+                status_code: 200,
+                duration_ms: 1000,
+                duration_to_first_byte_ms: Some(100),
+                prompt_tokens: 10,
+                completion_tokens: 10,
+                reasoning_tokens: 0,
+                total_tokens: 20,
+                response_type: "chat_completion".to_string(),
+                user_id: None,
+                access_source: "api_key".to_string(),
+                input_price_per_token: None,
+                output_price_per_token: None,
+                server_address: "api.openai.com".to_string(),
+                server_port: 443,
+                provider_name: Some("openai".to_string()),
+                fusillade_batch_id: *fusillade_batch_id,
+                fusillade_request_id: None,
+                custom_id: None,
+                request_origin: "api".to_string(),
+                batch_sla: batch_sla.to_string(),
+                batch_request_source: String::new(),
+            };
+            metrics.record_from_analytics(&row).await;
+        }
+
+        let metric_families = registry.gather();
+        let duration_metric = metric_families
+            .iter()
+            .find(|m| m.name() == "gen_ai_server_request_duration_seconds")
+            .expect("Should have request duration metric");
+
+        let mut seen: Vec<String> = duration_metric
+            .get_metric()
+            .iter()
+            .filter_map(|m| find_label(m.get_label(), "service_tier"))
+            .collect();
+        seen.sort();
+        let mut expected: Vec<String> = cases.iter().map(|(_, _, tier)| tier.to_string()).collect();
+        expected.sort();
+        assert_eq!(seen, expected, "each (batch_id, sla) combination maps to its tier");
     }
 
     #[tokio::test]
