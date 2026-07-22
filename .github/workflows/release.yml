@@ -81,7 +81,7 @@ jobs:
       - name: Trigger deployment
         uses: actions/github-script@v9
         with:
-          github-token: ${{ secrets.DEPLOY_PAT }}
+          github-token: ${{ secrets.PREVIEW_DISPATCH_TOKEN }}
           script: |
             await github.rest.repos.createDispatchEvent({
               owner: '${{ secrets.DEPLOY_TARGET_OWNER }}',
