@@ -1305,6 +1305,8 @@ async fn test_request_logging_disabled(pool: PgPool) {
         .expect("Failed to create task runner"),
     );
     let response_store = std::sync::Arc::new(crate::inference::store::FusilladeResponseStore::new(request_manager.clone()));
+    let api_key_cache = crate::sync::api_key_cache::ApiKeyMetadataCache::empty();
+    let flex_batch_key_resolver = crate::sync::api_key_cache::FlexBatchKeyResolver::new(pool.clone(), api_key_cache.clone());
     let mut app_state = AppState::builder()
         .db(DbPools::new(pool.clone()))
         .config(shared_config)
@@ -1314,6 +1316,8 @@ async fn test_request_logging_disabled(pool: PgPool) {
         .response_store(response_store)
         .image_normalizer(std::sync::Arc::new(crate::image_normalizer::DisabledNormalizer)
             as std::sync::Arc<dyn crate::image_normalizer::ImageNormalizer>)
+        .api_key_cache(api_key_cache)
+        .flex_batch_key_resolver(flex_batch_key_resolver)
         .build();
     let onwards_router = axum::Router::new(); // Empty onwards router for testing
     let router = super::build_router(&mut app_state, onwards_router, None, None, None, false, None)
@@ -1918,6 +1922,8 @@ async fn test_build_router_with_metrics_disabled(pool: PgPool) {
         .expect("Failed to create task runner"),
     );
     let response_store = std::sync::Arc::new(crate::inference::store::FusilladeResponseStore::new(request_manager.clone()));
+    let api_key_cache = crate::sync::api_key_cache::ApiKeyMetadataCache::empty();
+    let flex_batch_key_resolver = crate::sync::api_key_cache::FlexBatchKeyResolver::new(pool.clone(), api_key_cache.clone());
     let mut app_state = AppState::builder()
         .db(DbPools::new(pool))
         .config(shared_config)
@@ -1927,6 +1933,8 @@ async fn test_build_router_with_metrics_disabled(pool: PgPool) {
         .response_store(response_store)
         .image_normalizer(std::sync::Arc::new(crate::image_normalizer::DisabledNormalizer)
             as std::sync::Arc<dyn crate::image_normalizer::ImageNormalizer>)
+        .api_key_cache(api_key_cache)
+        .flex_batch_key_resolver(flex_batch_key_resolver)
         .build();
 
     let onwards_router = axum::Router::new();
@@ -1980,6 +1988,8 @@ async fn test_build_router_with_metrics_enabled(pool: PgPool) {
         .expect("Failed to create task runner"),
     );
     let response_store = std::sync::Arc::new(crate::inference::store::FusilladeResponseStore::new(request_manager.clone()));
+    let api_key_cache = crate::sync::api_key_cache::ApiKeyMetadataCache::empty();
+    let flex_batch_key_resolver = crate::sync::api_key_cache::FlexBatchKeyResolver::new(pool.clone(), api_key_cache.clone());
     let mut app_state = AppState::builder()
         .db(DbPools::new(pool))
         .config(shared_config)
@@ -1989,6 +1999,8 @@ async fn test_build_router_with_metrics_enabled(pool: PgPool) {
         .response_store(response_store)
         .image_normalizer(std::sync::Arc::new(crate::image_normalizer::DisabledNormalizer)
             as std::sync::Arc<dyn crate::image_normalizer::ImageNormalizer>)
+        .api_key_cache(api_key_cache)
+        .flex_batch_key_resolver(flex_batch_key_resolver)
         .build();
 
     let onwards_router = axum::Router::new();

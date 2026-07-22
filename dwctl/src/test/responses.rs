@@ -599,7 +599,7 @@ async fn enable_zdr_for_key(pool: &PgPool, bg: &crate::BackgroundServices, api_k
     .execute(pool)
     .await
     .unwrap();
-    bg.sync_zdr_keys(pool).await.unwrap();
+    bg.sync_api_key_cache(pool).await.unwrap();
 }
 
 /// Poll for the newest completed gpt-4o realtime row whose id is not `exclude`

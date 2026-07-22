@@ -357,7 +357,7 @@ fn modality_label(purpose: &str) -> String {
 /// The modality a Flex request is dispatched as.
 ///
 /// Flex bodies are queued and later dispatched through `onwards` using the key
-/// owner's hidden **batch** key (see `resolve_flex_batch_api_key`), so the
+/// owner's hidden **batch** key (see `FlexBatchKeyResolver`), so the
 /// modality a Flex request must be checked against is `batch` — NOT the caller's
 /// own key purpose. A `realtime` deny rule is intended to push users onto the
 /// async/Flex path, so it must not block Flex; only a `batch` deny rule (which

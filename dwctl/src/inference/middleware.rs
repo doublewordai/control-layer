@@ -29,7 +29,6 @@ use sqlx_pool_router::PoolProvider;
 use super::image_normalizer_middleware::{normalize_error_response, normalize_value_to_tokens};
 use super::store::{self as response_store, ONWARDS_RESPONSE_ID_HEADER, OnwardsDaemonId};
 use super::streaming::{ReplayFrame, flex_stream_response};
-use crate::db::{errors::DbError, handlers::api_keys::ApiKeys, models::api_keys::ApiKeyPurpose};
 use crate::image_normalizer::ImageNormalizer;
 
 /// State for the inference middleware.
@@ -70,11 +69,11 @@ pub struct InferenceMiddlewareState<P: PoolProvider + Clone = sqlx_pool_router::
     pub flex_completion_window: String,
     /// Encrypted key custody for ZDR flex bodies. `None` disables ZDR.
     pub keystore: Option<crate::keystore::Keystore>,
-    /// Per-key ZDR policy map (api key secret to the owning account's
-    /// `zero_data_retention` flag), kept fresh by [`crate::sync::zdr_keys`].
-    /// Read by [`super::zdr::is_zdr_request`] on the submit path. Defaults to
-    /// empty (every key reads as non-ZDR) when the sync is not wired.
-    pub zdr_key_cache: crate::sync::zdr_keys::ZdrKeyCache,
+    /// Per-key response hot-path metadata, kept fresh by
+    /// [`crate::sync::api_key_cache`].
+    pub api_key_cache: crate::sync::api_key_cache::ApiKeyMetadataCache,
+    /// Shared cold-path resolver for a presented key's hidden batch identity.
+    pub flex_batch_key_resolver: crate::sync::api_key_cache::FlexBatchKeyResolver,
 }
 
 /// Middleware that routes inference requests based on service_tier and background.
@@ -232,7 +231,7 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
     // outlet logs that ZDR cannot cover. Reject at submit for both tiers, keyed
     // on per-key policy alone (a keystore is irrelevant to whether we can
     // safely serve the request).
-    if is_responses_api && has_tools && crate::inference::zdr::is_zdr_request(&state.zdr_key_cache, api_key.as_deref()) {
+    if is_responses_api && has_tools && crate::inference::zdr::is_zdr_request(&state.api_key_cache, api_key.as_deref()) {
         return Response::builder()
             .status(StatusCode::BAD_REQUEST)
             .header("content-type", "application/json")
@@ -312,35 +311,38 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
         None
     };
     let flex_batch_key = if matches!(service_tier, ServiceTier::Flex) {
-        match resolve_flex_batch_api_key(&state.dwctl_pool, api_key.as_deref()).await {
-            Ok(Some(key)) => Some(key),
-            Ok(None) => {
-                tracing::warn!("Flex API key disappeared before hidden batch-key resolution");
-                return Response::builder()
-                    .status(StatusCode::FORBIDDEN)
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        serde_json::json!({"error": {"message": "Invalid API key", "type": "invalid_request_error"}}).to_string(),
-                    ))
-                    .unwrap();
-            }
-            Err(e) => {
-                tracing::error!(error = %e, "Failed to resolve flex hidden batch key");
-                return Response::builder()
-                    .status(StatusCode::INTERNAL_SERVER_ERROR)
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        serde_json::json!({
-                            "error": {
-                                "message": "Failed to prepare flex request",
-                                "type": "server_error",
-                                "code": 500,
-                            }
-                        })
-                        .to_string(),
-                    ))
-                    .unwrap();
-            }
+        match api_key.as_deref() {
+            Some(key) => match state.flex_batch_key_resolver.resolve_hidden_batch_key(key).await {
+                Ok(Some(key)) => Some(key),
+                Ok(None) => {
+                    tracing::warn!("Flex API key disappeared before hidden batch-key resolution");
+                    return Response::builder()
+                        .status(StatusCode::FORBIDDEN)
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            serde_json::json!({"error": {"message": "Invalid API key", "type": "invalid_request_error"}}).to_string(),
+                        ))
+                        .unwrap();
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "Failed to resolve flex hidden batch key");
+                    return Response::builder()
+                        .status(StatusCode::INTERNAL_SERVER_ERROR)
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            serde_json::json!({
+                                "error": {
+                                    "message": "Failed to prepare flex request",
+                                    "type": "server_error",
+                                    "code": 500,
+                                }
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap();
+                }
+            },
+            None => None,
         }
     } else {
         None
@@ -350,7 +352,7 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
     // persisted and dispatched later (they don't pass through onwards' rate
     // limiter), so without this an unverified user could enqueue unbounded
     // volume. The creditor id and verified flag ride along on the hidden
-    // batch-key resolution above (`key_owner_id` is `api_keys.user_id`), so this
+    // batch-key resolution above (`owner_id` is `api_keys.user_id`), so this
     // costs no extra query. `flex_batch_key` is `Some` only for the flex tier,
     // and its resolution already failed closed (403/500) on lookup errors above,
     // so an unresolved creditor never reaches enforcement. No-op for verified
@@ -359,7 +361,7 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
         && let Err(err) = crate::api::handlers::unverified_volume::enforce_unverified_volume_limit(
             &*state.request_manager,
             state.unverified_requests_per_completion_hour,
-            key.key_owner_id,
+            key.owner_id,
             key.verified,
             &state.flex_completion_window,
             1,
@@ -381,7 +383,7 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
             // Realtime ZDR is non-persistence (no encryption): decided per-key
             // from the same policy map as flex, but without a keystore since we
             // suppress the stored copies rather than encrypt them.
-            let zdr = crate::inference::zdr::is_zdr_request(&state.zdr_key_cache, api_key.as_deref());
+            let zdr = crate::inference::zdr::is_zdr_request(&state.api_key_cache, api_key.as_deref());
             let realtime_input = fusillade::CreateRealtimeInput {
                 request_id,
                 // ZDR: never persist the request body to `request_templates`
@@ -402,7 +404,7 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
             // retrieve key off the stored body's sentinel instead of re-checking.
             // The tool-using case is already rejected above, before the warm-path
             // branch, for both tiers.
-            let zdr = crate::inference::zdr::is_zdr_request(&state.zdr_key_cache, api_key.as_deref());
+            let zdr = crate::inference::zdr::is_zdr_request(&state.api_key_cache, api_key.as_deref());
             // Flex encrypts the body at rest, which requires a configured
             // keystore. A ZDR account whose request cannot be encrypted must fail
             // loudly - never silently fall back to plaintext, and bail before we
@@ -507,7 +509,7 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                 .unwrap_or_else(|| api_key.clone().unwrap_or_default());
             let flex_created_by = flex_batch_key
                 .as_ref()
-                .map(|key| key.key_owner_id.to_string())
+                .map(|key| key.owner_id.to_string())
                 .or_else(|| created_by.clone())
                 .unwrap_or_default();
             let flex_input = fusillade::CreateFlexInput {
@@ -538,83 +540,6 @@ enum ServiceTier {
     Realtime,
     /// Flex: batch of 1 with 1h completion window, processed by fusillade daemon.
     Flex,
-}
-
-#[derive(Debug, Clone)]
-struct FlexBatchApiKey {
-    secret: String,
-    key_owner_id: uuid::Uuid,
-    /// The key owner's `users.verified` flag (organizations are `users` rows
-    /// too). Rides along on this lookup so the unverified upload-volume cap on
-    /// the flex path needs no extra query. `false` when no user row matches.
-    verified: bool,
-}
-
-async fn resolve_flex_batch_api_key(pool: &sqlx::PgPool, api_key: Option<&str>) -> Result<Option<FlexBatchApiKey>, DbError> {
-    let Some(api_key) = api_key else {
-        return Ok(None);
-    };
-
-    // The cap-scope child is fetched in the same by-secret lookup (this runs
-    // per flex request — no extra round trip). If the authenticating key has a
-    // cap-scope child (`parent_api_key_id = ak.id`), the flex request executes
-    // on it so spend can be attributed/enforced per key when a cap is set
-    // (children are minted at cap-set time and deliberately outlive cap
-    // removal). If no child exists, fall back to the shared hidden batch key
-    // as before.
-    //
-    // Invariant: the bearer here is always an external, user-visible key. The
-    // only traffic that carries hidden batch keys (shared or cap-scope child)
-    // is the fusillade daemon loopback, which bypasses this middleware via the
-    // `x-fusillade-request-id` guard at the top of `inference_middleware`, and
-    // hidden-key secrets are never exposed to clients.
-    let row = sqlx::query(
-        r#"
-        SELECT ak.user_id, ak.created_by, u.verified, child.secret AS child_secret
-        FROM api_keys ak
-        LEFT JOIN users u ON u.id = ak.user_id
-        LEFT JOIN api_keys child
-               ON child.parent_api_key_id = ak.id
-              AND child.purpose = 'batch'
-              AND child.hidden = true
-              AND child.is_deleted = false
-        WHERE ak.secret = $1 AND ak.is_deleted = false
-        LIMIT 1
-        "#,
-    )
-    .bind(api_key)
-    .fetch_optional(pool)
-    .await?;
-
-    let Some(row) = row else {
-        return Ok(None);
-    };
-    let key_owner_id: uuid::Uuid = sqlx::Row::get(&row, "user_id");
-    let created_by: uuid::Uuid = sqlx::Row::get(&row, "created_by");
-    // NULL when the LEFT JOIN found no user row; a missing row counts as
-    // unverified, matching `Users::is_verified`.
-    let verified: bool = sqlx::Row::try_get(&row, "verified").ok().flatten().unwrap_or(false);
-    // NULL (no child) decodes as None via the Option; genuine decode errors
-    // propagate rather than silently downgrading a capped key to the shared
-    // (uncapped) execution key.
-    let child_secret: Option<String> = sqlx::Row::try_get(&row, "child_secret")?;
-
-    let secret = match child_secret {
-        Some(secret) => secret,
-        None => {
-            let mut conn = pool.acquire().await?;
-            let mut api_keys_repo = ApiKeys::new(&mut conn);
-            api_keys_repo
-                .get_or_create_hidden_key(key_owner_id, ApiKeyPurpose::Batch, created_by)
-                .await?
-        }
-    };
-
-    Ok(Some(FlexBatchApiKey {
-        secret,
-        key_owner_id,
-        verified,
-    }))
 }
 
 impl std::fmt::Display for ServiceTier {
@@ -1326,69 +1251,6 @@ mod tests {
     #[test]
     fn test_resolve_service_tier_flex() {
         assert!(matches!(resolve_service_tier(Some("flex")), ServiceTier::Flex));
-    }
-
-    #[sqlx::test]
-    async fn resolve_flex_batch_key_uses_hidden_batch_key_for_key_owner(pool: sqlx::PgPool) {
-        use crate::api::models::{api_keys::ApiKeyCreate, users::Role};
-        use crate::db::{
-            handlers::{Repository, api_keys::ApiKeys},
-            models::api_keys::{ApiKeyCreateDBRequest, ApiKeyPurpose},
-        };
-
-        let user = crate::test::utils::create_test_user(&pool, Role::BatchAPIUser).await;
-        let org = crate::test::utils::create_test_org(&pool, user.id).await;
-        let realtime_key = {
-            let mut conn = pool.acquire().await.expect("acquire connection");
-            let mut repo = ApiKeys::new(&mut conn);
-            repo.create(&ApiKeyCreateDBRequest::new(
-                org.id,
-                user.id,
-                ApiKeyCreate {
-                    name: "Org realtime key".to_string(),
-                    description: None,
-                    purpose: ApiKeyPurpose::Realtime,
-                    requests_per_second: None,
-                    burst_size: None,
-                    member_id: None,
-                    spend_limit: None,
-                    spend_limit_interval: None,
-                },
-            ))
-            .await
-            .expect("create realtime key")
-            .secret
-        };
-
-        let flex_key = resolve_flex_batch_api_key(&pool, Some(&realtime_key))
-            .await
-            .expect("resolve flex key")
-            .expect("known realtime key should resolve");
-
-        assert_ne!(flex_key.secret, realtime_key);
-        assert_eq!(flex_key.key_owner_id, org.id);
-
-        let row = sqlx::query(
-            r#"
-            SELECT user_id, created_by, purpose, hidden
-            FROM api_keys
-            WHERE secret = $1
-            "#,
-        )
-        .bind(&flex_key.secret)
-        .fetch_one(&pool)
-        .await
-        .expect("hidden key row");
-
-        let row_user_id: uuid::Uuid = sqlx::Row::get(&row, "user_id");
-        let row_created_by: uuid::Uuid = sqlx::Row::get(&row, "created_by");
-        let row_purpose: String = sqlx::Row::get(&row, "purpose");
-        let row_hidden: bool = sqlx::Row::get(&row, "hidden");
-
-        assert_eq!(row_user_id, org.id);
-        assert_eq!(row_created_by, user.id);
-        assert_eq!(row_purpose, "batch");
-        assert!(row_hidden);
     }
 
     // Routing-decision tests for `warm_path_branch`. The whole point

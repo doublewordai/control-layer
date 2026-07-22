@@ -516,6 +516,8 @@ mod tests {
             response_step_manager: state.response_step_manager,
             image_normalizer: state.image_normalizer.clone(),
             keystore: state.keystore.clone(),
+            api_key_cache: state.api_key_cache.clone(),
+            flex_batch_key_resolver: state.flex_batch_key_resolver.clone(),
         };
 
         let request = axum::http::Request::builder()
@@ -630,6 +632,8 @@ mod tests {
             response_step_manager: state.response_step_manager,
             image_normalizer: state.image_normalizer.clone(),
             keystore: state.keystore.clone(),
+            api_key_cache: state.api_key_cache.clone(),
+            flex_batch_key_resolver: state.flex_batch_key_resolver.clone(),
         };
 
         let header_external_user_id = header_user.external_user_id.as_ref().unwrap_or(&header_user.username);
@@ -746,6 +750,8 @@ mod tests {
             response_step_manager: state.response_step_manager,
             image_normalizer: state.image_normalizer.clone(),
             keystore: state.keystore.clone(),
+            api_key_cache: state.api_key_cache.clone(),
+            flex_batch_key_resolver: state.flex_batch_key_resolver.clone(),
         };
 
         // Request with JWT cookie - should be ignored since native auth is disabled
@@ -929,6 +935,8 @@ mod tests {
             response_step_manager: state.response_step_manager,
             image_normalizer: state.image_normalizer.clone(),
             keystore: state.keystore.clone(),
+            api_key_cache: state.api_key_cache.clone(),
+            flex_batch_key_resolver: state.flex_batch_key_resolver.clone(),
         };
 
         let external_user_id = user.external_user_id.as_ref().unwrap_or(&user.username);
@@ -1045,6 +1053,8 @@ mod tests {
             response_step_manager: state.response_step_manager,
             image_normalizer: state.image_normalizer.clone(),
             keystore: state.keystore.clone(),
+            api_key_cache: state.api_key_cache.clone(),
+            flex_batch_key_resolver: state.flex_batch_key_resolver.clone(),
         };
 
         let request = axum::http::Request::builder()

@@ -39,6 +39,8 @@ pub async fn create_test_app_state_with_config(pool: PgPool, config: crate::conf
     let request_manager = std::sync::Arc::new(fusillade_arsenal::PostgresRequestManager::new(fusillade_pools, Default::default()));
     let limiters = crate::limits::Limiters::new(&config.limits);
     let shared_config = crate::SharedConfig::new(config);
+    let api_key_cache = crate::sync::api_key_cache::ApiKeyMetadataCache::empty();
+    let flex_batch_key_resolver = crate::sync::api_key_cache::FlexBatchKeyResolver::new(pool.clone(), api_key_cache.clone());
 
     underway::run_migrations(&pool).await.expect("Failed to run underway migrations");
     let task_state = crate::tasks::TaskState {
@@ -79,6 +81,8 @@ pub async fn create_test_app_state_with_config(pool: PgPool, config: crate::conf
         .limiters(limiters)
         .response_store(response_store)
         .image_normalizer(image_normalizer)
+        .api_key_cache(api_key_cache)
+        .flex_batch_key_resolver(flex_batch_key_resolver)
         .build()
 }
 
@@ -135,6 +139,8 @@ pub async fn create_test_app_state_with_database_pools(
     ));
     let limiters = crate::limits::Limiters::new(&config.limits);
     let shared_config = crate::SharedConfig::new(config);
+    let api_key_cache = crate::sync::api_key_cache::ApiKeyMetadataCache::empty();
+    let flex_batch_key_resolver = crate::sync::api_key_cache::FlexBatchKeyResolver::new(pool.clone(), api_key_cache.clone());
 
     underway::run_migrations(&pool).await.expect("Failed to run underway migrations");
     let task_state = crate::tasks::TaskState {
@@ -173,6 +179,8 @@ pub async fn create_test_app_state_with_database_pools(
         .limiters(limiters)
         .response_store(response_store)
         .image_normalizer(image_normalizer)
+        .api_key_cache(api_key_cache)
+        .flex_batch_key_resolver(flex_batch_key_resolver)
         .build()
 }
 

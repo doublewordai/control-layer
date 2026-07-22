@@ -32,14 +32,14 @@ pub const ZDR_MARKER_KEY: &str = "zdr";
 pub const ZDR_MARKER_HEADER: &str = "x-fusillade-batch-zdr";
 
 /// Whether a request's key opts into ZDR. Decided once, at submit, from the
-/// per-key policy map ([`crate::sync::zdr_keys`]); dispatch and retrieve instead
+/// per-key policy map ([`crate::sync::api_key_cache`]); dispatch and retrieve instead
 /// key off the body sentinel. A key absent from the map (deleted/invalid, which
 /// auth rejects anyway) reads as non-ZDR, and a `None` key never opts in.
 ///
 /// This answers per-key policy only. Callers that must encrypt (the flex path)
 /// additionally require a configured keystore.
-pub fn is_zdr_request(zdr_cache: &crate::sync::zdr_keys::ZdrKeyCache, api_key: Option<&str>) -> bool {
-    api_key.is_some_and(|key| zdr_cache.is_zdr(key))
+pub fn is_zdr_request(api_key_cache: &crate::sync::api_key_cache::ApiKeyMetadataCache, api_key: Option<&str>) -> bool {
+    api_key.is_some_and(|key| api_key_cache.is_zdr(key))
 }
 
 /// Prepare a ZDR flex request for storage: strip the control fields fusillade's
@@ -253,7 +253,36 @@ mod tests {
 
     #[test]
     fn is_zdr_request_reads_the_key_map() {
-        let cache = crate::sync::zdr_keys::ZdrKeyCache::from_pairs([("sk-on".to_string(), true), ("sk-off".to_string(), false)]);
+        use std::collections::HashMap;
+
+        use crate::db::models::api_keys::ApiKeyPurpose;
+        use crate::sync::api_key_cache::{ApiKeyMetadata, ApiKeyMetadataCache};
+
+        let cache = ApiKeyMetadataCache::empty();
+        cache.replace(HashMap::from([
+            (
+                "sk-on".to_string(),
+                ApiKeyMetadata {
+                    owner_id: Uuid::nil(),
+                    created_by: Uuid::nil(),
+                    purpose: ApiKeyPurpose::Realtime,
+                    verified: true,
+                    zero_data_retention: true,
+                    hidden_batch_key: None,
+                },
+            ),
+            (
+                "sk-off".to_string(),
+                ApiKeyMetadata {
+                    owner_id: Uuid::nil(),
+                    created_by: Uuid::nil(),
+                    purpose: ApiKeyPurpose::Realtime,
+                    verified: true,
+                    zero_data_retention: false,
+                    hidden_batch_key: None,
+                },
+            ),
+        ]));
         assert!(is_zdr_request(&cache, Some("sk-on")));
         assert!(!is_zdr_request(&cache, Some("sk-off")));
         // Absent key (deleted/invalid, auth-rejected) reads as non-ZDR.
