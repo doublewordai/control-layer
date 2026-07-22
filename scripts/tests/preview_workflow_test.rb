@@ -14,7 +14,7 @@ class PreviewWorkflowTest < Minitest::Test
     assert_includes workflow, "DOCKER_METADATA_SHORT_SHA_LENGTH: 40"
     assert_includes workflow, "steps.preview-image.outputs.digest"
     assert_includes backend_gate,
-                    "needs: [backend-crate-test, backend-lint, frontend-test, build]"
+                    "needs: [backend-crate-test, backend-dwctl-test, backend-lint, frontend-test, build]"
     assert_includes backend_gate, "ruby scripts/tests/preview_workflow_test.rb"
     assert_includes backend_gate, "name: Publish preview artifact"
     assert_includes backend_gate, "startsWith(github.head_ref, 'preview/')"
