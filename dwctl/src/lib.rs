@@ -1650,10 +1650,14 @@ pub async fn build_router(
         error_enrichment::ErrorEnrichmentState {
             pool: state.db.write().clone(),
             cap_reset_retry_after_secs: if fallback_ms == 0 { 60 } else { fallback_ms.div_ceil(1000).max(1) },
-            // Matches the sync predicate's grace (SQL default 300s) but never
-            // less than the fallback interval, upholding the grace >= fallback
-            // invariant on the error path even if the interval is raised.
-            cap_boundary_grace_secs: (fallback_ms.div_ceil(1000).max(300)).min(i32::MAX as u64) as i32,
+            // MUST stay in lockstep with the sync predicate's grace, which is
+            // fixed at the SQL default (300s — api_key_cap_near_boundary,
+            // migration 123): advertising a larger grace here would promise
+            // "reinstatement pending" on a schedule the sync doesn't honor.
+            // If the fallback interval is ever raised above 300s, early
+            // readmission degrades to post-boundary; the fix then is to plumb
+            // one configurable grace through BOTH sites, not to widen this one.
+            cap_boundary_grace_secs: 300,
         },
         error_enrichment::error_enrichment_middleware,
     ));

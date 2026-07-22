@@ -66,8 +66,9 @@ pub struct ErrorEnrichmentState {
     /// within this many seconds of its calendar boundary is treated as
     /// "reinstatement pending" (retriable 429) rather than "cap exceeded"
     /// (hard 402), matching the sync predicate readmitting such scopes early.
-    /// Wired to max(300, fallback interval) in prod; overridden in tests to
-    /// pin time-dependent behavior.
+    /// Wired to the same fixed 300s grace as the sync predicate (the SQL
+    /// default of `api_key_cap_near_boundary` — keep in lockstep); overridden
+    /// in tests to pin time-dependent behavior.
     pub cap_boundary_grace_secs: i32,
 }
 

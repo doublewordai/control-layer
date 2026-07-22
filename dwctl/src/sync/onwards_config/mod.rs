@@ -653,8 +653,13 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                       -- treated as already reset, so a fallback tick inside
                       -- the grace readmits the scope BEFORE midnight instead
                       -- of up to one tick after (nothing writes at a boundary
-                      -- => no NOTIFY there). Grace must stay >= the deployed
-                      -- fallback interval — see api_key_cap_near_boundary.
+                      -- => no NOTIFY there). Grace is the fixed 300s SQL
+                      -- default of api_key_cap_near_boundary, matching the
+                      -- prod fallback default; if the fallback interval is
+                      -- ever raised above it, pre-boundary readmission
+                      -- degrades to post-boundary — plumb one configurable
+                      -- grace through this predicate AND the error enricher
+                      -- in that case (they must stay in lockstep).
                       AND NOT api_key_cap_near_boundary(root.spend_limit_interval)
                       AND EXISTS (
                           SELECT 1 FROM model_tariffs mt
@@ -1407,8 +1412,13 @@ pub async fn load_targets_from_db(
                       -- treated as already reset, so a fallback tick inside
                       -- the grace readmits the scope BEFORE midnight instead
                       -- of up to one tick after (nothing writes at a boundary
-                      -- => no NOTIFY there). Grace must stay >= the deployed
-                      -- fallback interval — see api_key_cap_near_boundary.
+                      -- => no NOTIFY there). Grace is the fixed 300s SQL
+                      -- default of api_key_cap_near_boundary, matching the
+                      -- prod fallback default; if the fallback interval is
+                      -- ever raised above it, pre-boundary readmission
+                      -- degrades to post-boundary — plumb one configurable
+                      -- grace through this predicate AND the error enricher
+                      -- in that case (they must stay in lockstep).
                       AND NOT api_key_cap_near_boundary(root.spend_limit_interval)
                       AND EXISTS (
                           SELECT 1 FROM model_tariffs mt
