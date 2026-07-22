@@ -1,5 +1,18 @@
 # Changelog
 
+## [8.96.0](https://github.com/doublewordai/control-layer/compare/v8.95.1...v8.96.0) (2026-07-22)
+
+
+### Features
+
+* publish immutable preview artifacts ([#1324](https://github.com/doublewordai/control-layer/issues/1324)) ([f231ffb](https://github.com/doublewordai/control-layer/commit/f231ffbf5c1892333b4a3a37a2e3cd6137b28417))
+
+
+### Bug Fixes
+
+* combined batch results stream (inout and output) was missing the… ([#1335](https://github.com/doublewordai/control-layer/issues/1335)) ([52fd53b](https://github.com/doublewordai/control-layer/commit/52fd53b965c8fc02abf6a58bceb4c0177f9ba6fb))
+* preserve release component identity ([#1333](https://github.com/doublewordai/control-layer/issues/1333)) ([ef5583d](https://github.com/doublewordai/control-layer/commit/ef5583da1afc73455141438d64dbb1e3da7c706f))
+
 ## [8.95.1](https://github.com/doublewordai/control-layer/compare/v8.95.0...v8.95.1) (2026-07-22)
 
 

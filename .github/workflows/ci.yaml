@@ -100,6 +100,116 @@ jobs:
           curl -X POST "https://charts.somnial.co/doubleword-control-layer/total-bundle-size?value=${TOTAL_SIZE}" || true
           curl -X POST "https://charts.somnial.co/doubleword-control-layer/gzipped-bundle-size?value=${GZIPPED_SIZE}" || true
 
+  backend-dwctl-test-shard:
+    if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
+    name: dwctl / test (${{ matrix.partition }}/4)
+    strategy:
+      fail-fast: false
+      matrix:
+        partition: [1, 2, 3, 4]
+    runs-on: depot-ubuntu-24.04-16
+
+    # Each partition has an isolated PostgreSQL instance. SQLx tests create
+    # their own databases, pools, and listeners, so retain the raised
+    # connection limit from the unpartitioned job.
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Start Postgres
+        run: |
+          docker run -d --name postgres \
+            -e POSTGRES_DB=test \
+            -e POSTGRES_USER=postgres \
+            -e POSTGRES_PASSWORD=postgres \
+            -e POSTGRES_HOST_AUTH_METHOD=trust \
+            -p 5432:5432 \
+            postgres:latest \
+            -c max_connections=300
+          for _ in $(seq 1 30); do
+            docker exec postgres pg_isready -U postgres && break
+            sleep 1
+          done
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: backend-test-dwctl-sharded
+          cache-on-failure: true
+
+      - name: Install just
+        uses: extractions/setup-just@v3
+        with:
+          just-version: "1.46.0"
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      - name: Install sqlx-cli and cargo-llvm-cov
+        run: |
+          cargo install cargo-llvm-cov --locked
+          cargo install sqlx-cli --version '^0.8' --no-default-features --features native-tls,postgres --locked
+
+      - name: Set up test databases
+        env:
+          DB_PASS: postgres
+        run: just db-setup
+
+      - name: Compile and test dwctl partition ${{ matrix.partition }}/4
+        run: |
+          START_TIME=$(date +%s)
+
+          cargo llvm-cov clean --workspace
+          # cargo-llvm-cov's wrapper includes the process ID in every profile
+          # filename. Nextest runs one process per test, so that creates
+          # thousands of files and makes profile merging the new bottleneck.
+          # LLVM's merge pool safely bounds concurrent writers instead.
+          # shellcheck disable=SC1090
+          source <(cargo llvm-cov show-env --export-prefix)
+          export LLVM_PROFILE_FILE="$PWD/target/dwctl-${{ matrix.partition }}-%32m.profraw"
+
+          cargo nextest run --package dwctl \
+            --cargo-profile ci \
+            --partition "count:${{ matrix.partition }}/4"
+          cargo llvm-cov report --profile ci \
+            --lcov \
+            --output-path "lcov-dwctl-${{ matrix.partition }}.info"
+
+          END_TIME=$(date +%s)
+          CI_DURATION=$((END_TIME - START_TIME))
+          echo "dwctl partition ${{ matrix.partition }}/4 completed in ${CI_DURATION}s"
+          curl -X POST \
+            "https://charts.somnial.co/doubleword-control-layer/backend-dwctl-partition-${{ matrix.partition }}-ci-duration?value=${CI_DURATION}" || true
+
+      - name: Upload dwctl partition ${{ matrix.partition }} coverage
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-coverage-dwctl-${{ matrix.partition }}
+          path: lcov-dwctl-${{ matrix.partition }}.info
+          if-no-files-found: error
+          retention-days: 1
+
+  backend-dwctl-test:
+    if: always() && (github.event_name == 'pull_request' || github.event_name == 'merge_group')
+    needs: backend-dwctl-test-shard
+    runs-on: ubuntu-latest
+    name: dwctl / test
+
+    steps:
+      - name: Require all dwctl test partitions
+        env:
+          DWCTL_TEST_RESULT: ${{ needs.backend-dwctl-test-shard.result }}
+        run: |
+          if [[ "$DWCTL_TEST_RESULT" != "success" ]]; then
+            echo "One or more dwctl test partitions failed: $DWCTL_TEST_RESULT" >&2
+            exit 1
+          fi
+
   backend-crate-test:
     if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
     name: ${{ matrix.package }} / test
@@ -107,9 +217,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - package: dwctl
-            runner: depot-ubuntu-24.04-16
-            database: true
           - package: fusillade
             runner: depot-ubuntu-24.04-8
             database: true
@@ -252,7 +359,7 @@ jobs:
 
   backend-test:
     if: always() && (github.event_name == 'pull_request' || github.event_name == 'merge_group')
-    needs: [backend-crate-test, backend-lint]
+    needs: [backend-crate-test, backend-dwctl-test, backend-lint, frontend-test, build]
     runs-on: ubuntu-latest
     name: workspace / rust gate
     env:
@@ -262,13 +369,21 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v6
 
+      - name: Validate preview workflow contract
+        run: ruby scripts/tests/preview_workflow_test.rb
+
       - name: Require crate tests and lint
         env:
           CRATE_TEST_RESULT: ${{ needs.backend-crate-test.result }}
+          DWCTL_TEST_RESULT: ${{ needs.backend-dwctl-test.result }}
           LINT_RESULT: ${{ needs.backend-lint.result }}
         run: |
           if [[ "$CRATE_TEST_RESULT" != "success" ]]; then
             echo "One or more crate test jobs failed: $CRATE_TEST_RESULT" >&2
+            exit 1
+          fi
+          if [[ "$DWCTL_TEST_RESULT" != "success" ]]; then
+            echo "dwctl test partitions failed: $DWCTL_TEST_RESULT" >&2
             exit 1
           fi
           if [[ "$LINT_RESULT" != "success" ]]; then
@@ -288,8 +403,8 @@ jobs:
         run: |
           shopt -s nullglob
           coverage_files=(rust-coverage/*.info)
-          if (( ${#coverage_files[@]} != 5 )); then
-            echo "Expected 5 coverage files, found ${#coverage_files[@]}" >&2
+          if (( ${#coverage_files[@]} != 8 )); then
+            echo "Expected 8 coverage files, found ${#coverage_files[@]}" >&2
             exit 1
           fi
 
@@ -302,6 +417,41 @@ jobs:
           echo "Backend code coverage: ${COVERAGE}%"
           curl -X POST \
             "https://charts.somnial.co/doubleword-control-layer/backend-code-coverage?value=${COVERAGE}" || true
+
+      - name: Publish preview artifact
+        if: >-
+          github.event_name == 'pull_request' &&
+          startsWith(github.head_ref, 'preview/') &&
+          github.event.pull_request.head.repo.full_name == github.repository &&
+          needs.frontend-test.result == 'success' &&
+          needs.build.result == 'success'
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        env:
+          ARTIFACT_DIGEST: ${{ needs.build.outputs.image-digest }}
+        with:
+          github-token: ${{ secrets.PREVIEW_DISPATCH_TOKEN }}
+          script: |
+            const sha = context.payload.pull_request.head.sha
+            const digest = process.env.ARTIFACT_DIGEST
+            if (!/^[0-9a-f]{40}$/.test(sha) || !/^sha256:[0-9a-f]{64}$/.test(digest)) {
+              core.setFailed('Preview artifact identity is invalid')
+              return
+            }
+            await github.rest.repos.createDispatchEvent({
+              owner: '${{ secrets.PREVIEW_DISPATCH_OWNER }}',
+              repo: '${{ secrets.PREVIEW_DISPATCH_REPOSITORY }}',
+              event_type: 'preview-artifact-published',
+              client_payload: {
+                repository: context.repo.owner + '/' + context.repo.repo,
+                pull_request: context.payload.pull_request.number,
+                branch: context.payload.pull_request.head.ref,
+                sha,
+                artifact_kind: 'image',
+                artifact_repository: 'ghcr.io/doublewordai/control-layer',
+                version: `sha-${sha}`,
+                digest
+              }
+            })
 
   # Image builds are first-wave jobs. Keep this and `build` free of `needs` so
   # the independently published Onwards and dwctl images build in parallel.
@@ -665,6 +815,8 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v4
@@ -678,6 +830,7 @@ jobs:
         uses: docker/metadata-action@v6
         env:
           DOCKER_METADATA_PR_HEAD_SHA: true
+          DOCKER_METADATA_SHORT_SHA_LENGTH: 40
         with:
           images: ghcr.io/doublewordai/control-layer
           sep-tags: "\n"
@@ -692,6 +845,7 @@ jobs:
           echo "Starting Docker build at $(date)"
 
       - name: Build and push with Depot
+        id: preview-image
         uses: depot/build-push-action@v1
         with:
           context: .
@@ -715,6 +869,7 @@ jobs:
 
     outputs:
       image-tag: ${{ steps.meta.outputs.tags }}
+      image-digest: ${{ steps.preview-image.outputs.digest }}
 
   openresponses-compliance:
     if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
