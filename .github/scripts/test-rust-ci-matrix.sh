@@ -24,6 +24,38 @@ require_exact_line() {
   fi
 }
 
+extract_job() {
+  local job_name="$1"
+
+  awk -v job_name="$job_name" '
+    $0 == "  " job_name ":" { in_job = 1 }
+    in_job && $0 ~ /^  [[:alnum:]_-]+:$/ && $0 != "  " job_name ":" { exit }
+    in_job { print }
+  ' "$workflow"
+}
+
+extract_step() {
+  local job_block="$1"
+  local step_name="$2"
+
+  awk -v step_name="$step_name" '
+    $0 == "      - name: " step_name { in_step = 1 }
+    in_step && /^      - name: / && $0 != "      - name: " step_name { exit }
+    in_step { print }
+  ' <<< "$job_block"
+}
+
+require_block_line() {
+  local block="$1"
+  local expected="$2"
+  local description="$3"
+
+  if ! grep -Fxq -- "$expected" <<< "$block"; then
+    echo "Rust CI workflow must ${description}: missing '${expected}' in its scoped block" >&2
+    exit 1
+  fi
+}
+
 require_text 'backend-crate-test:' 'define a per-crate test job'
 require_text 'name: ${{ matrix.package }} / test' 'scope every crate test check to its package'
 require_text 'fail-fast: false' 'allow every crate result to complete'
@@ -69,17 +101,9 @@ if grep -Fq 'workflow_dispatch' "$workflow"; then
   exit 1
 fi
 
-onwards_compliance_job="$(
-  sed -n '/^  onwards-openresponses-compliance:/,/^  build:/p' "$workflow"
-)"
-
-onwards_image_job="$(
-  sed -n '/^  onwards-pr-image:/,/^  onwards-compliance-changes:/p' "$workflow"
-)"
-
-dwctl_image_job="$(
-  sed -n '/^  build:/,/^  openresponses-compliance:/p' "$workflow"
-)"
+onwards_compliance_job="$(extract_job onwards-openresponses-compliance)"
+onwards_image_job="$(extract_job onwards-pr-image)"
+dwctl_image_job="$(extract_job build)"
 
 if grep -Eq '^[[:space:]]+needs:' <<< "$onwards_image_job" || \
    grep -Eq '^[[:space:]]+needs:' <<< "$dwctl_image_job"; then
@@ -97,26 +121,107 @@ if grep -Fq 'git checkout fa29df5' <<< "$onwards_compliance_job"; then
   exit 1
 fi
 
-require_text "    if: always()" 'expand both Onwards compliance modes after the change detector'
-require_text "    needs: onwards-compliance-changes" 'wait for the Onwards compliance change detector'
-require_text "      RUN_STRICT_COMPLIANCE: \${{ needs.onwards-compliance-changes.outputs.strict == 'true' && (github.event_name == 'merge_group' || (github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]')) }}" 'only run strict compliance for trusted events'
-require_text "      - name: Skip strict compliance for untrusted or unchanged events" 'declare a no-op strict compliance path'
-require_text "        if: env.RUN_STRICT_COMPLIANCE != 'true'" 'skip strict compliance safely when it is not allowed'
-require_text "        if: env.RUN_STRICT_COMPLIANCE == 'true'" 'guard real Onwards compliance steps with the trust gate'
-require_text "        if: always() && env.RUN_STRICT_COMPLIANCE == 'true'" 'guard Onwards compliance diagnostics, artifacts, and cleanup with the trust gate'
+require_block_line "$onwards_compliance_job" "    if: always()" 'always expand the Onwards compliance matrix after the change detector'
+require_block_line "$onwards_compliance_job" "    needs: onwards-compliance-changes" 'wait for the Onwards compliance change detector'
+require_block_line "$onwards_compliance_job" "      RUN_STRICT_COMPLIANCE: \${{ needs.onwards-compliance-changes.outputs.strict == 'true' && (github.event_name == 'merge_group' || (github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]')) }}" 'only run strict compliance for trusted events'
+
+skip_step="$(extract_step "$onwards_compliance_job" 'Skip strict compliance for untrusted or unchanged events')"
+require_block_line "$skip_step" "        if: env.RUN_STRICT_COMPLIANCE != 'true'" 'declare the no-op strict compliance path'
+
+for step_name in \
+  'Checkout code' \
+  'Require Gemini API key' \
+  'Install Rust' \
+  'Build Onwards' \
+  'Install Bun' \
+  'Clone Open Responses' \
+  'Install Open Responses dependencies' \
+  'Write Gemini adapter config' \
+  'Start Gemini adapter upstream' \
+  'Write Onwards config' \
+  'Start Onwards' \
+  'Run compliance tests'; do
+  compliance_step="$(extract_step "$onwards_compliance_job" "$step_name")"
+  require_block_line "$compliance_step" "        if: env.RUN_STRICT_COMPLIANCE == 'true'" "guard Onwards compliance step '${step_name}' with the trust gate"
+done
+
+for step_name in \
+  'Show Onwards logs' \
+  'Upload Onwards compliance artifacts' \
+  'Stop Onwards processes'; do
+  compliance_step="$(extract_step "$onwards_compliance_job" "$step_name")"
+  require_block_line "$compliance_step" "        if: always() && env.RUN_STRICT_COMPLIANCE == 'true'" "guard Onwards compliance diagnostic step '${step_name}' with the trust gate"
+done
 
 trusted_event_condition="github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]')"
-require_text "    if: ${trusted_event_condition}" 'run image publishing only for trusted PRs and merge groups'
-require_text "tags: ghcr.io/doublewordai/onwards:sha-\${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}" 'tag Onwards images with the PR head or merge-group SHA'
-require_text "            type=raw,value=sha-\${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}" 'tag dwctl images with the PR head or merge-group SHA'
+require_block_line "$onwards_image_job" "    if: ${trusted_event_condition}" 'run Onwards image publishing only for trusted PRs and merge groups'
+require_block_line "$onwards_image_job" "          tags: ghcr.io/doublewordai/onwards:sha-\${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}" 'tag Onwards images with the PR head or merge-group SHA'
+require_block_line "$dwctl_image_job" '          DOCKER_METADATA_PR_HEAD_SHA: true' 'preserve PR-head metadata tagging for dwctl images'
+require_block_line "$dwctl_image_job" '            type=sha,prefix=sha-' 'preserve SHA metadata tagging for dwctl images'
+if grep -Fq 'type=raw,value=sha-' <<< "$dwctl_image_job"; then
+  echo "dwctl image tags must use docker metadata SHA handling, not a raw full SHA" >&2
+  exit 1
+fi
 
 pr_title_workflow=".github/workflows/pr-title-check.yml"
+pr_title_job="$(awk '/^  check-title:/{ in_job = 1 } in_job { print }' "$pr_title_workflow")"
+semantic_title_step="$(extract_step "$pr_title_job" 'Validate pull request title')"
+merge_group_title_step="$(extract_step "$pr_title_job" 'Skip pull request title validation for merge-group commits')"
 if ! grep -Fq '  merge_group:' "$pr_title_workflow" || \
-   ! grep -Fq '    types: [checks_requested]' "$pr_title_workflow" || \
-   ! grep -Fq "        if: github.event_name == 'pull_request'" "$pr_title_workflow" || \
-   ! grep -Fq '      - name: Skip pull request title validation for merge-group commits' "$pr_title_workflow" || \
-   ! grep -Fq "        if: github.event_name == 'merge_group'" "$pr_title_workflow"; then
+   ! grep -Fq '    types: [checks_requested]' "$pr_title_workflow"; then
   echo "PR title check must emit its required context for merge-group commits without reading PR data" >&2
+  exit 1
+fi
+require_block_line "$semantic_title_step" "        if: github.event_name == 'pull_request'" 'limit the semantic title action to pull-request events'
+require_block_line "$semantic_title_step" '        uses: amannn/action-semantic-pull-request@v6' 'run the semantic title action in its pull-request step'
+require_block_line "$merge_group_title_step" "        if: github.event_name == 'merge_group'" 'limit the merge-group title no-op to merge-group events'
+require_block_line "$merge_group_title_step" '        run: echo "Pull request title was validated before this merge-group commit was queued."' 'run the merge-group title no-op in its own step'
+
+required_check_names=(
+  'dashboard / test'
+  'dwctl / test'
+  'fusillade / test'
+  'fusillade-core / test'
+  'fusillade-arsenal / test'
+  'onwards / test'
+  'workspace / rust lint'
+  'workspace / rust gate'
+  'onwards / image'
+  'onwards / compliance changes'
+  'onwards / open responses (adapter)'
+  'onwards / open responses (passthrough)'
+  'dwctl / image'
+  'dwctl / open responses'
+  'dwctl / security'
+  'workspace / e2e'
+  'workspace / pull request title'
+)
+actual_check_names=()
+while IFS= read -r name; do
+  case "$name" in
+    '${{ matrix.package }} / test')
+      actual_check_names+=(
+        'dwctl / test'
+        'fusillade / test'
+        'fusillade-core / test'
+        'fusillade-arsenal / test'
+        'onwards / test'
+      )
+      ;;
+    'onwards / open responses (${{ matrix.mode }})')
+      actual_check_names+=(
+        'onwards / open responses (adapter)'
+        'onwards / open responses (passthrough)'
+      )
+      ;;
+    *) actual_check_names+=("$name") ;;
+  esac
+done < <(awk '/^    name: / { sub(/^    name: /, ""); print }' "$workflow" "$pr_title_workflow")
+
+if ! diff -u \
+  <(printf '%s\n' "${required_check_names[@]}") \
+  <(printf '%s\n' "${actual_check_names[@]}"); then
+  echo "CI and PR-title workflows must declare exactly the 17 repository-required check contexts" >&2
   exit 1
 fi
 

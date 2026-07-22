@@ -309,24 +309,88 @@ if grep -Fq 'workflow_dispatch' .github/workflows/ci.yaml; then
   exit 1
 fi
 
+extract_workflow_job() {
+  local workflow_path="$1"
+  local job_name="$2"
+
+  awk -v job_name="$job_name" '
+    $0 == "  " job_name ":" { in_job = 1 }
+    in_job && $0 ~ /^  [[:alnum:]_-]+:$/ && $0 != "  " job_name ":" { exit }
+    in_job { print }
+  ' "$workflow_path"
+}
+
+extract_workflow_step() {
+  local job_block="$1"
+  local step_name="$2"
+
+  awk -v step_name="$step_name" '
+    $0 == "      - name: " step_name { in_step = 1 }
+    in_step && /^      - name: / && $0 != "      - name: " step_name { exit }
+    in_step { print }
+  ' <<< "$job_block"
+}
+
+require_scoped_line() {
+  local block="$1"
+  local expected="$2"
+  local description="$3"
+
+  if ! grep -Fxq -- "$expected" <<< "$block"; then
+    echo "${description}: missing '${expected}' in its scoped block" >&2
+    exit 1
+  fi
+}
+
+pr_title_job="$(extract_workflow_job .github/workflows/pr-title-check.yml check-title)"
+semantic_title_step="$(extract_workflow_step "$pr_title_job" 'Validate pull request title')"
+merge_group_title_step="$(extract_workflow_step "$pr_title_job" 'Skip pull request title validation for merge-group commits')"
 if ! grep -Fq '  merge_group:' .github/workflows/pr-title-check.yml || \
-   ! grep -Fq '    types: [checks_requested]' .github/workflows/pr-title-check.yml || \
-   ! grep -Fq "        if: github.event_name == 'pull_request'" .github/workflows/pr-title-check.yml || \
-   ! grep -Fq "        if: github.event_name == 'merge_group'" .github/workflows/pr-title-check.yml; then
+   ! grep -Fq '    types: [checks_requested]' .github/workflows/pr-title-check.yml; then
   echo "PR title validation must produce a safe merge-group check context" >&2
   exit 1
 fi
+require_scoped_line "$semantic_title_step" "        if: github.event_name == 'pull_request'" 'PR title semantic action must be scoped to pull requests'
+require_scoped_line "$semantic_title_step" '        uses: amannn/action-semantic-pull-request@v6' 'PR title semantic action must stay in its pull-request step'
+require_scoped_line "$merge_group_title_step" "        if: github.event_name == 'merge_group'" 'PR title no-op must be scoped to merge groups'
 
-if ! grep -Fq '    if: always()' .github/workflows/ci.yaml || \
-   ! grep -Fq "RUN_STRICT_COMPLIANCE: \${{ needs.onwards-compliance-changes.outputs.strict == 'true' && (github.event_name == 'merge_group' || (github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]')) }}" .github/workflows/ci.yaml || \
-   ! grep -Fq "if: always() && env.RUN_STRICT_COMPLIANCE == 'true'" .github/workflows/ci.yaml; then
-  echo "Onwards strict compliance must always declare stable matrix checks and gate secret use to trusted events" >&2
-  exit 1
-fi
+onwards_compliance_job="$(extract_workflow_job .github/workflows/ci.yaml onwards-openresponses-compliance)"
+require_scoped_line "$onwards_compliance_job" '    if: always()' 'Onwards compliance matrix must always expand'
+require_scoped_line "$onwards_compliance_job" "      RUN_STRICT_COMPLIANCE: \${{ needs.onwards-compliance-changes.outputs.strict == 'true' && (github.event_name == 'merge_group' || (github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]')) }}" 'Onwards strict compliance must gate secret use to trusted events'
+
+for step_name in \
+  'Checkout code' \
+  'Require Gemini API key' \
+  'Install Rust' \
+  'Build Onwards' \
+  'Install Bun' \
+  'Clone Open Responses' \
+  'Install Open Responses dependencies' \
+  'Write Gemini adapter config' \
+  'Start Gemini adapter upstream' \
+  'Write Onwards config' \
+  'Start Onwards' \
+  'Run compliance tests'; do
+  compliance_step="$(extract_workflow_step "$onwards_compliance_job" "$step_name")"
+  require_scoped_line "$compliance_step" "        if: env.RUN_STRICT_COMPLIANCE == 'true'" "Onwards compliance step '${step_name}' must use the trust gate"
+done
+
+for step_name in \
+  'Show Onwards logs' \
+  'Upload Onwards compliance artifacts' \
+  'Stop Onwards processes'; do
+  compliance_step="$(extract_workflow_step "$onwards_compliance_job" "$step_name")"
+  require_scoped_line "$compliance_step" "        if: always() && env.RUN_STRICT_COMPLIANCE == 'true'" "Onwards compliance diagnostic step '${step_name}' must use the trust gate"
+done
 
 trusted_event_condition="github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]')"
-if [[ "$(grep -Fc "if: ${trusted_event_condition}" .github/workflows/ci.yaml)" != "2" ]] || \
-   ! grep -Fq "github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha" .github/workflows/ci.yaml; then
+onwards_image_job="$(extract_workflow_job .github/workflows/ci.yaml onwards-pr-image)"
+dwctl_image_job="$(extract_workflow_job .github/workflows/ci.yaml build)"
+if ! grep -Fxq "    if: ${trusted_event_condition}" <<< "$onwards_image_job" || \
+   ! grep -Fxq "    if: ${trusted_event_condition}" <<< "$dwctl_image_job" || \
+   ! grep -Fxq '          DOCKER_METADATA_PR_HEAD_SHA: true' <<< "$dwctl_image_job" || \
+   ! grep -Fxq '            type=sha,prefix=sha-' <<< "$dwctl_image_job" || \
+   grep -Fq 'type=raw,value=sha-' <<< "$dwctl_image_job"; then
   echo "Image publishing must be first-wave work limited to trusted PRs and merge groups" >&2
   exit 1
 fi

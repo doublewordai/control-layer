@@ -681,7 +681,7 @@ jobs:
           images: ghcr.io/doublewordai/control-layer
           sep-tags: "\n"
           tags: |
-            type=raw,value=sha-${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+            type=sha,prefix=sha-
 
       - name: Build and push all images
         id: build-step
