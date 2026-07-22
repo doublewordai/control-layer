@@ -127,10 +127,11 @@ fi
 
 require_block_line "$onwards_compliance_job" "    if: always()" 'always expand the Onwards compliance matrix after the change detector'
 require_block_line "$onwards_compliance_job" "    needs: onwards-compliance-changes" 'wait for the Onwards compliance change detector'
-trusted_pull_request_condition="github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]'"
+trusted_pull_request_condition="github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]'"
 require_block_line "$onwards_compliance_job" "      RUN_STRICT_COMPLIANCE: \${{ needs.onwards-compliance-changes.outputs.strict == 'true' && ${trusted_pull_request_condition} }}" 'only run strict compliance for trusted pull requests'
-if grep -Fq "github.event_name == 'merge_group'" <<< "$onwards_compliance_job"; then
-  echo "Onwards compliance must not trust merge-group commits with repository secrets" >&2
+if grep -Fq "github.event_name == 'merge_group'" <<< "$onwards_compliance_job" || \
+   grep -Fq "github.actor != 'dependabot[bot]'" <<< "$onwards_compliance_job"; then
+  echo "Onwards compliance must classify trust from pull-request provenance" >&2
   exit 1
 fi
 
@@ -172,8 +173,10 @@ if grep -Fq 'type=raw,value=sha-' <<< "$dwctl_image_job"; then
   exit 1
 fi
 if grep -Fq "github.event_name == 'merge_group'" <<< "$onwards_image_job" || \
-   grep -Fq "github.event_name == 'merge_group'" <<< "$dwctl_image_job"; then
-  echo "Image publishing must not trust merge-group commits" >&2
+   grep -Fq "github.event_name == 'merge_group'" <<< "$dwctl_image_job" || \
+   grep -Fq "github.actor != 'dependabot[bot]'" <<< "$onwards_image_job" || \
+   grep -Fq "github.actor != 'dependabot[bot]'" <<< "$dwctl_image_job"; then
+  echo "Image publishing must classify trust from pull-request provenance" >&2
   exit 1
 fi
 
