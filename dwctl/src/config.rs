@@ -2436,6 +2436,9 @@ pub struct TaskWorkersConfig {
     /// to row visible. Replaces the previous underway-based
     /// `response_workers` setting.
     pub response_writer_batch_size: usize,
+    /// Maximum time to collect more response lifecycle commands after the
+    /// first command arrives. Zero disables lingering for deterministic tests.
+    pub response_writer_max_linger_ms: u64,
 }
 
 impl Default for TaskWorkersConfig {
@@ -2445,6 +2448,7 @@ impl Default for TaskWorkersConfig {
             cascade_batch_state_workers: 1,
             purge_user_data_workers: 1,
             response_writer_batch_size: 100,
+            response_writer_max_linger_ms: 2,
         }
     }
 }
@@ -2979,6 +2983,23 @@ impl Config {
 mod tests {
     use super::*;
     use figment::Jail;
+
+    #[test]
+    fn response_writer_linger_defaults_to_two_ms_and_allows_zero() {
+        assert_eq!(TaskWorkersConfig::default().response_writer_max_linger_ms, 2);
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                "secret_key: hello\nbackground_services:\n  task_workers:\n    response_writer_max_linger_ms: 0\n",
+            )?;
+            let config = Config::load(&Args {
+                config: "test.yaml".into(),
+                validate: false,
+            })?;
+            assert_eq!(config.background_services.task_workers.response_writer_max_linger_ms, 0);
+            Ok(())
+        });
+    }
 
     #[test]
     fn test_model_sources_config() {

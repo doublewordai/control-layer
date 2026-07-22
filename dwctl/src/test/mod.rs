@@ -1299,6 +1299,7 @@ async fn test_request_logging_disabled(pool: PgPool) {
                 cascade_batch_state_workers: 0,
                 purge_user_data_workers: 0,
                 response_writer_batch_size: 0,
+                response_writer_max_linger_ms: 0,
             },
         )
         .await
@@ -1916,6 +1917,7 @@ async fn test_build_router_with_metrics_disabled(pool: PgPool) {
                 cascade_batch_state_workers: 0,
                 purge_user_data_workers: 0,
                 response_writer_batch_size: 0,
+                response_writer_max_linger_ms: 0,
             },
         )
         .await
@@ -1982,6 +1984,7 @@ async fn test_build_router_with_metrics_enabled(pool: PgPool) {
                 cascade_batch_state_workers: 0,
                 purge_user_data_workers: 0,
                 response_writer_batch_size: 0,
+                response_writer_max_linger_ms: 0,
             },
         )
         .await

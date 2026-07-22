@@ -62,6 +62,7 @@ pub async fn create_test_app_state_with_config(pool: PgPool, config: crate::conf
                 cascade_batch_state_workers: 0,
                 purge_user_data_workers: 0,
                 response_writer_batch_size: 0,
+                response_writer_max_linger_ms: 0,
             },
         )
         .await
@@ -162,6 +163,7 @@ pub async fn create_test_app_state_with_database_pools(
                 cascade_batch_state_workers: 0,
                 purge_user_data_workers: 0,
                 response_writer_batch_size: 0,
+                response_writer_max_linger_ms: 0,
             },
         )
         .await
@@ -333,6 +335,7 @@ pub fn create_test_config() -> crate::config::Config {
                 cascade_batch_state_workers: 0,
                 purge_user_data_workers: 0,
                 response_writer_batch_size: 0,
+                response_writer_max_linger_ms: 0,
             },
             ..Default::default()
         },

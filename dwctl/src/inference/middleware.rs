@@ -127,6 +127,9 @@ fn validate_flex_access(
 /// State for the inference middleware.
 #[derive(Clone)]
 pub struct InferenceMiddlewareState<P: PoolProvider + Clone = sqlx_pool_router::DbPools> {
+    /// Commit-acknowledging response lifecycle writer. Task 5 routes create
+    /// admissions through this singleton before upstream dispatch.
+    pub requests_writer: super::engine::RequestsWriterHandle,
     pub request_manager: Arc<PostgresRequestManager<P>>,
     pub daemon_id: OnwardsDaemonId,
     /// Base URL for loopback requests (e.g., "http://127.0.0.1:3001/ai").
@@ -1556,7 +1559,10 @@ mod tests {
         let flex_batch_key_resolver = crate::sync::api_key_cache::FlexBatchKeyResolver::new(main_pool.clone(), api_key_cache.clone());
         let onwards_targets = flex_access_targets(&[FLEX_TEST_KEY, hidden_key], HashMap::new(), Vec::new());
 
+        let (_requests_writer_task, requests_writer) =
+            crate::inference::engine::writer::RequestsWriter::new(request_manager.clone(), 1, Duration::ZERO);
         let state = InferenceMiddlewareState {
+            requests_writer,
             request_manager,
             daemon_id: OnwardsDaemonId(Uuid::new_v4()),
             loopback_base_url: "http://127.0.0.1:3001/ai".to_string(),
@@ -1651,7 +1657,10 @@ mod tests {
             },
         )]));
         let flex_batch_key_resolver = crate::sync::api_key_cache::FlexBatchKeyResolver::new(main_pool.clone(), api_key_cache.clone());
+        let (_requests_writer_task, requests_writer) =
+            crate::inference::engine::writer::RequestsWriter::new(request_manager.clone(), 1, Duration::ZERO);
         let state = InferenceMiddlewareState {
+            requests_writer,
             request_manager,
             daemon_id: OnwardsDaemonId(Uuid::new_v4()),
             loopback_base_url: "http://127.0.0.1:3001/ai".to_string(),
@@ -1737,7 +1746,10 @@ mod tests {
                 hidden_batch_key: Some("sk-flex-hidden".to_string()),
             },
         )]));
+        let (_requests_writer_task, requests_writer) =
+            crate::inference::engine::writer::RequestsWriter::new(request_manager.clone(), 1, Duration::ZERO);
         let state = InferenceMiddlewareState {
+            requests_writer,
             request_manager,
             daemon_id: OnwardsDaemonId(Uuid::new_v4()),
             loopback_base_url: "http://127.0.0.1:3001/ai".to_string(),

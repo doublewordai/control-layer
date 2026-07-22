@@ -1143,7 +1143,7 @@ pub async fn build_router(
     state: &mut AppState,
     onwards_router: Router,
     analytics_sender: Option<request_logging::batcher::AnalyticsSender>,
-    requests_writer_sender: Option<crate::inference::engine::writer::RequestsWriterSender>,
+    requests_writer_handle: Option<crate::inference::engine::writer::RequestsWriterHandle>,
     metrics_recorder: Option<GenAiMetrics>,
     strict_mode: bool,
     inference_middleware_state: Option<crate::inference::middleware::InferenceMiddlewareState>,
@@ -1161,7 +1161,8 @@ pub async fn build_router(
     let request_logging_enabled = state.outlet_db.is_some() && config.enable_request_logging;
     let analytics_enabled = config.enable_analytics;
 
-    let outlet_layer = if request_logging_enabled || analytics_enabled {
+    let response_lifecycle_enabled = inference_middleware_state.is_some() && requests_writer_handle.is_some();
+    let outlet_layer = if request_logging_enabled || analytics_enabled || response_lifecycle_enabled {
         // Store the metrics recorder in state (created earlier in Application::new)
         state.metrics_recorder = metrics_recorder;
 
@@ -1194,10 +1195,11 @@ pub async fn build_router(
         // Add FusilladeOutletHandler so completed responses get written to
         // fusillade via the in-process RequestsWriter. We only attach when
         // both the inference middleware is active and we actually have a
-        // sender to give the handler; without a sender the handler would
+        // writer handle to give the handler; without a handle the handler would
         // silently swallow rows.
-        if let (Some(rms), Some(sender)) = (inference_middleware_state.as_ref(), requests_writer_sender.clone()) {
-            let fusillade_handler = crate::inference::engine::outlet_handler::FusilladeOutletHandler::new(sender, rms.dwctl_pool.clone());
+        if let (Some(rms), Some(writer)) = (inference_middleware_state.as_ref(), requests_writer_handle.clone()) {
+            let fusillade_handler =
+                crate::inference::engine::outlet_handler::FusilladeOutletHandler::new(writer, rms.api_key_cache.clone());
             multi_handler = multi_handler.with(fusillade_handler);
         }
 
@@ -2073,11 +2075,9 @@ pub struct BackgroundServices {
     strict_mode: bool,
     /// Sender for analytics records (if analytics is enabled)
     analytics_sender: Option<request_logging::batcher::AnalyticsSender>,
-    /// Sender for completed-response records consumed by the in-process
-    /// `RequestsWriter` (replaces the underway response jobs). Always set
-    /// once `setup_background_services` runs; `None` only in test harnesses
-    /// that bypass that path.
-    requests_writer_sender: Option<crate::inference::engine::writer::RequestsWriterSender>,
+    /// Handle for durable creates and best-effort completion records consumed
+    /// by the in-process `RequestsWriter`.
+    requests_writer_handle: crate::inference::engine::writer::RequestsWriterHandle,
     // JoinSet is cancel-safe - can be polled in select! without losing tasks
     background_tasks: tokio::task::JoinSet<anyhow::Result<()>>,
     // Map task IDs to names for logging
@@ -2867,18 +2867,19 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
 
     // Start the responses writer. Replaces the underway create-response /
     // complete-response jobs. Outlet's FusilladeOutletHandler holds the
-    // sender; this task drains the channel and flushes to fusillade.
-    let requests_writer_sender = {
-        let (writer, sender) = crate::inference::engine::writer::RequestsWriter::new(
+    // handle; this task drains the channel and flushes to fusillade.
+    let requests_writer_handle = {
+        let (writer, handle) = crate::inference::engine::writer::RequestsWriter::new(
             request_manager.clone(),
             config.background_services.task_workers.response_writer_batch_size,
+            std::time::Duration::from_millis(config.background_services.task_workers.response_writer_max_linger_ms),
         );
         let writer_shutdown = shutdown_token.clone();
         background_tasks.spawn("responses-writer", async move {
             writer.run(writer_shutdown).await;
             Ok(())
         });
-        Some(sender)
+        handle
     };
 
     // Build the underway task runner for background jobs (batch population, sync pipeline, etc.)
@@ -2926,7 +2927,7 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
         onwards_sender,
         strict_mode: config.onwards.strict_mode,
         analytics_sender,
-        requests_writer_sender,
+        requests_writer_handle,
         background_tasks,
         task_names,
         shutdown_token,
@@ -3293,6 +3294,7 @@ impl Application {
         // does any DB work up front; the completion path goes through
         // FusilladeOutletHandler -> RequestsWriter.
         let inference_middleware_state = crate::inference::middleware::InferenceMiddlewareState {
+            requests_writer: bg_services.requests_writer_handle.clone(),
             request_manager: bg_services.request_manager.clone(),
             daemon_id: crate::inference::store::OnwardsDaemonId(onwards_daemon_id),
             loopback_base_url: {
@@ -3378,7 +3380,7 @@ impl Application {
             &mut app_state,
             onwards_router,
             bg_services.analytics_sender.clone(),
-            bg_services.requests_writer_sender.clone(),
+            Some(bg_services.requests_writer_handle.clone()),
             metrics_recorder,
             bg_services.onwards_targets.strict_mode,
             Some(inference_middleware_state),
