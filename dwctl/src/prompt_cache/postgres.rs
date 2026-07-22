@@ -4,13 +4,14 @@
 //!
 //! ## Connection-error retry
 //!
-//! Every op retries ONCE on a connection-class failure. Evidence (2026-07): 100% of the
+//! Every op retries up to `cache.index_conn_retries` times (default 1, backed off
+//! 100ms·2^n) on a connection-class failure. Evidence (2026-07): 100% of the
 //! ~500-1000/day classify errors occur on the fusillade-batch pod, which idles between
 //! batches then fires ~100 concurrent loopback requests in a second. Neon's proxy reaps
 //! idle connections sooner than the pool's `idle_timeout`, so the burst is handed
 //! already-severed conns ("expected to read 5 bytes, got 0") while simultaneously
 //! cold-starting new ones (TLS EOF / auth timeout) — instant-fail errors, not slow queries.
-//! One retry acquires a fresh connection and typically succeeds in milliseconds, well
+//! A retry acquires a fresh connection and typically succeeds in milliseconds, well
 //! inside the classify deadline (which still bounds the caller — a retry never extends it).
 //! Non-connection errors (constraint violations, bad data) are NOT retried. This mirrors
 //! the fix the batch daemon's own queries received for the same severed-conn failure mode.
