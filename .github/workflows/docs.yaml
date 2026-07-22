@@ -41,6 +41,9 @@ jobs:
           mdbook build onwards/docs --dest-dir "$RUNNER_TEMP/pages/onwards"
           test -f "$RUNNER_TEMP/pages/index.html"
           test -f "$RUNNER_TEMP/pages/onwards/index.html"
+          grep -q '/edit/main/docs/src/control-layer-overview.md' "$RUNNER_TEMP/pages/control-layer-overview.html"
+          grep -q '/edit/main/onwards/docs/src/introduction.md' "$RUNNER_TEMP/pages/onwards/introduction.html"
+          ! grep -R -q '/src/src/' "$RUNNER_TEMP/pages"
 
       - if: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' }}
         uses: actions/upload-pages-artifact@v4

@@ -7,5 +7,5 @@ src = "src"
 
 [output.html]
 git-repository-url = "https://github.com/doublewordai/control-layer"
-edit-url-template = "https://github.com/doublewordai/control-layer/edit/main/onwards/docs/src/{path}"
+edit-url-template = "https://github.com/doublewordai/control-layer/edit/main/onwards/docs/{path}"
 site-url = "/control-layer/onwards/"
