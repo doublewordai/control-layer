@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.98.0](https://github.com/doublewordai/control-layer/compare/v8.97.1...v8.98.0) (2026-07-22)
+
+
+### Features
+
+* api-key spend caps schema, cap-scope child keys, and execution-… ([#1344](https://github.com/doublewordai/control-layer/issues/1344)) ([c44557f](https://github.com/doublewordai/control-layer/commit/c44557f9ce9aa8c979bb0f471ca011f28d70972a))
+
 ## [8.97.1](https://github.com/doublewordai/control-layer/compare/v8.97.0...v8.97.1) (2026-07-22)
 
 
