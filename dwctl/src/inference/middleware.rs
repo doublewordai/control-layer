@@ -560,6 +560,12 @@ async fn resolve_flex_batch_api_key(pool: &sqlx::PgPool, api_key: Option<&str>) 
     // child (`parent_api_key_id = ak.id`), the flex request executes on it so
     // its spend counts against the key's spending cap; a key with no child is
     // uncapped and falls through to the shared hidden batch key as before.
+    //
+    // Invariant: the bearer here is always an external, user-visible key. The
+    // only traffic that carries hidden batch keys (shared or cap-scope child)
+    // is the fusillade daemon loopback, which bypasses this middleware via the
+    // `x-fusillade-request-id` guard at the top of `inference_middleware`, and
+    // hidden-key secrets are never exposed to clients.
     let row = sqlx::query(
         r#"
         SELECT ak.user_id, ak.created_by, u.verified, child.secret AS child_secret
