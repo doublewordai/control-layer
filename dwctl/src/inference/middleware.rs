@@ -555,11 +555,21 @@ async fn resolve_flex_batch_api_key(pool: &sqlx::PgPool, api_key: Option<&str>) 
         return Ok(None);
     };
 
+    // The cap-scope child is fetched in the same by-secret lookup (this runs
+    // per flex request — no extra round trip). If the authenticating key has a
+    // child (`parent_api_key_id = ak.id`), the flex request executes on it so
+    // its spend counts against the key's spending cap; a key with no child is
+    // uncapped and falls through to the shared hidden batch key as before.
     let row = sqlx::query(
         r#"
-        SELECT ak.user_id, ak.created_by, u.verified
+        SELECT ak.user_id, ak.created_by, u.verified, child.secret AS child_secret
         FROM api_keys ak
         LEFT JOIN users u ON u.id = ak.user_id
+        LEFT JOIN api_keys child
+               ON child.parent_api_key_id = ak.id
+              AND child.purpose = 'batch'
+              AND child.hidden = true
+              AND child.is_deleted = false
         WHERE ak.secret = $1 AND ak.is_deleted = false
         LIMIT 1
         "#,
@@ -576,12 +586,18 @@ async fn resolve_flex_batch_api_key(pool: &sqlx::PgPool, api_key: Option<&str>) 
     // NULL when the LEFT JOIN found no user row; a missing row counts as
     // unverified, matching `Users::is_verified`.
     let verified: bool = sqlx::Row::try_get(&row, "verified").ok().flatten().unwrap_or(false);
+    let child_secret: Option<String> = sqlx::Row::try_get(&row, "child_secret").ok().flatten();
 
-    let mut conn = pool.acquire().await?;
-    let mut api_keys_repo = ApiKeys::new(&mut conn);
-    let secret = api_keys_repo
-        .get_or_create_hidden_key(key_owner_id, ApiKeyPurpose::Batch, created_by)
-        .await?;
+    let secret = match child_secret {
+        Some(secret) => secret,
+        None => {
+            let mut conn = pool.acquire().await?;
+            let mut api_keys_repo = ApiKeys::new(&mut conn);
+            api_keys_repo
+                .get_or_create_hidden_key(key_owner_id, ApiKeyPurpose::Batch, created_by)
+                .await?
+        }
+    };
 
     Ok(Some(FlexBatchApiKey {
         secret,

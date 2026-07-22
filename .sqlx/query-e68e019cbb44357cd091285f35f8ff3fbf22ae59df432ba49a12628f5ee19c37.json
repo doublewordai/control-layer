@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT id, name, description, secret, purpose, user_id, created_by, created_at, last_used, requests_per_second, burst_size, hidden, is_deleted\n            FROM api_keys\n            WHERE hidden = false AND is_deleted = false\n              AND ($1::uuid IS NULL OR user_id = $1)\n              AND ($4::uuid IS NULL OR created_by = $4)\n            ORDER BY created_at DESC\n            LIMIT $2 OFFSET $3",
+  "query": "SELECT id, name, description, secret, purpose, user_id, created_by, created_at, last_used, requests_per_second, burst_size, hidden, is_deleted, spend_limit, spend_limit_interval, parent_api_key_id FROM api_keys WHERE id = ANY($1) AND is_deleted = false",
   "describe": {
     "columns": [
       {
@@ -67,14 +67,26 @@
         "ordinal": 12,
         "name": "is_deleted",
         "type_info": "Bool"
+      },
+      {
+        "ordinal": 13,
+        "name": "spend_limit",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 14,
+        "name": "spend_limit_interval",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 15,
+        "name": "parent_api_key_id",
+        "type_info": "Uuid"
       }
     ],
     "parameters": {
       "Left": [
-        "Uuid",
-        "Int8",
-        "Int8",
-        "Uuid"
+        "UuidArray"
       ]
     },
     "nullable": [
@@ -90,8 +102,11 @@
       true,
       true,
       false,
-      false
+      false,
+      true,
+      true,
+      true
     ]
   },
-  "hash": "365fb63fb633db2e53ab9e6ede9f1e1c6c2c286334f8c3ebbae7b669ae823a3b"
+  "hash": "e68e019cbb44357cd091285f35f8ff3fbf22ae59df432ba49a12628f5ee19c37"
 }

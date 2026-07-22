@@ -1171,10 +1171,13 @@ pub async fn upload_file<P: PoolProvider>(
 
     // Get or create user-specific hidden batch API key for batch request execution.
     // We need the key ID for per-member attribution within orgs.
+    // A capped authenticating key resolves to its cap-scope child (the template
+    // key is only the legacy COALESCE fallback for batches without their own
+    // key, but keep it scope-consistent with batch creation).
     let mut conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
     let mut api_keys_repo = ApiKeys::new(&mut conn);
     let (user_api_key, api_key_id) = api_keys_repo
-        .get_or_create_hidden_key_with_id(target_user_id, ApiKeyPurpose::Batch, current_user.id)
+        .resolve_batch_execution_key(target_user_id, current_user.id, current_user.api_key_id)
         .await
         .map_err(Error::Database)?;
 
@@ -1338,13 +1341,10 @@ pub async fn list_files<P: PoolProvider>(
     let api_key_ids_filter = if let Some(member_id) = query.member_id {
         let mut read_conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
         let key_ids = match current_user.active_organization {
-            Some(org_id) => {
-                let key_id = ApiKeys::new(&mut read_conn)
-                    .find_hidden_key_id(org_id, ApiKeyPurpose::Batch, member_id)
-                    .await
-                    .map_err(Error::Database)?;
-                key_id.into_iter().collect::<Vec<_>>()
-            }
+            Some(org_id) => ApiKeys::new(&mut read_conn)
+                .find_hidden_key_ids(org_id, ApiKeyPurpose::Batch, member_id)
+                .await
+                .map_err(Error::Database)?,
             None if can_read_all_files => ApiKeys::new(&mut read_conn)
                 .find_all_hidden_key_ids_by_creator(ApiKeyPurpose::Batch, member_id)
                 .await
@@ -1368,11 +1368,10 @@ pub async fn list_files<P: PoolProvider>(
     } else if let Some(org_id) = current_user.active_organization.filter(|_| query.own) {
         // own=true in org context: filter to files created by the current user's hidden key
         let mut read_conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
-        let key_id = ApiKeys::new(&mut read_conn)
-            .find_hidden_key_id(org_id, ApiKeyPurpose::Batch, current_user.id)
+        let key_ids = ApiKeys::new(&mut read_conn)
+            .find_hidden_key_ids(org_id, ApiKeyPurpose::Batch, current_user.id)
             .await
             .map_err(Error::Database)?;
-        let key_ids: Vec<_> = key_id.into_iter().collect();
         if key_ids.is_empty() {
             return Ok(Json(FileListResponse {
                 object_type: ListObject::List,

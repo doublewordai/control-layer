@@ -3,6 +3,7 @@
 use crate::api::models::api_keys::ApiKeyCreate;
 use crate::types::{ApiKeyId, DeploymentId, UserId};
 use chrono::{DateTime, Utc};
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
@@ -99,4 +100,12 @@ pub struct ApiKeyDBResponse {
     pub model_access: Vec<DeploymentId>,
     pub requests_per_second: Option<f32>,
     pub burst_size: Option<i32>,
+    /// Optional spending cap (credits) for this key's cap scope. NULL = uncapped.
+    pub spend_limit: Option<Decimal>,
+    /// Cap reset period: None = one-off, else daily/weekly/monthly on
+    /// calendar-aligned UTC boundaries (never rolling windows).
+    pub spend_limit_interval: Option<String>,
+    /// Set only on hidden cap-scope child keys; see migration 122. Spend
+    /// accounting/enforcement group by COALESCE(parent_api_key_id, id).
+    pub parent_api_key_id: Option<ApiKeyId>,
 }
