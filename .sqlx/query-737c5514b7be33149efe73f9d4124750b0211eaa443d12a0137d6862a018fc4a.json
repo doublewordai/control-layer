@@ -1,0 +1,32 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT model, state, expected_ready_at\n            FROM (\n                SELECT DISTINCT ON (model)\n                    model, state, expected_ready_at\n                FROM model_filters\n                ORDER BY model, created_at DESC, id DESC\n            ) latest\n            WHERE state <> 'absent'\n            ORDER BY model\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "model",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "state",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "expected_ready_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "737c5514b7be33149efe73f9d4124750b0211eaa443d12a0137d6862a018fc4a"
+}
