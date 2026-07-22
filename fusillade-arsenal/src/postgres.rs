@@ -11612,6 +11612,9 @@ mod tests {
             .collect()
             .await;
         assert_eq!(live.len(), 3, "pre-archive stream serves all rows");
+        for item in live {
+            item.expect("live result item must be Ok");
+        }
 
         assert_eq!(
             manager.archive_batch(batch_id).await.unwrap(),
