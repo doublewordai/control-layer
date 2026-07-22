@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.95.0](https://github.com/doublewordai/control-layer/compare/v8.94.2...v8.95.0) (2026-07-22)
+
+
+### Features
+
+* integrate Fusillade and Onwards into the Rust workspace ([#1325](https://github.com/doublewordai/control-layer/issues/1325)) ([6f712ba](https://github.com/doublewordai/control-layer/commit/6f712ba299eb1144d20e294b11ced08d3ef4224e))
+
 ## [8.94.2](https://github.com/doublewordai/control-layer/compare/v8.94.1...v8.94.2) (2026-07-21)
 
 
