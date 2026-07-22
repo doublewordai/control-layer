@@ -1705,6 +1705,13 @@ pub struct DaemonConfig {
     pub batch_archive_backfill_interval_ms: u64,
     #[serde(default = "default_batch_archive_moves_per_tick")]
     pub batch_archive_backfill_moves_per_tick: i64,
+    /// Concurrent moves per backfill tick. Per-move cost is dominated by
+    /// fixed transaction overhead on small batches, so this — not tick
+    /// pacing — is the drain-throughput lever. Concurrent movers are safe
+    /// (the batch lock is taken SKIP LOCKED); the default keeps a
+    /// historical drain in the hours range without fleet-level scaling.
+    #[serde(default = "default_batch_archive_backfill_concurrency")]
+    pub batch_archive_backfill_concurrency: usize,
     /// Weekly archive-partition runway maintained by the daemon's daily tick
     /// (runs regardless of the flags above so partitions exist before any
     /// flip; fusillade_archive_partitions_ahead gauges it).
@@ -1726,6 +1733,10 @@ fn default_batch_archive_cancel_grace_secs() -> f64 {
 
 fn default_batch_archive_backfill_interval_ms() -> u64 {
     1_000
+}
+
+fn default_batch_archive_backfill_concurrency() -> usize {
+    8
 }
 
 fn default_batch_archive_partitions_weeks_ahead() -> i32 {
@@ -1895,6 +1906,7 @@ impl Default for DaemonConfig {
             batch_archive_backfill_enabled: false,
             batch_archive_backfill_interval_ms: default_batch_archive_backfill_interval_ms(),
             batch_archive_backfill_moves_per_tick: default_batch_archive_moves_per_tick(),
+            batch_archive_backfill_concurrency: default_batch_archive_backfill_concurrency(),
             batch_archive_partitions_weeks_ahead: default_batch_archive_partitions_weeks_ahead(),
         }
     }
@@ -1972,6 +1984,7 @@ impl DaemonConfig {
             batch_archive_backfill_enabled: self.batch_archive_backfill_enabled,
             batch_archive_backfill_interval_ms: self.batch_archive_backfill_interval_ms,
             batch_archive_backfill_moves_per_tick: self.batch_archive_backfill_moves_per_tick,
+            batch_archive_backfill_concurrency: self.batch_archive_backfill_concurrency,
             batch_archive_partitions_weeks_ahead: self.batch_archive_partitions_weeks_ahead,
             ..Default::default()
         }
