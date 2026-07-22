@@ -774,13 +774,15 @@ fn state_to_status(state: &str) -> &'static str {
 pub fn detail_to_response_object(detail: &fusillade::RequestDetail) -> serde_json::Value {
     let status = state_to_status(&detail.status);
 
-    // Derive background from the stored request body if available.
-    let background = detail
-        .body
-        .as_deref()
-        .and_then(|b| serde_json::from_str::<serde_json::Value>(b).ok())
-        .and_then(|v| v.get("background")?.as_bool())
-        .unwrap_or(false);
+    // The background service tier is always asynchronous. Other tiers retain
+    // the existing request-body flag behavior (when that field was persisted).
+    let background = detail.service_tier.as_deref() == Some("background")
+        || detail
+            .body
+            .as_deref()
+            .and_then(|b| serde_json::from_str::<serde_json::Value>(b).ok())
+            .and_then(|v| v.get("background")?.as_bool())
+            .unwrap_or(false);
 
     let mut resp = serde_json::json!({
         "id": format!("resp_{}", detail.id),
@@ -791,6 +793,9 @@ pub fn detail_to_response_object(detail: &fusillade::RequestDetail) -> serde_jso
         "background": background,
         "output": [],
     });
+    if let Some(service_tier) = detail.service_tier.as_deref() {
+        resp["service_tier"] = serde_json::json!(service_tier);
+    }
 
     if status == "completed" {
         let response_status = match detail.response_status {
@@ -1834,6 +1839,19 @@ mod tests {
             service_tier: None,
             created_by: "test-user".to_string(),
         }
+    }
+
+    #[test]
+    fn background_request_detail_preserves_async_tier_in_response_object() {
+        let mut detail = make_detail("pending", None, None, None);
+        detail.body = Some(r#"{"model":"test-model","input":"hello"}"#.to_string());
+        detail.service_tier = Some("background".to_string());
+
+        let response = detail_to_response_object(&detail);
+
+        assert_eq!(response["status"], "queued");
+        assert_eq!(response["background"], true);
+        assert_eq!(response["service_tier"], "background");
     }
 
     #[test]

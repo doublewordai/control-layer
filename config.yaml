@@ -190,9 +190,10 @@ auth:
   #   - RequestViewer: Read-only access to request logs and analytics
   #   - BillingManager: Full access to credit system and user billing
   #   - BatchAPIUser: Can manage files and batches for batch processing
+  #   - BackgroundInferenceUser: Can submit spare-capacity background inference
   # Example: To give all new users request viewing capabilities:
   #   default_user_roles: ["StandardUser", "RequestViewer"]
-  default_user_roles: ["StandardUser", "BatchAPIUser"]
+  default_user_roles: ["StandardUser", "BatchAPIUser", "BackgroundInferenceUser"]
 
   # Security settings
   security:

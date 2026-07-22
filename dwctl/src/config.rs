@@ -704,7 +704,7 @@ impl Default for AuthConfig {
             native: NativeAuthConfig::default(),
             proxy_header: ProxyHeaderAuthConfig::default(),
             security: SecurityConfig::default(),
-            default_user_roles: vec![Role::StandardUser],
+            default_user_roles: vec![Role::StandardUser, Role::BackgroundInferenceUser],
             rate_limits: RateLimitTiersConfig::default(),
         }
     }
@@ -2973,6 +2973,11 @@ impl Config {
 mod tests {
     use super::*;
     use figment::Jail;
+
+    #[test]
+    fn default_auth_roles_include_background_inference() {
+        assert!(AuthConfig::default().default_user_roles.contains(&Role::BackgroundInferenceUser));
+    }
 
     #[test]
     fn test_model_sources_config() {
