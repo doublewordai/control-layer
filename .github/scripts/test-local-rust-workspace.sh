@@ -162,13 +162,29 @@ if ! grep -Fq 'onwards-image:' "$release_workflow" || \
   exit 1
 fi
 
-if ! grep -Fq "type=semver,pattern={{major}}.{{minor}},value=\${{ steps.version.outputs.version }},enable=\${{ github.event_name == 'release' }}" \
-     "$release_workflow" || \
-   ! grep -Fq "type=raw,value=latest,enable=\${{ github.event_name == 'release' }}" \
-     "$release_workflow"; then
-  echo "Manual Onwards retries must not move floating image tags" >&2
+if ! grep -Fq 'promote-onwards-image:' "$release_workflow" || \
+   ! grep -Fq 'needs: [onwards-image]' "$release_workflow" || \
+   ! grep -Fq 'onwards-floating-tags.cjs' "$release_workflow" || \
+   ! grep -Fq 'github.paginate(' "$release_workflow" || \
+   ! grep -Fq 'github.rest.repos.listReleases' "$release_workflow" || \
+   ! grep -Fq 'group: onwards-image-floating-tags' "$release_workflow" || \
+   ! grep -Fq 'queue: max' "$release_workflow" || \
+   ! grep -Fq "digest: \${{ steps.onwards-build.outputs.digest }}" "$release_workflow" || \
+   ! grep -Fq 'docker buildx imagetools create' "$release_workflow" || \
+   ! grep -Fq "ghcr.io/doublewordai/onwards:\${SERIES}" "$release_workflow" || \
+   ! grep -Fq 'ghcr.io/doublewordai/onwards:latest' "$release_workflow" || \
+   ! grep -Fq "ghcr.io/doublewordai/onwards@\${IMAGE_DIGEST}" "$release_workflow"; then
+  echo "Onwards floating image tags must be promoted from the newest published release" >&2
   exit 1
 fi
+
+if grep -Fq "type=semver,pattern={{major}}.{{minor}},value=\${{ steps.version.outputs.version }}" "$release_workflow" || \
+   grep -Fq 'type=raw,value=latest,enable=' "$release_workflow"; then
+  echo "Onwards immutable image builds must not publish floating tags" >&2
+  exit 1
+fi
+
+node .github/scripts/test-onwards-floating-tags.cjs
 
 if [[ ! -f onwards/Dockerfile ]]; then
   echo "Onwards must retain a standalone image definition" >&2
