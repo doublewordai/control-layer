@@ -83,7 +83,8 @@ require_text 'name: rust-coverage-dwctl-${{ matrix.partition }}' 'upload each dw
 require_text 'backend-dwctl-test:' 'preserve a dedicated aggregate dwctl test gate'
 require_exact_line '    name: dwctl / test' 'preserve the required dwctl test context'
 require_text 'name: workspace / rust lint' 'scope Rust linting to the workspace'
-require_text 'needs: [backend-crate-test, backend-dwctl-test, backend-lint]' 'gate backend-test on every crate and lint'
+require_text 'needs: [backend-crate-test, backend-dwctl-test, backend-lint, frontend-test, build]' \
+  'gate backend-test on every crate, dwctl partition, lint, frontend test, and image build'
 require_exact_line '    name: workspace / rust gate' 'name the aggregate Rust gate clearly'
 require_text 'pattern: rust-coverage-*' 'download all per-package coverage artifacts'
 require_text 'MINIMUM_COVERAGE: "60"' 'preserve the aggregate line coverage threshold'
