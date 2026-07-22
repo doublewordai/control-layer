@@ -313,6 +313,13 @@ pub struct CreateFlexInput {
     pub created_by: String,
 }
 
+/// Command for creating either kind of durable response row.
+#[derive(Debug, Clone)]
+pub enum CreateResponseInput {
+    Flex(CreateFlexInput),
+    Realtime(CreateRealtimeInput),
+}
+
 /// Result of a paginated request list query.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RequestListResult {

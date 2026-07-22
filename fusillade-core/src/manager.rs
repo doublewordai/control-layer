@@ -10,9 +10,9 @@ use crate::batch::{
 use crate::daemon_record::{AnyDaemonRecord, DaemonRecord, DaemonState, DaemonStatus};
 use crate::error::Result;
 use crate::request::{
-    AnyRequest, CascadeTargetState, Claimed, CreateFlexInput, CreateRealtimeInput, DaemonId,
-    ListRequestsFilter, PersistCompletedRealtimeInput, Request, RequestDetail, RequestId,
-    RequestListResult, RequestState, ServiceTierFilter,
+    AnyRequest, CascadeTargetState, Claimed, CreateFlexInput, CreateRealtimeInput,
+    CreateResponseInput, DaemonId, ListRequestsFilter, PersistCompletedRealtimeInput, Request,
+    RequestDetail, RequestId, RequestListResult, RequestState, ServiceTierFilter,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -784,6 +784,14 @@ pub trait Storage: Send + Sync {
     /// `batch_id = NULL` in `pending` state. The daemon claims and processes
     /// it via the standard flex pipeline.
     async fn create_flex(&self, input: CreateFlexInput) -> Result<RequestId>;
+
+    /// Create multiple realtime and/or flex responses atomically.
+    ///
+    /// Returned IDs preserve the order of `inputs`.
+    async fn create_responses_batch(
+        &self,
+        inputs: &[CreateResponseInput],
+    ) -> Result<Vec<RequestId>>;
 
     /// Complete a processing request with the response body.
     ///

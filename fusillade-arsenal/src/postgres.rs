@@ -38,8 +38,9 @@ use crate::daemon::{
 use crate::error::{FusilladeError, Result};
 use crate::request::{
     Canceled, CascadeTargetState, Claimed, Completed, CreateFlexInput, CreateRealtimeInput,
-    DaemonId, Failed, FailureReason, LeakStamp, Pending, PersistCompletedRealtimeInput, Processing,
-    Request, RequestData, RequestId, RequestState, ServiceTierFilter,
+    CreateResponseInput, DaemonId, Failed, FailureReason, LeakStamp, Pending,
+    PersistCompletedRealtimeInput, Processing, Request, RequestData, RequestId, RequestState,
+    ServiceTierFilter,
 };
 
 use super::utils::{
@@ -4782,12 +4783,12 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                                       daemon_id, claimed_at, started_at, response_status, response_body,
                                       completed_at, error, failed_at, canceled_at, created_at, updated_at,
                                       custom_id, model, response_size, routed_model, service_tier, created_by)
-                SELECT id, batch_id, template_id, 'pending', 0, NULL,
+                SELECT a.id, a.batch_id, a.template_id, 'pending', 0, NULL,
                        NULL, NULL, NULL, NULL, NULL,
-                       NULL, NULL, NULL, NULL, created_at, NOW(),
-                       custom_id, model, 0, NULL, service_tier, created_by
-                FROM batch_requests_archive
-                WHERE id = ANY($1) AND state = 'failed'
+                       NULL, NULL, NULL, NULL, a.created_at, NOW(),
+                       a.custom_id, a.model, 0, NULL, a.service_tier, a.created_by
+                FROM batch_requests_archive a
+                WHERE a.id = ANY($1) AND a.state = 'failed'
                 ON CONFLICT (id) DO NOTHING
                 RETURNING id
                 "#,
@@ -4984,12 +4985,13 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                                       daemon_id, claimed_at, started_at, response_status, response_body,
                                       completed_at, error, failed_at, canceled_at, created_at, updated_at,
                                       custom_id, model, response_size, routed_model, service_tier, created_by)
-                SELECT id, batch_id, template_id, 'pending', 0, NULL,
+                SELECT a.id, a.batch_id, a.template_id, 'pending', 0, NULL,
                        NULL, NULL, NULL, NULL, NULL,
-                       NULL, NULL, NULL, NULL, created_at, NOW(),
-                       custom_id, model, 0, NULL, service_tier, created_by
-                FROM batch_requests_archive
-                WHERE archive_bucket = $2 AND batch_id = $1 AND state IN ('failed', 'canceled')
+                       NULL, NULL, NULL, NULL, a.created_at, NOW(),
+                       a.custom_id, a.model, 0, NULL, a.service_tier, a.created_by
+                FROM batch_requests_archive a
+                WHERE a.archive_bucket = $2 AND a.batch_id = $1
+                  AND a.state IN ('failed', 'canceled')
                 ON CONFLICT (id) DO NOTHING
                 "#,
                 *batch_id as Uuid,
@@ -5562,122 +5564,176 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
 
     #[tracing::instrument(level = "debug", skip(self, input), fields(request_id = %input.request_id))]
     async fn create_realtime(&self, input: CreateRealtimeInput) -> Result<RequestId> {
-        let template_id = Uuid::new_v4();
-        let now = Utc::now();
-
-        let mut tx = self
-            .begin_write()
-            .await
-            .map_err(|e| FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e)))?;
-
-        // Insert template row (file_id = NULL for daemon-managed requests)
-        let stored_body = sanitize_outbound_body(&input.body);
-        let body_byte_size = stored_body.len() as i64;
-        sqlx::query(
-            "INSERT INTO request_templates (id, file_id, custom_id, endpoint, method, path, body, model, api_key, body_byte_size)
-             VALUES ($1, NULL, NULL, $2, $3, $4, $5, $6, $7, $8)",
-        )
-        .bind(template_id)
-        .bind(&input.endpoint)
-        .bind(&input.method)
-        .bind(&input.path)
-        .bind(stored_body.as_ref())
-        .bind(&input.model)
-        .bind(&input.api_key)
-        .bind(body_byte_size)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| {
-            FusilladeError::Other(anyhow!("Failed to insert realtime template: {}", e))
-        })?;
-
-        // The proxy is already handling this request, so the row enters
-        // processing immediately. daemon_id = nil sentinel keeps the daemon
-        // from claiming or unclaiming it; service_tier = 'priority' matches
-        // the legacy "0s" completion_window mapping.
-        // Empty or whitespace-only created_by is a contract violation (the
-        // API guarantees a real user); trim then coerce to NULL so the XOR
-        // CHECK rejects it loudly rather than letting a phantom-user row
-        // slip into the listing. Matches the SQL `NULLIF(TRIM(...), '')`
-        // used by persist_completed_realtime_batch.
-        let created_by = Some(input.created_by.trim()).filter(|s| !s.is_empty());
-        sqlx::query(
-            "INSERT INTO requests (id, batch_id, template_id, model, custom_id, state, retry_attempt, service_tier, created_by, daemon_id, claimed_at, started_at)
-             VALUES ($1, NULL, $2, $3, NULL, 'processing', 0, 'priority', $4, $5, $6, $6)",
-        )
-        .bind(input.request_id)
-        .bind(template_id)
-        .bind(&input.model)
-        .bind(created_by)
-        .bind(Uuid::nil())
-        .bind(now)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| FusilladeError::Other(anyhow!("Failed to insert realtime request: {}", e)))?;
-
-        tx.commit().await.map_err(|e| {
-            FusilladeError::Other(anyhow!(
-                "Failed to commit realtime request transaction: {}",
-                e
-            ))
-        })?;
-
-        Ok(RequestId(input.request_id))
+        let ids = self
+            .create_responses_batch(std::slice::from_ref(&CreateResponseInput::Realtime(input)))
+            .await?;
+        Ok(ids
+            .into_iter()
+            .next()
+            .expect("singleton realtime create must return one ID"))
     }
 
     #[tracing::instrument(level = "debug", skip(self, input), fields(request_id = %input.request_id))]
     async fn create_flex(&self, input: CreateFlexInput) -> Result<RequestId> {
-        let template_id = Uuid::new_v4();
+        let ids = self
+            .create_responses_batch(std::slice::from_ref(&CreateResponseInput::Flex(input)))
+            .await?;
+        Ok(ids
+            .into_iter()
+            .next()
+            .expect("singleton flex create must return one ID"))
+    }
+
+    #[tracing::instrument(level = "debug", skip(self, inputs), fields(input_count = inputs.len()))]
+    async fn create_responses_batch(
+        &self,
+        inputs: &[CreateResponseInput],
+    ) -> Result<Vec<RequestId>> {
+        if inputs.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        struct PreparedCreate<'a> {
+            request_id: Uuid,
+            template_id: Uuid,
+            endpoint: &'a str,
+            method: &'a str,
+            path: &'a str,
+            body: std::borrow::Cow<'a, str>,
+            model: &'a str,
+            api_key: &'a str,
+            created_by: &'a str,
+            realtime: bool,
+        }
+
+        // Body sanitisation and all per-row preparation happen before the
+        // transaction, keeping its lock/connection hold time to the two bulk
+        // statements and commit.
+        let prepared: Vec<PreparedCreate<'_>> = inputs
+            .iter()
+            .map(|input| {
+                let (input, realtime) = match input {
+                    CreateResponseInput::Flex(input) => (
+                        (
+                            input.request_id,
+                            input.endpoint.as_str(),
+                            input.method.as_str(),
+                            input.path.as_str(),
+                            input.body.as_str(),
+                            input.model.as_str(),
+                            input.api_key.as_str(),
+                            input.created_by.trim(),
+                        ),
+                        false,
+                    ),
+                    CreateResponseInput::Realtime(input) => (
+                        (
+                            input.request_id,
+                            input.endpoint.as_str(),
+                            input.method.as_str(),
+                            input.path.as_str(),
+                            input.body.as_str(),
+                            input.model.as_str(),
+                            input.api_key.as_str(),
+                            input.created_by.trim(),
+                        ),
+                        true,
+                    ),
+                };
+                PreparedCreate {
+                    request_id: input.0,
+                    template_id: Uuid::new_v4(),
+                    endpoint: input.1,
+                    method: input.2,
+                    path: input.3,
+                    body: sanitize_outbound_body(input.4),
+                    model: input.5,
+                    api_key: input.6,
+                    created_by: input.7,
+                    realtime,
+                }
+            })
+            .collect();
+        let now = Utc::now();
+
+        let template_ids: Vec<Uuid> = prepared.iter().map(|row| row.template_id).collect();
+        let endpoints: Vec<&str> = prepared.iter().map(|row| row.endpoint).collect();
+        let methods: Vec<&str> = prepared.iter().map(|row| row.method).collect();
+        let paths: Vec<&str> = prepared.iter().map(|row| row.path).collect();
+        let bodies: Vec<&str> = prepared.iter().map(|row| row.body.as_ref()).collect();
+        let body_sizes: Vec<i64> = prepared.iter().map(|row| row.body.len() as i64).collect();
+        let models: Vec<&str> = prepared.iter().map(|row| row.model).collect();
+        let api_keys: Vec<&str> = prepared.iter().map(|row| row.api_key).collect();
+        let request_ids: Vec<Uuid> = prepared.iter().map(|row| row.request_id).collect();
+        let created_bys: Vec<&str> = prepared.iter().map(|row| row.created_by).collect();
+        let realtime: Vec<bool> = prepared.iter().map(|row| row.realtime).collect();
 
         let mut tx = self
             .begin_write()
             .await
             .map_err(|e| FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e)))?;
 
-        let stored_body = sanitize_outbound_body(&input.body);
-        let body_byte_size = stored_body.len() as i64;
-        sqlx::query(
-            "INSERT INTO request_templates (id, file_id, custom_id, endpoint, method, path, body, model, api_key, body_byte_size)
-             VALUES ($1, NULL, NULL, $2, $3, $4, $5, $6, $7, $8)",
+        sqlx::query!(
+            r#"
+            INSERT INTO request_templates
+                (id, file_id, custom_id, endpoint, method, path, body, model, api_key, body_byte_size)
+            SELECT id, NULL, NULL, endpoint, method, path, body, model, api_key, body_byte_size
+            FROM UNNEST(
+                $1::uuid[], $2::text[], $3::text[], $4::text[],
+                $5::text[], $6::text[], $7::text[], $8::bigint[]
+            ) AS t(id, endpoint, method, path, body, model, api_key, body_byte_size)
+            "#,
+            &template_ids as &[Uuid],
+            &endpoints as &[&str],
+            &methods as &[&str],
+            &paths as &[&str],
+            &bodies as &[&str],
+            &models as &[&str],
+            &api_keys as &[&str],
+            &body_sizes as &[i64],
         )
-        .bind(template_id)
-        .bind(&input.endpoint)
-        .bind(&input.method)
-        .bind(&input.path)
-        .bind(stored_body.as_ref())
-        .bind(&input.model)
-        .bind(&input.api_key)
-        .bind(body_byte_size)
         .execute(&mut *tx)
         .await
-        .map_err(|e| FusilladeError::Other(anyhow!("Failed to insert flex template: {}", e)))?;
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to insert response templates: {}", e)))?;
 
-        // Pending row — the daemon will claim and process it like any other
-        // pending request.
-        // Empty-string (or whitespace-only) created_by is a contract violation
-        // (the API guarantees a real user); coerce to NULL so the XOR CHECK
-        // rejects it loudly rather than letting a phantom-user row slip into
-        // the listing. Trim matches the SQL-side `NULLIF(TRIM(...), '')` used
-        // by `persist_completed_realtime_batch` so all three call sites
-        // normalise identically.
-        let created_by = Some(input.created_by.trim()).filter(|s| !s.is_empty());
-        sqlx::query(
-            "INSERT INTO requests (id, batch_id, template_id, model, custom_id, state, retry_attempt, service_tier, created_by)
-             VALUES ($1, NULL, $2, $3, NULL, 'pending', 0, 'flex', $4)",
+        sqlx::query!(
+            r#"
+            INSERT INTO requests (
+                id, batch_id, template_id, model, custom_id, state, retry_attempt,
+                service_tier, created_by, daemon_id, claimed_at, started_at
+            )
+            SELECT id, NULL, template_id, model, NULL,
+                   CASE WHEN realtime THEN 'processing' ELSE 'pending' END,
+                   0,
+                   CASE WHEN realtime THEN 'priority' ELSE 'flex' END,
+                   NULLIF(TRIM(created_by), ''),
+                   CASE WHEN realtime THEN $1::uuid ELSE NULL END,
+                   CASE WHEN realtime THEN $2::timestamptz ELSE NULL END,
+                   CASE WHEN realtime THEN $2::timestamptz ELSE NULL END
+            FROM UNNEST(
+                $3::uuid[], $4::uuid[], $5::text[], $6::text[], $7::bool[]
+            ) AS r(id, template_id, model, created_by, realtime)
+            "#,
+            Uuid::nil(),
+            now,
+            &request_ids as &[Uuid],
+            &template_ids as &[Uuid],
+            &models as &[&str],
+            &created_bys as &[&str],
+            &realtime as &[bool],
         )
-        .bind(input.request_id)
-        .bind(template_id)
-        .bind(&input.model)
-        .bind(created_by)
         .execute(&mut *tx)
         .await
-        .map_err(|e| FusilladeError::Other(anyhow!("Failed to insert flex request: {}", e)))?;
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to insert responses: {}", e)))?;
 
         tx.commit().await.map_err(|e| {
-            FusilladeError::Other(anyhow!("Failed to commit flex request transaction: {}", e))
+            FusilladeError::Other(anyhow!(
+                "Failed to commit response create transaction: {}",
+                e
+            ))
         })?;
 
-        Ok(RequestId(input.request_id))
+        Ok(request_ids.into_iter().map(RequestId).collect())
     }
 
     async fn complete_request(
@@ -7696,14 +7752,22 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
             return Ok(ArchiveOutcome::SkippedResponseSteps);
         }
 
-        // Forward move. Positional alignment (`r.*, $bucket`) is guaranteed
-        // by the schema-parity test suite (archive = requests' columns +
-        // archive_bucket appended last). ON CONFLICT makes crash-resume
+        // Forward move. The named mapping allows the two tables' physical
+        // column order to evolve independently. ON CONFLICT makes crash-resume
         // replay a no-op for rows already copied.
         let inserted = sqlx::query(
             r#"
-            INSERT INTO batch_requests_archive
-            SELECT r.*, $2::date
+            INSERT INTO batch_requests_archive (
+                id, batch_id, template_id, state, retry_attempt, not_before, daemon_id,
+                claimed_at, started_at, response_status, response_body, completed_at,
+                error, failed_at, canceled_at, created_at, updated_at, custom_id, model,
+                response_size, routed_model, service_tier, created_by, archive_bucket
+            )
+            SELECT r.id, r.batch_id, r.template_id, r.state, r.retry_attempt, r.not_before,
+                   r.daemon_id, r.claimed_at, r.started_at, r.response_status, r.response_body,
+                   r.completed_at, r.error, r.failed_at, r.canceled_at, r.created_at,
+                   r.updated_at, r.custom_id, r.model, r.response_size, r.routed_model,
+                   r.service_tier, r.created_by, $2::date
             FROM requests r
             WHERE r.batch_id = $1
             ON CONFLICT (id, archive_bucket) DO NOTHING
@@ -11437,8 +11501,18 @@ mod tests {
         // DELETE/stamp committed: pre-copy a single row into the archive
         // exactly as the move would have.
         sqlx::query(
-            "INSERT INTO batch_requests_archive
-             SELECT r.*, date_trunc('week', (SELECT created_at FROM batches WHERE id = $1) AT TIME ZONE 'UTC')::date
+            "INSERT INTO batch_requests_archive (
+                 id, batch_id, template_id, state, retry_attempt, not_before, daemon_id,
+                 claimed_at, started_at, response_status, response_body, completed_at,
+                 error, failed_at, canceled_at, created_at, updated_at, custom_id, model,
+                 response_size, routed_model, service_tier, created_by, archive_bucket
+             )
+             SELECT r.id, r.batch_id, r.template_id, r.state, r.retry_attempt, r.not_before,
+                    r.daemon_id, r.claimed_at, r.started_at, r.response_status, r.response_body,
+                    r.completed_at, r.error, r.failed_at, r.canceled_at, r.created_at,
+                    r.updated_at, r.custom_id, r.model, r.response_size, r.routed_model,
+                    r.service_tier, r.created_by,
+                    date_trunc('week', (SELECT created_at FROM batches WHERE id = $1) AT TIME ZONE 'UTC')::date
              FROM requests r WHERE r.batch_id = $1
              ORDER BY r.id LIMIT 1",
         )
@@ -21146,6 +21220,310 @@ mod tests {
     // =========================================================================
     // create_realtime / create_flex tests
     // =========================================================================
+
+    #[sqlx::test]
+    async fn test_create_responses_batch_empty_is_noop(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+
+        let ids = manager
+            .create_responses_batch(&[])
+            .await
+            .expect("empty create batch should succeed");
+
+        assert!(ids.is_empty());
+        let request_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM requests")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let template_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_templates")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!((request_count, template_count), (0, 0));
+    }
+
+    #[sqlx::test]
+    async fn test_create_responses_batch_mixed_shapes_and_stable_order(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+        let flex_id = uuid::Uuid::new_v4();
+        let realtime_id = uuid::Uuid::new_v4();
+        let inputs = vec![
+            crate::request::CreateResponseInput::Flex(crate::request::CreateFlexInput {
+                request_id: flex_id,
+                body: r#"{"input":"flex"}"#.to_string(),
+                model: "flex-model".to_string(),
+                endpoint: "http://flex.example".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/responses".to_string(),
+                api_key: "flex-key".to_string(),
+                created_by: "flex-user".to_string(),
+            }),
+            crate::request::CreateResponseInput::Realtime(crate::request::CreateRealtimeInput {
+                request_id: realtime_id,
+                body: r#"{"input":"realtime"}"#.to_string(),
+                model: "realtime-model".to_string(),
+                endpoint: "http://realtime.example".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/responses".to_string(),
+                api_key: "realtime-key".to_string(),
+                created_by: "realtime-user".to_string(),
+            }),
+        ];
+
+        let ids = manager
+            .create_responses_batch(&inputs)
+            .await
+            .expect("mixed create batch should succeed");
+        assert_eq!(
+            ids,
+            vec![
+                crate::request::RequestId(flex_id),
+                crate::request::RequestId(realtime_id)
+            ]
+        );
+
+        let rows = sqlx::query(
+            "SELECT id, batch_id, state, service_tier, daemon_id, claimed_at, started_at, created_by \
+             FROM requests WHERE id = ANY($1) ORDER BY id",
+        )
+        .bind(&[flex_id, realtime_id][..])
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 2);
+        for row in rows {
+            let id: uuid::Uuid = row.get("id");
+            assert!(row.get::<Option<uuid::Uuid>, _>("batch_id").is_none());
+            if id == flex_id {
+                assert_eq!(row.get::<String, _>("state"), "pending");
+                assert_eq!(
+                    row.get::<Option<String>, _>("service_tier").as_deref(),
+                    Some("flex")
+                );
+                assert!(row.get::<Option<uuid::Uuid>, _>("daemon_id").is_none());
+                assert!(
+                    row.get::<Option<chrono::DateTime<chrono::Utc>>, _>("claimed_at")
+                        .is_none()
+                );
+                assert!(
+                    row.get::<Option<chrono::DateTime<chrono::Utc>>, _>("started_at")
+                        .is_none()
+                );
+                assert_eq!(
+                    row.get::<Option<String>, _>("created_by").as_deref(),
+                    Some("flex-user")
+                );
+            } else {
+                assert_eq!(id, realtime_id);
+                assert_eq!(row.get::<String, _>("state"), "processing");
+                assert_eq!(
+                    row.get::<Option<String>, _>("service_tier").as_deref(),
+                    Some("priority")
+                );
+                assert_eq!(
+                    row.get::<Option<uuid::Uuid>, _>("daemon_id"),
+                    Some(uuid::Uuid::nil())
+                );
+                let claimed_at = row.get::<Option<chrono::DateTime<chrono::Utc>>, _>("claimed_at");
+                assert!(claimed_at.is_some());
+                assert_eq!(
+                    claimed_at,
+                    row.get::<Option<chrono::DateTime<chrono::Utc>>, _>("started_at")
+                );
+                assert_eq!(
+                    row.get::<Option<String>, _>("created_by").as_deref(),
+                    Some("realtime-user")
+                );
+            }
+        }
+    }
+
+    #[sqlx::test]
+    async fn test_create_responses_batch_sanitizes_bodies(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+        let request_id = uuid::Uuid::new_v4();
+        let inputs = [crate::request::CreateResponseInput::Flex(
+            crate::request::CreateFlexInput {
+                request_id,
+                body: r#"{"input":"hi","service_tier":"flex","background":true}"#.to_string(),
+                model: "model".to_string(),
+                endpoint: "http://example".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/responses".to_string(),
+                api_key: String::new(),
+                created_by: "user".to_string(),
+            },
+        )];
+
+        manager.create_responses_batch(&inputs).await.unwrap();
+
+        let row = sqlx::query(
+            "SELECT t.body, t.body_byte_size FROM request_templates t \
+             JOIN requests r ON r.template_id = t.id WHERE r.id = $1",
+        )
+        .bind(request_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let body: String = row.get("body");
+        assert_eq!(body, r#"{"input":"hi"}"#);
+        assert_eq!(row.get::<i64, _>("body_byte_size"), body.len() as i64);
+    }
+
+    #[sqlx::test]
+    async fn test_create_responses_batch_rejects_whitespace_created_by_atomically(
+        pool: sqlx::PgPool,
+    ) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+        let inputs = vec![
+            crate::request::CreateResponseInput::Flex(crate::request::CreateFlexInput {
+                request_id: uuid::Uuid::new_v4(),
+                body: "{}".to_string(),
+                model: "valid".to_string(),
+                endpoint: "http://example".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/responses".to_string(),
+                api_key: String::new(),
+                created_by: "valid-user".to_string(),
+            }),
+            crate::request::CreateResponseInput::Realtime(crate::request::CreateRealtimeInput {
+                request_id: uuid::Uuid::new_v4(),
+                body: "{}".to_string(),
+                model: "invalid".to_string(),
+                endpoint: "http://example".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/responses".to_string(),
+                api_key: String::new(),
+                created_by: "   ".to_string(),
+            }),
+        ];
+
+        assert!(manager.create_responses_batch(&inputs).await.is_err());
+        let request_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM requests")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let template_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_templates")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!((request_count, template_count), (0, 0));
+    }
+
+    #[sqlx::test]
+    async fn test_create_responses_batch_rejects_non_space_whitespace_created_by(
+        pool: sqlx::PgPool,
+    ) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+        let inputs = [crate::request::CreateResponseInput::Flex(
+            crate::request::CreateFlexInput {
+                request_id: uuid::Uuid::new_v4(),
+                body: "{}".to_string(),
+                model: "model".to_string(),
+                endpoint: "http://example".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/responses".to_string(),
+                api_key: String::new(),
+                created_by: "\t\n\u{2003}".to_string(),
+            },
+        )];
+
+        assert!(manager.create_responses_batch(&inputs).await.is_err());
+        let request_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM requests")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let template_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_templates")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!((request_count, template_count), (0, 0));
+    }
+
+    #[sqlx::test]
+    async fn test_create_responses_batch_normalizes_surrounding_non_space_whitespace(
+        pool: sqlx::PgPool,
+    ) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+        let request_id = uuid::Uuid::new_v4();
+        let inputs = [crate::request::CreateResponseInput::Realtime(
+            crate::request::CreateRealtimeInput {
+                request_id,
+                body: "{}".to_string(),
+                model: "model".to_string(),
+                endpoint: "http://example".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/responses".to_string(),
+                api_key: String::new(),
+                created_by: "\t\u{2003}user-123\u{2003}\n".to_string(),
+            },
+        )];
+
+        manager.create_responses_batch(&inputs).await.unwrap();
+
+        let created_by: String =
+            sqlx::query_scalar("SELECT created_by FROM requests WHERE id = $1")
+                .bind(request_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(created_by, "user-123");
+    }
+
+    #[sqlx::test]
+    async fn test_create_responses_batch_duplicate_id_rolls_back_templates(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+        let duplicate_id = uuid::Uuid::new_v4();
+        let make_input = |model: &str| {
+            crate::request::CreateResponseInput::Flex(crate::request::CreateFlexInput {
+                request_id: duplicate_id,
+                body: "{}".to_string(),
+                model: model.to_string(),
+                endpoint: "http://example".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/responses".to_string(),
+                api_key: String::new(),
+                created_by: "user".to_string(),
+            })
+        };
+
+        assert!(
+            manager
+                .create_responses_batch(&[make_input("one"), make_input("two")])
+                .await
+                .is_err()
+        );
+        let request_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM requests")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let template_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_templates")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!((request_count, template_count), (0, 0));
+    }
 
     #[sqlx::test]
     async fn test_create_flex_pending(pool: sqlx::PgPool) {

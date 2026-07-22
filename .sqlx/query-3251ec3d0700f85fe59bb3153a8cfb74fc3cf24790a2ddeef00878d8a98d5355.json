@@ -1,0 +1,20 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO requests (\n                id, batch_id, template_id, model, custom_id, state, retry_attempt,\n                service_tier, created_by, daemon_id, claimed_at, started_at\n            )\n            SELECT id, NULL, template_id, model, NULL,\n                   CASE WHEN realtime THEN 'processing' ELSE 'pending' END,\n                   0,\n                   CASE WHEN realtime THEN 'priority' ELSE 'flex' END,\n                   NULLIF(TRIM(created_by), ''),\n                   CASE WHEN realtime THEN $1::uuid ELSE NULL END,\n                   CASE WHEN realtime THEN $2::timestamptz ELSE NULL END,\n                   CASE WHEN realtime THEN $2::timestamptz ELSE NULL END\n            FROM UNNEST(\n                $3::uuid[], $4::uuid[], $5::text[], $6::text[], $7::bool[]\n            ) AS r(id, template_id, model, created_by, realtime)\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Timestamptz",
+        "UuidArray",
+        "UuidArray",
+        "TextArray",
+        "TextArray",
+        "BoolArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "3251ec3d0700f85fe59bb3153a8cfb74fc3cf24790a2ddeef00878d8a98d5355"
+}
