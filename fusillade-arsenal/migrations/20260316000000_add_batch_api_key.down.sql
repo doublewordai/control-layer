@@ -1,0 +1,1 @@
+ALTER TABLE batches DROP COLUMN IF EXISTS api_key;

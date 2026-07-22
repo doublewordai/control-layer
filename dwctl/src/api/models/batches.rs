@@ -183,7 +183,8 @@ pub struct BatchResponse {
     "total_tokens": 75000,
     "avg_duration_ms": 1250.5,
     "avg_ttfb_ms": 150.2,
-    "total_cost": "0.75"
+    "total_cost": "0.75",
+    "total_list_cost": "1.50"
 }))]
 pub struct BatchAnalytics {
     /// Total number of requests with analytics data
@@ -217,10 +218,20 @@ pub struct BatchAnalytics {
     #[schema(example = 150.2)]
     pub avg_ttfb_ms: Option<f64>,
 
-    /// Total cost in credits (if pricing is available)
+    /// Total BILLED cost in credits (if pricing is available) — what the batch actually cost
+    /// after prompt-cache discounts, matching the credits ledger / transactions page. (Until
+    /// 2026-07 this field erroneously reported the un-discounted list price; see
+    /// `total_list_cost` for that figure.)
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(example = "0.75")]
     pub total_cost: Option<String>,
+
+    /// Un-discounted list price of the same requests (no prompt-cache discounts applied).
+    /// `total_list_cost - total_cost` = what caching saved on this batch. Additive field —
+    /// clients that don't know it simply ignore it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = "1.50")]
+    pub total_list_cost: Option<String>,
 }
 
 /// Object type - always "batch"
