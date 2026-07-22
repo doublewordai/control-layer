@@ -1205,7 +1205,7 @@ where
             served_bys.push(crate::metrics::served_by_host(record.raw.served_by.as_deref()));
             api_key_ids_credit.push(record.api_key_id);
             service_tiers
-                .push(compute_service_tier(record.raw.fusillade_batch_id, record.raw.batch_completion_window.as_deref()).to_string());
+                .push(compute_billing_tier(record.raw.fusillade_batch_id, record.raw.batch_completion_window.as_deref()).to_string());
             fusillade_request_ids_credit.push(record.raw.fusillade_request_id);
         }
 
@@ -1446,7 +1446,7 @@ where
 
             let af = analytics_folds.entry(batch_id).or_insert_with(|| AnalyticsFold {
                 user_id,
-                service_tier: compute_service_tier(record.raw.fusillade_batch_id, record.raw.batch_completion_window.as_deref())
+                service_tier: compute_billing_tier(record.raw.fusillade_batch_id, record.raw.batch_completion_window.as_deref())
                     .to_string(),
                 min_created_at: record.raw.timestamp,
                 total_requests: 0,
@@ -1659,7 +1659,12 @@ fn compute_request_origin(api_key_purpose: Option<&ApiKeyPurpose>, fusillade_bat
     }
 }
 
-/// Compute the billing service tier from the fusillade metadata.
+/// Compute the Doubleword billing tier from the fusillade metadata.
+///
+/// This is our product/billing classification, deliberately named apart from
+/// the OpenAI-compatible `service_tier` request parameter (whose values —
+/// "auto", "priority", "flex" — don't map 1:1 onto it). The ledger persists it
+/// in columns historically named `service_tier`.
 ///
 /// Distinguished by whether the request was queued through fusillade (has a
 /// `fusillade_batch_id`) and its SLA (`completion_window`):
@@ -1667,7 +1672,7 @@ fn compute_request_origin(api_key_purpose: Option<&ApiKeyPurpose>, fusillade_bat
 /// - `flex`     — 1h SLA, no batch id (async single request)
 /// - `async`    — 1h SLA with a batch id
 /// - `batch`    — 24h SLA with a batch id (the /v1/batches API)
-fn compute_service_tier(fusillade_batch_id: Option<Uuid>, completion_window: Option<&str>) -> &'static str {
+pub(crate) fn compute_billing_tier(fusillade_batch_id: Option<Uuid>, completion_window: Option<&str>) -> &'static str {
     let window = completion_window.filter(|w| !w.is_empty());
     match (fusillade_batch_id.is_some(), window) {
         (false, None) => "realtime",
@@ -1682,13 +1687,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_compute_service_tier() {
+    fn test_compute_billing_tier() {
         let batch_id = Uuid::new_v4();
-        assert_eq!(compute_service_tier(None, None), "realtime");
-        assert_eq!(compute_service_tier(None, Some("")), "realtime");
-        assert_eq!(compute_service_tier(None, Some("1h")), "flex");
-        assert_eq!(compute_service_tier(Some(batch_id), Some("1h")), "async");
-        assert_eq!(compute_service_tier(Some(batch_id), Some("24h")), "batch");
+        assert_eq!(compute_billing_tier(None, None), "realtime");
+        assert_eq!(compute_billing_tier(None, Some("")), "realtime");
+        assert_eq!(compute_billing_tier(None, Some("1h")), "flex");
+        assert_eq!(compute_billing_tier(Some(batch_id), Some("1h")), "async");
+        assert_eq!(compute_billing_tier(Some(batch_id), Some("24h")), "batch");
     }
 
     #[test]
