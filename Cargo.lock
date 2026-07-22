@@ -1882,7 +1882,7 @@ checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
 
 [[package]]
 name = "dwctl"
-version = "8.94.2"
+version = "8.95.1"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -2355,11 +2355,10 @@ checksum = "e6d5a32815ae3f33302d95fdcb2ce17862f8c65363dcfd29360480ba1001fc9c"
 [[package]]
 name = "fusillade"
 version = "24.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1f9c53b88361ccafb9d8cc483c1eff776fbee515f85f3a63e9c28d7fa25ac3b8"
 dependencies = [
  "anyhow",
  "async-trait",
+ "axum",
  "bytes",
  "chrono",
  "dashmap",
@@ -2379,6 +2378,8 @@ dependencies = [
  "scopeguard",
  "serde",
  "serde_json",
+ "sqlx",
+ "test-log",
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
@@ -2391,12 +2392,11 @@ dependencies = [
 [[package]]
 name = "fusillade-arsenal"
 version = "3.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fae1c3be5660435191bce4657fb04e90041e8eb01a84037686b0fa4ea57e7c0a"
 dependencies = [
  "anyhow",
  "async-stream",
  "async-trait",
+ "axum",
  "chrono",
  "dashmap",
  "either",
@@ -2409,6 +2409,7 @@ dependencies = [
  "serde_json",
  "sqlx",
  "sqlx-pool-router",
+ "test-log",
  "tokio",
  "tokio-stream",
  "tokio-util",
@@ -2419,11 +2420,10 @@ dependencies = [
 [[package]]
 name = "fusillade-core"
 version = "4.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f335ed1e24e0510e131d8af71da3fa83a194410fed96d9d4dc6ab74ba0c3f114"
 dependencies = [
  "anyhow",
  "async-trait",
+ "axum",
  "chrono",
  "futures",
  "serde",
@@ -2616,6 +2616,12 @@ dependencies = [
  "opaque-debug",
  "polyval",
 ]
+
+[[package]]
+name = "glob"
+version = "0.3.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e4eba85ea1d0a966a983acd07deee566e67395d2d96b6fb39e62b5a833f1eb0b"
 
 [[package]]
 name = "google-cloud-auth"
@@ -4265,15 +4271,14 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "onwards"
-version = "0.35.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fff26aa9acd1e23db37fc96e8ef6f3dc97ae57606639f0f13d44c159c07efb72"
+version = "0.36.0"
 dependencies = [
  "anyhow",
  "async-stream",
  "async-trait",
  "axum",
  "axum-prometheus",
+ "axum-test",
  "bon",
  "brotli",
  "bytes",
@@ -4295,16 +4300,19 @@ dependencies = [
  "opentelemetry-otlp",
  "opentelemetry_sdk",
  "rand 0.9.4",
+ "rstest",
  "serde",
  "serde_json",
  "subtle",
  "tokio",
  "tokio-stream",
+ "tower",
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
  "url",
  "uuid",
+ "wiremock",
 ]
 
 [[package]]
@@ -5314,6 +5322,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
 
 [[package]]
+name = "relative-path"
+version = "1.9.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ba39f3699c378cd8970968dcbff9c43159ea4cfbd88d43c00b22f2ef10a435d2"
+
+[[package]]
 name = "rend"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5557,6 +5571,35 @@ dependencies = [
  "spki",
  "subtle",
  "zeroize",
+]
+
+[[package]]
+name = "rstest"
+version = "0.26.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f5a3193c063baaa2a95a33f03035c8a72b83d97a54916055ba22d35ed3839d49"
+dependencies = [
+ "futures-timer",
+ "futures-util",
+ "rstest_macros",
+]
+
+[[package]]
+name = "rstest_macros"
+version = "0.26.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9c845311f0ff7951c5506121a9ad75aec44d083c31583b2ea5a30bcb0b0abba0"
+dependencies = [
+ "cfg-if",
+ "glob",
+ "proc-macro-crate",
+ "proc-macro2",
+ "quote",
+ "regex",
+ "relative-path",
+ "rustc_version",
+ "syn 2.0.117",
+ "unicode-ident",
 ]
 
 [[package]]

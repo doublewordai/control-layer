@@ -810,6 +810,7 @@ pub async fn get_batch_analytics(pool: &PgPool, batch_id: &Uuid) -> Result<Optio
             count_duration_ms,
             sum_ttfb_ms,
             count_ttfb_ms,
+            total_amount,
             total_list_cost
         FROM batch_aggregates
         WHERE fusillade_batch_id = $1
@@ -830,6 +831,7 @@ pub async fn get_batch_analytics(pool: &PgPool, batch_id: &Uuid) -> Result<Optio
             r.count_duration_ms,
             r.sum_ttfb_ms,
             r.count_ttfb_ms,
+            r.total_amount,
             r.total_list_cost,
         )
     }))
@@ -850,6 +852,7 @@ fn batch_analytics_from_row(
     count_duration_ms: i64,
     sum_ttfb_ms: i64,
     count_ttfb_ms: i64,
+    total_amount: Decimal,
     total_list_cost: Decimal,
 ) -> BatchAnalytics {
     let avg = |sum: i64, count: i64| (count > 0).then(|| sum as f64 / count as f64);
@@ -861,7 +864,13 @@ fn batch_analytics_from_row(
         total_tokens,
         avg_duration_ms: avg(sum_duration_ms, count_duration_ms),
         avg_ttfb_ms: avg(sum_ttfb_ms, count_ttfb_ms),
-        total_cost: Some(total_list_cost.to_string()),
+        // BILLED cost (`total_amount`, folded from the credits ledger) — the cache-aware amount
+        // the customer actually paid. This endpoint historically recomputed price x tokens (list
+        // price, cache-unaware) and the COR-524 denorm faithfully preserved that as
+        // `total_list_cost`; customers read this field as "what I was billed", so it now serves
+        // the billed figure, with the list price alongside for the savings delta.
+        total_cost: Some(total_amount.to_string()),
+        total_list_cost: Some(total_list_cost.to_string()),
     }
 }
 
@@ -886,6 +895,7 @@ pub async fn get_batches_analytics_bulk(pool: &PgPool, batch_ids: &[Uuid]) -> Re
             count_duration_ms,
             sum_ttfb_ms,
             count_ttfb_ms,
+            total_amount,
             total_list_cost
         FROM batch_aggregates
         WHERE fusillade_batch_id = ANY($1)
@@ -910,6 +920,7 @@ pub async fn get_batches_analytics_bulk(pool: &PgPool, batch_ids: &[Uuid]) -> Re
                 row.count_duration_ms,
                 row.sum_ttfb_ms,
                 row.count_ttfb_ms,
+                row.total_amount,
                 row.total_list_cost,
             ),
         );
@@ -1889,6 +1900,48 @@ mod tests {
         let cost = result.total_cost.unwrap();
         let cost_f64: f64 = cost.parse().unwrap();
         assert!((cost_f64 - 0.0025).abs() < 0.00001);
+    }
+
+    #[sqlx::test]
+    async fn test_get_batch_analytics_serves_billed_cost_not_list_price(pool: PgPool) {
+        // The regression a customer caught from outside (2026-07): the endpoint served
+        // `total_list_cost` (un-discounted list price) as `total_cost`, while the ledger billed
+        // the cache-discounted amount. The test helper folds equal billed/list values, so this
+        // test writes a row where they DIFFER — a batch whose prompts were largely served from
+        // the prompt cache — and pins: `total_cost` = the billed `total_amount`, with the list
+        // price surfaced separately as `total_list_cost`.
+        use crate::api::models::users::Role;
+        use crate::test::utils::create_test_user;
+
+        let batch_id = Uuid::new_v4();
+        let user_id = create_test_user(&pool, Role::StandardUser).await.id;
+        sqlx::query!(
+            r#"
+            INSERT INTO batch_aggregates (
+                fusillade_batch_id, user_id, total_amount, transaction_count, max_seq, service_tier,
+                total_requests, total_prompt_tokens, total_completion_tokens, total_reasoning_tokens,
+                total_tokens, sum_duration_ms, count_duration_ms, sum_ttfb_ms, count_ttfb_ms,
+                total_list_cost
+            )
+            VALUES ($1, $2, 0.0199, 1000, 1, 'batch', 1000, 1433730, 50000, 0, 1483730, 500000, 1000, 0, 0, 0.0422)
+            "#,
+            batch_id,
+            user_id,
+        )
+        .execute(&pool)
+        .await
+        .expect("insert batch_aggregates row");
+
+        let result = get_batch_analytics(&pool, &batch_id)
+            .await
+            .unwrap()
+            .expect("batch has batch_aggregates analytics");
+
+        let billed: f64 = result.total_cost.expect("billed cost present").parse().unwrap();
+        let list: f64 = result.total_list_cost.expect("list cost present").parse().unwrap();
+        assert!((billed - 0.0199).abs() < 1e-9, "total_cost must be the BILLED amount, got {billed}");
+        assert!((list - 0.0422).abs() < 1e-9, "total_list_cost must be the list price, got {list}");
+        assert!(billed < list, "cache-discounted billed cost sits below list price");
     }
 
     #[sqlx::test]

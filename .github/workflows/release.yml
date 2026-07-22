@@ -3,10 +3,16 @@ name: Release
 on:
   release:
     types: [published]
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Onwards release tag to retry
+        required: true
+        type: string
 
 jobs:
   build:
-    if: ${{ !github.event.release.prerelease }}
+    if: ${{ !github.event.release.prerelease && startsWith(github.event.release.tag_name, 'v') }}
     runs-on: depot-ubuntu-24.04
 
     permissions:
@@ -67,7 +73,7 @@ jobs:
           curl -X POST "https://charts.somnial.co/doubleword-control-layer/docker-build-duration?value=${BUILD_DURATION}" || true
 
   notify-deploy:
-    if: ${{ !github.event.release.prerelease }}
+    if: ${{ !github.event.release.prerelease && startsWith(github.event.release.tag_name, 'v') }}
     needs: [build]
     runs-on: ubuntu-latest
 
@@ -88,41 +94,218 @@ jobs:
             })
             console.log(`Triggered deployment for version ${{ github.event.release.tag_name }}`)
 
-  publish-crates:
-    if: ${{ !github.event.release.prerelease }}
+  publish-onwards:
+    if: >-
+      ${{
+        (github.event_name == 'release' &&
+          !github.event.release.prerelease &&
+          startsWith(github.event.release.tag_name, 'onwards-v')) ||
+        (github.event_name == 'workflow_dispatch' &&
+          startsWith(inputs.release_tag, 'onwards-v'))
+      }}
     runs-on: depot-ubuntu-24.04
 
+    permissions:
+      contents: write
+
     steps:
-      - name: Checkout code
+      - name: Checkout Onwards release
         uses: actions/checkout@v6
-
-      - name: Install pnpm
-        uses: pnpm/action-setup@v5
         with:
-          version: 10
+          ref: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.release_tag }}
 
-      - name: Setup Node.js
-        uses: actions/setup-node@v6
+      - name: Checkout current release tooling
+        uses: actions/checkout@v6
         with:
-          node-version: "24"
-          cache: "pnpm"
-          cache-dependency-path: dashboard/pnpm-lock.yaml
+          ref: ${{ github.event.repository.default_branch }}
+          path: .release-tools
+
+      - name: Keep the application release marked latest
+        uses: actions/github-script@v9
+        env:
+          RELEASE_TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.release_tag }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const {data: release} = await github.rest.repos.getReleaseByTag({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              tag: process.env.RELEASE_TAG
+            })
+            await github.rest.repos.updateRelease({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              release_id: release.id,
+              make_latest: 'false'
+            })
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Install just
-        uses: extractions/setup-just@v3
-
-      - name: Copy SQLx metadata to dwctl package
-        run: |
-          echo "Copying .sqlx/ from workspace root to dwctl/"
-          cp -r .sqlx/ dwctl/.sqlx/
-          echo "SQLx metadata copied successfully"
-
-      - name: Publish to crates.io
-        run: just release
+      - name: Publish Onwards to crates.io
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          RELEASE_TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.release_tag }}
+        run: .release-tools/.github/scripts/publish-onwards-crate.sh "$RELEASE_TAG"
+
+  onwards-image:
+    if: >-
+      ${{
+        (github.event_name == 'release' &&
+          !github.event.release.prerelease &&
+          startsWith(github.event.release.tag_name, 'onwards-v')) ||
+        (github.event_name == 'workflow_dispatch' &&
+          startsWith(inputs.release_tag, 'onwards-v'))
+      }}
+    needs: [publish-onwards]
+    runs-on: depot-ubuntu-24.04
+    outputs:
+      digest: ${{ steps.onwards-build.outputs.digest }}
+
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+
+    steps:
+      - name: Checkout Onwards release
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.release_tag }}
+
+      - name: Resolve Onwards version
+        id: version
+        env:
+          RELEASE_TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.release_tag }}
+        run: |
+          VERSION="${RELEASE_TAG#onwards-v}"
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Invalid Onwards release tag: $RELEASE_TAG" >&2
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Onwards image metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/doublewordai/onwards
+          sep-tags: "\n"
+          tags: |
+            type=raw,value=v${{ steps.version.outputs.version }}
+            type=semver,pattern={{version}},value=${{ steps.version.outputs.version }}
+
+      - name: Build and push Onwards image
+        id: onwards-build
+        uses: depot/build-push-action@v1
+        with:
+          context: .
+          file: ./onwards/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          sbom: true
+          provenance: true
+
+  promote-onwards-image:
+    needs: [onwards-image]
+    if: ${{ needs.onwards-image.result == 'success' }}
+    runs-on: ubuntu-latest
+    concurrency:
+      # Only mutable aliases are serialized. Immutable version images have
+      # already been built by the unconstrained job above, and every promotion
+      # stays queued so a historical retry cannot displace a newer repair.
+      group: onwards-image-floating-tags
+      queue: max
+      cancel-in-progress: false
+
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout current release tooling
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          sparse-checkout: .github/scripts/onwards-floating-tags.cjs
+          sparse-checkout-cone-mode: false
+
+      - name: Resolve Onwards version
+        id: version
+        env:
+          RELEASE_TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.release_tag }}
+        run: |
+          VERSION="${RELEASE_TAG#onwards-v}"
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Invalid Onwards release tag: $RELEASE_TAG" >&2
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "series=${VERSION%.*}" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      # Keep this eligibility check immediately before promotion. A newer
+      # release that arrives while an immutable image is building will be
+      # visible here, so an older build cannot move aliases backwards.
+      - name: Determine whether this is the newest Onwards release
+        id: floating
+        uses: actions/github-script@v9
+        env:
+          RELEASE_TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.release_tag }}
+        with:
+          script: |
+            const path = require('node:path')
+            const resolverPath = path.join(
+              process.env.GITHUB_WORKSPACE,
+              '.github/scripts/onwards-floating-tags.cjs'
+            )
+            const {shouldPublishFloatingTags} = require(resolverPath)
+            const releases = await github.paginate(
+              github.rest.repos.listReleases,
+              {
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                per_page: 100
+              }
+            )
+            const enabled = shouldPublishFloatingTags(
+              process.env.RELEASE_TAG,
+              releases
+            )
+            core.setOutput('enabled', enabled ? 'true' : 'false')
+            core.info(
+              enabled
+                ? `${process.env.RELEASE_TAG} is the newest stable Onwards release; refreshing floating tags.`
+                : `${process.env.RELEASE_TAG} is not the newest stable Onwards release; preserving floating tags.`
+            )
+
+      - name: Promote floating Onwards image tags
+        if: ${{ steps.floating.outputs.enabled == 'true' }}
+        env:
+          IMAGE_DIGEST: ${{ needs.onwards-image.outputs.digest }}
+          SERIES: ${{ steps.version.outputs.series }}
+        run: |
+          docker buildx imagetools create \
+            --tag "ghcr.io/doublewordai/onwards:${SERIES}" \
+            --tag "ghcr.io/doublewordai/onwards:latest" \
+            "ghcr.io/doublewordai/onwards@${IMAGE_DIGEST}"

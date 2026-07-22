@@ -1,7 +1,8 @@
 [package]
 name = "dwctl"
-version = "8.94.2"
+version = "8.95.1" # x-release-please-version
 edition = "2024"
+publish = false
 description = "The Doubleword Control Layer - A self-hostable observability and analytics platform for LLM applications"
 license = "MIT OR Apache-2.0"
 
@@ -19,8 +20,8 @@ embedded-db = ["dep:postgresql_embedded"]
 
 [dependencies]
 axum = { version = "0.8", features = ["multipart"] }
-fusillade = "24.1.0"
-fusillade-arsenal = "3.0.0"
+fusillade = { path = "../fusillade" }
+fusillade-arsenal = { path = "../fusillade-arsenal" }
 tokio = { version = "1.0", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 tokio-util = "0.7"
@@ -81,7 +82,7 @@ jsonwebtoken = { version = "10", features = ["rust_crypto"] }
 argon2 = "0.5"
 base64 = "0.22"
 bytes = "1.5"
-onwards = { version = "0.35.6", features = ["multi-step"] }
+onwards = { path = "../onwards", features = ["multi-step"] }
 thiserror = "2.0.14"
 axum-prometheus = "0.10"
 # Metrics facade and exporter (same versions as axum-prometheus uses)

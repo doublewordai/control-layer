@@ -18,11 +18,8 @@
 //!   and asserting the sentinel does not appear. `#[sqlx::test]` runs on a
 //!   `current_thread` tokio runtime (sqlx `test_block_on`), so a thread-local
 //!   subscriber reliably captures the daemon's spawned-task logs — the test
-//!   includes a positive control that proves capture works. It is currently
-//!   `#[ignore]`d: it already caught a real leak — the *published* fusillade
-//!   logs the provider error body at WARN in `to_error_message()`, which a
-//!   later fusillade release scrubs — so it activates once control-layer bumps fusillade to
-//!   the release containing that fix. (The prompt-sentinel half already passes.)
+//!   includes a positive control that proves capture works. The local fusillade
+//!   crate scrubs the provider error body before it reaches terminal-failure logs.
 //!
 //! ## What is covered elsewhere
 //!
@@ -325,14 +322,6 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
 /// `#[sqlx::test]` uses a `current_thread` runtime (sqlx `test_block_on`), so the
 /// thread-local subscriber installed here captures the daemon's spawned-task
 /// logs. A positive control (a marker logged from a spawned task) proves that.
-///
-/// IGNORED until control-layer's `fusillade` dependency is bumped to a release
-/// containing that fix. This test was written *first* and immediately caught the
-/// real leak: published fusillade (19.0.1) logs the provider error body verbatim
-/// at WARN in `FailureReason::to_error_message()` on terminal failure — live in
-/// prod. A later fusillade release scrubs it; un-ignore once that lands here via the
-/// dependency bump. (The prompt-sentinel half of this test already passes.)
-#[ignore = "async/flex error-body leak fixed in fusillade; un-ignore after the control-layer fusillade bump"]
 #[sqlx::test]
 async fn zdr_sentinel_async_batch_failure_does_not_log_payload(pool: PgPool) {
     // Capture every tracing event on this (single) test thread for the whole test.
@@ -477,9 +466,6 @@ async fn zdr_sentinel_async_batch_failure_does_not_log_payload(pool: PgPool) {
     assert!(!logs.contains(ASYNC_PROMPT_SENTINEL), "prompt content leaked into async/flex logs");
     assert!(
         !logs.contains(ASYNC_ERROR_SENTINEL),
-        "provider error body leaked into async/flex logs (fusillade daemon \
-         terminal-failure log). Fixed in fusillade — un-ignore this \
-         test once control-layer's fusillade dependency is bumped to the release \
-         containing that scrub."
+        "provider error body leaked into async/flex logs (fusillade daemon terminal-failure log)"
     );
 }

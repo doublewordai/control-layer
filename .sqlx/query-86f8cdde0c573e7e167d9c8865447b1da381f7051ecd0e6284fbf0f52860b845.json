@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            WITH to_delete AS (\n                SELECT id FROM batches\n                WHERE created_by = $1\n                  AND deleted_at IS NULL\n                LIMIT $2\n                FOR UPDATE SKIP LOCKED\n            )\n            UPDATE batches b\n            SET deleted_at = NOW(),\n                metadata = NULL,\n                cancelling_at = CASE\n                    WHEN b.completed_at IS NULL AND b.failed_at IS NULL AND b.cancelled_at IS NULL\n                        THEN COALESCE(b.cancelling_at, NOW())\n                    ELSE b.cancelling_at\n                END,\n                cancelled_at = CASE\n                    WHEN b.completed_at IS NULL AND b.failed_at IS NULL AND b.cancelled_at IS NULL\n                        THEN COALESCE(b.cancelled_at, NOW())\n                    ELSE b.cancelled_at\n                END\n            FROM to_delete td\n            WHERE b.id = td.id\n            RETURNING b.id\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "86f8cdde0c573e7e167d9c8865447b1da381f7051ecd0e6284fbf0f52860b845"
+}

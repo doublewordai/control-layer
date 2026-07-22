@@ -1,10 +1,25 @@
 {
+  "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
+  "include-component-in-tag": false,
   "packages": {
-    "dwctl": {
+    ".": {
+      "component": "dwctl",
+      "package-name": "dwctl",
+      "release-type": "simple",
+      "changelog-path": "CHANGELOG.md",
+      "extra-files": [
+        {
+          "type": "generic",
+          "path": "dwctl/Cargo.toml"
+        }
+      ]
+    },
+    "onwards": {
+      "component": "onwards",
+      "package-name": "onwards",
       "release-type": "rust",
-      "changelog-path": "/CHANGELOG.md"
+      "changelog-path": "CHANGELOG.md",
+      "include-component-in-tag": true
     }
-  },
-  "plugins": ["cargo-workspace"],
-  "include-component-in-tag": false
+  }
 }
