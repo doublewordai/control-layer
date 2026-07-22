@@ -75,6 +75,13 @@ class PreviewWorkflowTest < Minitest::Test
       refute_includes workflow, "PREVIEW_DISPATCH_REPOSITORY"
       refute_includes workflow, "DEPLOY_PAT"
     end
+
+    release_workflow = File.read(File.join(ROOT, ".github", "workflows", "release.yml"))
+    deployment_dispatch = release_workflow[/^  notify-deploy:\n.*?(?=^  \S)/m]
+    refute_nil deployment_dispatch
+    assert_includes deployment_dispatch,
+                    "uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9"
+    refute_includes deployment_dispatch, "uses: actions/github-script@v9"
   end
 
   def test_comment_driven_staging_build_is_removed
