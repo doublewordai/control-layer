@@ -94,6 +94,10 @@ for manifest_path, dependencies in local_dependencies.items():
 release_config = json.loads((root / "release-please-config.json").read_text())
 if set(release_config["packages"]) != {".", "onwards"}:
     raise SystemExit("Release Please must manage the application and Onwards independently")
+if release_config.get("separate-pull-requests") is not True:
+    raise SystemExit(
+        "Release Please must use component-specific PRs so single-component releases can be identified"
+    )
 root_release = release_config["packages"]["."]
 if root_release.get("release-type") != "simple":
     raise SystemExit("root application release must use the annotated simple strategy")
