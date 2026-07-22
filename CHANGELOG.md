@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.97.1](https://github.com/doublewordai/control-layer/compare/v8.97.0...v8.97.1) (2026-07-22)
+
+
+### Bug Fixes
+
+* retry cache-index ops once on connection errors (batch-pod burst… ([#1341](https://github.com/doublewordai/control-layer/issues/1341)) ([8d36a94](https://github.com/doublewordai/control-layer/commit/8d36a9412db193026a11ad6ef7920868f85d9a6b))
+
 ## [8.97.0](https://github.com/doublewordai/control-layer/compare/v8.96.0...v8.97.0) (2026-07-22)
 
 
