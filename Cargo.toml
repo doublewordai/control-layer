@@ -1,3 +1,10 @@
 [workspace]
-members = ["dwctl"]
+members = [
+  "dwctl",
+  "fusillade",
+  "fusillade-arsenal",
+  "fusillade-core",
+  "onwards",
+]
+default-members = ["dwctl"]
 resolver = "2"

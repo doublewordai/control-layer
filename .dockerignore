@@ -71,6 +71,3 @@ docker-compose*.yml
 .nuxt/
 .out/
 .vercel/
-
-# Large directories that aren't needed
-onwards/
