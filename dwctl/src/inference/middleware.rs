@@ -557,9 +557,11 @@ async fn resolve_flex_batch_api_key(pool: &sqlx::PgPool, api_key: Option<&str>) 
 
     // The cap-scope child is fetched in the same by-secret lookup (this runs
     // per flex request — no extra round trip). If the authenticating key has a
-    // child (`parent_api_key_id = ak.id`), the flex request executes on it so
-    // its spend counts against the key's spending cap; a key with no child is
-    // uncapped and falls through to the shared hidden batch key as before.
+    // cap-scope child (`parent_api_key_id = ak.id`), the flex request executes
+    // on it so spend can be attributed/enforced per key when a cap is set
+    // (children are minted at cap-set time and deliberately outlive cap
+    // removal). If no child exists, fall back to the shared hidden batch key
+    // as before.
     //
     // Invariant: the bearer here is always an external, user-visible key. The
     // only traffic that carries hidden batch keys (shared or cap-scope child)
@@ -592,7 +594,10 @@ async fn resolve_flex_batch_api_key(pool: &sqlx::PgPool, api_key: Option<&str>) 
     // NULL when the LEFT JOIN found no user row; a missing row counts as
     // unverified, matching `Users::is_verified`.
     let verified: bool = sqlx::Row::try_get(&row, "verified").ok().flatten().unwrap_or(false);
-    let child_secret: Option<String> = sqlx::Row::try_get(&row, "child_secret").ok().flatten();
+    // NULL (no child) decodes as None via the Option; genuine decode errors
+    // propagate rather than silently downgrading a capped key to the shared
+    // (uncapped) execution key.
+    let child_secret: Option<String> = sqlx::Row::try_get(&row, "child_secret")?;
 
     let secret = match child_secret {
         Some(secret) => secret,

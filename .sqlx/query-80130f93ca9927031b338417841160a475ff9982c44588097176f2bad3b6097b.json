@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            WITH ins AS (\n                INSERT INTO api_keys (name, description, secret, purpose, user_id, created_by, hidden, parent_api_key_id)\n                SELECT\n                    'Internal batch key (cap scope ' || p.id::text || ')',\n                    'Automatically managed internal API key executing batch/flex traffic for a capped API key. Not visible to users.',\n                    $1,\n                    'batch',\n                    p.user_id,\n                    p.created_by,\n                    true,\n                    p.id\n                FROM api_keys p\n                -- Parent must be a root visible key: no children of hidden\n                -- keys and no grandchildren (a child's parent is never itself\n                -- a valid parent).\n                WHERE p.id = $2 AND p.is_deleted = false AND p.hidden = false AND p.parent_api_key_id IS NULL\n                ON CONFLICT (parent_api_key_id, purpose) WHERE hidden = true AND is_deleted = false AND parent_api_key_id IS NOT NULL\n                DO NOTHING\n                RETURNING id, secret\n            )\n            SELECT id, secret FROM ins\n            UNION ALL\n            SELECT id, secret FROM api_keys\n            WHERE parent_api_key_id = $2 AND purpose = 'batch'\n              AND hidden = true AND is_deleted = false\n            LIMIT 1\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "secret",
+        "type_info": "Varchar"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Varchar",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null,
+      null
+    ]
+  },
+  "hash": "80130f93ca9927031b338417841160a475ff9982c44588097176f2bad3b6097b"
+}

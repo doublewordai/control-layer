@@ -210,11 +210,27 @@ impl<'c> Repository for ApiKeys<'c> {
 
     #[instrument(skip(self), fields(api_key_id = %abbrev_uuid(&id)), err)]
     async fn delete(&mut self, id: Self::Id) -> Result<bool> {
-        let result = sqlx::query!("UPDATE api_keys SET is_deleted = true WHERE id = $1 AND is_deleted = false", id)
-            .execute(&mut *self.db)
-            .await?;
+        // Soft-deleting a visible key also soft-deletes its cap-scope children
+        // (hidden batch keys with parent_api_key_id = id) in the same
+        // statement — otherwise a child would stay in onwards' key set and
+        // keep authorizing batch/flex work after the parent was revoked. The
+        // returned bool still reflects only whether the requested key itself
+        // was deleted.
+        let deleted = sqlx::query_scalar!(
+            r#"
+            WITH deleted AS (
+                UPDATE api_keys SET is_deleted = true
+                WHERE (id = $1 OR parent_api_key_id = $1) AND is_deleted = false
+                RETURNING id
+            )
+            SELECT EXISTS(SELECT 1 FROM deleted WHERE id = $1) AS "deleted!"
+            "#,
+            id
+        )
+        .fetch_one(&mut *self.db)
+        .await?;
 
-        Ok(result.rows_affected() > 0)
+        Ok(deleted)
     }
 
     #[instrument(skip(self, request), fields(api_key_id = %abbrev_uuid(&id)), err)]
@@ -470,7 +486,10 @@ impl<'c> ApiKeys<'c> {
                     true,
                     p.id
                 FROM api_keys p
-                WHERE p.id = $2 AND p.is_deleted = false
+                -- Parent must be a root visible key: no children of hidden
+                -- keys and no grandchildren (a child's parent is never itself
+                -- a valid parent).
+                WHERE p.id = $2 AND p.is_deleted = false AND p.hidden = false AND p.parent_api_key_id IS NULL
                 ON CONFLICT (parent_api_key_id, purpose) WHERE hidden = true AND is_deleted = false AND parent_api_key_id IS NOT NULL
                 DO NOTHING
                 RETURNING id, secret
@@ -1068,6 +1087,51 @@ mod tests {
         // Session flows still get the shared key even when a child exists.
         let (_, session_id) = repo.resolve_batch_execution_key(user, user, None).await.unwrap();
         assert_eq!(session_id, shared_id);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_delete_parent_cascades_to_child(pool: PgPool) {
+        let user = create_user(&pool, "cap-delete").await;
+        let key = create_visible_key(&pool, user, user).await;
+
+        let mut conn = pool.acquire().await.unwrap();
+        let mut repo = ApiKeys::new(&mut conn);
+        let (_, child_id) = repo.get_or_create_child_hidden_key(key.id).await.unwrap();
+
+        // Deleting the parent revokes the child in the same statement, so it
+        // drops out of onwards' key set with the parent.
+        assert!(repo.delete(key.id).await.unwrap());
+        assert!(repo.get_by_id(key.id).await.unwrap().is_none());
+        assert!(repo.get_by_id(child_id).await.unwrap().is_none());
+
+        // Second delete is a no-op and reports "not deleted".
+        assert!(!repo.delete(key.id).await.unwrap());
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_child_creation_guard_rejects_non_root_parents(pool: PgPool) {
+        let user = create_user(&pool, "cap-guard").await;
+        let key = create_visible_key(&pool, user, user).await;
+
+        let mut conn = pool.acquire().await.unwrap();
+        let mut repo = ApiKeys::new(&mut conn);
+        let (_, child_id) = repo.get_or_create_child_hidden_key(key.id).await.unwrap();
+        let (_, shared_id) = repo
+            .get_or_create_hidden_key_with_id(user, ApiKeyPurpose::Batch, user)
+            .await
+            .unwrap();
+
+        // No grandchildren (child as parent) and no children of hidden keys.
+        assert!(matches!(
+            repo.get_or_create_child_hidden_key(child_id).await,
+            Err(DbError::NotFound)
+        ));
+        assert!(matches!(
+            repo.get_or_create_child_hidden_key(shared_id).await,
+            Err(DbError::NotFound)
+        ));
     }
 
     #[sqlx::test]
