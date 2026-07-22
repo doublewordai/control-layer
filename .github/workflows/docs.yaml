@@ -35,12 +35,19 @@ jobs:
           curl -sSL "https://github.com/rust-lang/mdBook/releases/download/${MDBOOK_VERSION}/mdbook-${MDBOOK_VERSION}-x86_64-unknown-linux-gnu.tar.gz" | tar -xz
           echo "$PWD" >> "$GITHUB_PATH"
 
+      - name: Test documentation extensions
+        run: node --test .github/scripts/test-docs-sidebar-link.mjs
+
       - name: Build documentation
         run: |
           mdbook build docs --dest-dir "$RUNNER_TEMP/pages"
           mdbook build onwards/docs --dest-dir "$RUNNER_TEMP/pages/onwards"
           test -f "$RUNNER_TEMP/pages/index.html"
           test -f "$RUNNER_TEMP/pages/onwards/index.html"
+          sidebar_script_count="$(find "$RUNNER_TEMP/pages" -maxdepth 1 -type f -name 'sidebar-links-*.js' | wc -l | tr -d ' ')"
+          test "$sidebar_script_count" -eq 1
+          sidebar_script="$(find "$RUNNER_TEMP/pages" -maxdepth 1 -type f -name 'sidebar-links-*.js' -print -quit)"
+          grep -Fq "src=\"$(basename "$sidebar_script")\"" "$RUNNER_TEMP/pages/index.html"
           grep -q '/edit/main/docs/src/control-layer-overview.md' "$RUNNER_TEMP/pages/control-layer-overview.html"
           grep -q '/edit/main/onwards/docs/src/introduction.md' "$RUNNER_TEMP/pages/onwards/introduction.html"
           ! grep -R -q '/src/src/' "$RUNNER_TEMP/pages"
