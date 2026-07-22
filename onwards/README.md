@@ -235,12 +235,12 @@ netstat -an | grep TIME_WAIT | wc -l  # macOS/Linux
 
 ## Documentation
 
-Full documentation is available at **[doublewordai.github.io/onwards](https://doublewordai.github.io/onwards/)**, covering:
+Full documentation is available at **[doublewordai.github.io/control-layer/onwards](https://doublewordai.github.io/control-layer/onwards/)**, covering:
 
-- [Configuration reference](https://doublewordai.github.io/onwards/configuration.html)
-- [Authentication](https://doublewordai.github.io/onwards/authentication.html)
-- [Rate limiting](https://doublewordai.github.io/onwards/rate-limiting.html)
-- [Load balancing](https://doublewordai.github.io/onwards/load-balancing.html)
-- [Strict mode](https://doublewordai.github.io/onwards/strict-mode.html)
-- [Response sanitization](https://doublewordai.github.io/onwards/sanitization.html)
-- [Contributing](https://doublewordai.github.io/onwards/contributing.html)
+- [Configuration reference](https://doublewordai.github.io/control-layer/onwards/configuration.html)
+- [Authentication](https://doublewordai.github.io/control-layer/onwards/authentication.html)
+- [Rate limiting](https://doublewordai.github.io/control-layer/onwards/rate-limiting.html)
+- [Load balancing](https://doublewordai.github.io/control-layer/onwards/load-balancing.html)
+- [Strict mode](https://doublewordai.github.io/control-layer/onwards/strict-mode.html)
+- [Response sanitization](https://doublewordai.github.io/control-layer/onwards/sanitization.html)
+- [Contributing](https://doublewordai.github.io/control-layer/onwards/contributing.html)

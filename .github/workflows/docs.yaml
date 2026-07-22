@@ -4,23 +4,27 @@ on:
   push:
     branches: [main]
     paths:
+      - ".github/workflows/docs.yaml"
       - "docs/**"
-      - "README.md"
+      - "onwards/docs/**"
+  pull_request:
+    paths:
+      - ".github/workflows/docs.yaml"
+      - "docs/**"
+      - "onwards/docs/**"
+  workflow_dispatch:
 
 permissions:
-  pages: write
-  id-token: write
+  contents: read
 
 concurrency:
-  group: pages
+  group: pages-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
-  deploy:
+  build:
+    name: Build mdBooks
     runs-on: ubuntu-latest
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - uses: actions/checkout@v6
 
@@ -31,12 +35,32 @@ jobs:
           curl -sSL "https://github.com/rust-lang/mdBook/releases/download/${MDBOOK_VERSION}/mdbook-${MDBOOK_VERSION}-x86_64-unknown-linux-gnu.tar.gz" | tar -xz
           echo "$PWD" >> "$GITHUB_PATH"
 
-      - name: Build book
-        run: mdbook build docs
+      - name: Build documentation
+        run: |
+          mdbook build docs --dest-dir "$RUNNER_TEMP/pages"
+          mdbook build onwards/docs --dest-dir "$RUNNER_TEMP/pages/onwards"
+          test -f "$RUNNER_TEMP/pages/index.html"
+          test -f "$RUNNER_TEMP/pages/onwards/index.html"
+          grep -q '/edit/main/docs/src/control-layer-overview.md' "$RUNNER_TEMP/pages/control-layer-overview.html"
+          grep -q '/edit/main/onwards/docs/src/introduction.md' "$RUNNER_TEMP/pages/onwards/introduction.html"
+          ! grep -R -q '/src/src/' "$RUNNER_TEMP/pages"
 
-      - uses: actions/upload-pages-artifact@v4
+      - if: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' }}
+        uses: actions/upload-pages-artifact@v4
         with:
-          path: docs/book
+          path: ${{ runner.temp }}/pages
 
+  deploy:
+    name: Deploy GitHub Pages
+    if: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' }}
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
       - id: deployment
         uses: actions/deploy-pages@v4
