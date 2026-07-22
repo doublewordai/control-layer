@@ -53,9 +53,12 @@ impl GenAiMetrics {
         registry.register(Box::new(request_duration.clone()))?;
 
         // Time to first token histogram (recommended)
-        // Buckets from OTel spec: 0.001s to 10.0s
+        // Preserve the OTel buckets through 10s, then use a sparse tail through 120s.
+        // Each extra boundary adds a Prometheus series per label set, so spacing widens
+        // as latency increases.
         let ttft_buckets = vec![
-            0.001, 0.005, 0.01, 0.02, 0.04, 0.06, 0.08, 0.1, 0.25, 0.5, 0.75, 1.0, 2.5, 5.0, 7.5, 10.0,
+            0.001, 0.005, 0.01, 0.02, 0.04, 0.06, 0.08, 0.1, 0.25, 0.5, 0.75, 1.0, 2.5, 5.0, 7.5, 10.0, 12.5, 15.0, 20.0, 30.0, 45.0, 60.0,
+            90.0, 120.0,
         ];
         let time_to_first_token = HistogramVec::new(
             HistogramOpts::new(
@@ -317,6 +320,39 @@ mod tests {
     /// Helper to find a label value in a Prometheus metric
     fn find_label(labels: &[prometheus::proto::LabelPair], name: &str) -> Option<String> {
         labels.iter().find(|l| l.name() == name).map(|l| l.value().to_string())
+    }
+
+    #[test]
+    fn test_time_to_first_token_histogram_buckets_cover_slow_requests() {
+        let registry = Registry::new();
+        let metrics = GenAiMetrics::new(&registry).expect("Failed to create metrics");
+        metrics.record_time_to_first_token(
+            46.0,
+            &["chat", "provider", "request-model", "response-model", "localhost", "443", "api", ""],
+        );
+
+        let metric_families = registry.gather();
+        let ttft_histogram = metric_families
+            .iter()
+            .find(|metric| metric.name() == "gen_ai_server_time_to_first_token_seconds")
+            .expect("Should have time to first token metric")
+            .get_metric()
+            .first()
+            .expect("Should have a time to first token label set")
+            .get_histogram();
+        let upper_bounds = ttft_histogram
+            .get_bucket()
+            .iter()
+            .map(|bucket| bucket.upper_bound())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            upper_bounds,
+            vec![
+                0.001, 0.005, 0.01, 0.02, 0.04, 0.06, 0.08, 0.1, 0.25, 0.5, 0.75, 1.0, 2.5, 5.0, 7.5, 10.0, 12.5, 15.0, 20.0, 30.0, 45.0,
+                60.0, 90.0, 120.0,
+            ]
+        );
     }
 
     #[tokio::test]
