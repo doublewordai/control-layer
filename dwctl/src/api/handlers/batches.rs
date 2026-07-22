@@ -13,12 +13,14 @@ use crate::api::models::batches::{
     ListBatchesQuery, ListObjectType, RequestCounts, RetryRequestsRequest,
 };
 use crate::api::models::users::CurrentUser;
-use crate::auth::permissions::{RequiresPermission, can_read_all_resources, has_permission, operation, resource};
+use crate::auth::permissions::{
+    RequiresPermission, can_read_all_resources, can_run_background_inference, has_permission, operation, resource,
+};
 use crate::db::handlers::deployments::BatchModelInfo;
 use crate::db::handlers::{BatchTemplates, Connections, Credits, Deployments, Users, api_keys::ApiKeys, repository::Repository};
 use crate::db::models::api_keys::ApiKeyPurpose;
 use crate::errors::{Error, Result};
-use crate::types::{Operation, Resource};
+use crate::types::{Operation, Permission, Resource};
 use axum::{
     Json,
     body::Body,
@@ -366,12 +368,34 @@ fn to_batch_response_enriched(batch: fusillade::Batch, creator_email: Option<&st
     // Convert batch-level errors (validation errors, system errors, etc.)
     let errors = batch.errors.and_then(|e| serde_json::from_value::<BatchErrors>(e).ok());
 
-    // Check if batch has expired
-    let expired_at = if chrono::Utc::now() > batch.expires_at {
-        Some(batch.expires_at.timestamp())
+    // The OpenAI-shaped response predates no-SLA batches. Preserve the SLA
+    // window for ordinary batches and use the explicit tier name for
+    // background batches so callers never receive a fabricated deadline.
+    let is_background = batch.service_tier.as_deref() == Some("background");
+    let completion_window = if is_background {
+        "background".to_string()
     } else {
-        None
+        batch
+            .completion_window
+            .clone()
+            .expect("non-background batch must have a completion window")
     };
+    let expires_at = if is_background {
+        None
+    } else {
+        Some(
+            batch
+                .expires_at
+                .as_ref()
+                .expect("non-background batch must have an expiry")
+                .timestamp(),
+        )
+    };
+    let expired_at = batch
+        .expires_at
+        .as_ref()
+        .filter(|expires_at| !is_background && chrono::Utc::now() > **expires_at)
+        .map(|expires_at| expires_at.timestamp());
 
     BatchResponse {
         id: batch.id.0.to_string(),
@@ -379,14 +403,14 @@ fn to_batch_response_enriched(batch: fusillade::Batch, creator_email: Option<&st
         endpoint: batch.endpoint.clone(),
         errors,
         input_file_id: batch.file_id.map(|id| id.0.to_string()).unwrap_or_default(),
-        completion_window: batch.completion_window.clone(),
+        completion_window,
         status: openai_status.to_string(),
         output_file_id: batch.output_file_id.map(|id| id.0.to_string()),
         // Always show error_file_id if it exists - the file content itself is filtered by fusillade
         error_file_id: batch.error_file_id.map(|id| id.0.to_string()),
         created_at: batch.created_at.timestamp(),
         in_progress_at,
-        expires_at: Some(batch.expires_at.timestamp()),
+        expires_at,
         finalizing_at,
         completed_at,
         failed_at,
@@ -441,11 +465,20 @@ pub async fn create_batch<P: PoolProvider>(
     Json(req): Json<CreateBatchRequest>,
 ) -> Result<(StatusCode, Json<BatchResponse>)> {
     let config = state.current_config();
+    let is_background = req.completion_window == "background";
+    if is_background && !can_run_background_inference(&current_user) {
+        return Err(Error::InsufficientPermissions {
+            required: Permission::Allow(Resource::Batches, Operation::CreateOwn),
+            action: Operation::CreateOwn,
+            resource: "background inference; assign the BackgroundInferenceUser role to submit this completion_window".to_string(),
+        });
+    }
+
     // Users with Batches::CreateAll (PlatformManager, admins) can use any
     // completion window that humantime can parse. Everyone else is restricted
     // to the configured allowed values.
     let can_use_any_window = has_permission(&current_user, Resource::Batches, Operation::CreateAll);
-    if !can_use_any_window && !config.batches.allowed_completion_windows.contains(&req.completion_window) {
+    if !is_background && !can_use_any_window && !config.batches.allowed_completion_windows.contains(&req.completion_window) {
         let allowed: Vec<&str> = config.batches.allowed_completion_windows.iter().map(|w| w.as_str()).collect();
 
         return Err(Error::BadRequest {
@@ -512,7 +545,6 @@ pub async fn create_batch<P: PoolProvider>(
             .as_deref()
             .is_some_and(|owner| is_batch_owner(&current_user, owner))
     {
-        use crate::types::{Operation, Permission};
         return Err(Error::InsufficientPermissions {
             required: Permission::Allow(Resource::Files, Operation::ReadAll),
             action: Operation::CreateOwn,
@@ -568,7 +600,7 @@ pub async fn create_batch<P: PoolProvider>(
     let model_aliases: Vec<String> = file_model_counts.keys().cloned().collect();
 
     // Check per-model batch completion window restrictions (skipped for elevated users)
-    if !can_use_any_window {
+    if !is_background && !can_use_any_window {
         for (alias, allowed_windows) in &batch_model_info.allowed_windows {
             if !allowed_windows.contains(&req.completion_window) {
                 if allowed_windows.is_empty() {
@@ -628,67 +660,84 @@ pub async fn create_batch<P: PoolProvider>(
     // Create batch input — created_by uses org ID when in org context for ownership scoping
     let total_requests: i64 = file_model_counts.values().sum();
 
-    // Bound how much an unverified creditor can queue. Checked before reserving
-    // capacity / creating the batch so over-limit submissions are rejected up
-    // front. No-op for verified creditors or a disabled cap.
-    crate::api::handlers::unverified_volume::enforce_unverified_volume_limit(
-        &*state.request_manager,
-        config.batches.unverified_requests_per_completion_hour,
-        target_user_id,
-        target_verified,
-        &req.completion_window,
-        total_requests,
-        crate::api::handlers::unverified_volume::SubmissionKind::Batch,
-    )
-    .await?;
-
-    let batch_input = fusillade::BatchInput {
-        file_id: fusillade::FileId(file_id),
-        endpoint: req.endpoint.clone(),
-        completion_window: req.completion_window.clone(),
-        metadata,
-        created_by: Some(target_user_id.to_string()),
-        api_key_id: Some(api_key_id),
-        api_key: Some(batch_api_key),
-        total_requests: Some(total_requests),
-    };
-
-    let reservation_ids = reserve_capacity_for_batch(
-        &state,
-        &req.completion_window,
-        &file_model_counts,
-        &model_throughputs,
-        &model_ids_by_alias,
-        config.batches.relaxation_factor(&req.completion_window),
-    )
-    .await?;
-
-    // RAII guard: releases reservations when this scope exits, whether by normal
-    // return, early return (e.g. create_batch error), or unwind panic.
-    // The spawn is best-effort — the TTL is the true safety net if the runtime
-    // is unavailable at drop time.
-    let _release_guard = scopeguard::guard(reservation_ids.clone(), |ids| {
-        let state = state.clone();
-        tokio::runtime::Handle::current().spawn(async move {
-            if let Err(e) = release_capacity_reservations(&state, &ids).await {
-                tracing::warn!(
-                    reservation_ids = ?ids,
-                    error = %e,
-                    "Failed to release capacity reservations — will expire via TTL"
-                );
-            }
-        });
-    });
-
     // Batch record (fusillade DB) and job enqueue (dwctl DB) are on separate databases,
     // so true atomicity isn't possible. Each is a single independent write.
-    let batch = state
-        .request_manager
-        .create_batch_record(batch_input)
-        .await
-        .map_err(|e| Error::Internal {
-            operation: format!("create batch record: {}", e),
-        })?;
+    let batch = if is_background {
+        state
+            .request_manager
+            .create_background_batch_record(fusillade::BackgroundBatchInput {
+                file_id: fusillade::FileId(file_id),
+                endpoint: req.endpoint.clone(),
+                metadata,
+                created_by: Some(target_user_id.to_string()),
+                api_key_id: Some(api_key_id),
+                api_key: Some(batch_api_key),
+                total_requests: Some(total_requests),
+            })
+            .await
+            .map_err(|e| Error::Internal {
+                operation: format!("create background batch record: {e}"),
+            })?
+    } else {
+        // Bound how much an unverified creditor can queue. Checked before
+        // reserving capacity / creating the batch so over-limit SLA submissions
+        // are rejected up front. No-op for verified creditors or a disabled cap.
+        crate::api::handlers::unverified_volume::enforce_unverified_volume_limit(
+            &*state.request_manager,
+            config.batches.unverified_requests_per_completion_hour,
+            target_user_id,
+            target_verified,
+            &req.completion_window,
+            total_requests,
+            crate::api::handlers::unverified_volume::SubmissionKind::Batch,
+        )
+        .await?;
+
+        let batch_input = fusillade::BatchInput {
+            file_id: fusillade::FileId(file_id),
+            endpoint: req.endpoint.clone(),
+            completion_window: req.completion_window.clone(),
+            metadata,
+            created_by: Some(target_user_id.to_string()),
+            api_key_id: Some(api_key_id),
+            api_key: Some(batch_api_key),
+            total_requests: Some(total_requests),
+        };
+
+        let reservation_ids = reserve_capacity_for_batch(
+            &state,
+            &req.completion_window,
+            &file_model_counts,
+            &model_throughputs,
+            &model_ids_by_alias,
+            config.batches.relaxation_factor(&req.completion_window),
+        )
+        .await?;
+
+        // RAII guard: releases reservations when this scope exits, whether by
+        // normal return, early return, or unwind panic. The TTL is the final
+        // safety net if the best-effort spawn cannot run.
+        let _release_guard = scopeguard::guard(reservation_ids.clone(), |ids| {
+            let state = state.clone();
+            tokio::runtime::Handle::current().spawn(async move {
+                if let Err(e) = release_capacity_reservations(&state, &ids).await {
+                    tracing::warn!(
+                        reservation_ids = ?ids,
+                        error = %e,
+                        "Failed to release capacity reservations — will expire via TTL"
+                    );
+                }
+            });
+        });
+
+        state
+            .request_manager
+            .create_batch_record(batch_input)
+            .await
+            .map_err(|e| Error::Internal {
+                operation: format!("create batch record: {e}"),
+            })?
+    };
 
     // Enqueue background job to populate requests from templates.
     if let Err(e) = state
@@ -1739,6 +1788,7 @@ pub async fn list_batches<P: PoolProvider>(
             created_before: query.created_before,
             active_first: query.active_first,
             completion_windows,
+            service_tiers: None,
         })
         .await
         .map_err(|e| match &e {
@@ -1952,7 +2002,7 @@ pub async fn list_batches<P: PoolProvider>(
 
 #[cfg(test)]
 mod tests {
-    use super::{load_and_validate_batch_models, parse_completion_window_filter};
+    use super::{load_and_validate_batch_models, parse_completion_window_filter, to_batch_response_with_email};
     use crate::api::models::batches::CreateBatchRequest;
     use crate::api::models::users::Role;
     use crate::db::handlers::Credits;
@@ -1968,6 +2018,67 @@ mod tests {
     use std::collections::HashMap;
     use std::time::Duration;
     use uuid::Uuid;
+
+    fn background_batch() -> fusillade::Batch {
+        let now = chrono::Utc::now();
+        fusillade::Batch {
+            id: fusillade::BatchId(Uuid::new_v4()),
+            file_id: Some(fusillade::FileId(Uuid::new_v4())),
+            created_at: now,
+            metadata: None,
+            service_tier: Some("background".to_string()),
+            completion_window: None,
+            endpoint: "/v1/chat/completions".to_string(),
+            output_file_id: None,
+            error_file_id: None,
+            created_by: Uuid::new_v4().to_string(),
+            expires_at: None,
+            cancelling_at: None,
+            errors: None,
+            total_requests: 1,
+            pending_requests: 1,
+            in_progress_requests: 0,
+            completed_requests: 0,
+            failed_requests: 0,
+            canceled_requests: 0,
+            requests_started_at: Some(now),
+            finalizing_at: None,
+            completed_at: None,
+            failed_at: None,
+            cancelled_at: None,
+            deleted_at: None,
+            notification_sent_at: None,
+            api_key_id: None,
+        }
+    }
+
+    #[test]
+    fn background_batch_response_has_a_tier_label_and_no_expiry() {
+        let response = to_batch_response_with_email(background_batch(), None);
+
+        assert_eq!(response.completion_window, "background");
+        assert!(response.expires_at.is_none());
+        assert!(response.expired_at.is_none());
+    }
+
+    #[test]
+    #[should_panic(expected = "non-background batch must have a completion window")]
+    fn sla_batch_response_requires_a_completion_window() {
+        let mut batch = background_batch();
+        batch.service_tier = None;
+
+        let _ = to_batch_response_with_email(batch, None);
+    }
+
+    #[test]
+    #[should_panic(expected = "non-background batch must have an expiry")]
+    fn sla_batch_response_requires_an_expiry() {
+        let mut batch = background_batch();
+        batch.service_tier = None;
+        batch.completion_window = Some("24h".to_string());
+
+        let _ = to_batch_response_with_email(batch, None);
+    }
 
     // -------------------------------------------------------------------------
     // parse_completion_window_filter — pure parsing, no DB needed.
@@ -3772,6 +3883,62 @@ mod tests {
             .add_header(&auth[0].0, &auth[0].1)
             .add_header(&auth[1].0, &auth[1].1)
             .await
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn background_batch_requires_background_inference_role(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = setup_batch_user(&pool).await;
+
+        let response = submit_one_request_batch(&app, &user, "background").await;
+
+        response.assert_status(StatusCode::FORBIDDEN);
+        let body = response.text();
+        assert!(body.contains("BackgroundInferenceUser"), "unexpected response: {body}");
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn background_batch_maps_completion_window_and_skips_sla_admission(pool: PgPool) {
+        let mut config = create_test_config();
+        config.batches.allowed_completion_windows = vec!["24h".to_string()];
+        config.batches.unverified_requests_per_completion_hour = 1;
+        config.batches.default_throughput = 0.0;
+        let (app, _bg_services) = create_test_app_with_config(pool.clone(), config, false).await;
+
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser, Role::BackgroundInferenceUser]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+        let deployment = create_test_deployment(&pool, user.id, "gpt-4-model", "gpt-4").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
+        sqlx::query("UPDATE deployed_models SET throughput = 0, batch_capacity = 0 WHERE id = $1")
+            .bind(deployment.id)
+            .execute(&pool)
+            .await
+            .expect("remove SLA capacity");
+
+        let first = submit_one_request_batch(&app, &user, "background").await;
+        first.assert_status(StatusCode::CREATED);
+        let body: serde_json::Value = first.json();
+        assert_eq!(body["completion_window"], "background");
+
+        let batch_id = Uuid::parse_str(body["id"].as_str().expect("batch id")).expect("UUID batch id");
+        let stored: (Option<String>, Option<String>, Option<chrono::DateTime<chrono::Utc>>) =
+            sqlx::query_as("SELECT service_tier, completion_window, expires_at FROM fusillade.batches WHERE id = $1")
+                .bind(batch_id)
+                .fetch_one(&pool)
+                .await
+                .expect("stored background batch");
+        assert_eq!(stored.0.as_deref(), Some("background"));
+        assert_eq!(stored.1, None);
+        assert_eq!(stored.2, None);
+
+        // A second request would exceed the configured unverified 1h SLA cap.
+        // Background has no SLA and must remain outside that admission path.
+        submit_one_request_batch(&app, &user, "background")
+            .await
+            .assert_status(StatusCode::CREATED);
     }
 
     #[sqlx::test]

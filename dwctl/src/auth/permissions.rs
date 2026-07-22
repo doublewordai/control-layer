@@ -311,6 +311,15 @@ pub fn has_permission(user: &CurrentUser, resource: Resource, operation: Operati
     user.roles.iter().any(|role| role_has_permission(role, resource, operation))
 }
 
+/// Whether a user may submit spare-capacity background inference.
+///
+/// This is an explicit capability check rather than a broad resource
+/// permission: platform managers, batch users, and legacy admins must also be
+/// assigned `BackgroundInferenceUser`.
+pub fn can_run_background_inference(user: &CurrentUser) -> bool {
+    user.roles.contains(&Role::BackgroundInferenceUser)
+}
+
 /// Check if a role grants permission for a resource/operation
 pub fn role_has_permission(role: &Role, resource: Resource, operation: Operation) -> bool {
     // No role gets system access (admins bypass this check entirely)
@@ -382,6 +391,7 @@ pub fn role_has_permission(role: &Role, resource: Resource, operation: Operation
                     | (Resource::Batches, Operation::DeleteOwn) // Can delete own batches
             )
         }
+        Role::BackgroundInferenceUser => false,
         Role::ConnectionsUser => {
             // Connections User can manage their own external data source connections
             // and trigger syncs. This role is typically given IN ADDITION to StandardUser.
@@ -638,6 +648,27 @@ mod tests {
         // But still not admin-level permissions
         assert!(!has_permission(&user, Resource::Files, Operation::ReadAll));
         assert!(!has_permission(&user, Resource::Users, Operation::CreateAll));
+    }
+
+    #[test]
+    fn background_inference_requires_exact_role() {
+        let allowed = create_user_with_roles(vec![Role::BackgroundInferenceUser], false);
+        let platform_manager = create_user_with_roles(vec![Role::PlatformManager], false);
+        let batch_user = create_user_with_roles(vec![Role::BatchAPIUser], false);
+        let legacy_admin = create_user_with_roles(vec![], true);
+
+        assert!(can_run_background_inference(&allowed));
+        assert!(!can_run_background_inference(&platform_manager));
+        assert!(!can_run_background_inference(&batch_user));
+        assert!(!can_run_background_inference(&legacy_admin));
+    }
+
+    #[test]
+    fn background_inference_role_uses_public_api_name() {
+        assert_eq!(
+            serde_json::to_value(Role::BackgroundInferenceUser).expect("serialize role"),
+            serde_json::json!("BackgroundInferenceUser")
+        );
     }
 
     #[test]

@@ -1,9 +1,11 @@
 use fusillade::PostgresDaemon;
-use fusillade::batch::{BatchInput, RequestTemplateInput};
+use fusillade::batch::{BackgroundBatchInput, BatchInput, RequestTemplateInput};
 use fusillade::daemon::{DaemonConfig, ModelEscalationConfig, default_should_retry};
 use fusillade::http::{HttpResponse, MockHttpClient};
 use fusillade::manager::{ModelFilter, ModelFilterState, Storage};
-use fusillade::request::{Failed, ListRequestsFilter, Request, ServiceTierFilter};
+use fusillade::request::{
+    CreateBackgroundInput, CreateFlexInput, Failed, ListRequestsFilter, Request, ServiceTierFilter,
+};
 use fusillade_arsenal::{PostgresRequestManager as PostgresStore, TestDbPools};
 use std::sync::Arc;
 use std::time::Duration;
@@ -51,11 +53,15 @@ fn assert_next_retry_would_cross_effective_deadline(
     failed: &Request<Failed>,
     config: &DaemonConfig,
 ) {
+    let batch_expires_at = failed
+        .state
+        .batch_expires_at
+        .expect("this assertion is only valid for SLA requests");
     let effective_deadline = match config.stop_before_deadline_ms {
         Some(stop_before_deadline_ms) => {
-            failed.state.batch_expires_at - chrono::Duration::milliseconds(stop_before_deadline_ms)
+            batch_expires_at - chrono::Duration::milliseconds(stop_before_deadline_ms)
         }
-        None => failed.state.batch_expires_at,
+        None => batch_expires_at,
     };
     let next_retry_at = failed.state.failed_at
         + chrono::Duration::milliseconds(retry_backoff_ms(config, failed.state.retry_attempt));
@@ -66,6 +72,230 @@ fn assert_next_retry_would_cross_effective_deadline(
         failed.state.failed_at,
         failed.state.retry_attempt
     );
+}
+
+async fn wait_for_mock_calls(client: &MockHttpClient, expected: usize) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if client.call_count() >= expected {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for {expected} HTTP calls; observed {}",
+            client.call_count()
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+fn call_priority(call: &fusillade::http::MockCall) -> i64 {
+    serde_json::from_str::<serde_json::Value>(&call.body).unwrap()["nvext"]["agent_hints"]
+        ["priority"]
+        .as_i64()
+        .expect("daemon must inject an integer priority")
+}
+
+#[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
+async fn background_tier_end_to_end(pool: sqlx::PgPool) {
+    let http_client = Arc::new(MockHttpClient::new());
+    let triggers: Vec<_> = (0..5)
+        .map(|index| {
+            http_client.add_response_with_trigger(
+                "POST /v1/background-test",
+                Ok(HttpResponse {
+                    status: 200,
+                    body: format!(r#"{{"result":{index}}}"#),
+                }),
+            )
+        })
+        .collect();
+    let mut triggers = triggers.into_iter();
+
+    let model_limits = Arc::new(dashmap::DashMap::new());
+    model_limits.insert("spare-model".to_string(), 4);
+    let config = DaemonConfig {
+        mode: fusillade::DaemonMode::Both,
+        claim_batch_size: 10,
+        batch_claim_size: 10,
+        batch_claim_batch_size: 10,
+        claim_interval_ms: 10,
+        batch_claim_interval_ms: 10,
+        model_concurrency_limits: model_limits,
+        background_concurrency_limit: 2,
+        inject_deadline_priority: true,
+        status_log_interval_ms: None,
+        throughput_log_interval_ms: None,
+        heartbeat_interval_ms: 10_000,
+        cancellation_poll_interval_ms: 100,
+        purge_interval_ms: 0,
+        ..Default::default()
+    };
+    let manager = postgres_store(pool.clone(), &config).await;
+
+    for sequence in 0..2 {
+        let request_id = uuid::Uuid::new_v4();
+        manager
+            .create_flex(CreateFlexInput {
+                request_id,
+                body: format!(r#"{{"kind":"sla","sequence":{sequence}}}"#),
+                model: "spare-model".to_string(),
+                endpoint: "https://api.example.com".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/background-test".to_string(),
+                api_key: "key".to_string(),
+                created_by: format!("sla-owner-{sequence}"),
+            })
+            .await
+            .unwrap();
+    }
+
+    let file_id = manager
+        .create_file(
+            "background-e2e".to_string(),
+            None,
+            vec![RequestTemplateInput {
+                custom_id: Some("background-batch".to_string()),
+                endpoint: "https://api.example.com".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/background-test".to_string(),
+                body: r#"{"kind":"background-batch","nvext":{"agent_hints":{"priority":999}}}"#
+                    .to_string(),
+                model: "spare-model".to_string(),
+                api_key: "key".to_string(),
+            }],
+        )
+        .await
+        .unwrap();
+    let background_batch = manager
+        .create_background_batch(BackgroundBatchInput {
+            file_id,
+            endpoint: "/v1/chat/completions".to_string(),
+            metadata: None,
+            created_by: Some("background-batch-owner".to_string()),
+            api_key_id: None,
+            api_key: None,
+            total_requests: Some(1),
+        })
+        .await
+        .unwrap();
+    let background_request_id = uuid::Uuid::new_v4();
+    manager
+        .create_background(CreateBackgroundInput {
+            request_id: background_request_id,
+            body: r#"{"kind":"background-batchless","nvext":{"agent_hints":{"priority":999}}}"#
+                .to_string(),
+            model: "spare-model".to_string(),
+            endpoint: "https://api.example.com".to_string(),
+            method: "POST".to_string(),
+            path: "/v1/background-test".to_string(),
+            api_key: "key".to_string(),
+            created_by: "background-request-owner".to_string(),
+        })
+        .await
+        .unwrap();
+    mark_models_live_for_test(manager.as_ref(), &["spare-model"]).await;
+
+    let shutdown = CancellationToken::new();
+    let daemon_handle = postgres_daemon(manager.clone(), http_client.clone(), config)
+        .run(shutdown.clone())
+        .unwrap();
+
+    wait_for_mock_calls(&http_client, 2).await;
+    let stability_deadline = tokio::time::Instant::now() + Duration::from_millis(150);
+    while tokio::time::Instant::now() < stability_deadline {
+        assert_eq!(
+            http_client.call_count(),
+            2,
+            "background must not enter the SLA-reserved portion of model capacity"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    for call in http_client.get_calls() {
+        assert!(call.body.contains(r#""kind":"sla""#));
+        assert!(call_priority(&call) > i32::MIN as i64);
+    }
+
+    triggers.next().unwrap().send(()).unwrap();
+    wait_for_mock_calls(&http_client, 3).await;
+    let calls = http_client.get_calls();
+    assert!(calls[2].body.contains("background"));
+    assert_eq!(call_priority(&calls[2]), i32::MIN as i64);
+    assert_eq!(
+        http_client.in_flight_count(),
+        2,
+        "one freed slot below the background ceiling admits exactly one background call"
+    );
+
+    let late_sla_id = uuid::Uuid::new_v4();
+    manager
+        .create_flex(CreateFlexInput {
+            request_id: late_sla_id,
+            body: r#"{"kind":"late-sla"}"#.to_string(),
+            model: "spare-model".to_string(),
+            endpoint: "https://api.example.com".to_string(),
+            method: "POST".to_string(),
+            path: "/v1/background-test".to_string(),
+            api_key: "key".to_string(),
+            created_by: "late-sla-owner".to_string(),
+        })
+        .await
+        .unwrap();
+    wait_for_mock_calls(&http_client, 4).await;
+    let calls = http_client.get_calls();
+    assert!(calls[3].body.contains("late-sla"));
+    assert!(call_priority(&calls[3]) > call_priority(&calls[2]));
+
+    for _ in 0..3 {
+        triggers.next().unwrap().send(()).unwrap();
+    }
+    wait_for_mock_calls(&http_client, 5).await;
+    let calls = http_client.get_calls();
+    assert!(calls[4].body.contains("background"));
+    assert_eq!(call_priority(&calls[4]), i32::MIN as i64);
+    triggers.next().unwrap().send(()).unwrap();
+
+    let completion_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let batch = manager.get_batch(background_batch.id).await.unwrap();
+        let background = manager
+            .get_request_detail(fusillade::RequestId(background_request_id))
+            .await
+            .unwrap();
+        let late_sla = manager
+            .get_request_detail(fusillade::RequestId(late_sla_id))
+            .await
+            .unwrap();
+        if batch.completed_at.is_some()
+            && background.status == "completed"
+            && late_sla.status == "completed"
+        {
+            assert!(batch.output_file_id.is_some());
+            assert!(batch.error_file_id.is_some());
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < completion_deadline,
+            "background work did not finalize before timeout"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let active: i64 = sqlx::query_scalar!(
+        r#"SELECT COUNT(*) AS "count!" FROM requests WHERE state IN ('claimed', 'processing')"#
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(active, 0);
+    assert_eq!(http_client.in_flight_count(), 0);
+
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(5), daemon_handle)
+        .await
+        .expect("daemon should stop")
+        .expect("daemon task should not panic")
+        .expect("daemon should stop cleanly");
 }
 
 #[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]

@@ -137,9 +137,98 @@ for req in requests {
 }
 ```
 
+## Background work
+
+Fusillade accepts no-SLA background work in both of its submission shapes. A
+file-backed background batch retains normal batch status, cancellation, and
+output/error files:
+
+```rust
+use fusillade::BackgroundBatchInput;
+
+let batch = store.create_background_batch(BackgroundBatchInput {
+    file_id,
+    endpoint: "/v1/chat/completions".to_string(),
+    metadata: None,
+    created_by: Some("user-id".to_string()),
+    api_key_id: None,
+    api_key: None,
+    total_requests: None,
+}).await?;
+```
+
+An asynchronous request can enter the same queue without a batch:
+
+```rust
+use fusillade::CreateBackgroundInput;
+use uuid::Uuid;
+
+let request_id = Uuid::new_v4();
+store.create_background(CreateBackgroundInput {
+    request_id,
+    body: r#"{"model":"gpt-4","input":"hello"}"#.to_string(),
+    model: "gpt-4".to_string(),
+    endpoint: "https://api.example.com".to_string(),
+    method: "POST".to_string(),
+    path: "/v1/responses".to_string(),
+    api_key: "key".to_string(),
+    created_by: "user-id".to_string(),
+}).await?;
+```
+
+Both forms use one database-wide pool per model. Configure an ordinary model
+limit and a lower background ceiling:
+
+```rust
+let mut config = DaemonConfig {
+    background_concurrency_limit: 50,
+    inject_deadline_priority: true,
+    ..Default::default()
+};
+config.model_concurrency_limits.insert("gpt-4".to_string(), 100);
+```
+
+The background ceiling is applied independently to every model and is clamped
+to each daemon process's ordinary limit. Database-wide active work consumes the
+shared ceiling: with limits 100/50, 70 total requests in flight leaves no
+background capacity, 40 leaves 10 slots, and zero leaves 50. Pending,
+immediately schedulable SLA work for a model blocks background claims for that
+model. A later SLA arrival can still use the reserved ordinary capacity.
+
+Background processing also requires:
+
+- PostgreSQL storage support for background claims;
+- an explicit latest `live` model-filter event (no event is not eligible); and
+- `inject_deadline_priority = true`. Background always overwrites caller
+  `nvext.agent_hints.priority` with `i32::MIN`; SLA priority is clamped above
+  that reserved value.
+
+The background loop can run with any `DaemonMode`. The selected mode controls
+which SLA claim loops share its process-local counters: `RequestOnly` accounts
+for batchless SLA work, `BatchOnly` accounts for batched SLA work, and `Both`
+accounts for both. Database-wide due-SLA gating and exact-live gating apply in
+all modes, and the node-level background priority remains strictly lowest.
+
+Background batches persist `service_tier = "background"` with
+`completion_window = NULL` and `expires_at = NULL`. They do not expire, escalate,
+or fail retries based on a completion deadline. A zero
+`background_concurrency_limit` disables processing but not submission,
+inspection, or cancellation.
+
+Ordinary pending-count queries exclude background demand. To expose it, use an
+explicit `ServiceTierFilter::Include(vec![Some("background".to_string())])`; results use a
+separate `"background"` bucket per model and combine batched and batchless
+backlog. The bucket is hidden while the model is not live, due SLA work exists,
+or active database work meets the configured background ceiling.
+
+Background claims take a non-blocking transaction-scoped advisory lock per
+model, then count database-wide active work and claim only the remaining shared
+headroom. Contending daemon processes skip that model until their next cycle.
+
 ## Claim daemons
 
-As of v20, the daemon runs **two independent claim loops** instead of one:
+The daemon can run two SLA claim loops and, when background processing is
+enabled, an additional background loop:
 
 - **Request daemon** — claims *batchless* pending rows (flex/async responses).
   Owns the leaky-bucket and deadline-ramp policy: rows for models that are not
@@ -148,6 +237,9 @@ As of v20, the daemon runs **two independent claim loops** instead of one:
   top-ranked batches per capacity-eligible model (fairness + deadline
   ordering), then claims rows only from those batches, so claim cost is
   bounded by batches selected rather than total pending backlog.
+- **Background daemon** — claims file-backed and batchless background rows in
+  one fair candidate set, only for explicitly live models, below the lower
+  background ceiling, and only after due SLA backlog for that model is empty.
 
 Batch claiming is gated on model liveness via the `model_filters` event log:
 models whose latest event is `live` are always claimable; models with **no**
@@ -166,6 +258,7 @@ Configuration (all optional):
 | `batch_claim_batch_size` | `4` | batches selected per model per iteration (spill-over pool) |
 | `batch_claim_interval_ms` | `0` (inherit `claim_interval_ms`) | batch loop cadence |
 | `batch_claim_require_live` | `false` | require an explicit `live` event to batch-claim |
+| `background_concurrency_limit` | `0` | lower per-model ceiling for background work; zero disables the loop |
 | `claim_ramp_exponent` | `0.56` | deadline-ramp curve (~59 min for 24h windows, ~10 min for 1h) |
 
 **Breaking changes relative to v19:**
@@ -178,7 +271,7 @@ Configuration (all optional):
   unchanged); not-live batches wait for liveness or the deadline ramp.
 - Claim metrics (`fusillade_claim_capacity`, `fusillade_claim_duration_seconds`,
   `fusillade_claim_size`) gained a `daemon` label (`request_daemon` /
-  `batch_daemon`); unlabeled legacy series are dual-emitted during a
+  `batch_daemon` / `background_daemon`); unlabeled legacy series are dual-emitted during a
   deprecation window.
 
 ## Database Setup

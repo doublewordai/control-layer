@@ -66,6 +66,12 @@ pub struct PostgresStorageConfig {
     pub urgency_weight: f64,
     #[serde(default)]
     pub batch_claim_require_live: bool,
+    /// Database-wide per-model in-flight ceiling below which explicitly
+    /// requested background backlog is claimable and exposed by pending-count
+    /// queries. Zero hides background demand and disables processing at the
+    /// daemon layer.
+    #[serde(default)]
+    pub background_concurrency_limit: usize,
     #[serde(default = "default_leaks_per_window")]
     pub leaks_per_window: f64,
     #[serde(default = "default_model_filters_keep_per_model")]
@@ -130,6 +136,7 @@ impl Default for PostgresStorageConfig {
             claim_ramp_exponent: default_claim_ramp_exponent(),
             urgency_weight: 0.0,
             batch_claim_require_live: false,
+            background_concurrency_limit: 0,
             leaks_per_window: default_leaks_per_window(),
             model_filters_keep_per_model: default_model_filters_keep_per_model(),
             model_filters_retention_ms: default_model_filters_retention_ms(),
@@ -206,8 +213,162 @@ pub fn is_retryable_db_error_message(message: &str) -> bool {
         || message.contains("connection pool timed out")
 }
 
+struct ConcurrentIndexMigration {
+    version: i64,
+    name: &'static str,
+    create_sql: &'static str,
+}
+
+const BACKGROUND_CONCURRENT_INDEX_MIGRATIONS: &[ConcurrentIndexMigration] = &[
+    ConcurrentIndexMigration {
+        version: 20260722000100,
+        name: "idx_requests_pending_background_batchless",
+        create_sql: r#"CREATE INDEX CONCURRENTLY idx_requests_pending_background_batchless
+            ON requests (model, created_at, id)
+            WHERE state = 'pending'
+              AND batch_id IS NULL
+              AND template_id IS NOT NULL
+              AND service_tier = 'background'"#,
+    },
+    ConcurrentIndexMigration {
+        version: 20260722000200,
+        name: "idx_requests_pending_background_batched",
+        create_sql: r#"CREATE INDEX CONCURRENTLY idx_requests_pending_background_batched
+            ON requests (model, batch_id, created_at, id)
+            WHERE state = 'pending'
+              AND batch_id IS NOT NULL
+              AND template_id IS NOT NULL
+              AND service_tier = 'background'"#,
+    },
+    ConcurrentIndexMigration {
+        version: 20260722000300,
+        name: "idx_requests_pending_batchless_sla",
+        create_sql: r#"CREATE INDEX CONCURRENTLY idx_requests_pending_batchless_sla
+            ON requests (model, created_at, id)
+            WHERE state = 'pending'
+              AND batch_id IS NULL
+              AND template_id IS NOT NULL
+              AND service_tier IS DISTINCT FROM 'background'"#,
+    },
+    ConcurrentIndexMigration {
+        version: 20260722000400,
+        name: "idx_requests_active_sla_counts",
+        create_sql: r#"CREATE INDEX CONCURRENTLY idx_requests_active_sla_counts
+            ON requests (batch_id, model)
+            WHERE state IN ('pending', 'claimed', 'processing')
+              AND template_id IS NOT NULL
+              AND (
+                  service_tier IS NULL
+                  OR service_tier NOT IN ('priority', 'background')
+              )"#,
+    },
+];
+
+async fn repair_interrupted_background_index_migrations(
+    connection: &mut sqlx::PgConnection,
+) -> Result<(), sqlx::migrate::MigrateError> {
+    let migration_table_exists =
+        sqlx::query_scalar::<_, bool>("SELECT to_regclass('_sqlx_migrations') IS NOT NULL")
+            .fetch_one(&mut *connection)
+            .await?;
+    if !migration_table_exists {
+        return Ok(());
+    }
+
+    for index in BACKGROUND_CONCURRENT_INDEX_MIGRATIONS {
+        let validity = sqlx::query_scalar::<_, bool>(
+            r#"
+            SELECT metadata.indisvalid
+            FROM pg_index metadata
+            WHERE metadata.indexrelid = to_regclass($1)
+            "#,
+        )
+        .bind(index.name)
+        .fetch_optional(&mut *connection)
+        .await?;
+        let migration_applied = sqlx::query_scalar::<_, bool>(
+            r#"
+            SELECT EXISTS (
+                SELECT 1
+                FROM _sqlx_migrations
+                WHERE version = $1 AND success
+            )
+            "#,
+        )
+        .bind(index.version)
+        .fetch_one(&mut *connection)
+        .await?;
+
+        match (validity, migration_applied) {
+            (Some(false), false) => {
+                // A cancelled CREATE INDEX CONCURRENTLY leaves an invalid
+                // relation behind. Remove it so SQLx can retry the unrecorded
+                // migration instead of accepting IF NOT EXISTS as success.
+                sqlx::query(&format!("DROP INDEX CONCURRENTLY IF EXISTS {}", index.name))
+                    .execute(&mut *connection)
+                    .await?;
+            }
+            (Some(false), true) => {
+                // If SQLx already recorded the migration, rebuild explicitly.
+                // Keeping DROP and CREATE as separate protocol messages lets
+                // both operations remain concurrent and retryable.
+                sqlx::query(&format!("DROP INDEX CONCURRENTLY IF EXISTS {}", index.name))
+                    .execute(&mut *connection)
+                    .await?;
+                sqlx::query(index.create_sql)
+                    .execute(&mut *connection)
+                    .await?;
+            }
+            (None, true) => {
+                // Restore an applied index that was removed during manual
+                // recovery before accepting new work.
+                sqlx::query(index.create_sql)
+                    .execute(&mut *connection)
+                    .await?;
+            }
+            (Some(true), _) | (None, false) => {}
+        }
+    }
+
+    Ok(())
+}
+
 /// Fusillade Arsenal database migrator.
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
+
+/// Repair interrupted concurrent index builds and run all Arsenal migrations.
+///
+/// Production callers should prefer this over invoking [`MIGRATOR`] directly.
+/// PostgreSQL can leave an invalid relation when `CREATE INDEX CONCURRENTLY` is
+/// interrupted; this entry point serializes migration runners and repairs that
+/// state before SQLx evaluates `IF NOT EXISTS`.
+pub async fn run_migrations(pool: &sqlx::PgPool) -> Result<(), sqlx::migrate::MigrateError> {
+    const LOCK: &str =
+        "SELECT pg_advisory_lock(hashtextextended('fusillade.concurrent-index-migrations', 0))";
+    const UNLOCK: &str =
+        "SELECT pg_advisory_unlock(hashtextextended('fusillade.concurrent-index-migrations', 0))";
+
+    // Detaching ensures cancellation closes the connection and releases the
+    // session-level advisory lock instead of returning a locked connection to
+    // the pool.
+    let mut connection = pool.acquire().await?.detach();
+    sqlx::query(LOCK).execute(&mut connection).await?;
+
+    let migration_result = async {
+        repair_interrupted_background_index_migrations(&mut connection).await?;
+        MIGRATOR.run(&mut connection).await
+    }
+    .await;
+    let unlock_result = sqlx::query(UNLOCK).execute(&mut connection).await;
+
+    match migration_result {
+        Err(error) => Err(error),
+        Ok(()) => {
+            unlock_result?;
+            Ok(())
+        }
+    }
+}
 
 /// Get the Fusillade Arsenal database migrator.
 ///
@@ -219,6 +380,30 @@ pub fn migrator() -> &'static sqlx::migrate::Migrator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[sqlx::test]
+    async fn migration_runner_restores_an_applied_concurrent_index(pool: sqlx::PgPool) {
+        sqlx::query("DROP INDEX CONCURRENTLY idx_requests_pending_background_batchless")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        run_migrations(&pool).await.unwrap();
+
+        let valid = sqlx::query_scalar::<_, bool>(
+            r#"
+            SELECT metadata.indisvalid
+            FROM pg_index metadata
+            WHERE metadata.indexrelid = to_regclass(
+                'idx_requests_pending_background_batchless'
+            )
+            "#,
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(valid);
+    }
 
     #[test]
     fn state_write_concurrency_defaults_when_missing() {

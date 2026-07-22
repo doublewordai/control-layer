@@ -1,0 +1,192 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            WITH locked_models AS (\n                SELECT model, capacity, model_order\n                FROM unnest($4::TEXT[], $5::BIGINT[]) WITH ORDINALITY\n                     AS m(model, capacity, model_order)\n            ),\n            user_priority AS (\n                SELECT *\n                FROM unnest($6::TEXT[], $7::BIGINT[]) AS u(user_id, active_count)\n            ),\n            active_counts AS (\n                SELECT locked.model, COUNT(active.id)::BIGINT AS active_count\n                FROM locked_models locked\n                LEFT JOIN requests active\n                  ON active.model = locked.model\n                 AND active.state IN ('claimed', 'processing')\n                 AND active.template_id IS NOT NULL\n                GROUP BY locked.model\n            ),\n            eligible_models AS (\n                SELECT m.model,\n                       LEAST(\n                           m.capacity,\n                           GREATEST($9::BIGINT - active.active_count, 0)\n                       ) AS capacity,\n                       m.model_order\n                FROM locked_models m\n                JOIN active_counts active ON active.model = m.model\n                JOIN LATERAL (\n                    SELECT mf.state\n                    FROM model_filters mf\n                    WHERE mf.model = m.model\n                    ORDER BY mf.created_at DESC, mf.id DESC\n                    LIMIT 1\n                ) latest ON latest.state = 'live'\n                WHERE active.active_count < $9::BIGINT\n                  AND NOT EXISTS (\n                    SELECT 1\n                    FROM requests sla\n                    LEFT JOIN batches parent ON parent.id = sla.batch_id\n                    WHERE sla.model = m.model\n                      AND sla.state = 'pending'\n                      AND sla.template_id IS NOT NULL\n                      AND sla.service_tier IS DISTINCT FROM 'background'\n                      AND (sla.not_before IS NULL OR sla.not_before <= $3)\n                      AND (\n                          sla.batch_id IS NULL\n                          OR (\n                              parent.id IS NOT NULL\n                              AND parent.service_tier IS DISTINCT FROM 'background'\n                              AND parent.cancelling_at IS NULL\n                              AND parent.deleted_at IS NULL\n                              AND parent.completed_at IS NULL\n                              AND parent.failed_at IS NULL\n                              AND parent.cancelled_at IS NULL\n                          )\n                      )\n                )\n            ),\n            selected_batches AS (\n                SELECT em.model, selected.id AS batch_id\n                FROM eligible_models em\n                CROSS JOIN LATERAL (\n                    SELECT b.id\n                    FROM batches b\n                    WHERE b.service_tier = 'background'\n                      AND b.cancelling_at IS NULL\n                      AND b.deleted_at IS NULL\n                      AND b.completed_at IS NULL\n                      AND b.failed_at IS NULL\n                      AND b.cancelled_at IS NULL\n                      AND EXISTS (\n                          SELECT 1\n                          FROM requests pending\n                          WHERE pending.batch_id = b.id\n                            AND pending.model = em.model\n                            AND pending.state = 'pending'\n                            AND pending.template_id IS NOT NULL\n                            AND pending.service_tier = 'background'\n                            AND (pending.not_before IS NULL OR pending.not_before <= $3)\n                      )\n                    ORDER BY b.created_at, b.id\n                    LIMIT $8::BIGINT\n                ) selected\n            ),\n            candidate_rows AS (\n                SELECT r.id, r.template_id, r.batch_id, r.model, r.created_at,\n                       r.created_by AS owner, em.capacity, em.model_order\n                FROM eligible_models em\n                JOIN requests r\n                  ON r.model = em.model\n                 AND r.batch_id IS NULL\n                 AND r.state = 'pending'\n                 AND r.template_id IS NOT NULL\n                 AND r.service_tier = 'background'\n                 AND (r.not_before IS NULL OR r.not_before <= $3)\n\n                UNION ALL\n\n                SELECT r.id, r.template_id, r.batch_id, r.model, r.created_at,\n                       b.created_by AS owner, em.capacity, em.model_order\n                FROM eligible_models em\n                JOIN selected_batches sb ON sb.model = em.model\n                JOIN batches b ON b.id = sb.batch_id\n                JOIN requests r\n                  ON r.batch_id = b.id\n                 AND r.model = em.model\n                 AND r.state = 'pending'\n                 AND r.template_id IS NOT NULL\n                 AND r.service_tier = 'background'\n                 AND (r.not_before IS NULL OR r.not_before <= $3)\n            ),\n            owner_ranked AS (\n                SELECT c.*,\n                       COALESCE(up.active_count, 0) AS active_count,\n                       row_number() OVER (\n                           PARTITION BY c.model, c.owner\n                           ORDER BY c.created_at, c.id\n                       ) AS owner_rank\n                FROM candidate_rows c\n                LEFT JOIN user_priority up ON up.user_id = c.owner\n            ),\n            model_ranked AS (\n                SELECT o.*,\n                       row_number() OVER (\n                           PARTITION BY o.model\n                           ORDER BY o.active_count + o.owner_rank - 1,\n                                    o.created_at, o.id\n                       ) AS model_rank\n                FROM owner_ranked o\n            ),\n            locked AS (\n                SELECT ranked.id, ranked.template_id, ranked.batch_id,\n                       ranked.model_rank, ranked.model_order, ranked.created_at\n                FROM model_ranked ranked\n                JOIN requests lock_row\n                  ON lock_row.id = ranked.id\n                 AND lock_row.state = 'pending'\n                 AND lock_row.service_tier = 'background'\n                 AND (lock_row.not_before IS NULL OR lock_row.not_before <= $3)\n                WHERE ranked.model_rank <= ranked.capacity\n                ORDER BY ranked.model_rank, ranked.model_order, ranked.created_at, ranked.id\n                LIMIT $2::BIGINT\n                FOR UPDATE OF lock_row SKIP LOCKED\n            )\n            UPDATE requests r\n            SET state = 'claimed',\n                daemon_id = $1,\n                claimed_at = $3\n            FROM locked claimed\n            JOIN active_request_templates t ON t.id = claimed.template_id\n            LEFT JOIN batches b ON b.id = claimed.batch_id\n            WHERE r.id = claimed.id\n            RETURNING r.id,\n                      r.batch_id,\n                      r.template_id as \"template_id!\", r.retry_attempt,\n                      t.custom_id, t.endpoint as \"endpoint!\", t.method as \"method!\", t.path as \"path!\",\n                      t.body as \"body!\", t.model as \"model!\", COALESCE(b.api_key, t.api_key) as \"api_key!\",\n                      NULL::TIMESTAMPTZ as \"batch_expires_at?\",\n                      COALESCE(b.id::TEXT, '') as \"batch_id_str!\",\n                      COALESCE(b.file_id::TEXT, '') as \"batch_file_id!\",\n                      COALESCE(b.endpoint, t.endpoint) as \"batch_endpoint!\",\n                      b.completion_window as \"batch_completion_window?\",\n                      b.metadata::TEXT as \"batch_metadata\",\n                      b.output_file_id::TEXT as \"batch_output_file_id\",\n                      b.error_file_id::TEXT as \"batch_error_file_id\",\n                      COALESCE(b.created_by, r.created_by, '') as \"batch_created_by!\",\n                      to_char(COALESCE(b.created_at, r.created_at) AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') as \"batch_created_at!\",\n                      NULL::TEXT as \"batch_expires_at_str\",\n                      to_char(b.cancelling_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') as \"batch_cancelling_at\",\n                      b.errors::TEXT as \"batch_errors\",\n                      COALESCE(b.total_requests::TEXT, '1') as \"batch_total_requests!\",\n                      FALSE as \"leaked!\",\n                      'background'::TEXT as \"window_class!\",\n                      0::DOUBLE PRECISION as \"window_secs!\"\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "batch_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "template_id!",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 3,
+        "name": "retry_attempt",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 4,
+        "name": "custom_id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "endpoint!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "method!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 7,
+        "name": "path!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 8,
+        "name": "body!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 9,
+        "name": "model!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 10,
+        "name": "api_key!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 11,
+        "name": "batch_expires_at?",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 12,
+        "name": "batch_id_str!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 13,
+        "name": "batch_file_id!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 14,
+        "name": "batch_endpoint!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 15,
+        "name": "batch_completion_window?",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 16,
+        "name": "batch_metadata",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 17,
+        "name": "batch_output_file_id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 18,
+        "name": "batch_error_file_id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 19,
+        "name": "batch_created_by!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 20,
+        "name": "batch_created_at!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 21,
+        "name": "batch_expires_at_str",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 22,
+        "name": "batch_cancelling_at",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 23,
+        "name": "batch_errors",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 24,
+        "name": "batch_total_requests!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 25,
+        "name": "leaked!",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 26,
+        "name": "window_class!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 27,
+        "name": "window_secs!",
+        "type_info": "Float8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int8",
+        "Timestamptz",
+        "TextArray",
+        "Int8Array",
+        "TextArray",
+        "Int8Array",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      true,
+      true,
+      false,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      null,
+      null,
+      null,
+      null,
+      null,
+      true,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "cdfe08c68420d8a20b3774ddc793bc26e3cb36ae136e72de03c07cecaed1a75c"
+}

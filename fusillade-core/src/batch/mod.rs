@@ -397,6 +397,10 @@ pub struct ListBatchesFilter {
     /// realtime tracking rows). `None` disables the filter; `Some(vec![])`
     /// matches no rows.
     pub completion_windows: Option<Vec<String>>,
+    /// Filter by explicit batch service tier. Currently the only named batch
+    /// tier is `background`; ordinary SLA batches store `NULL` here.
+    /// `None` disables the filter and an empty vector matches no rows.
+    pub service_tiers: Option<Vec<String>>,
 }
 
 /// Items that can be yielded from a file upload stream
@@ -447,6 +451,28 @@ pub struct BatchInput {
     pub total_requests: Option<i64>,
 }
 
+/// Input parameters for creating a file-backed background batch.
+///
+/// Background batches deliberately have no completion window. They use the
+/// ordinary batch lifecycle but are dispatched only by the background daemon.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackgroundBatchInput {
+    /// The file containing request templates.
+    pub file_id: FileId,
+    /// The API endpoint to use for all requests.
+    pub endpoint: String,
+    /// Optional metadata key-value pairs.
+    pub metadata: Option<serde_json::Value>,
+    /// User who created this batch.
+    pub created_by: Option<String>,
+    /// API key UUID that created this batch.
+    pub api_key_id: Option<Uuid>,
+    /// API key secret for batch request execution.
+    pub api_key: Option<String>,
+    /// Expected number of request templates in the source file.
+    pub total_requests: Option<i64>,
+}
+
 /// A batch represents one execution of all of a file's templates.
 #[derive(Debug, Clone, Serialize)]
 pub struct Batch {
@@ -455,8 +481,11 @@ pub struct Batch {
     pub created_at: DateTime<Utc>,
     /// Metadata key-value pairs (OpenAI allows up to 16 pairs)
     pub metadata: Option<serde_json::Value>,
-    /// Completion window (e.g., "24h")
-    pub completion_window: String,
+    /// Explicit scheduling tier. `Some("background")` identifies a background
+    /// batch; `None` retains completion-window-driven SLA semantics.
+    pub service_tier: Option<String>,
+    /// Completion window (e.g., "24h"). `None` for background batches.
+    pub completion_window: Option<String>,
     /// The API endpoint to use for all requests (e.g., "/v1/chat/completions")
     pub endpoint: String,
     /// File ID containing the successful results
@@ -465,9 +494,9 @@ pub struct Batch {
     pub error_file_id: Option<FileId>,
     /// User who created this batch
     pub created_by: String,
-    /// When the batch will expire (created_at + completion_window)
-    /// This is required for queue prioritization and SLA monitoring
-    pub expires_at: DateTime<Utc>,
+    /// When the batch will expire (created_at + completion_window).
+    /// `None` for background batches, which do not have a completion SLA.
+    pub expires_at: Option<DateTime<Utc>>,
     /// When batch cancellation was initiated
     pub cancelling_at: Option<DateTime<Utc>>,
     /// Batch-level errors (validation errors, system errors, etc.)
@@ -591,4 +620,64 @@ pub struct ModelTemplateStats {
     pub request_count: i64,
     /// Total size of all request bodies in bytes
     pub total_body_bytes: i64,
+}
+
+#[cfg(test)]
+mod background_tests {
+    use super::*;
+
+    #[test]
+    fn background_batch_input_does_not_require_a_completion_window() {
+        let file_id = FileId(Uuid::new_v4());
+        let input = BackgroundBatchInput {
+            file_id,
+            endpoint: "/v1/responses".to_string(),
+            metadata: None,
+            created_by: Some("user-a".to_string()),
+            api_key_id: None,
+            api_key: Some("test-key".to_string()),
+            total_requests: Some(2),
+        };
+
+        assert_eq!(input.file_id, file_id);
+        assert_eq!(input.total_requests, Some(2));
+    }
+
+    #[test]
+    fn background_batch_serializes_without_a_deadline() {
+        let batch = Batch {
+            id: BatchId(Uuid::new_v4()),
+            file_id: Some(FileId(Uuid::new_v4())),
+            created_at: Utc::now(),
+            metadata: None,
+            service_tier: Some("background".to_string()),
+            completion_window: None,
+            endpoint: "/v1/responses".to_string(),
+            output_file_id: None,
+            error_file_id: None,
+            created_by: "user-a".to_string(),
+            expires_at: None,
+            cancelling_at: None,
+            errors: None,
+            total_requests: 0,
+            pending_requests: 0,
+            in_progress_requests: 0,
+            completed_requests: 0,
+            failed_requests: 0,
+            canceled_requests: 0,
+            requests_started_at: None,
+            finalizing_at: None,
+            completed_at: None,
+            failed_at: None,
+            cancelled_at: None,
+            deleted_at: None,
+            notification_sent_at: None,
+            api_key_id: None,
+        };
+
+        let json = serde_json::to_value(batch).expect("batch should serialize");
+        assert_eq!(json["service_tier"], "background");
+        assert!(json["completion_window"].is_null());
+        assert!(json["expires_at"].is_null());
+    }
 }
