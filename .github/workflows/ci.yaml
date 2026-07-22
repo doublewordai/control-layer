@@ -4,7 +4,6 @@ on:
   pull_request:
     branches: [main]
   merge_group:
-  workflow_dispatch:
 
 jobs:
   frontend-test:
@@ -306,7 +305,7 @@ jobs:
   # Image builds are first-wave jobs. Keep this and `build` free of `needs` so
   # the independently published Onwards and dwctl images build in parallel.
   onwards-pr-image:
-    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+    if: github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]')
     name: onwards / image
     runs-on: depot-ubuntu-24.04
 
@@ -333,12 +332,12 @@ jobs:
           file: ./onwards/Dockerfile
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: ghcr.io/doublewordai/onwards:sha-${{ github.event.pull_request.head.sha }}
+          tags: ghcr.io/doublewordai/onwards:sha-${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
           sbom: true
           provenance: true
 
   onwards-compliance-changes:
-    if: github.event_name == 'pull_request' || github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
     name: onwards / compliance changes
     runs-on: ubuntu-latest
     outputs:
@@ -359,11 +358,6 @@ jobs:
           MERGE_GROUP_BASE_SHA: ${{ github.event.merge_group.base_sha }}
           MERGE_GROUP_HEAD_SHA: ${{ github.event.merge_group.head_sha }}
         run: |
-          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
-            echo "strict=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
           if [[ "$EVENT_NAME" == "pull_request" ]]; then
             BASE_SHA="$PULL_REQUEST_BASE_SHA"
             HEAD_SHA="$PULL_REQUEST_HEAD_SHA"
@@ -384,7 +378,7 @@ jobs:
           fi
 
   onwards-openresponses-compliance:
-    if: needs.onwards-compliance-changes.outputs.strict == 'true'
+    if: always()
     needs: onwards-compliance-changes
     runs-on: ubuntu-latest
     strategy:
@@ -394,15 +388,22 @@ jobs:
     name: onwards / open responses (${{ matrix.mode }})
 
     env:
+      RUN_STRICT_COMPLIANCE: ${{ needs.onwards-compliance-changes.outputs.strict == 'true' && (github.event_name == 'merge_group' || (github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]')) }}
       TEST_MODEL: gemini-2.5-flash
       # Match the supported HTTP /responses coverage exercised through dwctl below.
       OPENRESPONSES_COMPLIANCE_FILTER: basic-response,assistant-phase,response-output-phase-schema,streaming-response,system-prompt,tool-calling,image-input,multi-turn
 
     steps:
+      - name: Skip strict compliance for untrusted or unchanged events
+        if: env.RUN_STRICT_COMPLIANCE != 'true'
+        run: echo "Skipping strict compliance because this event is untrusted or has no strict-mode changes."
+
       - name: Checkout code
+        if: env.RUN_STRICT_COMPLIANCE == 'true'
         uses: actions/checkout@v6
 
       - name: Require Gemini API key
+        if: env.RUN_STRICT_COMPLIANCE == 'true'
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
@@ -412,16 +413,20 @@ jobs:
           fi
 
       - name: Install Rust
+        if: env.RUN_STRICT_COMPLIANCE == 'true'
         uses: dtolnay/rust-toolchain@stable
 
       - name: Build Onwards
+        if: env.RUN_STRICT_COMPLIANCE == 'true'
         working-directory: onwards
         run: cargo build --release --package onwards
 
       - name: Install Bun
+        if: env.RUN_STRICT_COMPLIANCE == 'true'
         uses: oven-sh/setup-bun@v2
 
       - name: Clone Open Responses
+        if: env.RUN_STRICT_COMPLIANCE == 'true'
         run: |
           git clone --depth 1 https://github.com/openresponses/openresponses /tmp/openresponses
           cd /tmp/openresponses
@@ -429,9 +434,11 @@ jobs:
           git log -1 --oneline
 
       - name: Install Open Responses dependencies
+        if: env.RUN_STRICT_COMPLIANCE == 'true'
         run: cd /tmp/openresponses && bun install
 
       - name: Write Gemini adapter config
+        if: env.RUN_STRICT_COMPLIANCE == 'true'
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
@@ -453,6 +460,7 @@ jobs:
           EOF
 
       - name: Start Gemini adapter upstream
+        if: env.RUN_STRICT_COMPLIANCE == 'true'
         run: |
           ./target/release/onwards \
             --port 3001 \
@@ -475,6 +483,7 @@ jobs:
           exit 1
 
       - name: Write Onwards config
+        if: env.RUN_STRICT_COMPLIANCE == 'true'
         env:
           ADAPTER_FLAG: ${{ matrix.mode == 'adapter' && 'true' || 'false' }}
         run: |
@@ -495,6 +504,7 @@ jobs:
           EOF
 
       - name: Start Onwards
+        if: env.RUN_STRICT_COMPLIANCE == 'true'
         run: |
           ./target/release/onwards \
             -f /tmp/onwards-openresponses-config.json \
@@ -514,6 +524,7 @@ jobs:
           exit 1
 
       - name: Run compliance tests
+        if: env.RUN_STRICT_COMPLIANCE == 'true'
         env:
           MODE: ${{ matrix.mode }}
         run: |
@@ -609,7 +620,7 @@ jobs:
           exit "$status"
 
       - name: Show Onwards logs
-        if: always()
+        if: always() && env.RUN_STRICT_COMPLIANCE == 'true'
         run: |
           echo "=== Onwards under test ==="
           cat /tmp/onwards.log || echo "No Onwards log file found"
@@ -618,7 +629,7 @@ jobs:
           cat /tmp/onwards-gemini-adapter.log || echo "No upstream log file found"
 
       - name: Upload Onwards compliance artifacts
-        if: always()
+        if: always() && env.RUN_STRICT_COMPLIANCE == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: onwards-openresponses-${{ matrix.mode }}
@@ -630,7 +641,7 @@ jobs:
           if-no-files-found: ignore
 
       - name: Stop Onwards processes
-        if: always()
+        if: always() && env.RUN_STRICT_COMPLIANCE == 'true'
         run: |
           if [[ -f /tmp/onwards.pid ]]; then
             kill "$(cat /tmp/onwards.pid)" || true
@@ -641,7 +652,7 @@ jobs:
 
   # Sibling image build to `onwards-pr-image`; both start as soon as CI begins.
   build:
-    if: github.event_name == 'pull_request' || github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]')
     name: dwctl / image
     runs-on: depot-ubuntu-24.04
 
@@ -670,8 +681,7 @@ jobs:
           images: ghcr.io/doublewordai/control-layer
           sep-tags: "\n"
           tags: |
-            type=sha,prefix=sha-
-            type=raw,value=manual,enable=${{ github.event_name == 'workflow_dispatch' }}
+            type=raw,value=sha-${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
 
       - name: Build and push all images
         id: build-step
@@ -706,7 +716,7 @@ jobs:
       image-tag: ${{ steps.meta.outputs.tags }}
 
   openresponses-compliance:
-    if: github.event_name == 'pull_request' || github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
     runs-on: ubuntu-latest
     needs: build
     name: dwctl / open responses

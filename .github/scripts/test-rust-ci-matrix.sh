@@ -64,6 +64,11 @@ require_text 'git clone --depth 1 https://github.com/openresponses/openresponses
 require_text 'onwards-openresponses-${MODE}-retry.json' 'retry only transiently failing Open Responses filters'
 require_text 'Malformed compliance output is always a failure.' 'reject malformed compliance runner output'
 
+if grep -Fq 'workflow_dispatch' "$workflow"; then
+  echo "Required-check CI must only run for pull requests and merge groups" >&2
+  exit 1
+fi
+
 onwards_compliance_job="$(
   sed -n '/^  onwards-openresponses-compliance:/,/^  build:/p' "$workflow"
 )"
@@ -89,6 +94,29 @@ fi
 
 if grep -Fq 'git checkout fa29df5' <<< "$onwards_compliance_job"; then
   echo "Standalone Onwards compliance must track the same current suite as control-layer compliance" >&2
+  exit 1
+fi
+
+require_text "    if: always()" 'expand both Onwards compliance modes after the change detector'
+require_text "    needs: onwards-compliance-changes" 'wait for the Onwards compliance change detector'
+require_text "      RUN_STRICT_COMPLIANCE: \${{ needs.onwards-compliance-changes.outputs.strict == 'true' && (github.event_name == 'merge_group' || (github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]')) }}" 'only run strict compliance for trusted events'
+require_text "      - name: Skip strict compliance for untrusted or unchanged events" 'declare a no-op strict compliance path'
+require_text "        if: env.RUN_STRICT_COMPLIANCE != 'true'" 'skip strict compliance safely when it is not allowed'
+require_text "        if: env.RUN_STRICT_COMPLIANCE == 'true'" 'guard real Onwards compliance steps with the trust gate'
+require_text "        if: always() && env.RUN_STRICT_COMPLIANCE == 'true'" 'guard Onwards compliance diagnostics, artifacts, and cleanup with the trust gate'
+
+trusted_event_condition="github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]')"
+require_text "    if: ${trusted_event_condition}" 'run image publishing only for trusted PRs and merge groups'
+require_text "tags: ghcr.io/doublewordai/onwards:sha-\${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}" 'tag Onwards images with the PR head or merge-group SHA'
+require_text "            type=raw,value=sha-\${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}" 'tag dwctl images with the PR head or merge-group SHA'
+
+pr_title_workflow=".github/workflows/pr-title-check.yml"
+if ! grep -Fq '  merge_group:' "$pr_title_workflow" || \
+   ! grep -Fq '    types: [checks_requested]' "$pr_title_workflow" || \
+   ! grep -Fq "        if: github.event_name == 'pull_request'" "$pr_title_workflow" || \
+   ! grep -Fq '      - name: Skip pull request title validation for merge-group commits' "$pr_title_workflow" || \
+   ! grep -Fq "        if: github.event_name == 'merge_group'" "$pr_title_workflow"; then
+  echo "PR title check must emit its required context for merge-group commits without reading PR data" >&2
   exit 1
 fi
 

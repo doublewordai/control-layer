@@ -304,6 +304,33 @@ if grep -Fq 'release-please--' .github/workflows/ci.yaml; then
   exit 1
 fi
 
+if grep -Fq 'workflow_dispatch' .github/workflows/ci.yaml; then
+  echo "Required-check CI must not emit manual-dispatch statuses" >&2
+  exit 1
+fi
+
+if ! grep -Fq '  merge_group:' .github/workflows/pr-title-check.yml || \
+   ! grep -Fq '    types: [checks_requested]' .github/workflows/pr-title-check.yml || \
+   ! grep -Fq "        if: github.event_name == 'pull_request'" .github/workflows/pr-title-check.yml || \
+   ! grep -Fq "        if: github.event_name == 'merge_group'" .github/workflows/pr-title-check.yml; then
+  echo "PR title validation must produce a safe merge-group check context" >&2
+  exit 1
+fi
+
+if ! grep -Fq '    if: always()' .github/workflows/ci.yaml || \
+   ! grep -Fq "RUN_STRICT_COMPLIANCE: \${{ needs.onwards-compliance-changes.outputs.strict == 'true' && (github.event_name == 'merge_group' || (github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]')) }}" .github/workflows/ci.yaml || \
+   ! grep -Fq "if: always() && env.RUN_STRICT_COMPLIANCE == 'true'" .github/workflows/ci.yaml; then
+  echo "Onwards strict compliance must always declare stable matrix checks and gate secret use to trusted events" >&2
+  exit 1
+fi
+
+trusted_event_condition="github.event_name == 'merge_group' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]')"
+if [[ "$(grep -Fc "if: ${trusted_event_condition}" .github/workflows/ci.yaml)" != "2" ]] || \
+   ! grep -Fq "github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha" .github/workflows/ci.yaml; then
+  echo "Image publishing must be first-wave work limited to trusted PRs and merge groups" >&2
+  exit 1
+fi
+
 for obsolete_script in \
   .github/scripts/publish-fusillade-crate.sh \
   .github/scripts/sync-fusillade-release-dependencies.py \
