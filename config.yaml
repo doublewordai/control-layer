@@ -576,6 +576,8 @@ background_services:
     #                                         # flip off to pause instantly (resumable by construction)
     # batch_archive_backfill_interval_ms: 1000
     # batch_archive_backfill_moves_per_tick: 4
+    # batch_archive_backfill_concurrency: 8    # Concurrent moves per tick; the drain-throughput lever
+    #                                          # (per-move cost is mostly fixed txn overhead). 1 = sequential
     # batch_archive_partitions_weeks_ahead: 4 # Weekly-partition runway maintained by the daily tick
 
     # Observability

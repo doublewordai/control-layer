@@ -1,5 +1,3 @@
-# syntax=docker/dockerfile:1.7
-
 # Dependency planner stage
 FROM lukemathwalker/cargo-chef:latest-rust-1.93.0-slim AS chef
 WORKDIR /app
@@ -7,11 +5,14 @@ WORKDIR /app
 FROM chef AS planner
 COPY Cargo.toml Cargo.lock ./
 COPY dwctl/ dwctl/
+COPY fusillade/ fusillade/
+COPY fusillade-core/ fusillade-core/
+COPY fusillade-arsenal/ fusillade-arsenal/
+COPY onwards/ onwards/
 RUN cargo chef prepare --recipe-path recipe.json
 
 # Backend build stage
 FROM chef AS builder
-ARG TARGETARCH
 
 # Install build dependencies including Node.js
 RUN apt-get update && apt-get install -y \
@@ -25,10 +26,7 @@ RUN apt-get update && apt-get install -y \
 
 # Build dependencies (cached unless Cargo.toml/Cargo.lock change)
 COPY --from=planner /app/recipe.json recipe.json
-RUN --mount=type=cache,id=dwctl-cargo-registry,target=/usr/local/cargo/registry \
-    --mount=type=cache,id=dwctl-cargo-git,target=/usr/local/cargo/git \
-    --mount=type=cache,id=dwctl-cargo-target-${TARGETARCH},target=/app/target \
-    cargo chef cook --release --recipe-path recipe.json
+RUN cargo chef cook --release --recipe-path recipe.json
 
 # Build frontend
 COPY dashboard/package.json dashboard/pnpm-lock.yaml dashboard/
@@ -39,16 +37,16 @@ RUN pnpm run build
 WORKDIR /app
 
 # Copy source and build
-COPY .sqlx/ .sqlx/
 COPY Cargo.toml Cargo.lock ./
+COPY .sqlx/ .sqlx/
 COPY dwctl/ dwctl/
+COPY fusillade/ fusillade/
+COPY fusillade-core/ fusillade-core/
+COPY fusillade-arsenal/ fusillade-arsenal/
+COPY onwards/ onwards/
 RUN rm -rf dwctl/static && cp -r dashboard/dist dwctl/static
 ENV SQLX_OFFLINE=true
-RUN --mount=type=cache,id=dwctl-cargo-registry,target=/usr/local/cargo/registry \
-    --mount=type=cache,id=dwctl-cargo-git,target=/usr/local/cargo/git \
-    --mount=type=cache,id=dwctl-cargo-target-${TARGETARCH},target=/app/target \
-    cargo build --release -p dwctl \
-    && cp target/release/dwctl /app/dwctl-bin
+RUN cargo build --release -p dwctl
 
 # Runtime stage
 FROM ubuntu:24.04
@@ -65,7 +63,7 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /app
 
 # Copy the binary from builder stage (frontend is already embedded in the binary)
-COPY --from=builder /app/dwctl-bin /app/dwctl
+COPY --from=builder /app/target/release/dwctl /app/dwctl
 
 # Copy default email templates (can be overridden via volume mount)
 COPY dwctl/default_templates/ /app/default_templates/

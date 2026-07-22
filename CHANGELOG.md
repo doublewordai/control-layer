@@ -1,5 +1,34 @@
 # Changelog
 
+## [8.95.1](https://github.com/doublewordai/control-layer/compare/v8.95.0...v8.95.1) (2026-07-22)
+
+
+### Bug Fixes
+
+* batch analytics endpoints must return the billed (discounted) c… ([#1329](https://github.com/doublewordai/control-layer/issues/1329)) ([435d945](https://github.com/doublewordai/control-layer/commit/435d945519e9b6449d8eb25fd3d34a3eadf4ae18))
+
+## [8.95.0](https://github.com/doublewordai/control-layer/compare/v8.94.2...v8.95.0) (2026-07-22)
+
+
+### Features
+
+* integrate Fusillade and Onwards into the Rust workspace ([#1325](https://github.com/doublewordai/control-layer/issues/1325)) ([6f712ba](https://github.com/doublewordai/control-layer/commit/6f712ba299eb1144d20e294b11ced08d3ef4224e))
+
+## [8.94.2](https://github.com/doublewordai/control-layer/compare/v8.94.1...v8.94.2) (2026-07-21)
+
+
+### Bug Fixes
+
+* fusillade 24.1.0 ([#1327](https://github.com/doublewordai/control-layer/issues/1327)) ([624b2a9](https://github.com/doublewordai/control-layer/commit/624b2a9495f5d05d27224a1d7dfdd61d64509e11))
+
+## [8.94.1](https://github.com/doublewordai/control-layer/compare/v8.94.0...v8.94.1) (2026-07-21)
+
+
+### Bug Fixes
+
+* bump fusillade 24.0.0 ([#1326](https://github.com/doublewordai/control-layer/issues/1326)) ([cd2b5a0](https://github.com/doublewordai/control-layer/commit/cd2b5a038226265986426bed0c24090074da8ae9))
+* reject zero upload watchdog settings ([#1320](https://github.com/doublewordai/control-layer/issues/1320)) ([ea03e16](https://github.com/doublewordai/control-layer/commit/ea03e16b2f259768de1cf86e7580c2839d55b212))
+
 ## [8.94.0](https://github.com/doublewordai/control-layer/compare/v8.93.1...v8.94.0) (2026-07-20)
 
 

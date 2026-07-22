@@ -505,31 +505,18 @@ async fn test_strict_mode_body_limit_uses_configured_max_body_size(pool: PgPool)
 
     // A 3 MB request body: larger than Axum's 2 MB default (which used to
     // reject it with 413) but within the configured 5 MB limit.
-    let within_limit_body = serde_json::json!({
-        "model": "gpt-4",
-        "messages": [{
-            "role": "user",
-            "content": "x".repeat(3 * 1024 * 1024)
-        }]
-    });
-    let start = std::time::Instant::now();
-    let chat_response = loop {
-        let response = server
-            .post("/ai/v1/chat/completions")
-            .add_header("Authorization", &format!("Bearer {}", api_key))
-            .add_header("Content-Type", "application/json")
-            .json(&within_limit_body)
-            .await;
-
-        // Model discovery and the credit/access snapshot are updated by
-        // separate notifications. A model can therefore become visible just
-        // before the key is authorized to use it; poll the real request until
-        // both sides of the asynchronous sync have converged.
-        if !matches!(response.status_code().as_u16(), 403 | 404) || start.elapsed() >= std::time::Duration::from_secs(3) {
-            break response;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-    };
+    let chat_response = server
+        .post("/ai/v1/chat/completions")
+        .add_header("Authorization", &format!("Bearer {}", api_key))
+        .add_header("Content-Type", "application/json")
+        .json(&serde_json::json!({
+            "model": "gpt-4",
+            "messages": [{
+                "role": "user",
+                "content": "x".repeat(3 * 1024 * 1024)
+            }]
+        }))
+        .await;
 
     let status = chat_response.status_code();
     assert_eq!(
