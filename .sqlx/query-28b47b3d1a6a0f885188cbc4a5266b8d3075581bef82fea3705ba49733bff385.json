@@ -1,0 +1,41 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                UPDATE api_key_spend_checkpoints ck SET\n                    total_spend = ck.total_spend + i.delta,\n                    window_spend = CASE\n                        WHEN api_key_cap_window_current(ck.window_started_at, ak.spend_limit_interval)\n                        THEN ck.window_spend + i.delta\n                        ELSE i.delta\n                    END,\n                    window_started_at = CASE\n                        WHEN api_key_cap_window_current(ck.window_started_at, ak.spend_limit_interval)\n                        THEN ck.window_started_at\n                        ELSE NOW()\n                    END,\n                    updated_at = NOW()\n                FROM UNNEST($1::uuid[], $2::numeric[]) AS i(api_key_id, delta)\n                JOIN api_keys ak ON ak.id = i.api_key_id\n                WHERE ck.api_key_id = i.api_key_id\n                RETURNING ck.api_key_id, ck.window_spend AS \"window_spend!\", i.delta AS \"delta!\", ak.spend_limit\n                ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "api_key_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "window_spend!",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 2,
+        "name": "delta!",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 3,
+        "name": "spend_limit",
+        "type_info": "Numeric"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "UuidArray",
+        "NumericArray"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      null,
+      true
+    ]
+  },
+  "hash": "28b47b3d1a6a0f885188cbc4a5266b8d3075581bef82fea3705ba49733bff385"
+}

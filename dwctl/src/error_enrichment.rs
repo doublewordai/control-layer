@@ -106,8 +106,13 @@ pub async fn error_enrichment_middleware(State(pool): State<PgPool>, request: Re
         //      the model at all, so report it first.
         //   2. Modality (traffic routing rule) — user has the model but their key
         //      kind (batch/realtime/playground) is denied.
-        //   3. Insufficient balance — onwards excludes keys with balance ≤ 0; this
-        //      is the catch-all if neither of the above explains the 403.
+        //   3. Insufficient balance — onwards excludes keys with balance ≤ 0.
+        //      Balance deliberately supersedes the spending cap below: if both
+        //      are blown, the account-level condition is the fundamental,
+        //      actionable one.
+        //   4. Spending cap — onwards excludes every key of a cap scope whose
+        //      window spend reached the limit; only reported when balance is
+        //      healthy.
 
         // 0. Non-inference key: explain why an otherwise-valid key was rejected,
         //    rather than leaving onwards' generic "forbidden" body.
@@ -165,9 +170,101 @@ pub async fn error_enrichment_middleware(State(pool): State<PgPool>, request: Re
             }
             .into_response();
         }
+
+        // 4. Spending cap. Read-only against the same checkpoint state and
+        //    window function the sync eligibility predicate uses.
+        if let Ok(Some(cap)) = get_spend_cap_state(pool.clone(), &key).await
+            && cap.window_spend >= cap.limit
+        {
+            if cap.window_current {
+                let resets = match cap.resets_at {
+                    Some(at) => format!("; resets {}", at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
+                    None => String::new(),
+                };
+                let body = serde_json::json!({
+                    "error": {
+                        "message": format!(
+                            "API key has reached its spending cap of ${} (spent ${} this period{resets}). Raise or remove the cap to resume.",
+                            cap.limit.round_dp(2),
+                            cap.window_spend.round_dp(2),
+                        ),
+                        "type": "insufficient_quota",
+                        "code": "spend_cap_exceeded",
+                        "param": null
+                    }
+                });
+                return Response::builder()
+                    .status(StatusCode::PAYMENT_REQUIRED)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap_or_else(|_| StatusCode::PAYMENT_REQUIRED.into_response());
+            }
+
+            // Reset-pending race: the key was yanked for its cap, but the
+            // calendar window has since rolled over — the periodic fallback
+            // sync (~10s) just hasn't readmitted the key yet. This request
+            // SHOULD succeed and only hit unfortunate timing, so return a
+            // retriable 429 + Retry-After: both fusillade's daemon and client
+            // SDKs retry 429s, and the retry lands after readmission.
+            // Deliberately not a 5xx — that would page the proxy-errors alert
+            // for a benign, self-healing race.
+            let body = serde_json::json!({
+                "error": {
+                    "message": "Spending cap window has reset; the key is being reinstated. Retry shortly.",
+                    "type": "rate_limit_error",
+                    "code": "spend_cap_reset_pending",
+                    "param": null
+                }
+            });
+            return Response::builder()
+                .status(StatusCode::TOO_MANY_REQUESTS)
+                .header("content-type", "application/json")
+                .header("retry-after", "10")
+                .body(Body::from(body.to_string()))
+                .unwrap_or_else(|_| StatusCode::TOO_MANY_REQUESTS.into_response());
+        }
     }
 
     response
+}
+
+/// Spending-cap state for the cap scope of the key with this secret (the key
+/// itself, or its capped parent when the secret belongs to a cap-scope child).
+/// `None` when the key is unknown or its scope has no cap set.
+struct SpendCapState {
+    limit: Decimal,
+    window_spend: Decimal,
+    /// Whether `window_started_at` falls in the current calendar window (UTC).
+    /// False for an exhausted-but-rolled window = reinstatement pending.
+    window_current: bool,
+    /// Next calendar boundary for windowed caps; `None` for one-off caps.
+    resets_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+#[instrument(skip_all, name = "dwctl.get_spend_cap_state")]
+async fn get_spend_cap_state(pool: PgPool, api_key: &str) -> Result<Option<SpendCapState>, DbError> {
+    let row = sqlx::query!(
+        r#"
+        SELECT root.spend_limit AS "spend_limit!",
+               COALESCE(ck.window_spend, 0) AS "window_spend!",
+               api_key_cap_window_current(ck.window_started_at, root.spend_limit_interval) AS "window_current!",
+               api_key_cap_window_resets_at(root.spend_limit_interval) AS resets_at
+        FROM api_keys ak
+        JOIN api_keys root ON root.id = COALESCE(ak.parent_api_key_id, ak.id)
+        LEFT JOIN api_key_spend_checkpoints ck ON ck.api_key_id = root.id
+        WHERE ak.secret = $1 AND ak.is_deleted = false AND root.spend_limit IS NOT NULL
+        "#,
+        api_key
+    )
+    .fetch_optional(&pool)
+    .await?;
+
+    Ok(row.map(|r| SpendCapState {
+        limit: r.spend_limit,
+        window_spend: r.window_spend,
+        window_current: r.window_current,
+        resets_at: r.resets_at,
+    }))
 }
 
 /// Render an `api_keys.purpose` value as a user-facing modality label.
@@ -542,6 +639,164 @@ mod tests {
         let body = response.text();
         println!("Enriched response body: {}", body);
         assert!(body.contains("balance too low"));
+    }
+
+    /// Integration test: the spend-cap enrichment arms. Covers the 402
+    /// `spend_cap_exceeded` envelope, the balance-supersedes-cap ordering,
+    /// and the 429 `spend_cap_reset_pending` reinstatement race.
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_error_enrichment_spend_cap_arms(pool: PgPool) {
+        use crate::db::handlers::api_keys::ApiKeys as ApiKeysRepo;
+        use crate::test::utils::{add_deployment_to_group, add_user_to_group, create_test_group};
+
+        // User with model access (so the model-access arm falls through) and
+        // healthy balance (so the balance arm falls through).
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        let endpoint_id = crate::test::utils::create_test_endpoint(&pool, "cap-endpoint", user.id).await;
+        let deployment_id = crate::test::utils::create_test_model(&pool, "cap-model-name", "cap-model", endpoint_id, user.id).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+        add_deployment_to_group(&pool, deployment_id, group.id, user.id).await;
+
+        let mut conn = pool.acquire().await.unwrap();
+        let mut api_keys_repo = ApiKeysRepo::new(&mut conn);
+        let api_key = api_keys_repo
+            .create(&ApiKeyCreateDBRequest {
+                user_id: user.id,
+                name: "Capped Key".to_string(),
+                description: None,
+                purpose: ApiKeyPurpose::Realtime,
+                requests_per_second: None,
+                burst_size: None,
+                created_by: user.id,
+            })
+            .await
+            .unwrap();
+        drop(conn);
+
+        let mut credits_conn = pool.acquire().await.unwrap();
+        let mut credits_repo = Credits::new(&mut credits_conn);
+        credits_repo
+            .create_transaction(&CreditTransactionCreateDBRequest {
+                user_id: user.id,
+                transaction_type: CreditTransactionType::AdminGrant,
+                amount: Decimal::new(5000, 2),
+                source_id: uuid::Uuid::new_v4().to_string(),
+                description: Some("Initial credits".to_string()),
+                fusillade_batch_id: None,
+                api_key_id: None,
+            })
+            .await
+            .unwrap();
+        drop(credits_conn);
+
+        // Cap the key at $10 (one-off) with an exhausted window.
+        sqlx::query("UPDATE api_keys SET spend_limit = 10 WHERE id = $1")
+            .bind(api_key.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO api_key_spend_checkpoints (api_key_id, total_spend, window_spend) VALUES ($1, 10.5, 10.5)")
+            .bind(api_key.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let router = axum::Router::new()
+            .route(
+                "/ai/v1/chat/completions",
+                axum::routing::post(|| async {
+                    axum::response::Response::builder()
+                        .status(StatusCode::FORBIDDEN)
+                        .body(axum::body::Body::from("Forbidden"))
+                        .unwrap()
+                }),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                pool.clone(),
+                crate::error_enrichment::error_enrichment_middleware,
+            ));
+        let server = axum_test::TestServer::new(router).expect("Failed to create test server");
+        let request = || {
+            server
+                .post("/ai/v1/chat/completions")
+                .add_header("authorization", &format!("Bearer {}", api_key.secret))
+                .json(&serde_json::json!({
+                    "model": "cap-model",
+                    "messages": [{"role": "user", "content": "Hello"}]
+                }))
+        };
+
+        // 1. Healthy balance + exhausted cap → explicit 402 spend_cap_exceeded.
+        let response = request().await;
+        assert_eq!(response.status_code().as_u16(), 402);
+        let body = response.text();
+        assert!(body.contains("spend_cap_exceeded"), "expected cap code, got: {body}");
+        assert!(body.contains("insufficient_quota"), "expected OpenAI quota type, got: {body}");
+        assert!(body.contains("spending cap of $10"), "expected cap amount, got: {body}");
+
+        // 2. Ordering: balance supersedes the cap. Blow the balance too — the
+        //    user must see the balance error, not the cap error.
+        let mut credits_conn = pool.acquire().await.unwrap();
+        let mut credits_repo = Credits::new(&mut credits_conn);
+        credits_repo
+            .create_transaction(&CreditTransactionCreateDBRequest {
+                user_id: user.id,
+                transaction_type: CreditTransactionType::Usage,
+                amount: Decimal::new(10000, 2),
+                source_id: uuid::Uuid::new_v4().to_string(),
+                description: Some("Usage".to_string()),
+                fusillade_batch_id: None,
+                api_key_id: None,
+            })
+            .await
+            .unwrap();
+        drop(credits_conn);
+        let response = request().await;
+        assert_eq!(response.status_code().as_u16(), 402);
+        let body = response.text();
+        assert!(body.contains("balance too low"), "balance must supersede the cap, got: {body}");
+        assert!(!body.contains("spend_cap_exceeded"), "cap error must not surface, got: {body}");
+
+        // 3. Reinstatement race: restore the balance, make the cap windowed
+        //    with a rolled-over (stale) window — exhausted counter, expired
+        //    window. The enricher must return a retriable 429, not a wrong
+        //    "cap exceeded" and not a 5xx.
+        let mut credits_conn = pool.acquire().await.unwrap();
+        let mut credits_repo = Credits::new(&mut credits_conn);
+        credits_repo
+            .create_transaction(&CreditTransactionCreateDBRequest {
+                user_id: user.id,
+                transaction_type: CreditTransactionType::AdminGrant,
+                amount: Decimal::new(20000, 2),
+                source_id: uuid::Uuid::new_v4().to_string(),
+                description: Some("Top-up".to_string()),
+                fusillade_batch_id: None,
+                api_key_id: None,
+            })
+            .await
+            .unwrap();
+        drop(credits_conn);
+        sqlx::query("UPDATE api_keys SET spend_limit_interval = 'daily' WHERE id = $1")
+            .bind(api_key.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE api_key_spend_checkpoints SET window_started_at = now() - interval '2 days' WHERE api_key_id = $1")
+            .bind(api_key.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let response = request().await;
+        assert_eq!(response.status_code().as_u16(), 429);
+        assert_eq!(
+            response.headers().get("retry-after").and_then(|v| v.to_str().ok()),
+            Some("10"),
+            "reset-pending must carry Retry-After"
+        );
+        let body = response.text();
+        assert!(body.contains("spend_cap_reset_pending"), "expected reset-pending code, got: {body}");
     }
 
     /// Integration test: Error enrichment middleware passes through 403 when user has access

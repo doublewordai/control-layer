@@ -613,6 +613,80 @@ async fn test_balance_change_toggles_paid_access_on_reload(pool: sqlx::PgPool) {
     );
 }
 
+/// Spending-cap gate: an exhausted scope loses paid-model access as a unit
+/// (capped root AND its hidden batch child), free models stay usable, one-off
+/// caps never self-heal, and a windowed cap readmits at the calendar boundary
+/// with no fold or traffic required (the lazy-readmission path the fallback
+/// sync provides).
+#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base", "cache_tariff_metered", "cache_balance_user_a_positive")))]
+async fn test_spend_cap_toggles_scope_access_on_reload(pool: sqlx::PgPool) {
+    use crate::db::handlers::api_keys::ApiKeys;
+
+    let tiers = RateLimitTiersConfig::default();
+    let key_a_id: uuid::Uuid = sqlx::query_scalar("SELECT id FROM api_keys WHERE secret = $1")
+        .bind(KEY_A_SECRET)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+    // Cap key A (one-off, $10) and mint its cap-scope child.
+    sqlx::query("UPDATE api_keys SET spend_limit = 10 WHERE id = $1")
+        .bind(key_a_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let child_secret = {
+        let mut conn = pool.acquire().await.unwrap();
+        let (secret, _) = ApiKeys::new(&mut conn).get_or_create_child_hidden_key(key_a_id).await.unwrap();
+        secret
+    };
+
+    // Under the cap: both scope keys are eligible for the paid pool.
+    let targets = super::load_targets_from_db(&pool, &[], false, &tiers).await.unwrap();
+    let metered = targets.targets.get("metered-public").unwrap();
+    assert!(pool_has_key(metered.value(), KEY_A_SECRET));
+    assert!(pool_has_key(metered.value(), &child_secret), "child shares the scope's eligibility");
+
+    // Exhaust the scope: window_spend reaches the limit.
+    sqlx::query("INSERT INTO api_key_spend_checkpoints (api_key_id, total_spend, window_spend) VALUES ($1, 10, 10)")
+        .bind(key_a_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let targets = super::load_targets_from_db(&pool, &[], false, &tiers).await.unwrap();
+    let metered = targets.targets.get("metered-public").unwrap();
+    assert!(!pool_has_key(metered.value(), KEY_A_SECRET), "exhausted scope loses the paid pool");
+    assert!(!pool_has_key(metered.value(), &child_secret), "the child is yanked with its root");
+    assert!(
+        pool_has_key(targets.targets.get("regular-public").unwrap().value(), KEY_A_SECRET),
+        "free models stay usable on an exhausted scope, like the balance gate"
+    );
+
+    // One-off caps never roll over: an arbitrarily old window stays exhausted.
+    sqlx::query("UPDATE api_key_spend_checkpoints SET window_started_at = now() - interval '40 days' WHERE api_key_id = $1")
+        .bind(key_a_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let targets = super::load_targets_from_db(&pool, &[], false, &tiers).await.unwrap();
+    assert!(
+        !pool_has_key(targets.targets.get("metered-public").unwrap().value(), KEY_A_SECRET),
+        "one-off cap must not self-heal"
+    );
+
+    // Windowed cap: the same stale window is no longer current, so the next
+    // reload readmits the whole scope — no fold, no traffic, no reset job.
+    sqlx::query("UPDATE api_keys SET spend_limit_interval = 'daily' WHERE id = $1")
+        .bind(key_a_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let targets = super::load_targets_from_db(&pool, &[], false, &tiers).await.unwrap();
+    let metered = targets.targets.get("metered-public").unwrap();
+    assert!(pool_has_key(metered.value(), KEY_A_SECRET), "rolled window readmits the root");
+    assert!(pool_has_key(metered.value(), &child_secret), "rolled window readmits the child");
+}
+
 #[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
 async fn test_cache_shape_batch_escalation_access_for_private_alias(pool: sqlx::PgPool) {
     let alias = "escalation-private".to_string();
