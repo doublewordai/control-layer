@@ -1617,6 +1617,13 @@ pub struct DaemonConfig {
     #[serde(default)]
     pub inject_deadline_priority: bool,
 
+    /// Database-wide per-model ceiling below which no-SLA background work may
+    /// be claimed. Zero disables background processing while leaving
+    /// submission and inspection available. Background processing also
+    /// requires `inject_deadline_priority = true`.
+    #[serde(default)]
+    pub background_concurrency_limit: usize,
+
     /// Maximum request rows the batch claim daemon takes per iteration.
     /// 0 inherits `claim_batch_size`, so an existing tuned cap carries over
     /// to the split batch daemon unchanged. Default: 0 (inherit).
@@ -1891,6 +1898,7 @@ impl Default for DaemonConfig {
             streamable_endpoints: Vec::new(),
             urgency_weight: default_urgency_weight(),
             inject_deadline_priority: false,
+            background_concurrency_limit: 0,
             batch_claim_size: 0,
             batch_claim_batch_size: default_batch_claim_batch_size(),
             batch_claim_interval_ms: 0,
@@ -1969,6 +1977,7 @@ impl DaemonConfig {
             streamable_endpoints: self.streamable_endpoints.clone(),
             urgency_weight: self.urgency_weight,
             inject_deadline_priority: self.inject_deadline_priority,
+            background_concurrency_limit: self.background_concurrency_limit,
             batch_claim_size: self.batch_claim_size,
             batch_claim_batch_size: self.batch_claim_batch_size,
             batch_claim_interval_ms: self.batch_claim_interval_ms,
@@ -2809,6 +2818,14 @@ impl Config {
         if self.background_services.batch_daemon.upload_stall_poll_ms == 0 {
             return Err(Error::Internal {
                 operation: "Config validation: upload_stall_poll_ms cannot be 0. Set a positive integer value (default: 100).".to_string(),
+            });
+        }
+
+        let batch_daemon = &self.background_services.batch_daemon;
+        if batch_daemon.background_concurrency_limit > 0 && !batch_daemon.inject_deadline_priority {
+            return Err(Error::Internal {
+                operation: "Config validation: background_concurrency_limit requires inject_deadline_priority=true so background work is always lower priority than SLA work."
+                    .to_string(),
             });
         }
 
@@ -3932,6 +3949,45 @@ background_services:
     }
 
     #[test]
+    fn test_background_concurrency_limit_yaml_override_and_mapping() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: test-secret-key
+background_services:
+  batch_daemon:
+    background_concurrency_limit: 37
+    inject_deadline_priority: true
+"#,
+            )?;
+            let args = Args {
+                config: "test.yaml".into(),
+                validate: false,
+            };
+
+            let config = Config::load(&args)?;
+            assert_eq!(
+                config
+                    .background_services
+                    .batch_daemon
+                    .to_fusillade_config()
+                    .background_concurrency_limit,
+                37
+            );
+            assert!(
+                config
+                    .background_services
+                    .batch_daemon
+                    .to_fusillade_config()
+                    .inject_deadline_priority
+            );
+
+            Ok(())
+        });
+    }
+
+    #[test]
     fn test_urgency_weight_default() {
         Jail::expect_with(|jail| {
             jail.create_file(
@@ -4143,6 +4199,21 @@ background_services:
         config.background_services.batch_daemon.upload_stall_poll_ms = 0;
         let err = config.validate().unwrap_err().to_string();
         assert!(err.contains("upload_stall_poll_ms cannot be 0"), "{err}");
+    }
+
+    #[test]
+    fn test_background_processing_requires_priority_injection() {
+        let mut config = Config::default();
+        config.auth.native.enabled = true;
+        config.secret_key = Some("test-secret-key".to_string());
+        config.background_services.batch_daemon.background_concurrency_limit = 1;
+        config.background_services.batch_daemon.inject_deadline_priority = false;
+
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("background_concurrency_limit requires inject_deadline_priority"),
+            "{err}"
+        );
     }
 
     #[test]

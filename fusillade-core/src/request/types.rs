@@ -136,8 +136,9 @@ pub struct Pending {
     /// None means it can be claimed immediately
     pub not_before: Option<DateTime<Utc>>,
 
-    /// When the batch expires (used for deadline-aware retry logic)
-    pub batch_expires_at: DateTime<Utc>,
+    /// When the batch expires (used for deadline-aware retry logic).
+    /// `None` for background requests, which have no completion SLA.
+    pub batch_expires_at: Option<DateTime<Utc>>,
 }
 
 impl RequestState for Pending {}
@@ -168,8 +169,8 @@ pub struct Claimed {
     pub claimed_at: DateTime<Utc>,
     /// Number of times this request has been attempted (carried over from Pending)
     pub retry_attempt: u32,
-    /// When the batch expires (carried over from Pending)
-    pub batch_expires_at: DateTime<Utc>,
+    /// When the batch expires (carried over from Pending). `None` for background.
+    pub batch_expires_at: Option<DateTime<Utc>>,
     /// Set iff this row was claimed via the leaky bucket (Source B); tells the
     /// daemon which `(user, window-class, model)` bucket to stamp (the model is
     /// read from the request's `data.model`). `None` for full-capacity claims.
@@ -186,8 +187,8 @@ pub struct Processing {
     pub started_at: DateTime<Utc>,
     /// Number of times this request has been attempted (carried over from Claimed)
     pub retry_attempt: u32,
-    /// When the batch expires (carried over from Claimed)
-    pub batch_expires_at: DateTime<Utc>,
+    /// When the batch expires (carried over from Claimed). `None` for background.
+    pub batch_expires_at: Option<DateTime<Utc>>,
     /// Channel receiver for the HTTP request result (wrapped in Arc<Mutex<>> for Sync)
     #[serde(skip)]
     pub result_rx: Arc<Mutex<mpsc::Receiver<Result<HttpResponse>>>>,
@@ -331,8 +332,8 @@ pub struct Failed {
     pub failed_at: DateTime<Utc>,
     /// Number of times this request has been attempted when it failed
     pub retry_attempt: u32,
-    /// When the batch expires (carried over from Processing)
-    pub batch_expires_at: DateTime<Utc>,
+    /// When the batch expires (carried over from Processing). `None` for background.
+    pub batch_expires_at: Option<DateTime<Utc>>,
     /// The model that was actually used (may differ from template if escalated)
     pub routed_model: String,
 }

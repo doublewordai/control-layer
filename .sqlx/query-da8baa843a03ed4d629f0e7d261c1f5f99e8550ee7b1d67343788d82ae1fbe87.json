@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT model AS \"model!\"\n            FROM unnest($1::TEXT[]) WITH ORDINALITY AS candidate(model, model_order)\n            WHERE pg_try_advisory_xact_lock(\n                hashtextextended('fusillade.background:' || model, 0)\n            )\n            ORDER BY model_order\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "model!",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "TextArray"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "da8baa843a03ed4d629f0e7d261c1f5f99e8550ee7b1d67343788d82ae1fbe87"
+}

@@ -122,7 +122,7 @@ impl BatchNotificationInfo {
             completed_requests: batch.completed_requests,
             failed_requests: batch.failed_requests,
             cancelled_requests: batch.canceled_requests,
-            completion_window: batch.completion_window.clone(),
+            completion_window: batch.completion_window.clone().unwrap_or_else(|| "background".to_string()),
             filename: notif.input_file_name.clone(),
             description: notif.input_file_description.clone(),
             output_file_id: batch.output_file_id.map(|f| f.0),
@@ -1011,6 +1011,48 @@ mod tests {
     use crate::payment_providers;
     use rust_decimal::Decimal;
     use sqlx::PgPool;
+
+    #[test]
+    fn background_batch_notification_uses_the_tier_as_its_window_label() {
+        let now = Utc::now();
+        let notification = fusillade::batch::BatchNotification {
+            batch: fusillade::Batch {
+                id: fusillade::BatchId(Uuid::new_v4()),
+                file_id: Some(fusillade::FileId(Uuid::new_v4())),
+                created_at: now,
+                metadata: None,
+                service_tier: Some("background".to_string()),
+                completion_window: None,
+                endpoint: "/v1/chat/completions".to_string(),
+                output_file_id: None,
+                error_file_id: None,
+                created_by: Uuid::new_v4().to_string(),
+                expires_at: None,
+                cancelling_at: None,
+                errors: None,
+                total_requests: 1,
+                pending_requests: 0,
+                in_progress_requests: 0,
+                completed_requests: 1,
+                failed_requests: 0,
+                canceled_requests: 0,
+                requests_started_at: Some(now),
+                finalizing_at: Some(now),
+                completed_at: Some(now),
+                failed_at: None,
+                cancelled_at: None,
+                deleted_at: None,
+                notification_sent_at: Some(now),
+                api_key_id: None,
+            },
+            model: "model".to_string(),
+            input_file_name: None,
+            input_file_description: None,
+        };
+
+        let info = BatchNotificationInfo::try_from_batch(&notification).unwrap();
+        assert_eq!(info.completion_window, "background");
+    }
 
     #[sqlx::test]
     async fn test_process_auto_topups_charges_below_threshold(pool: PgPool) {

@@ -530,6 +530,9 @@ background_services:
     #                                 # false treats no-event models (external providers) as live
     # claim_ramp_exponent: 0.56      # Deadline-ramp curve: not-live batches become claimable within
     #                                 # window_minutes^exponent minutes of deadline (~59m/24h, ~10m/1h)
+    # background_concurrency_limit: 0 # Database-wide per-model ceiling for no-SLA background work;
+    #                                 # 0 disables processing, and a nonzero value requires
+    #                                 # inject_deadline_priority: true below
 
     # Retry & Backoff Settings
     # All retry parameters are optional and default to fusillade's built-in defaults

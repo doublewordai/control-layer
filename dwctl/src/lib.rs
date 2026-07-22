@@ -838,7 +838,7 @@ async fn setup_database(
             }
         }
     };
-    fusillade_arsenal::migrator().run(&*fusillade_pools).await?;
+    fusillade_arsenal::run_migrations(&fusillade_pools).await?;
 
     // Run underway migrations (background task queue)
     underway::run_migrations(&*db_pools).await?;

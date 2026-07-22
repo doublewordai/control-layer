@@ -366,12 +366,15 @@ fn to_batch_response_enriched(batch: fusillade::Batch, creator_email: Option<&st
     // Convert batch-level errors (validation errors, system errors, etc.)
     let errors = batch.errors.and_then(|e| serde_json::from_value::<BatchErrors>(e).ok());
 
-    // Check if batch has expired
-    let expired_at = if chrono::Utc::now() > batch.expires_at {
-        Some(batch.expires_at.timestamp())
-    } else {
-        None
-    };
+    // The OpenAI-shaped response predates no-SLA batches. Preserve the SLA
+    // window for ordinary batches and use the explicit tier name for
+    // background batches so callers never receive a fabricated deadline.
+    let completion_window = batch.completion_window.clone().unwrap_or_else(|| "background".to_string());
+    let expires_at = batch.expires_at.map(|expires_at| expires_at.timestamp());
+    let expired_at = batch
+        .expires_at
+        .filter(|expires_at| chrono::Utc::now() > *expires_at)
+        .map(|expires_at| expires_at.timestamp());
 
     BatchResponse {
         id: batch.id.0.to_string(),
@@ -379,14 +382,14 @@ fn to_batch_response_enriched(batch: fusillade::Batch, creator_email: Option<&st
         endpoint: batch.endpoint.clone(),
         errors,
         input_file_id: batch.file_id.map(|id| id.0.to_string()).unwrap_or_default(),
-        completion_window: batch.completion_window.clone(),
+        completion_window,
         status: openai_status.to_string(),
         output_file_id: batch.output_file_id.map(|id| id.0.to_string()),
         // Always show error_file_id if it exists - the file content itself is filtered by fusillade
         error_file_id: batch.error_file_id.map(|id| id.0.to_string()),
         created_at: batch.created_at.timestamp(),
         in_progress_at,
-        expires_at: Some(batch.expires_at.timestamp()),
+        expires_at,
         finalizing_at,
         completed_at,
         failed_at,
@@ -1739,6 +1742,7 @@ pub async fn list_batches<P: PoolProvider>(
             created_before: query.created_before,
             active_first: query.active_first,
             completion_windows,
+            service_tiers: None,
         })
         .await
         .map_err(|e| match &e {
@@ -1952,7 +1956,7 @@ pub async fn list_batches<P: PoolProvider>(
 
 #[cfg(test)]
 mod tests {
-    use super::{load_and_validate_batch_models, parse_completion_window_filter};
+    use super::{load_and_validate_batch_models, parse_completion_window_filter, to_batch_response_with_email};
     use crate::api::models::batches::CreateBatchRequest;
     use crate::api::models::users::Role;
     use crate::db::handlers::Credits;
@@ -1968,6 +1972,48 @@ mod tests {
     use std::collections::HashMap;
     use std::time::Duration;
     use uuid::Uuid;
+
+    fn background_batch() -> fusillade::Batch {
+        let now = chrono::Utc::now();
+        fusillade::Batch {
+            id: fusillade::BatchId(Uuid::new_v4()),
+            file_id: Some(fusillade::FileId(Uuid::new_v4())),
+            created_at: now,
+            metadata: None,
+            service_tier: Some("background".to_string()),
+            completion_window: None,
+            endpoint: "/v1/chat/completions".to_string(),
+            output_file_id: None,
+            error_file_id: None,
+            created_by: Uuid::new_v4().to_string(),
+            expires_at: None,
+            cancelling_at: None,
+            errors: None,
+            total_requests: 1,
+            pending_requests: 1,
+            in_progress_requests: 0,
+            completed_requests: 0,
+            failed_requests: 0,
+            canceled_requests: 0,
+            requests_started_at: Some(now),
+            finalizing_at: None,
+            completed_at: None,
+            failed_at: None,
+            cancelled_at: None,
+            deleted_at: None,
+            notification_sent_at: None,
+            api_key_id: None,
+        }
+    }
+
+    #[test]
+    fn background_batch_response_has_a_tier_label_and_no_expiry() {
+        let response = to_batch_response_with_email(background_batch(), None);
+
+        assert_eq!(response.completion_window, "background");
+        assert!(response.expires_at.is_none());
+        assert!(response.expired_at.is_none());
+    }
 
     // -------------------------------------------------------------------------
     // parse_completion_window_filter — pure parsing, no DB needed.
