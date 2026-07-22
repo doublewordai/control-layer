@@ -413,11 +413,7 @@ mod tests {
             }]
         }"#;
         let result = sanitizer
-            .sanitize(
-                "/v1/chat/completions",
-                &HeaderMap::new(),
-                response_json.as_bytes(),
-            )
+            .sanitize("/v1/chat/completions", &HeaderMap::new(), response_json.as_bytes())
             .unwrap()
             .unwrap();
         let sanitized: serde_json::Value = serde_json::from_slice(&result).unwrap();

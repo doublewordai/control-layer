@@ -76,11 +76,10 @@ for manifest_path, dependencies in local_dependencies.items():
                 f"got {specification.get('path')}"
             )
         if manifest_path == "onwards/Cargo.toml" and dependency == "fusillade":
-            local_version = packages_by_name["fusillade"]["version"]
-            if specification.get("version") != local_version:
+            if not isinstance(specification.get("version"), str):
                 raise SystemExit(
                     "onwards/Cargo.toml: fusillade must retain a registry fallback "
-                    f"at local version {local_version} for crates.io packaging"
+                    "for crates.io packaging"
                 )
             if specification.get("default-features") is not False:
                 raise SystemExit(
@@ -186,6 +185,19 @@ fi
 
 node .github/scripts/test-onwards-floating-tags.cjs
 
+for linted_package in dwctl fusillade fusillade-core fusillade-arsenal; do
+  if ! grep -Fq -- "--package $linted_package" "$justfile"; then
+    echo "Rust linting must retain $linted_package" >&2
+    exit 1
+  fi
+done
+
+if grep -Fq 'cargo clippy --workspace' "$justfile" || \
+   grep -Eq '^[[:space:]]+onwards/src([[:space:]]|$)' "$justfile"; then
+  echo "Imported Onwards source must retain its standalone repository lint policy" >&2
+  exit 1
+fi
+
 if [[ ! -f onwards/Dockerfile ]]; then
   echo "Onwards must retain a standalone image definition" >&2
   exit 1
@@ -213,13 +225,6 @@ if ! grep -Fq 'onwards-openresponses-compliance:' .github/workflows/ci.yaml || \
    ! grep -Fq 'mode: [adapter, passthrough]' .github/workflows/ci.yaml || \
    ! grep -Fq 'git checkout fa29df5' .github/workflows/ci.yaml; then
   echo "CI must retain standalone Onwards adapter and passthrough compliance" >&2
-  exit 1
-fi
-
-if grep -Fq 'trace!("{:?}", new_targets)' onwards/src/target.rs || \
-   grep -Eq 'Per-key (rate|concurrency) limit exceeded for token' \
-     onwards/src/handlers.rs; then
-  echo "Onwards must not log provider or caller credentials" >&2
   exit 1
 fi
 

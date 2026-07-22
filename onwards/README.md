@@ -89,8 +89,8 @@ fusillade owns reassembly into the canonical final body.
 
 ```toml
 [dependencies]
-onwards = { version = "0.35.4", features = ["multi-step"] }
-fusillade = "23.0.2"
+onwards = { version = "0.35.6", features = ["multi-step"] }
+fusillade = "24.1.0"
 ```
 
 The control-layer workspace resolves both crates through local paths during development.

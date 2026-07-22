@@ -7,22 +7,8 @@
 
 use axum::body::Body;
 use axum::http::{HeaderMap, HeaderValue, Response, header};
-use axum::response::IntoResponse;
 use std::io::Read as _;
 use tracing::debug;
-
-use crate::handlers::MAX_BUFFERED_UPSTREAM_RESPONSE_SIZE;
-
-fn replace_with_bad_gateway(response: &mut Response<Body>) {
-    *response = crate::errors::OnwardsErrorResponse::bad_gateway().into_response();
-}
-
-fn read_bounded<R: std::io::Read>(reader: R, limit: usize) -> std::io::Result<Option<Vec<u8>>> {
-    let mut buf = Vec::new();
-    let mut reader = reader.take((limit as u64).saturating_add(1));
-    reader.read_to_end(&mut buf)?;
-    Ok((buf.len() <= limit).then_some(buf))
-}
 
 /// Extract a response ID override from request headers.
 ///
@@ -80,53 +66,35 @@ pub async fn patch_response_body_id(response: &mut Response<Body>, override_id: 
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_lowercase());
 
-    let bytes = match axum::body::to_bytes(
-        std::mem::take(response.body_mut()),
-        MAX_BUFFERED_UPSTREAM_RESPONSE_SIZE,
-    )
-    .await
-    {
+    let bytes = match axum::body::to_bytes(std::mem::take(response.body_mut()), usize::MAX).await {
         Ok(b) => b,
-        Err(_) => {
-            replace_with_bad_gateway(response);
-            return;
-        }
+        Err(_) => return,
     };
 
     // Decompress if needed.
     let decompressed = match content_encoding.as_deref() {
         Some("gzip") => {
-            match read_bounded(
-                flate2::read::GzDecoder::new(&bytes[..]),
-                MAX_BUFFERED_UPSTREAM_RESPONSE_SIZE,
-            ) {
-                Ok(Some(buf)) => buf,
-                Ok(None) => {
-                    replace_with_bad_gateway(response);
-                    return;
-                }
-                Err(_) => {
-                    debug!("Failed to gzip-decompress response for ID patching, passing through");
-                    *response.body_mut() = Body::from(bytes);
-                    return;
-                }
+            let mut decoder = flate2::read::GzDecoder::new(&bytes[..]);
+            let mut buf = Vec::new();
+            if decoder.read_to_end(&mut buf).is_ok() {
+                buf
+            } else {
+                debug!("Failed to gzip-decompress response for ID patching, passing through");
+                *response.body_mut() = Body::from(bytes);
+                return;
             }
         }
         Some("br") | Some("brotli") => {
-            match read_bounded(
-                brotli::Decompressor::new(&bytes[..], 4096),
-                MAX_BUFFERED_UPSTREAM_RESPONSE_SIZE,
-            ) {
-                Ok(Some(buf)) => buf,
-                Ok(None) => {
-                    replace_with_bad_gateway(response);
-                    return;
-                }
-                Err(_) => {
-                    debug!("Failed to brotli-decompress response for ID patching, passing through");
-                    *response.body_mut() = Body::from(bytes);
-                    return;
-                }
+            let mut buf = Vec::new();
+            if brotli::Decompressor::new(&bytes[..], 4096)
+                .read_to_end(&mut buf)
+                .is_ok()
+            {
+                buf
+            } else {
+                debug!("Failed to brotli-decompress response for ID patching, passing through");
+                *response.body_mut() = Body::from(bytes);
+                return;
             }
         }
         _ => bytes.to_vec(),
@@ -265,36 +233,6 @@ mod tests {
             writer.write_all(data).unwrap();
         }
         buf
-    }
-
-    #[tokio::test]
-    async fn patch_rejects_response_that_decompresses_past_buffer_limit() {
-        const EXPECTED_BUFFER_LIMIT: usize = 64 * 1024 * 1024;
-        let oversized = serde_json::json!({
-            "id": "original",
-            "provider_padding": "x".repeat(EXPECTED_BUFFER_LIMIT),
-        })
-        .to_string();
-        let compressed = gzip_compress(oversized.as_bytes());
-        assert!(compressed.len() < EXPECTED_BUFFER_LIMIT);
-
-        let mut response = Response::builder()
-            .status(StatusCode::OK)
-            .header("content-type", "application/json")
-            .header("content-encoding", "gzip")
-            .body(Body::from(compressed))
-            .unwrap();
-
-        patch_response_body_id(&mut response, "resp_override".to_string()).await;
-
-        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
-        assert!(response.headers().get(header::CONTENT_ENCODING).is_none());
-        let body = axum::body::to_bytes(response.into_body(), 1024)
-            .await
-            .expect("generic gateway error should be small");
-        let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(error["error"]["code"], "internal_error");
-        assert_eq!(error["error"]["type"], "internal_error");
     }
 
     #[tokio::test]

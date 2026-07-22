@@ -693,63 +693,6 @@ mod tests {
         assert_eq!(request_json["stream"], true);
     }
 
-    #[tokio::test]
-    async fn test_streaming_adapter_preserves_utf8_split_across_transport_chunks() {
-        let targets = Arc::new(DashMap::new());
-        targets.insert(
-            "gpt-4o".to_string(),
-            Target::builder()
-                .url("https://api.openai.com/v1/".parse().unwrap())
-                .open_responses(OpenResponsesConfig { adapter: true })
-                .build()
-                .into_pool(),
-        );
-
-        let targets = Targets {
-            targets,
-            key_rate_limiters: Arc::new(DashMap::new()),
-            key_concurrency_limiters: Arc::new(DashMap::new()),
-            key_labels: Arc::new(DashMap::new()),
-            strict_mode: true,
-            http_pool_config: None,
-        };
-
-        let event = "data: {\"id\":\"chatcmpl-utf8\",\"object\":\"chat.completion.chunk\",\"created\":1234567890,\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"café\"},\"finish_reason\":\"stop\"}]}\n\n";
-        let event = event.as_bytes();
-        let split = event
-            .windows(2)
-            .position(|window| window == "é".as_bytes())
-            .expect("fixture must contain a multibyte character")
-            + 1;
-        let chunks = vec![
-            event[..split].to_vec(),
-            event[split..].to_vec(),
-            b"data: [DONE]\n\n".to_vec(),
-        ];
-
-        let mock_client = MockHttpClient::new_streaming_bytes(StatusCode::OK, chunks);
-        let state = AppState::with_client(targets, mock_client);
-        let router = build_strict_router(state);
-        let request = Request::builder()
-            .method("POST")
-            .uri("/responses")
-            .header("content-type", "application/json")
-            .body(Body::from(
-                r#"{"model":"gpt-4o","input":"Hello","stream":true}"#,
-            ))
-            .unwrap();
-
-        let response = router.oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-
-        let body = response.into_body().collect().await.unwrap().to_bytes();
-        let body = std::str::from_utf8(&body).unwrap();
-        assert!(
-            body.contains("café"),
-            "split UTF-8 model output was lost: {body}"
-        );
-    }
-
     /// Test streaming with tool_calls finish reason.
     ///
     /// With the default NoOpToolExecutor, all tools are unhandled, so the

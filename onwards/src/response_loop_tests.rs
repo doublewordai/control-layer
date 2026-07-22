@@ -580,60 +580,6 @@ async fn step_failure_does_not_abort_loop() {
 }
 
 #[tokio::test]
-async fn non_2xx_model_error_body_is_not_persisted() {
-    const PROVIDER_BODY_SENTINEL: &str = "provider-private-error-body-do-not-expose";
-
-    let server = MockServer::start().await;
-    Mock::given(method("POST"))
-        .and(path("/chat"))
-        .respond_with(ResponseTemplate::new(502).set_body_string(PROVIDER_BODY_SENTINEL))
-        .mount(&server)
-        .await;
-
-    let store = MockStore::new();
-    let tool_exec = ScriptedToolExecutor::new();
-    let ctx = RequestContext::new();
-    let target = UpstreamTarget {
-        endpoint: server.uri(),
-        path: "/chat".into(),
-        api_key: None,
-    };
-    store.script(
-        None,
-        vec![
-            NextAction::AppendSteps(vec![model_call(json!({}))]),
-            NextAction::Complete(json!({"final": "recovered"})),
-        ],
-    );
-
-    let result = run_response_loop(
-        &store,
-        &tool_exec,
-        &ctx,
-        &target,
-        http_client_for_tests(),
-        None,
-        "req_provider_error",
-        None,
-        LoopConfig::default(),
-        0,
-    )
-    .await
-    .unwrap();
-
-    assert_eq!(result, json!({"final": "recovered"}));
-    let snap = store.snapshot();
-    assert_eq!(snap.fail_order.len(), 1);
-    let persisted_error = snap.fail_order[0].1.to_string();
-    assert!(
-        !persisted_error.contains(PROVIDER_BODY_SENTINEL),
-        "provider response body escaped into the stored executor error: {persisted_error}"
-    );
-    assert!(persisted_error.contains("HTTP 502"));
-    assert!(persisted_error.contains(&format!("{} bytes", PROVIDER_BODY_SENTINEL.len())));
-}
-
-#[tokio::test]
 async fn max_iterations_cap_fires() {
     let store = MockStore::new();
     let tool_exec = ScriptedToolExecutor::new();

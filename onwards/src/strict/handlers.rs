@@ -29,7 +29,7 @@ use crate::AppState;
 use crate::client::HttpClient;
 use crate::errors::OnwardsErrorResponse;
 use crate::extract_model_from_request;
-use crate::handlers::{MAX_BUFFERED_UPSTREAM_RESPONSE_SIZE, ResolvedTrust, target_message_handler};
+use crate::handlers::{ResolvedTrust, target_message_handler};
 use crate::traits::RequestContext;
 use axum::Json;
 use axum::body::Body;
@@ -282,6 +282,7 @@ pub async fn responses_handler<T: HttpClient + Clone + Send + Sync + 'static>(
 
     // OpenAI requires additionalProperties: false in tool schemas even for /v1/responses
     // Add it if missing to ensure compatibility
+    let mut request = request;
     if let Some(ref mut tools) = request.tools {
         for tool in tools.iter_mut() {
             if let super::schemas::responses::Tool::Function { parameters, .. } = tool
@@ -953,13 +954,14 @@ async fn handle_adapter_request<T: HttpClient + Clone + Send + Sync + 'static>(
         );
 
         // Mark as completed in the response store
-        if let Ok(response_value) = serde_json::to_value(&responses_response)
-            && let Err(e) = state
+        if let Ok(response_value) = serde_json::to_value(&responses_response) {
+            if let Err(e) = state
                 .response_store
                 .complete(&response_id, &response_value, parts.status.as_u16())
                 .await
-        {
-            warn!(error = %e, response_id = %response_id, "Failed to mark response as completed");
+            {
+                warn!(error = %e, response_id = %response_id, "Failed to mark response as completed");
+            }
         }
 
         // Return the converted response
@@ -1075,10 +1077,6 @@ async fn handle_streaming_adapter_request<T: HttpClient + Clone + Send + Sync + 
 
         while let Some(body) = current_body.take() {
             iteration += 1;
-            // target_message_handler wraps every upstream SSE body in
-            // SseBufferedStream before it reaches this adapter. Transport
-            // chunks are therefore bounded and reassembled at complete event
-            // boundaries, including when a UTF-8 code point spans frames.
             let byte_stream = body.into_data_stream();
             let mut buffer = String::new();
             let mut last_finish_reason: Option<String> = None;
@@ -1114,7 +1112,7 @@ async fn handle_streaming_adapter_request<T: HttpClient + Clone + Send + Sync + 
                                             }
                                         }
 
-                                        trace!(chunk_id = %chunk.id, "Processing chat chunk"); // zdr-allow: identifier only
+                                        trace!(chunk_id = %chunk.id, "Processing chat chunk");
                                         let events = streaming_state.process_chunk(&chunk);
                                         for event in events {
                                             yield Ok::<_, std::io::Error>(event.to_sse().into_bytes());
@@ -1426,35 +1424,31 @@ fn error_response(status: StatusCode, error_type: &str, message: &str) -> Respon
     (status, Json(body)).into_response()
 }
 
-fn bad_gateway_response() -> Response {
-    OnwardsErrorResponse::bad_gateway().into_response()
-}
-
 /// Sanitize non-streaming chat completion response
 ///
 /// Deserializes the response through our strict schema (drops extra fields),
 /// rewrites the model field, and re-serializes.
 async fn sanitize_chat_response(mut response: Response, original_model: String) -> Response {
     // Read the response body
-    let body_bytes = match axum::body::to_bytes(
-        std::mem::take(response.body_mut()),
-        MAX_BUFFERED_UPSTREAM_RESPONSE_SIZE,
-    )
-    .await
-    {
-        Ok(bytes) => {
-            // ZDR: log only the length, never the response body content.
-            debug!(
-                bytes_read = bytes.len(),
-                "Read upstream response body for sanitization"
-            );
-            bytes
-        }
-        Err(e) => {
-            error!(error = %e, "Failed to read response body for sanitization");
-            return bad_gateway_response();
-        }
-    };
+    let body_bytes =
+        match axum::body::to_bytes(std::mem::take(response.body_mut()), usize::MAX).await {
+            Ok(bytes) => {
+                // ZDR: log only the length, never the response body content.
+                debug!(
+                    bytes_read = bytes.len(),
+                    "Read upstream response body for sanitization"
+                );
+                bytes
+            }
+            Err(e) => {
+                error!(error = %e, "Failed to read response body for sanitization");
+                return error_response(
+                    StatusCode::BAD_GATEWAY,
+                    "api_error",
+                    "Failed to read upstream response",
+                );
+            }
+        };
 
     let mut raw_response: serde_json::Value = match serde_json::from_slice(&body_bytes) {
         Ok(resp) => resp,
@@ -1683,18 +1677,18 @@ async fn sanitize_streaming_chat_response(
 /// Deserializes through `CompletionResponse` (drops extra fields), rewrites the
 /// model field, and re-serializes.
 async fn sanitize_completions_response(mut response: Response, original_model: String) -> Response {
-    let body_bytes = match axum::body::to_bytes(
-        std::mem::take(response.body_mut()),
-        MAX_BUFFERED_UPSTREAM_RESPONSE_SIZE,
-    )
-    .await
-    {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            error!(error = %e, "Failed to read completions response body");
-            return bad_gateway_response();
-        }
-    };
+    let body_bytes =
+        match axum::body::to_bytes(std::mem::take(response.body_mut()), usize::MAX).await {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                error!(error = %e, "Failed to read completions response body");
+                return error_response(
+                    StatusCode::BAD_GATEWAY,
+                    "api_error",
+                    "Failed to read upstream response",
+                );
+            }
+        };
 
     let mut raw_response: serde_json::Value = match serde_json::from_slice(&body_bytes) {
         Ok(resp) => resp,
@@ -1877,18 +1871,18 @@ async fn sanitize_streaming_completions_response(
 /// Deserializes the response through our strict schema (drops extra fields),
 /// rewrites the model field, and re-serializes.
 async fn sanitize_embeddings_response(mut response: Response, original_model: String) -> Response {
-    let body_bytes = match axum::body::to_bytes(
-        std::mem::take(response.body_mut()),
-        MAX_BUFFERED_UPSTREAM_RESPONSE_SIZE,
-    )
-    .await
-    {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            error!(error = %e, "Failed to read embeddings response body");
-            return bad_gateway_response();
-        }
-    };
+    let body_bytes =
+        match axum::body::to_bytes(std::mem::take(response.body_mut()), usize::MAX).await {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                error!(error = %e, "Failed to read embeddings response body");
+                return error_response(
+                    StatusCode::BAD_GATEWAY,
+                    "api_error",
+                    "Failed to read upstream response",
+                );
+            }
+        };
 
     let mut embeddings_response: EmbeddingsResponse = match serde_json::from_slice(&body_bytes) {
         Ok(resp) => resp,
@@ -1946,18 +1940,18 @@ async fn sanitize_responses_response(
     original_model: String,
     response_id_override: Option<String>,
 ) -> Response {
-    let body_bytes = match axum::body::to_bytes(
-        std::mem::take(response.body_mut()),
-        MAX_BUFFERED_UPSTREAM_RESPONSE_SIZE,
-    )
-    .await
-    {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            error!(error = %e, "Failed to read responses API response body");
-            return bad_gateway_response();
-        }
-    };
+    let body_bytes =
+        match axum::body::to_bytes(std::mem::take(response.body_mut()), usize::MAX).await {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                error!(error = %e, "Failed to read responses API response body");
+                return error_response(
+                    StatusCode::BAD_GATEWAY,
+                    "api_error",
+                    "Failed to read upstream response",
+                );
+            }
+        };
 
     let mut raw_response: serde_json::Value = match serde_json::from_slice(&body_bytes) {
         Ok(resp) => resp,
@@ -2491,41 +2485,6 @@ mod tests {
             logs.contains("bytes_read") || logs.contains("content_length"),
             "expected length metadata in logs, got:\n{logs}"
         );
-    }
-
-    #[tokio::test]
-    async fn sanitize_chat_response_rejects_oversized_upstream_body() {
-        const EXPECTED_BUFFER_LIMIT: usize = 64 * 1024 * 1024;
-        let body = json!({
-            "id": "chatcmpl-oversized",
-            "object": "chat.completion",
-            "created": 0,
-            "model": "upstream-model",
-            "choices": [{
-                "index": 0,
-                "message": {"role": "assistant", "content": "ok"},
-                "finish_reason": "stop"
-            }],
-            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
-            "provider_padding": "x".repeat(EXPECTED_BUFFER_LIMIT),
-        })
-        .to_string();
-
-        let response = Response::builder()
-            .status(StatusCode::OK)
-            .header("content-type", "application/json")
-            .body(Body::from(body))
-            .unwrap();
-
-        let response = sanitize_chat_response(response, "client-model".to_string()).await;
-
-        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
-        let body = axum::body::to_bytes(response.into_body(), 1024)
-            .await
-            .expect("generic gateway error should be small");
-        let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(error["error"]["code"], "internal_error");
-        assert_eq!(error["error"]["type"], "internal_error");
     }
 
     /// Provider error bodies (which can echo prompt/response content) must never

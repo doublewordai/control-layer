@@ -1149,13 +1149,7 @@ impl Targets {
                 match result {
                     Ok(new_targets) => {
                         info!("Config file changed, updating targets...");
-                        trace!(
-                            target_count = new_targets.targets.len(),
-                            key_rate_limiter_count = new_targets.key_rate_limiters.len(),
-                            key_concurrency_limiter_count =
-                                new_targets.key_concurrency_limiters.len(),
-                            "Received target configuration update"
-                        );
+                        trace!("{:?}", new_targets);
 
                         // Update targets atomically
                         let current_target_keys: Vec<String> =

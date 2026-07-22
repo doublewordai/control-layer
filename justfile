@@ -526,7 +526,8 @@ test target="" *args="":
 # rust: Rust code formatting and linting
 # - Runs cargo fmt --check to verify formatting
 # - Runs cargo clippy for Rust-specific lints and suggestions
-# - Checks all Rust projects (dwctl)
+# - Checks the application and locally maintained Fusillade crates
+# - Onwards retains its imported standalone-repository lint policy
 # - Pass clippy args like -- -D warnings for stricter checking
 #
 #
@@ -552,13 +553,23 @@ lint target *args="":
             echo "Checking Cargo.lock sync..."
             cargo metadata --locked > /dev/null
             echo "Running cargo fmt --check..."
-            cargo fmt --check
+            cargo fmt --check \
+                --package dwctl \
+                --package fusillade \
+                --package fusillade-core \
+                --package fusillade-arsenal
             echo "Running cargo clippy..."
-            cargo clippy --workspace --all-features {{args}}
+            cargo clippy \
+                --package dwctl \
+                --package fusillade \
+                --package fusillade-core \
+                --package fusillade-arsenal \
+                --all-features \
+                --no-deps \
+                {{args}}
             echo "Running ZDR no-payload-logging guard..."
             ./scripts/check-no-payload-logging.sh \
                 dwctl/src \
-                onwards/src \
                 fusillade/src \
                 fusillade-core/src \
                 fusillade-arsenal/src
@@ -589,7 +600,7 @@ lint target *args="":
 #
 # rust: Rust code formatting
 # - Uses cargo fmt to format all Rust code
-# - Formats all Rust projects (dwctl)
+# - Formats the application and locally maintained Fusillade crates
 # - Applies standard Rust formatting conventions
 # - Modifies files in place to fix formatting issues
 #
@@ -605,8 +616,13 @@ fmt target *args="":
             cd dashboard && pnpm exec prettier --write . {{args}}
             ;;
         rust)
-            echo "Running cargo fmt for dwctl..."
-            cargo fmt {{args}}
+            echo "Running cargo fmt for dwctl and Fusillade..."
+            cargo fmt \
+                --package dwctl \
+                --package fusillade \
+                --package fusillade-core \
+                --package fusillade-arsenal \
+                {{args}}
             ;;
         *)
             echo "Usage: just fmt [ts|rust]"

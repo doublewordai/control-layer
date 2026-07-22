@@ -1,7 +1,7 @@
 [package]
 name = "fusillade-core"
 edition = "2024"
-version = "3.0.0"
+version = "4.0.0"
 publish = false
 description = "Core domain types and storage traits for Fusillade"
 license = "MIT OR Apache-2.0"

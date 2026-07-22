@@ -1,5 +1,24 @@
 # Changelog
 
+## [24.1.0](https://github.com/doublewordai/fusillade/compare/fusillade-v24.0.0...fusillade-v24.1.0) (2026-07-21)
+
+
+### Features
+
+* backfill concurrency ([#375](https://github.com/doublewordai/fusillade/issues/375)) ([e463c9c](https://github.com/doublewordai/fusillade/commit/e463c9c846cd0d38eaee410483c824d3560197fb))
+
+## [24.0.0](https://github.com/doublewordai/fusillade/compare/fusillade-v23.0.2...fusillade-v24.0.0) (2026-07-21)
+
+
+### ⚠ BREAKING CHANGES
+
+* bound concurrent request state writes ([#372](https://github.com/doublewordai/fusillade/issues/372))
+
+### Bug Fixes
+
+* bound concurrent request state writes ([#372](https://github.com/doublewordai/fusillade/issues/372)) ([57fbfb4](https://github.com/doublewordai/fusillade/commit/57fbfb43431a9884e7f1b753255eb5962db6f314))
+* fusilalde replicas dont work well in parallel for archiving ([#374](https://github.com/doublewordai/fusillade/issues/374)) ([35c5dc2](https://github.com/doublewordai/fusillade/commit/35c5dc2bb9a19471c7f84a7d3259ec64780b6605))
+
 ## [23.0.2](https://github.com/doublewordai/fusillade/compare/fusillade-v23.0.1...fusillade-v23.0.2) (2026-07-21)
 
 

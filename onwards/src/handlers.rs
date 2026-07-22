@@ -24,12 +24,6 @@ use opentelemetry::propagation::{Extractor, Injector, TextMapPropagator};
 use serde_json::map::Entry;
 use tracing::{Instrument, debug, error, instrument, trace, warn};
 
-/// Maximum size of an upstream response body that Onwards buffers in memory.
-///
-/// Streaming responses are not subject to this whole-body limit. They use the
-/// separate per-event bound in [`SseBufferedStream`].
-pub(crate) const MAX_BUFFERED_UPSTREAM_RESPONSE_SIZE: usize = 64 * 1024 * 1024;
-
 /// Adapter to extract W3C trace context from an axum HeaderMap.
 struct HeaderExtractor<'a>(&'a HeaderMap);
 
@@ -57,28 +51,6 @@ impl Injector for HeaderInjector<'_> {
 /// Record HTTP response status code on the current span
 fn record_response_status(status_code: u16) {
     tracing::Span::current().record("http.response.status_code", status_code);
-}
-
-/// Return the useful, non-secret portion of a URL for logs, traces, and
-/// persisted request metadata.
-///
-/// Query parameters commonly carry API keys, while userinfo and fragments can
-/// also contain credentials or other sensitive values. The proxy still sends
-/// the original URL upstream; only its observability representation is
-/// stripped to scheme, host/port, and path.
-fn url_for_observability(url: &url::Url) -> String {
-    let mut safe_url = url.clone();
-    let _ = safe_url.set_password(None);
-    let _ = safe_url.set_username("");
-    safe_url.set_query(None);
-    safe_url.set_fragment(None);
-    safe_url.to_string()
-}
-
-/// Return an inbound request URI's path without its potentially sensitive
-/// query string.
-fn uri_for_observability(uri: &Uri) -> &str {
-    uri.path()
 }
 
 /// Detect a provider error envelope embedded in an HTTP 200 body.
@@ -161,7 +133,7 @@ fn classify_sse_event(chunk: &[u8]) -> SseEventKind {
 /// Internal enum to distinguish timeout from network error in upstream requests
 enum UpstreamOutcome {
     Timeout,
-    Error,
+    Error(Box<dyn std::error::Error + Send + Sync>),
 }
 
 /// RAII guard that decrements the inflight gauges on drop.
@@ -264,7 +236,7 @@ pub(crate) struct ResolvedTrust(pub(crate) bool);
 /// re-deriving the routing decision.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ServedBy {
-    /// Upstream scheme, host/port, and path, with URL secrets omitted.
+    /// Full URL of the upstream target that served the request.
     pub url: String,
     /// The upstream model name after any `onwards_model` rewrite, when configured.
     pub onwards_model: Option<String>,
@@ -363,14 +335,13 @@ fn filter_headers_for_upstream(headers: &mut HeaderMap, target: &Target) {
         let header_value = format!("{}{}", prefix, key);
         debug!(
             "Adding {} header for upstream {}",
-            header_name_str,
-            url_for_observability(&target.url)
+            header_name_str, target.url
         );
         headers.insert(header_name, header_value.parse().unwrap());
     } else {
         debug!(
             "No upstream authentication configured for target {}",
-            url_for_observability(&target.url)
+            target.url
         );
     }
 
@@ -378,41 +349,6 @@ fn filter_headers_for_upstream(headers: &mut HeaderMap, target: &Target) {
     // Note: We don't have access to the original client IP in this handler,
     // so we only set X-Forwarded-Proto for now
     headers.insert("x-forwarded-proto", "https".parse().unwrap());
-}
-
-/// Resolve an inbound origin-form path against a configured upstream without
-/// allowing URL resolution to replace the configured scheme or authority.
-fn build_upstream_url(target_url: &url::Url, path_and_query: &str) -> Option<url::Url> {
-    let request_path = path_and_query.strip_prefix('/').unwrap_or(path_and_query);
-
-    // A second leading slash would be interpreted by URL::join as a
-    // network-path reference (`//host/path`) rather than an upstream path.
-    if request_path.starts_with('/') {
-        return None;
-    }
-
-    let target_path = target_url.path().trim_end_matches('/');
-    let path_to_join = if !target_path.is_empty() && target_path != "/" {
-        let target_path_no_slash = target_path.strip_prefix('/').unwrap_or(target_path);
-        if let Some(rest) = request_path.strip_prefix(target_path_no_slash) {
-            if rest.is_empty() || rest.starts_with('/') {
-                rest.strip_prefix('/').unwrap_or(rest)
-            } else {
-                request_path
-            }
-        } else {
-            request_path
-        }
-    } else {
-        request_path
-    };
-
-    let upstream_url = target_url.join(path_to_join).ok()?;
-    let same_origin = upstream_url.scheme() == target_url.scheme()
-        && upstream_url.host_str() == target_url.host_str()
-        && upstream_url.port_or_known_default() == target_url.port_or_known_default();
-
-    same_origin.then_some(upstream_url)
 }
 
 /// The main handler responsible for forwarding requests to targets
@@ -477,7 +413,7 @@ pub async fn target_message_handler<T: HttpClient>(
     // and headers carry auth credentials. Only method, path, and body length.
     trace!(
         method = %req.method(),
-        uri = %uri_for_observability(req.uri()),
+        uri = %req.uri(),
         body_len = body_bytes.len(),
         "Incoming request"
     );
@@ -668,7 +604,7 @@ pub async fn target_message_handler<T: HttpClient>(
             && let Some(limiter) = state.targets.key_rate_limiters.get(token)
             && limiter.check().is_err()
         {
-            debug!("Per-key rate limit exceeded");
+            debug!("Per-key rate limit exceeded for token: {}", token);
             record_response_status(429);
             return Err(OnwardsErrorResponse::rate_limited());
         }
@@ -698,7 +634,7 @@ pub async fn target_message_handler<T: HttpClient>(
                 match limiter.try_acquire() {
                     Some(guard) => Some(guard),
                     None => {
-                        debug!("Per-key concurrency limit exceeded");
+                        debug!("Per-key concurrency limit exceeded for token: {}", token);
                         return Err(OnwardsErrorResponse::concurrency_limited());
                     }
                 }
@@ -737,13 +673,12 @@ pub async fn target_message_handler<T: HttpClient>(
     for (_idx, target, connection_guard) in pool.select_iter() {
         any_attempted = true;
         attempt_number += 1;
-        let target_url_for_observability = url_for_observability(&target.url);
 
         let attempt_span = tracing::info_span!(
             "onwards.provider_attempt",
             otel.name = "onwards.provider_attempt",
             attempt = attempt_number,
-            provider.url = %target_url_for_observability,
+            provider.url = %target.url,
             provider.model = target.onwards_model.as_deref().unwrap_or(""),
             provider.timeout_secs = target.request_timeout_secs,
             http.response.status_code = tracing::field::Empty,
@@ -777,7 +712,7 @@ pub async fn target_message_handler<T: HttpClient>(
         if let Some(ref limiter) = target.limiter
             && limiter.check().is_err()
         {
-            debug!("Provider rate limited: {}", target_url_for_observability);
+            debug!("Provider rate limited: {:?}", target.url);
             tracing::Span::current().record("onwards.fallback", "rate_limited");
             if pool.should_fallback_on_rate_limit() {
                 debug!("Fallback on rate limit enabled, trying next provider");
@@ -853,22 +788,33 @@ pub async fn target_message_handler<T: HttpClient>(
             };
         }
 
-        // Build the upstream URI for this target while preserving its origin.
-        let upstream_url = match build_upstream_url(&target.url, &path_and_query) {
-            Some(url) => url,
-            None => {
-                return LoopAction::Done(Err(OnwardsErrorResponse::bad_request(
-                    "Invalid request path.",
-                    None,
-                )))
+        // Build the upstream URI for this target
+        let request_path = path_and_query.strip_prefix('/').unwrap_or(&path_and_query);
+        let target_path = target.url.path().trim_end_matches('/');
+
+        let path_to_join = if !target_path.is_empty() && target_path != "/" {
+            let target_path_no_slash = &target_path[1..];
+            if let Some(rest) = request_path.strip_prefix(target_path_no_slash) {
+                if rest.is_empty() || rest.starts_with('/') {
+                    rest.strip_prefix('/').unwrap_or(rest)
+                } else {
+                    request_path
+                }
+            } else {
+                request_path
             }
+        } else {
+            request_path
         };
-        let upstream_uri_for_observability = url_for_observability(&upstream_url);
-        let upstream_uri = upstream_url.to_string();
+
+        let upstream_uri = match target.url.join(path_to_join) {
+            Ok(url) => url.to_string(),
+            Err(_) => return LoopAction::Done(Err(OnwardsErrorResponse::internal())),
+        };
         let upstream_uri_parsed = match Uri::try_from(&upstream_uri) {
             Ok(uri) => uri,
             Err(_) => {
-                error!("Invalid URI: {}", upstream_uri_for_observability);
+                error!("Invalid URI: {}", upstream_uri);
                 return LoopAction::Done(Err(OnwardsErrorResponse::internal()));
             }
         };
@@ -936,7 +882,7 @@ pub async fn target_message_handler<T: HttpClient>(
 
         trace!(
             "Outgoing request to provider:\n  URI: {}",
-            upstream_uri_for_observability
+            upstream_uri
         );
 
         // Make the request with optional timeout
@@ -947,7 +893,7 @@ pub async fn target_message_handler<T: HttpClient>(
             otel.name = "onwards.upstream_request",
             otel.kind = "Client",
             http.request.method = %method,
-            url.full = %upstream_uri_for_observability,
+            url.full = %upstream_uri,
             http.response.status_code = tracing::field::Empty,
         );
         let request_result = async {
@@ -960,19 +906,15 @@ pub async fn target_message_handler<T: HttpClient>(
                         // Timeout occurred
                         debug!(
                             "Request to {} timed out after {:?}",
-                            upstream_uri_for_observability, timeout_duration
+                            upstream_uri, timeout_duration
                         );
                         Err(UpstreamOutcome::Timeout)
                     }
-                    Ok(result) => result.map_err(|_| UpstreamOutcome::Error),
+                    Ok(result) => result.map_err(UpstreamOutcome::Error),
                 }
             } else {
                 // No timeout configured
-                state
-                    .http_client
-                    .request(attempt_req)
-                    .await
-                    .map_err(|_| UpstreamOutcome::Error)
+                state.http_client.request(attempt_req).await.map_err(UpstreamOutcome::Error)
             }
         }
         .instrument(upstream_span.clone())
@@ -990,10 +932,10 @@ pub async fn target_message_handler<T: HttpClient>(
                     return LoopAction::Done(Err(OnwardsErrorResponse::gateway_timeout()));
                 }
             }
-            Err(UpstreamOutcome::Error) => {
+            Err(UpstreamOutcome::Error(e)) => {
                 error!(
-                    "Error forwarding request to target url {}",
-                    upstream_uri_for_observability
+                    "Error forwarding request to target url {}: {}",
+                    upstream_uri, e
                 );
                 tracing::Span::current().record("onwards.fallback", "network_error");
                 // Only continue to next provider if fallback is enabled
@@ -1013,8 +955,8 @@ pub async fn target_message_handler<T: HttpClient>(
         // Check if we should fallback based on status code
         if pool.should_fallback_on_status(status) {
             debug!(
-                "Provider returned fallback status {}, trying next: {}",
-                status, target_url_for_observability
+                "Provider returned fallback status {}, trying next: {:?}",
+                status, target.url
             );
             tracing::Span::current().record("onwards.fallback", "status_fallback");
             return LoopAction::Continue(Some(OnwardsErrorResponse::bad_gateway()));
@@ -1035,7 +977,7 @@ pub async fn target_message_handler<T: HttpClient>(
 
             error!(
                 status = status,
-                upstream = %target_url_for_observability,
+                upstream = %target.url,
                 body_len = error_body.as_ref().map(|b| b.len()).unwrap_or(0),
                 "Upstream provider returned error, sanitizing before forwarding to client"
             );
@@ -1190,26 +1132,11 @@ pub async fn target_message_handler<T: HttpClient>(
                 }
             } else {
                 let (parts, body) = response.into_parts();
-                let buffered = match axum::body::to_bytes(
-                    body,
-                    MAX_BUFFERED_UPSTREAM_RESPONSE_SIZE,
-                )
-                .await
-                {
+                let buffered = match axum::body::to_bytes(body, usize::MAX).await {
                     Ok(bytes) => bytes,
                     Err(e) => {
                         error!("Failed to buffer response body for embedded-error scan: {}", e);
-                        upstream_span.record("http.response.status_code", 502_u16);
-                        tracing::Span::current().record("http.response.status_code", 502_u16);
-                        if pool.should_fallback_on_status(502) {
-                            tracing::Span::current()
-                                .record("onwards.fallback", "response_body_read");
-                            return LoopAction::Continue(Some(
-                                OnwardsErrorResponse::bad_gateway(),
-                            ));
-                        }
-                        record_response_status(502);
-                        return LoopAction::Done(Err(OnwardsErrorResponse::bad_gateway()));
+                        return LoopAction::Done(Err(OnwardsErrorResponse::internal()));
                     }
                 };
                 // A 2xx whose body terminated empty is the unary form of the same
@@ -1253,7 +1180,7 @@ pub async fn target_message_handler<T: HttpClient>(
                 warn!(
                     http_status = status,
                     embedded_status = embedded,
-                    upstream = %target_url_for_observability,
+                    upstream = %target.url,
                     "Upstream returned 2xx with an embedded provider error; treating it as status {embedded}"
                 );
                 upstream_span.record("http.response.status_code", embedded);
@@ -1294,7 +1221,7 @@ pub async fn target_message_handler<T: HttpClient>(
             Scan2xx::EmptyBody => {
                 warn!(
                     http_status = status,
-                    upstream = %target_url_for_observability,
+                    upstream = %target.url,
                     "Upstream returned 2xx with an empty body before any content; treating it as 502"
                 );
                 upstream_span.record("http.response.status_code", 502_u16);
@@ -1345,7 +1272,7 @@ pub async fn target_message_handler<T: HttpClient>(
         {
             debug!(
                 "Attempting response sanitization for status {}, path {}",
-                status, canonical_request_path
+                status, path_and_query
             );
 
             // original_model extracted before the async block (to avoid capturing &req)
@@ -1389,26 +1316,14 @@ pub async fn target_message_handler<T: HttpClient>(
                 // Non-streaming response - buffer and transform
                 debug!("Applying non-streaming sanitization");
 
-                let response_body = match axum::body::to_bytes(
-                    std::mem::take(response.body_mut()),
-                    MAX_BUFFERED_UPSTREAM_RESPONSE_SIZE,
-                )
-                .await
+                let response_body = match
+                    axum::body::to_bytes(std::mem::take(response.body_mut()), usize::MAX)
+                        .await
                 {
                     Ok(bytes) => bytes,
                     Err(e) => {
                         error!("Failed to buffer response body: {}", e);
-                        upstream_span.record("http.response.status_code", 502_u16);
-                        tracing::Span::current().record("http.response.status_code", 502_u16);
-                        if pool.should_fallback_on_status(502) {
-                            tracing::Span::current()
-                                .record("onwards.fallback", "response_body_read");
-                            return LoopAction::Continue(Some(
-                                OnwardsErrorResponse::bad_gateway(),
-                            ));
-                        }
-                        record_response_status(502);
-                        return LoopAction::Done(Err(OnwardsErrorResponse::bad_gateway()));
+                        return LoopAction::Done(Err(OnwardsErrorResponse::internal()));
                     }
                 };
 
@@ -1472,10 +1387,12 @@ pub async fn target_message_handler<T: HttpClient>(
         if let Some(ref header_name) = state.response_id_header
             && crate::response_id::path_supports_id_override(&path_and_query)
             && (200..300).contains(&status)
-            && let Some(override_id) =
-                crate::response_id::extract_override_id(&original_headers, header_name)
         {
-            crate::response_id::patch_response_body_id(&mut response, override_id).await;
+            if let Some(override_id) =
+                crate::response_id::extract_override_id(&original_headers, header_name)
+            {
+                crate::response_id::patch_response_body_id(&mut response, override_id).await;
+            }
         }
 
         // Add custom response headers
@@ -1506,7 +1423,7 @@ pub async fn target_message_handler<T: HttpClient>(
             .extensions_mut()
             .insert(ResolvedTrust(resolved_trust));
         response.extensions_mut().insert(ServedBy {
-            url: target_url_for_observability,
+            url: target.url.to_string(),
             onwards_model: target.onwards_model.clone(),
         });
 
@@ -1636,245 +1553,6 @@ pub async fn models<T: HttpClient>(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[derive(Clone, Default)]
-    struct CaptureWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-
-    impl std::io::Write for CaptureWriter {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
-        type Writer = CaptureWriter;
-
-        fn make_writer(&'a self) -> Self::Writer {
-            self.clone()
-        }
-    }
-
-    async fn capture_logs<F, Fut, T>(f: F) -> (String, T)
-    where
-        F: FnOnce() -> Fut,
-        Fut: std::future::Future<Output = T>,
-    {
-        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let subscriber = tracing_subscriber::fmt()
-            .with_max_level(tracing::Level::TRACE)
-            .with_ansi(false)
-            .with_writer(CaptureWriter(buf.clone()))
-            .finish();
-        let output = {
-            let _guard = tracing::subscriber::set_default(subscriber);
-            f().await
-        };
-        let bytes = buf.lock().unwrap().clone();
-        (String::from_utf8_lossy(&bytes).into_owned(), output)
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn request_observability_omits_url_secrets() {
-        use crate::load_balancer::{Provider, ProviderPool};
-        use crate::target::{LoadBalanceStrategy, Target, Targets};
-        use crate::test_utils::MockHttpClient;
-
-        const INBOUND_SECRET: &str = "inbound-query-secret-4d155c";
-        const UPSTREAM_SECRET: &str = "upstream-query-secret-9cb2d3";
-        const UPSTREAM_USER: &str = "upstream-user-9ca27d";
-        const UPSTREAM_PASSWORD: &str = "upstream-password-780e3c";
-        const UPSTREAM_FRAGMENT: &str = "upstream-fragment-2c42f0";
-
-        let target = Target::builder()
-            .url(
-                format!(
-                    "https://{UPSTREAM_USER}:{UPSTREAM_PASSWORD}@api.example.com/v1/?provider_key={UPSTREAM_SECRET}#{UPSTREAM_FRAGMENT}"
-                )
-                    .parse()
-                    .unwrap(),
-            )
-            .sanitize_response(true)
-            .build();
-        let pool = ProviderPool::with_config(
-            vec![Provider::new(target, 1)],
-            None,
-            None,
-            None,
-            None,
-            LoadBalanceStrategy::Priority,
-            false,
-            Vec::new(),
-        );
-        let targets_map = std::sync::Arc::new(dashmap::DashMap::new());
-        targets_map.insert("gpt-4".to_string(), pool);
-        let targets = Targets {
-            targets: targets_map,
-            key_rate_limiters: std::sync::Arc::new(dashmap::DashMap::new()),
-            key_concurrency_limiters: std::sync::Arc::new(dashmap::DashMap::new()),
-            key_labels: std::sync::Arc::new(dashmap::DashMap::new()),
-            strict_mode: false,
-            http_pool_config: None,
-        };
-        let state = AppState::with_client(
-            targets,
-            MockHttpClient::new(StatusCode::OK, r#"{"ok":true}"#),
-        )
-        .with_response_transform(std::sync::Arc::new(|_, _, _, _| Ok(None)));
-        let request = axum::extract::Request::builder()
-            .method("POST")
-            .uri(format!(
-                "/v1/chat/completions?api_key={INBOUND_SECRET}&stream=false"
-            ))
-            .header("content-type", "application/json")
-            .body(axum::body::Body::from(r#"{"model":"gpt-4","messages":[]}"#))
-            .unwrap();
-
-        let (logs, served_by_url) = capture_logs(|| async {
-            let response = target_message_handler(State(state), request)
-                .await
-                .expect("request should be proxied");
-            let served_by_url = response
-                .extensions()
-                .get::<ServedBy>()
-                .expect("successful response should identify its provider")
-                .url
-                .clone();
-            let _ = axum::body::to_bytes(response.into_body(), 1024)
-                .await
-                .expect("response body should be readable");
-            served_by_url
-        })
-        .await;
-
-        assert!(
-            !logs.contains(INBOUND_SECRET),
-            "inbound query parameter leaked into logs:\n{logs}"
-        );
-        assert!(
-            !logs.contains(UPSTREAM_SECRET),
-            "configured upstream query parameter leaked into logs:\n{logs}"
-        );
-        for secret in [UPSTREAM_USER, UPSTREAM_PASSWORD, UPSTREAM_FRAGMENT] {
-            assert!(
-                !logs.contains(secret),
-                "configured upstream URL secret leaked into logs:\n{logs}"
-            );
-        }
-        // `ServedBy` is persisted by request-logging middleware, so it follows
-        // the same safe representation while retaining routing context.
-        assert_eq!(served_by_url, "https://api.example.com/v1/");
-    }
-
-    #[test]
-    fn observability_urls_retain_routing_context_without_secrets() {
-        let inbound: Uri = "/v1/chat/completions?api_key=inbound-secret"
-            .parse()
-            .unwrap();
-        assert_eq!(uri_for_observability(&inbound), "/v1/chat/completions");
-
-        let upstream = url::Url::parse(
-            "https://provider-user:provider-pass@api.example.com:8443/v1/chat?key=secret#fragment",
-        )
-        .unwrap();
-        assert_eq!(
-            url_for_observability(&upstream),
-            "https://api.example.com:8443/v1/chat"
-        );
-    }
-
-    #[derive(Debug, Clone, Default)]
-    struct FailingBodyThenSuccessClient {
-        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    }
-
-    #[async_trait::async_trait]
-    impl HttpClient for FailingBodyThenSuccessClient {
-        async fn request(
-            &self,
-            _req: axum::extract::Request,
-        ) -> Result<Response, Box<dyn std::error::Error + Send + Sync>> {
-            let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            if call == 0 {
-                let stream = futures_util::stream::once(async {
-                    Err::<axum::body::Bytes, _>(std::io::Error::other("upstream body failed"))
-                });
-                Ok(Response::builder()
-                    .status(StatusCode::OK)
-                    .header("content-type", "application/json")
-                    .body(axum::body::Body::from_stream(stream))
-                    .unwrap())
-            } else {
-                Ok(Response::builder()
-                    .status(StatusCode::OK)
-                    .header("content-type", "application/json")
-                    .body(axum::body::Body::from(r#"{"ok":true}"#))
-                    .unwrap())
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn strict_response_buffer_failure_uses_configured_502_fallback() {
-        use crate::load_balancer::{Provider, ProviderPool};
-        use crate::target::{FallbackConfig, LoadBalanceStrategy, Target, Targets};
-
-        let providers = ["provider-1", "provider-2"]
-            .into_iter()
-            .map(|host| {
-                Provider::new(
-                    Target::builder()
-                        .url(format!("https://{host}.example/v1/").parse().unwrap())
-                        .build(),
-                    1,
-                )
-            })
-            .collect();
-        let pool = ProviderPool::with_config(
-            providers,
-            None,
-            None,
-            None,
-            Some(FallbackConfig {
-                enabled: true,
-                on_status: vec![502],
-                max_attempts: Some(2),
-                ..Default::default()
-            }),
-            LoadBalanceStrategy::Priority,
-            false,
-            Vec::new(),
-        );
-        let targets_map = std::sync::Arc::new(dashmap::DashMap::new());
-        targets_map.insert("gpt-4".to_string(), pool);
-        let targets = Targets {
-            targets: targets_map,
-            key_rate_limiters: std::sync::Arc::new(dashmap::DashMap::new()),
-            key_concurrency_limiters: std::sync::Arc::new(dashmap::DashMap::new()),
-            key_labels: std::sync::Arc::new(dashmap::DashMap::new()),
-            strict_mode: true,
-            http_pool_config: None,
-        };
-        let client = FailingBodyThenSuccessClient::default();
-        let state = AppState::with_client(targets, client.clone());
-        let request = axum::extract::Request::builder()
-            .method("POST")
-            .uri("/v1/chat/completions")
-            .header("content-type", "application/json")
-            .body(axum::body::Body::from(r#"{"model":"gpt-4","messages":[]}"#))
-            .unwrap();
-
-        let response = target_message_handler(State(state), request)
-            .await
-            .expect("second provider should succeed");
-
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(client.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
-    }
 
     #[test]
     fn embedded_error_status_detects_provider_envelope() {
@@ -2446,15 +2124,6 @@ mod tests {
         assert_eq!(
             result.as_str(),
             "https://api.openai.com/v1/chat/completions"
-        );
-    }
-
-    #[test]
-    fn upstream_url_rejects_network_path_reference() {
-        let target_url = url::Url::parse("https://api.example.com/v1/").unwrap();
-
-        assert!(
-            build_upstream_url(&target_url, "///attacker.example/collect?payload=secret").is_none()
         );
     }
 

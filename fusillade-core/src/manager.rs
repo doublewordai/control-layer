@@ -32,9 +32,14 @@ pub enum ArchiveOutcome {
     Archived { rows: u64 },
     /// Batch missing or soft-deleted (purge owns its rows, not the archive).
     SkippedNotFound,
-    /// `location` was `'archive'` — already fully archived (idempotent
-    /// no-op). Split batches ARE valid candidates: re-archiving after a
-    /// retry resumes moves the remaining live rows into the same bucket.
+    /// The batch is not available to this mover: either `location` is
+    /// already `'archive'` (idempotent no-op), or another transaction holds
+    /// its row lock right now — a concurrent mover, or a retry/cancel/freeze
+    /// updating the batch (the mover locks with `SKIP LOCKED` and bounces
+    /// rather than queueing behind a held lock; contention is counted via
+    /// the `fusillade_archive_contended_total` metric). Split batches ARE
+    /// valid candidates: re-archiving after a retry resumes moves the
+    /// remaining live rows into the same bucket.
     SkippedNotLive,
     /// Counts not frozen: the batch is active again (retry) or was never
     /// finalized. It will re-candidate once frozen.

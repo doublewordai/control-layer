@@ -1,12 +1,13 @@
 [package]
 name = "onwards"
-version = "0.35.5"
+version = "0.35.6"
 edition = "2024"
 rust-version = "1.88.0"
 description = "A flexible LLM proxy library"
 license = "MIT"
 repository = "https://github.com/doublewordai/control-layer"
 homepage = "https://github.com/doublewordai/control-layer"
+documentation = "https://docs.rs/onwards"
 keywords = ["llm", "proxy", "ai", "openai", "anthropic"]
 categories = ["web-programming", "api-bindings"]
 
@@ -69,7 +70,7 @@ metrics = "0.24"
 governor = "0.10.1"
 rand = "0.9"
 uuid = { version = "1", features = ["v4"] }
-fusillade = { version = "23.0.2", path = "../fusillade", optional = true, default-features = false }
+fusillade = { version = "24.0.0", path = "../fusillade", optional = true, default-features = false }
 
 [dev-dependencies]
 axum-test = "18.0.0"

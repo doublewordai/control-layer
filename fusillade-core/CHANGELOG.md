@@ -1,5 +1,17 @@
 # Changelog
 
+## [4.0.0](https://github.com/doublewordai/fusillade/compare/fusillade-core-v3.0.0...fusillade-core-v4.0.0) (2026-07-21)
+
+
+### ⚠ BREAKING CHANGES
+
+* bound concurrent request state writes ([#372](https://github.com/doublewordai/fusillade/issues/372))
+
+### Bug Fixes
+
+* bound concurrent request state writes ([#372](https://github.com/doublewordai/fusillade/issues/372)) ([57fbfb4](https://github.com/doublewordai/fusillade/commit/57fbfb43431a9884e7f1b753255eb5962db6f314))
+* fusilalde replicas dont work well in parallel for archiving ([#374](https://github.com/doublewordai/fusillade/issues/374)) ([35c5dc2](https://github.com/doublewordai/fusillade/commit/35c5dc2bb9a19471c7f84a7d3259ec64780b6605))
+
 ## [3.0.0](https://github.com/doublewordai/fusillade/compare/fusillade-core-v2.1.0...fusillade-core-v3.0.0) (2026-07-20)
 
 

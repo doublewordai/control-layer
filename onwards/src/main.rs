@@ -19,10 +19,10 @@ pub async fn main() -> anyhow::Result<()> {
     let result = run().await;
 
     // Flush pending spans before exit
-    if let Some(provider) = tracer_provider
-        && let Err(e) = provider.shutdown()
-    {
-        eprintln!("Failed to shutdown tracer provider: {e}");
+    if let Some(provider) = tracer_provider {
+        if let Err(e) = provider.shutdown() {
+            eprintln!("Failed to shutdown tracer provider: {e}");
+        }
     }
 
     result

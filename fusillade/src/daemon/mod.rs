@@ -1324,7 +1324,7 @@ where
             );
         }
 
-        // ---- Batch-archive maintenance + movers (phase 3) ----
+        // ---- Batch-archive maintenance + movers ----
         // Only batch-mode daemons touch the archive. The partition-runway
         // tick ALWAYS runs for them (partitions must exist before anyone
         // flips the move flags); the sweep/backfill movers are config-gated:
@@ -1365,13 +1365,14 @@ where
             // a backlog, the oldest batches are the least likely to ever be
             // re-read, so early issues have minimal blast radius (same
             // argument as the historical drain).
-            for (worker, enabled, interval_ms, per_tick, dwell) in [
+            for (worker, enabled, interval_ms, per_tick, dwell, concurrency) in [
                 (
                     "sweep",
                     self.config.batch_archive_sweep_enabled,
                     self.config.batch_archive_sweep_interval_ms,
                     self.config.batch_archive_sweep_moves_per_tick,
                     self.config.batch_archive_sweep_dwell_secs,
+                    1usize,
                 ),
                 (
                     "backfill",
@@ -1379,6 +1380,7 @@ where
                     self.config.batch_archive_backfill_interval_ms,
                     self.config.batch_archive_backfill_moves_per_tick,
                     0.0,
+                    self.config.batch_archive_backfill_concurrency,
                 ),
             ] {
                 if !enabled {
@@ -1427,43 +1429,75 @@ where
                             }
                         };
 
-                        for batch_id in ids {
+                        // Moves run in waves of `concurrency`: per-move cost
+                        // is dominated by fixed transaction overhead on small
+                        // batches, so concurrent moves — safe because the
+                        // batch lock is taken SKIP LOCKED — are what raise
+                        // throughput. An error stops further waves this tick;
+                        // the next tick retries (the queue is the data).
+                        let mut abort_tick = false;
+                        for wave in ids.chunks(concurrency.max(1)) {
                             if shutdown_token.is_cancelled() {
                                 return;
                             }
-                            let started = std::time::Instant::now();
-                            match storage.archive_batch(batch_id).await {
-                                Ok(ArchiveOutcome::Archived { rows }) => {
-                                    counter!("fusillade_archive_moves_total", "worker" => worker, "outcome" => "archived").increment(1);
-                                    counter!("fusillade_archive_moved_rows_total", "worker" => worker).increment(rows);
-                                    histogram!("fusillade_archive_move_duration_seconds", "worker" => worker)
-                                        .record(started.elapsed().as_secs_f64());
+                            if abort_tick {
+                                break;
+                            }
+                            let results = futures::future::join_all(wave.iter().map(|batch_id| {
+                                let storage = storage.clone();
+                                async move {
+                                    let started = std::time::Instant::now();
+                                    let result = storage.archive_batch(*batch_id).await;
+                                    // Elapsed measured HERE, inside the future:
+                                    // after join_all it would include waiting
+                                    // for slower wave-mates.
+                                    (*batch_id, started.elapsed(), result)
                                 }
-                                Ok(outcome) => {
-                                    let label = match outcome {
-                                        ArchiveOutcome::Archived { .. } => unreachable!(),
-                                        ArchiveOutcome::SkippedNotFound => "skipped_not_found",
-                                        ArchiveOutcome::SkippedNotLive => "skipped_not_live",
-                                        ArchiveOutcome::SkippedNotFrozen => "skipped_not_frozen",
-                                        ArchiveOutcome::SkippedNoPartition => {
-                                            "skipped_no_partition"
-                                        }
-                                        ArchiveOutcome::SkippedResponseSteps => {
-                                            "skipped_response_steps"
-                                        }
-                                        ArchiveOutcome::SkippedRetryRaced => "skipped_retry_raced",
-                                    };
-                                    counter!("fusillade_archive_moves_total", "worker" => worker, "outcome" => label).increment(1);
-                                    if outcome == ArchiveOutcome::SkippedNoPartition {
-                                        // The one alert-worthy skip: the
-                                        // partition runway failed. The batch
-                                        // stays live and fully served.
-                                        crate::background_error!("archive_partition_missing", Error, batch_id = %batch_id, "Archive partition missing for batch bucket");
+                            }))
+                            .await;
+                            for (batch_id, elapsed, result) in results {
+                                match result {
+                                    Ok(ArchiveOutcome::Archived { rows }) => {
+                                        counter!("fusillade_archive_moves_total", "worker" => worker, "outcome" => "archived").increment(1);
+                                        counter!("fusillade_archive_moved_rows_total", "worker" => worker).increment(rows);
+                                        histogram!("fusillade_archive_move_duration_seconds", "worker" => worker)
+                                            .record(elapsed.as_secs_f64());
                                     }
-                                }
-                                Err(e) => {
-                                    crate::background_error!("archive_move_failed", Error, error = %e, batch_id = %batch_id, "Failed to archive batch");
-                                    break;
+                                    Ok(outcome) => {
+                                        let label = match outcome {
+                                            ArchiveOutcome::Archived { .. } => unreachable!(),
+                                            ArchiveOutcome::SkippedNotFound => "skipped_not_found",
+                                            ArchiveOutcome::SkippedNotLive => "skipped_not_live",
+                                            ArchiveOutcome::SkippedNotFrozen => {
+                                                "skipped_not_frozen"
+                                            }
+                                            ArchiveOutcome::SkippedNoPartition => {
+                                                "skipped_no_partition"
+                                            }
+                                            ArchiveOutcome::SkippedResponseSteps => {
+                                                "skipped_response_steps"
+                                            }
+                                            ArchiveOutcome::SkippedRetryRaced => {
+                                                "skipped_retry_raced"
+                                            }
+                                        };
+                                        counter!("fusillade_archive_moves_total", "worker" => worker, "outcome" => label).increment(1);
+                                        if outcome == ArchiveOutcome::SkippedNoPartition {
+                                            // The one alert-worthy skip: the
+                                            // partition runway failed. The batch
+                                            // stays live and fully served.
+                                            crate::background_error!("archive_partition_missing", Error, batch_id = %batch_id, "Archive partition missing for batch bucket");
+                                        }
+                                    }
+                                    Err(e) => {
+                                        // One error per tick: a wave-wide DB
+                                        // failure would otherwise emit
+                                        // `concurrency` copies every tick.
+                                        if !abort_tick {
+                                            crate::background_error!("archive_move_failed", Error, error = %e, batch_id = %batch_id, "Failed to archive batch");
+                                        }
+                                        abort_tick = true;
+                                    }
                                 }
                             }
                         }
@@ -1566,10 +1600,8 @@ mod tests {
     fn daemon_mode_defaults_to_both_and_roundtrips_through_config() {
         assert_eq!(DaemonConfig::default().mode, DaemonMode::Both);
 
-        let config = DaemonConfig {
-            mode: DaemonMode::BatchOnly,
-            ..DaemonConfig::default()
-        };
+        let mut config = DaemonConfig::default();
+        config.mode = DaemonMode::BatchOnly;
 
         let json = serde_json::to_value(&config).expect("config should serialize");
         assert_eq!(json["mode"], serde_json::json!("batch_only"));

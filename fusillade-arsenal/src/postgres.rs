@@ -7556,6 +7556,15 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
         // derived HERE, once, in UTC (`AT TIME ZONE 'UTC'` so the ISO-week
         // Monday can never depend on the session TimeZone) and stamped;
         // every later reader uses the stamped value, never re-derives.
+        //
+        // SKIP LOCKED, not a plain FOR UPDATE: concurrent movers all walk
+        // the same oldest-first candidate list, so with a waiting lock they
+        // serialize behind whichever mover holds the current oldest batch
+        // and burn its whole move duration discovering it's taken. Bouncing
+        // off a held row and reporting SkippedNotLive (with the contention
+        // counted via fusillade_archive_contended_total) lets each mover
+        // fall through to its next candidate — disjoint work, no
+        // coordinator.
         let batch = sqlx::query!(
             r#"
             SELECT retry_version,
@@ -7567,7 +7576,7 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
                    ) AS "bucket!"
             FROM batches
             WHERE id = $1 AND deleted_at IS NULL
-            FOR UPDATE
+            FOR UPDATE SKIP LOCKED
             "#,
             *batch_id as Uuid,
         )
@@ -7576,7 +7585,28 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to lock batch for archive: {}", e)))?;
 
         let Some(batch) = batch else {
-            return Ok(ArchiveOutcome::SkippedNotFound);
+            // No row can mean "missing/deleted" or "exists but locked by
+            // another mover" — SKIP LOCKED conflates them. Disambiguate:
+            // contention is routine under concurrent movers and is counted
+            // here (it deliberately does NOT get its own public outcome —
+            // to the caller the batch is simply not available, same as
+            // already-archived), while a persisting NotFound for a listed
+            // candidate would be odd.
+            let exists = sqlx::query_scalar!(
+                r#"SELECT EXISTS(SELECT 1 FROM batches WHERE id = $1 AND deleted_at IS NULL) AS "exists!""#,
+                *batch_id as Uuid,
+            )
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| {
+                FusilladeError::Other(anyhow!("Failed to check batch existence: {}", e))
+            })?;
+            return Ok(if exists {
+                metrics::counter!("fusillade_archive_contended_total").increment(1);
+                ArchiveOutcome::SkippedNotLive
+            } else {
+                ArchiveOutcome::SkippedNotFound
+            });
         };
         if batch.location == "archive" {
             return Ok(ArchiveOutcome::SkippedNotLive);
@@ -7585,7 +7615,7 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
             return Ok(ArchiveOutcome::SkippedNotFrozen);
         }
 
-        // Graceful degradation (§7 of the phase 3 plan): a missing partition
+        // Graceful degradation: a missing partition
         // means the batch stays live — fully served, exactly as today — and
         // the caller alerts. Name derivation must match
         // ensure_archive_partitions() exactly.
@@ -11195,6 +11225,94 @@ mod tests {
         // Idempotent: a second call is a clean no-op skip.
         let again = manager.archive_batch(batch_id).await.unwrap();
         assert_eq!(again, ArchiveOutcome::SkippedNotLive);
+    }
+
+    /// The mover must BOUNCE off a batch another mover holds, not queue
+    /// behind its whole move transaction: with N movers walking the same
+    /// oldest-first list, waiting locks would serialize the fleet.
+    #[sqlx::test]
+    async fn test_archive_batch_bounces_off_held_lock(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+        let batch_id = setup_frozen_batch(&manager, &pool, "arch-contend", 3).await;
+
+        // Simulate another mover mid-move: hold the batch row lock in a
+        // separate transaction.
+        let mut holder = pool.begin().await.unwrap();
+        sqlx::query!(
+            "SELECT id FROM batches WHERE id = $1 FOR UPDATE",
+            *batch_id as Uuid
+        )
+        .fetch_one(&mut *holder)
+        .await
+        .unwrap();
+
+        // Must return SkippedNotLive promptly instead of blocking until the
+        // holder commits; the timeout proves the non-blocking property.
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            manager.archive_batch(batch_id),
+        )
+        .await
+        .expect("archive_batch must not queue behind a held batch lock")
+        .unwrap();
+        assert_eq!(outcome, ArchiveOutcome::SkippedNotLive);
+
+        // Batch untouched by the bounce.
+        let (location, _, live, archived) = archive_state(&pool, batch_id).await;
+        assert_eq!((location.as_str(), live, archived), ("live", 3, 0));
+
+        // Once the holder releases, the same batch archives normally.
+        holder.rollback().await.unwrap();
+        let outcome = manager.archive_batch(batch_id).await.unwrap();
+        assert_eq!(outcome, ArchiveOutcome::Archived { rows: 3 });
+    }
+
+    /// Two movers racing for the same batch: exactly one wins and moves it;
+    /// the loser reports a benign SkippedNotLive whether it arrived mid-move
+    /// (lock bounce) or after the winner committed. Never two moves, never
+    /// an error.
+    #[sqlx::test]
+    async fn test_concurrent_archive_batch_exactly_one_wins(pool: sqlx::PgPool) {
+        let manager = Arc::new(PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        ));
+        let batch_id = setup_frozen_batch(&manager, &pool, "arch-race", 3).await;
+
+        let (a, b) = tokio::join!(
+            {
+                let m = manager.clone();
+                async move { m.archive_batch(batch_id).await.unwrap() }
+            },
+            {
+                let m = manager.clone();
+                async move { m.archive_batch(batch_id).await.unwrap() }
+            }
+        );
+
+        let archived_count = [&a, &b]
+            .iter()
+            .filter(|o| matches!(o, ArchiveOutcome::Archived { rows: 3 }))
+            .count();
+        assert_eq!(
+            archived_count, 1,
+            "exactly one mover must win: {a:?} / {b:?}"
+        );
+        let loser = if matches!(a, ArchiveOutcome::Archived { .. }) {
+            &b
+        } else {
+            &a
+        };
+        assert!(
+            matches!(loser, ArchiveOutcome::SkippedNotLive),
+            "loser must skip benignly, got {loser:?}"
+        );
+
+        let (location, _, live, archived) = archive_state(&pool, batch_id).await;
+        assert_eq!((location.as_str(), live, archived), ("archive", 0, 3));
     }
 
     #[sqlx::test]

@@ -247,6 +247,13 @@ pub struct DaemonConfig {
     pub batch_archive_backfill_interval_ms: u64,
     #[serde(default = "default_archive_moves_per_tick")]
     pub batch_archive_backfill_moves_per_tick: i64,
+    /// Concurrent moves per backfill tick (waves of this size). Per-move
+    /// cost is dominated by fixed transaction overhead on small batches, so
+    /// concurrency — not tick pacing — is what raises drain throughput.
+    /// Safe under concurrent movers (SKIP LOCKED); values < 1 behave as 1.
+    /// The sweeper stays sequential — steady-state volume never needs more.
+    #[serde(default = "default_archive_backfill_concurrency")]
+    pub batch_archive_backfill_concurrency: usize,
     /// Weekly-partition runway maintained by the daily maintenance tick.
     #[serde(default = "default_archive_partitions_weeks_ahead")]
     pub batch_archive_partitions_weeks_ahead: i32,
@@ -338,6 +345,10 @@ fn default_archive_cancel_grace_secs() -> f64 {
     600.0
 }
 
+fn default_archive_backfill_concurrency() -> usize {
+    1
+}
+
 fn default_archive_backfill_interval_ms() -> u64 {
     1_000
 }
@@ -409,6 +420,7 @@ impl Default for DaemonConfig {
             batch_archive_backfill_enabled: false,
             batch_archive_backfill_interval_ms: default_archive_backfill_interval_ms(),
             batch_archive_backfill_moves_per_tick: default_archive_moves_per_tick(),
+            batch_archive_backfill_concurrency: default_archive_backfill_concurrency(),
             batch_archive_partitions_weeks_ahead: default_archive_partitions_weeks_ahead(),
             purge_batch_size: 1000,
             purge_throttle_ms: 100,
@@ -491,6 +503,7 @@ mod tests {
         assert_eq!(c.batch_archive_partitions_weeks_ahead, 4);
         assert!(c.batch_archive_sweep_moves_per_tick > 0);
         assert!(c.batch_archive_backfill_moves_per_tick > 0);
+        assert_eq!(c.batch_archive_backfill_concurrency, 1);
         // Old serialized configs (no archive keys) must keep deserializing:
         // strip the new keys before decoding so the missing-field path is
         // what the test actually exercises.
@@ -501,6 +514,7 @@ mod tests {
             "batch_archive_sweep_interval_ms",
             "batch_archive_sweep_moves_per_tick",
             "batch_archive_sweep_dwell_secs",
+            "batch_archive_backfill_concurrency",
             "batch_archive_cancel_grace_secs",
             "batch_archive_backfill_enabled",
             "batch_archive_backfill_interval_ms",
