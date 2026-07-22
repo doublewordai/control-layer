@@ -602,10 +602,13 @@ pub async fn create_batch<P: PoolProvider>(
     // Get the hidden API key for batch execution and per-member attribution.
     // The secret is stored on the batch so the daemon uses the batch creator's
     // credentials, not the file uploader's key from request_templates.
+    // If the request was authenticated with a capped API key, this resolves to
+    // that key's cap-scope child instead of the shared member key, so the
+    // batch's spend counts against the authenticating key's spending cap.
     let (batch_api_key, api_key_id, target_verified) = {
         let mut conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
         let (secret, key_id) = ApiKeys::new(&mut conn)
-            .get_or_create_hidden_key_with_id(target_user_id, ApiKeyPurpose::Batch, current_user.id)
+            .resolve_batch_execution_key(target_user_id, current_user.id, current_user.api_key_id)
             .await
             .map_err(Error::Database)?;
         // Resolve the creditor's verified flag on the same connection (the org in
@@ -1686,12 +1689,13 @@ pub async fn list_batches<P: PoolProvider>(
         let mut read_conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
         let key_ids = match current_user.active_organization {
             Some(org_id) => {
-                // Org context: find the single hidden key for this member in this org
-                let key_id = ApiKeys::new(&mut read_conn)
-                    .find_hidden_key_id(org_id, ApiKeyPurpose::Batch, member_id)
+                // Org context: the member's hidden keys in this org (shared +
+                // any cap-scope children, all of which their batches may be
+                // attributed to)
+                ApiKeys::new(&mut read_conn)
+                    .find_hidden_key_ids(org_id, ApiKeyPurpose::Batch, member_id)
                     .await
-                    .map_err(Error::Database)?;
-                key_id.into_iter().collect::<Vec<_>>()
+                    .map_err(Error::Database)?
             }
             None if can_read_all => {
                 // PM personal context: find ALL hidden keys created by this member

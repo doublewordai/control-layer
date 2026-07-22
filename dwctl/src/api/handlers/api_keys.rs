@@ -392,11 +392,17 @@ pub async fn delete_user_api_key<P: PoolProvider>(
     let mut tx = state.db.write().begin().await.map_err(|e| Error::Database(e.into()))?;
     let mut repo = ApiKeys::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
 
-    // Check if the API key exists, belongs to the target user, and was created by current user
+    // Check if the API key exists, belongs to the target user, and was created by current user.
+    // Cap-scope child keys (parent_api_key_id set) are system-managed and can
+    // never be deleted directly — their ids leak via transaction rows, and
+    // deleting one would silently route the parent's batch/flex traffic back
+    // to the shared (uncapped) hidden key, bypassing the spending cap. They
+    // are revoked only via their parent's deletion (repo cascade).
     repo.get_by_id(api_key_id)
         .await?
         .filter(|key| key.user_id == target_user_id)
         .filter(|key| skip_created_by_filter || key.created_by == current_user.id)
+        .filter(|key| key.parent_api_key_id.is_none())
         .ok_or_else(|| Error::NotFound {
             resource: "API key".to_string(),
             id: api_key_id.to_string(),
@@ -611,6 +617,46 @@ mod tests {
         let paginated: PaginatedResponse<ApiKeyInfoResponse> = list_response.json();
         assert_eq!(paginated.data.len(), 0);
         assert_eq!(paginated.total_count, 0);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_delete_rejects_cap_scope_child_key(pool: PgPool) {
+        use crate::db::handlers::api_keys::ApiKeys;
+        use crate::db::handlers::repository::Repository;
+
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        let api_key = create_test_api_key_for_user(&pool, user.id).await;
+
+        // Mint a cap-scope child for the visible key.
+        let child_id = {
+            let mut conn = pool.acquire().await.unwrap();
+            let (_, child_id) = ApiKeys::new(&mut conn).get_or_create_child_hidden_key(api_key.id).await.unwrap();
+            child_id
+        };
+
+        // Children are system-managed: direct deletion is rejected (404), even
+        // though the child belongs to and was created by this user.
+        let response = app
+            .delete(&format!("/admin/api/v1/users/current/api-keys/{child_id}"))
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        response.assert_status(axum::http::StatusCode::NOT_FOUND);
+
+        // The child is still alive (and would still resolve for execution).
+        let mut conn = pool.acquire().await.unwrap();
+        assert!(ApiKeys::new(&mut conn).get_by_id(child_id).await.unwrap().is_some());
+
+        // Deleting the parent is the only path that revokes it.
+        let response = app
+            .delete(&format!("/admin/api/v1/users/current/api-keys/{}", api_key.id))
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        response.assert_status(axum::http::StatusCode::NO_CONTENT);
+        assert!(ApiKeys::new(&mut conn).get_by_id(child_id).await.unwrap().is_none());
     }
 
     #[sqlx::test]

@@ -67,6 +67,21 @@
         "ordinal": 12,
         "name": "created_by",
         "type_info": "Uuid"
+      },
+      {
+        "ordinal": 13,
+        "name": "spend_limit",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 14,
+        "name": "spend_limit_interval",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 15,
+        "name": "parent_api_key_id",
+        "type_info": "Uuid"
       }
     ],
     "parameters": {
@@ -91,7 +106,10 @@
       false,
       false,
       false,
-      false
+      false,
+      true,
+      true,
+      true
     ]
   },
   "hash": "09139014124c382fced3c0e35c87b437d5d1ba4b5a17788b3b5352428151128f"

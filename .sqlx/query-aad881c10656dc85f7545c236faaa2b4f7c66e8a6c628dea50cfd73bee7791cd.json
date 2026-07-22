@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT id, name, description, secret, purpose, user_id, created_by, created_at, last_used, requests_per_second, burst_size, hidden, is_deleted FROM api_keys WHERE id = ANY($1) AND is_deleted = false",
+  "query": "SELECT id, name, description, secret, purpose, user_id, created_by, created_at, last_used, requests_per_second, burst_size, hidden, is_deleted, spend_limit, spend_limit_interval, parent_api_key_id FROM api_keys WHERE id = $1 AND is_deleted = false",
   "describe": {
     "columns": [
       {
@@ -67,11 +67,26 @@
         "ordinal": 12,
         "name": "is_deleted",
         "type_info": "Bool"
+      },
+      {
+        "ordinal": 13,
+        "name": "spend_limit",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 14,
+        "name": "spend_limit_interval",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 15,
+        "name": "parent_api_key_id",
+        "type_info": "Uuid"
       }
     ],
     "parameters": {
       "Left": [
-        "UuidArray"
+        "Uuid"
       ]
     },
     "nullable": [
@@ -87,8 +102,11 @@
       true,
       true,
       false,
-      false
+      false,
+      true,
+      true,
+      true
     ]
   },
-  "hash": "ec5d14f4679f69f2376a14f1eb2b35803dca6b327bceca5deaa5c47f27fbff29"
+  "hash": "aad881c10656dc85f7545c236faaa2b4f7c66e8a6c628dea50cfd73bee7791cd"
 }
