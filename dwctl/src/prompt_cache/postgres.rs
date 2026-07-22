@@ -18,6 +18,7 @@
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use rand::RngExt;
 use sqlx::PgPool;
 use tracing::instrument;
 
@@ -70,7 +71,7 @@ macro_rules! with_conn_retry {
                     // instant, so identical deterministic sleeps would re-storm connection
                     // setup in lockstep.
                     let base_ms = 100u64 << attempt.min(4);
-                    let jitter_ms = rand::prelude::RngExt::random_range(&mut rand::rng(), 0..(base_ms / 5 + 1));
+                    let jitter_ms = rand::rng().random_range(0..(base_ms / 5 + 1));
                     tokio::time::sleep(std::time::Duration::from_millis(base_ms + jitter_ms)).await;
                     attempt += 1;
                 }
