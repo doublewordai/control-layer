@@ -1,0 +1,11 @@
+[book]
+title = "Onwards"
+description = "Documentation for the Onwards AI Gateway"
+authors = ["Doubleword"]
+language = "en"
+src = "src"
+
+[output.html]
+git-repository-url = "https://github.com/doublewordai/control-layer"
+edit-url-template = "https://github.com/doublewordai/control-layer/edit/main/onwards/docs/src/{path}"
+site-url = "/control-layer/onwards/"
