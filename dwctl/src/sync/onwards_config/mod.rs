@@ -910,6 +910,7 @@ fn convert_composite_to_target_spec(
                 .and_then(|n| usize::try_from(n).ok().filter(|&v| v >= 1)),
             backoff,
             max_total_backoff_ms,
+            stream_continuation: None,
         })
     } else {
         None
@@ -1174,6 +1175,7 @@ fn convert_to_config_file(
                         .and_then(|n| usize::try_from(n).ok().filter(|&v| v >= 1)),
                     backoff,
                     max_total_backoff_ms,
+                    stream_continuation: None,
                 })
             } else {
                 None
