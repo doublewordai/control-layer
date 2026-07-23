@@ -92,6 +92,30 @@ const groupsData = groupsDataRaw as Group[];
 const endpointsData = endpointsDataRaw as Endpoint[];
 const modelsData = modelsDataRaw.data as Model[];
 const apiKeysData = apiKeysDataRaw as ApiKey[];
+
+// Next calendar-aligned UTC reset boundary for a usage-limit interval; null
+// for one-off caps. Mirrors the backend's date_trunc semantics (and the
+// spendCap.ts helper — duplicated so mocks stay free of component imports).
+function nextCapResetIso(interval: string | null): string | null {
+  if (!interval) return null;
+  const now = new Date();
+  const y = now.getUTCFullYear();
+  const m = now.getUTCMonth();
+  const d = now.getUTCDate();
+  switch (interval) {
+    case "daily":
+      return new Date(Date.UTC(y, m, d + 1)).toISOString();
+    case "weekly": {
+      const dow = now.getUTCDay();
+      const daysUntilMonday = dow === 0 ? 1 : 8 - dow;
+      return new Date(Date.UTC(y, m, d + daysUntilMonday)).toISOString();
+    }
+    case "monthly":
+      return new Date(Date.UTC(y, m + 1, 1)).toISOString();
+    default:
+      return null;
+  }
+}
 const transactionsData = transactionsDataRaw as Transaction[];
 const organizationsData = organizationsDataRaw as unknown as Organization[];
 let providerDisplayConfigsData: ProviderDisplayConfig[] = [
@@ -1022,11 +1046,66 @@ export const handlers = [
       id: `key-${Date.now()}`,
       name: body.name,
       description: body.description,
+      purpose: body.purpose ?? "realtime",
+      // Attribute to the demo current user (usersData[0]) so the
+      // edit-permission gate treats created keys as manageable.
+      created_by: usersData[0].id,
       created_at: new Date().toISOString(),
       key: `sk-${Math.random().toString(36).substring(2, 50)}`,
+      spend_limit: body.spend_limit ?? null,
+      spend_limit_interval: body.spend_limit_interval ?? null,
+      spend: body.spend_limit != null ? "0" : null,
+      total_spend: body.spend_limit != null ? "0" : null,
+      resets_at:
+        body.spend_limit != null
+          ? nextCapResetIso(body.spend_limit_interval ?? null)
+          : null,
     };
+    // Persist so demo-mode refetches (query invalidation) show the new key.
+    apiKeysData.push(newApiKey as unknown as ApiKey);
     return HttpResponse.json(newApiKey, { status: 201 });
   }),
+
+  http.patch(
+    "/admin/api/v1/users/:userId/api-keys/:keyId",
+    async ({ params, request }) => {
+      const apiKey = apiKeysData.find((k) => k.id === params.keyId) as
+        | Record<string, unknown>
+        | undefined;
+      if (!apiKey) {
+        return HttpResponse.json(
+          { error: "API key not found" },
+          { status: 404 },
+        );
+      }
+      const body = (await request.json()) as Record<string, unknown>;
+      // Mirror the API's tri-state semantics: absent = unchanged, null =
+      // clear, value = set. reset_window zeroes the counted window spend.
+      const merged: Record<string, unknown> = { ...apiKey };
+      if ("spend_limit" in body) merged.spend_limit = body.spend_limit;
+      if ("spend_limit_interval" in body)
+        merged.spend_limit_interval = body.spend_limit_interval;
+      if (body.reset_window === true) merged.spend = "0";
+      if ("name" in body && body.name !== undefined) merged.name = body.name;
+      // Keep derived fields consistent with the cap state.
+      if (merged.spend_limit == null) {
+        merged.spend = null;
+        merged.total_spend = null;
+        merged.resets_at = null;
+        merged.spend_limit_interval = null;
+      } else {
+        merged.spend = merged.spend ?? "0";
+        merged.total_spend = merged.total_spend ?? "0";
+        merged.resets_at = nextCapResetIso(
+          (merged.spend_limit_interval as string | null) ?? null,
+        );
+      }
+      // Persist so follow-up list/get requests (query invalidation) reflect
+      // the edit rather than reverting to the seed data.
+      Object.assign(apiKey, merged);
+      return HttpResponse.json(apiKey);
+    },
+  ),
 
   http.delete("/admin/api/v1/users/:userId/api-keys/:keyId", ({ params }) => {
     const apiKey = apiKeysData.find((k) => k.id === params.keyId);

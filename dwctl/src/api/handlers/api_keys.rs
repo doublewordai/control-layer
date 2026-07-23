@@ -454,6 +454,11 @@ pub async fn update_user_api_key<P: PoolProvider>(
         }
     }
 
+    // NOTE(org-perms follow-up): updates use the same creator-or-PM scoping
+    // as every other key operation — caps are a pure extension on existing
+    // behavior. Tightening org-key cap edits to org owners/admins (so members
+    // can't raise their own budget) is deliberately deferred to a dedicated
+    // org-permissions PR, together with the org key-visibility model.
     let skip_created_by_filter = can_update_all;
 
     let mut tx = state.db.write().begin().await.map_err(|e| Error::Database(e.into()))?;
@@ -669,7 +674,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_create_api_key_with_spend_cap(pool: PgPool) {
-        use crate::db::handlers::{Repository as _, api_keys::ApiKeys};
+        use crate::db::handlers::api_keys::ApiKeys;
 
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user = create_test_user(&pool, Role::StandardUser).await;
@@ -1855,7 +1860,9 @@ mod tests {
             .await;
         response.assert_status(axum::http::StatusCode::CREATED);
 
-        // Alice lists org keys → should only see her own key
+        // Alice lists org keys → visibility is unchanged: everyone (owner
+        // included) sees only keys they created. Only cap EDITING is
+        // owner/admin-gated.
         let response = app
             .get(&format!("/admin/api/v1/users/{}/api-keys", org.id))
             .add_header(&add_auth_headers(&alice)[0].0, &add_auth_headers(&alice)[0].1)
@@ -1897,7 +1904,8 @@ mod tests {
         response.assert_status(axum::http::StatusCode::CREATED);
         let bob_key: ApiKeyResponse = response.json();
 
-        // Alice tries to get Bob's key by ID → should get 404
+        // Alice tries to get Bob's key by ID → should get 404 (read
+        // visibility is creator-scoped for everyone below PlatformManager)
         let response = app
             .get(&format!("/admin/api/v1/users/{}/api-keys/{}", org.id, bob_key.id))
             .add_header(&add_auth_headers(&alice)[0].0, &add_auth_headers(&alice)[0].1)

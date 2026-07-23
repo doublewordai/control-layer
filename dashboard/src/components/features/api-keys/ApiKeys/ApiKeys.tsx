@@ -14,9 +14,17 @@ import {
   useApiKeys,
   useCreateApiKey,
   useDeleteApiKey,
+  useUpdateApiKey,
+  type ApiKey,
   type ApiKeyCreateResponse,
   type ApiKeyPurpose,
+  type SpendLimitInterval,
 } from "../../../../api/control-layer";
+import {
+  formatCredits,
+  formatResetInstant,
+  resetPreviewLine,
+} from "./spendCap";
 import { useUser } from "../../../../api/control-layer/hooks";
 import { DataTable } from "../../../ui/data-table";
 import { createColumns } from "./columns";
@@ -65,8 +73,17 @@ export const ApiKeys: React.FC = () => {
     number | ""
   >("");
   const [newKeyBurstSize, setNewKeyBurstSize] = useState<number | "">("");
+  const [newKeyCapAmount, setNewKeyCapAmount] = useState("");
+  const [newKeyCapInterval, setNewKeyCapInterval] = useState<
+    SpendLimitInterval | "none"
+  >("none");
   const [newKeyResponse, setNewKeyResponse] =
     useState<ApiKeyCreateResponse | null>(null);
+  const [editModal, setEditModal] = useState<ApiKey | null>(null);
+  const [editCapAmount, setEditCapAmount] = useState("");
+  const [editCapInterval, setEditCapInterval] = useState<
+    SpendLimitInterval | "none"
+  >("none");
   const [deleteModal, setDeleteModal] = useState<{
     keyId: string;
     keyName: string;
@@ -91,6 +108,7 @@ export const ApiKeys: React.FC = () => {
 
   const createApiKeyMutation = useCreateApiKey();
   const deleteApiKeyMutation = useDeleteApiKey();
+  const updateApiKeyMutation = useUpdateApiKey();
 
   const handleCreateApiKey = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -106,12 +124,63 @@ export const ApiKeys: React.FC = () => {
             ? null
             : Number(newKeyRequestsPerSecond),
         burst_size: newKeyBurstSize === "" ? null : Number(newKeyBurstSize),
+        spend_limit: newKeyCapAmount.trim() === "" ? null : newKeyCapAmount.trim(),
+        spend_limit_interval:
+          newKeyCapAmount.trim() === "" || newKeyCapInterval === "none"
+            ? null
+            : newKeyCapInterval,
       },
       userId: targetUserId,
     });
 
     setNewKeyResponse(newKey);
     // Don't close the form - show success state instead
+  };
+
+  const openEditModal = (apiKey: ApiKey) => {
+    setEditModal(apiKey);
+    setEditCapAmount(apiKey.spend_limit ?? "");
+    setEditCapInterval(apiKey.spend_limit_interval ?? "none");
+  };
+
+  const handleSaveCap = async () => {
+    if (!editModal) return;
+    try {
+      // Tri-state PATCH: both cap fields are always sent explicitly so removal
+      // (null) actually clears server-side, matching the API semantics.
+      await updateApiKeyMutation.mutateAsync({
+        keyId: editModal.id,
+        data: {
+          spend_limit: editCapAmount.trim() === "" ? null : editCapAmount.trim(),
+          spend_limit_interval:
+            editCapAmount.trim() === "" || editCapInterval === "none"
+              ? null
+              : editCapInterval,
+        },
+        userId: targetUserId,
+      });
+      toast.success("Usage limit updated");
+      setEditModal(null);
+    } catch (e) {
+      console.error("Failed to update usage limit:", e);
+      toast.error((e as Error)?.message ?? "Failed to update usage limit");
+    }
+  };
+
+  const handleResetWindow = async () => {
+    if (!editModal) return;
+    try {
+      await updateApiKeyMutation.mutateAsync({
+        keyId: editModal.id,
+        data: { reset_window: true },
+        userId: targetUserId,
+      });
+      toast.success("Spend window reset");
+      setEditModal(null);
+    } catch (e) {
+      console.error("Failed to reset spend window:", e);
+      toast.error((e as Error)?.message ?? "Failed to reset spend window");
+    }
   };
 
   const handleDeleteApiKey = (keyId: string) => {
@@ -165,8 +234,17 @@ export const ApiKeys: React.FC = () => {
     }
   };
 
+  // Mirrors what the PATCH endpoint permits: the key's creator, or a
+  // PlatformManager. (Org-specific cap permissions — e.g. restricting cap
+  // edits on org keys to owners/admins — are deferred to the dedicated
+  // org-permissions follow-up; keep this gate in lockstep with the server.)
+  const canManageKey = (apiKey: ApiKey) =>
+    isPlatformManager || (!!apiKey.created_by && apiKey.created_by === user?.id);
+
   const columns = createColumns({
     onDelete: handleDeleteFromTable,
+    onEdit: openEditModal,
+    canManage: canManageKey,
     isPlatformManager,
   });
 
@@ -314,6 +392,8 @@ export const ApiKeys: React.FC = () => {
             setNewKeyPurpose("realtime");
             setNewKeyRequestsPerSecond("");
             setNewKeyBurstSize("");
+            setNewKeyCapAmount("");
+            setNewKeyCapInterval("none");
             setNewKeyResponse(null);
             setAdvancedOpen(false);
           } else {
@@ -324,12 +404,11 @@ export const ApiKeys: React.FC = () => {
         <DialogContent className="sm:max-w-md">
           <DialogHeader>
             <DialogTitle>
-              {newKeyResponse
-                ? "API Key Created Successfully"
-                : "Create New API Key"}
+              {newKeyResponse ? "API Key Created Successfully" : "Create API key"}
             </DialogTitle>
             <DialogDescription>
-              Create a new API key to access the platform programmatically.
+              Give the key a recognizable name. You'll see the secret value
+              once on the next screen.
             </DialogDescription>
           </DialogHeader>
 
@@ -391,6 +470,8 @@ export const ApiKeys: React.FC = () => {
                     setNewKeyPurpose("realtime");
                     setNewKeyRequestsPerSecond("");
                     setNewKeyBurstSize("");
+                    setNewKeyCapAmount("");
+                    setNewKeyCapInterval("none");
                     setNewKeyResponse(null);
                     setAdvancedOpen(false);
                   }}
@@ -408,30 +489,135 @@ export const ApiKeys: React.FC = () => {
                 className="space-y-4"
               >
                 <div className="space-y-2">
-                  <Label htmlFor="keyName">Name *</Label>
+                  <Label htmlFor="keyName">Name</Label>
                   <Input
                     id="keyName"
                     type="text"
                     value={newKeyName}
                     onChange={(e) => setNewKeyName(e.target.value)}
-                    placeholder="My API Key"
+                    placeholder="Production worker"
                     required
                   />
                 </div>
 
                 <div className="space-y-2">
-                  <Label htmlFor="keyDescription">Description</Label>
+                  <Label htmlFor="keyDescription">
+                    Description{" "}
+                    <span className="font-normal text-doubleword-neutral-400">
+                      (optional)
+                    </span>
+                  </Label>
                   <Textarea
                     id="keyDescription"
                     value={newKeyDescription}
                     onChange={(e) => setNewKeyDescription(e.target.value)}
-                    placeholder="What will this key be used for?"
-                    rows={3}
+                    placeholder="Where will this key be used?"
+                    rows={2}
                     className="resize-none"
                   />
                 </div>
 
-                {/* Advanced Settings (Purpose & Rate Limiting) - Collapsible */}
+                {/* Key type — card-style choice, matching the design */}
+                <div className="space-y-2">
+                  <Label>Key type</Label>
+                  <div role="radiogroup" aria-label="Key type" className="space-y-2">
+                    {(
+                      [
+                        {
+                          value: "realtime",
+                          title: "Inference",
+                          desc: "Calls chat completions, embeddings, responses, and batches.",
+                        },
+                        {
+                          value: "platform",
+                          title: "Platform",
+                          desc: "Hits the management API. Required by dw-cli and other tools that read or change account settings.",
+                        },
+                      ] as const
+                    ).map((opt) => (
+                      <button
+                        key={opt.value}
+                        type="button"
+                        role="radio"
+                        aria-checked={newKeyPurpose === opt.value}
+                        aria-label={opt.title}
+                        onClick={() =>
+                          setNewKeyPurpose(opt.value as ApiKeyPurpose)
+                        }
+                        className={`w-full rounded-lg border p-3 text-left transition-colors ${
+                          newKeyPurpose === opt.value
+                            ? "border-doubleword-neutral-900 ring-1 ring-doubleword-neutral-900 bg-doubleword-neutral-50"
+                            : "border-doubleword-neutral-200 hover:border-doubleword-neutral-300"
+                        }`}
+                      >
+                        <div className="font-medium text-doubleword-neutral-900">
+                          {opt.title}
+                        </div>
+                        <div className="text-sm text-doubleword-neutral-600">
+                          {opt.desc}
+                        </div>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                {/* Usage Limit */}
+                <div className="space-y-2">
+                  <Label htmlFor="usageLimit">
+                    Usage Limit{" "}
+                    <span className="font-normal text-doubleword-neutral-400">
+                      (optional)
+                    </span>
+                  </Label>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    <div className="relative">
+                      <span className="absolute left-3 top-1/2 -translate-y-1/2 text-sm text-doubleword-neutral-400">
+                        $
+                      </span>
+                      <Input
+                        id="usageLimit"
+                        type="number"
+                        min="0.01"
+                        step="any"
+                        className="pl-7"
+                        value={newKeyCapAmount}
+                        onChange={(e) => setNewKeyCapAmount(e.target.value)}
+                        placeholder="Amount"
+                        aria-label="Usage limit amount"
+                      />
+                    </div>
+                    <Select
+                      value={newKeyCapInterval}
+                      onValueChange={(value) =>
+                        setNewKeyCapInterval(value as SpendLimitInterval | "none")
+                      }
+                      disabled={newKeyCapAmount.trim() === ""}
+                    >
+                      <SelectTrigger
+                        className="w-full"
+                        aria-label="Usage limit reset period"
+                      >
+                        <SelectValue placeholder="No reset (N/A)" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="none">No reset (N/A)</SelectItem>
+                        <SelectItem value="daily">Daily</SelectItem>
+                        <SelectItem value="weekly">Weekly</SelectItem>
+                        <SelectItem value="monthly">Monthly</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
+                  <p className="text-xs text-doubleword-neutral-500">
+                    Restrict how much API credit this specific key can consume.
+                    Leave amount blank for no limit.
+                    {newKeyCapAmount.trim() !== "" &&
+                      ` ${resetPreviewLine(
+                        newKeyCapInterval === "none" ? null : newKeyCapInterval,
+                      )}`}
+                  </p>
+                </div>
+
+                {/* Advanced Settings (Rate Limiting, PM-only) - Collapsible */}
                 {isPlatformManager && (
                   <Collapsible
                     open={advancedOpen}
@@ -452,68 +638,6 @@ export const ApiKeys: React.FC = () => {
                       </button>
                     </CollapsibleTrigger>
                     <CollapsibleContent className="space-y-3 pt-4">
-                      {/* Purpose Selection */}
-                      <div className="space-y-2">
-                        <div className="flex items-center gap-1">
-                          <Label htmlFor="purpose">Purpose</Label>
-                          <HoverCard openDelay={200} closeDelay={100}>
-                            <HoverCardTrigger asChild>
-                              <button
-                                type="button"
-                                className="text-gray-400 hover:text-gray-600 transition-colors"
-                                onFocus={(e) => e.preventDefault()}
-                                tabIndex={-1}
-                              >
-                                <Info className="h-4 w-4" />
-                                <span className="sr-only">
-                                  Purpose information
-                                </span>
-                              </button>
-                            </HoverCardTrigger>
-                            <HoverCardContent className="w-80" sideOffset={5}>
-                              <p className="text-sm text-muted-foreground">
-                                Choose the API access level for this key.
-                                Inference keys can access AI endpoints (/ai/*),
-                                while Platform keys can access management APIs
-                                (/admin/api/*).
-                              </p>
-                            </HoverCardContent>
-                          </HoverCard>
-                        </div>
-                        <Select
-                          value={newKeyPurpose}
-                          onValueChange={(value) =>
-                            setNewKeyPurpose(value as ApiKeyPurpose)
-                          }
-                        >
-                          <SelectTrigger id="purpose" className="w-full">
-                            <SelectValue placeholder="Select purpose">
-                              {newKeyPurpose === "realtime"
-                                ? "Inference"
-                                : "Platform"}
-                            </SelectValue>
-                          </SelectTrigger>
-                          <SelectContent>
-                            <SelectItem value="realtime">
-                              <div className="flex flex-col gap-0.5">
-                                <span>Inference</span>
-                                <span className="text-xs text-muted-foreground">
-                                  For AI inference endpoints (/ai/*)
-                                </span>
-                              </div>
-                            </SelectItem>
-                            <SelectItem value="platform">
-                              <div className="flex flex-col gap-0.5">
-                                <span>Platform</span>
-                                <span className="text-xs text-muted-foreground">
-                                  For platform management APIs (/admin/api/*)
-                                </span>
-                              </div>
-                            </SelectItem>
-                          </SelectContent>
-                        </Select>
-                      </div>
-
                       {/* Rate Limiting */}
                       <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                         <div className="space-y-2">
@@ -621,6 +745,8 @@ export const ApiKeys: React.FC = () => {
                     setNewKeyPurpose("realtime");
                     setNewKeyRequestsPerSecond("");
                     setNewKeyBurstSize("");
+                    setNewKeyCapAmount("");
+                    setNewKeyCapInterval("none");
                     setAdvancedOpen(false);
                   }}
                 >
@@ -692,6 +818,125 @@ export const ApiKeys: React.FC = () => {
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      {/* Edit Usage Limit Modal */}
+      <Dialog
+        open={!!editModal}
+        onOpenChange={(open) => {
+          if (!open) setEditModal(null);
+        }}
+      >
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>Edit Usage Limit</DialogTitle>
+            <DialogDescription>
+              Update limits for <strong>{editModal?.name}</strong>
+            </DialogDescription>
+          </DialogHeader>
+
+          {editModal?.spend_limit != null && (
+            <div className="rounded-lg bg-doubleword-neutral-50 border border-doubleword-neutral-200 p-3 text-sm text-doubleword-neutral-700">
+              Spent {formatCredits(editModal.spend ?? "0")} of{" "}
+              {formatCredits(editModal.spend_limit)} this window
+              {editModal.resets_at
+                ? ` · resets ${formatResetInstant(editModal.resets_at)}`
+                : " · no automatic reset"}
+            </div>
+          )}
+
+          <div className="space-y-2">
+            <Label htmlFor="editUsageLimit">
+              Usage Limit{" "}
+              <span className="font-normal text-doubleword-neutral-400">
+                (optional)
+              </span>
+            </Label>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <div className="relative">
+                <span className="absolute left-3 top-1/2 -translate-y-1/2 text-sm text-doubleword-neutral-400">
+                  $
+                </span>
+                <Input
+                  id="editUsageLimit"
+                  type="number"
+                  min="0.01"
+                  step="any"
+                  className="pl-7"
+                  value={editCapAmount}
+                  onChange={(e) => setEditCapAmount(e.target.value)}
+                  placeholder="Amount"
+                  aria-label="Usage limit amount"
+                />
+              </div>
+              <Select
+                value={editCapInterval}
+                onValueChange={(value) =>
+                  setEditCapInterval(value as SpendLimitInterval | "none")
+                }
+                disabled={editCapAmount.trim() === ""}
+              >
+                <SelectTrigger
+                  className="w-full"
+                  aria-label="Usage limit reset period"
+                >
+                  <SelectValue placeholder="No reset (N/A)" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="none">No reset (N/A)</SelectItem>
+                  <SelectItem value="daily">Daily</SelectItem>
+                  <SelectItem value="weekly">Weekly</SelectItem>
+                  <SelectItem value="monthly">Monthly</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+            <p className="text-xs text-doubleword-neutral-500">
+              Restrict how much API credit this specific key can consume. Leave
+              amount blank for no limit.
+              {editCapAmount.trim() !== "" &&
+                ` ${resetPreviewLine(
+                  editCapInterval === "none" ? null : editCapInterval,
+                )}`}
+            </p>
+          </div>
+
+          <DialogFooter className="gap-2 sm:justify-between">
+            {editModal?.spend_limit != null ? (
+              <Button
+                type="button"
+                variant="outline"
+                onClick={handleResetWindow}
+                disabled={updateApiKeyMutation.isPending}
+                aria-label="Reset spend window now"
+              >
+                Reset window now
+              </Button>
+            ) : (
+              <span />
+            )}
+            <div className="flex gap-2">
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() => setEditModal(null)}
+                disabled={updateApiKeyMutation.isPending}
+              >
+                Cancel
+              </Button>
+              <Button
+                type="button"
+                onClick={handleSaveCap}
+                disabled={updateApiKeyMutation.isPending}
+              >
+                {updateApiKeyMutation.isPending && (
+                  <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                )}
+                Save changes
+              </Button>
+            </div>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
 
       {/* Bulk Delete Confirmation Modal */}
       <Dialog open={showBulkDeleteModal} onOpenChange={setShowBulkDeleteModal}>
