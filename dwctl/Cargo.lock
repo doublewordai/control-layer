@@ -1105,6 +1105,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "bs58"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bf88ba1141d185c399bee5288d850d63b8369520c1eafc32a0430b5b6c287bf4"
+dependencies = [
+ "tinyvec",
+]
+
+[[package]]
 name = "bumpalo"
 version = "3.20.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1882,7 +1891,7 @@ checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
 
 [[package]]
 name = "dwctl"
-version = "8.94.2"
+version = "8.101.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -2355,8 +2364,6 @@ checksum = "e6d5a32815ae3f33302d95fdcb2ce17862f8c65363dcfd29360480ba1001fc9c"
 [[package]]
 name = "fusillade"
 version = "24.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1f9c53b88361ccafb9d8cc483c1eff776fbee515f85f3a63e9c28d7fa25ac3b8"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2391,8 +2398,6 @@ dependencies = [
 [[package]]
 name = "fusillade-arsenal"
 version = "3.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fae1c3be5660435191bce4657fb04e90041e8eb01a84037686b0fa4ea57e7c0a"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -2419,8 +2424,6 @@ dependencies = [
 [[package]]
 name = "fusillade-core"
 version = "4.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f335ed1e24e0510e131d8af71da3fa83a194410fed96d9d4dc6ab74ba0c3f114"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4265,9 +4268,7 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "onwards"
-version = "0.35.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fff26aa9acd1e23db37fc96e8ef6f3dc97ae57606639f0f13d44c159c07efb72"
+version = "0.36.0"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -5940,11 +5941,12 @@ dependencies = [
 
 [[package]]
 name = "serde_with"
-version = "3.19.0"
+version = "3.21.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f05839ce67618e14a09b286535c0d9c94e85ef25469b0e13cb4f844e5593eb19"
+checksum = "76a5c54c7310e7b8b9577c286d7e399ddd876c3e12b3ed917a8aabc4b96e9e8c"
 dependencies = [
  "base64",
+ "bs58",
  "chrono",
  "hex",
  "indexmap 1.9.3",
@@ -5959,9 +5961,9 @@ dependencies = [
 
 [[package]]
 name = "serde_with_macros"
-version = "3.19.0"
+version = "3.21.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cf2ebbe86054f9b45bc3881e865683ccfaccce97b9b4cb53f3039d67f355a334"
+checksum = "84d57bc0c8b9a17920c178daa6bb924850d54a9c97ab45194bb8c17ad66bb660"
 dependencies = [
  "darling 0.23.0",
  "proc-macro2",
