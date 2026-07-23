@@ -184,6 +184,66 @@ async fn attempt_id_is_nullable_without_default_and_reaches_existing_partitions(
 }
 
 #[sqlx::test]
+async fn processing_admission_id_is_nullable_and_reaches_existing_partitions(pool: PgPool) {
+    for table in ["requests", "batch_requests_archive"] {
+        let shape: (String, String, Option<String>) = sqlx::query_as(
+            r#"
+            SELECT data_type, is_nullable, column_default
+            FROM information_schema.columns
+            WHERE table_schema = current_schema()
+              AND table_name = $1
+              AND column_name = 'processing_admission_id'
+            "#,
+        )
+        .bind(table)
+        .fetch_one(&pool)
+        .await
+        .unwrap_or_else(|_| panic!("{table}.processing_admission_id must exist"));
+        assert_eq!(
+            (&shape.0[..], &shape.1[..], shape.2.as_deref()),
+            ("uuid", "YES", None),
+            "{table}.processing_admission_id must remain nullable without a default",
+        );
+    }
+
+    let existing_partition: String = sqlx::query_scalar(
+        r#"
+        SELECT child.relname
+        FROM pg_inherits
+        JOIN pg_class parent ON parent.oid = inhparent
+        JOIN pg_class child ON child.oid = inhrelid
+        WHERE parent.oid = 'batch_requests_archive'::regclass
+        ORDER BY child.relname
+        LIMIT 1
+        "#,
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("archive migration must have created an existing weekly partition");
+    let child_shape: (String, String, Option<String>) = sqlx::query_as(
+        r#"
+        SELECT data_type, is_nullable, column_default
+        FROM information_schema.columns
+        WHERE table_schema = current_schema()
+          AND table_name = $1
+          AND column_name = 'processing_admission_id'
+        "#,
+    )
+    .bind(existing_partition)
+    .fetch_one(&pool)
+    .await
+    .expect("processing_admission_id must propagate to existing archive partitions");
+    assert_eq!(
+        (
+            &child_shape.0[..],
+            &child_shape.1[..],
+            child_shape.2.as_deref()
+        ),
+        ("uuid", "YES", None),
+    );
+}
+
+#[sqlx::test]
 async fn forward_move_shape_compiles_and_round_trips(pool: PgPool) {
     // Exercise the exact explicit forward and retry-to-pending reverse
     // mappings end to end. This remains valid when an upgraded archive has
@@ -212,13 +272,13 @@ async fn forward_move_shape_compiles_and_round_trips(pool: PgPool) {
              claimed_at, started_at, response_status, response_body, completed_at,
              error, failed_at, canceled_at, created_at, updated_at, custom_id, model,
              response_size, routed_model, service_tier, created_by, attempt_id,
-             archive_bucket
+             processing_admission_id, archive_bucket
          )
          SELECT r.id, r.batch_id, r.template_id, r.state, r.retry_attempt, r.not_before,
                 r.daemon_id, r.claimed_at, r.started_at, r.response_status, r.response_body,
                 r.completed_at, r.error, r.failed_at, r.canceled_at, r.created_at,
                 r.updated_at, r.custom_id, r.model, r.response_size, r.routed_model,
-                r.service_tier, r.created_by, r.attempt_id,
+                r.service_tier, r.created_by, r.attempt_id, r.processing_admission_id,
                 date_trunc('week', now() AT TIME ZONE 'UTC')::date
          FROM requests r WHERE r.batch_id = '11111111-1111-1111-1111-111111111111'",
     )
@@ -251,13 +311,14 @@ async fn forward_move_shape_compiles_and_round_trips(pool: PgPool) {
              id, batch_id, template_id, state, retry_attempt, not_before, daemon_id,
              claimed_at, started_at, response_status, response_body, completed_at,
              error, failed_at, canceled_at, created_at, updated_at, custom_id, model,
-             response_size, routed_model, service_tier, created_by, attempt_id
+             response_size, routed_model, service_tier, created_by, attempt_id,
+             processing_admission_id
          )
          SELECT a.id, a.batch_id, a.template_id, 'pending', 0, NULL,
                 NULL, NULL, NULL, NULL, NULL,
                 NULL, NULL, NULL, NULL, a.created_at, now(),
                 a.custom_id, a.model, 0, NULL,
-                a.service_tier, a.created_by, NULL
+                a.service_tier, a.created_by, NULL, NULL
          FROM batch_requests_archive a
          WHERE a.id = '22222222-2222-2222-2222-222222222222'",
     )

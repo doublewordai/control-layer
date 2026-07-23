@@ -159,7 +159,9 @@ pub async fn decrypt_response_body(
 /// `ResponseTransformer` hook. Exists only because fusillade reassembles the
 /// upstream stream and persists the body itself, leaving dwctl no other point at
 /// which to encrypt it. Remove when stream reassembly moves into dwctl. See
-/// [`crate::keystore`] and fusillade's `transform` module.
+/// [`crate::keystore`] and fusillade's `transform` module. Body preparation is
+/// side-effect-free; request-key shredding happens only in the post-commit hook
+/// after the exact terminal transition wins its storage fence.
 pub struct ZdrResponseEncryptor {
     keystore: crate::keystore::Keystore,
 }
@@ -220,6 +222,18 @@ impl fusillade::ResponseTransformer for ZdrResponseEncryptor {
             // permanently drop a response that could still be encrypted on retry.
             Err(error) => Err(classify_response_keystore_error(error)),
         }
+    }
+
+    async fn after_terminal_persisted(&self, request: &fusillade::RequestData) -> fusillade::Result<()> {
+        let is_zdr = request.batch_metadata.get(ZDR_MARKER_KEY).is_some_and(|value| value == "1");
+        if !is_zdr {
+            return Ok(());
+        }
+
+        self.keystore
+            .delete(&key_id(&request.id.0, KeyKind::Request))
+            .await
+            .map_err(|error| fusillade::FusilladeError::Other(anyhow::anyhow!("ZDR request key shred-on-terminal failed: {error}")))
     }
 }
 

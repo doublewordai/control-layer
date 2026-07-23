@@ -201,4 +201,11 @@ impl fusillade_arsenal::ResponseTransformer for ResponseTransformerAdapter {
     ) -> crate::Result<String> {
         self.0.transform(request, body).await
     }
+
+    async fn after_terminal_persisted(
+        &self,
+        request: &crate::request::RequestData,
+    ) -> crate::Result<()> {
+        self.0.after_terminal_persisted(request).await
+    }
 }
