@@ -573,6 +573,9 @@ async fn fire_model_call<H: FusilladeHttpClient + 'static>(
         model,
         api_key: api_key.clone(),
         created_by: String::new(),
+        // Synthetic sub-request built at dispatch time, not a claimed queue
+        // row — there is no submission epoch to measure from.
+        submitted_at: None,
         batch_metadata: HashMap::new(),
     };
 
