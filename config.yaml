@@ -570,8 +570,21 @@ background_services:
     upload_stall_timeout_ms: 60000 # Max time without upload progress (1 minute)
     upload_chunk_bytes: 65536 # Upload progress granularity (64 KiB)
     upload_stall_poll_ms: 100 # Upload progress check interval (100 ms)
-    claim_timeout_ms: 60000 # Max time in "claimed" state before auto-unclaim (1 minute)
-    processing_timeout_ms: 600000 # Max time in "processing" state before auto-unclaim (10 minutes)
+    # Attempt ownership and recovery:
+    # - A tokenized row that remains "claimed" past claim_timeout_ms is returned
+    #   to pending and its exact attempt token is revoked.
+    # - A "processing" row is never reclaimed by age while its daemon is
+    #   healthy. Recovery requires the owner to be missing, dead, or heartbeat
+    #   stale (internal defaults: 5s heartbeat, 30s stale threshold, 100 rows
+    #   per reclaim/repair query; deliberately no separate operator knobs).
+    # During a rolling deploy, legacy pods create NULL-token claims, so exact
+    # attempt fencing is complete only after every daemon pod is upgraded.
+    # A code rollback must leave the additive nullable attempt_id columns in
+    # place. On a later roll-forward, the bounded reclaim loop automatically
+    # clears residual attempt tokens from pending rows and makes them claimable
+    # again. Legacy pods may recreate residue until all are upgraded.
+    claim_timeout_ms: 60000 # Tokenized pre-dispatch claim lifetime (1 minute)
+    processing_timeout_ms: 600000 # Compatibility/dispatch-URL TTL input; not a processing reclaim deadline
     pending_request_counts_timeout_ms: 60000 # Statement timeout for pending request count queries (1 minute)
 
     # Batch archive (fusillade phase 3): moves frozen terminal batches' rows
@@ -588,7 +601,8 @@ background_services:
     # batch_archive_sweep_moves_per_tick: 4   # Bounded batch moves per tick, never drain-until-empty
     # batch_archive_sweep_dwell_secs: 0       # Post-freeze dwell before archiving (0 = move immediately)
     # batch_archive_cancel_grace_secs: 600    # Hold batches with in-flight-canceled rows this long so late
-    #                                         # billed results can still supersede the cancel on the live row
+    #                                         # billed results can supersede cancellation. Archival after this
+    #                                         # fixed window revokes late writes; it is not tied to processing_timeout_ms
     # batch_archive_backfill_enabled: false   # Historical drain: same mover, own pacing, oldest-first;
     #                                         # flip off to pause instantly (resumable by construction)
     # batch_archive_backfill_interval_ms: 1000
@@ -701,15 +715,14 @@ image_normalizer:
       - image/gif
   signing:
     realtime_ttl_secs: 900            # 15 min — covers a chat completion
-    # dispatch_ttl_secs: 1800         # Optional override. When omitted,
-                                      # derived as
-                                      #   processing_timeout_ms (from
-                                      #   background_services.batch_daemon)
-                                      #   + dispatch_ttl_headroom_secs
-                                      # so the URL is always valid for at
-                                      # least one full dispatch attempt.
-                                      # Each retry gets a brand-new URL.
-    dispatch_ttl_headroom_secs: 300   # +5 min on top of processing_timeout
+    # dispatch_ttl_secs: 1800         # Optional override. When omitted, this is
+                                      # derived from the compatibility
+                                      # processing_timeout_ms value plus
+                                      # dispatch_ttl_headroom_secs. It does not
+                                      # bound processing lifetime; set an
+                                      # explicit TTL when URLs need longer
+                                      # validity. Each retry gets a new URL.
+    dispatch_ttl_headroom_secs: 300   # +5 min on top of the compatibility baseline
     dashboard_ttl_secs: 300           # 5 min — dashboard image-view path
 
 # NOTE on bucket data lifetime:
@@ -731,9 +744,8 @@ image_normalizer:
 #                          "condition":{"age":7}}]}}
 #   EOF
 #
-# Tighter retention is fine — the worst-case batch dispatch attempt is
-# bounded by background_services.batch_daemon.processing_timeout_ms,
-# and dispatch URLs are signed per-attempt. The only constraint is the
-# bucket retention MUST exceed the maximum time a batch can sit
-# between ingest and final dispatch attempt (typically the batch
-# completion window, 24h for OpenAI-style "24h" batches).
+# Do not use background_services.batch_daemon.processing_timeout_ms as
+# a retention bound: healthy processing is not reclaimed by age. Bucket
+# retention MUST exceed the maximum time a batch can sit between ingest
+# and final dispatch attempt (typically the batch completion window, 24h
+# for OpenAI-style "24h" batches), plus any desired support/replay window.

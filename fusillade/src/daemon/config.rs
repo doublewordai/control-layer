@@ -196,6 +196,7 @@ pub struct DaemonConfig {
     /// `first_chunk_timeout_ms`.
     pub body_timeout_ms: u64,
     pub status_log_interval_ms: Option<u64>,
+    /// Cadence for refreshing this daemon's durable liveness record.
     pub heartbeat_interval_ms: u64,
     #[serde(skip, default = "default_should_retry_fn")]
     pub should_retry: ShouldRetryFn,
@@ -205,11 +206,25 @@ pub struct DaemonConfig {
     /// status-based retries. Values below 400 are ignored.
     #[serde(default = "default_additional_retryable_statuses")]
     pub additional_retryable_statuses: Vec<u16>,
+    /// Maximum age of a tokenized pre-dispatch claim before storage may revoke
+    /// that exact attempt and return the row to pending.
+    ///
+    /// Legacy NULL-token claims still require an unavailable owner.
     pub claim_timeout_ms: u64,
+    /// Compatibility value retained in serialized and storage configuration.
+    ///
+    /// PostgreSQL does not reclaim a healthy `processing` row by age; it
+    /// requires positive evidence that the daemon owner is unavailable.
     pub processing_timeout_ms: u64,
     #[serde(default = "default_pending_request_counts_timeout_ms")]
     pub pending_request_counts_timeout_ms: u64,
+    /// Heartbeat age after which a running daemon is considered unavailable.
+    ///
+    /// This is the recovery condition for `processing` rows and legacy
+    /// NULL-token claims.
     pub stale_daemon_threshold_ms: u64,
+    /// Maximum combined rows reclaimed or repaired for pending-token residue
+    /// by one maintenance query.
     pub unclaim_batch_size: usize,
     pub cancellation_poll_interval_ms: u64,
     #[serde(default = "default_batch_metadata_fields")]
@@ -239,8 +254,9 @@ pub struct DaemonConfig {
     /// Cancellation grace window: a batch with canceled rows that were IN
     /// FLIGHT at cancel (claimed_at set) younger than this is not archived
     /// yet, so late billed results can still supersede the cancel on the
-    /// live row. Default mirrors processing_timeout (~10 min); only
-    /// cancelled batches archive later, fully served from live meanwhile.
+    /// live row. Once archived, the missing live row revokes that late-write
+    /// opportunity. This fixed boundary is independent of processing timeout.
+    /// Default: 10 minutes.
     #[serde(default = "default_archive_cancel_grace_secs")]
     pub batch_archive_cancel_grace_secs: f64,
     /// Historical backfill worker: same move machinery as the sweeper on its
@@ -537,6 +553,17 @@ mod tests {
         let decoded: DaemonConfig = serde_json::from_value(serialized).unwrap();
         assert!(!decoded.batch_archive_sweep_enabled);
         assert_eq!(decoded.batch_archive_partitions_weeks_ahead, 4);
+    }
+
+    #[test]
+    fn reclaim_defaults_preserve_compatibility_contract() {
+        let config = DaemonConfig::default();
+
+        assert_eq!(config.claim_timeout_ms, 60_000);
+        assert_eq!(config.processing_timeout_ms, 600_000);
+        assert_eq!(config.heartbeat_interval_ms, 5_000);
+        assert_eq!(config.stale_daemon_threshold_ms, 30_000);
+        assert_eq!(config.unclaim_batch_size, 100);
     }
 
     #[test]
