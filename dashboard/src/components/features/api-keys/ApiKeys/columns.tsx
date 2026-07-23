@@ -1,13 +1,15 @@
 "use client";
 
 import { type ColumnDef } from "@tanstack/react-table";
-import { ArrowUpDown, Trash2, Key } from "lucide-react";
+import { ArrowUpDown, Trash2, Key, Pencil } from "lucide-react";
 import { Button } from "../../../ui/button";
 import { Checkbox } from "../../../ui/checkbox";
 import type { ApiKey } from "../../../../api/control-layer/types";
+import { formatCredits, formatResetInstant } from "./spendCap";
 
 interface ColumnActions {
   onDelete: (apiKey: ApiKey) => void;
+  onEdit: (apiKey: ApiKey) => void;
   isPlatformManager?: boolean;
 }
 
@@ -123,6 +125,55 @@ export const createColumns = (actions: ColumnActions): ColumnDef<ApiKey>[] => {
     //   },
     // },
     {
+      id: "spend",
+      header: "Spend",
+      cell: ({ row }) => {
+        const apiKey = row.original;
+        // Uncapped keys show no spend: their usage isn't tracked against a
+        // budget (and any leftover numbers from a removed cap are frozen).
+        if (apiKey.spend_limit === null || apiKey.spend_limit === undefined) {
+          return <span className="text-doubleword-neutral-400 text-sm">—</span>;
+        }
+        const spent = Number(apiKey.spend ?? 0);
+        const limit = Number(apiKey.spend_limit);
+        const capReached = limit > 0 && spent >= limit;
+        const pct =
+          limit > 0 ? Math.min(100, Math.round((spent / limit) * 100)) : 0;
+        return (
+          <div className="min-w-32" aria-label="Spending cap usage">
+            <div className="flex items-center gap-2 text-sm">
+              <span className="text-doubleword-neutral-700">
+                {formatCredits(apiKey.spend ?? "0")} /{" "}
+                {formatCredits(apiKey.spend_limit)}
+              </span>
+              {capReached && (
+                <span className="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-red-100 text-red-800">
+                  Cap reached
+                </span>
+              )}
+            </div>
+            <div
+              className="mt-1 h-1.5 w-full rounded bg-doubleword-neutral-100"
+              role="progressbar"
+              aria-valuenow={pct}
+              aria-valuemin={0}
+              aria-valuemax={100}
+            >
+              <div
+                className={`h-1.5 rounded ${capReached ? "bg-red-500" : "bg-doubleword-neutral-500"}`}
+                style={{ width: `${pct}%` }}
+              />
+            </div>
+            <div className="mt-0.5 text-xs text-doubleword-neutral-500">
+              {apiKey.resets_at
+                ? `Resets ${formatResetInstant(apiKey.resets_at)}`
+                : "No automatic reset"}
+            </div>
+          </div>
+        );
+      },
+    },
+    {
       accessorKey: "created_at",
       header: ({ column }) => {
         return (
@@ -155,14 +206,26 @@ export const createColumns = (actions: ColumnActions): ColumnDef<ApiKey>[] => {
         const apiKey = row.original;
 
         return (
-          <Button
-            variant="ghost"
-            size="sm"
-            onClick={() => actions.onDelete(apiKey)}
-            className="text-red-600 hover:text-red-700 hover:bg-red-50"
-          >
-            <Trash2 className="h-4 w-4" />
-          </Button>
+          <div className="flex items-center">
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => actions.onEdit(apiKey)}
+              aria-label={`Edit spending cap for ${apiKey.name}`}
+              className="text-doubleword-neutral-600 hover:text-doubleword-neutral-900"
+            >
+              <Pencil className="h-4 w-4" />
+            </Button>
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => actions.onDelete(apiKey)}
+              aria-label={`Delete ${apiKey.name}`}
+              className="text-red-600 hover:text-red-700 hover:bg-red-50"
+            >
+              <Trash2 className="h-4 w-4" />
+            </Button>
+          </div>
         );
       },
     },

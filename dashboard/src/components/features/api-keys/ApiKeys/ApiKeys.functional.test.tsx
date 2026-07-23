@@ -617,7 +617,10 @@ describe("API Keys Component - Functional Tests", () => {
       const keyRow = keyName.closest("tr");
       expect(keyRow).not.toBeNull();
 
-      await user.click(within(keyRow!).getByRole("button"));
+      // Rows now carry both Edit and Delete actions; target Delete explicitly.
+      await user.click(
+        within(keyRow!).getByRole("button", { name: /delete/i }),
+      );
 
       await waitFor(() => {
         expect(
@@ -726,6 +729,163 @@ describe("API Keys Component - Functional Tests", () => {
       // Form should still be functional on mobile
       const nameInput = screen.getByLabelText(/name/i);
       expect(nameInput).toBeInTheDocument();
+    });
+  });
+
+  describe("Spending Caps", () => {
+    it("shows spend against the cap for capped keys and a dash for uncapped ones", async () => {
+      const { container } = render(<ApiKeys />, { wrapper: createWrapper() });
+
+      // key-1 in the mock data is capped at $50 monthly with $12.34 spent.
+      await waitFor(() => {
+        expect(
+          within(container).getByText("$12.34 / $50.00"),
+        ).toBeInTheDocument();
+      });
+      // The reset date is calendar-aligned UTC and displayed as such.
+      expect(
+        within(container).getByText(/resets aug 1, 2026, 00:00 utc/i),
+      ).toBeInTheDocument();
+      // Uncapped keys (all other rows) show the em-dash placeholder.
+      expect(
+        within(container).getAllByText("—").length,
+      ).toBeGreaterThanOrEqual(1);
+    });
+
+    it("creates a key with a spending cap and shows the reset preview", async () => {
+      const user = userEvent.setup();
+      const { container } = render(<ApiKeys />, { wrapper: createWrapper() });
+
+      await user.click(
+        await within(container).findByRole("button", {
+          name: /create new api key/i,
+        }),
+      );
+      await waitFor(() => {
+        expect(screen.getByRole("dialog")).toBeInTheDocument();
+      });
+
+      await user.type(screen.getByLabelText(/name \*/i), "Budgeted Agent");
+      await user.type(
+        screen.getByLabelText(/spending cap amount in credits/i),
+        "25",
+      );
+
+      // Choosing a period surfaces the calendar-aligned reset preview.
+      await user.click(
+        screen.getByRole("combobox", { name: /spending cap reset period/i }),
+      );
+      await user.click(screen.getByRole("option", { name: /daily/i }));
+      expect(screen.getByText(/next resets .* utc\./i)).toBeInTheDocument();
+
+      await user.click(screen.getByRole("button", { name: /create key/i }));
+
+      // Success state shows the one-time key.
+      await waitFor(() => {
+        expect(
+          screen.getByText(/save this key - it won't be shown again/i),
+        ).toBeInTheDocument();
+      });
+    });
+
+    it("edits a cap through the edit dialog and PATCHes tri-state fields", async () => {
+      const user = userEvent.setup();
+      let patchBody: Record<string, unknown> | null = null;
+      server.use(
+        http.patch(
+          "/admin/api/v1/users/:userId/api-keys/:keyId",
+          async ({ request }) => {
+            patchBody = (await request.json()) as Record<string, unknown>;
+            return HttpResponse.json({
+              id: "key-1",
+              name: "CI/CD Pipeline",
+              created_at: "2025-04-01T10:00:00Z",
+              spend_limit: "75",
+              spend_limit_interval: "weekly",
+              spend: "12.34",
+              total_spend: "148.20",
+              resets_at: "2026-07-27T00:00:00Z",
+            });
+          },
+        ),
+      );
+
+      const { container } = render(<ApiKeys />, { wrapper: createWrapper() });
+
+      // Open the edit dialog for the capped key.
+      await user.click(
+        await within(container).findByRole("button", {
+          name: /edit spending cap for ci\/cd pipeline/i,
+        }),
+      );
+      await waitFor(() => {
+        expect(screen.getByRole("dialog")).toBeInTheDocument();
+      });
+
+      // Current usage summary is shown for capped keys.
+      expect(
+        screen.getByText(/spent \$12\.34 of \$50\.00 this window/i),
+      ).toBeInTheDocument();
+
+      // Change the amount and period, then save.
+      const amount = screen.getByLabelText(/spending cap amount in credits/i);
+      await user.clear(amount);
+      await user.type(amount, "75");
+      await user.click(
+        screen.getByRole("combobox", { name: /spending cap reset period/i }),
+      );
+      await user.click(screen.getByRole("option", { name: /weekly/i }));
+      await user.click(screen.getByRole("button", { name: /^save$/i }));
+
+      await waitFor(() => {
+        expect(patchBody).not.toBeNull();
+      });
+      expect(patchBody).toMatchObject({
+        spend_limit: "75",
+        spend_limit_interval: "weekly",
+      });
+    });
+
+    it("resets the spend window from the edit dialog", async () => {
+      const user = userEvent.setup();
+      let patchBody: Record<string, unknown> | null = null;
+      server.use(
+        http.patch(
+          "/admin/api/v1/users/:userId/api-keys/:keyId",
+          async ({ request }) => {
+            patchBody = (await request.json()) as Record<string, unknown>;
+            return HttpResponse.json({
+              id: "key-1",
+              name: "CI/CD Pipeline",
+              created_at: "2025-04-01T10:00:00Z",
+              spend_limit: "50",
+              spend_limit_interval: "monthly",
+              spend: "0",
+              total_spend: "148.20",
+              resets_at: "2026-08-01T00:00:00Z",
+            });
+          },
+        ),
+      );
+
+      const { container } = render(<ApiKeys />, { wrapper: createWrapper() });
+
+      await user.click(
+        await within(container).findByRole("button", {
+          name: /edit spending cap for ci\/cd pipeline/i,
+        }),
+      );
+      await waitFor(() => {
+        expect(screen.getByRole("dialog")).toBeInTheDocument();
+      });
+
+      await user.click(
+        screen.getByRole("button", { name: /reset spend window now/i }),
+      );
+
+      await waitFor(() => {
+        expect(patchBody).toEqual({ reset_window: true });
+      });
     });
   });
 });

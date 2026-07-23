@@ -14,9 +14,13 @@ import {
   useApiKeys,
   useCreateApiKey,
   useDeleteApiKey,
+  useUpdateApiKey,
+  type ApiKey,
   type ApiKeyCreateResponse,
   type ApiKeyPurpose,
+  type SpendLimitInterval,
 } from "../../../../api/control-layer";
+import { formatCredits, resetPreviewLine } from "./spendCap";
 import { useUser } from "../../../../api/control-layer/hooks";
 import { DataTable } from "../../../ui/data-table";
 import { createColumns } from "./columns";
@@ -65,8 +69,17 @@ export const ApiKeys: React.FC = () => {
     number | ""
   >("");
   const [newKeyBurstSize, setNewKeyBurstSize] = useState<number | "">("");
+  const [newKeyCapAmount, setNewKeyCapAmount] = useState("");
+  const [newKeyCapInterval, setNewKeyCapInterval] = useState<
+    SpendLimitInterval | "none"
+  >("none");
   const [newKeyResponse, setNewKeyResponse] =
     useState<ApiKeyCreateResponse | null>(null);
+  const [editModal, setEditModal] = useState<ApiKey | null>(null);
+  const [editCapAmount, setEditCapAmount] = useState("");
+  const [editCapInterval, setEditCapInterval] = useState<
+    SpendLimitInterval | "none"
+  >("none");
   const [deleteModal, setDeleteModal] = useState<{
     keyId: string;
     keyName: string;
@@ -91,6 +104,7 @@ export const ApiKeys: React.FC = () => {
 
   const createApiKeyMutation = useCreateApiKey();
   const deleteApiKeyMutation = useDeleteApiKey();
+  const updateApiKeyMutation = useUpdateApiKey();
 
   const handleCreateApiKey = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -106,12 +120,53 @@ export const ApiKeys: React.FC = () => {
             ? null
             : Number(newKeyRequestsPerSecond),
         burst_size: newKeyBurstSize === "" ? null : Number(newKeyBurstSize),
+        spend_limit: newKeyCapAmount.trim() === "" ? null : newKeyCapAmount,
+        spend_limit_interval:
+          newKeyCapAmount.trim() === "" || newKeyCapInterval === "none"
+            ? null
+            : newKeyCapInterval,
       },
       userId: targetUserId,
     });
 
     setNewKeyResponse(newKey);
     // Don't close the form - show success state instead
+  };
+
+  const openEditModal = (apiKey: ApiKey) => {
+    setEditModal(apiKey);
+    setEditCapAmount(apiKey.spend_limit ?? "");
+    setEditCapInterval(apiKey.spend_limit_interval ?? "none");
+  };
+
+  const handleSaveCap = async () => {
+    if (!editModal) return;
+    // Tri-state PATCH: both cap fields are always sent explicitly so removal
+    // (null) actually clears server-side, matching the API semantics.
+    await updateApiKeyMutation.mutateAsync({
+      keyId: editModal.id,
+      data: {
+        spend_limit: editCapAmount.trim() === "" ? null : editCapAmount,
+        spend_limit_interval:
+          editCapAmount.trim() === "" || editCapInterval === "none"
+            ? null
+            : editCapInterval,
+      },
+      userId: targetUserId,
+    });
+    toast.success("Spending cap updated");
+    setEditModal(null);
+  };
+
+  const handleResetWindow = async () => {
+    if (!editModal) return;
+    await updateApiKeyMutation.mutateAsync({
+      keyId: editModal.id,
+      data: { reset_window: true },
+      userId: targetUserId,
+    });
+    toast.success("Spend window reset");
+    setEditModal(null);
   };
 
   const handleDeleteApiKey = (keyId: string) => {
@@ -167,6 +222,7 @@ export const ApiKeys: React.FC = () => {
 
   const columns = createColumns({
     onDelete: handleDeleteFromTable,
+    onEdit: openEditModal,
     isPlatformManager,
   });
 
@@ -314,6 +370,8 @@ export const ApiKeys: React.FC = () => {
             setNewKeyPurpose("realtime");
             setNewKeyRequestsPerSecond("");
             setNewKeyBurstSize("");
+            setNewKeyCapAmount("");
+            setNewKeyCapInterval("none");
             setNewKeyResponse(null);
             setAdvancedOpen(false);
           } else {
@@ -391,6 +449,8 @@ export const ApiKeys: React.FC = () => {
                     setNewKeyPurpose("realtime");
                     setNewKeyRequestsPerSecond("");
                     setNewKeyBurstSize("");
+                    setNewKeyCapAmount("");
+                    setNewKeyCapInterval("none");
                     setNewKeyResponse(null);
                     setAdvancedOpen(false);
                   }}
@@ -429,6 +489,83 @@ export const ApiKeys: React.FC = () => {
                     rows={3}
                     className="resize-none"
                   />
+                </div>
+
+                {/* Spending Cap - available to all users */}
+                <div className="space-y-3 rounded-lg border border-doubleword-neutral-200 p-3">
+                  <div className="flex items-center gap-1">
+                    <Label htmlFor="spendLimit">Spending cap (optional)</Label>
+                    <HoverCard openDelay={200} closeDelay={100}>
+                      <HoverCardTrigger asChild>
+                        <button
+                          type="button"
+                          className="text-gray-400 hover:text-gray-600 transition-colors"
+                          onFocus={(e) => e.preventDefault()}
+                          tabIndex={-1}
+                        >
+                          <Info className="h-4 w-4" />
+                          <span className="sr-only">
+                            Spending cap information
+                          </span>
+                        </button>
+                      </HoverCardTrigger>
+                      <HoverCardContent className="w-80" sideOffset={5}>
+                        <p className="text-sm text-muted-foreground">
+                          Hard limit on this key's spend, covering realtime,
+                          batch and flex usage made with the key. Playground
+                          and dashboard-created batches are not counted.
+                          Enforcement is near-real-time, so a small overshoot
+                          is possible. Reset periods are fixed calendar
+                          windows (UTC), not rolling windows.
+                        </p>
+                      </HoverCardContent>
+                    </HoverCard>
+                  </div>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    <div className="space-y-2">
+                      <Input
+                        id="spendLimit"
+                        type="number"
+                        min="0.01"
+                        step="any"
+                        value={newKeyCapAmount}
+                        onChange={(e) => setNewKeyCapAmount(e.target.value)}
+                        placeholder="No cap"
+                        aria-label="Spending cap amount in credits"
+                      />
+                    </div>
+                    <div className="space-y-2">
+                      <Select
+                        value={newKeyCapInterval}
+                        onValueChange={(value) =>
+                          setNewKeyCapInterval(
+                            value as SpendLimitInterval | "none",
+                          )
+                        }
+                        disabled={newKeyCapAmount.trim() === ""}
+                      >
+                        <SelectTrigger
+                          className="w-full"
+                          aria-label="Spending cap reset period"
+                        >
+                          <SelectValue placeholder="Reset period" />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="none">One-off (no reset)</SelectItem>
+                          <SelectItem value="daily">Daily</SelectItem>
+                          <SelectItem value="weekly">Weekly</SelectItem>
+                          <SelectItem value="monthly">Monthly</SelectItem>
+                        </SelectContent>
+                      </Select>
+                    </div>
+                  </div>
+                  {newKeyCapAmount.trim() !== "" && (
+                    <p className="text-xs text-doubleword-neutral-500">
+                      {resetPreviewLine(
+                        newKeyCapInterval === "none" ? null : newKeyCapInterval,
+                      )}
+                    </p>
+                  )}
                 </div>
 
                 {/* Advanced Settings (Purpose & Rate Limiting) - Collapsible */}
@@ -621,6 +758,8 @@ export const ApiKeys: React.FC = () => {
                     setNewKeyPurpose("realtime");
                     setNewKeyRequestsPerSecond("");
                     setNewKeyBurstSize("");
+                    setNewKeyCapAmount("");
+                    setNewKeyCapInterval("none");
                     setAdvancedOpen(false);
                   }}
                 >
@@ -689,6 +828,130 @@ export const ApiKeys: React.FC = () => {
               )}
               Delete API Key
             </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Edit Spending Cap Modal */}
+      <Dialog
+        open={!!editModal}
+        onOpenChange={(open) => {
+          if (!open) setEditModal(null);
+        }}
+      >
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>Spending Cap</DialogTitle>
+            <DialogDescription>
+              Set a hard spend limit for "{editModal?.name}". Covers realtime,
+              batch and flex usage made with this key.
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="space-y-4">
+            {editModal?.spend_limit != null && (
+              <div className="rounded-lg bg-doubleword-neutral-50 border border-doubleword-neutral-200 p-3 text-sm text-doubleword-neutral-700">
+                Spent {formatCredits(editModal.spend ?? "0")} of{" "}
+                {formatCredits(editModal.spend_limit)} this window
+                {editModal.resets_at
+                  ? ` · resets ${new Date(editModal.resets_at).toLocaleDateString(
+                      "en-US",
+                      {
+                        month: "short",
+                        day: "numeric",
+                        timeZone: "UTC",
+                      },
+                    )} (UTC)`
+                  : " · no automatic reset"}
+              </div>
+            )}
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <div className="space-y-2">
+                <Label htmlFor="editSpendLimit">Cap amount</Label>
+                <Input
+                  id="editSpendLimit"
+                  type="number"
+                  min="0.01"
+                  step="any"
+                  value={editCapAmount}
+                  onChange={(e) => setEditCapAmount(e.target.value)}
+                  placeholder="No cap"
+                  aria-label="Spending cap amount in credits"
+                />
+              </div>
+              <div className="space-y-2">
+                <Label>Reset period</Label>
+                <Select
+                  value={editCapInterval}
+                  onValueChange={(value) =>
+                    setEditCapInterval(value as SpendLimitInterval | "none")
+                  }
+                  disabled={editCapAmount.trim() === ""}
+                >
+                  <SelectTrigger
+                    className="w-full"
+                    aria-label="Spending cap reset period"
+                  >
+                    <SelectValue placeholder="Reset period" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="none">One-off (no reset)</SelectItem>
+                    <SelectItem value="daily">Daily</SelectItem>
+                    <SelectItem value="weekly">Weekly</SelectItem>
+                    <SelectItem value="monthly">Monthly</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+            </div>
+
+            <p className="text-xs text-doubleword-neutral-500">
+              {editCapAmount.trim() === ""
+                ? "Leave the amount empty to remove the cap."
+                : resetPreviewLine(
+                    editCapInterval === "none" ? null : editCapInterval,
+                  )}
+              {editCapAmount.trim() !== "" &&
+                editCapInterval !==
+                  (editModal?.spend_limit_interval ?? "none") &&
+                " Changing the reset period restarts the spend window."}
+            </p>
+          </div>
+
+          <DialogFooter className="gap-2 sm:justify-between">
+            {editModal?.spend_limit != null ? (
+              <Button
+                type="button"
+                variant="outline"
+                onClick={handleResetWindow}
+                disabled={updateApiKeyMutation.isPending}
+                aria-label="Reset spend window now"
+              >
+                Reset window now
+              </Button>
+            ) : (
+              <span />
+            )}
+            <div className="flex gap-2">
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() => setEditModal(null)}
+                disabled={updateApiKeyMutation.isPending}
+              >
+                Cancel
+              </Button>
+              <Button
+                type="button"
+                onClick={handleSaveCap}
+                disabled={updateApiKeyMutation.isPending}
+              >
+                {updateApiKeyMutation.isPending && (
+                  <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                )}
+                Save
+              </Button>
+            </div>
           </DialogFooter>
         </DialogContent>
       </Dialog>

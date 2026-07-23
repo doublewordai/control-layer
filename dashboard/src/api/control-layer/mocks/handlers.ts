@@ -1024,9 +1024,46 @@ export const handlers = [
       description: body.description,
       created_at: new Date().toISOString(),
       key: `sk-${Math.random().toString(36).substring(2, 50)}`,
+      spend_limit: body.spend_limit ?? null,
+      spend_limit_interval: body.spend_limit_interval ?? null,
+      spend: body.spend_limit != null ? "0" : null,
+      total_spend: body.spend_limit != null ? "0" : null,
+      resets_at:
+        body.spend_limit != null && body.spend_limit_interval != null
+          ? "2026-08-01T00:00:00Z"
+          : null,
     };
     return HttpResponse.json(newApiKey, { status: 201 });
   }),
+
+  http.patch(
+    "/admin/api/v1/users/:userId/api-keys/:keyId",
+    async ({ params, request }) => {
+      const apiKey = apiKeysData.find((k) => k.id === params.keyId);
+      if (!apiKey) {
+        return HttpResponse.json(
+          { error: "API key not found" },
+          { status: 404 },
+        );
+      }
+      const body = (await request.json()) as Record<string, unknown>;
+      // Mirror the API's tri-state semantics: absent = unchanged, null =
+      // clear, value = set. reset_window zeroes the counted window spend.
+      const merged: Record<string, unknown> = { ...apiKey };
+      if ("spend_limit" in body) merged.spend_limit = body.spend_limit;
+      if ("spend_limit_interval" in body)
+        merged.spend_limit_interval = body.spend_limit_interval;
+      if (body.reset_window === true) merged.spend = "0";
+      if ("name" in body && body.name !== undefined) merged.name = body.name;
+      if (merged.spend_limit == null) {
+        merged.spend = null;
+        merged.total_spend = null;
+        merged.resets_at = null;
+        merged.spend_limit_interval = null;
+      }
+      return HttpResponse.json(merged);
+    },
+  ),
 
   http.delete("/admin/api/v1/users/:userId/api-keys/:keyId", ({ params }) => {
     const apiKey = apiKeysData.find((k) => k.id === params.keyId);
