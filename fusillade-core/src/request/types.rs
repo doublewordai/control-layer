@@ -244,6 +244,10 @@ pub enum FailureReason {
     /// This should be retried as it may be a transient issue.
     TaskTerminated,
 
+    /// The request processor returned an unexpected error before producing an
+    /// outcome. The daemon may safely retry the request as a fresh attempt.
+    ProcessorError,
+
     /// Failed to construct the HTTP request before it could be sent.
     /// This includes invalid header values, malformed URLs, or other builder errors.
     /// These are data errors that will never succeed on retry.
@@ -263,6 +267,7 @@ impl FailureReason {
             FailureReason::NetworkError { .. } => true,
             FailureReason::Timeout { .. } => true,
             FailureReason::TaskTerminated => true,
+            FailureReason::ProcessorError => true,
             FailureReason::RequestBuilderError { .. } => false,
             FailureReason::BatchTerminated => false,
         }
@@ -276,6 +281,7 @@ impl FailureReason {
             FailureReason::NetworkError { .. } => "network_error",
             FailureReason::Timeout { .. } => "timeout",
             FailureReason::TaskTerminated => "task_terminated",
+            FailureReason::ProcessorError => "processor_error",
             FailureReason::RequestBuilderError { .. } => "builder_error",
             FailureReason::BatchTerminated => "batch_terminated",
         }
@@ -319,6 +325,9 @@ impl FailureReason {
                 format!("Request timed out: {}", error)
             }
             FailureReason::TaskTerminated => "HTTP task terminated unexpectedly".to_string(),
+            FailureReason::ProcessorError => {
+                "Request processor returned an unexpected error".to_string()
+            }
             FailureReason::BatchTerminated => {
                 "Request was not processed because its batch reached a terminal state".to_string()
             }
@@ -639,5 +648,18 @@ mod zdr_logging_tests {
             // And the message must be non-empty (daemon asserts this).
             assert!(!msg.is_empty());
         }
+    }
+
+    #[test]
+    fn processor_error_is_retriable_and_redacted() {
+        let reason = FailureReason::ProcessorError;
+
+        assert!(reason.is_retriable());
+        assert_eq!(reason.metric_label(), "processor_error");
+        assert_eq!(reason.status_code_label(), "");
+        assert_eq!(
+            reason.to_error_message(),
+            "Request processor returned an unexpected error"
+        );
     }
 }

@@ -35,6 +35,20 @@ pub enum FusilladeError {
         attempt_id: AttemptId,
     },
 
+    /// A transient infrastructure failure while applying an attempt-aware
+    /// persistence operation.
+    ///
+    /// Reserved for storage adapters after positive classification of a
+    /// transient database or persistence-infrastructure failure. This must
+    /// never represent validation, serialization, transformation, admission
+    /// closure, or programming errors.
+    #[error("Request attempt persistence infrastructure failure during {operation}")]
+    AttemptPersistenceInfrastructure {
+        operation: &'static str,
+        #[source]
+        source: anyhow::Error,
+    },
+
     /// Cancelled request
     #[error("Request cancelled: {0}")]
     RequestCancelled(RequestId),

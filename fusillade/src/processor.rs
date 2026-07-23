@@ -24,8 +24,8 @@
 //! - the `tokio::select!` between batch-cancel and shutdown tokens (the
 //!   resulting `CancellationReason` future is passed in to the processor as
 //!   an opaque future)
-//! - retry orchestration after a `Failed` outcome (`can_retry`, persist
-//!   `Pending`)
+//! - durable terminal persistence and retry orchestration after a `Failed`
+//!   outcome
 //! - daemon-level `outcome` field on the parent span
 //!
 //! This keeps cross-cutting concerns out of the trait and avoids forcing
@@ -56,11 +56,17 @@ pub type ShouldRetry = Arc<dyn Fn(&HttpResponse) -> bool + Send + Sync>;
 ///
 /// The trait is generic over the storage and HTTP client types the daemon was
 /// constructed with so that the existing typestate methods (`request.process`,
-/// `processing.complete`) can be used without `dyn` indirection.
+/// `processing.complete_unpersisted`) can be used without `dyn` indirection.
 ///
-/// Implementations must drive a `Request<Claimed>` to a terminal state,
-/// returning the appropriate [`RequestCompletionResult`]. The daemon will
-/// then handle retry persistence and metric emission against that outcome.
+/// Implementations are called once for one claimed attempt and must return an
+/// unpersisted [`RequestCompletionResult`]. They must not redispatch or loop
+/// when an attempt should be retried: the daemon applies retry policy, moves
+/// the exact attempt back to `pending`, and lets the ordinary claim path
+/// reacquire model and user admission.
+///
+/// Daemon claims must use attempt-aware typestate methods. Calling
+/// [`Storage::persist`] directly for claimed work bypasses attempt fencing.
+/// Terminal durability and retry scheduling belong exclusively to the daemon.
 #[async_trait]
 pub trait RequestProcessor<S, H>: Send + Sync
 where
@@ -75,7 +81,12 @@ where
     ///   call (typically via `request.process(http, storage)`).
     /// - Wait for the result (or for `cancellation` to resolve), classifying
     ///   non-2xx responses with `should_retry` to decide whether to retry.
-    /// - Return the typed terminal request.
+    /// - Return the typed outcome without persisting it.
+    ///
+    /// A panic is caught at the daemon boundary and recovered as a retriable
+    /// terminated attempt. Rust's panic hook runs before that catch, so panic
+    /// payloads must never contain request content, credentials, or other
+    /// secrets.
     ///
     /// The default impl ([`DefaultRequestProcessor`]) is the canonical
     /// reference for this contract.
@@ -95,7 +106,7 @@ where
 ///
 /// ```ignore
 /// let processing = request.process(http, storage).await?;
-/// processing.complete(storage, should_retry, cancellation).await
+/// processing.complete_unpersisted(should_retry, cancellation).await
 /// ```
 ///
 /// inside the same `fusillade.state.claimed` and `fusillade.state.processing`
@@ -147,7 +158,7 @@ where
         // cancellation)
         async {
             processing
-                .complete(storage, |response| (should_retry)(response), cancellation)
+                .complete_unpersisted(|response| (should_retry)(response), cancellation)
                 .await
         }
         .instrument(tracing::info_span!(

@@ -30,5 +30,11 @@ pub trait ResponseTransformer: Send + Sync {
     /// `request` is the request being persisted - its id and `batch_metadata`
     /// let an implementation decide whether (and how) to transform without a
     /// separate lookup. `body` is the terminal response/error body to persist.
+    ///
+    /// Return [`crate::FusilladeError::AttemptPersistenceInfrastructure`] only
+    /// when retrying the same transformation can recover from a transient
+    /// dependency outage. Deterministic encryption, validation, or preparation
+    /// failures must use another error variant so daemon durability does not
+    /// retry them indefinitely.
     async fn transform(&self, request: &RequestData, body: &str) -> Result<String>;
 }

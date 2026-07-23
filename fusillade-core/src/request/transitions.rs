@@ -424,10 +424,11 @@ impl Request<Failed> {
 }
 
 impl Request<Processing> {
-    /// Wait for the HTTP request to complete.
+    /// Wait for the HTTP request to complete without persisting its outcome.
     ///
     /// This method awaits the result from the spawned HTTP task and transitions
     /// the request to one of three terminal states: `Completed`, `Failed`, or `Canceled`.
+    /// The caller owns durable terminal persistence and retry scheduling.
     ///
     /// The `should_retry` predicate determines whether a response should be considered
     /// a failure (and thus eligible for retry) or a success.
@@ -442,14 +443,12 @@ impl Request<Processing> {
     /// - `RequestCompletionResult::Failed` if the HTTP request failed or should be retried
     /// - `RequestCompletionResult::Canceled` if the request was canceled by user
     /// - `Err(FusilladeError::Shutdown)` if the daemon is shutting down
-    pub async fn complete<S, F, Fut>(
+    pub async fn complete_unpersisted<F, Fut>(
         self,
-        storage: &S,
         should_retry: F,
         cancellation: Fut,
     ) -> Result<RequestCompletionResult>
     where
-        S: RequestTransitionStorage + ?Sized,
         F: Fn(&HttpResponse) -> bool,
         Fut: std::future::Future<Output = CancellationReason>,
     {
@@ -539,7 +538,6 @@ impl Request<Processing> {
                         data: self.data,
                         state: failed_state,
                     };
-                    persist_owned_transition(storage, &request, attempt_id).await?;
                     Ok(RequestCompletionResult::Failed(request))
                 } else {
                     // HTTP request completed successfully
@@ -555,7 +553,6 @@ impl Request<Processing> {
                         data: self.data,
                         state: completed_state,
                     };
-                    persist_owned_transition(storage, &request, attempt_id).await?;
                     Ok(RequestCompletionResult::Completed(request))
                 }
             }
@@ -573,9 +570,6 @@ impl Request<Processing> {
                     data: self.data,
                     state: failed_state,
                 };
-                if !request.state.reason.is_retriable() {
-                    persist_owned_transition(storage, &request, attempt_id).await?;
-                }
                 Ok(RequestCompletionResult::Failed(request))
             }
             None => {
@@ -591,10 +585,44 @@ impl Request<Processing> {
                     data: self.data,
                     state: failed_state,
                 };
-                persist_owned_transition(storage, &request, attempt_id).await?;
                 Ok(RequestCompletionResult::Failed(request))
             }
         }
+    }
+
+    /// Wait for completion and persist terminal outcomes.
+    ///
+    /// Daemon processors should use [`Self::complete_unpersisted`] so the
+    /// daemon can retain an already-produced outcome across transient storage
+    /// failures. This compatibility method remains useful for callers that own
+    /// the complete transition themselves.
+    pub async fn complete<S, F, Fut>(
+        self,
+        storage: &S,
+        should_retry: F,
+        cancellation: Fut,
+    ) -> Result<RequestCompletionResult>
+    where
+        S: RequestTransitionStorage + ?Sized,
+        F: Fn(&HttpResponse) -> bool,
+        Fut: std::future::Future<Output = CancellationReason>,
+    {
+        let attempt_id = self.state.attempt_id;
+        let result = self
+            .complete_unpersisted(should_retry, cancellation)
+            .await?;
+
+        match &result {
+            RequestCompletionResult::Completed(request) => {
+                persist_owned_transition(storage, request, attempt_id).await?;
+            }
+            RequestCompletionResult::Failed(request) if !request.state.reason.is_retriable() => {
+                persist_owned_transition(storage, request, attempt_id).await?;
+            }
+            RequestCompletionResult::Failed(_) | RequestCompletionResult::Canceled(_) => {}
+        }
+
+        Ok(result)
     }
 
     pub async fn cancel<S: RequestTransitionStorage + ?Sized>(
@@ -885,6 +913,67 @@ mod attempt_transition_tests {
                     embedded: None,
                 },
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn unpersisted_completion_never_writes_terminal_outcomes() {
+        let storage = RecordingTransitionStorage::applied();
+        let attempt_id = AttemptId(Uuid::new_v4());
+
+        let completed = claimed_request(attempt_id)
+            .process(&storage, async {
+                Ok(HttpResponse {
+                    status: 200,
+                    body: "ok".to_string(),
+                })
+            })
+            .await
+            .unwrap()
+            .complete_unpersisted(|_| false, std::future::pending::<CancellationReason>())
+            .await
+            .unwrap();
+
+        assert!(matches!(completed, RequestCompletionResult::Completed(_)));
+        assert!(
+            storage
+                .records()
+                .iter()
+                .all(|record| record.target != "completed"),
+            "daemon-owned completion must not persist inside the processor"
+        );
+    }
+
+    #[tokio::test]
+    async fn terminated_http_task_is_returned_unpersisted_for_retry() {
+        let storage = RecordingTransitionStorage::applied();
+        let attempt_id = AttemptId(Uuid::new_v4());
+
+        let outcome = claimed_request(attempt_id)
+            .process(&storage, async {
+                panic!("synthetic provider task termination");
+                #[allow(unreachable_code)]
+                Ok(HttpResponse {
+                    status: 200,
+                    body: String::new(),
+                })
+            })
+            .await
+            .unwrap()
+            .complete_unpersisted(|_| false, std::future::pending::<CancellationReason>())
+            .await
+            .unwrap();
+
+        let RequestCompletionResult::Failed(failed) = outcome else {
+            panic!("expected failed outcome");
+        };
+        assert_eq!(failed.state.reason, FailureReason::TaskTerminated);
+        assert!(
+            storage
+                .records()
+                .iter()
+                .all(|record| record.target != "failed"),
+            "retriable completion must remain owned by the daemon"
         );
     }
 

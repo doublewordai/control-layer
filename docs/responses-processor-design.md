@@ -3,7 +3,8 @@
 ## Decision
 
 dwctl's `DwctlRequestProcessor` reuses fusillade's
-`Request<Claimed>::process` → `Request<Processing>::complete` machinery.
+`Request<Claimed>::process` →
+`Request<Processing>::complete_unpersisted` machinery.
 The multi-step response loop is plugged in via fusillade's `HttpClient`
 trait — `execute()` runs the loop and returns the assembled response as a
 synthesized `HttpResponse`.
@@ -64,7 +65,7 @@ async fn process(&self, request, http, storage, should_retry, cancellation) -> R
     }
     let loop_client = ResponseLoopHttpClient { /* clones of Arcs */ };
     let processing = request.process(loop_client, storage).await?;
-    processing.complete(storage, should_retry, cancellation).await
+    processing.complete_unpersisted(should_retry, cancellation).await
 }
 ```
 
@@ -84,15 +85,16 @@ daemon claims pending /v1/responses row (state: claimed)
         │     │     └─ return HttpResponse { status, body }
         │     ├─ persist state=processing                  [fusillade]
         │     └─ return Request<Processing> { result_rx, abort_handle }
-        └─ processing.complete(should_retry, cancellation) [fusillade]
+        └─ processing.complete_unpersisted(should_retry, cancellation) [fusillade]
               ├─ await result_rx vs cancellation
               ├─ apply should_retry policy
-              └─ persist Completed | Failed                [fusillade]
+              └─ return typed Completed | Failed outcome
+                    └─ daemon persists exact attempt or re-pends for retry
 ```
 
 ## Abort
 
-`Processing::complete`'s cancellation future (daemon shutdown, user
+`Processing::complete_unpersisted`'s cancellation future (daemon shutdown, user
 cancel) calls `abort_handle.abort()` on the spawned task. tokio drops
 the task's future at the next await, which cascades into
 `run_response_loop` → `fire_model_call` → the in-flight upstream

@@ -780,6 +780,51 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
         }
     }
 
+    fn is_transient_attempt_sqlstate(code: &str) -> bool {
+        code.starts_with("08")
+            || code.starts_with("53")
+            || matches!(
+                code,
+                "40001"
+                    | "40003"
+                    | "40P01"
+                    | "55P03"
+                    | "57014"
+                    | "57P01"
+                    | "57P02"
+                    | "57P03"
+                    | "57P05"
+                    | "58030"
+            )
+    }
+
+    fn is_transient_attempt_sqlx_error(error: &sqlx::Error) -> bool {
+        match error {
+            sqlx::Error::PoolTimedOut | sqlx::Error::Io(_) | sqlx::Error::Tls(_) => true,
+            sqlx::Error::Database(database) => {
+                database
+                    .code()
+                    .as_deref()
+                    .is_some_and(Self::is_transient_attempt_sqlstate)
+                    || database.message().contains("Authentication timed out")
+            }
+            _ => false,
+        }
+    }
+
+    fn classify_attempt_sqlx_error(operation: &'static str, source: sqlx::Error) -> FusilladeError {
+        if Self::is_transient_attempt_sqlx_error(&source) {
+            FusilladeError::AttemptPersistenceInfrastructure {
+                operation,
+                source: source.into(),
+            }
+        } else {
+            FusilladeError::Other(anyhow!(
+                "Attempt persistence failed during {operation}: {source}"
+            ))
+        }
+    }
+
     async fn retry_attempt_once(
         &self,
         operation: &'static str,
@@ -825,12 +870,7 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
         )
         .fetch_one(self.admitted_write_executor(operation))
         .await
-        .map_err(|error| {
-            FusilladeError::Other(anyhow!(
-                "Failed to reschedule request attempt for retry: {}",
-                error
-            ))
-        })?;
+        .map_err(|error| Self::classify_attempt_sqlx_error(operation, error))?;
 
         Self::classify_attempt_cas(request_id, row.exists, row.applied)
     }
@@ -3102,9 +3142,10 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                     })
                     .is_ok()
                 {
-                    return Err(FusilladeError::Other(anyhow!(
-                        "injected fenced persistence failure"
-                    )));
+                    return Err(Self::classify_attempt_sqlx_error(
+                        "persist_attempt",
+                        sqlx::Error::PoolTimedOut,
+                    ));
                 }
 
                 match request {
@@ -3144,10 +3185,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                         .fetch_one(self.admitted_write_executor("persist_attempt"))
                         .await
                         .map_err(|error| {
-                            FusilladeError::Other(anyhow!(
-                                "Failed to persist fenced pending transition: {}",
-                                error
-                            ))
+                            Self::classify_attempt_sqlx_error("persist_attempt", error)
                         })?;
                         Self::classify_attempt_cas(req.data.id, row.exists, row.applied)
                     }
@@ -3188,23 +3226,15 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                         .fetch_one(self.admitted_write_executor("persist_attempt"))
                         .await
                         .map_err(|error| {
-                            FusilladeError::Other(anyhow!(
-                                "Failed to persist fenced claimed transition: {}",
-                                error
-                            ))
+                            Self::classify_attempt_sqlx_error("persist_attempt", error)
                         })?;
                         Self::classify_attempt_cas(req.data.id, row.exists, row.applied)
                     }
                     AnyRequest::Processing(req) => {
-                        let (mut tx, _admission_permit) = self
-                            .begin_admitted_write("persist_attempt")
-                            .await
-                            .map_err(|error| {
-                                FusilladeError::Other(anyhow!(
-                                    "Failed to begin fenced processing transition: {}",
-                                    error
-                                ))
-                            })?;
+                        let (mut tx, _admission_permit) =
+                            self.begin_admitted_write("persist_attempt").await.map_err(
+                                |error| Self::classify_attempt_sqlx_error("persist_attempt", error),
+                            )?;
                         let row = sqlx::query!(
                             r#"
                             WITH target AS MATERIALIZED (
@@ -3240,18 +3270,12 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                         .fetch_one(&mut *tx)
                         .await
                         .map_err(|error| {
-                            FusilladeError::Other(anyhow!(
-                                "Failed to persist fenced processing transition: {}",
-                                error
-                            ))
+                            Self::classify_attempt_sqlx_error("persist_attempt", error)
                         })?;
 
                         if !row.applied {
                             tx.rollback().await.map_err(|error| {
-                                FusilladeError::Other(anyhow!(
-                                    "Failed to roll back fenced processing transition: {}",
-                                    error
-                                ))
+                                Self::classify_attempt_sqlx_error("persist_attempt", error)
                             })?;
                             return Self::classify_attempt_cas(
                                 req.data.id,
@@ -3276,10 +3300,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                         .execute(&mut *tx)
                         .await
                         .map_err(|error| {
-                            FusilladeError::Other(anyhow!(
-                                "Failed to stamp fenced processing start: {}",
-                                error
-                            ))
+                            Self::classify_attempt_sqlx_error("persist_attempt", error)
                         })?
                         .rows_affected();
                         if stamped != 1 {
@@ -3290,10 +3311,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                         }
 
                         tx.commit().await.map_err(|error| {
-                            FusilladeError::Other(anyhow!(
-                                "Failed to commit fenced processing transition: {}",
-                                error
-                            ))
+                            Self::classify_attempt_sqlx_error("persist_attempt", error)
                         })?;
                         Ok(true)
                     }
@@ -3356,10 +3374,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                         .fetch_one(self.admitted_write_executor("persist_attempt"))
                         .await
                         .map_err(|error| {
-                            FusilladeError::Other(anyhow!(
-                                "Failed to persist fenced completion: {}",
-                                error
-                            ))
+                            Self::classify_attempt_sqlx_error("persist_attempt", error)
                         })?;
                         let applied =
                             Self::classify_attempt_cas(req.data.id, row.exists, row.applied)?;
@@ -3436,10 +3451,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                         .fetch_one(self.admitted_write_executor("persist_attempt"))
                         .await
                         .map_err(|error| {
-                            FusilladeError::Other(anyhow!(
-                                "Failed to persist fenced failure: {}",
-                                error
-                            ))
+                            Self::classify_attempt_sqlx_error("persist_attempt", error)
                         })?;
                         let applied =
                             Self::classify_attempt_cas(req.data.id, row.exists, row.applied)?;
@@ -3484,10 +3496,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                         .fetch_one(self.admitted_write_executor("persist_attempt"))
                         .await
                         .map_err(|error| {
-                            FusilladeError::Other(anyhow!(
-                                "Failed to persist fenced cancellation: {}",
-                                error
-                            ))
+                            Self::classify_attempt_sqlx_error("persist_attempt", error)
                         })?;
                         Self::classify_attempt_cas(req.data.id, row.exists, row.applied)
                     }
@@ -3514,8 +3523,10 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                 Err(FusilladeError::RequestNotFound(id)) => {
                     return Err(FusilladeError::RequestNotFound(id));
                 }
-                Err(error) if sql_attempt < MAX_ATTEMPTS - 1 => {
-                    tracing::warn!(
+                Err(error @ FusilladeError::AttemptPersistenceInfrastructure { .. })
+                    if sql_attempt < MAX_ATTEMPTS - 1 =>
+                {
+                    tracing::debug!(
                         %request_id,
                         %attempt_id,
                         transition,
@@ -3635,8 +3646,10 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                 Err(FusilladeError::RequestNotFound(id)) => {
                     return Err(FusilladeError::RequestNotFound(id));
                 }
-                Err(error) if sql_attempt < MAX_ATTEMPTS - 1 => {
-                    tracing::warn!(
+                Err(error @ FusilladeError::AttemptPersistenceInfrastructure { .. })
+                    if sql_attempt < MAX_ATTEMPTS - 1 =>
+                {
+                    tracing::debug!(
                         %request_id,
                         %attempt_id,
                         sql_attempt = sql_attempt + 1,
@@ -9188,6 +9201,48 @@ mod tests {
     }
 
     #[test]
+    fn attempt_sqlstate_classifier_is_positive_and_conservative() {
+        for code in [
+            "08006", "40001", "40003", "40P01", "53300", "55P03", "57014", "57P03", "58030",
+        ] {
+            assert!(
+                PostgresRequestManager::<TestDbPools>::is_transient_attempt_sqlstate(code),
+                "{code} should be transient"
+            );
+        }
+        for code in ["22001", "23505", "23514", "42501", "42703", "XX000"] {
+            assert!(
+                !PostgresRequestManager::<TestDbPools>::is_transient_attempt_sqlstate(code),
+                "{code} should be definitive"
+            );
+        }
+    }
+
+    #[test]
+    fn attempt_sqlx_classifier_retries_only_transport_and_pool_availability() {
+        let io = sqlx::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "connection reset",
+        ));
+        let tls = sqlx::Error::Tls(Box::new(std::io::Error::other("TLS unavailable")));
+
+        for error in [sqlx::Error::PoolTimedOut, io, tls] {
+            assert!(PostgresRequestManager::<TestDbPools>::is_transient_attempt_sqlx_error(&error));
+        }
+        for error in [
+            sqlx::Error::Protocol("response admission semaphore closed".to_string()),
+            sqlx::Error::RowNotFound,
+            sqlx::Error::InvalidArgument("bad argument".to_string()),
+            sqlx::Error::PoolClosed,
+            sqlx::Error::BeginFailed,
+        ] {
+            assert!(
+                !PostgresRequestManager::<TestDbPools>::is_transient_attempt_sqlx_error(&error)
+            );
+        }
+    }
+
+    #[test]
     fn state_write_limiter_caps_defaults_to_pool_headroom() {
         for (pool_max, expected_total, expected_writes, expected_reads) in
             [(1, 1, 1, 1), (4, 2, 2, 2), (20, 18, 18, 8)]
@@ -11666,6 +11721,20 @@ mod tests {
         }
     }
 
+    struct FailingTransformer {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl crate::transform::ResponseTransformer for FailingTransformer {
+        async fn transform(&self, _request: &RequestData, _body: &str) -> Result<String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(FusilladeError::Other(anyhow!(
+                "deterministic response transformation failure"
+            )))
+        }
+    }
+
     /// Test double that proves the *specific* request being persisted reaches the
     /// hook: it records the id it was handed and echoes it into the body, so a test
     /// can assert both that the transformer saw the right request (not some other
@@ -11768,6 +11837,45 @@ mod tests {
                 routed_model: req.data.model.clone(),
             },
         }
+    }
+
+    async fn install_terminal_transition_fault(pool: &sqlx::PgPool, sqlstate: &str, failures: u32) {
+        assert!(
+            matches!(sqlstate, "23514" | "40001"),
+            "test helper only accepts fixed SQLSTATE fixtures"
+        );
+        sqlx::query("CREATE SEQUENCE terminal_transition_fault_seq")
+            .execute(pool)
+            .await
+            .unwrap();
+        let function = format!(
+            r#"
+            CREATE FUNCTION fail_terminal_transition() RETURNS trigger AS $$
+            BEGIN
+                IF NEW.state = 'completed'
+                   AND OLD.state = 'processing'
+                   AND nextval('terminal_transition_fault_seq') <= {failures}
+                THEN
+                    RAISE EXCEPTION USING
+                        ERRCODE = '{sqlstate}',
+                        MESSAGE = 'synthetic terminal transition fault';
+                END IF;
+                RETURN NEW;
+            END;
+            $$ LANGUAGE plpgsql
+            "#
+        );
+        sqlx::query(&function).execute(pool).await.unwrap();
+        sqlx::query(
+            r#"
+            CREATE TRIGGER fail_terminal_transition
+            BEFORE UPDATE ON requests
+            FOR EACH ROW EXECUTE FUNCTION fail_terminal_transition()
+            "#,
+        )
+        .execute(pool)
+        .await
+        .unwrap();
     }
 
     fn pending_for_id(request_id: RequestId) -> Request<Pending> {
@@ -12892,6 +13000,87 @@ mod tests {
             1,
             "transform must run exactly once per persist (it sits before the DB retry loop)",
         );
+    }
+
+    #[sqlx::test]
+    async fn deterministic_transform_failure_is_not_retried_or_written(pool: sqlx::PgPool) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (manager, req) = claim_one_processing(
+            &pool,
+            Some(Arc::new(FailingTransformer {
+                calls: calls.clone(),
+            })),
+        )
+        .await;
+
+        let error = manager
+            .persist_attempt(&completed_from(&req, "plaintext"), req.state.attempt_id)
+            .await
+            .expect_err("deterministic transformer failure must be definitive");
+
+        assert!(matches!(error, FusilladeError::Other(_)));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let (state, attempt_id): (String, Option<Uuid>) =
+            sqlx::query_as("SELECT state, attempt_id FROM requests WHERE id = $1")
+                .bind(*req.data.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(state, "processing");
+        assert_eq!(attempt_id, Some(*req.state.attempt_id));
+    }
+
+    #[sqlx::test]
+    async fn definitive_sqlstate_does_not_enter_attempt_retry_loop(pool: sqlx::PgPool) {
+        let (manager, req) = claim_one_processing(&pool, None).await;
+        install_terminal_transition_fault(&pool, "23514", 3).await;
+
+        let error = manager
+            .persist_attempt(&completed_from(&req, "done"), req.state.attempt_id)
+            .await
+            .expect_err("constraint fault must be definitive");
+
+        assert!(matches!(error, FusilladeError::Other(_)));
+        let calls: i64 = sqlx::query_scalar("SELECT last_value FROM terminal_transition_fault_seq")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(calls, 1, "definitive SQLSTATE must not be retried");
+        let (state, attempt_id): (String, Option<Uuid>) =
+            sqlx::query_as("SELECT state, attempt_id FROM requests WHERE id = $1")
+                .bind(*req.data.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(state, "processing");
+        assert_eq!(attempt_id, Some(*req.state.attempt_id));
+    }
+
+    #[sqlx::test]
+    async fn transient_sqlstate_retries_the_same_attempt_cas(pool: sqlx::PgPool) {
+        let (manager, req) = claim_one_processing(&pool, None).await;
+        install_terminal_transition_fault(&pool, "40001", 2).await;
+
+        assert!(
+            manager
+                .persist_attempt(&completed_from(&req, "done"), req.state.attempt_id)
+                .await
+                .unwrap()
+        );
+
+        let calls: i64 = sqlx::query_scalar("SELECT last_value FROM terminal_transition_fault_seq")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(calls, 3);
+        let (state, attempt_id): (String, Option<Uuid>) =
+            sqlx::query_as("SELECT state, attempt_id FROM requests WHERE id = $1")
+                .bind(*req.data.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(state, "completed");
+        assert_eq!(attempt_id, None);
     }
 
     #[sqlx::test]
