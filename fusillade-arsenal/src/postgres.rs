@@ -5083,11 +5083,13 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                 INSERT INTO requests (id, batch_id, template_id, state, retry_attempt, not_before,
                                       daemon_id, claimed_at, started_at, response_status, response_body,
                                       completed_at, error, failed_at, canceled_at, created_at, updated_at,
-                                      custom_id, model, response_size, routed_model, service_tier, created_by)
+                                      custom_id, model, response_size, routed_model, service_tier, created_by,
+                                      attempt_id)
                 SELECT a.id, a.batch_id, a.template_id, 'pending', 0, NULL,
                        NULL, NULL, NULL, NULL, NULL,
                        NULL, NULL, NULL, NULL, a.created_at, NOW(),
-                       a.custom_id, a.model, 0, NULL, a.service_tier, a.created_by
+                       a.custom_id, a.model, 0, NULL, a.service_tier, a.created_by,
+                       NULL
                 FROM batch_requests_archive a
                 WHERE a.id = ANY($1) AND a.state = 'failed'
                 ON CONFLICT (id) DO NOTHING
@@ -5285,11 +5287,13 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                 INSERT INTO requests (id, batch_id, template_id, state, retry_attempt, not_before,
                                       daemon_id, claimed_at, started_at, response_status, response_body,
                                       completed_at, error, failed_at, canceled_at, created_at, updated_at,
-                                      custom_id, model, response_size, routed_model, service_tier, created_by)
+                                      custom_id, model, response_size, routed_model, service_tier, created_by,
+                                      attempt_id)
                 SELECT a.id, a.batch_id, a.template_id, 'pending', 0, NULL,
                        NULL, NULL, NULL, NULL, NULL,
                        NULL, NULL, NULL, NULL, a.created_at, NOW(),
-                       a.custom_id, a.model, 0, NULL, a.service_tier, a.created_by
+                       a.custom_id, a.model, 0, NULL, a.service_tier, a.created_by,
+                       NULL
                 FROM batch_requests_archive a
                 WHERE a.archive_bucket = $2 AND a.batch_id = $1
                   AND a.state IN ('failed', 'canceled')
@@ -8111,13 +8115,14 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
                 id, batch_id, template_id, state, retry_attempt, not_before, daemon_id,
                 claimed_at, started_at, response_status, response_body, completed_at,
                 error, failed_at, canceled_at, created_at, updated_at, custom_id, model,
-                response_size, routed_model, service_tier, created_by, archive_bucket
+                response_size, routed_model, service_tier, created_by, attempt_id,
+                archive_bucket
             )
             SELECT r.id, r.batch_id, r.template_id, r.state, r.retry_attempt, r.not_before,
                    r.daemon_id, r.claimed_at, r.started_at, r.response_status, r.response_body,
                    r.completed_at, r.error, r.failed_at, r.canceled_at, r.created_at,
                    r.updated_at, r.custom_id, r.model, r.response_size, r.routed_model,
-                   r.service_tier, r.created_by, $2::date
+                   r.service_tier, r.created_by, r.attempt_id, $2::date
             FROM requests r
             WHERE r.batch_id = $1
             ON CONFLICT (id, archive_bucket) DO NOTHING
@@ -12429,13 +12434,14 @@ mod tests {
                  id, batch_id, template_id, state, retry_attempt, not_before, daemon_id,
                  claimed_at, started_at, response_status, response_body, completed_at,
                  error, failed_at, canceled_at, created_at, updated_at, custom_id, model,
-                 response_size, routed_model, service_tier, created_by, archive_bucket
+                 response_size, routed_model, service_tier, created_by, attempt_id,
+                 archive_bucket
              )
              SELECT r.id, r.batch_id, r.template_id, r.state, r.retry_attempt, r.not_before,
                     r.daemon_id, r.claimed_at, r.started_at, r.response_status, r.response_body,
                     r.completed_at, r.error, r.failed_at, r.canceled_at, r.created_at,
                     r.updated_at, r.custom_id, r.model, r.response_size, r.routed_model,
-                    r.service_tier, r.created_by,
+                    r.service_tier, r.created_by, r.attempt_id,
                     date_trunc('week', (SELECT created_at FROM batches WHERE id = $1) AT TIME ZONE 'UTC')::date
              FROM requests r WHERE r.batch_id = $1
              ORDER BY r.id LIMIT 1",
