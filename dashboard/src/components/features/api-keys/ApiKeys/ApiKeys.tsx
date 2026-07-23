@@ -145,32 +145,42 @@ export const ApiKeys: React.FC = () => {
 
   const handleSaveCap = async () => {
     if (!editModal) return;
-    // Tri-state PATCH: both cap fields are always sent explicitly so removal
-    // (null) actually clears server-side, matching the API semantics.
-    await updateApiKeyMutation.mutateAsync({
-      keyId: editModal.id,
-      data: {
-        spend_limit: editCapAmount.trim() === "" ? null : editCapAmount,
-        spend_limit_interval:
-          editCapAmount.trim() === "" || editCapInterval === "none"
-            ? null
-            : editCapInterval,
-      },
-      userId: targetUserId,
-    });
-    toast.success("Spending cap updated");
-    setEditModal(null);
+    try {
+      // Tri-state PATCH: both cap fields are always sent explicitly so removal
+      // (null) actually clears server-side, matching the API semantics.
+      await updateApiKeyMutation.mutateAsync({
+        keyId: editModal.id,
+        data: {
+          spend_limit: editCapAmount.trim() === "" ? null : editCapAmount,
+          spend_limit_interval:
+            editCapAmount.trim() === "" || editCapInterval === "none"
+              ? null
+              : editCapInterval,
+        },
+        userId: targetUserId,
+      });
+      toast.success("Usage limit updated");
+      setEditModal(null);
+    } catch (e) {
+      console.error("Failed to update usage limit:", e);
+      toast.error((e as Error)?.message ?? "Failed to update usage limit");
+    }
   };
 
   const handleResetWindow = async () => {
     if (!editModal) return;
-    await updateApiKeyMutation.mutateAsync({
-      keyId: editModal.id,
-      data: { reset_window: true },
-      userId: targetUserId,
-    });
-    toast.success("Spend window reset");
-    setEditModal(null);
+    try {
+      await updateApiKeyMutation.mutateAsync({
+        keyId: editModal.id,
+        data: { reset_window: true },
+        userId: targetUserId,
+      });
+      toast.success("Spend window reset");
+      setEditModal(null);
+    } catch (e) {
+      console.error("Failed to reset spend window:", e);
+      toast.error((e as Error)?.message ?? "Failed to reset spend window");
+    }
   };
 
   const handleDeleteApiKey = (keyId: string) => {
@@ -226,10 +236,9 @@ export const ApiKeys: React.FC = () => {
 
   // Mirrors what the PATCH endpoint permits: the key's creator, or a
   // PlatformManager. (Non-PM org admins cannot edit members' keys server-side
-  // today; if that changes, extend this gate alongside it.) Keys without
-  // created_by (legacy rows) fall back to visible so they stay manageable.
+  // today; if that changes, extend this gate alongside it.)
   const canManageKey = (apiKey: ApiKey) =>
-    isPlatformManager || !apiKey.created_by || apiKey.created_by === user?.id;
+    isPlatformManager || (!!apiKey.created_by && apiKey.created_by === user?.id);
 
   const columns = createColumns({
     onDelete: handleDeleteFromTable,
