@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.101.0](https://github.com/doublewordai/control-layer/compare/v8.100.0...v8.101.0) (2026-07-23)
+
+
+### Features
+
+* capped api keys, api surface ([#1351](https://github.com/doublewordai/control-layer/issues/1351)) ([8129e1e](https://github.com/doublewordai/control-layer/commit/8129e1ed1a252d5aeee354ce1ac81a634d46690e))
+
 ## [8.100.0](https://github.com/doublewordai/control-layer/compare/v8.99.0...v8.100.0) (2026-07-23)
 
 
