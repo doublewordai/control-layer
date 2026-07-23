@@ -5562,6 +5562,55 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         Ok(detail)
     }
 
+    #[tracing::instrument(
+        skip(self, owner_id),
+        fields(response_id = %response_id.0)
+    )]
+    async fn get_response_detail_for_owner(
+        &self,
+        response_id: crate::request::RequestId,
+        owner_id: &str,
+    ) -> Result<crate::request::ResolvedResponseDetail> {
+        let detail = sqlx::query_as::<_, crate::request::ResolvedResponseDetail>(
+            r#"
+            WITH resolved AS (
+                SELECT
+                    COALESCE(rs.id, input.response_id) AS public_response_id,
+                    COALESCE(rs.request_id, input.response_id) AS request_id
+                FROM (VALUES ($1::uuid)) AS input(response_id)
+                LEFT JOIN response_steps rs ON rs.id = input.response_id
+                WHERE rs.id IS NULL OR rs.request_id IS NOT NULL
+            )
+            SELECT
+                resolved.public_response_id,
+                r.id, r.batch_id, r.model, r.state, r.created_at,
+                r.completed_at, r.failed_at,
+                (CASE WHEN r.completed_at IS NOT NULL AND r.started_at IS NOT NULL
+                    THEN EXTRACT(EPOCH FROM (r.completed_at - r.started_at)) * 1000
+                    ELSE NULL END)::float8 AS duration_ms,
+                r.response_status,
+                CASE WHEN f.deleted_at IS NULL OR t.file_id IS NULL
+                    THEN t.body ELSE NULL END AS body,
+                r.response_body, r.error,
+                r.service_tier, r.created_by
+            FROM resolved
+            JOIN requests r ON r.id = resolved.request_id
+            LEFT JOIN request_templates t ON t.id = r.template_id
+            LEFT JOIN files f ON f.id = t.file_id
+            WHERE r.created_by = $2
+              AND r.batch_id IS NULL
+            "#,
+        )
+        .bind(response_id.0)
+        .bind(owner_id)
+        .fetch_optional(self.read_executor())
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to get owned response detail: {}", e)))?
+        .ok_or(FusilladeError::RequestNotFound(response_id))?;
+
+        Ok(detail)
+    }
+
     #[tracing::instrument(level = "debug", skip(self, input), fields(request_id = %input.request_id))]
     async fn create_realtime(&self, input: CreateRealtimeInput) -> Result<RequestId> {
         let ids = self
@@ -21150,6 +21199,232 @@ mod tests {
         assert_eq!(detail.status, "processing");
         assert_eq!(detail.created_by, "test-user-id");
         assert!(detail.body.as_deref().unwrap().contains("gpt-4"));
+    }
+
+    #[sqlx::test]
+    async fn test_get_response_detail_for_owner_resolves_single_and_multi_step_ids(
+        pool: sqlx::PgPool,
+    ) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+        let owner = "owned-response-user";
+
+        let single_id = uuid::Uuid::new_v4();
+        manager
+            .create_realtime(crate::request::CreateRealtimeInput {
+                request_id: single_id,
+                body: r#"{"input":"single"}"#.to_string(),
+                model: "single-model".to_string(),
+                endpoint: "http://localhost:3001/ai".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/responses".to_string(),
+                api_key: String::new(),
+                created_by: owner.to_string(),
+            })
+            .await
+            .unwrap();
+
+        let single = manager
+            .get_response_detail_for_owner(crate::request::RequestId(single_id), owner)
+            .await
+            .expect("owned single-step response should resolve");
+        assert_eq!(single.public_response_id, single_id);
+        assert_eq!(single.detail.id, single_id);
+        assert_eq!(single.detail.created_by, owner);
+        assert_eq!(single.detail.model, "single-model");
+        assert_eq!(single.detail.body.as_deref(), Some(r#"{"input":"single"}"#));
+
+        let backing_request_id = uuid::Uuid::new_v4();
+        manager
+            .create_realtime(crate::request::CreateRealtimeInput {
+                request_id: backing_request_id,
+                body: r#"{"input":"multi"}"#.to_string(),
+                model: "multi-model".to_string(),
+                endpoint: "http://localhost:3001/ai".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/responses".to_string(),
+                api_key: String::new(),
+                created_by: owner.to_string(),
+            })
+            .await
+            .unwrap();
+        let public_head_id = uuid::Uuid::new_v4();
+        sqlx::query(
+            r#"
+            INSERT INTO response_steps (
+                id, request_id, step_kind, step_sequence, request_payload, state
+            ) VALUES ($1, $2, 'model_call', 0, '{}'::jsonb, 'pending')
+            "#,
+        )
+        .bind(public_head_id)
+        .bind(backing_request_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let multi = manager
+            .get_response_detail_for_owner(crate::request::RequestId(public_head_id), owner)
+            .await
+            .expect("owned multi-step response should resolve through its backing request");
+        assert_eq!(multi.public_response_id, public_head_id);
+        assert_eq!(multi.detail.id, backing_request_id);
+        assert_eq!(multi.detail.created_by, owner);
+        assert_eq!(multi.detail.model, "multi-model");
+    }
+
+    #[sqlx::test]
+    async fn test_get_response_detail_for_owner_hides_unowned_unresolved_and_batched_rows(
+        pool: sqlx::PgPool,
+    ) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+        let owner = "response-owner";
+        let request_id = uuid::Uuid::new_v4();
+        manager
+            .create_realtime(crate::request::CreateRealtimeInput {
+                request_id,
+                body: "{}".to_string(),
+                model: "owned-model".to_string(),
+                endpoint: "http://localhost:3001/ai".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/responses".to_string(),
+                api_key: String::new(),
+                created_by: owner.to_string(),
+            })
+            .await
+            .unwrap();
+
+        let wrong_owner = manager
+            .get_response_detail_for_owner(crate::request::RequestId(request_id), "different-owner")
+            .await
+            .expect_err("cross-owner response must be hidden");
+        assert!(
+            matches!(
+                wrong_owner,
+                FusilladeError::RequestNotFound(id)
+                    if id == crate::request::RequestId(request_id)
+            ),
+            "wrong owner must be indistinguishable from a missing response: {wrong_owner:?}",
+        );
+
+        let missing_id = uuid::Uuid::new_v4();
+        let missing = manager
+            .get_response_detail_for_owner(crate::request::RequestId(missing_id), owner)
+            .await
+            .expect_err("unknown response must be hidden");
+        assert!(
+            matches!(
+                missing,
+                FusilladeError::RequestNotFound(id)
+                    if id == crate::request::RequestId(missing_id)
+            ),
+            "unknown response should return RequestNotFound: {missing:?}",
+        );
+
+        // A matched tool-call step has no backing request. Deliberately make
+        // its public UUID collide with a real request UUID: an unguarded
+        // COALESCE(response_steps.request_id, input_id) would expose that
+        // unrelated request as the tool-call response.
+        let colliding_id = uuid::Uuid::new_v4();
+        manager
+            .create_realtime(crate::request::CreateRealtimeInput {
+                request_id: colliding_id,
+                body: r#"{"must":"stay hidden"}"#.to_string(),
+                model: "collision-model".to_string(),
+                endpoint: "http://localhost:3001/ai".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/responses".to_string(),
+                api_key: String::new(),
+                created_by: owner.to_string(),
+            })
+            .await
+            .unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO response_steps (
+                id, request_id, step_kind, step_sequence, request_payload, state
+            ) VALUES ($1, NULL, 'tool_call', 0, '{}'::jsonb, 'pending')
+            "#,
+        )
+        .bind(colliding_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let unresolved = manager
+            .get_response_detail_for_owner(crate::request::RequestId(colliding_id), owner)
+            .await
+            .expect_err("a tool step without a backing request must not fall through");
+        assert!(
+            matches!(
+                unresolved,
+                FusilladeError::RequestNotFound(id)
+                    if id == crate::request::RequestId(colliding_id)
+            ),
+            "unresolved tool step should return RequestNotFound: {unresolved:?}",
+        );
+
+        let batch_id = setup_freeze_test_batch(&manager, "owned-detail-live-batch", 1).await;
+        let batched_request_id: uuid::Uuid =
+            sqlx::query_scalar("SELECT id FROM requests WHERE batch_id = $1")
+                .bind(*batch_id as uuid::Uuid)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let batched = manager
+            .get_response_detail_for_owner(crate::request::RequestId(batched_request_id), owner)
+            .await
+            .expect_err("live batched rows are outside the Responses API lookup");
+        assert!(matches!(batched, FusilladeError::RequestNotFound(_)));
+    }
+
+    #[sqlx::test]
+    async fn test_get_response_detail_for_owner_excludes_archived_rows(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+        let batch_id = setup_frozen_batch(&manager, &pool, "owned-detail-archive", 1).await;
+        let request_id: uuid::Uuid =
+            sqlx::query_scalar("SELECT id FROM requests WHERE batch_id = $1")
+                .bind(*batch_id as uuid::Uuid)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+
+        assert_eq!(
+            manager.archive_batch(batch_id).await.unwrap(),
+            ArchiveOutcome::Archived { rows: 1 },
+        );
+        let archived: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM batch_requests_archive WHERE id = $1)")
+                .bind(request_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(
+            archived,
+            "fixture must actually move the request to the archive"
+        );
+
+        let result = manager
+            .get_response_detail_for_owner(
+                crate::request::RequestId(request_id),
+                "irrelevant-owner",
+            )
+            .await
+            .expect_err("archived rows are outside the Responses API lookup");
+        assert!(
+            matches!(
+                result,
+                FusilladeError::RequestNotFound(id)
+                    if id == crate::request::RequestId(request_id)
+            ),
+            "archived response should return RequestNotFound: {result:?}",
+        );
     }
 
     #[sqlx::test]

@@ -205,7 +205,53 @@ impl<P: PoolProvider + Clone> FusilladeResponseStore<P> {
         })
     }
 
-    /// Retrieve a response by ID. Used by the GET /v1/responses/{id} handler.
+    /// Retrieve a response by ID after resolving ownership in the same
+    /// Fusillade statement as the response detail.
+    ///
+    /// Unknown and cross-owner IDs both return [`ResponseLookup::NotFound`].
+    /// The public response ID remains the head-step UUID for multi-step
+    /// responses, while ZDR decryption uses the resolved backing request UUID.
+    pub async fn get_response_for_owner(&self, response_id: &str, owner_id: &str) -> Result<ResponseLookup, StoreError> {
+        let parsed_uuid = parse_response_id(response_id)?;
+        let mut resolved = match self
+            .request_manager
+            .get_response_detail_for_owner(RequestId(parsed_uuid), owner_id)
+            .await
+        {
+            Ok(resolved) => resolved,
+            Err(fusillade::FusilladeError::RequestNotFound(_)) => {
+                return Ok(ResponseLookup::NotFound);
+            }
+            Err(e) => {
+                return Err(StoreError::StorageError(format!("Failed to fetch owned response: {e}")));
+            }
+        };
+
+        if let Some(ks) = self.keystore.as_ref() {
+            match crate::inference::zdr::decrypt_response_body(ks, &resolved.detail.id, resolved.detail.response_body.as_deref())
+                .await
+                .map_err(|e| StoreError::StorageError(format!("ZDR response decrypt: {e}")))?
+            {
+                crate::inference::zdr::DecryptOutcome::Unchanged => {}
+                crate::inference::zdr::DecryptOutcome::Decrypted(plain) => {
+                    resolved.detail.response_body = Some(plain);
+                }
+                crate::inference::zdr::DecryptOutcome::Gone => {
+                    return Ok(ResponseLookup::Gone);
+                }
+            }
+        }
+
+        let mut response = detail_to_response_object(&resolved.detail);
+        response["id"] = serde_json::Value::String(format!("resp_{}", resolved.public_response_id));
+        Ok(ResponseLookup::Found(response))
+    }
+
+    /// Retrieve a response without an ownership predicate.
+    ///
+    /// This path exists only for onwards' internal `previous_response_id`
+    /// context contract, which does not currently carry an owner identity.
+    /// Public HTTP retrieval must use [`Self::get_response_for_owner`].
     ///
     /// Two retrieval paths:
     ///

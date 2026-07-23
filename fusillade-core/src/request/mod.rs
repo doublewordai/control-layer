@@ -15,7 +15,7 @@ pub use query::RequestSummaryWithCount;
 pub use query::{
     CreateFlexInput, CreateRealtimeInput, CreateResponseInput, ListRequestsFilter,
     PersistCompletedRealtimeInput, RequestDetail, RequestListResult, RequestSummary,
-    ServiceTierFilter,
+    ResolvedResponseDetail, ServiceTierFilter,
 };
 pub use transitions::CancellationReason;
 pub use types::*;
