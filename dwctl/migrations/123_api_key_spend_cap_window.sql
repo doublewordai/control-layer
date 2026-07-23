@@ -42,40 +42,22 @@ AS $$
   END
 $$;
 
--- Whether a windowed cap is within `grace_seconds` of its next calendar
--- boundary. Used ONLY by enforcement (the sync eligibility predicate and the
--- error enricher) to readmit exhausted scopes slightly EARLY: the fallback
--- sync ticks every ~5 minutes (onwards_sync.fallback_interval_milliseconds)
--- and nothing writes at a calendar boundary (so no NOTIFY fires there); by
--- treating an exhausted window as already over during the final grace period,
--- some fallback tick inside that period readmits the keys BEFORE the boundary
--- instead of up to one tick after it. A short pre-boundary overrun on an
--- already-over-budget key beats post-midnight rejections that look broken.
---
--- INVARIANT: grace_seconds must be >= the deployed fallback interval, or
--- readmission degrades to after-the-boundary again. Default 300s matches the
--- prod fallback default; keep them in lockstep.
---
--- MUST NOT be used in the batcher fold's rollover decision — rolling the
--- window early would reset window_spend repeatedly during the grace period
--- and misattribute end-of-window spend to the next window.
-CREATE OR REPLACE FUNCTION api_key_cap_near_boundary(cap_interval text, grace_seconds int DEFAULT 300)
-RETURNS boolean
-LANGUAGE sql
-STABLE
-AS $$
-  SELECT CASE
-    -- One-off caps have no boundary: never in grace.
-    WHEN cap_interval IS NULL THEN false
-    WHEN cap_interval = 'daily'
-      THEN now() AT TIME ZONE 'utc' >= date_trunc('day',   now() AT TIME ZONE 'utc') + interval '1 day'   - make_interval(secs => grace_seconds)
-    WHEN cap_interval = 'weekly'
-      THEN now() AT TIME ZONE 'utc' >= date_trunc('week',  now() AT TIME ZONE 'utc') + interval '1 week'  - make_interval(secs => grace_seconds)
-    WHEN cap_interval = 'monthly'
-      THEN now() AT TIME ZONE 'utc' >= date_trunc('month', now() AT TIME ZONE 'utc') + interval '1 month' - make_interval(secs => grace_seconds)
-    ELSE false
-  END
-$$;
+-- NOTE on readmission timing (v1, deliberate): nothing writes at a calendar
+-- boundary, so no NOTIFY fires there. Caps are enforced hard right up to the
+-- boundary. Readmission of an exhausted scope whose window rolled comes from
+-- whichever happens first:
+--   * the DEMAND-DRIVEN boundary resync: the first post-boundary request on a
+--     drained key 403s, and the error enricher fires the config-changed
+--     NOTIFY (throttled per pod) — readmitting EVERY rolled capped scope
+--     within seconds (see error_enrichment::maybe_fire_boundary_resync);
+--   * the periodic fallback sync (worst case one interval, prod default
+--     5 minutes) when no traffic arrives to trigger the above.
+-- So one sacrificial request at the boundary buys everyone's readmission.
+-- Deliberately NOT a shorter fallback interval (full reloads are expensive)
+-- and NOT pre-boundary readmission grace (spends over the cap and couples
+-- enforcement to fallback timing). A scheduled midnight resync (underway
+-- cron) remains an optional future addition to eliminate even that one
+-- boundary failure.
 
 -- Next calendar boundary for a windowed cap, for user-facing "resets at ..."
 -- messages (error enrichment, key listings). NULL for one-off caps.

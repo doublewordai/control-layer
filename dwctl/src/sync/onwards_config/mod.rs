@@ -648,19 +648,6 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                       AND root.spend_limit IS NOT NULL
                       AND api_key_cap_window_current(ck.window_started_at, root.spend_limit_interval)
                       AND ck.window_spend >= root.spend_limit
-                      -- Pre-boundary readmission grace: an exhausted windowed
-                      -- cap within 5 minutes of its calendar boundary is
-                      -- treated as already reset, so a fallback tick inside
-                      -- the grace readmits the scope BEFORE midnight instead
-                      -- of up to one tick after (nothing writes at a boundary
-                      -- => no NOTIFY there). Grace is the fixed 300s SQL
-                      -- default of api_key_cap_near_boundary, matching the
-                      -- prod fallback default; if the fallback interval is
-                      -- ever raised above it, pre-boundary readmission
-                      -- degrades to post-boundary — plumb one configurable
-                      -- grace through this predicate AND the error enricher
-                      -- in that case (they must stay in lockstep).
-                      AND NOT api_key_cap_near_boundary(root.spend_limit_interval)
                       AND EXISTS (
                           SELECT 1 FROM model_tariffs mt
                           WHERE mt.deployed_model_id = cm.id
@@ -1407,19 +1394,6 @@ pub async fn load_targets_from_db(
                       AND root.spend_limit IS NOT NULL
                       AND api_key_cap_window_current(ck.window_started_at, root.spend_limit_interval)
                       AND ck.window_spend >= root.spend_limit
-                      -- Pre-boundary readmission grace: an exhausted windowed
-                      -- cap within 5 minutes of its calendar boundary is
-                      -- treated as already reset, so a fallback tick inside
-                      -- the grace readmits the scope BEFORE midnight instead
-                      -- of up to one tick after (nothing writes at a boundary
-                      -- => no NOTIFY there). Grace is the fixed 300s SQL
-                      -- default of api_key_cap_near_boundary, matching the
-                      -- prod fallback default; if the fallback interval is
-                      -- ever raised above it, pre-boundary readmission
-                      -- degrades to post-boundary — plumb one configurable
-                      -- grace through this predicate AND the error enricher
-                      -- in that case (they must stay in lockstep).
-                      AND NOT api_key_cap_near_boundary(root.spend_limit_interval)
                       AND EXISTS (
                           SELECT 1 FROM model_tariffs mt
                           WHERE mt.deployed_model_id = dm.id
