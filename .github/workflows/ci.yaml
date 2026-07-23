@@ -438,8 +438,8 @@ jobs:
               return
             }
             await github.rest.repos.createDispatchEvent({
-              owner: '${{ secrets.PREVIEW_DISPATCH_OWNER }}',
-              repo: '${{ secrets.PREVIEW_DISPATCH_REPOSITORY }}',
+              owner: '${{ secrets.DEPLOY_TARGET_OWNER }}',
+              repo: '${{ secrets.DEPLOY_TARGET_REPO }}',
               event_type: 'preview-artifact-published',
               client_payload: {
                 repository: context.repo.owner + '/' + context.repo.repo,
