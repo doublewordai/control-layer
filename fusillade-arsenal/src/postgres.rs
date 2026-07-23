@@ -123,6 +123,22 @@ impl Default for BatchInsertStrategy {
     }
 }
 
+/// Private control-flow signal for a terminal statement whose MVCC snapshot
+/// saw an in-flight child but whose row lock subsequently observed a committed
+/// cancellation. The statement intentionally declines to update without the
+/// parent lock; `persist_attempt` consumes this signal and reruns the same
+/// already-prepared terminal outcome.
+#[derive(Debug)]
+struct ParentLockSnapshotRace;
+
+impl std::fmt::Display for ParentLockSnapshotRace {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("terminal persistence must reacquire the parent lock")
+    }
+}
+
+impl std::error::Error for ParentLockSnapshotRace {}
+
 pub struct PostgresRequestManager<P: PoolProvider> {
     pools: P,
     config: PostgresStorageConfig,
@@ -3350,7 +3366,8 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         // mistake a concurrent clone's transition for its own.
         let processing_admission_id = Uuid::new_v4();
 
-        for sql_attempt in 0..MAX_ATTEMPTS {
+        let mut infrastructure_failures = 0u32;
+        loop {
             let terminal_request_data = Self::terminal_request_data(&request).cloned();
             let request = request.clone();
             let result: Result<bool> = async {
@@ -3713,8 +3730,8 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                             Self::classify_attempt_sqlx_error("persist_attempt", error)
                         })?;
                         if row.reroute {
-                            return Err(FusilladeError::Other(anyhow!(
-                                "Fenced canceled completion raced its parent-lock snapshot"
+                            return Err(FusilladeError::Other(anyhow::Error::new(
+                                ParentLockSnapshotRace,
                             )));
                         }
                         let applied =
@@ -3834,8 +3851,8 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                             Self::classify_attempt_sqlx_error("persist_attempt", error)
                         })?;
                         if row.reroute {
-                            return Err(FusilladeError::Other(anyhow!(
-                                "Fenced canceled failure raced its parent-lock snapshot"
+                            return Err(FusilladeError::Other(anyhow::Error::new(
+                                ParentLockSnapshotRace,
                             )));
                         }
                         let applied =
@@ -3914,27 +3931,36 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                 Err(FusilladeError::RequestNotFound(id)) => {
                     return Err(FusilladeError::RequestNotFound(id));
                 }
-                Err(error @ FusilladeError::AttemptPersistenceInfrastructure { .. })
-                    if sql_attempt < MAX_ATTEMPTS - 1 =>
-                {
+                Err(FusilladeError::Other(error)) if error.is::<ParentLockSnapshotRace>() => {
                     tracing::debug!(
                         %request_id,
                         %attempt_id,
                         transition,
-                        sql_attempt = sql_attempt + 1,
+                        "Terminal persistence snapshot raced cancellation; reacquiring parent lock"
+                    );
+                    tokio::task::yield_now().await;
+                }
+                Err(error @ FusilladeError::AttemptPersistenceInfrastructure { .. }) => {
+                    infrastructure_failures += 1;
+                    if infrastructure_failures >= MAX_ATTEMPTS {
+                        return Err(error);
+                    }
+                    tracing::debug!(
+                        %request_id,
+                        %attempt_id,
+                        transition,
+                        sql_attempt = infrastructure_failures,
                         error = %error,
                         "Failed to persist fenced request transition, retrying"
                     );
                     tokio::time::sleep(std::time::Duration::from_millis(
-                        100 * 2u64.pow(sql_attempt),
+                        100 * 2u64.pow(infrastructure_failures - 1),
                     ))
                     .await;
                 }
                 Err(error) => return Err(error),
             }
         }
-
-        unreachable!("fenced persistence loop returns on every final iteration")
     }
 
     async fn reschedule_for_retry(
@@ -13664,6 +13690,86 @@ mod tests {
 
         let batch = manager.get_batch(batch_id).await.unwrap();
         assert_eq!((batch.canceled_requests, batch.completed_requests), (0, 1));
+    }
+
+    #[sqlx::test]
+    async fn fenced_terminal_retries_when_cancellation_races_child_snapshot(pool: sqlx::PgPool) {
+        let (manager, req) = claim_one_processing(&pool, None).await;
+        let request_id = req.data.id;
+        let attempt_id = req.state.attempt_id;
+
+        // Hold an uncommitted cancellation on the child. The terminal
+        // statement takes its MVCC snapshot while the old processing row is
+        // still visible, then waits for this transaction's child lock. Once
+        // cancellation commits, EvalPlanQual exposes the canceled row but the
+        // statement has not acquired its parent lock, forcing the intentional
+        // reroute path.
+        let mut cancellation = pool.begin().await.unwrap();
+        let canceled = sqlx::query(
+            "UPDATE requests
+             SET state = 'canceled',
+                 canceled_at = NOW(),
+                 daemon_id = NULL,
+                 processing_admission_id = NULL
+             WHERE id = $1
+               AND state = 'processing'",
+        )
+        .bind(*request_id)
+        .execute(&mut *cancellation)
+        .await
+        .unwrap()
+        .rows_affected();
+        assert_eq!(canceled, 1);
+
+        let terminal = tokio::spawn(async move {
+            manager
+                .persist_attempt(&completed_from(&req, "raced result"), attempt_id)
+                .await
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let blocked = sqlx::query_scalar::<_, i64>(
+                    "SELECT COUNT(*)
+                     FROM pg_stat_activity
+                     WHERE datname = current_database()
+                       AND state = 'active'
+                       AND wait_event_type = 'Lock'
+                       AND query LIKE '%WITH snapshot AS MATERIALIZED%'",
+                )
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+                if blocked > 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("terminal write never waited on the cancellation's child lock");
+
+        cancellation.commit().await.unwrap();
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), terminal)
+                .await
+                .expect("terminal write remained blocked")
+                .unwrap()
+                .expect("snapshot reroute must remain internal to persistence"),
+            "the original attempt still owns the canceled row"
+        );
+
+        let stored: (String, Option<String>) =
+            sqlx::query_as("SELECT state, response_body FROM requests WHERE id = $1")
+                .bind(*request_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            stored,
+            ("completed".to_string(), Some("raced result".to_string()))
+        );
     }
 
     #[sqlx::test]
