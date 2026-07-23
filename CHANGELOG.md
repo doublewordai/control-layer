@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.99.0](https://github.com/doublewordai/control-layer/compare/v8.98.0...v8.99.0) (2026-07-23)
+
+
+### Features
+
+* fusillade submission-epoch latency metrics and per-window completion labels ([#1347](https://github.com/doublewordai/control-layer/issues/1347)) ([9ce69d6](https://github.com/doublewordai/control-layer/commit/9ce69d6145d86819a90e34fe848d78cd1f612bda))
+
 ## [8.98.0](https://github.com/doublewordai/control-layer/compare/v8.97.1...v8.98.0) (2026-07-22)
 
 

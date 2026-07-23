@@ -651,6 +651,20 @@ where
                     .get("completion_window")
                     .cloned()
                     .unwrap_or_default();
+
+                // Pickup delay: submission (`created_at`) to first claim — the
+                // queue-wait component of submission-epoch TTFT. Re-claims after
+                // retries are retry mechanics, not pickup, so only the first
+                // attempt records.
+                if request.state.retry_attempt == 0
+                    && let Some(created_at) = crate::http::submission_time(&request.data)
+                {
+                    let delay_ms = (request.state.claimed_at - created_at).num_milliseconds();
+                    if delay_ms >= 0 {
+                        histogram!("fusillade_request_pickup_delay_seconds", "model" => model_clone.clone(), "completion_window" => completion_window.clone())
+                            .record(delay_ms as f64 / 1000.0);
+                    }
+                }
                 let storage = self.storage.clone();
                 let http_client = (*self.http_client).clone();
                 let processor = self.processor.clone();
@@ -755,7 +769,7 @@ where
                                 completed: AtomicU64::new(0),
                                 failed: AtomicU64::new(0),
                             }).completed.fetch_add(1, Ordering::Relaxed);
-                            counter!("fusillade_requests_completed_total", "model" => model_clone.clone(), "status" => "success").increment(1);
+                            counter!("fusillade_requests_completed_total", "model" => model_clone.clone(), "status" => "success", "completion_window" => completion_window.clone()).increment(1);
                             counter!("fusillade_user_requests_completed_total", "user" => user_id.clone(), "status" => "success", "completion_window" => completion_window.clone()).increment(1);
                             histogram!("fusillade_request_duration_seconds", "model" => model_clone.clone(), "status" => "success")
                                 .record(processing_start.elapsed().as_secs_f64());
@@ -767,7 +781,7 @@ where
                             gauge!("fusillade_request_deadline_margin_seconds", "model" => model_clone.clone(), "status" => "success")
                                 .set(seconds_until_deadline);
                             if completed_at > batch_expires_at {
-                                counter!("fusillade_requests_completed_after_sla_total", "model" => model_clone.clone(), "status" => "success").increment(1);
+                                counter!("fusillade_requests_completed_after_sla_total", "model" => model_clone.clone(), "status" => "success", "completion_window" => completion_window.clone()).increment(1);
                                 tracing::warn!(
                                     request_id = %request_id,
                                     batch_id = ?batch_id,
@@ -826,12 +840,12 @@ where
                                             completed: AtomicU64::new(0),
                                             failed: AtomicU64::new(0),
                                         }).failed.fetch_add(1, Ordering::Relaxed);
-                                        counter!("fusillade_requests_completed_total", "model" => model_clone.clone(), "status" => "failed", "reason" => failed.state.reason.metric_label(), "status_code" => failed.state.reason.status_code_label()).increment(1);
+                                        counter!("fusillade_requests_completed_total", "model" => model_clone.clone(), "status" => "failed", "reason" => failed.state.reason.metric_label(), "status_code" => failed.state.reason.status_code_label(), "completion_window" => completion_window.clone()).increment(1);
                                         counter!("fusillade_user_requests_completed_total", "user" => user_id.clone(), "status" => "failed", "completion_window" => completion_window.clone()).increment(1);
                                         histogram!("fusillade_request_duration_seconds", "model" => model_clone.clone(), "status" => "failed")
                                             .record(processing_start.elapsed().as_secs_f64());
                                         if failed.state.failed_at > batch_expires_at {
-                                            counter!("fusillade_requests_completed_after_sla_total", "model" => model_clone.clone(), "status" => "failed").increment(1);
+                                            counter!("fusillade_requests_completed_after_sla_total", "model" => model_clone.clone(), "status" => "failed", "completion_window" => completion_window.clone()).increment(1);
                                             tracing::warn!(
                                                 request_id = %request_id,
                                                 batch_id = ?batch_id,
@@ -854,12 +868,12 @@ where
                                     completed: AtomicU64::new(0),
                                     failed: AtomicU64::new(0),
                                 }).failed.fetch_add(1, Ordering::Relaxed);
-                                counter!("fusillade_requests_completed_total", "model" => model_clone.clone(), "status" => "failed", "reason" => failed.state.reason.metric_label(), "status_code" => failed.state.reason.status_code_label()).increment(1);
+                                counter!("fusillade_requests_completed_total", "model" => model_clone.clone(), "status" => "failed", "reason" => failed.state.reason.metric_label(), "status_code" => failed.state.reason.status_code_label(), "completion_window" => completion_window.clone()).increment(1);
                                 counter!("fusillade_user_requests_completed_total", "user" => user_id.clone(), "status" => "failed", "completion_window" => completion_window.clone()).increment(1);
                                 histogram!("fusillade_request_duration_seconds", "model" => model_clone.clone(), "status" => "failed")
                                     .record(processing_start.elapsed().as_secs_f64());
                                 if failed.state.failed_at > batch_expires_at {
-                                    counter!("fusillade_requests_completed_after_sla_total", "model" => model_clone.clone(), "status" => "failed").increment(1);
+                                    counter!("fusillade_requests_completed_after_sla_total", "model" => model_clone.clone(), "status" => "failed", "completion_window" => completion_window.clone()).increment(1);
                                     tracing::warn!(
                                         request_id = %request_id,
                                         batch_id = ?batch_id,
@@ -882,7 +896,7 @@ where
                             // Keep the pre-split counter shape alive so existing
                             // dashboards/alerts on completed_total{status="cancelled"}
                             // don't silently break (deprecation window).
-                            counter!("fusillade_requests_completed_total", "model" => model_clone.clone(), "status" => "cancelled").increment(1);
+                            counter!("fusillade_requests_completed_total", "model" => model_clone.clone(), "status" => "cancelled", "completion_window" => completion_window.clone()).increment(1);
                             counter!("fusillade_user_requests_completed_total", "user" => user_id.clone(), "status" => "cancelled", "completion_window" => completion_window.clone()).increment(1);
                             Ok(())
                         }
