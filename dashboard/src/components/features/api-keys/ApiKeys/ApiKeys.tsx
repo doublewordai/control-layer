@@ -124,7 +124,7 @@ export const ApiKeys: React.FC = () => {
             ? null
             : Number(newKeyRequestsPerSecond),
         burst_size: newKeyBurstSize === "" ? null : Number(newKeyBurstSize),
-        spend_limit: newKeyCapAmount.trim() === "" ? null : newKeyCapAmount,
+        spend_limit: newKeyCapAmount.trim() === "" ? null : newKeyCapAmount.trim(),
         spend_limit_interval:
           newKeyCapAmount.trim() === "" || newKeyCapInterval === "none"
             ? null
@@ -151,7 +151,7 @@ export const ApiKeys: React.FC = () => {
       await updateApiKeyMutation.mutateAsync({
         keyId: editModal.id,
         data: {
-          spend_limit: editCapAmount.trim() === "" ? null : editCapAmount,
+          spend_limit: editCapAmount.trim() === "" ? null : editCapAmount.trim(),
           spend_limit_interval:
             editCapAmount.trim() === "" || editCapInterval === "none"
               ? null

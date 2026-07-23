@@ -477,7 +477,7 @@ export interface ApiKey {
   last_used?: string; // ISO 8601 timestamp
   requests_per_second?: number | null; // Rate limiting: requests per second
   burst_size?: number | null; // Rate limiting: burst capacity
-  created_by?: string; // UUID of the user who created the key
+  created_by: string; // UUID of the user who created the key (always present in API responses)
   spend_limit?: string | null; // Spending cap in credits (decimal string); null = no cap
   spend_limit_interval?: SpendLimitInterval | null; // null = one-off cap
   spend?: string | null; // Spend counted against the cap in the current window (decimal string; null when uncapped)

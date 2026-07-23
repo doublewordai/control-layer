@@ -17,27 +17,31 @@
     "name": "Batch Processing - Production",
     "description": "Production batch job submissions",
     "created_at": "2025-05-15T09:15:00Z",
-    "last_used": "2026-02-17T22:30:00Z"
+    "last_used": "2026-02-17T22:30:00Z",
+    "created_by": "550e8400-e29b-41d4-a716-446655440001"
   },
   {
     "id": "key-3",
     "name": "Partner Integration - ClientCorp",
     "description": "API access for ClientCorp partner integration",
     "created_at": "2025-06-01T14:00:00Z",
-    "last_used": "2026-02-16T18:45:00Z"
+    "last_used": "2026-02-16T18:45:00Z",
+    "created_by": "550e8400-e29b-41d4-a716-446655440001"
   },
   {
     "id": "key-4",
     "name": "Development - Local",
     "description": "Local development and testing",
     "created_at": "2025-03-10T11:30:00Z",
-    "last_used": "2026-02-14T10:20:00Z"
+    "last_used": "2026-02-14T10:20:00Z",
+    "created_by": "550e8400-e29b-41d4-a716-446655440001"
   },
   {
     "id": "key-5",
     "name": "Monitoring & Health Checks",
     "description": "Automated endpoint health monitoring",
     "created_at": "2025-08-20T08:00:00Z",
-    "last_used": "2026-02-18T07:00:00Z"
+    "last_used": "2026-02-18T07:00:00Z",
+    "created_by": "550e8400-e29b-41d4-a716-446655440001"
   }
 ]

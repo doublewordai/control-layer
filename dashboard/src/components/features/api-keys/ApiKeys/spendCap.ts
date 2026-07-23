@@ -1,4 +1,5 @@
 import type { SpendLimitInterval } from "../../../../api/control-layer/types";
+import { formatDollars } from "../../../../utils/money";
 
 // Spending-cap display helpers.
 //
@@ -12,10 +13,11 @@ import type { SpendLimitInterval } from "../../../../api/control-layer/types";
 export function formatCredits(value: string | null | undefined): string {
   if (value === null || value === undefined || value === "") return "—";
   const n = Number(value);
-  if (Number.isNaN(n)) return "—";
-  // Show cents; extend precision for sub-cent amounts so tiny spend is visible.
-  const decimals = n !== 0 && Math.abs(n) < 0.01 ? 4 : 2;
-  return `$${n.toFixed(decimals)}`;
+  if (!Number.isFinite(n)) return "—";
+  // Shared money formatter (locale/grouping-consistent); extend precision for
+  // sub-cent amounts so tiny spend is visible rather than rounding to $0.00.
+  const maxDecimalPlaces = n !== 0 && Math.abs(n) < 0.01 ? 4 : 2;
+  return formatDollars(n, maxDecimalPlaces);
 }
 
 /**
@@ -56,7 +58,9 @@ export function formatResetInstant(date: Date | string): string {
   const time = d.toLocaleTimeString("en-US", {
     hour: "2-digit",
     minute: "2-digit",
-    hour12: false,
+    // h23 pins midnight to "00:00" — bare hour12:false can render "24:00"
+    // in some Intl implementations.
+    hourCycle: "h23",
     timeZone: "UTC",
   });
   return `${day}, ${time} UTC`;
