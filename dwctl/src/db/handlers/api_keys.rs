@@ -359,7 +359,7 @@ impl<'c> ApiKeys<'c> {
 
         // Use INSERT ... ON CONFLICT DO NOTHING to avoid firing the api_keys_notify
         // AFTER UPDATE trigger on the common "key already exists" path.
-        let inserted_secret = sqlx::query_scalar::<_, String>(
+        let inserted_secret = sqlx::query_scalar!(
             r#"
             INSERT INTO api_keys (name, description, secret, purpose, user_id, created_by, hidden)
             VALUES ($1, $2, $3, $4, $5, $6, true)
@@ -367,13 +367,13 @@ impl<'c> ApiKeys<'c> {
             DO NOTHING
             RETURNING secret
             "#,
+            name,
+            description,
+            secret,
+            purpose_str,
+            user_id,
+            created_by
         )
-        .bind(name)
-        .bind(description)
-        .bind(secret)
-        .bind(purpose_str)
-        .bind(user_id)
-        .bind(created_by)
         .fetch_optional(&mut *self.db)
         .await?;
 
@@ -384,7 +384,7 @@ impl<'c> ApiKeys<'c> {
         // A conflicting insert can commit after this method's INSERT statement
         // took its snapshot. A separate statement is required for the loser to
         // see and return that committed row.
-        let existing_secret = sqlx::query_scalar::<_, String>(
+        let existing_secret = sqlx::query_scalar!(
             r#"
             SELECT secret
             FROM api_keys
@@ -396,10 +396,10 @@ impl<'c> ApiKeys<'c> {
               AND parent_api_key_id IS NULL
             LIMIT 1
             "#,
+            user_id,
+            created_by,
+            purpose_str
         )
-        .bind(user_id)
-        .bind(created_by)
-        .bind(purpose_str)
         .fetch_optional(&mut *self.db)
         .await?
         .ok_or(DbError::NotFound)?;

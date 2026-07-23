@@ -86,6 +86,24 @@ pub struct FlexBatchKeyResolver {
 
 type ResolverLocks = DashMap<(Uuid, Uuid), Arc<Mutex<()>>>;
 
+struct ResolverLockLease {
+    locks: Arc<ResolverLocks>,
+    key: (Uuid, Uuid),
+    lock: Arc<Mutex<()>>,
+}
+
+impl Drop for ResolverLockLease {
+    fn drop(&mut self) {
+        // `locks` and this lease are the only expected strong references once
+        // the mutex guard has been dropped and no caller is queued. Holding the
+        // DashMap shard lock while checking and removing closes the race with a
+        // new caller cloning the same entry.
+        let _ = self.locks.remove_if(&self.key, |_, candidate| {
+            Arc::ptr_eq(candidate, &self.lock) && Arc::strong_count(candidate) == 2
+        });
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CachedFlexResolution {
     /// Execution key visible in the metadata snapshot when this result was
@@ -124,7 +142,12 @@ impl FlexBatchKeyResolver {
 
         let lock_key = (metadata.owner_id, metadata.created_by);
         let lock = self.locks.entry(lock_key).or_insert_with(|| Arc::new(Mutex::new(()))).clone();
-        let _guard = lock.lock().await;
+        let lease = ResolverLockLease {
+            locks: self.locks.clone(),
+            key: lock_key,
+            lock,
+        };
+        let _guard = lease.lock.lock().await;
 
         let Some(metadata) = self.cache.get(presented_secret) else {
             return Ok(None);
@@ -1028,6 +1051,10 @@ mod tests {
         .await
         .expect("count hidden batch keys");
         assert_eq!(hidden_key_count, 1);
+        assert!(
+            resolver.locks.is_empty(),
+            "completed cold resolutions must release their per-identity lock entry"
+        );
     }
 
     #[sqlx::test]
