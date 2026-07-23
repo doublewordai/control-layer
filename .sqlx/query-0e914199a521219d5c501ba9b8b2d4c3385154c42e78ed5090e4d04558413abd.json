@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                    INSERT INTO api_key_spend_checkpoints (api_key_id, total_spend, window_spend)\n                    SELECT i.api_key_id, i.delta, i.delta\n                    FROM UNNEST($1::uuid[], $2::numeric[]) AS i(api_key_id, delta)\n                    ON CONFLICT (api_key_id) DO UPDATE SET\n                        total_spend = api_key_spend_checkpoints.total_spend + EXCLUDED.total_spend,\n                        window_spend = api_key_spend_checkpoints.window_spend + EXCLUDED.window_spend,\n                        updated_at = NOW()\n                    RETURNING api_key_id, window_spend AS \"window_spend!\"\n                    ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "api_key_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "window_spend!",
+        "type_info": "Numeric"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "UuidArray",
+        "NumericArray"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "0e914199a521219d5c501ba9b8b2d4c3385154c42e78ed5090e4d04558413abd"
+}

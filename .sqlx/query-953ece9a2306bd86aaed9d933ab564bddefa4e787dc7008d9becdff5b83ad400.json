@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT ak.secret, ak.user_id, ak.id as api_key_id, ak.purpose\n            FROM api_keys ak\n            WHERE ak.secret = ANY($1) AND ak.is_deleted = false\n            ",
+  "query": "\n            SELECT ak.secret, ak.user_id, ak.id as api_key_id, ak.purpose,\n                   CASE WHEN root.spend_limit IS NOT NULL THEN root.id END AS cap_scope_root\n            FROM api_keys ak\n            JOIN api_keys root ON root.id = COALESCE(ak.parent_api_key_id, ak.id)\n            WHERE ak.secret = ANY($1) AND ak.is_deleted = false\n            ",
   "describe": {
     "columns": [
       {
@@ -22,6 +22,11 @@
         "ordinal": 3,
         "name": "purpose",
         "type_info": "Varchar"
+      },
+      {
+        "ordinal": 4,
+        "name": "cap_scope_root",
+        "type_info": "Uuid"
       }
     ],
     "parameters": {
@@ -33,8 +38,9 @@
       false,
       false,
       false,
-      false
+      false,
+      null
     ]
   },
-  "hash": "2ab155fb70d93389330f5331a457491afaf18b84dd2d613e78c918abb427dd3e"
+  "hash": "953ece9a2306bd86aaed9d933ab564bddefa4e787dc7008d9becdff5b83ad400"
 }

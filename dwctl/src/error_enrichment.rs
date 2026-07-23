@@ -55,6 +55,9 @@ struct ChatRequest {
 /// - 403 Forbidden errors (likely insufficient credits) → enriched with balance
 /// - 403 Forbidden errors (likely model access denied) → enriched with model name
 /// - 403 Forbidden errors (likely modality blocked by routing rule) → enriched with modality + model
+/// - 403 Forbidden errors (spending cap exhausted) → rewritten to 402 with cap details
+/// - 403 Forbidden errors (cap window rolled, reinstatement pending) → retriable 429
+///   plus a demand-driven config resync so the retry succeeds within seconds
 #[instrument(name = "dwctl.error_enrichment", skip_all, fields(http.request.method = %request.method(), url.path = %request.uri().path(), url.query = request.uri().query().unwrap_or("")))]
 pub async fn error_enrichment_middleware(State(pool): State<PgPool>, request: Request<Body>, next: Next) -> Response<Body> {
     // Extract API key from request headers before passing to onwards
@@ -106,8 +109,13 @@ pub async fn error_enrichment_middleware(State(pool): State<PgPool>, request: Re
         //      the model at all, so report it first.
         //   2. Modality (traffic routing rule) — user has the model but their key
         //      kind (batch/realtime/playground) is denied.
-        //   3. Insufficient balance — onwards excludes keys with balance ≤ 0; this
-        //      is the catch-all if neither of the above explains the 403.
+        //   3. Insufficient balance — onwards excludes keys with balance ≤ 0.
+        //      Balance deliberately supersedes the spending cap below: if both
+        //      are blown, the account-level condition is the fundamental,
+        //      actionable one.
+        //   4. Spending cap — onwards excludes every key of a cap scope whose
+        //      window spend reached the limit; only reported when balance is
+        //      healthy.
 
         // 0. Non-inference key: explain why an otherwise-valid key was rejected,
         //    rather than leaving onwards' generic "forbidden" body.
@@ -165,9 +173,164 @@ pub async fn error_enrichment_middleware(State(pool): State<PgPool>, request: Re
             }
             .into_response();
         }
+
+        // 4. Spending cap. Read-only against the same checkpoint state and
+        //    window function the sync eligibility predicate uses. The
+        //    window-currency check keeps this arm honest during the small
+        //    post-boundary lag: a key whose window has rolled but which the
+        //    periodic fallback sync hasn't readmitted yet is never reported
+        //    as "cap exceeded".
+        if let Ok(Some(cap)) = get_spend_cap_state(pool.clone(), &key).await
+            && cap.window_spend >= cap.limit
+        {
+            if cap.window_current {
+                let resets = match cap.resets_at {
+                    Some(at) => format!("; resets {}", at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
+                    None => String::new(),
+                };
+                let body = serde_json::json!({
+                    "error": {
+                        "message": format!(
+                            "API key has reached its spending cap of ${} (spent ${} this period{resets}). Raise or remove the cap to resume.",
+                            cap.limit.round_dp(2),
+                            cap.window_spend.round_dp(2),
+                        ),
+                        "type": "insufficient_quota",
+                        "code": "spend_cap_exceeded",
+                        "param": null
+                    }
+                });
+                return Response::builder()
+                    .status(StatusCode::PAYMENT_REQUIRED)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap_or_else(|_| StatusCode::PAYMENT_REQUIRED.into_response());
+            }
+
+            // The window has ROLLED but the sync hasn't readmitted the scope
+            // yet. Fire a demand-driven resync so the NEXT request — and
+            // every other drained capped key whose window rolled at the same
+            // boundary — finds its key back in onwards within ~seconds
+            // (throttled per pod so a degraded/slow reload can't be amplified
+            // into a resync storm by a burst of 403s; if the notify is
+            // throttled or lost, the periodic fallback sync readmits within
+            // one interval anyway).
+            maybe_fire_boundary_resync(&pool).await;
+
+            // And tell the triggering request the truth: its cap has reset
+            // and the key is being reinstated. 429 deliberately, because it
+            // is retriable everywhere it matters — fusillade's daemon retries
+            // 429s (so a batch spanning the boundary loses nothing, the
+            // request just lands after readmission) and client SDKs back off
+            // and retry automatically. The short Retry-After reflects the
+            // notify-driven readmission (~seconds), not the fallback backstop.
+            // Deliberately not a 5xx — that would page the proxy-errors
+            // alert for a benign, self-healing race.
+            let body = serde_json::json!({
+                "error": {
+                    "message": "Spending cap window has reset; the key is being reinstated. Retry shortly.",
+                    "type": "rate_limit_error",
+                    "code": "spend_cap_reset_pending",
+                    "param": null
+                }
+            });
+            return Response::builder()
+                .status(StatusCode::TOO_MANY_REQUESTS)
+                .header("content-type", "application/json")
+                .header("retry-after", "5")
+                .body(Body::from(body.to_string()))
+                .unwrap_or_else(|_| StatusCode::TOO_MANY_REQUESTS.into_response());
+        }
     }
 
     response
+}
+
+/// Per-pod throttle for the demand-driven boundary resync: at most one NOTIFY
+/// per minute. One fire readmits every rolled scope at once (full config
+/// reload), so the throttle only bites in the pathological case — reloads slow
+/// or failing while capped traffic keeps 403ing — which is exactly when extra
+/// reload pressure must be avoided.
+static LAST_BOUNDARY_RESYNC_EPOCH_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+const BOUNDARY_RESYNC_MIN_INTERVAL_SECS: u64 = 60;
+
+#[cfg(test)]
+pub(crate) fn reset_boundary_resync_throttle_for_tests() {
+    LAST_BOUNDARY_RESYNC_EPOCH_SECS.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+async fn maybe_fire_boundary_resync(pool: &PgPool) {
+    use std::sync::atomic::Ordering;
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let last = LAST_BOUNDARY_RESYNC_EPOCH_SECS.load(Ordering::Relaxed);
+    if now.saturating_sub(last) < BOUNDARY_RESYNC_MIN_INTERVAL_SECS {
+        return;
+    }
+    // Single winner per throttle window per pod; losers of the race skip.
+    if LAST_BOUNDARY_RESYNC_EPOCH_SECS
+        .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+        .is_err()
+    {
+        return;
+    }
+
+    let epoch_micros = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros();
+    let payload = format!("api_key_spend_cap_boundary:{epoch_micros}");
+    // Best-effort: on failure the fallback sync readmits within the interval.
+    if let Err(e) = sqlx::query("SELECT pg_notify($1, $2)")
+        .bind(crate::config::ONWARDS_CONFIG_CHANGED_CHANNEL)
+        .bind(&payload)
+        .execute(pool)
+        .await
+    {
+        debug!(error = %e, "boundary resync notify failed (best-effort; fallback sync will readmit)");
+    }
+}
+
+/// Spending-cap state for the cap scope of the key with this secret (the key
+/// itself, or its capped parent when the secret belongs to a cap-scope child).
+/// `None` when the key is unknown or its scope has no cap set.
+struct SpendCapState {
+    limit: Decimal,
+    window_spend: Decimal,
+    /// Whether `window_started_at` falls in the current calendar window (UTC).
+    /// False for an exhausted-but-rolled window = reinstatement pending.
+    window_current: bool,
+    /// Next calendar boundary for windowed caps; `None` for one-off caps.
+    resets_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+#[instrument(skip_all, name = "dwctl.get_spend_cap_state")]
+async fn get_spend_cap_state(pool: PgPool, api_key: &str) -> Result<Option<SpendCapState>, DbError> {
+    let row = sqlx::query!(
+        r#"
+        SELECT root.spend_limit AS "spend_limit!",
+               COALESCE(ck.window_spend, 0) AS "window_spend!",
+               api_key_cap_window_current(ck.window_started_at, root.spend_limit_interval) AS "window_current!",
+               api_key_cap_window_resets_at(root.spend_limit_interval) AS resets_at
+        FROM api_keys ak
+        JOIN api_keys root ON root.id = COALESCE(ak.parent_api_key_id, ak.id)
+        LEFT JOIN api_key_spend_checkpoints ck ON ck.api_key_id = root.id
+        WHERE ak.secret = $1 AND ak.is_deleted = false AND root.spend_limit IS NOT NULL
+        "#,
+        api_key
+    )
+    .fetch_optional(&pool)
+    .await?;
+
+    Ok(row.map(|r| SpendCapState {
+        limit: r.spend_limit,
+        window_spend: r.window_spend,
+        window_current: r.window_current,
+        resets_at: r.resets_at,
+    }))
 }
 
 /// Render an `api_keys.purpose` value as a user-facing modality label.
@@ -542,6 +705,212 @@ mod tests {
         let body = response.text();
         println!("Enriched response body: {}", body);
         assert!(body.contains("balance too low"));
+    }
+
+    /// Integration test: the spend-cap enrichment arms. Covers the 402
+    /// `spend_cap_exceeded` envelope, the balance-supersedes-cap ordering,
+    /// and the rolled-window fallthrough (no false "cap exceeded" during the
+    /// post-boundary readmission lag).
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_error_enrichment_spend_cap_arms(pool: PgPool) {
+        use crate::db::handlers::api_keys::ApiKeys as ApiKeysRepo;
+        use crate::test::utils::{add_deployment_to_group, add_user_to_group, create_test_group};
+
+        // User with model access (so the model-access arm falls through) and
+        // healthy balance (so the balance arm falls through).
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        let endpoint_id = crate::test::utils::create_test_endpoint(&pool, "cap-endpoint", user.id).await;
+        let deployment_id = crate::test::utils::create_test_model(&pool, "cap-model-name", "cap-model", endpoint_id, user.id).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+        add_deployment_to_group(&pool, deployment_id, group.id, user.id).await;
+
+        let mut conn = pool.acquire().await.unwrap();
+        let mut api_keys_repo = ApiKeysRepo::new(&mut conn);
+        let api_key = api_keys_repo
+            .create(&ApiKeyCreateDBRequest {
+                user_id: user.id,
+                name: "Capped Key".to_string(),
+                description: None,
+                purpose: ApiKeyPurpose::Realtime,
+                requests_per_second: None,
+                burst_size: None,
+                created_by: user.id,
+            })
+            .await
+            .unwrap();
+        drop(conn);
+
+        let mut credits_conn = pool.acquire().await.unwrap();
+        let mut credits_repo = Credits::new(&mut credits_conn);
+        credits_repo
+            .create_transaction(&CreditTransactionCreateDBRequest {
+                user_id: user.id,
+                transaction_type: CreditTransactionType::AdminGrant,
+                amount: Decimal::new(5000, 2),
+                source_id: uuid::Uuid::new_v4().to_string(),
+                description: Some("Initial credits".to_string()),
+                fusillade_batch_id: None,
+                api_key_id: None,
+            })
+            .await
+            .unwrap();
+        drop(credits_conn);
+
+        // Cap the key at $10 (one-off) with an exhausted window.
+        sqlx::query("UPDATE api_keys SET spend_limit = 10 WHERE id = $1")
+            .bind(api_key.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO api_key_spend_checkpoints (api_key_id, total_spend, window_spend) VALUES ($1, 10.5, 10.5)")
+            .bind(api_key.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let router = axum::Router::new()
+            .route(
+                "/ai/v1/chat/completions",
+                axum::routing::post(|| async {
+                    axum::response::Response::builder()
+                        .status(StatusCode::FORBIDDEN)
+                        .body(axum::body::Body::from("Forbidden"))
+                        .unwrap()
+                }),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                pool.clone(),
+                crate::error_enrichment::error_enrichment_middleware,
+            ));
+        let server = axum_test::TestServer::new(router).expect("Failed to create test server");
+        let request = || {
+            server
+                .post("/ai/v1/chat/completions")
+                .add_header("authorization", &format!("Bearer {}", api_key.secret))
+                .json(&serde_json::json!({
+                    "model": "cap-model",
+                    "messages": [{"role": "user", "content": "Hello"}]
+                }))
+        };
+
+        // 1. Healthy balance + exhausted cap → explicit 402 spend_cap_exceeded.
+        let response = request().await;
+        assert_eq!(response.status_code().as_u16(), 402);
+        let body = response.text();
+        assert!(body.contains("spend_cap_exceeded"), "expected cap code, got: {body}");
+        assert!(body.contains("insufficient_quota"), "expected OpenAI quota type, got: {body}");
+        assert!(body.contains("spending cap of $10"), "expected cap amount, got: {body}");
+
+        // 2. Ordering: balance supersedes the cap. Blow the balance too — the
+        //    user must see the balance error, not the cap error.
+        let mut credits_conn = pool.acquire().await.unwrap();
+        let mut credits_repo = Credits::new(&mut credits_conn);
+        credits_repo
+            .create_transaction(&CreditTransactionCreateDBRequest {
+                user_id: user.id,
+                transaction_type: CreditTransactionType::Usage,
+                amount: Decimal::new(10000, 2),
+                source_id: uuid::Uuid::new_v4().to_string(),
+                description: Some("Usage".to_string()),
+                fusillade_batch_id: None,
+                api_key_id: None,
+            })
+            .await
+            .unwrap();
+        drop(credits_conn);
+        let response = request().await;
+        assert_eq!(response.status_code().as_u16(), 402);
+        let body = response.text();
+        assert!(body.contains("balance too low"), "balance must supersede the cap, got: {body}");
+        assert!(!body.contains("spend_cap_exceeded"), "cap error must not surface, got: {body}");
+
+        // 3. Post-boundary lag: restore the balance, make the cap windowed
+        //    with a rolled-over (stale) window — exhausted counter, expired
+        //    window. Until the sync readmits the key, requests still 403 at
+        //    onwards; the enricher must NOT claim the cap is exceeded (the
+        //    window has reset), must return the retriable 429 reset-pending
+        //    response, and must fire the demand-driven boundary resync NOTIFY
+        //    so the retry finds the key readmitted.
+        let mut credits_conn = pool.acquire().await.unwrap();
+        let mut credits_repo = Credits::new(&mut credits_conn);
+        credits_repo
+            .create_transaction(&CreditTransactionCreateDBRequest {
+                user_id: user.id,
+                transaction_type: CreditTransactionType::AdminGrant,
+                amount: Decimal::new(20000, 2),
+                source_id: uuid::Uuid::new_v4().to_string(),
+                description: Some("Top-up".to_string()),
+                fusillade_batch_id: None,
+                api_key_id: None,
+            })
+            .await
+            .unwrap();
+        drop(credits_conn);
+        sqlx::query("UPDATE api_keys SET spend_limit_interval = 'daily' WHERE id = $1")
+            .bind(api_key.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE api_key_spend_checkpoints SET window_started_at = now() - interval '2 days' WHERE api_key_id = $1")
+            .bind(api_key.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // Listener on the config channel to observe the boundary resync
+        // notify (throttle reset so a parallel test can't have consumed it).
+        crate::error_enrichment::reset_boundary_resync_throttle_for_tests();
+        let mut listener = sqlx::postgres::PgListener::connect_with(&pool).await.unwrap();
+        listener.listen(crate::config::ONWARDS_CONFIG_CHANGED_CHANNEL).await.unwrap();
+        while tokio::time::timeout(std::time::Duration::from_millis(10), listener.try_recv())
+            .await
+            .is_ok()
+        {}
+
+        let response = request().await;
+        assert_eq!(
+            response.status_code().as_u16(),
+            429,
+            "rolled window returns the retriable reset-pending response"
+        );
+        assert_eq!(
+            response.headers().get("retry-after").and_then(|v| v.to_str().ok()),
+            Some("5"),
+            "reset-pending must carry the short notify-driven Retry-After"
+        );
+        let body = response.text();
+        assert!(body.contains("spend_cap_reset_pending"), "expected reset-pending code, got: {body}");
+        assert!(
+            !body.contains("spend_cap_exceeded"),
+            "must not claim an exceeded cap after the window rolled, got: {body}"
+        );
+
+        let notification = tokio::time::timeout(std::time::Duration::from_secs(2), listener.recv())
+            .await
+            .expect("timeout waiting for boundary resync notification")
+            .expect("failed to receive notification");
+        assert!(
+            notification.payload().starts_with("api_key_spend_cap_boundary:"),
+            "expected boundary resync payload, got: {}",
+            notification.payload()
+        );
+
+        // Throttled: an immediate second failing request gets the same 429
+        // but does not re-notify.
+        let response = request().await;
+        assert_eq!(response.status_code().as_u16(), 429);
+        while let Ok(Ok(n)) = tokio::time::timeout(std::time::Duration::from_millis(500), listener.try_recv()).await {
+            if let Some(n) = n {
+                assert!(
+                    !n.payload().starts_with("api_key_spend_cap_boundary:"),
+                    "second request within the throttle window must not re-notify"
+                );
+            } else {
+                break;
+            }
+        }
     }
 
     /// Integration test: Error enrichment middleware passes through 403 when user has access
