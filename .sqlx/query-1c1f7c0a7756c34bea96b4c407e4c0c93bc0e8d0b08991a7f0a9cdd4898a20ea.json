@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO api_key_spend_checkpoints (api_key_id, total_spend, window_spend, window_started_at)\n            VALUES ($1, 0, 0, NOW())\n            ON CONFLICT (api_key_id) DO UPDATE SET\n                window_spend = 0,\n                window_started_at = NOW(),\n                updated_at = NOW()\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "1c1f7c0a7756c34bea96b4c407e4c0c93bc0e8d0b08991a7f0a9cdd4898a20ea"
+}

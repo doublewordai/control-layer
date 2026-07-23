@@ -6,7 +6,7 @@ use crate::crypto::generate_api_key;
 use crate::db::errors::DbError;
 use crate::db::errors::Result;
 use crate::db::handlers::repository::Repository;
-use crate::db::models::api_keys::{ApiKeyCreateDBRequest, ApiKeyDBResponse, ApiKeyPurpose, ApiKeyUpdateDBRequest};
+use crate::db::models::api_keys::{ApiKeyCreateDBRequest, ApiKeyDBResponse, ApiKeyPurpose, ApiKeySpendState, ApiKeyUpdateDBRequest};
 use crate::types::{ApiKeyId, DeploymentId, UserId, abbrev_uuid};
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
@@ -127,8 +127,8 @@ impl<'c> Repository for ApiKeys<'c> {
         let api_key = sqlx::query_as!(
             ApiKey,
             r#"
-            INSERT INTO api_keys (name, description, secret, purpose, user_id, created_by, requests_per_second, burst_size, hidden)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, false)
+            INSERT INTO api_keys (name, description, secret, purpose, user_id, created_by, requests_per_second, burst_size, hidden, spend_limit, spend_limit_interval)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, false, $9, $10)
             RETURNING *
             "#,
             request.name,
@@ -138,7 +138,9 @@ impl<'c> Repository for ApiKeys<'c> {
             request.user_id,
             request.created_by,
             request.requests_per_second,
-            request.burst_size
+            request.burst_size,
+            request.spend_limit,
+            request.spend_limit_interval
         )
         .fetch_one(&mut *self.db)
         .await?;
@@ -553,6 +555,138 @@ impl<'c> ApiKeys<'c> {
             .await
     }
 
+    /// Set, change, or clear a key's spending cap. Writes BOTH cap columns
+    /// unconditionally — the caller resolves absent-vs-null tri-state against
+    /// current values first — so removal actually works (unlike the CASE
+    /// pattern in the generic `update`, which cannot write NULL). The
+    /// api_keys notify trigger (migration 122) covers these columns, so the
+    /// onwards sync picks the change up automatically.
+    ///
+    /// This method does NOT reset the spend window or mint the cap-scope
+    /// child; those are the cap-set path's responsibility (see
+    /// `reset_spend_window` / `get_or_create_child_hidden_key` and the
+    /// contract on `EnrichedRecord::cap_scope_root` in the batcher).
+    #[instrument(skip(self), fields(api_key_id = %abbrev_uuid(&id)), err)]
+    pub async fn update_spend_cap(
+        &mut self,
+        id: ApiKeyId,
+        spend_limit: Option<Decimal>,
+        spend_limit_interval: Option<String>,
+    ) -> Result<()> {
+        let result = sqlx::query!(
+            r#"
+            UPDATE api_keys SET spend_limit = $2, spend_limit_interval = $3
+            WHERE id = $1 AND is_deleted = false
+            "#,
+            id,
+            spend_limit,
+            spend_limit_interval
+        )
+        .execute(&mut *self.db)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            return Err(DbError::NotFound);
+        }
+        Ok(())
+    }
+
+    /// Reset a cap scope's spend window: zero `window_spend` and start a fresh
+    /// window now (lifetime `total_spend` is preserved). Upserts so the
+    /// checkpoint row exists from cap-set time onward — REQUIRED whenever a
+    /// cap transitions from unset to set (else the scope inherits spend
+    /// accumulated before/between caps and can exhaust immediately), on
+    /// interval changes, and for the explicit owner "re-arm" action.
+    #[instrument(skip(self), fields(api_key_id = %abbrev_uuid(&scope_root_id)), err)]
+    pub async fn reset_spend_window(&mut self, scope_root_id: ApiKeyId) -> Result<()> {
+        sqlx::query!(
+            r#"
+            INSERT INTO api_key_spend_checkpoints (api_key_id, total_spend, window_spend, window_started_at)
+            VALUES ($1, 0, 0, NOW())
+            ON CONFLICT (api_key_id) DO UPDATE SET
+                window_spend = 0,
+                window_started_at = NOW(),
+                updated_at = NOW()
+            "#,
+            scope_root_id
+        )
+        .execute(&mut *self.db)
+        .await?;
+        Ok(())
+    }
+
+    /// Bulk spend display state for visible keys (each is its own cap-scope
+    /// root; children never appear in listings). `spend` is the CURRENT
+    /// window's counted spend — 0 when the calendar window has rolled but no
+    /// request has folded yet, NULL when the key has never folded (uncapped
+    /// keys are not folded at all).
+    #[instrument(skip(self, ids), fields(count = ids.len()), err)]
+    pub async fn get_spend_states(&mut self, ids: &[ApiKeyId]) -> Result<HashMap<ApiKeyId, ApiKeySpendState>> {
+        if ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let rows = sqlx::query!(
+            r#"
+            SELECT ak.id,
+                   CASE WHEN ck.api_key_id IS NULL THEN NULL
+                        WHEN api_key_cap_window_current(ck.window_started_at, ak.spend_limit_interval)
+                        THEN ck.window_spend ELSE 0 END AS spend,
+                   ck.total_spend AS "total_spend?",
+                   CASE WHEN ak.spend_limit IS NOT NULL
+                        THEN api_key_cap_window_resets_at(ak.spend_limit_interval) END AS resets_at
+            FROM api_keys ak
+            LEFT JOIN api_key_spend_checkpoints ck ON ck.api_key_id = ak.id
+            WHERE ak.id = ANY($1)
+            "#,
+            ids
+        )
+        .fetch_all(&mut *self.db)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                (
+                    r.id,
+                    ApiKeySpendState {
+                        spend: r.spend,
+                        total_spend: r.total_spend,
+                        resets_at: r.resets_at,
+                    },
+                )
+            })
+            .collect())
+    }
+
+    /// Whether the cap scope this key belongs to (root or child alike) is
+    /// currently exhausted — the same predicate the onwards sync uses to yank
+    /// keys, minus the per-model free-tariff arm. Used by admission checks
+    /// (batch creation pre-flight) to reject work that would only fail
+    /// request-by-request at the proxy.
+    #[instrument(skip(self), fields(api_key_id = %abbrev_uuid(&api_key_id)), err)]
+    pub async fn is_scope_exhausted(&mut self, api_key_id: ApiKeyId) -> Result<bool> {
+        let exhausted = sqlx::query_scalar!(
+            r#"
+            SELECT EXISTS(
+                SELECT 1
+                FROM api_keys ak
+                JOIN api_keys root ON root.id = COALESCE(ak.parent_api_key_id, ak.id)
+                LEFT JOIN api_key_spend_checkpoints ck ON ck.api_key_id = root.id
+                WHERE ak.id = $1
+                  AND root.spend_limit IS NOT NULL
+                  AND api_key_cap_window_current(ck.window_started_at, root.spend_limit_interval)
+                  AND ck.window_spend >= root.spend_limit
+            ) AS "exhausted!"
+            "#,
+            api_key_id
+        )
+        .fetch_one(&mut *self.db)
+        .await?;
+
+        Ok(exhausted)
+    }
+
     /// Find ALL hidden API key IDs for a given user, purpose, and creator.
     /// Returns empty if no matching key exists (member hasn't created any batches/files yet).
     ///
@@ -965,6 +1099,8 @@ mod tests {
                     requests_per_second: None,
                     burst_size: None,
                     created_by: userid,
+                    spend_limit: None,
+                    spend_limit_interval: None,
                 };
 
                 api_key = api_repo.create(&api_key_create).await.unwrap();
@@ -1006,6 +1142,8 @@ mod tests {
                 requests_per_second: None,
                 burst_size: None,
                 created_by,
+                spend_limit: None,
+                spend_limit_interval: None,
             })
             .await
             .unwrap()
@@ -1164,6 +1302,8 @@ mod tests {
                 requests_per_second: None,
                 burst_size: None,
                 created_by: user.id,
+                spend_limit: None,
+                spend_limit_interval: None,
             };
             let key2 = ApiKeyCreateDBRequest {
                 user_id: user.id,
@@ -1173,6 +1313,8 @@ mod tests {
                 requests_per_second: None,
                 burst_size: None,
                 created_by: user.id,
+                spend_limit: None,
+                spend_limit_interval: None,
             };
 
             api_repo.create(&key1).await.unwrap();
@@ -1229,6 +1371,8 @@ mod tests {
                 requests_per_second: None,
                 burst_size: None,
                 created_by: user.id,
+                spend_limit: None,
+                spend_limit_interval: None,
             };
             api_key = api_repo.create(&api_key_create).await.unwrap();
         }
@@ -1273,6 +1417,8 @@ mod tests {
                 requests_per_second: None,
                 burst_size: None,
                 created_by: user.id,
+                spend_limit: None,
+                spend_limit_interval: None,
             };
 
             // Test create via Repository trait
@@ -1398,6 +1544,8 @@ mod tests {
                 requests_per_second: None,
                 burst_size: None,
                 created_by: user.id,
+                spend_limit: None,
+                spend_limit_interval: None,
             };
             api_key = api_key_repo.create(&api_key_create).await.unwrap();
         }
@@ -1529,6 +1677,8 @@ mod tests {
                 requests_per_second: None,
                 burst_size: None,
                 created_by: user.id,
+                spend_limit: None,
+                spend_limit_interval: None,
             };
             api_key = api_key_repo.create(&api_key_create).await.unwrap();
         }
@@ -1674,6 +1824,8 @@ mod tests {
                 requests_per_second: None,
                 burst_size: None,
                 created_by: user.id,
+                spend_limit: None,
+                spend_limit_interval: None,
             };
             api_key = api_key_repo.create(&api_key_create).await.unwrap();
         }
@@ -1845,6 +1997,8 @@ mod tests {
                 requests_per_second: None,
                 burst_size: None,
                 created_by: user1.id,
+                spend_limit: None,
+                spend_limit_interval: None,
             };
             api_key1 = api_key_repo.create(&api_key1_create).await.unwrap();
 
@@ -1856,6 +2010,8 @@ mod tests {
                 requests_per_second: None,
                 burst_size: None,
                 created_by: user2.id,
+                spend_limit: None,
+                spend_limit_interval: None,
             };
             api_key2 = api_key_repo.create(&api_key2_create).await.unwrap();
         }
@@ -2031,6 +2187,8 @@ mod tests {
                 requests_per_second: None,
                 burst_size: None,
                 created_by: user.id,
+                spend_limit: None,
+                spend_limit_interval: None,
             };
             api_key = api_key_repo.create(&api_key_create).await.unwrap();
         }
@@ -2174,6 +2332,8 @@ mod tests {
                 requests_per_second: None,
                 burst_size: None,
                 created_by: user.id,
+                spend_limit: None,
+                spend_limit_interval: None,
             };
             api_key = api_key_repo.create(&api_key_create).await.unwrap();
         }
@@ -2388,6 +2548,8 @@ mod tests {
                 requests_per_second: None,
                 burst_size: None,
                 created_by: user.id,
+                spend_limit: None,
+                spend_limit_interval: None,
             };
             api_key = api_key_repo.create(&api_key_create).await.unwrap();
         }
@@ -2473,6 +2635,8 @@ mod tests {
                     requests_per_second: None,
                     burst_size: None,
                     created_by: user.id,
+                    spend_limit: None,
+                    spend_limit_interval: None,
                 };
                 api_repo.create(&key_create).await.unwrap();
             }
@@ -2606,6 +2770,8 @@ mod tests {
                 requests_per_second: None,
                 burst_size: None,
                 created_by: user1.id,
+                spend_limit: None,
+                spend_limit_interval: None,
             };
             let key2 = ApiKeyCreateDBRequest {
                 user_id: user2.id,
@@ -2615,6 +2781,8 @@ mod tests {
                 requests_per_second: None,
                 burst_size: None,
                 created_by: user2.id,
+                spend_limit: None,
+                spend_limit_interval: None,
             };
 
             api_repo.create(&key1).await.unwrap();
@@ -2681,6 +2849,8 @@ mod tests {
             requests_per_second: None,
             burst_size: None,
             created_by: user.id,
+            spend_limit: None,
+            spend_limit_interval: None,
         };
         let key2_create = ApiKeyCreateDBRequest {
             user_id: user.id,
@@ -2690,6 +2860,8 @@ mod tests {
             requests_per_second: None,
             burst_size: None,
             created_by: user.id,
+            spend_limit: None,
+            spend_limit_interval: None,
         };
         let key3_create = ApiKeyCreateDBRequest {
             user_id: user.id,
@@ -2699,6 +2871,8 @@ mod tests {
             requests_per_second: None,
             burst_size: None,
             created_by: user.id,
+            spend_limit: None,
+            spend_limit_interval: None,
         };
 
         let mut api_conn = pool.acquire().await.unwrap();
@@ -2757,6 +2931,8 @@ mod tests {
             requests_per_second: None,
             burst_size: None,
             created_by: user.id,
+            spend_limit: None,
+            spend_limit_interval: None,
         };
 
         let mut api_conn = pool.acquire().await.unwrap();
@@ -2837,6 +3013,8 @@ mod tests {
             requests_per_second: None,
             burst_size: None,
             created_by: user.id,
+            spend_limit: None,
+            spend_limit_interval: None,
         };
         let mut api_conn = pool.acquire().await.unwrap();
         let mut api_repo = ApiKeys::new(&mut api_conn);
@@ -2926,6 +3104,8 @@ mod tests {
             requests_per_second: None,
             burst_size: None,
             created_by: user.id,
+            spend_limit: None,
+            spend_limit_interval: None,
         };
         let key2_create = ApiKeyCreateDBRequest {
             user_id: user.id,
@@ -2935,6 +3115,8 @@ mod tests {
             requests_per_second: None,
             burst_size: None,
             created_by: user.id,
+            spend_limit: None,
+            spend_limit_interval: None,
         };
 
         let mut api_repo = ApiKeys::new(&mut tx);
@@ -2996,6 +3178,8 @@ mod tests {
             requests_per_second: None,
             burst_size: None,
             created_by: user1.id,
+            spend_limit: None,
+            spend_limit_interval: None,
         };
         let key2_create = ApiKeyCreateDBRequest {
             user_id: user2.id,
@@ -3005,6 +3189,8 @@ mod tests {
             requests_per_second: None,
             burst_size: None,
             created_by: user2.id,
+            spend_limit: None,
+            spend_limit_interval: None,
         };
         let mut api_repo = ApiKeys::new(&mut tx);
 
@@ -3250,6 +3436,8 @@ mod tests {
                 burst_size: None,
                 created_by: user_with_credits.id,
                 purpose: ApiKeyPurpose::Realtime,
+                spend_limit: None,
+                spend_limit_interval: None,
             })
             .await
             .unwrap();
@@ -3263,6 +3451,8 @@ mod tests {
                 burst_size: None,
                 created_by: user_without_credits.id,
                 purpose: ApiKeyPurpose::Realtime,
+                spend_limit: None,
+                spend_limit_interval: None,
             })
             .await
             .unwrap();
@@ -3392,6 +3582,8 @@ mod tests {
                     burst_size: None,
                     created_by: platform_manager.id,
                     purpose: ApiKeyPurpose::Realtime,
+                    spend_limit: None,
+                    spend_limit_interval: None,
                 })
                 .await
                 .unwrap();
@@ -3486,6 +3678,8 @@ mod tests {
                     burst_size: None,
                     created_by: user_no_transactions.id,
                     purpose: ApiKeyPurpose::Realtime,
+                    spend_limit: None,
+                    spend_limit_interval: None,
                 })
                 .await
                 .unwrap();
@@ -3549,6 +3743,8 @@ mod tests {
                     burst_size: None,
                     created_by: user_negative.id,
                     purpose: ApiKeyPurpose::Realtime,
+                    spend_limit: None,
+                    spend_limit_interval: None,
                 })
                 .await
                 .unwrap();
@@ -3641,6 +3837,8 @@ mod tests {
                     burst_size: None,
                     created_by: user.id,
                     purpose: ApiKeyPurpose::Realtime,
+                    spend_limit: None,
+                    spend_limit_interval: None,
                 })
                 .await
                 .unwrap();
@@ -3783,6 +3981,8 @@ mod tests {
                 burst_size: None,
                 created_by: user_no_credits.id,
                 purpose: ApiKeyPurpose::Realtime,
+                spend_limit: None,
+                spend_limit_interval: None,
             })
             .await
             .unwrap();
@@ -3920,6 +4120,8 @@ mod tests {
                 burst_size: None,
                 created_by: user_no_credits.id,
                 purpose: ApiKeyPurpose::Realtime,
+                spend_limit: None,
+                spend_limit_interval: None,
             })
             .await
             .unwrap();
@@ -4057,6 +4259,8 @@ mod tests {
                 burst_size: None,
                 created_by: user_no_credits.id,
                 purpose: ApiKeyPurpose::Realtime,
+                spend_limit: None,
+                spend_limit_interval: None,
             })
             .await
             .unwrap();
@@ -4118,6 +4322,8 @@ mod tests {
                 requests_per_second: None,
                 burst_size: None,
                 created_by: user.id,
+                spend_limit: None,
+                spend_limit_interval: None,
             };
 
             api_key = api_repo.create(&api_key_create).await.unwrap();
@@ -4179,6 +4385,8 @@ mod tests {
                     requests_per_second: None,
                     burst_size: None,
                     created_by: user.id,
+                    spend_limit: None,
+                    spend_limit_interval: None,
                 })
                 .await
                 .unwrap();
@@ -4234,6 +4442,8 @@ mod tests {
                     requests_per_second: None,
                     burst_size: None,
                     created_by: user.id,
+                    spend_limit: None,
+                    spend_limit_interval: None,
                 })
                 .await
                 .unwrap();
@@ -4247,6 +4457,8 @@ mod tests {
                     requests_per_second: None,
                     burst_size: None,
                     created_by: user.id,
+                    spend_limit: None,
+                    spend_limit_interval: None,
                 })
                 .await
                 .unwrap();
@@ -4314,6 +4526,8 @@ mod tests {
                 requests_per_second: None,
                 burst_size: None,
                 created_by: member.id,
+                spend_limit: None,
+                spend_limit_interval: None,
             })
             .await
             .unwrap();
@@ -4541,6 +4755,8 @@ mod tests {
                     requests_per_second: None,
                     burst_size: None,
                     created_by: member_a.id,
+                    spend_limit: None,
+                    spend_limit_interval: None,
                 })
                 .await
                 .unwrap();
@@ -4553,6 +4769,8 @@ mod tests {
                     requests_per_second: None,
                     burst_size: None,
                     created_by: member_a.id,
+                    spend_limit: None,
+                    spend_limit_interval: None,
                 })
                 .await
                 .unwrap();
@@ -4566,6 +4784,8 @@ mod tests {
                     requests_per_second: None,
                     burst_size: None,
                     created_by: member_b.id,
+                    spend_limit: None,
+                    spend_limit_interval: None,
                 })
                 .await
                 .unwrap();
@@ -4666,6 +4886,8 @@ mod tests {
                         requests_per_second: None,
                         burst_size: None,
                         created_by: member_a.id,
+                        spend_limit: None,
+                        spend_limit_interval: None,
                     })
                     .await
                     .unwrap();
@@ -4679,6 +4901,8 @@ mod tests {
                     requests_per_second: None,
                     burst_size: None,
                     created_by: member_b.id,
+                    spend_limit: None,
+                    spend_limit_interval: None,
                 })
                 .await
                 .unwrap();

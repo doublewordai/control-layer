@@ -2578,6 +2578,8 @@ mod integration_tests {
                 requests_per_second: None,
                 burst_size: None,
                 created_by: user_id,
+                spend_limit: None,
+                spend_limit_interval: None,
             })
             .await
             .unwrap();

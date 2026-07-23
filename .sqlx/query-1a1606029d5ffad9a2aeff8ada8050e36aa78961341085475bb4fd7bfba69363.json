@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT EXISTS(\n                SELECT 1\n                FROM api_keys ak\n                JOIN api_keys root ON root.id = COALESCE(ak.parent_api_key_id, ak.id)\n                LEFT JOIN api_key_spend_checkpoints ck ON ck.api_key_id = root.id\n                WHERE ak.id = $1\n                  AND root.spend_limit IS NOT NULL\n                  AND api_key_cap_window_current(ck.window_started_at, root.spend_limit_interval)\n                  AND ck.window_spend >= root.spend_limit\n            ) AS \"exhausted!\"\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "exhausted!",
+        "type_info": "Bool"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "1a1606029d5ffad9a2aeff8ada8050e36aa78961341085475bb4fd7bfba69363"
+}

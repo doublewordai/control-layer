@@ -610,6 +610,8 @@ mod tests {
                 requests_per_second: None,
                 burst_size: None,
                 created_by: user.id,
+                spend_limit: None,
+                spend_limit_interval: None,
             })
             .await
             .unwrap();
@@ -737,6 +739,8 @@ mod tests {
                 requests_per_second: None,
                 burst_size: None,
                 created_by: user.id,
+                spend_limit: None,
+                spend_limit_interval: None,
             })
             .await
             .unwrap();
@@ -938,6 +942,8 @@ mod tests {
                 requests_per_second: None,
                 burst_size: None,
                 created_by: user.id,
+                spend_limit: None,
+                spend_limit_interval: None,
             })
             .await
             .unwrap();
@@ -1085,6 +1091,8 @@ mod tests {
                 requests_per_second: None,
                 burst_size: None,
                 created_by: user.id,
+                spend_limit: None,
+                spend_limit_interval: None,
             })
             .await
             .unwrap();
@@ -1178,6 +1186,8 @@ mod tests {
                 requests_per_second: None,
                 burst_size: None,
                 created_by: user.id,
+                spend_limit: None,
+                spend_limit_interval: None,
             })
             .await
             .unwrap();
@@ -1235,6 +1245,8 @@ mod tests {
                 requests_per_second: None,
                 burst_size: None,
                 created_by: user.id,
+                spend_limit: None,
+                spend_limit_interval: None,
             })
             .await
             .unwrap();
@@ -1281,6 +1293,8 @@ mod tests {
                 requests_per_second: None,
                 burst_size: None,
                 created_by: user.id,
+                spend_limit: None,
+                spend_limit_interval: None,
             })
             .await
             .unwrap();
@@ -1326,6 +1340,8 @@ mod tests {
                 requests_per_second: None,
                 burst_size: None,
                 created_by: user.id,
+                spend_limit: None,
+                spend_limit_interval: None,
             })
             .await
             .unwrap();
@@ -1354,6 +1370,8 @@ mod tests {
                 requests_per_second: None,
                 burst_size: None,
                 created_by: uuid::Uuid::nil(),
+                spend_limit: None,
+                spend_limit_interval: None,
             })
             .await
             .unwrap();

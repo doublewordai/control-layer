@@ -60,6 +60,10 @@ pub struct ApiKeyCreateDBRequest {
     pub burst_size: Option<i32>,
     /// The individual user who created this key
     pub created_by: UserId,
+    /// Optional spending cap; see migration 122. Callers that set this must
+    /// also mint the cap-scope child key (handler responsibility).
+    pub spend_limit: Option<Decimal>,
+    pub spend_limit_interval: Option<String>,
 }
 
 impl ApiKeyCreateDBRequest {
@@ -72,6 +76,8 @@ impl ApiKeyCreateDBRequest {
             requests_per_second: create.requests_per_second,
             burst_size: create.burst_size,
             created_by,
+            spend_limit: create.spend_limit,
+            spend_limit_interval: create.spend_limit_interval,
         }
     }
 }
@@ -108,4 +114,19 @@ pub struct ApiKeyDBResponse {
     /// Set only on hidden cap-scope child keys; see migration 122. Spend
     /// accounting/enforcement group by COALESCE(parent_api_key_id, id).
     pub parent_api_key_id: Option<ApiKeyId>,
+}
+
+/// Spend display state for one cap scope (read from `api_key_spend_checkpoints`
+/// plus the migration-123 window helpers). All fields are display-only; the
+/// enforcement predicate lives in the onwards sync query.
+#[derive(Debug, Clone)]
+pub struct ApiKeySpendState {
+    /// Spend counted in the CURRENT calendar window (0 after a rollover that
+    /// hasn't folded yet; None if the scope has never folded).
+    pub spend: Option<Decimal>,
+    /// Lifetime folded spend for the scope (None if never folded).
+    pub total_spend: Option<Decimal>,
+    /// Next calendar boundary for windowed caps; None for one-off caps and
+    /// uncapped keys.
+    pub resets_at: Option<DateTime<Utc>>,
 }

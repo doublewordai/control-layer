@@ -1,0 +1,40 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT ak.id,\n                   CASE WHEN ck.api_key_id IS NULL THEN NULL\n                        WHEN api_key_cap_window_current(ck.window_started_at, ak.spend_limit_interval)\n                        THEN ck.window_spend ELSE 0 END AS spend,\n                   ck.total_spend AS \"total_spend?\",\n                   CASE WHEN ak.spend_limit IS NOT NULL\n                        THEN api_key_cap_window_resets_at(ak.spend_limit_interval) END AS resets_at\n            FROM api_keys ak\n            LEFT JOIN api_key_spend_checkpoints ck ON ck.api_key_id = ak.id\n            WHERE ak.id = ANY($1)\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "spend",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 2,
+        "name": "total_spend?",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 3,
+        "name": "resets_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "UuidArray"
+      ]
+    },
+    "nullable": [
+      false,
+      null,
+      true,
+      null
+    ]
+  },
+  "hash": "cfbcd35a8e6d23bfc2cc849f3b159168b0d1f988dfdd5473202241b09c0890e8"
+}
