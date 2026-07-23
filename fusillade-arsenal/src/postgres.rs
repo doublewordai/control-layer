@@ -37,8 +37,8 @@ use crate::daemon::{
 };
 use crate::error::{FusilladeError, Result};
 use crate::request::{
-    Canceled, CascadeTargetState, Claimed, Completed, CreateFlexInput, CreateRealtimeInput,
-    CreateResponseInput, DaemonId, Failed, FailureReason, LeakStamp, Pending,
+    AttemptId, Canceled, CascadeTargetState, Claimed, Completed, CreateFlexInput,
+    CreateRealtimeInput, CreateResponseInput, DaemonId, Failed, FailureReason, LeakStamp, Pending,
     PersistCompletedRealtimeInput, Processing, Request, RequestData, RequestId, RequestState,
     ServiceTierFilter,
 };
@@ -789,6 +789,10 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
                 Request {
                     state: Claimed {
                         daemon_id,
+                        // Transitional compatibility for Task 3: Task 4 replaces
+                        // this in-memory token with the UUID generated and
+                        // returned by the atomic PostgreSQL claim UPDATE.
+                        attempt_id: AttemptId(Uuid::new_v4()),
                         claimed_at,
                         retry_attempt: row.retry_attempt as u32,
                         batch_expires_at: row.batch_expires_at,
@@ -3019,6 +3023,10 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                         daemon_id: DaemonId(row.daemon_id.ok_or_else(|| {
                             FusilladeError::Other(anyhow!("Missing daemon_id for claimed request"))
                         })?),
+                        // Read-only reconstruction of a legacy/null database
+                        // token. Core authorizing transitions reject this nil
+                        // sentinel; Task 4 projects the stored attempt_id.
+                        attempt_id: AttemptId(Uuid::nil()),
                         claimed_at: row.claimed_at.ok_or_else(|| {
                             FusilladeError::Other(anyhow!("Missing claimed_at for claimed request"))
                         })?,
@@ -3044,6 +3052,8 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                                     "Missing daemon_id for processing request"
                                 ))
                             })?),
+                            // Inspection-only legacy sentinel; never authority.
+                            attempt_id: AttemptId(Uuid::nil()),
                             claimed_at: row.claimed_at.ok_or_else(|| {
                                 FusilladeError::Other(anyhow!(
                                     "Missing claimed_at for processing request"
@@ -5540,6 +5550,9 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                                 "Missing daemon_id for claimed execution"
                             ))
                         })?),
+                        // Read-only legacy/null reconstruction. Task 4 replaces
+                        // this with the projected database token.
+                        attempt_id: AttemptId(Uuid::nil()),
                         claimed_at: row.claimed_at.ok_or_else(|| {
                             FusilladeError::Other(anyhow!(
                                 "Missing claimed_at for claimed execution"
@@ -5562,6 +5575,8 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                                     "Missing daemon_id for processing execution"
                                 ))
                             })?),
+                            // Inspection-only legacy sentinel; never authority.
+                            attempt_id: AttemptId(Uuid::nil()),
                             claimed_at: row.claimed_at.ok_or_else(|| {
                                 FusilladeError::Other(anyhow!(
                                     "Missing claimed_at for processing execution"

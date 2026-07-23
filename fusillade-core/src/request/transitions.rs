@@ -110,8 +110,8 @@ use tracing::Instrument;
 use crate::{FusilladeError, error::Result, manager::Storage};
 
 use super::types::{
-    Canceled, Claimed, Completed, DaemonId, Failed, FailureReason, HttpResponse, Pending,
-    Processing, Request, RequestCompletionResult,
+    AttemptId, Canceled, Claimed, Completed, DaemonId, Failed, FailureReason, HttpResponse,
+    Pending, Processing, Request, RequestCompletionResult, RequestState,
 };
 
 /// Reason for cancelling a request.
@@ -123,16 +123,154 @@ pub enum CancellationReason {
     Shutdown,
 }
 
+fn fresh_attempt_id() -> AttemptId {
+    AttemptId::from(uuid::Uuid::new_v4())
+}
+
+fn validate_attempt_authority(attempt_id: AttemptId) -> Result<()> {
+    if attempt_id.is_nil() {
+        return Err(FusilladeError::ValidationError(
+            "nil attempt ID cannot authorize a state transition".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+async fn persist_owned_transition<S, T>(
+    storage: &S,
+    request: &Request<T>,
+    attempt_id: AttemptId,
+) -> Result<()>
+where
+    S: Storage + ?Sized,
+    T: RequestState + Clone,
+    super::types::AnyRequest: From<Request<T>>,
+{
+    validate_attempt_authority(attempt_id)?;
+    if !storage.persist_attempt(request, attempt_id).await? {
+        return Err(FusilladeError::RequestAttemptLost {
+            id: request.data.id,
+            attempt_id,
+        });
+    }
+    Ok(())
+}
+
+fn prepare_processing_request<Fut>(
+    request: Request<Claimed>,
+    response_fut: Fut,
+) -> (Request<Processing>, oneshot::Sender<()>)
+where
+    Fut: std::future::Future<Output = Result<HttpResponse>> + Send + 'static,
+{
+    let (dispatch_tx, dispatch_rx) = oneshot::channel();
+    let (tx, rx) = tokio::sync::mpsc::channel(1);
+
+    // Spawn now so Processing can own an abort handle, but keep the upstream
+    // future completely unpolled until durable processing admission succeeds.
+    let current_span = tracing::Span::current();
+    let task_handle = tokio::spawn(
+        async move {
+            if dispatch_rx.await.is_err() {
+                return;
+            }
+            tokio::select! {
+                // Dropping Request<Processing> closes the result receiver.
+                // Selecting this branch drops response_fut and propagates
+                // cancellation to the underlying HTTP request.
+                _ = tx.closed() => {}
+                result = response_fut => {
+                    let _ = tx.send(result).await;
+                }
+            }
+        }
+        .instrument(current_span),
+    );
+
+    let processing = Request {
+        data: request.data,
+        state: Processing {
+            daemon_id: request.state.daemon_id,
+            attempt_id: request.state.attempt_id,
+            claimed_at: request.state.claimed_at,
+            started_at: chrono::Utc::now(),
+            retry_attempt: request.state.retry_attempt,
+            batch_expires_at: request.state.batch_expires_at,
+            result_rx: Arc::new(Mutex::new(rx)),
+            abort_handle: task_handle.abort_handle(),
+        },
+    };
+
+    (processing, dispatch_tx)
+}
+
+fn finish_processing_admission(
+    mut request: Request<Processing>,
+    dispatch_tx: oneshot::Sender<()>,
+    attempt_id: AttemptId,
+    persistence: Result<bool>,
+) -> Result<Request<Processing>> {
+    if request.state.attempt_id != attempt_id {
+        request.state.abort_handle.abort();
+        return Err(FusilladeError::ValidationError(
+            "processing request attempt does not match persistence fence".to_string(),
+        ));
+    }
+
+    match persistence {
+        Ok(true) => {
+            // Storage admission may have waited behind a database limiter.
+            // Align in-memory timeout accounting with actual dispatch; the
+            // storage implementation owns the durable post-admission stamp.
+            request.state.started_at = chrono::Utc::now();
+            if dispatch_tx.send(()).is_err() {
+                request.state.abort_handle.abort();
+                return Err(FusilladeError::Other(anyhow::anyhow!(
+                    "HTTP dispatch task terminated before request processing began"
+                )));
+            }
+            Ok(request)
+        }
+        Ok(false) => {
+            request.state.abort_handle.abort();
+            Err(FusilladeError::RequestAttemptLost {
+                id: request.data.id,
+                attempt_id,
+            })
+        }
+        Err(error) => {
+            request.state.abort_handle.abort();
+            Err(error)
+        }
+    }
+}
+
+fn failure_reason_from_http_error(error: FusilladeError) -> FailureReason {
+    match error {
+        FusilladeError::HttpRequestBuilder(error) => FailureReason::RequestBuilderError { error },
+        FusilladeError::HttpClientTimeout(error)
+        | FusilladeError::FirstChunkTimeout(error)
+        | FusilladeError::UploadStallTimeout(error)
+        | FusilladeError::TokensTimeout(error)
+        | FusilladeError::BodyTimeout(error) => FailureReason::Timeout { error },
+        error => FailureReason::NetworkError {
+            error: crate::error::error_serialization::serialize_error(&error.into()),
+        },
+    }
+}
+
 impl Request<Pending> {
     pub async fn claim<S: Storage + ?Sized>(
         self,
         daemon_id: DaemonId,
         storage: &S,
     ) -> Result<Request<Claimed>> {
+        let attempt_id = fresh_attempt_id();
         let request = Request {
             data: self.data,
             state: Claimed {
                 daemon_id,
+                attempt_id,
                 claimed_at: chrono::Utc::now(),
                 retry_attempt: self.state.retry_attempt, // Carry over retry attempt
                 batch_expires_at: self.state.batch_expires_at, // Carry over batch deadline
@@ -140,7 +278,7 @@ impl Request<Pending> {
                 leak: None,
             },
         };
-        storage.persist(&request).await?;
+        persist_owned_transition(storage, &request, attempt_id).await?;
         Ok(request)
     }
 
@@ -158,6 +296,8 @@ impl Request<Pending> {
 
 impl Request<Claimed> {
     pub async fn unclaim<S: Storage + ?Sized>(self, storage: &S) -> Result<Request<Pending>> {
+        let attempt_id = self.state.attempt_id;
+        validate_attempt_authority(attempt_id)?;
         let request = Request {
             data: self.data,
             state: Pending {
@@ -166,18 +306,20 @@ impl Request<Claimed> {
                 batch_expires_at: self.state.batch_expires_at, // Carry over batch deadline
             },
         };
-        storage.persist(&request).await?;
+        persist_owned_transition(storage, &request, attempt_id).await?;
         Ok(request)
     }
 
     pub async fn cancel<S: Storage + ?Sized>(self, storage: &S) -> Result<Request<Canceled>> {
+        let attempt_id = self.state.attempt_id;
+        validate_attempt_authority(attempt_id)?;
         let request = Request {
             data: self.data,
             state: Canceled {
                 canceled_at: chrono::Utc::now(),
             },
         };
-        storage.persist(&request).await?;
+        persist_owned_transition(storage, &request, attempt_id).await?;
         Ok(request)
     }
 
@@ -190,61 +332,11 @@ impl Request<Claimed> {
         S: Storage,
         Fut: std::future::Future<Output = Result<HttpResponse>> + Send + 'static,
     {
-        // Create channels for dispatching and receiving the HTTP result. The
-        // dispatch gate keeps the response future completely unpolled until
-        // the Processing transition is durable.
-        let (dispatch_tx, dispatch_rx) = oneshot::channel();
-        let (tx, rx) = tokio::sync::mpsc::channel(1);
-
-        // Spawn the HTTP request as an async task, propagating the current
-        // span so that the execute span becomes a child of process_request.
-        let current_span = tracing::Span::current();
-        let task_handle = tokio::spawn(
-            async move {
-                if dispatch_rx.await.is_err() {
-                    return;
-                }
-                let result = response_fut.await;
-                let _ = tx.send(result).await; // Ignore send errors (receiver dropped)
-            }
-            .instrument(current_span),
-        );
-
-        let processing_state = Processing {
-            daemon_id: self.state.daemon_id,
-            claimed_at: self.state.claimed_at,
-            started_at: chrono::Utc::now(),
-            retry_attempt: self.state.retry_attempt,
-            batch_expires_at: self.state.batch_expires_at,
-            result_rx: Arc::new(Mutex::new(rx)),
-            abort_handle: task_handle.abort_handle(),
-        };
-
-        let mut request = Request {
-            data: self.data,
-            state: processing_state,
-        };
-
-        // Persist the Processing state so we can cancel it if needed
-        // If persist fails, abort the spawned HTTP task
-        if let Err(e) = storage.persist(&request).await {
-            request.state.abort_handle.abort();
-            return Err(e);
-        }
-
-        // Storage admission may have waited behind the state-write limiter.
-        // Keep in-memory timeout accounting aligned with actual dispatch;
-        // Postgres storage stamps its durable value after acquiring the permit.
-        request.state.started_at = chrono::Utc::now();
-
-        if dispatch_tx.send(()).is_err() {
-            request.state.abort_handle.abort();
-            return Err(FusilladeError::Other(anyhow::anyhow!(
-                "HTTP dispatch task terminated before request processing began"
-            )));
-        }
-
-        Ok(request)
+        let attempt_id = self.state.attempt_id;
+        validate_attempt_authority(attempt_id)?;
+        let (request, dispatch_tx) = prepare_processing_request(self, response_fut);
+        let persistence = storage.persist_attempt(&request, attempt_id).await;
+        finish_processing_admission(request, dispatch_tx, attempt_id, persistence)
     }
 }
 
@@ -352,6 +444,9 @@ impl Request<Processing> {
         F: Fn(&HttpResponse) -> bool,
         Fut: std::future::Future<Output = CancellationReason>,
     {
+        let attempt_id = self.state.attempt_id;
+        validate_attempt_authority(attempt_id)?;
+
         // Await the result from the channel (lock the mutex to access the receiver)
         // We use an enum to track whether we got a result or cancellation so we can
         // drop the mutex guard before calling self.cancel()
@@ -435,7 +530,7 @@ impl Request<Processing> {
                         data: self.data,
                         state: failed_state,
                     };
-                    storage.persist(&request).await?;
+                    persist_owned_transition(storage, &request, attempt_id).await?;
                     Ok(RequestCompletionResult::Failed(request))
                 } else {
                     // HTTP request completed successfully
@@ -451,36 +546,12 @@ impl Request<Processing> {
                         data: self.data,
                         state: completed_state,
                     };
-                    storage.persist(&request).await?;
+                    persist_owned_transition(storage, &request, attempt_id).await?;
                     Ok(RequestCompletionResult::Completed(request))
                 }
             }
             Some(Err(e)) => {
-                let reason = match &e {
-                    FusilladeError::HttpRequestBuilder(error) => {
-                        FailureReason::RequestBuilderError {
-                            error: error.clone(),
-                        }
-                    }
-                    FusilladeError::HttpClientTimeout(error) => FailureReason::Timeout {
-                        error: error.clone(),
-                    },
-                    FusilladeError::FirstChunkTimeout(msg) => {
-                        FailureReason::Timeout { error: msg.clone() }
-                    }
-                    FusilladeError::UploadStallTimeout(msg) => {
-                        FailureReason::Timeout { error: msg.clone() }
-                    }
-                    FusilladeError::TokensTimeout(msg) => {
-                        FailureReason::Timeout { error: msg.clone() }
-                    }
-                    FusilladeError::BodyTimeout(msg) => {
-                        FailureReason::Timeout { error: msg.clone() }
-                    }
-                    _ => FailureReason::NetworkError {
-                        error: crate::error::error_serialization::serialize_error(&e.into()),
-                    },
-                };
+                let reason = failure_reason_from_http_error(e);
 
                 let failed_state = Failed {
                     reason,
@@ -493,6 +564,9 @@ impl Request<Processing> {
                     data: self.data,
                     state: failed_state,
                 };
+                if !request.state.reason.is_retriable() {
+                    persist_owned_transition(storage, &request, attempt_id).await?;
+                }
                 Ok(RequestCompletionResult::Failed(request))
             }
             None => {
@@ -508,7 +582,7 @@ impl Request<Processing> {
                     data: self.data,
                     state: failed_state,
                 };
-                storage.persist(&request).await?;
+                persist_owned_transition(storage, &request, attempt_id).await?;
                 Ok(RequestCompletionResult::Failed(request))
             }
         }
@@ -517,6 +591,8 @@ impl Request<Processing> {
     pub async fn cancel<S: Storage + ?Sized>(self, storage: &S) -> Result<Request<Canceled>> {
         // Abort the in-flight HTTP request
         self.state.abort_handle.abort();
+        let attempt_id = self.state.attempt_id;
+        validate_attempt_authority(attempt_id)?;
 
         let request = Request {
             data: self.data,
@@ -524,7 +600,182 @@ impl Request<Processing> {
                 canceled_at: chrono::Utc::now(),
             },
         };
-        storage.persist(&request).await?;
+        persist_owned_transition(storage, &request, attempt_id).await?;
         Ok(request)
+    }
+}
+
+#[cfg(test)]
+mod attempt_transition_tests {
+    use std::collections::{HashMap, HashSet};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use chrono::Duration;
+    use tokio::time::{sleep, timeout};
+    use uuid::Uuid;
+
+    use super::*;
+    use crate::batch::TemplateId;
+    use crate::request::{AttemptId, RequestData, RequestId};
+
+    fn claimed_request(attempt_id: AttemptId) -> Request<Claimed> {
+        Request {
+            data: RequestData {
+                id: RequestId(Uuid::new_v4()),
+                batch_id: None,
+                template_id: TemplateId(Uuid::new_v4()),
+                custom_id: None,
+                endpoint: "http://example.test".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/chat/completions".to_string(),
+                body: "{}".to_string(),
+                model: "test-model".to_string(),
+                api_key: "test-key".to_string(),
+                created_by: "test-owner".to_string(),
+                batch_metadata: HashMap::new(),
+            },
+            state: Claimed {
+                daemon_id: DaemonId(Uuid::new_v4()),
+                attempt_id,
+                claimed_at: chrono::Utc::now(),
+                retry_attempt: 0,
+                batch_expires_at: chrono::Utc::now() + Duration::hours(1),
+                leak: None,
+            },
+        }
+    }
+
+    #[test]
+    fn fresh_attempt_ids_are_non_nil_and_unique() {
+        let attempts: HashSet<_> = (0..64).map(|_| fresh_attempt_id()).collect();
+
+        assert_eq!(attempts.len(), 64);
+        assert!(attempts.iter().all(|attempt_id| !attempt_id.is_nil()));
+    }
+
+    #[test]
+    fn nil_attempt_cannot_authorize_a_transition() {
+        let error = validate_attempt_authority(AttemptId(Uuid::nil())).unwrap_err();
+
+        assert!(matches!(error, FusilladeError::ValidationError(_)));
+        assert!(error.to_string().contains("nil"));
+    }
+
+    #[tokio::test]
+    async fn lost_processing_admission_never_polls_the_response_future() {
+        let attempt_id = fresh_attempt_id();
+        let polled = Arc::new(AtomicBool::new(false));
+        let response_fut = {
+            let polled = polled.clone();
+            std::future::poll_fn(move |_| {
+                polled.store(true, Ordering::SeqCst);
+                std::task::Poll::<Result<HttpResponse>>::Pending
+            })
+        };
+        let (request, dispatch_tx) =
+            prepare_processing_request(claimed_request(attempt_id), response_fut);
+        let request_id = request.data.id;
+
+        let error =
+            finish_processing_admission(request, dispatch_tx, attempt_id, Ok(false)).unwrap_err();
+
+        assert!(matches!(
+            error,
+            FusilladeError::RequestAttemptLost {
+                id,
+                attempt_id: lost_attempt,
+            } if id == request_id && lost_attempt == attempt_id
+        ));
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !polled.load(Ordering::SeqCst),
+            "ownership loss must not open the dispatch gate"
+        );
+    }
+
+    struct DropFlag(Arc<AtomicBool>);
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn dropping_processing_request_drops_the_response_future() {
+        let attempt_id = fresh_attempt_id();
+        let started = Arc::new(AtomicBool::new(false));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let response_fut = {
+            let started = started.clone();
+            let dropped = dropped.clone();
+            async move {
+                let _drop_flag = DropFlag(dropped);
+                started.store(true, Ordering::SeqCst);
+                std::future::pending::<()>().await;
+                unreachable!()
+            }
+        };
+        let (request, dispatch_tx) =
+            prepare_processing_request(claimed_request(attempt_id), response_fut);
+        let abort_handle = request.state.abort_handle.clone();
+        let processing =
+            finish_processing_admission(request, dispatch_tx, attempt_id, Ok(true)).unwrap();
+
+        timeout(std::time::Duration::from_secs(1), async {
+            while !started.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("response future never started");
+
+        drop(processing);
+
+        let dropped_in_time = timeout(std::time::Duration::from_secs(1), async {
+            while !dropped.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        if dropped_in_time.is_err() {
+            abort_handle.abort();
+        }
+        dropped_in_time.expect("dropping Request<Processing> left the response future running");
+    }
+
+    #[tokio::test]
+    async fn processing_start_is_refreshed_after_durable_admission() {
+        let attempt_id = fresh_attempt_id();
+        let (request, dispatch_tx) = prepare_processing_request(
+            claimed_request(attempt_id),
+            std::future::pending::<Result<HttpResponse>>(),
+        );
+        let before_admission = request.state.started_at;
+        let abort_handle = request.state.abort_handle.clone();
+
+        sleep(std::time::Duration::from_millis(2)).await;
+        let processing =
+            finish_processing_admission(request, dispatch_tx, attempt_id, Ok(true)).unwrap();
+
+        assert!(processing.state.started_at > before_admission);
+        abort_handle.abort();
+    }
+
+    #[test]
+    fn upload_stall_remains_a_retriable_timeout() {
+        let reason = failure_reason_from_http_error(FusilladeError::UploadStallTimeout(
+            "upload stalled".to_string(),
+        ));
+
+        assert_eq!(
+            reason,
+            FailureReason::Timeout {
+                error: "upload stalled".to_string(),
+            }
+        );
+        assert!(reason.is_retriable());
     }
 }

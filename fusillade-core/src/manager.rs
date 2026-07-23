@@ -10,7 +10,7 @@ use crate::batch::{
 use crate::daemon_record::{AnyDaemonRecord, DaemonRecord, DaemonState, DaemonStatus};
 use crate::error::Result;
 use crate::request::{
-    AnyRequest, CascadeTargetState, Claimed, CreateFlexInput, CreateRealtimeInput,
+    AnyRequest, AttemptId, CascadeTargetState, Claimed, CreateFlexInput, CreateRealtimeInput,
     CreateResponseInput, DaemonId, ListRequestsFilter, PersistCompletedRealtimeInput, Request,
     RequestDetail, RequestId, RequestListResult, RequestState, ResolvedResponseDetail,
     ServiceTierFilter,
@@ -733,6 +733,55 @@ pub trait Storage: Send + Sync {
     where
         AnyRequest: From<Request<T>>;
 
+    /// Persist a state transition owned by one exact daemon attempt.
+    ///
+    /// Implementations must compare-and-set on the request's current state and
+    /// `attempt_id`. `Ok(false)` means this attempt lost ownership and its stale
+    /// transition was discarded; this is an expected concurrency outcome.
+    ///
+    /// The default is a temporary compatibility bridge for storage backends
+    /// while attempt-aware persistence is introduced. It validates that the
+    /// token is non-nil but delegates to the unfenced persistence API. Any
+    /// backend used by a daemon must override this before attempt fencing is
+    /// considered active.
+    async fn persist_attempt<T: RequestState + Clone>(
+        &self,
+        request: &Request<T>,
+        attempt_id: AttemptId,
+    ) -> Result<bool>
+    where
+        AnyRequest: From<Request<T>>,
+    {
+        if attempt_id.is_nil() {
+            return Err(crate::error::FusilladeError::ValidationError(
+                "nil attempt ID cannot authorize persistence".to_string(),
+            ));
+        }
+        self.persist(request).await.map(|_| true)
+    }
+
+    /// Recover an errored processor from `claimed` or `processing`.
+    ///
+    /// Implementations must compare both `owner` and `attempt_id`. The default
+    /// keeps source compatibility only; it delegates to the legacy owner-only
+    /// retry hook and must be overridden with a real attempt CAS before use.
+    async fn recover_attempt_for_retry(
+        &self,
+        request_id: RequestId,
+        owner: DaemonId,
+        attempt_id: AttemptId,
+        retry_attempt: u32,
+        not_before: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<bool> {
+        if attempt_id.is_nil() {
+            return Err(crate::error::FusilladeError::ValidationError(
+                "nil attempt ID cannot authorize recovery".to_string(),
+            ));
+        }
+        self.reschedule_for_retry(request_id, owner, retry_attempt, not_before)
+            .await
+    }
+
     /// Reschedule an in-flight request back to `pending` for an automatic retry,
     /// fenced on the worker that currently owns it.
     ///
@@ -758,6 +807,31 @@ pub trait Storage: Send + Sync {
         retry_attempt: u32,
         not_before: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<bool>;
+
+    /// Attempt-aware variant of [`Storage::reschedule_for_retry`].
+    ///
+    /// Implementations must include both `owner` and `attempt_id` in the
+    /// compare-and-set. `Ok(false)` is a normal ownership-loss result.
+    ///
+    /// This default is a temporary compatibility bridge and remains
+    /// owner-only. Production storage must override it before daemon retry code
+    /// starts calling this method.
+    async fn reschedule_attempt_for_retry(
+        &self,
+        request_id: RequestId,
+        owner: DaemonId,
+        attempt_id: AttemptId,
+        retry_attempt: u32,
+        not_before: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<bool> {
+        if attempt_id.is_nil() {
+            return Err(crate::error::FusilladeError::ValidationError(
+                "nil attempt ID cannot authorize retry".to_string(),
+            ));
+        }
+        self.reschedule_for_retry(request_id, owner, retry_attempt, not_before)
+            .await
+    }
 
     /// List individual requests across batches with filtering and pagination.
     ///

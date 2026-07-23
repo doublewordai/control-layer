@@ -2,7 +2,7 @@
 
 use thiserror::Error;
 
-use crate::types::RequestId;
+use crate::types::{AttemptId, RequestId};
 
 /// Result type alias using the fusillade error type.
 pub type Result<T> = std::result::Result<T, FusilladeError>;
@@ -26,6 +26,13 @@ pub enum FusilladeError {
         id: RequestId,
         current_state: String,
         expected: &'static str,
+    },
+
+    /// The in-memory daemon execution no longer owns the persisted request.
+    #[error("Request {id} attempt {attempt_id} lost ownership")]
+    RequestAttemptLost {
+        id: RequestId,
+        attempt_id: AttemptId,
     },
 
     /// Cancelled request

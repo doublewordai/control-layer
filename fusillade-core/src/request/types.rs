@@ -165,6 +165,9 @@ pub struct LeakStamp {
 #[derive(Debug, Clone, Serialize)]
 pub struct Claimed {
     pub daemon_id: DaemonId,
+    /// Unique identity for this claim. A new value is assigned every time the
+    /// request moves from pending to claimed, even when the daemon is unchanged.
+    pub attempt_id: AttemptId,
     pub claimed_at: DateTime<Utc>,
     /// Number of times this request has been attempted (carried over from Pending)
     pub retry_attempt: u32,
@@ -182,6 +185,8 @@ impl RequestState for Claimed {}
 #[derive(Debug, Clone, Serialize)]
 pub struct Processing {
     pub daemon_id: DaemonId,
+    /// The exact claim that owns this in-flight upstream execution.
+    pub attempt_id: AttemptId,
     pub claimed_at: DateTime<Utc>,
     pub started_at: DateTime<Utc>,
     /// Number of times this request has been attempted (carried over from Claimed)
@@ -419,6 +424,36 @@ impl std::ops::Deref for DaemonId {
     }
 }
 
+/// Unique identifier for one daemon execution attempt.
+///
+/// Unlike [`DaemonId`], this changes on every claim and therefore distinguishes
+/// overlapping executions started by the same daemon. A nil value may be used
+/// only when reconstructing legacy database rows for inspection; it must never
+/// authorize a state transition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(transparent)]
+pub struct AttemptId(pub Uuid);
+
+impl std::fmt::Display for AttemptId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl From<Uuid> for AttemptId {
+    fn from(uuid: Uuid) -> Self {
+        Self(uuid)
+    }
+}
+
+impl std::ops::Deref for AttemptId {
+    type Target = Uuid;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
 // ============================================================================
 // Unified Request Representation
 // ============================================================================
@@ -554,6 +589,20 @@ impl From<Request<Failed>> for AnyRequest {
 impl From<Request<Canceled>> for AnyRequest {
     fn from(r: Request<Canceled>) -> Self {
         AnyRequest::Canceled(r)
+    }
+}
+
+#[cfg(test)]
+mod attempt_id_tests {
+    use super::*;
+
+    #[test]
+    fn display_uses_the_full_uuid() {
+        let uuid = Uuid::parse_str("12345678-1234-4567-89ab-1234567890ab").unwrap();
+        let attempt_id = AttemptId::from(uuid);
+
+        assert_eq!(attempt_id.to_string(), uuid.to_string());
+        assert_eq!(*attempt_id, uuid);
     }
 }
 
