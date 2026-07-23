@@ -56,6 +56,8 @@ struct ChatRequest {
 /// - 403 Forbidden errors (likely model access denied) → enriched with model name
 /// - 403 Forbidden errors (likely modality blocked by routing rule) → enriched with modality + model
 /// - 403 Forbidden errors (spending cap exhausted) → rewritten to 402 with cap details
+/// - 403 Forbidden errors (cap window rolled, reinstatement pending) → retriable 429
+///   plus a demand-driven config resync so the retry succeeds within seconds
 #[instrument(name = "dwctl.error_enrichment", skip_all, fields(http.request.method = %request.method(), url.path = %request.uri().path(), url.query = request.uri().query().unwrap_or("")))]
 pub async fn error_enrichment_middleware(State(pool): State<PgPool>, request: Request<Body>, next: Next) -> Response<Body> {
     // Extract API key from request headers before passing to onwards
@@ -205,18 +207,39 @@ pub async fn error_enrichment_middleware(State(pool): State<PgPool>, request: Re
                     .unwrap_or_else(|_| StatusCode::PAYMENT_REQUIRED.into_response());
             }
 
-            // The window has ROLLED but the periodic fallback sync (worst case
-            // one interval, prod 5 min) hasn't readmitted the scope yet. Fire
-            // a demand-driven resync so the NEXT request — and every other
-            // drained capped key whose window rolled at the same boundary —
-            // finds its key back in onwards within ~seconds. This request
-            // itself still falls through to the generic 403: accepted v1
-            // semantics, the first post-boundary request on a drained key
-            // fails and pays for everyone's readmission. Throttled per pod so
-            // a degraded/slow reload can't be amplified into a resync storm
-            // by a burst of 403s; if the notify is throttled or lost, the
-            // fallback sync readmits within the interval anyway.
+            // The window has ROLLED but the sync hasn't readmitted the scope
+            // yet. Fire a demand-driven resync so the NEXT request — and
+            // every other drained capped key whose window rolled at the same
+            // boundary — finds its key back in onwards within ~seconds
+            // (throttled per pod so a degraded/slow reload can't be amplified
+            // into a resync storm by a burst of 403s; if the notify is
+            // throttled or lost, the periodic fallback sync readmits within
+            // one interval anyway).
             maybe_fire_boundary_resync(&pool).await;
+
+            // And tell the triggering request the truth: its cap has reset
+            // and the key is being reinstated. 429 deliberately, because it
+            // is retriable everywhere it matters — fusillade's daemon retries
+            // 429s (so a batch spanning the boundary loses nothing, the
+            // request just lands after readmission) and client SDKs back off
+            // and retry automatically. The short Retry-After reflects the
+            // notify-driven readmission (~seconds), not the fallback backstop.
+            // Deliberately not a 5xx — that would page the proxy-errors
+            // alert for a benign, self-healing race.
+            let body = serde_json::json!({
+                "error": {
+                    "message": "Spending cap window has reset; the key is being reinstated. Retry shortly.",
+                    "type": "rate_limit_error",
+                    "code": "spend_cap_reset_pending",
+                    "param": null
+                }
+            });
+            return Response::builder()
+                .status(StatusCode::TOO_MANY_REQUESTS)
+                .header("content-type", "application/json")
+                .header("retry-after", "5")
+                .body(Body::from(body.to_string()))
+                .unwrap_or_else(|_| StatusCode::TOO_MANY_REQUESTS.into_response());
         }
     }
 
@@ -807,9 +830,9 @@ mod tests {
         //    with a rolled-over (stale) window — exhausted counter, expired
         //    window. Until the sync readmits the key, requests still 403 at
         //    onwards; the enricher must NOT claim the cap is exceeded (the
-        //    window has reset), must fall through to the generic 403, and
-        //    must fire the demand-driven boundary resync NOTIFY so the next
-        //    request finds the key readmitted.
+        //    window has reset), must return the retriable 429 reset-pending
+        //    response, and must fire the demand-driven boundary resync NOTIFY
+        //    so the retry finds the key readmitted.
         let mut credits_conn = pool.acquire().await.unwrap();
         let mut credits_repo = Credits::new(&mut credits_conn);
         credits_repo
@@ -849,10 +872,16 @@ mod tests {
         let response = request().await;
         assert_eq!(
             response.status_code().as_u16(),
-            403,
-            "rolled window falls through to the generic 403"
+            429,
+            "rolled window returns the retriable reset-pending response"
+        );
+        assert_eq!(
+            response.headers().get("retry-after").and_then(|v| v.to_str().ok()),
+            Some("5"),
+            "reset-pending must carry the short notify-driven Retry-After"
         );
         let body = response.text();
+        assert!(body.contains("spend_cap_reset_pending"), "expected reset-pending code, got: {body}");
         assert!(
             !body.contains("spend_cap_exceeded"),
             "must not claim an exceeded cap after the window rolled, got: {body}"
@@ -868,9 +897,10 @@ mod tests {
             notification.payload()
         );
 
-        // Throttled: an immediate second failing request does not re-notify.
+        // Throttled: an immediate second failing request gets the same 429
+        // but does not re-notify.
         let response = request().await;
-        assert_eq!(response.status_code().as_u16(), 403);
+        assert_eq!(response.status_code().as_u16(), 429);
         while let Ok(Ok(n)) = tokio::time::timeout(std::time::Duration::from_millis(500), listener.try_recv()).await {
             if let Some(n) = n {
                 assert!(

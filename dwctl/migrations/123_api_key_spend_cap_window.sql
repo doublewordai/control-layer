@@ -47,12 +47,14 @@ $$;
 -- boundary. Readmission of an exhausted scope whose window rolled comes from
 -- whichever happens first:
 --   * the DEMAND-DRIVEN boundary resync: the first post-boundary request on a
---     drained key 403s, and the error enricher fires the config-changed
---     NOTIFY (throttled per pod) — readmitting EVERY rolled capped scope
---     within seconds (see error_enrichment::maybe_fire_boundary_resync);
+--     drained key hits onwards' 403, and the error enricher both fires the
+--     config-changed NOTIFY (throttled per pod) — readmitting EVERY rolled
+--     capped scope within seconds — and answers that request with a
+--     retriable 429 (spend_cap_reset_pending, Retry-After: 5), so fusillade
+--     and SDK clients simply retry and land after readmission: nothing is
+--     lost (see error_enrichment::maybe_fire_boundary_resync);
 --   * the periodic fallback sync (worst case one interval, prod default
 --     5 minutes) when no traffic arrives to trigger the above.
--- So one sacrificial request at the boundary buys everyone's readmission.
 -- Deliberately NOT a shorter fallback interval (full reloads are expensive)
 -- and NOT pre-boundary readmission grace (spends over the cap and couples
 -- enforcement to fallback timing). A scheduled midnight resync (underway
