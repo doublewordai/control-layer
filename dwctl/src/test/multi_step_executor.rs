@@ -25,7 +25,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use fusillade::ReqwestHttpClient;
-use fusillade_arsenal::{PoolProvider as FusilladePoolProvider, PostgresRequestManager, PostgresResponseStepManager, TestDbPools};
+use fusillade_arsenal::{PoolProvider as FusilladePoolProvider, PostgresRequestManager, TestDbPools};
 use onwards::traits::RequestContext;
 use onwards::{
     ChainStep, LoopConfig, MultiStepStore, NextAction, RecordedStep, StepDescriptor, StepKind, StepState, StoreError, UpstreamTarget,
@@ -207,7 +207,7 @@ async fn store_with_real_fusillade(
 ) {
     let pools = TestDbPools::new(pool).await.unwrap();
     let request_manager = Arc::new(PostgresRequestManager::new(pools.clone(), Default::default()));
-    let step_manager = Arc::new(PostgresResponseStepManager::new(pools));
+    let step_manager = Arc::new(request_manager.response_step_manager());
     let (writer, writer_handle) =
         crate::inference::engine::writer::RequestsWriter::new(request_manager.clone(), 1, std::time::Duration::ZERO);
     (

@@ -19,7 +19,7 @@ use sqlx::QueryBuilder;
 use sqlx::Row;
 use sqlx::postgres::{PgListener, PgPool};
 use std::collections::{HashMap, HashSet};
-use tokio::sync::{Mutex, Semaphore, SemaphorePermit, mpsc};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
 
@@ -126,7 +126,7 @@ impl Default for BatchInsertStrategy {
 pub struct PostgresRequestManager<P: PoolProvider> {
     pools: P,
     config: PostgresStorageConfig,
-    state_write_limiter: StateWriteLimiter,
+    response_admission: ResponseAdmission,
     db_retry_config: crate::DbRetryConfig,
     download_buffer_size: usize,
     batch_insert_strategy: BatchInsertStrategy,
@@ -134,56 +134,188 @@ pub struct PostgresRequestManager<P: PoolProvider> {
     /// error bodies before persistence; `None` is identity. Remove when stream
     /// reassembly moves into dwctl.
     response_transformer: std::sync::OnceLock<Arc<dyn crate::transform::ResponseTransformer>>,
+    #[cfg(test)]
+    admission_release_test_hook: Option<Arc<AdmissionReleaseTestHook>>,
 }
 
-struct StateWriteLimiter {
-    semaphore: Option<Semaphore>,
+#[cfg(test)]
+#[derive(Default)]
+struct AdmissionReleaseTestHook {
+    entered: tokio::sync::Notify,
+    resume: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+impl AdmissionReleaseTestHook {
+    async fn pause(&self) {
+        self.entered.notify_one();
+        self.resume.notified().await;
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum AdmissionClass {
+    Read,
+    Write,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum AdmissionLaneKind {
+    Total,
+    Read,
+    Write,
+}
+
+#[derive(Clone)]
+pub(crate) struct ResponseAdmission(Arc<ResponseAdmissionInner>);
+
+struct ResponseAdmissionInner {
+    total: Arc<AdmissionLane>,
+    reads: Arc<AdmissionLane>,
+    writes: Arc<AdmissionLane>,
+}
+
+struct AdmissionLane {
+    kind: AdmissionLaneKind,
+    #[cfg_attr(not(test), allow(dead_code))]
+    capacity: Option<usize>,
+    semaphore: Option<Arc<Semaphore>>,
     waiting: AtomicUsize,
     in_flight: AtomicUsize,
 }
 
-impl StateWriteLimiter {
-    fn new(limit: usize) -> Self {
-        Self {
-            semaphore: (limit > 0).then(|| Semaphore::new(limit)),
+impl AdmissionLane {
+    fn new(kind: AdmissionLaneKind, capacity: Option<usize>) -> Arc<Self> {
+        Arc::new(Self {
+            kind,
+            capacity,
+            semaphore: capacity.map(|limit| Arc::new(Semaphore::new(limit))),
             waiting: AtomicUsize::new(0),
             in_flight: AtomicUsize::new(0),
+        })
+    }
+
+    fn increment_waiting(&self, operation: &'static str) {
+        match self.kind {
+            AdmissionLaneKind::Total => {
+                metrics::gauge!("fusillade_response_traffic_waiting", "operation" => operation)
+                    .increment(1.0);
+            }
+            AdmissionLaneKind::Read => {
+                metrics::gauge!("fusillade_response_reads_waiting", "operation" => operation)
+                    .increment(1.0);
+            }
+            AdmissionLaneKind::Write => {
+                metrics::gauge!("fusillade_state_writes_waiting", "operation" => operation)
+                    .increment(1.0);
+            }
         }
     }
 
-    async fn acquire(&self, operation: &'static str) -> Result<StateWritePermit<'_>> {
+    fn decrement_waiting(&self, operation: &'static str) {
+        match self.kind {
+            AdmissionLaneKind::Total => {
+                metrics::gauge!("fusillade_response_traffic_waiting", "operation" => operation)
+                    .decrement(1.0);
+            }
+            AdmissionLaneKind::Read => {
+                metrics::gauge!("fusillade_response_reads_waiting", "operation" => operation)
+                    .decrement(1.0);
+            }
+            AdmissionLaneKind::Write => {
+                metrics::gauge!("fusillade_state_writes_waiting", "operation" => operation)
+                    .decrement(1.0);
+            }
+        }
+    }
+
+    fn record_wait(&self, operation: &'static str, elapsed: f64) {
+        match self.kind {
+            AdmissionLaneKind::Total => {
+                metrics::histogram!(
+                    "fusillade_response_traffic_wait_duration_seconds",
+                    "operation" => operation
+                )
+                .record(elapsed);
+            }
+            AdmissionLaneKind::Read => {
+                metrics::histogram!(
+                    "fusillade_response_read_wait_duration_seconds",
+                    "operation" => operation
+                )
+                .record(elapsed);
+            }
+            AdmissionLaneKind::Write => {
+                metrics::histogram!(
+                    "fusillade_state_write_wait_duration_seconds",
+                    "operation" => operation
+                )
+                .record(elapsed);
+            }
+        }
+    }
+
+    fn increment_in_flight(&self, operation: &'static str) {
+        match self.kind {
+            AdmissionLaneKind::Total => {
+                metrics::gauge!("fusillade_response_traffic_in_flight", "operation" => operation)
+                    .increment(1.0);
+            }
+            AdmissionLaneKind::Read => {
+                metrics::gauge!("fusillade_response_reads_in_flight", "operation" => operation)
+                    .increment(1.0);
+            }
+            AdmissionLaneKind::Write => {
+                metrics::gauge!("fusillade_state_writes_in_flight", "operation" => operation)
+                    .increment(1.0);
+            }
+        }
+    }
+
+    fn decrement_in_flight(&self, operation: &'static str) {
+        match self.kind {
+            AdmissionLaneKind::Total => {
+                metrics::gauge!("fusillade_response_traffic_in_flight", "operation" => operation)
+                    .decrement(1.0);
+            }
+            AdmissionLaneKind::Read => {
+                metrics::gauge!("fusillade_response_reads_in_flight", "operation" => operation)
+                    .decrement(1.0);
+            }
+            AdmissionLaneKind::Write => {
+                metrics::gauge!("fusillade_state_writes_in_flight", "operation" => operation)
+                    .decrement(1.0);
+            }
+        }
+    }
+
+    async fn acquire(self: &Arc<Self>, operation: &'static str) -> Result<AdmissionLanePermit> {
         let started = std::time::Instant::now();
         let waiting = self.semaphore.as_ref().map(|_| {
             self.waiting.fetch_add(1, Ordering::Relaxed);
-            metrics::gauge!("fusillade_state_writes_waiting", "operation" => operation)
-                .increment(1.0);
-            StateWriteWaitGuard {
+            self.increment_waiting(operation);
+            AdmissionWaitGuard {
+                lane: self.clone(),
                 operation,
-                waiting: &self.waiting,
             }
         });
 
         let permit = match &self.semaphore {
-            Some(semaphore) => Some(semaphore.acquire().await.map_err(|_| {
-                FusilladeError::Other(anyhow!("state write concurrency limiter closed"))
+            Some(semaphore) => Some(semaphore.clone().acquire_owned().await.map_err(|_| {
+                FusilladeError::Other(anyhow!("response admission semaphore closed"))
             })?),
             None => None,
         };
 
         drop(waiting);
-        metrics::histogram!(
-            "fusillade_state_write_wait_duration_seconds",
-            "operation" => operation
-        )
-        .record(started.elapsed().as_secs_f64());
-        metrics::gauge!("fusillade_state_writes_in_flight", "operation" => operation)
-            .increment(1.0);
+        self.record_wait(operation, started.elapsed().as_secs_f64());
+        self.increment_in_flight(operation);
         self.in_flight.fetch_add(1, Ordering::Relaxed);
 
-        Ok(StateWritePermit {
+        Ok(AdmissionLanePermit {
             _permit: permit,
+            lane: self.clone(),
             operation,
-            in_flight: &self.in_flight,
         })
     }
 
@@ -196,37 +328,120 @@ impl StateWriteLimiter {
     }
 }
 
-struct StateWriteWaitGuard<'a> {
-    operation: &'static str,
-    waiting: &'a AtomicUsize,
-}
+impl ResponseAdmission {
+    pub(crate) fn new(pool_max: usize, config: &PostgresStorageConfig) -> Self {
+        let total_capacity = pool_max.saturating_sub(2).max(1);
+        let write_capacity = (config.max_concurrent_state_writes != 0)
+            .then_some(config.max_concurrent_state_writes.min(total_capacity));
+        let read_capacity = (config.max_concurrent_response_reads != 0)
+            .then_some(config.max_concurrent_response_reads);
 
-impl Drop for StateWriteWaitGuard<'_> {
-    fn drop(&mut self) {
-        self.waiting.fetch_sub(1, Ordering::Relaxed);
-        metrics::gauge!(
-            "fusillade_state_writes_waiting",
-            "operation" => self.operation
+        Self(Arc::new(ResponseAdmissionInner {
+            total: AdmissionLane::new(AdmissionLaneKind::Total, Some(total_capacity)),
+            reads: AdmissionLane::new(AdmissionLaneKind::Read, read_capacity),
+            writes: AdmissionLane::new(AdmissionLaneKind::Write, write_capacity),
+        }))
+    }
+
+    pub(crate) fn read_request(&self, operation: &'static str) -> ResponseAdmissionRequest {
+        ResponseAdmissionRequest {
+            admission: self.clone(),
+            class: AdmissionClass::Read,
+            operation,
+        }
+    }
+
+    pub(crate) fn write_request(&self, operation: &'static str) -> ResponseAdmissionRequest {
+        ResponseAdmissionRequest {
+            admission: self.clone(),
+            class: AdmissionClass::Write,
+            operation,
+        }
+    }
+
+    #[cfg(test)]
+    async fn acquire_read(&self, operation: &'static str) -> Result<ResponseAdmissionPermit> {
+        self.read_request(operation).acquire().await
+    }
+
+    #[cfg(test)]
+    async fn acquire_write(&self, operation: &'static str) -> Result<ResponseAdmissionPermit> {
+        self.write_request(operation).acquire().await
+    }
+
+    #[cfg(test)]
+    fn capacities(&self) -> (usize, Option<usize>, Option<usize>) {
+        let total = self
+            .0
+            .total
+            .capacity
+            .expect("aggregate lane is always enabled");
+        (
+            total,
+            self.0.writes.capacity.map(|capacity| capacity.min(total)),
+            self.0.reads.capacity.map(|capacity| capacity.min(total)),
         )
-        .decrement(1.0);
+    }
+
+    #[cfg(test)]
+    fn counts(&self) -> ((usize, usize), (usize, usize), (usize, usize)) {
+        (
+            self.0.total.counts(),
+            self.0.reads.counts(),
+            self.0.writes.counts(),
+        )
     }
 }
 
-struct StateWritePermit<'a> {
-    _permit: Option<SemaphorePermit<'a>>,
+#[derive(Clone)]
+pub(crate) struct ResponseAdmissionRequest {
+    admission: ResponseAdmission,
+    class: AdmissionClass,
     operation: &'static str,
-    in_flight: &'a AtomicUsize,
 }
 
-impl Drop for StateWritePermit<'_> {
-    fn drop(&mut self) {
-        self.in_flight.fetch_sub(1, Ordering::Relaxed);
-        metrics::gauge!(
-            "fusillade_state_writes_in_flight",
-            "operation" => self.operation
-        )
-        .decrement(1.0);
+impl ResponseAdmissionRequest {
+    pub(crate) async fn acquire(&self) -> Result<ResponseAdmissionPermit> {
+        let total = self.admission.0.total.acquire(self.operation).await?;
+        let class = match self.class {
+            AdmissionClass::Read => self.admission.0.reads.acquire(self.operation).await?,
+            AdmissionClass::Write => self.admission.0.writes.acquire(self.operation).await?,
+        };
+        Ok(ResponseAdmissionPermit {
+            _total: total,
+            _class: class,
+        })
     }
+}
+
+struct AdmissionWaitGuard {
+    lane: Arc<AdmissionLane>,
+    operation: &'static str,
+}
+
+impl Drop for AdmissionWaitGuard {
+    fn drop(&mut self) {
+        self.lane.waiting.fetch_sub(1, Ordering::Relaxed);
+        self.lane.decrement_waiting(self.operation);
+    }
+}
+
+struct AdmissionLanePermit {
+    _permit: Option<OwnedSemaphorePermit>,
+    lane: Arc<AdmissionLane>,
+    operation: &'static str,
+}
+
+impl Drop for AdmissionLanePermit {
+    fn drop(&mut self) {
+        self.lane.in_flight.fetch_sub(1, Ordering::Relaxed);
+        self.lane.decrement_in_flight(self.operation);
+    }
+}
+
+pub(crate) struct ResponseAdmissionPermit {
+    _total: AdmissionLanePermit,
+    _class: AdmissionLanePermit,
 }
 
 struct ClaimedRequestRow {
@@ -320,15 +535,20 @@ macro_rules! batch_status_from_dynamic_row {
 impl<P: PoolProvider> PostgresRequestManager<P> {
     /// Create a new PostgreSQL storage manager.
     pub fn new(pools: P, config: PostgresStorageConfig) -> Self {
-        let state_write_limiter = StateWriteLimiter::new(config.max_concurrent_state_writes);
+        let response_admission = ResponseAdmission::new(
+            pools.write().options().get_max_connections() as usize,
+            &config,
+        );
         Self {
             pools,
             config,
-            state_write_limiter,
+            response_admission,
             db_retry_config: crate::DbRetryConfig::default(),
             download_buffer_size: 100,
             batch_insert_strategy: BatchInsertStrategy::default(),
             response_transformer: std::sync::OnceLock::new(),
+            #[cfg(test)]
+            admission_release_test_hook: None,
         }
     }
 
@@ -354,13 +574,34 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
     ///
     /// This is a builder method that can be chained after `new()`.
     pub fn with_config(mut self, config: PostgresStorageConfig) -> Self {
-        self.state_write_limiter = StateWriteLimiter::new(config.max_concurrent_state_writes);
+        assert_eq!(
+            Arc::strong_count(&self.response_admission.0),
+            1,
+            "response admission configuration is frozen after sharing",
+        );
+        self.response_admission = ResponseAdmission::new(
+            self.pools.write().options().get_max_connections() as usize,
+            &config,
+        );
         self.config = config;
         self
     }
 
+    /// Replace storage configuration before sharing response admission.
+    ///
+    /// Once [`Self::response_step_manager`] has cloned the admission handle,
+    /// replacing only this manager's handle would split the shared budget, so
+    /// reconfiguration is rejected.
     pub fn set_config(&mut self, config: PostgresStorageConfig) {
-        self.state_write_limiter = StateWriteLimiter::new(config.max_concurrent_state_writes);
+        assert_eq!(
+            Arc::strong_count(&self.response_admission.0),
+            1,
+            "response admission configuration is frozen after sharing",
+        );
+        self.response_admission = ResponseAdmission::new(
+            self.pools.write().options().get_max_connections() as usize,
+            &config,
+        );
         self.config = config;
     }
 
@@ -369,11 +610,21 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
     /// The manager retries errors that look like SQLx pool-acquire timeouts,
     /// including "pool timed out while waiting for an open connection".
     pub fn with_db_retry_config(mut self, config: crate::DbRetryConfig) -> Self {
+        assert_eq!(
+            Arc::strong_count(&self.response_admission.0),
+            1,
+            "database retry configuration is frozen after sharing",
+        );
         self.db_retry_config = config;
         self
     }
 
     pub fn set_db_retry_config(&mut self, config: crate::DbRetryConfig) {
+        assert_eq!(
+            Arc::strong_count(&self.response_admission.0),
+            1,
+            "database retry configuration is frozen after sharing",
+        );
         self.db_retry_config = config;
     }
 
@@ -389,6 +640,16 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
         crate::db::RetryingPgPool::new(self.pools.write(), &self.db_retry_config)
     }
 
+    fn admitted_read_executor(&self, operation: &'static str) -> crate::db::RetryingPgPool {
+        self.read_executor()
+            .with_admission(self.response_admission.read_request(operation))
+    }
+
+    fn admitted_write_executor(&self, operation: &'static str) -> crate::db::RetryingPgPool {
+        self.write_executor()
+            .with_admission(self.response_admission.write_request(operation))
+    }
+
     async fn begin_read(
         &self,
     ) -> std::result::Result<sqlx::Transaction<'static, sqlx::Postgres>, sqlx::Error> {
@@ -399,6 +660,39 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
         &self,
     ) -> std::result::Result<sqlx::Transaction<'static, sqlx::Postgres>, sqlx::Error> {
         crate::db::begin_transaction(self.pools.write(), &self.db_retry_config).await
+    }
+
+    async fn begin_admitted_write(
+        &self,
+        operation: &'static str,
+    ) -> std::result::Result<
+        (
+            sqlx::Transaction<'static, sqlx::Postgres>,
+            ResponseAdmissionPermit,
+        ),
+        sqlx::Error,
+    > {
+        crate::db::begin_admitted_transaction(
+            self.pools.write(),
+            &self.db_retry_config,
+            &self.response_admission.write_request(operation),
+        )
+        .await
+    }
+
+    pub fn response_step_manager(&self) -> crate::PostgresResponseStepManager<P> {
+        crate::PostgresResponseStepManager::with_admission(
+            self.pools.clone(),
+            self.db_retry_config.clone(),
+            self.response_admission.clone(),
+        )
+    }
+
+    #[cfg(test)]
+    async fn pause_for_admission_release_test(&self) {
+        if let Some(hook) = &self.admission_release_test_hook {
+            hook.pause().await;
+        }
     }
 
     pub fn config(&self) -> &PostgresStorageConfig {
@@ -649,6 +943,9 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
     /// Do not "fix" a state-conflict here by weakening the arm guards; the
     /// guards and this helper are two halves of the same matrix.
     async fn dropped_or_missing(&self, request_id: RequestId) -> Result<Option<RequestId>> {
+        #[cfg(test)]
+        self.pause_for_admission_release_test().await;
+
         let current: Option<String> =
             sqlx::query_scalar("SELECT state FROM requests WHERE id = $1")
                 .bind(*request_id as Uuid)
@@ -2234,10 +2531,6 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
             tracing::debug!(request_id = %request.data.id, "Persisting request state");
             let any_request = any_request.clone();
 
-            // Limit active database attempts, not retry backoff. A failed write
-            // releases its slot before sleeping and queues fairly for its next
-            // attempt alongside fresh lifecycle transitions.
-            let state_write_permit = self.state_write_limiter.acquire("persist").await?;
             let result: Result<Option<RequestId>> = async {
                 match any_request {
                     AnyRequest::Pending(req) => {
@@ -2263,7 +2556,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                             req.state.retry_attempt as i32,
                             req.state.not_before,
                         )
-                        .execute(self.write_executor())
+                        .execute(self.admitted_write_executor("persist"))
                         .await
                         .map_err(|e| {
                             FusilladeError::Other(anyhow!("Failed to update request: {}", e))
@@ -2292,7 +2585,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                             *req.state.daemon_id as Uuid,
                             req.state.claimed_at,
                         )
-                        .execute(self.write_executor())
+                        .execute(self.admitted_write_executor("persist"))
                         .await
                         .map_err(|e| {
                             FusilladeError::Other(anyhow!("Failed to update request: {}", e))
@@ -2304,12 +2597,13 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                         }
                     }
                     AnyRequest::Processing(req) => {
-                        let mut tx = self.begin_write().await.map_err(|e| {
-                            FusilladeError::Other(anyhow!(
-                                "Failed to begin processing transition: {}",
-                                e
-                            ))
-                        })?;
+                        let (mut tx, admission_permit) =
+                            self.begin_admitted_write("persist").await.map_err(|e| {
+                                FusilladeError::Other(anyhow!(
+                                    "Failed to begin processing transition: {}",
+                                    e
+                                ))
+                            })?;
                         let rows_affected = sqlx::query!(
                             r#"
                             UPDATE requests SET
@@ -2340,6 +2634,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                                     e
                                 ))
                             })?;
+                            drop(admission_permit);
                             return self.dropped_or_missing(req.data.id).await;
                         }
 
@@ -2431,7 +2726,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                             response_size,
                             req.state.routed_model,
                         )
-                        .fetch_optional(self.write_executor())
+                        .fetch_optional(self.admitted_write_executor("persist"))
                         .await
                         .map_err(|e| {
                             FusilladeError::Other(anyhow!("Failed to update request: {}", e))
@@ -2505,7 +2800,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                             response_size,
                             req.state.routed_model,
                         )
-                        .fetch_optional(self.write_executor())
+                        .fetch_optional(self.admitted_write_executor("persist"))
                         .await
                         .map_err(|e| {
                             FusilladeError::Other(anyhow!("Failed to update request: {}", e))
@@ -2535,7 +2830,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                             *req.data.id as Uuid,
                             req.state.canceled_at,
                         )
-                        .execute(self.write_executor())
+                        .execute(self.admitted_write_executor("persist"))
                         .await
                         .map_err(|e| {
                             FusilladeError::Other(anyhow!("Failed to update request: {}", e))
@@ -2551,7 +2846,6 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                 Ok(None)
             }
             .await;
-            drop(state_write_permit);
 
             match result {
                 Ok(val) => return Ok(val),
@@ -2585,8 +2879,6 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         retry_attempt: u32,
         not_before: Option<DateTime<Utc>>,
     ) -> Result<bool> {
-        let _state_write_permit = self.state_write_limiter.acquire("retry").await?;
-
         // Fenced retry: only re-pend the row if it is still the in-flight claim
         // held by `owner`. The `state = 'processing' AND daemon_id = $2` guard is
         // what distinguishes this from the manual retry path (which uses persist()
@@ -2612,7 +2904,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
             retry_attempt as i32,
             not_before,
         )
-        .execute(self.write_executor())
+        .execute(self.admitted_write_executor("retry"))
         .await
         .map_err(|e| {
             FusilladeError::Other(anyhow!("Failed to reschedule request for retry: {}", e))
@@ -4543,8 +4835,8 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         // write of response_steps will FK-violate (the row is gone) and
         // surface that as an error log without corrupting state. Both are
         // acceptable failure modes for an explicit user-initiated erasure.
-        let mut tx = self
-            .begin_write()
+        let (mut tx, admission_permit) = self
+            .begin_admitted_write("response_delete")
             .await
             .map_err(|e| FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e)))?;
 
@@ -4557,6 +4849,15 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to delete request: {}", e)))?;
 
         let Some(template_id) = template_id else {
+            tx.rollback().await.map_err(|e| {
+                FusilladeError::Other(anyhow!(
+                    "Failed to roll back missing request deletion: {}",
+                    e
+                ))
+            })?;
+            drop(admission_permit);
+            #[cfg(test)]
+            self.pause_for_admission_release_test().await;
             return Err(FusilladeError::RequestNotFound(request_id));
         };
 
@@ -5603,7 +5904,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         )
         .bind(response_id.0)
         .bind(owner_id)
-        .fetch_optional(self.read_executor())
+        .fetch_optional(self.admitted_read_executor("response_get"))
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to get owned response detail: {}", e)))?
         .ok_or(FusilladeError::RequestNotFound(response_id))?;
@@ -5717,8 +6018,8 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         let created_bys: Vec<&str> = prepared.iter().map(|row| row.created_by).collect();
         let realtime: Vec<bool> = prepared.iter().map(|row| row.realtime).collect();
 
-        let mut tx = self
-            .begin_write()
+        let (mut tx, _admission_permit) = self
+            .begin_admitted_write("response_create")
             .await
             .map_err(|e| FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e)))?;
 
@@ -5818,7 +6119,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         .bind(status_code as i16)
         .bind(response_body)
         .bind(size)
-        .fetch_optional(self.write_executor())
+        .fetch_optional(self.admitted_write_executor("response_complete"))
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to complete request: {}", e)))?;
 
@@ -5866,7 +6167,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         .bind(request_id.0)
         .bind(&error_json)
         .bind(error_size)
-        .fetch_optional(self.write_executor())
+        .fetch_optional(self.admitted_write_executor("response_fail"))
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to fail request: {}", e)))?;
 
@@ -5889,11 +6190,6 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         if records.is_empty() {
             return Ok(());
         }
-
-        let mut tx = self
-            .begin_write()
-            .await
-            .map_err(|e| FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e)))?;
 
         // Bulk UPDATE for rows that already exist in 'processing' state.
         // These are the background-realtime case: the caller invoked
@@ -5931,6 +6227,11 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
             }))
         };
         let errors: Vec<Option<String>> = records.iter().map(&to_failure_error).collect();
+
+        let (mut tx, _admission_permit) = self
+            .begin_admitted_write("response_realtime_complete_batch")
+            .await
+            .map_err(|e| FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e)))?;
 
         // Scope the UPDATE to realtime rows only: `service_tier = 'priority'`
         // and `batch_id IS NULL` together uniquely identify rows that
@@ -8072,7 +8373,9 @@ mod tests {
         AnyDaemonRecord, DaemonConfig, DaemonData, DaemonRecord, DaemonStats, DaemonStatus, Dead,
         Initializing, Running,
     };
+    use crate::response_step::ResponseStepStore;
     use chrono::Timelike;
+    use sqlx::postgres::PgPoolOptions;
 
     #[derive(Debug, Clone, Default)]
     struct MockHttpClient;
@@ -8083,19 +8386,591 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn zero_state_write_limit_is_unbounded() {
-        let limiter = StateWriteLimiter::new(0);
-        let (first, second, third) = tokio::join!(
-            limiter.acquire("first"),
-            limiter.acquire("second"),
-            limiter.acquire("third")
-        );
-        let permits = (first.unwrap(), second.unwrap(), third.unwrap());
+    #[test]
+    fn state_write_limiter_caps_defaults_to_pool_headroom() {
+        for (pool_max, expected_total, expected_writes, expected_reads) in
+            [(1, 1, 1, 1), (4, 2, 2, 2), (20, 18, 18, 8)]
+        {
+            let admission = ResponseAdmission::new(pool_max, &PostgresStorageConfig::default());
+            assert_eq!(
+                admission.capacities(),
+                (expected_total, Some(expected_writes), Some(expected_reads)),
+                "unexpected capacities for max_connections({pool_max})",
+            );
+        }
+    }
 
-        assert_eq!(limiter.counts(), (0, 3));
-        drop(permits);
-        assert_eq!(limiter.counts(), (0, 0));
+    #[test]
+    fn response_admission_preserves_explicit_class_caps() {
+        let admission = ResponseAdmission::new(
+            20,
+            &PostgresStorageConfig {
+                max_concurrent_state_writes: 3,
+                max_concurrent_response_reads: 5,
+                ..Default::default()
+            },
+        );
+        assert_eq!(admission.capacities(), (18, Some(3), Some(5)));
+    }
+
+    #[tokio::test]
+    async fn response_read_acquires_total_before_class() {
+        let admission = ResponseAdmission::new(
+            4,
+            &PostgresStorageConfig {
+                max_concurrent_response_reads: 1,
+                ..Default::default()
+            },
+        );
+        let first = admission.acquire_read("response_get").await.unwrap();
+
+        let queued_admission = admission.clone();
+        let queued =
+            tokio::spawn(async move { queued_admission.acquire_read("response_get").await });
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if admission.counts() == ((0, 2), (1, 1), (0, 0)) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("second read never held total while waiting for its class");
+
+        drop(first);
+        drop(queued.await.unwrap().unwrap());
+        assert_eq!(admission.counts(), ((0, 0), (0, 0), (0, 0)));
+    }
+
+    #[tokio::test]
+    async fn zero_state_write_limit_disables_only_class_lane() {
+        let admission = ResponseAdmission::new(
+            4,
+            &PostgresStorageConfig {
+                max_concurrent_state_writes: 0,
+                ..Default::default()
+            },
+        );
+        assert_eq!(admission.capacities(), (2, None, Some(2)));
+
+        let first = admission.acquire_write("first").await.unwrap();
+        let second = admission.acquire_write("second").await.unwrap();
+        let queued_admission = admission.clone();
+        let queued = tokio::spawn(async move { queued_admission.acquire_write("third").await });
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let (total, _reads, writes) = admission.counts();
+                if total == (1, 2) && writes == (0, 2) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("aggregate lane did not bound writes with class limiter disabled");
+
+        drop(first);
+        drop(second);
+        drop(queued.await.unwrap().unwrap());
+        assert_eq!(admission.counts(), ((0, 0), (0, 0), (0, 0)));
+    }
+
+    #[tokio::test]
+    async fn zero_response_read_limit_disables_only_class_lane() {
+        let admission = ResponseAdmission::new(
+            4,
+            &PostgresStorageConfig {
+                max_concurrent_response_reads: 0,
+                ..Default::default()
+            },
+        );
+        assert_eq!(admission.capacities(), (2, Some(2), None));
+
+        let first = admission.acquire_read("first").await.unwrap();
+        let second = admission.acquire_read("second").await.unwrap();
+        let queued_admission = admission.clone();
+        let queued = tokio::spawn(async move { queued_admission.acquire_read("third").await });
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let (total, reads, _writes) = admission.counts();
+                if total == (1, 2) && reads == (0, 2) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("aggregate lane did not bound reads with class limiter disabled");
+
+        drop(first);
+        drop(second);
+        drop(queued.await.unwrap().unwrap());
+        assert_eq!(admission.counts(), ((0, 0), (0, 0), (0, 0)));
+    }
+
+    #[tokio::test]
+    async fn canceled_admission_wait_restores_counters_and_owned_permits() {
+        let admission = ResponseAdmission::new(
+            4,
+            &PostgresStorageConfig {
+                max_concurrent_response_reads: 1,
+                ..Default::default()
+            },
+        );
+        let first = admission.acquire_read("first").await.unwrap();
+
+        let class_wait_admission = admission.clone();
+        let class_wait =
+            tokio::spawn(async move { class_wait_admission.acquire_read("class_wait").await });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if admission.counts() == ((0, 2), (1, 1), (0, 0)) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("read never reached its class-lane wait");
+        class_wait.abort();
+        assert!(matches!(
+            class_wait.await,
+            Err(join_error) if join_error.is_cancelled()
+        ));
+        assert_eq!(admission.counts(), ((0, 1), (0, 1), (0, 0)));
+
+        let total_wait_admission = admission.clone();
+        let second_total = total_wait_admission
+            .acquire_write("fill_total")
+            .await
+            .unwrap();
+        let total_wait_admission = admission.clone();
+        let total_wait =
+            tokio::spawn(async move { total_wait_admission.acquire_write("total_wait").await });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if admission.counts() == ((1, 2), (0, 1), (0, 1)) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("write never reached its aggregate-lane wait");
+        total_wait.abort();
+        assert!(matches!(
+            total_wait.await,
+            Err(join_error) if join_error.is_cancelled()
+        ));
+        assert_eq!(admission.counts(), ((0, 2), (0, 1), (0, 1)));
+
+        drop(second_total);
+        drop(first);
+        assert_eq!(admission.counts(), ((0, 0), (0, 0), (0, 0)));
+    }
+
+    #[tokio::test]
+    async fn response_step_factory_shares_admission_identity() {
+        let pool = PgPoolOptions::new()
+            .max_connections(4)
+            .connect_lazy("postgres://postgres:password@localhost/fusillade")
+            .unwrap();
+        let manager = PostgresRequestManager::new(pool, PostgresStorageConfig::default());
+
+        assert_eq!(Arc::strong_count(&manager.response_admission.0), 1);
+        let _step_manager = manager.response_step_manager();
+        assert_eq!(Arc::strong_count(&manager.response_admission.0), 2);
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "response admission configuration is frozen after sharing")]
+    async fn response_configuration_setter_rejects_change_after_factory_sharing() {
+        let pool = PgPoolOptions::new()
+            .max_connections(4)
+            .connect_lazy("postgres://postgres:password@localhost/fusillade")
+            .unwrap();
+        let mut manager = PostgresRequestManager::new(pool, PostgresStorageConfig::default());
+        let _step_manager = manager.response_step_manager();
+
+        manager.set_config(PostgresStorageConfig {
+            max_concurrent_state_writes: 1,
+            ..Default::default()
+        });
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "response admission configuration is frozen after sharing")]
+    async fn response_configuration_builder_rejects_change_after_factory_sharing() {
+        let pool = PgPoolOptions::new()
+            .max_connections(4)
+            .connect_lazy("postgres://postgres:password@localhost/fusillade")
+            .unwrap();
+        let manager = PostgresRequestManager::new(pool, PostgresStorageConfig::default());
+        let _step_manager = manager.response_step_manager();
+        let _manager = manager.with_config(PostgresStorageConfig::default());
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "database retry configuration is frozen after sharing")]
+    async fn response_retry_builder_rejects_change_after_factory_sharing() {
+        let pool = PgPoolOptions::new()
+            .max_connections(4)
+            .connect_lazy("postgres://postgres:password@localhost/fusillade")
+            .unwrap();
+        let manager = PostgresRequestManager::new(pool, PostgresStorageConfig::default());
+        let _step_manager = manager.response_step_manager();
+        let _manager = manager.with_db_retry_config(crate::DbRetryConfig::disabled());
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "database retry configuration is frozen after sharing")]
+    async fn response_retry_setter_rejects_change_after_factory_sharing() {
+        let pool = PgPoolOptions::new()
+            .max_connections(4)
+            .connect_lazy("postgres://postgres:password@localhost/fusillade")
+            .unwrap();
+        let mut manager = PostgresRequestManager::new(pool, PostgresStorageConfig::default());
+        let _step_manager = manager.response_step_manager();
+        manager.set_db_retry_config(crate::DbRetryConfig::disabled());
+    }
+
+    #[sqlx::test]
+    async fn admitted_pool_retry_releases_permit_during_backoff(pool: sqlx::PgPool) {
+        let limited_pool = PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(std::time::Duration::from_millis(50))
+            .connect_with(pool.connect_options().as_ref().clone())
+            .await
+            .unwrap();
+        let manager =
+            PostgresRequestManager::new(limited_pool.clone(), PostgresStorageConfig::default())
+                .with_db_retry_config(crate::DbRetryConfig::fixed(
+                    1,
+                    std::time::Duration::from_secs(1),
+                ));
+        let step_manager = Arc::new(manager.response_step_manager());
+        let held_connection = limited_pool.acquire().await.unwrap();
+
+        let create = {
+            let step_manager = step_manager.clone();
+            tokio::spawn(async move {
+                step_manager
+                    .create_step(crate::response_step::CreateStepInput {
+                        id: Some(Uuid::new_v4()),
+                        request_id: None,
+                        prev_step_id: None,
+                        parent_step_id: None,
+                        step_kind: crate::response_step::StepKind::ToolCall,
+                        step_sequence: 0,
+                        request_payload: serde_json::json!({"test": "admitted retry"}),
+                    })
+                    .await
+            })
+        };
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let (total, _reads, writes) = manager.response_admission.counts();
+                if total.1 == 1 && writes.1 == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("admitted attempt never entered pool acquisition");
+
+        tokio::time::timeout(std::time::Duration::from_millis(500), async {
+            loop {
+                let (total, _reads, writes) = manager.response_admission.counts();
+                if total.1 == 0 && writes.1 == 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("permits remained held during pool retry backoff");
+        assert!(
+            !create.is_finished(),
+            "operation should still be sleeping in backoff"
+        );
+
+        drop(held_connection);
+        let step_id = tokio::time::timeout(std::time::Duration::from_secs(2), create)
+            .await
+            .expect("retry did not complete")
+            .unwrap()
+            .unwrap();
+        assert!(step_manager.get_step(step_id).await.unwrap().is_some());
+    }
+
+    fn response_test_input(request_id: Uuid, owner: &str) -> CreateRealtimeInput {
+        CreateRealtimeInput {
+            request_id,
+            body: "{}".to_string(),
+            model: "test-model".to_string(),
+            endpoint: "http://localhost".to_string(),
+            method: "POST".to_string(),
+            path: "/v1/responses".to_string(),
+            api_key: String::new(),
+            created_by: owner.to_string(),
+        }
+    }
+
+    #[sqlx::test]
+    async fn response_request_and_step_writes_share_pool_headroom(pool: sqlx::PgPool) {
+        let limited_pool = PgPoolOptions::new()
+            .max_connections(4)
+            .connect_with(pool.connect_options().as_ref().clone())
+            .await
+            .unwrap();
+        let manager = Arc::new(PostgresRequestManager::new(
+            limited_pool,
+            PostgresStorageConfig {
+                max_concurrent_state_writes: 2,
+                ..Default::default()
+            },
+        ));
+        let step_manager = Arc::new(manager.response_step_manager());
+
+        let request_ids = [Uuid::new_v4(), Uuid::new_v4()];
+        for request_id in request_ids {
+            manager
+                .create_realtime(response_test_input(request_id, "contention-owner"))
+                .await
+                .unwrap();
+        }
+        let mut step_ids = Vec::new();
+        for sequence in 0..2 {
+            step_ids.push(
+                step_manager
+                    .create_step(crate::response_step::CreateStepInput {
+                        id: Some(Uuid::new_v4()),
+                        request_id: None,
+                        prev_step_id: None,
+                        parent_step_id: None,
+                        step_kind: crate::response_step::StepKind::ToolCall,
+                        step_sequence: sequence,
+                        request_payload: serde_json::json!({}),
+                    })
+                    .await
+                    .unwrap(),
+            );
+        }
+
+        let mut blocker = pool.begin().await.unwrap();
+        sqlx::query("LOCK TABLE requests, response_steps IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *blocker)
+            .await
+            .unwrap();
+
+        let request_write = {
+            let manager = manager.clone();
+            tokio::spawn(async move {
+                manager
+                    .complete_request(RequestId(request_ids[0]), "{}", 200)
+                    .await
+            })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if manager.response_admission.counts().0.1 == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("request write did not enter the shared admission budget");
+
+        let step_write = {
+            let step_manager = step_manager.clone();
+            let step_id = step_ids[0];
+            tokio::spawn(async move { step_manager.mark_step_processing(step_id).await })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let (total, _reads, writes) = manager.response_admission.counts();
+                assert!(total.1 <= 2, "aggregate response writes exceeded headroom");
+                assert!(writes.1 <= 2, "write class exceeded configured limit");
+                if total.1 == 2 && writes.1 == 2 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("request and step writes did not share admission");
+
+        let queued_request = {
+            let manager = manager.clone();
+            tokio::spawn(async move {
+                manager
+                    .fail_request(RequestId(request_ids[1]), "failed", 500)
+                    .await
+            })
+        };
+        let queued_step = {
+            let step_manager = step_manager.clone();
+            let step_id = step_ids[1];
+            tokio::spawn(async move { step_manager.mark_step_processing(step_id).await })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let (total, _reads, writes) = manager.response_admission.counts();
+                assert!(total.1 <= 2, "aggregate response writes exceeded headroom");
+                assert!(writes.1 <= 2, "write class exceeded configured limit");
+                if total.0 >= 2 && total.1 == 2 && writes.1 == 2 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("excess mixed writes did not queue at the aggregate lane");
+
+        blocker.rollback().await.unwrap();
+        for handle in [request_write, queued_request] {
+            tokio::time::timeout(std::time::Duration::from_secs(3), handle)
+                .await
+                .expect("request write did not complete")
+                .unwrap()
+                .unwrap();
+        }
+        for handle in [step_write, queued_step] {
+            tokio::time::timeout(std::time::Duration::from_secs(3), handle)
+                .await
+                .expect("step write did not complete")
+                .unwrap()
+                .unwrap();
+        }
+        assert_eq!(
+            manager.response_admission.counts(),
+            ((0, 0), (0, 0), (0, 0))
+        );
+    }
+
+    #[sqlx::test]
+    async fn response_reads_share_headroom_and_respect_class_limit(pool: sqlx::PgPool) {
+        let limited_pool = PgPoolOptions::new()
+            .max_connections(4)
+            .connect_with(pool.connect_options().as_ref().clone())
+            .await
+            .unwrap();
+        let manager = Arc::new(PostgresRequestManager::new(
+            limited_pool,
+            PostgresStorageConfig {
+                max_concurrent_response_reads: 1,
+                ..Default::default()
+            },
+        ));
+        let owner = "read-contention-owner";
+        let request_ids = [Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
+        for request_id in request_ids {
+            manager
+                .create_realtime(response_test_input(request_id, owner))
+                .await
+                .unwrap();
+        }
+
+        let mut blocker = pool.begin().await.unwrap();
+        sqlx::query("LOCK TABLE requests IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *blocker)
+            .await
+            .unwrap();
+
+        let handles: Vec<_> = request_ids
+            .into_iter()
+            .map(|request_id| {
+                let manager = manager.clone();
+                tokio::spawn(async move {
+                    manager
+                        .get_response_detail_for_owner(RequestId(request_id), owner)
+                        .await
+                })
+            })
+            .collect();
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let (total, reads, _writes) = manager.response_admission.counts();
+                assert!(total.1 <= 2, "response reads exceeded aggregate headroom");
+                assert!(reads.1 <= 1, "response reads exceeded their class limit");
+                if total == (1, 2) && reads == (1, 1) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("response reads did not queue total-before-class");
+
+        blocker.rollback().await.unwrap();
+        for handle in handles {
+            tokio::time::timeout(std::time::Duration::from_secs(3), handle)
+                .await
+                .expect("response read did not complete")
+                .unwrap()
+                .unwrap();
+        }
+        assert_eq!(
+            manager.response_admission.counts(),
+            ((0, 0), (0, 0), (0, 0))
+        );
+    }
+
+    #[sqlx::test]
+    async fn processing_conflict_releases_admission_before_diagnostic(pool: sqlx::PgPool) {
+        let (mut manager, claimed) = claim_one_processing(&pool, None).await;
+        sqlx::query("UPDATE requests SET state = 'canceled', canceled_at = NOW() WHERE id = $1")
+            .bind(*claimed.data.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let hook = Arc::new(AdmissionReleaseTestHook::default());
+        manager.admission_release_test_hook = Some(hook.clone());
+        let manager = Arc::new(manager);
+        let (_result_tx, result_rx) = tokio::sync::mpsc::channel(1);
+        let processing = Request {
+            data: claimed.data.clone(),
+            state: Processing {
+                daemon_id: claimed.state.daemon_id,
+                claimed_at: claimed.state.claimed_at,
+                started_at: Utc::now(),
+                retry_attempt: claimed.state.retry_attempt,
+                batch_expires_at: claimed.state.batch_expires_at,
+                result_rx: Arc::new(Mutex::new(result_rx)),
+                abort_handle: tokio::spawn(async {}).abort_handle(),
+            },
+        };
+
+        let persist = {
+            let manager = manager.clone();
+            tokio::spawn(async move { manager.persist(&processing).await })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(2), hook.entered.notified())
+            .await
+            .expect("persist miss never reached its diagnostic");
+
+        let (total, _reads, writes) = manager.response_admission.counts();
+        assert_eq!(
+            (total.1, writes.1),
+            (0, 0),
+            "processing conflict must release admission before its diagnostic await",
+        );
+
+        hook.resume.notify_one();
+        assert_eq!(
+            persist.await.unwrap().unwrap(),
+            None,
+            "terminal conflict should remain a dropped transition",
+        );
     }
 
     fn expect_stream_success(result: FileStreamResult) -> FileId {
@@ -9823,7 +10698,7 @@ mod tests {
 
         let blocked_writes = tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
-                let counts = manager.state_write_limiter.counts();
+                let (_total, _reads, counts) = manager.response_admission.counts();
                 if counts == (1, 2) {
                     let blocked = sqlx::query_scalar::<_, i64>(
                         r#"
@@ -18390,15 +19265,34 @@ mod tests {
     #[sqlx::test]
     async fn test_delete_request_not_found(pool: sqlx::PgPool) {
         let http_client = Arc::new(MockHttpClient::new());
-        let manager = PostgresRequestManager::with_client(
+        let mut manager = PostgresRequestManager::with_client(
             TestDbPools::new(pool.clone()).await.unwrap(),
             http_client,
         );
+        let hook = Arc::new(AdmissionReleaseTestHook::default());
+        manager.admission_release_test_hook = Some(hook.clone());
+        let manager = Arc::new(manager);
 
         let bogus = crate::request::RequestId(uuid::Uuid::new_v4());
-        let err = manager
-            .delete_request(bogus)
+        let delete = {
+            let manager = manager.clone();
+            tokio::spawn(async move { manager.delete_request(bogus).await })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(2), hook.entered.notified())
             .await
+            .expect("missing delete never reached its return path");
+
+        let (total, _reads, writes) = manager.response_admission.counts();
+        assert_eq!(
+            (total.1, writes.1),
+            (0, 0),
+            "missing delete must roll back and release admission before returning",
+        );
+
+        hook.resume.notify_one();
+        let err = delete
+            .await
+            .unwrap()
             .expect_err("delete on non-existent id should error");
 
         assert!(

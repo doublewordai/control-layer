@@ -138,9 +138,15 @@ pub struct DaemonConfig {
     /// Maximum number of request state transitions that may write to storage
     /// concurrently. This is independent of inference concurrency so a large
     /// claim can saturate downstream workers without opening the same number of
-    /// database connections. Set to `0` to disable the storage-side limit.
+    /// database connections. Set to `0` to disable only the write-class
+    /// limit; the aggregate response-traffic budget still applies.
     #[serde(default = "default_max_concurrent_state_writes")]
     pub max_concurrent_state_writes: usize,
+    /// Maximum number of consolidated response detail reads that may run
+    /// concurrently. Set to `0` to disable only the read-class limit; the
+    /// aggregate response-traffic budget still applies.
+    #[serde(default = "default_max_concurrent_response_reads")]
+    pub max_concurrent_response_reads: usize,
     pub max_retries: Option<u32>,
     pub stop_before_deadline_ms: Option<i64>,
     pub backoff_ms: u64,
@@ -321,6 +327,10 @@ fn default_max_concurrent_state_writes() -> usize {
     64
 }
 
+fn default_max_concurrent_response_reads() -> usize {
+    8
+}
+
 fn default_upload_stall_timeout_ms() -> u64 {
     crate::http::DEFAULT_UPLOAD_STALL_TIMEOUT.as_millis() as u64
 }
@@ -389,6 +399,7 @@ impl Default for DaemonConfig {
             claim_loop_max_consecutive_failures: default_claim_loop_max_consecutive_failures(),
             claim_query_timeout_ms: default_claim_query_timeout_ms(),
             max_concurrent_state_writes: default_max_concurrent_state_writes(),
+            max_concurrent_response_reads: default_max_concurrent_response_reads(),
             max_retries: Some(1000),
             stop_before_deadline_ms: Some(0),
             backoff_ms: 1000,
@@ -669,5 +680,26 @@ mod tests {
         let reencoded = serde_json::to_value(decoded).unwrap();
 
         assert_eq!(reencoded["max_concurrent_state_writes"], 17);
+    }
+
+    #[test]
+    fn response_read_concurrency_defaults_when_missing() {
+        let mut serialized = serde_json::to_value(DaemonConfig::default()).unwrap();
+        serialized
+            .as_object_mut()
+            .unwrap()
+            .remove("max_concurrent_response_reads");
+
+        let decoded: DaemonConfig = serde_json::from_value(serialized).unwrap();
+        assert_eq!(decoded.max_concurrent_response_reads, 8);
+    }
+
+    #[test]
+    fn response_read_concurrency_explicit_value_round_trips() {
+        let mut serialized = serde_json::to_value(DaemonConfig::default()).unwrap();
+        serialized["max_concurrent_response_reads"] = serde_json::json!(3);
+
+        let decoded: DaemonConfig = serde_json::from_value(serialized).unwrap();
+        assert_eq!(decoded.max_concurrent_response_reads, 3);
     }
 }

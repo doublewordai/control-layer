@@ -3081,7 +3081,7 @@ impl Application {
             request_manager.clone(),
             fusillade_daemon_config.clone(),
         ));
-        let step_manager = Arc::new(fusillade_arsenal::PostgresResponseStepManager::new(fusillade_pools.clone()));
+        let step_manager = Arc::new(request_manager.response_step_manager());
         // Build the ZDR keystore once and share it across the response store, the
         // daemon processor, and background services (which install the response
         // transformer). A misconfiguration is fatal.
