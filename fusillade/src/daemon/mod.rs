@@ -80,6 +80,26 @@ fn claim_loop_kinds_for_mode(
     }
 }
 
+fn reclaim_loop_kind_for_mode(mode: DaemonMode) -> ClaimLoopKind {
+    match mode {
+        DaemonMode::Both | DaemonMode::RequestOnly => ClaimLoopKind::Request,
+        DaemonMode::BatchOnly => ClaimLoopKind::Batch,
+    }
+}
+
+async fn prepare_claim_capacity<T, Maintenance, Capacity>(
+    run_reclaim: bool,
+    maintenance: Maintenance,
+    capacity: Capacity,
+) -> Result<(usize, Option<T>)>
+where
+    Maintenance: Future<Output = Result<usize>>,
+    Capacity: FnOnce() -> Option<T>,
+{
+    let reclaimed = if run_reclaim { maintenance.await? } else { 0 };
+    Ok((reclaimed, capacity()))
+}
+
 fn get_hostname() -> String {
     hostname::get()
         .ok()
@@ -134,8 +154,10 @@ where
         Self { core }
     }
 
-    async fn run(self) -> Result<()> {
-        self.core.run_claim_loop(ClaimLoopKind::Request).await
+    async fn run(self, run_reclaim: bool) -> Result<()> {
+        self.core
+            .run_claim_loop(ClaimLoopKind::Request, run_reclaim)
+            .await
     }
 }
 
@@ -160,8 +182,10 @@ where
         Self { core }
     }
 
-    async fn run(self) -> Result<()> {
-        self.core.run_claim_loop(ClaimLoopKind::Batch).await
+    async fn run(self, run_reclaim: bool) -> Result<()> {
+        self.core
+            .run_claim_loop(ClaimLoopKind::Batch, run_reclaim)
+            .await
     }
 }
 
@@ -371,7 +395,7 @@ where
         }
     }
 
-    async fn run_claim_loop(self: Arc<Self>, kind: ClaimLoopKind) -> Result<()> {
+    async fn run_claim_loop(self: Arc<Self>, kind: ClaimLoopKind, run_reclaim: bool) -> Result<()> {
         let mut join_set: JoinSet<Result<()>> = JoinSet::new();
         let (loop_name, interval_ms) = match kind {
             ClaimLoopKind::Request => ("request_daemon", self.config.claim_interval_ms),
@@ -420,72 +444,108 @@ where
                     break Ok(());
                 }
             };
-            let available_capacity = self.available_capacity();
-            if available_capacity.is_empty() {
-                tracing::trace!(
-                    loop_name,
-                    "No capacity available for any model, skipping claim"
-                );
-                continue;
-            }
-
-            let total_capacity: usize = available_capacity.values().sum();
-            // Dual-emit: keep the legacy unlabeled series alive alongside the
-            // new per-daemon one so existing dashboards/alerts survive the
-            // split (deprecation window).
-            gauge!("fusillade_claim_capacity").set(total_capacity as f64);
-            gauge!("fusillade_claim_capacity", "daemon" => loop_name).set(total_capacity as f64);
-
-            let user_active_counts = self.user_active_counts();
-            let leak_cooldown = if kind == ClaimLoopKind::Request {
-                self.leak_cooldown()
-            } else {
-                std::collections::HashSet::new()
-            };
-
-            let claim_start = std::time::Instant::now();
             let claim_timeout = Duration::from_millis(self.config.claim_query_timeout_ms);
-            let claim_result = match kind {
-                ClaimLoopKind::Request => {
-                    with_query_timeout(
-                        "batchless claim query",
-                        claim_timeout,
-                        self.storage.claim_batchless_requests(
-                            self.config.claim_batch_size,
-                            self.daemon_id,
-                            &available_capacity,
-                            &user_active_counts,
-                            &leak_cooldown,
+            let claim_result: Result<Option<(Vec<Request<Claimed>>, Duration)>> = tokio::select! {
+                result = async {
+                    let (reclaimed, available_capacity) = prepare_claim_capacity(
+                        run_reclaim,
+                        with_query_timeout(
+                            "stale request reclaim query",
+                            claim_timeout,
+                            self.storage.reclaim_stale_requests(),
                         ),
+                        || {
+                            let capacity = self.available_capacity();
+                            (!capacity.is_empty()).then_some(capacity)
+                        },
                     )
-                    .await
-                }
-                ClaimLoopKind::Batch => {
-                    // 0 = inherit the (often deployment-tuned) single-loop cap.
-                    let batch_claim_size = if self.config.batch_claim_size == 0 {
-                        self.config.claim_batch_size
-                    } else {
-                        self.config.batch_claim_size
+                    .await?;
+
+                    if reclaimed > 0 {
+                        tracing::info!(
+                            loop_name,
+                            reclaimed,
+                            "Reclaimed safely abandoned requests before claiming"
+                        );
+                    }
+
+                    let Some(available_capacity) = available_capacity else {
+                        tracing::trace!(
+                            loop_name,
+                            "No capacity available for any model, skipping claim"
+                        );
+                        return Ok(None);
                     };
-                    with_query_timeout(
-                        "batch claim query",
-                        claim_timeout,
-                        self.storage.claim_batch_requests(
-                            batch_claim_size,
-                            self.config.batch_claim_batch_size,
-                            self.daemon_id,
-                            &available_capacity,
-                            &user_active_counts,
-                        ),
-                    )
-                    .await
+
+                    let total_capacity: usize = available_capacity.values().sum();
+                    // Dual-emit: keep the legacy unlabeled series alive alongside the
+                    // new per-daemon one so existing dashboards/alerts survive the
+                    // split (deprecation window).
+                    gauge!("fusillade_claim_capacity").set(total_capacity as f64);
+                    gauge!("fusillade_claim_capacity", "daemon" => loop_name)
+                        .set(total_capacity as f64);
+
+                    let user_active_counts = self.user_active_counts();
+                    let leak_cooldown = if kind == ClaimLoopKind::Request {
+                        self.leak_cooldown()
+                    } else {
+                        std::collections::HashSet::new()
+                    };
+
+                    let claim_start = std::time::Instant::now();
+                    let claimed = match kind {
+                        ClaimLoopKind::Request => {
+                            with_query_timeout(
+                                "batchless claim query",
+                                claim_timeout,
+                                self.storage.claim_batchless_requests(
+                                    self.config.claim_batch_size,
+                                    self.daemon_id,
+                                    &available_capacity,
+                                    &user_active_counts,
+                                    &leak_cooldown,
+                                ),
+                            )
+                            .await?
+                        }
+                        ClaimLoopKind::Batch => {
+                            // 0 = inherit the (often deployment-tuned) single-loop cap.
+                            let batch_claim_size = if self.config.batch_claim_size == 0 {
+                                self.config.claim_batch_size
+                            } else {
+                                self.config.batch_claim_size
+                            };
+                            with_query_timeout(
+                                "batch claim query",
+                                claim_timeout,
+                                self.storage.claim_batch_requests(
+                                    batch_claim_size,
+                                    self.config.batch_claim_batch_size,
+                                    self.daemon_id,
+                                    &available_capacity,
+                                    &user_active_counts,
+                                ),
+                            )
+                            .await?
+                        }
+                    };
+
+                    Ok(Some((claimed, claim_start.elapsed())))
+                } => result,
+                _ = self.shutdown_token.cancelled() => {
+                    tracing::info!(loop_name, "Shutdown signal received, stopping claim loop");
+                    break Ok(());
                 }
             };
 
-            let mut claimed = match claim_result {
-                Ok(claimed) => {
+            let (mut claimed, claim_duration) = match claim_result {
+                Ok(Some(claimed)) => {
                     consecutive_claim_failures = 0;
                     claimed
+                }
+                Ok(None) => {
+                    consecutive_claim_failures = 0;
+                    continue;
                 }
                 Err(e) => {
                     drop(_claim_guard);
@@ -527,10 +587,9 @@ where
             };
             // Dual-emit legacy unlabeled histograms during the deprecation
             // window (see fusillade_claim_capacity above).
-            histogram!("fusillade_claim_duration_seconds")
-                .record(claim_start.elapsed().as_secs_f64());
+            histogram!("fusillade_claim_duration_seconds").record(claim_duration.as_secs_f64());
             histogram!("fusillade_claim_duration_seconds", "daemon" => loop_name)
-                .record(claim_start.elapsed().as_secs_f64());
+                .record(claim_duration.as_secs_f64());
             histogram!("fusillade_claim_size").record(claimed.len() as f64);
             histogram!("fusillade_claim_size", "daemon" => loop_name).record(claimed.len() as f64);
 
@@ -1524,15 +1583,17 @@ where
             }
         }
 
+        let reclaim_loop_kind = reclaim_loop_kind_for_mode(mode);
         for claim_loop_kind in claim_loop_kinds {
+            let run_reclaim = claim_loop_kind == reclaim_loop_kind;
             match claim_loop_kind {
                 ClaimLoopKind::Request => {
                     let request_daemon = RequestDaemon::new(self.clone());
-                    claim_daemons.spawn(async move { request_daemon.run().await });
+                    claim_daemons.spawn(async move { request_daemon.run(run_reclaim).await });
                 }
                 ClaimLoopKind::Batch => {
                     let batch_daemon = BatchDaemon::new(self.clone());
-                    claim_daemons.spawn(async move { batch_daemon.run().await });
+                    claim_daemons.spawn(async move { batch_daemon.run(run_reclaim).await });
                 }
             }
         }
@@ -1580,6 +1641,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
+
     use super::*;
 
     #[test]
@@ -1645,6 +1708,94 @@ mod tests {
             claim_loop_kinds_for_mode(DaemonMode::BatchOnly, false).is_err(),
             "batch-only mode should fail loudly when storage cannot claim batches"
         );
+    }
+
+    #[test]
+    fn daemon_mode_nominates_exactly_one_reclaim_loop() {
+        for (mode, supports_batch_claims, expected) in [
+            (DaemonMode::Both, true, ClaimLoopKind::Request),
+            (DaemonMode::Both, false, ClaimLoopKind::Request),
+            (DaemonMode::RequestOnly, true, ClaimLoopKind::Request),
+            (DaemonMode::BatchOnly, true, ClaimLoopKind::Batch),
+        ] {
+            let loops = claim_loop_kinds_for_mode(mode, supports_batch_claims).unwrap();
+            let nominated = reclaim_loop_kind_for_mode(mode);
+            assert_eq!(nominated, expected);
+            assert_eq!(
+                loops.iter().filter(|kind| **kind == nominated).count(),
+                1,
+                "{mode:?} must run reclaim from exactly one spawned loop"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn reclaim_runs_before_zero_capacity_exit() {
+        let maintenance_calls = Arc::new(AtomicUsize::new(0));
+        let capacity_checked = Arc::new(AtomicBool::new(false));
+        let calls = maintenance_calls.clone();
+        let checked = capacity_checked.clone();
+
+        let (reclaimed, capacity) = prepare_claim_capacity(
+            true,
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(2)
+            },
+            move || {
+                assert_eq!(
+                    maintenance_calls.load(Ordering::SeqCst),
+                    1,
+                    "capacity was checked before maintenance completed"
+                );
+                checked.store(true, Ordering::SeqCst);
+                None::<HashMap<String, usize>>
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(reclaimed, 2);
+        assert!(capacity.is_none());
+        assert!(capacity_checked.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn reclaim_error_prevents_capacity_and_claim_work() {
+        let capacity_checked = Arc::new(AtomicBool::new(false));
+        let checked = capacity_checked.clone();
+
+        let error = prepare_claim_capacity(
+            true,
+            async { Err(FusilladeError::Other(anyhow::anyhow!("maintenance failed"))) },
+            move || {
+                checked.store(true, Ordering::SeqCst);
+                Some(HashMap::<String, usize>::new())
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("maintenance failed"));
+        assert!(!capacity_checked.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn non_nominated_loop_does_not_poll_reclaim() {
+        let (reclaimed, capacity) = prepare_claim_capacity(
+            false,
+            async {
+                panic!("non-nominated loop polled reclaim future");
+                #[allow(unreachable_code)]
+                Ok(0)
+            },
+            || Some(HashMap::from([("test".to_string(), 1)])),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(reclaimed, 0);
+        assert_eq!(capacity.unwrap().get("test"), Some(&1));
     }
 
     #[test]

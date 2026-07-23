@@ -571,6 +571,16 @@ pub trait Storage: Send + Sync {
     // These methods are used by the DaemonExecutor for pulling requests, and then persisting their
     // states as they iterate through them
 
+    /// Release a bounded set of safely abandoned daemon-owned requests.
+    ///
+    /// The daemon invokes this maintenance hook from exactly one claim loop
+    /// before checking local capacity, so recovery still runs while all local
+    /// model permits are occupied. Storage backends without durable ownership
+    /// may keep the default no-op.
+    async fn reclaim_stale_requests(&self) -> Result<usize> {
+        Ok(0)
+    }
+
     /// Atomically claim pending batchless requests for processing.
     ///
     /// `available_capacity` maps model names to the number of permits the daemon

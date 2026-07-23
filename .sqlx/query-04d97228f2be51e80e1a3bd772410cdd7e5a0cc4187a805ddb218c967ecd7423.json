@@ -1,0 +1,200 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            WITH RECURSIVE all_models AS (\n                SELECT model, capacity\n                FROM unnest($4::TEXT[], $5::BIGINT[]) AS m(model, capacity)\n            ),\n            user_priority AS (\n                SELECT * FROM unnest($7::TEXT[], $8::BIGINT[]) AS u(user_id, active_count)\n            ),\n            latest_model_filters AS (\n                -- Scoped to the capacity-eligible models: DISTINCT ON over the\n                -- whole event log would grow with the table for no benefit.\n                SELECT DISTINCT ON (model) model, state\n                FROM model_filters\n                WHERE model = ANY($4::TEXT[])\n                ORDER BY model, created_at DESC, id DESC\n            ),\n            -- Distinct batch_ids that still have pending rows for each\n            -- capacity-eligible model, via an index-only \"loose index scan\"\n            -- (hop to the next batch_id > the current one) so enumeration costs\n            -- O(pairs · log N) — bounded by batches-with-pending-work per\n            -- model, never by total pending rows (a naive DISTINCT would scan\n            -- every pending index entry) nor by total open batches (the\n            -- previous models × batches join). Relies on idx_requests_pending\n            -- (model, batch_id).\n            batch_groups AS (\n                SELECT m.model, m.capacity,\n                       (SELECT r.batch_id FROM requests r\n                        WHERE r.state = 'pending' AND r.attempt_id IS NULL\n                          AND r.model = m.model\n                          AND r.template_id IS NOT NULL AND r.batch_id IS NOT NULL\n                        ORDER BY r.batch_id LIMIT 1) AS batch_id\n                FROM all_models m\n              UNION ALL\n                SELECT g.model, g.capacity,\n                       (SELECT r.batch_id FROM requests r\n                        WHERE r.state = 'pending' AND r.attempt_id IS NULL\n                          AND r.model = g.model\n                          AND r.template_id IS NOT NULL AND r.batch_id IS NOT NULL\n                          AND r.batch_id > g.batch_id\n                        ORDER BY r.batch_id LIMIT 1) AS batch_id\n                FROM batch_groups g WHERE g.batch_id IS NOT NULL\n            ),\n            selected_batches AS (\n                SELECT *\n                FROM (\n                    SELECT g.model, g.capacity, b.id AS batch_id,\n                           b.expires_at, b.created_at, b.created_by,\n                           COALESCE(b.completion_window, '24h') AS window_class,\n                           calc.pr,\n                           row_number() OVER (\n                               PARTITION BY g.model\n                               ORDER BY calc.pr ASC, b.expires_at ASC, b.id ASC\n                           ) AS batch_rank\n                    FROM batch_groups g\n                    JOIN batches b\n                      ON b.id = g.batch_id\n                     AND b.cancelling_at IS NULL\n                     AND b.deleted_at IS NULL\n                     AND b.completed_at IS NULL\n                     AND b.failed_at IS NULL\n                     AND b.cancelled_at IS NULL\n                    -- Liveness gate: models whose latest filter event is `live`\n                    -- are always eligible. Models with NO filter event (external /\n                    -- always-on providers that scouter does not manage) are only\n                    -- eligible when `batch_claim_require_live` is false (default),\n                    -- matching the historical NULL-is-live claim behaviour. Models\n                    -- whose latest event is `coming`/`absent` are only eligible\n                    -- via the deadline-ramp escape hatch (see WHERE below).\n                    LEFT JOIN latest_model_filters mf\n                      ON mf.model = g.model\n                    LEFT JOIN user_priority up ON b.created_by = up.user_id\n                    CROSS JOIN LATERAL (\n                        SELECT\n                            (1.0 - $9::DOUBLE PRECISION)\n                                * COALESCE(up.active_count, 0)::DOUBLE PRECISION\n                                / GREATEST(NULLIF((SELECT MAX(v) FROM unnest($8::BIGINT[]) v), 0), 1)::DOUBLE PRECISION\n                            + $9::DOUBLE PRECISION\n                                * LEAST(GREATEST(EXTRACT(EPOCH FROM b.expires_at - $3), 0.0) / 86400.0, 1.0) AS pr\n                    ) calc\n                    WHERE (\n                            mf.state = 'live'\n                            OR (NOT $10::BOOLEAN AND mf.state IS NULL)\n                            -- SLA escape hatch (deadline ramp): regardless of\n                            -- liveness, once a batch is within ramp(W) of its\n                            -- deadline it becomes claimable at full capacity so\n                            -- it can overflow to fallback providers instead of\n                            -- missing SLA waiting for the model. Same formula\n                            -- as the batchless claim: ramp = (W_minutes ^ $11)\n                            -- minutes (~59min for 24h windows, ~10min for 1h).\n                            OR (EXTRACT(EPOCH FROM (b.expires_at - $3))\n                                    <= power(GREATEST(EXTRACT(EPOCH FROM (b.expires_at - b.created_at)), 0.0) / 60.0,\n                                             $11::DOUBLE PRECISION) * 60.0)\n                          )\n                      -- Claimable-NOW probe (per enumerated pair, so bounded):\n                      -- the loose scan proves pending rows exist, but rows all\n                      -- backing off on not_before shouldn't burn a rank slot.\n                      AND EXISTS (\n                        SELECT 1\n                        FROM requests r\n                        WHERE r.state = 'pending'\n                          AND r.attempt_id IS NULL\n                          AND r.model = g.model\n                          AND r.batch_id = g.batch_id\n                          AND r.template_id IS NOT NULL\n                          AND (r.not_before IS NULL OR r.not_before <= $3)\n                    )\n                ) ranked\n                WHERE batch_rank <= $6\n            ),\n            candidate_rows AS (\n                SELECT sb.model, sb.capacity, sb.batch_id, sb.expires_at,\n                       sb.window_class, sb.pr, r.id, r.template_id, r.created_at,\n                       GREATEST(EXTRACT(EPOCH FROM (sb.expires_at - sb.created_at)), 0.0)::DOUBLE PRECISION AS window_secs\n                FROM selected_batches sb\n                CROSS JOIN LATERAL (\n                    SELECT r.id, r.template_id, r.created_at\n                    FROM requests r\n                    WHERE r.state = 'pending'\n                      AND r.attempt_id IS NULL\n                      AND r.model = sb.model\n                      AND r.batch_id = sb.batch_id\n                      AND r.template_id IS NOT NULL\n                      AND (r.not_before IS NULL OR r.not_before <= $3)\n                    ORDER BY r.created_at ASC\n                    LIMIT sb.capacity\n                    FOR UPDATE OF r SKIP LOCKED\n                ) r\n            ),\n            to_claim AS (\n                SELECT id, template_id, batch_id, expires_at AS effective_expires_at,\n                       FALSE AS leaked, window_class, window_secs\n                FROM (\n                    SELECT c.*,\n                           row_number() OVER (\n                               PARTITION BY c.model\n                               ORDER BY c.pr ASC, c.expires_at ASC, c.batch_id ASC, c.created_at ASC\n                           ) AS model_rank\n                    FROM candidate_rows c\n                ) ranked\n                WHERE model_rank <= capacity\n                ORDER BY pr ASC, expires_at ASC, batch_id ASC, created_at ASC\n                LIMIT $2::BIGINT\n            )\n            UPDATE requests r\n            SET\n                state = 'claimed',\n                daemon_id = $1,\n                attempt_id = gen_random_uuid(),\n                claimed_at = $3\n            FROM to_claim tc\n            JOIN active_request_templates t ON tc.template_id = t.id\n            JOIN batches b ON tc.batch_id = b.id\n            WHERE r.id = tc.id\n              AND r.state = 'pending'\n              AND r.attempt_id IS NULL\n            RETURNING r.id,\n                      r.batch_id,\n                      r.template_id as \"template_id!\", r.attempt_id as \"attempt_id!\", r.retry_attempt,\n                      t.custom_id, t.endpoint as \"endpoint!\", t.method as \"method!\", t.path as \"path!\",\n                      t.body as \"body!\", t.model as \"model!\", COALESCE(b.api_key, t.api_key) as \"api_key!\",\n                      tc.effective_expires_at as \"batch_expires_at!\",\n                      b.id::TEXT as \"batch_id_str!\",\n                      COALESCE(b.file_id::TEXT, '') as \"batch_file_id!\",\n                      b.endpoint as \"batch_endpoint!\",\n                      COALESCE(b.completion_window, '24h') as \"batch_completion_window!\",\n                      b.metadata::TEXT as \"batch_metadata\",\n                      b.output_file_id::TEXT as \"batch_output_file_id\",\n                      b.error_file_id::TEXT as \"batch_error_file_id\",\n                      COALESCE(b.created_by, '') as \"batch_created_by!\",\n                      to_char(b.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') as \"batch_created_at!\",\n                      to_char(tc.effective_expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') as \"batch_expires_at_str\",\n                      to_char(b.cancelling_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') as \"batch_cancelling_at\",\n                      b.errors::TEXT as \"batch_errors\",\n                      COALESCE(b.total_requests::TEXT, '1') as \"batch_total_requests!\",\n                      tc.leaked as \"leaked!\",\n                      tc.window_class as \"window_class!\",\n                      tc.window_secs as \"window_secs!\"\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "batch_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "template_id!",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 3,
+        "name": "attempt_id!",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 4,
+        "name": "retry_attempt",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 5,
+        "name": "custom_id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "endpoint!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 7,
+        "name": "method!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 8,
+        "name": "path!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 9,
+        "name": "body!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 10,
+        "name": "model!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 11,
+        "name": "api_key!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 12,
+        "name": "batch_expires_at!",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 13,
+        "name": "batch_id_str!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 14,
+        "name": "batch_file_id!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 15,
+        "name": "batch_endpoint!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 16,
+        "name": "batch_completion_window!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 17,
+        "name": "batch_metadata",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 18,
+        "name": "batch_output_file_id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 19,
+        "name": "batch_error_file_id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 20,
+        "name": "batch_created_by!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 21,
+        "name": "batch_created_at!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 22,
+        "name": "batch_expires_at_str",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 23,
+        "name": "batch_cancelling_at",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 24,
+        "name": "batch_errors",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 25,
+        "name": "batch_total_requests!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 26,
+        "name": "leaked!",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 27,
+        "name": "window_class!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 28,
+        "name": "window_secs!",
+        "type_info": "Float8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int8",
+        "Timestamptz",
+        "TextArray",
+        "Int8Array",
+        "Int8",
+        "TextArray",
+        "Int8Array",
+        "Float8",
+        "Bool",
+        "Float8"
+      ]
+    },
+    "nullable": [
+      false,
+      true,
+      true,
+      true,
+      false,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      null,
+      false,
+      null,
+      null,
+      false,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "04d97228f2be51e80e1a3bd772410cdd7e5a0cc4187a805ddb218c967ecd7423"
+}
