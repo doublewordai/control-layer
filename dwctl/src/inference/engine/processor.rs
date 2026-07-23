@@ -49,6 +49,18 @@ fn parse_jit_image_token(value: &str) -> fusillade::Result<crate::image_normaliz
     })
 }
 
+fn classify_request_keystore_error(error: &crate::keystore::KeystoreError) -> FailureReason {
+    if error.is_unreachable() {
+        FailureReason::NetworkError {
+            error: "Zero-data-retention request could not be processed".to_string(),
+        }
+    } else {
+        FailureReason::RequestBuilderError {
+            error: "Zero-data-retention request could not be processed".to_string(),
+        }
+    }
+}
+
 /// Dispatches per-claim work to the multi-step loop for `/v1/responses`
 /// requests, falling through to [`DefaultRequestProcessor`] for
 /// everything else.
@@ -296,26 +308,32 @@ where
                     return Ok(RequestCompletionResult::Failed(failed));
                 }
                 Err(e) => {
-                    // Keystore unreachable (transient - e.g. Redis restart). Return a
-                    // retriable failure so the daemon reschedules the still-`processing`
-                    // row back to `pending` and tries again, rather than a bare Err that
-                    // would strand it. Do NOT persist here: the daemon's retry path
-                    // re-pends the row itself, and a persisted Failed would look terminal
-                    // and lose the retry. Client reason stays generic; the infra detail
-                    // is logged for operators only.
-                    crate::background_error!(
-                        crate::metrics::errors::component::ZDR_DISPATCH,
-                        "keystore_unreachable",
-                        Warning,
-                        request_id = %request.data.id.0,
-                        error = %e,
-                        "ZDR keystore unreachable during dispatch; scheduling retry"
-                    );
+                    // Only transport unavailability is retriable. A malformed
+                    // envelope, retired wrap key, crypto failure, or invalid
+                    // configuration cannot improve on another dispatch attempt
+                    // and must terminalize without opening the upstream gate.
+                    if e.is_unreachable() {
+                        crate::background_error!(
+                            crate::metrics::errors::component::ZDR_DISPATCH,
+                            "keystore_unreachable",
+                            Warning,
+                            request_id = %request.data.id.0,
+                            error = %e,
+                            "ZDR keystore unreachable during dispatch; scheduling retry"
+                        );
+                    } else {
+                        crate::background_error!(
+                            crate::metrics::errors::component::ZDR_DISPATCH,
+                            "keystore_invalid_value",
+                            Error,
+                            request_id = %request.data.id.0,
+                            error = %e,
+                            "ZDR request key could not be prepared; failing request"
+                        );
+                    }
                     let failed = Request {
                         state: Failed {
-                            reason: FailureReason::NetworkError {
-                                error: "Zero-data-retention request could not be processed".to_string(),
-                            },
+                            reason: classify_request_keystore_error(&e),
                             failed_at: chrono::Utc::now(),
                             retry_attempt: request.state.retry_attempt,
                             batch_expires_at: request.state.batch_expires_at,
@@ -442,5 +460,26 @@ mod tests {
             parse_jit_image_token("dw-img://not-a-valid-token"),
             Err(fusillade::FusilladeError::ValidationError(_))
         ));
+    }
+
+    #[test]
+    fn only_unreachable_request_keystore_errors_are_retriable() {
+        assert!(matches!(
+            classify_request_keystore_error(&crate::keystore::KeystoreError::Unreachable("offline".to_string())),
+            FailureReason::NetworkError { .. }
+        ));
+
+        for definitive in [
+            crate::keystore::KeystoreError::UnknownWrapKeyId("retired".to_string()),
+            crate::keystore::KeystoreError::MalformedWrappedValue,
+            crate::keystore::KeystoreError::MalformedEnvelope,
+            crate::keystore::KeystoreError::Config("invalid".to_string()),
+            crate::keystore::KeystoreError::Crypto(crate::encryption::EncryptionError::DecryptionFailed),
+        ] {
+            assert!(matches!(
+                classify_request_keystore_error(&definitive),
+                FailureReason::RequestBuilderError { .. }
+            ));
+        }
     }
 }
