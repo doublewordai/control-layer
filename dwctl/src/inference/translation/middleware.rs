@@ -1,12 +1,14 @@
 //! The single generic edge-translation Axum middleware.
 //!
-//! Layered as the outermost Tower layer on the onwards router. Dispatches to a
-//! [`TranslationRegistry`]; a non-matching request is a pure pass-through.
+//! Layered inner to the inference middleware and the outlet, but outer to cache /
+//! image-normalisation / onwards (see the stack comment in `build_router`).
+//! Dispatches to a [`TranslationRegistry`]; a non-matching request is a pure
+//! pass-through.
 
 use axum::{
     body::Body,
     extract::State,
-    http::{Request, StatusCode, header},
+    http::{Method, Request, StatusCode, header},
     middleware::Next,
     response::Response,
 };
@@ -23,6 +25,18 @@ pub async fn translation_middleware(State(registry): State<TranslationRegistry>,
     let Some(translator) = registry.detect(&path, request.headers()) else {
         return next.run(request).await;
     };
+
+    // A translator that parses a request body can only act on a POST. Without
+    // this gate a GET/DELETE to a body-translating path (say `/v1/responses`)
+    // would be claimed and then rejected with a 400 from the body parse, instead
+    // of falling through to the real routing and its 404/405.
+    //
+    // Gated per-translator rather than up front, because not every translator
+    // consumes a body: `AnthropicModels` deliberately claims `GET /models` to
+    // normalise auth, and a blanket POST check here would silently break it.
+    if translator.translates_request_body() && request.method() != Method::POST {
+        return next.run(request).await;
+    }
     debug!(translator = translator.name(), path = %path, "edge translation: request matched");
 
     let (mut parts, body) = request.into_parts();
@@ -36,6 +50,23 @@ pub async fn translation_middleware(State(registry): State<TranslationRegistry>,
             return error_response(translator.as_ref(), StatusCode::PAYLOAD_TOO_LARGE, "request body too large");
         }
     };
+
+    // Snapshot the original inbound foreign request for the response side: the
+    // foreign response can echo request fields (e.g. Responses echoes model /
+    // tools / previous_response_id). A `Bytes` clone is a cheap refcount bump, so
+    // the no-op (Anthropic) path pays nothing meaningful.
+    let original_request = body_bytes.clone();
+
+    // The inference middleware (outer to us) has already minted this request's
+    // tracking id and stamped it here. The translator stamps it onto the foreign
+    // response's id field so a later `GET /v1/responses/{id}` resolves against the
+    // stored record. Absent on native paths / tests, where the translator
+    // self-generates an id instead.
+    let response_id = parts
+        .headers
+        .get("x-fusillade-request-id")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
 
     let translated = match translator.translate_request(&parts, body_bytes) {
         Ok(t) => t,
@@ -56,11 +87,18 @@ pub async fn translation_middleware(State(registry): State<TranslationRegistry>,
 
     let response = next.run(downstream_req).await;
 
-    translate_response_back(translator.as_ref(), response).await
+    translate_response_back(translator.as_ref(), &original_request, response_id.as_deref(), response).await
 }
 
-/// Translate the downstream response back into the foreign protocol.
-async fn translate_response_back(translator: &dyn ProtocolTranslator, response: Response) -> Response {
+/// Translate the downstream response back into the foreign protocol. `request`
+/// is the original inbound foreign request body, forwarded to the translator's
+/// response side for protocols whose response echoes request fields.
+async fn translate_response_back(
+    translator: &dyn ProtocolTranslator,
+    request: &Bytes,
+    response_id: Option<&str>,
+    response: Response,
+) -> Response {
     let (parts, body) = response.into_parts();
     let status = parts.status;
 
@@ -77,7 +115,7 @@ async fn translate_response_back(translator: &dyn ProtocolTranslator, response: 
         .unwrap_or(false);
 
     if is_sse {
-        return reframe_sse(translator, status, body);
+        return reframe_sse(translator, request, response_id, status, body);
     }
 
     let body_bytes = match axum::body::to_bytes(body, usize::MAX).await {
@@ -89,7 +127,7 @@ async fn translate_response_back(translator: &dyn ProtocolTranslator, response: 
     };
 
     if status.is_success() {
-        match translator.translate_response(body_bytes) {
+        match translator.translate_response(request, response_id, body_bytes) {
             Ok(new_body) => json_response(status, new_body),
             Err(e) => {
                 warn!(error = %e, translator = translator.name(), "edge translation: response translate failed");
@@ -122,8 +160,14 @@ fn error_response(translator: &dyn ProtocolTranslator, status: StatusCode, messa
 /// stream the foreign-protocol events out. Stays streaming (no buffering): each
 /// complete `\n\n`-delimited SSE event is parsed and fed to the reframer as it
 /// arrives.
-fn reframe_sse(translator: &dyn ProtocolTranslator, status: StatusCode, body: Body) -> Response {
-    let mut reframer = translator.stream_reframer();
+fn reframe_sse(
+    translator: &dyn ProtocolTranslator,
+    request: &Bytes,
+    response_id: Option<&str>,
+    status: StatusCode,
+    body: Body,
+) -> Response {
+    let mut reframer = translator.stream_reframer(request, response_id);
     let mut data = body.into_data_stream();
 
     let out = async_stream::stream! {
@@ -190,7 +234,8 @@ fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::inference::translation::{TranslationRegistry, anthropic::AnthropicMessages};
+    use crate::inference::translation::TranslationRegistry;
+    use crate::inference::translation::anthropic::AnthropicMessages;
     use axum::{Router, extract::Request, routing::post};
     use std::sync::Arc;
 
@@ -345,6 +390,77 @@ mod tests {
         // onwards' upstream-path join lands on the chat-completions endpoint.
         assert!(seen.ends_with("/chat/completions"), "downstream saw: {seen}");
         assert!(!seen.contains("/messages"), "downstream saw: {seen}");
+    }
+
+    /// A GET to a path claimed by a BODY-translating translator must pass straight
+    /// through to the real routing, rather than being intercepted and rejected
+    /// with a 400 from the body parse.
+    ///
+    /// The gate is per-translator, not blanket: see
+    /// `get_is_still_translated_for_header_only_translator` below, which pins the
+    /// case this must not break.
+    #[tokio::test]
+    async fn non_post_request_is_not_intercepted() {
+        async fn marker(_req: Request) -> Response {
+            json_response(StatusCode::OK, Bytes::from_static(b"{\"handler\":\"reached\"}"))
+        }
+
+        let inner = Router::new().route("/messages", axum::routing::get(marker));
+        let server = test_app(inner);
+
+        let response = server.get("/ai/v1/messages").add_header("x-api-key", "sk-test").await;
+
+        assert_eq!(
+            response.status_code().as_u16(),
+            200,
+            "a GET must reach the route, not be claimed by the translator"
+        );
+        let body: serde_json::Value = response.json();
+        assert_eq!(body["handler"], "reached");
+    }
+
+    /// The POST gate must NOT be blanket. `AnthropicModels` claims `GET /models`
+    /// purely to normalise `x-api-key` into `Authorization`; gating every
+    /// translator to POST silently broke that and 401'd Anthropic model
+    /// discovery. Assert a header-only translator still claims a GET.
+    #[tokio::test]
+    async fn get_is_still_translated_for_header_only_translator() {
+        // Echo the Authorization header the handler saw back as a model id: the
+        // translator rewrites the response into Anthropic's shape, so a custom
+        // top-level field would be dropped, but a model id survives.
+        async fn echo_auth(req: Request) -> Response {
+            let seen = req
+                .headers()
+                .get(header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("<none>")
+                .to_string();
+            let body = serde_json::json!({
+                "object": "list",
+                "data": [ { "id": seen, "object": "model", "created": 0, "owned_by": "test" } ]
+            });
+            json_response(StatusCode::OK, Bytes::from(serde_json::to_vec(&body).unwrap()))
+        }
+
+        let registry = TranslationRegistry::new(vec![Arc::new(crate::inference::translation::anthropic::models::AnthropicModels)]);
+        let inner = Router::new()
+            .route("/models", axum::routing::get(echo_auth))
+            .layer(axum::middleware::from_fn_with_state(registry, translation_middleware));
+        let app = Router::new().nest("/ai/v1", inner);
+        let server = axum_test::TestServer::new(app).expect("test server");
+
+        let response = server
+            .get("/ai/v1/models")
+            .add_header("x-api-key", "sk-test")
+            .add_header("anthropic-version", "2023-06-01")
+            .await;
+
+        assert_eq!(response.status_code().as_u16(), 200);
+        let body: serde_json::Value = response.json();
+        assert_eq!(
+            body["data"][0]["id"], "Bearer sk-test",
+            "a header-only translator must still normalise auth on a GET"
+        );
     }
 
     /// A streaming `/messages` request: the handler returns an OpenAI SSE

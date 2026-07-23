@@ -43,14 +43,9 @@ pub struct InferenceMiddlewareState<P: PoolProvider + Clone = sqlx_pool_router::
     pub loopback_base_url: String,
     /// dwctl database pool for model access validation.
     pub dwctl_pool: sqlx::PgPool,
-    /// Multi-step warm-path streaming pieces. When the user sends
-    /// `stream: true` (and not `background: true`) on `/v1/responses`,
-    /// the middleware routes the request through
-    /// [`super::streaming::run_inline_streaming`] using these.
+    /// Fusillade-backed response store. Used by the control plane here for
+    /// `previous_response_id` hydration, and by `GET /v1/responses/{id}`.
     pub response_store: Arc<super::store::FusilladeResponseStore<P>>,
-    pub multi_step_tool_executor: Arc<crate::inference::tools::HttpToolExecutor>,
-    pub multi_step_http_client: Arc<fusillade::ReqwestHttpClient>,
-    pub loop_config: onwards::LoopConfig,
     /// Image-input normaliser (content-addressed store). On the **Flex**
     /// path the request is persisted and dispatched later by the daemon, so
     /// images are normalised to `dw-img://` tokens here (when enabled) — the
@@ -112,6 +107,13 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
         }
     };
 
+    // Strip client-supplied completion/response id fields before the request is
+    // re-serialised and forwarded. dwctl owns the single parse-and-shape now, so
+    // onwards forwards the bytes verbatim (COR-522); this preserves the guarantee
+    // from onwards PR #240 that these ids never reach upstream. Exact-key removal:
+    // extension fields and a legitimate `previous_response_id` are left intact.
+    scrub_request_id_fields(&mut request_value);
+
     let model = request_value["model"].as_str().unwrap_or("unknown").to_string();
     let model = model.as_str();
     let nested_path = parts.uri.path();
@@ -157,6 +159,38 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
         }
     }
 
+    // `previous_response_id` hydration (Responses control plane). Inline the prior
+    // turn's output items ahead of the current input, in the Responses domain,
+    // BEFORE the edge translation (one layer inside this one) converts the request
+    // to Chat Completions. Runs here rather than in the translator so the pure
+    // translator stays stateless. Gated on the field's presence so the common path
+    // pays nothing. The hydrated body flows to every downstream path because it is
+    // re-serialised from `request_value` below.
+    if is_responses_api && request_value.get("previous_response_id").is_some() {
+        use crate::inference::translation::responses::hydrate::{HydrationError, hydrate_previous_response};
+        if let Err(e) = hydrate_previous_response(&*state.response_store, &mut request_value).await {
+            let (status, message) = match e {
+                HydrationError::NotFound(id) => (StatusCode::BAD_REQUEST, format!("previous response not found: {id}")),
+                HydrationError::Internal(msg) => {
+                    tracing::error!(error = %msg, "responses hydration failed");
+                    (StatusCode::INTERNAL_SERVER_ERROR, "failed to load previous response".to_string())
+                }
+            };
+            let err_type = if status == StatusCode::BAD_REQUEST {
+                "invalid_request_error"
+            } else {
+                "server_error"
+            };
+            return Response::builder()
+                .status(status)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"error": {"message": message, "type": err_type}}).to_string(),
+                ))
+                .unwrap();
+        }
+    }
+
     // Parse `service_tier` and `background` from the body.
     //
     // Both `/v1/responses` and `/v1/chat/completions` support
@@ -196,71 +230,6 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
     } else {
         requested_tier
     };
-    let is_flex = matches!(service_tier, ServiceTier::Flex);
-
-    // The warm path / multi-step loop only earns its keep when the
-    // request actually has tools to dispatch. Tool-free `/v1/responses`
-    // can be served by onwards' native single-step proxying (which
-    // rewrites /v1/responses → /v1/chat/completions on the wire and
-    // back), producing one tracking row via the standard outlet path
-    // instead of going through `record_step` / `response_steps` /
-    // `finalize_head_request`. We compute `has_tools` after tool
-    // injection so server-side-resolved tools also count.
-    let has_tools = request_value.get("tools").and_then(|v| v.as_array()).is_some_and(|a| !a.is_empty());
-
-    // Multi-step warm-path dispatch. Engages for tool-using
-    // `/v1/responses` realtime requests (priority / default / auto) so
-    // tool calls actually dispatch — single-step onwards proxying
-    // would forward server-side tools to the upstream model but never
-    // run them. Tool-free requests don't need this and fall through to
-    // `handle_realtime` like chat-completions.
-    // Flex requests skip the warm path entirely so they can reach
-    // `handle_flex` and be queued for the daemon (1h SLA, batch
-    // pricing). The daemon's `DwctlRequestProcessor` runs the same
-    // multi-step loop async when tools are present.
-    //
-    //   stream=true,  background=false, !flex, tools → SSE response, loop runs inline
-    //   stream=false, background=false, !flex, tools → JSON response, loop runs inline
-    //   stream=*,     background=true,  !flex, tools → 202 + spawned loop, GET /v1/responses/{id} polls
-    //   no tools, !flex                              → falls through to handle_realtime below
-    //   any flex                                     → falls through to handle_flex below
-    let stream_requested = is_responses_api && !background && request_value["stream"].as_bool().unwrap_or(false);
-
-    // ZDR + server-side tools (responses API) runs the multi-step tool loop —
-    // inline on the realtime warm path, async in the flex daemon — which
-    // scatters plaintext into response_steps / sub-request rows / per-step
-    // outlet logs that ZDR cannot cover. Reject at submit for both tiers, keyed
-    // on per-key policy alone (a keystore is irrelevant to whether we can
-    // safely serve the request).
-    if is_responses_api && has_tools && crate::inference::zdr::is_zdr_request(&state.zdr_key_cache, api_key.as_deref()) {
-        return Response::builder()
-            .status(StatusCode::BAD_REQUEST)
-            .header("content-type", "application/json")
-            .body(Body::from(
-                serde_json::json!({"error": {"message": "Zero-data-retention is not supported for requests that use server-side tools.", "type": "invalid_request_error"}}).to_string(),
-            ))
-            .unwrap();
-    }
-
-    match warm_path_branch(is_responses_api, is_flex, background, stream_requested, has_tools) {
-        WarmPathBranch::Stream => {
-            if let Some(resp) = try_warm_path_stream(&state, &request_value, api_key.as_deref(), model).await {
-                return resp;
-            }
-        }
-        WarmPathBranch::Blocking => {
-            if let Some(resp) = try_warm_path_blocking(&state, &request_value, api_key.as_deref(), model).await {
-                return resp;
-            }
-        }
-        WarmPathBranch::Background => {
-            if let Some(resp) = try_warm_path_background(&state, &request_value, api_key.as_deref(), model).await {
-                return resp;
-            }
-        }
-        WarmPathBranch::FallThrough => {}
-    }
-
     tracing::debug!(
         model = %model,
         service_tier = %service_tier,
@@ -510,6 +479,16 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                 .map(|key| key.key_owner_id.to_string())
                 .or_else(|| created_by.clone())
                 .unwrap_or_default();
+            // INVARIANT: the daemon dispatches this job back through the loopback
+            // (`endpoint` = `.../ai`), so it re-enters the FULL dwctl stack,
+            // including the edge translation layer. That is load-bearing for
+            // Responses: this middleware runs OUTER to translation, so `flex_body`
+            // and `path` are still the RAW `/responses` request here (untranslated).
+            // Translation converts it on the daemon's loopback in both directions
+            // (request -> chat for the model call, chat -> Responses for the stored
+            // result), which is what lets `GET /v1/responses/{id}` return a
+            // Responses object. Do not "optimise" the loopback to hit onwards
+            // directly - that would bypass translation and break Responses flex.
             let flex_input = fusillade::CreateFlexInput {
                 request_id,
                 body: flex_body,
@@ -633,59 +612,6 @@ fn resolve_service_tier(tier: Option<&str>) -> ServiceTier {
         Some("flex") => ServiceTier::Flex,
         // "priority", "default", "auto", None → realtime
         _ => ServiceTier::Realtime,
-    }
-}
-
-/// Which warm-path branch (if any) should handle a request, given
-/// the orthogonal flags `(is_responses_api, is_flex, background,
-/// stream_requested)`. `FallThrough` means the request continues to
-/// the realtime / flex dispatch below — that's how flex
-/// `/v1/responses` reaches `handle_flex` and how chat completions /
-/// embeddings always reach `handle_realtime`.
-///
-/// Extracted as a pure function so the routing decision is testable
-/// without standing up the full middleware state.
-///
-/// Check order matters for readability rather than correctness — both
-/// short-circuits return `FallThrough`, so reordering them produces
-/// the same answer — but reading flex-first makes the bug-this-PR-
-/// fixes connection explicit: flex must never reach the warm path.
-/// `is_responses_api` second documents that warm path is exclusive
-/// to `/v1/responses`. Stream/background tail dispatch is the only
-/// real branching.
-#[derive(Debug, PartialEq, Eq)]
-enum WarmPathBranch {
-    Stream,
-    Blocking,
-    Background,
-    FallThrough,
-}
-
-fn warm_path_branch(is_responses_api: bool, is_flex: bool, background: bool, stream_requested: bool, has_tools: bool) -> WarmPathBranch {
-    // Flex must reach `handle_flex` to land in fusillade-pending
-    // state for the daemon. Engaging warm-path for flex would defeat
-    // the tier (the loop runs inline, billed as realtime).
-    if is_flex {
-        return WarmPathBranch::FallThrough;
-    }
-    // Warm path is /v1/responses-only — chat completions and
-    // embeddings stay on the single-step proxy path.
-    if !is_responses_api {
-        return WarmPathBranch::FallThrough;
-    }
-    // Tool-free /v1/responses doesn't need the multi-step loop —
-    // there are no tool_calls to dispatch. Fall through so onwards'
-    // single-step /v1/responses → /v1/chat/completions proxy handles
-    // it, producing one tracking row via the standard outlet path.
-    if !has_tools {
-        return WarmPathBranch::FallThrough;
-    }
-    if stream_requested {
-        WarmPathBranch::Stream
-    } else if background {
-        WarmPathBranch::Background
-    } else {
-        WarmPathBranch::Blocking
     }
 }
 
@@ -1037,229 +963,35 @@ async fn handle_responses_flex_streaming<P: PoolProvider + Clone + Send + Sync +
 }
 
 /// Check if a request should be intercepted by this middleware.
+///
+/// `/messages` is included because this middleware now runs OUTER to the edge
+/// translation (so it sees the raw foreign path). Anthropic `/messages` still
+/// needs a tracking row and realtime/flex routing, exactly like `/chat/completions`
+/// it would otherwise be translated into; translation happens on the layer just
+/// inside this one.
 pub(crate) fn should_intercept(method: &axum::http::Method, path: &str) -> bool {
     method == axum::http::Method::POST
-        && (path.ends_with("/responses") || path.ends_with("/chat/completions") || path.ends_with("/embeddings"))
+        && (path.ends_with("/responses")
+            || path.ends_with("/chat/completions")
+            || path.ends_with("/messages")
+            || path.ends_with("/embeddings"))
 }
 
-/// Attempt to dispatch a `/v1/responses` request through the warm-path
-/// streaming handler. Returns `Some(response)` if the dispatch
-/// succeeded; `None` if the request can't be served via the warm path
-/// (no API key, missing tool resolution, etc.) and should fall through
-/// to the standard single-step / daemon paths.
-async fn try_warm_path_stream<P: PoolProvider + Clone + Send + Sync + 'static>(
-    state: &InferenceMiddlewareState<P>,
-    request_value: &serde_json::Value,
-    api_key: Option<&str>,
-    model: &str,
-) -> Option<Response> {
-    let api_key = api_key?;
-    let (head_step_uuid, resolved, upstream) = warm_path_setup(state, request_value, api_key, model).await?;
+/// Client-supplied completion/response id keys to strip from a request body
+/// before forwarding upstream (ported from onwards PR #240). Not legitimate
+/// request fields, so removing them never drops real input.
+const SCRUB_ID_KEYS: [&str; 5] = ["id", "completion_id", "completionId", "response_id", "responseId"];
 
-    let sse = super::streaming::run_inline_streaming(
-        state.response_store.clone(),
-        state.multi_step_tool_executor.clone(),
-        resolved,
-        state.multi_step_http_client.clone(),
-        upstream,
-        state.loop_config,
-        head_step_uuid.to_string(),
-        model.to_string(),
-    );
-    Some(sse.into_response())
-}
-
-/// Warm-path blocking handler for `/v1/responses` with
-/// `stream:false, background:false`. Same multi-step machinery as
-/// `try_warm_path_stream`, but accumulates the loop's output and
-/// returns a single JSON response instead of an SSE stream — so tools
-/// dispatch correctly even when the user opted out of streaming.
-async fn try_warm_path_blocking<P: PoolProvider + Clone + Send + Sync + 'static>(
-    state: &InferenceMiddlewareState<P>,
-    request_value: &serde_json::Value,
-    api_key: Option<&str>,
-    model: &str,
-) -> Option<Response> {
-    let api_key = api_key?;
-    let (request_id, resolved, upstream) = match warm_path_setup(state, request_value, api_key, model).await {
-        Some(s) => s,
-        None => return None,
-    };
-
-    let result = super::streaming::run_inline_blocking(
-        state.response_store.clone(),
-        state.multi_step_tool_executor.clone(),
-        resolved,
-        state.multi_step_http_client.clone(),
-        upstream,
-        state.loop_config,
-        request_id.to_string(),
-        model.to_string(),
-    )
-    .await;
-
-    let (status, body) = match result {
-        Ok(json) => (StatusCode::OK, json),
-        Err(err_payload) => (StatusCode::BAD_GATEWAY, serde_json::json!({"error": err_payload})),
-    };
-    Some((status, Json(body)).into_response())
-}
-
-/// Warm-path background handler for `/v1/responses` with
-/// `background:true`. Spawns the multi-step loop in a background
-/// task and returns a 202 with the in_progress response shape — the
-/// caller polls `GET /v1/responses/{id}` for the terminal state.
-async fn try_warm_path_background<P: PoolProvider + Clone + Send + Sync + 'static>(
-    state: &InferenceMiddlewareState<P>,
-    request_value: &serde_json::Value,
-    api_key: Option<&str>,
-    model: &str,
-) -> Option<Response> {
-    let api_key = api_key?;
-    let (request_id, resolved, upstream) = match warm_path_setup(state, request_value, api_key, model).await {
-        Some(s) => s,
-        None => return None,
-    };
-
-    let resp_id = format!("resp_{request_id}");
-    let response_body = serde_json::json!({
-        "id": resp_id,
-        "object": "response",
-        "status": "in_progress",
-        "model": model,
-        "background": true,
-        "output": [],
-    });
-
-    let response_store = state.response_store.clone();
-    let tool_executor = state.multi_step_tool_executor.clone();
-    let http_client = state.multi_step_http_client.clone();
-    let loop_config = state.loop_config;
-    let model_str = model.to_string();
-    let request_id_str = request_id.to_string();
-    tokio::spawn(async move {
-        let _ = super::streaming::run_inline_blocking(
-            response_store,
-            tool_executor,
-            resolved,
-            http_client,
-            upstream,
-            loop_config,
-            request_id_str,
-            model_str,
-        )
-        .await;
-    });
-
-    Some((StatusCode::ACCEPTED, Json(response_body)).into_response())
-}
-
-/// Shared setup for the three warm paths: register the per-response
-/// context in the side-channel so the bridge's `next_action_for` /
-/// `record_step` can re-parse the original body and stamp api_key /
-/// created_by / base_url on per-step sub-request rows; resolve
-/// per-request tools; build the upstream target.
+/// Remove the [`SCRUB_ID_KEYS`] from a request body's top-level object, in place.
 ///
-/// Returns the head-step UUID — the caller surfaces it to the user as
-/// `resp_<id>` and threads its string form into `run_response_loop` as
-/// the loop's `request_id` parameter.
-///
-/// A single `/v1/responses` fusillade row is created up front via
-/// `create_realtime` (state=`processing`, id=`head_step_uuid`). That
-/// row is the response: `record_step`'s head branch reuses it instead
-/// of inserting another, and `finalize_head_request` completes it when
-/// the loop terminates. Descendant model_call steps still mint their
-/// own sub-request rows. The asymmetry with the daemon-driven flex
-/// path (which uses `handle_flex` to create the same shape of row in
-/// `pending` state) is just state at insert: warm path doesn't go
-/// through the daemon's claim cycle.
-async fn warm_path_setup<P: PoolProvider + Clone + Send + Sync + 'static>(
-    state: &InferenceMiddlewareState<P>,
-    request_value: &serde_json::Value,
-    api_key: &str,
-    model: &str,
-) -> Option<(uuid::Uuid, Arc<crate::inference::tools::ResolvedToolSet>, onwards::UpstreamTarget)> {
-    let created_by = response_store::lookup_created_by(&state.dwctl_pool, Some(api_key)).await;
-
-    let resolved = match crate::inference::tools::resolve_tools_for_request(&state.dwctl_pool, api_key, Some(model)).await {
-        Ok(Some(set)) => Arc::new(set),
-        Ok(None) => Arc::new(crate::inference::tools::ResolvedToolSet::new(
-            std::collections::HashMap::new(),
-            std::collections::HashMap::new(),
-        )),
-        Err(e) => {
-            tracing::warn!(error = %e, "warm-path: tool resolution failed; running with no tools");
-            Arc::new(crate::inference::tools::ResolvedToolSet::new(
-                std::collections::HashMap::new(),
-                std::collections::HashMap::new(),
-            ))
+/// Exact-key removal only: every other extension field is preserved, and a
+/// legitimate `previous_response_id` (a different key) is untouched.
+fn scrub_request_id_fields(value: &mut serde_json::Value) {
+    if let Some(obj) = value.as_object_mut() {
+        for key in SCRUB_ID_KEYS {
+            obj.remove(key);
         }
-    };
-
-    // The transition function uses these names to decide which
-    // tool_calls returned by the model can be auto-dispatched and
-    // which must be passed through to the client as `function_call`
-    // output items. Any tool the user supplies in their request body
-    // that isn't registered in `tool_sources` ends up outside this set
-    // and gets the client-side passthrough treatment — without this,
-    // HttpToolExecutor would try to dispatch the unknown name and the
-    // step would fail with `Tool not found`.
-    let resolved_tool_names = resolved.tools.keys().cloned().collect();
-
-    // Allocate the head step UUID up front so the side-channel entry
-    // and the fusillade row share the same id — `record_step`'s head
-    // branch reuses this row instead of creating a separate sub-request.
-    let head_step_uuid = uuid::Uuid::new_v4();
-
-    let pending = response_store::PendingResponseInput {
-        body: request_value.to_string(),
-        api_key: Some(api_key.to_string()),
-        created_by: created_by.clone(),
-        base_url: state.loopback_base_url.clone(),
-        resolved_tool_names,
-    };
-    if let Err(e) = state.response_store.register_pending_with_id(head_step_uuid, pending) {
-        tracing::error!(
-            error = %e,
-            request_id = %head_step_uuid,
-            "warm-path: failed to register pending input — aborting warm path",
-        );
-        return None;
     }
-
-    // Create the /v1/responses row up front in `processing` state so
-    // it's not claimable by the daemon (warm path owns its lifecycle)
-    // and so `record_step`'s head branch can attach to it via id.
-    let realtime_input = fusillade::CreateRealtimeInput {
-        request_id: head_step_uuid,
-        body: request_value.to_string(),
-        model: model.to_string(),
-        endpoint: state.loopback_base_url.clone(),
-        method: "POST".to_string(),
-        path: "/v1/responses".to_string(),
-        api_key: api_key.to_string(),
-        created_by: created_by.unwrap_or_default(),
-    };
-    if let Err(e) = fusillade::Storage::create_realtime(&*state.request_manager, realtime_input).await {
-        tracing::error!(
-            error = %e,
-            request_id = %head_step_uuid,
-            "warm-path: failed to create /v1/responses tracking row — aborting warm path",
-        );
-        state.response_store.unregister_pending(&head_step_uuid.to_string());
-        return None;
-    }
-
-    // Endpoint + path are split (not pre-concatenated) so fusillade
-    // can match `/v1/chat/completions` against its streamable_endpoints
-    // list and pick the streaming branch when the user requested SSE.
-    let upstream = onwards::UpstreamTarget {
-        endpoint: state.loopback_base_url.clone(),
-        path: "/v1/chat/completions".to_string(),
-        api_key: Some(api_key.to_string()),
-    };
-
-    Some((head_step_uuid, resolved, upstream))
 }
 
 #[cfg(test)]
@@ -1301,6 +1033,30 @@ mod tests {
     #[test]
     fn test_should_not_intercept_files() {
         assert!(!should_intercept(&axum::http::Method::POST, "/v1/files"));
+    }
+
+    #[test]
+    fn scrub_strips_id_keys_and_preserves_extensions_and_previous_response_id() {
+        let mut v = serde_json::json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "hi"}],
+            "id": "gone",
+            "completion_id": "gone",
+            "completionId": "gone",
+            "response_id": "gone",
+            "responseId": "gone",
+            "previous_response_id": "resp_keep",
+            "x_custom_extension": "keep",
+        });
+        scrub_request_id_fields(&mut v);
+        let obj = v.as_object().unwrap();
+        for k in super::SCRUB_ID_KEYS {
+            assert!(!obj.contains_key(k), "{k} should have been scrubbed");
+        }
+        // previous_response_id (a superstring of a scrub key) and other extensions survive.
+        assert_eq!(obj["previous_response_id"], "resp_keep");
+        assert_eq!(obj["x_custom_extension"], "keep");
+        assert_eq!(obj["model"], "gpt-4o");
     }
 
     #[test]
@@ -1389,68 +1145,5 @@ mod tests {
         assert_eq!(row_created_by, user.id);
         assert_eq!(row_purpose, "batch");
         assert!(row_hidden);
-    }
-
-    // Routing-decision tests for `warm_path_branch`. The whole point
-    // of this PR is that flex `/v1/responses` must skip the warm
-    // path and fall through to `handle_flex`; these tests pin that
-    // contract so a future refactor that re-engages warm-path for
-    // flex can't silently regress the routing back to the bug.
-
-    #[test]
-    fn warm_path_branch_flex_responses_falls_through_to_handle_flex() {
-        // The bug being fixed: flex /v1/responses used to engage warm
-        // path regardless of tier and run the loop inline at realtime
-        // cost. After the fix, every flex case must fall through.
-        for &background in &[false, true] {
-            for &stream in &[false, true] {
-                for &has_tools in &[false, true] {
-                    assert_eq!(
-                        warm_path_branch(true, true, background, stream, has_tools),
-                        WarmPathBranch::FallThrough,
-                        "flex /v1/responses must fall through (background={background}, stream={stream}, has_tools={has_tools})"
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn warm_path_branch_realtime_responses_with_tools_picks_correct_warm_branch() {
-        // Realtime /v1/responses with tools keeps the existing
-        // warm-path behavior: stream → SSE, background → spawned
-        // task, neither → blocking JSON.
-        assert_eq!(warm_path_branch(true, false, false, true, true), WarmPathBranch::Stream);
-        assert_eq!(warm_path_branch(true, false, true, false, true), WarmPathBranch::Background);
-        assert_eq!(warm_path_branch(true, false, false, false, true), WarmPathBranch::Blocking);
-    }
-
-    #[test]
-    fn warm_path_branch_realtime_responses_without_tools_falls_through() {
-        // Without tools the multi-step loop has nothing to dispatch.
-        // Fall through so onwards' single-step /v1/responses proxy
-        // handles it — produces one tracking row via the standard
-        // outlet path instead of record_step / response_steps.
-        for &background in &[false, true] {
-            for &stream in &[false, true] {
-                assert_eq!(
-                    warm_path_branch(true, false, background, stream, false),
-                    WarmPathBranch::FallThrough,
-                    "tool-free realtime /v1/responses must fall through (background={background}, stream={stream})"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn warm_path_branch_chat_completions_always_falls_through() {
-        // Warm path is /v1/responses-only. Chat completions and
-        // embeddings never engage it regardless of tier — they go
-        // through the single-step proxy.
-        for &has_tools in &[false, true] {
-            assert_eq!(warm_path_branch(false, false, false, false, has_tools), WarmPathBranch::FallThrough);
-            assert_eq!(warm_path_branch(false, true, false, false, has_tools), WarmPathBranch::FallThrough);
-            assert_eq!(warm_path_branch(false, false, false, true, has_tools), WarmPathBranch::FallThrough);
-        }
     }
 }

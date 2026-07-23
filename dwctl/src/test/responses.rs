@@ -279,169 +279,66 @@ async fn test_blocking_response_id_matches_fusillade_id(pool: PgPool) {
     assert!(found, "Response should be retrievable by the client-facing ID");
 }
 
-/// A multi-step `/v1/responses` chain — head model_call, server-side
-/// tool_call, summarizing model_call — assembles into the OpenAI
-/// Response shape and retrieves cleanly via GET /v1/responses/{id}.
+/// POST `/ai/v1/responses` (realtime) then GET it back by the client-facing id.
 ///
-/// The warm path runs the loop in-process and fires per-step model_calls
-/// over HTTP loopback, which the axum_test in-memory transport doesn't
-/// expose — so we drive the bridge primitives directly from the test.
-/// Same code path the loop drives in production (record_step →
-/// complete_step → finalize_head_request → get_response), just without
-/// the loop wrapper. End-to-end POST→GET coverage of the warm path
-/// itself lives under the loopback-listener integration suite (out of
-/// scope for unit tests).
+/// Exercises the whole edge path with the translation layer sitting inner to the
+/// outlet: the request is translated to Chat Completions, the upstream
+/// completion is translated back into a Responses object stamped with the
+/// tracking id, the outlet persists that Responses object, and the client's own
+/// id resolves via GET. This is the POST-then-GET coverage the id/placement fix
+/// turns on - at the broken placement the client received `resp_<upstream chat
+/// id>` while the row was keyed by `resp_<uuid>`, so this GET 404'd.
 #[sqlx::test]
 #[test_log::test]
-async fn test_multi_step_chain_assembles_and_is_retrievable_via_get(pool: PgPool) {
-    use crate::inference::store::{FusilladeResponseStore, PendingResponseInput};
-    use crate::test::utils::setup_fusillade_pool;
-    use fusillade_arsenal::{PostgresRequestManager, PostgresResponseStepManager, TestDbPools};
-    use onwards::{MultiStepStore, StepDescriptor, StepKind as OnwardsStepKind};
-    use serde_json::json;
-    use std::sync::Arc;
+async fn test_responses_post_then_get_by_client_id(pool: PgPool) {
+    let mock_server = wiremock::MockServer::start().await;
+    mount_chat_completions_mock(&mock_server).await;
 
-    let pool = setup_fusillade_pool(&pool).await;
-    let test_pools = TestDbPools::new(pool).await.unwrap();
-    let request_manager = Arc::new(PostgresRequestManager::new(test_pools.clone(), Default::default()));
-    let step_manager = Arc::new(PostgresResponseStepManager::new(test_pools));
-    let store = FusilladeResponseStore::new(request_manager.clone()).with_step_manager(step_manager);
+    let (server, api_key, _bg) = setup_ai_test(pool.clone(), &mock_server, true).await;
 
-    // Stand in for warm_path_setup — create the up-front /v1/responses
-    // fusillade row that `record_step`'s head branch reuses, then
-    // register the per-response context in the side-channel keyed by
-    // the same UUID.
-    let head_uuid = uuid::Uuid::new_v4();
-    let body = json!({"model": "gpt-4o", "input": "weather in Paris?"}).to_string();
-    fusillade::Storage::create_realtime(
-        &*request_manager,
-        fusillade::CreateRealtimeInput {
-            request_id: head_uuid,
-            body: body.clone(),
-            model: "gpt-4o".to_string(),
-            endpoint: "http://upstream-mock".to_string(),
-            method: "POST".to_string(),
-            path: "/v1/responses".to_string(),
-            api_key: String::new(),
-            created_by: "test-user".to_string(),
-        },
-    )
-    .await
-    .unwrap();
-    store
-        .register_pending_with_id(
-            head_uuid,
-            PendingResponseInput {
-                body,
-                api_key: None,
-                created_by: Some("test-user".to_string()),
-                base_url: "http://upstream-mock".to_string(),
-                resolved_tool_names: std::collections::HashSet::new(),
-            },
-        )
-        .unwrap();
-    let request_id = head_uuid.to_string();
-
-    // Step 1: head model_call returns a tool_call.
-    let head_descriptor = StepDescriptor {
-        kind: OnwardsStepKind::ModelCall,
-        request_payload: json!({
+    let response = server
+        .post("/ai/v1/responses")
+        .add_header("Authorization", &format!("Bearer {}", api_key))
+        .add_header("Content-Type", "application/json")
+        .json(&serde_json::json!({
             "model": "gpt-4o",
-            "messages": [{"role":"user","content":"weather in Paris?"}],
-        }),
-    };
-    let head = MultiStepStore::record_step(&store, &request_id, None, None, &head_descriptor)
-        .await
-        .unwrap();
-    MultiStepStore::mark_step_processing(&store, &head.id).await.unwrap();
-    MultiStepStore::complete_step(
-        &store,
-        &head.id,
-        &json!({
-            "choices": [{
-                "message": {
-                    "role":"assistant",
-                    "tool_calls":[{
-                        "id":"call_1",
-                        "type":"function",
-                        "function":{"name":"get_weather","arguments":"{\"city\":\"Paris\"}"}
-                    }]
-                },
-                "finish_reason":"tool_calls"
-            }],
-            "usage": {"prompt_tokens": 10, "completion_tokens": 5},
-        }),
-    )
-    .await
-    .unwrap();
+            "input": "Hello"
+        }))
+        .await;
 
-    // Step 2: tool_call (server-side dispatch).
-    let tool_descriptor = StepDescriptor {
-        kind: OnwardsStepKind::ToolCall,
-        request_payload: json!({"name":"get_weather","args":{"city":"Paris"},"call_id":"call_1"}),
-    };
-    let tool = MultiStepStore::record_step(&store, &request_id, None, Some(&head.id), &tool_descriptor)
-        .await
-        .unwrap();
-    MultiStepStore::mark_step_processing(&store, &tool.id).await.unwrap();
-    MultiStepStore::complete_step(&store, &tool.id, &json!({"temp_c": 18, "condition": "cloudy"}))
-        .await
-        .unwrap();
+    assert_eq!(response.status_code(), 200, "POST /responses should succeed");
+    let body: serde_json::Value = response.json();
+    // The client got a Responses object, not a chat completion.
+    assert_eq!(
+        body["object"].as_str(),
+        Some("response"),
+        "expected a Responses object, got: {body}"
+    );
+    assert_eq!(body["status"].as_str(), Some("completed"));
+    assert_eq!(body["output"][0]["content"][0]["text"].as_str(), Some("Hello from the test!"));
+    let client_id = body["id"].as_str().unwrap().to_string();
+    assert!(client_id.starts_with("resp_"), "id should be a resp_ tracking id, got: {client_id}");
 
-    // Step 3: summarizing model_call returns final assistant text.
-    let summary_descriptor = StepDescriptor {
-        kind: OnwardsStepKind::ModelCall,
-        request_payload: json!({
-            "model": "gpt-4o",
-            "messages": [
-                {"role":"user","content":"weather in Paris?"},
-                {"role":"tool","tool_call_id":"call_1","content":"{\"temp_c\":18}"},
-            ],
-        }),
-    };
-    let summary = MultiStepStore::record_step(&store, &request_id, None, Some(&tool.id), &summary_descriptor)
-        .await
-        .unwrap();
-    MultiStepStore::mark_step_processing(&store, &summary.id).await.unwrap();
-    MultiStepStore::complete_step(
-        &store,
-        &summary.id,
-        &json!({
-            "choices": [{
-                "message": {"role":"assistant","content":"It's 18°C and cloudy in Paris."},
-                "finish_reason":"stop"
-            }],
-            "usage": {"prompt_tokens": 12, "completion_tokens": 8},
-        }),
-    )
-    .await
-    .unwrap();
-
-    // Finalize like the warm path does on Ok exit: assemble the chain
-    // and stamp the result onto the head step's sub-request fusillade
-    // row so GET retrieval surfaces a completed response.
-    let assembled = MultiStepStore::assemble_response(&store, &request_id).await.unwrap();
-    store.finalize_head_request(&request_id, 200, assembled).await.unwrap();
-
-    // GET retrieval: the response is completed, the id matches the head
-    // step (not any internal sub-request id), and the chain is listable.
-    let resp_id = format!("resp_{request_id}");
-    let response = match store.get_response(&resp_id).await.unwrap() {
-        crate::inference::store::ResponseLookup::Found(v) => v,
-        other => panic!("response should be retrievable, got {other:?}"),
-    };
-    assert_eq!(response["id"].as_str(), Some(resp_id.as_str()));
-    assert_eq!(response["status"].as_str(), Some("completed"));
-
-    let chain = MultiStepStore::list_chain(&store, &request_id, None).await.unwrap();
-    assert_eq!(chain.len(), 3, "chain should have head + tool + summary");
-    assert_eq!(chain[0].id, head.id);
-    assert_eq!(chain[1].id, tool.id);
-    assert_eq!(chain[2].id, summary.id);
-    assert!(matches!(chain[0].kind, onwards::StepKind::ModelCall));
-    assert!(matches!(chain[1].kind, onwards::StepKind::ToolCall));
-    assert!(matches!(chain[2].kind, onwards::StepKind::ModelCall));
-    assert!(chain.iter().all(|s| matches!(s.state, onwards::StepState::Completed)));
+    // The client's OWN id must resolve (poll until the outlet writes the row).
+    let start = std::time::Instant::now();
+    let mut found = false;
+    while start.elapsed() < std::time::Duration::from_secs(5) {
+        let retrieve = server
+            .get(&format!("/ai/v1/responses/{}", client_id))
+            .add_header("Authorization", &format!("Bearer {}", api_key))
+            .await;
+        if retrieve.status_code() == 200 {
+            let r: serde_json::Value = retrieve.json();
+            if r["status"].as_str() == Some("completed") {
+                assert_eq!(r["object"].as_str(), Some("response"), "GET must return a Responses object");
+                assert_eq!(r["id"].as_str(), Some(client_id.as_str()), "GET id must equal the client-facing id");
+                found = true;
+                break;
+            }
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    }
+    assert!(found, "the client-facing /responses id must resolve via GET");
 }
 
 /// Test that GET /v1/responses/{id} returns 404 for non-existent IDs.
@@ -707,72 +604,3 @@ async fn test_realtime_zdr_suppresses_stored_bodies(pool: PgPool) {
         "ZDR realtime request_templates.body must be blank at rest"
     );
 }
-
-/// A ZDR account cannot use server-side tools on /v1/responses: the multi-step
-/// warm-path loop would scatter plaintext into response_steps / sub-request rows
-/// / per-step logs that ZDR cannot cover, so it is rejected at submit. A ZDR
-/// request WITHOUT tools is not rejected - the gate is tool-specific.
-#[sqlx::test]
-#[test_log::test]
-async fn test_realtime_zdr_rejects_server_side_tools(pool: PgPool) {
-    let mock_server = wiremock::MockServer::start().await;
-    mount_chat_completions_mock(&mock_server).await;
-
-    let (server, api_key, bg) = setup_ai_test(pool.clone(), &mock_server, true).await;
-    enable_zdr_for_key(&pool, &bg, &api_key).await;
-
-    // ZDR + /v1/responses + tools -> 400 at submit (before the warm path, so no
-    // upstream call is made).
-    let rejected = server
-        .post("/ai/v1/responses")
-        .add_header("Authorization", &format!("Bearer {}", api_key))
-        .add_header("Content-Type", "application/json")
-        .json(&serde_json::json!({
-            "model": "gpt-4o",
-            "input": "hello",
-            "tools": [{"type": "function", "name": "get_weather", "parameters": {"type": "object", "properties": {}}}]
-        }))
-        .await;
-    assert_eq!(rejected.status_code(), 400, "ZDR + server-side tools must be rejected");
-    let body: serde_json::Value = rejected.json();
-    assert!(
-        body["error"]["message"]
-            .as_str()
-            .unwrap_or("")
-            .contains("Zero-data-retention is not supported"),
-        "unexpected error body: {body}"
-    );
-
-    // Same ZDR key, no tools -> not rejected by the gate (falls through to the
-    // single-step realtime path).
-    let allowed = server
-        .post("/ai/v1/responses")
-        .add_header("Authorization", &format!("Bearer {}", api_key))
-        .add_header("Content-Type", "application/json")
-        .json(&serde_json::json!({"model": "gpt-4o", "input": "hello"}))
-        .await;
-    assert_ne!(
-        allowed.status_code(),
-        400,
-        "ZDR without tools must not hit the tools-rejection gate (got {})",
-        allowed.status_code()
-    );
-}
-
-// Removed: `test_flex_background_returns_202_with_queued_status`,
-// `test_flex_blocking_waits_for_completion`,
-// `test_priority_background_completes_and_is_retrievable`.
-//
-// All three asserted on the pre-warm-path routing where flex went
-// through the fusillade daemon (returning `status=queued`) and
-// background invoked the realtime path with daemon polling. Since
-// commit `6a7c24d7` every `/v1/responses` engages the multi-step warm
-// path regardless of tier or background flag — the daemon-driven and
-// queued/in_progress assertions don't model current behavior. End-to-
-// end coverage of the warm path itself needs a real HTTP loopback
-// listener (the axum_test in-memory transport doesn't bind a port);
-// that integration suite is tracked under the daemon-path
-// rewrite and the loopback fixture follow-up. Bridge-primitive
-// coverage for the multi-step path lives in
-// `test_multi_step_chain_assembles_and_is_retrievable_via_get` above
-// and `test::multi_step_executor::loop_drives_real_tool_and_model_calls_through_production_executor`.

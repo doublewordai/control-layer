@@ -36,6 +36,12 @@ impl ProtocolTranslator for AnthropicModels {
         path.ends_with("/models") && headers.contains_key("anthropic-version")
     }
 
+    /// This translator claims `GET /models` and never reads a body, so it must
+    /// not be gated to POST.
+    fn translates_request_body(&self) -> bool {
+        false
+    }
+
     fn translate_request(&self, parts: &Parts, body: Bytes) -> Result<TranslatedRequest, TranslationError> {
         // A GET with no body to translate. The path already targets onwards'
         // models handler, so we leave it as-is and only normalise auth.
@@ -48,7 +54,7 @@ impl ProtocolTranslator for AnthropicModels {
         })
     }
 
-    fn translate_response(&self, body: Bytes) -> Result<Bytes, TranslationError> {
+    fn translate_response(&self, _request: &Bytes, _response_id: Option<&str>, body: Bytes) -> Result<Bytes, TranslationError> {
         from_openai_models(body)
     }
 
@@ -60,7 +66,7 @@ impl ProtocolTranslator for AnthropicModels {
         response::anthropic_error(status, message.to_string())
     }
 
-    fn stream_reframer(&self) -> Box<dyn StreamReframer> {
+    fn stream_reframer(&self, _request: &Bytes, _response_id: Option<&str>) -> Box<dyn StreamReframer> {
         // The models list is never streamed (the response is application/json, so
         // the middleware never reaches the SSE path); a no-op satisfies the trait.
         Box::new(NoopReframer)
