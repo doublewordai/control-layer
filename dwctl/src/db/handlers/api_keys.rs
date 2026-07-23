@@ -629,10 +629,15 @@ impl<'c> ApiKeys<'c> {
         let rows = sqlx::query!(
             r#"
             SELECT ak.id,
-                   CASE WHEN ck.api_key_id IS NULL THEN NULL
+                   -- Uncapped keys report NULL even when a checkpoint row
+                   -- lingers from a removed cap: the fold stops when the cap
+                   -- is removed, so any leftover numbers are frozen and would
+                   -- mislead. (The row itself is kept for instant re-capping.)
+                   CASE WHEN ak.spend_limit IS NULL THEN NULL
+                        WHEN ck.api_key_id IS NULL THEN NULL
                         WHEN api_key_cap_window_current(ck.window_started_at, ak.spend_limit_interval)
                         THEN ck.window_spend ELSE 0 END AS spend,
-                   ck.total_spend AS "total_spend?",
+                   CASE WHEN ak.spend_limit IS NULL THEN NULL ELSE ck.total_spend END AS "total_spend?",
                    CASE WHEN ak.spend_limit IS NOT NULL
                         THEN api_key_cap_window_resets_at(ak.spend_limit_interval) END AS resets_at
             FROM api_keys ak

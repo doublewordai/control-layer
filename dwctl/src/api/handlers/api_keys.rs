@@ -820,6 +820,9 @@ mod tests {
         let body: ApiKeyInfoResponse = resp.json();
         assert_eq!(body.spend_limit, None);
         assert_eq!(body.spend_limit_interval, None, "clearing the cap clears the interval");
+        assert_eq!(body.spend, None, "uncapped keys never display (frozen) spend");
+        assert_eq!(body.total_spend, None, "uncapped keys never display (frozen) totals");
+        assert_eq!(body.resets_at, None);
         let child_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM api_keys WHERE parent_api_key_id = $1 AND is_deleted = false")
             .bind(key.id)
             .fetch_one(&pool)
