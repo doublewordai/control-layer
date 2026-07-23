@@ -135,16 +135,23 @@ struct QueuedCommand {
     command: ResponseWriteCommand,
 }
 
+type PendingCreate = (Instant, CreateResponseInput, oneshot::Sender<fusillade::Result<RequestId>>);
+
 #[cfg(test)]
 #[derive(Clone, Default)]
 pub(crate) struct RequestsWriterTestObserver {
     create_transaction_attempts: Arc<AtomicUsize>,
+    create_retry_backoffs: Arc<AtomicUsize>,
 }
 
 #[cfg(test)]
 impl RequestsWriterTestObserver {
     pub(crate) fn create_transaction_attempts(&self) -> usize {
         self.create_transaction_attempts.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn create_retry_backoffs(&self) -> usize {
+        self.create_retry_backoffs.load(Ordering::SeqCst)
     }
 }
 
@@ -438,7 +445,7 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> RequestsWriter<P> {
         .await;
     }
 
-    async fn flush_creates(&self, creates: Vec<(Instant, CreateResponseInput, oneshot::Sender<fusillade::Result<RequestId>>)>) {
+    async fn flush_creates(&self, mut creates: Vec<PendingCreate>) {
         if creates.is_empty() {
             return;
         }
@@ -450,6 +457,7 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> RequestsWriter<P> {
                 .record(enqueued_at.elapsed().as_secs_f64());
         }
 
+        discard_canceled_creates(&mut creates);
         let mut valid_creates = Vec::with_capacity(submitted_batch_size);
         for (enqueued_at, input, ack) in creates {
             if create_input_created_by(&input).trim().is_empty() {
@@ -465,9 +473,12 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> RequestsWriter<P> {
             return;
         }
 
+        let result = self.retry_create_batch(&mut valid_creates).await;
         let batch_size = valid_creates.len();
-        let inputs: Vec<_> = valid_creates.iter().map(|(_, input, _)| input.clone()).collect();
-        let result = self.retry_create_batch(&inputs).await;
+        if valid_creates.is_empty() {
+            histogram!("dwctl_requests_writer_flush_duration_seconds", "command" => "create").record(start.elapsed().as_secs_f64());
+            return;
+        }
 
         match result {
             Ok(ids) if ids.len() == valid_creates.len() => {
@@ -505,11 +516,21 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> RequestsWriter<P> {
         histogram!("dwctl_requests_writer_flush_duration_seconds", "command" => "create").record(start.elapsed().as_secs_f64());
     }
 
-    async fn retry_create_batch(&self, inputs: &[CreateResponseInput]) -> fusillade::Result<Vec<RequestId>> {
+    async fn retry_create_batch(&self, creates: &mut Vec<PendingCreate>) -> fusillade::Result<Vec<RequestId>> {
         for attempt in 0..=self.max_retries {
+            // The admission future owns the acknowledgement receiver. If it
+            // has gone away, persisting the create would leave an orphaned
+            // request that no caller can dispatch or complete. Re-check at
+            // every attempt because the caller can disappear during retry
+            // backoff as well as while the command is queued.
+            discard_canceled_creates(creates);
+            if creates.is_empty() {
+                return Ok(Vec::new());
+            }
+            let inputs: Vec<_> = creates.iter().map(|(_, input, _)| input.clone()).collect();
             #[cfg(test)]
             self.test_observer.create_transaction_attempts.fetch_add(1, Ordering::SeqCst);
-            match self.request_manager.create_responses_batch(inputs).await {
+            match self.request_manager.create_responses_batch(&inputs).await {
                 Ok(ids) => {
                     if attempt > 0 {
                         counter!("dwctl_requests_writer_retries_total", "command" => "create", "outcome" => "success").increment(1);
@@ -517,7 +538,15 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> RequestsWriter<P> {
                     return Ok(ids);
                 }
                 Err(error) if attempt < self.max_retries && is_retryable_db_error(&error) => {
+                    // Avoid an otherwise unnecessary backoff when every
+                    // waiter was canceled while this attempt was failing.
+                    discard_canceled_creates(creates);
+                    if creates.is_empty() {
+                        return Ok(Vec::new());
+                    }
                     counter!("dwctl_requests_writer_retries_total", "command" => "create", "outcome" => "retry").increment(1);
+                    #[cfg(test)]
+                    self.test_observer.create_retry_backoffs.fetch_add(1, Ordering::SeqCst);
                     tokio::time::sleep(self.retry_base_delay * 2u32.pow(attempt)).await;
                 }
                 Err(error) => return Err(error),
@@ -623,6 +652,20 @@ fn invalid_create_owner() -> fusillade::FusilladeError {
     fusillade::FusilladeError::ValidationError("response lifecycle create requires non-empty created_by".to_string())
 }
 
+fn discard_canceled_creates(creates: &mut Vec<PendingCreate>) {
+    let submitted = creates.len();
+    creates.retain(|(_, _, ack)| !ack.is_closed());
+    let discarded = submitted - creates.len();
+    if discarded > 0 {
+        counter!("dwctl_requests_writer_create_ack_total", "outcome" => "canceled").increment(discarded as u64);
+        debug!(
+            discarded,
+            remaining = creates.len(),
+            "Discarded response creates whose callers were canceled"
+        );
+    }
+}
+
 fn redacted_create_error(error: &fusillade::FusilladeError) -> String {
     let kind = match error {
         fusillade::FusilladeError::ValidationError(_) => "validation error",
@@ -633,7 +676,7 @@ fn redacted_create_error(error: &fusillade::FusilladeError) -> String {
     format!("responses writer create failed: {kind}")
 }
 
-fn fan_out_create_error(creates: Vec<(Instant, CreateResponseInput, oneshot::Sender<fusillade::Result<RequestId>>)>, safe_message: &str) {
+fn fan_out_create_error(creates: Vec<PendingCreate>, safe_message: &str) {
     for (_, _, ack) in creates {
         let _ = ack.send(Err(fusillade::FusilladeError::Other(anyhow::anyhow!(safe_message.to_string()))));
         counter!("dwctl_requests_writer_create_ack_total", "outcome" => "error").increment(1);
@@ -757,6 +800,115 @@ mod tests {
 
         shutdown.cancel();
         writer_task.await.unwrap();
+    }
+
+    #[sqlx::test]
+    async fn create_canceled_before_writer_start_is_not_persisted(pool: sqlx::PgPool) {
+        let (writer, handle, _manager, fusillade_pool) = build_writer_with_pool(pool).await;
+        let request_id = Uuid::new_v4();
+        let acknowledgement = tokio::spawn({
+            let handle = handle.clone();
+            async move { handle.admit_realtime(realtime_input(request_id, "canceled-owner")).await }
+        });
+        timeout(Duration::from_secs(1), async {
+            while handle.queued_commands() != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("create should enter the channel before its caller is canceled");
+
+        acknowledgement.abort();
+        assert!(
+            acknowledgement.await.unwrap_err().is_cancelled(),
+            "aborting the caller must close the create acknowledgement receiver"
+        );
+
+        let shutdown = CancellationToken::new();
+        let writer_task = tokio::spawn(writer.run(shutdown.clone()));
+        timeout(Duration::from_secs(1), async {
+            while handle.queued_commands() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("writer should drain the canceled create");
+        shutdown.cancel();
+        writer_task.await.unwrap();
+
+        let request_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM requests")
+            .fetch_one(&fusillade_pool)
+            .await
+            .unwrap();
+        let template_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_templates")
+            .fetch_one(&fusillade_pool)
+            .await
+            .unwrap();
+        assert_eq!((request_count, template_count), (0, 0));
+    }
+
+    #[sqlx::test]
+    async fn create_canceled_during_retry_backoff_is_not_retried_or_persisted(pool: sqlx::PgPool) {
+        let migrated_pool = crate::test::utils::setup_fusillade_pool(&pool).await;
+        let constrained_pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .min_connections(0)
+            .acquire_timeout(Duration::from_millis(25))
+            .connect_with(migrated_pool.connect_options().as_ref().clone())
+            .await
+            .unwrap();
+        let pools = TestDbPools::new(constrained_pool.clone()).await.unwrap();
+        let manager = Arc::new(
+            PostgresRequestManager::with_client(pools, Arc::new(ReqwestHttpClient::default()))
+                .with_db_retry_config(fusillade_arsenal::DbRetryConfig::disabled()),
+        );
+        let (mut writer, handle) = RequestsWriter::new(manager, 8, Duration::ZERO);
+        writer.max_retries = 1;
+        writer.retry_base_delay = Duration::from_millis(500);
+        let observer = handle.test_observer();
+
+        let pool_guard = constrained_pool.acquire().await.unwrap();
+        let acknowledgement = tokio::spawn({
+            let handle = handle.clone();
+            async move { handle.admit_realtime(realtime_input(Uuid::new_v4(), "canceled-owner")).await }
+        });
+        let shutdown = CancellationToken::new();
+        let writer_task = tokio::spawn(writer.run(shutdown.clone()));
+
+        timeout(Duration::from_secs(1), async {
+            while observer.create_retry_backoffs() != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the exhausted pool should put the create into retry backoff");
+
+        acknowledgement.abort();
+        assert!(
+            acknowledgement.await.unwrap_err().is_cancelled(),
+            "aborting during backoff must close the acknowledgement receiver"
+        );
+        drop(pool_guard);
+        shutdown.cancel();
+        timeout(Duration::from_secs(2), writer_task)
+            .await
+            .expect("writer should finish the bounded backoff")
+            .unwrap();
+
+        assert_eq!(
+            observer.create_transaction_attempts(),
+            1,
+            "a create whose caller canceled during backoff must not make a second DB attempt"
+        );
+        let request_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM requests")
+            .fetch_one(&constrained_pool)
+            .await
+            .unwrap();
+        let template_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_templates")
+            .fetch_one(&constrained_pool)
+            .await
+            .unwrap();
+        assert_eq!((request_count, template_count), (0, 0));
     }
 
     #[sqlx::test]
