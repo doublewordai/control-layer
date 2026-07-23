@@ -56,6 +56,8 @@
 //! ```
 
 use crate::metrics::errors::component::RESPONSES_WRITER;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -133,14 +135,39 @@ struct QueuedCommand {
     command: ResponseWriteCommand,
 }
 
+#[cfg(test)]
+#[derive(Clone, Default)]
+pub(crate) struct RequestsWriterTestObserver {
+    create_transaction_attempts: Arc<AtomicUsize>,
+}
+
+#[cfg(test)]
+impl RequestsWriterTestObserver {
+    pub(crate) fn create_transaction_attempts(&self) -> usize {
+        self.create_transaction_attempts.load(Ordering::SeqCst)
+    }
+}
+
 /// Cloneable producer handle for durable creates and best-effort completions.
 #[derive(Clone)]
 pub struct RequestsWriterHandle {
     sender: mpsc::Sender<QueuedCommand>,
     shutdown_token: Arc<OnceLock<CancellationToken>>,
+    #[cfg(test)]
+    test_observer: RequestsWriterTestObserver,
 }
 
 impl RequestsWriterHandle {
+    #[cfg(test)]
+    pub(crate) fn test_observer(&self) -> RequestsWriterTestObserver {
+        self.test_observer.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn queued_commands(&self) -> usize {
+        self.sender.max_capacity() - self.sender.capacity()
+    }
+
     pub async fn admit_flex(&self, input: CreateFlexInput) -> fusillade::Result<RequestId> {
         self.create(CreateResponseInput::Flex(input)).await
     }
@@ -211,6 +238,8 @@ pub struct RequestsWriter<P: PoolProvider + Clone + Send + Sync + 'static> {
     max_linger: Duration,
     max_retries: u32,
     retry_base_delay: Duration,
+    #[cfg(test)]
+    test_observer: RequestsWriterTestObserver,
 }
 
 impl<P: PoolProvider + Clone + Send + Sync + 'static> RequestsWriter<P> {
@@ -220,6 +249,8 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> RequestsWriter<P> {
     pub fn new(request_manager: Arc<PostgresRequestManager<P>>, batch_size: usize, max_linger: Duration) -> (Self, RequestsWriterHandle) {
         let (sender, receiver) = mpsc::channel(CHANNEL_BUFFER_SIZE);
         let shutdown_token = Arc::new(OnceLock::new());
+        #[cfg(test)]
+        let test_observer = RequestsWriterTestObserver::default();
         let writer = Self {
             request_manager,
             receiver,
@@ -228,8 +259,18 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> RequestsWriter<P> {
             max_linger,
             max_retries: DEFAULT_MAX_RETRIES,
             retry_base_delay: Duration::from_millis(DEFAULT_RETRY_BASE_DELAY_MS),
+            #[cfg(test)]
+            test_observer: test_observer.clone(),
         };
-        (writer, RequestsWriterHandle { sender, shutdown_token })
+        (
+            writer,
+            RequestsWriterHandle {
+                sender,
+                shutdown_token,
+                #[cfg(test)]
+                test_observer,
+            },
+        )
     }
 
     /// Run the writer until the shutdown token fires or the channel closes.
@@ -466,6 +507,8 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> RequestsWriter<P> {
 
     async fn retry_create_batch(&self, inputs: &[CreateResponseInput]) -> fusillade::Result<Vec<RequestId>> {
         for attempt in 0..=self.max_retries {
+            #[cfg(test)]
+            self.test_observer.create_transaction_attempts.fetch_add(1, Ordering::SeqCst);
             match self.request_manager.create_responses_batch(inputs).await {
                 Ok(ids) => {
                     if attempt > 0 {

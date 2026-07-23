@@ -1462,6 +1462,108 @@ mod tests {
         serde_json::from_slice(&body).unwrap()
     }
 
+    fn responses_burst_flex_request(input: String) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("authorization", format!("Bearer {FLEX_TEST_KEY}"))
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "model": FLEX_TEST_MODEL,
+                    "service_tier": "flex",
+                    "background": true,
+                    "tools": [],
+                    "input": input,
+                })
+                .to_string(),
+            ))
+            .unwrap()
+    }
+
+    fn responses_burst_get_request(request_id: Uuid) -> Request<Body> {
+        Request::builder()
+            .uri(format!("/v1/responses/resp_{request_id}"))
+            .header("authorization", format!("Bearer {FLEX_TEST_KEY}"))
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    async fn responses_burst_json(response: Response) -> Result<(StatusCode, serde_json::Value), String> {
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .map_err(|error| format!("failed to read response body: {error}"))?;
+        let body = serde_json::from_slice(&body).map_err(|error| format!("HTTP {status} returned non-JSON body: {error}"))?;
+        Ok((status, body))
+    }
+
+    fn responses_burst_created_ids(
+        responses: Vec<Result<(StatusCode, serde_json::Value), String>>,
+        expected_count: usize,
+    ) -> Result<Vec<Uuid>, String> {
+        if responses.len() != expected_count {
+            return Err(format!("expected {expected_count} create responses, got {}", responses.len()));
+        }
+
+        let mut ids = Vec::with_capacity(expected_count);
+        let mut unique = HashSet::with_capacity(expected_count);
+        for (index, response) in responses.into_iter().enumerate() {
+            let (status, body) = response?;
+            if status != StatusCode::ACCEPTED {
+                return Err(format!("create {index} returned HTTP {status}: {body}"));
+            }
+            for (field, expected) in [("object", "response"), ("status", "queued"), ("model", FLEX_TEST_MODEL)] {
+                if body[field].as_str() != Some(expected) {
+                    return Err(format!("create {index} returned unexpected {field}: {body}"));
+                }
+            }
+            if body["background"].as_bool() != Some(true) {
+                return Err(format!("create {index} did not preserve background=true: {body}"));
+            }
+            let response_id = body["id"]
+                .as_str()
+                .ok_or_else(|| format!("create {index} returned no response id: {body}"))?;
+            let raw_id = response_id
+                .strip_prefix("resp_")
+                .ok_or_else(|| format!("create {index} returned malformed response id: {response_id}"))?;
+            let request_id =
+                Uuid::parse_str(raw_id).map_err(|error| format!("create {index} returned invalid UUID {response_id}: {error}"))?;
+            if !unique.insert(request_id) {
+                return Err(format!("create {index} repeated response id {response_id}"));
+            }
+            ids.push(request_id);
+        }
+        Ok(ids)
+    }
+
+    fn responses_burst_validate_gets(
+        responses: Vec<(Uuid, Result<(StatusCode, serde_json::Value), String>)>,
+        expected_count: usize,
+    ) -> Result<(), String> {
+        if responses.len() != expected_count {
+            return Err(format!("expected {expected_count} GET responses, got {}", responses.len()));
+        }
+        for (expected_id, response) in responses {
+            let (status, body) = response?;
+            if status != StatusCode::OK {
+                return Err(format!("GET resp_{expected_id} returned HTTP {status}: {body}"));
+            }
+            let expected_response_id = format!("resp_{expected_id}");
+            if body["id"].as_str() != Some(expected_response_id.as_str())
+                || body["object"].as_str() != Some("response")
+                || body["status"].as_str() != Some("queued")
+                || body["model"].as_str() != Some(FLEX_TEST_MODEL)
+                // The durable outbound template intentionally strips admission-only
+                // `background`; queued retrieval therefore uses its canonical default.
+                || body["background"].as_bool() != Some(false)
+            {
+                return Err(format!("GET resp_{expected_id} returned the wrong owner-visible object: {body}"));
+            }
+        }
+        Ok(())
+    }
+
     #[sqlx::test]
     async fn background_realtime_missing_bearer_returns_canonical_unauthorized_before_admission(pool: sqlx::PgPool) {
         use std::time::Duration;
@@ -1900,6 +2002,458 @@ mod tests {
 
         writer_shutdown.cancel();
         writer_task.await.unwrap();
+    }
+
+    #[sqlx::test]
+    async fn responses_burst_survives_low_pools_and_batches_durable_creates(pool: sqlx::PgPool) {
+        use std::sync::OnceLock;
+        use std::time::Duration;
+
+        use axum::{
+            Router, middleware,
+            routing::{get, post},
+        };
+        use futures::future::join_all;
+        use sqlx::postgres::PgPoolOptions;
+        use tower::ServiceExt;
+
+        const INITIAL_CREATES: usize = 100;
+        const MIXED_CREATES: usize = 34;
+        const MIXED_GETS: usize = 33;
+        const MIXED_COMPLETIONS: usize = 33;
+        const COMPLETION_MODEL: &str = "responses-burst-realtime";
+
+        let main_pool = PgPoolOptions::new()
+            .max_connections(1)
+            .min_connections(0)
+            .acquire_timeout(Duration::from_millis(25))
+            .connect_with(pool.connect_options().as_ref().clone())
+            .await
+            .unwrap();
+
+        let migration_pool = crate::test::utils::setup_fusillade_pool(&pool).await;
+        let fusillade_pool = PgPoolOptions::new()
+            .max_connections(4)
+            .min_connections(0)
+            .acquire_timeout(Duration::from_millis(50))
+            .connect_with(migration_pool.connect_options().as_ref().clone())
+            .await
+            .unwrap();
+        migration_pool.close().await;
+
+        let request_manager = Arc::new(fusillade_arsenal::PostgresRequestManager::new(
+            fusillade_pool.clone(),
+            Default::default(),
+        ));
+        let response_step_manager = Arc::new(request_manager.response_step_manager());
+        let (requests_writer_task, requests_writer) =
+            crate::inference::engine::writer::RequestsWriter::new(request_manager.clone(), INITIAL_CREATES, Duration::from_millis(2));
+        let writer_observer = requests_writer.test_observer();
+        let response_store = Arc::new(
+            response_store::FusilladeResponseStore::new(request_manager.clone(), requests_writer.clone())
+                .with_step_manager(response_step_manager.clone()),
+        );
+
+        let owner = crate::test::utils::create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
+        sqlx::query("UPDATE users SET verified = true WHERE id = $1")
+            .bind(owner.id)
+            .execute(&pool)
+            .await
+            .expect("mark burst owner verified");
+        let presented_key = crate::test::utils::create_test_api_key_for_user(&pool, owner.id).await;
+        sqlx::query("UPDATE api_keys SET secret = $1, spend_limit = 10 WHERE id = $2")
+            .bind(FLEX_TEST_KEY)
+            .bind(presented_key.id)
+            .execute(&pool)
+            .await
+            .expect("install deterministic capped burst key");
+        let hidden_key = {
+            let mut conn = pool.acquire().await.expect("acquire cap-child setup connection");
+            crate::db::handlers::api_keys::ApiKeys::new(&mut conn)
+                .get_or_create_child_hidden_key(presented_key.id)
+                .await
+                .expect("create cap-scoped execution key")
+                .0
+        };
+        let owner_id = owner.id;
+        let api_key_cache = crate::sync::api_key_cache::initial_cache(&main_pool)
+            .await
+            .expect("load capped burst key metadata");
+        let cached_key = api_key_cache.get(FLEX_TEST_KEY).expect("presented burst key must be cached");
+        assert_eq!(cached_key.owner_id, owner_id);
+        assert_eq!(cached_key.hidden_batch_key.as_deref(), Some(hidden_key.as_str()));
+        assert!(
+            cached_key.hidden_batch_key_is_child,
+            "measured hot phase requires an authoritative cap-child cache entry"
+        );
+        let flex_batch_key_resolver = crate::sync::api_key_cache::FlexBatchKeyResolver::new(main_pool.clone(), api_key_cache.clone());
+        let primed_flex_key = flex_batch_key_resolver
+            .resolve_hidden_batch_key(FLEX_TEST_KEY)
+            .await
+            .expect("hidden Flex key setup should succeed")
+            .expect("presented Flex key should resolve");
+        assert_eq!(primed_flex_key.secret, hidden_key);
+        let inference_state = InferenceMiddlewareState {
+            requests_writer: requests_writer.clone(),
+            request_manager: request_manager.clone(),
+            daemon_id: OnwardsDaemonId(Uuid::new_v4()),
+            loopback_base_url: "http://127.0.0.1:3001/ai".to_string(),
+            dwctl_pool: main_pool.clone(),
+            response_store: response_store.clone(),
+            multi_step_tool_executor: Arc::new(crate::inference::tools::HttpToolExecutor::new(reqwest::Client::new(), None)),
+            multi_step_http_client: Arc::new(fusillade::ReqwestHttpClient::new(
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+                Vec::new(),
+            )),
+            loop_config: onwards::LoopConfig::default(),
+            image_normalizer: Arc::new(crate::image_normalizer::DisabledNormalizer),
+            image_normalizer_enabled: false,
+            unverified_requests_per_completion_hour: 0,
+            flex_completion_window: "1h".to_string(),
+            keystore: None,
+            api_key_cache: api_key_cache.clone(),
+            flex_batch_key_resolver: flex_batch_key_resolver.clone(),
+            onwards_targets: flex_access_targets(&[FLEX_TEST_KEY, hidden_key.as_str()], HashMap::new(), Vec::new()),
+        };
+
+        let config = crate::test::utils::create_test_config();
+        let shared_config = crate::SharedConfig::new(config.clone());
+        underway::run_migrations(&pool).await.expect("underway migrations should succeed");
+        let task_runner = Arc::new(
+            crate::tasks::TaskRunner::new(
+                pool.clone(),
+                crate::tasks::TaskState {
+                    request_manager: request_manager.clone(),
+                    dwctl_pool: pool.clone(),
+                    config: shared_config.clone(),
+                    encryption_key: None,
+                    ingest_file_job: Arc::new(OnceLock::new()),
+                    activate_batch_job: Arc::new(OnceLock::new()),
+                    create_batch_job: Arc::new(OnceLock::new()),
+                    cascade_batch_state_job: Arc::new(OnceLock::new()),
+                },
+                &crate::config::TaskWorkersConfig {
+                    create_batch_workers: 0,
+                    cascade_batch_state_workers: 0,
+                    purge_user_data_workers: 0,
+                    response_writer_batch_size: 0,
+                    response_writer_max_linger_ms: 0,
+                },
+            )
+            .await
+            .expect("task runner should build before measured pool contention"),
+        );
+        let app_state = crate::AppState::builder()
+            .db(main_pool.clone())
+            .config(shared_config)
+            .request_manager(request_manager.clone())
+            .requests_writer(requests_writer.clone())
+            .task_runner(task_runner)
+            .limiters(crate::limits::Limiters::new(&config.limits))
+            .response_store(response_store)
+            .response_step_manager(response_step_manager)
+            .image_normalizer(Arc::new(crate::image_normalizer::DisabledNormalizer) as Arc<dyn crate::image_normalizer::ImageNormalizer>)
+            .api_key_cache(api_key_cache)
+            .flex_batch_key_resolver(flex_batch_key_resolver)
+            .build();
+        let app = Router::new()
+            .route("/v1/responses", post(|| async { StatusCode::IM_A_TEAPOT }))
+            .route(
+                "/v1/responses/{response_id}",
+                get(crate::inference::handler::get_response::<sqlx::PgPool>),
+            )
+            .layer(middleware::from_fn_with_state(inference_state, inference_middleware))
+            .with_state(app_state);
+
+        let held_main_connection = main_pool.acquire().await.unwrap();
+        let held_fusillade_connection_a = fusillade_pool.acquire().await.unwrap();
+        let held_fusillade_connection_b = fusillade_pool.acquire().await.unwrap();
+
+        let phase_a_app = app.clone();
+        let mut phase_a_task = tokio::spawn(async move {
+            join_all((0..INITIAL_CREATES).map(|index| {
+                let app = phase_a_app.clone();
+                async move {
+                    let response = app
+                        .oneshot(responses_burst_flex_request(format!("initial-{index}")))
+                        .await
+                        .expect("Axum router is infallible");
+                    responses_burst_json(response).await
+                }
+            }))
+            .await
+        });
+
+        let writer_shutdown = tokio_util::sync::CancellationToken::new();
+        let writer_shutdown_task = writer_shutdown.clone();
+        let (start_writer, writer_start) = tokio::sync::oneshot::channel();
+        let mut writer_task = tokio::spawn(async move {
+            if writer_start.await.is_ok() {
+                requests_writer_task.run(writer_shutdown_task).await;
+            }
+        });
+
+        let hot_result: Result<(), String> = tokio::time::timeout(Duration::from_secs(10), async {
+            let queue_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            loop {
+                if requests_writer.queued_commands() == INITIAL_CREATES {
+                    break;
+                }
+                if phase_a_task.is_finished() {
+                    let early = (&mut phase_a_task)
+                        .await
+                        .map_err(|error| format!("initial HTTP group failed early: {error}"))?;
+                    let statuses = early
+                        .iter()
+                        .map(|response| match response {
+                            Ok((status, _)) => status.to_string(),
+                            Err(error) => error.clone(),
+                        })
+                        .collect::<Vec<_>>();
+                    return Err(format!("initial HTTP group completed before 100 commands queued: {statuses:?}"));
+                }
+                if tokio::time::Instant::now() >= queue_deadline {
+                    return Err(format!(
+                        "timed out with {} of {INITIAL_CREATES} commands queued",
+                        requests_writer.queued_commands()
+                    ));
+                }
+                tokio::task::yield_now().await;
+            }
+
+            if writer_observer.create_transaction_attempts() != 0 {
+                return Err("create transaction started before the writer was released".to_string());
+            }
+            let rows_before_writer: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM fusillade.requests")
+                .fetch_one(&pool)
+                .await
+                .map_err(|error| format!("count rows before writer start: {error}"))?;
+            if rows_before_writer != 0 {
+                return Err(format!(
+                    "{rows_before_writer} rows were visible before durable writer acknowledgement"
+                ));
+            }
+            if phase_a_task.is_finished() {
+                return Err("HTTP creates completed before durable writer acknowledgement".to_string());
+            }
+
+            start_writer.send(()).map_err(|_| "writer start gate closed".to_string())?;
+            let phase_a_responses = (&mut phase_a_task)
+                .await
+                .map_err(|error| format!("initial HTTP group panicked: {error}"))?;
+            let phase_a_ids = responses_burst_created_ids(phase_a_responses, INITIAL_CREATES)?;
+
+            let create_attempts = writer_observer.create_transaction_attempts();
+            if create_attempts != 1 || create_attempts >= INITIAL_CREATES {
+                return Err(format!("100 prequeued creates used {create_attempts} storage transaction attempts"));
+            }
+
+            let phase_a_rows: Vec<(Uuid, String, String, Option<String>, String, Option<Uuid>, Uuid)> = sqlx::query_as(
+                "SELECT r.id, r.state, r.service_tier, r.created_by, r.model, \
+                            r.batch_id, t.id \
+                       FROM fusillade.requests r \
+                       JOIN fusillade.request_templates t ON t.id = r.template_id \
+                      WHERE r.id = ANY($1)",
+            )
+            .bind(&phase_a_ids)
+            .fetch_all(&pool)
+            .await
+            .map_err(|error| format!("observe initial durable rows: {error}"))?;
+            let expected_phase_a: HashSet<Uuid> = phase_a_ids.iter().copied().collect();
+            let stored_phase_a: HashSet<Uuid> = phase_a_rows.iter().map(|row| row.0).collect();
+            let template_ids: HashSet<Uuid> = phase_a_rows.iter().map(|row| row.6).collect();
+            if phase_a_rows.len() != INITIAL_CREATES || stored_phase_a != expected_phase_a || template_ids.len() != INITIAL_CREATES {
+                return Err(format!(
+                    "acknowledged create set did not match durable request/template rows: \
+                         requests={}, templates={}",
+                    phase_a_rows.len(),
+                    template_ids.len()
+                ));
+            }
+            let owner = owner_id.to_string();
+            if let Some(invalid) = phase_a_rows.iter().find(|row| {
+                row.1 != "pending"
+                    || row.2 != "flex"
+                    || row.3.as_deref() != Some(owner.as_str())
+                    || row.4 != FLEX_TEST_MODEL
+                    || row.5.is_some()
+            }) {
+                return Err(format!("initial create row has invalid lifecycle shape: {invalid:?}"));
+            }
+
+            let phase_b_responses = join_all(phase_a_ids.iter().copied().map(|request_id| {
+                let app = app.clone();
+                async move {
+                    let response = app
+                        .oneshot(responses_burst_get_request(request_id))
+                        .await
+                        .expect("Axum router is infallible");
+                    (request_id, responses_burst_json(response).await)
+                }
+            }))
+            .await;
+            responses_burst_validate_gets(phase_b_responses, INITIAL_CREATES)?;
+
+            let mixed_completion_records: Vec<(Uuid, String)> = (0..MIXED_COMPLETIONS)
+                .map(|index| {
+                    (
+                        Uuid::new_v4(),
+                        serde_json::json!({
+                            "output": format!("mixed-completion-{index}")
+                        })
+                        .to_string(),
+                    )
+                })
+                .collect();
+            let mixed_create_app = app.clone();
+            let mixed_get_app = app.clone();
+            let mixed_writer = requests_writer.clone();
+            let mixed_create_future = join_all((0..MIXED_CREATES).map(|index| {
+                let app = mixed_create_app.clone();
+                async move {
+                    let response = app
+                        .oneshot(responses_burst_flex_request(format!("mixed-{index}")))
+                        .await
+                        .expect("Axum router is infallible");
+                    responses_burst_json(response).await
+                }
+            }));
+            let mixed_get_future = join_all(phase_a_ids.iter().take(MIXED_GETS).copied().map(|request_id| {
+                let app = mixed_get_app.clone();
+                async move {
+                    let response = app
+                        .oneshot(responses_burst_get_request(request_id))
+                        .await
+                        .expect("Axum router is infallible");
+                    (request_id, responses_burst_json(response).await)
+                }
+            }));
+            let mixed_completion_future = join_all(mixed_completion_records.iter().cloned().map(|(request_id, response_body)| {
+                let writer = mixed_writer.clone();
+                let owner = owner.clone();
+                async move {
+                    let started_at = chrono::DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
+                    let completed_at = started_at + chrono::Duration::milliseconds(1);
+                    writer
+                        .complete_realtime(crate::inference::engine::writer::RawCompletedRequest {
+                            request_id,
+                            status_code: 200,
+                            response_body,
+                            request_body: serde_json::json!({
+                                "model": COMPLETION_MODEL,
+                                "input": format!("completion-{request_id}"),
+                            })
+                            .to_string(),
+                            model: COMPLETION_MODEL.to_string(),
+                            endpoint: "/v1/responses".to_string(),
+                            api_key: FLEX_TEST_KEY.to_string(),
+                            created_by: owner,
+                            started_at,
+                            completed_at,
+                        })
+                        .await
+                        .map_err(|error| format!("completion {request_id} admission failed: {error}"))
+                }
+            }));
+            let (mixed_create_responses, mixed_get_responses, mixed_completion_results) =
+                tokio::join!(mixed_create_future, mixed_get_future, mixed_completion_future,);
+            let mixed_create_ids = responses_burst_created_ids(mixed_create_responses, MIXED_CREATES)?;
+            responses_burst_validate_gets(mixed_get_responses, MIXED_GETS)?;
+            for completion in mixed_completion_results {
+                completion?;
+            }
+
+            writer_shutdown.cancel();
+            tokio::time::timeout(Duration::from_secs(3), &mut writer_task)
+                .await
+                .map_err(|_| "writer did not drain within 3 seconds".to_string())?
+                .map_err(|error| format!("writer task panicked: {error}"))?;
+
+            let mixed_flex_rows: Vec<(Uuid, Uuid)> = sqlx::query_as(
+                "SELECT r.id, t.id \
+                       FROM fusillade.requests r \
+                       JOIN fusillade.request_templates t ON t.id = r.template_id \
+                      WHERE r.id = ANY($1)",
+            )
+            .bind(&mixed_create_ids)
+            .fetch_all(&pool)
+            .await
+            .map_err(|error| format!("observe mixed Flex rows: {error}"))?;
+            if mixed_flex_rows.len() != MIXED_CREATES
+                || mixed_flex_rows.iter().map(|row| row.0).collect::<HashSet<_>>() != mixed_create_ids.iter().copied().collect()
+                || mixed_flex_rows.iter().map(|row| row.1).collect::<HashSet<_>>().len() != MIXED_CREATES
+            {
+                return Err("mixed Flex acknowledgements did not match durable request/template rows".to_string());
+            }
+
+            let completion_ids: Vec<Uuid> = mixed_completion_records.iter().map(|row| row.0).collect();
+            let completion_rows: Vec<(Uuid, String, Option<i16>, Option<String>, Option<String>, String)> = sqlx::query_as(
+                "SELECT id, state, response_status, response_body, created_by, model \
+                       FROM fusillade.requests \
+                      WHERE id = ANY($1)",
+            )
+            .bind(&completion_ids)
+            .fetch_all(&pool)
+            .await
+            .map_err(|error| format!("observe mixed completion rows: {error}"))?;
+            let expected_completion_bodies: HashMap<Uuid, &str> =
+                mixed_completion_records.iter().map(|(id, body)| (*id, body.as_str())).collect();
+            if completion_rows.len() != MIXED_COMPLETIONS {
+                return Err(format!(
+                    "expected {MIXED_COMPLETIONS} completion rows, got {}",
+                    completion_rows.len()
+                ));
+            }
+            if let Some(invalid) = completion_rows.iter().find(|row| {
+                row.1 != "completed"
+                    || row.2 != Some(200)
+                    || row.3.as_deref() != expected_completion_bodies.get(&row.0).copied()
+                    || row.4.as_deref() != Some(owner.as_str())
+                    || row.5 != COMPLETION_MODEL
+            }) {
+                return Err(format!("mixed completion row has invalid terminal state: {invalid:?}"));
+            }
+
+            let original_ids: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM fusillade.requests WHERE id = ANY($1)")
+                .bind(&phase_a_ids)
+                .fetch_all(&pool)
+                .await
+                .map_err(|error| format!("recheck original rows: {error}"))?;
+            if original_ids.iter().copied().collect::<HashSet<_>>() != expected_phase_a {
+                return Err("mixed pass changed or removed an original response row".to_string());
+            }
+
+            let total_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM fusillade.requests")
+                .fetch_one(&pool)
+                .await
+                .map_err(|error| format!("count final response rows: {error}"))?;
+            let expected_total = INITIAL_CREATES + MIXED_CREATES + MIXED_COMPLETIONS;
+            if total_rows != expected_total as i64 {
+                return Err(format!("expected {expected_total} total rows after mixed pass, got {total_rows}"));
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|_| "responses burst hot phase exceeded 10 seconds".to_string())
+        .and_then(|result| result);
+
+        if let Err(error) = hot_result {
+            phase_a_task.abort();
+            writer_shutdown.cancel();
+            if !writer_task.is_finished() {
+                let _ = tokio::time::timeout(Duration::from_secs(3), &mut writer_task).await;
+            }
+            drop(held_fusillade_connection_b);
+            drop(held_fusillade_connection_a);
+            drop(held_main_connection);
+            panic!("{error}");
+        }
+
+        drop(held_fusillade_connection_b);
+        drop(held_fusillade_connection_a);
+        drop(held_main_connection);
     }
 
     #[sqlx::test]
