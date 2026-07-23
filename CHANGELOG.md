@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.100.0](https://github.com/doublewordai/control-layer/compare/v8.99.0...v8.100.0) (2026-07-23)
+
+
+### Features
+
+* capped keys part 2 - enforcement and yanking ([#1346](https://github.com/doublewordai/control-layer/issues/1346)) ([c5d8670](https://github.com/doublewordai/control-layer/commit/c5d8670d899e51a38a52256b35229414879e5e0d))
+
 ## [8.99.0](https://github.com/doublewordai/control-layer/compare/v8.98.0...v8.99.0) (2026-07-23)
 
 
