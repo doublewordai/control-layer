@@ -139,6 +139,8 @@ impl std::fmt::Display for ParentLockSnapshotRace {
 
 impl std::error::Error for ParentLockSnapshotRace {}
 
+type ProcessingCommitState = (String, Option<Uuid>, Option<Uuid>, Option<Uuid>);
+
 pub struct PostgresRequestManager<P: PoolProvider> {
     pools: P,
     config: PostgresStorageConfig,
@@ -890,7 +892,7 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
         // executor reacquires its permit for each pool-acquisition attempt,
         // releasing it before retry backoff while preserving pool headroom
         // and the configured state-write cap.
-        let current: Option<(String, Option<Uuid>, Option<Uuid>, Option<Uuid>)> = sqlx::query_as(
+        let current: Option<ProcessingCommitState> = sqlx::query_as(
             "SELECT state, daemon_id, attempt_id, processing_admission_id
                  FROM requests WHERE id = $1",
         )
