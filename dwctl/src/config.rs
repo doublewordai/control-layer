@@ -1067,6 +1067,27 @@ pub struct CacheConfig {
     /// Set via environment: `DWCTL_CACHE__DEFAULT_TTL=5m`
     pub default_ttl: String,
 
+    /// Deadline for joining the classify fork at response time. classify races the (slower)
+    /// model call, so this only bites when classification is still unresolved as the response
+    /// completes — a tokenizer/index hiccup — in which case the request bills un-cached
+    /// (fail-safe) once the deadline fires. Latency-sensitive realtime pods keep the tight
+    /// default; the fusillade-batch pod (no first-token pressure; classify joins inline after
+    /// the response) can afford a larger value (e.g. 10) so index retries have room to land.
+    ///
+    /// Set via environment: `DWCTL_CACHE__CLASSIFY_DEADLINE_SECS=10`
+    pub classify_deadline_secs: u64,
+
+    /// How many times a cache-index DB op (lookup/write/refresh) retries after a
+    /// connection-class failure (severed idle conn, TLS handshake EOF, auth timeout — the
+    /// Neon burst-churn family; non-connection errors never retry). Retries back off
+    /// 100ms·2^n so a herd of simultaneous failures doesn't re-storm the connection setup.
+    /// The classify deadline still bounds the caller regardless. Evidence for the default and
+    /// per-pod tuning: 100% of classify errors occur on the bursty batch pod, so it warrants
+    /// a higher value (e.g. 3) than the steady-traffic API pods.
+    ///
+    /// Set via environment: `DWCTL_CACHE__INDEX_CONN_RETRIES=3`
+    pub index_conn_retries: u32,
+
     /// Handling of provider-injected per-request *telemetry* blocks (e.g. the Claude Code SDK's
     /// `x-anthropic-billing-header` line, whose nonce changes every request). Such a block sits
     /// ahead of the caller's `cache_control` breakpoint, so leaving it in would change the prefix
@@ -1084,6 +1105,8 @@ impl Default for CacheConfig {
             pricing: CachePricingConfig::default(),
             enabled_ttls: vec!["5m".to_string(), "1h".to_string()],
             default_ttl: "5m".to_string(),
+            classify_deadline_secs: 5,
+            index_conn_retries: 1,
             telemetry_blocks: TelemetryBlockConfig::default(),
         }
     }

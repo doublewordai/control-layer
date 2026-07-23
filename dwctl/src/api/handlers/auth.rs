@@ -810,6 +810,8 @@ pub async fn cli_callback<P: PoolProvider>(
             requests_per_second: None,
             burst_size: None,
             created_by: user_id,
+            spend_limit: None,
+            spend_limit_interval: None,
         })
         .await
         .map_err(Error::Database)?
@@ -825,6 +827,8 @@ pub async fn cli_callback<P: PoolProvider>(
             requests_per_second: None,
             burst_size: None,
             created_by: user_id,
+            spend_limit: None,
+            spend_limit_interval: None,
         })
         .await
         .map_err(Error::Database)?
@@ -2587,6 +2591,8 @@ mod tests {
                 requests_per_second: None,
                 burst_size: None,
                 created_by: user.id,
+                spend_limit: None,
+                spend_limit_interval: None,
             })
             .await
             .unwrap();

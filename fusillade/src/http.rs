@@ -13,6 +13,7 @@ pub use crate::request::HttpResponse;
 pub type StreamReassembler = fn(&[eventsource_stream::Event]) -> anyhow::Result<String>;
 use crate::request::RequestData;
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use opentelemetry::trace::TraceContextExt;
 use std::sync::Arc;
 use std::time::Duration;
@@ -575,6 +576,67 @@ async fn race_upload_stall<T>(
     }
 }
 
+/// Submission timestamp of a request, parsed from the `created_at` batch
+/// metadata field (RFC3339; the claim queries populate it for both batch and
+/// batchless rows — the batch's creation for batch rows, the row's own for
+/// batchless).
+pub(crate) fn submission_time(request: &RequestData) -> Option<DateTime<Utc>> {
+    request
+        .batch_metadata
+        .get("created_at")?
+        .parse::<DateTime<Utc>>()
+        .ok()
+}
+
+/// Record time-to-first-token measured from submission (`created_at`) — the
+/// quantity behind the async-tier "starts within a minute" SLO, spanning queue
+/// wait + claim + dispatch + prefill in one measurement (quantiles of separate
+/// pickup/dispatch histograms cannot be summed).
+///
+/// Recorded when an attempt's response starts with a 2xx: at headers for
+/// non-streaming (engines send the whole body at once, so this is close to
+/// time-to-last-token — conservative in the right direction), at the first SSE
+/// event for streaming (headers can arrive while the request is still queued
+/// upstream). A 2xx-opening attempt that later fails mid-stream and is retried
+/// contributes an extra sample; that is rare enough to document rather than
+/// thread response-start timestamps through `HttpResponse`.
+fn record_submission_ttft(request: &RequestData, status: u16) {
+    if let Some((seconds, completion_window)) = submission_ttft_sample(request, status, Utc::now())
+    {
+        metrics::histogram!(
+            "fusillade_request_time_to_first_token_seconds",
+            "model" => request.model.clone(),
+            "completion_window" => completion_window,
+        )
+        .record(seconds);
+    }
+}
+
+/// The pure decision behind [`record_submission_ttft`]: `Some((seconds,
+/// completion_window))` when a sample should be recorded — the response opened
+/// 2xx, the row carries a parseable `created_at`, and the clock didn't run
+/// backwards.
+fn submission_ttft_sample(
+    request: &RequestData,
+    status: u16,
+    now: DateTime<Utc>,
+) -> Option<(f64, String)> {
+    if !(200..300).contains(&status) {
+        return None;
+    }
+    let created_at = submission_time(request)?;
+    let elapsed_ms = (now - created_at).num_milliseconds();
+    if elapsed_ms < 0 {
+        return None;
+    }
+    let completion_window = request
+        .batch_metadata
+        .get("completion_window")
+        .cloned()
+        .unwrap_or_default();
+    Some((elapsed_ms as f64 / 1000.0, completion_window))
+}
+
 impl ReqwestHttpClient {
     /// Execute a non-streaming request with a single overall timeout.
     /// Uses first_chunk_timeout + body_timeout as the total allowed time,
@@ -625,6 +687,7 @@ impl ReqwestHttpClient {
         })?;
 
         let status = response.status().as_u16();
+        record_submission_ttft(request, status);
         let body = response.text().await.map_err(map_reqwest_error)?;
 
         tracing::debug!(
@@ -758,6 +821,12 @@ impl ReqwestHttpClient {
                 self.first_chunk_timeout.as_millis()
             ))
         })??;
+
+        // First token observed (headers alone don't count on this path — see
+        // the phase 1 comment about servers that queue behind early headers).
+        if first_event.is_some() {
+            record_submission_ttft(request, status);
+        }
 
         // Phase 2: collect all SSE events with per-event and total body
         // timeouts. If `on_event` is set, fire it per event in arrival
@@ -1073,6 +1142,68 @@ impl Drop for InFlightGuard {
 mod tests {
     use super::*;
     use crate::request::RequestId;
+
+    fn ttft_test_request(metadata: &[(&str, &str)]) -> RequestData {
+        RequestData {
+            id: RequestId::from(uuid::Uuid::new_v4()),
+            batch_id: None,
+            template_id: crate::batch::TemplateId::from(uuid::Uuid::new_v4()),
+            custom_id: None,
+            endpoint: "https://api.example.com".to_string(),
+            method: "POST".to_string(),
+            path: "/test".to_string(),
+            body: "{}".to_string(),
+            model: "test-model".to_string(),
+            api_key: "test-key".to_string(),
+            created_by: String::new(),
+            batch_metadata: metadata
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn submission_ttft_sample_gates_and_measures() {
+        let now: DateTime<Utc> = "2026-07-23T12:00:30Z".parse().unwrap();
+        let with_meta = ttft_test_request(&[
+            ("created_at", "2026-07-23T12:00:00.000000Z"),
+            ("completion_window", "1h"),
+        ]);
+
+        // Valid: 2xx + parseable created_at 30s ago.
+        let (seconds, window) =
+            submission_ttft_sample(&with_meta, 200, now).expect("should record");
+        assert!((seconds - 30.0).abs() < 0.001, "elapsed = {seconds}");
+        assert_eq!(window, "1h");
+
+        // Non-2xx openings never record.
+        assert_eq!(submission_ttft_sample(&with_meta, 429, now), None);
+        assert_eq!(submission_ttft_sample(&with_meta, 500, now), None);
+
+        // Missing or unparseable created_at → no sample rather than a junk one.
+        assert_eq!(
+            submission_ttft_sample(&ttft_test_request(&[]), 200, now),
+            None
+        );
+        assert_eq!(
+            submission_ttft_sample(
+                &ttft_test_request(&[("created_at", "not a time")]),
+                200,
+                now
+            ),
+            None
+        );
+
+        // Clock skew (created_at in the future) → no sample.
+        let future = ttft_test_request(&[("created_at", "2026-07-23T12:05:00Z")]);
+        assert_eq!(submission_ttft_sample(&future, 200, now), None);
+
+        // Missing window falls back to empty label, still records.
+        let no_window = ttft_test_request(&[("created_at", "2026-07-23T12:00:00Z")]);
+        let (_, window) = submission_ttft_sample(&no_window, 200, now).unwrap();
+        assert_eq!(window, "");
+    }
 
     #[test]
     fn upload_completes_only_after_transport_releases_final_chunk() {

@@ -132,6 +132,25 @@ struct EnrichedRecord {
     /// `None` under the same no-pricing condition as `total_cost`, so the two are NULL in
     /// lockstep. Equals `total_cost` whenever the request cached nothing.
     uncached_cost: Option<Decimal>,
+    /// The spending-cap scope this request's cost folds into: the id of the
+    /// capped root key — `COALESCE(parent_api_key_id, id)` of the billing key,
+    /// but only when that root currently has `spend_limit` set. `None` for the
+    /// uncapped 99% (no checkpoint row is ever written for them). Removing a
+    /// cap therefore stops folding; when a cap is later (re-)enabled, the
+    /// cap-set path MUST reset the scope's checkpoint window (zero
+    /// window_spend, fresh window_started_at) or the scope inherits old spend
+    /// and can exhaust immediately — this includes caps set via manual SQL
+    /// while no API path exists yet.
+    cap_scope_root: Option<Uuid>,
+}
+
+/// Per-bearer-token lookup result used during enrichment.
+struct KeyLookup {
+    user_id: Uuid,
+    api_key_id: Uuid,
+    purpose: ApiKeyPurpose,
+    /// See `EnrichedRecord::cap_scope_root`.
+    cap_scope_root: Option<Uuid>,
 }
 
 /// A `model_cache_tariffs` row (per model, per tier), with its validity window so batch
@@ -596,14 +615,20 @@ where
         // Enrich each record
         let mut enriched = Vec::with_capacity(buffer.len());
         for raw in buffer.iter().cloned() {
-            let (user_id, api_key_id, access_source, api_key_purpose) = if let Some(ref token) = raw.bearer_token {
-                if let Some((uid, akid, purpose)) = user_map.get(token) {
-                    (Some(*uid), Some(*akid), "api_key".to_string(), Some(purpose.clone()))
+            let (user_id, api_key_id, access_source, api_key_purpose, cap_scope_root) = if let Some(ref token) = raw.bearer_token {
+                if let Some(key) = user_map.get(token) {
+                    (
+                        Some(key.user_id),
+                        Some(key.api_key_id),
+                        "api_key".to_string(),
+                        Some(key.purpose.clone()),
+                        key.cap_scope_root,
+                    )
                 } else {
-                    (None, None, "unknown_api_key".to_string(), None)
+                    (None, None, "unknown_api_key".to_string(), None, None)
                 }
             } else {
-                (None, None, "unauthenticated".to_string(), None)
+                (None, None, "unauthenticated".to_string(), None, None)
             };
 
             if raw.request_model.is_none() && (raw.completion_tokens > 0 || raw.prompt_tokens > 0) {
@@ -680,6 +705,7 @@ where
                 output_price_per_token: output_price,
                 total_cost,
                 uncached_cost,
+                cap_scope_root,
             });
         }
 
@@ -687,8 +713,13 @@ where
     }
 
     /// Batch lookup user info by bearer tokens.
+    ///
+    /// `cap_scope_root` is the spending-cap scope for the key (see
+    /// `EnrichedRecord::cap_scope_root`): the root of `COALESCE(parent, id)`
+    /// when that root currently has a cap, else `None`. Resolved here (PK
+    /// self-join) so the fold in `batch_insert_credits` needs no extra query.
     #[tracing::instrument(skip_all)]
-    async fn batch_lookup_users(&self, tokens: &[&str]) -> Result<HashMap<String, (Uuid, Uuid, ApiKeyPurpose)>, sqlx::Error> {
+    async fn batch_lookup_users(&self, tokens: &[&str]) -> Result<HashMap<String, KeyLookup>, sqlx::Error> {
         let tokens_vec: Vec<String> = tokens.iter().map(|s| s.to_string()).collect();
 
         struct UserRow {
@@ -696,13 +727,16 @@ where
             user_id: Uuid,
             api_key_id: Uuid,
             purpose: String,
+            cap_scope_root: Option<Uuid>,
         }
 
         let rows: Vec<UserRow> = sqlx::query_as!(
             UserRow,
             r#"
-            SELECT ak.secret, ak.user_id, ak.id as api_key_id, ak.purpose
+            SELECT ak.secret, ak.user_id, ak.id as api_key_id, ak.purpose,
+                   CASE WHEN root.spend_limit IS NOT NULL THEN root.id END AS cap_scope_root
             FROM api_keys ak
+            JOIN api_keys root ON root.id = COALESCE(ak.parent_api_key_id, ak.id)
             WHERE ak.secret = ANY($1) AND ak.is_deleted = false
             "#,
             &tokens_vec
@@ -713,7 +747,15 @@ where
         let mut map = HashMap::with_capacity(rows.len());
         for row in rows {
             let purpose = parse_api_key_purpose(&row.purpose);
-            map.insert(row.secret, (row.user_id, row.api_key_id, purpose));
+            map.insert(
+                row.secret,
+                KeyLookup {
+                    user_id: row.user_id,
+                    api_key_id: row.api_key_id,
+                    purpose,
+                    cap_scope_root: row.cap_scope_root,
+                },
+            );
         }
 
         trace!(count = map.len(), "Batch lookup users completed");
@@ -1162,6 +1204,9 @@ where
         // durably (by fusillade_request_id) instead of joining http_analytics, which ages
         // out of retention. NULL for non-fusillade (realtime) usage.
         let mut fusillade_request_ids_credit: Vec<Option<Uuid>> = Vec::new();
+        // Spending-cap scope root per billed row (None for the uncapped
+        // majority); parallel to the vecs above, consumed by the cap fold below.
+        let mut cap_scope_roots: Vec<Option<Uuid>> = Vec::new();
 
         for record in records {
             // Skip if no user or no pricing
@@ -1205,8 +1250,9 @@ where
             served_bys.push(crate::metrics::served_by_host(record.raw.served_by.as_deref()));
             api_key_ids_credit.push(record.api_key_id);
             service_tiers
-                .push(compute_service_tier(record.raw.fusillade_batch_id, record.raw.batch_completion_window.as_deref()).to_string());
+                .push(compute_billing_tier(record.raw.fusillade_batch_id, record.raw.batch_completion_window.as_deref()).to_string());
             fusillade_request_ids_credit.push(record.raw.fusillade_request_id);
+            cap_scope_roots.push(record.cap_scope_root);
         }
 
         if user_ids.is_empty() {
@@ -1360,6 +1406,145 @@ where
             counter!("dwctl_balance_crossings_total", "direction" => "down").increment(crossed_down.len() as u64);
         }
 
+        // Fold this flush's billed amounts into the per-cap-scope spend
+        // checkpoints, mirroring the user-balance fold above: grouped per
+        // scope per flush, riding the RETURNING'd (inserted) rows so retries
+        // never double-fold. Only rows whose key belongs to a currently-capped
+        // scope carry a `cap_scope_root`, so this is a no-op for the uncapped
+        // majority. Cap-crossing NOTIFYs are edge-triggered like balance
+        // zero-crossings.
+        let mut scope_folds: HashMap<Uuid, Decimal> = HashMap::new();
+        for row in &inserted_rows {
+            if let Some(&(idx, ..)) = source_id_to_record.get(&row.source_id)
+                && let Some(scope_root) = cap_scope_roots[idx]
+            {
+                *scope_folds.entry(scope_root).or_insert(Decimal::ZERO) += row.amount;
+            }
+        }
+
+        if !scope_folds.is_empty() {
+            // Sorted for the same cross-replica deadlock avoidance as the
+            // balance fold.
+            let mut scope_ids: Vec<Uuid> = scope_folds.keys().copied().collect();
+            scope_ids.sort_unstable();
+            let scope_deltas: Vec<Decimal> = scope_ids.iter().map(|s| scope_folds[s]).collect();
+
+            // Main path: the checkpoint row exists (created at cap-set time).
+            // Windows are CALENDAR-ALIGNED (UTC) — `api_key_cap_window_current`
+            // (migration 123, shared with the sync eligibility predicate) says
+            // whether window_started_at falls in the same calendar day/week/
+            // month as now(); a stale window means this is the first billed
+            // request past the boundary, so the fold REPLACES window_spend
+            // with this delta instead of accumulating (lazy rollover — no
+            // scheduled job exists).
+            let updated = sqlx::query!(
+                r#"
+                UPDATE api_key_spend_checkpoints ck SET
+                    total_spend = ck.total_spend + i.delta,
+                    window_spend = CASE
+                        WHEN api_key_cap_window_current(ck.window_started_at, ak.spend_limit_interval)
+                        THEN ck.window_spend + i.delta
+                        ELSE i.delta
+                    END,
+                    window_started_at = CASE
+                        WHEN api_key_cap_window_current(ck.window_started_at, ak.spend_limit_interval)
+                        THEN ck.window_started_at
+                        ELSE NOW()
+                    END,
+                    updated_at = NOW()
+                FROM UNNEST($1::uuid[], $2::numeric[]) AS i(api_key_id, delta)
+                JOIN api_keys ak ON ak.id = i.api_key_id
+                WHERE ck.api_key_id = i.api_key_id
+                RETURNING ck.api_key_id, ck.window_spend AS "window_spend!", i.delta AS "delta!", ak.spend_limit
+                "#,
+                &scope_ids,
+                &scope_deltas,
+            )
+            .fetch_all(&mut **tx)
+            .await?;
+
+            let mut crossed_caps: u64 = 0;
+            for row in &updated {
+                // Edge-trigger: crossed iff this delta moved the window total
+                // from below the limit to at/above it. Holds for rolled-over
+                // windows too (there window_spend == delta, so the "before"
+                // side is 0 < limit).
+                if let Some(limit) = row.spend_limit
+                    && row.window_spend >= limit
+                    && row.window_spend - row.delta < limit
+                {
+                    crossed_caps += 1;
+                }
+            }
+
+            // Fallback: checkpoint row missing (cap set without the PR-3 API,
+            // e.g. manual SQL). Accumulate-only upsert — on the conflict arm
+            // (a concurrent flush just created the row milliseconds ago) the
+            // window cannot have rolled, so plain accumulation is correct and
+            // no delta is ever lost.
+            let missing: Vec<usize> = scope_ids
+                .iter()
+                .enumerate()
+                .filter(|(_, id)| !updated.iter().any(|u| u.api_key_id == **id))
+                .map(|(i, _)| i)
+                .collect();
+            if !missing.is_empty() {
+                let missing_ids: Vec<Uuid> = missing.iter().map(|&i| scope_ids[i]).collect();
+                let missing_deltas: Vec<Decimal> = missing.iter().map(|&i| scope_deltas[i]).collect();
+
+                let inserted = sqlx::query!(
+                    r#"
+                    INSERT INTO api_key_spend_checkpoints (api_key_id, total_spend, window_spend)
+                    SELECT i.api_key_id, i.delta, i.delta
+                    FROM UNNEST($1::uuid[], $2::numeric[]) AS i(api_key_id, delta)
+                    ON CONFLICT (api_key_id) DO UPDATE SET
+                        total_spend = api_key_spend_checkpoints.total_spend + EXCLUDED.total_spend,
+                        window_spend = api_key_spend_checkpoints.window_spend + EXCLUDED.window_spend,
+                        updated_at = NOW()
+                    RETURNING api_key_id, window_spend AS "window_spend!"
+                    "#,
+                    &missing_ids,
+                    &missing_deltas,
+                )
+                .fetch_all(&mut **tx)
+                .await?;
+
+                // Limits for the fresh rows (rare path; usually empty).
+                let fresh_ids: Vec<Uuid> = inserted.iter().map(|r| r.api_key_id).collect();
+                let limits = sqlx::query!(r#"SELECT id, spend_limit FROM api_keys WHERE id = ANY($1)"#, &fresh_ids)
+                    .fetch_all(&mut **tx)
+                    .await?;
+                let limit_map: HashMap<Uuid, Option<Decimal>> = limits.into_iter().map(|r| (r.id, r.spend_limit)).collect();
+                let delta_map: HashMap<Uuid, Decimal> = missing_ids.iter().copied().zip(missing_deltas.iter().copied()).collect();
+                for row in &inserted {
+                    // Total lookup: a scope id absent from the map (cannot
+                    // happen — `inserted` is a subset of `missing_ids`) counts
+                    // as zero delta, which can never mis-fire a crossing.
+                    let delta = delta_map.get(&row.api_key_id).copied().unwrap_or(Decimal::ZERO);
+                    if let Some(Some(limit)) = limit_map.get(&row.api_key_id)
+                        && row.window_spend >= *limit
+                        && row.window_spend - delta < *limit
+                    {
+                        crossed_caps += 1;
+                    }
+                }
+            }
+
+            if crossed_caps > 0 {
+                let epoch_micros = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_micros();
+                let payload = format!("api_key_spend_cap:{}", epoch_micros);
+                sqlx::query("SELECT pg_notify($1, $2)")
+                    .bind(ONWARDS_CONFIG_CHANGED_CHANNEL)
+                    .bind(&payload)
+                    .execute(&mut **tx)
+                    .await?;
+                counter!("dwctl_spend_cap_crossings_total").increment(crossed_caps);
+            }
+        }
+
         // Aggregate this flush's batched rows into batch_aggregates (the
         // grouped view the transactions UI reads). Sorted for the same
         // deadlock-avoidance reason as above.
@@ -1446,7 +1631,7 @@ where
 
             let af = analytics_folds.entry(batch_id).or_insert_with(|| AnalyticsFold {
                 user_id,
-                service_tier: compute_service_tier(record.raw.fusillade_batch_id, record.raw.batch_completion_window.as_deref())
+                service_tier: compute_billing_tier(record.raw.fusillade_batch_id, record.raw.batch_completion_window.as_deref())
                     .to_string(),
                 min_created_at: record.raw.timestamp,
                 total_requests: 0,
@@ -1659,7 +1844,12 @@ fn compute_request_origin(api_key_purpose: Option<&ApiKeyPurpose>, fusillade_bat
     }
 }
 
-/// Compute the billing service tier from the fusillade metadata.
+/// Compute the Doubleword billing tier from the fusillade metadata.
+///
+/// This is our product/billing classification, deliberately named apart from
+/// the OpenAI-compatible `service_tier` request parameter (whose values —
+/// "auto", "priority", "flex" — don't map 1:1 onto it). The ledger persists it
+/// in columns historically named `service_tier`.
 ///
 /// Distinguished by whether the request was queued through fusillade (has a
 /// `fusillade_batch_id`) and its SLA (`completion_window`):
@@ -1667,7 +1857,7 @@ fn compute_request_origin(api_key_purpose: Option<&ApiKeyPurpose>, fusillade_bat
 /// - `flex`     — 1h SLA, no batch id (async single request)
 /// - `async`    — 1h SLA with a batch id
 /// - `batch`    — 24h SLA with a batch id (the /v1/batches API)
-fn compute_service_tier(fusillade_batch_id: Option<Uuid>, completion_window: Option<&str>) -> &'static str {
+pub(crate) fn compute_billing_tier(fusillade_batch_id: Option<Uuid>, completion_window: Option<&str>) -> &'static str {
     let window = completion_window.filter(|w| !w.is_empty());
     match (fusillade_batch_id.is_some(), window) {
         (false, None) => "realtime",
@@ -1682,13 +1872,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_compute_service_tier() {
+    fn test_compute_billing_tier() {
         let batch_id = Uuid::new_v4();
-        assert_eq!(compute_service_tier(None, None), "realtime");
-        assert_eq!(compute_service_tier(None, Some("")), "realtime");
-        assert_eq!(compute_service_tier(None, Some("1h")), "flex");
-        assert_eq!(compute_service_tier(Some(batch_id), Some("1h")), "async");
-        assert_eq!(compute_service_tier(Some(batch_id), Some("24h")), "batch");
+        assert_eq!(compute_billing_tier(None, None), "realtime");
+        assert_eq!(compute_billing_tier(None, Some("")), "realtime");
+        assert_eq!(compute_billing_tier(None, Some("1h")), "flex");
+        assert_eq!(compute_billing_tier(Some(batch_id), Some("1h")), "async");
+        assert_eq!(compute_billing_tier(Some(batch_id), Some("24h")), "batch");
     }
 
     #[test]
@@ -2388,6 +2578,8 @@ mod integration_tests {
                 requests_per_second: None,
                 burst_size: None,
                 created_by: user_id,
+                spend_limit: None,
+                spend_limit_interval: None,
             })
             .await
             .unwrap();
@@ -2911,6 +3103,193 @@ mod integration_tests {
             "Balance should be negative after depletion, got: {}",
             final_balance
         );
+    }
+
+    /// Drain the listener asserting no `api_key_spend_cap:` notification arrives.
+    async fn assert_no_cap_notification(listener: &mut sqlx::postgres::PgListener) {
+        use std::time::Duration;
+        use tokio::time::timeout;
+        while let Ok(Ok(n)) = timeout(Duration::from_millis(500), listener.try_recv()).await {
+            if let Some(n) = n {
+                assert!(
+                    !n.payload().starts_with("api_key_spend_cap:"),
+                    "unexpected cap notification: {}",
+                    n.payload()
+                );
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Mixed flush across a cap scope: the parent's realtime row and the
+    /// child's batch row fold into ONE checkpoint row keyed by the scope root,
+    /// uncapped keys produce no row, the crossing NOTIFY fires exactly once
+    /// (edge-triggered), and further over-cap flushes fold silently.
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_batcher_folds_cap_scope_and_notifies_on_crossing(pool: PgPool) {
+        use crate::db::handlers::api_keys::ApiKeys;
+        use sqlx::postgres::PgListener;
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        let model_id = create_test_model(&pool, "gpt-4-cap-fold-test").await;
+        let input_price = Decimal::from_str("0.00001").unwrap();
+        let output_price = Decimal::from_str("0.00003").unwrap();
+        setup_tariff(&pool, model_id, input_price, output_price, ApiKeyPurpose::Realtime).await;
+        setup_tariff(&pool, model_id, input_price, output_price, ApiKeyPurpose::Batch).await;
+
+        // Wealthy user so no balance crossing interferes with the assertions.
+        let user_id = setup_user_with_balance(&pool, Decimal::from_str("100").unwrap()).await;
+        let parent_secret = create_api_key_for_user(&pool, user_id, ApiKeyPurpose::Realtime).await;
+        let uncapped_secret = create_api_key_for_user(&pool, user_id, ApiKeyPurpose::Realtime).await;
+
+        // Cap the parent at $0.04 (each request below costs $0.025) and mint its child.
+        sqlx::query("UPDATE api_keys SET spend_limit = 0.04 WHERE secret = $1")
+            .bind(&parent_secret)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let parent_id: Uuid = sqlx::query_scalar("SELECT id FROM api_keys WHERE secret = $1")
+            .bind(&parent_secret)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let child_secret = {
+            let mut conn = pool.acquire().await.unwrap();
+            let (secret, _) = ApiKeys::new(&mut conn).get_or_create_child_hidden_key(parent_id).await.unwrap();
+            secret
+        };
+
+        let mut listener = PgListener::connect_with(&pool).await.expect("Failed to create listener");
+        listener.listen(ONWARDS_CONFIG_CHANGED_CHANNEL).await.expect("Failed to listen");
+        while timeout(Duration::from_millis(10), listener.try_recv()).await.is_ok() {}
+
+        // Parent realtime + child batch + uncapped key, one flush. Each row
+        // costs $0.025; the scope total 0.05 crosses the 0.04 cap.
+        let mut child_record = create_raw_record("gpt-4-cap-fold-test", Some(child_secret), 1000, 500);
+        child_record.batch_completion_window = Some("24h".to_string());
+        let records = vec![
+            create_raw_record("gpt-4-cap-fold-test", Some(parent_secret.clone()), 1000, 500),
+            child_record,
+            create_raw_record("gpt-4-cap-fold-test", Some(uncapped_secret), 1000, 500),
+        ];
+        run_batcher_with_records(&pool, records).await;
+
+        let notification = timeout(Duration::from_secs(2), listener.recv())
+            .await
+            .expect("Timeout waiting for cap crossing notification")
+            .expect("Failed to receive notification");
+        assert!(
+            notification.payload().starts_with("api_key_spend_cap:"),
+            "Expected cap payload, got: {}",
+            notification.payload()
+        );
+
+        // One checkpoint row, keyed by the scope ROOT, summing parent + child.
+        let rows = sqlx::query!("SELECT api_key_id, total_spend, window_spend FROM api_key_spend_checkpoints")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1, "only the cap scope folds; uncapped keys get no row");
+        assert_eq!(rows[0].api_key_id, parent_id);
+        assert_eq!(rows[0].total_spend, Decimal::from_str("0.05").unwrap());
+        assert_eq!(rows[0].window_spend, Decimal::from_str("0.05").unwrap());
+
+        // Edge-trigger: a further over-cap flush folds but does not re-notify.
+        run_batcher_with_records(
+            &pool,
+            vec![create_raw_record("gpt-4-cap-fold-test", Some(parent_secret), 1000, 500)],
+        )
+        .await;
+        assert_no_cap_notification(&mut listener).await;
+        let window_spend: Decimal = sqlx::query_scalar!(
+            r#"SELECT window_spend AS "window_spend!" FROM api_key_spend_checkpoints WHERE api_key_id = $1"#,
+            parent_id
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(window_spend, Decimal::from_str("0.075").unwrap());
+    }
+
+    /// Lazy calendar rollover: the first billed request past the boundary
+    /// REPLACES window_spend instead of accumulating, advances
+    /// window_started_at, keeps total_spend monotonic, and does not fire a
+    /// crossing NOTIFY when the fresh window is under the cap.
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_batcher_cap_window_rollover(pool: PgPool) {
+        use sqlx::postgres::PgListener;
+        use std::time::Duration;
+        use tokio::time::timeout;
+
+        let model_id = create_test_model(&pool, "gpt-4-cap-rollover-test").await;
+        setup_tariff(
+            &pool,
+            model_id,
+            Decimal::from_str("0.00001").unwrap(),
+            Decimal::from_str("0.00003").unwrap(),
+            ApiKeyPurpose::Realtime,
+        )
+        .await;
+        let user_id = setup_user_with_balance(&pool, Decimal::from_str("100").unwrap()).await;
+        let secret = create_api_key_for_user(&pool, user_id, ApiKeyPurpose::Realtime).await;
+
+        sqlx::query("UPDATE api_keys SET spend_limit = 10, spend_limit_interval = 'daily' WHERE secret = $1")
+            .bind(&secret)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let key_id: Uuid = sqlx::query_scalar("SELECT id FROM api_keys WHERE secret = $1")
+            .bind(&secret)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        // Exhausted checkpoint from a previous calendar day.
+        sqlx::query(
+            "INSERT INTO api_key_spend_checkpoints (api_key_id, total_spend, window_spend, window_started_at)
+             VALUES ($1, 999, 999, now() - interval '2 days')",
+        )
+        .bind(key_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mut listener = PgListener::connect_with(&pool).await.expect("Failed to create listener");
+        listener.listen(ONWARDS_CONFIG_CHANGED_CHANNEL).await.expect("Failed to listen");
+        while timeout(Duration::from_millis(10), listener.try_recv()).await.is_ok() {}
+
+        run_batcher_with_records(&pool, vec![create_raw_record("gpt-4-cap-rollover-test", Some(secret), 1000, 500)]).await;
+
+        let row = sqlx::query!(
+            r#"SELECT total_spend AS "total_spend!", window_spend AS "window_spend!",
+                      window_started_at AS "window_started_at!"
+               FROM api_key_spend_checkpoints WHERE api_key_id = $1"#,
+            key_id
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            row.window_spend,
+            Decimal::from_str("0.025").unwrap(),
+            "rollover replaces, not accumulates"
+        );
+        assert_eq!(
+            row.total_spend,
+            Decimal::from_str("999.025").unwrap(),
+            "lifetime total stays monotonic"
+        );
+        assert!(
+            row.window_started_at > chrono::Utc::now() - chrono::Duration::hours(1),
+            "window_started_at advances at rollover"
+        );
+
+        // Fresh window is far under the cap: no crossing NOTIFY.
+        assert_no_cap_notification(&mut listener).await;
     }
 
     #[sqlx::test]

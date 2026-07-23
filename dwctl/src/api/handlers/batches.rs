@@ -602,12 +602,24 @@ pub async fn create_batch<P: PoolProvider>(
     // Get the hidden API key for batch execution and per-member attribution.
     // The secret is stored on the batch so the daemon uses the batch creator's
     // credentials, not the file uploader's key from request_templates.
+    // If the request was authenticated with a capped API key, this resolves to
+    // that key's cap-scope child instead of the shared member key, so the
+    // batch's spend counts against the authenticating key's spending cap.
     let (batch_api_key, api_key_id, target_verified) = {
         let mut conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
         let (secret, key_id) = ApiKeys::new(&mut conn)
-            .get_or_create_hidden_key_with_id(target_user_id, ApiKeyPurpose::Batch, current_user.id)
+            .resolve_batch_execution_key(target_user_id, current_user.id, current_user.api_key_id)
             .await
             .map_err(Error::Database)?;
+        // Spending-cap pre-flight, beside the balance gate above: if the
+        // execution key's cap scope is already exhausted, reject up front
+        // instead of accepting a batch whose every request would be refused
+        // request-by-request at the proxy.
+        if ApiKeys::new(&mut conn).is_scope_exhausted(key_id).await.map_err(Error::Database)? {
+            return Err(Error::SpendCapExceeded {
+                message: "The API key used for this batch has reached its spending cap. Raise or remove the cap, or wait for the cap window to reset, then resubmit.".to_string(),
+            });
+        }
         // Resolve the creditor's verified flag on the same connection (the org in
         // org context, else the user) for the volume cap below — no extra acquire.
         let verified = Users::new(&mut conn).is_verified(target_user_id).await?;
@@ -1686,12 +1698,13 @@ pub async fn list_batches<P: PoolProvider>(
         let mut read_conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
         let key_ids = match current_user.active_organization {
             Some(org_id) => {
-                // Org context: find the single hidden key for this member in this org
-                let key_id = ApiKeys::new(&mut read_conn)
-                    .find_hidden_key_id(org_id, ApiKeyPurpose::Batch, member_id)
+                // Org context: the member's hidden keys in this org (shared +
+                // any cap-scope children, all of which their batches may be
+                // attributed to)
+                ApiKeys::new(&mut read_conn)
+                    .find_hidden_key_ids(org_id, ApiKeyPurpose::Batch, member_id)
                     .await
-                    .map_err(Error::Database)?;
-                key_id.into_iter().collect::<Vec<_>>()
+                    .map_err(Error::Database)?
             }
             None if can_read_all => {
                 // PM personal context: find ALL hidden keys created by this member
@@ -3797,6 +3810,94 @@ mod tests {
             body.contains("Unverified") && body.to_lowercase().contains("verify"),
             "expected an actionable verify message, got: {body}"
         );
+    }
+
+    /// Spending-cap pre-flight: creating a batch with an API key whose cap
+    /// scope is exhausted is rejected up front with the explicit 402, instead
+    /// of accepting a batch whose every request the proxy would refuse.
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_create_batch_rejected_when_spend_cap_exhausted(pool: PgPool) {
+        use crate::db::handlers::Repository as _;
+        use crate::db::handlers::api_keys::ApiKeys;
+        use crate::db::models::api_keys::{ApiKeyCreateDBRequest, ApiKeyPurpose};
+
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = setup_batch_user(&pool).await;
+
+        // A capped realtime key for the user, its cap scope provisioned as the
+        // cap-set path would (child + zeroed window), then exhausted.
+        let mut conn = pool.acquire().await.unwrap();
+        let mut repo = ApiKeys::new(&mut conn);
+        let key = repo
+            .create(&ApiKeyCreateDBRequest {
+                user_id: user.id,
+                name: "capped-batch-key".to_string(),
+                description: None,
+                purpose: ApiKeyPurpose::Realtime,
+                requests_per_second: None,
+                burst_size: None,
+                created_by: user.id,
+                spend_limit: Some(rust_decimal::Decimal::from(10)),
+                spend_limit_interval: None,
+            })
+            .await
+            .unwrap();
+        repo.get_or_create_child_hidden_key(key.id).await.unwrap();
+        repo.reset_spend_window(key.id).await.unwrap();
+        sqlx::query("UPDATE api_key_spend_checkpoints SET window_spend = 10, total_spend = 10 WHERE api_key_id = $1")
+            .bind(key.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        drop(conn);
+
+        // Upload the input file (session auth — uploads aren't the gated step).
+        let jsonl = r#"{"custom_id":"r1","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}}"#;
+        let file_part = axum_test::multipart::Part::bytes(jsonl.as_bytes()).file_name("test.jsonl");
+        let multipart = axum_test::multipart::MultipartForm::new()
+            .add_part("file", file_part)
+            .add_part("purpose", axum_test::multipart::Part::text("batch"));
+        let auth = add_auth_headers(&user);
+        let upload = app
+            .post("/ai/v1/files")
+            .multipart(multipart)
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+        upload.assert_status(StatusCode::CREATED);
+        let file: serde_json::Value = upload.json();
+        let file_id = file["id"].as_str().unwrap().to_string();
+
+        // Creating the batch WITH the capped key resolves the execution key to
+        // its exhausted cap scope → explicit 402 up front.
+        let create_req = CreateBatchRequest {
+            input_file_id: file_id.clone(),
+            endpoint: "/v1/chat/completions".to_string(),
+            completion_window: "24h".to_string(),
+            metadata: None,
+        };
+        let resp = app
+            .post("/ai/v1/batches")
+            .json(&create_req)
+            .add_header("authorization", &format!("Bearer {}", key.secret))
+            .await;
+        resp.assert_status(StatusCode::PAYMENT_REQUIRED);
+        let body = resp.text();
+        assert!(
+            body.to_lowercase().contains("spending cap"),
+            "expected an explicit cap message, got: {body}"
+        );
+
+        // Control: the same batch via session auth (uncapped shared hidden
+        // key) is admitted — caps scope to the key, not the user.
+        let resp = app
+            .post("/ai/v1/batches")
+            .json(&create_req)
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+        resp.assert_status(StatusCode::CREATED);
     }
 
     #[sqlx::test]
