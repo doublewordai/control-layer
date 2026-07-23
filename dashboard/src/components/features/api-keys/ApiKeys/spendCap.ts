@@ -76,3 +76,19 @@ export function resetPreviewLine(
   }
   return `Next resets ${formatResetInstant(boundary)}.`;
 }
+
+/** Table subtext for a capped key's reset period, e.g. "Daily limit". */
+export function limitPeriodLabel(
+  interval: SpendLimitInterval | null | undefined,
+): string {
+  switch (interval) {
+    case "daily":
+      return "Daily limit";
+    case "weekly":
+      return "Weekly limit";
+    case "monthly":
+      return "Monthly limit";
+    default:
+      return "One-off limit";
+  }
+}

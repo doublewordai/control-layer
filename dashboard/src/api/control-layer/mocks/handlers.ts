@@ -92,6 +92,30 @@ const groupsData = groupsDataRaw as Group[];
 const endpointsData = endpointsDataRaw as Endpoint[];
 const modelsData = modelsDataRaw.data as Model[];
 const apiKeysData = apiKeysDataRaw as ApiKey[];
+
+// Next calendar-aligned UTC reset boundary for a usage-limit interval; null
+// for one-off caps. Mirrors the backend's date_trunc semantics (and the
+// spendCap.ts helper — duplicated so mocks stay free of component imports).
+function nextCapResetIso(interval: string | null): string | null {
+  if (!interval) return null;
+  const now = new Date();
+  const y = now.getUTCFullYear();
+  const m = now.getUTCMonth();
+  const d = now.getUTCDate();
+  switch (interval) {
+    case "daily":
+      return new Date(Date.UTC(y, m, d + 1)).toISOString();
+    case "weekly": {
+      const dow = now.getUTCDay();
+      const daysUntilMonday = dow === 0 ? 1 : 8 - dow;
+      return new Date(Date.UTC(y, m, d + daysUntilMonday)).toISOString();
+    }
+    case "monthly":
+      return new Date(Date.UTC(y, m + 1, 1)).toISOString();
+    default:
+      return null;
+  }
+}
 const transactionsData = transactionsDataRaw as Transaction[];
 const organizationsData = organizationsDataRaw as unknown as Organization[];
 let providerDisplayConfigsData: ProviderDisplayConfig[] = [
@@ -1029,8 +1053,8 @@ export const handlers = [
       spend: body.spend_limit != null ? "0" : null,
       total_spend: body.spend_limit != null ? "0" : null,
       resets_at:
-        body.spend_limit != null && body.spend_limit_interval != null
-          ? "2026-08-01T00:00:00Z"
+        body.spend_limit != null
+          ? nextCapResetIso(body.spend_limit_interval ?? null)
           : null,
     };
     return HttpResponse.json(newApiKey, { status: 201 });
@@ -1039,7 +1063,9 @@ export const handlers = [
   http.patch(
     "/admin/api/v1/users/:userId/api-keys/:keyId",
     async ({ params, request }) => {
-      const apiKey = apiKeysData.find((k) => k.id === params.keyId);
+      const apiKey = apiKeysData.find((k) => k.id === params.keyId) as
+        | Record<string, unknown>
+        | undefined;
       if (!apiKey) {
         return HttpResponse.json(
           { error: "API key not found" },
@@ -1055,13 +1081,23 @@ export const handlers = [
         merged.spend_limit_interval = body.spend_limit_interval;
       if (body.reset_window === true) merged.spend = "0";
       if ("name" in body && body.name !== undefined) merged.name = body.name;
+      // Keep derived fields consistent with the cap state.
       if (merged.spend_limit == null) {
         merged.spend = null;
         merged.total_spend = null;
         merged.resets_at = null;
         merged.spend_limit_interval = null;
+      } else {
+        merged.spend = merged.spend ?? "0";
+        merged.total_spend = merged.total_spend ?? "0";
+        merged.resets_at = nextCapResetIso(
+          (merged.spend_limit_interval as string | null) ?? null,
+        );
       }
-      return HttpResponse.json(merged);
+      // Persist so follow-up list/get requests (query invalidation) reflect
+      // the edit rather than reverting to the seed data.
+      Object.assign(apiKey, merged);
+      return HttpResponse.json(apiKey);
     },
   ),
 

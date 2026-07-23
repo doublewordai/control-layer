@@ -5,6 +5,7 @@
     "description": "Automated testing and evaluation pipeline",
     "created_at": "2025-04-01T10:00:00Z",
     "last_used": "2026-02-18T06:15:00Z",
+    "created_by": "550e8400-e29b-41d4-a716-446655440001",
     "spend_limit": "50",
     "spend_limit_interval": "monthly",
     "spend": "12.34",

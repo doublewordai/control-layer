@@ -20,7 +20,11 @@ import {
   type ApiKeyPurpose,
   type SpendLimitInterval,
 } from "../../../../api/control-layer";
-import { formatCredits, resetPreviewLine } from "./spendCap";
+import {
+  formatCredits,
+  formatResetInstant,
+  resetPreviewLine,
+} from "./spendCap";
 import { useUser } from "../../../../api/control-layer/hooks";
 import { DataTable } from "../../../ui/data-table";
 import { createColumns } from "./columns";
@@ -220,9 +224,17 @@ export const ApiKeys: React.FC = () => {
     }
   };
 
+  // Mirrors what the PATCH endpoint permits: the key's creator, or a
+  // PlatformManager. (Non-PM org admins cannot edit members' keys server-side
+  // today; if that changes, extend this gate alongside it.) Keys without
+  // created_by (legacy rows) fall back to visible so they stay manageable.
+  const canManageKey = (apiKey: ApiKey) =>
+    isPlatformManager || !apiKey.created_by || apiKey.created_by === user?.id;
+
   const columns = createColumns({
     onDelete: handleDeleteFromTable,
     onEdit: openEditModal,
+    canManage: canManageKey,
     isPlatformManager,
   });
 
@@ -382,12 +394,11 @@ export const ApiKeys: React.FC = () => {
         <DialogContent className="sm:max-w-md">
           <DialogHeader>
             <DialogTitle>
-              {newKeyResponse
-                ? "API Key Created Successfully"
-                : "Create New API Key"}
+              {newKeyResponse ? "API Key Created Successfully" : "Create API key"}
             </DialogTitle>
             <DialogDescription>
-              Create a new API key to access the platform programmatically.
+              Give the key a recognizable name. You'll see the secret value
+              once on the next screen.
             </DialogDescription>
           </DialogHeader>
 
@@ -468,107 +479,135 @@ export const ApiKeys: React.FC = () => {
                 className="space-y-4"
               >
                 <div className="space-y-2">
-                  <Label htmlFor="keyName">Name *</Label>
+                  <Label htmlFor="keyName">Name</Label>
                   <Input
                     id="keyName"
                     type="text"
                     value={newKeyName}
                     onChange={(e) => setNewKeyName(e.target.value)}
-                    placeholder="My API Key"
+                    placeholder="Production worker"
                     required
                   />
                 </div>
 
                 <div className="space-y-2">
-                  <Label htmlFor="keyDescription">Description</Label>
+                  <Label htmlFor="keyDescription">
+                    Description{" "}
+                    <span className="font-normal text-doubleword-neutral-400">
+                      (optional)
+                    </span>
+                  </Label>
                   <Textarea
                     id="keyDescription"
                     value={newKeyDescription}
                     onChange={(e) => setNewKeyDescription(e.target.value)}
-                    placeholder="What will this key be used for?"
-                    rows={3}
+                    placeholder="Where will this key be used?"
+                    rows={2}
                     className="resize-none"
                   />
                 </div>
 
-                {/* Spending Cap - available to all users */}
-                <div className="space-y-3 rounded-lg border border-doubleword-neutral-200 p-3">
-                  <div className="flex items-center gap-1">
-                    <Label htmlFor="spendLimit">Spending cap (optional)</Label>
-                    <HoverCard openDelay={200} closeDelay={100}>
-                      <HoverCardTrigger asChild>
-                        <button
-                          type="button"
-                          className="text-gray-400 hover:text-gray-600 transition-colors"
-                          onFocus={(e) => e.preventDefault()}
-                          tabIndex={-1}
-                        >
-                          <Info className="h-4 w-4" />
-                          <span className="sr-only">
-                            Spending cap information
-                          </span>
-                        </button>
-                      </HoverCardTrigger>
-                      <HoverCardContent className="w-80" sideOffset={5}>
-                        <p className="text-sm text-muted-foreground">
-                          Hard limit on this key's spend, covering realtime,
-                          batch and flex usage made with the key. Playground
-                          and dashboard-created batches are not counted.
-                          Enforcement is near-real-time, so a small overshoot
-                          is possible. Reset periods are fixed calendar
-                          windows (UTC), not rolling windows.
-                        </p>
-                      </HoverCardContent>
-                    </HoverCard>
+                {/* Key type — card-style choice, matching the design */}
+                <div className="space-y-2">
+                  <Label>Key type</Label>
+                  <div role="radiogroup" aria-label="Key type" className="space-y-2">
+                    {(
+                      [
+                        {
+                          value: "realtime",
+                          title: "Inference",
+                          desc: "Calls chat completions, embeddings, responses, and batches.",
+                        },
+                        {
+                          value: "platform",
+                          title: "Platform",
+                          desc: "Hits the management API. Required by dw-cli and other tools that read or change account settings.",
+                        },
+                      ] as const
+                    ).map((opt) => (
+                      <button
+                        key={opt.value}
+                        type="button"
+                        role="radio"
+                        aria-checked={newKeyPurpose === opt.value}
+                        aria-label={opt.title}
+                        onClick={() =>
+                          setNewKeyPurpose(opt.value as ApiKeyPurpose)
+                        }
+                        className={`w-full rounded-lg border p-3 text-left transition-colors ${
+                          newKeyPurpose === opt.value
+                            ? "border-doubleword-neutral-900 ring-1 ring-doubleword-neutral-900 bg-doubleword-neutral-50"
+                            : "border-doubleword-neutral-200 hover:border-doubleword-neutral-300"
+                        }`}
+                      >
+                        <div className="font-medium text-doubleword-neutral-900">
+                          {opt.title}
+                        </div>
+                        <div className="text-sm text-doubleword-neutral-600">
+                          {opt.desc}
+                        </div>
+                      </button>
+                    ))}
                   </div>
+                </div>
+
+                {/* Usage Limit */}
+                <div className="space-y-2">
+                  <Label htmlFor="usageLimit">
+                    Usage Limit{" "}
+                    <span className="font-normal text-doubleword-neutral-400">
+                      (optional)
+                    </span>
+                  </Label>
                   <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                    <div className="space-y-2">
+                    <div className="relative">
+                      <span className="absolute left-3 top-1/2 -translate-y-1/2 text-sm text-doubleword-neutral-400">
+                        $
+                      </span>
                       <Input
-                        id="spendLimit"
+                        id="usageLimit"
                         type="number"
                         min="0.01"
                         step="any"
+                        className="pl-7"
                         value={newKeyCapAmount}
                         onChange={(e) => setNewKeyCapAmount(e.target.value)}
-                        placeholder="No cap"
-                        aria-label="Spending cap amount in credits"
+                        placeholder="Amount"
+                        aria-label="Usage limit amount"
                       />
                     </div>
-                    <div className="space-y-2">
-                      <Select
-                        value={newKeyCapInterval}
-                        onValueChange={(value) =>
-                          setNewKeyCapInterval(
-                            value as SpendLimitInterval | "none",
-                          )
-                        }
-                        disabled={newKeyCapAmount.trim() === ""}
+                    <Select
+                      value={newKeyCapInterval}
+                      onValueChange={(value) =>
+                        setNewKeyCapInterval(value as SpendLimitInterval | "none")
+                      }
+                      disabled={newKeyCapAmount.trim() === ""}
+                    >
+                      <SelectTrigger
+                        className="w-full"
+                        aria-label="Usage limit reset period"
                       >
-                        <SelectTrigger
-                          className="w-full"
-                          aria-label="Spending cap reset period"
-                        >
-                          <SelectValue placeholder="Reset period" />
-                        </SelectTrigger>
-                        <SelectContent>
-                          <SelectItem value="none">One-off (no reset)</SelectItem>
-                          <SelectItem value="daily">Daily</SelectItem>
-                          <SelectItem value="weekly">Weekly</SelectItem>
-                          <SelectItem value="monthly">Monthly</SelectItem>
-                        </SelectContent>
-                      </Select>
-                    </div>
+                        <SelectValue placeholder="No reset (N/A)" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="none">No reset (N/A)</SelectItem>
+                        <SelectItem value="daily">Daily</SelectItem>
+                        <SelectItem value="weekly">Weekly</SelectItem>
+                        <SelectItem value="monthly">Monthly</SelectItem>
+                      </SelectContent>
+                    </Select>
                   </div>
-                  {newKeyCapAmount.trim() !== "" && (
-                    <p className="text-xs text-doubleword-neutral-500">
-                      {resetPreviewLine(
+                  <p className="text-xs text-doubleword-neutral-500">
+                    Restrict how much API credit this specific key can consume.
+                    Leave amount blank for no limit.
+                    {newKeyCapAmount.trim() !== "" &&
+                      ` ${resetPreviewLine(
                         newKeyCapInterval === "none" ? null : newKeyCapInterval,
-                      )}
-                    </p>
-                  )}
+                      )}`}
+                  </p>
                 </div>
 
-                {/* Advanced Settings (Purpose & Rate Limiting) - Collapsible */}
+                {/* Advanced Settings (Rate Limiting, PM-only) - Collapsible */}
                 {isPlatformManager && (
                   <Collapsible
                     open={advancedOpen}
@@ -589,68 +628,6 @@ export const ApiKeys: React.FC = () => {
                       </button>
                     </CollapsibleTrigger>
                     <CollapsibleContent className="space-y-3 pt-4">
-                      {/* Purpose Selection */}
-                      <div className="space-y-2">
-                        <div className="flex items-center gap-1">
-                          <Label htmlFor="purpose">Purpose</Label>
-                          <HoverCard openDelay={200} closeDelay={100}>
-                            <HoverCardTrigger asChild>
-                              <button
-                                type="button"
-                                className="text-gray-400 hover:text-gray-600 transition-colors"
-                                onFocus={(e) => e.preventDefault()}
-                                tabIndex={-1}
-                              >
-                                <Info className="h-4 w-4" />
-                                <span className="sr-only">
-                                  Purpose information
-                                </span>
-                              </button>
-                            </HoverCardTrigger>
-                            <HoverCardContent className="w-80" sideOffset={5}>
-                              <p className="text-sm text-muted-foreground">
-                                Choose the API access level for this key.
-                                Inference keys can access AI endpoints (/ai/*),
-                                while Platform keys can access management APIs
-                                (/admin/api/*).
-                              </p>
-                            </HoverCardContent>
-                          </HoverCard>
-                        </div>
-                        <Select
-                          value={newKeyPurpose}
-                          onValueChange={(value) =>
-                            setNewKeyPurpose(value as ApiKeyPurpose)
-                          }
-                        >
-                          <SelectTrigger id="purpose" className="w-full">
-                            <SelectValue placeholder="Select purpose">
-                              {newKeyPurpose === "realtime"
-                                ? "Inference"
-                                : "Platform"}
-                            </SelectValue>
-                          </SelectTrigger>
-                          <SelectContent>
-                            <SelectItem value="realtime">
-                              <div className="flex flex-col gap-0.5">
-                                <span>Inference</span>
-                                <span className="text-xs text-muted-foreground">
-                                  For AI inference endpoints (/ai/*)
-                                </span>
-                              </div>
-                            </SelectItem>
-                            <SelectItem value="platform">
-                              <div className="flex flex-col gap-0.5">
-                                <span>Platform</span>
-                                <span className="text-xs text-muted-foreground">
-                                  For platform management APIs (/admin/api/*)
-                                </span>
-                              </div>
-                            </SelectItem>
-                          </SelectContent>
-                        </Select>
-                      </div>
-
                       {/* Rate Limiting */}
                       <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                         <div className="space-y-2">
@@ -832,7 +809,7 @@ export const ApiKeys: React.FC = () => {
         </DialogContent>
       </Dialog>
 
-      {/* Edit Spending Cap Modal */}
+      {/* Edit Usage Limit Modal */}
       <Dialog
         open={!!editModal}
         onOpenChange={(open) => {
@@ -841,80 +818,74 @@ export const ApiKeys: React.FC = () => {
       >
         <DialogContent className="sm:max-w-md">
           <DialogHeader>
-            <DialogTitle>Spending Cap</DialogTitle>
+            <DialogTitle>Edit Usage Limit</DialogTitle>
             <DialogDescription>
-              Set a hard spend limit for "{editModal?.name}". Covers realtime,
-              batch and flex usage made with this key.
+              Update limits for <strong>{editModal?.name}</strong>
             </DialogDescription>
           </DialogHeader>
 
-          <div className="space-y-4">
-            {editModal?.spend_limit != null && (
-              <div className="rounded-lg bg-doubleword-neutral-50 border border-doubleword-neutral-200 p-3 text-sm text-doubleword-neutral-700">
-                Spent {formatCredits(editModal.spend ?? "0")} of{" "}
-                {formatCredits(editModal.spend_limit)} this window
-                {editModal.resets_at
-                  ? ` · resets ${new Date(editModal.resets_at).toLocaleDateString(
-                      "en-US",
-                      {
-                        month: "short",
-                        day: "numeric",
-                        timeZone: "UTC",
-                      },
-                    )} (UTC)`
-                  : " · no automatic reset"}
-              </div>
-            )}
+          {editModal?.spend_limit != null && (
+            <div className="rounded-lg bg-doubleword-neutral-50 border border-doubleword-neutral-200 p-3 text-sm text-doubleword-neutral-700">
+              Spent {formatCredits(editModal.spend ?? "0")} of{" "}
+              {formatCredits(editModal.spend_limit)} this window
+              {editModal.resets_at
+                ? ` · resets ${formatResetInstant(editModal.resets_at)}`
+                : " · no automatic reset"}
+            </div>
+          )}
 
+          <div className="space-y-2">
+            <Label htmlFor="editUsageLimit">
+              Usage Limit{" "}
+              <span className="font-normal text-doubleword-neutral-400">
+                (optional)
+              </span>
+            </Label>
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-              <div className="space-y-2">
-                <Label htmlFor="editSpendLimit">Cap amount</Label>
+              <div className="relative">
+                <span className="absolute left-3 top-1/2 -translate-y-1/2 text-sm text-doubleword-neutral-400">
+                  $
+                </span>
                 <Input
-                  id="editSpendLimit"
+                  id="editUsageLimit"
                   type="number"
                   min="0.01"
                   step="any"
+                  className="pl-7"
                   value={editCapAmount}
                   onChange={(e) => setEditCapAmount(e.target.value)}
-                  placeholder="No cap"
-                  aria-label="Spending cap amount in credits"
+                  placeholder="Amount"
+                  aria-label="Usage limit amount"
                 />
               </div>
-              <div className="space-y-2">
-                <Label>Reset period</Label>
-                <Select
-                  value={editCapInterval}
-                  onValueChange={(value) =>
-                    setEditCapInterval(value as SpendLimitInterval | "none")
-                  }
-                  disabled={editCapAmount.trim() === ""}
+              <Select
+                value={editCapInterval}
+                onValueChange={(value) =>
+                  setEditCapInterval(value as SpendLimitInterval | "none")
+                }
+                disabled={editCapAmount.trim() === ""}
+              >
+                <SelectTrigger
+                  className="w-full"
+                  aria-label="Usage limit reset period"
                 >
-                  <SelectTrigger
-                    className="w-full"
-                    aria-label="Spending cap reset period"
-                  >
-                    <SelectValue placeholder="Reset period" />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="none">One-off (no reset)</SelectItem>
-                    <SelectItem value="daily">Daily</SelectItem>
-                    <SelectItem value="weekly">Weekly</SelectItem>
-                    <SelectItem value="monthly">Monthly</SelectItem>
-                  </SelectContent>
-                </Select>
-              </div>
+                  <SelectValue placeholder="No reset (N/A)" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="none">No reset (N/A)</SelectItem>
+                  <SelectItem value="daily">Daily</SelectItem>
+                  <SelectItem value="weekly">Weekly</SelectItem>
+                  <SelectItem value="monthly">Monthly</SelectItem>
+                </SelectContent>
+              </Select>
             </div>
-
             <p className="text-xs text-doubleword-neutral-500">
-              {editCapAmount.trim() === ""
-                ? "Leave the amount empty to remove the cap."
-                : resetPreviewLine(
-                    editCapInterval === "none" ? null : editCapInterval,
-                  )}
+              Restrict how much API credit this specific key can consume. Leave
+              amount blank for no limit.
               {editCapAmount.trim() !== "" &&
-                editCapInterval !==
-                  (editModal?.spend_limit_interval ?? "none") &&
-                " Changing the reset period restarts the spend window."}
+                ` ${resetPreviewLine(
+                  editCapInterval === "none" ? null : editCapInterval,
+                )}`}
             </p>
           </div>
 
@@ -949,12 +920,13 @@ export const ApiKeys: React.FC = () => {
                 {updateApiKeyMutation.isPending && (
                   <Loader2 className="w-4 h-4 mr-2 animate-spin" />
                 )}
-                Save
+                Save changes
               </Button>
             </div>
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
 
       {/* Bulk Delete Confirmation Modal */}
       <Dialog open={showBulkDeleteModal} onOpenChange={setShowBulkDeleteModal}>
