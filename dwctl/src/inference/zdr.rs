@@ -269,6 +269,7 @@ mod tests {
                     verified: true,
                     zero_data_retention: true,
                     hidden_batch_key: None,
+                    hidden_batch_key_is_child: false,
                 },
             ),
             (
@@ -280,6 +281,7 @@ mod tests {
                     verified: true,
                     zero_data_retention: false,
                     hidden_batch_key: None,
+                    hidden_batch_key_is_child: false,
                 },
             ),
         ]));

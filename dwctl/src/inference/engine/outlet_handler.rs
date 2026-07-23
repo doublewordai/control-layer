@@ -581,6 +581,7 @@ mod tests {
                 verified: true,
                 zero_data_retention: false,
                 hidden_batch_key: None,
+                hidden_batch_key_is_child: false,
             },
         )]));
         let handler = FusilladeOutletHandler::new(handle, cache);

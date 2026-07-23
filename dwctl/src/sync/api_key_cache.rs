@@ -26,6 +26,10 @@ pub struct ApiKeyMetadata {
     pub verified: bool,
     pub zero_data_retention: bool,
     pub hidden_batch_key: Option<String>,
+    /// Whether `hidden_batch_key` was joined through this key's cap-scope
+    /// child. A shared fallback is not durable authority because a child may
+    /// be created while the in-memory snapshot still names the shared key.
+    pub hidden_batch_key_is_child: bool,
 }
 
 /// Cheap-to-clone handle to an atomically replaced API-key metadata snapshot.
@@ -67,15 +71,29 @@ pub struct ResolvedFlexKey {
     pub verified: bool,
 }
 
-/// Resolves cached hidden batch identities and serializes cold creation by owner and creator.
+/// Resolves hidden batch identities and serializes cold creation by owner and creator.
+///
+/// Snapshot-proven and positively checked spend-cap children stay on the
+/// memory-only hot path. A shared fallback is rechecked against PostgreSQL on
+/// every Flex resolution because a cap child can appear between snapshots.
 #[derive(Clone)]
 pub struct FlexBatchKeyResolver {
     pool: PgPool,
     cache: ApiKeyMetadataCache,
     locks: Arc<ResolverLocks>,
+    resolutions: Arc<DashMap<String, CachedFlexResolution>>,
 }
 
 type ResolverLocks = DashMap<(Uuid, Uuid), Arc<Mutex<()>>>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CachedFlexResolution {
+    /// Execution key visible in the metadata snapshot when this result was
+    /// checked against PostgreSQL.
+    snapshot_secret: Option<String>,
+    /// Authoritative child key. Negative/shared resolutions are never cached.
+    resolved_secret: String,
+}
 
 impl FlexBatchKeyResolver {
     /// Bind a resolver to the shared metadata snapshot and primary database pool.
@@ -84,6 +102,7 @@ impl FlexBatchKeyResolver {
             pool,
             cache,
             locks: Arc::new(DashMap::new()),
+            resolutions: Arc::new(DashMap::new()),
         }
     }
 
@@ -92,8 +111,15 @@ impl FlexBatchKeyResolver {
         let Some(metadata) = self.cache.get(presented_secret) else {
             return Ok(None);
         };
-        if let Some(secret) = metadata.hidden_batch_key.clone() {
+        if metadata.hidden_batch_key_is_child {
+            let secret = metadata
+                .hidden_batch_key
+                .clone()
+                .expect("child provenance requires a hidden batch key");
             return Ok(Some(resolved_flex_key(secret, &metadata)));
+        }
+        if let Some(resolved) = self.cached_resolution(presented_secret, &metadata) {
+            return Ok(Some(resolved));
         }
 
         let lock_key = (metadata.owner_id, metadata.created_by);
@@ -103,22 +129,87 @@ impl FlexBatchKeyResolver {
         let Some(metadata) = self.cache.get(presented_secret) else {
             return Ok(None);
         };
-        if let Some(secret) = metadata.hidden_batch_key.clone() {
+        if metadata.hidden_batch_key_is_child {
+            let secret = metadata
+                .hidden_batch_key
+                .clone()
+                .expect("child provenance requires a hidden batch key");
             return Ok(Some(resolved_flex_key(secret, &metadata)));
         }
+        if let Some(resolved) = self.cached_resolution(presented_secret, &metadata) {
+            return Ok(Some(resolved));
+        }
 
-        let secret = {
-            let mut conn = self.pool.acquire().await?;
-            ApiKeys::new(&mut conn)
-                .get_or_create_hidden_key(metadata.owner_id, ApiKeyPurpose::Batch, metadata.created_by)
-                .await?
-        };
-        refresh(&self.pool, &self.cache).await?;
+        // A cap-scope child can be created after this process loaded its
+        // snapshot. Check PostgreSQL before every shared fallback; caching a
+        // negative result would bypass per-key spend attribution until the
+        // independently refreshed metadata snapshot caught up.
+        let child_secret = sqlx::query_scalar::<_, String>(
+            r#"
+            SELECT child.secret
+            FROM api_keys parent
+            JOIN api_keys child
+              ON child.parent_api_key_id = parent.id
+             AND child.purpose = 'batch'
+             AND child.hidden = true
+             AND child.is_deleted = false
+            WHERE parent.secret = $1
+              AND parent.is_deleted = false
+            LIMIT 1
+            "#,
+        )
+        .bind(presented_secret)
+        .fetch_optional(&self.pool)
+        .await?;
 
-        let Some(refreshed_metadata) = self.cache.get(presented_secret) else {
-            return Ok(None);
+        let (secret, resolved_metadata, cache_positive_child) = match child_secret {
+            Some(secret) => (secret, metadata, true),
+            None if metadata.hidden_batch_key.is_some() => {
+                let secret = metadata.hidden_batch_key.clone().expect("guard above requires a cached shared key");
+                (secret, metadata, false)
+            }
+            None => {
+                let mut conn = self.pool.acquire().await?;
+                let shared_secret = ApiKeys::new(&mut conn)
+                    .get_or_create_hidden_key(metadata.owner_id, ApiKeyPurpose::Batch, metadata.created_by)
+                    .await?;
+                refresh(&self.pool, &self.cache).await?;
+                let Some(refreshed_metadata) = self.cache.get(presented_secret) else {
+                    return Ok(None);
+                };
+                if refreshed_metadata.hidden_batch_key_is_child {
+                    let child_secret = refreshed_metadata
+                        .hidden_batch_key
+                        .clone()
+                        .expect("child provenance requires a hidden batch key");
+                    (child_secret, refreshed_metadata, true)
+                } else {
+                    (shared_secret, refreshed_metadata, false)
+                }
+            }
         };
-        Ok(Some(resolved_flex_key(secret, &refreshed_metadata)))
+        if cache_positive_child {
+            self.resolutions.insert(
+                presented_secret.to_string(),
+                CachedFlexResolution {
+                    snapshot_secret: resolved_metadata.hidden_batch_key.clone(),
+                    resolved_secret: secret.clone(),
+                },
+            );
+        } else {
+            // A negative lookup is never durable authority: a cap child may
+            // appear without changing the current metadata snapshot. Recheck
+            // PostgreSQL on the next Flex request.
+            self.resolutions.remove(presented_secret);
+        }
+        Ok(Some(resolved_flex_key(secret, &resolved_metadata)))
+    }
+
+    fn cached_resolution(&self, presented_secret: &str, metadata: &ApiKeyMetadata) -> Option<ResolvedFlexKey> {
+        self.resolutions
+            .get(presented_secret)
+            .filter(|resolution| resolution.snapshot_secret == metadata.hidden_batch_key)
+            .map(|resolution| resolved_flex_key(resolution.resolved_secret.clone(), metadata))
     }
 }
 
@@ -139,6 +230,7 @@ struct ApiKeyMetadataRow {
     verified: bool,
     zero_data_retention: bool,
     hidden_batch_key: Option<String>,
+    hidden_batch_key_is_child: bool,
 }
 
 async fn load(pool: &PgPool) -> Result<HashMap<String, ApiKeyMetadata>, sqlx::Error> {
@@ -151,15 +243,22 @@ async fn load(pool: &PgPool) -> Result<HashMap<String, ApiKeyMetadata>, sqlx::Er
             ak.purpose,
             u.verified,
             u.zero_data_retention,
-            batch.secret AS hidden_batch_key
+            COALESCE(child.secret, batch.secret) AS hidden_batch_key,
+            child.secret IS NOT NULL AS hidden_batch_key_is_child
         FROM api_keys ak
         JOIN users u ON u.id = ak.user_id
+        LEFT JOIN api_keys child
+          ON child.parent_api_key_id = ak.id
+         AND child.purpose = 'batch'
+         AND child.hidden = true
+         AND child.is_deleted = false
         LEFT JOIN api_keys batch
           ON batch.user_id = ak.user_id
          AND batch.created_by = ak.created_by
          AND batch.purpose = 'batch'
          AND batch.hidden = true
          AND batch.is_deleted = false
+         AND batch.parent_api_key_id IS NULL
         WHERE ak.is_deleted = false
         "#,
     )
@@ -178,6 +277,7 @@ async fn load(pool: &PgPool) -> Result<HashMap<String, ApiKeyMetadata>, sqlx::Er
                     verified: row.verified,
                     zero_data_retention: row.zero_data_retention,
                     hidden_batch_key: row.hidden_batch_key,
+                    hidden_batch_key_is_child: row.hidden_batch_key_is_child,
                 },
             )
         })
@@ -221,6 +321,23 @@ pub async fn run(
     'outer: loop {
         let mut listener = PgListener::connect_with(&pool).await?;
         listener.listen(ONWARDS_CONFIG_CHANGED_CHANNEL).await?;
+        // LISTEN has no replay. Refresh after subscribing so a change committed
+        // while the previous connection was unavailable cannot remain hidden
+        // until the long fallback interval; a concurrent change is either in
+        // this snapshot or queued as a notification on the new connection.
+        loop {
+            let refreshed = tokio::select! {
+                refreshed = reload(&pool, &cache) => refreshed,
+                _ = shutdown.cancelled() => break 'outer,
+            };
+            if refreshed {
+                break;
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(MIN_RELOAD_INTERVAL) => {},
+                _ = shutdown.cancelled() => break 'outer,
+            }
+        }
         info!("Started API key metadata sync listener");
 
         let mut last_reload = tokio::time::Instant::now();
@@ -255,7 +372,10 @@ pub async fn run(
                         } else {
                             trailing_reload = None;
                             last_reload = tokio::time::Instant::now();
-                            reload(&pool, &cache).await;
+                            if !reload(&pool, &cache).await {
+                                trailing_reload =
+                                    Some(tokio::time::Instant::now() + MIN_RELOAD_INTERVAL);
+                            }
                         }
                     }
                     Ok(None) => {
@@ -270,13 +390,19 @@ pub async fn run(
                 _ = trailing => {
                     trailing_reload = None;
                     last_reload = tokio::time::Instant::now();
-                    reload(&pool, &cache).await;
+                    if !reload(&pool, &cache).await {
+                        trailing_reload =
+                            Some(tokio::time::Instant::now() + MIN_RELOAD_INTERVAL);
+                    }
                 }
                 _ = tick => {
                     if last_reload.elapsed() < MIN_RELOAD_INTERVAL { continue; }
                     trailing_reload = None;
                     last_reload = tokio::time::Instant::now();
-                    reload(&pool, &cache).await;
+                    if !reload(&pool, &cache).await {
+                        trailing_reload =
+                            Some(tokio::time::Instant::now() + MIN_RELOAD_INTERVAL);
+                    }
                 }
             }
         }
@@ -284,11 +410,15 @@ pub async fn run(
     Ok(())
 }
 
-async fn reload(pool: &PgPool, cache: &ApiKeyMetadataCache) {
+async fn reload(pool: &PgPool, cache: &ApiKeyMetadataCache) -> bool {
     match refresh(pool, cache).await {
-        Ok(keys) => debug!(keys, "API key metadata sync: reloaded map"),
+        Ok(keys) => {
+            debug!(keys, "API key metadata sync: reloaded map");
+            true
+        }
         Err(error) => {
             crate::background_error!(component::API_KEY_CACHE_SYNC, "load", Error, error = %error, "API key metadata sync: failed to reload map");
+            false
         }
     }
 }
@@ -336,6 +466,7 @@ mod tests {
             verified: true,
             zero_data_retention: true,
             hidden_batch_key: Some("sk-batch".to_string()),
+            hidden_batch_key_is_child: true,
         };
         let cache = ApiKeyMetadataCache::empty();
         cache.replace(HashMap::from([("sk-presented".to_string(), metadata.clone())]));
@@ -364,6 +495,7 @@ mod tests {
                     verified: false,
                     zero_data_retention,
                     hidden_batch_key: None,
+                    hidden_batch_key_is_child: false,
                 },
             )])
         }
@@ -508,6 +640,146 @@ mod tests {
     }
 
     #[sqlx::test]
+    async fn listener_start_refreshes_changes_missed_before_subscription(pool: sqlx::PgPool) {
+        let owner = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+        let secret = create_realtime_key(&pool, owner.id, owner.id, "pre-listen policy change").await;
+        let cache = initial_cache(&pool).await.expect("initial cache load");
+        assert!(!cache.is_zdr(&secret));
+
+        // This notification has no subscriber. Starting the listener must
+        // still close that gap by refreshing after LISTEN succeeds.
+        sqlx::query("UPDATE users SET zero_data_retention = true WHERE id = $1")
+            .bind(owner.id)
+            .execute(&pool)
+            .await
+            .expect("change policy before listener starts");
+
+        let shutdown = CancellationToken::new();
+        let sync_task = tokio::spawn(run(pool.clone(), cache.clone(), 0, shutdown.clone()));
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !cache.is_zdr(&secret) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("post-LISTEN refresh should observe the missed change");
+
+        shutdown.cancel();
+        sync_task
+            .await
+            .expect("join cache sync task")
+            .expect("cache sync should shut down cleanly");
+    }
+
+    #[sqlx::test]
+    async fn listener_start_retries_a_failed_post_subscription_refresh(pool: sqlx::PgPool) {
+        let owner = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+        let secret = create_realtime_key(&pool, owner.id, owner.id, "post-listen retry").await;
+        let cache = initial_cache(&pool).await.expect("initial cache load");
+        assert!(!cache.is_zdr(&secret));
+
+        // Commit a change with no listener, then make the first post-LISTEN
+        // snapshot load fail. Restoring the table emits no auth notification,
+        // so fallback=0 can recover only if startup retries the failed load.
+        sqlx::query("UPDATE users SET zero_data_retention = true WHERE id = $1")
+            .bind(owner.id)
+            .execute(&pool)
+            .await
+            .expect("change policy before listener starts");
+        sqlx::query("ALTER TABLE api_keys RENAME TO api_keys_temporarily_unavailable")
+            .execute(&pool)
+            .await
+            .expect("make first post-LISTEN load fail");
+
+        let shutdown = CancellationToken::new();
+        let sync_task = tokio::spawn(run(pool.clone(), cache.clone(), 0, shutdown.clone()));
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+        sqlx::query("ALTER TABLE api_keys_temporarily_unavailable RENAME TO api_keys")
+            .execute(&pool)
+            .await
+            .expect("restore API-key table without a notification");
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !cache.is_zdr(&secret) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("post-LISTEN refresh failure should be retried with fallback disabled");
+
+        shutdown.cancel();
+        sync_task
+            .await
+            .expect("join cache sync task")
+            .expect("cache sync should shut down cleanly");
+    }
+
+    #[sqlx::test]
+    async fn listener_retries_a_failed_notification_refresh(pool: sqlx::PgPool) {
+        let owner = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+        let secret = create_realtime_key(&pool, owner.id, owner.id, "notification retry").await;
+        let cache = initial_cache(&pool).await.expect("initial cache load");
+        assert!(!cache.is_zdr(&secret));
+
+        let shutdown = CancellationToken::new();
+        let sync_task = tokio::spawn(run(pool.clone(), cache.clone(), 0, shutdown.clone()));
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let listeners: i64 = sqlx::query_scalar(
+                    r#"
+                    SELECT COUNT(*)
+                    FROM pg_stat_activity
+                    WHERE datname = current_database()
+                      AND query LIKE 'LISTEN%auth_config_changed%'
+                    "#,
+                )
+                .fetch_one(&pool)
+                .await
+                .expect("inspect listener activity");
+                if listeners > 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("API-key cache listener should subscribe");
+        tokio::time::sleep(std::time::Duration::from_millis(110)).await;
+
+        sqlx::query("ALTER TABLE api_keys RENAME TO api_keys_temporarily_unavailable")
+            .execute(&pool)
+            .await
+            .expect("make notification refresh fail");
+        sqlx::query("UPDATE users SET zero_data_retention = true WHERE id = $1")
+            .bind(owner.id)
+            .execute(&pool)
+            .await
+            .expect("emit policy-change notification");
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        assert!(!cache.is_zdr(&secret), "failed loads must not replace the snapshot");
+
+        sqlx::query("ALTER TABLE api_keys_temporarily_unavailable RENAME TO api_keys")
+            .execute(&pool)
+            .await
+            .expect("restore API-key table without a second notification");
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !cache.is_zdr(&secret) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("failed notification refresh should retry with fallback disabled");
+
+        shutdown.cancel();
+        sync_task
+            .await
+            .expect("join cache sync task")
+            .expect("cache sync should shut down cleanly");
+    }
+
+    #[sqlx::test]
     async fn org_scoped_resolution_uses_matching_creator_hidden_key(pool: sqlx::PgPool) {
         let member = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
         let other_member = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
@@ -538,6 +810,189 @@ mod tests {
         assert_eq!(resolved.secret, expected_secret);
         assert_ne!(resolved.secret, other_secret);
         assert_eq!(resolved.owner_id, org.id);
+    }
+
+    #[sqlx::test]
+    async fn cap_scoped_child_is_preferred_without_leaking_to_sibling_keys(pool: sqlx::PgPool) {
+        let member = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+        let org = crate::test::utils::create_test_org(&pool, member.id).await;
+        let capped_secret = create_realtime_key(&pool, org.id, member.id, "capped execution key").await;
+        let uncapped_secret = create_realtime_key(&pool, org.id, member.id, "uncapped execution key").await;
+        let capped_id: Uuid = sqlx::query_scalar("SELECT id FROM api_keys WHERE secret = $1")
+            .bind(&capped_secret)
+            .fetch_one(&pool)
+            .await
+            .expect("load capped key id");
+        let (shared_secret, child_secret) = {
+            let mut conn = pool.acquire().await.expect("acquire hidden-key connection");
+            let mut api_keys = ApiKeys::new(&mut conn);
+            let shared = api_keys
+                .get_or_create_hidden_key(org.id, ApiKeyPurpose::Batch, member.id)
+                .await
+                .expect("create shared hidden key");
+            let (child, _) = api_keys
+                .get_or_create_child_hidden_key(capped_id)
+                .await
+                .expect("create cap-scoped child");
+            (shared, child)
+        };
+        let cache = initial_cache(&pool).await.expect("initial cache load");
+        let resolver = FlexBatchKeyResolver::new(pool.clone(), cache);
+
+        let capped = resolver
+            .resolve_hidden_batch_key(&capped_secret)
+            .await
+            .expect("resolve capped key")
+            .expect("known capped key");
+        let uncapped = resolver
+            .resolve_hidden_batch_key(&uncapped_secret)
+            .await
+            .expect("resolve uncapped key")
+            .expect("known uncapped key");
+
+        assert_eq!(capped.secret, child_secret);
+        assert_eq!(uncapped.secret, shared_secret);
+        assert_ne!(capped.secret, uncapped.secret);
+    }
+
+    #[sqlx::test]
+    async fn shared_snapshot_checks_for_a_child_created_after_the_snapshot(pool: sqlx::PgPool) {
+        let member = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+        let org = crate::test::utils::create_test_org(&pool, member.id).await;
+        let presented_secret = create_realtime_key(&pool, org.id, member.id, "shared then cap child").await;
+        let parent_id: Uuid = sqlx::query_scalar("SELECT id FROM api_keys WHERE secret = $1")
+            .bind(&presented_secret)
+            .fetch_one(&pool)
+            .await
+            .expect("load parent key id");
+        let shared_secret = {
+            let mut conn = pool.acquire().await.expect("acquire shared-key connection");
+            ApiKeys::new(&mut conn)
+                .get_or_create_hidden_key(org.id, ApiKeyPurpose::Batch, member.id)
+                .await
+                .expect("create shared hidden key before snapshot")
+        };
+        let cache = initial_cache(&pool).await.expect("load snapshot with shared key");
+        assert_eq!(
+            cache.get(&presented_secret).and_then(|metadata| metadata.hidden_batch_key),
+            Some(shared_secret)
+        );
+        let child_secret = {
+            let mut conn = pool.acquire().await.expect("acquire child-key connection");
+            ApiKeys::new(&mut conn)
+                .get_or_create_child_hidden_key(parent_id)
+                .await
+                .expect("create cap child after shared snapshot")
+                .0
+        };
+        let resolver = FlexBatchKeyResolver::new(pool.clone(), cache);
+
+        let resolved = resolver
+            .resolve_hidden_batch_key(&presented_secret)
+            .await
+            .expect("resolve shared snapshot after child creation")
+            .expect("known presented key");
+
+        assert_eq!(resolved.secret, child_secret);
+    }
+
+    #[sqlx::test]
+    async fn shared_resolution_rechecks_for_a_child_created_after_negative_lookup(pool: sqlx::PgPool) {
+        let member = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+        let org = crate::test::utils::create_test_org(&pool, member.id).await;
+        let presented_secret = create_realtime_key(&pool, org.id, member.id, "shared resolve then cap child").await;
+        let parent_id: Uuid = sqlx::query_scalar("SELECT id FROM api_keys WHERE secret = $1")
+            .bind(&presented_secret)
+            .fetch_one(&pool)
+            .await
+            .expect("load parent key id");
+        let shared_secret = {
+            let mut conn = pool.acquire().await.expect("acquire shared-key connection");
+            ApiKeys::new(&mut conn)
+                .get_or_create_hidden_key(org.id, ApiKeyPurpose::Batch, member.id)
+                .await
+                .expect("create shared hidden key before snapshot")
+        };
+        let cache = initial_cache(&pool).await.expect("load snapshot with shared key");
+        let resolver = FlexBatchKeyResolver::new(pool.clone(), cache);
+
+        let before_child = resolver
+            .resolve_hidden_batch_key(&presented_secret)
+            .await
+            .expect("resolve shared key before child creation")
+            .expect("known presented key");
+        assert_eq!(before_child.secret, shared_secret);
+
+        let child_secret = {
+            let mut conn = pool.acquire().await.expect("acquire child-key connection");
+            ApiKeys::new(&mut conn)
+                .get_or_create_child_hidden_key(parent_id)
+                .await
+                .expect("create cap child after negative lookup")
+                .0
+        };
+
+        let after_child = resolver
+            .resolve_hidden_batch_key(&presented_secret)
+            .await
+            .expect("recheck shared resolution after child creation")
+            .expect("known presented key");
+
+        assert_eq!(after_child.secret, child_secret);
+    }
+
+    #[sqlx::test]
+    async fn cold_snapshot_observes_cap_child_before_shared_fallback(pool: sqlx::PgPool) {
+        let member = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+        let org = crate::test::utils::create_test_org(&pool, member.id).await;
+        let presented_secret = create_realtime_key(&pool, org.id, member.id, "late cap child").await;
+        let parent_id: Uuid = sqlx::query_scalar("SELECT id FROM api_keys WHERE secret = $1")
+            .bind(&presented_secret)
+            .fetch_one(&pool)
+            .await
+            .expect("load parent key id");
+        let cache = initial_cache(&pool).await.expect("load snapshot before child creation");
+        assert!(
+            cache
+                .get(&presented_secret)
+                .is_some_and(|metadata| metadata.hidden_batch_key.is_none()),
+            "fixture must enter the cold resolver path"
+        );
+        let child_secret = {
+            let mut conn = pool.acquire().await.expect("acquire child-key connection");
+            ApiKeys::new(&mut conn)
+                .get_or_create_child_hidden_key(parent_id)
+                .await
+                .expect("create cap child after snapshot")
+                .0
+        };
+        let resolver = FlexBatchKeyResolver::new(pool.clone(), cache);
+
+        let resolved = resolver
+            .resolve_hidden_batch_key(&presented_secret)
+            .await
+            .expect("resolve stale cold snapshot")
+            .expect("known presented key");
+
+        assert_eq!(resolved.secret, child_secret);
+        let shared_count: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM api_keys
+            WHERE user_id = $1
+              AND created_by = $2
+              AND purpose = 'batch'
+              AND hidden = true
+              AND is_deleted = false
+              AND parent_api_key_id IS NULL
+            "#,
+        )
+        .bind(org.id)
+        .bind(member.id)
+        .fetch_one(&pool)
+        .await
+        .expect("count shared fallback keys");
+        assert_eq!(shared_count, 0, "a stale snapshot must not bypass the cap-scoped child");
     }
 
     #[sqlx::test]

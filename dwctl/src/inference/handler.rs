@@ -374,6 +374,7 @@ mod tests {
                 verified: true,
                 zero_data_retention: false,
                 hidden_batch_key: None,
+                hidden_batch_key_is_child: false,
             },
         )]));
         let flex_batch_key_resolver = crate::sync::api_key_cache::FlexBatchKeyResolver::new(main_pool.clone(), api_key_cache.clone());

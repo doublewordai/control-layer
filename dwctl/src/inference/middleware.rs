@@ -1349,6 +1349,7 @@ mod tests {
             verified: true,
             zero_data_retention: false,
             hidden_batch_key: Some("sk-flex-hidden".to_string()),
+            hidden_batch_key_is_child: true,
         }
     }
 
@@ -1817,6 +1818,7 @@ mod tests {
                 verified: true,
                 zero_data_retention: false,
                 hidden_batch_key: Some(hidden_key.to_string()),
+                hidden_batch_key_is_child: true,
             },
         )]));
         let flex_batch_key_resolver = crate::sync::api_key_cache::FlexBatchKeyResolver::new(main_pool.clone(), api_key_cache.clone());
@@ -1937,6 +1939,7 @@ mod tests {
                 verified: true,
                 zero_data_retention: false,
                 hidden_batch_key: Some("sk-flex-hidden".to_string()),
+                hidden_batch_key_is_child: true,
             },
         )]));
         let flex_batch_key_resolver = crate::sync::api_key_cache::FlexBatchKeyResolver::new(main_pool.clone(), api_key_cache.clone());
@@ -2063,6 +2066,7 @@ mod tests {
                 verified: true,
                 zero_data_retention: false,
                 hidden_batch_key: Some("sk-flex-hidden".to_string()),
+                hidden_batch_key_is_child: true,
             },
         )]));
         let state = InferenceMiddlewareState {
