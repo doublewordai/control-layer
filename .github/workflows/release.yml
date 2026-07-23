@@ -22,7 +22,7 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v4
@@ -110,12 +110,12 @@ jobs:
 
     steps:
       - name: Checkout Onwards release
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           ref: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.release_tag }}
 
       - name: Checkout current release tooling
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           ref: ${{ github.event.repository.default_branch }}
           path: .release-tools
@@ -171,7 +171,7 @@ jobs:
 
     steps:
       - name: Checkout Onwards release
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           ref: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.release_tag }}
 
@@ -235,7 +235,7 @@ jobs:
 
     steps:
       - name: Checkout current release tooling
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           ref: ${{ github.event.repository.default_branch }}
           sparse-checkout: .github/scripts/onwards-floating-tags.cjs
