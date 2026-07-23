@@ -107,7 +107,7 @@ use std::sync::Arc;
 use tokio::sync::{Mutex, oneshot};
 use tracing::Instrument;
 
-use crate::{FusilladeError, error::Result, manager::Storage};
+use crate::{FusilladeError, error::Result, manager::RequestTransitionStorage};
 
 use super::types::{
     AttemptId, Canceled, Claimed, Completed, DaemonId, Failed, FailureReason, HttpResponse,
@@ -142,7 +142,7 @@ async fn persist_owned_transition<S, T>(
     attempt_id: AttemptId,
 ) -> Result<()>
 where
-    S: Storage + ?Sized,
+    S: RequestTransitionStorage + ?Sized,
     T: RequestState + Clone,
     super::types::AnyRequest: From<Request<T>>,
 {
@@ -260,7 +260,7 @@ fn failure_reason_from_http_error(error: FusilladeError) -> FailureReason {
 }
 
 impl Request<Pending> {
-    pub async fn claim<S: Storage + ?Sized>(
+    pub async fn claim<S: RequestTransitionStorage + ?Sized>(
         self,
         daemon_id: DaemonId,
         storage: &S,
@@ -282,7 +282,10 @@ impl Request<Pending> {
         Ok(request)
     }
 
-    pub async fn cancel<S: Storage + ?Sized>(self, storage: &S) -> Result<Request<Canceled>> {
+    pub async fn cancel<S: RequestTransitionStorage + ?Sized>(
+        self,
+        storage: &S,
+    ) -> Result<Request<Canceled>> {
         let request = Request {
             data: self.data,
             state: Canceled {
@@ -295,7 +298,10 @@ impl Request<Pending> {
 }
 
 impl Request<Claimed> {
-    pub async fn unclaim<S: Storage + ?Sized>(self, storage: &S) -> Result<Request<Pending>> {
+    pub async fn unclaim<S: RequestTransitionStorage + ?Sized>(
+        self,
+        storage: &S,
+    ) -> Result<Request<Pending>> {
         let attempt_id = self.state.attempt_id;
         validate_attempt_authority(attempt_id)?;
         let request = Request {
@@ -310,7 +316,10 @@ impl Request<Claimed> {
         Ok(request)
     }
 
-    pub async fn cancel<S: Storage + ?Sized>(self, storage: &S) -> Result<Request<Canceled>> {
+    pub async fn cancel<S: RequestTransitionStorage + ?Sized>(
+        self,
+        storage: &S,
+    ) -> Result<Request<Canceled>> {
         let attempt_id = self.state.attempt_id;
         validate_attempt_authority(attempt_id)?;
         let request = Request {
@@ -329,7 +338,7 @@ impl Request<Claimed> {
         response_fut: Fut,
     ) -> Result<Request<Processing>>
     where
-        S: Storage,
+        S: RequestTransitionStorage + ?Sized,
         Fut: std::future::Future<Output = Result<HttpResponse>> + Send + 'static,
     {
         let attempt_id = self.state.attempt_id;
@@ -440,7 +449,7 @@ impl Request<Processing> {
         cancellation: Fut,
     ) -> Result<RequestCompletionResult>
     where
-        S: Storage + ?Sized,
+        S: RequestTransitionStorage + ?Sized,
         F: Fn(&HttpResponse) -> bool,
         Fut: std::future::Future<Output = CancellationReason>,
     {
@@ -588,7 +597,10 @@ impl Request<Processing> {
         }
     }
 
-    pub async fn cancel<S: Storage + ?Sized>(self, storage: &S) -> Result<Request<Canceled>> {
+    pub async fn cancel<S: RequestTransitionStorage + ?Sized>(
+        self,
+        storage: &S,
+    ) -> Result<Request<Canceled>> {
         // Abort the in-flight HTTP request
         self.state.abort_handle.abort();
         let attempt_id = self.state.attempt_id;
@@ -608,6 +620,7 @@ impl Request<Processing> {
 #[cfg(test)]
 mod attempt_transition_tests {
     use std::collections::{HashMap, HashSet};
+    use std::sync::Mutex as StdMutex;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use chrono::Duration;
@@ -616,7 +629,94 @@ mod attempt_transition_tests {
 
     use super::*;
     use crate::batch::TemplateId;
-    use crate::request::{AttemptId, RequestData, RequestId};
+    use crate::manager::RequestTransitionStorage;
+    use crate::request::{AnyRequest, AttemptId, RequestData, RequestId};
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct PersistRecord {
+        target: &'static str,
+        argument: AttemptId,
+        embedded: Option<AttemptId>,
+    }
+
+    struct RecordingTransitionStorage {
+        records: StdMutex<Vec<PersistRecord>>,
+        applied: bool,
+        fail: bool,
+    }
+
+    impl RecordingTransitionStorage {
+        fn applied() -> Self {
+            Self {
+                records: StdMutex::new(Vec::new()),
+                applied: true,
+                fail: false,
+            }
+        }
+
+        fn lost() -> Self {
+            Self {
+                records: StdMutex::new(Vec::new()),
+                applied: false,
+                fail: false,
+            }
+        }
+
+        fn failing() -> Self {
+            Self {
+                records: StdMutex::new(Vec::new()),
+                applied: false,
+                fail: true,
+            }
+        }
+
+        fn records(&self) -> Vec<PersistRecord> {
+            self.records.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl RequestTransitionStorage for RecordingTransitionStorage {
+        async fn persist<T: RequestState + Clone>(
+            &self,
+            _request: &Request<T>,
+        ) -> Result<Option<RequestId>>
+        where
+            AnyRequest: From<Request<T>>,
+        {
+            Ok(None)
+        }
+
+        async fn persist_attempt<T: RequestState + Clone>(
+            &self,
+            request: &Request<T>,
+            attempt_id: AttemptId,
+        ) -> Result<bool>
+        where
+            AnyRequest: From<Request<T>>,
+        {
+            if self.fail {
+                return Err(FusilladeError::Other(anyhow::anyhow!(
+                    "recording storage failure"
+                )));
+            }
+            let request = AnyRequest::from(request.clone());
+            let (target, embedded) = match request {
+                AnyRequest::Pending(_) => ("pending", None),
+                AnyRequest::Claimed(req) => ("claimed", Some(req.state.attempt_id)),
+                AnyRequest::Processing(req) => ("processing", Some(req.state.attempt_id)),
+                AnyRequest::Completed(_) => ("completed", None),
+                AnyRequest::Failed(_) => ("failed", None),
+                AnyRequest::Canceled(_) => ("canceled", None),
+            };
+            self.records.lock().unwrap().push(PersistRecord {
+                target,
+                argument: attempt_id,
+                embedded,
+            });
+            Ok(self.applied)
+        }
+    }
 
     fn claimed_request(attempt_id: AttemptId) -> Request<Claimed> {
         Request {
@@ -643,6 +743,269 @@ mod attempt_transition_tests {
                 leak: None,
             },
         }
+    }
+
+    fn pending_request() -> Request<Pending> {
+        let claimed = claimed_request(AttemptId(Uuid::new_v4()));
+        Request {
+            data: claimed.data,
+            state: Pending {
+                retry_attempt: 0,
+                not_before: None,
+                batch_expires_at: chrono::Utc::now() + Duration::hours(1),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn public_claim_passes_one_exact_generated_attempt_to_storage() {
+        let storage = RecordingTransitionStorage::applied();
+
+        let claimed = pending_request()
+            .claim(DaemonId(Uuid::new_v4()), &storage)
+            .await
+            .unwrap();
+
+        assert!(!claimed.state.attempt_id.is_nil());
+        assert_eq!(
+            storage.records(),
+            vec![PersistRecord {
+                target: "claimed",
+                argument: claimed.state.attempt_id,
+                embedded: Some(claimed.state.attempt_id),
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn public_claimed_transitions_forward_the_embedded_attempt() {
+        let storage = RecordingTransitionStorage::applied();
+        let attempt_id = AttemptId(Uuid::new_v4());
+
+        claimed_request(attempt_id).unclaim(&storage).await.unwrap();
+        claimed_request(attempt_id).cancel(&storage).await.unwrap();
+        let processing = claimed_request(attempt_id)
+            .process(&storage, std::future::pending::<Result<HttpResponse>>())
+            .await
+            .unwrap();
+        drop(processing);
+
+        assert_eq!(
+            storage.records(),
+            vec![
+                PersistRecord {
+                    target: "pending",
+                    argument: attempt_id,
+                    embedded: None,
+                },
+                PersistRecord {
+                    target: "canceled",
+                    argument: attempt_id,
+                    embedded: None,
+                },
+                PersistRecord {
+                    target: "processing",
+                    argument: attempt_id,
+                    embedded: Some(attempt_id),
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn public_processing_terminal_paths_forward_the_processing_attempt() {
+        let storage = RecordingTransitionStorage::applied();
+        let attempt_id = AttemptId(Uuid::new_v4());
+
+        let completed = claimed_request(attempt_id)
+            .process(&storage, async {
+                Ok(HttpResponse {
+                    status: 200,
+                    body: "ok".to_string(),
+                })
+            })
+            .await
+            .unwrap()
+            .complete(
+                &storage,
+                |_| false,
+                std::future::pending::<CancellationReason>(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(completed, RequestCompletionResult::Completed(_)));
+
+        let failed = claimed_request(attempt_id)
+            .process(&storage, async {
+                Ok(HttpResponse {
+                    status: 400,
+                    body: "bad".to_string(),
+                })
+            })
+            .await
+            .unwrap()
+            .complete(
+                &storage,
+                |_| false,
+                std::future::pending::<CancellationReason>(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(failed, RequestCompletionResult::Failed(_)));
+
+        claimed_request(attempt_id)
+            .process(&storage, std::future::pending::<Result<HttpResponse>>())
+            .await
+            .unwrap()
+            .cancel(&storage)
+            .await
+            .unwrap();
+
+        let records = storage.records();
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| matches!(record.target, "completed" | "failed" | "canceled"))
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec![
+                PersistRecord {
+                    target: "completed",
+                    argument: attempt_id,
+                    embedded: None,
+                },
+                PersistRecord {
+                    target: "failed",
+                    argument: attempt_id,
+                    embedded: None,
+                },
+                PersistRecord {
+                    target: "canceled",
+                    argument: attempt_id,
+                    embedded: None,
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn every_public_attempt_boundary_maps_storage_loss_to_attempt_lost() {
+        let lost = RecordingTransitionStorage::lost();
+        let attempt_id = AttemptId(Uuid::new_v4());
+
+        let claim_error = pending_request()
+            .claim(DaemonId(Uuid::new_v4()), &lost)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            claim_error,
+            FusilladeError::RequestAttemptLost { .. }
+        ));
+        for error in [
+            claimed_request(attempt_id)
+                .unclaim(&lost)
+                .await
+                .unwrap_err(),
+            claimed_request(attempt_id).cancel(&lost).await.unwrap_err(),
+            claimed_request(attempt_id)
+                .process(&lost, std::future::pending::<Result<HttpResponse>>())
+                .await
+                .unwrap_err(),
+        ] {
+            assert!(matches!(
+                error,
+                FusilladeError::RequestAttemptLost {
+                    attempt_id: lost_attempt,
+                    ..
+                } if lost_attempt == attempt_id
+            ));
+        }
+
+        let admitted = RecordingTransitionStorage::applied();
+        let completion_error = claimed_request(attempt_id)
+            .process(&admitted, async {
+                Ok(HttpResponse {
+                    status: 200,
+                    body: "ok".to_string(),
+                })
+            })
+            .await
+            .unwrap()
+            .complete(
+                &lost,
+                |_| false,
+                std::future::pending::<CancellationReason>(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            completion_error,
+            FusilladeError::RequestAttemptLost {
+                attempt_id: lost_attempt,
+                ..
+            } if lost_attempt == attempt_id
+        ));
+
+        let failure_error = claimed_request(attempt_id)
+            .process(&admitted, async {
+                Ok(HttpResponse {
+                    status: 400,
+                    body: "bad".to_string(),
+                })
+            })
+            .await
+            .unwrap()
+            .complete(
+                &lost,
+                |_| false,
+                std::future::pending::<CancellationReason>(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            failure_error,
+            FusilladeError::RequestAttemptLost {
+                attempt_id: lost_attempt,
+                ..
+            } if lost_attempt == attempt_id
+        ));
+
+        let cancel_error = claimed_request(attempt_id)
+            .process(&admitted, std::future::pending::<Result<HttpResponse>>())
+            .await
+            .unwrap()
+            .cancel(&lost)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            cancel_error,
+            FusilladeError::RequestAttemptLost {
+                attempt_id: lost_attempt,
+                ..
+            } if lost_attempt == attempt_id
+        ));
+    }
+
+    #[tokio::test]
+    async fn public_processing_storage_error_never_polls_upstream_future() {
+        let storage = RecordingTransitionStorage::failing();
+        let polled = Arc::new(AtomicBool::new(false));
+        let polled_by_future = polled.clone();
+
+        let error = claimed_request(AttemptId(Uuid::new_v4()))
+            .process(&storage, async move {
+                polled_by_future.store(true, Ordering::SeqCst);
+                Ok(HttpResponse {
+                    status: 200,
+                    body: "must not run".to_string(),
+                })
+            })
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, FusilladeError::Other(_)));
+        tokio::task::yield_now().await;
+        assert!(!polled.load(Ordering::SeqCst));
     }
 
     #[test]

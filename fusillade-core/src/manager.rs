@@ -792,14 +792,14 @@ pub trait Storage: Send + Sync {
             .await
     }
 
-    /// Reschedule an in-flight request back to `pending` for an automatic retry,
-    /// fenced on the worker that currently owns it.
+    /// Legacy compatibility path for rescheduling a pre-fencing in-flight
+    /// request back to `pending`.
     ///
-    /// This is the daemon's per-attempt retry path. Unlike [`Storage::persist`]
-    /// (which matches on `id` only, so the manual retry path can intentionally
-    /// resurrect a `failed` row), this transition is guarded by
-    /// `state = 'processing' AND daemon_id = <owner>`: it applies ONLY if the row
-    /// is still the in-flight claim held by `daemon_id`.
+    /// Implementations should restrict this owner-only operation to
+    /// `state = 'processing' AND daemon_id = <owner> AND attempt_id IS NULL`.
+    /// Tokenized daemon work must use
+    /// [`Storage::reschedule_attempt_for_retry`] so a replacement attempt owned
+    /// by the same daemon cannot be overwritten.
     ///
     /// The guard prevents a finalize-then-resurrect race: if another writer (a
     /// zombie/duplicate worker, or a stale-claim reclaim) has already moved the
@@ -931,6 +931,54 @@ pub trait Storage: Send + Sync {
         &self,
         records: &[PersistCompletedRealtimeInput],
     ) -> Result<()>;
+}
+
+/// Narrow persistence seam used by public request typestate transitions.
+///
+/// Production storage implements [`Storage`] and receives this implementation
+/// automatically. Keeping the transition boundary small also lets tests prove
+/// that exact attempt authority reaches storage without mocking the entire
+/// management API.
+#[async_trait]
+pub trait RequestTransitionStorage: Send + Sync {
+    async fn persist<T: RequestState + Clone>(
+        &self,
+        request: &Request<T>,
+    ) -> Result<Option<RequestId>>
+    where
+        AnyRequest: From<Request<T>>;
+
+    async fn persist_attempt<T: RequestState + Clone>(
+        &self,
+        request: &Request<T>,
+        attempt_id: AttemptId,
+    ) -> Result<bool>
+    where
+        AnyRequest: From<Request<T>>;
+}
+
+#[async_trait]
+impl<S: Storage + ?Sized> RequestTransitionStorage for S {
+    async fn persist<T: RequestState + Clone>(
+        &self,
+        request: &Request<T>,
+    ) -> Result<Option<RequestId>>
+    where
+        AnyRequest: From<Request<T>>,
+    {
+        Storage::persist(self, request).await
+    }
+
+    async fn persist_attempt<T: RequestState + Clone>(
+        &self,
+        request: &Request<T>,
+        attempt_id: AttemptId,
+    ) -> Result<bool>
+    where
+        AnyRequest: From<Request<T>>,
+    {
+        Storage::persist_attempt(self, request, attempt_id).await
+    }
 }
 
 /// Daemon lifecycle persistence.
