@@ -2519,22 +2519,21 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
         (onwards::target::Targets::from_config(empty_config)?, None)
     };
 
-    // API-key response metadata: an initial synchronous load ALWAYS runs so
-    // response hot paths never serve from a warming cache. Only the
-    // LISTEN/NOTIFY refresh loop is gated on onwards config sync.
+    // API-key response metadata has its own authorization duty for the
+    // Responses API. Load it synchronously so response hot paths never serve
+    // from a warming cache, then keep it fresh independently of onwards target
+    // synchronization.
     let api_key_cache = crate::sync::api_key_cache::initial_cache(&pool).await?;
     let flex_batch_key_resolver = crate::sync::api_key_cache::FlexBatchKeyResolver::new(pool.clone(), api_key_cache.clone());
-    if config.background_services.onwards_sync.enabled {
-        let cache_pool = pool.clone();
-        let cache = api_key_cache.clone();
-        let cache_shutdown = shutdown_token.clone();
-        let cache_fallback = config.background_services.onwards_sync.fallback_interval_milliseconds;
-        background_tasks.spawn("api-key-metadata-sync", async move {
-            crate::sync::api_key_cache::run(cache_pool, cache, cache_fallback, cache_shutdown)
-                .await
-                .context("API key metadata sync failed")
-        });
-    }
+    let cache_pool = pool.clone();
+    let cache = api_key_cache.clone();
+    let cache_shutdown = shutdown_token.clone();
+    let cache_fallback = config.background_services.onwards_sync.fallback_interval_milliseconds;
+    background_tasks.spawn("api-key-metadata-sync", async move {
+        crate::sync::api_key_cache::run(cache_pool, cache, cache_fallback, cache_shutdown)
+            .await
+            .context("API key metadata sync failed")
+    });
 
     // Leader election lock ID: 0x44574354_50524F42 (DWCT_PROB in hex for "dwctl probes")
     const LEADER_LOCK_ID: i64 = 0x4457_4354_5052_4F42_i64;

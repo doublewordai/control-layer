@@ -7,7 +7,7 @@
 //! - Batch requests (with X-Fusillade-Request-Id) don't create duplicate rows
 
 use crate::api::models::users::Role;
-use crate::test::utils::{add_auth_headers, create_test_admin_user, create_test_config, create_test_user};
+use crate::test::utils::{add_auth_headers, create_test_admin_user, create_test_api_key_for_user, create_test_config, create_test_user};
 use sqlx::PgPool;
 
 /// Helper to set up a test app with a wiremock endpoint, model, API key, and
@@ -524,6 +524,92 @@ async fn test_get_response_returns_404_for_unknown_id(pool: PgPool) {
         .await;
 
     assert_eq!(response.status_code(), 404);
+}
+
+/// The response metadata cache has its own authorization duty even when live
+/// onwards target synchronization is disabled. Revoking a key must therefore
+/// invalidate GET and DELETE authorization without a process restart.
+#[sqlx::test]
+#[test_log::test]
+async fn test_response_auth_refreshes_revoked_key_when_onwards_sync_is_disabled(pool: PgPool) {
+    let user = create_test_user(&pool, Role::StandardUser).await;
+    let api_key = create_test_api_key_for_user(&pool, user.id).await;
+
+    let mut config = create_test_config();
+    config.background_services.onwards_sync.enabled = false;
+    config.background_services.onwards_sync.fallback_interval_milliseconds = 25;
+    let app = crate::Application::new_with_pool(config, Some(pool.clone()), None)
+        .await
+        .expect("application should start with onwards target sync disabled");
+    let (server, bg_services) = app.into_test_server();
+
+    let response_id = uuid::Uuid::new_v4();
+    fusillade::Storage::create_realtime(
+        &*bg_services.request_manager,
+        fusillade::CreateRealtimeInput {
+            request_id: response_id,
+            body: r#"{"model":"gpt-4o","input":"hello"}"#.to_string(),
+            model: "gpt-4o".to_string(),
+            endpoint: "http://unused.invalid".to_string(),
+            method: "POST".to_string(),
+            path: "/v1/responses".to_string(),
+            api_key: String::new(),
+            created_by: user.id.to_string(),
+        },
+    )
+    .await
+    .expect("create completed response fixture");
+    fusillade::Storage::complete_request(
+        &*bg_services.request_manager,
+        fusillade::RequestId(response_id),
+        r#"{"output":[]}"#,
+        200,
+    )
+    .await
+    .expect("complete response fixture");
+
+    let response_path = format!("/ai/v1/responses/resp_{response_id}");
+    let authorized = server
+        .get(&response_path)
+        .add_header("Authorization", &format!("Bearer {}", api_key.secret))
+        .await;
+    assert_eq!(authorized.status_code(), 200, "initial cache must authorize the live key");
+
+    {
+        use crate::db::handlers::Repository;
+
+        let mut conn = pool.acquire().await.expect("acquire key-revocation connection");
+        let mut keys = crate::db::handlers::api_keys::ApiKeys::new(&mut conn);
+        assert!(keys.delete(api_key.id).await.expect("revoke API key"));
+    }
+
+    let revoked_get = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            let response = server
+                .get(&response_path)
+                .add_header("Authorization", &format!("Bearer {}", api_key.secret))
+                .await;
+            if response.status_code() == 401 {
+                break response;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("revoked key should be removed from the response metadata cache");
+    assert_eq!(revoked_get.status_code(), 401);
+
+    let revoked_delete = server
+        .delete(&response_path)
+        .add_header("Authorization", &format!("Bearer {}", api_key.secret))
+        .await;
+    assert_eq!(
+        revoked_delete.status_code(),
+        401,
+        "DELETE must share the refreshed revoked-key authorization"
+    );
+
+    bg_services.shutdown().await;
 }
 
 /// Test that requests with X-Fusillade-Request-Id header don't create
