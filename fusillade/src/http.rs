@@ -576,16 +576,12 @@ async fn race_upload_stall<T>(
     }
 }
 
-/// Submission timestamp of a request, parsed from the `created_at` batch
-/// metadata field (RFC3339; the claim queries populate it for both batch and
-/// batchless rows — the batch's creation for batch rows, the row's own for
-/// batchless).
+/// Submission timestamp of a request. Carried on `RequestData` directly by the
+/// claim mapping (the batch's creation for batch rows, the row's own for
+/// batchless), independent of the configurable `batch_metadata_fields`
+/// forwarding list — trimming forwarded headers must not disable SLO metrics.
 pub(crate) fn submission_time(request: &RequestData) -> Option<DateTime<Utc>> {
-    request
-        .batch_metadata
-        .get("created_at")?
-        .parse::<DateTime<Utc>>()
-        .ok()
+    request.submitted_at
 }
 
 /// Record time-to-first-token measured from submission (`created_at`) — the
@@ -1156,6 +1152,7 @@ mod tests {
             model: "test-model".to_string(),
             api_key: "test-key".to_string(),
             created_by: String::new(),
+            submitted_at: None,
             batch_metadata: metadata
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -1166,41 +1163,33 @@ mod tests {
     #[test]
     fn submission_ttft_sample_gates_and_measures() {
         let now: DateTime<Utc> = "2026-07-23T12:00:30Z".parse().unwrap();
-        let with_meta = ttft_test_request(&[
-            ("created_at", "2026-07-23T12:00:00.000000Z"),
-            ("completion_window", "1h"),
-        ]);
+        let submitted: DateTime<Utc> = "2026-07-23T12:00:00Z".parse().unwrap();
+        let mut valid = ttft_test_request(&[("completion_window", "1h")]);
+        valid.submitted_at = Some(submitted);
 
-        // Valid: 2xx + parseable created_at 30s ago.
-        let (seconds, window) =
-            submission_ttft_sample(&with_meta, 200, now).expect("should record");
+        // Valid: 2xx + submission time 30s ago.
+        let (seconds, window) = submission_ttft_sample(&valid, 200, now).expect("should record");
         assert!((seconds - 30.0).abs() < 0.001, "elapsed = {seconds}");
         assert_eq!(window, "1h");
 
         // Non-2xx openings never record.
-        assert_eq!(submission_ttft_sample(&with_meta, 429, now), None);
-        assert_eq!(submission_ttft_sample(&with_meta, 500, now), None);
+        assert_eq!(submission_ttft_sample(&valid, 429, now), None);
+        assert_eq!(submission_ttft_sample(&valid, 500, now), None);
 
-        // Missing or unparseable created_at → no sample rather than a junk one.
+        // No submission timestamp (never claimed) → no sample rather than junk.
         assert_eq!(
             submission_ttft_sample(&ttft_test_request(&[]), 200, now),
             None
         );
-        assert_eq!(
-            submission_ttft_sample(
-                &ttft_test_request(&[("created_at", "not a time")]),
-                200,
-                now
-            ),
-            None
-        );
 
-        // Clock skew (created_at in the future) → no sample.
-        let future = ttft_test_request(&[("created_at", "2026-07-23T12:05:00Z")]);
+        // Clock skew (submission apparently in the future) → no sample.
+        let mut future = ttft_test_request(&[]);
+        future.submitted_at = Some("2026-07-23T12:05:00Z".parse().unwrap());
         assert_eq!(submission_ttft_sample(&future, 200, now), None);
 
         // Missing window falls back to empty label, still records.
-        let no_window = ttft_test_request(&[("created_at", "2026-07-23T12:00:00Z")]);
+        let mut no_window = ttft_test_request(&[]);
+        no_window.submitted_at = Some(submitted);
         let (_, window) = submission_ttft_sample(&no_window, 200, now).unwrap();
         assert_eq!(window, "");
     }
@@ -1408,6 +1397,7 @@ mod tests {
             model: "test-model".to_string(),
             api_key: "test-key".to_string(),
             created_by: String::new(),
+            submitted_at: None,
             batch_metadata: std::collections::HashMap::new(),
         };
 
@@ -1453,6 +1443,7 @@ mod tests {
             model: "test-model".to_string(),
             api_key: "test-key".to_string(),
             created_by: String::new(),
+            submitted_at: None,
             batch_metadata: std::collections::HashMap::new(),
         };
 
@@ -1481,6 +1472,7 @@ mod tests {
             model: "test-model".to_string(),
             api_key: "test-key".to_string(),
             created_by: String::new(),
+            submitted_at: None,
             batch_metadata: std::collections::HashMap::new(),
         };
 
@@ -1512,6 +1504,7 @@ mod tests {
             model: "test-model".to_string(),
             api_key: "test-key".to_string(),
             created_by: String::new(),
+            submitted_at: None,
             batch_metadata: std::collections::HashMap::new(),
         };
 
@@ -1566,6 +1559,7 @@ mod tests {
             model: "test-model".to_string(),
             api_key: "test-key".to_string(),
             created_by: String::new(),
+            submitted_at: None,
             batch_metadata: batch_metadata.clone(),
         };
 
@@ -1679,6 +1673,7 @@ mod tests {
             model: "test-model".to_string(),
             api_key: "test-api-key".to_string(),
             created_by: String::new(),
+            submitted_at: None,
             batch_metadata,
         };
 
@@ -1733,6 +1728,7 @@ mod tests {
             model: "test-model".to_string(),
             api_key: "".to_string(),
             created_by: String::new(),
+            submitted_at: None,
             batch_metadata: std::collections::HashMap::new(),
         };
 
@@ -1781,6 +1777,7 @@ mod tests {
             model: "test-model".to_string(),
             api_key: "".to_string(),
             created_by: String::new(),
+            submitted_at: None,
             batch_metadata: std::collections::HashMap::new(),
         };
 
@@ -1851,6 +1848,7 @@ mod tests {
             model: "test-model".to_string(),
             api_key: "".to_string(),
             created_by: String::new(),
+            submitted_at: None,
             batch_metadata: std::collections::HashMap::new(),
         };
 
@@ -1888,6 +1886,7 @@ mod tests {
             model: "test-model".to_string(),
             api_key: "test-key".to_string(),
             created_by: String::new(),
+            submitted_at: None,
             batch_metadata: std::collections::HashMap::new(),
         };
 
@@ -1946,6 +1945,7 @@ mod tests {
             model: "gpt-4".to_string(),
             api_key: "".to_string(),
             created_by: String::new(),
+            submitted_at: None,
             batch_metadata: std::collections::HashMap::new(),
         };
 
@@ -2008,6 +2008,7 @@ mod tests {
             model: "gpt-4".to_string(),
             api_key: "".to_string(),
             created_by: String::new(),
+            submitted_at: None,
             batch_metadata: std::collections::HashMap::new(),
         };
 
@@ -2076,6 +2077,7 @@ mod tests {
             model: "gpt-4".to_string(),
             api_key: "".to_string(),
             created_by: String::new(),
+            submitted_at: None,
             batch_metadata: std::collections::HashMap::new(),
         };
 
@@ -2146,6 +2148,7 @@ mod tests {
             model: "gpt-4".to_string(),
             api_key: "".to_string(),
             created_by: String::new(),
+            submitted_at: None,
             batch_metadata: std::collections::HashMap::new(),
         };
 
@@ -2208,6 +2211,7 @@ mod tests {
             model: "test-model".to_string(),
             api_key: "".to_string(),
             created_by: String::new(),
+            submitted_at: None,
             batch_metadata: std::collections::HashMap::new(),
         };
 

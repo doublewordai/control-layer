@@ -115,6 +115,14 @@ pub struct RequestData {
     #[serde(default)]
     pub created_by: String,
 
+    /// When the request row was created (submission time). Populated by the
+    /// claim mapping directly from the row, independently of the configurable
+    /// `batch_metadata_fields` forwarding list, so submission-epoch metrics
+    /// cannot be silently disabled by header-forwarding config. `None` only
+    /// for constructions that never touched the claim path.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub submitted_at: Option<chrono::DateTime<chrono::Utc>>,
+
     /// Batch metadata fields to be sent as headers (x-fusillade-COLUMN-NAME)
     #[serde(skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub batch_metadata: std::collections::HashMap<String, String>,
