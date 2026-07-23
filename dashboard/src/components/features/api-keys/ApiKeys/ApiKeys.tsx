@@ -235,8 +235,9 @@ export const ApiKeys: React.FC = () => {
   };
 
   // Mirrors what the PATCH endpoint permits: the key's creator, or a
-  // PlatformManager. (Non-PM org admins cannot edit members' keys server-side
-  // today; if that changes, extend this gate alongside it.)
+  // PlatformManager. (Org-specific cap permissions — e.g. restricting cap
+  // edits on org keys to owners/admins — are deferred to the dedicated
+  // org-permissions follow-up; keep this gate in lockstep with the server.)
   const canManageKey = (apiKey: ApiKey) =>
     isPlatformManager || (!!apiKey.created_by && apiKey.created_by === user?.id);
 
