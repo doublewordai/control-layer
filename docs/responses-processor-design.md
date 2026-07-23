@@ -2,15 +2,16 @@
 
 ## Decision
 
-dwctl's `DwctlRequestProcessor` reuses fusillade's existing
-`Request<Claimed>::process` → `Request<Processing>::complete` machinery
-unchanged. The multi-step response loop is plugged in via fusillade's
-`HttpClient` trait — `execute()` runs the loop and returns the assembled
-response as a synthesized `HttpResponse`.
+dwctl's `DwctlRequestProcessor` reuses fusillade's
+`Request<Claimed>::process` →
+`Request<Processing>::complete_unpersisted` machinery.
+The multi-step response loop is plugged in via fusillade's `HttpClient`
+trait — `execute()` runs the loop and returns the assembled response as a
+synthesized `HttpResponse`.
 
-No fusillade changes. The state transitions, retry policy, persistence,
-span instrumentation, and cancellation hookup are inherited from the
-default-processor path.
+The response processor adds no separate lifecycle. It inherits fusillade's
+state transitions, retry policy, attempt fencing, persistence, span
+instrumentation, and cancellation hookup.
 
 ## The seam
 
@@ -64,7 +65,7 @@ async fn process(&self, request, http, storage, should_retry, cancellation) -> R
     }
     let loop_client = ResponseLoopHttpClient { /* clones of Arcs */ };
     let processing = request.process(loop_client, storage).await?;
-    processing.complete(storage, should_retry, cancellation).await
+    processing.complete_unpersisted(should_retry, cancellation).await
 }
 ```
 
@@ -84,15 +85,16 @@ daemon claims pending /v1/responses row (state: claimed)
         │     │     └─ return HttpResponse { status, body }
         │     ├─ persist state=processing                  [fusillade]
         │     └─ return Request<Processing> { result_rx, abort_handle }
-        └─ processing.complete(should_retry, cancellation) [fusillade]
+        └─ processing.complete_unpersisted(should_retry, cancellation) [fusillade]
               ├─ await result_rx vs cancellation
               ├─ apply should_retry policy
-              └─ persist Completed | Failed                [fusillade]
+              └─ return typed Completed | Failed outcome
+                    └─ daemon persists exact attempt or re-pends for retry
 ```
 
 ## Abort
 
-`Processing::complete`'s cancellation future (daemon shutdown, user
+`Processing::complete_unpersisted`'s cancellation future (daemon shutdown, user
 cancel) calls `abort_handle.abort()` on the spawned task. tokio drops
 the task's future at the next await, which cascades into
 `run_response_loop` → `fire_model_call` → the in-flight upstream
@@ -101,12 +103,20 @@ in-flight calls.
 
 ## Resume
 
-The parent row sits in `processing` for the entire loop, getting the
-`processing_timeout_ms` budget (4h prod) instead of the 60s
-`claim_timeout_ms`. Steady-state operation has no reclaim race.
+The claim receives a unique attempt token. While the row is still `claimed`,
+`claim_timeout_ms` bounds the pre-dispatch phase: reclamation revokes that
+exact token before returning the row to `pending`. After the transition to
+`processing`, a healthy owner is never reclaimed by age. Recovery requires
+the daemon to be missing, marked dead, or heartbeat-stale; the old attempt
+cannot persist a terminal result or schedule another retry after its token is
+revoked.
 
-After a genuine worker death, another dwctl process eventually
-re-claims the row and starts a fresh `ResponseLoopHttpClient::execute`.
+`processing_timeout_ms` remains in configuration for compatibility and is
+used by dwctl when deriving the image-normalizer dispatch URL TTL. It is not
+an execution budget or a processing reclaim condition.
+
+After a genuine worker death, another dwctl process eventually reclaims the
+row and starts a fresh `ResponseLoopHttpClient::execute`.
 The persisted chain (`fusillade.response_steps`) is read by
 `next_action_for`:
 

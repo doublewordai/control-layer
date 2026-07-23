@@ -107,11 +107,11 @@ use std::sync::Arc;
 use tokio::sync::{Mutex, oneshot};
 use tracing::Instrument;
 
-use crate::{FusilladeError, error::Result, manager::Storage};
+use crate::{FusilladeError, error::Result, manager::RequestTransitionStorage};
 
 use super::types::{
-    Canceled, Claimed, Completed, DaemonId, Failed, FailureReason, HttpResponse, Pending,
-    Processing, Request, RequestCompletionResult,
+    AttemptId, Canceled, Claimed, Completed, DaemonId, Failed, FailureReason, HttpResponse,
+    Pending, Processing, Request, RequestCompletionResult, RequestState,
 };
 
 /// Reason for cancelling a request.
@@ -123,16 +123,154 @@ pub enum CancellationReason {
     Shutdown,
 }
 
+fn fresh_attempt_id() -> AttemptId {
+    AttemptId::from(uuid::Uuid::new_v4())
+}
+
+fn validate_attempt_authority(attempt_id: AttemptId) -> Result<()> {
+    if attempt_id.is_nil() {
+        return Err(FusilladeError::ValidationError(
+            "nil attempt ID cannot authorize a state transition".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+async fn persist_owned_transition<S, T>(
+    storage: &S,
+    request: &Request<T>,
+    attempt_id: AttemptId,
+) -> Result<()>
+where
+    S: RequestTransitionStorage + ?Sized,
+    T: RequestState + Clone,
+    super::types::AnyRequest: From<Request<T>>,
+{
+    validate_attempt_authority(attempt_id)?;
+    if !storage.persist_attempt(request, attempt_id).await? {
+        return Err(FusilladeError::RequestAttemptLost {
+            id: request.data.id,
+            attempt_id,
+        });
+    }
+    Ok(())
+}
+
+fn prepare_processing_request<Fut>(
+    request: Request<Claimed>,
+    response_fut: Fut,
+) -> (Request<Processing>, oneshot::Sender<()>)
+where
+    Fut: std::future::Future<Output = Result<HttpResponse>> + Send + 'static,
+{
+    let (dispatch_tx, dispatch_rx) = oneshot::channel();
+    let (tx, rx) = tokio::sync::mpsc::channel(1);
+
+    // Spawn now so Processing can own an abort handle, but keep the upstream
+    // future completely unpolled until durable processing admission succeeds.
+    let current_span = tracing::Span::current();
+    let task_handle = tokio::spawn(
+        async move {
+            if dispatch_rx.await.is_err() {
+                return;
+            }
+            tokio::select! {
+                // Dropping Request<Processing> closes the result receiver.
+                // Selecting this branch drops response_fut and propagates
+                // cancellation to the underlying HTTP request.
+                _ = tx.closed() => {}
+                result = response_fut => {
+                    let _ = tx.send(result).await;
+                }
+            }
+        }
+        .instrument(current_span),
+    );
+
+    let processing = Request {
+        data: request.data,
+        state: Processing {
+            daemon_id: request.state.daemon_id,
+            attempt_id: request.state.attempt_id,
+            claimed_at: request.state.claimed_at,
+            started_at: chrono::Utc::now(),
+            retry_attempt: request.state.retry_attempt,
+            batch_expires_at: request.state.batch_expires_at,
+            result_rx: Arc::new(Mutex::new(rx)),
+            abort_handle: task_handle.abort_handle(),
+        },
+    };
+
+    (processing, dispatch_tx)
+}
+
+fn finish_processing_admission(
+    mut request: Request<Processing>,
+    dispatch_tx: oneshot::Sender<()>,
+    attempt_id: AttemptId,
+    persistence: Result<bool>,
+) -> Result<Request<Processing>> {
+    if request.state.attempt_id != attempt_id {
+        request.state.abort_handle.abort();
+        return Err(FusilladeError::ValidationError(
+            "processing request attempt does not match persistence fence".to_string(),
+        ));
+    }
+
+    match persistence {
+        Ok(true) => {
+            // Storage admission may have waited behind a database limiter.
+            // Align in-memory timeout accounting with actual dispatch; the
+            // storage implementation owns the durable post-admission stamp.
+            request.state.started_at = chrono::Utc::now();
+            if dispatch_tx.send(()).is_err() {
+                request.state.abort_handle.abort();
+                return Err(FusilladeError::Other(anyhow::anyhow!(
+                    "HTTP dispatch task terminated before request processing began"
+                )));
+            }
+            Ok(request)
+        }
+        Ok(false) => {
+            request.state.abort_handle.abort();
+            Err(FusilladeError::RequestAttemptLost {
+                id: request.data.id,
+                attempt_id,
+            })
+        }
+        Err(error) => {
+            request.state.abort_handle.abort();
+            Err(error)
+        }
+    }
+}
+
+fn failure_reason_from_http_error(error: FusilladeError) -> FailureReason {
+    match error {
+        FusilladeError::HttpRequestBuilder(error) => FailureReason::RequestBuilderError { error },
+        FusilladeError::HttpClientTimeout(error)
+        | FusilladeError::FirstChunkTimeout(error)
+        | FusilladeError::UploadStallTimeout(error)
+        | FusilladeError::TokensTimeout(error)
+        | FusilladeError::BodyTimeout(error) => FailureReason::Timeout { error },
+        error => FailureReason::NetworkError {
+            error: crate::error::error_serialization::serialize_error(&error.into()),
+        },
+    }
+}
+
 impl Request<Pending> {
-    pub async fn claim<S: Storage + ?Sized>(
+    pub async fn claim<S: RequestTransitionStorage + ?Sized>(
         self,
         daemon_id: DaemonId,
         storage: &S,
     ) -> Result<Request<Claimed>> {
+        let attempt_id = fresh_attempt_id();
         let request = Request {
             data: self.data,
             state: Claimed {
                 daemon_id,
+                attempt_id,
                 claimed_at: chrono::Utc::now(),
                 retry_attempt: self.state.retry_attempt, // Carry over retry attempt
                 batch_expires_at: self.state.batch_expires_at, // Carry over batch deadline
@@ -140,11 +278,14 @@ impl Request<Pending> {
                 leak: None,
             },
         };
-        storage.persist(&request).await?;
+        persist_owned_transition(storage, &request, attempt_id).await?;
         Ok(request)
     }
 
-    pub async fn cancel<S: Storage + ?Sized>(self, storage: &S) -> Result<Request<Canceled>> {
+    pub async fn cancel<S: RequestTransitionStorage + ?Sized>(
+        self,
+        storage: &S,
+    ) -> Result<Request<Canceled>> {
         let request = Request {
             data: self.data,
             state: Canceled {
@@ -157,7 +298,12 @@ impl Request<Pending> {
 }
 
 impl Request<Claimed> {
-    pub async fn unclaim<S: Storage + ?Sized>(self, storage: &S) -> Result<Request<Pending>> {
+    pub async fn unclaim<S: RequestTransitionStorage + ?Sized>(
+        self,
+        storage: &S,
+    ) -> Result<Request<Pending>> {
+        let attempt_id = self.state.attempt_id;
+        validate_attempt_authority(attempt_id)?;
         let request = Request {
             data: self.data,
             state: Pending {
@@ -166,18 +312,23 @@ impl Request<Claimed> {
                 batch_expires_at: self.state.batch_expires_at, // Carry over batch deadline
             },
         };
-        storage.persist(&request).await?;
+        persist_owned_transition(storage, &request, attempt_id).await?;
         Ok(request)
     }
 
-    pub async fn cancel<S: Storage + ?Sized>(self, storage: &S) -> Result<Request<Canceled>> {
+    pub async fn cancel<S: RequestTransitionStorage + ?Sized>(
+        self,
+        storage: &S,
+    ) -> Result<Request<Canceled>> {
+        let attempt_id = self.state.attempt_id;
+        validate_attempt_authority(attempt_id)?;
         let request = Request {
             data: self.data,
             state: Canceled {
                 canceled_at: chrono::Utc::now(),
             },
         };
-        storage.persist(&request).await?;
+        persist_owned_transition(storage, &request, attempt_id).await?;
         Ok(request)
     }
 
@@ -187,64 +338,14 @@ impl Request<Claimed> {
         response_fut: Fut,
     ) -> Result<Request<Processing>>
     where
-        S: Storage,
+        S: RequestTransitionStorage + ?Sized,
         Fut: std::future::Future<Output = Result<HttpResponse>> + Send + 'static,
     {
-        // Create channels for dispatching and receiving the HTTP result. The
-        // dispatch gate keeps the response future completely unpolled until
-        // the Processing transition is durable.
-        let (dispatch_tx, dispatch_rx) = oneshot::channel();
-        let (tx, rx) = tokio::sync::mpsc::channel(1);
-
-        // Spawn the HTTP request as an async task, propagating the current
-        // span so that the execute span becomes a child of process_request.
-        let current_span = tracing::Span::current();
-        let task_handle = tokio::spawn(
-            async move {
-                if dispatch_rx.await.is_err() {
-                    return;
-                }
-                let result = response_fut.await;
-                let _ = tx.send(result).await; // Ignore send errors (receiver dropped)
-            }
-            .instrument(current_span),
-        );
-
-        let processing_state = Processing {
-            daemon_id: self.state.daemon_id,
-            claimed_at: self.state.claimed_at,
-            started_at: chrono::Utc::now(),
-            retry_attempt: self.state.retry_attempt,
-            batch_expires_at: self.state.batch_expires_at,
-            result_rx: Arc::new(Mutex::new(rx)),
-            abort_handle: task_handle.abort_handle(),
-        };
-
-        let mut request = Request {
-            data: self.data,
-            state: processing_state,
-        };
-
-        // Persist the Processing state so we can cancel it if needed
-        // If persist fails, abort the spawned HTTP task
-        if let Err(e) = storage.persist(&request).await {
-            request.state.abort_handle.abort();
-            return Err(e);
-        }
-
-        // Storage admission may have waited behind the state-write limiter.
-        // Keep in-memory timeout accounting aligned with actual dispatch;
-        // Postgres storage stamps its durable value after acquiring the permit.
-        request.state.started_at = chrono::Utc::now();
-
-        if dispatch_tx.send(()).is_err() {
-            request.state.abort_handle.abort();
-            return Err(FusilladeError::Other(anyhow::anyhow!(
-                "HTTP dispatch task terminated before request processing began"
-            )));
-        }
-
-        Ok(request)
+        let attempt_id = self.state.attempt_id;
+        validate_attempt_authority(attempt_id)?;
+        let (request, dispatch_tx) = prepare_processing_request(self, response_fut);
+        let persistence = storage.persist_attempt(&request, attempt_id).await;
+        finish_processing_admission(request, dispatch_tx, attempt_id, persistence)
     }
 }
 
@@ -323,10 +424,11 @@ impl Request<Failed> {
 }
 
 impl Request<Processing> {
-    /// Wait for the HTTP request to complete.
+    /// Wait for the HTTP request to complete without persisting its outcome.
     ///
     /// This method awaits the result from the spawned HTTP task and transitions
     /// the request to one of three terminal states: `Completed`, `Failed`, or `Canceled`.
+    /// The caller owns durable terminal persistence and retry scheduling.
     ///
     /// The `should_retry` predicate determines whether a response should be considered
     /// a failure (and thus eligible for retry) or a success.
@@ -341,17 +443,18 @@ impl Request<Processing> {
     /// - `RequestCompletionResult::Failed` if the HTTP request failed or should be retried
     /// - `RequestCompletionResult::Canceled` if the request was canceled by user
     /// - `Err(FusilladeError::Shutdown)` if the daemon is shutting down
-    pub async fn complete<S, F, Fut>(
+    pub async fn complete_unpersisted<F, Fut>(
         self,
-        storage: &S,
         should_retry: F,
         cancellation: Fut,
     ) -> Result<RequestCompletionResult>
     where
-        S: Storage + ?Sized,
         F: Fn(&HttpResponse) -> bool,
         Fut: std::future::Future<Output = CancellationReason>,
     {
+        let attempt_id = self.state.attempt_id;
+        validate_attempt_authority(attempt_id)?;
+
         // Await the result from the channel (lock the mutex to access the receiver)
         // We use an enum to track whether we got a result or cancellation so we can
         // drop the mutex guard before calling self.cancel()
@@ -435,7 +538,6 @@ impl Request<Processing> {
                         data: self.data,
                         state: failed_state,
                     };
-                    storage.persist(&request).await?;
                     Ok(RequestCompletionResult::Failed(request))
                 } else {
                     // HTTP request completed successfully
@@ -451,36 +553,11 @@ impl Request<Processing> {
                         data: self.data,
                         state: completed_state,
                     };
-                    storage.persist(&request).await?;
                     Ok(RequestCompletionResult::Completed(request))
                 }
             }
             Some(Err(e)) => {
-                let reason = match &e {
-                    FusilladeError::HttpRequestBuilder(error) => {
-                        FailureReason::RequestBuilderError {
-                            error: error.clone(),
-                        }
-                    }
-                    FusilladeError::HttpClientTimeout(error) => FailureReason::Timeout {
-                        error: error.clone(),
-                    },
-                    FusilladeError::FirstChunkTimeout(msg) => {
-                        FailureReason::Timeout { error: msg.clone() }
-                    }
-                    FusilladeError::UploadStallTimeout(msg) => {
-                        FailureReason::Timeout { error: msg.clone() }
-                    }
-                    FusilladeError::TokensTimeout(msg) => {
-                        FailureReason::Timeout { error: msg.clone() }
-                    }
-                    FusilladeError::BodyTimeout(msg) => {
-                        FailureReason::Timeout { error: msg.clone() }
-                    }
-                    _ => FailureReason::NetworkError {
-                        error: crate::error::error_serialization::serialize_error(&e.into()),
-                    },
-                };
+                let reason = failure_reason_from_http_error(e);
 
                 let failed_state = Failed {
                     reason,
@@ -508,15 +585,54 @@ impl Request<Processing> {
                     data: self.data,
                     state: failed_state,
                 };
-                storage.persist(&request).await?;
                 Ok(RequestCompletionResult::Failed(request))
             }
         }
     }
 
-    pub async fn cancel<S: Storage + ?Sized>(self, storage: &S) -> Result<Request<Canceled>> {
+    /// Wait for completion and persist terminal outcomes.
+    ///
+    /// Daemon processors should use [`Self::complete_unpersisted`] so the
+    /// daemon can retain an already-produced outcome across transient storage
+    /// failures. This compatibility method remains useful for callers that own
+    /// the complete transition themselves.
+    pub async fn complete<S, F, Fut>(
+        self,
+        storage: &S,
+        should_retry: F,
+        cancellation: Fut,
+    ) -> Result<RequestCompletionResult>
+    where
+        S: RequestTransitionStorage + ?Sized,
+        F: Fn(&HttpResponse) -> bool,
+        Fut: std::future::Future<Output = CancellationReason>,
+    {
+        let attempt_id = self.state.attempt_id;
+        let result = self
+            .complete_unpersisted(should_retry, cancellation)
+            .await?;
+
+        match &result {
+            RequestCompletionResult::Completed(request) => {
+                persist_owned_transition(storage, request, attempt_id).await?;
+            }
+            RequestCompletionResult::Failed(request) if !request.state.reason.is_retriable() => {
+                persist_owned_transition(storage, request, attempt_id).await?;
+            }
+            RequestCompletionResult::Failed(_) | RequestCompletionResult::Canceled(_) => {}
+        }
+
+        Ok(result)
+    }
+
+    pub async fn cancel<S: RequestTransitionStorage + ?Sized>(
+        self,
+        storage: &S,
+    ) -> Result<Request<Canceled>> {
         // Abort the in-flight HTTP request
         self.state.abort_handle.abort();
+        let attempt_id = self.state.attempt_id;
+        validate_attempt_authority(attempt_id)?;
 
         let request = Request {
             data: self.data,
@@ -524,7 +640,594 @@ impl Request<Processing> {
                 canceled_at: chrono::Utc::now(),
             },
         };
-        storage.persist(&request).await?;
+        persist_owned_transition(storage, &request, attempt_id).await?;
         Ok(request)
+    }
+}
+
+#[cfg(test)]
+mod attempt_transition_tests {
+    use std::collections::{HashMap, HashSet};
+    use std::sync::Mutex as StdMutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use chrono::Duration;
+    use tokio::time::{sleep, timeout};
+    use uuid::Uuid;
+
+    use super::*;
+    use crate::batch::TemplateId;
+    use crate::manager::RequestTransitionStorage;
+    use crate::request::{AnyRequest, AttemptId, RequestData, RequestId};
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct PersistRecord {
+        target: &'static str,
+        argument: AttemptId,
+        embedded: Option<AttemptId>,
+    }
+
+    struct RecordingTransitionStorage {
+        records: StdMutex<Vec<PersistRecord>>,
+        applied: bool,
+        fail: bool,
+    }
+
+    impl RecordingTransitionStorage {
+        fn applied() -> Self {
+            Self {
+                records: StdMutex::new(Vec::new()),
+                applied: true,
+                fail: false,
+            }
+        }
+
+        fn lost() -> Self {
+            Self {
+                records: StdMutex::new(Vec::new()),
+                applied: false,
+                fail: false,
+            }
+        }
+
+        fn failing() -> Self {
+            Self {
+                records: StdMutex::new(Vec::new()),
+                applied: false,
+                fail: true,
+            }
+        }
+
+        fn records(&self) -> Vec<PersistRecord> {
+            self.records.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl RequestTransitionStorage for RecordingTransitionStorage {
+        async fn persist<T: RequestState + Clone>(
+            &self,
+            _request: &Request<T>,
+        ) -> Result<Option<RequestId>>
+        where
+            AnyRequest: From<Request<T>>,
+        {
+            Ok(None)
+        }
+
+        async fn persist_attempt<T: RequestState + Clone>(
+            &self,
+            request: &Request<T>,
+            attempt_id: AttemptId,
+        ) -> Result<bool>
+        where
+            AnyRequest: From<Request<T>>,
+        {
+            if self.fail {
+                return Err(FusilladeError::Other(anyhow::anyhow!(
+                    "recording storage failure"
+                )));
+            }
+            let request = AnyRequest::from(request.clone());
+            let (target, embedded) = match request {
+                AnyRequest::Pending(_) => ("pending", None),
+                AnyRequest::Claimed(req) => ("claimed", Some(req.state.attempt_id)),
+                AnyRequest::Processing(req) => ("processing", Some(req.state.attempt_id)),
+                AnyRequest::Completed(_) => ("completed", None),
+                AnyRequest::Failed(_) => ("failed", None),
+                AnyRequest::Canceled(_) => ("canceled", None),
+            };
+            self.records.lock().unwrap().push(PersistRecord {
+                target,
+                argument: attempt_id,
+                embedded,
+            });
+            Ok(self.applied)
+        }
+    }
+
+    fn claimed_request(attempt_id: AttemptId) -> Request<Claimed> {
+        Request {
+            data: RequestData {
+                id: RequestId(Uuid::new_v4()),
+                batch_id: None,
+                template_id: TemplateId(Uuid::new_v4()),
+                custom_id: None,
+                endpoint: "http://example.test".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/chat/completions".to_string(),
+                body: "{}".to_string(),
+                model: "test-model".to_string(),
+                api_key: "test-key".to_string(),
+                created_by: "test-owner".to_string(),
+                batch_metadata: HashMap::new(),
+            },
+            state: Claimed {
+                daemon_id: DaemonId(Uuid::new_v4()),
+                attempt_id,
+                claimed_at: chrono::Utc::now(),
+                retry_attempt: 0,
+                batch_expires_at: chrono::Utc::now() + Duration::hours(1),
+                leak: None,
+            },
+        }
+    }
+
+    fn pending_request() -> Request<Pending> {
+        let claimed = claimed_request(AttemptId(Uuid::new_v4()));
+        Request {
+            data: claimed.data,
+            state: Pending {
+                retry_attempt: 0,
+                not_before: None,
+                batch_expires_at: chrono::Utc::now() + Duration::hours(1),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn public_claim_passes_one_exact_generated_attempt_to_storage() {
+        let storage = RecordingTransitionStorage::applied();
+
+        let claimed = pending_request()
+            .claim(DaemonId(Uuid::new_v4()), &storage)
+            .await
+            .unwrap();
+
+        assert!(!claimed.state.attempt_id.is_nil());
+        assert_eq!(
+            storage.records(),
+            vec![PersistRecord {
+                target: "claimed",
+                argument: claimed.state.attempt_id,
+                embedded: Some(claimed.state.attempt_id),
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn public_claimed_transitions_forward_the_embedded_attempt() {
+        let storage = RecordingTransitionStorage::applied();
+        let attempt_id = AttemptId(Uuid::new_v4());
+
+        claimed_request(attempt_id).unclaim(&storage).await.unwrap();
+        claimed_request(attempt_id).cancel(&storage).await.unwrap();
+        let processing = claimed_request(attempt_id)
+            .process(&storage, std::future::pending::<Result<HttpResponse>>())
+            .await
+            .unwrap();
+        drop(processing);
+
+        assert_eq!(
+            storage.records(),
+            vec![
+                PersistRecord {
+                    target: "pending",
+                    argument: attempt_id,
+                    embedded: None,
+                },
+                PersistRecord {
+                    target: "canceled",
+                    argument: attempt_id,
+                    embedded: None,
+                },
+                PersistRecord {
+                    target: "processing",
+                    argument: attempt_id,
+                    embedded: Some(attempt_id),
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn public_processing_terminal_paths_forward_the_processing_attempt() {
+        let storage = RecordingTransitionStorage::applied();
+        let attempt_id = AttemptId(Uuid::new_v4());
+
+        let completed = claimed_request(attempt_id)
+            .process(&storage, async {
+                Ok(HttpResponse {
+                    status: 200,
+                    body: "ok".to_string(),
+                })
+            })
+            .await
+            .unwrap()
+            .complete(
+                &storage,
+                |_| false,
+                std::future::pending::<CancellationReason>(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(completed, RequestCompletionResult::Completed(_)));
+
+        let failed = claimed_request(attempt_id)
+            .process(&storage, async {
+                Ok(HttpResponse {
+                    status: 400,
+                    body: "bad".to_string(),
+                })
+            })
+            .await
+            .unwrap()
+            .complete(
+                &storage,
+                |_| false,
+                std::future::pending::<CancellationReason>(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(failed, RequestCompletionResult::Failed(_)));
+
+        claimed_request(attempt_id)
+            .process(&storage, std::future::pending::<Result<HttpResponse>>())
+            .await
+            .unwrap()
+            .cancel(&storage)
+            .await
+            .unwrap();
+
+        let records = storage.records();
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| matches!(record.target, "completed" | "failed" | "canceled"))
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec![
+                PersistRecord {
+                    target: "completed",
+                    argument: attempt_id,
+                    embedded: None,
+                },
+                PersistRecord {
+                    target: "failed",
+                    argument: attempt_id,
+                    embedded: None,
+                },
+                PersistRecord {
+                    target: "canceled",
+                    argument: attempt_id,
+                    embedded: None,
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn unpersisted_completion_never_writes_terminal_outcomes() {
+        let storage = RecordingTransitionStorage::applied();
+        let attempt_id = AttemptId(Uuid::new_v4());
+
+        let completed = claimed_request(attempt_id)
+            .process(&storage, async {
+                Ok(HttpResponse {
+                    status: 200,
+                    body: "ok".to_string(),
+                })
+            })
+            .await
+            .unwrap()
+            .complete_unpersisted(|_| false, std::future::pending::<CancellationReason>())
+            .await
+            .unwrap();
+
+        assert!(matches!(completed, RequestCompletionResult::Completed(_)));
+        assert!(
+            storage
+                .records()
+                .iter()
+                .all(|record| record.target != "completed"),
+            "daemon-owned completion must not persist inside the processor"
+        );
+    }
+
+    #[tokio::test]
+    async fn terminated_http_task_is_returned_unpersisted_for_retry() {
+        let storage = RecordingTransitionStorage::applied();
+        let attempt_id = AttemptId(Uuid::new_v4());
+
+        let outcome = claimed_request(attempt_id)
+            .process(&storage, async {
+                panic!("synthetic provider task termination");
+                #[allow(unreachable_code)]
+                Ok(HttpResponse {
+                    status: 200,
+                    body: String::new(),
+                })
+            })
+            .await
+            .unwrap()
+            .complete_unpersisted(|_| false, std::future::pending::<CancellationReason>())
+            .await
+            .unwrap();
+
+        let RequestCompletionResult::Failed(failed) = outcome else {
+            panic!("expected failed outcome");
+        };
+        assert_eq!(failed.state.reason, FailureReason::TaskTerminated);
+        assert!(
+            storage
+                .records()
+                .iter()
+                .all(|record| record.target != "failed"),
+            "retriable completion must remain owned by the daemon"
+        );
+    }
+
+    #[tokio::test]
+    async fn every_public_attempt_boundary_maps_storage_loss_to_attempt_lost() {
+        let lost = RecordingTransitionStorage::lost();
+        let attempt_id = AttemptId(Uuid::new_v4());
+
+        let claim_error = pending_request()
+            .claim(DaemonId(Uuid::new_v4()), &lost)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            claim_error,
+            FusilladeError::RequestAttemptLost { .. }
+        ));
+        for error in [
+            claimed_request(attempt_id)
+                .unclaim(&lost)
+                .await
+                .unwrap_err(),
+            claimed_request(attempt_id).cancel(&lost).await.unwrap_err(),
+            claimed_request(attempt_id)
+                .process(&lost, std::future::pending::<Result<HttpResponse>>())
+                .await
+                .unwrap_err(),
+        ] {
+            assert!(matches!(
+                error,
+                FusilladeError::RequestAttemptLost {
+                    attempt_id: lost_attempt,
+                    ..
+                } if lost_attempt == attempt_id
+            ));
+        }
+
+        let admitted = RecordingTransitionStorage::applied();
+        let completion_error = claimed_request(attempt_id)
+            .process(&admitted, async {
+                Ok(HttpResponse {
+                    status: 200,
+                    body: "ok".to_string(),
+                })
+            })
+            .await
+            .unwrap()
+            .complete(
+                &lost,
+                |_| false,
+                std::future::pending::<CancellationReason>(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            completion_error,
+            FusilladeError::RequestAttemptLost {
+                attempt_id: lost_attempt,
+                ..
+            } if lost_attempt == attempt_id
+        ));
+
+        let failure_error = claimed_request(attempt_id)
+            .process(&admitted, async {
+                Ok(HttpResponse {
+                    status: 400,
+                    body: "bad".to_string(),
+                })
+            })
+            .await
+            .unwrap()
+            .complete(
+                &lost,
+                |_| false,
+                std::future::pending::<CancellationReason>(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            failure_error,
+            FusilladeError::RequestAttemptLost {
+                attempt_id: lost_attempt,
+                ..
+            } if lost_attempt == attempt_id
+        ));
+
+        let cancel_error = claimed_request(attempt_id)
+            .process(&admitted, std::future::pending::<Result<HttpResponse>>())
+            .await
+            .unwrap()
+            .cancel(&lost)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            cancel_error,
+            FusilladeError::RequestAttemptLost {
+                attempt_id: lost_attempt,
+                ..
+            } if lost_attempt == attempt_id
+        ));
+    }
+
+    #[tokio::test]
+    async fn public_processing_storage_error_never_polls_upstream_future() {
+        let storage = RecordingTransitionStorage::failing();
+        let polled = Arc::new(AtomicBool::new(false));
+        let polled_by_future = polled.clone();
+
+        let error = claimed_request(AttemptId(Uuid::new_v4()))
+            .process(&storage, async move {
+                polled_by_future.store(true, Ordering::SeqCst);
+                Ok(HttpResponse {
+                    status: 200,
+                    body: "must not run".to_string(),
+                })
+            })
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, FusilladeError::Other(_)));
+        tokio::task::yield_now().await;
+        assert!(!polled.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn fresh_attempt_ids_are_non_nil_and_unique() {
+        let attempts: HashSet<_> = (0..64).map(|_| fresh_attempt_id()).collect();
+
+        assert_eq!(attempts.len(), 64);
+        assert!(attempts.iter().all(|attempt_id| !attempt_id.is_nil()));
+    }
+
+    #[test]
+    fn nil_attempt_cannot_authorize_a_transition() {
+        let error = validate_attempt_authority(AttemptId(Uuid::nil())).unwrap_err();
+
+        assert!(matches!(error, FusilladeError::ValidationError(_)));
+        assert!(error.to_string().contains("nil"));
+    }
+
+    #[tokio::test]
+    async fn lost_processing_admission_never_polls_the_response_future() {
+        let attempt_id = fresh_attempt_id();
+        let polled = Arc::new(AtomicBool::new(false));
+        let response_fut = {
+            let polled = polled.clone();
+            std::future::poll_fn(move |_| {
+                polled.store(true, Ordering::SeqCst);
+                std::task::Poll::<Result<HttpResponse>>::Pending
+            })
+        };
+        let (request, dispatch_tx) =
+            prepare_processing_request(claimed_request(attempt_id), response_fut);
+        let request_id = request.data.id;
+
+        let error =
+            finish_processing_admission(request, dispatch_tx, attempt_id, Ok(false)).unwrap_err();
+
+        assert!(matches!(
+            error,
+            FusilladeError::RequestAttemptLost {
+                id,
+                attempt_id: lost_attempt,
+            } if id == request_id && lost_attempt == attempt_id
+        ));
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !polled.load(Ordering::SeqCst),
+            "ownership loss must not open the dispatch gate"
+        );
+    }
+
+    struct DropFlag(Arc<AtomicBool>);
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn dropping_processing_request_drops_the_response_future() {
+        let attempt_id = fresh_attempt_id();
+        let started = Arc::new(AtomicBool::new(false));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let response_fut = {
+            let started = started.clone();
+            let dropped = dropped.clone();
+            async move {
+                let _drop_flag = DropFlag(dropped);
+                started.store(true, Ordering::SeqCst);
+                std::future::pending::<()>().await;
+                unreachable!()
+            }
+        };
+        let (request, dispatch_tx) =
+            prepare_processing_request(claimed_request(attempt_id), response_fut);
+        let abort_handle = request.state.abort_handle.clone();
+        let processing =
+            finish_processing_admission(request, dispatch_tx, attempt_id, Ok(true)).unwrap();
+
+        timeout(std::time::Duration::from_secs(1), async {
+            while !started.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("response future never started");
+
+        drop(processing);
+
+        let dropped_in_time = timeout(std::time::Duration::from_secs(1), async {
+            while !dropped.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        if dropped_in_time.is_err() {
+            abort_handle.abort();
+        }
+        dropped_in_time.expect("dropping Request<Processing> left the response future running");
+    }
+
+    #[tokio::test]
+    async fn processing_start_is_refreshed_after_durable_admission() {
+        let attempt_id = fresh_attempt_id();
+        let (request, dispatch_tx) = prepare_processing_request(
+            claimed_request(attempt_id),
+            std::future::pending::<Result<HttpResponse>>(),
+        );
+        let before_admission = request.state.started_at;
+        let abort_handle = request.state.abort_handle.clone();
+
+        sleep(std::time::Duration::from_millis(2)).await;
+        let processing =
+            finish_processing_admission(request, dispatch_tx, attempt_id, Ok(true)).unwrap();
+
+        assert!(processing.state.started_at > before_admission);
+        abort_handle.abort();
+    }
+
+    #[test]
+    fn upload_stall_remains_a_retriable_timeout() {
+        let reason = failure_reason_from_http_error(FusilladeError::UploadStallTimeout(
+            "upload stalled".to_string(),
+        ));
+
+        assert_eq!(
+            reason,
+            FailureReason::Timeout {
+                error: "upload stalled".to_string(),
+            }
+        );
+        assert!(reason.is_retriable());
     }
 }

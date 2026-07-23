@@ -1,0 +1,33 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                            WITH target AS MATERIALIZED (\n                                SELECT id, state, daemon_id, attempt_id\n                                FROM requests\n                                WHERE id = $1\n                                FOR UPDATE\n                            ),\n                            updated AS (\n                                UPDATE requests r\n                                SET state = 'processing',\n                                    retry_attempt = $2,\n                                    daemon_id = $3,\n                                    claimed_at = $4,\n                                    started_at = clock_timestamp(),\n                                    processing_admission_id = $6\n                                FROM target t\n                                WHERE r.id = t.id\n                                  AND t.state = 'claimed'\n                                  AND t.daemon_id = $3\n                                  AND t.attempt_id = $5\n                                RETURNING r.id\n                            )\n                            SELECT\n                                EXISTS (SELECT 1 FROM target) AS \"exists!\",\n                                EXISTS (SELECT 1 FROM updated) AS \"applied!\"\n                            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "exists!",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 1,
+        "name": "applied!",
+        "type_info": "Bool"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int4",
+        "Uuid",
+        "Timestamptz",
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null,
+      null
+    ]
+  },
+  "hash": "3e1c714f717916359918606aa17c01a5ceafaaf928b0b74615b57433f3e8e5f0"
+}

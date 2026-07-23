@@ -304,8 +304,8 @@ background_services:
     first_chunk_timeout_ms: 86400000 # Max time waiting for response headers (24 hours)
     chunk_timeout_ms: 86400000 # Max idle time between response body chunks (24 hours)
     body_timeout_ms: 86400000 # Max total time for entire response body (24 hours)
-    claim_timeout_ms: 60000 # Max time in "claimed" state before auto-unclaim (1 minute)
-    processing_timeout_ms: 600000 # Max time in "processing" state before auto-unclaim (10 minutes)
+    claim_timeout_ms: 60000 # Tokenized pre-dispatch claim lifetime (1 minute)
+    processing_timeout_ms: 600000 # Compatibility/dispatch-URL TTL input; not a processing reclaim deadline
     pending_request_counts_timeout_ms: 60000 # Statement timeout for pending request count queries (1 minute)
 
     # Observability

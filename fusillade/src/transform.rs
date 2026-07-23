@@ -20,8 +20,9 @@ use async_trait::async_trait;
 
 use crate::{RequestData, Result};
 
-/// Transforms a response or error body just before persistence. With no
-/// transformer installed (the default) the behaviour is identity.
+/// Prepares a response or error body for persistence and optionally performs
+/// best-effort cleanup after a terminal write commits. With no transformer
+/// installed (the default) the behaviour is identity.
 #[async_trait]
 pub trait ResponseTransformer: Send + Sync {
     /// Return the body to persist for `request`. Implementations must return the
@@ -30,5 +31,20 @@ pub trait ResponseTransformer: Send + Sync {
     /// `request` is the request being persisted - its id and `batch_metadata`
     /// let an implementation decide whether (and how) to transform without a
     /// separate lookup. `body` is the terminal response/error body to persist.
+    ///
+    /// This method runs before the storage compare-and-set and must not perform
+    /// destructive side effects.
+    ///
+    /// Return [`crate::FusilladeError::AttemptPersistenceInfrastructure`] only
+    /// when retrying the same transformation can recover from a transient
+    /// dependency outage. Deterministic encryption, validation, or preparation
+    /// failures must use another error variant so daemon durability does not
+    /// retry them indefinitely.
     async fn transform(&self, request: &RequestData, body: &str) -> Result<String>;
+
+    /// Best-effort notification after the exact terminal transition was
+    /// durably applied. The default has no cleanup to perform.
+    async fn after_terminal_persisted(&self, _request: &RequestData) -> Result<()> {
+        Ok(())
+    }
 }

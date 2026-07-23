@@ -165,6 +165,9 @@ pub struct LeakStamp {
 #[derive(Debug, Clone, Serialize)]
 pub struct Claimed {
     pub daemon_id: DaemonId,
+    /// Unique identity for this claim. A new value is assigned every time the
+    /// request moves from pending to claimed, even when the daemon is unchanged.
+    pub attempt_id: AttemptId,
     pub claimed_at: DateTime<Utc>,
     /// Number of times this request has been attempted (carried over from Pending)
     pub retry_attempt: u32,
@@ -182,6 +185,8 @@ impl RequestState for Claimed {}
 #[derive(Debug, Clone, Serialize)]
 pub struct Processing {
     pub daemon_id: DaemonId,
+    /// The exact claim that owns this in-flight upstream execution.
+    pub attempt_id: AttemptId,
     pub claimed_at: DateTime<Utc>,
     pub started_at: DateTime<Utc>,
     /// Number of times this request has been attempted (carried over from Claimed)
@@ -239,6 +244,10 @@ pub enum FailureReason {
     /// This should be retried as it may be a transient issue.
     TaskTerminated,
 
+    /// The request processor returned an unexpected error before producing an
+    /// outcome. The daemon may safely retry the request as a fresh attempt.
+    ProcessorError,
+
     /// Failed to construct the HTTP request before it could be sent.
     /// This includes invalid header values, malformed URLs, or other builder errors.
     /// These are data errors that will never succeed on retry.
@@ -258,6 +267,7 @@ impl FailureReason {
             FailureReason::NetworkError { .. } => true,
             FailureReason::Timeout { .. } => true,
             FailureReason::TaskTerminated => true,
+            FailureReason::ProcessorError => true,
             FailureReason::RequestBuilderError { .. } => false,
             FailureReason::BatchTerminated => false,
         }
@@ -271,6 +281,7 @@ impl FailureReason {
             FailureReason::NetworkError { .. } => "network_error",
             FailureReason::Timeout { .. } => "timeout",
             FailureReason::TaskTerminated => "task_terminated",
+            FailureReason::ProcessorError => "processor_error",
             FailureReason::RequestBuilderError { .. } => "builder_error",
             FailureReason::BatchTerminated => "batch_terminated",
         }
@@ -314,6 +325,9 @@ impl FailureReason {
                 format!("Request timed out: {}", error)
             }
             FailureReason::TaskTerminated => "HTTP task terminated unexpectedly".to_string(),
+            FailureReason::ProcessorError => {
+                "Request processor returned an unexpected error".to_string()
+            }
             FailureReason::BatchTerminated => {
                 "Request was not processed because its batch reached a terminal state".to_string()
             }
@@ -414,6 +428,36 @@ impl From<Uuid> for DaemonId {
 
 impl std::ops::Deref for DaemonId {
     type Target = Uuid;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+/// Unique identifier for one daemon execution attempt.
+///
+/// Unlike [`DaemonId`], this changes on every claim and therefore distinguishes
+/// overlapping executions started by the same daemon. A nil value may be used
+/// only when reconstructing legacy database rows for inspection; it must never
+/// authorize a state transition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(transparent)]
+pub struct AttemptId(pub Uuid);
+
+impl std::fmt::Display for AttemptId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl From<Uuid> for AttemptId {
+    fn from(uuid: Uuid) -> Self {
+        Self(uuid)
+    }
+}
+
+impl std::ops::Deref for AttemptId {
+    type Target = Uuid;
+
     fn deref(&self) -> &Self::Target {
         &self.0
     }
@@ -558,6 +602,20 @@ impl From<Request<Canceled>> for AnyRequest {
 }
 
 #[cfg(test)]
+mod attempt_id_tests {
+    use super::*;
+
+    #[test]
+    fn display_uses_the_full_uuid() {
+        let uuid = Uuid::parse_str("12345678-1234-4567-89ab-1234567890ab").unwrap();
+        let attempt_id = AttemptId::from(uuid);
+
+        assert_eq!(attempt_id.to_string(), uuid.to_string());
+        assert_eq!(*attempt_id, uuid);
+    }
+}
+
+#[cfg(test)]
 mod zdr_logging_tests {
     use super::*;
 
@@ -590,5 +648,18 @@ mod zdr_logging_tests {
             // And the message must be non-empty (daemon asserts this).
             assert!(!msg.is_empty());
         }
+    }
+
+    #[test]
+    fn processor_error_is_retriable_and_redacted() {
+        let reason = FailureReason::ProcessorError;
+
+        assert!(reason.is_retriable());
+        assert_eq!(reason.metric_label(), "processor_error");
+        assert_eq!(reason.status_code_label(), "");
+        assert_eq!(
+            reason.to_error_message(),
+            "Request processor returned an unexpected error"
+        );
     }
 }

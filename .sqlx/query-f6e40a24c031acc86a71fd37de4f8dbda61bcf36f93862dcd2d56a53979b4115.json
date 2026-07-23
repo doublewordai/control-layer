@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                    UPDATE requests\n                    SET state = 'canceled',\n                        canceled_at = COALESCE(canceled_at, NOW()),\n                        daemon_id = NULL,\n                        attempt_id = CASE\n                            WHEN state = 'pending' THEN NULL\n                            ELSE attempt_id\n                        END,\n                        processing_admission_id = NULL\n                    WHERE batch_id = $1\n                      AND state IN ('pending', 'claimed', 'processing')\n                    ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "f6e40a24c031acc86a71fd37de4f8dbda61bcf36f93862dcd2d56a53979b4115"
+}

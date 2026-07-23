@@ -385,7 +385,11 @@ background_services:
     max_concurrent_state_writes: 64
     max_concurrent_response_reads: 8
     max_retries: 1000
-    timeout_ms: 600000             # 10 minutes per request
+    first_chunk_timeout_ms: 86400000
+    chunk_timeout_ms: 86400000
+    body_timeout_ms: 86400000
+    claim_timeout_ms: 60000
+    processing_timeout_ms: 600000  # Compatibility/dispatch-URL TTL input
     backoff_ms: 1000
     backoff_factor: 2
     max_backoff_ms: 10000
@@ -400,13 +404,56 @@ background_services:
 | `max_concurrent_state_writes` | integer | `64` | Response-related state-write class limit, capped by shared pool headroom. `0` disables only this class limit. |
 | `max_concurrent_response_reads` | integer | `8` | Consolidated response-detail read class limit. `0` disables only this class limit. |
 | `max_retries` | integer | `1000` | Max retry attempts. `null` = unlimited until deadline. |
-| `timeout_ms` | integer | `600000` | Per-request timeout (10 min). |
+| `first_chunk_timeout_ms` | integer | `86400000` | Maximum wait for response headers. |
+| `chunk_timeout_ms` | integer | `86400000` | Maximum idle gap between streamed response chunks. |
+| `body_timeout_ms` | integer | `86400000` | Maximum total response-body collection time. |
+| `claim_timeout_ms` | integer | `60000` | Maximum age of a tokenized pre-dispatch claim before that exact attempt is revoked and the row returns to pending. |
+| `processing_timeout_ms` | integer | `600000` | Compatibility value and image-normalizer dispatch-URL TTL input. It is not a processing reclaim deadline. |
 | `stop_before_deadline_ms` | integer | `900000` | Stop retrying before deadline (15 min buffer). |
 
 Response reads and writes also share an aggregate budget of
 `max_connections - 2`, with a minimum of one permit. This preserves two
 primary-pool connections when the pool has at least three; a one-connection
 pool keeps one admitted operation for liveness and cannot reserve headroom.
+
+#### Attempt ownership and recovery
+
+Each new daemon claim carries a unique attempt token. A tokenized row that
+remains `claimed` beyond `claim_timeout_ms` may be returned to `pending`
+because any later write from that exact attempt is fenced out. Once the row is
+`processing`, age alone does not make it reclaimable. Recovery requires
+positive evidence that its daemon owner is missing, marked dead, or
+heartbeat-stale.
+
+The heartbeat interval (5 seconds), stale-owner threshold (30 seconds), and
+reclaim batch size (100 rows) are internal compatibility defaults rather than
+additional configuration keys. Legacy NULL-token claims also require an
+unavailable owner before reclamation. The maintenance loop uses the same
+cadence and batch bound to repair `pending` rows carrying a residual non-NULL
+`attempt_id`. Repair defensively clears the token and all daemon ownership
+timestamps before the row is claimed.
+
+The `attempt_id` database columns are additive and nullable for rolling
+deployment:
+
+- During a mixed-version rollout, legacy pods continue to create NULL-token
+  claims. Exact-attempt fencing is complete only after every daemon pod runs the
+  new version.
+- Roll back application code without rolling back the schema. Legacy code does
+  not maintain the token lifecycle and may leave ownership residue on a
+  `pending` row. A later roll-forward needs no manual cleanup: upgraded
+  maintenance repairs those rows in bounded batches. Legacy pods can recreate
+  residue during a mixed-version rollout, so convergence is complete only
+  after they are gone.
+- The database down migration refuses to remove the columns while any token is
+  non-NULL.
+
+Canceled rows that were already in flight remain live for
+`batch_archive_cancel_grace_secs` (default 600 seconds), allowing a late billed
+result from the owning attempt to supersede best-effort cancellation. Once the
+batch is archived, the live row is gone and that late-write opportunity is
+revoked: persistence observes a missing live row and discards the late result.
+The grace is a fixed boundary independent of `processing_timeout_ms`.
 
 #### Model Escalation
 

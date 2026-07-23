@@ -10,7 +10,7 @@ use crate::batch::{
 use crate::daemon_record::{AnyDaemonRecord, DaemonRecord, DaemonState, DaemonStatus};
 use crate::error::Result;
 use crate::request::{
-    AnyRequest, CascadeTargetState, Claimed, CreateFlexInput, CreateRealtimeInput,
+    AnyRequest, AttemptId, CascadeTargetState, Claimed, CreateFlexInput, CreateRealtimeInput,
     CreateResponseInput, DaemonId, ListRequestsFilter, PersistCompletedRealtimeInput, Request,
     RequestDetail, RequestId, RequestListResult, RequestState, ResolvedResponseDetail,
     ServiceTierFilter,
@@ -571,6 +571,16 @@ pub trait Storage: Send + Sync {
     // These methods are used by the DaemonExecutor for pulling requests, and then persisting their
     // states as they iterate through them
 
+    /// Release a bounded set of safely abandoned daemon-owned requests.
+    ///
+    /// The daemon invokes this maintenance hook from exactly one claim loop
+    /// before checking local capacity, so recovery still runs while all local
+    /// model permits are occupied. Storage backends without durable ownership
+    /// may keep the default no-op.
+    async fn reclaim_stale_requests(&self) -> Result<usize> {
+        Ok(0)
+    }
+
     /// Atomically claim pending batchless requests for processing.
     ///
     /// `available_capacity` maps model names to the number of permits the daemon
@@ -733,14 +743,63 @@ pub trait Storage: Send + Sync {
     where
         AnyRequest: From<Request<T>>;
 
-    /// Reschedule an in-flight request back to `pending` for an automatic retry,
-    /// fenced on the worker that currently owns it.
+    /// Persist a state transition owned by one exact daemon attempt.
     ///
-    /// This is the daemon's per-attempt retry path. Unlike [`Storage::persist`]
-    /// (which matches on `id` only, so the manual retry path can intentionally
-    /// resurrect a `failed` row), this transition is guarded by
-    /// `state = 'processing' AND daemon_id = <owner>`: it applies ONLY if the row
-    /// is still the in-flight claim held by `daemon_id`.
+    /// Implementations must compare-and-set on the request's current state and
+    /// `attempt_id`. `Ok(false)` means this attempt lost ownership and its stale
+    /// transition was discarded; this is an expected concurrency outcome.
+    ///
+    /// The default is a temporary compatibility bridge for storage backends
+    /// while attempt-aware persistence is introduced. It validates that the
+    /// token is non-nil but delegates to the unfenced persistence API. Any
+    /// backend used by a daemon must override this before attempt fencing is
+    /// considered active.
+    async fn persist_attempt<T: RequestState + Clone>(
+        &self,
+        request: &Request<T>,
+        attempt_id: AttemptId,
+    ) -> Result<bool>
+    where
+        AnyRequest: From<Request<T>>,
+    {
+        if attempt_id.is_nil() {
+            return Err(crate::error::FusilladeError::ValidationError(
+                "nil attempt ID cannot authorize persistence".to_string(),
+            ));
+        }
+        self.persist(request).await.map(|_| true)
+    }
+
+    /// Recover an errored processor from `claimed` or `processing`.
+    ///
+    /// Implementations must compare both `owner` and `attempt_id`. The default
+    /// keeps source compatibility only; it delegates to the legacy owner-only
+    /// retry hook and must be overridden with a real attempt CAS before use.
+    async fn recover_attempt_for_retry(
+        &self,
+        request_id: RequestId,
+        owner: DaemonId,
+        attempt_id: AttemptId,
+        retry_attempt: u32,
+        not_before: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<bool> {
+        if attempt_id.is_nil() {
+            return Err(crate::error::FusilladeError::ValidationError(
+                "nil attempt ID cannot authorize recovery".to_string(),
+            ));
+        }
+        self.reschedule_for_retry(request_id, owner, retry_attempt, not_before)
+            .await
+    }
+
+    /// Legacy compatibility path for rescheduling a pre-fencing in-flight
+    /// request back to `pending`.
+    ///
+    /// Implementations should restrict this owner-only operation to
+    /// `state = 'processing' AND daemon_id = <owner> AND attempt_id IS NULL`.
+    /// Tokenized daemon work must use
+    /// [`Storage::reschedule_attempt_for_retry`] so a replacement attempt owned
+    /// by the same daemon cannot be overwritten.
     ///
     /// The guard prevents a finalize-then-resurrect race: if another writer (a
     /// zombie/duplicate worker, or a stale-claim reclaim) has already moved the
@@ -758,6 +817,31 @@ pub trait Storage: Send + Sync {
         retry_attempt: u32,
         not_before: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<bool>;
+
+    /// Attempt-aware variant of [`Storage::reschedule_for_retry`].
+    ///
+    /// Implementations must include both `owner` and `attempt_id` in the
+    /// compare-and-set. `Ok(false)` is a normal ownership-loss result.
+    ///
+    /// This default is a temporary compatibility bridge and remains
+    /// owner-only. Production storage must override it before daemon retry code
+    /// starts calling this method.
+    async fn reschedule_attempt_for_retry(
+        &self,
+        request_id: RequestId,
+        owner: DaemonId,
+        attempt_id: AttemptId,
+        retry_attempt: u32,
+        not_before: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<bool> {
+        if attempt_id.is_nil() {
+            return Err(crate::error::FusilladeError::ValidationError(
+                "nil attempt ID cannot authorize retry".to_string(),
+            ));
+        }
+        self.reschedule_for_retry(request_id, owner, retry_attempt, not_before)
+            .await
+    }
 
     /// List individual requests across batches with filtering and pagination.
     ///
@@ -847,6 +931,54 @@ pub trait Storage: Send + Sync {
         &self,
         records: &[PersistCompletedRealtimeInput],
     ) -> Result<()>;
+}
+
+/// Narrow persistence seam used by public request typestate transitions.
+///
+/// Production storage implements [`Storage`] and receives this implementation
+/// automatically. Keeping the transition boundary small also lets tests prove
+/// that exact attempt authority reaches storage without mocking the entire
+/// management API.
+#[async_trait]
+pub trait RequestTransitionStorage: Send + Sync {
+    async fn persist<T: RequestState + Clone>(
+        &self,
+        request: &Request<T>,
+    ) -> Result<Option<RequestId>>
+    where
+        AnyRequest: From<Request<T>>;
+
+    async fn persist_attempt<T: RequestState + Clone>(
+        &self,
+        request: &Request<T>,
+        attempt_id: AttemptId,
+    ) -> Result<bool>
+    where
+        AnyRequest: From<Request<T>>;
+}
+
+#[async_trait]
+impl<S: Storage + ?Sized> RequestTransitionStorage for S {
+    async fn persist<T: RequestState + Clone>(
+        &self,
+        request: &Request<T>,
+    ) -> Result<Option<RequestId>>
+    where
+        AnyRequest: From<Request<T>>,
+    {
+        Storage::persist(self, request).await
+    }
+
+    async fn persist_attempt<T: RequestState + Clone>(
+        &self,
+        request: &Request<T>,
+        attempt_id: AttemptId,
+    ) -> Result<bool>
+    where
+        AnyRequest: From<Request<T>>,
+    {
+        Storage::persist_attempt(self, request, attempt_id).await
+    }
 }
 
 /// Daemon lifecycle persistence.

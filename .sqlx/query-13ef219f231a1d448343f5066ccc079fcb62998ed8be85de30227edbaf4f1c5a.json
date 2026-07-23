@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                UPDATE requests\n                SET state = 'pending',\n                    retry_attempt = 0,\n                    not_before = NULL,\n                    error = NULL,\n                    failed_at = NULL,\n                    canceled_at = NULL,\n                    completed_at = NULL,\n                    response_status = NULL,\n                    response_body = NULL,\n                    response_size = 0,\n                    routed_model = NULL,\n                    daemon_id = NULL,\n                    attempt_id = NULL,\n                    processing_admission_id = NULL,\n                    claimed_at = NULL,\n                    started_at = NULL\n                WHERE id = ANY($1) AND state = 'failed'\n                RETURNING id\n                ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "UuidArray"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "13ef219f231a1d448343f5066ccc079fcb62998ed8be85de30227edbaf4f1c5a"
+}

@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                            UPDATE requests\n                            SET started_at = clock_timestamp()\n                            WHERE id = $1\n                              AND state = 'processing'\n                              AND daemon_id = $2\n                              AND attempt_id IS NULL\n                            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "4de81149b17658c2e75b9e8746c7be7a51cf38eb2156f4f9c956773a087e3700"
+}

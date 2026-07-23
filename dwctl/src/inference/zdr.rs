@@ -159,7 +159,9 @@ pub async fn decrypt_response_body(
 /// `ResponseTransformer` hook. Exists only because fusillade reassembles the
 /// upstream stream and persists the body itself, leaving dwctl no other point at
 /// which to encrypt it. Remove when stream reassembly moves into dwctl. See
-/// [`crate::keystore`] and fusillade's `transform` module.
+/// [`crate::keystore`] and fusillade's `transform` module. Body preparation is
+/// side-effect-free; request-key shredding happens only in the post-commit hook
+/// after the exact terminal transition wins its storage fence.
 pub struct ZdrResponseEncryptor {
     keystore: crate::keystore::Keystore,
 }
@@ -167,6 +169,17 @@ pub struct ZdrResponseEncryptor {
 impl ZdrResponseEncryptor {
     pub fn new(keystore: crate::keystore::Keystore) -> Self {
         Self { keystore }
+    }
+}
+
+fn classify_response_keystore_error(error: KeystoreError) -> fusillade::FusilladeError {
+    if error.is_unreachable() {
+        fusillade::FusilladeError::AttemptPersistenceInfrastructure {
+            operation: "response_transform",
+            source: anyhow::anyhow!("ZDR response keystore is unreachable"),
+        }
+    } else {
+        fusillade::FusilladeError::Other(anyhow::anyhow!("ZDR response encryption key could not be prepared"))
     }
 }
 
@@ -187,23 +200,18 @@ impl fusillade::ResponseTransformer for ZdrResponseEncryptor {
             Ok(Some(key)) => {
                 let encrypted = encrypt_body(&key, body)
                     .map_err(|e| fusillade::FusilladeError::Other(anyhow::anyhow!("ZDR response encrypt failed: {e}")))?;
-                // This is the terminal store (the daemon only reaches persist() on
-                // a terminal outcome; retriable-and-will-retry failures reschedule
-                // to pending instead), so the prompt is done being dispatched -
-                // crypto-shred the request key now (plan: "Deleted when a terminal
-                // response is stored"). Best-effort: the key's TTL is the backstop.
-                if let Err(e) = self.keystore.delete(&key_id(request_id, KeyKind::Request)).await {
-                    tracing::warn!(error = %e, "ZDR request key shred-on-terminal failed; relying on TTL");
-                }
+                // Transforming precedes the attempt-token CAS. It must therefore
+                // remain free of destructive side effects: a stale attempt may
+                // reach this point and then lose the CAS to its replacement.
+                // Keep the request key until its TTL expires until a post-commit
+                // hook can shred it only after the exact attempt wins.
                 Ok(encrypted)
             }
             // Fail closed on a definitively-absent key: this IS a ZDR request
             // but its response key is gone (TTL expired/deleted), so there is no
-            // key to encrypt with. We must not persist the plaintext - but
-            // erroring here would bubble up as a persist failure that the daemon
-            // does NOT terminalize, stranding the request in `processing` forever.
-            // So blank the body instead: no plaintext reaches the DB and the
-            // request completes cleanly (the response is simply not retained).
+            // key to encrypt with. Blank the body so no plaintext reaches the DB
+            // and the request can complete without invoking the daemon's redacted
+            // terminal persistence fallback.
             // With a TTL sized above the flex completion window this is unreachable.
             Ok(None) => {
                 tracing::warn!(request_id = %request_id, "ZDR response key gone at persist; storing blank (response not retained)");
@@ -212,10 +220,20 @@ impl fusillade::ResponseTransformer for ZdrResponseEncryptor {
             // Unreachable keystore is transient, not authoritative: propagate the
             // error rather than blank, so a momentary Redis blip does not
             // permanently drop a response that could still be encrypted on retry.
-            Err(e) => Err(fusillade::FusilladeError::Other(anyhow::anyhow!(
-                "ZDR keystore error during response encrypt: {e}"
-            ))),
+            Err(error) => Err(classify_response_keystore_error(error)),
         }
+    }
+
+    async fn after_terminal_persisted(&self, request: &fusillade::RequestData) -> fusillade::Result<()> {
+        let is_zdr = request.batch_metadata.get(ZDR_MARKER_KEY).is_some_and(|value| value == "1");
+        if !is_zdr {
+            return Ok(());
+        }
+
+        self.keystore
+            .delete(&key_id(&request.id.0, KeyKind::Request))
+            .await
+            .map_err(|error| fusillade::FusilladeError::Other(anyhow::anyhow!("ZDR request key shred-on-terminal failed: {error}")))
     }
 }
 
@@ -243,6 +261,28 @@ mod tests {
         assert!(!is_zdr_body(plaintext));
         assert!(is_zdr_body(&envelope));
         assert_eq!(decrypt_body(&key, &envelope).unwrap(), plaintext);
+    }
+
+    #[test]
+    fn unreachable_response_keystore_is_the_only_retriable_transform_error() {
+        let unreachable = classify_response_keystore_error(KeystoreError::Unreachable("offline".to_string()));
+        assert!(matches!(
+            unreachable,
+            fusillade::FusilladeError::AttemptPersistenceInfrastructure {
+                operation: "response_transform",
+                ..
+            }
+        ));
+
+        for definitive in [
+            KeystoreError::Config("bad config".to_string()),
+            KeystoreError::Crypto(crate::encryption::EncryptionError::EncryptionFailed),
+        ] {
+            assert!(matches!(
+                classify_response_keystore_error(definitive),
+                fusillade::FusilladeError::Other(_)
+            ));
+        }
     }
 
     #[test]

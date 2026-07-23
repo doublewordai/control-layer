@@ -13,15 +13,14 @@
 //! That single decision gives us, for free:
 //!
 //! - `claimed → processing` state transition (via fusillade's
-//!   `process()` UPDATE), which means the row gets the longer
-//!   `processing_timeout_ms` budget instead of the short
-//!   `claim_timeout_ms` — no more reclaim race on slow upstreams.
+//!   `process()` UPDATE). Healthy processing is owner-liveness fenced rather
+//!   than age-reclaimed, so slow upstream work is not duplicated by a timeout.
 //! - `abort_handle` cancellation: cancelling the spawned task drops
 //!   the loop future, which cascades into the in-flight upstream
 //!   request being cancelled.
-//! - `should_retry` policy + terminal-state persistence via
-//!   `Request<Processing>::complete` — same path every other request
-//!   goes through.
+//! - `should_retry` policy via `Request<Processing>::complete_unpersisted`;
+//!   the daemon durably commits that typed outcome — same path every other
+//!   request goes through.
 //!
 //! See `docs/responses-processor-design.md` for the full design.
 //!
@@ -43,6 +42,24 @@ use onwards::traits::ToolExecutor;
 
 use crate::inference::engine::loop_http_client::ResponseLoopHttpClient;
 use crate::inference::store::FusilladeResponseStore;
+
+fn parse_jit_image_token(value: &str) -> fusillade::Result<crate::image_normalizer::ImageToken> {
+    value.parse().map_err(|_: crate::image_normalizer::TokenParseError| {
+        fusillade::FusilladeError::ValidationError("JIT image signing encountered an invalid image token".to_string())
+    })
+}
+
+fn classify_request_keystore_error(error: &crate::keystore::KeystoreError) -> FailureReason {
+    if error.is_unreachable() {
+        FailureReason::NetworkError {
+            error: "Zero-data-retention request could not be processed".to_string(),
+        }
+    } else {
+        FailureReason::RequestBuilderError {
+            error: "Zero-data-retention request could not be processed".to_string(),
+        }
+    }
+}
 
 /// Dispatches per-claim work to the multi-step loop for `/v1/responses`
 /// requests, falling through to [`DefaultRequestProcessor`] for
@@ -198,9 +215,8 @@ where
             let Some(keystore) = self.keystore.as_ref() else {
                 // A ZDR ciphertext was claimed but no keystore is configured, so the
                 // prompt can never be decrypted. Terminalize as a non-retriable
-                // failure (persist Failed, then return Ok(Failed)) rather than a bare
-                // Err, which would only log a task failure and leave the row stuck in
-                // `processing` ("running") until the batch window expires. The
+                // failure rather than a bare error, which cannot produce a durable
+                // client outcome. The
                 // client-facing reason is deliberately generic - the real cause (a
                 // server misconfiguration) is logged for operators, never surfaced.
                 crate::background_error!(
@@ -222,7 +238,6 @@ where
                     },
                     data: request.data,
                 };
-                storage.persist(&failed).await?;
                 return Ok(RequestCompletionResult::Failed(failed));
             };
             let key_id = crate::inference::zdr::key_id(&request.data.id.0, crate::inference::zdr::KeyKind::Request);
@@ -256,7 +271,6 @@ where
                                 },
                                 data: request.data,
                             };
-                            storage.persist(&failed).await?;
                             return Ok(RequestCompletionResult::Failed(failed));
                         }
                     }
@@ -275,11 +289,10 @@ where
                 Ok(None) => {
                     // Key expired/deleted before dispatch: the prompt is gone and
                     // this request can never be processed. Terminalize it as a
-                    // non-retriable failure - persist the Failed state, then return
-                    // Ok(Failed) so the daemon records it as terminally failed.
-                    // Returning a bare Err would only log a task failure and leave
-                    // the row stuck in `processing` (shown as "running") until the
-                    // batch window eventually expires.
+                    // non-retriable failure so the daemon records it as terminally
+                    // failed for this exact attempt.
+                    // Returning a bare error would not produce the definitive
+                    // client outcome this permanent key loss requires.
                     let failed = Request {
                         state: Failed {
                             reason: FailureReason::RequestBuilderError {
@@ -292,30 +305,35 @@ where
                         },
                         data: request.data,
                     };
-                    storage.persist(&failed).await?;
                     return Ok(RequestCompletionResult::Failed(failed));
                 }
                 Err(e) => {
-                    // Keystore unreachable (transient - e.g. Redis restart). Return a
-                    // retriable failure so the daemon reschedules the still-`processing`
-                    // row back to `pending` and tries again, rather than a bare Err that
-                    // would strand it. Do NOT persist here: the daemon's retry path
-                    // re-pends the row itself, and a persisted Failed would look terminal
-                    // and lose the retry. Client reason stays generic; the infra detail
-                    // is logged for operators only.
-                    crate::background_error!(
-                        crate::metrics::errors::component::ZDR_DISPATCH,
-                        "keystore_unreachable",
-                        Warning,
-                        request_id = %request.data.id.0,
-                        error = %e,
-                        "ZDR keystore unreachable during dispatch; scheduling retry"
-                    );
+                    // Only transport unavailability is retriable. A malformed
+                    // envelope, retired wrap key, crypto failure, or invalid
+                    // configuration cannot improve on another dispatch attempt
+                    // and must terminalize without opening the upstream gate.
+                    if e.is_unreachable() {
+                        crate::background_error!(
+                            crate::metrics::errors::component::ZDR_DISPATCH,
+                            "keystore_unreachable",
+                            Warning,
+                            request_id = %request.data.id.0,
+                            error = %e,
+                            "ZDR keystore unreachable during dispatch; scheduling retry"
+                        );
+                    } else {
+                        crate::background_error!(
+                            crate::metrics::errors::component::ZDR_DISPATCH,
+                            "keystore_invalid_value",
+                            Error,
+                            request_id = %request.data.id.0,
+                            error = %e,
+                            "ZDR request key could not be prepared; failing request"
+                        );
+                    }
                     let failed = Request {
                         state: Failed {
-                            reason: FailureReason::NetworkError {
-                                error: "Zero-data-retention request could not be processed".to_string(),
-                            },
+                            reason: classify_request_keystore_error(&e),
                             failed_at: chrono::Utc::now(),
                             retry_attempt: request.state.retry_attempt,
                             batch_expires_at: request.state.batch_expires_at,
@@ -343,16 +361,11 @@ where
             // silently dispatching the literal token to an upstream
             // (which can't fetch a `dw-img://` URL) would manifest as a
             // confusing upstream error far from the root cause.
-            // Use ValidationError (not Other): a body that won't parse as
-            // JSON is malformed input that will never succeed on retry —
-            // semantically a validation failure, not a transient/unknown
-            // error. (The fusillade daemon currently treats all process()
-            // Err variants the same, but classifying it correctly future-
-            // proofs against fusillade differentiating non-retryable errors.)
-            let mut body_value: serde_json::Value = serde_json::from_str(&request.data.body).map_err(|e| {
-                fusillade::FusilladeError::ValidationError(format!(
-                    "JIT image signing: request body is not valid JSON ({e}); refusing to dispatch with unresolved tokens"
-                ))
+            // Use ValidationError (not Other): malformed JSON and malformed
+            // opaque tokens are deterministic input failures that will never
+            // succeed on retry.
+            let mut body_value: serde_json::Value = serde_json::from_str(&request.data.body).map_err(|_| {
+                fusillade::FusilladeError::ValidationError("JIT image signing requires a valid JSON request body".to_string())
             })?;
             let result = crate::image_normalizer::walker::substitute_with(
                 &mut body_value,
@@ -360,30 +373,22 @@ where
                 |maybe_token| {
                     let normalizer = Arc::clone(&normalizer);
                     async move {
-                        let token: crate::image_normalizer::ImageToken = maybe_token
-                            .parse()
-                            .map_err(|e: crate::image_normalizer::TokenParseError| format!("invalid dw-img token: {e}"))?;
-                        let signed = normalizer.sign(token, ttl).await.map_err(|e| format!("sign failed: {e}"))?;
-                        Ok::<String, String>(signed.url)
+                        let token = parse_jit_image_token(&maybe_token)?;
+                        let signed = normalizer
+                            .sign(token, ttl)
+                            .await
+                            .map_err(|_| fusillade::FusilladeError::Other(anyhow::anyhow!("JIT image signing backend unavailable")))?;
+                        Ok::<String, fusillade::FusilladeError>(signed.url)
                     }
                 },
             )
             .await;
             match result {
-                Ok(count) if count > 0 => match serde_json::to_string(&body_value) {
-                    Ok(new_body) => request.data.body = new_body,
-                    Err(e) => {
-                        return Err(fusillade::FusilladeError::Other(anyhow::anyhow!(
-                            "re-serialise body after JIT signing: {e}"
-                        )));
-                    }
-                },
-                Ok(_) => {} // no tokens found, leave body alone
-                Err(e) => {
-                    return Err(fusillade::FusilladeError::Other(anyhow::anyhow!(
-                        "JIT image-URL signing failed: {e}"
-                    )));
+                Ok(count) if count > 0 => {
+                    request.data.body = serde_json::to_string(&body_value)?;
                 }
+                Ok(_) => {} // no tokens found, leave body alone
+                Err(error) => return Err(error),
             }
         }
 
@@ -436,7 +441,7 @@ where
         let processing = request.process(storage, response_fut).await?;
         // `ShouldRetry` is an `Arc<dyn Fn>`; `complete` wants a bare `Fn`,
         // so deref through the Arc.
-        processing.complete(storage, |resp| should_retry(resp), cancellation).await
+        processing.complete_unpersisted(|resp| should_retry(resp), cancellation).await
     }
 }
 
@@ -444,3 +449,37 @@ where
 // rust-analyzer cleanup.
 #[allow(dead_code)]
 fn _smoke(_c: Canceled) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn invalid_jit_image_tokens_are_validation_errors() {
+        assert!(matches!(
+            parse_jit_image_token("dw-img://not-a-valid-token"),
+            Err(fusillade::FusilladeError::ValidationError(_))
+        ));
+    }
+
+    #[test]
+    fn only_unreachable_request_keystore_errors_are_retriable() {
+        assert!(matches!(
+            classify_request_keystore_error(&crate::keystore::KeystoreError::Unreachable("offline".to_string())),
+            FailureReason::NetworkError { .. }
+        ));
+
+        for definitive in [
+            crate::keystore::KeystoreError::UnknownWrapKeyId("retired".to_string()),
+            crate::keystore::KeystoreError::MalformedWrappedValue,
+            crate::keystore::KeystoreError::MalformedEnvelope,
+            crate::keystore::KeystoreError::Config("invalid".to_string()),
+            crate::keystore::KeystoreError::Crypto(crate::encryption::EncryptionError::DecryptionFailed),
+        ] {
+            assert!(matches!(
+                classify_request_keystore_error(&definitive),
+                FailureReason::RequestBuilderError { .. }
+            ));
+        }
+    }
+}

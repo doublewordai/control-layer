@@ -7,6 +7,7 @@ use std::time::Duration;
 
 pub mod config;
 
+use futures::FutureExt;
 use metrics::{counter, gauge, histogram};
 use tokio::task::JoinSet;
 
@@ -20,7 +21,10 @@ use crate::error::Result;
 use crate::http::HttpClient;
 use crate::manager::{ArchiveOutcome, DaemonStorage, Storage};
 use crate::processor::{DefaultRequestProcessor, RequestProcessor};
-use crate::request::{Claimed, DaemonId, Request, RequestCompletionResult};
+use crate::request::{
+    AnyRequest, AttemptId, Claimed, DaemonId, Failed, FailureReason, Request,
+    RequestCompletionResult, RequestData, RequestId, RequestState,
+};
 
 pub use config::{
     DaemonConfig, DaemonMode, ModelEscalationConfig, ShouldRetryFn, default_should_retry,
@@ -55,6 +59,254 @@ fn claim_failure_backoff(consecutive_failures: u32, claim_interval_ms: u64) -> D
     )
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttemptWriteResolution {
+    Applied,
+    LostOwnership,
+    RequestMissing,
+}
+
+enum TerminalPersistenceResolution {
+    OriginalApplied,
+    FallbackApplied(Box<Request<Failed>>),
+    LostOwnership,
+    RequestMissing,
+}
+
+fn classify_attempt_write_result(result: Result<bool>) -> Result<AttemptWriteResolution> {
+    match result {
+        Ok(true) => Ok(AttemptWriteResolution::Applied),
+        Ok(false)
+        | Err(FusilladeError::RequestAttemptLost { .. })
+        | Err(FusilladeError::RequestStateConflict { .. }) => {
+            Ok(AttemptWriteResolution::LostOwnership)
+        }
+        Err(FusilladeError::RequestNotFound(_)) => Ok(AttemptWriteResolution::RequestMissing),
+        Err(error) => Err(error),
+    }
+}
+
+fn attempt_write_backoff(failures: u32) -> Duration {
+    Duration::from_millis(
+        100u64
+            .saturating_mul(2u64.saturating_pow(failures.saturating_sub(1).min(6)))
+            .min(5_000),
+    )
+}
+
+async fn attempt_write_until_resolved<F, Fut>(
+    shutdown: &tokio_util::sync::CancellationToken,
+    request_id: RequestId,
+    attempt_id: AttemptId,
+    operation: &'static str,
+    mut write: F,
+) -> Result<AttemptWriteResolution>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<bool>>,
+{
+    let mut failures = 0u32;
+
+    loop {
+        let result = tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => return Err(FusilladeError::Shutdown),
+            result = write() => result,
+        };
+
+        match result {
+            Err(FusilladeError::AttemptPersistenceInfrastructure { .. }) => {
+                failures = failures.saturating_add(1);
+                let delay = attempt_write_backoff(failures);
+                counter!(
+                    "fusillade_request_attempt_write_retries_total",
+                    "operation" => operation
+                )
+                .increment(1);
+
+                if failures.is_power_of_two() {
+                    tracing::warn!(
+                        %request_id,
+                        %attempt_id,
+                        operation,
+                        failures,
+                        retry_after_ms = delay.as_millis(),
+                        "Request attempt persistence unavailable; retrying"
+                    );
+                } else {
+                    tracing::debug!(
+                        %request_id,
+                        %attempt_id,
+                        operation,
+                        failures,
+                        retry_after_ms = delay.as_millis(),
+                        "Request attempt persistence still unavailable"
+                    );
+                }
+
+                tokio::select! {
+                    biased;
+                    _ = shutdown.cancelled() => return Err(FusilladeError::Shutdown),
+                    _ = tokio::time::sleep(delay) => {}
+                }
+            }
+            result => return classify_attempt_write_result(result),
+        }
+    }
+}
+
+fn terminal_persistence_fallback(
+    data: RequestData,
+    retry_attempt: u32,
+    batch_expires_at: chrono::DateTime<chrono::Utc>,
+    routed_model: String,
+) -> Request<Failed> {
+    Request {
+        data,
+        state: Failed {
+            reason: FailureReason::RequestBuilderError {
+                error: "Request outcome could not be stored".to_string(),
+            },
+            failed_at: chrono::Utc::now(),
+            retry_attempt,
+            batch_expires_at,
+            routed_model,
+        },
+    }
+}
+
+async fn persist_terminal_attempt<S, T>(
+    storage: &S,
+    shutdown: &tokio_util::sync::CancellationToken,
+    request: &Request<T>,
+    fallback: Request<Failed>,
+    attempt_id: AttemptId,
+    operation: &'static str,
+) -> Result<TerminalPersistenceResolution>
+where
+    S: Storage + ?Sized,
+    T: RequestState + Clone,
+    AnyRequest: From<Request<T>>,
+{
+    let request_id = request.data.id;
+    match attempt_write_until_resolved(shutdown, request_id, attempt_id, operation, || {
+        Storage::persist_attempt::<T>(storage, request, attempt_id)
+    })
+    .await
+    {
+        Ok(AttemptWriteResolution::Applied) => Ok(TerminalPersistenceResolution::OriginalApplied),
+        Ok(AttemptWriteResolution::LostOwnership) => {
+            Ok(TerminalPersistenceResolution::LostOwnership)
+        }
+        Ok(AttemptWriteResolution::RequestMissing) => {
+            Ok(TerminalPersistenceResolution::RequestMissing)
+        }
+        Err(FusilladeError::Shutdown) => Err(FusilladeError::Shutdown),
+        Err(_) => {
+            counter!(
+                "fusillade_request_terminal_persistence_fallback_total",
+                "operation" => operation
+            )
+            .increment(1);
+            tracing::warn!(
+                %request_id,
+                %attempt_id,
+                operation,
+                "Terminal outcome could not be prepared; storing redacted failure"
+            );
+
+            match attempt_write_until_resolved(
+                shutdown,
+                request_id,
+                attempt_id,
+                "terminal_fallback",
+                || Storage::persist_attempt::<Failed>(storage, &fallback, attempt_id),
+            )
+            .await?
+            {
+                AttemptWriteResolution::Applied => Ok(
+                    TerminalPersistenceResolution::FallbackApplied(Box::new(fallback)),
+                ),
+                AttemptWriteResolution::LostOwnership => {
+                    Ok(TerminalPersistenceResolution::LostOwnership)
+                }
+                AttemptWriteResolution::RequestMissing => {
+                    Ok(TerminalPersistenceResolution::RequestMissing)
+                }
+            }
+        }
+    }
+}
+
+struct TerminalFailureContext<'a> {
+    request_id: RequestId,
+    batch_id: Option<BatchId>,
+    model: &'a str,
+    user_id: &'a str,
+    completion_window: &'a str,
+    processing_start: std::time::Instant,
+    batch_expires_at: chrono::DateTime<chrono::Utc>,
+    requests_failed: &'a AtomicU64,
+    user_throughput: &'a dashmap::DashMap<String, UserThroughputStats>,
+}
+
+fn record_terminal_failure(failed: &Request<Failed>, context: TerminalFailureContext<'_>) {
+    context.requests_failed.fetch_add(1, Ordering::Relaxed);
+    context
+        .user_throughput
+        .entry(context.user_id.to_string())
+        .or_insert_with(|| UserThroughputStats {
+            completed: AtomicU64::new(0),
+            failed: AtomicU64::new(0),
+        })
+        .failed
+        .fetch_add(1, Ordering::Relaxed);
+    counter!(
+        "fusillade_requests_completed_total",
+        "model" => context.model.to_string(),
+        "status" => "failed",
+        "reason" => failed.state.reason.metric_label(),
+        "status_code" => failed.state.reason.status_code_label(),
+        "completion_window" => context.completion_window.to_string()
+    )
+    .increment(1);
+    counter!(
+        "fusillade_user_requests_completed_total",
+        "user" => context.user_id.to_string(),
+        "status" => "failed",
+        "completion_window" => context.completion_window.to_string()
+    )
+    .increment(1);
+    histogram!(
+        "fusillade_request_duration_seconds",
+        "model" => context.model.to_string(),
+        "status" => "failed"
+    )
+    .record(context.processing_start.elapsed().as_secs_f64());
+
+    if failed.state.failed_at > context.batch_expires_at {
+        counter!(
+            "fusillade_requests_completed_after_sla_total",
+            "model" => context.model.to_string(),
+            "status" => "failed",
+            "completion_window" => context.completion_window.to_string()
+        )
+        .increment(1);
+        tracing::warn!(
+            request_id = %context.request_id,
+            batch_id = ?context.batch_id,
+            "Request failed permanently after SLA"
+        );
+    }
+    tracing::warn!(
+        request_id = %context.request_id,
+        batch_id = ?context.batch_id,
+        retry_attempt = failed.state.retry_attempt,
+        failure_reason = failed.state.reason.metric_label(),
+        "request.terminal_failure"
+    );
+}
+
 fn claim_loop_kinds_for_mode(
     mode: DaemonMode,
     supports_batch_claims: bool,
@@ -78,6 +330,26 @@ fn claim_loop_kinds_for_mode(
             }
         }
     }
+}
+
+fn reclaim_loop_kind_for_mode(mode: DaemonMode) -> ClaimLoopKind {
+    match mode {
+        DaemonMode::Both | DaemonMode::RequestOnly => ClaimLoopKind::Request,
+        DaemonMode::BatchOnly => ClaimLoopKind::Batch,
+    }
+}
+
+async fn prepare_claim_capacity<T, Maintenance, Capacity>(
+    run_reclaim: bool,
+    maintenance: Maintenance,
+    capacity: Capacity,
+) -> Result<(usize, Option<T>)>
+where
+    Maintenance: Future<Output = Result<usize>>,
+    Capacity: FnOnce() -> Option<T>,
+{
+    let reclaimed = if run_reclaim { maintenance.await? } else { 0 };
+    Ok((reclaimed, capacity()))
 }
 
 fn get_hostname() -> String {
@@ -134,8 +406,10 @@ where
         Self { core }
     }
 
-    async fn run(self) -> Result<()> {
-        self.core.run_claim_loop(ClaimLoopKind::Request).await
+    async fn run(self, run_reclaim: bool) -> Result<()> {
+        self.core
+            .run_claim_loop(ClaimLoopKind::Request, run_reclaim)
+            .await
     }
 }
 
@@ -160,8 +434,10 @@ where
         Self { core }
     }
 
-    async fn run(self) -> Result<()> {
-        self.core.run_claim_loop(ClaimLoopKind::Batch).await
+    async fn run(self, run_reclaim: bool) -> Result<()> {
+        self.core
+            .run_claim_loop(ClaimLoopKind::Batch, run_reclaim)
+            .await
     }
 }
 
@@ -371,7 +647,7 @@ where
         }
     }
 
-    async fn run_claim_loop(self: Arc<Self>, kind: ClaimLoopKind) -> Result<()> {
+    async fn run_claim_loop(self: Arc<Self>, kind: ClaimLoopKind, run_reclaim: bool) -> Result<()> {
         let mut join_set: JoinSet<Result<()>> = JoinSet::new();
         let (loop_name, interval_ms) = match kind {
             ClaimLoopKind::Request => ("request_daemon", self.config.claim_interval_ms),
@@ -420,72 +696,108 @@ where
                     break Ok(());
                 }
             };
-            let available_capacity = self.available_capacity();
-            if available_capacity.is_empty() {
-                tracing::trace!(
-                    loop_name,
-                    "No capacity available for any model, skipping claim"
-                );
-                continue;
-            }
-
-            let total_capacity: usize = available_capacity.values().sum();
-            // Dual-emit: keep the legacy unlabeled series alive alongside the
-            // new per-daemon one so existing dashboards/alerts survive the
-            // split (deprecation window).
-            gauge!("fusillade_claim_capacity").set(total_capacity as f64);
-            gauge!("fusillade_claim_capacity", "daemon" => loop_name).set(total_capacity as f64);
-
-            let user_active_counts = self.user_active_counts();
-            let leak_cooldown = if kind == ClaimLoopKind::Request {
-                self.leak_cooldown()
-            } else {
-                std::collections::HashSet::new()
-            };
-
-            let claim_start = std::time::Instant::now();
             let claim_timeout = Duration::from_millis(self.config.claim_query_timeout_ms);
-            let claim_result = match kind {
-                ClaimLoopKind::Request => {
-                    with_query_timeout(
-                        "batchless claim query",
-                        claim_timeout,
-                        self.storage.claim_batchless_requests(
-                            self.config.claim_batch_size,
-                            self.daemon_id,
-                            &available_capacity,
-                            &user_active_counts,
-                            &leak_cooldown,
+            let claim_result: Result<Option<(Vec<Request<Claimed>>, Duration)>> = tokio::select! {
+                result = async {
+                    let (reclaimed, available_capacity) = prepare_claim_capacity(
+                        run_reclaim,
+                        with_query_timeout(
+                            "stale request reclaim query",
+                            claim_timeout,
+                            self.storage.reclaim_stale_requests(),
                         ),
+                        || {
+                            let capacity = self.available_capacity();
+                            (!capacity.is_empty()).then_some(capacity)
+                        },
                     )
-                    .await
-                }
-                ClaimLoopKind::Batch => {
-                    // 0 = inherit the (often deployment-tuned) single-loop cap.
-                    let batch_claim_size = if self.config.batch_claim_size == 0 {
-                        self.config.claim_batch_size
-                    } else {
-                        self.config.batch_claim_size
+                    .await?;
+
+                    if reclaimed > 0 {
+                        tracing::info!(
+                            loop_name,
+                            reclaimed,
+                            "Reclaimed safely abandoned requests before claiming"
+                        );
+                    }
+
+                    let Some(available_capacity) = available_capacity else {
+                        tracing::trace!(
+                            loop_name,
+                            "No capacity available for any model, skipping claim"
+                        );
+                        return Ok(None);
                     };
-                    with_query_timeout(
-                        "batch claim query",
-                        claim_timeout,
-                        self.storage.claim_batch_requests(
-                            batch_claim_size,
-                            self.config.batch_claim_batch_size,
-                            self.daemon_id,
-                            &available_capacity,
-                            &user_active_counts,
-                        ),
-                    )
-                    .await
+
+                    let total_capacity: usize = available_capacity.values().sum();
+                    // Dual-emit: keep the legacy unlabeled series alive alongside the
+                    // new per-daemon one so existing dashboards/alerts survive the
+                    // split (deprecation window).
+                    gauge!("fusillade_claim_capacity").set(total_capacity as f64);
+                    gauge!("fusillade_claim_capacity", "daemon" => loop_name)
+                        .set(total_capacity as f64);
+
+                    let user_active_counts = self.user_active_counts();
+                    let leak_cooldown = if kind == ClaimLoopKind::Request {
+                        self.leak_cooldown()
+                    } else {
+                        std::collections::HashSet::new()
+                    };
+
+                    let claim_start = std::time::Instant::now();
+                    let claimed = match kind {
+                        ClaimLoopKind::Request => {
+                            with_query_timeout(
+                                "batchless claim query",
+                                claim_timeout,
+                                self.storage.claim_batchless_requests(
+                                    self.config.claim_batch_size,
+                                    self.daemon_id,
+                                    &available_capacity,
+                                    &user_active_counts,
+                                    &leak_cooldown,
+                                ),
+                            )
+                            .await?
+                        }
+                        ClaimLoopKind::Batch => {
+                            // 0 = inherit the (often deployment-tuned) single-loop cap.
+                            let batch_claim_size = if self.config.batch_claim_size == 0 {
+                                self.config.claim_batch_size
+                            } else {
+                                self.config.batch_claim_size
+                            };
+                            with_query_timeout(
+                                "batch claim query",
+                                claim_timeout,
+                                self.storage.claim_batch_requests(
+                                    batch_claim_size,
+                                    self.config.batch_claim_batch_size,
+                                    self.daemon_id,
+                                    &available_capacity,
+                                    &user_active_counts,
+                                ),
+                            )
+                            .await?
+                        }
+                    };
+
+                    Ok(Some((claimed, claim_start.elapsed())))
+                } => result,
+                _ = self.shutdown_token.cancelled() => {
+                    tracing::info!(loop_name, "Shutdown signal received, stopping claim loop");
+                    break Ok(());
                 }
             };
 
-            let mut claimed = match claim_result {
-                Ok(claimed) => {
+            let (mut claimed, claim_duration) = match claim_result {
+                Ok(Some(claimed)) => {
                     consecutive_claim_failures = 0;
                     claimed
+                }
+                Ok(None) => {
+                    consecutive_claim_failures = 0;
+                    continue;
                 }
                 Err(e) => {
                     drop(_claim_guard);
@@ -527,10 +839,9 @@ where
             };
             // Dual-emit legacy unlabeled histograms during the deprecation
             // window (see fusillade_claim_capacity above).
-            histogram!("fusillade_claim_duration_seconds")
-                .record(claim_start.elapsed().as_secs_f64());
+            histogram!("fusillade_claim_duration_seconds").record(claim_duration.as_secs_f64());
             histogram!("fusillade_claim_duration_seconds", "daemon" => loop_name)
-                .record(claim_start.elapsed().as_secs_f64());
+                .record(claim_duration.as_secs_f64());
             histogram!("fusillade_claim_size").record(claimed.len() as f64);
             histogram!("fusillade_claim_size", "daemon" => loop_name).record(claimed.len() as f64);
 
@@ -739,6 +1050,9 @@ where
                     let batch_expires_at = request.state.batch_expires_at;
                     let retry_attempt_at_completion = request.state.retry_attempt;
                     let owning_daemon_id = request.state.daemon_id;
+                    let attempt_id = request.state.attempt_id;
+                    let recovery_data = request.data.clone();
+                    let recovery_shutdown_token = shutdown_token.clone();
 
                     let cancellation: crate::processor::CancellationFuture = Box::pin(async move {
                         tokio::select! {
@@ -751,18 +1065,182 @@ where
                         }
                     });
 
-                    let completion_result = processor
-                        .process(
+                    let processor_result =
+                        std::panic::AssertUnwindSafe(processor.process(
                             request,
                             http_client,
                             storage.as_ref(),
                             should_retry.clone(),
                             cancellation,
-                        )
+                        ))
+                        .catch_unwind()
                         .await;
 
+                    let mut processor_failure = None;
+                    let completion_result = match processor_result {
+                        Ok(Ok(result)) => result,
+                        Ok(Err(FusilladeError::Shutdown)) => {
+                            tracing::Span::current().record("outcome", "shutdown");
+                            return Ok(());
+                        }
+                        Ok(Err(
+                            FusilladeError::RequestAttemptLost { .. }
+                            | FusilladeError::RequestNotFound(_)
+                            | FusilladeError::RequestStateConflict { .. },
+                        )) => {
+                            tracing::Span::current().record("outcome", "ownership_lost");
+                            counter!(
+                                "fusillade_request_attempt_outcomes_total",
+                                "model" => model_clone.clone(),
+                                "resolution" => "revoked"
+                            )
+                            .increment(1);
+                            tracing::info!(
+                                %request_id,
+                                ?batch_id,
+                                %attempt_id,
+                                "Request attempt result discarded after ownership loss"
+                            );
+                            return Ok(());
+                        }
+                        Ok(Err(
+                            FusilladeError::ValidationError(_)
+                            | FusilladeError::Serialization(_)
+                            | FusilladeError::HttpRequestBuilder(_)
+                            | FusilladeError::InvalidState(..),
+                        )) => {
+                            tracing::warn!(
+                                %request_id,
+                                ?batch_id,
+                                %attempt_id,
+                                "Request processor returned a validation error; terminalizing"
+                            );
+                            RequestCompletionResult::Failed(Request {
+                                data: recovery_data.clone(),
+                                state: Failed {
+                                    reason: FailureReason::RequestBuilderError {
+                                        error: "Request processor rejected the request".to_string(),
+                                    },
+                                    failed_at: chrono::Utc::now(),
+                                    retry_attempt: retry_attempt_at_completion,
+                                    batch_expires_at,
+                                    routed_model: model_clone.clone(),
+                                },
+                            })
+                        }
+                        Ok(Err(_)) => {
+                            processor_failure = Some("error");
+                            counter!(
+                                "fusillade_request_processor_failures_total",
+                                "model" => model_clone.clone(),
+                                "source" => "error"
+                            )
+                            .increment(1);
+                            tracing::warn!(
+                                %request_id,
+                                ?batch_id,
+                                %attempt_id,
+                                "Request processor failed; recovering the exact attempt"
+                            );
+                            RequestCompletionResult::Failed(Request {
+                                data: recovery_data.clone(),
+                                state: Failed {
+                                    reason: FailureReason::ProcessorError,
+                                    failed_at: chrono::Utc::now(),
+                                    retry_attempt: retry_attempt_at_completion,
+                                    batch_expires_at,
+                                    routed_model: model_clone.clone(),
+                                },
+                            })
+                        }
+                        Err(_) => {
+                            processor_failure = Some("panic");
+                            counter!(
+                                "fusillade_request_processor_failures_total",
+                                "model" => model_clone.clone(),
+                                "source" => "panic"
+                            )
+                            .increment(1);
+                            tracing::error!(
+                                %request_id,
+                                ?batch_id,
+                                %attempt_id,
+                                "Request processor panicked; recovering the exact attempt"
+                            );
+                            RequestCompletionResult::Failed(Request {
+                                data: recovery_data.clone(),
+                                state: Failed {
+                                    reason: FailureReason::TaskTerminated,
+                                    failed_at: chrono::Utc::now(),
+                                    retry_attempt: retry_attempt_at_completion,
+                                    batch_expires_at,
+                                    routed_model: model_clone.clone(),
+                                },
+                            })
+                        }
+                    };
+
                     match completion_result {
-                        Ok(RequestCompletionResult::Completed(completed)) => {
+                        RequestCompletionResult::Completed(completed) => {
+                            let fallback = terminal_persistence_fallback(
+                                recovery_data.clone(),
+                                retry_attempt_at_completion,
+                                batch_expires_at,
+                                model_clone.clone(),
+                            );
+                            let resolution = match persist_terminal_attempt(
+                                storage.as_ref(),
+                                &recovery_shutdown_token,
+                                &completed,
+                                fallback,
+                                attempt_id,
+                                "terminal_completion",
+                            )
+                            .await
+                            {
+                                Ok(resolution) => resolution,
+                                Err(FusilladeError::Shutdown) => {
+                                    tracing::Span::current().record("outcome", "shutdown");
+                                    return Ok(());
+                                }
+                                Err(error) => return Err(error),
+                            };
+
+                            match resolution {
+                                TerminalPersistenceResolution::OriginalApplied => {}
+                                TerminalPersistenceResolution::FallbackApplied(failed) => {
+                                    tracing::Span::current()
+                                        .record("outcome", "persistence_fallback");
+                                    record_terminal_failure(
+                                        &failed,
+                                        TerminalFailureContext {
+                                            request_id,
+                                            batch_id,
+                                            model: &model_clone,
+                                            user_id: &user_id,
+                                            completion_window: &completion_window,
+                                            processing_start,
+                                            batch_expires_at,
+                                            requests_failed: requests_failed.as_ref(),
+                                            user_throughput: user_throughput.as_ref(),
+                                        },
+                                    );
+                                    return Ok(());
+                                }
+                                TerminalPersistenceResolution::LostOwnership
+                                | TerminalPersistenceResolution::RequestMissing => {
+                                    tracing::Span::current()
+                                        .record("outcome", "ownership_lost");
+                                    counter!(
+                                        "fusillade_request_attempt_outcomes_total",
+                                        "model" => model_clone.clone(),
+                                        "resolution" => "revoked"
+                                    )
+                                    .increment(1);
+                                    return Ok(());
+                                }
+                            }
+
                             tracing::Span::current().record("outcome", "completed");
                             requests_processed.fetch_add(1, Ordering::Relaxed);
                             user_throughput.entry(user_id.clone()).or_insert_with(|| UserThroughputStats {
@@ -790,107 +1268,172 @@ where
                             }
                             Ok(())
                         }
-                        Ok(RequestCompletionResult::Failed(failed)) => {
+                        RequestCompletionResult::Failed(failed) => {
                             tracing::Span::current().record("outcome", "failed");
                             let retry_attempt = failed.state.retry_attempt;
-                            let reason_label = failed.state.reason.metric_label();
-                            if failed.state.reason.is_retriable() {
+                            let terminal_failed = if failed.state.reason.is_retriable() {
                                 match failed.can_retry(retry_attempt, retry_config.clone()) {
                                     Ok(pending) => {
-                                        let rescheduled = storage
-                                            .reschedule_for_retry(
-                                                request_id,
-                                                owning_daemon_id,
-                                                pending.state.retry_attempt,
-                                                pending.state.not_before,
-                                            )
-                                            .await?;
-                                        if rescheduled {
-                                            counter!(
-                                                "fusillade_requests_retried_total",
-                                                "model" => model_clone.clone(),
-                                                "attempt" => (retry_attempt + 1).to_string()
-                                            )
-                                            .increment(1);
-                                            tracing::info!(
-                                                request_id = %request_id,
-                                                batch_id = ?batch_id,
-                                                retry_attempt = retry_attempt + 1,
-                                                "request.retry_persisted"
-                                            );
-                                        } else {
-                                            counter!(
-                                                "fusillade_requests_retry_lost_ownership_total",
-                                                "model" => model_clone.clone()
-                                            )
-                                            .increment(1);
-                                            tracing::warn!(
-                                                request_id = %request_id,
-                                                batch_id = ?batch_id,
-                                                retry_attempt = retry_attempt + 1,
-                                                "request.retry_skipped_lost_ownership"
-                                            );
+                                        let resolution = match attempt_write_until_resolved(
+                                            &recovery_shutdown_token,
+                                            request_id,
+                                            attempt_id,
+                                            if processor_failure.is_some() {
+                                                "processor_recovery_retry"
+                                            } else {
+                                                "retry_reschedule"
+                                            },
+                                            || {
+                                                if processor_failure.is_some() {
+                                                    storage.recover_attempt_for_retry(
+                                                        request_id,
+                                                        owning_daemon_id,
+                                                        attempt_id,
+                                                        pending.state.retry_attempt,
+                                                        pending.state.not_before,
+                                                    )
+                                                } else {
+                                                    storage.reschedule_attempt_for_retry(
+                                                        request_id,
+                                                        owning_daemon_id,
+                                                        attempt_id,
+                                                        pending.state.retry_attempt,
+                                                        pending.state.not_before,
+                                                    )
+                                                }
+                                            },
+                                        )
+                                        .await
+                                        {
+                                            Ok(resolution) => resolution,
+                                            Err(FusilladeError::Shutdown) => {
+                                                tracing::Span::current()
+                                                    .record("outcome", "shutdown");
+                                                return Ok(());
+                                            }
+                                            Err(error) => return Err(error),
+                                        };
+
+                                        match resolution {
+                                            AttemptWriteResolution::Applied => {
+                                                counter!(
+                                                    "fusillade_requests_retried_total",
+                                                    "model" => model_clone.clone()
+                                                )
+                                                .increment(1);
+                                                if let Some(source) = processor_failure {
+                                                    counter!(
+                                                        "fusillade_request_processor_recoveries_total",
+                                                        "model" => model_clone.clone(),
+                                                        "source" => source,
+                                                        "resolution" => "rescheduled"
+                                                    )
+                                                    .increment(1);
+                                                }
+                                                tracing::info!(
+                                                    %request_id,
+                                                    ?batch_id,
+                                                    %attempt_id,
+                                                    retry_attempt = retry_attempt + 1,
+                                                    "Request retry returned to ordinary admission"
+                                                );
+                                            }
+                                            AttemptWriteResolution::LostOwnership
+                                            | AttemptWriteResolution::RequestMissing => {
+                                                counter!(
+                                                    "fusillade_requests_retry_lost_ownership_total",
+                                                    "model" => model_clone.clone()
+                                                )
+                                                .increment(1);
+                                                tracing::info!(
+                                                    %request_id,
+                                                    ?batch_id,
+                                                    %attempt_id,
+                                                    "Request retry skipped after ownership loss"
+                                                );
+                                            }
                                         }
                                         return Ok(());
                                     }
-                                    Err(failed) => {
-                                        storage.persist(&*failed).await?;
-                                        requests_failed.fetch_add(1, Ordering::Relaxed);
-                                        user_throughput.entry(user_id.clone()).or_insert_with(|| UserThroughputStats {
-                                            completed: AtomicU64::new(0),
-                                            failed: AtomicU64::new(0),
-                                        }).failed.fetch_add(1, Ordering::Relaxed);
-                                        counter!("fusillade_requests_completed_total", "model" => model_clone.clone(), "status" => "failed", "reason" => failed.state.reason.metric_label(), "status_code" => failed.state.reason.status_code_label(), "completion_window" => completion_window.clone()).increment(1);
-                                        counter!("fusillade_user_requests_completed_total", "user" => user_id.clone(), "status" => "failed", "completion_window" => completion_window.clone()).increment(1);
-                                        histogram!("fusillade_request_duration_seconds", "model" => model_clone.clone(), "status" => "failed")
-                                            .record(processing_start.elapsed().as_secs_f64());
-                                        if failed.state.failed_at > batch_expires_at {
-                                            counter!("fusillade_requests_completed_after_sla_total", "model" => model_clone.clone(), "status" => "failed", "completion_window" => completion_window.clone()).increment(1);
-                                            tracing::warn!(
-                                                request_id = %request_id,
-                                                batch_id = ?batch_id,
-                                                "Request failed permanently after SLA"
-                                            );
-                                        }
-                                        tracing::warn!(
-                                            request_id = %request_id,
-                                            batch_id = ?batch_id,
-                                            retry_attempt,
-                                            failure_reason = %failed.state.reason.metric_label(),
-                                            error = %failed.state.reason.to_error_message(),
-                                            "request.terminal_failure"
-                                        );
-                                    }
+                                    Err(failed) => *failed,
                                 }
                             } else {
-                                requests_failed.fetch_add(1, Ordering::Relaxed);
-                                user_throughput.entry(user_id.clone()).or_insert_with(|| UserThroughputStats {
-                                    completed: AtomicU64::new(0),
-                                    failed: AtomicU64::new(0),
-                                }).failed.fetch_add(1, Ordering::Relaxed);
-                                counter!("fusillade_requests_completed_total", "model" => model_clone.clone(), "status" => "failed", "reason" => failed.state.reason.metric_label(), "status_code" => failed.state.reason.status_code_label(), "completion_window" => completion_window.clone()).increment(1);
-                                counter!("fusillade_user_requests_completed_total", "user" => user_id.clone(), "status" => "failed", "completion_window" => completion_window.clone()).increment(1);
-                                histogram!("fusillade_request_duration_seconds", "model" => model_clone.clone(), "status" => "failed")
-                                    .record(processing_start.elapsed().as_secs_f64());
-                                if failed.state.failed_at > batch_expires_at {
-                                    counter!("fusillade_requests_completed_after_sla_total", "model" => model_clone.clone(), "status" => "failed", "completion_window" => completion_window.clone()).increment(1);
-                                    tracing::warn!(
-                                        request_id = %request_id,
-                                        batch_id = ?batch_id,
-                                        "Request failed with non-retriable error after SLA"
-                                    );
+                                failed
+                            };
+
+                            let fallback = terminal_persistence_fallback(
+                                recovery_data.clone(),
+                                terminal_failed.state.retry_attempt,
+                                terminal_failed.state.batch_expires_at,
+                                model_clone.clone(),
+                            );
+                            let resolution = match persist_terminal_attempt(
+                                storage.as_ref(),
+                                &recovery_shutdown_token,
+                                &terminal_failed,
+                                fallback,
+                                attempt_id,
+                                if processor_failure.is_some() {
+                                    "processor_recovery_terminal"
+                                } else {
+                                    "terminal_failure"
+                                },
+                            )
+                            .await
+                            {
+                                Ok(resolution) => resolution,
+                                Err(FusilladeError::Shutdown) => {
+                                    tracing::Span::current().record("outcome", "shutdown");
+                                    return Ok(());
                                 }
-                                tracing::warn!(
-                                    request_id = %request_id,
-                                    batch_id = ?batch_id,
-                                    failure_reason = %reason_label,
-                                    error = %failed.state.reason.to_error_message(),
-                                    "request.terminal_failure"
-                                );
+                                Err(error) => return Err(error),
+                            };
+
+                            let terminal_failed = match resolution {
+                                TerminalPersistenceResolution::OriginalApplied => terminal_failed,
+                                TerminalPersistenceResolution::FallbackApplied(fallback) => {
+                                    *fallback
+                                }
+                                TerminalPersistenceResolution::LostOwnership
+                                | TerminalPersistenceResolution::RequestMissing => {
+                                    tracing::Span::current()
+                                        .record("outcome", "ownership_lost");
+                                    counter!(
+                                        "fusillade_request_attempt_outcomes_total",
+                                        "model" => model_clone.clone(),
+                                        "resolution" => "revoked"
+                                    )
+                                    .increment(1);
+                                    return Ok(());
+                                }
+                            };
+
+                            if let Some(source) = processor_failure {
+                                counter!(
+                                    "fusillade_request_processor_recoveries_total",
+                                    "model" => model_clone.clone(),
+                                    "source" => source,
+                                    "resolution" => "terminal"
+                                )
+                                .increment(1);
                             }
+                            record_terminal_failure(
+                                &terminal_failed,
+                                TerminalFailureContext {
+                                    request_id,
+                                    batch_id,
+                                    model: &model_clone,
+                                    user_id: &user_id,
+                                    completion_window: &completion_window,
+                                    processing_start,
+                                    batch_expires_at,
+                                    requests_failed: requests_failed.as_ref(),
+                                    user_throughput: user_throughput.as_ref(),
+                                },
+                            );
                             Ok(())
                         }
-                        Ok(RequestCompletionResult::Canceled(_canceled)) => {
+                        RequestCompletionResult::Canceled(_canceled) => {
                             tracing::Span::current().record("outcome", "canceled");
                             counter!("fusillade_requests_cancelled_total", "model" => model_clone.clone()).increment(1);
                             // Keep the pre-split counter shape alive so existing
@@ -899,17 +1442,6 @@ where
                             counter!("fusillade_requests_completed_total", "model" => model_clone.clone(), "status" => "cancelled", "completion_window" => completion_window.clone()).increment(1);
                             counter!("fusillade_user_requests_completed_total", "user" => user_id.clone(), "status" => "cancelled", "completion_window" => completion_window.clone()).increment(1);
                             Ok(())
-                        }
-                        Err(FusilladeError::Shutdown) => {
-                            // Expected during daemon shutdown — treat as a clean
-                            // exit so poll_processing_tasks doesn't log it as a
-                            // background task failure.
-                            tracing::Span::current().record("outcome", "shutdown");
-                            Ok(())
-                        }
-                        Err(e) => {
-                            tracing::Span::current().record("outcome", "error");
-                            Err(e)
                         }
                     }
                 }.instrument(process_span));
@@ -1524,15 +2056,17 @@ where
             }
         }
 
+        let reclaim_loop_kind = reclaim_loop_kind_for_mode(mode);
         for claim_loop_kind in claim_loop_kinds {
+            let run_reclaim = claim_loop_kind == reclaim_loop_kind;
             match claim_loop_kind {
                 ClaimLoopKind::Request => {
                     let request_daemon = RequestDaemon::new(self.clone());
-                    claim_daemons.spawn(async move { request_daemon.run().await });
+                    claim_daemons.spawn(async move { request_daemon.run(run_reclaim).await });
                 }
                 ClaimLoopKind::Batch => {
                     let batch_daemon = BatchDaemon::new(self.clone());
-                    claim_daemons.spawn(async move { batch_daemon.run().await });
+                    claim_daemons.spawn(async move { batch_daemon.run(run_reclaim).await });
                 }
             }
         }
@@ -1580,6 +2114,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
+
     use super::*;
 
     #[test]
@@ -1648,8 +2184,281 @@ mod tests {
     }
 
     #[test]
+    fn daemon_mode_nominates_exactly_one_reclaim_loop() {
+        for (mode, supports_batch_claims, expected) in [
+            (DaemonMode::Both, true, ClaimLoopKind::Request),
+            (DaemonMode::Both, false, ClaimLoopKind::Request),
+            (DaemonMode::RequestOnly, true, ClaimLoopKind::Request),
+            (DaemonMode::BatchOnly, true, ClaimLoopKind::Batch),
+        ] {
+            let loops = claim_loop_kinds_for_mode(mode, supports_batch_claims).unwrap();
+            let nominated = reclaim_loop_kind_for_mode(mode);
+            assert_eq!(nominated, expected);
+            assert_eq!(
+                loops.iter().filter(|kind| **kind == nominated).count(),
+                1,
+                "{mode:?} must run reclaim from exactly one spawned loop"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn reclaim_runs_before_zero_capacity_exit() {
+        let maintenance_calls = Arc::new(AtomicUsize::new(0));
+        let capacity_checked = Arc::new(AtomicBool::new(false));
+        let calls = maintenance_calls.clone();
+        let checked = capacity_checked.clone();
+
+        let (reclaimed, capacity) = prepare_claim_capacity(
+            true,
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(2)
+            },
+            move || {
+                assert_eq!(
+                    maintenance_calls.load(Ordering::SeqCst),
+                    1,
+                    "capacity was checked before maintenance completed"
+                );
+                checked.store(true, Ordering::SeqCst);
+                None::<HashMap<String, usize>>
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(reclaimed, 2);
+        assert!(capacity.is_none());
+        assert!(capacity_checked.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn reclaim_error_prevents_capacity_and_claim_work() {
+        let capacity_checked = Arc::new(AtomicBool::new(false));
+        let checked = capacity_checked.clone();
+
+        let error = prepare_claim_capacity(
+            true,
+            async { Err(FusilladeError::Other(anyhow::anyhow!("maintenance failed"))) },
+            move || {
+                checked.store(true, Ordering::SeqCst);
+                Some(HashMap::<String, usize>::new())
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("maintenance failed"));
+        assert!(!capacity_checked.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn non_nominated_loop_does_not_poll_reclaim() {
+        let (reclaimed, capacity) = prepare_claim_capacity(
+            false,
+            async {
+                panic!("non-nominated loop polled reclaim future");
+                #[allow(unreachable_code)]
+                Ok(0)
+            },
+            || Some(HashMap::from([("test".to_string(), 1)])),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(reclaimed, 0);
+        assert_eq!(capacity.unwrap().get("test"), Some(&1));
+    }
+
+    #[test]
     fn default_claim_query_timeout_is_three_minutes() {
         assert_eq!(DaemonConfig::default().claim_query_timeout_ms, 180_000);
+    }
+
+    #[tokio::test]
+    async fn attempt_write_retries_only_typed_infrastructure_failures() {
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let request_id = crate::request::RequestId::from(uuid::Uuid::new_v4());
+        let attempt_id = crate::request::AttemptId::from(uuid::Uuid::new_v4());
+
+        let resolution =
+            attempt_write_until_resolved(&shutdown, request_id, attempt_id, "test_write", || {
+                let call = calls.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if call < 2 {
+                        Err(FusilladeError::AttemptPersistenceInfrastructure {
+                            operation: "test_write",
+                            source: anyhow::anyhow!("synthetic database outage"),
+                        })
+                    } else {
+                        Ok(true)
+                    }
+                }
+            })
+            .await
+            .expect("transient write should recover");
+
+        assert_eq!(resolution, AttemptWriteResolution::Applied);
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn deterministic_attempt_write_error_is_not_retried() {
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let request_id = crate::request::RequestId::from(uuid::Uuid::new_v4());
+        let attempt_id = crate::request::AttemptId::from(uuid::Uuid::new_v4());
+
+        let error =
+            attempt_write_until_resolved(&shutdown, request_id, attempt_id, "test_write", || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                async {
+                    Err(FusilladeError::Other(anyhow::anyhow!(
+                        "response body too large"
+                    )))
+                }
+            })
+            .await
+            .expect_err("deterministic error must fail loudly");
+
+        assert!(error.to_string().contains("response body too large"));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn legacy_pool_timeout_text_does_not_make_other_retryable() {
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        let error = attempt_write_until_resolved(
+            &shutdown,
+            crate::request::RequestId::from(uuid::Uuid::new_v4()),
+            crate::request::AttemptId::from(uuid::Uuid::new_v4()),
+            "test_write",
+            || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                async {
+                    Err(FusilladeError::Other(anyhow::anyhow!(
+                        "pool timed out while waiting for an open connection"
+                    )))
+                }
+            },
+        )
+        .await
+        .expect_err("generic error text must not enter durability retry");
+
+        assert!(matches!(error, FusilladeError::Other(_)));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn definitive_attempt_write_outcomes_are_classified_without_retry() {
+        let request_id = crate::request::RequestId::from(uuid::Uuid::new_v4());
+        let attempt_id = crate::request::AttemptId::from(uuid::Uuid::new_v4());
+
+        assert_eq!(
+            classify_attempt_write_result(Ok(false)).unwrap(),
+            AttemptWriteResolution::LostOwnership
+        );
+        assert_eq!(
+            classify_attempt_write_result(Err(FusilladeError::RequestNotFound(request_id)))
+                .unwrap(),
+            AttemptWriteResolution::RequestMissing
+        );
+        assert_eq!(
+            classify_attempt_write_result(Err(FusilladeError::RequestAttemptLost {
+                id: request_id,
+                attempt_id,
+            }))
+            .unwrap(),
+            AttemptWriteResolution::LostOwnership
+        );
+        assert_eq!(
+            classify_attempt_write_result(Err(FusilladeError::RequestStateConflict {
+                id: request_id,
+                current_state: "completed".to_string(),
+                expected: "claimed or processing",
+            }))
+            .unwrap(),
+            AttemptWriteResolution::LostOwnership
+        );
+        assert!(matches!(
+            classify_attempt_write_result(Err(FusilladeError::ValidationError(
+                "bad attempt".to_string()
+            ))),
+            Err(FusilladeError::ValidationError(_))
+        ));
+        assert!(matches!(
+            classify_attempt_write_result(Err(FusilladeError::InvalidState(
+                request_id,
+                "claimed".to_string(),
+                "processing".to_string(),
+            ))),
+            Err(FusilladeError::InvalidState(..))
+        ));
+    }
+
+    #[tokio::test]
+    async fn shutdown_interrupts_an_attempt_write_in_progress() {
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        shutdown.cancel();
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(100),
+            attempt_write_until_resolved(
+                &shutdown,
+                crate::request::RequestId::from(uuid::Uuid::new_v4()),
+                crate::request::AttemptId::from(uuid::Uuid::new_v4()),
+                "test_write",
+                || std::future::pending::<Result<bool>>(),
+            ),
+        )
+        .await
+        .expect("shutdown must interrupt the storage future");
+
+        assert!(matches!(result, Err(FusilladeError::Shutdown)));
+    }
+
+    #[tokio::test]
+    async fn shutdown_interrupts_attempt_write_backoff() {
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let first_call = Arc::new(tokio::sync::Notify::new());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let task = {
+            let shutdown = shutdown.clone();
+            let first_call = first_call.clone();
+            let calls = calls.clone();
+            tokio::spawn(async move {
+                attempt_write_until_resolved(
+                    &shutdown,
+                    crate::request::RequestId::from(uuid::Uuid::new_v4()),
+                    crate::request::AttemptId::from(uuid::Uuid::new_v4()),
+                    "test_write",
+                    || {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        first_call.notify_one();
+                        async {
+                            Err(FusilladeError::AttemptPersistenceInfrastructure {
+                                operation: "test_write",
+                                source: anyhow::anyhow!("synthetic outage"),
+                            })
+                        }
+                    },
+                )
+                .await
+            })
+        };
+
+        first_call.notified().await;
+        shutdown.cancel();
+        let result = tokio::time::timeout(Duration::from_millis(100), task)
+            .await
+            .expect("shutdown must interrupt durability backoff")
+            .expect("durability task panicked");
+        assert!(matches!(result, Err(FusilladeError::Shutdown)));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

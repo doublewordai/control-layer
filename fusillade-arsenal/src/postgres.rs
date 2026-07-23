@@ -37,8 +37,8 @@ use crate::daemon::{
 };
 use crate::error::{FusilladeError, Result};
 use crate::request::{
-    Canceled, CascadeTargetState, Claimed, Completed, CreateFlexInput, CreateRealtimeInput,
-    CreateResponseInput, DaemonId, Failed, FailureReason, LeakStamp, Pending,
+    AttemptId, Canceled, CascadeTargetState, Claimed, Completed, CreateFlexInput,
+    CreateRealtimeInput, CreateResponseInput, DaemonId, Failed, FailureReason, LeakStamp, Pending,
     PersistCompletedRealtimeInput, Processing, Request, RequestData, RequestId, RequestState,
     ServiceTierFilter,
 };
@@ -123,6 +123,24 @@ impl Default for BatchInsertStrategy {
     }
 }
 
+/// Private control-flow signal for a terminal statement whose MVCC snapshot
+/// saw an in-flight child but whose row lock subsequently observed a committed
+/// cancellation. The statement intentionally declines to update without the
+/// parent lock; `persist_attempt` consumes this signal and reruns the same
+/// already-prepared terminal outcome.
+#[derive(Debug)]
+struct ParentLockSnapshotRace;
+
+impl std::fmt::Display for ParentLockSnapshotRace {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("terminal persistence must reacquire the parent lock")
+    }
+}
+
+impl std::error::Error for ParentLockSnapshotRace {}
+
+type ProcessingCommitState = (String, Option<Uuid>, Option<Uuid>, Option<Uuid>);
+
 pub struct PostgresRequestManager<P: PoolProvider> {
     pools: P,
     config: PostgresStorageConfig,
@@ -135,18 +153,26 @@ pub struct PostgresRequestManager<P: PoolProvider> {
     /// reassembly moves into dwctl.
     response_transformer: std::sync::OnceLock<Arc<dyn crate::transform::ResponseTransformer>>,
     #[cfg(test)]
-    admission_release_test_hook: Option<Arc<AdmissionReleaseTestHook>>,
+    admission_release_test_hook: Option<Arc<TestPauseHook>>,
+    #[cfg(test)]
+    attempt_persist_failures_remaining: AtomicUsize,
+    #[cfg(test)]
+    processing_commit_ack_failures_remaining: AtomicUsize,
+    #[cfg(test)]
+    processing_commit_rollback_failures_remaining: AtomicUsize,
+    #[cfg(test)]
+    processing_commit_rollback_test_hook: Option<Arc<TestPauseHook>>,
 }
 
 #[cfg(test)]
 #[derive(Default)]
-struct AdmissionReleaseTestHook {
+struct TestPauseHook {
     entered: tokio::sync::Notify,
     resume: tokio::sync::Notify,
 }
 
 #[cfg(test)]
-impl AdmissionReleaseTestHook {
+impl TestPauseHook {
     async fn pause(&self) {
         self.entered.notify_one();
         self.resume.notified().await;
@@ -448,6 +474,7 @@ struct ClaimedRequestRow {
     id: Uuid,
     batch_id: Option<Uuid>,
     template_id: Uuid,
+    attempt_id: Uuid,
     retry_attempt: i32,
     custom_id: Option<String>,
     endpoint: String,
@@ -549,6 +576,14 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
             response_transformer: std::sync::OnceLock::new(),
             #[cfg(test)]
             admission_release_test_hook: None,
+            #[cfg(test)]
+            attempt_persist_failures_remaining: AtomicUsize::new(0),
+            #[cfg(test)]
+            processing_commit_ack_failures_remaining: AtomicUsize::new(0),
+            #[cfg(test)]
+            processing_commit_rollback_failures_remaining: AtomicUsize::new(0),
+            #[cfg(test)]
+            processing_commit_rollback_test_hook: None,
         }
     }
 
@@ -711,6 +746,257 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
         self.config.pending_request_counts_timeout_ms as i64
     }
 
+    async fn prepare_request_for_persistence<T>(&self, request: &Request<T>) -> Result<AnyRequest>
+    where
+        T: RequestState + Clone,
+        AnyRequest: From<Request<T>>,
+    {
+        self.prepare_any_request_for_persistence(AnyRequest::from(request.clone()))
+            .await
+    }
+
+    async fn prepare_any_request_for_persistence(
+        &self,
+        mut request: AnyRequest,
+    ) -> Result<AnyRequest> {
+        if let Some(transformer) = self.response_transformer.get() {
+            match &mut request {
+                AnyRequest::Completed(req) => {
+                    req.state.response_body = transformer
+                        .transform(&req.data, &req.state.response_body)
+                        .await?;
+                }
+                AnyRequest::Failed(req) => match &mut req.state.reason {
+                    FailureReason::RetriableHttpStatus { body, .. }
+                    | FailureReason::NonRetriableHttpStatus { body, .. } => {
+                        *body = transformer.transform(&req.data, body).await?;
+                    }
+                    _ => {}
+                },
+                _ => {}
+            }
+        }
+        Ok(request)
+    }
+
+    async fn run_terminal_post_commit_hook(&self, request: &RequestData) {
+        let Some(transformer) = self.response_transformer.get() else {
+            return;
+        };
+        if let Err(error) = transformer.after_terminal_persisted(request).await {
+            tracing::warn!(
+                request_id = %request.id,
+                error = %error,
+                "Terminal persistence cleanup failed; relying on its retention backstop"
+            );
+        }
+    }
+
+    fn terminal_request_data(request: &AnyRequest) -> Option<&RequestData> {
+        match request {
+            AnyRequest::Completed(req) => Some(&req.data),
+            AnyRequest::Failed(req) => Some(&req.data),
+            AnyRequest::Canceled(req) => Some(&req.data),
+            AnyRequest::Pending(_) | AnyRequest::Claimed(_) | AnyRequest::Processing(_) => None,
+        }
+    }
+
+    fn validate_attempt_request(request: &AnyRequest, attempt_id: AttemptId) -> Result<()> {
+        if attempt_id.is_nil() {
+            return Err(FusilladeError::ValidationError(
+                "nil attempt ID cannot authorize persistence".to_string(),
+            ));
+        }
+
+        match request {
+            AnyRequest::Claimed(req) if req.state.attempt_id != attempt_id => {
+                Err(FusilladeError::ValidationError(
+                    "claimed request attempt does not match persistence fence".to_string(),
+                ))
+            }
+            AnyRequest::Processing(req) if req.state.attempt_id != attempt_id => {
+                Err(FusilladeError::ValidationError(
+                    "processing request attempt does not match persistence fence".to_string(),
+                ))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn classify_attempt_cas(request_id: RequestId, exists: bool, applied: bool) -> Result<bool> {
+        match (exists, applied) {
+            (true, true) => Ok(true),
+            (true, false) => Ok(false),
+            (false, false) => Err(FusilladeError::RequestNotFound(request_id)),
+            (false, true) => unreachable!("an update cannot apply without a target row"),
+        }
+    }
+
+    fn is_transient_attempt_sqlstate(code: &str) -> bool {
+        code.starts_with("08")
+            || code.starts_with("53")
+            || matches!(
+                code,
+                "40001"
+                    | "40003"
+                    | "40P01"
+                    | "55P03"
+                    | "57014"
+                    | "57P01"
+                    | "57P02"
+                    | "57P03"
+                    | "57P05"
+                    | "58030"
+            )
+    }
+
+    fn is_transient_attempt_sqlx_error(error: &sqlx::Error) -> bool {
+        match error {
+            sqlx::Error::PoolTimedOut | sqlx::Error::Io(_) | sqlx::Error::Tls(_) => true,
+            sqlx::Error::Database(database) => {
+                database
+                    .code()
+                    .as_deref()
+                    .is_some_and(Self::is_transient_attempt_sqlstate)
+                    || database.message().contains("Authentication timed out")
+            }
+            _ => false,
+        }
+    }
+
+    fn classify_attempt_sqlx_error(operation: &'static str, source: sqlx::Error) -> FusilladeError {
+        if Self::is_transient_attempt_sqlx_error(&source) {
+            FusilladeError::AttemptPersistenceInfrastructure {
+                operation,
+                source: source.into(),
+            }
+        } else {
+            FusilladeError::Other(anyhow!(
+                "Attempt persistence failed during {operation}: {source}"
+            ))
+        }
+    }
+
+    /// Reconcile only this invocation's ambiguous `Claimed -> Processing`
+    /// commit. `Some(true)` means the exact transition is visible, `None`
+    /// means it is still exactly claimed and should be retried, and
+    /// `Some(false)` is a definitive ownership/state loss.
+    async fn reconcile_processing_commit(
+        &self,
+        request_id: RequestId,
+        owner: DaemonId,
+        attempt_id: AttemptId,
+        processing_admission_id: Uuid,
+    ) -> Result<Option<bool>> {
+        // A reconciliation is itself a state-write operation. The admitted
+        // executor reacquires its permit for each pool-acquisition attempt,
+        // releasing it before retry backoff while preserving pool headroom
+        // and the configured state-write cap.
+        let current: Option<ProcessingCommitState> = sqlx::query_as(
+            "SELECT state, daemon_id, attempt_id, processing_admission_id
+                 FROM requests WHERE id = $1",
+        )
+        .bind(*request_id)
+        .fetch_optional(self.admitted_write_executor("persist_attempt_reconcile"))
+        .await
+        .map_err(|error| Self::classify_attempt_sqlx_error("persist_attempt_reconcile", error))?;
+
+        match current {
+            None => Err(FusilladeError::RequestNotFound(request_id)),
+            Some((state, daemon_id, visible_attempt, visible_admission))
+                if state == "processing"
+                    && daemon_id == Some(*owner)
+                    && visible_attempt == Some(*attempt_id) =>
+            {
+                if visible_admission != Some(processing_admission_id) {
+                    metrics::counter!(
+                        "fusillade_processing_commit_reconciliations_total",
+                        "outcome" => "different_invocation"
+                    )
+                    .increment(1);
+                    return Ok(Some(false));
+                }
+                metrics::counter!(
+                    "fusillade_processing_commit_reconciliations_total",
+                    "outcome" => "committed"
+                )
+                .increment(1);
+                Ok(Some(true))
+            }
+            Some((state, daemon_id, visible_attempt, _))
+                if state == "claimed"
+                    && daemon_id == Some(*owner)
+                    && visible_attempt == Some(*attempt_id) =>
+            {
+                metrics::counter!(
+                    "fusillade_processing_commit_reconciliations_total",
+                    "outcome" => "retry"
+                )
+                .increment(1);
+                Ok(None)
+            }
+            Some(_) => {
+                metrics::counter!(
+                    "fusillade_processing_commit_reconciliations_total",
+                    "outcome" => "lost"
+                )
+                .increment(1);
+                Ok(Some(false))
+            }
+        }
+    }
+
+    async fn retry_attempt_once(
+        &self,
+        operation: &'static str,
+        request_id: RequestId,
+        owner: DaemonId,
+        attempt_id: AttemptId,
+        retry_attempt: u32,
+        not_before: Option<DateTime<Utc>>,
+    ) -> Result<bool> {
+        let row = sqlx::query!(
+            r#"
+            WITH target AS MATERIALIZED (
+                SELECT id, state, daemon_id, attempt_id
+                FROM requests
+                WHERE id = $1
+                FOR UPDATE
+            ),
+            updated AS (
+                UPDATE requests r
+                SET state = 'pending',
+                    retry_attempt = $4,
+                    not_before = $5,
+                    daemon_id = NULL,
+                    attempt_id = NULL,
+                    processing_admission_id = NULL,
+                    claimed_at = NULL,
+                    started_at = NULL
+                FROM target t
+                WHERE r.id = t.id
+                  AND t.state IN ('claimed', 'processing')
+                  AND t.daemon_id = $2
+                  AND t.attempt_id = $3
+                RETURNING r.id
+            )
+            SELECT
+                EXISTS (SELECT 1 FROM target) AS "exists!",
+                EXISTS (SELECT 1 FROM updated) AS "applied!"
+            "#,
+            *request_id as Uuid,
+            *owner as Uuid,
+            *attempt_id as Uuid,
+            retry_attempt as i32,
+            not_before,
+        )
+        .fetch_one(self.admitted_write_executor(operation))
+        .await
+        .map_err(|error| Self::classify_attempt_sqlx_error(operation, error))?;
+
+        Self::classify_attempt_cas(request_id, row.exists, row.applied)
+    }
+
     fn claimed_rows_to_requests(
         &self,
         rows: Vec<ClaimedRequestRow>,
@@ -789,6 +1075,7 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
                 Request {
                     state: Claimed {
                         daemon_id,
+                        attempt_id: AttemptId(row.attempt_id),
                         claimed_at,
                         retry_attempt: row.retry_attempt as u32,
                         batch_expires_at: row.batch_expires_at,
@@ -946,8 +1233,8 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
         #[cfg(test)]
         self.pause_for_admission_release_test().await;
 
-        let current: Option<String> =
-            sqlx::query_scalar("SELECT state FROM requests WHERE id = $1")
+        let current: Option<(String, Option<Uuid>)> =
+            sqlx::query_as("SELECT state, attempt_id FROM requests WHERE id = $1")
                 .bind(*request_id as Uuid)
                 .fetch_optional(self.write_executor())
                 .await
@@ -957,7 +1244,12 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
 
         match current {
             None => Err(FusilladeError::RequestNotFound(request_id)),
-            Some(state) => {
+            Some((state, Some(_))) => Err(FusilladeError::RequestStateConflict {
+                id: request_id,
+                current_state: format!("{state} (owned by a daemon attempt)"),
+                expected: "unowned request (attempt_id IS NULL)",
+            }),
+            Some((state, None)) => {
                 tracing::warn!(
                     request_id = %request_id,
                     current_state = %state,
@@ -971,80 +1263,156 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
         }
     }
 
-    /// Unclaim stale requests that have been stuck in "claimed" or "processing" states
-    /// for longer than the configured timeouts. This handles daemon crashes.
+    /// Reclaim claims that are safe to release after an abandoned attempt.
     ///
-    /// Returns the number of requests that were unclaimed. Limited by `unclaim_batch_size`
-    /// to prevent unbounded database load when many requests become stale simultaneously.
+    /// Tokenized claims may be released by age because their owner cannot pass
+    /// the processing fence after the token is revoked. Processing and legacy
+    /// NULL-token claims require positive evidence that their daemon is
+    /// unavailable. The bounded lock phase rechecks the exact owner and attempt
+    /// observed by the candidate scan so it cannot revoke a replacement claim.
     #[tracing::instrument(skip(self))]
     async fn unclaim_stale_requests(&self) -> Result<usize> {
         let claim_timeout_ms = self.config.claim_timeout_ms as i64;
-        let processing_timeout_ms = self.config.processing_timeout_ms as i64;
         let stale_daemon_threshold_ms = self.config.stale_daemon_threshold_ms as i64;
         let limit = self.config.unclaim_batch_size as i64;
 
-        // Unclaim requests that are stuck in claimed or processing states.
-        // Three reclaim paths, from fastest to slowest:
-        //   1. Daemon marked itself dead (graceful shutdown) — immediate
-        //   2. Daemon's heartbeat went stale (SIGKILL/OOM) — stale_daemon_threshold_ms
-        //   3. Time-based fallback (any cause) — claim_timeout_ms / processing_timeout_ms
-        //
-        // Uses UNION (not OR) so the planner can optimize each branch independently.
-        // With OR, Postgres falls into a bitmap heap scan of all in-progress rows (~50K)
-        // to evaluate the EXISTS subquery. With UNION, each branch uses its optimal
-        // index scan: ~4ms total vs ~1s with OR on a 14.5M row table.
+        // Keep invariant repair, age, and liveness as separate UNION ALL
+        // branches so each can use its own index strategy. The current-state and exact-identity
+        // predicates in `to_unclaim` are deliberately repeated after candidate
+        // discovery: EvalPlanQual must reject a row that changed attempt, owner,
+        // or claimed->processing before this statement acquired its lock.
         let unclaim_start = std::time::Instant::now();
         let result = sqlx::query!(
             r#"
-            UPDATE requests
-            SET
-                state = 'pending',
-                daemon_id = NULL,
-                claimed_at = NULL,
-                started_at = NULL
-            WHERE id IN (
-                SELECT id FROM (
-                    -- Time-based fallback: request stuck too long regardless of daemon state
-                    SELECT r.id FROM requests r
-                    WHERE
-                        (r.state = 'claimed' AND r.claimed_at < NOW() - ($1 || ' milliseconds')::INTERVAL)
-                        OR
-                        (r.state = 'processing' AND r.started_at < NOW() - ($2 || ' milliseconds')::INTERVAL)
-                    UNION
-                    -- Daemon-aware reclaim: daemon is dead or its heartbeat went stale
-                    SELECT r.id FROM requests r
-                    WHERE
-                        r.state IN ('claimed', 'processing')
-                        AND r.daemon_id IN (
-                            SELECT d.id FROM daemons d
-                            WHERE d.status = 'dead'
-                               OR d.last_heartbeat < NOW() - ($3 || ' milliseconds')::INTERVAL
+            WITH candidate_reasons AS (
+                SELECT r.id, r.daemon_id, r.attempt_id,
+                       FALSE AS owner_unavailable,
+                       TRUE AS repair_pending
+                FROM requests r
+                WHERE r.state = 'pending'
+                  AND r.attempt_id IS NOT NULL
+
+                UNION ALL
+
+                SELECT r.id, r.daemon_id, r.attempt_id,
+                       FALSE AS owner_unavailable,
+                       FALSE AS repair_pending
+                FROM requests r
+                WHERE r.state = 'claimed'
+                  AND r.attempt_id IS NOT NULL
+                  AND r.claimed_at
+                      < NOW() - ($1 || ' milliseconds')::INTERVAL
+
+                UNION ALL
+
+                SELECT r.id, r.daemon_id, r.attempt_id,
+                       TRUE AS owner_unavailable,
+                       FALSE AS repair_pending
+                FROM requests r
+                LEFT JOIN daemons d ON d.id = r.daemon_id
+                WHERE r.state IN ('claimed', 'processing')
+                  AND r.daemon_id
+                      <> '00000000-0000-0000-0000-000000000000'::UUID
+                  AND (
+                      d.id IS NULL
+                      OR d.status = 'dead'
+                      OR (
+                          d.status = 'running'
+                          AND d.last_heartbeat
+                              < NOW() - ($2 || ' milliseconds')::INTERVAL
+                      )
+                  )
+            ),
+            candidates AS (
+                SELECT id, daemon_id, attempt_id,
+                       BOOL_OR(owner_unavailable) AS owner_unavailable,
+                       BOOL_OR(repair_pending) AS repair_pending
+                FROM candidate_reasons
+                GROUP BY id, daemon_id, attempt_id
+            ),
+            to_unclaim AS (
+                SELECT r.id, c.repair_pending
+                FROM requests r
+                JOIN candidates c
+                  ON c.id = r.id
+                 AND r.daemon_id IS NOT DISTINCT FROM c.daemon_id
+                 AND r.attempt_id IS NOT DISTINCT FROM c.attempt_id
+                WHERE
+                    (
+                        r.state = 'pending'
+                        AND c.repair_pending
+                        AND r.attempt_id IS NOT NULL
+                    )
+                    OR (
+                        r.state = 'claimed'
+                        AND (
+                            c.owner_unavailable
+                            OR (
+                                r.attempt_id IS NOT NULL
+                                AND r.claimed_at
+                                    < NOW() - ($1 || ' milliseconds')::INTERVAL
+                            )
                         )
-                ) sub
-                LIMIT $4
+                    )
+                    OR (
+                        r.state = 'processing'
+                        AND c.owner_unavailable
+                    )
+                ORDER BY r.id
+                LIMIT $3
+                FOR UPDATE OF r SKIP LOCKED
+            ),
+            updated AS (
+                UPDATE requests r
+                SET
+                    state = 'pending',
+                    daemon_id = NULL,
+                    attempt_id = NULL,
+                    processing_admission_id = NULL,
+                    claimed_at = NULL,
+                    started_at = NULL
+                FROM to_unclaim stale
+                WHERE r.id = stale.id
+                RETURNING stale.repair_pending
             )
+            SELECT
+                COUNT(*)::BIGINT AS "total!",
+                COUNT(*) FILTER (WHERE repair_pending)::BIGINT AS "repaired_pending!"
+            FROM updated
             "#,
             claim_timeout_ms.to_string(),
-            processing_timeout_ms.to_string(),
             stale_daemon_threshold_ms.to_string(),
             limit,
         )
-        .execute(self.write_executor())
+        .fetch_one(self.write_executor())
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to unclaim stale requests: {}", e)))?;
         metrics::histogram!("fusillade_unclaim_stale_duration_seconds")
             .record(unclaim_start.elapsed().as_secs_f64());
 
-        let count = result.rows_affected() as usize;
+        let count = result.total as usize;
+        let repaired_pending = result.repaired_pending as usize;
+
+        if repaired_pending > 0 {
+            metrics::counter!("fusillade_pending_attempt_residue_repaired_total")
+                .increment(repaired_pending as u64);
+        }
+
+        let reclaimed_stale = count - repaired_pending;
+        if reclaimed_stale > 0 {
+            metrics::counter!("fusillade_stale_requests_reclaimed_total")
+                .increment(reclaimed_stale as u64);
+        }
 
         if count > 0 {
-            metrics::counter!("fusillade_stale_requests_reclaimed_total").increment(count as u64);
             tracing::warn!(
                 count = count,
+                repaired_pending,
+                reclaimed_stale,
                 claim_timeout_ms,
-                processing_timeout_ms,
                 stale_daemon_threshold_ms,
-                "Unclaimed stale requests (likely due to daemon crash or shutdown)"
+                "Reclaimed expired claims, repaired pending authority residue, or recovered \
+                 requests from unavailable daemons"
             );
         }
 
@@ -1822,15 +2190,6 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         user_active_counts: &std::collections::HashMap<String, usize>,
         leak_cooldown: &HashSet<(String, String, String)>,
     ) -> Result<Vec<Request<Claimed>>> {
-        // First, unclaim any stale requests (self-healing for daemon crashes)
-        let unclaimed_count = self.unclaim_stale_requests().await?;
-        if unclaimed_count > 0 {
-            tracing::info!(
-                unclaimed_count,
-                "Unclaimed stale requests before claiming new ones"
-            );
-        }
-
         let now = Utc::now();
 
         // Build model/capacity arrays for the single claim query.
@@ -1961,7 +2320,8 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                                     + $8::DOUBLE PRECISION
                                         * LEAST(GREATEST(EXTRACT(EPOCH FROM e.eff - $3), 0.0) / 86400.0, 1.0) AS blend
                             ) calc
-                            WHERE r.state = 'pending' AND r.model = m.model AND r.batch_id IS NULL
+                            WHERE r.state = 'pending' AND r.attempt_id IS NULL
+                              AND r.model = m.model AND r.batch_id IS NULL
                               AND r.template_id IS NOT NULL AND (r.not_before IS NULL OR r.not_before <= $3)
                               AND ((mf.state IS NULL OR mf.state = 'live')
                                    OR (EXTRACT(EPOCH FROM (e.eff - $3))
@@ -2015,7 +2375,8 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                                             + $8::DOUBLE PRECISION
                                                 * LEAST(GREATEST(EXTRACT(EPOCH FROM e.eff - $3), 0.0) / 86400.0, 1.0) AS blend
                                     ) calc
-                                    WHERE r.state = 'pending' AND r.model = m.model AND r.batch_id IS NULL
+                                    WHERE r.state = 'pending' AND r.attempt_id IS NULL
+                                      AND r.model = m.model AND r.batch_id IS NULL
                                       AND r.template_id IS NOT NULL AND (r.not_before IS NULL OR r.not_before <= $3)
                                       AND NOT ((mf.state IS NULL OR mf.state = 'live')
                                                OR (EXTRACT(EPOCH FROM (e.eff - $3))
@@ -2031,6 +2392,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                             CROSS JOIN LATERAL (
                                 SELECT 1 FROM requests r
                                 WHERE r.id = picks.id AND r.state = 'pending'
+                                  AND r.attempt_id IS NULL
                                 FOR UPDATE OF r SKIP LOCKED
                             ) lk
                         ) blb
@@ -2046,13 +2408,17 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
             SET
                 state = 'claimed',
                 daemon_id = $1,
+                attempt_id = gen_random_uuid(),
+                processing_admission_id = NULL,
                 claimed_at = $3
             FROM to_claim tc
             JOIN active_request_templates t ON tc.template_id = t.id
             WHERE r.id = tc.id
+              AND r.state = 'pending'
+              AND r.attempt_id IS NULL
             RETURNING r.id,
                       r.batch_id,
-                      r.template_id as "template_id!", r.retry_attempt,
+                      r.template_id as "template_id!", r.attempt_id as "attempt_id!", r.retry_attempt,
                       t.custom_id, t.endpoint as "endpoint!", t.method as "method!", t.path as "path!",
                       t.body as "body!", t.model as "model!", t.api_key as "api_key!",
                       tc.effective_expires_at as "batch_expires_at!",
@@ -2121,12 +2487,6 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         available_capacity: &std::collections::HashMap<String, usize>,
         user_active_counts: &std::collections::HashMap<String, usize>,
     ) -> Result<Vec<Request<Claimed>>> {
-        // NOTE: stale-request reclamation deliberately does NOT run here. The
-        // request daemon's `claim_batchless_requests` already runs
-        // `unclaim_stale_requests` every cycle (and reclaims batched rows too);
-        // repeating it here would double the serialized DB round-trips under
-        // the shared claim mutex for no additional coverage.
-
         let now = Utc::now();
         let mut model_capacity_pairs: Vec<(String, i64)> = available_capacity
             .iter()
@@ -2189,14 +2549,16 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
             batch_groups AS (
                 SELECT m.model, m.capacity,
                        (SELECT r.batch_id FROM requests r
-                        WHERE r.state = 'pending' AND r.model = m.model
+                        WHERE r.state = 'pending' AND r.attempt_id IS NULL
+                          AND r.model = m.model
                           AND r.template_id IS NOT NULL AND r.batch_id IS NOT NULL
                         ORDER BY r.batch_id LIMIT 1) AS batch_id
                 FROM all_models m
               UNION ALL
                 SELECT g.model, g.capacity,
                        (SELECT r.batch_id FROM requests r
-                        WHERE r.state = 'pending' AND r.model = g.model
+                        WHERE r.state = 'pending' AND r.attempt_id IS NULL
+                          AND r.model = g.model
                           AND r.template_id IS NOT NULL AND r.batch_id IS NOT NULL
                           AND r.batch_id > g.batch_id
                         ORDER BY r.batch_id LIMIT 1) AS batch_id
@@ -2260,6 +2622,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                         SELECT 1
                         FROM requests r
                         WHERE r.state = 'pending'
+                          AND r.attempt_id IS NULL
                           AND r.model = g.model
                           AND r.batch_id = g.batch_id
                           AND r.template_id IS NOT NULL
@@ -2277,6 +2640,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                     SELECT r.id, r.template_id, r.created_at
                     FROM requests r
                     WHERE r.state = 'pending'
+                      AND r.attempt_id IS NULL
                       AND r.model = sb.model
                       AND r.batch_id = sb.batch_id
                       AND r.template_id IS NOT NULL
@@ -2305,14 +2669,18 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
             SET
                 state = 'claimed',
                 daemon_id = $1,
+                attempt_id = gen_random_uuid(),
+                processing_admission_id = NULL,
                 claimed_at = $3
             FROM to_claim tc
             JOIN active_request_templates t ON tc.template_id = t.id
             JOIN batches b ON tc.batch_id = b.id
             WHERE r.id = tc.id
+              AND r.state = 'pending'
+              AND r.attempt_id IS NULL
             RETURNING r.id,
                       r.batch_id,
-                      r.template_id as "template_id!", r.retry_attempt,
+                      r.template_id as "template_id!", r.attempt_id as "attempt_id!", r.retry_attempt,
                       t.custom_id, t.endpoint as "endpoint!", t.method as "method!", t.path as "path!",
                       t.body as "body!", t.model as "model!", COALESCE(b.api_key, t.api_key) as "api_key!",
                       tc.effective_expires_at as "batch_expires_at!",
@@ -2373,6 +2741,10 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
             leak_cooldown,
         )
         .await
+    }
+
+    async fn reclaim_stale_requests(&self) -> Result<usize> {
+        self.unclaim_stale_requests().await
     }
 
     async fn append_model_filter_event(&self, entry: &ModelFilter) -> Result<()> {
@@ -2494,53 +2866,22 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
     {
         const MAX_ATTEMPTS: u32 = 3;
 
-        // TRANSITIONAL ZDR hook (see crate::transform): encrypt the terminal
-        // body ONCE, before the retry loop, so a DB retry can neither re-run
-        // the keystore nor double-encrypt. Only Completed/Failed carry a
-        // persisted body. The daemon (flex/batch) completes through persist(),
-        // so this is the write path ZDR bodies actually flow through -
-        // complete_request/fail_request are reached only by the realtime
-        // tool-loop path, which ZDR rejects at submit.
-        let mut any_request = AnyRequest::from(request.clone());
-        if let Some(transformer) = self.response_transformer.get() {
-            match &mut any_request {
-                AnyRequest::Completed(req) => {
-                    req.state.response_body = transformer
-                        .transform(&req.data, &req.state.response_body)
-                        .await?;
-                }
-                AnyRequest::Failed(req) => {
-                    // Only the HTTP-status variants carry an upstream response
-                    // body; the rest are internal error strings with no user
-                    // data. The encrypted body sits in the `error` column,
-                    // which retrieval never renders from (it omits the body),
-                    // so this closes the at-rest leak without affecting output.
-                    match &mut req.state.reason {
-                        FailureReason::RetriableHttpStatus { body, .. }
-                        | FailureReason::NonRetriableHttpStatus { body, .. } => {
-                            *body = transformer.transform(&req.data, body).await?;
-                        }
-                        _ => {}
-                    }
-                }
-                _ => {}
-            }
-        }
+        // Prepare terminal response data once before the SQL retry loop. The
+        // same helper is used by attempt-fenced persistence so ZDR behavior
+        // cannot diverge between compatibility and daemon paths.
+        let any_request = self.prepare_request_for_persistence(request).await?;
 
         for attempt in 0..MAX_ATTEMPTS {
             tracing::debug!(request_id = %request.data.id, "Persisting request state");
             let any_request = any_request.clone();
 
             let result: Result<Option<RequestId>> = async {
+                let terminal_request_data = Self::terminal_request_data(&any_request).cloned();
                 match any_request {
                     AnyRequest::Pending(req) => {
-                        // DELIBERATELY no terminal-state guard on this arm
-                        // (unlike every arm below): the manual retry path
-                        // uses persist(Pending) to intentionally move a
-                        // terminal `failed` row back to pending (see the
-                        // reschedule_for_retry comment). Daemon-side requeue
-                        // goes through reschedule_for_retry, which carries
-                        // its own state+owner fence.
+                        // Compatibility-only manual re-pend. It may revive an
+                        // unowned failed row, but cannot overwrite an active
+                        // attempt or broaden retry to other lifecycle states.
                         let rows_affected = sqlx::query!(
                             r#"
                             UPDATE requests SET
@@ -2548,9 +2889,13 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                                 retry_attempt = $2,
                                 not_before = $3,
                                 daemon_id = NULL,
+                                attempt_id = NULL,
+                                processing_admission_id = NULL,
                                 claimed_at = NULL,
                                 started_at = NULL
                             WHERE id = $1
+                              AND state = 'failed'
+                              AND attempt_id IS NULL
                             "#,
                             *req.data.id as Uuid,
                             req.state.retry_attempt as i32,
@@ -2564,7 +2909,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                         .rows_affected();
 
                         if rows_affected == 0 {
-                            return Err(FusilladeError::RequestNotFound(req.data.id));
+                            return self.dropped_or_missing(req.data.id).await;
                         }
                     }
                     AnyRequest::Claimed(req) => {
@@ -2576,9 +2921,11 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                                 daemon_id = $3,
                                 claimed_at = $4,
                                 started_at = NULL,
-                                not_before = NULL
+                                not_before = NULL,
+                                processing_admission_id = NULL
                             WHERE id = $1
-                              AND state NOT IN ('completed', 'failed', 'canceled')
+                              AND state = 'pending'
+                              AND attempt_id IS NULL
                             "#,
                             *req.data.id as Uuid,
                             req.state.retry_attempt as i32,
@@ -2611,9 +2958,12 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                                 retry_attempt = $2,
                                 daemon_id = $3,
                                 claimed_at = $4,
-                                started_at = clock_timestamp()
+                                started_at = clock_timestamp(),
+                                processing_admission_id = NULL
                             WHERE id = $1
-                              AND state NOT IN ('completed', 'failed', 'canceled')
+                              AND state = 'claimed'
+                              AND daemon_id = $3
+                              AND attempt_id IS NULL
                             "#,
                             *req.data.id as Uuid,
                             req.state.retry_attempt as i32,
@@ -2647,8 +2997,12 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                             UPDATE requests
                             SET started_at = clock_timestamp()
                             WHERE id = $1
+                              AND state = 'processing'
+                              AND daemon_id = $2
+                              AND attempt_id IS NULL
                             "#,
                             *req.data.id as Uuid,
+                            *req.state.daemon_id as Uuid,
                         )
                         .execute(&mut *tx)
                         .await
@@ -2678,21 +3032,35 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                         // supersedes the cancel (the user gets what they paid for).
                         // completed/failed are HARD terminals: only manual retry's
                         // re-pend may follow them; duplicate terminal persists are
-                        // dropped (first result wins). Superseding a canceled row on
-                        // a FROZEN batch must repair the counters in the SAME atomic
-                        // statement (canceled-1 / completed+1, total conserved) or
-                        // frozen counts drift from the rows — the prod 2026-07-16
-                        // incident (batch 2bdfb32f). If a concurrent retry already
-                        // unfroze the batch, the counter fix no-ops: live recount is
-                        // truth again.
-                        let old_state = sqlx::query_scalar!(
+                        // dropped (first result wins). The rare canceled
+                        // supersession takes locks batch-before-request, matching
+                        // retry/archive. Normal processing completions stay on the
+                        // child-only fast path. Frozen counters are repaired in the
+                        // same statement; an unfrozen batch advances retry_version
+                        // so a lazy finalizer cannot freeze a stale category count.
+                        let row = sqlx::query!(
                             r#"
-                            WITH prev AS (
-                                SELECT id, state AS old_state, batch_id
+                            WITH snapshot AS MATERIALIZED (
+                                SELECT state, batch_id, attempt_id
                                 FROM requests WHERE id = $1
-                                FOR UPDATE
                             ),
-                            upd AS (
+                            parent_lock AS MATERIALIZED (
+                                SELECT b.id
+                                FROM batches b
+                                JOIN snapshot s ON s.batch_id = b.id
+                                WHERE s.state = 'canceled'
+                                  AND s.attempt_id IS NULL
+                                FOR UPDATE OF b
+                            ),
+                            target AS MATERIALIZED (
+                                SELECT r.id, r.state AS old_state, r.batch_id,
+                                       r.attempt_id, p.id AS locked_batch_id
+                                FROM requests r
+                                LEFT JOIN parent_lock p ON p.id = r.batch_id
+                                WHERE r.id = $1
+                                FOR UPDATE OF r
+                            ),
+                            updated AS (
                                 UPDATE requests r SET
                                     state = 'completed',
                                     response_status = $2,
@@ -2701,22 +3069,55 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                                     completed_at = $5,
                                     response_size = $6,
                                     routed_model = $7,
-                                    canceled_at = NULL
-                                FROM prev
-                                WHERE r.id = prev.id
-                                  AND r.state NOT IN ('completed', 'failed')
-                                RETURNING prev.old_state, prev.batch_id
+                                    canceled_at = NULL,
+                                    daemon_id = NULL,
+                                    attempt_id = NULL,
+                                    processing_admission_id = NULL
+                                FROM target t
+                                WHERE r.id = t.id
+                                  AND t.old_state IN ('processing', 'canceled')
+                                  AND t.attempt_id IS NULL
+                                  AND (
+                                      t.old_state <> 'canceled'
+                                      OR t.batch_id IS NULL
+                                      OR t.locked_batch_id IS NOT NULL
+                                  )
+                                RETURNING t.old_state, t.batch_id
                             ),
-                            counter_fix AS (
+                            batch_change AS (
                                 UPDATE batches b SET
-                                    canceled_requests = b.canceled_requests - 1,
-                                    completed_requests = b.completed_requests + 1
-                                FROM upd
-                                WHERE upd.old_state = 'canceled'
-                                  AND b.id = upd.batch_id
-                                  AND b.counts_frozen_at IS NOT NULL
+                                    canceled_requests = CASE
+                                        WHEN b.counts_frozen_at IS NOT NULL
+                                            THEN b.canceled_requests - 1
+                                        ELSE b.canceled_requests
+                                    END,
+                                    completed_requests = CASE
+                                        WHEN b.counts_frozen_at IS NOT NULL
+                                            THEN b.completed_requests + 1
+                                        ELSE b.completed_requests
+                                    END,
+                                    retry_version = CASE
+                                        WHEN b.counts_frozen_at IS NULL
+                                            THEN b.retry_version + 1
+                                        ELSE b.retry_version
+                                    END
+                                FROM updated u
+                                WHERE u.old_state = 'canceled'
+                                  AND b.id = u.batch_id
+                                RETURNING b.id
                             )
-                            SELECT old_state AS "old_state!" FROM upd
+                            SELECT
+                                EXISTS (SELECT 1 FROM target) AS "exists!",
+                                EXISTS (SELECT 1 FROM updated) AS "applied!",
+                                (SELECT old_state FROM updated) AS "old_state?",
+                                (SELECT COUNT(*) FROM batch_change) AS "batch_changes!",
+                                EXISTS (
+                                    SELECT 1 FROM target t
+                                    WHERE t.old_state = 'canceled'
+                                      AND t.attempt_id IS NULL
+                                      AND t.batch_id IS NOT NULL
+                                      AND t.locked_batch_id IS NULL
+                                ) AS "reroute!"
                             "#,
                             *req.data.id as Uuid,
                             req.state.response_status as i16,
@@ -2726,22 +3127,26 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                             response_size,
                             req.state.routed_model,
                         )
-                        .fetch_optional(self.admitted_write_executor("persist"))
+                        .fetch_one(self.admitted_write_executor("persist"))
                         .await
                         .map_err(|e| {
                             FusilladeError::Other(anyhow!("Failed to update request: {}", e))
                         })?;
 
-                        match old_state {
-                            Some(old) if old == "canceled" => {
-                                tracing::info!(
-                                    request_id = %req.data.id,
-                                    "Late completion superseded best-effort cancellation \
-                                     (result was billed; frozen counters repaired atomically)"
-                                );
-                            }
-                            Some(_) => {}
-                            None => return self.dropped_or_missing(req.data.id).await,
+                        if row.reroute {
+                            return Err(FusilladeError::Other(anyhow!(
+                                "Canceled completion supersession raced its parent-lock snapshot"
+                            )));
+                        }
+                        if !row.applied {
+                            return self.dropped_or_missing(req.data.id).await;
+                        }
+                        if row.old_state.as_deref() == Some("canceled") {
+                            tracing::info!(
+                                request_id = %req.data.id,
+                                batch_changes = row.batch_changes,
+                                "Late completion superseded best-effort cancellation"
+                            );
                         }
                     }
                     AnyRequest::Failed(req) => {
@@ -2759,16 +3164,31 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                                 FusilladeError::Other(anyhow!("Error message too large"))
                             })?;
 
-                        // Same supersede-canceled semantics as the Completed arm
-                        // above (canceled = soft terminal; atomic counter repair).
-                        let old_state = sqlx::query_scalar!(
+                        // Same conditional parent-first canceled supersession
+                        // and count-snapshot invalidation as Completed above.
+                        let row = sqlx::query!(
                             r#"
-                            WITH prev AS (
-                                SELECT id, state AS old_state, batch_id
+                            WITH snapshot AS MATERIALIZED (
+                                SELECT state, batch_id, attempt_id
                                 FROM requests WHERE id = $1
-                                FOR UPDATE
                             ),
-                            upd AS (
+                            parent_lock AS MATERIALIZED (
+                                SELECT b.id
+                                FROM batches b
+                                JOIN snapshot s ON s.batch_id = b.id
+                                WHERE s.state = 'canceled'
+                                  AND s.attempt_id IS NULL
+                                FOR UPDATE OF b
+                            ),
+                            target AS MATERIALIZED (
+                                SELECT r.id, r.state AS old_state, r.batch_id,
+                                       r.attempt_id, p.id AS locked_batch_id
+                                FROM requests r
+                                LEFT JOIN parent_lock p ON p.id = r.batch_id
+                                WHERE r.id = $1
+                                FOR UPDATE OF r
+                            ),
+                            updated AS (
                                 UPDATE requests r SET
                                     state = 'failed',
                                     retry_attempt = $2,
@@ -2776,22 +3196,55 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                                     failed_at = $4,
                                     response_size = $5,
                                     routed_model = $6,
-                                    canceled_at = NULL
-                                FROM prev
-                                WHERE r.id = prev.id
-                                  AND r.state NOT IN ('completed', 'failed')
-                                RETURNING prev.old_state, prev.batch_id
+                                    canceled_at = NULL,
+                                    daemon_id = NULL,
+                                    attempt_id = NULL,
+                                    processing_admission_id = NULL
+                                FROM target t
+                                WHERE r.id = t.id
+                                  AND t.old_state IN ('claimed', 'processing', 'canceled')
+                                  AND t.attempt_id IS NULL
+                                  AND (
+                                      t.old_state <> 'canceled'
+                                      OR t.batch_id IS NULL
+                                      OR t.locked_batch_id IS NOT NULL
+                                  )
+                                RETURNING t.old_state, t.batch_id
                             ),
-                            counter_fix AS (
+                            batch_change AS (
                                 UPDATE batches b SET
-                                    canceled_requests = b.canceled_requests - 1,
-                                    failed_requests = b.failed_requests + 1
-                                FROM upd
-                                WHERE upd.old_state = 'canceled'
-                                  AND b.id = upd.batch_id
-                                  AND b.counts_frozen_at IS NOT NULL
+                                    canceled_requests = CASE
+                                        WHEN b.counts_frozen_at IS NOT NULL
+                                            THEN b.canceled_requests - 1
+                                        ELSE b.canceled_requests
+                                    END,
+                                    failed_requests = CASE
+                                        WHEN b.counts_frozen_at IS NOT NULL
+                                            THEN b.failed_requests + 1
+                                        ELSE b.failed_requests
+                                    END,
+                                    retry_version = CASE
+                                        WHEN b.counts_frozen_at IS NULL
+                                            THEN b.retry_version + 1
+                                        ELSE b.retry_version
+                                    END
+                                FROM updated u
+                                WHERE u.old_state = 'canceled'
+                                  AND b.id = u.batch_id
+                                RETURNING b.id
                             )
-                            SELECT old_state AS "old_state!" FROM upd
+                            SELECT
+                                EXISTS (SELECT 1 FROM target) AS "exists!",
+                                EXISTS (SELECT 1 FROM updated) AS "applied!",
+                                (SELECT old_state FROM updated) AS "old_state?",
+                                (SELECT COUNT(*) FROM batch_change) AS "batch_changes!",
+                                EXISTS (
+                                    SELECT 1 FROM target t
+                                    WHERE t.old_state = 'canceled'
+                                      AND t.attempt_id IS NULL
+                                      AND t.batch_id IS NOT NULL
+                                      AND t.locked_batch_id IS NULL
+                                ) AS "reroute!"
                             "#,
                             *req.data.id as Uuid,
                             req.state.retry_attempt as i32,
@@ -2800,22 +3253,26 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                             response_size,
                             req.state.routed_model,
                         )
-                        .fetch_optional(self.admitted_write_executor("persist"))
+                        .fetch_one(self.admitted_write_executor("persist"))
                         .await
                         .map_err(|e| {
                             FusilladeError::Other(anyhow!("Failed to update request: {}", e))
                         })?;
 
-                        match old_state {
-                            Some(old) if old == "canceled" => {
-                                tracing::info!(
-                                    request_id = %req.data.id,
-                                    "Late failure superseded best-effort cancellation \
-                                     (frozen counters repaired atomically)"
-                                );
-                            }
-                            Some(_) => {}
-                            None => return self.dropped_or_missing(req.data.id).await,
+                        if row.reroute {
+                            return Err(FusilladeError::Other(anyhow!(
+                                "Canceled failure supersession raced its parent-lock snapshot"
+                            )));
+                        }
+                        if !row.applied {
+                            return self.dropped_or_missing(req.data.id).await;
+                        }
+                        if row.old_state.as_deref() == Some("canceled") {
+                            tracing::info!(
+                                request_id = %req.data.id,
+                                batch_changes = row.batch_changes,
+                                "Late failure superseded best-effort cancellation"
+                            );
                         }
                     }
                     AnyRequest::Canceled(req) => {
@@ -2823,9 +3280,13 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                             r#"
                             UPDATE requests SET
                                 state = 'canceled',
-                                canceled_at = $2
+                                canceled_at = $2,
+                                daemon_id = NULL,
+                                attempt_id = NULL,
+                                processing_admission_id = NULL
                             WHERE id = $1
-                              AND state NOT IN ('completed', 'failed')
+                              AND state IN ('pending', 'claimed', 'processing', 'canceled')
+                              AND attempt_id IS NULL
                             "#,
                             *req.data.id as Uuid,
                             req.state.canceled_at,
@@ -2843,6 +3304,9 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                     }
                 }
 
+                if let Some(request_data) = terminal_request_data {
+                    self.run_terminal_post_commit_hook(&request_data).await;
+                }
                 Ok(None)
             }
             .await;
@@ -2872,6 +3336,635 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         )))
     }
 
+    async fn persist_attempt<T: RequestState + Clone>(
+        &self,
+        request: &Request<T>,
+        attempt_id: AttemptId,
+    ) -> Result<bool>
+    where
+        AnyRequest: From<Request<T>>,
+    {
+        const MAX_ATTEMPTS: u32 = 3;
+
+        let request = AnyRequest::from(request.clone());
+        Self::validate_attempt_request(&request, attempt_id)?;
+        let request = self.prepare_any_request_for_persistence(request).await?;
+        let transition = match &request {
+            AnyRequest::Pending(_) => "claimed_to_pending",
+            AnyRequest::Claimed(_) => "pending_to_claimed",
+            AnyRequest::Processing(_) => "claimed_to_processing",
+            AnyRequest::Completed(_) => "processing_to_completed",
+            AnyRequest::Failed(_) => "in_flight_to_failed",
+            AnyRequest::Canceled(_) => "in_flight_to_canceled",
+        };
+        let request_id = request.data().id;
+        // Set only after this invocation receives an error acknowledging its
+        // own COMMIT. It lets a later SQL retry continue reconciliation
+        // without making ordinary duplicate process calls idempotent.
+        let mut processing_commit_ambiguous = false;
+        // A claim attempt identifies the upstream execution, but
+        // Request<Claimed> is cloneable. Give this individual admission call
+        // a durable identity so ambiguous COMMIT reconciliation cannot
+        // mistake a concurrent clone's transition for its own.
+        let processing_admission_id = Uuid::new_v4();
+
+        let mut infrastructure_failures = 0u32;
+        loop {
+            let terminal_request_data = Self::terminal_request_data(&request).cloned();
+            let request = request.clone();
+            let result: Result<bool> = async {
+                #[cfg(test)]
+                if self
+                    .attempt_persist_failures_remaining
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                        remaining.checked_sub(1)
+                    })
+                    .is_ok()
+                {
+                    return Err(Self::classify_attempt_sqlx_error(
+                        "persist_attempt",
+                        sqlx::Error::PoolTimedOut,
+                    ));
+                }
+
+                match request {
+                    AnyRequest::Pending(req) => {
+                        let row = sqlx::query!(
+                            r#"
+                            WITH target AS MATERIALIZED (
+                                SELECT id, state, attempt_id
+                                FROM requests
+                                WHERE id = $1
+                                FOR UPDATE
+                            ),
+                            updated AS (
+                                UPDATE requests r
+                                SET state = 'pending',
+                                    retry_attempt = $2,
+                                    not_before = $3,
+                                    daemon_id = NULL,
+                                    attempt_id = NULL,
+                                    processing_admission_id = NULL,
+                                    claimed_at = NULL,
+                                    started_at = NULL
+                                FROM target t
+                                WHERE r.id = t.id
+                                  AND t.state = 'claimed'
+                                  AND t.attempt_id = $4
+                                RETURNING r.id
+                            )
+                            SELECT
+                                EXISTS (SELECT 1 FROM target) AS "exists!",
+                                EXISTS (SELECT 1 FROM updated) AS "applied!"
+                            "#,
+                            *req.data.id as Uuid,
+                            req.state.retry_attempt as i32,
+                            req.state.not_before,
+                            *attempt_id as Uuid,
+                        )
+                        .fetch_one(self.admitted_write_executor("persist_attempt"))
+                        .await
+                        .map_err(|error| {
+                            Self::classify_attempt_sqlx_error("persist_attempt", error)
+                        })?;
+                        Self::classify_attempt_cas(req.data.id, row.exists, row.applied)
+                    }
+                    AnyRequest::Claimed(req) => {
+                        let row = sqlx::query!(
+                            r#"
+                            WITH target AS MATERIALIZED (
+                                SELECT id, state, attempt_id
+                                FROM requests
+                                WHERE id = $1
+                                FOR UPDATE
+                            ),
+                            updated AS (
+                                UPDATE requests r
+                                SET state = 'claimed',
+                                    retry_attempt = $2,
+                                    daemon_id = $3,
+                                    attempt_id = $4,
+                                    processing_admission_id = NULL,
+                                    claimed_at = $5,
+                                    started_at = NULL,
+                                    not_before = NULL
+                                FROM target t
+                                WHERE r.id = t.id
+                                  AND t.state = 'pending'
+                                  AND t.attempt_id IS NULL
+                                RETURNING r.id
+                            )
+                            SELECT
+                                EXISTS (SELECT 1 FROM target) AS "exists!",
+                                EXISTS (SELECT 1 FROM updated) AS "applied!"
+                            "#,
+                            *req.data.id as Uuid,
+                            req.state.retry_attempt as i32,
+                            *req.state.daemon_id as Uuid,
+                            *attempt_id as Uuid,
+                            req.state.claimed_at,
+                        )
+                        .fetch_one(self.admitted_write_executor("persist_attempt"))
+                        .await
+                        .map_err(|error| {
+                            Self::classify_attempt_sqlx_error("persist_attempt", error)
+                        })?;
+                        Self::classify_attempt_cas(req.data.id, row.exists, row.applied)
+                    }
+                    AnyRequest::Processing(req) => {
+                        if processing_commit_ambiguous
+                            && let Some(applied) = self
+                                .reconcile_processing_commit(
+                                    req.data.id,
+                                    req.state.daemon_id,
+                                    attempt_id,
+                                    processing_admission_id,
+                                )
+                                .await?
+                        {
+                            return Ok(applied);
+                        }
+
+                        let (mut tx, admission_permit) =
+                            self.begin_admitted_write("persist_attempt").await.map_err(
+                                |error| Self::classify_attempt_sqlx_error("persist_attempt", error),
+                            )?;
+                        let row = sqlx::query!(
+                            r#"
+                            WITH target AS MATERIALIZED (
+                                SELECT id, state, daemon_id, attempt_id
+                                FROM requests
+                                WHERE id = $1
+                                FOR UPDATE
+                            ),
+                            updated AS (
+                                UPDATE requests r
+                                SET state = 'processing',
+                                    retry_attempt = $2,
+                                    daemon_id = $3,
+                                    claimed_at = $4,
+                                    started_at = clock_timestamp(),
+                                    processing_admission_id = $6
+                                FROM target t
+                                WHERE r.id = t.id
+                                  AND t.state = 'claimed'
+                                  AND t.daemon_id = $3
+                                  AND t.attempt_id = $5
+                                RETURNING r.id
+                            )
+                            SELECT
+                                EXISTS (SELECT 1 FROM target) AS "exists!",
+                                EXISTS (SELECT 1 FROM updated) AS "applied!"
+                            "#,
+                            *req.data.id as Uuid,
+                            req.state.retry_attempt as i32,
+                            *req.state.daemon_id as Uuid,
+                            req.state.claimed_at,
+                            *attempt_id as Uuid,
+                            processing_admission_id,
+                        )
+                        .fetch_one(&mut *tx)
+                        .await
+                        .map_err(|error| {
+                            Self::classify_attempt_sqlx_error("persist_attempt", error)
+                        })?;
+
+                        if !row.applied {
+                            tx.rollback().await.map_err(|error| {
+                                Self::classify_attempt_sqlx_error("persist_attempt", error)
+                            })?;
+                            return Self::classify_attempt_cas(
+                                req.data.id,
+                                row.exists,
+                                row.applied,
+                            );
+                        }
+
+                        let stamped = sqlx::query!(
+                            r#"
+                            UPDATE requests
+                            SET started_at = clock_timestamp()
+                            WHERE id = $1
+                              AND state = 'processing'
+                              AND daemon_id = $2
+                              AND attempt_id = $3
+                            "#,
+                            *req.data.id as Uuid,
+                            *req.state.daemon_id as Uuid,
+                            *attempt_id as Uuid,
+                        )
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(|error| {
+                            Self::classify_attempt_sqlx_error("persist_attempt", error)
+                        })?
+                        .rows_affected();
+                        if stamped != 1 {
+                            return Err(FusilladeError::Other(anyhow!(
+                                "Fenced processing start restamp matched {} rows",
+                                stamped
+                            )));
+                        }
+
+                        #[cfg(test)]
+                        let inject_rollback = self
+                            .processing_commit_rollback_failures_remaining
+                            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                                remaining.checked_sub(1)
+                            })
+                            .is_ok();
+                        #[cfg(not(test))]
+                        let inject_rollback = false;
+
+                        #[allow(unused_mut)]
+                        let mut commit_result = if inject_rollback {
+                            tx.rollback().await.map_err(|error| {
+                                Self::classify_attempt_sqlx_error("persist_attempt_rollback", error)
+                            })?;
+                            #[cfg(test)]
+                            if let Some(hook) = &self.processing_commit_rollback_test_hook {
+                                hook.pause().await;
+                            }
+                            Err(sqlx::Error::Protocol(
+                                "injected ambiguous processing commit rollback".to_string(),
+                            ))
+                        } else {
+                            tx.commit().await
+                        };
+                        #[cfg(test)]
+                        if commit_result.is_ok()
+                            && self
+                                .processing_commit_ack_failures_remaining
+                                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                                    remaining.checked_sub(1)
+                                })
+                                .is_ok()
+                        {
+                            commit_result = Err(sqlx::Error::Protocol(
+                                "injected lost processing commit acknowledgement".to_string(),
+                            ));
+                        }
+                        match commit_result {
+                            Ok(()) => Ok(true),
+                            Err(error) => {
+                                processing_commit_ambiguous = true;
+                                // The reconciliation read acquires admission
+                                // itself. Release the consumed transaction's
+                                // permit before reacquiring so a configured
+                                // write limit of one cannot self-deadlock.
+                                drop(admission_permit);
+                                match self
+                                    .reconcile_processing_commit(
+                                        req.data.id,
+                                        req.state.daemon_id,
+                                        attempt_id,
+                                        processing_admission_id,
+                                    )
+                                    .await?
+                                {
+                                    Some(applied) => Ok(applied),
+                                    None => Err(Self::classify_attempt_sqlx_error(
+                                        "persist_attempt_commit",
+                                        error,
+                                    )),
+                                }
+                            }
+                        }
+                    }
+                    AnyRequest::Completed(req) => {
+                        let response_size = calculate_response_body_size(&req.state.response_body)
+                            .ok_or_else(|| {
+                                FusilladeError::Other(anyhow!("Response body too large"))
+                            })?;
+                        let row = sqlx::query!(
+                            r#"
+                            WITH snapshot AS MATERIALIZED (
+                                SELECT state, batch_id, attempt_id
+                                FROM requests WHERE id = $1
+                            ),
+                            parent_lock AS MATERIALIZED (
+                                SELECT b.id
+                                FROM batches b
+                                JOIN snapshot s ON s.batch_id = b.id
+                                WHERE s.state = 'canceled'
+                                  AND s.attempt_id = $8
+                                FOR UPDATE OF b
+                            ),
+                            target AS MATERIALIZED (
+                                SELECT r.id, r.state AS old_state, r.batch_id,
+                                       r.attempt_id, p.id AS locked_batch_id
+                                FROM requests r
+                                LEFT JOIN parent_lock p ON p.id = r.batch_id
+                                WHERE r.id = $1
+                                FOR UPDATE OF r
+                            ),
+                            updated AS (
+                                UPDATE requests r
+                                SET state = 'completed',
+                                    response_status = $2,
+                                    response_body = $3,
+                                    claimed_at = $4,
+                                    completed_at = $5,
+                                    response_size = $6,
+                                    routed_model = $7,
+                                    canceled_at = NULL,
+                                    daemon_id = NULL,
+                                    attempt_id = NULL,
+                                    processing_admission_id = NULL
+                                FROM target t
+                                WHERE r.id = t.id
+                                  AND t.old_state IN ('processing', 'canceled')
+                                  AND t.attempt_id = $8
+                                  AND (
+                                      t.old_state <> 'canceled'
+                                      OR t.batch_id IS NULL
+                                      OR t.locked_batch_id IS NOT NULL
+                                  )
+                                RETURNING t.old_state, t.batch_id
+                            ),
+                            batch_change AS (
+                                UPDATE batches b
+                                SET canceled_requests = CASE
+                                        WHEN b.counts_frozen_at IS NOT NULL
+                                            THEN b.canceled_requests - 1
+                                        ELSE b.canceled_requests
+                                    END,
+                                    completed_requests = CASE
+                                        WHEN b.counts_frozen_at IS NOT NULL
+                                            THEN b.completed_requests + 1
+                                        ELSE b.completed_requests
+                                    END,
+                                    retry_version = CASE
+                                        WHEN b.counts_frozen_at IS NULL
+                                            THEN b.retry_version + 1
+                                        ELSE b.retry_version
+                                    END
+                                FROM updated u
+                                WHERE u.old_state = 'canceled'
+                                  AND b.id = u.batch_id
+                                RETURNING b.id
+                            )
+                            SELECT
+                                EXISTS (SELECT 1 FROM target) AS "exists!",
+                                EXISTS (SELECT 1 FROM updated) AS "applied!",
+                                (SELECT old_state FROM updated) AS "old_state?",
+                                (SELECT COUNT(*) FROM batch_change) AS "batch_changes!",
+                                EXISTS (
+                                    SELECT 1 FROM target t
+                                    WHERE t.old_state = 'canceled'
+                                      AND t.attempt_id = $8
+                                      AND t.batch_id IS NOT NULL
+                                      AND t.locked_batch_id IS NULL
+                                ) AS "reroute!"
+                            "#,
+                            *req.data.id as Uuid,
+                            req.state.response_status as i16,
+                            req.state.response_body,
+                            req.state.claimed_at,
+                            req.state.completed_at,
+                            response_size,
+                            req.state.routed_model,
+                            *attempt_id as Uuid,
+                        )
+                        .fetch_one(self.admitted_write_executor("persist_attempt"))
+                        .await
+                        .map_err(|error| {
+                            Self::classify_attempt_sqlx_error("persist_attempt", error)
+                        })?;
+                        if row.reroute {
+                            return Err(FusilladeError::Other(anyhow::Error::new(
+                                ParentLockSnapshotRace,
+                            )));
+                        }
+                        let applied =
+                            Self::classify_attempt_cas(req.data.id, row.exists, row.applied)?;
+                        if applied && row.old_state.as_deref() == Some("canceled") {
+                            tracing::info!(
+                                request_id = %req.data.id,
+                                batch_changes = row.batch_changes,
+                                "Fenced late completion superseded best-effort cancellation"
+                            );
+                        }
+                        Ok(applied)
+                    }
+                    AnyRequest::Failed(req) => {
+                        let error_json =
+                            serde_json::to_string(&req.state.reason).map_err(|error| {
+                                FusilladeError::Other(anyhow!(
+                                    "Failed to serialize failure reason: {}",
+                                    error
+                                ))
+                            })?;
+                        let response_size =
+                            calculate_error_message_size(&error_json).ok_or_else(|| {
+                                FusilladeError::Other(anyhow!("Error message too large"))
+                            })?;
+                        let row = sqlx::query!(
+                            r#"
+                            WITH snapshot AS MATERIALIZED (
+                                SELECT state, batch_id, attempt_id
+                                FROM requests WHERE id = $1
+                            ),
+                            parent_lock AS MATERIALIZED (
+                                SELECT b.id
+                                FROM batches b
+                                JOIN snapshot s ON s.batch_id = b.id
+                                WHERE s.state = 'canceled'
+                                  AND s.attempt_id = $7
+                                FOR UPDATE OF b
+                            ),
+                            target AS MATERIALIZED (
+                                SELECT r.id, r.state AS old_state, r.batch_id,
+                                       r.attempt_id, p.id AS locked_batch_id
+                                FROM requests r
+                                LEFT JOIN parent_lock p ON p.id = r.batch_id
+                                WHERE r.id = $1
+                                FOR UPDATE OF r
+                            ),
+                            updated AS (
+                                UPDATE requests r
+                                SET state = 'failed',
+                                    retry_attempt = $2,
+                                    error = $3,
+                                    failed_at = $4,
+                                    response_size = $5,
+                                    routed_model = $6,
+                                    canceled_at = NULL,
+                                    daemon_id = NULL,
+                                    attempt_id = NULL,
+                                    processing_admission_id = NULL
+                                FROM target t
+                                WHERE r.id = t.id
+                                  AND t.old_state IN ('claimed', 'processing', 'canceled')
+                                  AND t.attempt_id = $7
+                                  AND (
+                                      t.old_state <> 'canceled'
+                                      OR t.batch_id IS NULL
+                                      OR t.locked_batch_id IS NOT NULL
+                                  )
+                                RETURNING t.old_state, t.batch_id
+                            ),
+                            batch_change AS (
+                                UPDATE batches b
+                                SET canceled_requests = CASE
+                                        WHEN b.counts_frozen_at IS NOT NULL
+                                            THEN b.canceled_requests - 1
+                                        ELSE b.canceled_requests
+                                    END,
+                                    failed_requests = CASE
+                                        WHEN b.counts_frozen_at IS NOT NULL
+                                            THEN b.failed_requests + 1
+                                        ELSE b.failed_requests
+                                    END,
+                                    retry_version = CASE
+                                        WHEN b.counts_frozen_at IS NULL
+                                            THEN b.retry_version + 1
+                                        ELSE b.retry_version
+                                    END
+                                FROM updated u
+                                WHERE u.old_state = 'canceled'
+                                  AND b.id = u.batch_id
+                                RETURNING b.id
+                            )
+                            SELECT
+                                EXISTS (SELECT 1 FROM target) AS "exists!",
+                                EXISTS (SELECT 1 FROM updated) AS "applied!",
+                                (SELECT old_state FROM updated) AS "old_state?",
+                                (SELECT COUNT(*) FROM batch_change) AS "batch_changes!",
+                                EXISTS (
+                                    SELECT 1 FROM target t
+                                    WHERE t.old_state = 'canceled'
+                                      AND t.attempt_id = $7
+                                      AND t.batch_id IS NOT NULL
+                                      AND t.locked_batch_id IS NULL
+                                ) AS "reroute!"
+                            "#,
+                            *req.data.id as Uuid,
+                            req.state.retry_attempt as i32,
+                            error_json,
+                            req.state.failed_at,
+                            response_size,
+                            req.state.routed_model,
+                            *attempt_id as Uuid,
+                        )
+                        .fetch_one(self.admitted_write_executor("persist_attempt"))
+                        .await
+                        .map_err(|error| {
+                            Self::classify_attempt_sqlx_error("persist_attempt", error)
+                        })?;
+                        if row.reroute {
+                            return Err(FusilladeError::Other(anyhow::Error::new(
+                                ParentLockSnapshotRace,
+                            )));
+                        }
+                        let applied =
+                            Self::classify_attempt_cas(req.data.id, row.exists, row.applied)?;
+                        if applied && row.old_state.as_deref() == Some("canceled") {
+                            tracing::info!(
+                                request_id = %req.data.id,
+                                batch_changes = row.batch_changes,
+                                "Fenced late failure superseded best-effort cancellation"
+                            );
+                        }
+                        Ok(applied)
+                    }
+                    AnyRequest::Canceled(req) => {
+                        let row = sqlx::query!(
+                            r#"
+                            WITH target AS MATERIALIZED (
+                                SELECT id, state, attempt_id
+                                FROM requests
+                                WHERE id = $1
+                                FOR UPDATE
+                            ),
+                            updated AS (
+                                UPDATE requests r
+                                SET state = 'canceled',
+                                    canceled_at = $2,
+                                    daemon_id = NULL,
+                                    attempt_id = NULL,
+                                    processing_admission_id = NULL
+                                FROM target t
+                                WHERE r.id = t.id
+                                  AND t.state IN ('claimed', 'processing', 'canceled')
+                                  AND t.attempt_id = $3
+                                RETURNING r.id
+                            )
+                            SELECT
+                                EXISTS (SELECT 1 FROM target) AS "exists!",
+                                EXISTS (SELECT 1 FROM updated) AS "applied!"
+                            "#,
+                            *req.data.id as Uuid,
+                            req.state.canceled_at,
+                            *attempt_id as Uuid,
+                        )
+                        .fetch_one(self.admitted_write_executor("persist_attempt"))
+                        .await
+                        .map_err(|error| {
+                            Self::classify_attempt_sqlx_error("persist_attempt", error)
+                        })?;
+                        Self::classify_attempt_cas(req.data.id, row.exists, row.applied)
+                    }
+                }
+            }
+            .await;
+
+            match result {
+                Ok(true) => {
+                    if let Some(request_data) = &terminal_request_data {
+                        self.run_terminal_post_commit_hook(request_data).await;
+                    }
+                    return Ok(true);
+                }
+                Ok(false) => {
+                    metrics::counter!(
+                        "fusillade_request_attempt_fence_rejections_total",
+                        "transition" => transition
+                    )
+                    .increment(1);
+                    tracing::warn!(
+                        %request_id,
+                        %attempt_id,
+                        transition,
+                        "request.attempt_lost_ownership"
+                    );
+                    return Ok(false);
+                }
+                Err(FusilladeError::RequestNotFound(id)) => {
+                    return Err(FusilladeError::RequestNotFound(id));
+                }
+                Err(FusilladeError::Other(error)) if error.is::<ParentLockSnapshotRace>() => {
+                    tracing::debug!(
+                        %request_id,
+                        %attempt_id,
+                        transition,
+                        "Terminal persistence snapshot raced cancellation; reacquiring parent lock"
+                    );
+                    tokio::task::yield_now().await;
+                }
+                Err(error @ FusilladeError::AttemptPersistenceInfrastructure { .. }) => {
+                    infrastructure_failures += 1;
+                    if infrastructure_failures >= MAX_ATTEMPTS {
+                        return Err(error);
+                    }
+                    tracing::debug!(
+                        %request_id,
+                        %attempt_id,
+                        transition,
+                        sql_attempt = infrastructure_failures,
+                        error = %error,
+                        "Failed to persist fenced request transition, retrying"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        100 * 2u64.pow(infrastructure_failures - 1),
+                    ))
+                    .await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
     async fn reschedule_for_retry(
         &self,
         request_id: RequestId,
@@ -2893,11 +3986,14 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                 retry_attempt = $3,
                 not_before = $4,
                 daemon_id = NULL,
+                attempt_id = NULL,
+                processing_admission_id = NULL,
                 claimed_at = NULL,
                 started_at = NULL
             WHERE id = $1
               AND state = 'processing'
               AND daemon_id = $2
+              AND attempt_id IS NULL
             "#,
             *request_id as Uuid,
             *owner as Uuid,
@@ -2914,6 +4010,84 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         Ok(rows_affected > 0)
     }
 
+    async fn reschedule_attempt_for_retry(
+        &self,
+        request_id: RequestId,
+        owner: DaemonId,
+        attempt_id: AttemptId,
+        retry_attempt: u32,
+        not_before: Option<DateTime<Utc>>,
+    ) -> Result<bool> {
+        if attempt_id.is_nil() {
+            return Err(FusilladeError::ValidationError(
+                "nil attempt ID cannot authorize retry".to_string(),
+            ));
+        }
+        self.retry_attempt_once(
+            "retry_attempt",
+            request_id,
+            owner,
+            attempt_id,
+            retry_attempt,
+            not_before,
+        )
+        .await
+    }
+
+    async fn recover_attempt_for_retry(
+        &self,
+        request_id: RequestId,
+        owner: DaemonId,
+        attempt_id: AttemptId,
+        retry_attempt: u32,
+        not_before: Option<DateTime<Utc>>,
+    ) -> Result<bool> {
+        const MAX_ATTEMPTS: u32 = 3;
+
+        if attempt_id.is_nil() {
+            return Err(FusilladeError::ValidationError(
+                "nil attempt ID cannot authorize recovery".to_string(),
+            ));
+        }
+
+        for sql_attempt in 0..MAX_ATTEMPTS {
+            match self
+                .retry_attempt_once(
+                    "recover_attempt",
+                    request_id,
+                    owner,
+                    attempt_id,
+                    retry_attempt,
+                    not_before,
+                )
+                .await
+            {
+                Ok(applied) => return Ok(applied),
+                Err(FusilladeError::RequestNotFound(id)) => {
+                    return Err(FusilladeError::RequestNotFound(id));
+                }
+                Err(error @ FusilladeError::AttemptPersistenceInfrastructure { .. })
+                    if sql_attempt < MAX_ATTEMPTS - 1 =>
+                {
+                    tracing::debug!(
+                        %request_id,
+                        %attempt_id,
+                        sql_attempt = sql_attempt + 1,
+                        error = %error,
+                        "Failed to recover request attempt, retrying"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        100 * 2u64.pow(sql_attempt),
+                    ))
+                    .await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
+        unreachable!("attempt recovery loop returns on every final iteration")
+    }
+
     #[tracing::instrument(skip(self, ids), fields(count = ids.len()))]
     async fn get_requests(&self, ids: Vec<RequestId>) -> Result<Vec<Result<AnyRequest>>> {
         let uuid_ids: Vec<Uuid> = ids.iter().map(|id| **id).collect();
@@ -2924,7 +4098,8 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                 r.id as "id!", r.batch_id as "batch_id!", r.template_id as "template_id?", r.state as "state!",
                 t.custom_id as "custom_id?", t.endpoint as "endpoint?", t.method as "method?",
                 t.path as "path?", t.body as "body?", t.model as "model?", t.api_key as "api_key?",
-                r.retry_attempt as "retry_attempt!", r.not_before, r.daemon_id, r.claimed_at, r.started_at,
+                r.retry_attempt as "retry_attempt!", r.not_before, r.daemon_id,
+                r.attempt_id as "attempt_id?", r.claimed_at, r.started_at,
                 r.response_status, r.response_body, r.completed_at, r.error, r.failed_at, r.canceled_at,
                 b.expires_at as batch_expires_at, r.routed_model
             FROM (
@@ -2933,12 +4108,12 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                 -- bucket to prune by (ids arrive without batch context) and
                 -- plans as an Append of cheap per-partition index probes —
                 -- fine for this admin/detail-shaped path.
-                SELECT id, batch_id, template_id, state, retry_attempt, not_before, daemon_id,
+                SELECT id, batch_id, template_id, state, retry_attempt, not_before, daemon_id, attempt_id,
                        claimed_at, started_at, response_status, response_body, completed_at,
                        error, failed_at, canceled_at, routed_model
                 FROM requests WHERE id = ANY($1)
                 UNION ALL
-                SELECT id, batch_id, template_id, state, retry_attempt, not_before, daemon_id,
+                SELECT id, batch_id, template_id, state, retry_attempt, not_before, daemon_id, attempt_id,
                        claimed_at, started_at, response_status, response_body, completed_at,
                        error, failed_at, canceled_at, routed_model
                 FROM batch_requests_archive WHERE id = ANY($1)
@@ -3019,6 +4194,9 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                         daemon_id: DaemonId(row.daemon_id.ok_or_else(|| {
                             FusilladeError::Other(anyhow!("Missing daemon_id for claimed request"))
                         })?),
+                        // A NULL legacy token becomes an inspection-only nil
+                        // sentinel; durable authority is projected exactly.
+                        attempt_id: AttemptId(row.attempt_id.unwrap_or_else(Uuid::nil)),
                         claimed_at: row.claimed_at.ok_or_else(|| {
                             FusilladeError::Other(anyhow!("Missing claimed_at for claimed request"))
                         })?,
@@ -3044,6 +4222,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                                     "Missing daemon_id for processing request"
                                 ))
                             })?),
+                            attempt_id: AttemptId(row.attempt_id.unwrap_or_else(Uuid::nil)),
                             claimed_at: row.claimed_at.ok_or_else(|| {
                                 FusilladeError::Other(anyhow!(
                                     "Missing claimed_at for processing request"
@@ -4734,7 +5913,13 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                     r#"
                     UPDATE requests
                     SET state = 'canceled',
-                        canceled_at = COALESCE(canceled_at, NOW())
+                        canceled_at = COALESCE(canceled_at, NOW()),
+                        daemon_id = NULL,
+                        attempt_id = CASE
+                            WHEN state = 'pending' THEN NULL
+                            ELSE attempt_id
+                        END,
+                        processing_admission_id = NULL
                     WHERE batch_id = $1
                       AND state IN ('pending', 'claimed', 'processing')
                     "#,
@@ -4756,7 +5941,10 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                             WHEN COALESCE(response_size, 0) = 0
                                 THEN octet_length(COALESCE(error, $2))
                             ELSE response_size
-                        END
+                        END,
+                        daemon_id = NULL,
+                        attempt_id = NULL,
+                        processing_admission_id = NULL
                     WHERE batch_id = $1
                       AND state IN ('pending', 'claimed', 'processing')
                     "#,
@@ -5065,6 +6253,12 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                 _ => None,
             })
             .collect();
+        let mut retry_batch_ids: Vec<Uuid> = retryable
+            .iter()
+            .filter_map(|(_, batch_id)| *batch_id)
+            .collect();
+        retry_batch_ids.sort_unstable();
+        retry_batch_ids.dedup();
 
         let repended: std::collections::HashSet<Uuid> = if retryable.is_empty() {
             Default::default()
@@ -5073,6 +6267,30 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
             let mut tx = self.begin_write().await.map_err(|e| {
                 FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e))
             })?;
+
+            // Every batch lifecycle transaction takes parent locks before
+            // touching live or archived children. Sort UUIDs so two multi-batch
+            // retries cannot deadlock by receiving request IDs in opposite
+            // order. Some rows may cease to be retryable after this pre-read;
+            // locking their immutable parent is harmless and keeps the
+            // request-before-parent inversion impossible.
+            if !retry_batch_ids.is_empty() {
+                sqlx::query(
+                    "SELECT id FROM batches
+                     WHERE id = ANY($1)
+                     ORDER BY id
+                     FOR UPDATE",
+                )
+                .bind(&retry_batch_ids)
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(|e| {
+                    FusilladeError::Other(anyhow!(
+                        "Failed to lock parent batches for request retry: {}",
+                        e
+                    ))
+                })?;
+            }
 
             // Phase 3: failed rows of ARCHIVED batches live in the archive —
             // move them back as pending first (same one-step re-pend shape as
@@ -5083,11 +6301,13 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                 INSERT INTO requests (id, batch_id, template_id, state, retry_attempt, not_before,
                                       daemon_id, claimed_at, started_at, response_status, response_body,
                                       completed_at, error, failed_at, canceled_at, created_at, updated_at,
-                                      custom_id, model, response_size, routed_model, service_tier, created_by)
+                                      custom_id, model, response_size, routed_model, service_tier, created_by,
+                                      attempt_id, processing_admission_id)
                 SELECT a.id, a.batch_id, a.template_id, 'pending', 0, NULL,
                        NULL, NULL, NULL, NULL, NULL,
                        NULL, NULL, NULL, NULL, a.created_at, NOW(),
-                       a.custom_id, a.model, 0, NULL, a.service_tier, a.created_by
+                       a.custom_id, a.model, 0, NULL, a.service_tier, a.created_by,
+                       NULL, NULL
                 FROM batch_requests_archive a
                 WHERE a.id = ANY($1) AND a.state = 'failed'
                 ON CONFLICT (id) DO NOTHING
@@ -5136,6 +6356,8 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                     response_size = 0,
                     routed_model = NULL,
                     daemon_id = NULL,
+                    attempt_id = NULL,
+                    processing_admission_id = NULL,
                     claimed_at = NULL,
                     started_at = NULL
                 WHERE id = ANY($1) AND state = 'failed'
@@ -5285,11 +6507,13 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                 INSERT INTO requests (id, batch_id, template_id, state, retry_attempt, not_before,
                                       daemon_id, claimed_at, started_at, response_status, response_body,
                                       completed_at, error, failed_at, canceled_at, created_at, updated_at,
-                                      custom_id, model, response_size, routed_model, service_tier, created_by)
+                                      custom_id, model, response_size, routed_model, service_tier, created_by,
+                                      attempt_id, processing_admission_id)
                 SELECT a.id, a.batch_id, a.template_id, 'pending', 0, NULL,
                        NULL, NULL, NULL, NULL, NULL,
                        NULL, NULL, NULL, NULL, a.created_at, NOW(),
-                       a.custom_id, a.model, 0, NULL, a.service_tier, a.created_by
+                       a.custom_id, a.model, 0, NULL, a.service_tier, a.created_by,
+                       NULL, NULL
                 FROM batch_requests_archive a
                 WHERE a.archive_bucket = $2 AND a.batch_id = $1
                   AND a.state IN ('failed', 'canceled')
@@ -5348,6 +6572,8 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                 response_size = 0,
                 routed_model = NULL,
                 daemon_id = NULL,
+                attempt_id = NULL,
+                processing_admission_id = NULL,
                 claimed_at = NULL,
                 started_at = NULL
             WHERE batch_id = $1 AND state IN ('failed', 'canceled')
@@ -5441,7 +6667,8 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                 r.id as "id!", r.batch_id as "batch_id!", r.template_id as "template_id?", r.state as "state!",
                 t.custom_id as "custom_id?", t.endpoint as "endpoint?", t.method as "method?",
                 t.path as "path?", t.body as "body?", t.model as "model?", t.api_key as "api_key?",
-                r.retry_attempt as "retry_attempt!", r.not_before, r.daemon_id, r.claimed_at, r.started_at,
+                r.retry_attempt as "retry_attempt!", r.not_before, r.daemon_id,
+                r.attempt_id as "attempt_id?", r.claimed_at, r.started_at,
                 r.response_status, r.response_body, r.completed_at, r.error, r.failed_at, r.canceled_at,
                 b.expires_at as batch_expires_at, r.routed_model
             FROM (
@@ -5451,12 +6678,12 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                 -- from the batch row, so it prunes to one partition; for a
                 -- never-archived batch the bucket is NULL and the arm is
                 -- empty.
-                SELECT id, batch_id, template_id, state, retry_attempt, not_before, daemon_id,
+                SELECT id, batch_id, template_id, state, retry_attempt, not_before, daemon_id, attempt_id,
                        claimed_at, started_at, response_status, response_body, completed_at,
                        error, failed_at, canceled_at, routed_model, created_at
                 FROM requests WHERE batch_id = $1
                 UNION ALL
-                SELECT a.id, a.batch_id, a.template_id, a.state, a.retry_attempt, a.not_before, a.daemon_id,
+                SELECT a.id, a.batch_id, a.template_id, a.state, a.retry_attempt, a.not_before, a.daemon_id, a.attempt_id,
                        a.claimed_at, a.started_at, a.response_status, a.response_body, a.completed_at,
                        a.error, a.failed_at, a.canceled_at, a.routed_model, a.created_at
                 FROM batch_requests_archive a
@@ -5536,6 +6763,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                                 "Missing daemon_id for claimed execution"
                             ))
                         })?),
+                        attempt_id: AttemptId(row.attempt_id.unwrap_or_else(Uuid::nil)),
                         claimed_at: row.claimed_at.ok_or_else(|| {
                             FusilladeError::Other(anyhow!(
                                 "Missing claimed_at for claimed execution"
@@ -5558,6 +6786,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                                     "Missing daemon_id for processing execution"
                                 ))
                             })?),
+                            attempt_id: AttemptId(row.attempt_id.unwrap_or_else(Uuid::nil)),
                             claimed_at: row.claimed_at.ok_or_else(|| {
                                 FusilladeError::Other(anyhow!(
                                     "Missing claimed_at for processing execution"
@@ -6100,19 +7329,25 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         // distinguish a genuine missing row from a row that another writer had
         // already moved out of 'processing'. Concurrent completers (zombie
         // task replays, duplicate enqueues) hit the wrong-state case routinely.
-        let row: Option<(bool, Option<String>)> = sqlx::query_as(
+        let row: Option<(bool, Option<String>, Option<Uuid>)> = sqlx::query_as(
             "WITH updated AS (
                  UPDATE requests
                     SET state = 'completed',
                         response_status = $2,
                         response_body = $3,
                         response_size = $4,
-                        completed_at = NOW()
-                  WHERE id = $1 AND state = 'processing'
+                        completed_at = NOW(),
+                        processing_admission_id = NULL
+                  WHERE id = $1
+                    AND state = 'processing'
+                    AND service_tier = 'priority'
+                    AND batch_id IS NULL
+                    AND attempt_id IS NULL
                  RETURNING 1
              )
              SELECT EXISTS(SELECT 1 FROM updated) AS matched,
-                    (SELECT state FROM requests WHERE id = $1) AS current_state
+                    (SELECT state FROM requests WHERE id = $1) AS current_state,
+                    (SELECT attempt_id FROM requests WHERE id = $1) AS current_attempt
              WHERE EXISTS(SELECT 1 FROM requests WHERE id = $1)",
         )
         .bind(request_id.0)
@@ -6124,14 +7359,26 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to complete request: {}", e)))?;
 
         match row {
-            Some((true, _)) => Ok(()),
-            Some((false, Some(current_state))) => Err(FusilladeError::RequestStateConflict {
-                id: request_id,
-                current_state,
-                expected: "processing",
-            }),
+            Some((true, _, _)) => Ok(()),
+            Some((false, Some(current_state), current_attempt)) => {
+                let (current_state, expected) = if current_attempt.is_some() {
+                    (
+                        format!("{current_state} (owned by a daemon attempt)"),
+                        "unowned realtime processing row",
+                    )
+                } else if current_state == "processing" {
+                    (current_state, "unowned realtime processing row")
+                } else {
+                    (current_state, "processing")
+                };
+                Err(FusilladeError::RequestStateConflict {
+                    id: request_id,
+                    current_state,
+                    expected,
+                })
+            }
             // Fallback: row vanished between the CTE and the SELECT, or no row exists.
-            Some((false, None)) | None => Err(FusilladeError::RequestNotFound(request_id)),
+            Some((false, None, _)) | None => Err(FusilladeError::RequestNotFound(request_id)),
         }
     }
 
@@ -6150,18 +7397,24 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         })?;
 
         let error_size = error_json.len() as i64;
-        let row: Option<(bool, Option<String>)> = sqlx::query_as(
+        let row: Option<(bool, Option<String>, Option<Uuid>)> = sqlx::query_as(
             "WITH updated AS (
                  UPDATE requests
                     SET state = 'failed',
                         error = $2,
                         response_size = $3,
-                        failed_at = NOW()
-                  WHERE id = $1 AND state = 'processing'
+                        failed_at = NOW(),
+                        processing_admission_id = NULL
+                  WHERE id = $1
+                    AND state = 'processing'
+                    AND service_tier = 'priority'
+                    AND batch_id IS NULL
+                    AND attempt_id IS NULL
                  RETURNING 1
              )
              SELECT EXISTS(SELECT 1 FROM updated) AS matched,
-                    (SELECT state FROM requests WHERE id = $1) AS current_state
+                    (SELECT state FROM requests WHERE id = $1) AS current_state,
+                    (SELECT attempt_id FROM requests WHERE id = $1) AS current_attempt
              WHERE EXISTS(SELECT 1 FROM requests WHERE id = $1)",
         )
         .bind(request_id.0)
@@ -6172,13 +7425,25 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to fail request: {}", e)))?;
 
         match row {
-            Some((true, _)) => Ok(()),
-            Some((false, Some(current_state))) => Err(FusilladeError::RequestStateConflict {
-                id: request_id,
-                current_state,
-                expected: "processing",
-            }),
-            Some((false, None)) | None => Err(FusilladeError::RequestNotFound(request_id)),
+            Some((true, _, _)) => Ok(()),
+            Some((false, Some(current_state), current_attempt)) => {
+                let (current_state, expected) = if current_attempt.is_some() {
+                    (
+                        format!("{current_state} (owned by a daemon attempt)"),
+                        "unowned realtime processing row",
+                    )
+                } else if current_state == "processing" {
+                    (current_state, "unowned realtime processing row")
+                } else {
+                    (current_state, "processing")
+                };
+                Err(FusilladeError::RequestStateConflict {
+                    id: request_id,
+                    current_state,
+                    expected,
+                })
+            }
+            Some((false, None, _)) | None => Err(FusilladeError::RequestNotFound(request_id)),
         }
     }
 
@@ -6248,7 +7513,8 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                    response_size = v.size,
                    error = v.error,
                    completed_at = CASE WHEN v.status BETWEEN 200 AND 299 THEN NOW() ELSE NULL END,
-                   failed_at = CASE WHEN v.status BETWEEN 200 AND 299 THEN NULL ELSE NOW() END
+                   failed_at = CASE WHEN v.status BETWEEN 200 AND 299 THEN NULL ELSE NOW() END,
+                   processing_admission_id = NULL
               FROM UNNEST(
                   $1::uuid[], $2::text[], $3::bigint[], $4::smallint[], $5::text[]
               ) AS v(id, body, size, status, error)
@@ -6256,6 +7522,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                AND r.state = 'processing'
                AND r.service_tier = 'priority'
                AND r.batch_id IS NULL
+               AND r.attempt_id IS NULL
             RETURNING r.id
             "#,
             &ids as &[Uuid],
@@ -6569,10 +7836,11 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
             // Write-time race guards — our counts come from an earlier
             // SELECT, and a concurrent retry/cancel can commit in between:
             // - retry_version CAS: batch retry increments retry_version while
-            //   resetting terminal state. The retried row is otherwise
-            //   indistinguishable from a never-stamped one, and this is a
-            //   target-row condition, so it stays correct even when this
-            //   UPDATE resumes from a lock wait (subquery guards do not).
+            //   resetting terminal state, and an unfrozen canceled terminal
+            //   supersession increments it when changing count categories.
+            //   This is the generation of the count snapshot, and a target-row
+            //   condition stays correct even when this UPDATE resumes from a
+            //   lock wait (subquery guards do not).
             // - terminal timestamps still unset (target-row; also blocks
             //   stamping over a concurrent cancel).
             // - NOT EXISTS non-terminal rows: re-verifies against writers
@@ -6654,7 +7922,7 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
             if is_actually_terminal
                 && (completed_at.is_some() || failed_at.is_some() || cancelled_at.is_some())
             {
-                sqlx::query!(
+                let freeze_result = sqlx::query!(
                     r#"
                     UPDATE batches
                     SET completed_requests = $2,
@@ -6682,6 +7950,19 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
                 .map_err(|e| {
                     FusilladeError::Other(anyhow!("Failed to freeze batch counts: {}", e))
                 })?;
+
+                if freeze_result.rows_affected() == 0 && retry_on_lost_race {
+                    tracing::debug!(
+                        %batch_id,
+                        "Count freeze lost its snapshot generation; re-reading batch"
+                    );
+                    return Box::pin(self.get_batch_from_pool_inner(
+                        batch_id,
+                        executor_for_retry,
+                        false,
+                    ))
+                    .await;
+                }
             }
             (finalizing_at_db, completed_at, failed_at)
         };
@@ -6738,7 +8019,9 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
             r#"
             -- Step 1: Find candidate batches that are terminal by count.
             -- Batches already frozen (counts_frozen_at set) skip the recount
-            -- and serve their persisted counters.
+            -- and serve their persisted counters. retry_version is the count
+            -- snapshot generation: retries and unfrozen terminal-category
+            -- changes invalidate candidates before the guarded write below.
             WITH candidates AS (
                 SELECT b.id,
                        b.retry_version,
@@ -7997,12 +9280,13 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
             .await
             .map_err(|e| FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e)))?;
 
-        // Lock the batch row for the whole move. Retry / cancel / freeze all
-        // UPDATE this row, so they queue behind the move (and vice versa) —
-        // no interleaving is possible while we hold the lock. The bucket is
-        // derived HERE, once, in UTC (`AT TIME ZONE 'UTC'` so the ISO-week
-        // Monday can never depend on the session TimeZone) and stamped;
-        // every later reader uses the stamped value, never re-derives.
+        // Lock the batch row for the whole move. Retry / cancel / freeze and
+        // canceled->completed/failed supersession all take the same
+        // parent-before-child order, so they queue behind the move (and vice
+        // versa) without an inversion. The bucket is derived HERE, once, in
+        // UTC (`AT TIME ZONE 'UTC'` so the ISO-week Monday can never depend on
+        // the session TimeZone) and stamped; every later reader uses the
+        // stamped value, never re-derives.
         //
         // SKIP LOCKED, not a plain FOR UPDATE: concurrent movers all walk
         // the same oldest-first candidate list, so with a waiting lock they
@@ -8104,20 +9388,25 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
 
         // Forward move. The named mapping allows the two tables' physical
         // column order to evolve independently. ON CONFLICT makes crash-resume
-        // replay a no-op for rows already copied.
+        // replay a no-op for rows already copied. A copied attempt_id is
+        // historical inspection data only: deleting the live row below is the
+        // revocation boundary, and attempt-authorized writes target only
+        // `requests`, where they subsequently report RequestNotFound.
         let inserted = sqlx::query(
             r#"
             INSERT INTO batch_requests_archive (
                 id, batch_id, template_id, state, retry_attempt, not_before, daemon_id,
                 claimed_at, started_at, response_status, response_body, completed_at,
                 error, failed_at, canceled_at, created_at, updated_at, custom_id, model,
-                response_size, routed_model, service_tier, created_by, archive_bucket
+                response_size, routed_model, service_tier, created_by, attempt_id,
+                processing_admission_id, archive_bucket
             )
             SELECT r.id, r.batch_id, r.template_id, r.state, r.retry_attempt, r.not_before,
                    r.daemon_id, r.claimed_at, r.started_at, r.response_status, r.response_body,
                    r.completed_at, r.error, r.failed_at, r.canceled_at, r.created_at,
                    r.updated_at, r.custom_id, r.model, r.response_size, r.routed_model,
-                   r.service_tier, r.created_by, $2::date
+                   r.service_tier, r.created_by, r.attempt_id, r.processing_admission_id,
+                   $2::date
             FROM requests r
             WHERE r.batch_id = $1
             ON CONFLICT (id, archive_bucket) DO NOTHING
@@ -8383,6 +9672,48 @@ mod tests {
     impl MockHttpClient {
         fn new() -> Self {
             Self
+        }
+    }
+
+    #[test]
+    fn attempt_sqlstate_classifier_is_positive_and_conservative() {
+        for code in [
+            "08006", "40001", "40003", "40P01", "53300", "55P03", "57014", "57P03", "58030",
+        ] {
+            assert!(
+                PostgresRequestManager::<TestDbPools>::is_transient_attempt_sqlstate(code),
+                "{code} should be transient"
+            );
+        }
+        for code in ["22001", "23505", "23514", "42501", "42703", "XX000"] {
+            assert!(
+                !PostgresRequestManager::<TestDbPools>::is_transient_attempt_sqlstate(code),
+                "{code} should be definitive"
+            );
+        }
+    }
+
+    #[test]
+    fn attempt_sqlx_classifier_retries_only_transport_and_pool_availability() {
+        let io = sqlx::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "connection reset",
+        ));
+        let tls = sqlx::Error::Tls(Box::new(std::io::Error::other("TLS unavailable")));
+
+        for error in [sqlx::Error::PoolTimedOut, io, tls] {
+            assert!(PostgresRequestManager::<TestDbPools>::is_transient_attempt_sqlx_error(&error));
+        }
+        for error in [
+            sqlx::Error::Protocol("response admission semaphore closed".to_string()),
+            sqlx::Error::RowNotFound,
+            sqlx::Error::InvalidArgument("bad argument".to_string()),
+            sqlx::Error::PoolClosed,
+            sqlx::Error::BeginFailed,
+        ] {
+            assert!(
+                !PostgresRequestManager::<TestDbPools>::is_transient_attempt_sqlx_error(&error)
+            );
         }
     }
 
@@ -8927,13 +10258,17 @@ mod tests {
     #[sqlx::test]
     async fn processing_conflict_releases_admission_before_diagnostic(pool: sqlx::PgPool) {
         let (mut manager, claimed) = claim_one_processing(&pool, None).await;
-        sqlx::query("UPDATE requests SET state = 'canceled', canceled_at = NOW() WHERE id = $1")
-            .bind(*claimed.data.id)
-            .execute(&pool)
-            .await
-            .unwrap();
+        sqlx::query(
+            "UPDATE requests \
+             SET state = 'canceled', canceled_at = NOW(), attempt_id = NULL \
+             WHERE id = $1",
+        )
+        .bind(*claimed.data.id)
+        .execute(&pool)
+        .await
+        .unwrap();
 
-        let hook = Arc::new(AdmissionReleaseTestHook::default());
+        let hook = Arc::new(TestPauseHook::default());
         manager.admission_release_test_hook = Some(hook.clone());
         let manager = Arc::new(manager);
         let (_result_tx, result_rx) = tokio::sync::mpsc::channel(1);
@@ -8941,6 +10276,7 @@ mod tests {
             data: claimed.data.clone(),
             state: Processing {
                 daemon_id: claimed.state.daemon_id,
+                attempt_id: claimed.state.attempt_id,
                 claimed_at: claimed.state.claimed_at,
                 started_at: Utc::now(),
                 retry_attempt: claimed.state.retry_attempt,
@@ -9005,14 +10341,6 @@ mod tests {
         user_active_counts: &HashMap<String, usize>,
     ) -> Vec<Request<Claimed>> {
         mark_models_live_for_test(manager, available_capacity.keys()).await;
-        // The batch claim itself no longer reclaims stale rows — in production
-        // the request daemon's claim cycle runs `unclaim_stale_requests` every
-        // interval (covering batched rows too). Mirror that here so tests that
-        // exercise stale-reclaim via the batch path keep working.
-        manager
-            .unclaim_stale_requests()
-            .await
-            .expect("unclaim stale failed");
         manager
             .claim_batch_requests(
                 limit,
@@ -10003,6 +11331,354 @@ mod tests {
     // Request claiming, cancellation, and retrieval
 
     #[sqlx::test]
+    async fn test_claim_batchless_request_returns_stored_attempt_token(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+        let request_id = manager
+            .create_flex(CreateFlexInput {
+                request_id: Uuid::new_v4(),
+                body: r#"{"model":"test","service_tier":"flex"}"#.to_string(),
+                model: "test".to_string(),
+                endpoint: "https://api.example.com".to_string(),
+                method: "POST".to_string(),
+                path: "/test".to_string(),
+                api_key: "key".to_string(),
+                created_by: "user".to_string(),
+            })
+            .await
+            .unwrap();
+
+        let claimed = manager
+            .claim_batchless_requests(
+                1,
+                DaemonId::from(Uuid::new_v4()),
+                &HashMap::from([("test".to_string(), 1)]),
+                &HashMap::new(),
+                &HashSet::new(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].data.id, request_id);
+        let stored_attempt: Option<Uuid> =
+            sqlx::query_scalar("SELECT attempt_id FROM requests WHERE id = $1")
+                .bind(*request_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            stored_attempt,
+            Some(*claimed[0].state.attempt_id),
+            "the daemon must receive the exact token installed by the claim UPDATE"
+        );
+        assert!(!claimed[0].state.attempt_id.is_nil());
+    }
+
+    #[sqlx::test]
+    async fn test_claim_batch_request_returns_stored_attempt_token(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+        let file_id = manager
+            .create_file(
+                "attempt-token-batch".to_string(),
+                None,
+                vec![RequestTemplateInput {
+                    custom_id: None,
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/test".to_string(),
+                    body: "{}".to_string(),
+                    model: "test".to_string(),
+                    api_key: "key".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+        manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+                api_key_id: None,
+                api_key: None,
+                total_requests: None,
+            })
+            .await
+            .unwrap();
+        mark_models_live_for_test(&manager, ["test"]).await;
+
+        let claimed = manager
+            .claim_batch_requests(
+                1,
+                1,
+                DaemonId::from(Uuid::new_v4()),
+                &HashMap::from([("test".to_string(), 1)]),
+                &HashMap::new(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(claimed.len(), 1);
+        let stored_attempt: Option<Uuid> =
+            sqlx::query_scalar("SELECT attempt_id FROM requests WHERE id = $1")
+                .bind(*claimed[0].data.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            stored_attempt,
+            Some(*claimed[0].state.attempt_id),
+            "the batch daemon must receive the exact stored claim token"
+        );
+        assert!(!claimed[0].state.attempt_id.is_nil());
+    }
+
+    #[sqlx::test]
+    async fn test_claim_skips_pending_row_with_retained_attempt_token(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+        let request_id = manager
+            .create_flex(CreateFlexInput {
+                request_id: Uuid::new_v4(),
+                body: r#"{"model":"test","service_tier":"flex"}"#.to_string(),
+                model: "test".to_string(),
+                endpoint: "https://api.example.com".to_string(),
+                method: "POST".to_string(),
+                path: "/test".to_string(),
+                api_key: "key".to_string(),
+                created_by: "user".to_string(),
+            })
+            .await
+            .unwrap();
+        let retained_attempt = Uuid::new_v4();
+        sqlx::query("UPDATE requests SET attempt_id = $2 WHERE id = $1")
+            .bind(*request_id)
+            .bind(retained_attempt)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let claimed = manager
+            .claim_batchless_requests(
+                1,
+                DaemonId::from(Uuid::new_v4()),
+                &HashMap::from([("test".to_string(), 1)]),
+                &HashMap::new(),
+                &HashSet::new(),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            claimed.is_empty(),
+            "pending rows with an ownership token violate the claim invariant"
+        );
+        let (state, stored_attempt): (String, Option<Uuid>) =
+            sqlx::query_as("SELECT state, attempt_id FROM requests WHERE id = $1")
+                .bind(*request_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(state, "pending");
+        assert_eq!(stored_attempt, Some(retained_attempt));
+    }
+
+    #[sqlx::test]
+    async fn test_batchless_claim_skips_poisoned_row_without_consuming_capacity(
+        pool: sqlx::PgPool,
+    ) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+        let poisoned_id = manager
+            .create_flex(CreateFlexInput {
+                request_id: Uuid::new_v4(),
+                body: r#"{"model":"test","service_tier":"flex"}"#.to_string(),
+                model: "test".to_string(),
+                endpoint: "https://api.example.com".to_string(),
+                method: "POST".to_string(),
+                path: "/test".to_string(),
+                api_key: "key".to_string(),
+                created_by: "user".to_string(),
+            })
+            .await
+            .unwrap();
+        let valid_id = manager
+            .create_flex(CreateFlexInput {
+                request_id: Uuid::new_v4(),
+                body: r#"{"model":"test","service_tier":"flex"}"#.to_string(),
+                model: "test".to_string(),
+                endpoint: "https://api.example.com".to_string(),
+                method: "POST".to_string(),
+                path: "/test".to_string(),
+                api_key: "key".to_string(),
+                created_by: "user".to_string(),
+            })
+            .await
+            .unwrap();
+        let retained_attempt = Uuid::new_v4();
+        sqlx::query(
+            "UPDATE requests \
+             SET attempt_id = $2, created_at = NOW() - INTERVAL '1 hour' \
+             WHERE id = $1",
+        )
+        .bind(*poisoned_id)
+        .bind(retained_attempt)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE requests SET created_at = NOW() WHERE id = $1")
+            .bind(*valid_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let claimed = manager
+            .claim_batchless_requests(
+                1,
+                DaemonId::from(Uuid::new_v4()),
+                &HashMap::from([("test".to_string(), 1)]),
+                &HashMap::new(),
+                &HashSet::new(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(
+            claimed[0].data.id, valid_id,
+            "an earlier poisoned row must not consume the model's only capacity slot"
+        );
+        let (state, stored_attempt): (String, Option<Uuid>) =
+            sqlx::query_as("SELECT state, attempt_id FROM requests WHERE id = $1")
+                .bind(*poisoned_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(state, "pending");
+        assert_eq!(stored_attempt, Some(retained_attempt));
+    }
+
+    #[sqlx::test]
+    async fn test_batch_claim_skips_poisoned_row_without_consuming_capacity(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+        let file_id = manager
+            .create_file(
+                "poisoned-capacity-batch".to_string(),
+                None,
+                vec![
+                    RequestTemplateInput {
+                        custom_id: Some("poisoned".to_string()),
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/test".to_string(),
+                        body: "{}".to_string(),
+                        model: "test".to_string(),
+                        api_key: "key".to_string(),
+                    },
+                    RequestTemplateInput {
+                        custom_id: Some("valid".to_string()),
+                        endpoint: "https://api.example.com".to_string(),
+                        method: "POST".to_string(),
+                        path: "/test".to_string(),
+                        body: "{}".to_string(),
+                        model: "test".to_string(),
+                        api_key: "key".to_string(),
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+        manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+                api_key_id: None,
+                api_key: None,
+                total_requests: None,
+            })
+            .await
+            .unwrap();
+        mark_models_live_for_test(&manager, ["test"]).await;
+
+        let poisoned_id: Uuid = sqlx::query_scalar(
+            "SELECT r.id \
+             FROM requests r \
+             JOIN request_templates t ON t.id = r.template_id \
+             WHERE t.custom_id = 'poisoned'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let valid_id: Uuid = sqlx::query_scalar(
+            "SELECT r.id \
+             FROM requests r \
+             JOIN request_templates t ON t.id = r.template_id \
+             WHERE t.custom_id = 'valid'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let retained_attempt = Uuid::new_v4();
+        sqlx::query(
+            "UPDATE requests \
+             SET attempt_id = $2, created_at = NOW() - INTERVAL '1 hour' \
+             WHERE id = $1",
+        )
+        .bind(poisoned_id)
+        .bind(retained_attempt)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE requests SET created_at = NOW() WHERE id = $1")
+            .bind(valid_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let claimed = manager
+            .claim_batch_requests(
+                1,
+                1,
+                DaemonId::from(Uuid::new_v4()),
+                &HashMap::from([("test".to_string(), 1)]),
+                &HashMap::new(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(
+            *claimed[0].data.id, valid_id,
+            "an earlier poisoned row must not consume the model's only capacity slot"
+        );
+        let (state, stored_attempt): (String, Option<Uuid>) =
+            sqlx::query_as("SELECT state, attempt_id FROM requests WHERE id = $1")
+                .bind(poisoned_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(state, "pending");
+        assert_eq!(stored_attempt, Some(retained_attempt));
+    }
+
+    #[sqlx::test]
     async fn test_claim_batchless_requests_ignores_batched_rows(pool: sqlx::PgPool) {
         let manager = PostgresRequestManager::with_client(
             TestDbPools::new(pool.clone()).await.unwrap(),
@@ -10472,11 +12148,17 @@ mod tests {
 
         // Advance claimed -> processing, keeping the same owner. This mirrors the
         // daemon's claimed->processing transition without spawning HTTP work.
-        sqlx::query("UPDATE requests SET state = 'processing', started_at = NOW() WHERE id = $1")
-            .bind(*request_id)
-            .execute(pool)
-            .await
-            .unwrap();
+        // This helper exercises the compatibility owner-only retry API, so
+        // explicitly model a pre-fencing processing row.
+        sqlx::query(
+            "UPDATE requests \
+             SET state = 'processing', started_at = NOW(), attempt_id = NULL \
+             WHERE id = $1",
+        )
+        .bind(*request_id)
+        .execute(pool)
+        .await
+        .unwrap();
 
         (manager, request_id)
     }
@@ -10514,6 +12196,53 @@ mod tests {
         }
     }
 
+    struct FailingTransformer {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl crate::transform::ResponseTransformer for FailingTransformer {
+        async fn transform(&self, _request: &RequestData, _body: &str) -> Result<String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(FusilladeError::Other(anyhow!(
+                "deterministic response transformation failure"
+            )))
+        }
+    }
+
+    struct TerminalHookTransformer {
+        transforms: Arc<std::sync::atomic::AtomicUsize>,
+        terminal_hooks: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl crate::transform::ResponseTransformer for TerminalHookTransformer {
+        async fn transform(&self, _request: &RequestData, body: &str) -> Result<String> {
+            self.transforms.fetch_add(1, Ordering::SeqCst);
+            Ok(format!("PREPARED:{body}"))
+        }
+
+        async fn after_terminal_persisted(&self, _request: &RequestData) -> Result<()> {
+            self.terminal_hooks.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    struct FailingTerminalHookTransformer;
+
+    #[async_trait]
+    impl crate::transform::ResponseTransformer for FailingTerminalHookTransformer {
+        async fn transform(&self, _request: &RequestData, body: &str) -> Result<String> {
+            Ok(body.to_string())
+        }
+
+        async fn after_terminal_persisted(&self, _request: &RequestData) -> Result<()> {
+            Err(FusilladeError::Other(anyhow!(
+                "injected terminal cleanup failure"
+            )))
+        }
+    }
+
     /// Test double that proves the *specific* request being persisted reaches the
     /// hook: it records the id it was handed and echoes it into the body, so a test
     /// can assert both that the transformer saw the right request (not some other
@@ -10532,8 +12261,7 @@ mod tests {
 
     /// Claim a single request into an in-flight state and hand back the request
     /// itself (so the caller can drive it to a terminal state and persist it),
-    /// with an optional transformer installed on the manager. persist() matches
-    /// on id alone, so the exact claimed/processing state does not matter here.
+    /// with an optional transformer installed on the manager.
     async fn claim_one_processing(
         pool: &sqlx::PgPool,
         transformer: Option<Arc<dyn crate::transform::ResponseTransformer>>,
@@ -10582,7 +12310,13 @@ mod tests {
             claim_batch_requests_for_test(&manager, 1, 1, daemon_id, &capacity, &HashMap::new())
                 .await;
         assert_eq!(claimed.len(), 1);
-        (manager, claimed.pop().unwrap())
+        let claimed = claimed.pop().unwrap();
+        sqlx::query("UPDATE requests SET state = 'processing', started_at = NOW() WHERE id = $1")
+            .bind(*claimed.data.id)
+            .execute(pool)
+            .await
+            .unwrap();
+        (manager, claimed)
     }
 
     fn completed_from(req: &Request<Claimed>, body: &str) -> Request<Completed> {
@@ -10610,6 +12344,848 @@ mod tests {
                 batch_expires_at: req.state.batch_expires_at,
                 routed_model: req.data.model.clone(),
             },
+        }
+    }
+
+    async fn install_terminal_transition_fault(pool: &sqlx::PgPool, sqlstate: &str, failures: u32) {
+        assert!(
+            matches!(sqlstate, "23514" | "40001"),
+            "test helper only accepts fixed SQLSTATE fixtures"
+        );
+        sqlx::query("CREATE SEQUENCE terminal_transition_fault_seq")
+            .execute(pool)
+            .await
+            .unwrap();
+        let function = format!(
+            r#"
+            CREATE FUNCTION fail_terminal_transition() RETURNS trigger AS $$
+            BEGIN
+                IF NEW.state = 'completed'
+                   AND OLD.state = 'processing'
+                   AND nextval('terminal_transition_fault_seq') <= {failures}
+                THEN
+                    RAISE EXCEPTION USING
+                        ERRCODE = '{sqlstate}',
+                        MESSAGE = 'synthetic terminal transition fault';
+                END IF;
+                RETURN NEW;
+            END;
+            $$ LANGUAGE plpgsql
+            "#
+        );
+        sqlx::query(&function).execute(pool).await.unwrap();
+        sqlx::query(
+            r#"
+            CREATE TRIGGER fail_terminal_transition
+            BEFORE UPDATE ON requests
+            FOR EACH ROW EXECUTE FUNCTION fail_terminal_transition()
+            "#,
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    fn pending_for_id(request_id: RequestId) -> Request<Pending> {
+        Request {
+            data: RequestData {
+                id: request_id,
+                batch_id: None,
+                template_id: TemplateId(Uuid::new_v4()),
+                custom_id: None,
+                endpoint: "https://api.example.com".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/responses".to_string(),
+                body: r#"{"model":"test"}"#.to_string(),
+                model: "test".to_string(),
+                api_key: "key".to_string(),
+                created_by: "user".to_string(),
+                batch_metadata: HashMap::new(),
+            },
+            state: Pending {
+                retry_attempt: 0,
+                not_before: None,
+                batch_expires_at: Utc::now() + chrono::Duration::hours(1),
+            },
+        }
+    }
+
+    async fn create_scalar_pending(
+        manager: &PostgresRequestManager<TestDbPools>,
+    ) -> Request<Pending> {
+        let request_id = manager
+            .create_flex(CreateFlexInput {
+                request_id: Uuid::new_v4(),
+                body: r#"{"model":"test"}"#.to_string(),
+                model: "test".to_string(),
+                endpoint: "https://api.example.com".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/responses".to_string(),
+                api_key: "key".to_string(),
+                created_by: "user".to_string(),
+            })
+            .await
+            .unwrap();
+        pending_for_id(request_id)
+    }
+
+    #[sqlx::test]
+    async fn persist_attempt_scalar_claim_unclaim_process_and_claimed_failure(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+        let owner = DaemonId(Uuid::new_v4());
+
+        let first_claim = create_scalar_pending(&manager)
+            .await
+            .claim(owner, &manager)
+            .await
+            .unwrap();
+        assert!(!first_claim.state.attempt_id.is_nil());
+        let repended = first_claim.clone().unclaim(&manager).await.unwrap();
+        let unclaimed: (String, Option<Uuid>, Option<Uuid>) =
+            sqlx::query_as("SELECT state, daemon_id, attempt_id FROM requests WHERE id = $1")
+                .bind(*repended.data.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(unclaimed, ("pending".to_string(), None, None));
+
+        let second_claim = repended.claim(owner, &manager).await.unwrap();
+        assert_ne!(first_claim.state.attempt_id, second_claim.state.attempt_id);
+        let processing = second_claim
+            .clone()
+            .process(
+                &manager,
+                std::future::pending::<Result<crate::request::HttpResponse>>(),
+            )
+            .await
+            .unwrap();
+        let processing_row: (String, Option<Uuid>, Option<Uuid>, Option<DateTime<Utc>>) =
+            sqlx::query_as(
+                "SELECT state, daemon_id, attempt_id, started_at FROM requests WHERE id = $1",
+            )
+            .bind(*processing.data.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(processing_row.0, "processing");
+        assert_eq!(processing_row.1, Some(*owner));
+        assert_eq!(processing_row.2, Some(*second_claim.state.attempt_id));
+        assert!(processing_row.3.is_some());
+        processing.cancel(&manager).await.unwrap();
+        let canceled: (String, Option<Uuid>, Option<Uuid>) =
+            sqlx::query_as("SELECT state, daemon_id, attempt_id FROM requests WHERE id = $1")
+                .bind(*second_claim.data.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(canceled, ("canceled".to_string(), None, None));
+
+        let claimed_for_failure = create_scalar_pending(&manager)
+            .await
+            .claim(owner, &manager)
+            .await
+            .unwrap();
+        assert!(
+            manager
+                .persist_attempt(
+                    &failed_from(
+                        &claimed_for_failure,
+                        FailureReason::RequestBuilderError {
+                            error: "invalid request".to_string(),
+                        },
+                    ),
+                    claimed_for_failure.state.attempt_id,
+                )
+                .await
+                .unwrap()
+        );
+        let failed: (String, Option<Uuid>, Option<Uuid>) =
+            sqlx::query_as("SELECT state, daemon_id, attempt_id FROM requests WHERE id = $1")
+                .bind(*claimed_for_failure.data.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(failed, ("failed".to_string(), None, None));
+    }
+
+    #[sqlx::test]
+    async fn lost_processing_commit_ack_reconciles_before_dispatch(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+        let owner = DaemonId(Uuid::new_v4());
+        let claimed = create_scalar_pending(&manager)
+            .await
+            .claim(owner, &manager)
+            .await
+            .unwrap();
+        let request_id = claimed.data.id;
+        manager
+            .processing_commit_ack_failures_remaining
+            .store(1, Ordering::SeqCst);
+
+        let dispatches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let dispatched = dispatches.clone();
+        let processing = claimed
+            .process(&manager, async move {
+                dispatched.fetch_add(1, Ordering::SeqCst);
+                Ok(crate::request::HttpResponse {
+                    status: 200,
+                    body: "one dispatch".to_string(),
+                })
+            })
+            .await
+            .expect("a committed processing transition must survive a lost acknowledgement");
+
+        let completion = processing
+            .complete(
+                &manager,
+                |_| false,
+                std::future::pending::<crate::request::CancellationReason>(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            completion,
+            crate::request::RequestCompletionResult::Completed(_)
+        ));
+        assert_eq!(
+            dispatches.load(Ordering::SeqCst),
+            1,
+            "commit reconciliation must open exactly one dispatch gate",
+        );
+
+        let state: String = sqlx::query_scalar("SELECT state FROM requests WHERE id = $1")
+            .bind(*request_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            state, "completed",
+            "the row must not remain stuck processing"
+        );
+    }
+
+    #[sqlx::test]
+    async fn processing_commit_reconciliation_uses_one_write_permit(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        )
+        .with_config(PostgresStorageConfig {
+            max_concurrent_state_writes: 1,
+            ..PostgresStorageConfig::default()
+        });
+        manager
+            .processing_commit_ack_failures_remaining
+            .store(1, Ordering::SeqCst);
+
+        let claimed = create_scalar_pending(&manager)
+            .await
+            .claim(DaemonId(Uuid::new_v4()), &manager)
+            .await
+            .unwrap();
+        let processing = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            claimed.process(
+                &manager,
+                std::future::pending::<Result<crate::request::HttpResponse>>(),
+            ),
+        )
+        .await
+        .expect("processing reconciliation deadlocked while reacquiring write admission")
+        .unwrap();
+        assert_eq!(
+            manager.response_admission.counts(),
+            ((0, 0), (0, 0), (0, 0)),
+            "processing reconciliation must release every admission permit",
+        );
+
+        processing.cancel(&manager).await.unwrap();
+    }
+
+    #[sqlx::test]
+    async fn ambiguous_rollback_cannot_admit_a_concurrent_same_attempt_clone(pool: sqlx::PgPool) {
+        let rollback_hook = Arc::new(TestPauseHook::default());
+        let mut manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+        manager.processing_commit_rollback_test_hook = Some(rollback_hook.clone());
+        manager
+            .processing_commit_rollback_failures_remaining
+            .store(1, Ordering::SeqCst);
+        let manager = Arc::new(manager);
+
+        let claimed = create_scalar_pending(manager.as_ref())
+            .await
+            .claim(DaemonId(Uuid::new_v4()), manager.as_ref())
+            .await
+            .unwrap();
+        let request_id = claimed.data.id;
+
+        let first_polled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let first_future_polled = first_polled.clone();
+        let first_claim = claimed.clone();
+        let first_manager = manager.clone();
+        let first = tokio::spawn(async move {
+            first_claim
+                .process(first_manager.as_ref(), async move {
+                    first_future_polled.store(true, Ordering::SeqCst);
+                    Ok(crate::request::HttpResponse {
+                        status: 200,
+                        body: "wrong invocation".to_string(),
+                    })
+                })
+                .await
+        });
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            rollback_hook.entered.notified(),
+        )
+        .await
+        .expect("first invocation did not reach the ambiguous rollback seam");
+
+        let second_polls = Arc::new(AtomicUsize::new(0));
+        let second_future_polls = second_polls.clone();
+        let winning = claimed
+            .process(manager.as_ref(), async move {
+                second_future_polls.fetch_add(1, Ordering::SeqCst);
+                Ok(crate::request::HttpResponse {
+                    status: 200,
+                    body: "winning invocation".to_string(),
+                })
+            })
+            .await
+            .expect("the concurrent invocation should durably admit processing");
+        let winning_marker: Option<Uuid> =
+            sqlx::query_scalar("SELECT processing_admission_id FROM requests WHERE id = $1")
+                .bind(*request_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(
+            winning_marker.is_some(),
+            "a durably processing row must carry its invocation identity",
+        );
+
+        rollback_hook.resume.notify_one();
+        let first_error = tokio::time::timeout(std::time::Duration::from_secs(5), first)
+            .await
+            .expect("ambiguous invocation did not reconcile")
+            .unwrap()
+            .expect_err("an invocation must not reconcile another caller's commit");
+        assert!(matches!(
+            first_error,
+            FusilladeError::RequestAttemptLost { .. }
+        ));
+
+        let completion = winning
+            .complete(
+                manager.as_ref(),
+                |_| false,
+                std::future::pending::<crate::request::CancellationReason>(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            completion,
+            crate::request::RequestCompletionResult::Completed(_)
+        ));
+        assert!(
+            !first_polled.load(Ordering::SeqCst),
+            "the rolled-back invocation's upstream future must remain unpolled",
+        );
+        assert_eq!(
+            second_polls.load(Ordering::SeqCst),
+            1,
+            "exactly the invocation whose durable marker won may dispatch",
+        );
+
+        let terminal: (String, Option<Uuid>) =
+            sqlx::query_as("SELECT state, processing_admission_id FROM requests WHERE id = $1")
+                .bind(*request_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(terminal, ("completed".to_string(), None));
+    }
+
+    #[sqlx::test]
+    async fn ordinary_duplicate_processing_admission_is_not_idempotent(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+        let owner = DaemonId(Uuid::new_v4());
+        let claimed = create_scalar_pending(&manager)
+            .await
+            .claim(owner, &manager)
+            .await
+            .unwrap();
+
+        let admitted = claimed
+            .clone()
+            .process(
+                &manager,
+                std::future::pending::<Result<crate::request::HttpResponse>>(),
+            )
+            .await
+            .unwrap();
+
+        let duplicate_polled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let polled = duplicate_polled.clone();
+        let error = claimed
+            .process(&manager, async move {
+                polled.store(true, Ordering::SeqCst);
+                Ok(crate::request::HttpResponse {
+                    status: 200,
+                    body: "duplicate".to_string(),
+                })
+            })
+            .await
+            .expect_err("only a failed COMMIT invocation may reconcile processing");
+        assert!(matches!(error, FusilladeError::RequestAttemptLost { .. }));
+        tokio::task::yield_now().await;
+        assert!(
+            !duplicate_polled.load(Ordering::SeqCst),
+            "a normal duplicate must not open a second dispatch gate",
+        );
+
+        admitted.cancel(&manager).await.unwrap();
+    }
+
+    #[sqlx::test]
+    async fn persist_attempt_waits_for_replacement_and_rejects_stale_token(pool: sqlx::PgPool) {
+        let (manager, req) = claim_one_processing(&pool, None).await;
+        let replacement = Uuid::new_v4();
+        let mut replacement_tx = pool.begin().await.unwrap();
+        sqlx::query("SELECT id FROM requests WHERE id = $1 FOR UPDATE")
+            .bind(*req.data.id)
+            .fetch_one(&mut *replacement_tx)
+            .await
+            .unwrap();
+
+        let request_id = req.data.id;
+        let stale_attempt = req.state.attempt_id;
+        let persist = tokio::spawn(async move {
+            manager
+                .persist_attempt(&completed_from(&req, "stale"), stale_attempt)
+                .await
+        });
+        tokio::task::yield_now().await;
+
+        sqlx::query("UPDATE requests SET attempt_id = $2 WHERE id = $1")
+            .bind(*request_id)
+            .bind(replacement)
+            .execute(&mut *replacement_tx)
+            .await
+            .unwrap();
+        replacement_tx.commit().await.unwrap();
+
+        assert!(!persist.await.unwrap().unwrap());
+        let row: (String, Option<Uuid>, Option<String>) =
+            sqlx::query_as("SELECT state, attempt_id, response_body FROM requests WHERE id = $1")
+                .bind(*request_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(row, ("processing".to_string(), Some(replacement), None));
+    }
+
+    #[sqlx::test]
+    async fn persist_attempt_rejects_replacement_token_without_mutation(pool: sqlx::PgPool) {
+        let (manager, req) = claim_one_processing(&pool, None).await;
+        let replacement = Uuid::new_v4();
+        sqlx::query("UPDATE requests SET attempt_id = $2 WHERE id = $1")
+            .bind(*req.data.id)
+            .bind(replacement)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let applied = manager
+            .persist_attempt(&completed_from(&req, "stale result"), req.state.attempt_id)
+            .await
+            .unwrap();
+
+        assert!(!applied);
+        let row: (String, Option<Uuid>, Option<String>) =
+            sqlx::query_as("SELECT state, attempt_id, response_body FROM requests WHERE id = $1")
+                .bind(*req.data.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(row, ("processing".to_string(), Some(replacement), None));
+    }
+
+    #[sqlx::test]
+    async fn persist_attempt_distinguishes_missing_from_lost_ownership(pool: sqlx::PgPool) {
+        let (manager, req) = claim_one_processing(&pool, None).await;
+        sqlx::query("DELETE FROM requests WHERE id = $1")
+            .bind(*req.data.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let error = manager
+            .persist_attempt(
+                &completed_from(&req, "orphaned result"),
+                req.state.attempt_id,
+            )
+            .await
+            .expect_err("a deleted live row is missing, not an ownership loss");
+
+        assert!(matches!(
+            error,
+            FusilladeError::RequestNotFound(id) if id == req.data.id
+        ));
+    }
+
+    #[sqlx::test]
+    async fn persist_attempt_validates_nil_before_transforming(pool: sqlx::PgPool) {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (manager, req) = claim_one_processing(
+            &pool,
+            Some(Arc::new(MarkingTransformer {
+                calls: calls.clone(),
+            })),
+        )
+        .await;
+
+        let error = manager
+            .persist_attempt(&completed_from(&req, "plaintext"), AttemptId(Uuid::nil()))
+            .await
+            .expect_err("nil attempt IDs must be rejected locally");
+
+        assert!(matches!(error, FusilladeError::ValidationError(_)));
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "invalid attempt authority must be rejected before ZDR work",
+        );
+    }
+
+    #[sqlx::test]
+    async fn persist_attempt_rejects_mismatched_embedded_authority(pool: sqlx::PgPool) {
+        let (manager, claimed) = claim_one_processing(&pool, None).await;
+        let authoritative = claimed.state.attempt_id;
+
+        let mut mismatched_claimed = claimed.clone();
+        mismatched_claimed.state.attempt_id = AttemptId(Uuid::new_v4());
+        assert!(matches!(
+            manager
+                .persist_attempt(&mismatched_claimed, authoritative)
+                .await,
+            Err(FusilladeError::ValidationError(_))
+        ));
+
+        let (_result_tx, result_rx) = tokio::sync::mpsc::channel(1);
+        let mismatched_processing = Request {
+            data: claimed.data,
+            state: Processing {
+                daemon_id: claimed.state.daemon_id,
+                attempt_id: AttemptId(Uuid::new_v4()),
+                claimed_at: claimed.state.claimed_at,
+                started_at: Utc::now(),
+                retry_attempt: claimed.state.retry_attempt,
+                batch_expires_at: claimed.state.batch_expires_at,
+                result_rx: Arc::new(Mutex::new(result_rx)),
+                abort_handle: tokio::spawn(async {}).abort_handle(),
+            },
+        };
+        assert!(matches!(
+            manager
+                .persist_attempt(&mismatched_processing, authoritative)
+                .await,
+            Err(FusilladeError::ValidationError(_))
+        ));
+    }
+
+    #[sqlx::test]
+    async fn attempt_retry_accepts_claimed_and_fences_owner_and_token(pool: sqlx::PgPool) {
+        let (manager, req) = claim_one_processing(&pool, None).await;
+        sqlx::query("UPDATE requests SET state = 'claimed', started_at = NULL WHERE id = $1")
+            .bind(*req.data.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let not_before = Utc::now() + chrono::Duration::seconds(30);
+
+        assert!(
+            manager
+                .reschedule_attempt_for_retry(
+                    req.data.id,
+                    DaemonId(Uuid::new_v4()),
+                    req.state.attempt_id,
+                    1,
+                    Some(not_before),
+                )
+                .await
+                .unwrap()
+                == false
+        );
+        assert!(
+            manager
+                .reschedule_attempt_for_retry(
+                    req.data.id,
+                    req.state.daemon_id,
+                    AttemptId(Uuid::new_v4()),
+                    1,
+                    Some(not_before),
+                )
+                .await
+                .unwrap()
+                == false
+        );
+        assert!(
+            manager
+                .reschedule_attempt_for_retry(
+                    req.data.id,
+                    req.state.daemon_id,
+                    req.state.attempt_id,
+                    2,
+                    Some(not_before),
+                )
+                .await
+                .unwrap()
+        );
+
+        let row: (
+            String,
+            i32,
+            Option<DateTime<Utc>>,
+            Option<Uuid>,
+            Option<Uuid>,
+        ) = sqlx::query_as(
+            "SELECT state, retry_attempt, not_before, daemon_id, attempt_id \
+                 FROM requests WHERE id = $1",
+        )
+        .bind(*req.data.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.0, "pending");
+        assert_eq!(row.1, 2);
+        assert_eq!(row.2, Some(not_before));
+        assert_eq!(row.3, None);
+        assert_eq!(row.4, None);
+    }
+
+    #[sqlx::test]
+    async fn attempt_recovery_accepts_processing_and_reports_missing(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+        let owner = DaemonId(Uuid::new_v4());
+        let claimed = create_scalar_pending(&manager)
+            .await
+            .claim(owner, &manager)
+            .await
+            .unwrap();
+        let attempt_id = claimed.state.attempt_id;
+        let request_id = claimed.data.id;
+        let processing = claimed
+            .process(
+                &manager,
+                std::future::pending::<Result<crate::request::HttpResponse>>(),
+            )
+            .await
+            .unwrap();
+        let not_before = Utc::now() + chrono::Duration::seconds(10);
+
+        assert!(
+            manager
+                .recover_attempt_for_retry(
+                    processing.data.id,
+                    owner,
+                    attempt_id,
+                    3,
+                    Some(not_before),
+                )
+                .await
+                .unwrap()
+        );
+        drop(processing);
+        let row: (
+            String,
+            i32,
+            Option<DateTime<Utc>>,
+            Option<Uuid>,
+            Option<Uuid>,
+        ) = sqlx::query_as(
+            "SELECT state, retry_attempt, not_before, daemon_id, attempt_id \
+                 FROM requests WHERE id = $1",
+        )
+        .bind(*request_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.0, "pending");
+        assert_eq!(row.1, 3);
+        assert_eq!(row.2, Some(not_before));
+        assert_eq!((row.3, row.4), (None, None));
+
+        let missing = RequestId(Uuid::new_v4());
+        let error = manager
+            .recover_attempt_for_retry(missing, owner, attempt_id, 1, None)
+            .await
+            .expect_err("missing recovery targets must not look like ownership loss");
+        assert!(matches!(
+            error,
+            FusilladeError::RequestNotFound(id) if id == missing
+        ));
+    }
+
+    #[sqlx::test]
+    async fn unfenced_persist_cannot_mutate_attempt_owned_row(pool: sqlx::PgPool) {
+        let (manager, req) = claim_one_processing(&pool, None).await;
+
+        let error = manager
+            .persist(&completed_from(&req, "unfenced"))
+            .await
+            .expect_err("ordinary persistence must not bypass attempt authority");
+
+        assert!(matches!(error, FusilladeError::RequestStateConflict { .. }));
+        let row: (String, Option<Uuid>, Option<String>) =
+            sqlx::query_as("SELECT state, attempt_id, response_body FROM requests WHERE id = $1")
+                .bind(*req.data.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            row,
+            ("processing".to_string(), Some(*req.state.attempt_id), None)
+        );
+    }
+
+    #[sqlx::test]
+    async fn realtime_writers_cannot_mutate_attempt_owned_processing_row(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+        let request_id = manager
+            .create_flex(CreateFlexInput {
+                request_id: Uuid::new_v4(),
+                body: r#"{"model":"test"}"#.to_string(),
+                model: "test".to_string(),
+                endpoint: "https://api.example.com".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/responses".to_string(),
+                api_key: "key".to_string(),
+                created_by: "user".to_string(),
+            })
+            .await
+            .unwrap();
+        let attempt_id = Uuid::new_v4();
+        sqlx::query(
+            "UPDATE requests
+             SET state = 'processing',
+                 service_tier = 'priority',
+                 daemon_id = $2,
+                 attempt_id = $3,
+                 claimed_at = NOW(),
+                 started_at = NOW()
+             WHERE id = $1",
+        )
+        .bind(*request_id)
+        .bind(Uuid::new_v4())
+        .bind(attempt_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        for result in [
+            manager
+                .complete_request(request_id, r#"{"output":"single"}"#, 200)
+                .await,
+            manager
+                .fail_request(request_id, "single failure", 500)
+                .await,
+        ] {
+            assert!(matches!(
+                result,
+                Err(FusilladeError::RequestStateConflict { .. })
+            ));
+        }
+
+        let started_at = Utc::now();
+        manager
+            .persist_completed_realtime_batch(&[crate::request::PersistCompletedRealtimeInput {
+                request_id: *request_id,
+                response_body: r#"{"output":"bulk"}"#.to_string(),
+                status_code: 200,
+                request_body: r#"{"model":"test"}"#.to_string(),
+                model: "test".to_string(),
+                endpoint: "https://api.example.com".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/responses".to_string(),
+                api_key: "key".to_string(),
+                created_by: "user".to_string(),
+                started_at,
+                completed_at: started_at + chrono::Duration::seconds(1),
+            }])
+            .await
+            .unwrap();
+
+        let row: (String, Option<Uuid>, Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT state, attempt_id, response_body, error
+             FROM requests WHERE id = $1",
+        )
+        .bind(*request_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            row,
+            ("processing".to_string(), Some(attempt_id), None, None),
+        );
+    }
+
+    #[sqlx::test]
+    async fn request_reads_project_durable_attempt_authority(pool: sqlx::PgPool) {
+        let (manager, req) = claim_one_processing(&pool, None).await;
+
+        let by_id = manager.get_requests(vec![req.data.id]).await.unwrap();
+        let by_batch = manager
+            .get_batch_requests(req.data.batch_id.unwrap())
+            .await
+            .unwrap();
+
+        for request in [
+            by_id.into_iter().next().unwrap().unwrap(),
+            by_batch.into_iter().next().unwrap(),
+        ] {
+            match request {
+                AnyRequest::Processing(request) => {
+                    assert_eq!(request.state.attempt_id, req.state.attempt_id);
+                }
+                other => panic!("expected processing request, got {}", other.variant()),
+            }
+        }
+
+        sqlx::query("UPDATE requests SET attempt_id = NULL WHERE id = $1")
+            .bind(*req.data.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let legacy = manager
+            .get_requests(vec![req.data.id])
+            .await
+            .unwrap()
+            .pop()
+            .unwrap()
+            .unwrap();
+        match legacy {
+            AnyRequest::Processing(request) => assert!(request.state.attempt_id.is_nil()),
+            other => panic!("expected processing request, got {}", other.variant()),
         }
     }
 
@@ -10682,9 +13258,10 @@ mod tests {
         {
             let manager = manager.clone();
             let request_id = claimed[0].data.id;
+            let attempt_id = claimed[0].state.attempt_id;
             handles.push(tokio::spawn(async move {
                 let rescheduled = manager
-                    .reschedule_for_retry(request_id, daemon_id, 1, None)
+                    .reschedule_attempt_for_retry(request_id, daemon_id, attempt_id, 1, None)
                     .await?;
                 assert!(rescheduled);
                 Ok::<(), FusilladeError>(())
@@ -10693,7 +13270,13 @@ mod tests {
         handles.extend(claimed[1..].iter().map(|request| {
             let manager = manager.clone();
             let completed = completed_from(request, "done");
-            tokio::spawn(async move { manager.persist(&completed).await.map(|_| ()) })
+            let attempt_id = request.state.attempt_id;
+            tokio::spawn(async move {
+                manager
+                    .persist_attempt(&completed, attempt_id)
+                    .await
+                    .map(|_| ())
+            })
         }));
 
         let blocked_writes = tokio::time::timeout(std::time::Duration::from_secs(2), async {
@@ -10707,7 +13290,6 @@ mod tests {
                         WHERE datname = current_database()
                           AND state = 'active'
                           AND wait_event_type = 'Lock'
-                          AND query LIKE '%UPDATE requests%'
                         "#,
                     )
                     .fetch_one(&pool)
@@ -10748,7 +13330,7 @@ mod tests {
             .unwrap();
 
         manager
-            .persist(&completed_from(&req, "done"))
+            .persist_attempt(&completed_from(&req, "done"), req.state.attempt_id)
             .await
             .unwrap();
 
@@ -10773,18 +13355,46 @@ mod tests {
         let (manager, req) = claim_one_processing(&pool, None).await;
 
         // The cancel cascade catches the row while the daemon holds it.
-        sqlx::query(
-            "UPDATE requests SET state = 'canceled', canceled_at = NOW(), \
-             daemon_id = NULL, claimed_at = NULL, started_at = NULL WHERE id = $1",
-        )
-        .bind(*req.data.id)
-        .execute(&pool)
-        .await
-        .unwrap();
+        manager
+            .cascade_batch_state_to_requests(
+                req.data.batch_id.unwrap(),
+                CascadeTargetState::Canceled,
+            )
+            .await
+            .unwrap();
+        let canceled_authority: (String, Option<Uuid>, Option<Uuid>, Option<Uuid>) =
+            sqlx::query_as(
+                "SELECT state, daemon_id, attempt_id, processing_admission_id
+                 FROM requests WHERE id = $1",
+            )
+            .bind(*req.data.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            canceled_authority,
+            (
+                "canceled".to_string(),
+                None,
+                Some(*req.state.attempt_id),
+                None,
+            ),
+            "soft cancellation retains attempt authority but clears transient commit identity",
+        );
+        assert!(
+            !manager
+                .persist_attempt(
+                    &completed_from(&req, "wrong attempt"),
+                    AttemptId(Uuid::new_v4()),
+                )
+                .await
+                .unwrap(),
+            "a different attempt cannot supersede soft cancellation",
+        );
 
         // Daemon finishes its HTTP call and stores the billed result.
         manager
-            .persist(&completed_from(&req, "late result"))
+            .persist_attempt(&completed_from(&req, "late result"), req.state.attempt_id)
             .await
             .unwrap();
 
@@ -10808,20 +13418,51 @@ mod tests {
     #[sqlx::test]
     async fn persist_failed_supersedes_canceled_row(pool: sqlx::PgPool) {
         let (manager, req) = claim_one_processing(&pool, None).await;
-        sqlx::query("UPDATE requests SET state = 'canceled', canceled_at = NOW() WHERE id = $1")
-            .bind(*req.data.id)
-            .execute(&pool)
+        manager
+            .cascade_batch_state_to_requests(
+                req.data.batch_id.unwrap(),
+                CascadeTargetState::Canceled,
+            )
             .await
             .unwrap();
+        let canceled_authority: (String, Option<Uuid>, Option<Uuid>) =
+            sqlx::query_as("SELECT state, daemon_id, attempt_id FROM requests WHERE id = $1")
+                .bind(*req.data.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            canceled_authority,
+            ("canceled".to_string(), None, Some(*req.state.attempt_id)),
+        );
+        assert!(
+            !manager
+                .persist_attempt(
+                    &failed_from(
+                        &req,
+                        FailureReason::NonRetriableHttpStatus {
+                            status: 500,
+                            body: "wrong attempt".to_string(),
+                        },
+                    ),
+                    AttemptId(Uuid::new_v4()),
+                )
+                .await
+                .unwrap(),
+            "a different attempt cannot supersede soft cancellation",
+        );
 
         manager
-            .persist(&failed_from(
-                &req,
-                FailureReason::NonRetriableHttpStatus {
-                    status: 500,
-                    body: "late failure".to_string(),
-                },
-            ))
+            .persist_attempt(
+                &failed_from(
+                    &req,
+                    FailureReason::NonRetriableHttpStatus {
+                        status: 500,
+                        body: "late failure".to_string(),
+                    },
+                ),
+                req.state.attempt_id,
+            )
             .await
             .unwrap();
 
@@ -10845,15 +13486,22 @@ mod tests {
     #[sqlx::test]
     async fn duplicate_terminal_persist_is_dropped(pool: sqlx::PgPool) {
         let (manager, req) = claim_one_processing(&pool, None).await;
-        manager
-            .persist(&completed_from(&req, "first result"))
-            .await
-            .unwrap();
+        assert!(
+            manager
+                .persist_attempt(&completed_from(&req, "first result"), req.state.attempt_id)
+                .await
+                .unwrap()
+        );
         // Replay with a different body: must be dropped, first body retained.
-        manager
-            .persist(&completed_from(&req, "replayed result"))
-            .await
-            .unwrap();
+        assert!(
+            !manager
+                .persist_attempt(
+                    &completed_from(&req, "replayed result"),
+                    req.state.attempt_id
+                )
+                .await
+                .unwrap()
+        );
         let body = stored_response_body(&pool, req.data.id).await;
         assert_eq!(body.as_deref(), Some("first result"));
     }
@@ -10869,9 +13517,8 @@ mod tests {
 
         // Cancel the batch + cascade its in-flight row.
         manager.cancel_batch(batch_id).await.unwrap();
-        sqlx::query("UPDATE requests SET state = 'canceled', canceled_at = NOW() WHERE id = $1")
-            .bind(*req.data.id)
-            .execute(&pool)
+        manager
+            .cascade_batch_state_to_requests(batch_id, CascadeTargetState::Canceled)
             .await
             .unwrap();
 
@@ -10894,7 +13541,7 @@ mod tests {
         // The late completion lands after the freeze: row flips to
         // completed and the counters swap in the same statement.
         manager
-            .persist(&completed_from(&req, "too late"))
+            .persist_attempt(&completed_from(&req, "too late"), req.state.attempt_id)
             .await
             .unwrap();
 
@@ -10918,19 +13565,453 @@ mod tests {
         );
     }
 
+    #[sqlx::test]
+    async fn late_failure_repairs_frozen_counts(pool: sqlx::PgPool) {
+        let (manager, req) = claim_one_processing(&pool, None).await;
+        let batch_id = req.data.batch_id.expect("claimed row belongs to a batch");
+
+        manager.cancel_batch(batch_id).await.unwrap();
+        manager
+            .cascade_batch_state_to_requests(batch_id, CascadeTargetState::Canceled)
+            .await
+            .unwrap();
+        manager.get_batch(batch_id).await.unwrap();
+        let frozen: (bool, i64) = sqlx::query_as(
+            "SELECT counts_frozen_at IS NOT NULL, canceled_requests
+             FROM batches WHERE id = $1",
+        )
+        .bind(*batch_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(frozen, (true, 1));
+
+        assert!(
+            manager
+                .persist_attempt(
+                    &failed_from(
+                        &req,
+                        FailureReason::NonRetriableHttpStatus {
+                            status: 500,
+                            body: "late failure".to_string(),
+                        },
+                    ),
+                    req.state.attempt_id,
+                )
+                .await
+                .unwrap()
+        );
+
+        let repaired: (i64, i64, bool, i64, i64) = sqlx::query_as(
+            "SELECT b.canceled_requests, b.failed_requests,
+                    b.counts_frozen_at IS NOT NULL,
+                    (SELECT COUNT(*) FROM requests
+                     WHERE batch_id = b.id AND state = 'canceled'),
+                    (SELECT COUNT(*) FROM requests
+                     WHERE batch_id = b.id AND state = 'failed')
+             FROM batches b WHERE b.id = $1",
+        )
+        .bind(*batch_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(repaired, (0, 1, true, 0, 1));
+    }
+
+    #[sqlx::test]
+    async fn canceled_supersession_invalidates_unfrozen_count_snapshot(pool: sqlx::PgPool) {
+        let (manager, req) = claim_one_processing(&pool, None).await;
+        let batch_id = req.data.batch_id.expect("claimed row belongs to a batch");
+
+        manager.cancel_batch(batch_id).await.unwrap();
+        manager
+            .cascade_batch_state_to_requests(batch_id, CascadeTargetState::Canceled)
+            .await
+            .unwrap();
+
+        // Model the first half of lazy finalization: it observed the canceled
+        // child and captured this retry_version, but has not attempted its
+        // guarded freeze yet.
+        let snapshot: (i64, i64, i64, Option<DateTime<Utc>>) = sqlx::query_as(
+            "SELECT retry_version,
+                    (SELECT COUNT(*) FROM requests
+                     WHERE batch_id = b.id AND state = 'canceled'),
+                    (SELECT COUNT(*) FROM requests
+                     WHERE batch_id = b.id AND state = 'completed'),
+                    counts_frozen_at
+             FROM batches b WHERE id = $1",
+        )
+        .bind(*batch_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!((snapshot.1, snapshot.2, snapshot.3), (1, 0, None));
+
+        assert!(
+            manager
+                .persist_attempt(
+                    &completed_from(&req, "late completion"),
+                    req.state.attempt_id,
+                )
+                .await
+                .unwrap()
+        );
+
+        let version_after: i64 =
+            sqlx::query_scalar("SELECT retry_version FROM batches WHERE id = $1")
+                .bind(*batch_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(
+            version_after > snapshot.0,
+            "canceled category changes must invalidate a previously counted snapshot",
+        );
+
+        let stale_freeze = sqlx::query(
+            "UPDATE batches
+             SET canceled_requests = $3,
+                 completed_requests = $4,
+                 counts_frozen_at = NOW()
+             WHERE id = $1
+               AND retry_version = $2
+               AND counts_frozen_at IS NULL",
+        )
+        .bind(*batch_id)
+        .bind(snapshot.0)
+        .bind(snapshot.1)
+        .bind(snapshot.2)
+        .execute(&pool)
+        .await
+        .unwrap()
+        .rows_affected();
+        assert_eq!(
+            stale_freeze, 0,
+            "the stale freeze snapshot must lose its CAS"
+        );
+
+        let batch = manager.get_batch(batch_id).await.unwrap();
+        assert_eq!((batch.canceled_requests, batch.completed_requests), (0, 1));
+    }
+
+    #[sqlx::test]
+    async fn fenced_terminal_retries_when_cancellation_races_child_snapshot(pool: sqlx::PgPool) {
+        let (manager, req) = claim_one_processing(&pool, None).await;
+        let request_id = req.data.id;
+        let attempt_id = req.state.attempt_id;
+
+        // Hold an uncommitted cancellation on the child. The terminal
+        // statement takes its MVCC snapshot while the old processing row is
+        // still visible, then waits for this transaction's child lock. Once
+        // cancellation commits, EvalPlanQual exposes the canceled row but the
+        // statement has not acquired its parent lock, forcing the intentional
+        // reroute path.
+        let mut cancellation = pool.begin().await.unwrap();
+        let canceled = sqlx::query(
+            "UPDATE requests
+             SET state = 'canceled',
+                 canceled_at = NOW(),
+                 daemon_id = NULL,
+                 processing_admission_id = NULL
+             WHERE id = $1
+               AND state = 'processing'",
+        )
+        .bind(*request_id)
+        .execute(&mut *cancellation)
+        .await
+        .unwrap()
+        .rows_affected();
+        assert_eq!(canceled, 1);
+
+        let terminal = tokio::spawn(async move {
+            manager
+                .persist_attempt(&completed_from(&req, "raced result"), attempt_id)
+                .await
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let blocked = sqlx::query_scalar::<_, i64>(
+                    "SELECT COUNT(*)
+                     FROM pg_stat_activity
+                     WHERE datname = current_database()
+                       AND state = 'active'
+                       AND wait_event_type = 'Lock'
+                       AND query LIKE '%WITH snapshot AS MATERIALIZED%'",
+                )
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+                if blocked > 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("terminal write never waited on the cancellation's child lock");
+
+        cancellation.commit().await.unwrap();
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), terminal)
+                .await
+                .expect("terminal write remained blocked")
+                .unwrap()
+                .expect("snapshot reroute must remain internal to persistence"),
+            "the original attempt still owns the canceled row"
+        );
+
+        let stored: (String, Option<String>) =
+            sqlx::query_as("SELECT state, response_body FROM requests WHERE id = $1")
+                .bind(*request_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            stored,
+            ("completed".to_string(), Some("raced result".to_string()))
+        );
+    }
+
+    #[sqlx::test]
+    async fn late_terminal_and_batch_retry_lock_parent_before_child(pool: sqlx::PgPool) {
+        let (manager, req) = claim_one_processing(&pool, None).await;
+        let manager = Arc::new(manager);
+        let batch_id = req.data.batch_id.expect("claimed row belongs to a batch");
+
+        manager.cancel_batch(batch_id).await.unwrap();
+        manager
+            .cascade_batch_state_to_requests(batch_id, CascadeTargetState::Canceled)
+            .await
+            .unwrap();
+        manager.get_batch(batch_id).await.unwrap();
+
+        // Hold the child so the late terminal statement remains in-flight after
+        // taking whatever earlier locks its SQL declares.
+        let mut child_blocker = pool.begin().await.unwrap();
+        sqlx::query("SELECT id FROM requests WHERE id = $1 FOR UPDATE")
+            .bind(*req.data.id)
+            .fetch_one(&mut *child_blocker)
+            .await
+            .unwrap();
+
+        let late_manager = manager.clone();
+        let late_request = completed_from(&req, "late");
+        let attempt_id = req.state.attempt_id;
+        let late = tokio::spawn(async move {
+            late_manager
+                .persist_attempt(&late_request, attempt_id)
+                .await
+        });
+
+        // Parent-first is observable while the child remains blocked: a
+        // NOWAIT parent probe must lose to the late terminal statement.
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let mut probe = pool.begin().await.unwrap();
+                let result = sqlx::query("SELECT id FROM batches WHERE id = $1 FOR UPDATE NOWAIT")
+                    .bind(*batch_id)
+                    .fetch_one(&mut *probe)
+                    .await;
+                match result {
+                    Err(sqlx::Error::Database(error))
+                        if error.code().as_deref() == Some("55P03") =>
+                    {
+                        probe.rollback().await.unwrap();
+                        break;
+                    }
+                    Ok(_) => {
+                        probe.rollback().await.unwrap();
+                        tokio::task::yield_now().await;
+                    }
+                    Err(error) => panic!("unexpected parent-lock probe error: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("late terminal never locked the parent before waiting on its child");
+
+        let retry_manager = manager.clone();
+        let retry = tokio::spawn(async move {
+            retry_manager
+                .retry_failed_requests_for_batch(batch_id)
+                .await
+        });
+        tokio::task::yield_now().await;
+        child_blocker.rollback().await.unwrap();
+
+        let (late_result, retry_result) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                tokio::join!(late, retry)
+            })
+            .await
+            .expect("parent-first terminal and batch retry deadlocked");
+        assert!(late_result.unwrap().unwrap());
+        retry_result.unwrap().unwrap();
+
+        let state: String = sqlx::query_scalar("SELECT state FROM requests WHERE id = $1")
+            .bind(*req.data.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(state, "completed");
+    }
+
+    #[sqlx::test]
+    async fn individual_retry_locks_parents_before_children(pool: sqlx::PgPool) {
+        let (manager, req) = claim_one_processing(&pool, None).await;
+        let manager = Arc::new(manager);
+        let batch_id = req.data.batch_id.expect("claimed row belongs to a batch");
+        assert!(
+            manager
+                .persist_attempt(
+                    &failed_from(
+                        &req,
+                        FailureReason::NonRetriableHttpStatus {
+                            status: 500,
+                            body: "failed".to_string(),
+                        },
+                    ),
+                    req.state.attempt_id,
+                )
+                .await
+                .unwrap()
+        );
+
+        let mut child_blocker = pool.begin().await.unwrap();
+        sqlx::query("SELECT id FROM requests WHERE id = $1 FOR UPDATE")
+            .bind(*req.data.id)
+            .fetch_one(&mut *child_blocker)
+            .await
+            .unwrap();
+
+        let retry_manager = manager.clone();
+        let request_id = req.data.id;
+        let retry =
+            tokio::spawn(
+                async move { retry_manager.retry_failed_requests(vec![request_id]).await },
+            );
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let mut probe = pool.begin().await.unwrap();
+                let result = sqlx::query("SELECT id FROM batches WHERE id = $1 FOR UPDATE NOWAIT")
+                    .bind(*batch_id)
+                    .fetch_one(&mut *probe)
+                    .await;
+                match result {
+                    Err(sqlx::Error::Database(error))
+                        if error.code().as_deref() == Some("55P03") =>
+                    {
+                        probe.rollback().await.unwrap();
+                        break;
+                    }
+                    Ok(_) => {
+                        probe.rollback().await.unwrap();
+                        tokio::task::yield_now().await;
+                    }
+                    Err(error) => panic!("unexpected parent-lock probe error: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("individual retry touched its child before locking the parent");
+
+        child_blocker.rollback().await.unwrap();
+        let results = tokio::time::timeout(std::time::Duration::from_secs(5), retry)
+            .await
+            .expect("individual retry remained blocked")
+            .unwrap()
+            .unwrap();
+        assert!(matches!(results.as_slice(), [Ok(())]));
+
+        let state: String = sqlx::query_scalar("SELECT state FROM requests WHERE id = $1")
+            .bind(*req.data.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(state, "pending");
+    }
+
+    #[sqlx::test]
+    async fn hard_failure_cascade_revokes_attempt_authority(pool: sqlx::PgPool) {
+        let (manager, req) = claim_one_processing(&pool, None).await;
+        manager
+            .cascade_batch_state_to_requests(req.data.batch_id.unwrap(), CascadeTargetState::Failed)
+            .await
+            .unwrap();
+
+        let row: (String, Option<Uuid>, Option<Uuid>) =
+            sqlx::query_as("SELECT state, daemon_id, attempt_id FROM requests WHERE id = $1")
+                .bind(*req.data.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(row, ("failed".to_string(), None, None));
+        assert!(
+            !manager
+                .persist_attempt(&completed_from(&req, "stale"), req.state.attempt_id)
+                .await
+                .unwrap(),
+            "hard failure is terminal and its revoked attempt cannot overwrite it",
+        );
+    }
+
+    #[sqlx::test]
+    async fn explicit_attempt_cancel_consumes_retained_soft_cancel_token(pool: sqlx::PgPool) {
+        let (manager, req) = claim_one_processing(&pool, None).await;
+        manager
+            .cascade_batch_state_to_requests(
+                req.data.batch_id.unwrap(),
+                CascadeTargetState::Canceled,
+            )
+            .await
+            .unwrap();
+        let canceled = Request {
+            data: req.data.clone(),
+            state: Canceled {
+                canceled_at: Utc::now(),
+            },
+        };
+        assert!(
+            manager
+                .persist_attempt(&canceled, req.state.attempt_id)
+                .await
+                .unwrap()
+        );
+
+        let authority: Option<Uuid> =
+            sqlx::query_scalar("SELECT attempt_id FROM requests WHERE id = $1")
+                .bind(*req.data.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(authority, None);
+        assert!(
+            !manager
+                .persist_attempt(&completed_from(&req, "too late"), req.state.attempt_id)
+                .await
+                .unwrap(),
+        );
+    }
+
     /// The manual-retry contract survives: persist(Pending) may still move a
-    /// terminal failed row back to pending (deliberately unguarded arm).
+    /// terminal unowned failed row back to pending.
     #[sqlx::test]
     async fn persist_pending_still_repends_failed_row(pool: sqlx::PgPool) {
         let (manager, req) = claim_one_processing(&pool, None).await;
         manager
-            .persist(&failed_from(
-                &req,
-                FailureReason::NonRetriableHttpStatus {
-                    status: 500,
-                    body: "boom".to_string(),
-                },
-            ))
+            .persist_attempt(
+                &failed_from(
+                    &req,
+                    FailureReason::NonRetriableHttpStatus {
+                        status: 500,
+                        body: "boom".to_string(),
+                    },
+                ),
+                req.state.attempt_id,
+            )
             .await
             .unwrap();
 
@@ -10986,7 +14067,7 @@ mod tests {
         .await;
 
         manager
-            .persist(&completed_from(&req, "hello"))
+            .persist_attempt(&completed_from(&req, "hello"), req.state.attempt_id)
             .await
             .unwrap();
 
@@ -10999,6 +14080,344 @@ mod tests {
             1,
             "transform must run exactly once per persist (it sits before the DB retry loop)",
         );
+    }
+
+    #[sqlx::test]
+    async fn deterministic_transform_failure_is_not_retried_or_written(pool: sqlx::PgPool) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (manager, req) = claim_one_processing(
+            &pool,
+            Some(Arc::new(FailingTransformer {
+                calls: calls.clone(),
+            })),
+        )
+        .await;
+
+        let error = manager
+            .persist_attempt(&completed_from(&req, "plaintext"), req.state.attempt_id)
+            .await
+            .expect_err("deterministic transformer failure must be definitive");
+
+        assert!(matches!(error, FusilladeError::Other(_)));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let (state, attempt_id): (String, Option<Uuid>) =
+            sqlx::query_as("SELECT state, attempt_id FROM requests WHERE id = $1")
+                .bind(*req.data.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(state, "processing");
+        assert_eq!(attempt_id, Some(*req.state.attempt_id));
+    }
+
+    #[sqlx::test]
+    async fn definitive_sqlstate_does_not_enter_attempt_retry_loop(pool: sqlx::PgPool) {
+        let (manager, req) = claim_one_processing(&pool, None).await;
+        install_terminal_transition_fault(&pool, "23514", 3).await;
+
+        let error = manager
+            .persist_attempt(&completed_from(&req, "done"), req.state.attempt_id)
+            .await
+            .expect_err("constraint fault must be definitive");
+
+        assert!(matches!(error, FusilladeError::Other(_)));
+        let calls: i64 = sqlx::query_scalar("SELECT last_value FROM terminal_transition_fault_seq")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(calls, 1, "definitive SQLSTATE must not be retried");
+        let (state, attempt_id): (String, Option<Uuid>) =
+            sqlx::query_as("SELECT state, attempt_id FROM requests WHERE id = $1")
+                .bind(*req.data.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(state, "processing");
+        assert_eq!(attempt_id, Some(*req.state.attempt_id));
+    }
+
+    #[sqlx::test]
+    async fn transient_sqlstate_retries_the_same_attempt_cas(pool: sqlx::PgPool) {
+        let (manager, req) = claim_one_processing(&pool, None).await;
+        install_terminal_transition_fault(&pool, "40001", 2).await;
+
+        assert!(
+            manager
+                .persist_attempt(&completed_from(&req, "done"), req.state.attempt_id)
+                .await
+                .unwrap()
+        );
+
+        let calls: i64 = sqlx::query_scalar("SELECT last_value FROM terminal_transition_fault_seq")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(calls, 3);
+        let (state, attempt_id): (String, Option<Uuid>) =
+            sqlx::query_as("SELECT state, attempt_id FROM requests WHERE id = $1")
+                .bind(*req.data.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(state, "completed");
+        assert_eq!(attempt_id, None);
+    }
+
+    #[sqlx::test]
+    async fn response_transformer_runs_once_across_internal_attempt_retries(pool: sqlx::PgPool) {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (manager, req) = claim_one_processing(
+            &pool,
+            Some(Arc::new(MarkingTransformer {
+                calls: calls.clone(),
+            })),
+        )
+        .await;
+        manager
+            .attempt_persist_failures_remaining
+            .store(2, Ordering::SeqCst);
+
+        assert!(
+            manager
+                .persist_attempt(&completed_from(&req, "hello"), req.state.attempt_id)
+                .await
+                .unwrap()
+        );
+
+        assert_eq!(
+            stored_response_body(&pool, req.data.id).await.as_deref(),
+            Some("XFORM:hello"),
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "SQL retries must reuse the one prepared terminal payload",
+        );
+
+        let (failure_manager, failure_req) = claim_one_processing(
+            &pool,
+            Some(Arc::new(MarkingTransformer {
+                calls: calls.clone(),
+            })),
+        )
+        .await;
+        failure_manager
+            .attempt_persist_failures_remaining
+            .store(2, Ordering::SeqCst);
+        assert!(
+            failure_manager
+                .persist_attempt(
+                    &failed_from(
+                        &failure_req,
+                        FailureReason::RetriableHttpStatus {
+                            status: 503,
+                            body: "failure body".to_string(),
+                        },
+                    ),
+                    failure_req.state.attempt_id,
+                )
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            stored_failure_reason(&pool, failure_req.data.id).await,
+            FailureReason::RetriableHttpStatus {
+                status: 503,
+                body: "XFORM:failure body".to_string(),
+            },
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "each storage invocation transforms once despite internal retries",
+        );
+    }
+
+    #[sqlx::test]
+    async fn repeated_attempt_persistence_reprepares_from_immutable_plaintext(pool: sqlx::PgPool) {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (manager, req) = claim_one_processing(
+            &pool,
+            Some(Arc::new(MarkingTransformer {
+                calls: calls.clone(),
+            })),
+        )
+        .await;
+        let completed = completed_from(&req, "plaintext");
+
+        assert!(
+            !manager
+                .persist_attempt(&completed, AttemptId(Uuid::new_v4()))
+                .await
+                .unwrap()
+        );
+        assert!(
+            manager
+                .persist_attempt(&completed, req.state.attempt_id)
+                .await
+                .unwrap()
+        );
+
+        assert_eq!(
+            stored_response_body(&pool, req.data.id).await.as_deref(),
+            Some("XFORM:plaintext"),
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[sqlx::test]
+    async fn terminal_side_effect_runs_only_after_the_winning_attempt_commits(pool: sqlx::PgPool) {
+        let transforms = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let terminal_hooks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (manager, req) = claim_one_processing(
+            &pool,
+            Some(Arc::new(TerminalHookTransformer {
+                transforms: transforms.clone(),
+                terminal_hooks: terminal_hooks.clone(),
+            })),
+        )
+        .await;
+
+        let replacement = AttemptId(Uuid::new_v4());
+        sqlx::query("UPDATE requests SET attempt_id = $2 WHERE id = $1")
+            .bind(*req.data.id)
+            .bind(*replacement)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        assert!(
+            !manager
+                .persist_attempt(&completed_from(&req, "stale attempt"), req.state.attempt_id,)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            terminal_hooks.load(Ordering::SeqCst),
+            0,
+            "a stale attempt may prepare ciphertext but must not shred its request key",
+        );
+
+        assert!(
+            manager
+                .persist_attempt(&completed_from(&req, "replacement"), replacement)
+                .await
+                .unwrap()
+        );
+        assert_eq!(transforms.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            terminal_hooks.load(Ordering::SeqCst),
+            1,
+            "only the replacement attempt that won the CAS may finalize terminal side effects",
+        );
+    }
+
+    #[sqlx::test]
+    async fn terminal_side_effect_does_not_run_before_a_successful_database_write(
+        pool: sqlx::PgPool,
+    ) {
+        let transforms = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let terminal_hooks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (manager, req) = claim_one_processing(
+            &pool,
+            Some(Arc::new(TerminalHookTransformer {
+                transforms: transforms.clone(),
+                terminal_hooks: terminal_hooks.clone(),
+            })),
+        )
+        .await;
+        manager
+            .attempt_persist_failures_remaining
+            .store(3, Ordering::SeqCst);
+
+        manager
+            .persist_attempt(&completed_from(&req, "not committed"), req.state.attempt_id)
+            .await
+            .expect_err("all injected pre-commit writes should fail");
+        assert_eq!(transforms.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            terminal_hooks.load(Ordering::SeqCst),
+            0,
+            "pre-commit failure must leave destructive cleanup to the TTL backstop",
+        );
+
+        assert!(
+            manager
+                .persist_attempt(&completed_from(&req, "committed"), req.state.attempt_id)
+                .await
+                .unwrap()
+        );
+        assert_eq!(terminal_hooks.load(Ordering::SeqCst), 1);
+    }
+
+    #[sqlx::test]
+    async fn terminal_cleanup_failure_is_best_effort(pool: sqlx::PgPool) {
+        let (manager, req) =
+            claim_one_processing(&pool, Some(Arc::new(FailingTerminalHookTransformer))).await;
+
+        assert!(
+            manager
+                .persist_attempt(&completed_from(&req, "durable"), req.state.attempt_id)
+                .await
+                .unwrap(),
+            "cleanup failure must not turn a committed terminal write into a storage failure",
+        );
+        assert_eq!(
+            stored_response_body(&pool, req.data.id).await.as_deref(),
+            Some("durable"),
+        );
+    }
+
+    #[sqlx::test]
+    async fn ordinary_terminal_persist_finalizes_and_invalidates_canceled_snapshot(
+        pool: sqlx::PgPool,
+    ) {
+        let transforms = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let terminal_hooks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (manager, req) = claim_one_processing(
+            &pool,
+            Some(Arc::new(TerminalHookTransformer {
+                transforms: transforms.clone(),
+                terminal_hooks: terminal_hooks.clone(),
+            })),
+        )
+        .await;
+        let batch_id = req.data.batch_id.unwrap();
+
+        manager
+            .cascade_batch_state_to_requests(batch_id, CascadeTargetState::Canceled)
+            .await
+            .unwrap();
+        // Model a pre-attempt-fencing compatibility row.
+        sqlx::query("UPDATE requests SET attempt_id = NULL WHERE id = $1")
+            .bind(*req.data.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let version_before: i64 =
+            sqlx::query_scalar("SELECT retry_version FROM batches WHERE id = $1")
+                .bind(*batch_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+
+        manager
+            .persist(&completed_from(&req, "compatibility result"))
+            .await
+            .unwrap();
+
+        let row: (String, i64) = sqlx::query_as(
+            "SELECT r.state, b.retry_version
+             FROM requests r JOIN batches b ON b.id = r.batch_id
+             WHERE r.id = $1",
+        )
+        .bind(*req.data.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row, ("completed".to_string(), version_before + 1));
+        assert_eq!(transforms.load(Ordering::SeqCst), 1);
+        assert_eq!(terminal_hooks.load(Ordering::SeqCst), 1);
     }
 
     /// The hook is handed the *specific* request being persisted, so an
@@ -11014,7 +14433,7 @@ mod tests {
         .await;
 
         manager
-            .persist(&completed_from(&req, "hello"))
+            .persist_attempt(&completed_from(&req, "hello"), req.state.attempt_id)
             .await
             .unwrap();
 
@@ -11059,7 +14478,10 @@ mod tests {
             )
             .await;
 
-            manager.persist(&failed_from(&req, reason)).await.unwrap();
+            manager
+                .persist_attempt(&failed_from(&req, reason), req.state.attempt_id)
+                .await
+                .unwrap();
 
             let stored_body = match stored_failure_reason(&pool, req.data.id).await {
                 FailureReason::RetriableHttpStatus { body, .. }
@@ -11085,12 +14507,15 @@ mod tests {
         .await;
 
         manager
-            .persist(&failed_from(
-                &req,
-                FailureReason::Timeout {
-                    error: "timed out".to_string(),
-                },
-            ))
+            .persist_attempt(
+                &failed_from(
+                    &req,
+                    FailureReason::Timeout {
+                        error: "timed out".to_string(),
+                    },
+                ),
+                req.state.attempt_id,
+            )
             .await
             .unwrap();
 
@@ -11114,7 +14539,7 @@ mod tests {
         let (manager, req) = claim_one_processing(&pool, None).await;
 
         manager
-            .persist(&completed_from(&req, "plaintext"))
+            .persist_attempt(&completed_from(&req, "plaintext"), req.state.attempt_id)
             .await
             .unwrap();
 
@@ -12429,13 +15854,14 @@ mod tests {
                  id, batch_id, template_id, state, retry_attempt, not_before, daemon_id,
                  claimed_at, started_at, response_status, response_body, completed_at,
                  error, failed_at, canceled_at, created_at, updated_at, custom_id, model,
-                 response_size, routed_model, service_tier, created_by, archive_bucket
+                 response_size, routed_model, service_tier, created_by, attempt_id,
+                 processing_admission_id, archive_bucket
              )
              SELECT r.id, r.batch_id, r.template_id, r.state, r.retry_attempt, r.not_before,
                     r.daemon_id, r.claimed_at, r.started_at, r.response_status, r.response_body,
                     r.completed_at, r.error, r.failed_at, r.canceled_at, r.created_at,
                     r.updated_at, r.custom_id, r.model, r.response_size, r.routed_model,
-                    r.service_tier, r.created_by,
+                    r.service_tier, r.created_by, r.attempt_id, r.processing_admission_id,
                     date_trunc('week', (SELECT created_at FROM batches WHERE id = $1) AT TIME ZONE 'UTC')::date
              FROM requests r WHERE r.batch_id = $1
              ORDER BY r.id LIMIT 1",
@@ -13832,6 +17258,820 @@ mod tests {
     // - Not unclaiming recently claimed requests
     // - Preserving retry_attempt across unclaim operations
 
+    async fn setup_claimed_attempt_for_reclaim(
+        pool: &sqlx::PgPool,
+        config: DaemonConfig,
+        owner: DaemonId,
+    ) -> (
+        Arc<PostgresRequestManager<TestDbPools>>,
+        RequestId,
+        AttemptId,
+    ) {
+        let manager = Arc::new(
+            PostgresRequestManager::with_client(
+                TestDbPools::new(pool.clone()).await.unwrap(),
+                Arc::new(MockHttpClient::new()),
+            )
+            .with_config(config),
+        );
+        let file_id = manager
+            .create_file(
+                format!("attempt-reclaim-{}", Uuid::new_v4()),
+                None,
+                vec![RequestTemplateInput {
+                    custom_id: None,
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/test".to_string(),
+                    body: "{}".to_string(),
+                    model: "test".to_string(),
+                    api_key: "key".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+        manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+                api_key_id: None,
+                api_key: None,
+                total_requests: None,
+            })
+            .await
+            .unwrap();
+        mark_models_live_for_test(&manager, ["test"]).await;
+        let claimed = manager
+            .claim_batch_requests(
+                1,
+                1,
+                owner,
+                &HashMap::from([("test".to_string(), 1)]),
+                &HashMap::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(claimed.len(), 1);
+        (manager, claimed[0].data.id, claimed[0].state.attempt_id)
+    }
+
+    async fn persist_running_owner(
+        manager: &PostgresRequestManager<TestDbPools>,
+        owner: DaemonId,
+        last_heartbeat: DateTime<Utc>,
+    ) {
+        manager
+            .persist_daemon(&DaemonRecord {
+                data: DaemonData {
+                    id: owner,
+                    hostname: "test-host".to_string(),
+                    pid: 1234,
+                    version: "test".to_string(),
+                    config_snapshot: serde_json::json!({}),
+                },
+                state: Running {
+                    started_at: Utc::now() - chrono::Duration::minutes(10),
+                    last_heartbeat,
+                    stats: DaemonStats::default(),
+                },
+            })
+            .await
+            .unwrap();
+    }
+
+    #[sqlx::test]
+    async fn test_attempt_reclaim_preserves_proxy_owned_realtime_request(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+        let request_id = manager
+            .create_realtime(CreateRealtimeInput {
+                request_id: Uuid::new_v4(),
+                body: r#"{"model":"realtime-model","input":"hello"}"#.to_string(),
+                model: "realtime-model".to_string(),
+                endpoint: "https://api.example.com".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/responses".to_string(),
+                api_key: "key".to_string(),
+                created_by: "realtime-user".to_string(),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            manager.reclaim_stale_requests().await.unwrap(),
+            0,
+            "the nil UUID denotes a live proxy owner, not a missing daemon"
+        );
+        assert_eq!(
+            manager.get_request_detail(request_id).await.unwrap().status,
+            "processing"
+        );
+
+        let daemon_claims = manager
+            .claim_batchless_requests(
+                1,
+                DaemonId::from(Uuid::new_v4()),
+                &HashMap::from([("realtime-model".to_string(), 1)]),
+                &HashMap::new(),
+                &HashSet::new(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            daemon_claims.is_empty(),
+            "the daemon must never bulk-claim a proxy-owned realtime request"
+        );
+
+        manager
+            .complete_request(request_id, r#"{"output":"done"}"#, 200)
+            .await
+            .unwrap();
+        let completed = manager.get_request_detail(request_id).await.unwrap();
+        assert_eq!(completed.status, "completed");
+        assert_eq!(
+            completed.response_body.as_deref(),
+            Some(r#"{"output":"done"}"#)
+        );
+    }
+
+    #[sqlx::test]
+    async fn test_attempt_reclaim_repairs_pending_authority_residue(pool: sqlx::PgPool) {
+        let owner = DaemonId::from(Uuid::new_v4());
+        let (manager, request_id, poisoned_attempt) =
+            setup_claimed_attempt_for_reclaim(&pool, DaemonConfig::default(), owner).await;
+
+        // Model a rollback binary that re-pended a tokenized claim without
+        // revoking its authority fields. New claim SQL correctly skips it.
+        sqlx::query(
+            "UPDATE requests
+             SET state = 'pending',
+                 daemon_id = NULL,
+                 claimed_at = NULL,
+                 started_at = NULL
+             WHERE id = $1",
+        )
+        .bind(*request_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let capacity = HashMap::from([("test".to_string(), 1)]);
+        assert!(
+            manager
+                .claim_batch_requests(1, 1, owner, &capacity, &HashMap::new())
+                .await
+                .unwrap()
+                .is_empty(),
+            "pending rows with stale authority must not bypass the claim fence",
+        );
+
+        assert_eq!(manager.unclaim_stale_requests().await.unwrap(), 1);
+        let repaired: (
+            String,
+            Option<Uuid>,
+            Option<Uuid>,
+            Option<DateTime<Utc>>,
+            Option<DateTime<Utc>>,
+        ) = sqlx::query_as(
+            "SELECT state, daemon_id, attempt_id, claimed_at, started_at
+             FROM requests WHERE id = $1",
+        )
+        .bind(*request_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(repaired, ("pending".to_string(), None, None, None, None));
+
+        let replacement = manager
+            .claim_batch_requests(1, 1, owner, &capacity, &HashMap::new())
+            .await
+            .unwrap();
+        assert_eq!(replacement.len(), 1);
+        assert_eq!(replacement[0].data.id, request_id);
+        assert_ne!(replacement[0].state.attempt_id, poisoned_attempt);
+    }
+
+    #[sqlx::test]
+    async fn test_attempt_reclaim_aged_claimed_from_healthy_owner(pool: sqlx::PgPool) {
+        let owner = DaemonId::from(Uuid::new_v4());
+        let config = DaemonConfig {
+            claim_timeout_ms: 1_000,
+            stale_daemon_threshold_ms: 60_000,
+            ..Default::default()
+        };
+        let (manager, request_id, attempt_id) =
+            setup_claimed_attempt_for_reclaim(&pool, config, owner).await;
+        persist_running_owner(&manager, owner, Utc::now()).await;
+        let not_before = Utc::now() - chrono::Duration::seconds(30);
+        sqlx::query(
+            "UPDATE requests
+             SET claimed_at = NOW() - INTERVAL '3 seconds',
+                 retry_attempt = 4,
+                 not_before = $2
+             WHERE id = $1",
+        )
+        .bind(*request_id)
+        .bind(not_before)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(manager.unclaim_stale_requests().await.unwrap(), 1);
+        #[derive(sqlx::FromRow)]
+        struct ReclaimedRow {
+            state: String,
+            daemon_id: Option<Uuid>,
+            attempt_id: Option<Uuid>,
+            claimed_at: Option<DateTime<Utc>>,
+            started_at: Option<DateTime<Utc>>,
+            retry_attempt: i32,
+            not_before: Option<DateTime<Utc>>,
+        }
+        let row: ReclaimedRow = sqlx::query_as(
+            "SELECT state, daemon_id, attempt_id, claimed_at, started_at,
+                    retry_attempt, not_before
+             FROM requests WHERE id = $1",
+        )
+        .bind(*request_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.state, "pending");
+        assert_eq!(row.daemon_id, None);
+        assert_eq!(row.attempt_id, None, "reclaim must revoke {attempt_id}");
+        assert_eq!(row.claimed_at, None);
+        assert_eq!(row.started_at, None);
+        assert_eq!(row.retry_attempt, 4);
+        assert_eq!(row.not_before, Some(not_before));
+
+        let reclaimed = manager
+            .claim_batch_requests(
+                1,
+                1,
+                owner,
+                &HashMap::from([("test".to_string(), 1)]),
+                &HashMap::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reclaimed.len(), 1);
+        assert_eq!(reclaimed[0].data.id, request_id);
+        assert_ne!(
+            reclaimed[0].state.attempt_id, attempt_id,
+            "the same daemon must receive a fresh token for its replacement claim"
+        );
+        let stored_attempt: Option<Uuid> =
+            sqlx::query_scalar("SELECT attempt_id FROM requests WHERE id = $1")
+                .bind(*request_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(stored_attempt, Some(*reclaimed[0].state.attempt_id));
+    }
+
+    #[sqlx::test]
+    async fn test_attempt_reclaim_aged_legacy_claim_waits_for_owner_liveness(pool: sqlx::PgPool) {
+        let owner = DaemonId::from(Uuid::new_v4());
+        let config = DaemonConfig {
+            claim_timeout_ms: 1_000,
+            stale_daemon_threshold_ms: 60_000,
+            ..Default::default()
+        };
+        let (manager, request_id, _) =
+            setup_claimed_attempt_for_reclaim(&pool, config, owner).await;
+        persist_running_owner(&manager, owner, Utc::now()).await;
+        sqlx::query(
+            "UPDATE requests
+             SET attempt_id = NULL,
+                 claimed_at = NOW() - INTERVAL '3 seconds'
+             WHERE id = $1",
+        )
+        .bind(*request_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(manager.unclaim_stale_requests().await.unwrap(), 0);
+        let row: (String, Option<Uuid>) =
+            sqlx::query_as("SELECT state, attempt_id FROM requests WHERE id = $1")
+                .bind(*request_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(row, ("claimed".to_string(), None));
+    }
+
+    #[sqlx::test]
+    async fn test_attempt_reclaim_old_processing_waits_for_owner_liveness(pool: sqlx::PgPool) {
+        let owner = DaemonId::from(Uuid::new_v4());
+        let config = DaemonConfig {
+            processing_timeout_ms: 1,
+            stale_daemon_threshold_ms: 60_000,
+            ..Default::default()
+        };
+        let (manager, request_id, attempt_id) =
+            setup_claimed_attempt_for_reclaim(&pool, config, owner).await;
+        persist_running_owner(&manager, owner, Utc::now()).await;
+        sqlx::query(
+            "UPDATE requests
+             SET state = 'processing',
+                 claimed_at = NOW() - INTERVAL '1 hour',
+                 started_at = NOW() - INTERVAL '1 hour'
+             WHERE id = $1",
+        )
+        .bind(*request_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(manager.unclaim_stale_requests().await.unwrap(), 0);
+        let row: (String, Option<Uuid>, Option<Uuid>) =
+            sqlx::query_as("SELECT state, daemon_id, attempt_id FROM requests WHERE id = $1")
+                .bind(*request_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            row,
+            ("processing".to_string(), Some(*owner), Some(*attempt_id))
+        );
+    }
+
+    #[sqlx::test]
+    async fn test_attempt_reclaim_initializing_owner_remains_available(pool: sqlx::PgPool) {
+        let owner = DaemonId::from(Uuid::new_v4());
+        let config = DaemonConfig {
+            claim_timeout_ms: 1,
+            processing_timeout_ms: 1,
+            stale_daemon_threshold_ms: 1,
+            ..Default::default()
+        };
+        let (manager, legacy_claim_id, _) =
+            setup_claimed_attempt_for_reclaim(&pool, config.clone(), owner).await;
+        let (_, processing_id, processing_attempt) =
+            setup_claimed_attempt_for_reclaim(&pool, config, owner).await;
+        manager
+            .persist_daemon(&DaemonRecord {
+                data: DaemonData {
+                    id: owner,
+                    hostname: "test-host".to_string(),
+                    pid: 1234,
+                    version: "test".to_string(),
+                    config_snapshot: serde_json::json!({}),
+                },
+                state: Initializing {
+                    started_at: Utc::now() - chrono::Duration::hours(1),
+                },
+            })
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE requests
+             SET attempt_id = NULL,
+                 claimed_at = NOW() - INTERVAL '1 hour'
+             WHERE id = $1",
+        )
+        .bind(*legacy_claim_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE requests
+             SET state = 'processing',
+                 claimed_at = NOW() - INTERVAL '1 hour',
+                 started_at = NOW() - INTERVAL '1 hour'
+             WHERE id = $1",
+        )
+        .bind(*processing_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(manager.unclaim_stale_requests().await.unwrap(), 0);
+        let rows: Vec<(Uuid, String, Option<Uuid>, Option<Uuid>)> = sqlx::query_as(
+            "SELECT id, state, daemon_id, attempt_id
+             FROM requests
+             WHERE id = ANY($1)
+             ORDER BY id",
+        )
+        .bind(vec![*legacy_claim_id, *processing_id])
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 2);
+        for (id, state, daemon_id, attempt_id) in rows {
+            assert_eq!(daemon_id, Some(*owner));
+            if id == *legacy_claim_id {
+                assert_eq!(state, "claimed");
+                assert_eq!(attempt_id, None);
+            } else {
+                assert_eq!(state, "processing");
+                assert_eq!(attempt_id, Some(*processing_attempt));
+            }
+        }
+    }
+
+    #[sqlx::test]
+    async fn test_attempt_reclaim_dead_owner_recovers_recent_claimed_and_processing(
+        pool: sqlx::PgPool,
+    ) {
+        let owner = DaemonId::from(Uuid::new_v4());
+        let config = DaemonConfig {
+            claim_timeout_ms: 600_000,
+            processing_timeout_ms: 600_000,
+            stale_daemon_threshold_ms: 60_000,
+            ..Default::default()
+        };
+        let (manager, claimed_id, _) =
+            setup_claimed_attempt_for_reclaim(&pool, config.clone(), owner).await;
+        let (_, processing_id, _) = setup_claimed_attempt_for_reclaim(&pool, config, owner).await;
+        manager
+            .persist_daemon(&DaemonRecord {
+                data: DaemonData {
+                    id: owner,
+                    hostname: "test-host".to_string(),
+                    pid: 1234,
+                    version: "test".to_string(),
+                    config_snapshot: serde_json::json!({}),
+                },
+                state: Dead {
+                    started_at: Utc::now() - chrono::Duration::minutes(10),
+                    stopped_at: Utc::now(),
+                    final_stats: DaemonStats::default(),
+                },
+            })
+            .await
+            .unwrap();
+        sqlx::query("UPDATE requests SET state = 'processing', started_at = NOW() WHERE id = $1")
+            .bind(*processing_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(manager.unclaim_stale_requests().await.unwrap(), 2);
+        let states: Vec<String> =
+            sqlx::query_scalar("SELECT state FROM requests WHERE id = ANY($1) ORDER BY id")
+                .bind(vec![*claimed_id, *processing_id])
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(states, vec!["pending", "pending"]);
+    }
+
+    #[sqlx::test]
+    async fn test_attempt_reclaim_stale_owner_recovers_recent_claimed_and_processing(
+        pool: sqlx::PgPool,
+    ) {
+        let owner = DaemonId::from(Uuid::new_v4());
+        let config = DaemonConfig {
+            claim_timeout_ms: 600_000,
+            processing_timeout_ms: 600_000,
+            stale_daemon_threshold_ms: 1_000,
+            ..Default::default()
+        };
+        let (manager, _claimed_id, _) =
+            setup_claimed_attempt_for_reclaim(&pool, config.clone(), owner).await;
+        let (_, processing_id, _) = setup_claimed_attempt_for_reclaim(&pool, config, owner).await;
+        persist_running_owner(&manager, owner, Utc::now() - chrono::Duration::seconds(5)).await;
+        sqlx::query("UPDATE requests SET state = 'processing', started_at = NOW() WHERE id = $1")
+            .bind(*processing_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(manager.unclaim_stale_requests().await.unwrap(), 2);
+    }
+
+    #[sqlx::test]
+    async fn test_attempt_reclaim_missing_owner_recovers_recent_claimed_and_processing(
+        pool: sqlx::PgPool,
+    ) {
+        let owner = DaemonId::from(Uuid::new_v4());
+        let config = DaemonConfig {
+            claim_timeout_ms: 600_000,
+            processing_timeout_ms: 600_000,
+            stale_daemon_threshold_ms: 60_000,
+            ..Default::default()
+        };
+        let (manager, claimed_id, _) =
+            setup_claimed_attempt_for_reclaim(&pool, config.clone(), owner).await;
+        let (_, processing_id, _) = setup_claimed_attempt_for_reclaim(&pool, config, owner).await;
+        sqlx::query("UPDATE requests SET attempt_id = NULL WHERE id = $1")
+            .bind(*claimed_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE requests SET state = 'processing', started_at = NOW() WHERE id = $1")
+            .bind(*processing_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(manager.unclaim_stale_requests().await.unwrap(), 2);
+        let still_owned: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM requests
+             WHERE id = ANY($1)
+               AND (state <> 'pending' OR daemon_id IS NOT NULL OR attempt_id IS NOT NULL)",
+        )
+        .bind(vec![*claimed_id, *processing_id])
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(still_owned, 0);
+    }
+
+    #[sqlx::test]
+    async fn test_attempt_reclaim_skips_row_locked_by_terminal_writer(pool: sqlx::PgPool) {
+        let owner = DaemonId::from(Uuid::new_v4());
+        let config = DaemonConfig {
+            claim_timeout_ms: 1_000,
+            ..Default::default()
+        };
+        let (manager, request_id, _) =
+            setup_claimed_attempt_for_reclaim(&pool, config, owner).await;
+        sqlx::query(
+            "UPDATE requests
+             SET claimed_at = NOW() - INTERVAL '3 seconds'
+             WHERE id = $1",
+        )
+        .bind(*request_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mut terminal_writer = pool.begin().await.unwrap();
+        sqlx::query("SELECT id FROM requests WHERE id = $1 FOR UPDATE")
+            .bind(*request_id)
+            .fetch_one(&mut *terminal_writer)
+            .await
+            .unwrap();
+
+        let reclaimed = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            manager.reclaim_stale_requests(),
+        )
+        .await
+        .expect("reclaim must skip a terminal-writer-held row")
+        .unwrap();
+        assert_eq!(reclaimed, 0);
+        terminal_writer.rollback().await.unwrap();
+
+        let state: String = sqlx::query_scalar("SELECT state FROM requests WHERE id = $1")
+            .bind(*request_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(state, "claimed");
+    }
+
+    #[sqlx::test]
+    async fn test_attempt_reclaim_respects_batch_limit(pool: sqlx::PgPool) {
+        let owner = DaemonId::from(Uuid::new_v4());
+        let config = DaemonConfig {
+            claim_timeout_ms: 1_000,
+            unclaim_batch_size: 2,
+            ..Default::default()
+        };
+        let mut manager = None;
+        for _ in 0..3 {
+            let (candidate_manager, request_id, _) =
+                setup_claimed_attempt_for_reclaim(&pool, config.clone(), owner).await;
+            sqlx::query(
+                "UPDATE requests
+                 SET claimed_at = NOW() - INTERVAL '3 seconds'
+                 WHERE id = $1",
+            )
+            .bind(*request_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+            manager = Some(candidate_manager);
+        }
+        let manager = manager.unwrap();
+
+        assert_eq!(manager.reclaim_stale_requests().await.unwrap(), 2);
+        let counts: (i64, i64) = sqlx::query_as(
+            "SELECT COUNT(*) FILTER (WHERE state = 'pending'),
+                    COUNT(*) FILTER (WHERE state = 'claimed')
+             FROM requests",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(counts, (2, 1));
+        assert_eq!(manager.reclaim_stale_requests().await.unwrap(), 1);
+    }
+
+    async fn replace_claim_for_reclaim_race_for_test(
+        manager: &PostgresRequestManager<TestDbPools>,
+        pool: &sqlx::PgPool,
+        request_id: RequestId,
+        replacement_owner: DaemonId,
+    ) -> AttemptId {
+        sqlx::query(
+            "UPDATE requests
+             SET claimed_at = NOW() - INTERVAL '3 seconds'
+             WHERE id = $1",
+        )
+        .bind(*request_id)
+        .execute(pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            manager.reclaim_stale_requests().await.unwrap(),
+            1,
+            "the production reclaim statement must recognize and release attempt A"
+        );
+
+        let replacement = manager
+            .claim_batch_requests(
+                1,
+                1,
+                replacement_owner,
+                &HashMap::from([("test".to_string(), 1)]),
+                &HashMap::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(replacement.len(), 1);
+        assert_eq!(replacement[0].data.id, request_id);
+        replacement[0].state.attempt_id
+    }
+
+    // The production reclaim is deliberately one SQL statement with
+    // `FOR UPDATE ... SKIP LOCKED`, so there is no deterministic external seam
+    // between its MVCC candidate scan and locked recheck: a lock acquired
+    // before the scan makes the row get skipped, while a lock acquired after
+    // the recheck makes the replacement writer wait. Timing sleeps would only
+    // make this race probabilistic. The integration tests above exercise the
+    // complete production statement; this fixture injects a real observed
+    // attempt-A tuple into the identical locked recheck/update phase after the
+    // production statement has released A and the claim path has installed B.
+    async fn reclaim_observed_candidate_for_test(
+        pool: &sqlx::PgPool,
+        request_id: RequestId,
+        observed_owner: DaemonId,
+        observed_attempt: AttemptId,
+        owner_unavailable: bool,
+    ) -> u64 {
+        sqlx::query(
+            r#"
+            WITH candidates(id, daemon_id, attempt_id, owner_unavailable) AS (
+                VALUES ($1::UUID, $2::UUID, $3::UUID, $4::BOOLEAN)
+            ),
+            to_unclaim AS (
+                SELECT r.id
+                FROM requests r
+                JOIN candidates c
+                  ON c.id = r.id
+                 AND r.daemon_id IS NOT DISTINCT FROM c.daemon_id
+                 AND r.attempt_id IS NOT DISTINCT FROM c.attempt_id
+                WHERE
+                    (
+                        r.state = 'claimed'
+                        AND (
+                            c.owner_unavailable
+                            OR (
+                                r.attempt_id IS NOT NULL
+                                AND r.claimed_at < NOW() - INTERVAL '1 second'
+                            )
+                        )
+                    )
+                    OR (
+                        r.state = 'processing'
+                        AND c.owner_unavailable
+                    )
+                FOR UPDATE OF r SKIP LOCKED
+            )
+            UPDATE requests r
+            SET state = 'pending',
+                daemon_id = NULL,
+                attempt_id = NULL,
+                claimed_at = NULL,
+                started_at = NULL
+            FROM to_unclaim stale
+            WHERE r.id = stale.id
+            "#,
+        )
+        .bind(*request_id)
+        .bind(*observed_owner)
+        .bind(*observed_attempt)
+        .bind(owner_unavailable)
+        .execute(pool)
+        .await
+        .unwrap()
+        .rows_affected()
+    }
+
+    #[sqlx::test]
+    async fn test_attempt_reclaim_candidate_cannot_revoke_newer_same_owner_attempt(
+        pool: sqlx::PgPool,
+    ) {
+        let owner = DaemonId::from(Uuid::new_v4());
+        let config = DaemonConfig {
+            claim_timeout_ms: 1_000,
+            ..Default::default()
+        };
+        let (manager, request_id, observed_old_attempt) =
+            setup_claimed_attempt_for_reclaim(&pool, config, owner).await;
+        let current_attempt =
+            replace_claim_for_reclaim_race_for_test(&manager, &pool, request_id, owner).await;
+        assert_ne!(current_attempt, observed_old_attempt);
+
+        assert_eq!(
+            reclaim_observed_candidate_for_test(
+                &pool,
+                request_id,
+                owner,
+                observed_old_attempt,
+                true,
+            )
+            .await,
+            0
+        );
+        let row: (String, Option<Uuid>, Option<Uuid>) =
+            sqlx::query_as("SELECT state, daemon_id, attempt_id FROM requests WHERE id = $1")
+                .bind(*request_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            row,
+            ("claimed".to_string(), Some(*owner), Some(*current_attempt))
+        );
+    }
+
+    #[sqlx::test]
+    async fn test_attempt_reclaim_candidate_cannot_revoke_newer_different_owner_attempt(
+        pool: sqlx::PgPool,
+    ) {
+        let observed_old_owner = DaemonId::from(Uuid::new_v4());
+        let current_owner = DaemonId::from(Uuid::new_v4());
+        let config = DaemonConfig {
+            claim_timeout_ms: 1_000,
+            ..Default::default()
+        };
+        let (manager, request_id, observed_old_attempt) =
+            setup_claimed_attempt_for_reclaim(&pool, config, observed_old_owner).await;
+        let current_attempt =
+            replace_claim_for_reclaim_race_for_test(&manager, &pool, request_id, current_owner)
+                .await;
+
+        assert_eq!(
+            reclaim_observed_candidate_for_test(
+                &pool,
+                request_id,
+                observed_old_owner,
+                observed_old_attempt,
+                true,
+            )
+            .await,
+            0
+        );
+        let row: (Option<Uuid>, Option<Uuid>) =
+            sqlx::query_as("SELECT daemon_id, attempt_id FROM requests WHERE id = $1")
+                .bind(*request_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(row, (Some(*current_owner), Some(*current_attempt)));
+    }
+
+    #[sqlx::test]
+    async fn test_attempt_reclaim_age_candidate_cannot_revoke_processing_transition(
+        pool: sqlx::PgPool,
+    ) {
+        let owner = DaemonId::from(Uuid::new_v4());
+        let (_manager, request_id, attempt_id) =
+            setup_claimed_attempt_for_reclaim(&pool, DaemonConfig::default(), owner).await;
+        sqlx::query(
+            "UPDATE requests
+             SET state = 'processing',
+                 started_at = NOW(),
+                 claimed_at = NOW() - INTERVAL '3 seconds'
+             WHERE id = $1",
+        )
+        .bind(*request_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            reclaim_observed_candidate_for_test(&pool, request_id, owner, attempt_id, false).await,
+            0
+        );
+        let state: String = sqlx::query_scalar("SELECT state FROM requests WHERE id = $1")
+            .bind(*request_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(state, "processing");
+    }
+
     #[sqlx::test]
     async fn test_unclaim_stale_claimed_requests(pool: sqlx::PgPool) {
         let http_client = Arc::new(MockHttpClient::new());
@@ -13900,7 +18140,10 @@ mod tests {
         .await
         .unwrap();
 
-        // Now daemon2 tries to claim - should unclaim the stale request and re-claim it
+        // The nominated daemon loop reclaims before invoking either claim API.
+        assert_eq!(manager.reclaim_stale_requests().await.unwrap(), 1);
+
+        // Daemon2 can now claim the released row.
         let daemon2_id = DaemonId::from(Uuid::new_v4());
         let reclaimed =
             claim_batch_requests_for_test(&manager, 1, 1, daemon2_id, &capacity, &HashMap::new())
@@ -13993,7 +18236,9 @@ mod tests {
         let status_before = manager.get_batch_status(batch.id).await.unwrap();
         assert_eq!(status_before.in_progress_requests, 1);
 
-        // Now daemon2 tries to claim - should unclaim the stale processing request
+        assert_eq!(manager.reclaim_stale_requests().await.unwrap(), 1);
+
+        // Daemon2 can claim after the missing owner was proven unavailable.
         let daemon2_id = DaemonId::from(Uuid::new_v4());
         let reclaimed =
             claim_batch_requests_for_test(&manager, 1, 1, daemon2_id, &capacity, &HashMap::new())
@@ -14094,7 +18339,9 @@ mod tests {
         let status = manager.get_batch_status(batch.id).await.unwrap();
         assert_eq!(status.in_progress_requests, 1);
 
-        // Daemon2 claims — should reclaim daemon1's request because daemon1 is dead
+        assert_eq!(manager.reclaim_stale_requests().await.unwrap(), 1);
+
+        // Daemon2 claims the row released from the dead owner.
         let daemon2_id = DaemonId::from(Uuid::new_v4());
         let reclaimed =
             claim_batch_requests_for_test(&manager, 1, 1, daemon2_id, &capacity, &HashMap::new())
@@ -14195,7 +18442,9 @@ mod tests {
         let status = manager.get_batch_status(batch.id).await.unwrap();
         assert_eq!(status.in_progress_requests, 1);
 
-        // Daemon2 claims — should reclaim because daemon1's heartbeat is stale
+        assert_eq!(manager.reclaim_stale_requests().await.unwrap(), 1);
+
+        // Daemon2 claims after maintenance detects the stale heartbeat.
         let daemon2_id = DaemonId::from(Uuid::new_v4());
         let reclaimed =
             claim_batch_requests_for_test(&manager, 1, 1, daemon2_id, &capacity, &HashMap::new())
@@ -14303,6 +18552,8 @@ mod tests {
         .await
         .unwrap();
 
+        assert_eq!(manager.reclaim_stale_requests().await.unwrap(), 0);
+
         // Daemon2 claims — should get the second request, NOT steal from healthy daemon1
         let daemon2_id = DaemonId::from(Uuid::new_v4());
         let claimed2 =
@@ -14388,6 +18639,9 @@ mod tests {
             claim_batch_requests_for_test(&manager, 1, 1, daemon1_id, &capacity, &HashMap::new())
                 .await;
         assert_eq!(claimed1.len(), 1);
+
+        persist_running_owner(&manager, daemon1_id, Utc::now()).await;
+        assert_eq!(manager.reclaim_stale_requests().await.unwrap(), 0);
 
         // Daemon2 immediately tries to claim - should get the second request, not steal the first
         let daemon2_id = DaemonId::from(Uuid::new_v4());
@@ -14479,7 +18733,9 @@ mod tests {
         .await
         .unwrap();
 
-        // Claim should unclaim the stale request and reclaim it
+        assert_eq!(manager.reclaim_stale_requests().await.unwrap(), 1);
+
+        // Claim should take the released request.
         let capacity = HashMap::from([("test".to_string(), 10)]);
         let daemon_id = DaemonId::from(Uuid::new_v4());
         let claimed =
@@ -17231,46 +21487,38 @@ mod tests {
         );
 
         // Unclaim all requests so we can re-claim with user priorities
-        sqlx::query!("UPDATE requests SET state = 'pending', daemon_id = NULL, claimed_at = NULL WHERE state = 'claimed'")
+        sqlx::query("UPDATE requests SET state = 'pending', daemon_id = NULL, attempt_id = NULL, claimed_at = NULL WHERE state = 'claimed'")
             .execute(&pool)
             .await
             .unwrap();
 
-        // Re-claim with user-a having 5 in-flight requests; user-b and user-c have 0
+        // Re-claim within a four-slot capacity with user-a having 5 in-flight
+        // requests; user-b and user-c have 0. Limiting the claim makes fairness
+        // observable in the selected set without relying on UPDATE RETURNING
+        // row order, which PostgreSQL does not guarantee.
         let user_counts = HashMap::from([("user-a".to_string(), 5usize)]);
-        let claimed =
-            claim_batch_requests_for_test(&manager, 6, 3, daemon_id, &capacity, &user_counts).await;
+        let prioritized_capacity = HashMap::from([("fair-test".to_string(), 4)]);
+        let claimed = claim_batch_requests_for_test(
+            &manager,
+            4,
+            3,
+            daemon_id,
+            &prioritized_capacity,
+            &user_counts,
+        )
+        .await;
 
-        assert_eq!(claimed.len(), 6, "Should still claim all 6 requests");
+        assert_eq!(claimed.len(), 4);
 
         // Count how many requests were claimed per user
-        let mut per_user: HashMap<String, Vec<usize>> = HashMap::new();
-        for (i, req) in claimed.iter().enumerate() {
-            per_user
-                .entry(req.data.created_by.clone())
-                .or_default()
-                .push(i);
+        let mut per_user: HashMap<String, usize> = HashMap::new();
+        for req in &claimed {
+            *per_user.entry(req.data.created_by.clone()).or_default() += 1;
         }
 
-        // user-b and user-c should appear before user-a in the claim order
-        let user_a_first = per_user.get("user-a").map(|v| v[0]).unwrap_or(0);
-        let user_b_first = per_user.get("user-b").map(|v| v[0]).unwrap_or(usize::MAX);
-        let user_c_first = per_user.get("user-c").map(|v| v[0]).unwrap_or(usize::MAX);
-
-        assert!(
-            user_b_first < user_a_first,
-            "user-b (0 active) should be prioritised over user-a (5 active), \
-             but user-b first index={} vs user-a first index={}",
-            user_b_first,
-            user_a_first
-        );
-        assert!(
-            user_c_first < user_a_first,
-            "user-c (0 active) should be prioritised over user-a (5 active), \
-             but user-c first index={} vs user-a first index={}",
-            user_c_first,
-            user_a_first
-        );
+        assert_eq!(per_user.get("user-a"), None);
+        assert_eq!(per_user.get("user-b"), Some(&2));
+        assert_eq!(per_user.get("user-c"), Some(&2));
     }
 
     #[sqlx::test]
@@ -17442,8 +21690,8 @@ mod tests {
         );
 
         // Reset all requests to pending for the next test
-        sqlx::query!(
-            "UPDATE requests SET state = 'pending', daemon_id = NULL, claimed_at = NULL WHERE state = 'claimed'"
+        sqlx::query(
+            "UPDATE requests SET state = 'pending', daemon_id = NULL, attempt_id = NULL, claimed_at = NULL WHERE state = 'claimed'"
         )
         .execute(&pool)
         .await
@@ -17595,8 +21843,8 @@ mod tests {
         );
 
         // Reset to pending for the next claim.
-        sqlx::query!(
-            "UPDATE requests SET state='pending', daemon_id=NULL, claimed_at=NULL WHERE state='claimed'"
+        sqlx::query(
+            "UPDATE requests SET state='pending', daemon_id=NULL, attempt_id=NULL, claimed_at=NULL WHERE state='claimed'"
         )
         .execute(&pool)
         .await
@@ -19269,7 +23517,7 @@ mod tests {
             TestDbPools::new(pool.clone()).await.unwrap(),
             http_client,
         );
-        let hook = Arc::new(AdmissionReleaseTestHook::default());
+        let hook = Arc::new(TestPauseHook::default());
         manager.admission_release_test_hook = Some(hook.clone());
         let manager = Arc::new(manager);
 
@@ -20154,7 +24402,8 @@ mod tests {
              SET state = 'processing',
                  daemon_id = gen_random_uuid(),
                  claimed_at = NOW(),
-                 started_at = NOW()
+                 started_at = NOW(),
+                 service_tier = 'priority'
              WHERE id = $1",
         )
         .bind(recent_id)
@@ -20185,7 +24434,8 @@ mod tests {
              SET state = 'processing',
                  daemon_id = gen_random_uuid(),
                  claimed_at = NOW(),
-                 started_at = NOW()
+                 started_at = NOW(),
+                 service_tier = 'priority'
              WHERE id = $1",
         )
         .bind(old_id)
@@ -20216,7 +24466,8 @@ mod tests {
              SET state = 'processing',
                  daemon_id = gen_random_uuid(),
                  claimed_at = NOW(),
-                 started_at = NOW()
+                 started_at = NOW(),
+                 service_tier = 'priority'
              WHERE id = $1",
         )
         .bind(failed_id)
@@ -20244,17 +24495,23 @@ mod tests {
             .unwrap();
 
         sqlx::query(
-            "UPDATE requests SET completed_at = NOW() - INTERVAL '5 minutes' WHERE id = $1",
+            "UPDATE requests \
+             SET completed_at = NOW() - INTERVAL '5 minutes', service_tier = 'flex' \
+             WHERE id = $1",
         )
         .bind(recent_id)
         .execute(&pool)
         .await
         .unwrap();
-        sqlx::query("UPDATE requests SET failed_at = NOW() - INTERVAL '5 minutes' WHERE id = $1")
-            .bind(failed_id)
-            .execute(&pool)
-            .await
-            .unwrap();
+        sqlx::query(
+            "UPDATE requests \
+             SET failed_at = NOW() - INTERVAL '5 minutes', service_tier = 'flex' \
+             WHERE id = $1",
+        )
+        .bind(failed_id)
+        .execute(&pool)
+        .await
+        .unwrap();
         sqlx::query(
             "UPDATE requests SET state = 'canceled', canceled_at = NOW() - INTERVAL '5 minutes' WHERE id = $1",
         )
@@ -20263,7 +24520,9 @@ mod tests {
         .await
         .unwrap();
         sqlx::query(
-            "UPDATE requests SET completed_at = NOW() - INTERVAL '11 minutes' WHERE id = $1",
+            "UPDATE requests \
+             SET completed_at = NOW() - INTERVAL '11 minutes', service_tier = 'flex' \
+             WHERE id = $1",
         )
         .bind(old_id)
         .execute(&pool)
@@ -20391,7 +24650,8 @@ mod tests {
         sqlx::query(
             "UPDATE requests
              SET state = 'processing', daemon_id = gen_random_uuid(),
-                 claimed_at = NOW(), started_at = NOW()
+                 claimed_at = NOW(), started_at = NOW(),
+                 service_tier = 'priority'
              WHERE id = $1",
         )
         .bind(done_id)
@@ -20403,7 +24663,9 @@ mod tests {
             .await
             .unwrap();
         sqlx::query(
-            "UPDATE requests SET completed_at = NOW() - INTERVAL '5 minutes' WHERE id = $1",
+            "UPDATE requests \
+             SET completed_at = NOW() - INTERVAL '5 minutes', service_tier = 'flex' \
+             WHERE id = $1",
         )
         .bind(done_id)
         .execute(&pool)
@@ -22037,7 +26299,7 @@ mod tests {
         sqlx::query("UPDATE requests SET state='claimed', daemon_id=gen_random_uuid(), claimed_at=NOW(), started_at=NULL WHERE id=$1")
             .bind(req_ids[2])
             .execute(&pool).await.unwrap();
-        sqlx::query("UPDATE requests SET state='pending', daemon_id=NULL, claimed_at=NULL, started_at=NULL WHERE id=$1")
+        sqlx::query("UPDATE requests SET state='pending', daemon_id=NULL, attempt_id=NULL, claimed_at=NULL, started_at=NULL WHERE id=$1")
             .bind(req_ids[3])
             .execute(&pool).await.unwrap();
 

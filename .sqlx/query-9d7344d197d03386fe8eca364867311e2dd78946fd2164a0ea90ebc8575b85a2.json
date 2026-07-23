@@ -1,0 +1,51 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                            WITH snapshot AS MATERIALIZED (\n                                SELECT state, batch_id, attempt_id\n                                FROM requests WHERE id = $1\n                            ),\n                            parent_lock AS MATERIALIZED (\n                                SELECT b.id\n                                FROM batches b\n                                JOIN snapshot s ON s.batch_id = b.id\n                                WHERE s.state = 'canceled'\n                                  AND s.attempt_id IS NULL\n                                FOR UPDATE OF b\n                            ),\n                            target AS MATERIALIZED (\n                                SELECT r.id, r.state AS old_state, r.batch_id,\n                                       r.attempt_id, p.id AS locked_batch_id\n                                FROM requests r\n                                LEFT JOIN parent_lock p ON p.id = r.batch_id\n                                WHERE r.id = $1\n                                FOR UPDATE OF r\n                            ),\n                            updated AS (\n                                UPDATE requests r SET\n                                    state = 'failed',\n                                    retry_attempt = $2,\n                                    error = $3,\n                                    failed_at = $4,\n                                    response_size = $5,\n                                    routed_model = $6,\n                                    canceled_at = NULL,\n                                    daemon_id = NULL,\n                                    attempt_id = NULL,\n                                    processing_admission_id = NULL\n                                FROM target t\n                                WHERE r.id = t.id\n                                  AND t.old_state IN ('claimed', 'processing', 'canceled')\n                                  AND t.attempt_id IS NULL\n                                  AND (\n                                      t.old_state <> 'canceled'\n                                      OR t.batch_id IS NULL\n                                      OR t.locked_batch_id IS NOT NULL\n                                  )\n                                RETURNING t.old_state, t.batch_id\n                            ),\n                            batch_change AS (\n                                UPDATE batches b SET\n                                    canceled_requests = CASE\n                                        WHEN b.counts_frozen_at IS NOT NULL\n                                            THEN b.canceled_requests - 1\n                                        ELSE b.canceled_requests\n                                    END,\n                                    failed_requests = CASE\n                                        WHEN b.counts_frozen_at IS NOT NULL\n                                            THEN b.failed_requests + 1\n                                        ELSE b.failed_requests\n                                    END,\n                                    retry_version = CASE\n                                        WHEN b.counts_frozen_at IS NULL\n                                            THEN b.retry_version + 1\n                                        ELSE b.retry_version\n                                    END\n                                FROM updated u\n                                WHERE u.old_state = 'canceled'\n                                  AND b.id = u.batch_id\n                                RETURNING b.id\n                            )\n                            SELECT\n                                EXISTS (SELECT 1 FROM target) AS \"exists!\",\n                                EXISTS (SELECT 1 FROM updated) AS \"applied!\",\n                                (SELECT old_state FROM updated) AS \"old_state?\",\n                                (SELECT COUNT(*) FROM batch_change) AS \"batch_changes!\",\n                                EXISTS (\n                                    SELECT 1 FROM target t\n                                    WHERE t.old_state = 'canceled'\n                                      AND t.attempt_id IS NULL\n                                      AND t.batch_id IS NOT NULL\n                                      AND t.locked_batch_id IS NULL\n                                ) AS \"reroute!\"\n                            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "exists!",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 1,
+        "name": "applied!",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 2,
+        "name": "old_state?",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "batch_changes!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 4,
+        "name": "reroute!",
+        "type_info": "Bool"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int4",
+        "Text",
+        "Timestamptz",
+        "Int8",
+        "Text"
+      ]
+    },
+    "nullable": [
+      null,
+      null,
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "9d7344d197d03386fe8eca364867311e2dd78946fd2164a0ea90ebc8575b85a2"
+}

@@ -1,9 +1,9 @@
 use fusillade::PostgresDaemon;
 use fusillade::batch::{BatchInput, RequestTemplateInput};
-use fusillade::daemon::{DaemonConfig, ModelEscalationConfig, default_should_retry};
+use fusillade::daemon::{DaemonConfig, DaemonMode, ModelEscalationConfig, default_should_retry};
 use fusillade::http::{HttpResponse, MockHttpClient};
 use fusillade::manager::{ModelFilter, ModelFilterState, Storage};
-use fusillade::request::{Failed, ListRequestsFilter, Request, ServiceTierFilter};
+use fusillade::request::{CreateFlexInput, Failed, ListRequestsFilter, Request, ServiceTierFilter};
 use fusillade_arsenal::{PostgresRequestManager as PostgresStore, TestDbPools};
 use std::sync::Arc;
 use std::time::Duration;
@@ -66,6 +66,87 @@ fn assert_next_retry_would_cross_effective_deadline(
         failed.state.failed_at,
         failed.state.retry_attempt
     );
+}
+
+#[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
+#[test_log::test]
+async fn test_batch_only_daemon_reclaims_with_zero_local_capacity(pool: sqlx::PgPool) {
+    let config = DaemonConfig {
+        mode: DaemonMode::BatchOnly,
+        claim_interval_ms: 10,
+        batch_claim_interval_ms: 10,
+        claim_query_timeout_ms: 1_000,
+        heartbeat_interval_ms: 10_000,
+        cancellation_poll_interval_ms: 10_000,
+        status_log_interval_ms: None,
+        model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
+        ..Default::default()
+    };
+    let manager = postgres_store(pool.clone(), &config).await;
+    let request_id = manager
+        .create_flex(CreateFlexInput {
+            request_id: uuid::Uuid::new_v4(),
+            body: r#"{"model":"test-model","service_tier":"flex"}"#.to_string(),
+            model: "test-model".to_string(),
+            endpoint: "https://api.example.com".to_string(),
+            method: "POST".to_string(),
+            path: "/v1/test".to_string(),
+            api_key: "test-key".to_string(),
+            created_by: "test-user".to_string(),
+        })
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE requests
+         SET state = 'claimed',
+             daemon_id = $2,
+             attempt_id = $3,
+             claimed_at = NOW()
+         WHERE id = $1",
+    )
+    .bind(*request_id)
+    .bind(uuid::Uuid::new_v4())
+    .bind(uuid::Uuid::new_v4())
+    .execute(&pool)
+    .await
+    .unwrap();
+    let before: (String, Option<uuid::Uuid>) =
+        sqlx::query_as("SELECT state, attempt_id FROM requests WHERE id = $1")
+            .bind(*request_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(before.0, "claimed");
+    assert!(before.1.is_some());
+
+    let shutdown = CancellationToken::new();
+    let handle = postgres_daemon(manager, Arc::new(MockHttpClient::new()), config)
+        .run_with_mode(shutdown.clone(), DaemonMode::BatchOnly)
+        .unwrap();
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let row: (String, Option<uuid::Uuid>, Option<uuid::Uuid>) =
+                sqlx::query_as("SELECT state, daemon_id, attempt_id FROM requests WHERE id = $1")
+                    .bind(*request_id)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            if row == ("pending".to_string(), None, None) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("BatchOnly maintenance did not reclaim without local capacity");
+
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(5), handle)
+        .await
+        .expect("daemon did not stop")
+        .expect("daemon task panicked")
+        .expect("daemon returned an error");
 }
 
 #[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]

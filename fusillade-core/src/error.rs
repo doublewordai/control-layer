@@ -2,7 +2,7 @@
 
 use thiserror::Error;
 
-use crate::types::RequestId;
+use crate::types::{AttemptId, RequestId};
 
 /// Result type alias using the fusillade error type.
 pub type Result<T> = std::result::Result<T, FusilladeError>;
@@ -26,6 +26,27 @@ pub enum FusilladeError {
         id: RequestId,
         current_state: String,
         expected: &'static str,
+    },
+
+    /// The in-memory daemon execution no longer owns the persisted request.
+    #[error("Request {id} attempt {attempt_id} lost ownership")]
+    RequestAttemptLost {
+        id: RequestId,
+        attempt_id: AttemptId,
+    },
+
+    /// A transient infrastructure failure while applying an attempt-aware
+    /// persistence operation.
+    ///
+    /// Reserved for storage adapters after positive classification of a
+    /// transient database or persistence-infrastructure failure. This must
+    /// never represent validation, serialization, transformation, admission
+    /// closure, or programming errors.
+    #[error("Request attempt persistence infrastructure failure during {operation}")]
+    AttemptPersistenceInfrastructure {
+        operation: &'static str,
+        #[source]
+        source: anyhow::Error,
     },
 
     /// Cancelled request

@@ -1569,12 +1569,16 @@ pub struct DaemonConfig {
     /// Set to None to disable periodic status logging (default: Some(2000))
     pub status_log_interval_ms: Option<u64>,
 
-    /// Maximum time a request can stay in "claimed" state before being unclaimed
-    /// and returned to pending (milliseconds). This handles daemon crashes. (default: 60000 = 1 minute)
+    /// Maximum time a tokenized request may remain "claimed" before its exact
+    /// attempt is revoked and the row returns to pending (milliseconds).
+    /// Legacy NULL-token claims are reclaimed only when their owner is
+    /// unavailable. (default: 60000 = 1 minute)
     pub claim_timeout_ms: u64,
 
-    /// Maximum time a request can stay in "processing" state before being unclaimed
-    /// and returned to pending (milliseconds). This handles daemon crashes during execution. (default: 600000 = 10 minutes)
+    /// Compatibility value retained in the daemon/storage configuration and
+    /// used to derive the image-normalizer dispatch URL TTL. Healthy processing
+    /// rows are not reclaimed by age; recovery requires an unavailable daemon
+    /// owner. (default: 600000 = 10 minutes)
     pub processing_timeout_ms: u64,
 
     /// PostgreSQL statement timeout for pending request count queries (milliseconds).
@@ -1721,7 +1725,8 @@ pub struct DaemonConfig {
     /// Cancellation grace: batches with canceled rows that were in flight at
     /// cancel are not archived while those rows are younger than this, so
     /// late billed results can still supersede the cancel on the live row.
-    /// Default 600s, mirroring processing_timeout_ms.
+    /// Archiving after this fixed window revokes that late-write opportunity;
+    /// the value is independent of processing_timeout_ms. Default: 600s.
     #[serde(
         default = "default_batch_archive_cancel_grace_secs",
         deserialize_with = "deserialize_cancel_grace_secs"
@@ -4332,6 +4337,25 @@ background_services:
 
             Ok(())
         });
+    }
+
+    #[test]
+    fn test_batch_daemon_reclaim_defaults_preserve_compatibility_contract() {
+        let dwctl = DaemonConfig::default();
+        let fusillade = dwctl.to_fusillade_config();
+
+        // These two public values remain serialized for compatibility even
+        // though processing age is no longer a reclaim condition.
+        assert_eq!(fusillade.claim_timeout_ms, 60_000);
+        assert_eq!(fusillade.processing_timeout_ms, 600_000);
+
+        // Recovery liveness and batching intentionally stay internal defaults:
+        // introducing additional operator knobs would let mixed pods disagree
+        // about when an attempt loses ownership.
+        assert_eq!(fusillade.heartbeat_interval_ms, 5_000);
+        assert_eq!(fusillade.stale_daemon_threshold_ms, 30_000);
+        assert_eq!(fusillade.unclaim_batch_size, 100);
+        assert_eq!(fusillade.batch_archive_cancel_grace_secs, 600.0);
     }
 
     #[test]
