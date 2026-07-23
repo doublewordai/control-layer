@@ -28,7 +28,6 @@ fn test_request(endpoint: String, body: String) -> RequestData {
         model: "test-model".to_string(),
         api_key: "test-key".to_string(),
         created_by: String::new(),
-        submitted_at: None,
         batch_metadata: std::collections::HashMap::new(),
     }
 }

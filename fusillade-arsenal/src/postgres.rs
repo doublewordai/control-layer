@@ -505,10 +505,6 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
                         model: row.model,
                         api_key: row.api_key,
                         created_by: row.batch_created_by,
-                        // Parsed from the claim row directly (RFC3339), not from
-                        // the configurable batch_metadata forwarding list, so
-                        // submission-epoch metrics survive metadata trimming.
-                        submitted_at: row.batch_created_at.parse().ok(),
                         batch_metadata,
                     },
                 }
@@ -2687,9 +2683,6 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                     model,
                     api_key,
                     created_by: String::new(),
-                    // Inspection-path reconstruction; this query doesn't carry the
-                    // row's created_at and nothing downstream records metrics.
-                    submitted_at: None,
                     batch_metadata: std::collections::HashMap::new(),
                 },
                 _ => {
@@ -5200,9 +5193,6 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                     model,
                     api_key,
                     created_by: String::new(),
-                    // Inspection-path reconstruction; this query doesn't carry the
-                    // row's created_at and nothing downstream records metrics.
-                    submitted_at: None,
                     batch_metadata: std::collections::HashMap::new(),
                 },
                 _ => {
