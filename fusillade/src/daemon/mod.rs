@@ -68,7 +68,7 @@ enum AttemptWriteResolution {
 
 enum TerminalPersistenceResolution {
     OriginalApplied,
-    FallbackApplied(Request<Failed>),
+    FallbackApplied(Box<Request<Failed>>),
     LostOwnership,
     RequestMissing,
 }
@@ -224,9 +224,9 @@ where
             )
             .await?
             {
-                AttemptWriteResolution::Applied => {
-                    Ok(TerminalPersistenceResolution::FallbackApplied(fallback))
-                }
+                AttemptWriteResolution::Applied => Ok(
+                    TerminalPersistenceResolution::FallbackApplied(Box::new(fallback)),
+                ),
                 AttemptWriteResolution::LostOwnership => {
                     Ok(TerminalPersistenceResolution::LostOwnership)
                 }
@@ -238,21 +238,23 @@ where
     }
 }
 
-fn record_terminal_failure(
-    failed: &Request<Failed>,
+struct TerminalFailureContext<'a> {
     request_id: RequestId,
     batch_id: Option<BatchId>,
-    model: &str,
-    user_id: &str,
-    completion_window: &str,
+    model: &'a str,
+    user_id: &'a str,
+    completion_window: &'a str,
     processing_start: std::time::Instant,
     batch_expires_at: chrono::DateTime<chrono::Utc>,
-    requests_failed: &AtomicU64,
-    user_throughput: &dashmap::DashMap<String, UserThroughputStats>,
-) {
-    requests_failed.fetch_add(1, Ordering::Relaxed);
-    user_throughput
-        .entry(user_id.to_string())
+    requests_failed: &'a AtomicU64,
+    user_throughput: &'a dashmap::DashMap<String, UserThroughputStats>,
+}
+
+fn record_terminal_failure(failed: &Request<Failed>, context: TerminalFailureContext<'_>) {
+    context.requests_failed.fetch_add(1, Ordering::Relaxed);
+    context
+        .user_throughput
+        .entry(context.user_id.to_string())
         .or_insert_with(|| UserThroughputStats {
             completed: AtomicU64::new(0),
             failed: AtomicU64::new(0),
@@ -261,44 +263,44 @@ fn record_terminal_failure(
         .fetch_add(1, Ordering::Relaxed);
     counter!(
         "fusillade_requests_completed_total",
-        "model" => model.to_string(),
+        "model" => context.model.to_string(),
         "status" => "failed",
         "reason" => failed.state.reason.metric_label(),
         "status_code" => failed.state.reason.status_code_label(),
-        "completion_window" => completion_window.to_string()
+        "completion_window" => context.completion_window.to_string()
     )
     .increment(1);
     counter!(
         "fusillade_user_requests_completed_total",
-        "user" => user_id.to_string(),
+        "user" => context.user_id.to_string(),
         "status" => "failed",
-        "completion_window" => completion_window.to_string()
+        "completion_window" => context.completion_window.to_string()
     )
     .increment(1);
     histogram!(
         "fusillade_request_duration_seconds",
-        "model" => model.to_string(),
+        "model" => context.model.to_string(),
         "status" => "failed"
     )
-    .record(processing_start.elapsed().as_secs_f64());
+    .record(context.processing_start.elapsed().as_secs_f64());
 
-    if failed.state.failed_at > batch_expires_at {
+    if failed.state.failed_at > context.batch_expires_at {
         counter!(
             "fusillade_requests_completed_after_sla_total",
-            "model" => model.to_string(),
+            "model" => context.model.to_string(),
             "status" => "failed",
-            "completion_window" => completion_window.to_string()
+            "completion_window" => context.completion_window.to_string()
         )
         .increment(1);
         tracing::warn!(
-            %request_id,
-            ?batch_id,
+            request_id = %context.request_id,
+            batch_id = ?context.batch_id,
             "Request failed permanently after SLA"
         );
     }
     tracing::warn!(
-        %request_id,
-        ?batch_id,
+        request_id = %context.request_id,
+        batch_id = ?context.batch_id,
         retry_attempt = failed.state.retry_attempt,
         failure_reason = failed.state.reason.metric_label(),
         "request.terminal_failure"
@@ -1211,15 +1213,17 @@ where
                                         .record("outcome", "persistence_fallback");
                                     record_terminal_failure(
                                         &failed,
-                                        request_id,
-                                        batch_id,
-                                        &model_clone,
-                                        &user_id,
-                                        &completion_window,
-                                        processing_start,
-                                        batch_expires_at,
-                                        requests_failed.as_ref(),
-                                        user_throughput.as_ref(),
+                                        TerminalFailureContext {
+                                            request_id,
+                                            batch_id,
+                                            model: &model_clone,
+                                            user_id: &user_id,
+                                            completion_window: &completion_window,
+                                            processing_start,
+                                            batch_expires_at,
+                                            requests_failed: requests_failed.as_ref(),
+                                            user_throughput: user_throughput.as_ref(),
+                                        },
                                     );
                                     return Ok(());
                                 }
@@ -1387,7 +1391,9 @@ where
 
                             let terminal_failed = match resolution {
                                 TerminalPersistenceResolution::OriginalApplied => terminal_failed,
-                                TerminalPersistenceResolution::FallbackApplied(fallback) => fallback,
+                                TerminalPersistenceResolution::FallbackApplied(fallback) => {
+                                    *fallback
+                                }
                                 TerminalPersistenceResolution::LostOwnership
                                 | TerminalPersistenceResolution::RequestMissing => {
                                     tracing::Span::current()
@@ -1413,15 +1419,17 @@ where
                             }
                             record_terminal_failure(
                                 &terminal_failed,
-                                request_id,
-                                batch_id,
-                                &model_clone,
-                                &user_id,
-                                &completion_window,
-                                processing_start,
-                                batch_expires_at,
-                                requests_failed.as_ref(),
-                                user_throughput.as_ref(),
+                                TerminalFailureContext {
+                                    request_id,
+                                    batch_id,
+                                    model: &model_clone,
+                                    user_id: &user_id,
+                                    completion_window: &completion_window,
+                                    processing_start,
+                                    batch_expires_at,
+                                    requests_failed: requests_failed.as_ref(),
+                                    user_throughput: user_throughput.as_ref(),
+                                },
                             );
                             Ok(())
                         }
