@@ -269,7 +269,14 @@ const userApi = {
         },
       );
       if (!response.ok) {
-        throw new Error(`Failed to update API key: ${response.status}`);
+        // Surface the backend's message (e.g. validation errors) so UI
+        // toasts are actionable, not just a bare status code.
+        const text = await response.text().catch(() => "");
+        throw new Error(
+          text
+            ? `Failed to update API key: ${response.status} - ${text}`
+            : `Failed to update API key: ${response.status}`,
+        );
       }
       return response.json();
     },

@@ -204,9 +204,11 @@ describe("API Keys Component - Functional Tests", () => {
         ).toBeInTheDocument();
       });
 
-      // Should show the key name and API key
-      expect(screen.getByText("Test API Key")).toBeInTheDocument();
-      expect(screen.getByText(/save this key/i)).toBeInTheDocument();
+      // Should show the key name and API key (scoped to the dialog: the
+      // created key is now also persisted into the mock list behind it)
+      const dialog = screen.getByRole("dialog");
+      expect(within(dialog).getByText("Test API Key")).toBeInTheDocument();
+      expect(within(dialog).getByText(/save this key/i)).toBeInTheDocument();
     });
 
     it("submits realtime purpose when a platform manager selects Inference in org context", async () => {

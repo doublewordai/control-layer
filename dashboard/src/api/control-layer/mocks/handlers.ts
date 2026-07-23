@@ -1046,6 +1046,10 @@ export const handlers = [
       id: `key-${Date.now()}`,
       name: body.name,
       description: body.description,
+      purpose: body.purpose ?? "realtime",
+      // Attribute to the demo current user (usersData[0]) so the
+      // edit-permission gate treats created keys as manageable.
+      created_by: usersData[0].id,
       created_at: new Date().toISOString(),
       key: `sk-${Math.random().toString(36).substring(2, 50)}`,
       spend_limit: body.spend_limit ?? null,
@@ -1057,6 +1061,8 @@ export const handlers = [
           ? nextCapResetIso(body.spend_limit_interval ?? null)
           : null,
     };
+    // Persist so demo-mode refetches (query invalidation) show the new key.
+    apiKeysData.push(newApiKey as unknown as ApiKey);
     return HttpResponse.json(newApiKey, { status: 201 });
   }),
 
