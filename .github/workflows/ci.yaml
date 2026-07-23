@@ -108,6 +108,10 @@ jobs:
       matrix:
         partition: [1, 2, 3, 4]
     runs-on: depot-ubuntu-24.04-16
+    env:
+      CARGO_INCREMENTAL: "0"
+      RUSTC_WRAPPER: sccache
+      SCCACHE_IGNORE_SERVER_IO_ERROR: "1"
 
     # Each partition has an isolated PostgreSQL instance. SQLx tests create
     # their own databases, pools, and listeners, so retain the raised
@@ -136,11 +140,17 @@ jobs:
         with:
           components: llvm-tools-preview
 
-      - name: Cache Rust build
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+        with:
+          version: "v0.16.0"
+
+      - name: Cache Rust dependencies and tools
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: backend-test-dwctl-sharded
           cache-on-failure: true
+          cache-targets: "false"
 
       - name: Install just
         uses: extractions/setup-just@v3

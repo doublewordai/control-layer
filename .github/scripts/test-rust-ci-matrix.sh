@@ -123,6 +123,37 @@ onwards_compliance_job="$(extract_job onwards-openresponses-compliance)"
 onwards_image_job="$(extract_job onwards-pr-image)"
 dwctl_image_job="$(extract_job build)"
 crate_test_job="$(extract_job backend-crate-test)"
+dwctl_shard_job="$(extract_job backend-dwctl-test-shard)"
+
+require_block_line "$dwctl_shard_job" '    env:' \
+  'declare the compiler cache environment for every dwctl shard'
+require_block_line "$dwctl_shard_job" '      CARGO_INCREMENTAL: "0"' \
+  'disable incremental compilation so dwctl artifacts are cacheable'
+require_block_line "$dwctl_shard_job" '      RUSTC_WRAPPER: sccache' \
+  'compile dwctl through sccache'
+require_block_line "$dwctl_shard_job" '      SCCACHE_IGNORE_SERVER_IO_ERROR: "1"' \
+  'fall back to rustc when the remote cache is unavailable'
+require_block_line "$dwctl_shard_job" '      - name: Install sccache' \
+  'install sccache before compiling dwctl'
+require_block_line "$dwctl_shard_job" \
+  '        uses: mozilla-actions/sccache-action@v0.0.10' \
+  'use the current sccache GitHub Action'
+
+dwctl_sccache_step="$(extract_step "$dwctl_shard_job" 'Install sccache')"
+require_block_line "$dwctl_sccache_step" '          version: "v0.16.0"' \
+  'pin the sccache compiler cache version'
+
+dwctl_rust_cache_step="$(
+  extract_step "$dwctl_shard_job" 'Cache Rust dependencies and tools'
+)"
+require_block_line "$dwctl_rust_cache_step" '          cache-targets: "false"' \
+  'avoid restoring target artifacts that cargo-llvm-cov immediately deletes'
+
+if grep -Eq 'SCCACHE_(GHA_ENABLED|WEBDAV_(TOKEN|USERNAME|PASSWORD))' \
+  <<< "$dwctl_shard_job"; then
+  echo "Depot runners must provide sccache authentication without GitHub cache mode or a long-lived token" >&2
+  exit 1
+fi
 
 if grep -Fq -- '- package: dwctl' <<< "$crate_test_job"; then
   echo "dwctl must run in its partition matrix, not the generic crate matrix" >&2
