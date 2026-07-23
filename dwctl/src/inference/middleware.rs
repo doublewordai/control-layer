@@ -1473,7 +1473,6 @@ mod tests {
                     "model": FLEX_TEST_MODEL,
                     "service_tier": "flex",
                     "background": true,
-                    "tools": [],
                     "input": input,
                 })
                 .to_string(),
@@ -2109,7 +2108,12 @@ mod tests {
             )),
             loop_config: onwards::LoopConfig::default(),
             image_normalizer: Arc::new(crate::image_normalizer::DisabledNormalizer),
-            image_normalizer_enabled: false,
+            // Exercise the production-shaped pre-admission path as well as the
+            // cache-only path: with no `tools` field and normalization enabled,
+            // tool resolution and image attribution both encounter the held
+            // main-pool connection. Those best-effort lookups must not turn
+            // pool contention into a 5xx or prevent durable queue admission.
+            image_normalizer_enabled: true,
             unverified_requests_per_completion_hour: 0,
             flex_completion_window: "1h".to_string(),
             keystore: None,
