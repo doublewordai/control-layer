@@ -88,14 +88,12 @@ impl FusilladeOutletHandler {
         let api_key = Self::extract_api_key(request);
 
         if endpoint.is_empty() {
-            // Empty endpoint isn't fatal here — `complete_response_idempotent`
-            // will refuse to synthesize a row without it. We continue (rather
-            // than returning None) so the UPDATE path still succeeds if the
-            // row already exists.
+            // Empty endpoint isn't fatal at extraction time. We continue so
+            // completion persistence can still update an admitted row.
             tracing::warn!(
                 response_id = %response_id,
                 uri = %request.uri,
-                "Missing x-onwards-endpoint header — complete-response synthesize will fail if create-response hasn't run"
+                "Missing x-onwards-endpoint header on response completion"
             );
         }
 
@@ -538,10 +536,8 @@ mod tests {
 
     #[test]
     fn test_extract_complete_response_ctx_missing_endpoint_warns_but_returns_some() {
-        // Empty endpoint is non-fatal — extraction returns Some so the
-        // UPDATE path can still succeed if the row already exists.
-        // complete_response_idempotent refuses to synthesize on empty
-        // endpoint; that's the failure mode, not silent skip here.
+        // Empty endpoint is non-fatal — extraction returns Some so an already
+        // admitted row can still be updated.
         let mut headers = full_headers();
         headers.remove("x-onwards-endpoint");
         let request = make_request_data(headers);

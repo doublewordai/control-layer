@@ -5,9 +5,9 @@
 //!
 //! ## Routing
 //!
-//! - `priority` / `default` / `auto` (realtime): creates a batch of 1 with
-//!   `completion_window=0s` in `processing` state, proxies via onwards.
-//!   With `background=true`, returns 202 and spawns the proxy as a background task.
+//! - `priority` / `default` / `auto` (realtime): proxies via onwards.
+//!   Background requests durably admit a `processing` row before returning
+//!   202; ordinary requests synthesize their terminal row on completion.
 //! - `flex` (async): creates a batch of 1 with `completion_window=1h` in
 //!   `pending` state. The fusillade daemon picks it up. With `background=false`,
 //!   holds the connection and polls until complete. With `background=true`,
@@ -24,6 +24,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use fusillade_arsenal::PostgresRequestManager;
+use onwards::errors::OnwardsErrorResponse;
 use sqlx_pool_router::PoolProvider;
 
 use super::image_normalizer_middleware::{normalize_error_response, normalize_value_to_tokens};
@@ -339,23 +340,15 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
             .unwrap();
     }
 
-    match warm_path_branch(is_responses_api, is_flex, background, stream_requested, has_tools) {
-        WarmPathBranch::Stream => {
-            if let Some(resp) = try_warm_path_stream(&state, &request_value, api_key.as_deref(), model).await {
-                return resp;
-            }
-        }
-        WarmPathBranch::Blocking => {
-            if let Some(resp) = try_warm_path_blocking(&state, &request_value, api_key.as_deref(), model).await {
-                return resp;
-            }
-        }
-        WarmPathBranch::Background => {
-            if let Some(resp) = try_warm_path_background(&state, &request_value, api_key.as_deref(), model).await {
-                return resp;
-            }
-        }
-        WarmPathBranch::FallThrough => {}
+    let warm_attempt = match warm_path_branch(is_responses_api, is_flex, background, stream_requested, has_tools) {
+        WarmPathBranch::Stream => try_warm_path_stream(&state, &request_value, api_key.as_deref(), model).await,
+        WarmPathBranch::Blocking => try_warm_path_blocking(&state, &request_value, api_key.as_deref(), model).await,
+        WarmPathBranch::Background => try_warm_path_background(&state, &request_value, api_key.as_deref(), model).await,
+        WarmPathBranch::FallThrough => Ok(None),
+    };
+    match warm_attempt {
+        Ok(Some(response)) | Err(response) => return response,
+        Ok(None) => {}
     }
 
     tracing::debug!(
@@ -416,10 +409,13 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
     // exist before returning 202). Flex uses the key owner's hidden batch key
     // below, so resolving it there also supplies the attribution target.
     let created_by = if background && matches!(service_tier, ServiceTier::Realtime) {
-        api_key
-            .as_deref()
-            .and_then(|key| state.api_key_cache.get(key))
-            .map(|metadata| metadata.owner_id.to_string())
+        let Some(key) = api_key.as_deref() else {
+            return OnwardsErrorResponse::unauthorized().into_response();
+        };
+        let Some(metadata) = state.api_key_cache.get(key) else {
+            return OnwardsErrorResponse::forbidden().into_response();
+        };
+        Some(metadata.owner_id.to_string())
     } else {
         None
     };
@@ -767,6 +763,23 @@ fn warm_path_branch(is_responses_api: bool, is_flex: bool, background: bool, str
 /// completion time. The outlet handler sends a completion record to the
 /// in-process `RequestsWriter`, which inserts the row directly in
 /// `completed` state via the batched persist path.
+fn enqueue_error_response() -> Response {
+    Response::builder()
+        .status(StatusCode::INTERNAL_SERVER_ERROR)
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({
+                "error": {
+                    "message": "Failed to enqueue request",
+                    "type": "server_error",
+                    "code": 500,
+                }
+            })
+            .to_string(),
+        ))
+        .expect("static enqueue error response is valid")
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_realtime<P: PoolProvider + Clone + Send + Sync + 'static>(
     state: &InferenceMiddlewareState<P>,
@@ -779,15 +792,14 @@ async fn handle_realtime<P: PoolProvider + Clone + Send + Sync + 'static>(
     body_bytes: bytes::Bytes,
     next: Next,
 ) -> Response {
-    let rm = state.request_manager.clone();
-
     let endpoint_for_header = realtime_input.path.clone();
 
     if background {
         // Background mode: create row synchronously so it exists before
         // we return the 202 (client will poll immediately).
-        if let Err(e) = fusillade::Storage::create_realtime(&*rm, realtime_input).await {
-            tracing::warn!(error = %e, "Failed to create realtime tracking row");
+        if let Err(e) = state.requests_writer.admit_realtime(realtime_input).await {
+            tracing::error!(error = %e, "Failed to admit realtime tracking row");
+            return enqueue_error_response();
         }
     }
     // Non-background realtime: no pre-write. Row appears at completion via
@@ -864,22 +876,9 @@ async fn handle_flex<P: PoolProvider + Clone + Send + Sync + 'static>(
     background: bool,
 ) -> Response {
     // Flex needs the row created synchronously (daemon must find it).
-    if let Err(e) = fusillade::Storage::create_flex(&*state.request_manager, flex_input).await {
+    if let Err(e) = state.requests_writer.admit_flex(flex_input).await {
         tracing::error!(error = %e, "Failed to create flex row in fusillade");
-        return Response::builder()
-            .status(StatusCode::INTERNAL_SERVER_ERROR)
-            .header("content-type", "application/json")
-            .body(Body::from(
-                serde_json::json!({
-                    "error": {
-                        "message": "Failed to enqueue request",
-                        "type": "server_error",
-                        "code": 500,
-                    }
-                })
-                .to_string(),
-            ))
-            .unwrap();
+        return enqueue_error_response();
     }
 
     if background {
@@ -941,22 +940,9 @@ async fn handle_chat_completion_flex<P: PoolProvider + Clone + Send + Sync + 'st
     flex_input: fusillade::CreateFlexInput,
     request_id: uuid::Uuid,
 ) -> Response {
-    if let Err(e) = fusillade::Storage::create_flex(&*state.request_manager, flex_input).await {
+    if let Err(e) = state.requests_writer.admit_flex(flex_input).await {
         tracing::error!(error = %e, "Failed to create flex chat-completions batch in fusillade");
-        return Response::builder()
-            .status(StatusCode::INTERNAL_SERVER_ERROR)
-            .header("content-type", "application/json")
-            .body(Body::from(
-                serde_json::json!({
-                    "error": {
-                        "message": "Failed to enqueue request",
-                        "type": "server_error",
-                        "code": 500,
-                    }
-                })
-                .to_string(),
-            ))
-            .unwrap();
+        return enqueue_error_response();
     }
 
     let poll_interval = std::time::Duration::from_millis(500);
@@ -1012,6 +998,7 @@ async fn handle_chat_completion_flex_streaming<P: PoolProvider + Clone + Send + 
 ) -> Response {
     flex_stream_response(
         state.request_manager.clone(),
+        state.requests_writer.clone(),
         flex_input,
         request_id,
         true,
@@ -1054,6 +1041,7 @@ async fn handle_responses_flex_streaming<P: PoolProvider + Clone + Send + Sync +
 ) -> Response {
     flex_stream_response(
         state.request_manager.clone(),
+        state.requests_writer.clone(),
         flex_input,
         request_id,
         false,
@@ -1111,17 +1099,20 @@ pub(crate) fn should_intercept(method: &axum::http::Method, path: &str) -> bool 
 }
 
 /// Attempt to dispatch a `/v1/responses` request through the warm-path
-/// streaming handler. Returns `Some(response)` if the dispatch
-/// succeeded; `None` if the request can't be served via the warm path
-/// (no API key, missing tool resolution, etc.) and should fall through
-/// to the standard single-step / daemon paths.
+/// streaming handler. `Ok(None)` means the request is not applicable to
+/// this path (currently only a missing bearer key); `Err(response)` is a
+/// fatal admission failure and must not fall through to ordinary dispatch.
+type WarmPathAttempt = Result<Option<Response>, Response>;
+
 async fn try_warm_path_stream<P: PoolProvider + Clone + Send + Sync + 'static>(
     state: &InferenceMiddlewareState<P>,
     request_value: &serde_json::Value,
     api_key: Option<&str>,
     model: &str,
-) -> Option<Response> {
-    let api_key = api_key?;
+) -> WarmPathAttempt {
+    let Some(api_key) = api_key else {
+        return Ok(None);
+    };
     let (head_step_uuid, resolved, upstream) = warm_path_setup(state, request_value, api_key, model).await?;
 
     let sse = super::streaming::run_inline_streaming(
@@ -1134,7 +1125,7 @@ async fn try_warm_path_stream<P: PoolProvider + Clone + Send + Sync + 'static>(
         head_step_uuid.to_string(),
         model.to_string(),
     );
-    Some(sse.into_response())
+    Ok(Some(sse.into_response()))
 }
 
 /// Warm-path blocking handler for `/v1/responses` with
@@ -1147,12 +1138,11 @@ async fn try_warm_path_blocking<P: PoolProvider + Clone + Send + Sync + 'static>
     request_value: &serde_json::Value,
     api_key: Option<&str>,
     model: &str,
-) -> Option<Response> {
-    let api_key = api_key?;
-    let (request_id, resolved, upstream) = match warm_path_setup(state, request_value, api_key, model).await {
-        Some(s) => s,
-        None => return None,
+) -> WarmPathAttempt {
+    let Some(api_key) = api_key else {
+        return Ok(None);
     };
+    let (request_id, resolved, upstream) = warm_path_setup(state, request_value, api_key, model).await?;
 
     let result = super::streaming::run_inline_blocking(
         state.response_store.clone(),
@@ -1170,7 +1160,7 @@ async fn try_warm_path_blocking<P: PoolProvider + Clone + Send + Sync + 'static>
         Ok(json) => (StatusCode::OK, json),
         Err(err_payload) => (StatusCode::BAD_GATEWAY, serde_json::json!({"error": err_payload})),
     };
-    Some((status, Json(body)).into_response())
+    Ok(Some((status, Json(body)).into_response()))
 }
 
 /// Warm-path background handler for `/v1/responses` with
@@ -1182,12 +1172,11 @@ async fn try_warm_path_background<P: PoolProvider + Clone + Send + Sync + 'stati
     request_value: &serde_json::Value,
     api_key: Option<&str>,
     model: &str,
-) -> Option<Response> {
-    let api_key = api_key?;
-    let (request_id, resolved, upstream) = match warm_path_setup(state, request_value, api_key, model).await {
-        Some(s) => s,
-        None => return None,
+) -> WarmPathAttempt {
+    let Some(api_key) = api_key else {
+        return Ok(None);
     };
+    let (request_id, resolved, upstream) = warm_path_setup(state, request_value, api_key, model).await?;
 
     let resp_id = format!("resp_{request_id}");
     let response_body = serde_json::json!({
@@ -1219,7 +1208,7 @@ async fn try_warm_path_background<P: PoolProvider + Clone + Send + Sync + 'stati
         .await;
     });
 
-    Some((StatusCode::ACCEPTED, Json(response_body)).into_response())
+    Ok(Some((StatusCode::ACCEPTED, Json(response_body)).into_response()))
 }
 
 /// Shared setup for the three warm paths: register the per-response
@@ -1232,22 +1221,26 @@ async fn try_warm_path_background<P: PoolProvider + Clone + Send + Sync + 'stati
 /// `resp_<id>` and threads its string form into `run_response_loop` as
 /// the loop's `request_id` parameter.
 ///
-/// A single `/v1/responses` fusillade row is created up front via
-/// `create_realtime` (state=`processing`, id=`head_step_uuid`). That
-/// row is the response: `record_step`'s head branch reuses it instead
-/// of inserting another, and `finalize_head_request` completes it when
-/// the loop terminates. Descendant model_call steps still mint their
-/// own sub-request rows. The asymmetry with the daemon-driven flex
-/// path (which uses `handle_flex` to create the same shape of row in
-/// `pending` state) is just state at insert: warm path doesn't go
-/// through the daemon's claim cycle.
+/// A single `/v1/responses` fusillade row is admitted up front through
+/// the commit-acknowledging writer (state=`processing`,
+/// id=`head_step_uuid`). That row is the response: `record_step`'s head
+/// branch reuses it instead of inserting another, and
+/// `finalize_head_request` completes it when the loop terminates.
+/// Descendant model_call steps still mint their own sub-request rows.
+/// The asymmetry with the daemon-driven flex path (which uses
+/// `handle_flex` to admit the same shape of row in `pending` state) is
+/// just state at insert: warm path doesn't go through the daemon's
+/// claim cycle.
 async fn warm_path_setup<P: PoolProvider + Clone + Send + Sync + 'static>(
     state: &InferenceMiddlewareState<P>,
     request_value: &serde_json::Value,
     api_key: &str,
     model: &str,
-) -> Option<(uuid::Uuid, Arc<crate::inference::tools::ResolvedToolSet>, onwards::UpstreamTarget)> {
-    let created_by = state.api_key_cache.get(api_key).map(|metadata| metadata.owner_id.to_string());
+) -> Result<(uuid::Uuid, Arc<crate::inference::tools::ResolvedToolSet>, onwards::UpstreamTarget), Response> {
+    let Some(metadata) = state.api_key_cache.get(api_key) else {
+        return Err(OnwardsErrorResponse::forbidden().into_response());
+    };
+    let created_by = metadata.owner_id.to_string();
 
     let resolved = match crate::inference::tools::resolve_tools_for_request(&state.dwctl_pool, api_key, Some(model)).await {
         Ok(Some(set)) => Arc::new(set),
@@ -1282,7 +1275,7 @@ async fn warm_path_setup<P: PoolProvider + Clone + Send + Sync + 'static>(
     let pending = response_store::PendingResponseInput {
         body: request_value.to_string(),
         api_key: Some(api_key.to_string()),
-        created_by: created_by.clone(),
+        created_by: Some(created_by.clone()),
         base_url: state.loopback_base_url.clone(),
         resolved_tool_names,
     };
@@ -1292,7 +1285,7 @@ async fn warm_path_setup<P: PoolProvider + Clone + Send + Sync + 'static>(
             request_id = %head_step_uuid,
             "warm-path: failed to register pending input — aborting warm path",
         );
-        return None;
+        return Err(enqueue_error_response());
     }
 
     // Create the /v1/responses row up front in `processing` state so
@@ -1306,16 +1299,16 @@ async fn warm_path_setup<P: PoolProvider + Clone + Send + Sync + 'static>(
         method: "POST".to_string(),
         path: "/v1/responses".to_string(),
         api_key: api_key.to_string(),
-        created_by: created_by.unwrap_or_default(),
+        created_by,
     };
-    if let Err(e) = fusillade::Storage::create_realtime(&*state.request_manager, realtime_input).await {
+    if let Err(e) = state.requests_writer.admit_realtime(realtime_input).await {
         tracing::error!(
             error = %e,
             request_id = %head_step_uuid,
             "warm-path: failed to create /v1/responses tracking row — aborting warm path",
         );
         state.response_store.unregister_pending(&head_step_uuid.to_string());
-        return None;
+        return Err(enqueue_error_response());
     }
 
     // Endpoint + path are split (not pre-concatenated) so fusillade
@@ -1327,7 +1320,7 @@ async fn warm_path_setup<P: PoolProvider + Clone + Send + Sync + 'static>(
         api_key: Some(api_key.to_string()),
     };
 
-    Some((head_step_uuid, resolved, upstream))
+    Ok((head_step_uuid, resolved, upstream))
 }
 
 #[cfg(test)]
@@ -1385,6 +1378,270 @@ mod tests {
         targets.targets.insert(FLEX_TEST_MODEL.to_string(), pool);
         targets.key_labels.insert(FLEX_TEST_KEY.to_string(), labels);
         targets
+    }
+
+    struct RealtimeAuthFixture {
+        app: axum::Router,
+        state: InferenceMiddlewareState<sqlx_pool_router::TestDbPools>,
+        fusillade_pool: sqlx::PgPool,
+        dispatches: Arc<std::sync::atomic::AtomicUsize>,
+        writer_shutdown: tokio_util::sync::CancellationToken,
+        writer_task: tokio::task::JoinHandle<()>,
+    }
+
+    async fn realtime_auth_fixture(pool: &sqlx::PgPool) -> RealtimeAuthFixture {
+        use std::time::Duration;
+
+        use axum::{Router, middleware, routing::post};
+        use sqlx_pool_router::TestDbPools;
+
+        let fusillade_pool = crate::test::utils::setup_fusillade_pool(pool).await;
+        let fusillade_pools = TestDbPools::new(fusillade_pool.clone()).await.unwrap();
+        let request_manager = Arc::new(fusillade_arsenal::PostgresRequestManager::new(fusillade_pools, Default::default()));
+        let (requests_writer_task, requests_writer) =
+            crate::inference::engine::writer::RequestsWriter::new(request_manager.clone(), 1, Duration::ZERO);
+        let response_store = Arc::new(response_store::FusilladeResponseStore::new(
+            request_manager.clone(),
+            requests_writer.clone(),
+        ));
+        let api_key_cache = crate::sync::api_key_cache::ApiKeyMetadataCache::empty();
+        let state = InferenceMiddlewareState {
+            requests_writer,
+            request_manager,
+            daemon_id: OnwardsDaemonId(Uuid::new_v4()),
+            loopback_base_url: "http://127.0.0.1:3001/ai".to_string(),
+            dwctl_pool: pool.clone(),
+            response_store,
+            multi_step_tool_executor: Arc::new(crate::inference::tools::HttpToolExecutor::new(reqwest::Client::new(), None)),
+            multi_step_http_client: Arc::new(fusillade::ReqwestHttpClient::new(
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+                Duration::from_secs(1),
+                Vec::new(),
+            )),
+            loop_config: onwards::LoopConfig::default(),
+            image_normalizer: Arc::new(crate::image_normalizer::DisabledNormalizer),
+            image_normalizer_enabled: false,
+            unverified_requests_per_completion_hour: 0,
+            flex_completion_window: "1h".to_string(),
+            keystore: None,
+            api_key_cache: api_key_cache.clone(),
+            flex_batch_key_resolver: crate::sync::api_key_cache::FlexBatchKeyResolver::new(pool.clone(), api_key_cache),
+            onwards_targets: flex_access_targets(&[], HashMap::new(), Vec::new()),
+        };
+        let dispatches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let dispatch_counter = dispatches.clone();
+        let app = Router::new()
+            .route(
+                "/v1/responses",
+                post(move || {
+                    let dispatch_counter = dispatch_counter.clone();
+                    async move {
+                        dispatch_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        StatusCode::IM_A_TEAPOT
+                    }
+                }),
+            )
+            .layer(middleware::from_fn_with_state(state.clone(), inference_middleware));
+        let writer_shutdown = tokio_util::sync::CancellationToken::new();
+        let writer_task = tokio::spawn(requests_writer_task.run(writer_shutdown.clone()));
+
+        RealtimeAuthFixture {
+            app,
+            state,
+            fusillade_pool,
+            dispatches,
+            writer_shutdown,
+            writer_task,
+        }
+    }
+
+    async fn response_json(response: Response) -> serde_json::Value {
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    #[sqlx::test]
+    async fn background_realtime_missing_bearer_returns_canonical_unauthorized_before_admission(pool: sqlx::PgPool) {
+        use std::time::Duration;
+
+        use tower::ServiceExt;
+
+        let fixture = realtime_auth_fixture(&pool).await;
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "model": FLEX_TEST_MODEL,
+                    "background": true,
+                    "tools": [],
+                    "input": "hello",
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let response = tokio::time::timeout(Duration::from_secs(5), fixture.app.oneshot(request))
+            .await
+            .expect("missing bearer must be rejected without waiting for admission")
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            response_json(response).await,
+            serde_json::json!({
+                "error": {
+                    "message": "Please supply an authentication token to access this resource",
+                    "type": "invalid_request_error",
+                    "param": null,
+                    "code": "unauthenticated",
+                }
+            })
+        );
+        assert_eq!(fixture.dispatches.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM requests")
+            .fetch_one(&fixture.fusillade_pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 0);
+
+        fixture.writer_shutdown.cancel();
+        fixture.writer_task.await.unwrap();
+    }
+
+    #[sqlx::test]
+    async fn background_realtime_unknown_bearer_returns_canonical_forbidden_before_admission(pool: sqlx::PgPool) {
+        use std::time::Duration;
+
+        use tower::ServiceExt;
+
+        let fixture = realtime_auth_fixture(&pool).await;
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("authorization", "Bearer sk-unknown")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "model": FLEX_TEST_MODEL,
+                    "background": true,
+                    "tools": [],
+                    "input": "hello",
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let response = tokio::time::timeout(Duration::from_secs(5), fixture.app.oneshot(request))
+            .await
+            .expect("unknown bearer must be rejected without waiting for admission")
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            response_json(response).await,
+            serde_json::json!({
+                "error": {
+                    "message": "Forbidden",
+                    "type": "invalid_request_error",
+                    "param": null,
+                    "code": "forbidden",
+                }
+            })
+        );
+        assert_eq!(fixture.dispatches.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM requests")
+            .fetch_one(&fixture.fusillade_pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 0);
+
+        fixture.writer_shutdown.cancel();
+        fixture.writer_task.await.unwrap();
+    }
+
+    #[sqlx::test]
+    async fn warm_path_missing_bearer_falls_through_without_admission(pool: sqlx::PgPool) {
+        let fixture = realtime_auth_fixture(&pool).await;
+        let request_value = serde_json::json!({
+            "model": FLEX_TEST_MODEL,
+            "background": false,
+            "tools": [{
+                "type": "function",
+                "name": "client_tool",
+                "parameters": {"type": "object"},
+            }],
+            "input": "hello",
+        });
+
+        let attempt = try_warm_path_blocking(&fixture.state, &request_value, None, FLEX_TEST_MODEL).await;
+
+        assert!(matches!(attempt, Ok(None)));
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM requests")
+            .fetch_one(&fixture.fusillade_pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 0);
+
+        fixture.writer_shutdown.cancel();
+        fixture.writer_task.await.unwrap();
+    }
+
+    #[sqlx::test]
+    async fn warm_path_unknown_bearer_returns_canonical_forbidden_before_admission(pool: sqlx::PgPool) {
+        use std::time::Duration;
+
+        use tower::ServiceExt;
+
+        let fixture = realtime_auth_fixture(&pool).await;
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("authorization", "Bearer sk-unknown")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "model": FLEX_TEST_MODEL,
+                    "background": true,
+                    "tools": [{
+                        "type": "function",
+                        "name": "client_tool",
+                        "parameters": {"type": "object"},
+                    }],
+                    "input": "hello",
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let response = tokio::time::timeout(Duration::from_secs(5), fixture.app.oneshot(request))
+            .await
+            .expect("unknown warm-path bearer must be rejected without waiting for admission")
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            response_json(response).await,
+            serde_json::json!({
+                "error": {
+                    "message": "Forbidden",
+                    "type": "invalid_request_error",
+                    "param": null,
+                    "code": "forbidden",
+                }
+            })
+        );
+        assert_eq!(fixture.dispatches.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM requests")
+            .fetch_one(&fixture.fusillade_pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 0);
+
+        fixture.writer_shutdown.cancel();
+        fixture.writer_task.await.unwrap();
     }
 
     #[test]
@@ -1533,11 +1790,17 @@ mod tests {
         let fusillade_pool = crate::test::utils::setup_fusillade_pool(&pool).await;
         let fusillade_pools = TestDbPools::new(fusillade_pool.clone()).await.unwrap();
         let request_manager = Arc::new(fusillade_arsenal::PostgresRequestManager::new(fusillade_pools, Default::default()));
-        let response_store = Arc::new(response_store::FusilladeResponseStore::new(request_manager.clone()));
+        let (requests_writer_task, requests_writer) =
+            crate::inference::engine::writer::RequestsWriter::new(request_manager.clone(), 1, Duration::ZERO);
+        let response_store = Arc::new(response_store::FusilladeResponseStore::new(
+            request_manager.clone(),
+            requests_writer.clone(),
+        ));
 
         let main_pool = PgPoolOptions::new()
             .max_connections(1)
             .min_connections(0)
+            .acquire_timeout(Duration::from_millis(25))
             .connect_with(pool.connect_options().as_ref().clone())
             .await
             .unwrap();
@@ -1559,8 +1822,6 @@ mod tests {
         let flex_batch_key_resolver = crate::sync::api_key_cache::FlexBatchKeyResolver::new(main_pool.clone(), api_key_cache.clone());
         let onwards_targets = flex_access_targets(&[FLEX_TEST_KEY, hidden_key], HashMap::new(), Vec::new());
 
-        let (_requests_writer_task, requests_writer) =
-            crate::inference::engine::writer::RequestsWriter::new(request_manager.clone(), 1, Duration::ZERO);
         let state = InferenceMiddlewareState {
             requests_writer,
             request_manager,
@@ -1607,9 +1868,23 @@ mod tests {
             .unwrap();
 
         let _held_connection = main_pool.acquire().await.unwrap();
-        let response = tokio::time::timeout(Duration::from_millis(250), app.oneshot(request))
+        let mut request_task = tokio::spawn(app.oneshot(request));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut request_task).await.is_err(),
+            "Flex admission must wait for the writer's commit acknowledgement"
+        );
+        let rows_before_writer: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM requests")
+            .fetch_one(&fusillade_pool)
+            .await
+            .unwrap();
+        assert_eq!(rows_before_writer, 0, "the pending row must not be visible before writer commit");
+
+        let writer_shutdown = tokio_util::sync::CancellationToken::new();
+        let writer_task = tokio::spawn(requests_writer_task.run(writer_shutdown.clone()));
+        let response = tokio::time::timeout(Duration::from_secs(5), request_task)
             .await
             .expect("cached Flex validation must not acquire the unavailable main pool")
+            .unwrap()
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::ACCEPTED);
@@ -1620,6 +1895,9 @@ mod tests {
                 .unwrap();
         assert_eq!(stored_key, hidden_key);
         assert_eq!(created_by.as_deref(), Some(owner_id.to_string().as_str()));
+
+        writer_shutdown.cancel();
+        writer_task.await.unwrap();
     }
 
     #[sqlx::test]
@@ -1632,7 +1910,12 @@ mod tests {
         let fusillade_pool = crate::test::utils::setup_fusillade_pool(&pool).await;
         let fusillade_pools = TestDbPools::new(fusillade_pool.clone()).await.unwrap();
         let request_manager = Arc::new(fusillade_arsenal::PostgresRequestManager::new(fusillade_pools, Default::default()));
-        let response_store = Arc::new(response_store::FusilladeResponseStore::new(request_manager.clone()));
+        let (requests_writer_task, requests_writer) =
+            crate::inference::engine::writer::RequestsWriter::new(request_manager.clone(), 1, Duration::ZERO);
+        let response_store = Arc::new(response_store::FusilladeResponseStore::new(
+            request_manager.clone(),
+            requests_writer.clone(),
+        ));
 
         let main_pool = PgPoolOptions::new()
             .max_connections(1)
@@ -1657,8 +1940,6 @@ mod tests {
             },
         )]));
         let flex_batch_key_resolver = crate::sync::api_key_cache::FlexBatchKeyResolver::new(main_pool.clone(), api_key_cache.clone());
-        let (_requests_writer_task, requests_writer) =
-            crate::inference::engine::writer::RequestsWriter::new(request_manager.clone(), 1, Duration::ZERO);
         let state = InferenceMiddlewareState {
             requests_writer,
             request_manager,
@@ -1696,13 +1977,28 @@ mod tests {
         });
 
         let _held_connection = main_pool.acquire().await.unwrap();
-        let response = tokio::time::timeout(
-            Duration::from_millis(250),
-            try_warm_path_background(&state, &request_value, Some(FLEX_TEST_KEY), FLEX_TEST_MODEL),
-        )
-        .await
-        .expect("warm background attribution must not wait on the unavailable main pool")
-        .expect("warm background setup must retain cached attribution");
+        let warm_state = state.clone();
+        let warm_request = request_value.clone();
+        let mut warm_task =
+            tokio::spawn(async move { try_warm_path_background(&warm_state, &warm_request, Some(FLEX_TEST_KEY), FLEX_TEST_MODEL).await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut warm_task).await.is_err(),
+            "warm-path setup must wait for durable admission before spawning its loop"
+        );
+        let rows_before_writer: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM requests")
+            .fetch_one(&fusillade_pool)
+            .await
+            .unwrap();
+        assert_eq!(rows_before_writer, 0);
+
+        let writer_shutdown = tokio_util::sync::CancellationToken::new();
+        let writer_task = tokio::spawn(requests_writer_task.run(writer_shutdown.clone()));
+        let response = tokio::time::timeout(Duration::from_secs(5), warm_task)
+            .await
+            .expect("warm background attribution must not wait on the unavailable main pool")
+            .unwrap()
+            .expect("warm background setup must retain cached attribution")
+            .expect("warm background admission must succeed");
 
         assert_eq!(response.status(), StatusCode::ACCEPTED);
         let stored_created_by: Option<String> = sqlx::query_scalar("SELECT created_by FROM requests")
@@ -1710,6 +2006,23 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(stored_created_by.as_deref(), Some(owner_id.to_string().as_str()));
+        writer_shutdown.cancel();
+        writer_task.await.unwrap();
+
+        let rows_before_failure: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM requests")
+            .fetch_one(&fusillade_pool)
+            .await
+            .unwrap();
+        let failed = match try_warm_path_background(&state, &request_value, Some(FLEX_TEST_KEY), FLEX_TEST_MODEL).await {
+            Err(response) => response,
+            Ok(_) => panic!("closed writer must be a fatal warm-path admission failure"),
+        };
+        assert_eq!(failed.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let rows_after_failure: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM requests")
+            .fetch_one(&fusillade_pool)
+            .await
+            .unwrap();
+        assert_eq!(rows_after_failure, rows_before_failure);
     }
 
     #[sqlx::test]
@@ -1724,10 +2037,16 @@ mod tests {
         let fusillade_pool = crate::test::utils::setup_fusillade_pool(&pool).await;
         let fusillade_pools = TestDbPools::new(fusillade_pool.clone()).await.unwrap();
         let request_manager = Arc::new(fusillade_arsenal::PostgresRequestManager::new(fusillade_pools, Default::default()));
-        let response_store = Arc::new(response_store::FusilladeResponseStore::new(request_manager.clone()));
+        let (requests_writer_task, requests_writer) =
+            crate::inference::engine::writer::RequestsWriter::new(request_manager.clone(), 1, Duration::ZERO);
+        let response_store = Arc::new(response_store::FusilladeResponseStore::new(
+            request_manager.clone(),
+            requests_writer.clone(),
+        ));
         let main_pool = PgPoolOptions::new()
             .max_connections(1)
             .min_connections(0)
+            .acquire_timeout(Duration::from_millis(25))
             .connect_with(pool.connect_options().as_ref().clone())
             .await
             .unwrap();
@@ -1746,8 +2065,6 @@ mod tests {
                 hidden_batch_key: Some("sk-flex-hidden".to_string()),
             },
         )]));
-        let (_requests_writer_task, requests_writer) =
-            crate::inference::engine::writer::RequestsWriter::new(request_manager.clone(), 1, Duration::ZERO);
         let state = InferenceMiddlewareState {
             requests_writer,
             request_manager,
@@ -1772,8 +2089,19 @@ mod tests {
             flex_batch_key_resolver: crate::sync::api_key_cache::FlexBatchKeyResolver::new(main_pool.clone(), api_key_cache),
             onwards_targets: flex_access_targets(&[FLEX_TEST_KEY], HashMap::new(), Vec::new()),
         };
+        let dispatches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let dispatch_counter = dispatches.clone();
         let app = Router::new()
-            .route("/v1/responses", post(|| async { StatusCode::IM_A_TEAPOT }))
+            .route(
+                "/v1/responses",
+                post(move || {
+                    let dispatch_counter = dispatch_counter.clone();
+                    async move {
+                        dispatch_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        StatusCode::IM_A_TEAPOT
+                    }
+                }),
+            )
             .layer(middleware::from_fn_with_state(state, inference_middleware));
         let request = Request::builder()
             .method("POST")
@@ -1792,9 +2120,24 @@ mod tests {
             .unwrap();
 
         let _held_connection = main_pool.acquire().await.unwrap();
-        let response = tokio::time::timeout(Duration::from_millis(250), app.oneshot(request))
+        let mut request_task = tokio::spawn(app.clone().oneshot(request));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut request_task).await.is_err(),
+            "background realtime must wait for durable admission"
+        );
+        assert_eq!(dispatches.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let rows_before_writer: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM requests")
+            .fetch_one(&fusillade_pool)
+            .await
+            .unwrap();
+        assert_eq!(rows_before_writer, 0);
+
+        let writer_shutdown = tokio_util::sync::CancellationToken::new();
+        let writer_task = tokio::spawn(requests_writer_task.run(writer_shutdown.clone()));
+        let response = tokio::time::timeout(Duration::from_secs(5), request_task)
             .await
             .expect("background realtime attribution must not wait on the unavailable main pool")
+            .unwrap()
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::ACCEPTED);
@@ -1803,6 +2146,70 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(stored_created_by.as_deref(), Some(owner_id.to_string().as_str()));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while dispatches.load(std::sync::atomic::Ordering::SeqCst) != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("successful background admission should dispatch upstream");
+        writer_shutdown.cancel();
+        writer_task.await.unwrap();
+
+        let closed_writer_background = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("authorization", format!("Bearer {FLEX_TEST_KEY}"))
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "model": FLEX_TEST_MODEL,
+                    "background": true,
+                    "tools": [],
+                    "input": "must fail closed",
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let failed = app.clone().oneshot(closed_writer_background).await.unwrap();
+        assert_eq!(failed.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        tokio::task::yield_now().await;
+        assert_eq!(
+            dispatches.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "writer failure must prevent background upstream dispatch"
+        );
+
+        let rows_before_ordinary: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM requests")
+            .fetch_one(&fusillade_pool)
+            .await
+            .unwrap();
+        let ordinary_realtime = Request::builder()
+            .method("POST")
+            .uri("/v1/responses")
+            .header("authorization", format!("Bearer {FLEX_TEST_KEY}"))
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "model": FLEX_TEST_MODEL,
+                    "background": false,
+                    "tools": [],
+                    "input": "ordinary realtime bypass",
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let ordinary = app.oneshot(ordinary_realtime).await.unwrap();
+        assert_eq!(ordinary.status(), StatusCode::IM_A_TEAPOT);
+        assert_eq!(dispatches.load(std::sync::atomic::Ordering::SeqCst), 2);
+        let rows_after_ordinary: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM requests")
+            .fetch_one(&fusillade_pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            rows_after_ordinary, rows_before_ordinary,
+            "ordinary realtime must not create a lifecycle row before proxying"
+        );
     }
 
     #[test]

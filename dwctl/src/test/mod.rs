@@ -1277,6 +1277,8 @@ async fn test_request_logging_disabled(pool: PgPool) {
         DbPools::new(pool.clone()),
         Default::default(),
     ));
+    let (_requests_writer_task, requests_writer) =
+        crate::inference::engine::writer::RequestsWriter::new(request_manager.clone(), 1, std::time::Duration::ZERO);
     let limiters = crate::limits::Limiters::new(&config.limits);
     let shared_config = crate::SharedConfig::new(config);
     underway::run_migrations(&pool).await.expect("Failed to run underway migrations");
@@ -1305,13 +1307,17 @@ async fn test_request_logging_disabled(pool: PgPool) {
         .await
         .expect("Failed to create task runner"),
     );
-    let response_store = std::sync::Arc::new(crate::inference::store::FusilladeResponseStore::new(request_manager.clone()));
+    let response_store = std::sync::Arc::new(crate::inference::store::FusilladeResponseStore::new(
+        request_manager.clone(),
+        requests_writer.clone(),
+    ));
     let api_key_cache = crate::sync::api_key_cache::ApiKeyMetadataCache::empty();
     let flex_batch_key_resolver = crate::sync::api_key_cache::FlexBatchKeyResolver::new(pool.clone(), api_key_cache.clone());
     let mut app_state = AppState::builder()
         .db(DbPools::new(pool.clone()))
         .config(shared_config)
         .request_manager(request_manager)
+        .requests_writer(requests_writer)
         .task_runner(task_runner)
         .limiters(limiters)
         .response_store(response_store)
@@ -1321,7 +1327,7 @@ async fn test_request_logging_disabled(pool: PgPool) {
         .flex_batch_key_resolver(flex_batch_key_resolver)
         .build();
     let onwards_router = axum::Router::new(); // Empty onwards router for testing
-    let router = super::build_router(&mut app_state, onwards_router, None, None, None, false, None)
+    let router = super::build_router(&mut app_state, onwards_router, None, None, false, None)
         .await
         .expect("Failed to build router");
 
@@ -1895,6 +1901,8 @@ async fn test_build_router_with_metrics_disabled(pool: PgPool) {
         DbPools::new(pool.clone()),
         Default::default(),
     ));
+    let (_requests_writer_task, requests_writer) =
+        crate::inference::engine::writer::RequestsWriter::new(request_manager.clone(), 1, std::time::Duration::ZERO);
     let limiters = crate::limits::Limiters::new(&config.limits);
     let shared_config = crate::SharedConfig::new(config);
     underway::run_migrations(&pool).await.expect("Failed to run underway migrations");
@@ -1923,13 +1931,17 @@ async fn test_build_router_with_metrics_disabled(pool: PgPool) {
         .await
         .expect("Failed to create task runner"),
     );
-    let response_store = std::sync::Arc::new(crate::inference::store::FusilladeResponseStore::new(request_manager.clone()));
+    let response_store = std::sync::Arc::new(crate::inference::store::FusilladeResponseStore::new(
+        request_manager.clone(),
+        requests_writer.clone(),
+    ));
     let api_key_cache = crate::sync::api_key_cache::ApiKeyMetadataCache::empty();
     let flex_batch_key_resolver = crate::sync::api_key_cache::FlexBatchKeyResolver::new(pool.clone(), api_key_cache.clone());
     let mut app_state = AppState::builder()
         .db(DbPools::new(pool))
         .config(shared_config)
         .request_manager(request_manager)
+        .requests_writer(requests_writer)
         .task_runner(task_runner)
         .limiters(limiters)
         .response_store(response_store)
@@ -1940,7 +1952,7 @@ async fn test_build_router_with_metrics_disabled(pool: PgPool) {
         .build();
 
     let onwards_router = axum::Router::new();
-    let router = super::build_router(&mut app_state, onwards_router, None, None, None, false, None)
+    let router = super::build_router(&mut app_state, onwards_router, None, None, false, None)
         .await
         .expect("Failed to build router");
     let server = axum_test::TestServer::new(router).expect("Failed to create test server");
@@ -1962,6 +1974,8 @@ async fn test_build_router_with_metrics_enabled(pool: PgPool) {
         DbPools::new(pool.clone()),
         Default::default(),
     ));
+    let (_requests_writer_task, requests_writer) =
+        crate::inference::engine::writer::RequestsWriter::new(request_manager.clone(), 1, std::time::Duration::ZERO);
     let limiters = crate::limits::Limiters::new(&config.limits);
     let shared_config = crate::SharedConfig::new(config);
     underway::run_migrations(&pool).await.expect("Failed to run underway migrations");
@@ -1990,13 +2004,17 @@ async fn test_build_router_with_metrics_enabled(pool: PgPool) {
         .await
         .expect("Failed to create task runner"),
     );
-    let response_store = std::sync::Arc::new(crate::inference::store::FusilladeResponseStore::new(request_manager.clone()));
+    let response_store = std::sync::Arc::new(crate::inference::store::FusilladeResponseStore::new(
+        request_manager.clone(),
+        requests_writer.clone(),
+    ));
     let api_key_cache = crate::sync::api_key_cache::ApiKeyMetadataCache::empty();
     let flex_batch_key_resolver = crate::sync::api_key_cache::FlexBatchKeyResolver::new(pool.clone(), api_key_cache.clone());
     let mut app_state = AppState::builder()
         .db(DbPools::new(pool))
         .config(shared_config)
         .request_manager(request_manager)
+        .requests_writer(requests_writer)
         .task_runner(task_runner)
         .limiters(limiters)
         .response_store(response_store)
@@ -2007,7 +2025,7 @@ async fn test_build_router_with_metrics_enabled(pool: PgPool) {
         .build();
 
     let onwards_router = axum::Router::new();
-    let router = super::build_router(&mut app_state, onwards_router, None, None, None, false, None)
+    let router = super::build_router(&mut app_state, onwards_router, None, None, false, None)
         .await
         .expect("Failed to build router");
     let server = axum_test::TestServer::new(router).expect("Failed to create test server");

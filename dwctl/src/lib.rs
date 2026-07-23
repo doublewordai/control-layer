@@ -290,6 +290,8 @@ where
     #[builder(default = false)]
     pub is_leader: bool,
     pub request_manager: Arc<fusillade_arsenal::PostgresRequestManager<P>>,
+    /// Singleton commit-acknowledging response lifecycle writer.
+    pub requests_writer: crate::inference::engine::writer::RequestsWriterHandle,
     /// Background task runner for enqueuing deferred work (batch population, etc.)
     pub task_runner: Arc<tasks::TaskRunner<P>>,
     /// Resource limiters for protecting system capacity.
@@ -1143,7 +1145,6 @@ pub async fn build_router(
     state: &mut AppState,
     onwards_router: Router,
     analytics_sender: Option<request_logging::batcher::AnalyticsSender>,
-    requests_writer_handle: Option<crate::inference::engine::writer::RequestsWriterHandle>,
     metrics_recorder: Option<GenAiMetrics>,
     strict_mode: bool,
     inference_middleware_state: Option<crate::inference::middleware::InferenceMiddlewareState>,
@@ -1161,7 +1162,7 @@ pub async fn build_router(
     let request_logging_enabled = state.outlet_db.is_some() && config.enable_request_logging;
     let analytics_enabled = config.enable_analytics;
 
-    let response_lifecycle_enabled = inference_middleware_state.is_some() && requests_writer_handle.is_some();
+    let response_lifecycle_enabled = inference_middleware_state.is_some();
     let outlet_layer = if request_logging_enabled || analytics_enabled || response_lifecycle_enabled {
         // Store the metrics recorder in state (created earlier in Application::new)
         state.metrics_recorder = metrics_recorder;
@@ -1194,12 +1195,14 @@ pub async fn build_router(
 
         // Add FusilladeOutletHandler so completed responses get written to
         // fusillade via the in-process RequestsWriter. We only attach when
-        // both the inference middleware is active and we actually have a
-        // writer handle to give the handler; without a handle the handler would
-        // silently swallow rows.
-        if let (Some(rms), Some(writer)) = (inference_middleware_state.as_ref(), requests_writer_handle.clone()) {
-            let fusillade_handler =
-                crate::inference::engine::outlet_handler::FusilladeOutletHandler::new(writer, rms.api_key_cache.clone());
+        // the inference middleware is active. AppState owns the singleton
+        // writer handle, avoiding a second router parameter that could point
+        // at a different consumer.
+        if let Some(rms) = inference_middleware_state.as_ref() {
+            let fusillade_handler = crate::inference::engine::outlet_handler::FusilladeOutletHandler::new(
+                state.requests_writer.clone(),
+                rms.api_key_cache.clone(),
+            );
             multi_handler = multi_handler.with(fusillade_handler);
         }
 
@@ -2364,6 +2367,11 @@ pub(crate) struct BackgroundServicesInput {
     /// multi-step processor can share the same storage instance as the
     /// daemon runtime.
     pub request_manager: Arc<fusillade_arsenal::PostgresRequestManager<DbPools>>,
+    /// The singleton lifecycle writer consumer and its producer handle are
+    /// constructed before the response store so descendants cannot observe a
+    /// startup window without durable admission.
+    pub requests_writer: crate::inference::engine::writer::RequestsWriter<DbPools>,
+    pub requests_writer_handle: crate::inference::engine::writer::RequestsWriterHandle,
     /// Fusillade's scheduling daemon. Owns HTTP dispatch and runtime
     /// lifecycle; durable data operations live on `request_manager`.
     pub postgres_daemon: Arc<fusillade::PostgresDaemon<DbPools, fusillade::ReqwestHttpClient>>,
@@ -2404,6 +2412,8 @@ pub(crate) struct BackgroundServicesInput {
 async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Result<BackgroundServices> {
     let BackgroundServicesInput {
         request_manager,
+        requests_writer,
+        requests_writer_handle,
         postgres_daemon,
         step_manager,
         multi_step_processor,
@@ -2868,19 +2878,13 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
     // Start the responses writer. Replaces the underway create-response /
     // complete-response jobs. Outlet's FusilladeOutletHandler holds the
     // handle; this task drains the channel and flushes to fusillade.
-    let requests_writer_handle = {
-        let (writer, handle) = crate::inference::engine::writer::RequestsWriter::new(
-            request_manager.clone(),
-            config.background_services.task_workers.response_writer_batch_size,
-            std::time::Duration::from_millis(config.background_services.task_workers.response_writer_max_linger_ms),
-        );
+    {
         let writer_shutdown = shutdown_token.clone();
         background_tasks.spawn("responses-writer", async move {
-            writer.run(writer_shutdown).await;
+            requests_writer.run(writer_shutdown).await;
             Ok(())
         });
-        handle
-    };
+    }
 
     // Build the underway task runner for background jobs (batch population, sync pipeline, etc.)
     let encryption_key = match config.connections.encryption_key.as_deref().or(config.secret_key.as_deref()) {
@@ -3068,6 +3072,11 @@ impl Application {
                 batch_size: config.batches.files.batch_insert_size,
             }),
         );
+        let (requests_writer, requests_writer_handle) = crate::inference::engine::writer::RequestsWriter::new(
+            request_manager.clone(),
+            config.background_services.task_workers.response_writer_batch_size,
+            std::time::Duration::from_millis(config.background_services.task_workers.response_writer_max_linger_ms),
+        );
         let postgres_daemon = Arc::new(fusillade::PostgresDaemon::from_store(
             request_manager.clone(),
             fusillade_daemon_config.clone(),
@@ -3081,7 +3090,7 @@ impl Application {
             None => None,
         };
         let response_store = Arc::new(
-            crate::inference::store::FusilladeResponseStore::new(request_manager.clone())
+            crate::inference::store::FusilladeResponseStore::new(request_manager.clone(), requests_writer_handle.clone())
                 .with_step_manager(step_manager.clone())
                 .with_keystore(keystore.clone()),
         );
@@ -3169,6 +3178,8 @@ impl Application {
 
         let mut bg_services = setup_background_services(BackgroundServicesInput {
             request_manager: request_manager.clone(),
+            requests_writer,
+            requests_writer_handle: requests_writer_handle.clone(),
             postgres_daemon: postgres_daemon.clone(),
             step_manager: step_manager.clone(),
             multi_step_processor: multi_step_processor_for_setup,
@@ -3357,6 +3368,7 @@ impl Application {
             .config(shared_config.clone())
             .is_leader(bg_services.is_leader)
             .request_manager(bg_services.request_manager.clone())
+            .requests_writer(bg_services.requests_writer_handle.clone())
             .task_runner(bg_services.task_runner.clone())
             .maybe_outlet_db(outlet_pools.clone())
             .limiters(limiters)
@@ -3380,7 +3392,6 @@ impl Application {
             &mut app_state,
             onwards_router,
             bg_services.analytics_sender.clone(),
-            Some(bg_services.requests_writer_handle.clone()),
             metrics_recorder,
             bg_services.onwards_targets.strict_mode,
             Some(inference_middleware_state),

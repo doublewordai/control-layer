@@ -17,7 +17,15 @@ async fn setup_ai_test(
     mock_server: &wiremock::MockServer,
     strict_mode: bool,
 ) -> (axum_test::TestServer, String, crate::BackgroundServices) {
-    let mut config = create_test_config();
+    setup_ai_test_with_config(pool, mock_server, strict_mode, create_test_config()).await
+}
+
+async fn setup_ai_test_with_config(
+    pool: PgPool,
+    mock_server: &wiremock::MockServer,
+    strict_mode: bool,
+    mut config: crate::config::Config,
+) -> (axum_test::TestServer, String, crate::BackgroundServices) {
     config.onwards.strict_mode = strict_mode;
     config.background_services.onwards_sync.enabled = true;
     // 1 record per flush keeps the test deterministic: each completed
@@ -97,6 +105,10 @@ async fn setup_ai_test(
         .await;
     let key_data: serde_json::Value = key_response.json();
     let api_key = key_data["key"].as_str().unwrap().to_string();
+
+    // Response completion attribution reads the lock-free metadata snapshot;
+    // refresh it explicitly instead of relying on LISTEN timing.
+    bg_services.sync_api_key_cache(&pool).await.unwrap();
 
     // Sync onwards config and wait for model availability
     bg_services.sync_onwards_config(&pool).await.unwrap();
@@ -229,6 +241,51 @@ async fn test_chat_completion_creates_retrievable_response(pool: PgPool) {
     );
 }
 
+/// Response lifecycle persistence is independent of optional analytics and
+/// raw request logging handlers.
+#[sqlx::test]
+#[test_log::test]
+async fn test_realtime_completion_persists_when_logging_and_analytics_are_disabled(pool: PgPool) {
+    let mock_server = wiremock::MockServer::start().await;
+    mount_chat_completions_mock(&mock_server).await;
+
+    let mut config = create_test_config();
+    config.enable_analytics = false;
+    config.enable_request_logging = false;
+    let (server, api_key, _bg) = setup_ai_test_with_config(pool.clone(), &mock_server, true, config).await;
+
+    let response = server
+        .post("/ai/v1/chat/completions")
+        .add_header("Authorization", &format!("Bearer {api_key}"))
+        .add_header("Content-Type", "application/json")
+        .json(&serde_json::json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "Hello without logging"}],
+            "service_tier": "priority"
+        }))
+        .await;
+    assert_eq!(response.status_code(), 200);
+
+    let state = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if let Some(state) = sqlx::query_scalar::<_, String>(
+                "SELECT state FROM fusillade.requests WHERE model = 'gpt-4o' ORDER BY created_at DESC LIMIT 1",
+            )
+            .fetch_optional(&pool)
+            .await
+            .unwrap()
+                && state == "completed"
+            {
+                break state;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("response lifecycle row should complete without optional logging handlers");
+    assert_eq!(state, "completed");
+}
+
 /// Test that the blocking response ID returned to the client matches the fusillade ID.
 #[sqlx::test]
 #[test_log::test]
@@ -305,7 +362,11 @@ async fn test_multi_step_chain_assembles_and_is_retrievable_via_get(pool: PgPool
     let test_pools = TestDbPools::new(pool).await.unwrap();
     let request_manager = Arc::new(PostgresRequestManager::new(test_pools.clone(), Default::default()));
     let step_manager = Arc::new(PostgresResponseStepManager::new(test_pools));
-    let store = FusilladeResponseStore::new(request_manager.clone()).with_step_manager(step_manager);
+    let (requests_writer, requests_writer_handle) =
+        crate::inference::engine::writer::RequestsWriter::new(request_manager.clone(), 1, std::time::Duration::ZERO);
+    let writer_shutdown = tokio_util::sync::CancellationToken::new();
+    let writer_task = tokio::spawn(requests_writer.run(writer_shutdown.clone()));
+    let store = FusilladeResponseStore::new(request_manager.clone(), requests_writer_handle).with_step_manager(step_manager);
 
     // Stand in for warm_path_setup — create the up-front /v1/responses
     // fusillade row that `record_step`'s head branch reuses, then
@@ -442,6 +503,9 @@ async fn test_multi_step_chain_assembles_and_is_retrievable_via_get(pool: PgPool
     assert!(matches!(chain[1].kind, onwards::StepKind::ToolCall));
     assert!(matches!(chain[2].kind, onwards::StepKind::ModelCall));
     assert!(chain.iter().all(|s| matches!(s.state, onwards::StepState::Completed)));
+
+    writer_shutdown.cancel();
+    writer_task.await.unwrap();
 }
 
 /// Test that GET /v1/responses/{id} returns 404 for non-existent IDs.

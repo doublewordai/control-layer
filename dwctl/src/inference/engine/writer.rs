@@ -141,11 +141,11 @@ pub struct RequestsWriterHandle {
 }
 
 impl RequestsWriterHandle {
-    pub async fn create_flex(&self, input: CreateFlexInput) -> fusillade::Result<RequestId> {
+    pub async fn admit_flex(&self, input: CreateFlexInput) -> fusillade::Result<RequestId> {
         self.create(CreateResponseInput::Flex(input)).await
     }
 
-    pub async fn create_realtime(&self, input: CreateRealtimeInput) -> fusillade::Result<RequestId> {
+    pub async fn admit_realtime(&self, input: CreateRealtimeInput) -> fusillade::Result<RequestId> {
         self.create(CreateResponseInput::Realtime(input)).await
     }
 
@@ -362,11 +362,12 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> RequestsWriter<P> {
         }
     }
 
-    /// Flush the batch to fusillade in a single transaction. Records arrive
-    /// with `created_by` already resolved by the outlet handler, so the
-    /// flush path doesn't touch the dwctl pool. Retries on transient errors
-    /// with exponential backoff; drops the batch (and increments a metric)
-    /// only after all retries are exhausted.
+    /// Flush the batch to fusillade in a single transaction. Records normally
+    /// arrive with `created_by` already resolved by the caller, so the flush
+    /// path doesn't touch the dwctl pool. Invalid create commands are rejected
+    /// individually before the valid commands enter the shared transaction.
+    /// Retries on transient errors with exponential backoff; drops the batch
+    /// (and increments a metric) only after all retries are exhausted.
     async fn flush_batch(&self, buffer: &mut Vec<QueuedCommand>) {
         if buffer.is_empty() {
             return;
@@ -400,19 +401,36 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> RequestsWriter<P> {
         if creates.is_empty() {
             return;
         }
-        let batch_size = creates.len();
+        let submitted_batch_size = creates.len();
         let start = Instant::now();
-        histogram!("dwctl_requests_writer_flush_size", "command" => "create").record(batch_size as f64);
+        histogram!("dwctl_requests_writer_flush_size", "command" => "create").record(submitted_batch_size as f64);
         for (enqueued_at, _, _) in &creates {
             histogram!("dwctl_requests_writer_queue_wait_duration_seconds", "command" => "create")
                 .record(enqueued_at.elapsed().as_secs_f64());
         }
-        let inputs: Vec<_> = creates.iter().map(|(_, input, _)| input.clone()).collect();
+
+        let mut valid_creates = Vec::with_capacity(submitted_batch_size);
+        for (enqueued_at, input, ack) in creates {
+            if create_input_created_by(&input).trim().is_empty() {
+                let _ = ack.send(Err(invalid_create_owner()));
+                counter!("dwctl_requests_writer_create_ack_total", "outcome" => "error").increment(1);
+            } else {
+                valid_creates.push((enqueued_at, input, ack));
+            }
+        }
+
+        if valid_creates.is_empty() {
+            histogram!("dwctl_requests_writer_flush_duration_seconds", "command" => "create").record(start.elapsed().as_secs_f64());
+            return;
+        }
+
+        let batch_size = valid_creates.len();
+        let inputs: Vec<_> = valid_creates.iter().map(|(_, input, _)| input.clone()).collect();
         let result = self.retry_create_batch(&inputs).await;
 
         match result {
-            Ok(ids) if ids.len() == creates.len() => {
-                for ((_, _, ack), id) in creates.into_iter().zip(ids) {
+            Ok(ids) if ids.len() == valid_creates.len() => {
+                for ((_, _, ack), id) in valid_creates.into_iter().zip(ids) {
                     let _ = ack.send(Ok(id));
                     counter!("dwctl_requests_writer_create_ack_total", "outcome" => "success").increment(1);
                 }
@@ -428,7 +446,7 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> RequestsWriter<P> {
                     "Responses writer create batch returned an unexpected number of IDs"
                 );
                 fan_out_create_error(
-                    creates,
+                    valid_creates,
                     "responses writer create failed: storage returned an invalid acknowledgement count",
                 );
             }
@@ -440,7 +458,7 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> RequestsWriter<P> {
                     batch_size,
                     "Failed to flush responses create batch"
                 );
-                fan_out_create_error(creates, &safe_error);
+                fan_out_create_error(valid_creates, &safe_error);
             }
         }
         histogram!("dwctl_requests_writer_flush_duration_seconds", "command" => "create").record(start.elapsed().as_secs_f64());
@@ -549,6 +567,17 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> RequestsWriter<P> {
 
         debug!(batch_size, duration_ms = duration.as_millis() as u64, "Flushed responses batch");
     }
+}
+
+fn create_input_created_by(input: &CreateResponseInput) -> &str {
+    match input {
+        CreateResponseInput::Flex(input) => &input.created_by,
+        CreateResponseInput::Realtime(input) => &input.created_by,
+    }
+}
+
+fn invalid_create_owner() -> fusillade::FusilladeError {
+    fusillade::FusilladeError::ValidationError("response lifecycle create requires non-empty created_by".to_string())
 }
 
 fn redacted_create_error(error: &fusillade::FusilladeError) -> String {
@@ -663,11 +692,11 @@ mod tests {
 
         let flex_ack = tokio::spawn({
             let handle = handle.clone();
-            async move { handle.create_flex(flex_input(flex_id, "flex-owner")).await }
+            async move { handle.admit_flex(flex_input(flex_id, "flex-owner")).await }
         });
         let realtime_ack = tokio::spawn({
             let handle = handle.clone();
-            async move { handle.create_realtime(realtime_input(realtime_id, "realtime-owner")).await }
+            async move { handle.admit_realtime(realtime_input(realtime_id, "realtime-owner")).await }
         });
         tokio::task::yield_now().await;
 
@@ -693,7 +722,7 @@ mod tests {
         let ids = [Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
         let acknowledgements = ids.map(|id| {
             let handle = handle.clone();
-            tokio::spawn(async move { handle.create_realtime(realtime_input(id, "owner")).await })
+            tokio::spawn(async move { handle.admit_realtime(realtime_input(id, "owner")).await })
         });
         tokio::task::yield_now().await;
 
@@ -710,7 +739,7 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn exhausted_create_failure_is_fanned_out_and_completion_still_flushes(pool: sqlx::PgPool) {
+    async fn invalid_create_does_not_poison_valid_create_or_completion(pool: sqlx::PgPool) {
         let (mut writer, handle, manager) = build_writer(pool).await;
         writer.max_retries = 0;
         let valid_id = Uuid::new_v4();
@@ -719,23 +748,28 @@ mod tests {
 
         let valid_ack = tokio::spawn({
             let handle = handle.clone();
-            async move { handle.create_flex(flex_input(valid_id, "owner")).await }
+            async move { handle.admit_flex(flex_input(valid_id, "owner")).await }
         });
         let invalid_ack = tokio::spawn({
             let handle = handle.clone();
-            async move { handle.create_realtime(realtime_input(invalid_id, " ")).await }
+            async move { handle.admit_realtime(realtime_input(invalid_id, " ")).await }
         });
         handle.complete_realtime(completed_record(completion_id, "owner")).await.unwrap();
         tokio::task::yield_now().await;
 
         let shutdown = CancellationToken::new();
         let writer_task = tokio::spawn(writer.run(shutdown.clone()));
-        assert!(valid_ack.await.unwrap().is_err());
-        assert!(invalid_ack.await.unwrap().is_err());
+        assert_eq!(valid_ack.await.unwrap().unwrap(), RequestId(valid_id));
+        let invalid_error = invalid_ack.await.unwrap().unwrap_err();
         assert!(matches!(
-            Storage::get_request_detail(&*manager, RequestId(valid_id)).await,
-            Err(fusillade::FusilladeError::RequestNotFound(_))
+            invalid_error,
+            fusillade::FusilladeError::ValidationError(message)
+                if message == "response lifecycle create requires non-empty created_by"
         ));
+        assert_eq!(
+            Storage::get_request_detail(&*manager, RequestId(valid_id)).await.unwrap().status,
+            "pending"
+        );
         assert_eq!(wait_until_completed(&manager, completion_id, 5).await.status, "completed");
 
         shutdown.cancel();
@@ -747,7 +781,7 @@ mod tests {
         let (mut writer, handle, _manager) = build_writer(pool).await;
         writer.max_retries = 3;
         writer.retry_base_delay = Duration::from_secs(5);
-        let acknowledgement = tokio::spawn(async move { handle.create_realtime(realtime_input(Uuid::new_v4(), " ")).await });
+        let acknowledgement = tokio::spawn(async move { handle.admit_realtime(realtime_input(Uuid::new_v4(), " ")).await });
         tokio::task::yield_now().await;
 
         let shutdown = CancellationToken::new();
@@ -790,7 +824,7 @@ mod tests {
         let ids = [Uuid::new_v4(), Uuid::new_v4()];
         let acknowledgements = ids.map(|id| {
             let handle = handle.clone();
-            tokio::spawn(async move { handle.create_realtime(realtime_input(id, "owner")).await })
+            tokio::spawn(async move { handle.admit_realtime(realtime_input(id, "owner")).await })
         });
         tokio::task::yield_now().await;
 
@@ -818,7 +852,7 @@ mod tests {
         let admitted_id = Uuid::new_v4();
         let admitted_ack = tokio::spawn({
             let handle = handle.clone();
-            async move { handle.create_realtime(realtime_input(admitted_id, "owner")).await }
+            async move { handle.admit_realtime(realtime_input(admitted_id, "owner")).await }
         });
         timeout(Duration::from_secs(1), async {
             while handle.sender.capacity() != CHANNEL_BUFFER_SIZE - 1 {
@@ -847,7 +881,7 @@ mod tests {
         .await
         .expect("shutdown observed during linger must close admission before flushing");
 
-        let rejected = handle.create_realtime(realtime_input(Uuid::new_v4(), "owner")).await;
+        let rejected = handle.admit_realtime(realtime_input(Uuid::new_v4(), "owner")).await;
         assert_eq!(rejected.unwrap_err().to_string(), "responses writer unavailable");
         assert!(
             !admitted_ack.is_finished(),
@@ -874,7 +908,7 @@ mod tests {
         let admitted_id = Uuid::new_v4();
         let admitted_ack = tokio::spawn({
             let handle = handle.clone();
-            async move { handle.create_realtime(realtime_input(admitted_id, "owner")).await }
+            async move { handle.admit_realtime(realtime_input(admitted_id, "owner")).await }
         });
         timeout(Duration::from_secs(1), async {
             while handle.sender.capacity() != CHANNEL_BUFFER_SIZE - 1 {
@@ -897,7 +931,7 @@ mod tests {
         shutdown.cancel();
         let rejected = timeout(
             Duration::from_millis(250),
-            handle.create_realtime(realtime_input(Uuid::new_v4(), "owner")),
+            handle.admit_realtime(realtime_input(Uuid::new_v4(), "owner")),
         )
         .await
         .expect("post-cancellation create must reject while the prior flush is blocked");
@@ -922,7 +956,7 @@ mod tests {
 
         let error = timeout(
             Duration::from_secs(1),
-            handle.create_realtime(realtime_input(Uuid::new_v4(), "owner")),
+            handle.admit_realtime(realtime_input(Uuid::new_v4(), "owner")),
         )
         .await
         .expect("closed writer must not hang")
