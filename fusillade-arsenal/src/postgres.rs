@@ -144,8 +144,6 @@ pub struct PostgresRequestManager<P: PoolProvider> {
     processing_commit_rollback_failures_remaining: AtomicUsize,
     #[cfg(test)]
     processing_commit_rollback_test_hook: Option<Arc<TestPauseHook>>,
-    #[cfg(test)]
-    processing_reconcile_test_hook: Option<Arc<TestPauseHook>>,
 }
 
 #[cfg(test)]
@@ -568,8 +566,6 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
             processing_commit_rollback_failures_remaining: AtomicUsize::new(0),
             #[cfg(test)]
             processing_commit_rollback_test_hook: None,
-            #[cfg(test)]
-            processing_reconcile_test_hook: None,
         }
     }
 
@@ -874,30 +870,18 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
         attempt_id: AttemptId,
         processing_admission_id: Uuid,
     ) -> Result<Option<bool>> {
-        // A reconciliation is itself a state-write operation. Acquire the
-        // shared response admission lanes explicitly so retries after a
-        // failed reconciliation cannot bypass pool headroom or the configured
-        // state-write cap.
-        let _admission_permit = self
-            .response_admission
-            .write_request("persist_attempt_reconcile")
-            .acquire()
-            .await?;
-        #[cfg(test)]
-        if let Some(hook) = &self.processing_reconcile_test_hook {
-            hook.pause().await;
-        }
-
+        // A reconciliation is itself a state-write operation. The admitted
+        // executor reacquires its permit for each pool-acquisition attempt,
+        // releasing it before retry backoff while preserving pool headroom
+        // and the configured state-write cap.
         let current: Option<(String, Option<Uuid>, Option<Uuid>, Option<Uuid>)> = sqlx::query_as(
             "SELECT state, daemon_id, attempt_id, processing_admission_id
                  FROM requests WHERE id = $1",
         )
         .bind(*request_id)
-        .fetch_optional(self.write_executor())
+        .fetch_optional(self.admitted_write_executor("persist_attempt_reconcile"))
         .await
-        .map_err(|error| {
-            Self::classify_attempt_sqlx_error("persist_attempt_reconcile", error)
-        })?;
+        .map_err(|error| Self::classify_attempt_sqlx_error("persist_attempt_reconcile", error))?;
 
         match current {
             None => Err(FusilladeError::RequestNotFound(request_id)),
@@ -3482,15 +3466,10 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                             return Ok(applied);
                         }
 
-                        let (mut tx, admission_permit) = self
-                            .begin_admitted_write("persist_attempt")
-                            .await
-                            .map_err(|error| {
-                                Self::classify_attempt_sqlx_error(
-                                    "persist_attempt",
-                                    error,
-                                )
-                            })?;
+                        let (mut tx, admission_permit) =
+                            self.begin_admitted_write("persist_attempt").await.map_err(
+                                |error| Self::classify_attempt_sqlx_error("persist_attempt", error),
+                            )?;
                         let row = sqlx::query!(
                             r#"
                             WITH target AS MATERIALIZED (
@@ -3581,10 +3560,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                         #[allow(unused_mut)]
                         let mut commit_result = if inject_rollback {
                             tx.rollback().await.map_err(|error| {
-                                Self::classify_attempt_sqlx_error(
-                                    "persist_attempt_rollback",
-                                    error,
-                                )
+                                Self::classify_attempt_sqlx_error("persist_attempt_rollback", error)
                             })?;
                             #[cfg(test)]
                             if let Some(hook) = &self.processing_commit_rollback_test_hook {
@@ -12567,9 +12543,8 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn processing_commit_reconciliation_respects_write_admission(pool: sqlx::PgPool) {
-        let reconcile_hook = Arc::new(TestPauseHook::default());
-        let mut manager = PostgresRequestManager::with_client(
+    async fn processing_commit_reconciliation_uses_one_write_permit(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
             TestDbPools::new(pool.clone()).await.unwrap(),
             Arc::new(MockHttpClient::new()),
         )
@@ -12577,46 +12552,32 @@ mod tests {
             max_concurrent_state_writes: 1,
             ..PostgresStorageConfig::default()
         });
-        manager.processing_reconcile_test_hook = Some(reconcile_hook.clone());
         manager
             .processing_commit_ack_failures_remaining
             .store(1, Ordering::SeqCst);
-        let manager = Arc::new(manager);
 
-        let claimed = create_scalar_pending(manager.as_ref())
+        let claimed = create_scalar_pending(&manager)
             .await
-            .claim(DaemonId(Uuid::new_v4()), manager.as_ref())
+            .claim(DaemonId(Uuid::new_v4()), &manager)
             .await
             .unwrap();
-        let process_manager = manager.clone();
-        let process = tokio::spawn(async move {
-            claimed
-                .process(
-                    process_manager.as_ref(),
-                    std::future::pending::<Result<crate::request::HttpResponse>>(),
-                )
-                .await
-        });
-
-        tokio::time::timeout(
+        let processing = tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            reconcile_hook.entered.notified(),
+            claimed.process(
+                &manager,
+                std::future::pending::<Result<crate::request::HttpResponse>>(),
+            ),
         )
         .await
-        .expect("commit reconciliation did not start");
+        .expect("processing reconciliation deadlocked while reacquiring write admission")
+        .unwrap();
         assert_eq!(
             manager.response_admission.counts(),
-            ((0, 1), (0, 0), (0, 1)),
-            "the reconciliation read must hold aggregate and state-write admission",
+            ((0, 0), (0, 0), (0, 0)),
+            "processing reconciliation must release every admission permit",
         );
-        reconcile_hook.resume.notify_one();
 
-        let processing = tokio::time::timeout(std::time::Duration::from_secs(5), process)
-            .await
-            .expect("processing admission did not finish")
-            .unwrap()
-            .unwrap();
-        processing.cancel(manager.as_ref()).await.unwrap();
+        processing.cancel(&manager).await.unwrap();
     }
 
     #[sqlx::test]
