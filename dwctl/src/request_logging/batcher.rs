@@ -133,10 +133,14 @@ struct EnrichedRecord {
     /// lockstep. Equals `total_cost` whenever the request cached nothing.
     uncached_cost: Option<Decimal>,
     /// The spending-cap scope this request's cost folds into: the id of the
-    /// CAPPED root key — `COALESCE(parent_api_key_id, id)` of the billing key,
+    /// capped root key — `COALESCE(parent_api_key_id, id)` of the billing key,
     /// but only when that root currently has `spend_limit` set. `None` for the
     /// uncapped 99% (no checkpoint row is ever written for them). Removing a
-    /// cap therefore stops folding; re-capping resets the window anyway.
+    /// cap therefore stops folding; when a cap is later (re-)enabled, the
+    /// cap-set path MUST reset the scope's checkpoint window (zero
+    /// window_spend, fresh window_started_at) or the scope inherits old spend
+    /// and can exhaust immediately — this includes caps set via manual SQL
+    /// while no API path exists yet.
     cap_scope_root: Option<Uuid>,
 }
 
