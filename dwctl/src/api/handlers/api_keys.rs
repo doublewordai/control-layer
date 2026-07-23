@@ -4,19 +4,20 @@ use crate::api::models::api_keys::ListApiKeysQuery;
 use crate::{
     AppState,
     api::models::{
-        api_keys::{ApiKeyCreate, ApiKeyInfoResponse, ApiKeyResponse},
+        api_keys::{ApiKeyCreate, ApiKeyInfoResponse, ApiKeyResponse, ApiKeyUpdate},
         pagination::PaginatedResponse,
         users::CurrentUser,
     },
     auth::permissions::{
         can_create_all_resources, can_create_own_resource, can_delete_all_resources, can_delete_own_resource, can_read_all_resources,
-        can_read_own_resource, is_org_member,
+        can_read_own_resource, can_update_all_resources, can_update_own_resource, is_org_member,
     },
     db::handlers::{Repository, api_keys::ApiKeyFilter, api_keys::ApiKeys},
-    db::models::api_keys::ApiKeyCreateDBRequest,
+    db::models::api_keys::{ApiKeyCreateDBRequest, ApiKeyPurpose, ApiKeyUpdateDBRequest},
     errors::{Error, Result},
     types::{ApiKeyId, Operation, Permission, Resource, UserIdOrCurrent},
 };
+use rust_decimal::Decimal;
 use sqlx_pool_router::PoolProvider;
 
 use axum::{
@@ -25,6 +26,35 @@ use axum::{
     response::Json,
 };
 use sqlx::Acquire;
+
+/// Valid spend-cap reset periods (calendar-aligned UTC; see migration 122/123).
+const VALID_CAP_INTERVALS: [&str; 3] = ["daily", "weekly", "monthly"];
+
+/// Validate a (spend_limit, spend_limit_interval) pair as submitted via the
+/// API. Mirrors the DB CHECK constraints so users get a 400 with a message
+/// instead of a 500 from a constraint violation.
+fn validate_cap_fields(spend_limit: Option<&Decimal>, spend_limit_interval: Option<&str>) -> Result<()> {
+    if let Some(limit) = spend_limit
+        && *limit <= Decimal::ZERO
+    {
+        return Err(Error::BadRequest {
+            message: "spend_limit must be greater than zero".to_string(),
+        });
+    }
+    if let Some(interval) = spend_limit_interval {
+        if !VALID_CAP_INTERVALS.contains(&interval) {
+            return Err(Error::BadRequest {
+                message: format!("spend_limit_interval must be one of {VALID_CAP_INTERVALS:?} (calendar-aligned UTC windows)"),
+            });
+        }
+        if spend_limit.is_none() {
+            return Err(Error::BadRequest {
+                message: "spend_limit_interval requires spend_limit".to_string(),
+            });
+        }
+    }
+    Ok(())
+}
 
 /// Create an API key for the current user or a specified user.
 /// This returns `ApiKeyResponse`, which contains the actual API key.
@@ -65,6 +95,7 @@ pub async fn create_user_api_key<P: PoolProvider>(
             message: "API key name cannot be empty".to_string(),
         });
     }
+    validate_cap_fields(data.spend_limit.as_ref(), data.spend_limit_interval.as_deref())?;
 
     let target_user_id = match user_id {
         UserIdOrCurrent::Current(_) => current_user.id,
@@ -155,14 +186,30 @@ pub async fn create_user_api_key<P: PoolProvider>(
     };
 
     let mut repo = ApiKeys::new(&mut pool_conn);
+    let has_cap = data.spend_limit.is_some();
     let db_request = ApiKeyCreateDBRequest::new(target_user_id, created_by, data);
 
     let api_key = repo.create(&db_request).await?;
 
+    // Capped keys need their cap scope provisioned up front: the hidden batch
+    // child (so batch/flex traffic executes inside the scope, and is in
+    // onwards' key set before the first request fires) and a zeroed spend
+    // window (the cap counts from now).
+    if has_cap {
+        repo.get_or_create_child_hidden_key(api_key.id).await?;
+        repo.reset_spend_window(api_key.id).await?;
+    }
+
+    let key_id = api_key.id;
+    let spend_states = repo.get_spend_states(&[key_id]).await?;
+
     // api_key.created webhook deliveries are created by the notification poller
     // via PG LISTEN/NOTIFY on the api_keys table.
 
-    Ok((StatusCode::CREATED, Json(ApiKeyResponse::from(api_key))))
+    Ok((
+        StatusCode::CREATED,
+        Json(ApiKeyResponse::from(api_key).with_spend_state(spend_states.get(&key_id))),
+    ))
 }
 
 /// List the API keys for the current user or a specified user.
@@ -248,7 +295,17 @@ pub async fn list_user_api_keys<P: PoolProvider>(
     let total_count = repo.count(&filter).await?;
     let api_keys = repo.list(&filter).await?;
 
-    let data: Vec<ApiKeyInfoResponse> = api_keys.into_iter().map(ApiKeyInfoResponse::from).collect();
+    // Bulk-attach spend display state (one PK-joined query for the page).
+    let ids: Vec<ApiKeyId> = api_keys.iter().map(|k| k.id).collect();
+    let spend_states = repo.get_spend_states(&ids).await?;
+
+    let data: Vec<ApiKeyInfoResponse> = api_keys
+        .into_iter()
+        .map(|k| {
+            let state = spend_states.get(&k.id);
+            ApiKeyInfoResponse::from(k).with_spend_state(state)
+        })
+        .collect();
 
     Ok(Json(PaginatedResponse::new(data, total_count, skip, limit)))
 }
@@ -327,7 +384,173 @@ pub async fn get_user_api_key<P: PoolProvider>(
             id: api_key_id.to_string(),
         })?;
 
-    Ok(Json(ApiKeyInfoResponse::from(api_key)))
+    let key_id = api_key.id;
+    let spend_states = repo.get_spend_states(&[key_id]).await?;
+
+    Ok(Json(ApiKeyInfoResponse::from(api_key).with_spend_state(spend_states.get(&key_id))))
+}
+
+/// Update a specific API key: metadata, rate limits, and the spending cap.
+#[utoipa::path(
+    patch,
+    path = "/users/{user_id}/api-keys/{id}",
+    tag = "api_keys",
+    summary = "Update API key",
+    description = "Update an API key's name, description, rate limits, or spending cap. \
+                   Setting a cap where none existed provisions cap-scope batch/flex execution and starts a fresh spend window; \
+                   changing the cap interval or passing reset_window also restarts the window; \
+                   passing spend_limit: null removes the cap.",
+    request_body = ApiKeyUpdate,
+    params(
+        ("user_id" = String, Path, description = "User ID (UUID) or 'current' for current user"),
+        ("id" = uuid::Uuid, Path, description = "API key ID to update"),
+    ),
+    responses(
+        (status = 200, description = "Updated API key", body = ApiKeyInfoResponse),
+        (status = 400, description = "Bad request - invalid update data"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden - can only manage own API keys unless admin"),
+        (status = 404, description = "API key not found"),
+        (status = 500, description = "Internal server error"),
+    ),
+    security(
+        ("BearerAuth" = []),
+        ("CookieAuth" = []),
+        ("X-Doubleword-User" = [])
+    )
+)]
+#[tracing::instrument(skip_all)]
+pub async fn update_user_api_key<P: PoolProvider>(
+    State(state): State<AppState<P>>,
+    Path((user_id, api_key_id)): Path<(UserIdOrCurrent, ApiKeyId)>,
+    // Can't use RequiresPermission here because we need conditional logic for own vs other users
+    current_user: CurrentUser,
+    Json(data): Json<ApiKeyUpdate>,
+) -> Result<Json<ApiKeyInfoResponse>> {
+    let target_user_id = match user_id {
+        UserIdOrCurrent::Current(_) => current_user.id,
+        UserIdOrCurrent::Id(uuid) => uuid,
+    };
+
+    // Check permissions: UpdateAll, UpdateOwn, or org membership — the same
+    // shape as create/delete.
+    let can_update_all = can_update_all_resources(&current_user, Resource::ApiKeys);
+    let can_update_own = can_update_own_resource(&current_user, Resource::ApiKeys, target_user_id);
+
+    if !can_update_all && !can_update_own {
+        let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
+        let member = is_org_member(&current_user, target_user_id, &mut conn)
+            .await
+            .map_err(Error::Database)?;
+        if !member {
+            return Err(Error::InsufficientPermissions {
+                required: Permission::Any(vec![
+                    Permission::Allow(Resource::ApiKeys, Operation::UpdateAll),
+                    Permission::Allow(Resource::ApiKeys, Operation::UpdateOwn),
+                ]),
+                action: Operation::UpdateOwn,
+                resource: format!("API keys for user {target_user_id}"),
+            });
+        }
+    }
+
+    let skip_created_by_filter = can_update_all;
+
+    let mut tx = state.db.write().begin().await.map_err(|e| Error::Database(e.into()))?;
+    let mut repo = ApiKeys::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
+
+    // Fetch and gate the key. System-managed keys (hidden batch/playground and
+    // cap-scope children) are never updatable through the API — their
+    // lifecycle is derived (children: minted at cap-set, revoked with parent).
+    let key = repo
+        .get_by_id(api_key_id)
+        .await?
+        .filter(|key| key.user_id == target_user_id)
+        .filter(|key| skip_created_by_filter || key.created_by == current_user.id)
+        .filter(|key| key.parent_api_key_id.is_none())
+        .filter(|key| matches!(key.purpose, ApiKeyPurpose::Realtime | ApiKeyPurpose::Platform))
+        .ok_or_else(|| Error::NotFound {
+            resource: "API key".to_string(),
+            id: api_key_id.to_string(),
+        })?;
+
+    // Resolve the cap tri-state against current values: absent = unchanged,
+    // explicit null = clear, value = set.
+    let old_limit = key.spend_limit;
+    let old_interval = key.spend_limit_interval.clone();
+    let new_limit = match data.spend_limit {
+        None => old_limit,
+        Some(v) => v,
+    };
+    let new_interval = match data.spend_limit_interval.clone() {
+        None => {
+            // Clearing the cap implicitly clears the interval (the DB CHECK
+            // forbids an interval without a limit).
+            if new_limit.is_none() { None } else { old_interval.clone() }
+        }
+        Some(v) => v,
+    };
+    validate_cap_fields(new_limit.as_ref(), new_interval.as_deref())?;
+
+    let reset_window = data.reset_window.unwrap_or(false);
+    if reset_window && new_limit.is_none() {
+        return Err(Error::BadRequest {
+            message: "reset_window requires a spending cap".to_string(),
+        });
+    }
+
+    // Generic metadata/rate-limit fields via the existing repository update.
+    if data.name.is_some() || data.description.is_some() || data.requests_per_second.is_some() || data.burst_size.is_some() {
+        if let Some(name) = &data.name
+            && name.trim().is_empty()
+        {
+            return Err(Error::BadRequest {
+                message: "API key name cannot be empty".to_string(),
+            });
+        }
+        repo.update(
+            api_key_id,
+            &ApiKeyUpdateDBRequest {
+                name: data.name.clone(),
+                description: data.description.clone(),
+                requests_per_second: data.requests_per_second,
+                burst_size: data.burst_size,
+            },
+        )
+        .await?;
+    }
+
+    // Cap changes. The window resets when a cap appears where none was
+    // (REQUIRED — otherwise the scope inherits spend accumulated before or
+    // between caps and can exhaust immediately), when the interval changes,
+    // or on the explicit re-arm flag. The lifetime total is never reset.
+    let cap_changed = new_limit != old_limit || new_interval != old_interval;
+    let newly_capped = old_limit.is_none() && new_limit.is_some();
+    let interval_changed = new_limit.is_some() && new_interval != old_interval;
+
+    if cap_changed {
+        repo.update_spend_cap(api_key_id, new_limit, new_interval.clone()).await?;
+    }
+    if newly_capped {
+        // Provision the cap scope: hidden batch child for batch/flex coverage.
+        // Idempotent — re-capping reuses the existing child.
+        repo.get_or_create_child_hidden_key(api_key_id).await?;
+    }
+    if newly_capped || interval_changed || reset_window {
+        repo.reset_spend_window(api_key_id).await?;
+    }
+
+    let updated = repo.get_by_id(api_key_id).await?.ok_or_else(|| Error::NotFound {
+        resource: "API key".to_string(),
+        id: api_key_id.to_string(),
+    })?;
+    let spend_states = repo.get_spend_states(&[api_key_id]).await?;
+
+    tx.commit().await.map_err(|e| Error::Database(e.into()))?;
+
+    Ok(Json(
+        ApiKeyInfoResponse::from(updated).with_spend_state(spend_states.get(&api_key_id)),
+    ))
 }
 
 /// Delete a specific API key for the current user or a specified user.
@@ -423,6 +646,378 @@ mod tests {
     use crate::test::utils::*;
     use serde_json::json;
     use sqlx::PgPool;
+
+    /// PATCH helper: send an update body for a key as a given user.
+    async fn patch_key(
+        app: &axum_test::TestServer,
+        user: &crate::api::models::users::UserResponse,
+        key_id: crate::types::ApiKeyId,
+        body: serde_json::Value,
+    ) -> axum_test::TestResponse {
+        let auth = add_auth_headers(user);
+        app.patch(&format!("/admin/api/v1/users/current/api-keys/{key_id}"))
+            .json(&body)
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await
+    }
+
+    fn window_spend_of(resp: &ApiKeyInfoResponse) -> rust_decimal::Decimal {
+        resp.spend.expect("capped key should carry a spend value")
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_create_api_key_with_spend_cap(pool: PgPool) {
+        use crate::db::handlers::{Repository as _, api_keys::ApiKeys};
+
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        let auth = add_auth_headers(&user);
+
+        let response = app
+            .post("/admin/api/v1/users/current/api-keys")
+            .json(&json!({
+                "name": "Capped Key",
+                "spend_limit": "50",
+                "spend_limit_interval": "daily"
+            }))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+        response.assert_status(axum::http::StatusCode::CREATED);
+        let created: ApiKeyResponse = response.json();
+        assert_eq!(created.spend_limit, Some(rust_decimal::Decimal::from(50)));
+        assert_eq!(created.spend_limit_interval.as_deref(), Some("daily"));
+        assert!(created.resets_at.is_some(), "windowed cap advertises its next reset");
+        assert_eq!(created.spend, Some(rust_decimal::Decimal::ZERO), "fresh cap starts a zeroed window");
+
+        // Cap scope provisioned: hidden batch child + zeroed checkpoint row.
+        let mut conn = pool.acquire().await.unwrap();
+        let child: Option<uuid::Uuid> =
+            sqlx::query_scalar("SELECT id FROM api_keys WHERE parent_api_key_id = $1 AND purpose = 'batch' AND hidden = true")
+                .bind(created.id)
+                .fetch_optional(&pool)
+                .await
+                .unwrap();
+        assert!(child.is_some(), "cap-set must mint the batch/flex child");
+        let window_spend: rust_decimal::Decimal =
+            sqlx::query_scalar("SELECT window_spend FROM api_key_spend_checkpoints WHERE api_key_id = $1")
+                .bind(created.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(window_spend, rust_decimal::Decimal::ZERO);
+
+        // The resolver now routes this key's batch/flex work to the child.
+        let (_, resolved) = ApiKeys::new(&mut conn)
+            .resolve_batch_execution_key(user.id, user.id, Some(created.id))
+            .await
+            .unwrap();
+        assert_eq!(Some(resolved), child);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_create_api_key_cap_validation(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        let auth = add_auth_headers(&user);
+        let post = |body: serde_json::Value| {
+            let auth = add_auth_headers(&user);
+            let app = &app;
+            async move {
+                app.post("/admin/api/v1/users/current/api-keys")
+                    .json(&body)
+                    .add_header(&auth[0].0, &auth[0].1)
+                    .add_header(&auth[1].0, &auth[1].1)
+                    .await
+            }
+        };
+
+        // Zero / negative limit.
+        post(json!({"name": "k1", "spend_limit": "0"}))
+            .await
+            .assert_status(axum::http::StatusCode::BAD_REQUEST);
+        // Unknown interval.
+        post(json!({"name": "k2", "spend_limit": "5", "spend_limit_interval": "hourly"}))
+            .await
+            .assert_status(axum::http::StatusCode::BAD_REQUEST);
+        // Interval without a limit.
+        post(json!({"name": "k3", "spend_limit_interval": "daily"}))
+            .await
+            .assert_status(axum::http::StatusCode::BAD_REQUEST);
+
+        // Control: a valid one-off cap passes.
+        let ok = app
+            .post("/admin/api/v1/users/current/api-keys")
+            .json(&json!({"name": "k4", "spend_limit": "5"}))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+        ok.assert_status(axum::http::StatusCode::CREATED);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_patch_api_key_spend_cap_matrix(pool: PgPool) {
+        use rust_decimal::Decimal;
+
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        let key = create_test_api_key_for_user(&pool, user.id).await;
+
+        // Set from NULL: mints the child and starts a zeroed window.
+        let resp = patch_key(&app, &user, key.id, json!({"spend_limit": "25"})).await;
+        resp.assert_status_ok();
+        let body: ApiKeyInfoResponse = resp.json();
+        assert_eq!(body.spend_limit, Some(Decimal::from(25)));
+        assert_eq!(window_spend_of(&body), Decimal::ZERO);
+        let child_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM api_keys WHERE parent_api_key_id = $1")
+            .bind(key.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(child_count, 1, "setting a cap mints exactly one child");
+
+        // Seed some counted spend to observe keep-vs-reset behavior.
+        sqlx::query("UPDATE api_key_spend_checkpoints SET window_spend = 5, total_spend = 5 WHERE api_key_id = $1")
+            .bind(key.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // Raise the limit: the window is KEPT.
+        let resp = patch_key(&app, &user, key.id, json!({"spend_limit": "40"})).await;
+        resp.assert_status_ok();
+        let body: ApiKeyInfoResponse = resp.json();
+        assert_eq!(body.spend_limit, Some(Decimal::from(40)));
+        assert_eq!(window_spend_of(&body), Decimal::from(5), "raising the limit keeps counted spend");
+
+        // Change the interval: the window RESETS (lifetime total is kept).
+        let resp = patch_key(&app, &user, key.id, json!({"spend_limit_interval": "weekly"})).await;
+        resp.assert_status_ok();
+        let body: ApiKeyInfoResponse = resp.json();
+        assert_eq!(body.spend_limit_interval.as_deref(), Some("weekly"));
+        assert_eq!(window_spend_of(&body), Decimal::ZERO, "interval change resets the window");
+        assert_eq!(body.total_spend, Some(Decimal::from(5)), "lifetime total survives resets");
+
+        // Explicit re-arm resets the window too.
+        sqlx::query("UPDATE api_key_spend_checkpoints SET window_spend = 7 WHERE api_key_id = $1")
+            .bind(key.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let resp = patch_key(&app, &user, key.id, json!({"reset_window": true})).await;
+        resp.assert_status_ok();
+        let body: ApiKeyInfoResponse = resp.json();
+        assert_eq!(window_spend_of(&body), Decimal::ZERO, "reset_window re-arms the cap");
+
+        // Clear the cap: columns NULLed, enforcement stops, the child SURVIVES
+        // (it remains the execution key; re-capping reuses it).
+        let resp = patch_key(&app, &user, key.id, json!({"spend_limit": null})).await;
+        resp.assert_status_ok();
+        let body: ApiKeyInfoResponse = resp.json();
+        assert_eq!(body.spend_limit, None);
+        assert_eq!(body.spend_limit_interval, None, "clearing the cap clears the interval");
+        assert_eq!(body.spend, None, "uncapped keys never display (frozen) spend");
+        assert_eq!(body.total_spend, None, "uncapped keys never display (frozen) totals");
+        assert_eq!(body.resets_at, None);
+        let child_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM api_keys WHERE parent_api_key_id = $1 AND is_deleted = false")
+            .bind(key.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(child_count, 1, "cap removal must not revoke the child");
+
+        // Re-enable: the window resets rather than inheriting old spend
+        // (decision #8 — the contract on EnrichedRecord::cap_scope_root).
+        sqlx::query("UPDATE api_key_spend_checkpoints SET window_spend = 99 WHERE api_key_id = $1")
+            .bind(key.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let resp = patch_key(&app, &user, key.id, json!({"spend_limit": "10"})).await;
+        resp.assert_status_ok();
+        let body: ApiKeyInfoResponse = resp.json();
+        assert_eq!(window_spend_of(&body), Decimal::ZERO, "re-capping must not inherit prior spend");
+
+        // reset_window without a cap is a 400.
+        patch_key(&app, &user, key.id, json!({"spend_limit": null}))
+            .await
+            .assert_status_ok();
+        patch_key(&app, &user, key.id, json!({"reset_window": true}))
+            .await
+            .assert_status(axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_patch_api_key_permissions_and_system_keys(pool: PgPool) {
+        use crate::db::handlers::api_keys::ApiKeys;
+        use crate::db::models::api_keys::ApiKeyPurpose;
+
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let owner = create_test_user(&pool, Role::StandardUser).await;
+        let other = create_test_user(&pool, Role::StandardUser).await;
+        let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let key = create_test_api_key_for_user(&pool, owner.id).await;
+
+        // A stranger cannot update someone else's key.
+        let auth = add_auth_headers(&other);
+        app.patch(&format!("/admin/api/v1/users/{}/api-keys/{}", owner.id, key.id))
+            .json(&json!({"spend_limit": "5"}))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await
+            .assert_status(axum::http::StatusCode::FORBIDDEN);
+
+        // A PlatformManager can.
+        let auth = add_auth_headers(&admin);
+        app.patch(&format!("/admin/api/v1/users/{}/api-keys/{}", owner.id, key.id))
+            .json(&json!({"spend_limit": "5"}))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await
+            .assert_status_ok();
+
+        // System-managed keys are never PATCHable: the cap-scope child and the
+        // shared hidden batch key both 404 even for their own user.
+        let mut conn = pool.acquire().await.unwrap();
+        let mut repo = ApiKeys::new(&mut conn);
+        let (_, child_id) = repo.get_or_create_child_hidden_key(key.id).await.unwrap();
+        let (_, shared_id) = repo
+            .get_or_create_hidden_key_with_id(owner.id, ApiKeyPurpose::Batch, owner.id)
+            .await
+            .unwrap();
+        drop(conn);
+        patch_key(&app, &owner, child_id, json!({"name": "nope"}))
+            .await
+            .assert_status(axum::http::StatusCode::NOT_FOUND);
+        patch_key(&app, &owner, shared_id, json!({"name": "nope"}))
+            .await
+            .assert_status(axum::http::StatusCode::NOT_FOUND);
+    }
+
+    /// End-to-end acceptance path: a cap set through the real API, once
+    /// exhausted, excludes the whole scope from the onwards key set on the
+    /// next reload, and the proxy path answers with the explicit 402.
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_capped_key_end_to_end_402(pool: PgPool) {
+        use crate::config::RateLimitTiersConfig;
+        use crate::db::handlers::{Credits, Tariffs};
+        use crate::db::models::credits::{CreditTransactionCreateDBRequest, CreditTransactionType};
+        use crate::db::models::tariffs::TariffCreateDBRequest;
+        use onwards::auth::ConstantTimeString;
+
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user(&pool, Role::StandardUser).await;
+
+        // Model access + a PAID tariff (the cap gate, like the balance gate,
+        // only bites on paid models) + healthy balance (so the enricher's
+        // balance arm doesn't mask the cap arm).
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+        let endpoint_id = create_test_endpoint(&pool, "cap-e2e-endpoint", user.id).await;
+        let deployment_id = create_test_model(&pool, "cap-e2e-model-name", "cap-e2e-model", endpoint_id, user.id).await;
+        add_deployment_to_group(&pool, deployment_id, group.id, user.id).await;
+        let mut conn = pool.acquire().await.unwrap();
+        Tariffs::new(&mut conn)
+            .create(&TariffCreateDBRequest {
+                deployed_model_id: deployment_id,
+                name: "cap-e2e-tariff".to_string(),
+                api_key_purpose: Some(crate::db::models::api_keys::ApiKeyPurpose::Realtime),
+                input_price_per_token: rust_decimal::Decimal::new(1, 5),
+                output_price_per_token: rust_decimal::Decimal::new(3, 5),
+                valid_from: None,
+                completion_window: None,
+            })
+            .await
+            .unwrap();
+        Credits::new(&mut conn)
+            .create_transaction(&CreditTransactionCreateDBRequest {
+                user_id: user.id,
+                transaction_type: CreditTransactionType::AdminGrant,
+                amount: rust_decimal::Decimal::from(100),
+                source_id: uuid::Uuid::new_v4().to_string(),
+                description: Some("credits".to_string()),
+                fusillade_batch_id: None,
+                api_key_id: None,
+            })
+            .await
+            .unwrap();
+        drop(conn);
+
+        // Create the capped key through the real API.
+        let auth = add_auth_headers(&user);
+        let created: ApiKeyResponse = app
+            .post("/admin/api/v1/users/current/api-keys")
+            .json(&json!({"name": "e2e-capped", "spend_limit": "0.01"}))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await
+            .json();
+        let child_secret: String = sqlx::query_scalar("SELECT secret FROM api_keys WHERE parent_api_key_id = $1")
+            .bind(created.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        // Under the cap: both scope keys are in the paid pool.
+        let tiers = RateLimitTiersConfig::default();
+        let targets = crate::sync::onwards_config::load_targets_from_db(&pool, &[], false, &tiers)
+            .await
+            .unwrap();
+        let has_key = |targets: &onwards::target::Targets, secret: &str| {
+            let expected = ConstantTimeString::from(secret.to_string());
+            targets
+                .targets
+                .get("cap-e2e-model")
+                .is_some_and(|p| p.value().keys().is_some_and(|keys| keys.iter().any(|c| c == &expected)))
+        };
+        assert!(has_key(&targets, &created.key));
+        assert!(has_key(&targets, &child_secret));
+
+        // Exhaust the scope (as the batcher fold would) and reload: the whole
+        // scope is yanked.
+        sqlx::query("UPDATE api_key_spend_checkpoints SET window_spend = 0.02, total_spend = 0.02 WHERE api_key_id = $1")
+            .bind(created.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let targets = crate::sync::onwards_config::load_targets_from_db(&pool, &[], false, &tiers)
+            .await
+            .unwrap();
+        assert!(!has_key(&targets, &created.key), "exhausted root must leave the paid pool");
+        assert!(!has_key(&targets, &child_secret), "the child is yanked with its root");
+
+        // And the proxy path answers the yanked key's 403 with the explicit
+        // 402 (enrichment middleware, as wired on the /ai router).
+        let router = axum::Router::new()
+            .route(
+                "/ai/v1/chat/completions",
+                axum::routing::post(|| async {
+                    axum::response::Response::builder()
+                        .status(axum::http::StatusCode::FORBIDDEN)
+                        .body(axum::body::Body::from("Forbidden"))
+                        .unwrap()
+                }),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                pool.clone(),
+                crate::error_enrichment::error_enrichment_middleware,
+            ));
+        let proxy = axum_test::TestServer::new(router).unwrap();
+        let response = proxy
+            .post("/ai/v1/chat/completions")
+            .add_header("authorization", &format!("Bearer {}", created.key))
+            .json(&json!({"model": "cap-e2e-model", "messages": [{"role": "user", "content": "hi"}]}))
+            .await;
+        response.assert_status(axum::http::StatusCode::PAYMENT_REQUIRED);
+        let body = response.text();
+        assert!(body.contains("spend_cap_exceeded"), "expected explicit cap code, got: {body}");
+    }
 
     #[sqlx::test]
     #[test_log::test]

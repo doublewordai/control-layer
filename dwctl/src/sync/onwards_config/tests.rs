@@ -1474,6 +1474,8 @@ async fn test_batch_api_key_access_to_composite_escalation_target(pool: sqlx::Pg
             requests_per_second: None,
             burst_size: None,
             created_by: test_user.id,
+            spend_limit: None,
+            spend_limit_interval: None,
         })
         .await
         .unwrap();
