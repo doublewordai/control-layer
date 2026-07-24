@@ -531,6 +531,19 @@ mod tests {
         })
     }
 
+    async fn wait_for_index_commit(index: &PostgresIndex, scope: &IndexScope, hash: &crate::prompt_cache::PrefixHash) -> bool {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if !index.lookup(scope, std::slice::from_ref(hash)).await.unwrap().is_empty() {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
     #[sqlx::test]
     async fn end_to_end_injects_then_reads(pool: PgPool) {
         let user = create_test_user(&pool, Role::StandardUser).await;
@@ -605,14 +618,7 @@ mod tests {
             .cumulative_hashes[0]
             .clone();
         let idx = PostgresIndex::new(pool.clone(), 1);
-        let mut committed = false;
-        for _ in 0..100 {
-            if !idx.lookup(&scope, std::slice::from_ref(&hash)).await.unwrap().is_empty() {
-                committed = true;
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
+        let committed = wait_for_index_commit(&idx, &scope, &hash).await;
         assert!(committed, "the write should have committed after a 2xx");
 
         // Second identical request → now a read hit on the committed prefix.
@@ -729,14 +735,7 @@ mod tests {
         .cumulative_hashes[0]
             .clone();
         let idx = PostgresIndex::new(pool.clone(), 1);
-        let mut committed = false;
-        for _ in 0..100 {
-            if !idx.lookup(&scope, std::slice::from_ref(&hash)).await.unwrap().is_empty() {
-                committed = true;
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
+        let committed = wait_for_index_commit(&idx, &scope, &hash).await;
         assert!(committed, "streaming write commits after a clean usage frame");
 
         // Second identical stream → a read hit, injected into the terminal frame.

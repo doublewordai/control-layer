@@ -357,23 +357,15 @@ impl<'c> ApiKeys<'c> {
             purpose_str
         );
 
-        // Use INSERT ... ON CONFLICT DO NOTHING + SELECT to avoid firing the
-        // api_keys_notify AFTER UPDATE trigger on the common "key already exists" path.
-        let row_secret = sqlx::query_scalar!(
+        // Use INSERT ... ON CONFLICT DO NOTHING to avoid firing the api_keys_notify
+        // AFTER UPDATE trigger on the common "key already exists" path.
+        let inserted_secret = sqlx::query_scalar!(
             r#"
-            WITH ins AS (
-                INSERT INTO api_keys (name, description, secret, purpose, user_id, created_by, hidden)
-                VALUES ($1, $2, $3, $4, $5, $6, true)
-                ON CONFLICT (user_id, created_by, purpose) WHERE hidden = true AND is_deleted = false AND parent_api_key_id IS NULL
-                DO NOTHING
-                RETURNING secret
-            )
-            SELECT secret FROM ins
-            UNION ALL
-            SELECT secret FROM api_keys
-            WHERE user_id = $5 AND created_by = $6 AND purpose = $4
-              AND hidden = true AND is_deleted = false AND parent_api_key_id IS NULL
-            LIMIT 1
+            INSERT INTO api_keys (name, description, secret, purpose, user_id, created_by, hidden)
+            VALUES ($1, $2, $3, $4, $5, $6, true)
+            ON CONFLICT (user_id, created_by, purpose) WHERE hidden = true AND is_deleted = false AND parent_api_key_id IS NULL
+            DO NOTHING
+            RETURNING secret
             "#,
             name,
             description,
@@ -382,11 +374,37 @@ impl<'c> ApiKeys<'c> {
             user_id,
             created_by
         )
-        .fetch_one(&mut *self.db)
+        .fetch_optional(&mut *self.db)
+        .await?;
+
+        if let Some(inserted_secret) = inserted_secret {
+            return Ok(inserted_secret);
+        }
+
+        // A conflicting insert can commit after this method's INSERT statement
+        // took its snapshot. A separate statement is required for the loser to
+        // see and return that committed row.
+        let existing_secret = sqlx::query_scalar!(
+            r#"
+            SELECT secret
+            FROM api_keys
+            WHERE user_id = $1
+              AND created_by = $2
+              AND purpose = $3
+              AND hidden = true
+              AND is_deleted = false
+              AND parent_api_key_id IS NULL
+            LIMIT 1
+            "#,
+            user_id,
+            created_by,
+            purpose_str
+        )
+        .fetch_optional(&mut *self.db)
         .await?
         .ok_or(DbError::NotFound)?;
 
-        Ok(row_secret)
+        Ok(existing_secret)
     }
 
     /// Get or create a hidden API key, returning both the secret and the key's UUID.

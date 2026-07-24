@@ -382,6 +382,8 @@ background_services:
     claim_batch_size: 100
     default_model_concurrency: 10
     claim_interval_ms: 1000
+    max_concurrent_state_writes: 64
+    max_concurrent_response_reads: 8
     max_retries: 1000
     timeout_ms: 600000             # 10 minutes per request
     backoff_ms: 1000
@@ -395,9 +397,16 @@ background_services:
 | `enabled` | string | `"leader"` | When to run: `always`, `leader`, or `never`. |
 | `claim_batch_size` | integer | `100` | Requests claimed per iteration. |
 | `default_model_concurrency` | integer | `10` | Concurrent requests per model. |
+| `max_concurrent_state_writes` | integer | `64` | Response-related state-write class limit, capped by shared pool headroom. `0` disables only this class limit. |
+| `max_concurrent_response_reads` | integer | `8` | Consolidated response-detail read class limit. `0` disables only this class limit. |
 | `max_retries` | integer | `1000` | Max retry attempts. `null` = unlimited until deadline. |
 | `timeout_ms` | integer | `600000` | Per-request timeout (10 min). |
 | `stop_before_deadline_ms` | integer | `900000` | Stop retrying before deadline (15 min buffer). |
+
+Response reads and writes also share an aggregate budget of
+`max_connections - 2`, with a minimum of one permit. This preserves two
+primary-pool connections when the pool has at least three; a one-connection
+pool keeps one admitted operation for liveness and cannot reserve headroom.
 
 #### Model Escalation
 

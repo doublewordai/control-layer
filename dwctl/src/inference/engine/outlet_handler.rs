@@ -3,8 +3,8 @@
 //!
 //! This handler is added to outlet's `MultiHandler` alongside the existing
 //! `PostgresHandler` (which writes to `http_analytics`). After outlet captures
-//! the response body, this handler builds a `RawCompletedRequest` and pushes
-//! it onto the writer's mpsc channel; the batched writer task then persists
+//! the response body, this handler builds a `RawCompletedRequest` and submits
+//! it through the writer handle; the batched writer task then persists
 //! the row in fusillade.
 //!
 //! Channel-full backpressure flows back to the outlet handler via
@@ -14,28 +14,27 @@
 
 use chrono::{DateTime, Utc};
 use outlet::{RequestData, RequestHandler, ResponseData};
-use sqlx::PgPool;
 use uuid::Uuid;
 
-use super::writer::{RawCompletedRequest, RequestsWriterSender};
-use crate::inference::store::{ONWARDS_RESPONSE_ID_HEADER, lookup_created_by};
+use super::writer::{RawCompletedRequest, RequestsWriterHandle};
+use crate::inference::store::ONWARDS_RESPONSE_ID_HEADER;
+use crate::sync::api_key_cache::ApiKeyMetadataCache;
 
 /// Outlet handler that forwards completion records to the in-process writer.
 ///
-/// Resolves `created_by` from the api_key here (one indexed lookup against
-/// dwctl_pool) before sending so the writer can flush without touching the
-/// dwctl pool inside its bulk transaction. Records without a resolvable
+/// Resolves response ownership synchronously from the API-key metadata cache
+/// before sending so the writer never touches the dwctl pool. Records without a resolvable
 /// attribution are dropped (matches the underway era, where the
 /// create-response job returned early on missing/invalid api_key).
 #[derive(Clone)]
 pub struct FusilladeOutletHandler {
-    sender: RequestsWriterSender,
-    dwctl_pool: PgPool,
+    writer: RequestsWriterHandle,
+    api_key_cache: ApiKeyMetadataCache,
 }
 
 impl FusilladeOutletHandler {
-    pub fn new(sender: RequestsWriterSender, dwctl_pool: PgPool) -> Self {
-        Self { sender, dwctl_pool }
+    pub fn new(writer: RequestsWriterHandle, api_key_cache: ApiKeyMetadataCache) -> Self {
+        Self { writer, api_key_cache }
     }
 
     /// Extract the onwards response ID from request headers, if present.
@@ -89,14 +88,12 @@ impl FusilladeOutletHandler {
         let api_key = Self::extract_api_key(request);
 
         if endpoint.is_empty() {
-            // Empty endpoint isn't fatal here — `complete_response_idempotent`
-            // will refuse to synthesize a row without it. We continue (rather
-            // than returning None) so the UPDATE path still succeeds if the
-            // row already exists.
+            // Empty endpoint isn't fatal at extraction time. We continue so
+            // completion persistence can still update an admitted row.
             tracing::warn!(
                 response_id = %response_id,
                 uri = %request.uri,
-                "Missing x-onwards-endpoint header — complete-response synthesize will fail if create-response hasn't run"
+                "Missing x-onwards-endpoint header on response completion"
             );
         }
 
@@ -123,11 +120,12 @@ struct CompleteResponseCtx {
 }
 
 impl FusilladeOutletHandler {
-    /// Resolve `created_by` from the api_key, drop records that can't be
+    /// Resolve response attribution from the API key's cached `owner_id`,
+    /// dropping records that can't be
     /// attributed. The fusillade row's XOR check requires non-empty
     /// `created_by` for batchless rows; the underway-era code skipped the
     /// same case at the job level, so this is just where the skip moved to.
-    async fn resolve_attribution(&self, ctx: &CompleteResponseCtx) -> Option<(String, String)> {
+    fn resolve_attribution(&self, ctx: &CompleteResponseCtx) -> Option<(String, String)> {
         let api_key = match ctx.api_key.as_deref() {
             Some(key) if !key.is_empty() => key.to_string(),
             _ => {
@@ -139,9 +137,8 @@ impl FusilladeOutletHandler {
                 return None;
             }
         };
-        let created_by = lookup_created_by(&self.dwctl_pool, Some(&api_key)).await;
-        match created_by {
-            Some(uid) if !uid.is_empty() => Some((api_key, uid)),
+        match self.api_key_cache.get(&api_key) {
+            Some(metadata) => Some((api_key, metadata.owner_id.to_string())),
             _ => {
                 tracing::debug!(
                     response_id = %ctx.response_id,
@@ -158,14 +155,14 @@ impl RequestHandler for FusilladeOutletHandler {
     async fn handle_request(&self, _data: RequestData) {}
 
     fn handle_response(&self, request_data: RequestData, response_data: ResponseData) -> impl std::future::Future<Output = ()> + Send {
-        let sender = self.sender.clone();
+        let writer = self.writer.clone();
         let handler = self.clone();
 
         async move {
             let Some(ctx) = Self::extract_complete_response_ctx(&request_data) else {
                 return;
             };
-            let Some((api_key, created_by)) = handler.resolve_attribution(&ctx).await else {
+            let Some((api_key, created_by)) = handler.resolve_attribution(&ctx) else {
                 return;
             };
 
@@ -202,8 +199,8 @@ impl RequestHandler for FusilladeOutletHandler {
             let started_at: DateTime<Utc> = request_data.timestamp.into();
             let completed_at = started_at + response_duration(&response_data);
 
-            if let Err(e) = sender
-                .send(RawCompletedRequest {
+            if let Err(e) = writer
+                .complete_realtime(RawCompletedRequest {
                     request_id: ctx.request_id,
                     status_code,
                     response_body,
@@ -230,14 +227,14 @@ impl RequestHandler for FusilladeOutletHandler {
     }
 
     fn handle_abandoned(&self, request_data: RequestData) -> impl std::future::Future<Output = ()> + Send {
-        let sender = self.sender.clone();
+        let writer = self.writer.clone();
         let handler = self.clone();
 
         async move {
             let Some(ctx) = Self::extract_complete_response_ctx(&request_data) else {
                 return;
             };
-            let Some((api_key, created_by)) = handler.resolve_attribution(&ctx).await else {
+            let Some((api_key, created_by)) = handler.resolve_attribution(&ctx) else {
                 return;
             };
 
@@ -267,8 +264,8 @@ impl RequestHandler for FusilladeOutletHandler {
             // is truthful here — no round-trip completed).
             let started_at: DateTime<Utc> = request_data.timestamp.into();
 
-            if let Err(e) = sender
-                .send(RawCompletedRequest {
+            if let Err(e) = writer
+                .complete_realtime(RawCompletedRequest {
                     request_id: ctx.request_id,
                     status_code: STATUS_CLIENT_CLOSED,
                     response_body: abandoned_body,
@@ -382,8 +379,11 @@ impl<H: RequestHandler> RequestHandler for ZdrBodyScrubber<H> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::models::api_keys::ApiKeyPurpose;
+    use crate::sync::api_key_cache::ApiKeyMetadata;
     use bytes::Bytes;
     use std::collections::HashMap;
+    use std::sync::Arc;
     use std::time::SystemTime;
 
     fn make_request_data(headers: HashMap<String, Vec<Bytes>>) -> RequestData {
@@ -536,10 +536,8 @@ mod tests {
 
     #[test]
     fn test_extract_complete_response_ctx_missing_endpoint_warns_but_returns_some() {
-        // Empty endpoint is non-fatal — extraction returns Some so the
-        // UPDATE path can still succeed if the row already exists.
-        // complete_response_idempotent refuses to synthesize on empty
-        // endpoint; that's the failure mode, not silent skip here.
+        // Empty endpoint is non-fatal — extraction returns Some so an already
+        // admitted row can still be updated.
         let mut headers = full_headers();
         headers.remove("x-onwards-endpoint");
         let request = make_request_data(headers);
@@ -563,6 +561,37 @@ mod tests {
         let request = make_request_data(headers);
         let ctx = FusilladeOutletHandler::extract_complete_response_ctx(&request).expect("should extract");
         assert_eq!(ctx.api_key, None);
+    }
+
+    #[sqlx::test]
+    async fn attribution_uses_cached_owner_not_key_creator(pool: sqlx::PgPool) {
+        let fusillade_pool = crate::test::utils::setup_fusillade_pool(&pool).await;
+        let pools = sqlx_pool_router::TestDbPools::new(fusillade_pool).await.unwrap();
+        let manager = Arc::new(fusillade_arsenal::PostgresRequestManager::new(pools, Default::default()));
+        let (_writer, handle) = super::super::writer::RequestsWriter::new(manager, 1, std::time::Duration::ZERO);
+        let cache = ApiKeyMetadataCache::empty();
+        let owner_id = Uuid::new_v4();
+        let created_by = Uuid::new_v4();
+        cache.replace(HashMap::from([(
+            "sk-test".to_string(),
+            ApiKeyMetadata {
+                owner_id,
+                created_by,
+                purpose: ApiKeyPurpose::Realtime,
+                verified: true,
+                zero_data_retention: false,
+                hidden_batch_key: None,
+                hidden_batch_key_is_child: false,
+            },
+        )]));
+        let handler = FusilladeOutletHandler::new(handle, cache);
+        let ctx = FusilladeOutletHandler::extract_complete_response_ctx(&make_request_data(full_headers())).unwrap();
+
+        assert_eq!(
+            handler.resolve_attribution(&ctx),
+            Some(("sk-test".to_string(), owner_id.to_string()))
+        );
+        assert_ne!(owner_id, created_by);
     }
 
     // TRANSITIONAL (dwctl ZDR): the scrubber must blank bodies for ZDR-marked

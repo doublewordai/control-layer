@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                INSERT INTO requests (id, batch_id, template_id, state, retry_attempt, not_before,\n                                      daemon_id, claimed_at, started_at, response_status, response_body,\n                                      completed_at, error, failed_at, canceled_at, created_at, updated_at,\n                                      custom_id, model, response_size, routed_model, service_tier, created_by)\n                SELECT a.id, a.batch_id, a.template_id, 'pending', 0, NULL,\n                       NULL, NULL, NULL, NULL, NULL,\n                       NULL, NULL, NULL, NULL, a.created_at, NOW(),\n                       a.custom_id, a.model, 0, NULL, a.service_tier, a.created_by\n                FROM batch_requests_archive a\n                WHERE a.id = ANY($1) AND a.state = 'failed'\n                ON CONFLICT (id) DO NOTHING\n                RETURNING id\n                ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "UuidArray"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "fa5f7c95862e2679ae0196cf76afa24ac9af59569eaaf6dd27e338ced4e6db34"
+}

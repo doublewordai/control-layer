@@ -11,11 +11,13 @@ use sqlx::{
 };
 
 use crate::DbRetryConfig;
+use crate::postgres::{ResponseAdmissionPermit, ResponseAdmissionRequest};
 
 #[derive(Clone)]
 pub(crate) struct RetryingPgPool {
     pool: PgPool,
     retry_config: DbRetryConfig,
+    admission: Option<ResponseAdmissionRequest>,
 }
 
 impl RetryingPgPool {
@@ -23,7 +25,13 @@ impl RetryingPgPool {
         Self {
             pool: pool.clone(),
             retry_config: retry_config.clone(),
+            admission: None,
         }
+    }
+
+    pub(crate) fn with_admission(mut self, admission: ResponseAdmissionRequest) -> Self {
+        self.admission = Some(admission);
+        self
     }
 }
 
@@ -50,7 +58,13 @@ impl<'p> Executor<'p> for RetryingPgPool {
         E: 'q + Execute<'q, Self::Database>,
     {
         Box::pin(async_stream::try_stream! {
-            let mut connection = acquire_connection(&self.pool, &self.retry_config).await?;
+            let (mut connection, _admission_permit) =
+                acquire_connection_with_admission(
+                    &self.pool,
+                    &self.retry_config,
+                    self.admission.as_ref(),
+                )
+                .await?;
             let mut stream = connection.fetch_many(query);
 
             while let Some(item) = stream.try_next().await? {
@@ -67,7 +81,12 @@ impl<'p> Executor<'p> for RetryingPgPool {
         E: 'q + Execute<'q, Self::Database>,
     {
         Box::pin(async move {
-            let mut connection = acquire_connection(&self.pool, &self.retry_config).await?;
+            let (mut connection, _admission_permit) = acquire_connection_with_admission(
+                &self.pool,
+                &self.retry_config,
+                self.admission.as_ref(),
+            )
+            .await?;
             connection.fetch_optional(query).await
         })
     }
@@ -78,7 +97,12 @@ impl<'p> Executor<'p> for RetryingPgPool {
         parameters: &'e [<Self::Database as Database>::TypeInfo],
     ) -> BoxFuture<'e, Result<<Self::Database as Database>::Statement<'q>, SqlxError>> {
         Box::pin(async move {
-            let mut connection = acquire_connection(&self.pool, &self.retry_config).await?;
+            let (mut connection, _admission_permit) = acquire_connection_with_admission(
+                &self.pool,
+                &self.retry_config,
+                self.admission.as_ref(),
+            )
+            .await?;
             connection.prepare_with(sql, parameters).await
         })
     }
@@ -89,17 +113,45 @@ impl<'p> Executor<'p> for RetryingPgPool {
         sql: &'q str,
     ) -> BoxFuture<'e, Result<Describe<Self::Database>, SqlxError>> {
         Box::pin(async move {
-            let mut connection = acquire_connection(&self.pool, &self.retry_config).await?;
+            let (mut connection, _admission_permit) = acquire_connection_with_admission(
+                &self.pool,
+                &self.retry_config,
+                self.admission.as_ref(),
+            )
+            .await?;
             connection.describe(sql).await
         })
     }
 }
 
-pub(crate) async fn acquire_connection(
+async fn acquire_connection_with_admission(
     pool: &PgPool,
     retry_config: &DbRetryConfig,
-) -> Result<pool::PoolConnection<Postgres>, SqlxError> {
-    retry_sqlx_pool_acquire(retry_config, || pool.acquire()).await
+    admission: Option<&ResponseAdmissionRequest>,
+) -> Result<
+    (
+        pool::PoolConnection<Postgres>,
+        Option<ResponseAdmissionPermit>,
+    ),
+    SqlxError,
+> {
+    retry_sqlx_pool_acquire(retry_config, || async {
+        let permit = match admission {
+            Some(request) => Some(
+                request
+                    .acquire()
+                    .await
+                    .map_err(|error| SqlxError::Protocol(error.to_string()))?,
+            ),
+            None => None,
+        };
+
+        // `permit` is local to this attempt. A pool-acquire failure drops it
+        // before `retry_sqlx_pool_acquire` sleeps.
+        let connection = pool.acquire().await?;
+        Ok((connection, permit))
+    })
+    .await
 }
 
 pub(crate) async fn begin_transaction(
@@ -107,6 +159,25 @@ pub(crate) async fn begin_transaction(
     retry_config: &DbRetryConfig,
 ) -> Result<Transaction<'static, Postgres>, SqlxError> {
     retry_sqlx_pool_acquire(retry_config, || pool.begin()).await
+}
+
+pub(crate) async fn begin_admitted_transaction(
+    pool: &PgPool,
+    retry_config: &DbRetryConfig,
+    admission: &ResponseAdmissionRequest,
+) -> Result<(Transaction<'static, Postgres>, ResponseAdmissionPermit), SqlxError> {
+    retry_sqlx_pool_acquire(retry_config, || async {
+        let permit = admission
+            .acquire()
+            .await
+            .map_err(|error| SqlxError::Protocol(error.to_string()))?;
+
+        // As above, the attempt owns the permit so an error releases it before
+        // the retry cadence sleeps.
+        let transaction = pool.begin().await?;
+        Ok((transaction, permit))
+    })
+    .await
 }
 
 pub(crate) async fn connect_listener(

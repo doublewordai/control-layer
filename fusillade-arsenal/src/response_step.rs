@@ -21,9 +21,12 @@ pub use sqlx_pool_router::PoolProvider;
 /// PostgreSQL implementation of [`ResponseStepStore`].
 ///
 /// Holds a [`PoolProvider`] for write/read pool selection, mirroring
-/// [`crate::PostgresRequestManager`]. Construct directly or share the
-/// same `PoolProvider` instance with a request manager so that both
-/// stores see consistent reads.
+/// [`crate::PostgresRequestManager`]. [`PostgresResponseStepManager::new`]
+/// creates a standalone admission budget. When pairing this store with a
+/// request manager, construct it through
+/// [`crate::PostgresRequestManager::response_step_manager`] so both managers
+/// share the exact admission identity and retry configuration. Reusing only
+/// the same [`PoolProvider`] is not sufficient.
 ///
 /// All read methods on this impl route through the **write/primary**
 /// pool. The orchestration loop reads its own freshly-written rows on
@@ -35,13 +38,31 @@ pub use sqlx_pool_router::PoolProvider;
 pub struct PostgresResponseStepManager<P: PoolProvider> {
     pools: P,
     db_retry_config: crate::DbRetryConfig,
+    response_admission: crate::postgres::ResponseAdmission,
 }
 
 impl<P: PoolProvider> PostgresResponseStepManager<P> {
     pub fn new(pools: P) -> Self {
+        let response_admission = crate::postgres::ResponseAdmission::new(
+            pools.write().options().get_max_connections() as usize,
+            &crate::PostgresStorageConfig::default(),
+        );
         Self {
             pools,
             db_retry_config: crate::DbRetryConfig::default(),
+            response_admission,
+        }
+    }
+
+    pub(crate) fn with_admission(
+        pools: P,
+        db_retry_config: crate::DbRetryConfig,
+        response_admission: crate::postgres::ResponseAdmission,
+    ) -> Self {
+        Self {
+            pools,
+            db_retry_config,
+            response_admission,
         }
     }
 
@@ -57,6 +78,11 @@ impl<P: PoolProvider> PostgresResponseStepManager<P> {
 
     fn write_executor(&self) -> crate::db::RetryingPgPool {
         crate::db::RetryingPgPool::new(self.pools.write(), &self.db_retry_config)
+    }
+
+    fn admitted_write_executor(&self, operation: &'static str) -> crate::db::RetryingPgPool {
+        self.write_executor()
+            .with_admission(self.response_admission.write_request(operation))
     }
 }
 
@@ -125,7 +151,7 @@ impl<P: PoolProvider> ResponseStepStore for PostgresResponseStepManager<P> {
         .bind(input.step_kind.as_str())
         .bind(input.step_sequence)
         .bind(&input.request_payload)
-        .execute(self.write_executor())
+        .execute(self.admitted_write_executor("response_step_create"))
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to insert response_step: {}", e)))?;
 
@@ -199,7 +225,7 @@ impl<P: PoolProvider> ResponseStepStore for PostgresResponseStepManager<P> {
              WHERE id = $1 AND state = 'pending'",
         )
         .bind(id.0)
-        .execute(self.write_executor())
+        .execute(self.admitted_write_executor("response_step_processing"))
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to mark step as processing: {}", e)))?;
 
@@ -228,7 +254,7 @@ impl<P: PoolProvider> ResponseStepStore for PostgresResponseStepManager<P> {
         )
         .bind(id.0)
         .bind(&response)
-        .execute(self.write_executor())
+        .execute(self.admitted_write_executor("response_step_complete"))
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to complete response_step: {}", e)))?;
 
@@ -257,7 +283,7 @@ impl<P: PoolProvider> ResponseStepStore for PostgresResponseStepManager<P> {
         )
         .bind(id.0)
         .bind(&error)
-        .execute(self.write_executor())
+        .execute(self.admitted_write_executor("response_step_fail"))
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to fail response_step: {}", e)))?;
 
@@ -284,7 +310,7 @@ impl<P: PoolProvider> ResponseStepStore for PostgresResponseStepManager<P> {
              WHERE id = $1 AND state IN ('pending', 'processing')",
         )
         .bind(id.0)
-        .execute(self.write_executor())
+        .execute(self.admitted_write_executor("response_step_cancel"))
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to cancel response_step: {}", e)))?;
 
@@ -312,7 +338,7 @@ impl<P: PoolProvider> ResponseStepStore for PostgresResponseStepManager<P> {
              WHERE id = $1 AND state = 'processing'",
         )
         .bind(id.0)
-        .execute(self.write_executor())
+        .execute(self.admitted_write_executor("response_step_requeue"))
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to requeue response_step: {}", e)))?;
 

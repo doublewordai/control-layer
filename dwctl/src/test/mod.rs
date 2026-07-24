@@ -146,8 +146,12 @@ async fn setup_streaming_fixture(
     assert_eq!(api_key_response.status_code(), 201, "Failed to create API key");
     let api_key: crate::api::models::api_keys::ApiKeyResponse = api_key_response.json();
 
-    bg_services.sync_onwards_config(pool).await.expect("Failed to sync onwards config");
-    wait_for_model(&server, &api_key.key, alias).await;
+    bg_services.sync_api_key_cache(pool).await.expect("Failed to sync API-key metadata");
+    // Let the production-style Onwards listener be the sole routing writer.
+    // A manual refresh can overtake an older notification reload and then be
+    // overwritten by that stale snapshot, making the immediately following
+    // inference request fail nondeterministically.
+    wait_for_model(&bg_services, &api_key.key, alias).await;
 
     StreamingFixture {
         server,
@@ -159,37 +163,30 @@ async fn setup_streaming_fixture(
     }
 }
 
-async fn wait_for_model(server: &TestServer, api_key: &str, alias: &str) {
+async fn wait_for_model(bg_services: &crate::BackgroundServices, api_key: &str, alias: &str) {
     let poll_start = std::time::Instant::now();
-    let mut status = 404;
     let mut attempts = 0;
+    let mut route_available = false;
 
-    for i in 0..50 {
+    for i in 0..300 {
         attempts = i + 1;
-        let test_response = server
-            .get("/ai/v1/models")
-            .add_header("authorization", format!("Bearer {}", api_key))
-            .await;
-
-        status = test_response.status_code().as_u16();
-        if status == 200 {
-            let models: serde_json::Value = test_response.json();
-            if let Some(data) = models["data"].as_array()
-                && data.iter().any(|m| m["id"].as_str() == Some(alias))
-            {
-                break;
-            }
+        route_available = bg_services
+            .onwards_targets
+            .targets
+            .get(alias)
+            .and_then(|pool| pool.keys().map(|keys| onwards::auth::validate_bearer_token(keys, api_key)))
+            .unwrap_or(false);
+        if route_available {
+            break;
         }
-        tokio::task::yield_now().await;
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
 
-    println!(
-        "Polled for {:?} over {} attempts, final status: {}",
-        poll_start.elapsed(),
-        attempts,
-        status
+    println!("Polled live routing for {:?} over {} attempts", poll_start.elapsed(), attempts);
+    assert!(
+        route_available,
+        "Model and bearer key should be available in live onwards routing after polling"
     );
-    assert_eq!(status, 200, "Model should be available in onwards config after polling");
 }
 
 async fn create_standard_model_for_test(
@@ -1277,6 +1274,8 @@ async fn test_request_logging_disabled(pool: PgPool) {
         DbPools::new(pool.clone()),
         Default::default(),
     ));
+    let (_requests_writer_task, requests_writer) =
+        crate::inference::engine::writer::RequestsWriter::new(request_manager.clone(), 1, std::time::Duration::ZERO);
     let limiters = crate::limits::Limiters::new(&config.limits);
     let shared_config = crate::SharedConfig::new(config);
     underway::run_migrations(&pool).await.expect("Failed to run underway migrations");
@@ -1299,24 +1298,33 @@ async fn test_request_logging_disabled(pool: PgPool) {
                 cascade_batch_state_workers: 0,
                 purge_user_data_workers: 0,
                 response_writer_batch_size: 0,
+                response_writer_max_linger_ms: 0,
             },
         )
         .await
         .expect("Failed to create task runner"),
     );
-    let response_store = std::sync::Arc::new(crate::inference::store::FusilladeResponseStore::new(request_manager.clone()));
+    let response_store = std::sync::Arc::new(crate::inference::store::FusilladeResponseStore::new(
+        request_manager.clone(),
+        requests_writer.clone(),
+    ));
+    let api_key_cache = crate::sync::api_key_cache::ApiKeyMetadataCache::empty();
+    let flex_batch_key_resolver = crate::sync::api_key_cache::FlexBatchKeyResolver::new(pool.clone(), api_key_cache.clone());
     let mut app_state = AppState::builder()
         .db(DbPools::new(pool.clone()))
         .config(shared_config)
         .request_manager(request_manager)
+        .requests_writer(requests_writer)
         .task_runner(task_runner)
         .limiters(limiters)
         .response_store(response_store)
         .image_normalizer(std::sync::Arc::new(crate::image_normalizer::DisabledNormalizer)
             as std::sync::Arc<dyn crate::image_normalizer::ImageNormalizer>)
+        .api_key_cache(api_key_cache)
+        .flex_batch_key_resolver(flex_batch_key_resolver)
         .build();
     let onwards_router = axum::Router::new(); // Empty onwards router for testing
-    let router = super::build_router(&mut app_state, onwards_router, None, None, None, false, None)
+    let router = super::build_router(&mut app_state, onwards_router, None, None, false, None)
         .await
         .expect("Failed to build router");
 
@@ -1890,6 +1898,8 @@ async fn test_build_router_with_metrics_disabled(pool: PgPool) {
         DbPools::new(pool.clone()),
         Default::default(),
     ));
+    let (_requests_writer_task, requests_writer) =
+        crate::inference::engine::writer::RequestsWriter::new(request_manager.clone(), 1, std::time::Duration::ZERO);
     let limiters = crate::limits::Limiters::new(&config.limits);
     let shared_config = crate::SharedConfig::new(config);
     underway::run_migrations(&pool).await.expect("Failed to run underway migrations");
@@ -1912,25 +1922,34 @@ async fn test_build_router_with_metrics_disabled(pool: PgPool) {
                 cascade_batch_state_workers: 0,
                 purge_user_data_workers: 0,
                 response_writer_batch_size: 0,
+                response_writer_max_linger_ms: 0,
             },
         )
         .await
         .expect("Failed to create task runner"),
     );
-    let response_store = std::sync::Arc::new(crate::inference::store::FusilladeResponseStore::new(request_manager.clone()));
+    let response_store = std::sync::Arc::new(crate::inference::store::FusilladeResponseStore::new(
+        request_manager.clone(),
+        requests_writer.clone(),
+    ));
+    let api_key_cache = crate::sync::api_key_cache::ApiKeyMetadataCache::empty();
+    let flex_batch_key_resolver = crate::sync::api_key_cache::FlexBatchKeyResolver::new(pool.clone(), api_key_cache.clone());
     let mut app_state = AppState::builder()
         .db(DbPools::new(pool))
         .config(shared_config)
         .request_manager(request_manager)
+        .requests_writer(requests_writer)
         .task_runner(task_runner)
         .limiters(limiters)
         .response_store(response_store)
         .image_normalizer(std::sync::Arc::new(crate::image_normalizer::DisabledNormalizer)
             as std::sync::Arc<dyn crate::image_normalizer::ImageNormalizer>)
+        .api_key_cache(api_key_cache)
+        .flex_batch_key_resolver(flex_batch_key_resolver)
         .build();
 
     let onwards_router = axum::Router::new();
-    let router = super::build_router(&mut app_state, onwards_router, None, None, None, false, None)
+    let router = super::build_router(&mut app_state, onwards_router, None, None, false, None)
         .await
         .expect("Failed to build router");
     let server = axum_test::TestServer::new(router).expect("Failed to create test server");
@@ -1952,6 +1971,8 @@ async fn test_build_router_with_metrics_enabled(pool: PgPool) {
         DbPools::new(pool.clone()),
         Default::default(),
     ));
+    let (_requests_writer_task, requests_writer) =
+        crate::inference::engine::writer::RequestsWriter::new(request_manager.clone(), 1, std::time::Duration::ZERO);
     let limiters = crate::limits::Limiters::new(&config.limits);
     let shared_config = crate::SharedConfig::new(config);
     underway::run_migrations(&pool).await.expect("Failed to run underway migrations");
@@ -1974,25 +1995,34 @@ async fn test_build_router_with_metrics_enabled(pool: PgPool) {
                 cascade_batch_state_workers: 0,
                 purge_user_data_workers: 0,
                 response_writer_batch_size: 0,
+                response_writer_max_linger_ms: 0,
             },
         )
         .await
         .expect("Failed to create task runner"),
     );
-    let response_store = std::sync::Arc::new(crate::inference::store::FusilladeResponseStore::new(request_manager.clone()));
+    let response_store = std::sync::Arc::new(crate::inference::store::FusilladeResponseStore::new(
+        request_manager.clone(),
+        requests_writer.clone(),
+    ));
+    let api_key_cache = crate::sync::api_key_cache::ApiKeyMetadataCache::empty();
+    let flex_batch_key_resolver = crate::sync::api_key_cache::FlexBatchKeyResolver::new(pool.clone(), api_key_cache.clone());
     let mut app_state = AppState::builder()
         .db(DbPools::new(pool))
         .config(shared_config)
         .request_manager(request_manager)
+        .requests_writer(requests_writer)
         .task_runner(task_runner)
         .limiters(limiters)
         .response_store(response_store)
         .image_normalizer(std::sync::Arc::new(crate::image_normalizer::DisabledNormalizer)
             as std::sync::Arc<dyn crate::image_normalizer::ImageNormalizer>)
+        .api_key_cache(api_key_cache)
+        .flex_batch_key_resolver(flex_batch_key_resolver)
         .build();
 
     let onwards_router = axum::Router::new();
-    let router = super::build_router(&mut app_state, onwards_router, None, None, None, false, None)
+    let router = super::build_router(&mut app_state, onwards_router, None, None, false, None)
         .await
         .expect("Failed to build router");
     let server = axum_test::TestServer::new(router).expect("Failed to create test server");

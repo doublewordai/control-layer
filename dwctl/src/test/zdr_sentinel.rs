@@ -169,6 +169,7 @@ async fn setup_sentinel_fixture(pool: &PgPool) -> SentinelFixture {
         .json();
 
     bg_services.sync_onwards_config(pool).await.expect("Failed to sync onwards config");
+    bg_services.sync_api_key_cache(pool).await.expect("Failed to sync API key cache");
 
     SentinelFixture {
         server,

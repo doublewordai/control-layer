@@ -1582,6 +1582,14 @@ pub struct DaemonConfig {
     /// fails without accumulating behind callers' poll cadence. (default: 60000 = 1 minute)
     pub pending_request_counts_timeout_ms: u64,
 
+    /// Maximum concurrent response-related state writes. `0` disables only
+    /// this class limit; the shared response-traffic budget remains active.
+    pub max_concurrent_state_writes: usize,
+
+    /// Maximum concurrent consolidated response detail reads. `0` disables
+    /// only this class limit; the shared response-traffic budget remains active.
+    pub max_concurrent_response_reads: usize,
+
     /// Per-model configurations for completion window escalation via route-at-claim-time.
     /// When a request is claimed with less than `escalation_threshold_seconds` remaining
     /// before batch expiry, it's routed to the `escalation_model` instead.
@@ -1906,6 +1914,8 @@ impl Default for DaemonConfig {
             claim_timeout_ms: 60000,
             processing_timeout_ms: 600000,
             pending_request_counts_timeout_ms: 60000,
+            max_concurrent_state_writes: 64,
+            max_concurrent_response_reads: 8,
             batch_metadata_fields: default_batch_metadata_fields_dwctl(),
             model_escalations: HashMap::new(),
             purge_interval_ms: 600_000,
@@ -1985,6 +1995,8 @@ impl DaemonConfig {
             claim_timeout_ms: self.claim_timeout_ms,
             processing_timeout_ms: self.processing_timeout_ms,
             pending_request_counts_timeout_ms: self.pending_request_counts_timeout_ms,
+            max_concurrent_state_writes: self.max_concurrent_state_writes,
+            max_concurrent_response_reads: self.max_concurrent_response_reads,
             batch_metadata_fields: self.batch_metadata_fields.clone(),
             purge_interval_ms: self.purge_interval_ms,
             purge_batch_size: self.purge_batch_size,
@@ -2436,6 +2448,9 @@ pub struct TaskWorkersConfig {
     /// to row visible. Replaces the previous underway-based
     /// `response_workers` setting.
     pub response_writer_batch_size: usize,
+    /// Maximum time to collect more response lifecycle commands after the
+    /// first command arrives. Zero disables lingering for deterministic tests.
+    pub response_writer_max_linger_ms: u64,
 }
 
 impl Default for TaskWorkersConfig {
@@ -2445,6 +2460,7 @@ impl Default for TaskWorkersConfig {
             cascade_batch_state_workers: 1,
             purge_user_data_workers: 1,
             response_writer_batch_size: 100,
+            response_writer_max_linger_ms: 2,
         }
     }
 }
@@ -2979,6 +2995,23 @@ impl Config {
 mod tests {
     use super::*;
     use figment::Jail;
+
+    #[test]
+    fn response_writer_linger_defaults_to_two_ms_and_allows_zero() {
+        assert_eq!(TaskWorkersConfig::default().response_writer_max_linger_ms, 2);
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                "secret_key: hello\nbackground_services:\n  task_workers:\n    response_writer_max_linger_ms: 0\n",
+            )?;
+            let config = Config::load(&Args {
+                config: "test.yaml".into(),
+                validate: false,
+            })?;
+            assert_eq!(config.background_services.task_workers.response_writer_max_linger_ms, 0);
+            Ok(())
+        });
+    }
 
     #[test]
     fn test_model_sources_config() {
@@ -4166,6 +4199,43 @@ background_services:
         config.background_services.batch_daemon.upload_stall_poll_ms = 0;
         let err = config.validate().unwrap_err().to_string();
         assert!(err.contains("upload_stall_poll_ms cannot be 0"), "{err}");
+    }
+
+    #[test]
+    fn test_response_admission_defaults_override_and_mapping() {
+        Jail::expect_with(|jail| {
+            jail.create_file("test.yaml", "secret_key: test-secret-key\n")?;
+            let args = Args {
+                config: "test.yaml".into(),
+                validate: false,
+            };
+
+            let config = Config::load(&args)?;
+            let daemon = &config.background_services.batch_daemon;
+            assert_eq!(daemon.max_concurrent_state_writes, 64);
+            assert_eq!(daemon.max_concurrent_response_reads, 8);
+
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: test-secret-key
+background_services:
+  batch_daemon:
+    max_concurrent_state_writes: 5
+    max_concurrent_response_reads: 3
+"#,
+            )?;
+            let config = Config::load(&args)?;
+            let daemon = &config.background_services.batch_daemon;
+            assert_eq!(daemon.max_concurrent_state_writes, 5);
+            assert_eq!(daemon.max_concurrent_response_reads, 3);
+
+            let fusillade = daemon.to_fusillade_config();
+            assert_eq!(fusillade.max_concurrent_state_writes, 5);
+            assert_eq!(fusillade.max_concurrent_response_reads, 3);
+
+            Ok(())
+        });
     }
 
     #[test]

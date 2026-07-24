@@ -533,6 +533,10 @@ background_services:
     claim_batch_size: 100 # Maximum number of requests to claim in each iteration
     default_model_concurrency: 10 # Default concurrent requests per model
     claim_interval_ms: 1000 # Milliseconds to sleep between claim iterations
+    # Response DB traffic shares an aggregate budget of max_connections - 2
+    # (minimum 1 for a one-connection pool), preserving primary-pool headroom.
+    max_concurrent_state_writes: 64 # Write-class cap; 0 disables only this class cap
+    max_concurrent_response_reads: 8 # Consolidated GET class cap; 0 disables only this class cap
 
     # Split claim daemons (fusillade >= 20): batched and batchless (flex) rows
     # are claimed by independent loops. All optional:

@@ -37,8 +37,12 @@ pub async fn create_test_app_state_with_config(pool: PgPool, config: crate::conf
         .expect("Failed to create fusillade TestDbPools");
 
     let request_manager = std::sync::Arc::new(fusillade_arsenal::PostgresRequestManager::new(fusillade_pools, Default::default()));
+    let (_requests_writer_task, requests_writer) =
+        crate::inference::engine::writer::RequestsWriter::new(request_manager.clone(), 1, std::time::Duration::ZERO);
     let limiters = crate::limits::Limiters::new(&config.limits);
     let shared_config = crate::SharedConfig::new(config);
+    let api_key_cache = crate::sync::api_key_cache::ApiKeyMetadataCache::empty();
+    let flex_batch_key_resolver = crate::sync::api_key_cache::FlexBatchKeyResolver::new(pool.clone(), api_key_cache.clone());
 
     underway::run_migrations(&pool).await.expect("Failed to run underway migrations");
     let task_state = crate::tasks::TaskState {
@@ -60,13 +64,17 @@ pub async fn create_test_app_state_with_config(pool: PgPool, config: crate::conf
                 cascade_batch_state_workers: 0,
                 purge_user_data_workers: 0,
                 response_writer_batch_size: 0,
+                response_writer_max_linger_ms: 0,
             },
         )
         .await
         .expect("Failed to create task runner"),
     );
 
-    let response_store = std::sync::Arc::new(crate::inference::store::FusilladeResponseStore::new(request_manager.clone()));
+    let response_store = std::sync::Arc::new(crate::inference::store::FusilladeResponseStore::new(
+        request_manager.clone(),
+        requests_writer.clone(),
+    ));
     // Tests use the disabled no-op normaliser — they never exercise the
     // ingest/sign/read paths.
     let image_normalizer: std::sync::Arc<dyn crate::image_normalizer::ImageNormalizer> =
@@ -75,10 +83,13 @@ pub async fn create_test_app_state_with_config(pool: PgPool, config: crate::conf
         .db(test_pools)
         .config(shared_config)
         .request_manager(request_manager)
+        .requests_writer(requests_writer)
         .task_runner(task_runner)
         .limiters(limiters)
         .response_store(response_store)
         .image_normalizer(image_normalizer)
+        .api_key_cache(api_key_cache)
+        .flex_batch_key_resolver(flex_batch_key_resolver)
         .build()
 }
 
@@ -133,8 +144,12 @@ pub async fn create_test_app_state_with_database_pools(
         fusillade_test_pools,
         Default::default(),
     ));
+    let (_requests_writer_task, requests_writer) =
+        crate::inference::engine::writer::RequestsWriter::new(request_manager.clone(), 1, std::time::Duration::ZERO);
     let limiters = crate::limits::Limiters::new(&config.limits);
     let shared_config = crate::SharedConfig::new(config);
+    let api_key_cache = crate::sync::api_key_cache::ApiKeyMetadataCache::empty();
+    let flex_batch_key_resolver = crate::sync::api_key_cache::FlexBatchKeyResolver::new(pool.clone(), api_key_cache.clone());
 
     underway::run_migrations(&pool).await.expect("Failed to run underway migrations");
     let task_state = crate::tasks::TaskState {
@@ -156,23 +171,30 @@ pub async fn create_test_app_state_with_database_pools(
                 cascade_batch_state_workers: 0,
                 purge_user_data_workers: 0,
                 response_writer_batch_size: 0,
+                response_writer_max_linger_ms: 0,
             },
         )
         .await
         .expect("Failed to create task runner"),
     );
 
-    let response_store = std::sync::Arc::new(crate::inference::store::FusilladeResponseStore::new(request_manager.clone()));
+    let response_store = std::sync::Arc::new(crate::inference::store::FusilladeResponseStore::new(
+        request_manager.clone(),
+        requests_writer.clone(),
+    ));
     let image_normalizer: std::sync::Arc<dyn crate::image_normalizer::ImageNormalizer> =
         std::sync::Arc::new(crate::image_normalizer::DisabledNormalizer);
     crate::AppState::builder()
         .db(test_pools)
         .config(shared_config)
         .request_manager(request_manager)
+        .requests_writer(requests_writer)
         .task_runner(task_runner)
         .limiters(limiters)
         .response_store(response_store)
         .image_normalizer(image_normalizer)
+        .api_key_cache(api_key_cache)
+        .flex_batch_key_resolver(flex_batch_key_resolver)
         .build()
 }
 
@@ -325,6 +347,7 @@ pub fn create_test_config() -> crate::config::Config {
                 cascade_batch_state_workers: 0,
                 purge_user_data_workers: 0,
                 response_writer_batch_size: 0,
+                response_writer_max_linger_ms: 0,
             },
             ..Default::default()
         },

@@ -4,8 +4,7 @@
 //! `requests` table, mapping the row to an Open Responses API Response object.
 //!
 //! Authentication is via Bearer API key (same as AI proxy requests).
-//! Ownership is verified by checking the batch's `created_by` against the
-//! API key's `user_id` (which is the org ID for org-scoped keys).
+//! Ownership and response resolution are scoped in one Fusillade query.
 
 use axum::{
     Json,
@@ -62,83 +61,30 @@ pub async fn get_response<P: PoolProvider>(
     headers: HeaderMap,
     Path(response_id): Path<String>,
 ) -> Result<Json<serde_json::Value>> {
-    // Require a valid API key and resolve the owner (user_id).
-    // For org-scoped keys, user_id is the org ID.
+    // Require a valid API key and resolve its effective owner from the shared
+    // metadata snapshot. For org-scoped keys, owner_id is the org ID.
     let api_key = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.strip_prefix("Bearer "))
         .ok_or_else(|| Error::Unauthenticated { message: None })?;
-
-    let owner_id: String = sqlx::query_scalar("SELECT user_id::text FROM public.api_keys WHERE secret = $1 AND is_deleted = false LIMIT 1")
-        .bind(api_key)
-        .fetch_optional(state.db.read())
-        .await
-        .map_err(|e| Error::Database(e.into()))?
+    let owner_id = state
+        .api_key_cache
+        .get(api_key)
+        .map(|metadata| metadata.owner_id.to_string())
         .ok_or_else(|| Error::Unauthenticated { message: None })?;
 
-    // Parse the response ID to a head_step UUID. After the
-    // response_steps re-anchoring (fusillade 16.8) `resp_<id>` is the
-    // head step's id, NOT a fusillade.requests id.
-    let uuid_str = response_id.strip_prefix("resp_").unwrap_or(&response_id);
-    let head_step_uuid = uuid::Uuid::parse_str(uuid_str).map_err(|_| Error::NotFound {
-        resource: "response".to_string(),
-        id: response_id.clone(),
-    })?;
-
-    // Resolve the row that carries `created_by` for ownership.
-    // Two paths, mirroring `FusilladeResponseStore::get_response`:
-    //   * Multi-step — head step → its sub-request fusillade row.
-    //   * Single-step — the id is itself a fusillade.requests row
-    //     (chat completions / embeddings retrieved via the same GET).
-    // The auth resolution happens here on the row that's actually
-    // backing this response; `response_store.get_response` then
-    // assembles the API envelope.
-    let auth_request_id = match state.response_step_manager.as_ref() {
-        Some(step_manager) => match step_manager.get_step(fusillade::StepId(head_step_uuid)).await {
-            Ok(Some(head_step)) => head_step.request_id.unwrap_or(fusillade::RequestId(head_step_uuid)),
-            Ok(None) => fusillade::RequestId(head_step_uuid),
-            Err(e) => return Err(Error::Database(crate::db::errors::DbError::Other(anyhow::anyhow!("{e}")))),
-        },
-        None => fusillade::RequestId(head_step_uuid),
-    };
-
-    let detail = state
-        .request_manager
-        .get_request_detail(auth_request_id)
+    match state
+        .response_store
+        .get_response_for_owner(&response_id, &owner_id)
         .await
         .map_err(|e| match e {
-            fusillade::FusilladeError::RequestNotFound(_) => Error::NotFound {
+            StoreError::NotFound(_) => Error::NotFound {
                 resource: "response".to_string(),
                 id: response_id.clone(),
             },
             _ => Error::Database(crate::db::errors::DbError::Other(anyhow::anyhow!("{e}"))),
-        })?;
-
-    // Verify ownership: the row's created_by must match the API key's user_id.
-    // Return 404 (not 403) to avoid leaking existence of other users' responses.
-    // `detail.created_by` is non-empty by fusillade's schema invariants —
-    // `get_request_detail` filters out batched rows, and `create_realtime` /
-    // `create_flex` coerce empty inputs to NULL which the XOR CHECK rejects.
-    let owner = detail.created_by.as_str();
-    if owner != owner_id {
-        return Err(Error::NotFound {
-            resource: "response".to_string(),
-            id: response_id,
-        });
-    }
-
-    // Convert the detail to an Open Responses API response object. ZDR gone
-    // (encrypted body whose key was shredded on a prior retrieval or expiry) is
-    // decided inside `get_response` from the same keystore lookup that would
-    // decrypt, so there is no separate probe and no time-of-check gap.
-    match state.response_store.get_response(&response_id).await.map_err(|e| match e {
-        StoreError::NotFound(_) => Error::NotFound {
-            resource: "response".to_string(),
-            id: response_id.clone(),
-        },
-        _ => Error::Database(crate::db::errors::DbError::Other(anyhow::anyhow!("{e}"))),
-    })? {
+        })? {
         ResponseLookup::Found(resp) => Ok(Json(resp)),
         ResponseLookup::NotFound => Err(Error::NotFound {
             resource: "response".to_string(),
@@ -165,8 +111,8 @@ pub async fn get_response<P: PoolProvider>(
 /// (denormalized `fusillade_batch_id` only, no request-id link). Billing
 /// and usage records survive an erasure of the inference data.
 ///
-/// **Auth pattern** mirrors `get_response`: direct lookup against
-/// `public.api_keys` for the Bearer key. Session/cookie-authed dashboard
+/// **Auth pattern** mirrors `get_response`: lookup in the shared API-key
+/// metadata snapshot. Session/cookie-authed dashboard
 /// deletes flow through `DELETE /admin/api/v1/batches/requests/{id}`
 /// instead (uses the standard `RequiresPermission` middleware) — the
 /// `admin_ai_proxy_middleware` rewrite path used by chat-completions /
@@ -207,11 +153,10 @@ pub async fn delete_response<P: PoolProvider>(
         .and_then(|s| s.strip_prefix("Bearer "))
         .ok_or_else(|| Error::Unauthenticated { message: None })?;
 
-    let owner_id: String = sqlx::query_scalar("SELECT user_id::text FROM public.api_keys WHERE secret = $1 AND is_deleted = false LIMIT 1")
-        .bind(api_key)
-        .fetch_optional(state.db.read())
-        .await
-        .map_err(|e| Error::Database(e.into()))?
+    let owner_id = state
+        .api_key_cache
+        .get(api_key)
+        .map(|metadata| metadata.owner_id.to_string())
         .ok_or_else(|| Error::Unauthenticated { message: None })?;
 
     let uuid_str = response_id.strip_prefix("resp_").unwrap_or(&response_id);
@@ -345,4 +290,166 @@ pub async fn delete_response<P: PoolProvider>(
         object_type: ResponseDeletedObjectType::Response,
         deleted: true,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::{Arc, OnceLock};
+    use std::time::Duration;
+
+    use axum::{
+        Router,
+        body::Body,
+        http::{Request, StatusCode},
+        routing::get,
+    };
+    use fusillade::Storage;
+    use sqlx::postgres::PgPoolOptions;
+    use tower::ServiceExt;
+    use uuid::Uuid;
+
+    use crate::db::models::api_keys::ApiKeyPurpose;
+    use crate::sync::api_key_cache::{ApiKeyMetadata, ApiKeyMetadataCache};
+
+    #[sqlx::test]
+    async fn get_response_uses_cached_owner_while_main_pool_is_exhausted(pool: sqlx::PgPool) {
+        let main_pool = PgPoolOptions::new()
+            .max_connections(1)
+            .min_connections(0)
+            .acquire_timeout(Duration::from_secs(5))
+            .connect_with(pool.connect_options().as_ref().clone())
+            .await
+            .unwrap();
+        let fusillade_pool = crate::test::utils::setup_fusillade_pool(&pool).await;
+        let request_manager = Arc::new(fusillade_arsenal::PostgresRequestManager::new(
+            fusillade_pool.clone(),
+            Default::default(),
+        ));
+        let (_writer, requests_writer) = crate::inference::engine::writer::RequestsWriter::new(request_manager.clone(), 1, Duration::ZERO);
+        let response_store = Arc::new(crate::inference::store::FusilladeResponseStore::new(
+            request_manager.clone(),
+            requests_writer.clone(),
+        ));
+
+        let config = crate::test::utils::create_test_config();
+        let shared_config = crate::SharedConfig::new(config.clone());
+        underway::run_migrations(&pool).await.expect("underway migrations should succeed");
+        let task_state = crate::tasks::TaskState {
+            request_manager: request_manager.clone(),
+            dwctl_pool: pool.clone(),
+            config: shared_config.clone(),
+            encryption_key: None,
+            ingest_file_job: Arc::new(OnceLock::new()),
+            activate_batch_job: Arc::new(OnceLock::new()),
+            create_batch_job: Arc::new(OnceLock::new()),
+            cascade_batch_state_job: Arc::new(OnceLock::new()),
+        };
+        let task_runner = Arc::new(
+            crate::tasks::TaskRunner::new(
+                pool.clone(),
+                task_state,
+                &crate::config::TaskWorkersConfig {
+                    create_batch_workers: 0,
+                    cascade_batch_state_workers: 0,
+                    purge_user_data_workers: 0,
+                    response_writer_batch_size: 0,
+                    response_writer_max_linger_ms: 0,
+                },
+            )
+            .await
+            .expect("task runner should build before main-pool contention"),
+        );
+
+        let api_key = "sk-owned-response";
+        let owner_id = Uuid::new_v4();
+        let other_owner_id = Uuid::new_v4();
+        let api_key_cache = ApiKeyMetadataCache::empty();
+        api_key_cache.replace(HashMap::from([(
+            api_key.to_string(),
+            ApiKeyMetadata {
+                owner_id,
+                created_by: Uuid::new_v4(),
+                purpose: ApiKeyPurpose::Realtime,
+                verified: true,
+                zero_data_retention: false,
+                hidden_batch_key: None,
+                hidden_batch_key_is_child: false,
+            },
+        )]));
+        let flex_batch_key_resolver = crate::sync::api_key_cache::FlexBatchKeyResolver::new(main_pool.clone(), api_key_cache.clone());
+
+        let owned_id = Uuid::new_v4();
+        let other_id = Uuid::new_v4();
+        for (request_id, created_by) in [(owned_id, owner_id.to_string()), (other_id, other_owner_id.to_string())] {
+            request_manager
+                .create_realtime(fusillade::CreateRealtimeInput {
+                    request_id,
+                    body: r#"{"input":"hello"}"#.to_string(),
+                    model: "test-model".to_string(),
+                    endpoint: "http://localhost:3001/ai".to_string(),
+                    method: "POST".to_string(),
+                    path: "/v1/responses".to_string(),
+                    api_key: String::new(),
+                    created_by,
+                })
+                .await
+                .unwrap();
+            request_manager
+                .complete_request(fusillade::RequestId(request_id), r#"{"output":[]}"#, 200)
+                .await
+                .unwrap();
+        }
+
+        let state = crate::AppState::builder()
+            .db(main_pool.clone())
+            .config(shared_config)
+            .request_manager(request_manager)
+            .requests_writer(requests_writer)
+            .task_runner(task_runner)
+            .limiters(crate::limits::Limiters::new(&config.limits))
+            .response_store(response_store)
+            .image_normalizer(Arc::new(crate::image_normalizer::DisabledNormalizer) as Arc<dyn crate::image_normalizer::ImageNormalizer>)
+            .api_key_cache(api_key_cache)
+            .flex_batch_key_resolver(flex_batch_key_resolver)
+            .build();
+        let app = Router::new()
+            .route("/responses/{response_id}", get(super::get_response::<sqlx::PgPool>))
+            .with_state(state);
+
+        // With AppState<PgPool>, this is the exact pool the old handler reads.
+        // Holding its only connection makes any hidden primary DB dependency
+        // deterministic instead of relying on timing or a separate read pool.
+        let _held_main_connection = main_pool.acquire().await.unwrap();
+
+        let owned_response = tokio::time::timeout(
+            Duration::from_millis(250),
+            app.clone().oneshot(
+                Request::builder()
+                    .uri(format!("/responses/resp_{owned_id}"))
+                    .header("authorization", format!("Bearer {api_key}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            ),
+        )
+        .await
+        .expect("owned GET must not wait for the exhausted main pool")
+        .unwrap();
+        assert_eq!(owned_response.status(), StatusCode::OK);
+
+        let other_response = tokio::time::timeout(
+            Duration::from_millis(250),
+            app.oneshot(
+                Request::builder()
+                    .uri(format!("/responses/resp_{other_id}"))
+                    .header("authorization", format!("Bearer {api_key}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            ),
+        )
+        .await
+        .expect("cross-owner GET must not wait for the exhausted main pool")
+        .unwrap();
+        assert_eq!(other_response.status(), StatusCode::NOT_FOUND);
+    }
 }
