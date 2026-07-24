@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                UPDATE users\n                SET auto_topup_soft_failure_count = 1,\n                    auto_topup_retry_after = NOW() + INTERVAL '24 hours',\n                    updated_at = NOW()\n                WHERE id = $1\n                  AND auto_topup_soft_failure_count = $2\n                  AND auto_topup_amount IS NOT NULL\n                  AND auto_topup_threshold IS NOT NULL\n                ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int4"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "b7f2624732084aa92ef7b7c5b06b71a8284eeb8f735f31af7c038b2cb50a8680"
+}

@@ -132,6 +132,16 @@
         "ordinal": 25,
         "name": "zero_data_retention",
         "type_info": "Bool"
+      },
+      {
+        "ordinal": 26,
+        "name": "auto_topup_soft_failure_count",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 27,
+        "name": "auto_topup_retry_after",
+        "type_info": "Timestamptz"
       }
     ],
     "parameters": {
@@ -173,7 +183,9 @@
       true,
       false,
       false,
-      false
+      false,
+      false,
+      true
     ]
   },
   "hash": "df59ccd8080d8eb0bd1e11ab6e5a2b8fcdfbb3ae2c95a05ccd9f76042320f41a"

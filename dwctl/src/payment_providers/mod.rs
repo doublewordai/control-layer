@@ -34,6 +34,13 @@ pub fn create_provider(config: PaymentConfig) -> Box<dyn PaymentProvider> {
 /// Result type for payment provider operations
 pub type Result<T> = std::result::Result<T, PaymentError>;
 
+/// Whether an automatic top-up decline may be retried.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutoTopupDeclineKind {
+    Soft,
+    Hard,
+}
+
 /// Errors that can occur during payment processing
 #[derive(Debug, thiserror::Error)]
 pub enum PaymentError {
@@ -54,6 +61,9 @@ pub enum PaymentError {
 
     #[error("User does not have a payment provider customer ID")]
     NoCustomerId,
+
+    #[error("Automatic top-up payment was declined: {0:?}")]
+    AutoTopupDeclined(AutoTopupDeclineKind),
 }
 
 impl From<PaymentError> for StatusCode {
@@ -62,6 +72,7 @@ impl From<PaymentError> for StatusCode {
             PaymentError::PaymentNotCompleted => StatusCode::PAYMENT_REQUIRED,
             PaymentError::InvalidData(_) | PaymentError::NoCustomerId => StatusCode::BAD_REQUEST,
             PaymentError::AlreadyProcessed => StatusCode::OK,
+            PaymentError::AutoTopupDeclined(_) => StatusCode::PAYMENT_REQUIRED,
             PaymentError::ProviderApi(_) | PaymentError::Database(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }

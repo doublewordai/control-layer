@@ -17,6 +17,8 @@ struct EmailTemplates {
     low_balance: String,
     auto_topup_success: String,
     auto_topup_failed: String,
+    auto_topup_retry: String,
+    auto_topup_disabled: String,
     auto_topup_limit_reached: String,
     org_invite: String,
     org_email_change_verify_new: String,
@@ -32,6 +34,8 @@ impl EmailTemplates {
             low_balance: include_str!("../default_templates/low_balance.html").to_string(),
             auto_topup_success: include_str!("../default_templates/auto_topup_success.html").to_string(),
             auto_topup_failed: include_str!("../default_templates/auto_topup_failed.html").to_string(),
+            auto_topup_retry: include_str!("../default_templates/auto_topup_retry.html").to_string(),
+            auto_topup_disabled: include_str!("../default_templates/auto_topup_disabled.html").to_string(),
             auto_topup_limit_reached: include_str!("../default_templates/auto_topup_limit_reached.html").to_string(),
             org_invite: include_str!("../default_templates/org_invite.html").to_string(),
             org_email_change_verify_new: include_str!("../default_templates/org_email_change_verify_new.html").to_string(),
@@ -60,6 +64,8 @@ impl EmailTemplates {
             low_balance: load("low_balance.html", embedded.low_balance),
             auto_topup_success: load("auto_topup_success.html", embedded.auto_topup_success),
             auto_topup_failed: load("auto_topup_failed.html", embedded.auto_topup_failed),
+            auto_topup_retry: load("auto_topup_retry.html", embedded.auto_topup_retry),
+            auto_topup_disabled: load("auto_topup_disabled.html", embedded.auto_topup_disabled),
             auto_topup_limit_reached: load("auto_topup_limit_reached.html", embedded.auto_topup_limit_reached),
             org_invite: load("org_invite.html", embedded.org_invite),
             org_email_change_verify_new: load("org_email_change_verify_new.html", embedded.org_email_change_verify_new),
@@ -374,6 +380,40 @@ impl EmailService {
         let name = to_name.unwrap_or("User");
         let body = self
             .render_auto_topup_body(&self.templates.auto_topup_failed, name, amount, threshold, None)
+            .map_err(|e| Error::Internal {
+                operation: format!("render email template: {e}"),
+            })?;
+        self.send_email(to_email, to_name, subject, &body).await
+    }
+
+    pub async fn send_auto_topup_retry_email(
+        &self,
+        to_email: &str,
+        to_name: Option<&str>,
+        amount: &rust_decimal::Decimal,
+        threshold: &rust_decimal::Decimal,
+    ) -> Result<(), Error> {
+        let subject = "We couldn't top up your Doubleword account";
+        let name = to_name.unwrap_or("User");
+        let body = self
+            .render_auto_topup_body(&self.templates.auto_topup_retry, name, amount, threshold, None)
+            .map_err(|e| Error::Internal {
+                operation: format!("render email template: {e}"),
+            })?;
+        self.send_email(to_email, to_name, subject, &body).await
+    }
+
+    pub async fn send_auto_topup_disabled_email(
+        &self,
+        to_email: &str,
+        to_name: Option<&str>,
+        amount: &rust_decimal::Decimal,
+        threshold: &rust_decimal::Decimal,
+    ) -> Result<(), Error> {
+        let subject = "Auto top-up has been turned off";
+        let name = to_name.unwrap_or("User");
+        let body = self
+            .render_auto_topup_body(&self.templates.auto_topup_disabled, name, amount, threshold, None)
             .map_err(|e| Error::Internal {
                 operation: format!("render email template: {e}"),
             })?;
@@ -807,6 +847,40 @@ mod tests {
         assert!(body.contains("25.00"), "Should contain amount");
         assert!(body.contains("5.00"), "Should contain threshold");
         assert!(body.contains("cost-management"), "Should contain dashboard link");
+    }
+
+    #[tokio::test]
+    async fn test_auto_topup_retry_email_body() {
+        let config = create_test_config();
+        let email_service = EmailService::new(&config).unwrap();
+        let amount = rust_decimal::Decimal::new(2500, 2);
+        let threshold = rust_decimal::Decimal::new(500, 2);
+
+        let body = email_service
+            .render_auto_topup_body(&email_service.templates.auto_topup_retry, "Alice", &amount, &threshold, None)
+            .unwrap();
+
+        assert!(body.contains("couldn't top up your Doubleword account"));
+        assert!(body.contains("try again tomorrow"));
+        assert!(body.contains("update your card"));
+        assert!(body.contains("cost-management"));
+    }
+
+    #[tokio::test]
+    async fn test_auto_topup_disabled_email_body() {
+        let config = create_test_config();
+        let email_service = EmailService::new(&config).unwrap();
+        let amount = rust_decimal::Decimal::new(2500, 2);
+        let threshold = rust_decimal::Decimal::new(500, 2);
+
+        let body = email_service
+            .render_auto_topup_body(&email_service.templates.auto_topup_disabled, "Alice", &amount, &threshold, None)
+            .unwrap();
+
+        assert!(body.contains("Auto top-up has been turned off"));
+        assert!(body.contains("recharge your account manually"));
+        assert!(body.contains("continue using Doubleword"));
+        assert!(body.contains("cost-management"));
     }
 
     #[tokio::test]
