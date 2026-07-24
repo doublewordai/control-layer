@@ -30,9 +30,57 @@ use crate::{
         handlers::{credits::Credits, repository::Repository},
         models::credits::{CreditTransactionCreateDBRequest, CreditTransactionType},
     },
-    payment_providers::{AutoTopupSetupResult, CheckoutPayer, PaymentError, PaymentProvider, PaymentSession, Result, WebhookEvent},
+    payment_providers::{
+        AutoTopupDeclineKind, AutoTopupSetupResult, CheckoutPayer, PaymentError, PaymentProvider, PaymentSession, Result, WebhookEvent,
+    },
     types::UserId,
 };
+
+fn classify_card_decline(advice_code: Option<&str>, decline_code: Option<&str>) -> AutoTopupDeclineKind {
+    const HARD_DECLINE_CODES: &[&str] = &[
+        "do_not_honor",
+        "fraudulent",
+        "lost_card",
+        "merchant_blacklist",
+        "pickup_card",
+        "restricted_card",
+        "revocation_of_all_authorizations",
+        "revocation_of_authorization",
+        "security_violation",
+        "stolen_card",
+        "stop_payment_order",
+        "transaction_not_allowed",
+    ];
+
+    if advice_code == Some("do_not_try_again") || decline_code.is_some_and(|code| HARD_DECLINE_CODES.contains(&code)) {
+        AutoTopupDeclineKind::Hard
+    } else {
+        AutoTopupDeclineKind::Soft
+    }
+}
+
+fn map_auto_topup_charge_error(error: stripe::StripeError) -> PaymentError {
+    match error {
+        stripe::StripeError::Stripe(api_error, _) if matches!(api_error.type_, stripe::ApiErrorsType::CardError) => {
+            PaymentError::AutoTopupDeclined(classify_card_decline(
+                api_error.advice_code.as_deref(),
+                api_error.decline_code.as_deref(),
+            ))
+        }
+        stripe::StripeError::Stripe(api_error, status) => {
+            tracing::error!(
+                status,
+                error_type = %api_error.type_,
+                "Stripe rejected the auto top-up payment request"
+            );
+            PaymentError::ProviderApi(format!("Stripe {} error (HTTP {status})", api_error.type_))
+        }
+        other => {
+            tracing::error!(error = %other, "Failed to create auto top-up payment intent");
+            PaymentError::ProviderApi(other.to_string())
+        }
+    }
+}
 
 /// Stripe payment provider
 pub struct StripeProvider {
@@ -108,10 +156,7 @@ impl StripeProvider {
             .request_strategy(RequestStrategy::Idempotent(idem_key))
             .send(&self.client)
             .await
-            .map_err(|e| {
-                tracing::error!("Failed to create auto top-up payment intent: {:?}", e);
-                PaymentError::ProviderApi(e.to_string())
-            })
+            .map_err(map_auto_topup_charge_error)
     }
 
     async fn get_setup_session(&self, session_id: &str) -> Result<stripe_checkout::CheckoutSession> {
@@ -752,6 +797,36 @@ mod tests {
         let provider = StripeProvider::from(config);
 
         assert!(provider.config.enable_invoice_creation);
+    }
+
+    #[test]
+    fn classifies_auto_topup_do_not_retry_advice_as_hard_decline() {
+        assert_eq!(
+            classify_card_decline(Some("do_not_try_again"), Some("insufficient_funds")),
+            AutoTopupDeclineKind::Hard
+        );
+    }
+
+    #[test]
+    fn classifies_auto_topup_terminal_codes_as_hard_declines() {
+        for decline_code in ["do_not_honor", "fraudulent", "lost_card", "pickup_card", "stolen_card"] {
+            assert_eq!(
+                classify_card_decline(None, Some(decline_code)),
+                AutoTopupDeclineKind::Hard,
+                "{decline_code} should disable auto top-up immediately"
+            );
+        }
+    }
+
+    #[test]
+    fn classifies_auto_topup_retryable_card_errors_as_soft_declines() {
+        for decline_code in [Some("insufficient_funds"), Some("processing_error"), None] {
+            assert_eq!(
+                classify_card_decline(None, decline_code),
+                AutoTopupDeclineKind::Soft,
+                "{decline_code:?} should receive one retry after 24 hours"
+            );
+        }
     }
 
     #[sqlx::test]

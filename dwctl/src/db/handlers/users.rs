@@ -68,6 +68,8 @@ pub struct AutoTopupUser {
     pub auto_topup_monthly_limit: Option<rust_decimal::Decimal>,
     /// Whether we already sent a "limit reached" email this month.
     pub auto_topup_limit_notification_sent: bool,
+    /// Consecutive soft card declines since the last successful auto top-up.
+    pub auto_topup_soft_failure_count: i32,
 }
 
 /// User with a low-balance threshold configured.
@@ -109,6 +111,8 @@ struct User {
     pub auto_topup_threshold: Option<f32>,
     pub auto_topup_monthly_limit: Option<f32>,
     pub auto_topup_limit_notification_sent: bool,
+    pub auto_topup_soft_failure_count: i32,
+    pub auto_topup_retry_after: Option<DateTime<Utc>>,
     pub user_type: String,
     pub verified: bool,
     pub zero_data_retention: bool,
@@ -279,6 +283,8 @@ impl<'c> Repository for Users<'c> {
                 auto_topup_threshold: row.auto_topup_threshold,
                 auto_topup_monthly_limit: row.auto_topup_monthly_limit,
                 auto_topup_limit_notification_sent: row.auto_topup_limit_notification_sent,
+                auto_topup_soft_failure_count: 0,
+                auto_topup_retry_after: None,
                 user_type: row.user_type,
                 verified: row.verified,
                 zero_data_retention: row.zero_data_retention,
@@ -366,6 +372,8 @@ impl<'c> Repository for Users<'c> {
                 auto_topup_threshold: row.auto_topup_threshold,
                 auto_topup_monthly_limit: row.auto_topup_monthly_limit,
                 auto_topup_limit_notification_sent: row.auto_topup_limit_notification_sent,
+                auto_topup_soft_failure_count: 0,
+                auto_topup_retry_after: None,
                 user_type: row.user_type,
                 verified: row.verified,
                 zero_data_retention: row.zero_data_retention,
@@ -512,6 +520,14 @@ impl<'c> Repository for Users<'c> {
                 auto_topup_limit_notification_sent = CASE
                     WHEN $12::boolean THEN false
                     ELSE auto_topup_limit_notification_sent
+                END,
+                auto_topup_soft_failure_count = CASE
+                    WHEN $8::boolean OR $10::boolean THEN 0
+                    ELSE auto_topup_soft_failure_count
+                END,
+                auto_topup_retry_after = CASE
+                    WHEN $8::boolean OR $10::boolean THEN NULL
+                    ELSE auto_topup_retry_after
                 END,
                 zero_data_retention = COALESCE($14, zero_data_retention),
                 updated_at = NOW()
@@ -926,7 +942,8 @@ impl<'c> Users<'c> {
                    u.auto_topup_amount::decimal(20, 9) as "auto_topup_amount!",
                    c.balance as "checkpoint_balance?",
                    u.auto_topup_monthly_limit::decimal(20, 9) as "auto_topup_monthly_limit?",
-                   u.auto_topup_limit_notification_sent
+                   u.auto_topup_limit_notification_sent,
+                   u.auto_topup_soft_failure_count
             FROM users u
             LEFT JOIN user_balance_checkpoints c ON c.user_id = u.id
             WHERE u.id != '00000000-0000-0000-0000-000000000000'
@@ -934,12 +951,106 @@ impl<'c> Users<'c> {
               AND u.auto_topup_threshold IS NOT NULL
               AND u.auto_topup_amount IS NOT NULL
               AND u.payment_provider_id IS NOT NULL
+              AND (u.auto_topup_retry_after IS NULL OR u.auto_topup_retry_after <= NOW())
             "#,
         )
         .fetch_all(&mut *self.db)
         .await?;
 
         Ok(rows)
+    }
+
+    /// Apply a soft auto-top-up decline if the caller's observed failure count
+    /// is still current. Returns false when another poller already applied the
+    /// same decline transition.
+    #[instrument(skip(self), fields(user_id = %abbrev_uuid(&user_id), expected_failure_count), err)]
+    pub async fn apply_auto_topup_soft_decline(&mut self, user_id: UserId, expected_failure_count: i32) -> Result<bool> {
+        let result = if expected_failure_count == 0 {
+            sqlx::query!(
+                r#"
+                UPDATE users
+                SET auto_topup_soft_failure_count = 1,
+                    auto_topup_retry_after = NOW() + INTERVAL '24 hours',
+                    updated_at = NOW()
+                WHERE id = $1
+                  AND auto_topup_soft_failure_count = $2
+                  AND auto_topup_amount IS NOT NULL
+                  AND auto_topup_threshold IS NOT NULL
+                "#,
+                user_id,
+                expected_failure_count,
+            )
+            .execute(&mut *self.db)
+            .await?
+        } else {
+            sqlx::query!(
+                r#"
+                UPDATE users
+                SET auto_topup_amount = NULL,
+                    auto_topup_threshold = NULL,
+                    auto_topup_monthly_limit = NULL,
+                    auto_topup_soft_failure_count = 0,
+                    auto_topup_retry_after = NULL,
+                    updated_at = NOW()
+                WHERE id = $1
+                  AND auto_topup_soft_failure_count = $2
+                  AND auto_topup_amount IS NOT NULL
+                  AND auto_topup_threshold IS NOT NULL
+                "#,
+                user_id,
+                expected_failure_count,
+            )
+            .execute(&mut *self.db)
+            .await?
+        };
+
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// Disable auto top-up after a hard card decline.
+    ///
+    /// Returns false when auto top-up was already disabled by another poller.
+    #[instrument(skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
+    pub async fn disable_auto_topup_after_hard_decline(&mut self, user_id: UserId) -> Result<bool> {
+        let result = sqlx::query!(
+            r#"
+            UPDATE users
+            SET auto_topup_amount = NULL,
+                auto_topup_threshold = NULL,
+                auto_topup_monthly_limit = NULL,
+                auto_topup_soft_failure_count = 0,
+                auto_topup_retry_after = NULL,
+                updated_at = NOW()
+            WHERE id = $1
+              AND auto_topup_amount IS NOT NULL
+              AND auto_topup_threshold IS NOT NULL
+            "#,
+            user_id,
+        )
+        .execute(&mut *self.db)
+        .await?;
+
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// Clear decline backoff state after a successful charge.
+    #[instrument(skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
+    pub async fn reset_auto_topup_failure_state(&mut self, user_id: UserId) -> Result<()> {
+        sqlx::query!(
+            r#"
+            UPDATE users
+            SET auto_topup_soft_failure_count = 0,
+                auto_topup_retry_after = NULL,
+                updated_at = NOW()
+            WHERE id = $1
+              AND (auto_topup_soft_failure_count != 0 OR auto_topup_retry_after IS NOT NULL)
+            "#,
+            user_id,
+        )
+        .execute(&mut *self.db)
+        .await?;
+
+        Ok(())
     }
 
     /// Set the payment provider ID for a user if it's not already set
@@ -1585,6 +1696,164 @@ mod tests {
         let result = users.users_with_auto_topup_enabled().await.unwrap();
 
         assert!(result.is_empty(), "Should not include user with missing payment_provider_id");
+    }
+
+    #[sqlx::test]
+    async fn test_auto_topup_decline_first_soft_failure_pauses_for_24_hours(pool: PgPool) {
+        let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+        sqlx::query!(
+            r#"
+            UPDATE users
+            SET auto_topup_amount = 25.0,
+                auto_topup_threshold = 10.0,
+                payment_provider_id = 'cus_soft_decline'
+            WHERE id = $1
+            "#,
+            user.id
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let started_at = Utc::now();
+        let mut conn = pool.acquire().await.unwrap();
+        let applied = Users::new(&mut conn).apply_auto_topup_soft_decline(user.id, 0).await.unwrap();
+
+        assert!(applied);
+        let row = sqlx::query!(
+            r#"
+            SELECT auto_topup_amount, auto_topup_threshold,
+                   auto_topup_soft_failure_count, auto_topup_retry_after
+            FROM users
+            WHERE id = $1
+            "#,
+            user.id
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(row.auto_topup_amount, Some(25.0));
+        assert_eq!(row.auto_topup_threshold, Some(10.0));
+        assert_eq!(row.auto_topup_soft_failure_count, 1);
+        let retry_after = row.auto_topup_retry_after.unwrap();
+        assert!(retry_after >= started_at + chrono::Duration::hours(23) + chrono::Duration::minutes(59));
+        assert!(retry_after <= Utc::now() + chrono::Duration::hours(24) + chrono::Duration::minutes(1));
+
+        let candidates = Users::new(&mut conn).users_with_auto_topup_enabled().await.unwrap();
+        assert!(candidates.iter().all(|candidate| candidate.id != user.id));
+    }
+
+    #[sqlx::test]
+    async fn test_auto_topup_decline_second_soft_failure_disables_with_compare_and_set(pool: PgPool) {
+        let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+        sqlx::query!(
+            r#"
+            UPDATE users
+            SET auto_topup_amount = 25.0,
+                auto_topup_threshold = 10.0,
+                auto_topup_monthly_limit = 100.0,
+                auto_topup_soft_failure_count = 1,
+                auto_topup_retry_after = NOW() - INTERVAL '1 minute',
+                payment_provider_id = 'cus_soft_decline'
+            WHERE id = $1
+            "#,
+            user.id
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mut conn = pool.acquire().await.unwrap();
+        assert!(Users::new(&mut conn).apply_auto_topup_soft_decline(user.id, 1).await.unwrap());
+        assert!(
+            !Users::new(&mut conn).apply_auto_topup_soft_decline(user.id, 1).await.unwrap(),
+            "a stale duplicate transition must not apply twice"
+        );
+
+        let row = sqlx::query!(
+            r#"
+            SELECT auto_topup_amount, auto_topup_threshold,
+                   auto_topup_monthly_limit, auto_topup_soft_failure_count,
+                   auto_topup_retry_after
+            FROM users
+            WHERE id = $1
+            "#,
+            user.id
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(row.auto_topup_amount, None);
+        assert_eq!(row.auto_topup_threshold, None);
+        assert_eq!(row.auto_topup_monthly_limit, None);
+        assert_eq!(row.auto_topup_soft_failure_count, 0);
+        assert_eq!(row.auto_topup_retry_after, None);
+    }
+
+    #[sqlx::test]
+    async fn test_auto_topup_decline_hard_failure_disables_immediately(pool: PgPool) {
+        let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+        sqlx::query!(
+            r#"
+            UPDATE users
+            SET auto_topup_amount = 25.0,
+                auto_topup_threshold = 10.0,
+                auto_topup_monthly_limit = 100.0,
+                payment_provider_id = 'cus_hard_decline'
+            WHERE id = $1
+            "#,
+            user.id
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mut conn = pool.acquire().await.unwrap();
+        assert!(Users::new(&mut conn).disable_auto_topup_after_hard_decline(user.id).await.unwrap());
+        assert!(!Users::new(&mut conn).disable_auto_topup_after_hard_decline(user.id).await.unwrap());
+
+        let row = sqlx::query!(
+            "SELECT auto_topup_amount, auto_topup_threshold, auto_topup_monthly_limit FROM users WHERE id = $1",
+            user.id
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.auto_topup_amount, None);
+        assert_eq!(row.auto_topup_threshold, None);
+        assert_eq!(row.auto_topup_monthly_limit, None);
+    }
+
+    #[sqlx::test]
+    async fn test_auto_topup_decline_reset_clears_failure_state(pool: PgPool) {
+        let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+        sqlx::query!(
+            r#"
+            UPDATE users
+            SET auto_topup_soft_failure_count = 1,
+                auto_topup_retry_after = NOW() + INTERVAL '24 hours'
+            WHERE id = $1
+            "#,
+            user.id
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mut conn = pool.acquire().await.unwrap();
+        Users::new(&mut conn).reset_auto_topup_failure_state(user.id).await.unwrap();
+
+        let row = sqlx::query!(
+            "SELECT auto_topup_soft_failure_count, auto_topup_retry_after FROM users WHERE id = $1",
+            user.id
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.auto_topup_soft_failure_count, 0);
+        assert_eq!(row.auto_topup_retry_after, None);
     }
 
     #[sqlx::test]

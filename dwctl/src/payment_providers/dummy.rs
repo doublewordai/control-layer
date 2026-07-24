@@ -15,6 +15,9 @@ use crate::{
     payment_providers::{CheckoutPayer, PaymentError, PaymentProvider, PaymentSession, Result, WebhookEvent},
 };
 
+#[cfg(test)]
+use crate::payment_providers::AutoTopupDeclineKind;
+
 /// Dummy payment provider that adds credits automatically
 pub struct DummyProvider {
     config: crate::config::DummyConfig,
@@ -215,6 +218,20 @@ impl PaymentProvider for DummyProvider {
         _payment_method_id: &str,
         _idempotency_key: &str,
     ) -> Result<String> {
+        #[cfg(test)]
+        match _customer_id {
+            "cus_test_soft_decline" => {
+                return Err(PaymentError::AutoTopupDeclined(AutoTopupDeclineKind::Soft));
+            }
+            "cus_test_hard_decline" => {
+                return Err(PaymentError::AutoTopupDeclined(AutoTopupDeclineKind::Hard));
+            }
+            "cus_test_provider_error" => {
+                return Err(PaymentError::ProviderApi("simulated provider failure".to_string()));
+            }
+            _ => {}
+        }
+
         // Dummy provider always succeeds - return a fake payment intent ID
         Ok(format!("dummy_pi_{}", uuid::Uuid::new_v4()))
     }
