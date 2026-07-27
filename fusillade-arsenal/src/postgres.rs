@@ -648,6 +648,21 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
                     }
                 }
 
+                // Always present regardless of the configured forwarding list:
+                // the submission-epoch metrics (fusillade_request_time_to_first_
+                // token_seconds / pickup_delay) and window labels read these
+                // from the metadata map, and an SLO metric must not be silently
+                // disabled by trimming header-forwarding config. Operator-
+                // configured entries above are left untouched.
+                batch_metadata
+                    .entry("created_at".to_string())
+                    .or_insert_with(|| row.batch_created_at.clone());
+                if let Some(completion_window) = row.batch_completion_window.clone() {
+                    batch_metadata
+                        .entry("completion_window".to_string())
+                        .or_insert(completion_window);
+                }
+
                 Request {
                     state: Claimed {
                         daemon_id,
@@ -2567,7 +2582,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                       COALESCE(b.id::TEXT, '') as "batch_id_str!",
                       COALESCE(b.file_id::TEXT, '') as "batch_file_id!",
                       COALESCE(b.endpoint, t.endpoint) as "batch_endpoint!",
-                      b.completion_window as "batch_completion_window?",
+                      'background'::TEXT as "batch_completion_window?",
                       b.metadata::TEXT as "batch_metadata",
                       b.output_file_id::TEXT as "batch_output_file_id",
                       b.error_file_id::TEXT as "batch_error_file_id",
@@ -9746,6 +9761,14 @@ mod tests {
                 .iter()
                 .all(|request| request.state.batch_expires_at.is_none())
         );
+        assert!(claimed.iter().all(|request| {
+            request
+                .data
+                .batch_metadata
+                .get("completion_window")
+                .map(String::as_str)
+                == Some("background")
+        }));
         assert!(claimed.iter().any(|request| request.data.id == batchless));
         assert!(
             claimed

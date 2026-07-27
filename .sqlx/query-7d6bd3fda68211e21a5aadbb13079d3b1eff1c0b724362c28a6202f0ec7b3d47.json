@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                SELECT id, secret FROM api_keys\n                WHERE parent_api_key_id = $1 AND purpose = 'batch'\n                  AND hidden = true AND is_deleted = false\n                ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "secret",
+        "type_info": "Varchar"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "7d6bd3fda68211e21a5aadbb13079d3b1eff1c0b724362c28a6202f0ec7b3d47"
+}

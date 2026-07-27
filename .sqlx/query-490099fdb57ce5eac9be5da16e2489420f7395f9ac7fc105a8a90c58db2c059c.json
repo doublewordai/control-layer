@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE api_keys SET spend_limit = $2, spend_limit_interval = $3\n            WHERE id = $1 AND is_deleted = false\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Numeric",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "490099fdb57ce5eac9be5da16e2489420f7395f9ac7fc105a8a90c58db2c059c"
+}

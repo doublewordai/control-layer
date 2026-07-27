@@ -268,6 +268,7 @@ mod tests {
             avatar_url: None,
             organizations: vec![],
             active_organization: None,
+            api_key_id: None,
         }
     }
 

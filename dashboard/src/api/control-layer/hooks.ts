@@ -16,6 +16,7 @@ import type {
   ModelUpdateRequest,
   CachePricingUpdate,
   ApiKeyCreateRequest,
+  ApiKeyUpdateRequest,
   ApiKeysQuery,
   EndpointCreateRequest,
   EndpointUpdateRequest,
@@ -710,6 +711,29 @@ export function useCreateApiKey() {
     }) => dwctlApi.users.apiKeys.create(data, userId),
     onSuccess: () => {
       // Invalidate all API key queries to ensure table updates
+      queryClient.invalidateQueries({
+        queryKey: queryKeys.apiKeys.all,
+      });
+    },
+  });
+}
+
+export function useUpdateApiKey() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: ({
+      keyId,
+      data,
+      userId = "current",
+    }: {
+      keyId: string;
+      data: ApiKeyUpdateRequest;
+      userId?: string;
+    }) => dwctlApi.users.apiKeys.update(keyId, data, userId),
+    onSuccess: () => {
+      // Invalidate all API key queries so lists and detail views refresh
+      // (spend/cap fields change server-side state like reset windows).
       queryClient.invalidateQueries({
         queryKey: queryKeys.apiKeys.all,
       });

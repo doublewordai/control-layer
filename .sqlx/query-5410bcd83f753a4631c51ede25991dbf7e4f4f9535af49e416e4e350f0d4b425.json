@@ -1,55 +1,60 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT ak.user_id, ak.created_by, ak.purpose,\n               u.username, u.email, u.is_admin, u.display_name, u.avatar_url,\n               u.payment_provider_id, u.last_login\n        FROM api_keys ak\n        INNER JOIN users u ON ak.created_by = u.id\n        WHERE ak.secret = $1 AND ak.is_deleted = false\n        ",
+  "query": "\n        SELECT ak.id AS api_key_id, ak.user_id, ak.created_by, ak.purpose,\n               u.username, u.email, u.is_admin, u.display_name, u.avatar_url,\n               u.payment_provider_id, u.last_login\n        FROM api_keys ak\n        INNER JOIN users u ON ak.created_by = u.id\n        WHERE ak.secret = $1 AND ak.is_deleted = false\n        ",
   "describe": {
     "columns": [
       {
         "ordinal": 0,
-        "name": "user_id",
+        "name": "api_key_id",
         "type_info": "Uuid"
       },
       {
         "ordinal": 1,
-        "name": "created_by",
+        "name": "user_id",
         "type_info": "Uuid"
       },
       {
         "ordinal": 2,
+        "name": "created_by",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 3,
         "name": "purpose",
         "type_info": "Varchar"
       },
       {
-        "ordinal": 3,
+        "ordinal": 4,
         "name": "username",
         "type_info": "Varchar"
       },
       {
-        "ordinal": 4,
+        "ordinal": 5,
         "name": "email",
         "type_info": "Varchar"
       },
       {
-        "ordinal": 5,
+        "ordinal": 6,
         "name": "is_admin",
         "type_info": "Bool"
       },
       {
-        "ordinal": 6,
+        "ordinal": 7,
         "name": "display_name",
         "type_info": "Varchar"
       },
       {
-        "ordinal": 7,
+        "ordinal": 8,
         "name": "avatar_url",
         "type_info": "Varchar"
       },
       {
-        "ordinal": 8,
+        "ordinal": 9,
         "name": "payment_provider_id",
         "type_info": "Varchar"
       },
       {
-        "ordinal": 9,
+        "ordinal": 10,
         "name": "last_login",
         "type_info": "Timestamptz"
       }
@@ -66,11 +71,12 @@
       false,
       false,
       false,
+      false,
       true,
       true,
       true,
       true
     ]
   },
-  "hash": "f9ad5a23f3eee5be1288897259a63254e6506b5cc6ab64879288dd1ca121af1d"
+  "hash": "5410bcd83f753a4631c51ede25991dbf7e4f4f9535af49e416e4e350f0d4b425"
 }

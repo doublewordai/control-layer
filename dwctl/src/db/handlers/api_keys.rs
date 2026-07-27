@@ -6,9 +6,10 @@ use crate::crypto::generate_api_key;
 use crate::db::errors::DbError;
 use crate::db::errors::Result;
 use crate::db::handlers::repository::Repository;
-use crate::db::models::api_keys::{ApiKeyCreateDBRequest, ApiKeyDBResponse, ApiKeyPurpose, ApiKeyUpdateDBRequest};
+use crate::db::models::api_keys::{ApiKeyCreateDBRequest, ApiKeyDBResponse, ApiKeyPurpose, ApiKeySpendState, ApiKeyUpdateDBRequest};
 use crate::types::{ApiKeyId, DeploymentId, UserId, abbrev_uuid};
 use chrono::{DateTime, Utc};
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 use sqlx::PgConnection;
@@ -54,6 +55,9 @@ struct ApiKey {
     pub burst_size: Option<i32>,
     pub hidden: bool,
     pub is_deleted: bool,
+    pub spend_limit: Option<Decimal>,
+    pub spend_limit_interval: Option<String>,
+    pub parent_api_key_id: Option<ApiKeyId>,
 }
 
 impl From<(Vec<DeploymentId>, ApiKey)> for ApiKeyDBResponse {
@@ -88,6 +92,9 @@ impl From<(Vec<DeploymentId>, ApiKey)> for ApiKeyDBResponse {
             model_access,
             requests_per_second: api_key.requests_per_second,
             burst_size: api_key.burst_size,
+            spend_limit: api_key.spend_limit,
+            spend_limit_interval: api_key.spend_limit_interval,
+            parent_api_key_id: api_key.parent_api_key_id,
         }
     }
 }
@@ -120,8 +127,8 @@ impl<'c> Repository for ApiKeys<'c> {
         let api_key = sqlx::query_as!(
             ApiKey,
             r#"
-            INSERT INTO api_keys (name, description, secret, purpose, user_id, created_by, requests_per_second, burst_size, hidden)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, false)
+            INSERT INTO api_keys (name, description, secret, purpose, user_id, created_by, requests_per_second, burst_size, hidden, spend_limit, spend_limit_interval)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, false, $9, $10)
             RETURNING *
             "#,
             request.name,
@@ -131,7 +138,9 @@ impl<'c> Repository for ApiKeys<'c> {
             request.user_id,
             request.created_by,
             request.requests_per_second,
-            request.burst_size
+            request.burst_size,
+            request.spend_limit,
+            request.spend_limit_interval
         )
         .fetch_one(&mut *self.db)
         .await?;
@@ -143,7 +152,7 @@ impl<'c> Repository for ApiKeys<'c> {
     async fn get_by_id(&mut self, id: Self::Id) -> Result<Option<Self::Response>> {
         let api_key = sqlx::query_as!(
             ApiKey,
-            "SELECT id, name, description, secret, purpose, user_id, created_by, created_at, last_used, requests_per_second, burst_size, hidden, is_deleted FROM api_keys WHERE id = $1 AND is_deleted = false",
+            "SELECT id, name, description, secret, purpose, user_id, created_by, created_at, last_used, requests_per_second, burst_size, hidden, is_deleted, spend_limit, spend_limit_interval, parent_api_key_id FROM api_keys WHERE id = $1 AND is_deleted = false",
             id
         )
             .fetch_optional(&mut *self.db)
@@ -159,7 +168,7 @@ impl<'c> Repository for ApiKeys<'c> {
     async fn get_bulk(&mut self, ids: Vec<Self::Id>) -> Result<HashMap<Self::Id, Self::Response>> {
         let api_keys = sqlx::query_as!(
             ApiKey,
-            "SELECT id, name, description, secret, purpose, user_id, created_by, created_at, last_used, requests_per_second, burst_size, hidden, is_deleted FROM api_keys WHERE id = ANY($1) AND is_deleted = false",
+            "SELECT id, name, description, secret, purpose, user_id, created_by, created_at, last_used, requests_per_second, burst_size, hidden, is_deleted, spend_limit, spend_limit_interval, parent_api_key_id FROM api_keys WHERE id = ANY($1) AND is_deleted = false",
             &ids
         )
             .fetch_all(&mut *self.db)
@@ -177,7 +186,7 @@ impl<'c> Repository for ApiKeys<'c> {
     async fn list(&mut self, filter: &Self::Filter) -> Result<Vec<Self::Response>> {
         let api_keys = sqlx::query_as!(
             ApiKey,
-            r#"SELECT id, name, description, secret, purpose, user_id, created_by, created_at, last_used, requests_per_second, burst_size, hidden, is_deleted
+            r#"SELECT id, name, description, secret, purpose, user_id, created_by, created_at, last_used, requests_per_second, burst_size, hidden, is_deleted, spend_limit, spend_limit_interval, parent_api_key_id
             FROM api_keys
             WHERE hidden = false AND is_deleted = false
               AND ($1::uuid IS NULL OR user_id = $1)
@@ -203,11 +212,27 @@ impl<'c> Repository for ApiKeys<'c> {
 
     #[instrument(skip(self), fields(api_key_id = %abbrev_uuid(&id)), err)]
     async fn delete(&mut self, id: Self::Id) -> Result<bool> {
-        let result = sqlx::query!("UPDATE api_keys SET is_deleted = true WHERE id = $1 AND is_deleted = false", id)
-            .execute(&mut *self.db)
-            .await?;
+        // Soft-deleting a visible key also soft-deletes its cap-scope children
+        // (hidden batch keys with parent_api_key_id = id) in the same
+        // statement — otherwise a child would stay in onwards' key set and
+        // keep authorizing batch/flex work after the parent was revoked. The
+        // returned bool still reflects only whether the requested key itself
+        // was deleted.
+        let deleted = sqlx::query_scalar!(
+            r#"
+            WITH deleted AS (
+                UPDATE api_keys SET is_deleted = true
+                WHERE (id = $1 OR parent_api_key_id = $1) AND is_deleted = false
+                RETURNING id
+            )
+            SELECT EXISTS(SELECT 1 FROM deleted WHERE id = $1) AS "deleted!"
+            "#,
+            id
+        )
+        .fetch_one(&mut *self.db)
+        .await?;
 
-        Ok(result.rows_affected() > 0)
+        Ok(deleted)
     }
 
     #[instrument(skip(self, request), fields(api_key_id = %abbrev_uuid(&id)), err)]
@@ -339,7 +364,7 @@ impl<'c> ApiKeys<'c> {
             WITH ins AS (
                 INSERT INTO api_keys (name, description, secret, purpose, user_id, created_by, hidden)
                 VALUES ($1, $2, $3, $4, $5, $6, true)
-                ON CONFLICT (user_id, created_by, purpose) WHERE hidden = true AND is_deleted = false
+                ON CONFLICT (user_id, created_by, purpose) WHERE hidden = true AND is_deleted = false AND parent_api_key_id IS NULL
                 DO NOTHING
                 RETURNING secret
             )
@@ -347,7 +372,7 @@ impl<'c> ApiKeys<'c> {
             UNION ALL
             SELECT secret FROM api_keys
             WHERE user_id = $5 AND created_by = $6 AND purpose = $4
-              AND hidden = true AND is_deleted = false
+              AND hidden = true AND is_deleted = false AND parent_api_key_id IS NULL
             LIMIT 1
             "#,
             name,
@@ -401,7 +426,7 @@ impl<'c> ApiKeys<'c> {
             WITH ins AS (
                 INSERT INTO api_keys (name, description, secret, purpose, user_id, created_by, hidden)
                 VALUES ($1, $2, $3, $4, $5, $6, true)
-                ON CONFLICT (user_id, created_by, purpose) WHERE hidden = true AND is_deleted = false
+                ON CONFLICT (user_id, created_by, purpose) WHERE hidden = true AND is_deleted = false AND parent_api_key_id IS NULL
                 DO NOTHING
                 RETURNING id, secret
             )
@@ -409,7 +434,7 @@ impl<'c> ApiKeys<'c> {
             UNION ALL
             SELECT id, secret FROM api_keys
             WHERE user_id = $5 AND created_by = $6 AND purpose = $4
-              AND hidden = true AND is_deleted = false
+              AND hidden = true AND is_deleted = false AND parent_api_key_id IS NULL
             LIMIT 1
             "#,
             name,
@@ -428,10 +453,254 @@ impl<'c> ApiKeys<'c> {
         Ok((secret, id))
     }
 
-    /// Find the hidden API key ID for a given user, purpose, and creator.
-    /// Returns None if no matching key exists (member hasn't created any batches/files yet).
+    /// Get or create the hidden batch-purpose CHILD key for a capped visible key.
+    ///
+    /// The child copies the parent's `(user_id, created_by)` verbatim, so an
+    /// org-context parent yields an org-billed, member-attributed child and a
+    /// personal parent yields a personal one — scoping is derived from the
+    /// parent row, never from session context. One child per (parent, purpose)
+    /// (unique index `idx_api_keys_child_purpose`); the ON CONFLICT inference
+    /// spec below must stay in lockstep with that index's predicate.
+    ///
+    /// Called eagerly at cap-set time so the child is in onwards' key set
+    /// before the first batch/flex request fires (same race-avoidance as
+    /// pre-creating shared hidden keys at user creation).
+    #[instrument(skip(self), fields(parent_api_key_id = %abbrev_uuid(&parent_id)), err)]
+    pub async fn get_or_create_child_hidden_key(&mut self, parent_id: ApiKeyId) -> Result<(String, ApiKeyId)> {
+        let secret = generate_api_key();
+
+        // INSERT ... ON CONFLICT DO NOTHING + SELECT, like the shared-key
+        // upserts above, so the common "child already exists" path fires no
+        // UPDATE notify. Parent fields are read in the INSERT's SELECT so the
+        // child cannot be created with mismatched scoping; a deleted or
+        // missing parent inserts nothing and falls through to NotFound.
+        let row = sqlx::query!(
+            r#"
+            WITH ins AS (
+                INSERT INTO api_keys (name, description, secret, purpose, user_id, created_by, hidden, parent_api_key_id)
+                SELECT
+                    'Internal batch key (cap scope ' || p.id::text || ')',
+                    'Automatically managed internal API key executing batch/flex traffic for a capped API key. Not visible to users.',
+                    $1,
+                    'batch',
+                    p.user_id,
+                    p.created_by,
+                    true,
+                    p.id
+                FROM api_keys p
+                -- Parent must be a root visible key: no children of hidden
+                -- keys and no grandchildren (a child's parent is never itself
+                -- a valid parent).
+                WHERE p.id = $2 AND p.is_deleted = false AND p.hidden = false AND p.parent_api_key_id IS NULL
+                ON CONFLICT (parent_api_key_id, purpose) WHERE hidden = true AND is_deleted = false AND parent_api_key_id IS NOT NULL
+                DO NOTHING
+                RETURNING id, secret
+            )
+            SELECT id, secret FROM ins
+            UNION ALL
+            SELECT id, secret FROM api_keys
+            WHERE parent_api_key_id = $2 AND purpose = 'batch'
+              AND hidden = true AND is_deleted = false
+            LIMIT 1
+            "#,
+            secret,
+            parent_id
+        )
+        .fetch_optional(&mut *self.db)
+        .await?
+        .ok_or(DbError::NotFound)?;
+
+        let id = row.id.ok_or(DbError::NotFound)?;
+        let secret = row.secret.ok_or(DbError::NotFound)?;
+
+        Ok((secret, id))
+    }
+
+    /// Resolve the hidden batch-purpose execution key for batch/file/flex work.
+    ///
+    /// Previously every external key collapsed to the single shared hidden
+    /// batch key per (user, member). Now: if the authenticating visible key
+    /// has a child (`parent_api_key_id = K.id`), use that child — still a
+    /// hidden batch key, but connected to K's cap scope so its spend counts
+    /// against K's spending cap. A key with no child is by definition uncapped
+    /// (children are minted at cap-set time and outlive cap removal) and
+    /// stamps the shared hidden batch key unchanged. Session-authenticated
+    /// callers (`authenticating_key_id = None`) always get the shared key —
+    /// dashboard flows are deliberately uncapped.
+    #[instrument(skip(self), fields(user_id = %abbrev_uuid(&target_user_id)), err)]
+    pub async fn resolve_batch_execution_key(
+        &mut self,
+        target_user_id: UserId,
+        created_by: UserId,
+        authenticating_key_id: Option<ApiKeyId>,
+    ) -> Result<(String, ApiKeyId)> {
+        if let Some(parent_id) = authenticating_key_id {
+            let child = sqlx::query!(
+                r#"
+                SELECT id, secret FROM api_keys
+                WHERE parent_api_key_id = $1 AND purpose = 'batch'
+                  AND hidden = true AND is_deleted = false
+                "#,
+                parent_id
+            )
+            .fetch_optional(&mut *self.db)
+            .await?;
+
+            if let Some(child) = child {
+                return Ok((child.secret, child.id));
+            }
+        }
+
+        self.get_or_create_hidden_key_with_id(target_user_id, ApiKeyPurpose::Batch, created_by)
+            .await
+    }
+
+    /// Set, change, or clear a key's spending cap. Writes BOTH cap columns
+    /// unconditionally — the caller resolves absent-vs-null tri-state against
+    /// current values first — so removal actually works (unlike the CASE
+    /// pattern in the generic `update`, which cannot write NULL). The
+    /// api_keys notify trigger (migration 122) covers these columns, so the
+    /// onwards sync picks the change up automatically.
+    ///
+    /// This method does NOT reset the spend window or mint the cap-scope
+    /// child; those are the cap-set path's responsibility (see
+    /// `reset_spend_window` / `get_or_create_child_hidden_key` and the
+    /// contract on `EnrichedRecord::cap_scope_root` in the batcher).
+    #[instrument(skip(self), fields(api_key_id = %abbrev_uuid(&id)), err)]
+    pub async fn update_spend_cap(
+        &mut self,
+        id: ApiKeyId,
+        spend_limit: Option<Decimal>,
+        spend_limit_interval: Option<String>,
+    ) -> Result<()> {
+        let result = sqlx::query!(
+            r#"
+            UPDATE api_keys SET spend_limit = $2, spend_limit_interval = $3
+            WHERE id = $1 AND is_deleted = false
+            "#,
+            id,
+            spend_limit,
+            spend_limit_interval
+        )
+        .execute(&mut *self.db)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            return Err(DbError::NotFound);
+        }
+        Ok(())
+    }
+
+    /// Reset a cap scope's spend window: zero `window_spend` and start a fresh
+    /// window now (lifetime `total_spend` is preserved). Upserts so the
+    /// checkpoint row exists from cap-set time onward — REQUIRED whenever a
+    /// cap transitions from unset to set (else the scope inherits spend
+    /// accumulated before/between caps and can exhaust immediately), on
+    /// interval changes, and for the explicit owner "re-arm" action.
+    #[instrument(skip(self), fields(api_key_id = %abbrev_uuid(&scope_root_id)), err)]
+    pub async fn reset_spend_window(&mut self, scope_root_id: ApiKeyId) -> Result<()> {
+        sqlx::query!(
+            r#"
+            INSERT INTO api_key_spend_checkpoints (api_key_id, total_spend, window_spend, window_started_at)
+            VALUES ($1, 0, 0, NOW())
+            ON CONFLICT (api_key_id) DO UPDATE SET
+                window_spend = 0,
+                window_started_at = NOW(),
+                updated_at = NOW()
+            "#,
+            scope_root_id
+        )
+        .execute(&mut *self.db)
+        .await?;
+        Ok(())
+    }
+
+    /// Bulk spend display state for visible keys (each is its own cap-scope
+    /// root; children never appear in listings). `spend` is the CURRENT
+    /// window's counted spend — 0 when the calendar window has rolled but no
+    /// request has folded yet, NULL when the key has never folded (uncapped
+    /// keys are not folded at all).
+    #[instrument(skip(self, ids), fields(count = ids.len()), err)]
+    pub async fn get_spend_states(&mut self, ids: &[ApiKeyId]) -> Result<HashMap<ApiKeyId, ApiKeySpendState>> {
+        if ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let rows = sqlx::query!(
+            r#"
+            SELECT ak.id,
+                   -- Uncapped keys report NULL even when a checkpoint row
+                   -- lingers from a removed cap: the fold stops when the cap
+                   -- is removed, so any leftover numbers are frozen and would
+                   -- mislead. (The row itself is kept for instant re-capping.)
+                   CASE WHEN ak.spend_limit IS NULL THEN NULL
+                        WHEN ck.api_key_id IS NULL THEN NULL
+                        WHEN api_key_cap_window_current(ck.window_started_at, ak.spend_limit_interval)
+                        THEN ck.window_spend ELSE 0 END AS spend,
+                   CASE WHEN ak.spend_limit IS NULL THEN NULL ELSE ck.total_spend END AS "total_spend?",
+                   CASE WHEN ak.spend_limit IS NOT NULL
+                        THEN api_key_cap_window_resets_at(ak.spend_limit_interval) END AS resets_at
+            FROM api_keys ak
+            LEFT JOIN api_key_spend_checkpoints ck ON ck.api_key_id = ak.id
+            WHERE ak.id = ANY($1)
+            "#,
+            ids
+        )
+        .fetch_all(&mut *self.db)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                (
+                    r.id,
+                    ApiKeySpendState {
+                        spend: r.spend,
+                        total_spend: r.total_spend,
+                        resets_at: r.resets_at,
+                    },
+                )
+            })
+            .collect())
+    }
+
+    /// Whether the cap scope this key belongs to (root or child alike) is
+    /// currently exhausted — the same predicate the onwards sync uses to yank
+    /// keys, minus the per-model free-tariff arm. Used by admission checks
+    /// (batch creation pre-flight) to reject work that would only fail
+    /// request-by-request at the proxy.
+    #[instrument(skip(self), fields(api_key_id = %abbrev_uuid(&api_key_id)), err)]
+    pub async fn is_scope_exhausted(&mut self, api_key_id: ApiKeyId) -> Result<bool> {
+        let exhausted = sqlx::query_scalar!(
+            r#"
+            SELECT EXISTS(
+                SELECT 1
+                FROM api_keys ak
+                JOIN api_keys root ON root.id = COALESCE(ak.parent_api_key_id, ak.id)
+                LEFT JOIN api_key_spend_checkpoints ck ON ck.api_key_id = root.id
+                WHERE ak.id = $1
+                  AND root.spend_limit IS NOT NULL
+                  AND api_key_cap_window_current(ck.window_started_at, root.spend_limit_interval)
+                  AND ck.window_spend >= root.spend_limit
+            ) AS "exhausted!"
+            "#,
+            api_key_id
+        )
+        .fetch_one(&mut *self.db)
+        .await?;
+
+        Ok(exhausted)
+    }
+
+    /// Find ALL hidden API key IDs for a given user, purpose, and creator.
+    /// Returns empty if no matching key exists (member hasn't created any batches/files yet).
+    ///
+    /// Deliberately includes cap-scope child keys (`parent_api_key_id` set):
+    /// callers use this to translate a member into the hidden keys their
+    /// batches/files are attributed to, and a member's capped-key work is
+    /// stamped with the child's id, not the shared key's.
     #[instrument(skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
-    pub async fn find_hidden_key_id(&mut self, user_id: UserId, purpose: ApiKeyPurpose, created_by: UserId) -> Result<Option<ApiKeyId>> {
+    pub async fn find_hidden_key_ids(&mut self, user_id: UserId, purpose: ApiKeyPurpose, created_by: UserId) -> Result<Vec<ApiKeyId>> {
         let purpose_str = match purpose {
             ApiKeyPurpose::Platform => "platform",
             ApiKeyPurpose::Realtime => "realtime",
@@ -439,23 +708,22 @@ impl<'c> ApiKeys<'c> {
             ApiKeyPurpose::Playground => "playground",
         };
 
-        let key_id = sqlx::query_scalar!(
+        let key_ids = sqlx::query_scalar!(
             r#"
             SELECT id
             FROM api_keys
             WHERE user_id = $1 AND purpose = $2 AND hidden = true
             AND created_by = $3
             AND is_deleted = false
-            LIMIT 1
             "#,
             user_id,
             purpose_str,
             created_by
         )
-        .fetch_optional(&mut *self.db)
+        .fetch_all(&mut *self.db)
         .await?;
 
-        Ok(key_id)
+        Ok(key_ids)
     }
 
     /// Find ALL hidden API key IDs created by a given user across all contexts (personal + orgs).
@@ -558,7 +826,10 @@ impl<'c> ApiKeys<'c> {
                 ak.requests_per_second,
                 ak.burst_size,
                 ak.hidden as "hidden!",
-                ak.is_deleted as "is_deleted!"
+                ak.is_deleted as "is_deleted!",
+                ak.spend_limit,
+                ak.spend_limit_interval,
+                ak.parent_api_key_id
             FROM api_keys ak
             WHERE ak.user_id = $2  -- System user has access to all deployments
 
@@ -577,7 +848,10 @@ impl<'c> ApiKeys<'c> {
                 ak.requests_per_second,
                 ak.burst_size,
                 ak.hidden as "hidden!",
-                ak.is_deleted as "is_deleted!"
+                ak.is_deleted as "is_deleted!",
+                ak.spend_limit,
+                ak.spend_limit_interval,
+                ak.parent_api_key_id
             FROM api_keys ak
             INNER JOIN user_groups ug ON ak.user_id = ug.user_id
             INNER JOIN deployment_groups dg ON ug.group_id = dg.group_id
@@ -619,7 +893,10 @@ impl<'c> ApiKeys<'c> {
                 ak.requests_per_second,
                 ak.burst_size,
                 ak.hidden as "hidden!",
-                ak.is_deleted as "is_deleted!"
+                ak.is_deleted as "is_deleted!",
+                ak.spend_limit,
+                ak.spend_limit_interval,
+                ak.parent_api_key_id
             FROM api_keys ak
             INNER JOIN deployment_groups dg ON dg.group_id = '00000000-0000-0000-0000-000000000000'
             INNER JOIN deployed_models dm ON dg.deployment_id = dm.id
@@ -827,6 +1104,8 @@ mod tests {
                     requests_per_second: None,
                     burst_size: None,
                     created_by: userid,
+                    spend_limit: None,
+                    spend_limit_interval: None,
                 };
 
                 api_key = api_repo.create(&api_key_create).await.unwrap();
@@ -836,6 +1115,166 @@ mod tests {
         assert_eq!(api_key.name, "Test API Key");
         assert_eq!(api_key.user_id, userid);
         assert!(api_key.secret.starts_with("sk-"));
+    }
+
+    /// Helper: create a user and return its id.
+    async fn create_user(pool: &PgPool, username: &str) -> crate::types::UserId {
+        let mut conn = pool.acquire().await.unwrap();
+        let mut user_repo = Users::new(&mut conn);
+        user_repo
+            .create(&UserCreateDBRequest::from(UserCreate {
+                username: username.to_string(),
+                email: format!("{username}@example.com"),
+                display_name: None,
+                avatar_url: None,
+                roles: vec![Role::StandardUser],
+            }))
+            .await
+            .unwrap()
+            .id
+    }
+
+    /// Helper: create a visible key owned by `user_id`, created by `created_by`
+    /// (equal for personal keys, org/member for org-context keys).
+    async fn create_visible_key(pool: &PgPool, user_id: crate::types::UserId, created_by: crate::types::UserId) -> ApiKeyDBResponse {
+        let mut conn = pool.acquire().await.unwrap();
+        ApiKeys::new(&mut conn)
+            .create(&ApiKeyCreateDBRequest {
+                user_id,
+                name: format!("key-{}", &uuid::Uuid::new_v4().to_string()[..8]),
+                description: None,
+                purpose: ApiKeyPurpose::Realtime,
+                requests_per_second: None,
+                burst_size: None,
+                created_by,
+                spend_limit: None,
+                spend_limit_interval: None,
+            })
+            .await
+            .unwrap()
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_child_hidden_key_upsert_and_scoping(pool: PgPool) {
+        // Org-context shape: key owned by the org, created by the member.
+        let org = create_user(&pool, "cap-org").await;
+        let member = create_user(&pool, "cap-member").await;
+        let parent = create_visible_key(&pool, org, member).await;
+
+        let mut conn = pool.acquire().await.unwrap();
+        let mut repo = ApiKeys::new(&mut conn);
+
+        let (secret1, child_id) = repo.get_or_create_child_hidden_key(parent.id).await.unwrap();
+        // Idempotent: second call returns the same key, not a new one.
+        let (secret2, child_id2) = repo.get_or_create_child_hidden_key(parent.id).await.unwrap();
+        assert_eq!(child_id, child_id2);
+        assert_eq!(secret1, secret2);
+
+        // The child copies the parent's (user_id, created_by) verbatim and is
+        // a hidden batch-purpose key linked via parent_api_key_id.
+        let child = repo.get_by_id(child_id).await.unwrap().unwrap();
+        assert_eq!(child.purpose, ApiKeyPurpose::Batch);
+        assert_eq!(child.user_id, org);
+        assert_eq!(child.created_by, member);
+        assert_eq!(child.parent_api_key_id, Some(parent.id));
+        assert_eq!(child.spend_limit, None, "cap lives on the root, never the child");
+
+        let hidden: bool = sqlx::query_scalar!(r#"SELECT hidden FROM api_keys WHERE id = $1"#, child_id)
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap();
+        assert!(hidden);
+
+        // The shared member hidden key is a distinct row: the child does not
+        // collide with (and does not replace) the parentless upsert.
+        let mut repo = ApiKeys::new(&mut conn);
+        let (_, shared_id) = repo
+            .get_or_create_hidden_key_with_id(org, ApiKeyPurpose::Batch, member)
+            .await
+            .unwrap();
+        assert_ne!(shared_id, child_id);
+
+        // Member-filter lookups include both (batches may be attributed to either).
+        let ids = repo.find_hidden_key_ids(org, ApiKeyPurpose::Batch, member).await.unwrap();
+        assert!(ids.contains(&child_id) && ids.contains(&shared_id));
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_resolve_batch_execution_key(pool: PgPool) {
+        let user = create_user(&pool, "cap-resolve").await;
+        let key = create_visible_key(&pool, user, user).await;
+
+        let mut conn = pool.acquire().await.unwrap();
+        let mut repo = ApiKeys::new(&mut conn);
+
+        // Session-authenticated (no key id): shared hidden key.
+        let (_, shared_id) = repo.resolve_batch_execution_key(user, user, None).await.unwrap();
+        let (_, shared_again) = repo
+            .get_or_create_hidden_key_with_id(user, ApiKeyPurpose::Batch, user)
+            .await
+            .unwrap();
+        assert_eq!(shared_id, shared_again);
+
+        // Key-authenticated but no child (uncapped): shared hidden key.
+        let (_, resolved) = repo.resolve_batch_execution_key(user, user, Some(key.id)).await.unwrap();
+        assert_eq!(resolved, shared_id);
+
+        // Once a child exists (cap set), the same call resolves to the child.
+        let (child_secret, child_id) = repo.get_or_create_child_hidden_key(key.id).await.unwrap();
+        let (resolved_secret, resolved_id) = repo.resolve_batch_execution_key(user, user, Some(key.id)).await.unwrap();
+        assert_eq!(resolved_id, child_id);
+        assert_eq!(resolved_secret, child_secret);
+
+        // Session flows still get the shared key even when a child exists.
+        let (_, session_id) = repo.resolve_batch_execution_key(user, user, None).await.unwrap();
+        assert_eq!(session_id, shared_id);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_delete_parent_cascades_to_child(pool: PgPool) {
+        let user = create_user(&pool, "cap-delete").await;
+        let key = create_visible_key(&pool, user, user).await;
+
+        let mut conn = pool.acquire().await.unwrap();
+        let mut repo = ApiKeys::new(&mut conn);
+        let (_, child_id) = repo.get_or_create_child_hidden_key(key.id).await.unwrap();
+
+        // Deleting the parent revokes the child in the same statement, so it
+        // drops out of onwards' key set with the parent.
+        assert!(repo.delete(key.id).await.unwrap());
+        assert!(repo.get_by_id(key.id).await.unwrap().is_none());
+        assert!(repo.get_by_id(child_id).await.unwrap().is_none());
+
+        // Second delete is a no-op and reports "not deleted".
+        assert!(!repo.delete(key.id).await.unwrap());
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_child_creation_guard_rejects_non_root_parents(pool: PgPool) {
+        let user = create_user(&pool, "cap-guard").await;
+        let key = create_visible_key(&pool, user, user).await;
+
+        let mut conn = pool.acquire().await.unwrap();
+        let mut repo = ApiKeys::new(&mut conn);
+        let (_, child_id) = repo.get_or_create_child_hidden_key(key.id).await.unwrap();
+        let (_, shared_id) = repo
+            .get_or_create_hidden_key_with_id(user, ApiKeyPurpose::Batch, user)
+            .await
+            .unwrap();
+
+        // No grandchildren (child as parent) and no children of hidden keys.
+        assert!(matches!(
+            repo.get_or_create_child_hidden_key(child_id).await,
+            Err(DbError::NotFound)
+        ));
+        assert!(matches!(
+            repo.get_or_create_child_hidden_key(shared_id).await,
+            Err(DbError::NotFound)
+        ));
     }
 
     #[sqlx::test]
@@ -868,6 +1307,8 @@ mod tests {
                 requests_per_second: None,
                 burst_size: None,
                 created_by: user.id,
+                spend_limit: None,
+                spend_limit_interval: None,
             };
             let key2 = ApiKeyCreateDBRequest {
                 user_id: user.id,
@@ -877,6 +1318,8 @@ mod tests {
                 requests_per_second: None,
                 burst_size: None,
                 created_by: user.id,
+                spend_limit: None,
+                spend_limit_interval: None,
             };
 
             api_repo.create(&key1).await.unwrap();
@@ -933,6 +1376,8 @@ mod tests {
                 requests_per_second: None,
                 burst_size: None,
                 created_by: user.id,
+                spend_limit: None,
+                spend_limit_interval: None,
             };
             api_key = api_repo.create(&api_key_create).await.unwrap();
         }
@@ -977,6 +1422,8 @@ mod tests {
                 requests_per_second: None,
                 burst_size: None,
                 created_by: user.id,
+                spend_limit: None,
+                spend_limit_interval: None,
             };
 
             // Test create via Repository trait
@@ -1102,6 +1549,8 @@ mod tests {
                 requests_per_second: None,
                 burst_size: None,
                 created_by: user.id,
+                spend_limit: None,
+                spend_limit_interval: None,
             };
             api_key = api_key_repo.create(&api_key_create).await.unwrap();
         }
@@ -1233,6 +1682,8 @@ mod tests {
                 requests_per_second: None,
                 burst_size: None,
                 created_by: user.id,
+                spend_limit: None,
+                spend_limit_interval: None,
             };
             api_key = api_key_repo.create(&api_key_create).await.unwrap();
         }
@@ -1378,6 +1829,8 @@ mod tests {
                 requests_per_second: None,
                 burst_size: None,
                 created_by: user.id,
+                spend_limit: None,
+                spend_limit_interval: None,
             };
             api_key = api_key_repo.create(&api_key_create).await.unwrap();
         }
@@ -1549,6 +2002,8 @@ mod tests {
                 requests_per_second: None,
                 burst_size: None,
                 created_by: user1.id,
+                spend_limit: None,
+                spend_limit_interval: None,
             };
             api_key1 = api_key_repo.create(&api_key1_create).await.unwrap();
 
@@ -1560,6 +2015,8 @@ mod tests {
                 requests_per_second: None,
                 burst_size: None,
                 created_by: user2.id,
+                spend_limit: None,
+                spend_limit_interval: None,
             };
             api_key2 = api_key_repo.create(&api_key2_create).await.unwrap();
         }
@@ -1735,6 +2192,8 @@ mod tests {
                 requests_per_second: None,
                 burst_size: None,
                 created_by: user.id,
+                spend_limit: None,
+                spend_limit_interval: None,
             };
             api_key = api_key_repo.create(&api_key_create).await.unwrap();
         }
@@ -1878,6 +2337,8 @@ mod tests {
                 requests_per_second: None,
                 burst_size: None,
                 created_by: user.id,
+                spend_limit: None,
+                spend_limit_interval: None,
             };
             api_key = api_key_repo.create(&api_key_create).await.unwrap();
         }
@@ -2092,6 +2553,8 @@ mod tests {
                 requests_per_second: None,
                 burst_size: None,
                 created_by: user.id,
+                spend_limit: None,
+                spend_limit_interval: None,
             };
             api_key = api_key_repo.create(&api_key_create).await.unwrap();
         }
@@ -2177,6 +2640,8 @@ mod tests {
                     requests_per_second: None,
                     burst_size: None,
                     created_by: user.id,
+                    spend_limit: None,
+                    spend_limit_interval: None,
                 };
                 api_repo.create(&key_create).await.unwrap();
             }
@@ -2310,6 +2775,8 @@ mod tests {
                 requests_per_second: None,
                 burst_size: None,
                 created_by: user1.id,
+                spend_limit: None,
+                spend_limit_interval: None,
             };
             let key2 = ApiKeyCreateDBRequest {
                 user_id: user2.id,
@@ -2319,6 +2786,8 @@ mod tests {
                 requests_per_second: None,
                 burst_size: None,
                 created_by: user2.id,
+                spend_limit: None,
+                spend_limit_interval: None,
             };
 
             api_repo.create(&key1).await.unwrap();
@@ -2385,6 +2854,8 @@ mod tests {
             requests_per_second: None,
             burst_size: None,
             created_by: user.id,
+            spend_limit: None,
+            spend_limit_interval: None,
         };
         let key2_create = ApiKeyCreateDBRequest {
             user_id: user.id,
@@ -2394,6 +2865,8 @@ mod tests {
             requests_per_second: None,
             burst_size: None,
             created_by: user.id,
+            spend_limit: None,
+            spend_limit_interval: None,
         };
         let key3_create = ApiKeyCreateDBRequest {
             user_id: user.id,
@@ -2403,6 +2876,8 @@ mod tests {
             requests_per_second: None,
             burst_size: None,
             created_by: user.id,
+            spend_limit: None,
+            spend_limit_interval: None,
         };
 
         let mut api_conn = pool.acquire().await.unwrap();
@@ -2461,6 +2936,8 @@ mod tests {
             requests_per_second: None,
             burst_size: None,
             created_by: user.id,
+            spend_limit: None,
+            spend_limit_interval: None,
         };
 
         let mut api_conn = pool.acquire().await.unwrap();
@@ -2541,6 +3018,8 @@ mod tests {
             requests_per_second: None,
             burst_size: None,
             created_by: user.id,
+            spend_limit: None,
+            spend_limit_interval: None,
         };
         let mut api_conn = pool.acquire().await.unwrap();
         let mut api_repo = ApiKeys::new(&mut api_conn);
@@ -2630,6 +3109,8 @@ mod tests {
             requests_per_second: None,
             burst_size: None,
             created_by: user.id,
+            spend_limit: None,
+            spend_limit_interval: None,
         };
         let key2_create = ApiKeyCreateDBRequest {
             user_id: user.id,
@@ -2639,6 +3120,8 @@ mod tests {
             requests_per_second: None,
             burst_size: None,
             created_by: user.id,
+            spend_limit: None,
+            spend_limit_interval: None,
         };
 
         let mut api_repo = ApiKeys::new(&mut tx);
@@ -2700,6 +3183,8 @@ mod tests {
             requests_per_second: None,
             burst_size: None,
             created_by: user1.id,
+            spend_limit: None,
+            spend_limit_interval: None,
         };
         let key2_create = ApiKeyCreateDBRequest {
             user_id: user2.id,
@@ -2709,6 +3194,8 @@ mod tests {
             requests_per_second: None,
             burst_size: None,
             created_by: user2.id,
+            spend_limit: None,
+            spend_limit_interval: None,
         };
         let mut api_repo = ApiKeys::new(&mut tx);
 
@@ -2954,6 +3441,8 @@ mod tests {
                 burst_size: None,
                 created_by: user_with_credits.id,
                 purpose: ApiKeyPurpose::Realtime,
+                spend_limit: None,
+                spend_limit_interval: None,
             })
             .await
             .unwrap();
@@ -2967,6 +3456,8 @@ mod tests {
                 burst_size: None,
                 created_by: user_without_credits.id,
                 purpose: ApiKeyPurpose::Realtime,
+                spend_limit: None,
+                spend_limit_interval: None,
             })
             .await
             .unwrap();
@@ -3096,6 +3587,8 @@ mod tests {
                     burst_size: None,
                     created_by: platform_manager.id,
                     purpose: ApiKeyPurpose::Realtime,
+                    spend_limit: None,
+                    spend_limit_interval: None,
                 })
                 .await
                 .unwrap();
@@ -3190,6 +3683,8 @@ mod tests {
                     burst_size: None,
                     created_by: user_no_transactions.id,
                     purpose: ApiKeyPurpose::Realtime,
+                    spend_limit: None,
+                    spend_limit_interval: None,
                 })
                 .await
                 .unwrap();
@@ -3253,6 +3748,8 @@ mod tests {
                     burst_size: None,
                     created_by: user_negative.id,
                     purpose: ApiKeyPurpose::Realtime,
+                    spend_limit: None,
+                    spend_limit_interval: None,
                 })
                 .await
                 .unwrap();
@@ -3345,6 +3842,8 @@ mod tests {
                     burst_size: None,
                     created_by: user.id,
                     purpose: ApiKeyPurpose::Realtime,
+                    spend_limit: None,
+                    spend_limit_interval: None,
                 })
                 .await
                 .unwrap();
@@ -3487,6 +3986,8 @@ mod tests {
                 burst_size: None,
                 created_by: user_no_credits.id,
                 purpose: ApiKeyPurpose::Realtime,
+                spend_limit: None,
+                spend_limit_interval: None,
             })
             .await
             .unwrap();
@@ -3624,6 +4125,8 @@ mod tests {
                 burst_size: None,
                 created_by: user_no_credits.id,
                 purpose: ApiKeyPurpose::Realtime,
+                spend_limit: None,
+                spend_limit_interval: None,
             })
             .await
             .unwrap();
@@ -3761,6 +4264,8 @@ mod tests {
                 burst_size: None,
                 created_by: user_no_credits.id,
                 purpose: ApiKeyPurpose::Realtime,
+                spend_limit: None,
+                spend_limit_interval: None,
             })
             .await
             .unwrap();
@@ -3822,6 +4327,8 @@ mod tests {
                 requests_per_second: None,
                 burst_size: None,
                 created_by: user.id,
+                spend_limit: None,
+                spend_limit_interval: None,
             };
 
             api_key = api_repo.create(&api_key_create).await.unwrap();
@@ -3883,6 +4390,8 @@ mod tests {
                     requests_per_second: None,
                     burst_size: None,
                     created_by: user.id,
+                    spend_limit: None,
+                    spend_limit_interval: None,
                 })
                 .await
                 .unwrap();
@@ -3938,6 +4447,8 @@ mod tests {
                     requests_per_second: None,
                     burst_size: None,
                     created_by: user.id,
+                    spend_limit: None,
+                    spend_limit_interval: None,
                 })
                 .await
                 .unwrap();
@@ -3951,6 +4462,8 @@ mod tests {
                     requests_per_second: None,
                     burst_size: None,
                     created_by: user.id,
+                    spend_limit: None,
+                    spend_limit_interval: None,
                 })
                 .await
                 .unwrap();
@@ -4018,6 +4531,8 @@ mod tests {
                 requests_per_second: None,
                 burst_size: None,
                 created_by: member.id,
+                spend_limit: None,
+                spend_limit_interval: None,
             })
             .await
             .unwrap();
@@ -4245,6 +4760,8 @@ mod tests {
                     requests_per_second: None,
                     burst_size: None,
                     created_by: member_a.id,
+                    spend_limit: None,
+                    spend_limit_interval: None,
                 })
                 .await
                 .unwrap();
@@ -4257,6 +4774,8 @@ mod tests {
                     requests_per_second: None,
                     burst_size: None,
                     created_by: member_a.id,
+                    spend_limit: None,
+                    spend_limit_interval: None,
                 })
                 .await
                 .unwrap();
@@ -4270,6 +4789,8 @@ mod tests {
                     requests_per_second: None,
                     burst_size: None,
                     created_by: member_b.id,
+                    spend_limit: None,
+                    spend_limit_interval: None,
                 })
                 .await
                 .unwrap();
@@ -4370,6 +4891,8 @@ mod tests {
                         requests_per_second: None,
                         burst_size: None,
                         created_by: member_a.id,
+                        spend_limit: None,
+                        spend_limit_interval: None,
                     })
                     .await
                     .unwrap();
@@ -4383,6 +4906,8 @@ mod tests {
                     requests_per_second: None,
                     burst_size: None,
                     created_by: member_b.id,
+                    spend_limit: None,
+                    spend_limit_interval: None,
                 })
                 .await
                 .unwrap();

@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            INSERT INTO api_keys (name, description, secret, purpose, user_id, created_by, requests_per_second, burst_size, hidden)\n            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, false)\n            RETURNING *\n            ",
+  "query": "SELECT id, name, description, secret, purpose, user_id, created_by, created_at, last_used, requests_per_second, burst_size, hidden, is_deleted, spend_limit, spend_limit_interval, parent_api_key_id FROM api_keys WHERE id = ANY($1) AND is_deleted = false",
   "describe": {
     "columns": [
       {
@@ -25,60 +25,68 @@
       },
       {
         "ordinal": 4,
-        "name": "user_id",
-        "type_info": "Uuid"
-      },
-      {
-        "ordinal": 5,
-        "name": "created_at",
-        "type_info": "Timestamptz"
-      },
-      {
-        "ordinal": 6,
-        "name": "last_used",
-        "type_info": "Timestamptz"
-      },
-      {
-        "ordinal": 7,
-        "name": "requests_per_second",
-        "type_info": "Float4"
-      },
-      {
-        "ordinal": 8,
-        "name": "burst_size",
-        "type_info": "Int4"
-      },
-      {
-        "ordinal": 9,
         "name": "purpose",
         "type_info": "Varchar"
       },
       {
+        "ordinal": 5,
+        "name": "user_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 6,
+        "name": "created_by",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 7,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 8,
+        "name": "last_used",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 9,
+        "name": "requests_per_second",
+        "type_info": "Float4"
+      },
+      {
         "ordinal": 10,
+        "name": "burst_size",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 11,
         "name": "hidden",
         "type_info": "Bool"
       },
       {
-        "ordinal": 11,
+        "ordinal": 12,
         "name": "is_deleted",
         "type_info": "Bool"
       },
       {
-        "ordinal": 12,
-        "name": "created_by",
+        "ordinal": 13,
+        "name": "spend_limit",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 14,
+        "name": "spend_limit_interval",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 15,
+        "name": "parent_api_key_id",
         "type_info": "Uuid"
       }
     ],
     "parameters": {
       "Left": [
-        "Varchar",
-        "Text",
-        "Varchar",
-        "Varchar",
-        "Uuid",
-        "Uuid",
-        "Float4",
-        "Int4"
+        "UuidArray"
       ]
     },
     "nullable": [
@@ -88,14 +96,17 @@
       false,
       false,
       false,
+      false,
+      false,
       true,
       true,
       true,
       false,
       false,
-      false,
-      false
+      true,
+      true,
+      true
     ]
   },
-  "hash": "fc2ee1e9d96b1bb57a26c5c6bfecc054ee26c393839fdf581b86616d6365a35d"
+  "hash": "e68e019cbb44357cd091285f35f8ff3fbf22ae59df432ba49a12628f5ee19c37"
 }

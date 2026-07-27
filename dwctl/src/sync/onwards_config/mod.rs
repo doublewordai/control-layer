@@ -628,6 +628,34 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                 )
             )
             AND ak.is_deleted = false
+            -- Spending-cap gate: exclude every key of a cap scope (the capped
+            -- root and its hidden batch child alike) once the scope's
+            -- CALENDAR-ALIGNED (UTC, non-rolling) window spend has reached the
+            -- root's limit. Guarded so the uncapped majority short-circuits on
+            -- the first branch; the subquery is two PK probes. Free models
+            -- stay usable on an exhausted scope, mirroring the balance gate's
+            -- free-model arm. Un-capping needs no job or traffic: the
+            -- window-membership check (shared function, migration 123) turns
+            -- false at the calendar boundary and the periodic fallback sync
+            -- readmits the keys.
+            AND (
+                (ak.spend_limit IS NULL AND ak.parent_api_key_id IS NULL)
+                OR NOT EXISTS (
+                    SELECT 1
+                    FROM api_keys root
+                    LEFT JOIN api_key_spend_checkpoints ck ON ck.api_key_id = root.id
+                    WHERE root.id = COALESCE(ak.parent_api_key_id, ak.id)
+                      AND root.spend_limit IS NOT NULL
+                      AND api_key_cap_window_current(ck.window_started_at, root.spend_limit_interval)
+                      AND ck.window_spend >= root.spend_limit
+                      AND EXISTS (
+                          SELECT 1 FROM model_tariffs mt
+                          WHERE mt.deployed_model_id = cm.id
+                            AND mt.valid_until IS NULL
+                            AND (mt.input_price_per_token > 0 OR mt.output_price_per_token > 0)
+                      )
+                )
+            )
             -- Inference data plane only: platform (management) keys must never
             -- enter onwards' key set. Mirrors is_inference_purpose in
             -- db::models::api_keys (SQL cannot call it). The system key is
@@ -1346,6 +1374,34 @@ pub async fn load_targets_from_db(
                 )
             )
             AND ak.is_deleted = false
+            -- Spending-cap gate: exclude every key of a cap scope (the capped
+            -- root and its hidden batch child alike) once the scope's
+            -- CALENDAR-ALIGNED (UTC, non-rolling) window spend has reached the
+            -- root's limit. Guarded so the uncapped majority short-circuits on
+            -- the first branch; the subquery is two PK probes. Free models
+            -- stay usable on an exhausted scope, mirroring the balance gate's
+            -- free-model arm. Un-capping needs no job or traffic: the
+            -- window-membership check (shared function, migration 123) turns
+            -- false at the calendar boundary and the periodic fallback sync
+            -- readmits the keys.
+            AND (
+                (ak.spend_limit IS NULL AND ak.parent_api_key_id IS NULL)
+                OR NOT EXISTS (
+                    SELECT 1
+                    FROM api_keys root
+                    LEFT JOIN api_key_spend_checkpoints ck ON ck.api_key_id = root.id
+                    WHERE root.id = COALESCE(ak.parent_api_key_id, ak.id)
+                      AND root.spend_limit IS NOT NULL
+                      AND api_key_cap_window_current(ck.window_started_at, root.spend_limit_interval)
+                      AND ck.window_spend >= root.spend_limit
+                      AND EXISTS (
+                          SELECT 1 FROM model_tariffs mt
+                          WHERE mt.deployed_model_id = dm.id
+                            AND mt.valid_until IS NULL
+                            AND (mt.input_price_per_token > 0 OR mt.output_price_per_token > 0)
+                      )
+                )
+            )
             -- Inference data plane only: platform (management) keys must never
             -- enter onwards' key set. Mirrors is_inference_purpose in
             -- db::models::api_keys (SQL cannot call it). The system key is
