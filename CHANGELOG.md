@@ -1,5 +1,17 @@
 # Changelog
 
+## [8.102.0](https://github.com/doublewordai/control-layer/compare/v8.101.0...v8.102.0) (2026-07-23)
+
+
+### Features
+
+* UI for capped api keys ([#1355](https://github.com/doublewordai/control-layer/issues/1355)) ([56ac94e](https://github.com/doublewordai/control-layer/commit/56ac94e5de9351da4ced7d23f811dbf27f057de3))
+
+
+### Bug Fixes
+
+* simplify preview dispatch credentials ([#1342](https://github.com/doublewordai/control-layer/issues/1342)) ([d2b1929](https://github.com/doublewordai/control-layer/commit/d2b19293a2ea224af9ae1ecf7fa61f7d08e18126))
+
 ## [8.101.0](https://github.com/doublewordai/control-layer/compare/v8.100.0...v8.101.0) (2026-07-23)
 
 
