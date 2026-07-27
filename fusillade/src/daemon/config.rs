@@ -117,10 +117,11 @@ pub struct DaemonConfig {
     pub model_escalations: Arc<dashmap::DashMap<String, ModelEscalationConfig>>,
     #[serde(default)]
     pub inject_deadline_priority: bool,
-    /// Database-wide per-model in-flight ceiling below which background work
-    /// may run. Clamped to each process's ordinary model concurrency limit.
-    /// Zero disables the background claim loop while leaving submission APIs
-    /// available.
+    /// Database-wide per-model foreground in-flight threshold below which
+    /// background work may be dispatched. Already-dispatched background work
+    /// does not consume this threshold. Clamped to each process's ordinary
+    /// model concurrency limit. Zero disables background claim workers while
+    /// leaving submission APIs available.
     #[serde(default)]
     pub background_concurrency_limit: usize,
     pub claim_interval_ms: u64,

@@ -217,14 +217,24 @@ async fn background_tier_end_to_end(pool: sqlx::PgPool) {
     }
 
     triggers.next().unwrap().send(()).unwrap();
-    wait_for_mock_calls(&http_client, 3).await;
+    wait_for_mock_calls(&http_client, 4).await;
     let calls = http_client.get_calls();
     assert!(calls[2].body.contains("background"));
+    assert!(calls[3].body.contains("background"));
     assert_eq!(call_priority(&calls[2]), i32::MIN as i64);
+    assert_eq!(call_priority(&calls[3]), i32::MIN as i64);
+    assert!(
+        calls[2].body.contains(r#""kind":"background-batch""#)
+            || calls[3].body.contains(r#""kind":"background-batch""#)
+    );
+    assert!(
+        calls[2].body.contains(r#""kind":"background-batchless""#)
+            || calls[3].body.contains(r#""kind":"background-batchless""#)
+    );
     assert_eq!(
         http_client.in_flight_count(),
-        2,
-        "one freed slot below the background ceiling admits exactly one background call"
+        3,
+        "each background modality may use foreground headroom without reserving it"
     );
 
     let late_sla_id = uuid::Uuid::new_v4();
@@ -241,18 +251,14 @@ async fn background_tier_end_to_end(pool: sqlx::PgPool) {
         })
         .await
         .unwrap();
-    wait_for_mock_calls(&http_client, 4).await;
+    wait_for_mock_calls(&http_client, 5).await;
     let calls = http_client.get_calls();
-    assert!(calls[3].body.contains("late-sla"));
-    assert!(call_priority(&calls[3]) > call_priority(&calls[2]));
+    assert!(calls[4].body.contains("late-sla"));
+    assert!(call_priority(&calls[4]) > call_priority(&calls[2]));
 
     for _ in 0..3 {
         triggers.next().unwrap().send(()).unwrap();
     }
-    wait_for_mock_calls(&http_client, 5).await;
-    let calls = http_client.get_calls();
-    assert!(calls[4].body.contains("background"));
-    assert_eq!(call_priority(&calls[4]), i32::MIN as i64);
     triggers.next().unwrap().send(()).unwrap();
 
     let completion_deadline = tokio::time::Instant::now() + Duration::from_secs(5);

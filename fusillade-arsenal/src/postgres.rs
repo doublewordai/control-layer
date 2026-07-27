@@ -23,7 +23,9 @@ use tokio::sync::{Mutex, Semaphore, SemaphorePermit, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
 
-use super::{ArchiveOutcome, DaemonStorage, ModelFilter, ModelFilterState, Storage};
+use super::{
+    ArchiveOutcome, BackgroundClaimKind, DaemonStorage, ModelFilter, ModelFilterState, Storage,
+};
 use crate::PostgresStorageConfig;
 use crate::batch::{
     BackgroundBatchInput, Batch, BatchErrorDetails, BatchErrorItem, BatchId, BatchInput,
@@ -1683,6 +1685,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                     FROM requests r
                     WHERE r.state IN ('claimed', 'processing')
                       AND r.template_id IS NOT NULL
+                      AND r.service_tier IS DISTINCT FROM 'background'
                       AND (cardinality($2::TEXT[]) = 0 OR r.model = ANY($2))
                     GROUP BY r.model
                 ),
@@ -2336,8 +2339,9 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         skip(self, available_capacity, user_active_counts),
         fields(limit, batch_limit)
     )]
-    async fn claim_background_requests(
+    async fn claim_background_requests_by_kind(
         &self,
+        kind: BackgroundClaimKind,
         limit: usize,
         batch_limit: usize,
         daemon_id: DaemonId,
@@ -2345,6 +2349,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         user_active_counts: &HashMap<String, usize>,
     ) -> Result<Vec<Request<Claimed>>> {
         let now = Utc::now();
+        let claim_batches = kind == BackgroundClaimKind::Batch;
         let mut model_capacity_pairs: Vec<(String, i64)> = available_capacity
             .iter()
             .filter(|(_, capacity)| **capacity > 0)
@@ -2364,58 +2369,14 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
             .iter()
             .map(|(model, _)| model.clone())
             .collect();
+        let capacities_arr: Vec<i64> = model_capacity_pairs
+            .iter()
+            .map(|(_, capacity)| *capacity)
+            .collect();
         let user_ids_arr: Vec<String> = user_active_counts.keys().cloned().collect();
         let user_counts_arr: Vec<i64> = user_ids_arr
             .iter()
             .map(|owner| *user_active_counts.get(owner).unwrap_or(&0) as i64)
-            .collect();
-
-        let mut tx = self.begin_write().await.map_err(|error| {
-            FusilladeError::Other(anyhow!(
-                "Failed to begin background claim transaction: {error}"
-            ))
-        })?;
-
-        // Acquire the per-model locks before the count-and-claim statement.
-        // At READ COMMITTED, that second statement receives a fresh snapshot
-        // which includes any claims committed by the previous lock holder.
-        let locked_models: HashSet<String> = sqlx::query_scalar!(
-            r#"
-            SELECT model AS "model!"
-            FROM unnest($1::TEXT[]) WITH ORDINALITY AS candidate(model, model_order)
-            WHERE pg_try_advisory_xact_lock(
-                hashtextextended('fusillade.background:' || model, 0)
-            )
-            ORDER BY model_order
-            "#,
-            &models_arr,
-        )
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(|error| {
-            FusilladeError::Other(anyhow!(
-                "Failed to acquire background model claim locks: {error}"
-            ))
-        })?
-        .into_iter()
-        .collect();
-
-        model_capacity_pairs.retain(|(model, _)| locked_models.contains(model));
-        if model_capacity_pairs.is_empty() {
-            tx.rollback().await.map_err(|error| {
-                FusilladeError::Other(anyhow!(
-                    "Failed to close empty background claim transaction: {error}"
-                ))
-            })?;
-            return Ok(Vec::new());
-        }
-        let models_arr: Vec<String> = model_capacity_pairs
-            .iter()
-            .map(|(model, _)| model.clone())
-            .collect();
-        let capacities_arr: Vec<i64> = model_capacity_pairs
-            .iter()
-            .map(|(_, capacity)| *capacity)
             .collect();
 
         let rows = sqlx::query_as!(
@@ -2437,6 +2398,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                   ON active.model = locked.model
                  AND active.state IN ('claimed', 'processing')
                  AND active.template_id IS NOT NULL
+                 AND active.service_tier IS DISTINCT FROM 'background'
                 GROUP BY locked.model
             ),
             eligible_models AS (
@@ -2485,7 +2447,8 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                 CROSS JOIN LATERAL (
                     SELECT b.id
                     FROM batches b
-                    WHERE b.service_tier = 'background'
+                    WHERE $10::BOOLEAN
+                      AND b.service_tier = 'background'
                       AND b.cancelling_at IS NULL
                       AND b.deleted_at IS NULL
                       AND b.completed_at IS NULL
@@ -2516,6 +2479,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                  AND r.template_id IS NOT NULL
                  AND r.service_tier = 'background'
                  AND (r.not_before IS NULL OR r.not_before <= $3)
+                WHERE NOT $10::BOOLEAN
 
                 UNION ALL
 
@@ -2605,17 +2569,12 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
             &user_counts_arr,
             batch_limit as i64,
             self.config.background_concurrency_limit as i64,
+            claim_batches,
         )
-        .fetch_all(&mut *tx)
+        .fetch_all(self.write_executor())
         .await
         .map_err(|e| {
             FusilladeError::Other(anyhow!("Failed to claim background requests: {}", e))
-        })?;
-
-        tx.commit().await.map_err(|error| {
-            FusilladeError::Other(anyhow!(
-                "Failed to commit background request claims: {error}"
-            ))
         })?;
 
         if !rows.is_empty() {
@@ -9711,7 +9670,7 @@ mod tests {
     // Request claiming, cancellation, and retrieval
 
     #[sqlx::test]
-    async fn background_claim_requires_explicit_live_and_combines_sources(pool: sqlx::PgPool) {
+    async fn background_claims_require_explicit_live_and_separate_modalities(pool: sqlx::PgPool) {
         let manager = PostgresRequestManager::with_client(
             TestDbPools::new(pool.clone()).await.unwrap(),
             Arc::new(MockHttpClient::new()),
@@ -9728,7 +9687,7 @@ mod tests {
         let daemon_id = DaemonId::from(Uuid::new_v4());
 
         let unmanaged = manager
-            .claim_background_requests(10, 10, daemon_id, &capacity, &HashMap::new())
+            .claim_background_batchless_requests(10, daemon_id, &capacity, &HashMap::new())
             .await
             .expect("background claim should be supported");
         assert!(
@@ -9745,35 +9704,45 @@ mod tests {
             .await
             .unwrap();
         let coming = manager
-            .claim_background_requests(10, 10, daemon_id, &capacity, &HashMap::new())
+            .claim_background_batch_requests(10, 10, daemon_id, &capacity, &HashMap::new())
             .await
             .unwrap();
         assert!(coming.is_empty());
 
         mark_models_live_for_test(&manager, ["background-model"]).await;
-        let claimed = manager
-            .claim_background_requests(10, 10, daemon_id, &capacity, &HashMap::new())
+        let batchless_claimed = manager
+            .claim_background_batchless_requests(10, daemon_id, &capacity, &HashMap::new())
             .await
             .unwrap();
-        assert_eq!(claimed.len(), 2);
+        assert_eq!(batchless_claimed.len(), 1);
+        assert_eq!(batchless_claimed[0].data.id, batchless);
+        assert_eq!(batchless_claimed[0].data.batch_id, None);
+
+        let batch_claimed = manager
+            .claim_background_batch_requests(10, 10, daemon_id, &capacity, &HashMap::new())
+            .await
+            .unwrap();
+        assert_eq!(batch_claimed.len(), 1);
+        assert_eq!(batch_claimed[0].data.batch_id, Some(batch.id));
+
         assert!(
-            claimed
+            batchless_claimed
                 .iter()
+                .chain(batch_claimed.iter())
                 .all(|request| request.state.batch_expires_at.is_none())
         );
-        assert!(claimed.iter().all(|request| {
-            request
-                .data
-                .batch_metadata
-                .get("completion_window")
-                .map(String::as_str)
-                == Some("background")
-        }));
-        assert!(claimed.iter().any(|request| request.data.id == batchless));
         assert!(
-            claimed
+            batchless_claimed
                 .iter()
-                .any(|request| request.data.batch_id == Some(batch.id))
+                .chain(batch_claimed.iter())
+                .all(|request| {
+                    request
+                        .data
+                        .batch_metadata
+                        .get("completion_window")
+                        .map(String::as_str)
+                        == Some("background")
+                })
         );
     }
 
@@ -9809,7 +9778,7 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn background_claim_enforces_database_wide_model_ceiling(pool: sqlx::PgPool) {
+    async fn background_claim_threshold_counts_only_foreground_work(pool: sqlx::PgPool) {
         let config = DaemonConfig {
             background_concurrency_limit: 1,
             ..Default::default()
@@ -9831,8 +9800,7 @@ mod tests {
 
         let capacity = HashMap::from([("global-model".to_string(), 1)]);
         let first = first_manager
-            .claim_background_requests(
-                10,
+            .claim_background_batchless_requests(
                 10,
                 DaemonId::from(Uuid::new_v4()),
                 &capacity,
@@ -9843,8 +9811,7 @@ mod tests {
         assert_eq!(first.len(), 1);
 
         let second = second_manager
-            .claim_background_requests(
-                10,
+            .claim_background_batchless_requests(
                 10,
                 DaemonId::from(Uuid::new_v4()),
                 &capacity,
@@ -9852,39 +9819,57 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(
-            second.is_empty(),
-            "database-wide active work must consume the shared per-model background ceiling"
-        );
-
-        create_background_request_for_test(&first_manager, "racing-model", "owner-a").await;
-        create_background_request_for_test(&first_manager, "racing-model", "owner-b").await;
-        mark_models_live_for_test(&first_manager, ["racing-model"]).await;
-
-        let racing_capacity = HashMap::from([("racing-model".to_string(), 1)]);
-        let racing_active_counts = HashMap::new();
-        let first_daemon_id = DaemonId::from(Uuid::new_v4());
-        let second_daemon_id = DaemonId::from(Uuid::new_v4());
-        let (first_race, second_race) = tokio::join!(
-            first_manager.claim_background_requests(
-                10,
-                10,
-                first_daemon_id,
-                &racing_capacity,
-                &racing_active_counts,
-            ),
-            second_manager.claim_background_requests(
-                10,
-                10,
-                second_daemon_id,
-                &racing_capacity,
-                &racing_active_counts,
-            ),
-        );
-        let concurrently_claimed = first_race.unwrap().len() + second_race.unwrap().len();
         assert_eq!(
-            concurrently_claimed, 1,
-            "concurrent daemons must share one database-wide per-model slot"
+            second.len(),
+            1,
+            "active background work must not consume foreground headroom"
+        );
+
+        create_background_request_for_test(
+            &first_manager,
+            "foreground-saturated-model",
+            "background-owner",
+        )
+        .await;
+        first_manager
+            .create_flex(CreateFlexInput {
+                request_id: Uuid::new_v4(),
+                body: "{}".to_string(),
+                model: "foreground-saturated-model".to_string(),
+                endpoint: "https://api.example.com".to_string(),
+                method: "POST".to_string(),
+                path: "/test".to_string(),
+                api_key: "key".to_string(),
+                created_by: "foreground-owner".to_string(),
+            })
+            .await
+            .unwrap();
+        mark_models_live_for_test(&first_manager, ["foreground-saturated-model"]).await;
+        let foreground_capacity = HashMap::from([("foreground-saturated-model".to_string(), 1)]);
+        let foreground = first_manager
+            .claim_batchless_requests(
+                1,
+                DaemonId::from(Uuid::new_v4()),
+                &foreground_capacity,
+                &HashMap::new(),
+                &HashSet::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(foreground.len(), 1);
+
+        let blocked = second_manager
+            .claim_background_batchless_requests(
+                10,
+                DaemonId::from(Uuid::new_v4()),
+                &foreground_capacity,
+                &HashMap::new(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            blocked.is_empty(),
+            "active foreground work must consume background-admission headroom"
         );
     }
 
@@ -10082,6 +10067,41 @@ mod tests {
     }
 
     #[sqlx::test]
+    async fn combined_background_claim_shares_model_capacity_between_modalities(
+        pool: sqlx::PgPool,
+    ) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        )
+        .with_config(DaemonConfig {
+            background_concurrency_limit: 10,
+            ..Default::default()
+        });
+        create_background_request_for_test(&manager, "shared-capacity-model", "request-owner")
+            .await;
+        create_background_batch_for_test(&manager, "shared-capacity-model", "batch-owner").await;
+        mark_models_live_for_test(&manager, ["shared-capacity-model"]).await;
+
+        let claimed = manager
+            .claim_background_requests(
+                10,
+                10,
+                DaemonId::from(Uuid::new_v4()),
+                &HashMap::from([("shared-capacity-model".to_string(), 1)]),
+                &HashMap::new(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            claimed.len(),
+            1,
+            "the combined claim must share per-model capacity between modalities"
+        );
+    }
+
+    #[sqlx::test]
     async fn ordinary_claims_never_return_background_rows(pool: sqlx::PgPool) {
         let manager = PostgresRequestManager::with_client(
             TestDbPools::new(pool.clone()).await.unwrap(),
@@ -10160,9 +10180,20 @@ mod tests {
             ..Default::default()
         });
 
-        for model in ["available-model", "full-model", "sla-blocked-model"] {
+        for model in [
+            "available-model",
+            "background-active-model",
+            "full-model",
+            "sla-blocked-model",
+        ] {
             create_background_request_for_test(&manager, model, "background-owner").await;
         }
+        create_background_request_for_test(
+            &manager,
+            "background-active-model",
+            "second-background-owner",
+        )
+        .await;
         manager
             .create_realtime(CreateRealtimeInput {
                 request_id: Uuid::new_v4(),
@@ -10191,9 +10222,24 @@ mod tests {
             .unwrap();
         mark_models_live_for_test(
             &manager,
-            ["available-model", "full-model", "sla-blocked-model"],
+            [
+                "available-model",
+                "background-active-model",
+                "full-model",
+                "sla-blocked-model",
+            ],
         )
         .await;
+        let claimed_background = manager
+            .claim_background_batchless_requests(
+                1,
+                DaemonId::from(Uuid::new_v4()),
+                &HashMap::from([("background-active-model".to_string(), 1)]),
+                &HashMap::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(claimed_background.len(), 1);
 
         let result = manager
             .get_pending_request_counts_by_model_and_window(
@@ -10208,6 +10254,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(result["available-model"]["background"], 1);
+        assert_eq!(
+            result["background-active-model"]["background"], 1,
+            "active background work must not hide remaining background demand"
+        );
         assert!(!result.contains_key("full-model"));
         assert!(!result.contains_key("sla-blocked-model"));
     }

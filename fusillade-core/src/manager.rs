@@ -127,6 +127,15 @@ pub struct ModelFilter {
     pub expected_ready_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+/// Background queue modality selected by a dedicated daemon worker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackgroundClaimKind {
+    /// Requests submitted without a file-backed batch.
+    Batchless,
+    /// Requests belonging to a file-backed background batch.
+    Batch,
+}
+
 /// Storage trait for persisting and querying requests.
 ///
 /// This trait provides atomic operations for request lifecycle management.
@@ -702,10 +711,11 @@ pub trait Storage: Send + Sync {
         true
     }
 
-    /// Atomically claim pending background requests from both file-backed
-    /// batches and the batchless queue.
-    async fn claim_background_requests(
+    /// Atomically claim pending background requests for one queue modality.
+    #[doc(hidden)]
+    async fn claim_background_requests_by_kind(
         &self,
+        kind: BackgroundClaimKind,
         limit: usize,
         batch_limit: usize,
         daemon_id: DaemonId,
@@ -713,6 +723,7 @@ pub trait Storage: Send + Sync {
         user_active_counts: &std::collections::HashMap<String, usize>,
     ) -> Result<Vec<Request<Claimed>>> {
         let _ = (
+            kind,
             limit,
             batch_limit,
             daemon_id,
@@ -724,7 +735,89 @@ pub trait Storage: Send + Sync {
         )))
     }
 
-    /// Whether this backend implements [`Storage::claim_background_requests`].
+    /// Atomically claim pending background requests from the batchless queue.
+    async fn claim_background_batchless_requests(
+        &self,
+        limit: usize,
+        daemon_id: DaemonId,
+        available_capacity: &std::collections::HashMap<String, usize>,
+        user_active_counts: &std::collections::HashMap<String, usize>,
+    ) -> Result<Vec<Request<Claimed>>> {
+        self.claim_background_requests_by_kind(
+            BackgroundClaimKind::Batchless,
+            limit,
+            0,
+            daemon_id,
+            available_capacity,
+            user_active_counts,
+        )
+        .await
+    }
+
+    /// Atomically claim pending requests from file-backed background batches.
+    async fn claim_background_batch_requests(
+        &self,
+        limit: usize,
+        batch_limit: usize,
+        daemon_id: DaemonId,
+        available_capacity: &std::collections::HashMap<String, usize>,
+        user_active_counts: &std::collections::HashMap<String, usize>,
+    ) -> Result<Vec<Request<Claimed>>> {
+        self.claim_background_requests_by_kind(
+            BackgroundClaimKind::Batch,
+            limit,
+            batch_limit,
+            daemon_id,
+            available_capacity,
+            user_active_counts,
+        )
+        .await
+    }
+
+    /// Combined helper that claims batchless background requests first, then
+    /// uses the remaining global and per-model cycle capacity for batches.
+    async fn claim_background_requests(
+        &self,
+        limit: usize,
+        batch_limit: usize,
+        daemon_id: DaemonId,
+        available_capacity: &std::collections::HashMap<String, usize>,
+        user_active_counts: &std::collections::HashMap<String, usize>,
+    ) -> Result<Vec<Request<Claimed>>> {
+        let mut claimed = self
+            .claim_background_batchless_requests(
+                limit,
+                daemon_id,
+                available_capacity,
+                user_active_counts,
+            )
+            .await?;
+        let remaining = limit.saturating_sub(claimed.len());
+        let mut remaining_capacity = available_capacity.clone();
+        for request in &claimed {
+            if let Some(capacity) = remaining_capacity.get_mut(&request.data.model) {
+                *capacity = capacity.saturating_sub(1);
+            }
+        }
+        if remaining > 0
+            && batch_limit > 0
+            && remaining_capacity.values().any(|capacity| *capacity > 0)
+        {
+            claimed.extend(
+                self.claim_background_batch_requests(
+                    remaining,
+                    batch_limit,
+                    daemon_id,
+                    &remaining_capacity,
+                    user_active_counts,
+                )
+                .await?,
+            );
+        }
+        Ok(claimed)
+    }
+
+    /// Whether this backend implements background claim methods.
     fn supports_background_claims(&self) -> bool {
         false
     }

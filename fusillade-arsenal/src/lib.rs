@@ -13,7 +13,7 @@ pub mod transform;
 mod utils;
 
 pub use fusillade_core::manager::{
-    ArchiveOutcome, DaemonStorage, ModelFilter, ModelFilterState, Storage,
+    ArchiveOutcome, BackgroundClaimKind, DaemonStorage, ModelFilter, ModelFilterState, Storage,
 };
 pub use fusillade_core::request::AnyRequest;
 pub use fusillade_core::response_step;
@@ -66,9 +66,10 @@ pub struct PostgresStorageConfig {
     pub urgency_weight: f64,
     #[serde(default)]
     pub batch_claim_require_live: bool,
-    /// Database-wide per-model in-flight ceiling below which explicitly
-    /// requested background backlog is claimable and exposed by pending-count
-    /// queries. Zero hides background demand and disables processing at the
+    /// Database-wide per-model foreground in-flight threshold below which
+    /// explicitly requested background backlog is claimable and exposed by
+    /// pending-count queries. Active background work does not consume this
+    /// threshold. Zero hides background demand and disables processing at the
     /// daemon layer.
     #[serde(default)]
     pub background_concurrency_limit: usize,
