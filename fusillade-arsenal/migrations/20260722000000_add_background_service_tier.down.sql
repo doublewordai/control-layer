@@ -15,6 +15,10 @@ BEGIN
     END IF;
 END $$;
 
+DROP INDEX IF EXISTS idx_requests_active_sla_counts;
+DROP INDEX IF EXISTS idx_requests_pending_batchless_sla;
+DROP INDEX IF EXISTS idx_requests_pending_background_batched;
+DROP INDEX IF EXISTS idx_requests_pending_background_batchless;
 DROP INDEX IF EXISTS idx_batches_background_active;
 
 ALTER TABLE batches
