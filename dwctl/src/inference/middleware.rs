@@ -604,7 +604,7 @@ enum ServiceTier {
     Realtime,
     /// Flex: batch of 1 with 1h completion window, processed by fusillade daemon.
     Flex,
-    /// Background: no-SLA spare-capacity processing by the background daemon.
+    /// Background: no-SLA spare-capacity processing by background workers.
     Background,
 }
 
@@ -980,6 +980,18 @@ async fn handle_flex<P: PoolProvider + Clone + Send + Sync + 'static>(
     }
 }
 
+fn background_submission_body(resp_id: &str, model: &str) -> serde_json::Value {
+    serde_json::json!({
+        "id": resp_id,
+        "object": "response",
+        "status": "queued",
+        "model": model,
+        "background": true,
+        "service_tier": "background",
+        "output": [],
+    })
+}
+
 /// Enqueue a no-SLA Responses API request for spare-capacity processing.
 async fn handle_background<P: PoolProvider + Clone + Send + Sync + 'static>(
     state: &InferenceMiddlewareState<P>,
@@ -1005,15 +1017,7 @@ async fn handle_background<P: PoolProvider + Clone + Send + Sync + 'static>(
             .unwrap();
     }
 
-    let response_body = serde_json::json!({
-        "id": resp_id,
-        "object": "response",
-        "status": "in_progress",
-        "model": model,
-        "background": true,
-        "service_tier": "background",
-        "output": [],
-    });
+    let response_body = background_submission_body(resp_id, model);
     tracing::debug!(response_id = %resp_id, "Enqueued background request");
     (StatusCode::ACCEPTED, Json(response_body)).into_response()
 }
@@ -1488,6 +1492,24 @@ mod tests {
     #[test]
     fn test_resolve_service_tier_background() {
         assert!(matches!(resolve_service_tier(Some("background")), ServiceTier::Background));
+    }
+
+    #[test]
+    fn background_submission_is_queued_before_the_daemon_claims_it() {
+        let response = background_submission_body("resp_background", "test-model");
+
+        assert_eq!(
+            response,
+            serde_json::json!({
+                "id": "resp_background",
+                "object": "response",
+                "status": "queued",
+                "model": "test-model",
+                "background": true,
+                "service_tier": "background",
+                "output": [],
+            })
+        );
     }
 
     #[test]

@@ -176,8 +176,8 @@ store.create_background(CreateBackgroundInput {
 }).await?;
 ```
 
-Both forms use one database-wide pool per model. Configure an ordinary model
-limit and a lower background ceiling:
+Background admission is evaluated independently per model. Configure an
+ordinary model limit and a lower foreground threshold for background sends:
 
 ```rust
 let mut config = DaemonConfig {
@@ -188,12 +188,13 @@ let mut config = DaemonConfig {
 config.model_concurrency_limits.insert("gpt-4".to_string(), 100);
 ```
 
-The background ceiling is applied independently to every model and is clamped
-to each daemon process's ordinary limit. Database-wide active work consumes the
-shared ceiling: with limits 100/50, 70 total requests in flight leaves no
-background capacity, 40 leaves 10 slots, and zero leaves 50. Pending,
-immediately schedulable SLA work for a model blocks background claims for that
-model. A later SLA arrival can still use the reserved ordinary capacity.
+The background threshold is clamped to each daemon process's ordinary model
+limit. Only foreground work consumes it: with limits 100/50, 70 or 50
+foreground requests in flight block background sends, while 49 makes
+background work eligible. Already-dispatched background requests do not consume
+model or user foreground in-flight limits and do not reserve database headroom.
+Pending, immediately schedulable foreground work for a model blocks background
+claims. A later foreground arrival can still use the full ordinary capacity.
 
 Background processing also requires:
 
@@ -203,11 +204,13 @@ Background processing also requires:
   `nvext.agent_hints.priority` with `i32::MIN`; SLA priority is clamped above
   that reserved value.
 
-The background loop can run with any `DaemonMode`. The selected mode controls
-which SLA claim loops share its process-local counters: `RequestOnly` accounts
-for batchless SLA work, `BatchOnly` accounts for batched SLA work, and `Both`
-accounts for both. Database-wide due-SLA gating and exact-live gating apply in
-all modes, and the node-level background priority remains strictly lowest.
+Background workers mirror `DaemonMode`: `RequestOnly` starts the foreground and
+background batchless workers, `BatchOnly` starts the foreground and background
+batch workers, and `Both` starts all four when batch claiming is supported.
+Background workers read foreground counters but never update them or acquire
+the foreground claim mutex. Database-wide due-foreground gating and exact-live
+gating apply in all modes, and node-level background priority remains strictly
+lowest.
 
 Background batches persist `service_tier = "background"` with
 `completion_window = NULL` and `expires_at = NULL`. They do not expire, escalate,
@@ -219,16 +222,19 @@ Ordinary pending-count queries exclude background demand. To expose it, use an
 explicit `ServiceTierFilter::Include(vec![Some("background".to_string())])`; results use a
 separate `"background"` bucket per model and combine batched and batchless
 backlog. The bucket is hidden while the model is not live, due SLA work exists,
-or active database work meets the configured background ceiling.
+or active foreground work meets the configured background threshold. Active
+background rows do not hide additional eligible background demand.
 
-Background claims take a non-blocking transaction-scoped advisory lock per
-model, then count database-wide active work and claim only the remaining shared
-headroom. Contending daemon processes skip that model until their next cycle.
+Each background worker uses one atomic `FOR UPDATE SKIP LOCKED` claim query.
+Background claims do not take per-model advisory locks or reserve the observed
+foreground headroom. Concurrent background workers may therefore both dispatch
+against the same headroom; the reserved lowest node priority keeps that queued
+work behind later foreground sends.
 
 ## Claim daemons
 
-The daemon can run two SLA claim loops and, when background processing is
-enabled, an additional background loop:
+The daemon can run two foreground claim loops and two independent background
+claim loops:
 
 - **Request daemon** — claims *batchless* pending rows (flex/async responses).
   Owns the leaky-bucket and deadline-ramp policy: rows for models that are not
@@ -237,9 +243,13 @@ enabled, an additional background loop:
   top-ranked batches per capacity-eligible model (fairness + deadline
   ordering), then claims rows only from those batches, so claim cost is
   bounded by batches selected rather than total pending backlog.
-- **Background daemon** — claims file-backed and batchless background rows in
-  one fair candidate set, only for explicitly live models, below the lower
-  background ceiling, and only after due SLA backlog for that model is empty.
+- **Background request daemon** — claims batchless background rows using
+  `claim_interval_ms` and `claim_batch_size`, only for explicitly live models,
+  below the foreground threshold, and after due foreground backlog is empty.
+- **Background batch daemon** — claims file-backed background rows using
+  `batch_claim_interval_ms`, `batch_claim_size`, and
+  `batch_claim_batch_size`, with the same liveness, threshold, and
+  due-foreground gates.
 
 Batch claiming is gated on model liveness via the `model_filters` event log:
 models whose latest event is `live` are always claimable; models with **no**
@@ -258,7 +268,7 @@ Configuration (all optional):
 | `batch_claim_batch_size` | `4` | batches selected per model per iteration (spill-over pool) |
 | `batch_claim_interval_ms` | `0` (inherit `claim_interval_ms`) | batch loop cadence |
 | `batch_claim_require_live` | `false` | require an explicit `live` event to batch-claim |
-| `background_concurrency_limit` | `0` | lower per-model ceiling for background work; zero disables the loop |
+| `background_concurrency_limit` | `0` | per-model foreground threshold below which background workers may send; zero disables them |
 | `claim_ramp_exponent` | `0.56` | deadline-ramp curve (~59 min for 24h windows, ~10 min for 1h) |
 
 **Breaking changes relative to v19:**
@@ -271,8 +281,10 @@ Configuration (all optional):
   unchanged); not-live batches wait for liveness or the deadline ramp.
 - Claim metrics (`fusillade_claim_capacity`, `fusillade_claim_duration_seconds`,
   `fusillade_claim_size`) gained a `daemon` label (`request_daemon` /
-  `batch_daemon` / `background_daemon`); unlabeled legacy series are dual-emitted during a
-  deprecation window.
+  `batch_daemon` / `background_request_daemon` /
+  `background_batch_daemon`). Unlabeled legacy series are dual-emitted only by
+  foreground workers during the deprecation window; background metrics are
+  labeled-only so they cannot overwrite foreground dashboard values.
 
 ## Database Setup
 

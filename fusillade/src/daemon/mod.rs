@@ -53,6 +53,10 @@ impl ClaimLoopKind {
         !self.is_background()
     }
 
+    fn emits_legacy_claim_metrics(self) -> bool {
+        self.uses_foreground_accounting()
+    }
+
     fn claim_interval_ms(self, config: &DaemonConfig) -> u64 {
         if matches!(self, Self::Batch | Self::BackgroundBatch) && config.batch_claim_interval_ms > 0
         {
@@ -604,7 +608,9 @@ where
             }
 
             let total_capacity: usize = available_capacity.values().sum();
-            gauge!("fusillade_claim_capacity").set(total_capacity as f64);
+            if kind.emits_legacy_claim_metrics() {
+                gauge!("fusillade_claim_capacity").set(total_capacity as f64);
+            }
             gauge!("fusillade_claim_capacity", "daemon" => loop_name).set(total_capacity as f64);
 
             let user_active_counts = self.user_active_counts();
@@ -685,11 +691,13 @@ where
                 }
             };
 
-            histogram!("fusillade_claim_duration_seconds")
-                .record(claim_start.elapsed().as_secs_f64());
+            if kind.emits_legacy_claim_metrics() {
+                histogram!("fusillade_claim_duration_seconds")
+                    .record(claim_start.elapsed().as_secs_f64());
+                histogram!("fusillade_claim_size").record(claimed.len() as f64);
+            }
             histogram!("fusillade_claim_duration_seconds", "daemon" => loop_name)
                 .record(claim_start.elapsed().as_secs_f64());
-            histogram!("fusillade_claim_size").record(claimed.len() as f64);
             histogram!("fusillade_claim_size", "daemon" => loop_name).record(claimed.len() as f64);
 
             tracing::debug!(
@@ -2026,6 +2034,11 @@ mod tests {
         assert!(ClaimLoopKind::Batch.uses_foreground_accounting());
         assert!(!ClaimLoopKind::BackgroundRequest.uses_foreground_accounting());
         assert!(!ClaimLoopKind::BackgroundBatch.uses_foreground_accounting());
+
+        assert!(ClaimLoopKind::Request.emits_legacy_claim_metrics());
+        assert!(ClaimLoopKind::Batch.emits_legacy_claim_metrics());
+        assert!(!ClaimLoopKind::BackgroundRequest.emits_legacy_claim_metrics());
+        assert!(!ClaimLoopKind::BackgroundBatch.emits_legacy_claim_metrics());
 
         assert!(!ClaimLoopKind::Request.is_background());
         assert!(!ClaimLoopKind::Batch.is_background());
