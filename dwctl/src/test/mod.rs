@@ -332,10 +332,17 @@ async fn ai_models_lists_group_accessible_paid_models_without_credits(pool: PgPo
             "messages": [{"role": "user", "content": "hello"}]
         }))
         .await;
-    assert_eq!(
-        completion_response.status_code(),
-        404,
-        "Zero-credit key should remain absent from the dispatch target pool"
+    // The zero-credit key must not be able to dispatch. Depending on how the
+    // async onwards reconcile interleaves with NOTIFY-triggered reloads from
+    // concurrent tests, that surfaces as either 404 (alias absent from the
+    // targets snapshot) or 402 (target present, key excluded by the balance
+    // gate -> onwards 403 -> enriched to InsufficientCredits). Both prove the
+    // invariant; pinning one of them is a race.
+    let status = completion_response.status_code().as_u16();
+    assert!(
+        status == 404 || status == 402,
+        "Zero-credit key must not dispatch (got {status}): {}",
+        completion_response.text()
     );
 }
 
