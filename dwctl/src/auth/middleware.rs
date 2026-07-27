@@ -497,6 +497,7 @@ mod tests {
             payment_provider_id: None,
             organizations: vec![],
             active_organization: None,
+            api_key_id: None,
         };
         let jwt_token = session::create_session_token(&current_user, &config).unwrap();
 
@@ -610,6 +611,7 @@ mod tests {
             payment_provider_id: None,
             organizations: vec![],
             active_organization: None,
+            api_key_id: None,
         };
         let jwt_token = session::create_session_token(&current_user, &config).unwrap();
 
@@ -725,6 +727,7 @@ mod tests {
             payment_provider_id: None,
             organizations: vec![],
             active_organization: None,
+            api_key_id: None,
         };
         let jwt_token = session::create_session_token(&current_user, &config).unwrap();
 
@@ -1023,6 +1026,7 @@ mod tests {
             payment_provider_id: None,
             organizations: vec![],
             active_organization: None,
+            api_key_id: None,
         };
         let jwt_token = session::create_session_token(&current_user, &config).unwrap();
 

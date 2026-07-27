@@ -3,7 +3,7 @@
 use super::pagination::Pagination;
 use crate::api::models::groups::GroupResponse;
 use crate::db::models::users::UserDBResponse;
-use crate::types::UserId;
+use crate::types::{ApiKeyId, UserId};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_with::rust::double_option;
@@ -200,6 +200,13 @@ pub struct CurrentUser {
     /// Active organization ID (from X-Organization-Id header)
     #[schema(value_type = Option<String>, format = "uuid")]
     pub active_organization: Option<UserId>,
+    /// The API key that authenticated this request, when the request was
+    /// authenticated by API key (None for session/JWT/proxy-header auth).
+    /// Internal-only: lets handlers resolve per-key state — e.g. batch/file
+    /// creation picking a capped key's cap-scope child as the execution key.
+    /// Never serialized to clients.
+    #[serde(skip)]
+    pub api_key_id: Option<ApiKeyId>,
 }
 
 /// Context about a user's organization membership
@@ -296,6 +303,7 @@ impl From<UserDBResponse> for CurrentUser {
             payment_provider_id: db.payment_provider_id,
             organizations: vec![],
             active_organization: None,
+            api_key_id: None,
         }
     }
 }

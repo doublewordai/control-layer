@@ -132,6 +132,19 @@ pub fn record_tokenizer_version_cache(result: &'static str) {
     counter!("dwctl_cache_tokenizer_version_cache_total", "result" => result).increment(1);
 }
 
+// ── Index resilience ──────────────────────────────────────────────────────────
+
+/// A cache-index op hit a connection-class error and is being retried (bounded by
+/// `cache.index_conn_retries`; see `postgres.rs`). Incremented once per retry ATTEMPT, so a
+/// single op can contribute up to the configured budget under a sustained outage.
+/// `op` ∈ `lookup` | `write` | `refresh`. The rate of THIS counter shows the
+/// underlying connection churn (severed idle conns / handshake storms on the bursty batch
+/// pod) even when the retry succeeds and no classify error surfaces — the before/after
+/// instrument for the burst load test.
+pub fn record_index_conn_retry(op: &'static str) {
+    counter!("dwctl_cache_index_conn_retries_total", "op" => op).increment(1);
+}
+
 // ── Resolver L1 caches ────────────────────────────────────────────────────────
 
 /// principal resolver memo. `result` ∈ `hit` (L1 hit on a known key) | `miss` (L1 miss,

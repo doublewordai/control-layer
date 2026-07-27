@@ -462,6 +462,12 @@ export interface User {
   onboarding_redirect_url?: string; // only present for /users/current when last_login is null
 }
 
+// Spending-cap reset period. Windows are CALENDAR-ALIGNED (UTC) — a daily cap
+// resets at UTC midnight, weekly at the ISO week boundary, monthly on the 1st.
+// They are NOT rolling windows. null = one-off cap (counts spend since the cap
+// was set/reset, never resets automatically).
+export type SpendLimitInterval = "daily" | "weekly" | "monthly";
+
 export interface ApiKey {
   id: string;
   name: string;
@@ -471,7 +477,12 @@ export interface ApiKey {
   last_used?: string; // ISO 8601 timestamp
   requests_per_second?: number | null; // Rate limiting: requests per second
   burst_size?: number | null; // Rate limiting: burst capacity
-  created_by?: string; // UUID of the user who created the key
+  created_by: string; // UUID of the user who created the key (always present in API responses)
+  spend_limit?: string | null; // Spending cap in credits (decimal string); null = no cap
+  spend_limit_interval?: SpendLimitInterval | null; // null = one-off cap
+  spend?: string | null; // Spend counted against the cap in the current window (decimal string; null when uncapped)
+  total_spend?: string | null; // Lifetime tracked spend for the cap scope (null when uncapped)
+  resets_at?: string | null; // ISO 8601: next calendar reset (null for one-off caps / uncapped)
   // Note: actual key value only returned on creation
 }
 
@@ -572,6 +583,18 @@ export interface ApiKeyCreateRequest {
   purpose: ApiKeyPurpose; // Required: purpose of the key
   requests_per_second?: number | null;
   burst_size?: number | null;
+  spend_limit?: string | null; // Spending cap in credits (decimal string)
+  spend_limit_interval?: SpendLimitInterval | null; // Requires spend_limit; null = one-off
+}
+
+// PATCH /users/{id}/api-keys/{keyId}. Cap fields are tri-state: omit the field
+// to leave it unchanged, send null to remove, send a value to set.
+export interface ApiKeyUpdateRequest {
+  name?: string;
+  description?: string;
+  spend_limit?: string | null;
+  spend_limit_interval?: SpendLimitInterval | null;
+  reset_window?: boolean; // Re-arm the cap now: zero the counted window spend
 }
 
 export interface ApiKeysQuery {

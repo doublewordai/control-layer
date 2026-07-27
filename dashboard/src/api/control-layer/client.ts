@@ -13,6 +13,7 @@ import type {
   UserCreateRequest,
   GroupCreateRequest,
   ApiKeyCreateRequest,
+  ApiKeyUpdateRequest,
   UserUpdateRequest,
   GroupUpdateRequest,
   ModelUpdateRequest,
@@ -250,6 +251,32 @@ const userApi = {
       });
       if (!response.ok) {
         throw new Error(`Failed to create API key: ${response.status}`);
+      }
+      return response.json();
+    },
+
+    async update(
+      keyId: string,
+      data: ApiKeyUpdateRequest,
+      userId: string = "current",
+    ): Promise<ApiKey> {
+      const response = await fetch(
+        `/admin/api/v1/users/${userId}/api-keys/${keyId}`,
+        {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(data),
+        },
+      );
+      if (!response.ok) {
+        // Surface the backend's message (e.g. validation errors) so UI
+        // toasts are actionable, not just a bare status code.
+        const text = await response.text().catch(() => "");
+        throw new Error(
+          text
+            ? `Failed to update API key: ${response.status} - ${text}`
+            : `Failed to update API key: ${response.status}`,
+        );
       }
       return response.json();
     },

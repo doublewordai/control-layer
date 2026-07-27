@@ -355,6 +355,12 @@ fn get_or_install_prometheus_handle() -> PrometheusHandle {
             // Custom histogram buckets for fusillade retry attempts (0-10 retries)
             const RETRY_ATTEMPTS_BUCKETS: &[f64] = &[0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0];
 
+            // Custom histogram buckets for fusillade submission-epoch latencies
+            // (pickup delay and submission TTFT): 60 is an exact edge because
+            // the async-tier SLO ("starts within a minute") is read at it, and
+            // compliance ratios are only exact at a bucket edge.
+            const SUBMISSION_LATENCY_BUCKETS: &[f64] = &[1.0, 5.0, 15.0, 30.0, 60.0, 120.0, 300.0, 900.0, 1800.0, 3600.0];
+
             PrometheusBuilder::new()
                 .set_buckets_for_metric(Matcher::Full("dwctl_analytics_lag_seconds".to_string()), ANALYTICS_LAG_BUCKETS)
                 .expect("Failed to set custom buckets for dwctl_analytics_lag_seconds")
@@ -385,6 +391,16 @@ fn get_or_install_prometheus_handle() -> PrometheusHandle {
                     RETRY_ATTEMPTS_BUCKETS,
                 )
                 .expect("Failed to set custom buckets for fusillade_retry_attempts_on_success")
+                .set_buckets_for_metric(
+                    Matcher::Full("fusillade_request_time_to_first_token_seconds".to_string()),
+                    SUBMISSION_LATENCY_BUCKETS,
+                )
+                .expect("Failed to set custom buckets for fusillade_request_time_to_first_token_seconds")
+                .set_buckets_for_metric(
+                    Matcher::Full("fusillade_request_pickup_delay_seconds".to_string()),
+                    SUBMISSION_LATENCY_BUCKETS,
+                )
+                .expect("Failed to set custom buckets for fusillade_request_pickup_delay_seconds")
                 .install_recorder()
                 .expect("Failed to install Prometheus recorder")
         })
@@ -1233,6 +1249,10 @@ pub async fn build_router(
         .route("/users/{user_id}/api-keys/{id}", get(api::handlers::api_keys::get_user_api_key))
         .route(
             "/users/{user_id}/api-keys/{id}",
+            patch(api::handlers::api_keys::update_user_api_key),
+        )
+        .route(
+            "/users/{user_id}/api-keys/{id}",
             delete(api::handlers::api_keys::delete_user_api_key),
         )
         // Webhooks as user sub-resources
@@ -1660,7 +1680,7 @@ pub async fn build_router(
                 crate::prompt_cache::PrincipalResolver::new(pool.clone()),
                 crate::prompt_cache::ModelConfigResolver::new(pool.clone()),
                 crate::prompt_cache::TokenizerClient::new(cfg.cache.tokenizer_url.clone()),
-                Arc::new(crate::prompt_cache::PostgresIndex::new(pool)),
+                Arc::new(crate::prompt_cache::PostgresIndex::new(pool, cfg.cache.index_conn_retries)),
                 crate::prompt_cache::TierPolicy::from_config(&cfg.cache.enabled_ttls, &cfg.cache.default_ttl),
                 crate::prompt_cache::TelemetryPolicy::from_config(
                     cfg.cache.telemetry_blocks.strip_from_prompt,
@@ -1675,7 +1695,11 @@ pub async fn build_router(
             };
             tracing::info!("Cached-input pricing enabled - wiring cache layer into onwards stack");
             onwards_router.layer(middleware::from_fn_with_state(
-                crate::prompt_cache::CacheLayerState::new(classifier, body_limit),
+                crate::prompt_cache::CacheLayerState::new(
+                    classifier,
+                    body_limit,
+                    std::time::Duration::from_secs(cfg.cache.classify_deadline_secs),
+                ),
                 crate::prompt_cache::cache_middleware,
             ))
         } else {
