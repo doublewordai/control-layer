@@ -246,18 +246,19 @@ mod tests {
         };
         baseline.run(&pool).await.unwrap();
 
-        // Relation names and index names share a PostgreSQL namespace. Force
-        // the migration's final index statement to fail after every preceding
-        // background schema statement has executed.
-        sqlx::query("CREATE TABLE idx_requests_active_sla_counts (id INTEGER)")
-            .execute(&pool)
-            .await
-            .unwrap();
+        // Force a late constraint-name collision after the migration has
+        // changed request constraints and added the batch service-tier column.
+        sqlx::query(
+            "ALTER TABLE batches ADD CONSTRAINT batches_background_deadline_check CHECK (TRUE)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
 
         MIGRATOR
             .run(&pool)
             .await
-            .expect_err("the conflicting relation must reject the background migration");
+            .expect_err("the conflicting constraint must reject the background migration");
 
         let service_tier_column_exists = sqlx::query_scalar::<_, bool>(
             r#"
@@ -278,19 +279,108 @@ mod tests {
             "a late DDL failure must roll back the earlier background schema changes"
         );
 
-        for index_name in [
+        let migration_applied = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT 1 FROM _sqlx_migrations WHERE version = 20260722000000)",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(
+            !migration_applied,
+            "an atomic failure must not record the migration as applied"
+        );
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn background_schema_migration_accepts_prebuilt_indexes(pool: sqlx::PgPool) {
+        let baseline = sqlx::migrate::Migrator {
+            migrations: Cow::Owned(
+                MIGRATOR
+                    .iter()
+                    .filter(|migration| migration.version < 20260722000000)
+                    .cloned()
+                    .collect(),
+            ),
+            ignore_missing: false,
+            locking: true,
+            no_tx: false,
+        };
+        baseline.run(&pool).await.unwrap();
+
+        // Production builds these indexes concurrently before deploying the
+        // release. The migration must accept the pre-created column and index
+        // names so its remaining metadata-only changes stay cheap.
+        sqlx::query("ALTER TABLE batches ADD COLUMN service_tier TEXT")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        for statement in [
+            r#"
+            CREATE INDEX idx_batches_background_active
+            ON batches (created_at, id)
+            WHERE service_tier = 'background'
+              AND deleted_at IS NULL
+            "#,
+            r#"
+            CREATE INDEX idx_requests_pending_background_batchless
+            ON requests (model, created_at, id)
+            WHERE state = 'pending'
+              AND batch_id IS NULL
+              AND template_id IS NOT NULL
+              AND service_tier = 'background'
+            "#,
+            r#"
+            CREATE INDEX idx_requests_pending_background_batched
+            ON requests (model, batch_id, created_at, id)
+            WHERE state = 'pending'
+              AND batch_id IS NOT NULL
+              AND template_id IS NOT NULL
+              AND service_tier = 'background'
+            "#,
+            r#"
+            CREATE INDEX idx_requests_pending_batchless_sla
+            ON requests (model, created_at, id)
+            WHERE state = 'pending'
+              AND batch_id IS NULL
+              AND template_id IS NOT NULL
+              AND service_tier IS DISTINCT FROM 'background'
+            "#,
+            r#"
+            CREATE INDEX idx_requests_active_sla_counts
+            ON requests (batch_id, model)
+            WHERE state IN ('pending', 'claimed', 'processing')
+              AND template_id IS NOT NULL
+              AND (
+                  service_tier IS NULL
+                  OR service_tier NOT IN ('priority', 'background')
+              )
+            "#,
+        ] {
+            sqlx::query(statement).execute(&pool).await.unwrap();
+        }
+
+        MIGRATOR
+            .run(&pool)
+            .await
+            .expect("the background migration must skip the pre-created column and indexes");
+
+        for relation_name in [
+            "idx_batches_background_active",
             "idx_requests_pending_background_batchless",
             "idx_requests_pending_background_batched",
             "idx_requests_pending_batchless_sla",
+            "idx_requests_active_sla_counts",
         ] {
-            let index_exists = sqlx::query_scalar::<_, bool>("SELECT to_regclass($1) IS NOT NULL")
-                .bind(index_name)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+            let relation_exists =
+                sqlx::query_scalar::<_, bool>("SELECT to_regclass($1) IS NOT NULL")
+                    .bind(relation_name)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
             assert!(
-                !index_exists,
-                "a late DDL failure must roll back {index_name}"
+                relation_exists,
+                "the pre-created relation {relation_name} must remain"
             );
         }
 
@@ -301,8 +391,8 @@ mod tests {
         .await
         .unwrap();
         assert!(
-            !migration_applied,
-            "an atomic failure must not record the migration as applied"
+            migration_applied,
+            "the migration must be recorded after skipping pre-created indexes"
         );
     }
 
