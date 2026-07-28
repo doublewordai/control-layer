@@ -1,5 +1,12 @@
 # Changelog
 
+## [8.103.1](https://github.com/doublewordai/control-layer/compare/v8.103.0...v8.103.1) (2026-07-28)
+
+
+### Bug Fixes
+
+* allow background indexes to be prebuilt ([#1365](https://github.com/doublewordai/control-layer/issues/1365)) ([5da8b9e](https://github.com/doublewordai/control-layer/commit/5da8b9e8d142c7d7f235920028a5563055ff85ec))
+
 ## [8.103.0](https://github.com/doublewordai/control-layer/compare/v8.102.0...v8.103.0) (2026-07-28)
 
 
