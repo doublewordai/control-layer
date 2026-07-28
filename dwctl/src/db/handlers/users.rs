@@ -112,6 +112,9 @@ struct User {
     pub user_type: String,
     pub verified: bool,
     pub zero_data_retention: bool,
+    /// Org key governance mode ('open'|'managed'); always 'open' for
+    /// individual accounts. See migration 124.
+    pub org_key_management_mode: String,
 }
 
 pub struct Users<'c> {
@@ -144,6 +147,7 @@ impl From<(Vec<Role>, User)> for UserDBResponse {
             auto_topup_monthly_limit: user.auto_topup_monthly_limit,
             user_type: user.user_type,
             zero_data_retention: user.zero_data_retention,
+            org_key_management_mode: user.org_key_management_mode,
         }
     }
 }
@@ -243,11 +247,12 @@ impl<'c> Repository for Users<'c> {
                 u.user_type,
                 u.verified,
                 u.zero_data_retention,
+                u.org_key_management_mode,
                 ARRAY_AGG(ur.role) FILTER (WHERE ur.role IS NOT NULL) as "roles: Vec<Role>"
             FROM users u
             LEFT JOIN user_roles ur ON ur.user_id = u.id
             WHERE u.id = $1 AND u.id != '00000000-0000-0000-0000-000000000000' AND u.is_deleted = false
-            GROUP BY u.id, u.username, u.email, u.display_name, u.avatar_url, u.auth_source, u.created_at, u.updated_at, u.last_login, u.is_admin, u.password_hash, u.external_user_id, u.payment_provider_id, u.is_deleted, u.is_internal, u.batch_notifications_enabled, u.first_batch_email_sent, u.low_balance_notification_sent, u.low_balance_threshold, u.auto_topup_amount, u.auto_topup_threshold, u.auto_topup_monthly_limit, u.auto_topup_limit_notification_sent, u.user_type, u.verified, u.zero_data_retention
+            GROUP BY u.id, u.username, u.email, u.display_name, u.avatar_url, u.auth_source, u.created_at, u.updated_at, u.last_login, u.is_admin, u.password_hash, u.external_user_id, u.payment_provider_id, u.is_deleted, u.is_internal, u.batch_notifications_enabled, u.first_batch_email_sent, u.low_balance_notification_sent, u.low_balance_threshold, u.auto_topup_amount, u.auto_topup_threshold, u.auto_topup_monthly_limit, u.auto_topup_limit_notification_sent, u.user_type, u.verified, u.zero_data_retention, u.org_key_management_mode
             "#,
             id
         )
@@ -282,6 +287,7 @@ impl<'c> Repository for Users<'c> {
                 user_type: row.user_type,
                 verified: row.verified,
                 zero_data_retention: row.zero_data_retention,
+                org_key_management_mode: row.org_key_management_mode,
             };
 
             let roles = row.roles.unwrap_or_default();
@@ -328,11 +334,12 @@ impl<'c> Repository for Users<'c> {
                 u.user_type,
                 u.verified,
                 u.zero_data_retention,
+                u.org_key_management_mode,
                 ARRAY_AGG(ur.role) FILTER (WHERE ur.role IS NOT NULL) as "roles: Vec<Role>"
             FROM users u
             LEFT JOIN user_roles ur ON ur.user_id = u.id
             WHERE u.id = ANY($1) AND u.id != '00000000-0000-0000-0000-000000000000' AND u.is_deleted = false
-            GROUP BY u.id, u.username, u.email, u.display_name, u.avatar_url, u.auth_source, u.created_at, u.updated_at, u.last_login, u.is_admin, u.password_hash, u.external_user_id, u.payment_provider_id, u.is_deleted, u.is_internal, u.batch_notifications_enabled, u.first_batch_email_sent, u.low_balance_notification_sent, u.low_balance_threshold, u.auto_topup_amount, u.auto_topup_threshold, u.auto_topup_monthly_limit, u.auto_topup_limit_notification_sent, u.user_type, u.verified, u.zero_data_retention
+            GROUP BY u.id, u.username, u.email, u.display_name, u.avatar_url, u.auth_source, u.created_at, u.updated_at, u.last_login, u.is_admin, u.password_hash, u.external_user_id, u.payment_provider_id, u.is_deleted, u.is_internal, u.batch_notifications_enabled, u.first_batch_email_sent, u.low_balance_notification_sent, u.low_balance_threshold, u.auto_topup_amount, u.auto_topup_threshold, u.auto_topup_monthly_limit, u.auto_topup_limit_notification_sent, u.user_type, u.verified, u.zero_data_retention, u.org_key_management_mode
             "#,
             ids.as_slice()
         )
@@ -369,6 +376,7 @@ impl<'c> Repository for Users<'c> {
                 user_type: row.user_type,
                 verified: row.verified,
                 zero_data_retention: row.zero_data_retention,
+                org_key_management_mode: row.org_key_management_mode,
             };
 
             let roles = row.roles.unwrap_or_default();

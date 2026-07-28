@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use utoipa::{IntoParams, ToSchema};
 
 use super::dwext::BatchDwExtResponse;
+use crate::types::ApiKeyId;
 
 /// Batch-level errors
 #[derive(Debug, Serialize, Deserialize, ToSchema, Clone)]
@@ -72,6 +73,16 @@ pub struct CreateBatchRequest {
     /// Optional metadata (up to 16 key-value pairs)
     #[serde(default)]
     pub metadata: Option<HashMap<String, String>>,
+
+    /// Attribute this batch to a specific API key (organization context only).
+    /// The key must belong to the organization and be usable by the caller:
+    /// one they created, or any org key for org owners/admins. The batch's
+    /// spend counts against the selected key's usage limit and its usage is
+    /// attributed to the key's creator. Members of a managed-keys organization
+    /// must select a key when creating batches from the dashboard.
+    #[serde(default)]
+    #[schema(value_type = Option<String>, format = "uuid")]
+    pub api_key_id: Option<ApiKeyId>,
 }
 
 /// Request body for retrying specific requests

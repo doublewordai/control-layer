@@ -491,6 +491,13 @@ export interface ApiKeyCreateResponse extends ApiKey {
   key: string; // The actual API key - only returned on creation
 }
 
+// Response of the dedicated secret-fetch and rotate endpoints. The only
+// places (besides creation) a secret ever appears — every fetch is audited
+// server-side.
+export interface ApiKeySecretResponse {
+  key: string;
+}
+
 // Request payload types for CRUD operations Certain endpoints can have query
 // parameters that trigger additional data returns. For example, GET
 // /admin/api/v1/groups?include=users,models will return user ids and model ids
@@ -585,6 +592,9 @@ export interface ApiKeyCreateRequest {
   burst_size?: number | null;
   spend_limit?: string | null; // Spending cap in credits (decimal string)
   spend_limit_interval?: SpendLimitInterval | null; // Requires spend_limit; null = one-off
+  // Issue the key to another org member (org targets only; PlatformManager or
+  // org owner/admin). The key is attributed to — and visible to — the member.
+  member_id?: string;
 }
 
 // PATCH /users/{id}/api-keys/{keyId}. Cap fields are tri-state: omit the field
@@ -1361,6 +1371,10 @@ export interface BatchCreateRequest {
   endpoint: string;
   completion_window: string; // Completion window like "24h", "1h"
   metadata?: Record<string, string>;
+  // Attribute the batch to a specific API key (org context only). Spend
+  // counts against the key's usage limit; usage is attributed to the key's
+  // holder. Required for members of managed-keys orgs.
+  api_key_id?: string;
   output_expires_after?: {
     anchor: "created_at";
     seconds: number;
@@ -1687,9 +1701,14 @@ export interface OrganizationSummary {
   zero_data_retention: boolean; // Whether the organization has zero data retention enabled
 }
 
+/** Org key governance mode: 'open' = members self-manage their keys;
+ * 'managed' = only org owners/admins issue keys, members hold them read-only. */
+export type KeyManagementMode = "open" | "managed";
+
 /** Organization response — flattened User with org-specific fields */
 export interface Organization extends User {
   member_count?: number;
+  key_management_mode?: KeyManagementMode;
 }
 
 export interface OrganizationMember {
@@ -1714,6 +1733,7 @@ export interface OrganizationUpdateRequest {
   batch_notifications_enabled?: boolean;
   low_balance_threshold?: number | null;
   zero_data_retention?: boolean; // Account-wide zero-data-retention flag (admin-only)
+  key_management_mode?: KeyManagementMode; // Org owner/admin only
 }
 
 export interface InviteMemberRequest {

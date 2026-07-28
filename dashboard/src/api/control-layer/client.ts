@@ -13,6 +13,7 @@ import type {
   UserCreateRequest,
   GroupCreateRequest,
   ApiKeyCreateRequest,
+  ApiKeySecretResponse,
   ApiKeyUpdateRequest,
   UserUpdateRequest,
   GroupUpdateRequest,
@@ -291,6 +292,43 @@ const userApi = {
       if (!response.ok) {
         throw new Error(`Failed to delete API key: ${response.status}`);
       }
+    },
+
+    // Fetch a key's secret on demand (creator / org owner-admin / PM only;
+    // audited server-side). Never cached — call at the moment of reveal/copy.
+    async getSecret(
+      keyId: string,
+      userId: string = "current",
+    ): Promise<ApiKeySecretResponse> {
+      const response = await fetch(
+        `/admin/api/v1/users/${userId}/api-keys/${keyId}/secret`,
+      );
+      if (!response.ok) {
+        throw new Error(`Failed to fetch API key secret: ${response.status}`);
+      }
+      return response.json();
+    },
+
+    // Replace the key's secret. The old secret stops working within ~1s for
+    // NEW requests; batches already submitted keep running on their hidden
+    // execution key — cancel them separately if the old secret leaked.
+    async rotate(
+      keyId: string,
+      userId: string = "current",
+    ): Promise<ApiKeySecretResponse> {
+      const response = await fetch(
+        `/admin/api/v1/users/${userId}/api-keys/${keyId}/rotate`,
+        { method: "POST" },
+      );
+      if (!response.ok) {
+        const text = await response.text().catch(() => "");
+        throw new Error(
+          text
+            ? `Failed to rotate API key: ${response.status} - ${text}`
+            : `Failed to rotate API key: ${response.status}`,
+        );
+      }
+      return response.json();
     },
   },
 

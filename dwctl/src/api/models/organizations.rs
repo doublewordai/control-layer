@@ -43,6 +43,10 @@ pub struct OrganizationUpdate {
     /// Account-wide zero-data-retention flag. Admin-only: only callers with
     /// UpdateAll on organizations may set this. Omit to leave unchanged.
     pub zero_data_retention: Option<bool>,
+    /// Org key governance mode: 'open' (members create and manage their own
+    /// keys — the default) or 'managed' (only org owners/admins issue keys;
+    /// members hold them read-only). Omit to leave unchanged.
+    pub key_management_mode: Option<String>,
 }
 
 /// Full organization details returned by the API.

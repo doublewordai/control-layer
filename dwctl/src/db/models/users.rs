@@ -107,4 +107,7 @@ pub struct UserDBResponse {
     pub user_type: String,
     /// Account-wide zero-data-retention flag.
     pub zero_data_retention: bool,
+    /// Org key governance mode ('open'|'managed'); always 'open' for
+    /// individual accounts.
+    pub org_key_management_mode: String,
 }

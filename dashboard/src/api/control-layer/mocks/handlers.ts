@@ -1115,6 +1115,43 @@ export const handlers = [
     return HttpResponse.json(null, { status: 204 });
   }),
 
+  http.get(
+    "/admin/api/v1/users/:userId/api-keys/:keyId/secret",
+    ({ params }) => {
+      const apiKey = apiKeysData.find((k) => k.id === params.keyId) as
+        | (ApiKey & { key?: string })
+        | undefined;
+      if (!apiKey) {
+        return HttpResponse.json(
+          { error: "API key not found" },
+          { status: 404 },
+        );
+      }
+      // Seed keys have no stored secret; mint a stable-ish demo one.
+      const key = apiKey.key ?? `sk-demo-${apiKey.id}`;
+      return HttpResponse.json({ key });
+    },
+  ),
+
+  http.post(
+    "/admin/api/v1/users/:userId/api-keys/:keyId/rotate",
+    ({ params }) => {
+      const apiKey = apiKeysData.find((k) => k.id === params.keyId) as
+        | (ApiKey & { key?: string })
+        | undefined;
+      if (!apiKey) {
+        return HttpResponse.json(
+          { error: "API key not found" },
+          { status: 404 },
+        );
+      }
+      const key = `sk-${Math.random().toString(36).substring(2, 50)}`;
+      // Persist so a follow-up secret fetch returns the rotated value.
+      apiKey.key = key;
+      return HttpResponse.json({ key });
+    },
+  ),
+
   // Webhooks under users
   http.get("/admin/api/v1/users/:userId/webhooks", () => {
     return HttpResponse.json([]);

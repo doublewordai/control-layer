@@ -19,7 +19,12 @@ import {
 const mockOrgContext = vi.hoisted(() => ({
   value: {
     activeOrganizationId: null as string | null,
-    activeOrganization: null,
+    activeOrganization: null as {
+      id: string;
+      name: string;
+      role: string;
+      zero_data_retention: boolean;
+    } | null,
     isOrgContext: false,
     setActiveOrganization: async () => {},
   },
@@ -999,6 +1004,445 @@ describe("API Keys Component - Functional Tests", () => {
       await waitFor(() => {
         expect(patchBody).toEqual({ reset_window: true });
       });
+    });
+  });
+
+  describe("Secret Retrieval and Rotation", () => {
+    it("rotate dialog warns about in-flight batches and shows the new secret on confirm", async () => {
+      const user = userEvent.setup();
+      let rotatedKeyId: string | undefined;
+      server.use(
+        http.post(
+          "/admin/api/v1/users/:userId/api-keys/:keyId/rotate",
+          ({ params }) => {
+            rotatedKeyId = params.keyId as string;
+            return HttpResponse.json({ key: "sk-rotated-new-secret" });
+          },
+        ),
+      );
+
+      const { container } = render(<ApiKeys />, { wrapper: createWrapper() });
+
+      await user.click(
+        await within(container).findByRole("button", {
+          name: /rotate ci\/cd pipeline/i,
+        }),
+      );
+
+      // Confirm dialog carries the in-flight-batch warning.
+      await waitFor(() => {
+        expect(
+          screen.getByRole("heading", { name: /rotate api key/i }),
+        ).toBeInTheDocument();
+      });
+      expect(
+        screen.getByText(/batches already submitted with this key/i),
+      ).toBeInTheDocument();
+      expect(
+        screen.getByText(/cancel any in-flight batches\s+separately/i),
+      ).toBeInTheDocument();
+
+      await user.click(screen.getByRole("button", { name: /^rotate key$/i }));
+
+      // One-time secret display, same pattern as creation.
+      await waitFor(() => {
+        expect(
+          screen.getByRole("heading", { name: /api key rotated/i }),
+        ).toBeInTheDocument();
+      });
+      expect(rotatedKeyId).toBe("key-1");
+      expect(
+        screen.getByText(/save this key now - it won't be shown again/i),
+      ).toBeInTheDocument();
+      expect(screen.getByText("sk-rotated-new-secret")).toBeInTheDocument();
+      expect(
+        screen.getByRole("button", { name: /copy api key/i }),
+      ).toBeInTheDocument();
+    });
+
+    it("copy-secret action fetches the secret endpoint and copies to clipboard", async () => {
+      const user = userEvent.setup();
+      const testMockWrite = vi.fn().mockResolvedValue(undefined);
+      Object.defineProperty(navigator, "clipboard", {
+        value: { writeText: testMockWrite },
+        writable: true,
+        configurable: true,
+      });
+
+      let fetchedKeyId: string | undefined;
+      server.use(
+        http.get(
+          "/admin/api/v1/users/:userId/api-keys/:keyId/secret",
+          ({ params }) => {
+            fetchedKeyId = params.keyId as string;
+            return HttpResponse.json({ key: "sk-fetched-secret" });
+          },
+        ),
+      );
+
+      const { container } = render(<ApiKeys />, { wrapper: createWrapper() });
+
+      await user.click(
+        await within(container).findByRole("button", {
+          name: /copy secret for ci\/cd pipeline/i,
+        }),
+      );
+
+      await waitFor(() => {
+        expect(fetchedKeyId).toBe("key-1");
+        expect(testMockWrite).toHaveBeenCalledWith("sk-fetched-secret");
+        expect(toast.success as unknown as Mock).toHaveBeenCalledWith(
+          "API key secret copied to clipboard",
+        );
+      });
+    });
+
+    it("reveals a masked secret only after an explicit fetch", async () => {
+      const user = userEvent.setup();
+      const { container } = render(<ApiKeys />, { wrapper: createWrapper() });
+
+      const keyName = await within(container).findByText("CI/CD Pipeline");
+      const keyRow = keyName.closest("tr");
+      expect(keyRow).not.toBeNull();
+
+      // Masked until the user explicitly reveals.
+      expect(within(keyRow!).getByText("sk-••••••••")).toBeInTheDocument();
+
+      await user.click(
+        within(keyRow!).getByRole("button", {
+          name: /reveal secret for ci\/cd pipeline/i,
+        }),
+      );
+
+      // Default mock handler mints a stable demo secret per key.
+      await waitFor(() => {
+        expect(within(keyRow!).getByText("sk-demo-key-1")).toBeInTheDocument();
+      });
+      // The affordance flips to hide it again.
+      await user.click(
+        within(keyRow!).getByRole("button", {
+          name: /hide secret for ci\/cd pipeline/i,
+        }),
+      );
+      expect(within(keyRow!).getByText("sk-••••••••")).toBeInTheDocument();
+    });
+  });
+
+  describe("Org Key Management", () => {
+    const orgId = "org-550e8400-0001";
+    // Sarah Chen — usersData[0], the demo "current" user and org owner.
+    const managerId = "550e8400-e29b-41d4-a716-446655440001";
+    // James Wilson — usersData[1], plain member of the org.
+    const memberId = "550e8400-e29b-41d4-a716-446655440002";
+
+    function enterOrgContext(role: string) {
+      mockOrgContext.value = {
+        activeOrganizationId: orgId,
+        activeOrganization: {
+          id: orgId,
+          name: "Acme Corporation",
+          role,
+          zero_data_retention: false,
+        },
+        isOrgContext: true,
+        setActiveOrganization: async () => {},
+      };
+    }
+
+    it("shows scope tabs, member filter, and assignee column to an org manager", async () => {
+      enterOrgContext("owner");
+
+      const { container } = render(<ApiKeys />, { wrapper: createWrapper() });
+
+      // Manager default is "All keys".
+      const allKeysTab = await within(container).findByRole("tab", {
+        name: /all keys/i,
+      });
+      expect(allKeysTab).toHaveAttribute("aria-selected", "true");
+      expect(
+        within(container).getByRole("tab", { name: /my keys/i }),
+      ).toBeInTheDocument();
+
+      // Member filter dropdown, built from the org members list.
+      expect(
+        within(container).getByRole("combobox", { name: /filter by member/i }),
+      ).toBeInTheDocument();
+
+      // Assignee column resolves created_by via the members list.
+      expect(
+        within(container).getByRole("columnheader", { name: /assignee/i }),
+      ).toBeInTheDocument();
+      await waitFor(() => {
+        expect(
+          within(container).getAllByText("Sarah Chen").length,
+        ).toBeGreaterThanOrEqual(1);
+      });
+    });
+
+    it("filters the list down to a single member's keys", async () => {
+      const user = userEvent.setup();
+      enterOrgContext("owner");
+
+      server.use(
+        http.get("/admin/api/v1/users/:userId/api-keys", () => {
+          return HttpResponse.json({
+            data: [
+              {
+                id: "mgr-key",
+                name: "Manager Key",
+                created_at: "2026-01-01T00:00:00Z",
+                created_by: managerId,
+              },
+              {
+                id: "mem-key",
+                name: "Member Key",
+                created_at: "2026-01-02T00:00:00Z",
+                created_by: memberId,
+              },
+            ],
+            total_count: 2,
+            skip: 0,
+            limit: 10,
+          });
+        }),
+      );
+
+      const { container } = render(<ApiKeys />, { wrapper: createWrapper() });
+
+      // Managers see everyone's keys by default.
+      await within(container).findByText("Manager Key");
+      expect(within(container).getByText("Member Key")).toBeInTheDocument();
+
+      // Filter by James → only his key remains.
+      await user.click(
+        within(container).getByRole("combobox", { name: /filter by member/i }),
+      );
+      await user.click(screen.getByRole("option", { name: "James Wilson" }));
+      await waitFor(() => {
+        expect(
+          within(container).queryByText("Manager Key"),
+        ).not.toBeInTheDocument();
+      });
+      expect(within(container).getByText("Member Key")).toBeInTheDocument();
+
+      // "My keys" tab filters on created_by === me, overriding the member
+      // filter.
+      await user.click(
+        within(container).getByRole("tab", { name: /my keys/i }),
+      );
+      await waitFor(() => {
+        expect(within(container).getByText("Manager Key")).toBeInTheDocument();
+      });
+      expect(
+        within(container).queryByText("Member Key"),
+      ).not.toBeInTheDocument();
+    });
+
+    it("lets a manager issue a key to another member", async () => {
+      const user = userEvent.setup();
+      enterOrgContext("admin");
+
+      let capturedBody: Record<string, unknown> | undefined;
+      server.use(
+        http.post(
+          "/admin/api/v1/users/:userId/api-keys",
+          async ({ request }) => {
+            capturedBody = (await request.json()) as Record<string, unknown>;
+            return HttpResponse.json(
+              {
+                id: "issued-key",
+                name: capturedBody.name,
+                created_at: new Date().toISOString(),
+                created_by: memberId,
+                key: "sk-issued-to-member",
+              },
+              { status: 201 },
+            );
+          },
+        ),
+      );
+
+      const { container } = render(<ApiKeys />, { wrapper: createWrapper() });
+
+      await user.click(
+        await within(container).findByRole("button", {
+          name: /create new api key/i,
+        }),
+      );
+      await waitFor(() => {
+        expect(screen.getByRole("dialog")).toBeInTheDocument();
+      });
+
+      await user.type(screen.getByLabelText(/name/i), "James's Key");
+
+      // Assign to another member; helper text explains where the key lands.
+      const assignSelect = screen.getByRole("combobox", {
+        name: /assign to member/i,
+      });
+      expect(
+        screen.getByText(/retrieve the secret themselves/i),
+      ).toBeInTheDocument();
+      await user.click(assignSelect);
+      await user.click(screen.getByRole("option", { name: "James Wilson" }));
+
+      await user.click(screen.getByRole("button", { name: /create key/i }));
+
+      await waitFor(() => {
+        expect(capturedBody).toMatchObject({
+          name: "James's Key",
+          member_id: memberId,
+        });
+      });
+    });
+
+    it("managed mode: plain member sees the banner and view-only rows", async () => {
+      enterOrgContext("member");
+
+      server.use(
+        // Current user is James, a plain StandardUser member.
+        http.get("/admin/api/v1/users/:id", ({ params }) => {
+          if (params.id === "current") {
+            return HttpResponse.json({
+              id: memberId,
+              username: "github|87234156",
+              email: "james.wilson@acme.com",
+              roles: ["StandardUser"],
+            });
+          }
+          return HttpResponse.json({ error: "not found" }, { status: 404 });
+        }),
+        // The org is in managed key mode.
+        http.get("/admin/api/v1/organizations/:id", () => {
+          return HttpResponse.json({
+            id: orgId,
+            username: "acme-corp",
+            display_name: "Acme Corporation",
+            key_management_mode: "managed",
+          });
+        }),
+        // The member holds one org key (issued by an admin).
+        http.get("/admin/api/v1/users/:userId/api-keys", () => {
+          return HttpResponse.json({
+            data: [
+              {
+                id: "held-key",
+                name: "Issued Key",
+                created_at: "2026-01-01T00:00:00Z",
+                created_by: memberId,
+                spend_limit: "10",
+                spend_limit_interval: "monthly",
+                spend: "1",
+                resets_at: "2026-08-01T00:00:00Z",
+              },
+            ],
+            total_count: 1,
+            skip: 0,
+            limit: 10,
+          });
+        }),
+      );
+
+      const { container } = render(<ApiKeys />, { wrapper: createWrapper() });
+
+      await within(container).findByText("Issued Key");
+
+      // Info banner, and no create affordance anywhere.
+      await waitFor(() => {
+        expect(
+          within(container).getByText(
+            /api keys in this organization are issued by its admins/i,
+          ),
+        ).toBeInTheDocument();
+      });
+      expect(
+        within(container).queryByRole("button", { name: /create new api key/i }),
+      ).not.toBeInTheDocument();
+      expect(
+        within(container).queryByRole("button", { name: /create first api key/i }),
+      ).not.toBeInTheDocument();
+
+      // No manage actions on the row: edit, rotate, delete are all gone,
+      // and so is bulk selection.
+      expect(
+        within(container).queryByRole("button", {
+          name: /edit usage limit for issued key/i,
+        }),
+      ).not.toBeInTheDocument();
+      expect(
+        within(container).queryByRole("button", { name: /rotate issued key/i }),
+      ).not.toBeInTheDocument();
+      expect(
+        within(container).queryByRole("button", { name: /delete issued key/i }),
+      ).not.toBeInTheDocument();
+      expect(within(container).queryByRole("checkbox")).not.toBeInTheDocument();
+
+      // View + secret retrieval remain available.
+      expect(
+        within(container).getByRole("button", {
+          name: /reveal secret for issued key/i,
+        }),
+      ).toBeInTheDocument();
+      expect(
+        within(container).getByRole("button", {
+          name: /copy secret for issued key/i,
+        }),
+      ).toBeInTheDocument();
+      // No scoping tabs for non-managers.
+      expect(within(container).queryByRole("tab")).not.toBeInTheDocument();
+    });
+
+    it("managed mode: org managers keep full management of all org keys", async () => {
+      enterOrgContext("owner");
+
+      server.use(
+        http.get("/admin/api/v1/organizations/:id", () => {
+          return HttpResponse.json({
+            id: orgId,
+            username: "acme-corp",
+            display_name: "Acme Corporation",
+            key_management_mode: "managed",
+          });
+        }),
+        http.get("/admin/api/v1/users/:userId/api-keys", () => {
+          return HttpResponse.json({
+            data: [
+              {
+                id: "mem-key",
+                name: "Member Key",
+                created_at: "2026-01-02T00:00:00Z",
+                created_by: memberId,
+              },
+            ],
+            total_count: 1,
+            skip: 0,
+            limit: 10,
+          });
+        }),
+      );
+
+      const { container } = render(<ApiKeys />, { wrapper: createWrapper() });
+
+      await within(container).findByText("Member Key");
+
+      // Managers are unaffected by managed mode: create + full row actions,
+      // even on a key held by another member.
+      expect(
+        within(container).getByRole("button", { name: /create new api key/i }),
+      ).toBeInTheDocument();
+      expect(
+        within(container).queryByText(/issued by its admins/i),
+      ).not.toBeInTheDocument();
+      expect(
+        within(container).getByRole("button", {
+          name: /edit usage limit for member key/i,
+        }),
+      ).toBeInTheDocument();
+      expect(
+        within(container).getByRole("button", { name: /rotate member key/i }),
+      ).toBeInTheDocument();
+      expect(
+        within(container).getByRole("button", { name: /delete member key/i }),
+      ).toBeInTheDocument();
     });
   });
 });

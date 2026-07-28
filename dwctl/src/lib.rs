@@ -1252,6 +1252,14 @@ pub async fn build_router(
             patch(api::handlers::api_keys::update_user_api_key),
         )
         .route(
+            "/users/{user_id}/api-keys/{id}/secret",
+            get(api::handlers::api_keys::get_user_api_key_secret),
+        )
+        .route(
+            "/users/{user_id}/api-keys/{id}/rotate",
+            post(api::handlers::api_keys::rotate_user_api_key),
+        )
+        .route(
             "/users/{user_id}/api-keys/{id}",
             delete(api::handlers::api_keys::delete_user_api_key),
         )

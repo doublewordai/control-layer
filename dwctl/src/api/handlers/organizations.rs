@@ -490,6 +490,14 @@ pub async fn update_organization<P: PoolProvider>(
         });
     }
 
+    if let Some(ref mode) = data.key_management_mode
+        && !matches!(mode.as_str(), "open" | "managed")
+    {
+        return Err(Error::BadRequest {
+            message: "key_management_mode must be 'open' or 'managed'".to_string(),
+        });
+    }
+
     // Look up the current org so we can compare emails and address verification emails.
     let mut users_repo = Users::new(&mut pool_conn);
     let current_org = users_repo.get_by_id(id).await?.ok_or_else(|| Error::NotFound {
@@ -654,6 +662,7 @@ pub async fn update_organization<P: PoolProvider>(
         batch_notifications_enabled: data.batch_notifications_enabled,
         low_balance_threshold: data.low_balance_threshold,
         zero_data_retention: data.zero_data_retention,
+        key_management_mode: data.key_management_mode,
     };
     debug_assert!(
         db_request.email.is_none(),
@@ -1746,6 +1755,7 @@ pub async fn confirm_email_change<P: PoolProvider>(
             batch_notifications_enabled: None,
             low_balance_threshold: None,
             zero_data_retention: None,
+            key_management_mode: None,
         };
         org_repo.update(pending.organization_id, &update).await?;
         // The `confirm_*_email_side` UPDATE above already locked this row, so
@@ -3389,5 +3399,79 @@ mod tests {
             "next@example.com",
             "non-email PATCH must still surface the in-flight change; got: {body}",
         );
+    }
+
+    // ── Key management mode (org key governance setting) ──────────────────
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_org_key_management_mode_setting(pool: PgPool) {
+        use crate::test::utils::add_org_member;
+
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let owner = create_test_user(&pool, Role::StandardUser).await;
+        let admin_member = create_test_user(&pool, Role::StandardUser).await;
+        let member = create_test_user(&pool, Role::StandardUser).await;
+        let owner_headers = add_auth_headers(&owner);
+
+        let resp = server
+            .post("/admin/api/v1/organizations")
+            .add_header(&owner_headers[0].0, &owner_headers[0].1)
+            .add_header(&owner_headers[1].0, &owner_headers[1].1)
+            .json(&json!({ "name": "keymode-org", "email": "contact@keymode-org.com" }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::CREATED);
+        let org_id = resp.json::<serde_json::Value>()["id"].as_str().unwrap().to_string();
+        let org_uuid: uuid::Uuid = org_id.parse().unwrap();
+        add_org_member(&pool, org_uuid.into(), admin_member.id, "admin").await;
+        add_org_member(&pool, org_uuid.into(), member.id, "member").await;
+
+        // Defaults to open, and the mode is visible on GET.
+        let resp = server
+            .get(&format!("/admin/api/v1/organizations/{org_id}"))
+            .add_header(&owner_headers[0].0, &owner_headers[0].1)
+            .add_header(&owner_headers[1].0, &owner_headers[1].1)
+            .await;
+        resp.assert_status(axum::http::StatusCode::OK);
+        assert_eq!(resp.json::<serde_json::Value>()["key_management_mode"].as_str(), Some("open"));
+
+        // Plain member cannot flip it.
+        let member_headers = add_auth_headers(&member);
+        server
+            .patch(&format!("/admin/api/v1/organizations/{org_id}"))
+            .add_header(&member_headers[0].0, &member_headers[0].1)
+            .add_header(&member_headers[1].0, &member_headers[1].1)
+            .json(&json!({ "key_management_mode": "managed" }))
+            .await
+            .assert_status(axum::http::StatusCode::FORBIDDEN);
+
+        // Invalid values are rejected.
+        server
+            .patch(&format!("/admin/api/v1/organizations/{org_id}"))
+            .add_header(&owner_headers[0].0, &owner_headers[0].1)
+            .add_header(&owner_headers[1].0, &owner_headers[1].1)
+            .json(&json!({ "key_management_mode": "locked" }))
+            .await
+            .assert_status(axum::http::StatusCode::BAD_REQUEST);
+
+        // Org admins (not just the owner) can manage the mode.
+        let admin_headers = add_auth_headers(&admin_member);
+        let resp = server
+            .patch(&format!("/admin/api/v1/organizations/{org_id}"))
+            .add_header(&admin_headers[0].0, &admin_headers[0].1)
+            .add_header(&admin_headers[1].0, &admin_headers[1].1)
+            .json(&json!({ "key_management_mode": "managed" }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::OK);
+        assert_eq!(resp.json::<serde_json::Value>()["key_management_mode"].as_str(), Some("managed"));
+
+        // And it round-trips on GET.
+        let resp = server
+            .get(&format!("/admin/api/v1/organizations/{org_id}"))
+            .add_header(&owner_headers[0].0, &owner_headers[0].1)
+            .add_header(&owner_headers[1].0, &owner_headers[1].1)
+            .await;
+        resp.assert_status(axum::http::StatusCode::OK);
+        assert_eq!(resp.json::<serde_json::Value>()["key_management_mode"].as_str(), Some("managed"));
     }
 }

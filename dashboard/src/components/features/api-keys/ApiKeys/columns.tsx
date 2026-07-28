@@ -1,7 +1,7 @@
 "use client";
 
 import { type ColumnDef } from "@tanstack/react-table";
-import { ArrowUpDown, Trash2, Pencil } from "lucide-react";
+import { ArrowUpDown, Trash2, Pencil, Eye, EyeOff, Copy, RefreshCw } from "lucide-react";
 import { Button } from "../../../ui/button";
 import { Checkbox } from "../../../ui/checkbox";
 import type { ApiKey } from "../../../../api/control-layer/types";
@@ -10,10 +10,24 @@ import { formatCredits, formatResetInstant, limitPeriodLabel } from "./spendCap"
 interface ColumnActions {
   onDelete: (apiKey: ApiKey) => void;
   onEdit: (apiKey: ApiKey) => void;
-  /** Whether the current user may edit this key's usage limit (creator or
-   *  PlatformManager — mirrors what the PATCH endpoint permits). */
+  /** Whether the current user may manage this key (rename, edit caps, rotate,
+   *  delete). Mirrors what the server permits: PlatformManager, org
+   *  owner/admin in org context, or the key's creator — unless the org is in
+   *  managed key mode, where plain members hold their keys read-only. */
   canManage: (apiKey: ApiKey) => boolean;
   isPlatformManager?: boolean;
+  /** Org context only: show the holder of each key, resolved from the org
+   *  members list via created_by. */
+  showAssignee?: boolean;
+  resolveAssignee?: (createdBy: string) => string;
+  /** Secrets revealed via explicit user action, keyed by key id. Never part
+   *  of the list payload — fetched on demand from the secret endpoint. */
+  revealedSecrets?: Record<string, string>;
+  onRevealSecret: (apiKey: ApiKey) => void;
+  onCopySecret: (apiKey: ApiKey) => void;
+  onRotate: (apiKey: ApiKey) => void;
+  /** Hide the bulk-select column (e.g. managed-mode members can't delete). */
+  showSelect?: boolean;
 }
 
 export const createColumns = (actions: ColumnActions): ColumnDef<ApiKey>[] => {
@@ -79,6 +93,61 @@ export const createColumns = (actions: ColumnActions): ColumnDef<ApiKey>[] => {
                 {apiKey.description}
               </span>
             )}
+          </div>
+        );
+      },
+    },
+    {
+      id: "assignee",
+      header: "Assignee",
+      cell: ({ row }) => {
+        const apiKey = row.original;
+        return (
+          <span className="text-sm text-doubleword-neutral-700">
+            {actions.resolveAssignee
+              ? actions.resolveAssignee(apiKey.created_by)
+              : apiKey.created_by}
+          </span>
+        );
+      },
+    },
+    {
+      id: "secret",
+      header: "Secret",
+      cell: ({ row }) => {
+        const apiKey = row.original;
+        const revealed = actions.revealedSecrets?.[apiKey.id];
+        return (
+          <div className="flex items-center gap-1">
+            <code className="text-xs font-mono text-doubleword-neutral-600 max-w-48 overflow-x-auto whitespace-nowrap">
+              {revealed ?? "sk-••••••••"}
+            </code>
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => actions.onRevealSecret(apiKey)}
+              aria-label={
+                revealed
+                  ? `Hide secret for ${apiKey.name}`
+                  : `Reveal secret for ${apiKey.name}`
+              }
+              className="text-doubleword-neutral-600 hover:text-doubleword-neutral-900"
+            >
+              {revealed ? (
+                <EyeOff className="h-4 w-4" />
+              ) : (
+                <Eye className="h-4 w-4" />
+              )}
+            </Button>
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => actions.onCopySecret(apiKey)}
+              aria-label={`Copy secret for ${apiKey.name}`}
+              className="text-doubleword-neutral-600 hover:text-doubleword-neutral-900"
+            >
+              <Copy className="h-4 w-4" />
+            </Button>
           </div>
         );
       },
@@ -196,19 +265,32 @@ export const createColumns = (actions: ColumnActions): ColumnDef<ApiKey>[] => {
       cell: ({ row }) => {
         const apiKey = row.original;
 
+        if (!actions.canManage(apiKey)) {
+          // View-only rows (e.g. managed-mode org members): secret
+          // reveal/copy lives on the Secret column; no mutating actions.
+          return null;
+        }
+
         return (
           <div className="flex items-center">
-            {actions.canManage(apiKey) && (
-              <Button
-                variant="ghost"
-                size="sm"
-                onClick={() => actions.onEdit(apiKey)}
-                aria-label={`Edit usage limit for ${apiKey.name}`}
-                className="text-doubleword-neutral-600 hover:text-doubleword-neutral-900"
-              >
-                <Pencil className="h-4 w-4" />
-              </Button>
-            )}
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => actions.onEdit(apiKey)}
+              aria-label={`Edit usage limit for ${apiKey.name}`}
+              className="text-doubleword-neutral-600 hover:text-doubleword-neutral-900"
+            >
+              <Pencil className="h-4 w-4" />
+            </Button>
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => actions.onRotate(apiKey)}
+              aria-label={`Rotate ${apiKey.name}`}
+              className="text-doubleword-neutral-600 hover:text-doubleword-neutral-900"
+            >
+              <RefreshCw className="h-4 w-4" />
+            </Button>
             <Button
               variant="ghost"
               size="sm"
@@ -224,7 +306,12 @@ export const createColumns = (actions: ColumnActions): ColumnDef<ApiKey>[] => {
     },
   ];
 
-  // The key-type badge now rides inline on the Name column for everyone,
-  // matching the design; there is no separate purpose column to gate.
-  return allColumns;
+  // The key-type badge rides inline on the Name column for everyone; the
+  // Assignee column only appears in org context, and the bulk-select column
+  // is dropped for users who can't delete anything anyway.
+  return allColumns.filter((col) => {
+    if (col.id === "assignee" && !actions.showAssignee) return false;
+    if (col.id === "select" && actions.showSelect === false) return false;
+    return true;
+  });
 };

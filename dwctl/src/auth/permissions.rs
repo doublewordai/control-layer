@@ -460,6 +460,100 @@ pub async fn is_org_member(
     Ok(repo.get_user_org_role(current_user.id, target_user_id).await?.is_some())
 }
 
+/// Org-level key governance policy (users.org_key_management_mode).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyManagementMode {
+    /// Members self-serve: create and fully manage their OWN keys, including
+    /// usage limits (caps are an owner's tool — e.g. budgeting an agent key).
+    Open,
+    /// Only org owners/admins create/manage keys. Members hold issued keys
+    /// read-only: view usage/window/reset and fetch the secret, nothing else.
+    Managed,
+}
+
+/// Resolved key-management capabilities of `current_user` acting on keys
+/// owned by `target_user_id` (a personal account or an organization).
+///
+/// This is the single place the ownership rule lives (see
+/// working-docs/api-keys/org-key-management-plan.md): edit rights follow
+/// creation rights. PlatformManager checks remain the caller's concern (PMs
+/// bypass everything via the existing can_*_all helpers).
+#[derive(Debug, Clone, Copy)]
+pub struct KeyCapabilities {
+    /// Target is an organization (vs a personal account).
+    pub target_is_org: bool,
+    /// The org's governance mode; `Open` for personal targets.
+    pub mode: KeyManagementMode,
+    /// current_user is an owner/admin of the target org.
+    pub is_org_manager: bool,
+}
+
+impl KeyCapabilities {
+    /// May the user create keys of their own under this target?
+    /// (Also gates editing/rotating keys they created — ownership follows
+    /// creation, so managed-mode members hold issued keys read-only.)
+    pub fn can_self_manage_keys(&self) -> bool {
+        !self.target_is_org || self.is_org_manager || self.mode == KeyManagementMode::Open
+    }
+
+    /// Must a dashboard-created batch for this target select an API key?
+    /// (Managed orgs close the "UI batches bypass key budgets" hole; org
+    /// managers are exempt — unkeyed admin batches are their prerogative.)
+    pub fn requires_batch_key_selection(&self) -> bool {
+        self.target_is_org && self.mode == KeyManagementMode::Managed && !self.is_org_manager
+    }
+}
+
+/// Resolve `KeyCapabilities` in one round trip: target's type + mode joined
+/// with the caller's membership role.
+pub async fn resolve_key_capabilities(
+    current_user: &CurrentUser,
+    target_user_id: UserId,
+    db: &mut sqlx::PgConnection,
+) -> std::result::Result<KeyCapabilities, crate::db::errors::DbError> {
+    let row = sqlx::query!(
+        r#"
+        SELECT u.user_type AS "user_type!",
+               u.org_key_management_mode AS "mode!",
+               uo.role AS "role?"
+        FROM users u
+        LEFT JOIN user_organizations uo
+               ON uo.organization_id = u.id
+              AND uo.user_id = $2
+              AND uo.status = 'active'
+        WHERE u.id = $1
+        "#,
+        target_user_id,
+        current_user.id
+    )
+    .fetch_optional(&mut *db)
+    .await?;
+
+    let Some(row) = row else {
+        // Unknown target: no capabilities; callers' existing permission
+        // checks will reject before this matters.
+        return Ok(KeyCapabilities {
+            target_is_org: false,
+            mode: KeyManagementMode::Open,
+            is_org_manager: false,
+        });
+    };
+
+    let target_is_org = row.user_type == "organization";
+    let mode = if target_is_org && row.mode == "managed" {
+        KeyManagementMode::Managed
+    } else {
+        KeyManagementMode::Open
+    };
+    let is_org_manager = target_is_org && matches!(row.role.as_deref(), Some("owner") | Some("admin"));
+
+    Ok(KeyCapabilities {
+        target_is_org,
+        mode,
+        is_org_manager,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

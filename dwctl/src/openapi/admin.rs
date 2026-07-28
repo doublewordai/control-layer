@@ -142,6 +142,7 @@ impl Modify for AdminSecurityAddon {
             api::models::api_keys::ListApiKeysQuery,
             api::models::api_keys::ApiKeyResponse,
             api::models::api_keys::ApiKeyInfoResponse,
+            api::models::api_keys::ApiKeySecretResponse,
             api::models::deployments::DeployedModelCreate,
             api::models::deployments::DeployedModelUpdate,
             api::models::deployments::DeployedModelUpdateRequest,

@@ -132,6 +132,11 @@
         "ordinal": 25,
         "name": "zero_data_retention",
         "type_info": "Bool"
+      },
+      {
+        "ordinal": 26,
+        "name": "org_key_management_mode",
+        "type_info": "Varchar"
       }
     ],
     "parameters": {
@@ -163,6 +168,7 @@
       true,
       true,
       true,
+      false,
       false,
       false,
       false

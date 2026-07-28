@@ -8,6 +8,7 @@ import {
   Check,
   ChevronDown,
   Info,
+  RefreshCw,
 } from "lucide-react";
 import { toast } from "sonner";
 import {
@@ -25,7 +26,13 @@ import {
   formatResetInstant,
   resetPreviewLine,
 } from "./spendCap";
-import { useUser } from "../../../../api/control-layer/hooks";
+import {
+  useUser,
+  useFetchApiKeySecret,
+  useRotateApiKey,
+  useOrganization,
+  useOrganizationMembers,
+} from "../../../../api/control-layer/hooks";
 import { DataTable } from "../../../ui/data-table";
 import { createColumns } from "./columns";
 import {
@@ -57,18 +64,29 @@ import {
   HoverCardContent,
   HoverCardTrigger,
 } from "../../../ui/hover-card";
+import { Tabs, TabsList, TabsTrigger } from "../../../ui/tabs";
 import { useServerPagination } from "@/hooks/useServerPagination";
 import { useOrganizationContext } from "@/contexts";
 
 export const ApiKeys: React.FC = () => {
   const { data: user } = useUser("current");
-  const { activeOrganizationId } = useOrganizationContext();
+  const { activeOrganizationId, activeOrganization } = useOrganizationContext();
   // In org context, use org ID for API key operations (orgs are virtual users)
   const targetUserId = activeOrganizationId || user?.id || "current";
+  const isOrgContext = !!activeOrganizationId;
+  // Org "managers" (owner/admin) see and manage all org keys; the role comes
+  // from the current user's membership summary on the org context.
+  const isOrgManager =
+    activeOrganization?.role === "owner" || activeOrganization?.role === "admin";
+  const { data: org } = useOrganization(activeOrganizationId ?? "");
+  const { data: membersData } = useOrganizationMembers(
+    activeOrganizationId ?? "",
+  );
   const [showCreateForm, setShowCreateForm] = useState(false);
   const [newKeyName, setNewKeyName] = useState("");
   const [newKeyDescription, setNewKeyDescription] = useState("");
   const [newKeyPurpose, setNewKeyPurpose] = useState<ApiKeyPurpose>("realtime");
+  const [newKeyAssignee, setNewKeyAssignee] = useState<string>("self");
   const [newKeyRequestsPerSecond, setNewKeyRequestsPerSecond] = useState<
     number | ""
   >("");
@@ -92,9 +110,30 @@ export const ApiKeys: React.FC = () => {
   const [selectedKeys, setSelectedKeys] = useState<any[]>([]);
   const [showBulkDeleteModal, setShowBulkDeleteModal] = useState(false);
   const [advancedOpen, setAdvancedOpen] = useState(false);
+  const [rotateModal, setRotateModal] = useState<ApiKey | null>(null);
+  const [rotatedKey, setRotatedKey] = useState<{
+    name: string;
+    key: string;
+  } | null>(null);
+  // Secrets revealed via explicit user action only — never cached in the
+  // query cache and never part of the list payload.
+  const [revealedSecrets, setRevealedSecrets] = useState<
+    Record<string, string>
+  >({});
+  // Manager-only view scoping (org context): tab + per-member filter,
+  // applied client-side since the API already returns all org keys to
+  // managers.
+  const [keyScope, setKeyScope] = useState<"all" | "mine">("all");
+  const [memberFilter, setMemberFilter] = useState<string>("all");
 
   // Check if user is a platform manager
   const isPlatformManager = user?.roles?.includes("PlatformManager") || false;
+  // Managed key mode: only org owners/admins issue keys; plain members hold
+  // their keys read-only (view usage + fetch secret only). Personal keys are
+  // never affected by any org's mode.
+  const managedMode = isOrgContext && org?.key_management_mode === "managed";
+  const managedModeReadOnly = managedMode && !isOrgManager && !isPlatformManager;
+  const showScopingControls = isOrgContext && isOrgManager;
   const pagination = useServerPagination();
   const {
     data: apiKeysData,
@@ -106,19 +145,67 @@ export const ApiKeys: React.FC = () => {
 
   const apiKeys = apiKeysData?.data || [];
 
+  const orgMembers = (membersData ?? []).filter(
+    (m) => m.status === "active" && m.user,
+  );
+  const memberLabel = (memberUser: { display_name?: string; email: string }) =>
+    memberUser.display_name || memberUser.email;
+  const resolveAssignee = (createdBy: string) => {
+    const member = orgMembers.find((m) => m.user!.id === createdBy);
+    if (member) return memberLabel(member.user!);
+    // Holder is no longer an active member (or list still loading): fall
+    // back to a shortened UUID.
+    return `${createdBy.slice(0, 8)}…`;
+  };
+
+  const displayedKeys = showScopingControls
+    ? apiKeys.filter((key) => {
+        if (keyScope === "mine") return key.created_by === user?.id;
+        return memberFilter === "all" || key.created_by === memberFilter;
+      })
+    : apiKeys;
+
   const createApiKeyMutation = useCreateApiKey();
   const deleteApiKeyMutation = useDeleteApiKey();
   const updateApiKeyMutation = useUpdateApiKey();
+  const fetchSecretMutation = useFetchApiKeySecret();
+  const rotateApiKeyMutation = useRotateApiKey();
+
+  const resetCreateForm = () => {
+    setShowCreateForm(false);
+    setNewKeyName("");
+    setNewKeyDescription("");
+    setNewKeyPurpose("realtime");
+    setNewKeyAssignee("self");
+    setNewKeyRequestsPerSecond("");
+    setNewKeyBurstSize("");
+    setNewKeyCapAmount("");
+    setNewKeyCapInterval("none");
+    setNewKeyResponse(null);
+    setAdvancedOpen(false);
+  };
 
   const handleCreateApiKey = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!newKeyName.trim()) return;
+
+    // Managers can issue an org key to another member; the key lands in
+    // that member's view (created_by = member). Only send member_id when a
+    // member other than self is selected.
+    const assignedMemberId =
+      isOrgContext &&
+      isOrgManager &&
+      newKeyAssignee !== "self" &&
+      newKeyAssignee !== user?.id
+        ? newKeyAssignee
+        : undefined;
 
     const newKey = await createApiKeyMutation.mutateAsync({
       data: {
         name: newKeyName.trim(),
         description: newKeyDescription.trim() || undefined,
         purpose: newKeyPurpose,
+        member_id: assignedMemberId,
         requests_per_second:
           newKeyRequestsPerSecond === ""
             ? null
@@ -234,18 +321,91 @@ export const ApiKeys: React.FC = () => {
     }
   };
 
-  // Mirrors what the PATCH endpoint permits: the key's creator, or a
-  // PlatformManager. (Org-specific cap permissions — e.g. restricting cap
-  // edits on org keys to owners/admins — are deferred to the dedicated
-  // org-permissions follow-up; keep this gate in lockstep with the server.)
+  // Fetch a key's secret on demand and reveal it inline (toggles off if
+  // already revealed). Secrets are only ever fetched on explicit user action.
+  const handleRevealSecret = async (apiKey: ApiKey) => {
+    if (revealedSecrets[apiKey.id]) {
+      setRevealedSecrets((prev) => {
+        const next = { ...prev };
+        delete next[apiKey.id];
+        return next;
+      });
+      return;
+    }
+    try {
+      const { key } = await fetchSecretMutation.mutateAsync({
+        keyId: apiKey.id,
+        userId: targetUserId,
+      });
+      setRevealedSecrets((prev) => ({ ...prev, [apiKey.id]: key }));
+    } catch (e) {
+      console.error("Failed to fetch API key secret:", e);
+      toast.error(
+        (e as Error)?.message ?? "Failed to fetch API key secret",
+      );
+    }
+  };
+
+  const handleCopySecret = async (apiKey: ApiKey) => {
+    try {
+      const { key } = await fetchSecretMutation.mutateAsync({
+        keyId: apiKey.id,
+        userId: targetUserId,
+      });
+      await navigator.clipboard.writeText(key);
+      toast.success("API key secret copied to clipboard");
+    } catch (e) {
+      console.error("Failed to copy API key secret:", e);
+      toast.error((e as Error)?.message ?? "Failed to copy API key secret");
+    }
+  };
+
+  const handleRotateKey = async () => {
+    if (!rotateModal) return;
+    try {
+      const { key } = await rotateApiKeyMutation.mutateAsync({
+        keyId: rotateModal.id,
+        userId: targetUserId,
+      });
+      // One-time secret display, same pattern as creation.
+      setRotatedKey({ name: rotateModal.name, key });
+      setRotateModal(null);
+      // Any previously revealed secret for this key is now stale.
+      setRevealedSecrets((prev) => {
+        const next = { ...prev };
+        delete next[rotateModal.id];
+        return next;
+      });
+    } catch (e) {
+      console.error("Failed to rotate API key:", e);
+      toast.error((e as Error)?.message ?? "Failed to rotate API key");
+    }
+  };
+
+  // Mirrors what the server permits for edit/rotate/delete: a
+  // PlatformManager, an org owner/admin acting on any key of the active org,
+  // or the key's creator — except that in managed key mode plain members
+  // hold their org keys read-only. Keep this gate in lockstep with the
+  // server.
   const canManageKey = (apiKey: ApiKey) =>
-    isPlatformManager || (!!apiKey.created_by && apiKey.created_by === user?.id);
+    isPlatformManager ||
+    (isOrgContext && isOrgManager) ||
+    (!!apiKey.created_by &&
+      apiKey.created_by === user?.id &&
+      (!isOrgContext || !managedMode));
 
   const columns = createColumns({
     onDelete: handleDeleteFromTable,
     onEdit: openEditModal,
+    onRotate: setRotateModal,
+    onRevealSecret: handleRevealSecret,
+    onCopySecret: handleCopySecret,
+    revealedSecrets,
     canManage: canManageKey,
     isPlatformManager,
+    showAssignee: isOrgContext,
+    resolveAssignee: isOrgContext ? resolveAssignee : undefined,
+    showSelect: !managedModeReadOnly,
   });
 
   if (isLoading) {
@@ -277,7 +437,7 @@ export const ApiKeys: React.FC = () => {
               Manage your API keys for programmatic access
             </p>
           </div>
-          {apiKeys.length > 0 && (
+          {apiKeys.length > 0 && !managedModeReadOnly && (
             <Button
               onClick={() => setShowCreateForm(true)}
               className="bg-doubleword-background-dark hover:bg-doubleword-neutral-900 w-full sm:w-auto"
@@ -289,6 +449,19 @@ export const ApiKeys: React.FC = () => {
           )}
         </div>
       </div>
+
+      {managedModeReadOnly && (
+        <div
+          className="mb-6 flex items-center gap-2 rounded-lg border border-doubleword-neutral-200 bg-doubleword-neutral-50 px-4 py-3 text-sm text-doubleword-neutral-600"
+          role="status"
+        >
+          <Info className="h-4 w-4 shrink-0" />
+          <span>
+            API keys in this organization are issued by its admins. Contact an
+            org admin for a key.
+          </span>
+        </div>
+      )}
 
       {error && (
         <div className="mb-6 bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded-lg">
@@ -314,10 +487,39 @@ export const ApiKeys: React.FC = () => {
         </div>
       )}
 
+      {showScopingControls && apiKeys.length > 0 && (
+        <div className="mb-4 flex flex-wrap items-center gap-3">
+          <Tabs
+            value={keyScope}
+            onValueChange={(value) => setKeyScope(value as "all" | "mine")}
+          >
+            <TabsList aria-label="Key scope">
+              <TabsTrigger value="all">All keys</TabsTrigger>
+              <TabsTrigger value="mine">My keys</TabsTrigger>
+            </TabsList>
+          </Tabs>
+          {keyScope === "all" && (
+            <Select value={memberFilter} onValueChange={setMemberFilter}>
+              <SelectTrigger className="w-56" aria-label="Filter by member">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="all">All members</SelectItem>
+                {orgMembers.map((member) => (
+                  <SelectItem key={member.user!.id} value={member.user!.id}>
+                    {memberLabel(member.user!)}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          )}
+        </div>
+      )}
+
       {apiKeys.length > 0 ? (
         <DataTable
           columns={columns}
-          data={apiKeys}
+          data={displayedKeys}
           searchPlaceholder="Search API keys..."
           searchColumn="name"
           onSelectionChange={setSelectedKeys}
@@ -368,16 +570,20 @@ export const ApiKeys: React.FC = () => {
             No API keys configured
           </h3>
           <p className="text-doubleword-neutral-600 mb-6">
-            Create your first API key to start using the API
+            {managedModeReadOnly
+              ? "An org admin can issue an API key for you"
+              : "Create your first API key to start using the API"}
           </p>
-          <Button
-            onClick={() => setShowCreateForm(true)}
-            className="bg-doubleword-background-dark hover:bg-doubleword-neutral-900"
-            aria-label="Create first API key"
-          >
-            <Plus className="w-4 h-4 mr-2" />
-            Create API Key
-          </Button>
+          {!managedModeReadOnly && (
+            <Button
+              onClick={() => setShowCreateForm(true)}
+              className="bg-doubleword-background-dark hover:bg-doubleword-neutral-900"
+              aria-label="Create first API key"
+            >
+              <Plus className="w-4 h-4 mr-2" />
+              Create API Key
+            </Button>
+          )}
         </div>
       )}
 
@@ -386,16 +592,7 @@ export const ApiKeys: React.FC = () => {
         open={showCreateForm}
         onOpenChange={(open) => {
           if (!open) {
-            setShowCreateForm(false);
-            setNewKeyName("");
-            setNewKeyDescription("");
-            setNewKeyPurpose("realtime");
-            setNewKeyRequestsPerSecond("");
-            setNewKeyBurstSize("");
-            setNewKeyCapAmount("");
-            setNewKeyCapInterval("none");
-            setNewKeyResponse(null);
-            setAdvancedOpen(false);
+            resetCreateForm();
           } else {
             setShowCreateForm(true);
           }
@@ -462,21 +659,7 @@ export const ApiKeys: React.FC = () => {
               </div>
 
               <DialogFooter>
-                <Button
-                  onClick={() => {
-                    setShowCreateForm(false);
-                    setNewKeyName("");
-                    setNewKeyDescription("");
-                    setNewKeyPurpose("realtime");
-                    setNewKeyRequestsPerSecond("");
-                    setNewKeyBurstSize("");
-                    setNewKeyCapAmount("");
-                    setNewKeyCapInterval("none");
-                    setNewKeyResponse(null);
-                    setAdvancedOpen(false);
-                  }}
-                  className="w-full sm:w-auto"
-                >
+                <Button onClick={resetCreateForm} className="w-full sm:w-auto">
                   Done
                 </Button>
               </DialogFooter>
@@ -516,6 +699,47 @@ export const ApiKeys: React.FC = () => {
                     className="resize-none"
                   />
                 </div>
+
+                {/* Issue-to-member — managers only, org context only */}
+                {isOrgContext && isOrgManager && (
+                  <div className="space-y-2">
+                    <Label>
+                      Assign to member{" "}
+                      <span className="font-normal text-doubleword-neutral-400">
+                        (optional)
+                      </span>
+                    </Label>
+                    <Select
+                      value={newKeyAssignee}
+                      onValueChange={setNewKeyAssignee}
+                    >
+                      <SelectTrigger
+                        className="w-full"
+                        aria-label="Assign to member"
+                      >
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="self">Myself</SelectItem>
+                        {orgMembers
+                          .filter((member) => member.user!.id !== user?.id)
+                          .map((member) => (
+                            <SelectItem
+                              key={member.user!.id}
+                              value={member.user!.id}
+                            >
+                              {memberLabel(member.user!)}
+                            </SelectItem>
+                          ))}
+                      </SelectContent>
+                    </Select>
+                    <p className="text-xs text-doubleword-neutral-500">
+                      The key appears in the assigned member's view, and they
+                      can retrieve the secret themselves from their API Keys
+                      page.
+                    </p>
+                  </div>
+                )}
 
                 {/* Key type — card-style choice, matching the design */}
                 <div className="space-y-2">
@@ -735,21 +959,7 @@ export const ApiKeys: React.FC = () => {
               </form>
 
               <DialogFooter>
-                <Button
-                  type="button"
-                  variant="outline"
-                  onClick={() => {
-                    setShowCreateForm(false);
-                    setNewKeyName("");
-                    setNewKeyDescription("");
-                    setNewKeyPurpose("realtime");
-                    setNewKeyRequestsPerSecond("");
-                    setNewKeyBurstSize("");
-                    setNewKeyCapAmount("");
-                    setNewKeyCapInterval("none");
-                    setAdvancedOpen(false);
-                  }}
-                >
+                <Button type="button" variant="outline" onClick={resetCreateForm}>
                   Cancel
                 </Button>
                 <Button
@@ -937,6 +1147,138 @@ export const ApiKeys: React.FC = () => {
         </DialogContent>
       </Dialog>
 
+
+      {/* Rotate Confirmation Modal */}
+      <Dialog
+        open={!!rotateModal}
+        onOpenChange={(open) => {
+          if (!open) setRotateModal(null);
+        }}
+      >
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <div className="flex items-center gap-3">
+              <div className="w-10 h-10 bg-doubleword-neutral-100 rounded-full flex items-center justify-center">
+                <RefreshCw className="w-5 h-5 text-doubleword-neutral-700" />
+              </div>
+              <div>
+                <DialogTitle>Rotate API Key</DialogTitle>
+                <DialogDescription>
+                  Generate a new secret for{" "}
+                  <strong>{rotateModal?.name}</strong>
+                </DialogDescription>
+              </div>
+            </div>
+          </DialogHeader>
+
+          <div className="space-y-4 py-2">
+            <p className="text-sm text-gray-700">
+              The new secret is live immediately, and the old secret stops
+              working for new requests within about a second. The key itself
+              is unchanged — its usage limit, counted spend, and attribution
+              all carry over.
+            </p>
+            <div className="p-3 bg-yellow-50 border border-yellow-200 rounded-lg">
+              <p className="text-sm text-yellow-800">
+                <strong>Note:</strong> batches already submitted with this key
+                will keep running — they execute on an internal system key. If
+                this key was compromised, cancel any in-flight batches
+                separately.
+              </p>
+            </div>
+          </div>
+
+          <DialogFooter>
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => setRotateModal(null)}
+              disabled={rotateApiKeyMutation.isPending}
+            >
+              Cancel
+            </Button>
+            <Button
+              type="button"
+              onClick={handleRotateKey}
+              disabled={rotateApiKeyMutation.isPending}
+            >
+              {rotateApiKeyMutation.isPending && (
+                <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+              )}
+              Rotate Key
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Rotated Secret Modal — one-time display, same pattern as creation */}
+      <Dialog
+        open={!!rotatedKey}
+        onOpenChange={(open) => {
+          if (!open) setRotatedKey(null);
+        }}
+      >
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>API Key Rotated</DialogTitle>
+            <DialogDescription>
+              <strong>{rotatedKey?.name}</strong> has a new secret. The old
+              secret no longer works for new requests.
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="space-y-4">
+            <div
+              className="p-3 bg-green-50 border border-green-200 rounded-lg"
+              role="alert"
+            >
+              <div className="flex items-center gap-2">
+                <Key className="w-4 h-4 text-green-600" />
+                <p className="text-sm text-green-800 font-medium">
+                  Save this key now - it won't be shown again
+                </p>
+              </div>
+            </div>
+
+            <div className="space-y-2">
+              <Label>New API Key</Label>
+              <div className="flex items-center gap-2">
+                <div className="flex-1 overflow-hidden rounded border bg-gray-50">
+                  <code className="block text-xs font-mono px-3 py-2 overflow-x-auto whitespace-nowrap">
+                    {rotatedKey?.key}
+                  </code>
+                </div>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="icon"
+                  onClick={() => rotatedKey && copyToClipboard(rotatedKey.key)}
+                  aria-label={
+                    rotatedKey && copiedKey === rotatedKey.key
+                      ? "API key copied"
+                      : "Copy API key"
+                  }
+                >
+                  {rotatedKey && copiedKey === rotatedKey.key ? (
+                    <Check className="h-4 w-4 text-green-600" />
+                  ) : (
+                    <Copy className="h-4 w-4" />
+                  )}
+                </Button>
+              </div>
+            </div>
+          </div>
+
+          <DialogFooter>
+            <Button
+              onClick={() => setRotatedKey(null)}
+              className="w-full sm:w-auto"
+            >
+              Done
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       {/* Bulk Delete Confirmation Modal */}
       <Dialog open={showBulkDeleteModal} onOpenChange={setShowBulkDeleteModal}>

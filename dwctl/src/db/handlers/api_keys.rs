@@ -664,6 +664,58 @@ impl<'c> ApiKeys<'c> {
             .collect())
     }
 
+    /// Rotate a key's secret in place: the old secret stops authenticating
+    /// (the api_keys UPDATE trigger notifies the onwards sync, which drops it
+    /// within ~a second) while the key row — its id, cap, checkpoint, usage
+    /// and attribution — carries on unchanged.
+    ///
+    /// Restricted at the SQL level to visible root keys: rotating a hidden
+    /// key would break internal flows, and rotating a cap-scope child would
+    /// strand in-flight batches (they carry the child secret verbatim).
+    /// Note the inverse is the useful property: rotating a VISIBLE key does
+    /// NOT stop batches already submitted with it — they execute on the
+    /// hidden child. Callers must surface that to users.
+    #[instrument(skip(self), fields(api_key_id = %abbrev_uuid(&id)), err)]
+    pub async fn rotate_secret(&mut self, id: ApiKeyId) -> Result<String> {
+        let secret = generate_api_key();
+        let result = sqlx::query!(
+            r#"
+            UPDATE api_keys SET secret = $2
+            WHERE id = $1 AND is_deleted = false AND hidden = false AND parent_api_key_id IS NULL
+            "#,
+            id,
+            secret
+        )
+        .execute(&mut *self.db)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            return Err(DbError::NotFound);
+        }
+        Ok(secret)
+    }
+
+    /// Fire the onwards config NOTIFY after a spend-window re-arm.
+    ///
+    /// A pure window reset writes only to `api_key_spend_checkpoints`, which
+    /// has no notify trigger — without this, a re-armed exhausted key stays
+    /// yanked until the periodic fallback sync (up to ~5 min). Cap-COLUMN
+    /// changes don't need it (the api_keys UPDATE trigger covers those).
+    /// Transactional: fires only if the surrounding transaction commits.
+    #[instrument(skip(self), err)]
+    pub async fn notify_spend_cap_rearm(&mut self) -> Result<()> {
+        let epoch_micros = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros();
+        sqlx::query("SELECT pg_notify($1, $2)")
+            .bind(crate::config::ONWARDS_CONFIG_CHANGED_CHANNEL)
+            .bind(format!("api_key_spend_cap_rearm:{epoch_micros}"))
+            .execute(&mut *self.db)
+            .await?;
+        Ok(())
+    }
+
     /// Whether the cap scope this key belongs to (root or child alike) is
     /// currently exhausted — the same predicate the onwards sync uses to yank
     /// keys, minus the per-model free-tariff arm. Used by admission checks

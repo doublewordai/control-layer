@@ -1,4 +1,5 @@
 import { render, within, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { http, HttpResponse } from "msw";
@@ -173,6 +174,117 @@ describe("MyOrganization", () => {
     });
 
     expect(container.textContent).not.toMatch(/zero data retention/i);
+  });
+
+  describe("API key management setting", () => {
+    it("lets org owners change the mode", async () => {
+      server.use(userWithOrg("owner"));
+      server.use(orgDetail(false));
+      let patchBody: Record<string, unknown> | null = null;
+      server.use(
+        http.patch(
+          "/admin/api/v1/organizations/:id",
+          async ({ request }) => {
+            patchBody = (await request.json()) as Record<string, unknown>;
+            return HttpResponse.json({ id: ORG_ID, ...patchBody });
+          },
+        ),
+      );
+
+      const user = userEvent.setup();
+      const { container } = render(<MyOrganization />, {
+        wrapper: createWrapper(),
+      });
+
+      await waitFor(() => {
+        expect(
+          within(container).getByRole("heading", {
+            name: "API key management",
+          }),
+        ).toBeInTheDocument();
+      });
+
+      // Defaults to open (self-serve) when the org has no mode set.
+      const openRadio = within(container).getByRole("radio", {
+        name: "Self-serve (open)",
+      });
+      const managedRadio = within(container).getByRole("radio", {
+        name: "Admin-managed",
+      });
+      expect(openRadio).toBeChecked();
+      expect(openRadio).toBeEnabled();
+      expect(managedRadio).toBeEnabled();
+
+      await user.click(managedRadio);
+
+      await waitFor(() => {
+        expect(patchBody).toEqual({ key_management_mode: "managed" });
+      });
+    });
+
+    it("lets org admins change the mode", async () => {
+      server.use(userWithOrg("admin"));
+      server.use(orgDetail(false));
+      let patchBody: Record<string, unknown> | null = null;
+      server.use(
+        http.patch(
+          "/admin/api/v1/organizations/:id",
+          async ({ request }) => {
+            patchBody = (await request.json()) as Record<string, unknown>;
+            return HttpResponse.json({ id: ORG_ID, ...patchBody });
+          },
+        ),
+      );
+
+      const user = userEvent.setup();
+      const { container } = render(<MyOrganization />, {
+        wrapper: createWrapper(),
+      });
+
+      await waitFor(() => {
+        expect(
+          within(container).getByRole("heading", {
+            name: "API key management",
+          }),
+        ).toBeInTheDocument();
+      });
+
+      await user.click(
+        within(container).getByRole("radio", { name: "Admin-managed" }),
+      );
+
+      await waitFor(() => {
+        expect(patchBody).toEqual({ key_management_mode: "managed" });
+      });
+    });
+
+    it("shows the current mode read-only for regular members", async () => {
+      server.use(userWithOrg("member"));
+      server.use(orgDetail(false));
+
+      const { container } = render(<MyOrganization />, {
+        wrapper: createWrapper(),
+      });
+
+      await waitFor(() => {
+        expect(
+          within(container).getByRole("heading", {
+            name: "API key management",
+          }),
+        ).toBeInTheDocument();
+      });
+
+      const openRadio = within(container).getByRole("radio", {
+        name: "Self-serve (open)",
+      });
+      const managedRadio = within(container).getByRole("radio", {
+        name: "Admin-managed",
+      });
+      // Members can see the current mode but not change it.
+      expect(openRadio).toBeChecked();
+      expect(openRadio).toBeDisabled();
+      expect(managedRadio).toBeDisabled();
+    });
   });
 
   it("passes the org ID to NotificationSettings", async () => {
