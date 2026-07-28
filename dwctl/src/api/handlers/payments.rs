@@ -846,6 +846,13 @@ pub async fn enable_auto_topup<P: PoolProvider>(
                 StatusCode::INTERNAL_SERVER_ERROR
             })?;
 
+            // Reconfiguring is the user's way out of a stopped failure streak
+            // (e.g. they have just fixed a declined card), so retry from clean.
+            Users::new(&mut conn).clear_auto_topup_failures(&[target.id]).await.map_err(|e| {
+                tracing::error!("Failed to clear auto top-up failure state: {:?}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+
             Ok(Json(json!({
                 "has_payment_method": true,
                 "threshold": body.threshold,

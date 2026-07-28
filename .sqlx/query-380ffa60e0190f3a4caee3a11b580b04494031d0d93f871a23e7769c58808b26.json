@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE users\n               SET auto_topup_failure_count = GREATEST(auto_topup_failure_count + 1, $2),\n                   auto_topup_failed_at = NOW()\n               WHERE id = $1\n               RETURNING auto_topup_failure_count",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "auto_topup_failure_count",
+        "type_info": "Int4"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int4"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "380ffa60e0190f3a4caee3a11b580b04494031d0d93f871a23e7769c58808b26"
+}

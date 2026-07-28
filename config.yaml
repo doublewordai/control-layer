@@ -256,6 +256,16 @@ credits:
   # is derived from whether they have any prior purchase).
   # Example: 50 matches a new user's first $50 of credits.
   first_payment_match_up_to: 0
+  # Consecutive failed auto top-up charges before we stop retrying and send the
+  # customer a single "auto top-up failed" email. A failed charge records no
+  # transaction, so without this the poller would retry every tick forever.
+  # Retries back off exponentially: 2^(failures-1) minutes. A hard decline
+  # (card declined, insufficient funds, expired or invalid card) skips straight
+  # to this count, since retrying cannot fix it. The count resets on a
+  # successful charge or when the user reconfigures auto top-up.
+  auto_topup_max_failures: 8
+  # Upper bound on that exponential backoff, in seconds.
+  auto_topup_backoff_cap_secs: 86400
 
 # Optional feature toggles
 enable_metrics: true # Enable Prometheus metrics endpoint

@@ -68,6 +68,11 @@ pub struct AutoTopupUser {
     pub auto_topup_monthly_limit: Option<rust_decimal::Decimal>,
     /// Whether we already sent a "limit reached" email this month.
     pub auto_topup_limit_notification_sent: bool,
+    /// Consecutive failed charges. At the configured maximum we have stopped
+    /// retrying and sent exactly one failure email.
+    pub auto_topup_failure_count: i32,
+    /// When the most recent charge failed, used to space out retries.
+    pub auto_topup_failed_at: Option<DateTime<Utc>>,
 }
 
 /// User with a low-balance threshold configured.
@@ -109,6 +114,8 @@ struct User {
     pub auto_topup_threshold: Option<f32>,
     pub auto_topup_monthly_limit: Option<f32>,
     pub auto_topup_limit_notification_sent: bool,
+    pub auto_topup_failure_count: i32,
+    pub auto_topup_failed_at: Option<DateTime<Utc>>,
     pub user_type: String,
     pub verified: bool,
     pub zero_data_retention: bool,
@@ -240,6 +247,8 @@ impl<'c> Repository for Users<'c> {
                 u.auto_topup_threshold,
                 u.auto_topup_monthly_limit,
                 u.auto_topup_limit_notification_sent,
+                u.auto_topup_failure_count,
+                u.auto_topup_failed_at,
                 u.user_type,
                 u.verified,
                 u.zero_data_retention,
@@ -247,7 +256,7 @@ impl<'c> Repository for Users<'c> {
             FROM users u
             LEFT JOIN user_roles ur ON ur.user_id = u.id
             WHERE u.id = $1 AND u.id != '00000000-0000-0000-0000-000000000000' AND u.is_deleted = false
-            GROUP BY u.id, u.username, u.email, u.display_name, u.avatar_url, u.auth_source, u.created_at, u.updated_at, u.last_login, u.is_admin, u.password_hash, u.external_user_id, u.payment_provider_id, u.is_deleted, u.is_internal, u.batch_notifications_enabled, u.first_batch_email_sent, u.low_balance_notification_sent, u.low_balance_threshold, u.auto_topup_amount, u.auto_topup_threshold, u.auto_topup_monthly_limit, u.auto_topup_limit_notification_sent, u.user_type, u.verified, u.zero_data_retention
+            GROUP BY u.id, u.username, u.email, u.display_name, u.avatar_url, u.auth_source, u.created_at, u.updated_at, u.last_login, u.is_admin, u.password_hash, u.external_user_id, u.payment_provider_id, u.is_deleted, u.is_internal, u.batch_notifications_enabled, u.first_batch_email_sent, u.low_balance_notification_sent, u.low_balance_threshold, u.auto_topup_amount, u.auto_topup_threshold, u.auto_topup_monthly_limit, u.auto_topup_limit_notification_sent, u.auto_topup_failure_count, u.auto_topup_failed_at, u.user_type, u.verified, u.zero_data_retention
             "#,
             id
         )
@@ -279,6 +288,8 @@ impl<'c> Repository for Users<'c> {
                 auto_topup_threshold: row.auto_topup_threshold,
                 auto_topup_monthly_limit: row.auto_topup_monthly_limit,
                 auto_topup_limit_notification_sent: row.auto_topup_limit_notification_sent,
+                auto_topup_failure_count: row.auto_topup_failure_count,
+                auto_topup_failed_at: row.auto_topup_failed_at,
                 user_type: row.user_type,
                 verified: row.verified,
                 zero_data_retention: row.zero_data_retention,
@@ -325,6 +336,8 @@ impl<'c> Repository for Users<'c> {
                 u.auto_topup_threshold,
                 u.auto_topup_monthly_limit,
                 u.auto_topup_limit_notification_sent,
+                u.auto_topup_failure_count,
+                u.auto_topup_failed_at,
                 u.user_type,
                 u.verified,
                 u.zero_data_retention,
@@ -332,7 +345,7 @@ impl<'c> Repository for Users<'c> {
             FROM users u
             LEFT JOIN user_roles ur ON ur.user_id = u.id
             WHERE u.id = ANY($1) AND u.id != '00000000-0000-0000-0000-000000000000' AND u.is_deleted = false
-            GROUP BY u.id, u.username, u.email, u.display_name, u.avatar_url, u.auth_source, u.created_at, u.updated_at, u.last_login, u.is_admin, u.password_hash, u.external_user_id, u.payment_provider_id, u.is_deleted, u.is_internal, u.batch_notifications_enabled, u.first_batch_email_sent, u.low_balance_notification_sent, u.low_balance_threshold, u.auto_topup_amount, u.auto_topup_threshold, u.auto_topup_monthly_limit, u.auto_topup_limit_notification_sent, u.user_type, u.verified, u.zero_data_retention
+            GROUP BY u.id, u.username, u.email, u.display_name, u.avatar_url, u.auth_source, u.created_at, u.updated_at, u.last_login, u.is_admin, u.password_hash, u.external_user_id, u.payment_provider_id, u.is_deleted, u.is_internal, u.batch_notifications_enabled, u.first_batch_email_sent, u.low_balance_notification_sent, u.low_balance_threshold, u.auto_topup_amount, u.auto_topup_threshold, u.auto_topup_monthly_limit, u.auto_topup_limit_notification_sent, u.auto_topup_failure_count, u.auto_topup_failed_at, u.user_type, u.verified, u.zero_data_retention
             "#,
             ids.as_slice()
         )
@@ -366,6 +379,8 @@ impl<'c> Repository for Users<'c> {
                 auto_topup_threshold: row.auto_topup_threshold,
                 auto_topup_monthly_limit: row.auto_topup_monthly_limit,
                 auto_topup_limit_notification_sent: row.auto_topup_limit_notification_sent,
+                auto_topup_failure_count: row.auto_topup_failure_count,
+                auto_topup_failed_at: row.auto_topup_failed_at,
                 user_type: row.user_type,
                 verified: row.verified,
                 zero_data_retention: row.zero_data_retention,
@@ -879,6 +894,44 @@ impl<'c> Users<'c> {
         Ok(())
     }
 
+    /// Record a failed auto top-up charge, returning the new consecutive
+    /// failure count.
+    ///
+    /// The count drives the retry backoff, and reaching the configured maximum
+    /// is what marks the single failure email as sent.
+    ///
+    /// `min_count` floors the resulting count. Pass 0 for an ordinary failure
+    /// to simply increment; pass the configured maximum for a refusal that
+    /// retrying cannot fix (a hard decline), which stops retries immediately.
+    #[instrument(skip(self), err)]
+    pub async fn record_auto_topup_failure(&mut self, user_id: UserId, min_count: i32) -> Result<i32> {
+        let row = sqlx::query!(
+            r#"UPDATE users
+               SET auto_topup_failure_count = GREATEST(auto_topup_failure_count + 1, $2),
+                   auto_topup_failed_at = NOW()
+               WHERE id = $1
+               RETURNING auto_topup_failure_count"#,
+            user_id,
+            min_count
+        )
+        .fetch_one(&mut *self.db)
+        .await?;
+        Ok(row.auto_topup_failure_count)
+    }
+
+    /// Clear auto top-up failure state, re-enabling charges for these users.
+    /// Called after a successful charge and when a user reconfigures auto top-up.
+    #[instrument(skip(self, user_ids), fields(count = user_ids.len()), err)]
+    pub async fn clear_auto_topup_failures(&mut self, user_ids: &[UserId]) -> Result<()> {
+        sqlx::query!(
+            "UPDATE users SET auto_topup_failure_count = 0, auto_topup_failed_at = NULL WHERE id = ANY($1)",
+            user_ids
+        )
+        .execute(&mut *self.db)
+        .await?;
+        Ok(())
+    }
+
     /// Clear recovered users and fetch low-balance users in one round-trip.
     /// Uses the cached checkpoint balance — good enough for notification thresholds.
     #[instrument(skip(self), err)]
@@ -926,7 +979,9 @@ impl<'c> Users<'c> {
                    u.auto_topup_amount::decimal(20, 9) as "auto_topup_amount!",
                    c.balance as "checkpoint_balance?",
                    u.auto_topup_monthly_limit::decimal(20, 9) as "auto_topup_monthly_limit?",
-                   u.auto_topup_limit_notification_sent
+                   u.auto_topup_limit_notification_sent,
+                   u.auto_topup_failure_count,
+                   u.auto_topup_failed_at
             FROM users u
             LEFT JOIN user_balance_checkpoints c ON c.user_id = u.id
             WHERE u.id != '00000000-0000-0000-0000-000000000000'
