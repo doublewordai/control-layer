@@ -279,10 +279,12 @@ fn collapse_reasoning_fields(
     reasoning: &mut Option<String>,
     reasoning_content: &mut Option<String>,
 ) {
-    if let Some(text) = reasoning.take()
-        && reasoning_content.is_none()
-    {
-        *reasoning_content = Some(text);
+    // `reasoning` is always cleared, whether or not its text is needed: it is
+    // the spelling we are collapsing away, so it must never reach the caller.
+    let taken = reasoning.take();
+
+    if reasoning_content.is_none() {
+        *reasoning_content = taken;
     }
 }
 
