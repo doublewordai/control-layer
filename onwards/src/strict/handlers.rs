@@ -1482,6 +1482,13 @@ async fn sanitize_chat_response(mut response: Response, original_model: String) 
     // Rewrite model field to match original request
     chat_response.model = original_model;
 
+    // Collapse the provider-specific reasoning spelling so the field name does
+    // not change under the caller when a model alias fails over between
+    // upstreams.
+    for choice in &mut chat_response.choices {
+        choice.message.canonicalise_reasoning();
+    }
+
     // Re-serialize with only our defined fields
     match serde_json::to_vec(&chat_response) {
         Ok(sanitized_bytes) => {
@@ -1608,6 +1615,12 @@ async fn sanitize_streaming_chat_response(
                             Ok(mut chunk_data) => {
                                 // Rewrite model field
                                 chunk_data.model = original_model.clone();
+
+                                // Same reasoning canonicalisation as the
+                                // non-streaming path, applied per delta.
+                                for choice in &mut chunk_data.choices {
+                                    choice.delta.canonicalise_reasoning();
+                                }
 
                                 // Re-serialize
                                 match serde_json::to_string(&chunk_data) {

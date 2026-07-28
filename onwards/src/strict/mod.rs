@@ -434,6 +434,160 @@ mod tests {
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
+    /// Build strict-mode state whose upstream returns `body` verbatim.
+    fn create_reasoning_test_app_state(body: &str) -> AppState<MockHttpClient> {
+        let targets = Arc::new(DashMap::new());
+        targets.insert(
+            "gpt-4".to_string(),
+            Target::builder()
+                .url("https://api.openai.com/v1/".parse().unwrap())
+                .build()
+                .into_pool(),
+        );
+
+        let targets = Targets {
+            targets,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels: Arc::new(DashMap::new()),
+            strict_mode: true,
+            http_pool_config: None,
+        };
+
+        AppState::with_client(targets, MockHttpClient::new(StatusCode::OK, body))
+    }
+
+    /// Guards the handler wiring, not just the schema helper: a refactor that
+    /// stops calling `canonicalise_reasoning` would still pass the unit tests
+    /// in `schemas::chat_completions` but fail here.
+    #[tokio::test]
+    async fn strict_chat_completions_rewrites_openrouter_reasoning_field() {
+        let upstream = r#"{
+            "id": "chatcmpl-123",
+            "object": "chat.completion",
+            "created": 1234567890,
+            "model": "gpt-4",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "42",
+                    "reasoning": "let me think about this"
+                },
+                "finish_reason": "stop"
+            }]
+        }"#;
+
+        let router = build_strict_router(create_reasoning_test_app_state(upstream));
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}"#,
+            ))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        let message = &json["choices"][0]["message"];
+
+        assert_eq!(
+            message["reasoning_content"], "let me think about this",
+            "upstream `reasoning` should be rewritten onto `reasoning_content`"
+        );
+        assert!(
+            message.get("reasoning").is_none(),
+            "the OpenRouter spelling should not reach the caller"
+        );
+    }
+
+    /// The vLLM spelling is already canonical, so it must survive untouched.
+    #[tokio::test]
+    async fn strict_chat_completions_leaves_vllm_reasoning_content_alone() {
+        let upstream = r#"{
+            "id": "chatcmpl-123",
+            "object": "chat.completion",
+            "created": 1234567890,
+            "model": "gpt-4",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "42",
+                    "reasoning_content": "vllm style reasoning"
+                },
+                "finish_reason": "stop"
+            }]
+        }"#;
+
+        let router = build_strict_router(create_reasoning_test_app_state(upstream));
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}"#,
+            ))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        let message = &json["choices"][0]["message"];
+
+        assert_eq!(message["reasoning_content"], "vllm style reasoning");
+        assert!(message.get("reasoning").is_none());
+    }
+
+    /// Same guarantee on the streaming path, which sanitises chunk-by-chunk in
+    /// a separate code path from the non-streaming handler.
+    #[tokio::test]
+    async fn strict_streaming_chat_completions_rewrites_reasoning_field() {
+        let chunks = concat!(
+            "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1,",
+            "\"model\":\"gpt-4\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\"first \"},",
+            "\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1,",
+            "\"model\":\"gpt-4\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning\":\"second\"},",
+            "\"finish_reason\":null}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+
+        let router = build_strict_router(create_reasoning_test_app_state(chunks));
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"model":"gpt-4","messages":[{"role":"user","content":"hi"}],"stream":true}"#,
+            ))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body_bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let body_text = std::str::from_utf8(&body_bytes).unwrap();
+
+        assert!(
+            body_text.contains("reasoning_content"),
+            "streamed deltas should carry the canonical spelling; got: {body_text}"
+        );
+        assert!(
+            !body_text.contains("\"reasoning\""),
+            "the OpenRouter spelling should not survive in any chunk; got: {body_text}"
+        );
+    }
+
     #[tokio::test]
     async fn test_adapter_converts_responses_to_chat_completions() {
         let (state, mock_client) = create_adapter_test_app_state();
