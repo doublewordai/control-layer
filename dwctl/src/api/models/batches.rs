@@ -65,7 +65,9 @@ pub struct CreateBatchRequest {
     pub endpoint: String,
 
     /// The time window within which the batch should be processed (e.g., "24h", "1h").
-    /// Allowed values are configured per instance.
+    /// The provider extension `"background"` selects no-SLA spare-capacity
+    /// processing and requires the `BackgroundInferenceUser` role. Other
+    /// allowed values are configured per instance.
     #[schema(example = "24h")]
     pub completion_window: String,
 
@@ -118,7 +120,8 @@ pub struct BatchResponse {
     #[schema(example = "file-abc123")]
     pub input_file_id: String,
 
-    /// The time window within which the batch should be processed (e.g., "24h", "1h").
+    /// The requested processing window, or `"background"` for no-SLA
+    /// spare-capacity processing.
     #[schema(example = "24h")]
     pub completion_window: String,
 

@@ -1,0 +1,198 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            WITH all_models AS (\n                SELECT model, capacity FROM unnest($4::TEXT[], $5::BIGINT[]) AS m(model, capacity)\n            ),\n            user_priority AS (\n                SELECT * FROM unnest($6::TEXT[], $7::BIGINT[]) AS u(user_id, active_count)\n            ),\n            to_claim AS (\n                SELECT claimed.id, claimed.template_id, claimed.batch_id, claimed.effective_expires_at,\n                       claimed.leaked, claimed.window_class, claimed.window_secs\n                FROM all_models m\n                CROSS JOIN LATERAL (\n                    SELECT c.id, c.template_id, c.batch_id, c.effective_expires_at,\n                           c.leaked, c.window_class, c.window_secs\n                    FROM (\n                        SELECT bl.id, bl.template_id, bl.batch_id, bl.effective_expires_at,\n                               bl.leaked, bl.window_class, bl.window_secs,\n                               bl.ord_blend, bl.ord_exp, bl.ord_id\n                        FROM (\n                            SELECT r.id, r.template_id, r.batch_id,\n                                   e.eff AS effective_expires_at,\n                                   FALSE AS leaked, e.window_class AS window_class,\n                                   e.w_secs AS window_secs,\n                                   calc.blend AS ord_blend, e.eff AS ord_exp, r.id AS ord_id\n                            FROM requests r\n                            LEFT JOIN user_priority up ON r.created_by = up.user_id\n                            LEFT JOIN LATERAL (\n                                SELECT mfe.state FROM model_filters mfe\n                                WHERE mfe.model = m.model\n                                ORDER BY mfe.created_at DESC, mfe.id DESC LIMIT 1\n                            ) mf ON true\n                            CROSS JOIN LATERAL (\n                                SELECT COALESCE(\n                                    (SELECT stw.window_ms FROM unnest($10::TEXT[], $11::BIGINT[]) AS stw(tier, window_ms)\n                                     WHERE stw.tier = r.service_tier),\n                                    $12::BIGINT) AS window_ms\n                            ) wm\n                            CROSS JOIN LATERAL (\n                                SELECT COALESCE(r.service_tier, 'default') AS window_class,\n                                       wm.window_ms::DOUBLE PRECISION / 1000.0 AS w_secs,\n                                       r.created_at + (wm.window_ms * interval '1 millisecond') AS eff\n                            ) e\n                            CROSS JOIN LATERAL (\n                                SELECT\n                                    (1.0 - $8::DOUBLE PRECISION)\n                                        * COALESCE(up.active_count, 0)::DOUBLE PRECISION\n                                        / GREATEST(NULLIF((SELECT MAX(v) FROM unnest($7::BIGINT[]) v), 0), 1)::DOUBLE PRECISION\n                                    + $8::DOUBLE PRECISION\n                                        * LEAST(GREATEST(EXTRACT(EPOCH FROM e.eff - $3), 0.0) / 86400.0, 1.0) AS blend\n                            ) calc\n                            WHERE r.state = 'pending' AND r.model = m.model AND r.batch_id IS NULL\n                              AND r.template_id IS NOT NULL\n                              AND r.service_tier IS DISTINCT FROM 'background'\n                              AND (r.not_before IS NULL OR r.not_before <= $3)\n                              AND ((mf.state IS NULL OR mf.state = 'live')\n                                   OR (EXTRACT(EPOCH FROM (e.eff - $3))\n                                       <= power(GREATEST(e.w_secs, 0.0) / 60.0, $9::DOUBLE PRECISION) * 60.0))\n                            ORDER BY calc.blend ASC, e.eff ASC, r.id ASC\n                            LIMIT m.capacity\n                            FOR UPDATE OF r SKIP LOCKED\n                        ) bl\n\n                      UNION ALL\n                        SELECT blb.id, blb.template_id, blb.batch_id, blb.effective_expires_at,\n                               blb.leaked, blb.window_class, blb.window_secs,\n                               blb.ord_blend, blb.ord_exp, blb.ord_id\n                        FROM (\n                            SELECT picks.id, picks.template_id, picks.batch_id, picks.effective_expires_at,\n                                   picks.leaked, picks.window_class, picks.window_secs,\n                                   picks.ord_blend, picks.ord_exp, picks.ord_id\n                            FROM (\n                                SELECT DISTINCT ON (cand.created_by, cand.window_class)\n                                       cand.id, cand.template_id, cand.batch_id,\n                                       cand.eff AS effective_expires_at,\n                                       TRUE AS leaked, cand.window_class AS window_class,\n                                       cand.w_secs AS window_secs,\n                                       cand.blend AS ord_blend, cand.eff AS ord_exp, cand.id AS ord_id\n                                FROM (\n                                    SELECT r.id, r.template_id, r.batch_id, r.created_by,\n                                           e.window_class, e.w_secs, e.eff, calc.blend\n                                    FROM requests r\n                                    LEFT JOIN user_priority up ON r.created_by = up.user_id\n                                    LEFT JOIN LATERAL (\n                                        SELECT mfe.state FROM model_filters mfe\n                                        WHERE mfe.model = m.model\n                                        ORDER BY mfe.created_at DESC, mfe.id DESC LIMIT 1\n                                    ) mf ON true\n                                    CROSS JOIN LATERAL (\n                                        SELECT COALESCE(\n                                            (SELECT stw.window_ms FROM unnest($10::TEXT[], $11::BIGINT[]) AS stw(tier, window_ms)\n                                             WHERE stw.tier = r.service_tier),\n                                            $12::BIGINT) AS window_ms\n                                    ) wm\n                                    CROSS JOIN LATERAL (\n                                        SELECT COALESCE(r.service_tier, 'default') AS window_class,\n                                               wm.window_ms::DOUBLE PRECISION / 1000.0 AS w_secs,\n                                               r.created_at + (wm.window_ms * interval '1 millisecond') AS eff\n                                    ) e\n                                    CROSS JOIN LATERAL (\n                                        SELECT\n                                            (1.0 - $8::DOUBLE PRECISION)\n                                                * COALESCE(up.active_count, 0)::DOUBLE PRECISION\n                                                / GREATEST(NULLIF((SELECT MAX(v) FROM unnest($7::BIGINT[]) v), 0), 1)::DOUBLE PRECISION\n                                            + $8::DOUBLE PRECISION\n                                                * LEAST(GREATEST(EXTRACT(EPOCH FROM e.eff - $3), 0.0) / 86400.0, 1.0) AS blend\n                                    ) calc\n                                    WHERE r.state = 'pending' AND r.model = m.model AND r.batch_id IS NULL\n                                      AND r.template_id IS NOT NULL\n                                      AND r.service_tier IS DISTINCT FROM 'background'\n                                      AND (r.not_before IS NULL OR r.not_before <= $3)\n                                      AND NOT ((mf.state IS NULL OR mf.state = 'live')\n                                               OR (EXTRACT(EPOCH FROM (e.eff - $3))\n                                                   <= power(GREATEST(e.w_secs, 0.0) / 60.0, $9::DOUBLE PRECISION) * 60.0))\n                                      AND NOT EXISTS (\n                                          SELECT 1 FROM unnest($13::TEXT[], $14::TEXT[], $15::TEXT[]) AS cd(u, w, mdl)\n                                          WHERE cd.u = r.created_by AND cd.w = COALESCE(r.service_tier, 'default') AND cd.mdl = r.model\n                                      )\n                                ) cand\n                                ORDER BY cand.created_by, cand.window_class,\n                                         cand.blend ASC, cand.eff ASC, cand.id ASC\n                            ) picks\n                            CROSS JOIN LATERAL (\n                                SELECT 1 FROM requests r\n                                WHERE r.id = picks.id AND r.state = 'pending'\n                                FOR UPDATE OF r SKIP LOCKED\n                            ) lk\n                        ) blb\n                    ) c\n                    -- Source A (leaked = false) fills capacity first; Source B\n                    -- trickle takes any leftover, ordered by the same blend.\n                    ORDER BY c.leaked ASC, c.ord_blend ASC, c.ord_exp ASC, c.ord_id ASC\n                    LIMIT m.capacity\n                ) claimed\n                LIMIT $2::BIGINT\n            )\n            UPDATE requests r\n            SET\n                state = 'claimed',\n                daemon_id = $1,\n                claimed_at = $3\n            FROM to_claim tc\n            JOIN active_request_templates t ON tc.template_id = t.id\n            WHERE r.id = tc.id\n            RETURNING r.id,\n                      r.batch_id,\n                      r.template_id as \"template_id!\", r.retry_attempt,\n                      t.custom_id, t.endpoint as \"endpoint!\", t.method as \"method!\", t.path as \"path!\",\n                      t.body as \"body!\", t.model as \"model!\", t.api_key as \"api_key!\",\n                      tc.effective_expires_at as \"batch_expires_at?\",\n                      ''::TEXT as \"batch_id_str!\",\n                      ''::TEXT as \"batch_file_id!\",\n                      t.endpoint as \"batch_endpoint!\",\n                      '1h'::TEXT as \"batch_completion_window?\",\n                      NULL::TEXT as \"batch_metadata\",\n                      NULL::TEXT as \"batch_output_file_id\",\n                      NULL::TEXT as \"batch_error_file_id\",\n                      COALESCE(r.created_by, '') as \"batch_created_by!\",\n                      to_char(r.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') as \"batch_created_at!\",\n                      to_char(tc.effective_expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') as \"batch_expires_at_str\",\n                      NULL::TEXT as \"batch_cancelling_at\",\n                      NULL::TEXT as \"batch_errors\",\n                      '1'::TEXT as \"batch_total_requests!\",\n                      tc.leaked as \"leaked!\",\n                      tc.window_class as \"window_class!\",\n                      tc.window_secs as \"window_secs!\"\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "batch_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "template_id!",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 3,
+        "name": "retry_attempt",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 4,
+        "name": "custom_id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "endpoint!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 6,
+        "name": "method!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 7,
+        "name": "path!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 8,
+        "name": "body!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 9,
+        "name": "model!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 10,
+        "name": "api_key!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 11,
+        "name": "batch_expires_at?",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 12,
+        "name": "batch_id_str!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 13,
+        "name": "batch_file_id!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 14,
+        "name": "batch_endpoint!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 15,
+        "name": "batch_completion_window?",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 16,
+        "name": "batch_metadata",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 17,
+        "name": "batch_output_file_id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 18,
+        "name": "batch_error_file_id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 19,
+        "name": "batch_created_by!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 20,
+        "name": "batch_created_at!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 21,
+        "name": "batch_expires_at_str",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 22,
+        "name": "batch_cancelling_at",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 23,
+        "name": "batch_errors",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 24,
+        "name": "batch_total_requests!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 25,
+        "name": "leaked!",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 26,
+        "name": "window_class!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 27,
+        "name": "window_secs!",
+        "type_info": "Float8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int8",
+        "Timestamptz",
+        "TextArray",
+        "Int8Array",
+        "TextArray",
+        "Int8Array",
+        "Float8",
+        "Float8",
+        "TextArray",
+        "Int8Array",
+        "Int8",
+        "TextArray",
+        "TextArray",
+        "TextArray"
+      ]
+    },
+    "nullable": [
+      false,
+      true,
+      true,
+      false,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      null,
+      null,
+      null,
+      true,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "7ad6cb48dc2d641dc987551149ca77eddcbe460a62a77b16ec00d5b81f0bab32"
+}
