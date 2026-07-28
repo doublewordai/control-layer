@@ -1738,22 +1738,25 @@ pub async fn build_router(
             0 => usize::MAX,
             n => usize::try_from(n).unwrap_or(usize::MAX),
         };
-        let mut translators: Vec<std::sync::Arc<dyn crate::inference::translation::ProtocolTranslator>> = vec![
+        let translators: Vec<std::sync::Arc<dyn crate::inference::translation::ProtocolTranslator>> = vec![
             // Pass cache.enabled so the translator only emits the top-level automatic-caching marker
             // when the cache middleware is present to consume + strip it (else it would leak upstream).
             std::sync::Arc::new(crate::inference::translation::anthropic::AnthropicMessages::new(
                 config.cache.enabled,
             )),
             std::sync::Arc::new(crate::inference::translation::anthropic::models::AnthropicModels),
+            // Edge Responses translation. A pure Responses<->Chat converter; the
+            // Responses control plane (id minting, previous_response_id hydration,
+            // background routing) lives in the outer inference middleware, and
+            // persistence lives in the outlet just above. Registered in BOTH strict
+            // and non-strict mode, exactly like the Anthropic translators above.
+            // Downstream, strict mode dispatches the normalised `/chat/completions`
+            // body via onwards' `/responses` route, and non-strict forwards it by
+            // the normalised path through onwards' catch-all (the same mechanism the
+            // `/messages` translation already relies on). dwctl owns Responses in
+            // both modes so id stamping, GET retrieval and hydration work uniformly.
+            std::sync::Arc::new(crate::inference::translation::responses::OpenResponses::new()),
         ];
-        // Edge Responses translation. The OpenResponses translator is a pure
-        // Responses<->Chat converter; the Responses control plane (id minting,
-        // previous_response_id hydration, background routing) lives in the outer
-        // inference middleware, and persistence lives in the outlet just above.
-        // onwards' strict `/responses` route is an alias to its chat handler.
-        if strict_mode {
-            translators.push(std::sync::Arc::new(crate::inference::translation::responses::OpenResponses::new()));
-        }
         let translation_registry =
             crate::inference::translation::TranslationRegistry::new(translators).with_max_body_size(translation_body_limit);
         onwards_router.layer(middleware::from_fn_with_state(
