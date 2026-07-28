@@ -654,6 +654,7 @@ pub async fn create_batch<P: PoolProvider>(
             .map_err(Error::Database)?
             .filter(|key| key.user_id == target_user_id)
             // Hidden/system keys are not selectable.
+            .filter(|key| !key.hidden)
             .filter(|key| key.parent_api_key_id.is_none())
             .filter(|key| matches!(key.purpose, ApiKeyPurpose::Realtime | ApiKeyPurpose::Platform))
             // Usable by the caller: their own key, or any org key for org managers.
@@ -5282,6 +5283,25 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(batch_key_id, Some(child_id), "capped selection must execute on the cap-scope child");
+
+        // Hidden root keys (e.g. the shared batch key minted by the create
+        // above: hidden = true, parent NULL) are not selectable even by their
+        // holder — the hidden filter, not just the parent filter, must hold.
+        let hidden_root_id: Uuid = sqlx::query_scalar(
+            "SELECT id FROM api_keys WHERE hidden = true AND parent_api_key_id IS NULL AND user_id = $1 AND created_by = $2 LIMIT 1",
+        )
+        .bind(org.id)
+        .bind(owner.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        app.post("/ai/v1/batches")
+            .json(&batch_req(&file_id, Some(hidden_root_id)))
+            .add_header(&owner_auth[0].0, &owner_auth[0].1)
+            .add_header(&owner_auth[1].0, &owner_auth[1].1)
+            .add_header("cookie", &org_cookie)
+            .await
+            .assert_status(StatusCode::NOT_FOUND);
     }
 
     #[sqlx::test]

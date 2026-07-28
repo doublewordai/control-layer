@@ -181,6 +181,11 @@ async fn setup_sentinel_fixture(pool: &PgPool) -> SentinelFixture {
 
 /// Send the sentinel-bearing realtime request, polling until onwards has the
 /// model (sync is asynchronous). Returns once a 200 is observed.
+///
+/// Both 404 (model not yet in the routing table) and 403 (key synced but its
+/// model-access association not yet reflected) are transient sync states —
+/// config pushes are asynchronous and can land piecewise under load — so both
+/// are retried. Anything else fails immediately.
 async fn send_sentinel_request(fixture: &SentinelFixture) {
     let body = serde_json::json!({
         "model": MODEL_ALIAS,
@@ -193,7 +198,7 @@ async fn send_sentinel_request(fixture: &SentinelFixture) {
             .add_header("authorization", format!("Bearer {}", fixture.realtime_key))
             .json(&body)
             .await;
-        if resp.status_code().as_u16() != 404 {
+        if !matches!(resp.status_code().as_u16(), 404 | 403) {
             assert_eq!(
                 resp.status_code().as_u16(),
                 200,

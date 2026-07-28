@@ -525,6 +525,7 @@ pub async fn update_user_api_key<P: PoolProvider>(
         .await?
         .filter(|key| key.user_id == target_user_id)
         .filter(|key| skip_created_by_filter || key.created_by == current_user.id)
+        .filter(|key| !key.hidden)
         .filter(|key| key.parent_api_key_id.is_none())
         .filter(|key| matches!(key.purpose, ApiKeyPurpose::Realtime | ApiKeyPurpose::Platform))
         .ok_or_else(|| Error::NotFound {
@@ -698,6 +699,7 @@ pub async fn get_user_api_key_secret<P: PoolProvider>(
         .filter(|key| key.user_id == target_user_id)
         .filter(|key| skip_created_by_filter || key.created_by == current_user.id)
         // System-managed keys' secrets are never user-fetchable.
+        .filter(|key| !key.hidden)
         .filter(|key| key.parent_api_key_id.is_none())
         .filter(|key| matches!(key.purpose, ApiKeyPurpose::Realtime | ApiKeyPurpose::Platform))
         .ok_or_else(|| Error::NotFound {
@@ -801,6 +803,7 @@ pub async fn rotate_user_api_key<P: PoolProvider>(
         .await?
         .filter(|key| key.user_id == target_user_id)
         .filter(|key| skip_created_by_filter || key.created_by == current_user.id)
+        .filter(|key| !key.hidden)
         .filter(|key| key.parent_api_key_id.is_none())
         .filter(|key| matches!(key.purpose, ApiKeyPurpose::Realtime | ApiKeyPurpose::Platform))
         .ok_or_else(|| Error::NotFound {
@@ -914,6 +917,7 @@ pub async fn delete_user_api_key<P: PoolProvider>(
         .await?
         .filter(|key| key.user_id == target_user_id)
         .filter(|key| skip_created_by_filter || key.created_by == current_user.id)
+        .filter(|key| !key.hidden)
         .filter(|key| key.parent_api_key_id.is_none())
         .ok_or_else(|| Error::NotFound {
             resource: "API key".to_string(),
@@ -2704,6 +2708,26 @@ mod tests {
             .unwrap();
         let response = app
             .get(&format!("/admin/api/v1/users/current/api-keys/{}/secret", child_id))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+        response.assert_status_not_found();
+
+        // Hidden ROOT keys (the shared batch key: hidden = true, parent NULL)
+        // are equally unfetchable — the hidden filter, not just the parent
+        // filter, must hold.
+        let hidden_root_id = {
+            use crate::db::handlers::api_keys::ApiKeys;
+            use crate::db::models::api_keys::ApiKeyPurpose;
+            let mut conn = pool.acquire().await.unwrap();
+            let (_, id) = ApiKeys::new(&mut conn)
+                .get_or_create_hidden_key_with_id(user.id, ApiKeyPurpose::Batch, user.id)
+                .await
+                .unwrap();
+            id
+        };
+        let response = app
+            .get(&format!("/admin/api/v1/users/current/api-keys/{}/secret", hidden_root_id))
             .add_header(&auth[0].0, &auth[0].1)
             .add_header(&auth[1].0, &auth[1].1)
             .await;

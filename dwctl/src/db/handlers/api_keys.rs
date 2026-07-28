@@ -84,6 +84,7 @@ impl From<(Vec<DeploymentId>, ApiKey)> for ApiKeyDBResponse {
             name: api_key.name,
             description: api_key.description,
             secret: api_key.secret,
+            hidden: api_key.hidden,
             purpose,
             user_id: api_key.user_id,
             created_by: api_key.created_by,
