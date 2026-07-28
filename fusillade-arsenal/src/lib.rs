@@ -47,9 +47,15 @@ pub struct PostgresStorageConfig {
     #[serde(default = "default_pending_request_counts_timeout_ms")]
     pub pending_request_counts_timeout_ms: u64,
     /// Maximum number of request state transitions that may write to Postgres
-    /// concurrently. Set to `0` to disable the limit.
+    /// concurrently. Set to `0` to disable only the write-class limit; the
+    /// shared response-traffic budget still applies.
     #[serde(default = "default_max_concurrent_state_writes")]
     pub max_concurrent_state_writes: usize,
+    /// Maximum number of consolidated response detail reads that may run
+    /// concurrently. Set to `0` to disable only the read-class limit; the
+    /// shared response-traffic budget still applies.
+    #[serde(default = "default_max_concurrent_response_reads")]
+    pub max_concurrent_response_reads: usize,
     #[serde(default = "default_batch_metadata_fields")]
     pub batch_metadata_fields: Vec<String>,
     pub claim_timeout_ms: u64,
@@ -99,6 +105,10 @@ fn default_max_concurrent_state_writes() -> usize {
     64
 }
 
+fn default_max_concurrent_response_reads() -> usize {
+    8
+}
+
 fn default_claim_ramp_exponent() -> f64 {
     0.56
 }
@@ -120,6 +130,7 @@ impl Default for PostgresStorageConfig {
         Self {
             pending_request_counts_timeout_ms: default_pending_request_counts_timeout_ms(),
             max_concurrent_state_writes: default_max_concurrent_state_writes(),
+            max_concurrent_response_reads: default_max_concurrent_response_reads(),
             batch_metadata_fields: default_batch_metadata_fields(),
             claim_timeout_ms: 60_000,
             processing_timeout_ms: 600_000,
@@ -243,5 +254,26 @@ mod tests {
         let reencoded = serde_json::to_value(decoded).unwrap();
 
         assert_eq!(reencoded["max_concurrent_state_writes"], 17);
+    }
+
+    #[test]
+    fn response_read_concurrency_defaults_when_missing() {
+        let mut serialized = serde_json::to_value(PostgresStorageConfig::default()).unwrap();
+        serialized
+            .as_object_mut()
+            .unwrap()
+            .remove("max_concurrent_response_reads");
+
+        let decoded: PostgresStorageConfig = serde_json::from_value(serialized).unwrap();
+        assert_eq!(decoded.max_concurrent_response_reads, 8);
+    }
+
+    #[test]
+    fn response_read_concurrency_explicit_value_round_trips() {
+        let mut serialized = serde_json::to_value(PostgresStorageConfig::default()).unwrap();
+        serialized["max_concurrent_response_reads"] = serde_json::json!(3);
+
+        let decoded: PostgresStorageConfig = serde_json::from_value(serialized).unwrap();
+        assert_eq!(decoded.max_concurrent_response_reads, 3);
     }
 }

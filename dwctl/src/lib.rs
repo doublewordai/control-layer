@@ -290,6 +290,8 @@ where
     #[builder(default = false)]
     pub is_leader: bool,
     pub request_manager: Arc<fusillade_arsenal::PostgresRequestManager<P>>,
+    /// Singleton commit-acknowledging response lifecycle writer.
+    pub requests_writer: crate::inference::engine::writer::RequestsWriterHandle,
     /// Background task runner for enqueuing deferred work (batch population, etc.)
     pub task_runner: Arc<tasks::TaskRunner<P>>,
     /// Resource limiters for protecting system capacity.
@@ -313,6 +315,10 @@ where
     /// Encrypted key custody, built from `config.keystore`. `None` means it is
     /// not configured (ZDR flex disabled).
     pub keystore: Option<crate::keystore::Keystore>,
+    /// Lock-free API-key metadata snapshot shared by response hot paths.
+    pub api_key_cache: crate::sync::api_key_cache::ApiKeyMetadataCache,
+    /// Shared cold-path resolver for hidden Flex batch keys.
+    pub flex_batch_key_resolver: crate::sync::api_key_cache::FlexBatchKeyResolver,
 }
 
 impl<P> AppState<P>
@@ -1139,7 +1145,6 @@ pub async fn build_router(
     state: &mut AppState,
     onwards_router: Router,
     analytics_sender: Option<request_logging::batcher::AnalyticsSender>,
-    requests_writer_sender: Option<crate::inference::engine::writer::RequestsWriterSender>,
     metrics_recorder: Option<GenAiMetrics>,
     strict_mode: bool,
     inference_middleware_state: Option<crate::inference::middleware::InferenceMiddlewareState>,
@@ -1157,7 +1162,8 @@ pub async fn build_router(
     let request_logging_enabled = state.outlet_db.is_some() && config.enable_request_logging;
     let analytics_enabled = config.enable_analytics;
 
-    let outlet_layer = if request_logging_enabled || analytics_enabled {
+    let response_lifecycle_enabled = inference_middleware_state.is_some();
+    let outlet_layer = if request_logging_enabled || analytics_enabled || response_lifecycle_enabled {
         // Store the metrics recorder in state (created earlier in Application::new)
         state.metrics_recorder = metrics_recorder;
 
@@ -1189,11 +1195,14 @@ pub async fn build_router(
 
         // Add FusilladeOutletHandler so completed responses get written to
         // fusillade via the in-process RequestsWriter. We only attach when
-        // both the inference middleware is active and we actually have a
-        // sender to give the handler; without a sender the handler would
-        // silently swallow rows.
-        if let (Some(rms), Some(sender)) = (inference_middleware_state.as_ref(), requests_writer_sender.clone()) {
-            let fusillade_handler = crate::inference::engine::outlet_handler::FusilladeOutletHandler::new(sender, rms.dwctl_pool.clone());
+        // the inference middleware is active. AppState owns the singleton
+        // writer handle, avoiding a second router parameter that could point
+        // at a different consumer.
+        if let Some(rms) = inference_middleware_state.as_ref() {
+            let fusillade_handler = crate::inference::engine::outlet_handler::FusilladeOutletHandler::new(
+                state.requests_writer.clone(),
+                rms.api_key_cache.clone(),
+            );
             multi_handler = multi_handler.with(fusillade_handler);
         }
 
@@ -2058,21 +2067,20 @@ pub struct BackgroundServices {
     task_runner: Arc<tasks::TaskRunner>,
     is_leader: bool,
     onwards_targets: onwards::target::Targets,
-    /// Per-key ZDR policy map, initial-loaded and then refreshed by
-    /// [`crate::sync::zdr_keys`]. Handed to `AppState` so `is_zdr_request`
-    /// reads it on the request hot path.
-    zdr_key_cache: crate::sync::zdr_keys::ZdrKeyCache,
+    /// Per-key response hot-path metadata, initial-loaded and then refreshed by
+    /// [`crate::sync::api_key_cache`].
+    api_key_cache: crate::sync::api_key_cache::ApiKeyMetadataCache,
+    /// Shared cold-path resolver for hidden Flex batch keys.
+    flex_batch_key_resolver: crate::sync::api_key_cache::FlexBatchKeyResolver,
     #[cfg_attr(not(test), allow(dead_code))]
     onwards_sender: Option<tokio::sync::watch::Sender<onwards::target::Targets>>,
     #[allow(dead_code)] // Used in sync_onwards_config method
     strict_mode: bool,
     /// Sender for analytics records (if analytics is enabled)
     analytics_sender: Option<request_logging::batcher::AnalyticsSender>,
-    /// Sender for completed-response records consumed by the in-process
-    /// `RequestsWriter` (replaces the underway response jobs). Always set
-    /// once `setup_background_services` runs; `None` only in test harnesses
-    /// that bypass that path.
-    requests_writer_sender: Option<crate::inference::engine::writer::RequestsWriterSender>,
+    /// Handle for durable creates and best-effort completion records consumed
+    /// by the in-process `RequestsWriter`.
+    requests_writer_handle: crate::inference::engine::writer::RequestsWriterHandle,
     // JoinSet is cancel-safe - can be polled in select! without losing tasks
     background_tasks: tokio::task::JoinSet<anyhow::Result<()>>,
     // Map task IDs to names for logging
@@ -2286,8 +2294,8 @@ impl BackgroundServices {
     /// letting a test flip an account to ZDR mid-run without spawning the
     /// LISTEN/NOTIFY loop.
     #[cfg(test)]
-    pub async fn sync_zdr_keys(&self, pool: &sqlx::PgPool) -> anyhow::Result<()> {
-        crate::sync::zdr_keys::refresh(pool, &self.zdr_key_cache).await?;
+    pub async fn sync_api_key_cache(&self, pool: &sqlx::PgPool) -> anyhow::Result<()> {
+        crate::sync::api_key_cache::refresh(pool, &self.api_key_cache).await?;
         Ok(())
     }
 }
@@ -2359,6 +2367,11 @@ pub(crate) struct BackgroundServicesInput {
     /// multi-step processor can share the same storage instance as the
     /// daemon runtime.
     pub request_manager: Arc<fusillade_arsenal::PostgresRequestManager<DbPools>>,
+    /// The singleton lifecycle writer consumer and its producer handle are
+    /// constructed before the response store so descendants cannot observe a
+    /// startup window without durable admission.
+    pub requests_writer: crate::inference::engine::writer::RequestsWriter<DbPools>,
+    pub requests_writer_handle: crate::inference::engine::writer::RequestsWriterHandle,
     /// Fusillade's scheduling daemon. Owns HTTP dispatch and runtime
     /// lifecycle; durable data operations live on `request_manager`.
     pub postgres_daemon: Arc<fusillade::PostgresDaemon<DbPools, fusillade::ReqwestHttpClient>>,
@@ -2399,6 +2412,8 @@ pub(crate) struct BackgroundServicesInput {
 async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Result<BackgroundServices> {
     let BackgroundServicesInput {
         request_manager,
+        requests_writer,
+        requests_writer_handle,
         postgres_daemon,
         step_manager,
         multi_step_processor,
@@ -2504,24 +2519,21 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
         (onwards::target::Targets::from_config(empty_config)?, None)
     };
 
-    // Per-key ZDR policy map: an initial synchronous load ALWAYS runs, so the
-    // map is never empty under live traffic (an empty map reads every key as
-    // non-ZDR and would silently leak a ZDR account's body). Only the
-    // LISTEN/NOTIFY refresh loop is gated on onwards config sync, with which it
-    // shares the `auth_config_changed` channel; with sync disabled the map is
-    // still correct at startup, it just does not pick up later policy changes.
-    let zdr_key_cache = crate::sync::zdr_keys::initial_cache(&pool).await?;
-    if config.background_services.onwards_sync.enabled {
-        let zdr_pool = pool.clone();
-        let zdr_cache = zdr_key_cache.clone();
-        let zdr_shutdown = shutdown_token.clone();
-        let zdr_fallback = config.background_services.onwards_sync.fallback_interval_milliseconds;
-        background_tasks.spawn("zdr-key-sync", async move {
-            crate::sync::zdr_keys::run(zdr_pool, zdr_cache, zdr_fallback, zdr_shutdown)
-                .await
-                .context("ZDR key sync failed")
-        });
-    }
+    // API-key response metadata has its own authorization duty for the
+    // Responses API. Load it synchronously so response hot paths never serve
+    // from a warming cache, then keep it fresh independently of onwards target
+    // synchronization.
+    let api_key_cache = crate::sync::api_key_cache::initial_cache(&pool).await?;
+    let flex_batch_key_resolver = crate::sync::api_key_cache::FlexBatchKeyResolver::new(pool.clone(), api_key_cache.clone());
+    let cache_pool = pool.clone();
+    let cache = api_key_cache.clone();
+    let cache_shutdown = shutdown_token.clone();
+    let cache_fallback = config.background_services.onwards_sync.fallback_interval_milliseconds;
+    background_tasks.spawn("api-key-metadata-sync", async move {
+        crate::sync::api_key_cache::run(cache_pool, cache, cache_fallback, cache_shutdown)
+            .await
+            .context("API key metadata sync failed")
+    });
 
     // Leader election lock ID: 0x44574354_50524F42 (DWCT_PROB in hex for "dwctl probes")
     const LEADER_LOCK_ID: i64 = 0x4457_4354_5052_4F42_i64;
@@ -2864,19 +2876,14 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
 
     // Start the responses writer. Replaces the underway create-response /
     // complete-response jobs. Outlet's FusilladeOutletHandler holds the
-    // sender; this task drains the channel and flushes to fusillade.
-    let requests_writer_sender = {
-        let (writer, sender) = crate::inference::engine::writer::RequestsWriter::new(
-            request_manager.clone(),
-            config.background_services.task_workers.response_writer_batch_size,
-        );
+    // handle; this task drains the channel and flushes to fusillade.
+    {
         let writer_shutdown = shutdown_token.clone();
         background_tasks.spawn("responses-writer", async move {
-            writer.run(writer_shutdown).await;
+            requests_writer.run(writer_shutdown).await;
             Ok(())
         });
-        Some(sender)
-    };
+    }
 
     // Build the underway task runner for background jobs (batch population, sync pipeline, etc.)
     let encryption_key = match config.connections.encryption_key.as_deref().or(config.secret_key.as_deref()) {
@@ -2918,11 +2925,12 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
         task_runner,
         is_leader,
         onwards_targets: initial_targets,
-        zdr_key_cache,
+        api_key_cache,
+        flex_batch_key_resolver,
         onwards_sender,
         strict_mode: config.onwards.strict_mode,
         analytics_sender,
-        requests_writer_sender,
+        requests_writer_handle,
         background_tasks,
         task_names,
         shutdown_token,
@@ -3063,11 +3071,16 @@ impl Application {
                 batch_size: config.batches.files.batch_insert_size,
             }),
         );
+        let (requests_writer, requests_writer_handle) = crate::inference::engine::writer::RequestsWriter::new(
+            request_manager.clone(),
+            config.background_services.task_workers.response_writer_batch_size,
+            std::time::Duration::from_millis(config.background_services.task_workers.response_writer_max_linger_ms),
+        );
         let postgres_daemon = Arc::new(fusillade::PostgresDaemon::from_store(
             request_manager.clone(),
             fusillade_daemon_config.clone(),
         ));
-        let step_manager = Arc::new(fusillade_arsenal::PostgresResponseStepManager::new(fusillade_pools.clone()));
+        let step_manager = Arc::new(request_manager.response_step_manager());
         // Build the ZDR keystore once and share it across the response store, the
         // daemon processor, and background services (which install the response
         // transformer). A misconfiguration is fatal.
@@ -3076,7 +3089,7 @@ impl Application {
             None => None,
         };
         let response_store = Arc::new(
-            crate::inference::store::FusilladeResponseStore::new(request_manager.clone())
+            crate::inference::store::FusilladeResponseStore::new(request_manager.clone(), requests_writer_handle.clone())
                 .with_step_manager(step_manager.clone())
                 .with_keystore(keystore.clone()),
         );
@@ -3164,6 +3177,8 @@ impl Application {
 
         let mut bg_services = setup_background_services(BackgroundServicesInput {
             request_manager: request_manager.clone(),
+            requests_writer,
+            requests_writer_handle: requests_writer_handle.clone(),
             postgres_daemon: postgres_daemon.clone(),
             step_manager: step_manager.clone(),
             multi_step_processor: multi_step_processor_for_setup,
@@ -3289,6 +3304,7 @@ impl Application {
         // does any DB work up front; the completion path goes through
         // FusilladeOutletHandler -> RequestsWriter.
         let inference_middleware_state = crate::inference::middleware::InferenceMiddlewareState {
+            requests_writer: bg_services.requests_writer_handle.clone(),
             request_manager: bg_services.request_manager.clone(),
             daemon_id: crate::inference::store::OnwardsDaemonId(onwards_daemon_id),
             loopback_base_url: {
@@ -3310,7 +3326,9 @@ impl Application {
             unverified_requests_per_completion_hour: config.batches.unverified_requests_per_completion_hour,
             flex_completion_window: config.batches.async_requests.completion_window.clone(),
             keystore: bg_services.keystore.clone(),
-            zdr_key_cache: bg_services.zdr_key_cache.clone(),
+            api_key_cache: bg_services.api_key_cache.clone(),
+            flex_batch_key_resolver: bg_services.flex_batch_key_resolver.clone(),
+            onwards_targets: bg_services.onwards_targets.clone(),
         };
 
         // Build onwards router from targets with body transform, response sanitization, and tool executor.
@@ -3349,11 +3367,14 @@ impl Application {
             .config(shared_config.clone())
             .is_leader(bg_services.is_leader)
             .request_manager(bg_services.request_manager.clone())
+            .requests_writer(bg_services.requests_writer_handle.clone())
             .task_runner(bg_services.task_runner.clone())
             .maybe_outlet_db(outlet_pools.clone())
             .limiters(limiters)
             .maybe_connections_encryption_key(bg_services.connections_encryption_key.clone())
             .maybe_keystore(bg_services.keystore.clone())
+            .api_key_cache(bg_services.api_key_cache.clone())
+            .flex_batch_key_resolver(bg_services.flex_batch_key_resolver.clone())
             .response_store(response_store)
             .response_step_manager(bg_services.step_manager.clone())
             .image_normalizer(image_normalizer)
@@ -3370,7 +3391,6 @@ impl Application {
             &mut app_state,
             onwards_router,
             bg_services.analytics_sender.clone(),
-            bg_services.requests_writer_sender.clone(),
             metrics_recorder,
             bg_services.onwards_targets.strict_mode,
             Some(inference_middleware_state),

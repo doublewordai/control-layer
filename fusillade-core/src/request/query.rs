@@ -210,6 +210,19 @@ pub struct RequestDetail {
     pub created_by: String,
 }
 
+/// A public Responses API identifier resolved to its live, owned request row.
+///
+/// Multi-step responses expose the head step UUID while storing the model
+/// call under a distinct request UUID. Single-step responses use the same UUID
+/// for both fields.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "sqlx-postgres", derive(sqlx::FromRow))]
+pub struct ResolvedResponseDetail {
+    pub public_response_id: Uuid,
+    #[cfg_attr(feature = "sqlx-postgres", sqlx(flatten))]
+    pub detail: RequestDetail,
+}
+
 /// Input for creating a realtime response that the proxy is already handling.
 ///
 /// Inserts a request template (no parent file) and a request row in
@@ -311,6 +324,13 @@ pub struct CreateFlexInput {
     pub api_key: String,
     /// User/org ID that owns this request.
     pub created_by: String,
+}
+
+/// Command for creating either kind of durable response row.
+#[derive(Debug, Clone)]
+pub enum CreateResponseInput {
+    Flex(CreateFlexInput),
+    Realtime(CreateRealtimeInput),
 }
 
 /// Result of a paginated request list query.

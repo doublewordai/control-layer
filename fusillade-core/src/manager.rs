@@ -10,9 +10,10 @@ use crate::batch::{
 use crate::daemon_record::{AnyDaemonRecord, DaemonRecord, DaemonState, DaemonStatus};
 use crate::error::Result;
 use crate::request::{
-    AnyRequest, CascadeTargetState, Claimed, CreateFlexInput, CreateRealtimeInput, DaemonId,
-    ListRequestsFilter, PersistCompletedRealtimeInput, Request, RequestDetail, RequestId,
-    RequestListResult, RequestState, ServiceTierFilter,
+    AnyRequest, CascadeTargetState, Claimed, CreateFlexInput, CreateRealtimeInput,
+    CreateResponseInput, DaemonId, ListRequestsFilter, PersistCompletedRealtimeInput, Request,
+    RequestDetail, RequestId, RequestListResult, RequestState, ResolvedResponseDetail,
+    ServiceTierFilter,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -770,6 +771,17 @@ pub trait Storage: Send + Sync {
     /// Get a single request by ID with full detail (body, response, error).
     async fn get_request_detail(&self, request_id: RequestId) -> Result<RequestDetail>;
 
+    /// Resolve a public response ID to one live, batchless request owned by
+    /// `owner_id`.
+    ///
+    /// Unknown responses and responses owned by another account are both
+    /// reported as `RequestNotFound` so the caller does not leak existence.
+    async fn get_response_detail_for_owner(
+        &self,
+        response_id: RequestId,
+        owner_id: &str,
+    ) -> Result<ResolvedResponseDetail>;
+
     /// Create a realtime response that the proxy is already handling.
     ///
     /// Inserts a request template (no parent file) and a request row with
@@ -784,6 +796,14 @@ pub trait Storage: Send + Sync {
     /// `batch_id = NULL` in `pending` state. The daemon claims and processes
     /// it via the standard flex pipeline.
     async fn create_flex(&self, input: CreateFlexInput) -> Result<RequestId>;
+
+    /// Create multiple realtime and/or flex responses atomically.
+    ///
+    /// Returned IDs preserve the order of `inputs`.
+    async fn create_responses_batch(
+        &self,
+        inputs: &[CreateResponseInput],
+    ) -> Result<Vec<RequestId>>;
 
     /// Complete a processing request with the response body.
     ///

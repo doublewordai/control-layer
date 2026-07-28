@@ -1,8 +1,8 @@
 //! Fusillade-backed implementation of onwards' `ResponseStore` trait
 //! and standalone functions for creating/completing response records.
 //!
-//! All fusillade operations go through the `Storage` trait via `request_manager`.
-//! The only raw SQL is the `api_keys` lookup which queries a dwctl-owned table.
+//! Lifecycle creates go through the commit-acknowledging response writer;
+//! reads and state transitions use the `Storage` trait via `request_manager`.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
@@ -70,6 +70,7 @@ pub struct OnwardsDaemonId(pub Uuid);
 /// ResponseStore implementation backed by fusillade's `Storage` trait.
 pub struct FusilladeResponseStore<P: PoolProvider + Clone> {
     request_manager: Arc<PostgresRequestManager<P>>,
+    requests_writer: super::engine::RequestsWriterHandle,
     /// Step storage for multi-step responses. Optional so existing callers
     /// that only need the legacy single-step `ResponseStore` surface (e.g.
     /// the `previous_response_id` flow) can construct a store without
@@ -87,9 +88,10 @@ pub struct FusilladeResponseStore<P: PoolProvider + Clone> {
 }
 
 impl<P: PoolProvider + Clone> FusilladeResponseStore<P> {
-    pub fn new(request_manager: Arc<PostgresRequestManager<P>>) -> Self {
+    pub fn new(request_manager: Arc<PostgresRequestManager<P>>, requests_writer: super::engine::RequestsWriterHandle) -> Self {
         Self {
             request_manager,
+            requests_writer,
             step_manager: None,
             pending_inputs: Arc::new(RwLock::new(HashMap::new())),
             keystore: None,
@@ -203,7 +205,53 @@ impl<P: PoolProvider + Clone> FusilladeResponseStore<P> {
         })
     }
 
-    /// Retrieve a response by ID. Used by the GET /v1/responses/{id} handler.
+    /// Retrieve a response by ID after resolving ownership in the same
+    /// Fusillade statement as the response detail.
+    ///
+    /// Unknown and cross-owner IDs both return [`ResponseLookup::NotFound`].
+    /// The public response ID remains the head-step UUID for multi-step
+    /// responses, while ZDR decryption uses the resolved backing request UUID.
+    pub async fn get_response_for_owner(&self, response_id: &str, owner_id: &str) -> Result<ResponseLookup, StoreError> {
+        let parsed_uuid = parse_response_id(response_id)?;
+        let mut resolved = match self
+            .request_manager
+            .get_response_detail_for_owner(RequestId(parsed_uuid), owner_id)
+            .await
+        {
+            Ok(resolved) => resolved,
+            Err(fusillade::FusilladeError::RequestNotFound(_)) => {
+                return Ok(ResponseLookup::NotFound);
+            }
+            Err(e) => {
+                return Err(StoreError::StorageError(format!("Failed to fetch owned response: {e}")));
+            }
+        };
+
+        if let Some(ks) = self.keystore.as_ref() {
+            match crate::inference::zdr::decrypt_response_body(ks, &resolved.detail.id, resolved.detail.response_body.as_deref())
+                .await
+                .map_err(|e| StoreError::StorageError(format!("ZDR response decrypt: {e}")))?
+            {
+                crate::inference::zdr::DecryptOutcome::Unchanged => {}
+                crate::inference::zdr::DecryptOutcome::Decrypted(plain) => {
+                    resolved.detail.response_body = Some(plain);
+                }
+                crate::inference::zdr::DecryptOutcome::Gone => {
+                    return Ok(ResponseLookup::Gone);
+                }
+            }
+        }
+
+        let mut response = detail_to_response_object(&resolved.detail);
+        response["id"] = serde_json::Value::String(format!("resp_{}", resolved.public_response_id));
+        Ok(ResponseLookup::Found(response))
+    }
+
+    /// Retrieve a response without an ownership predicate.
+    ///
+    /// This path exists only for onwards' internal `previous_response_id`
+    /// context contract, which does not currently carry an owner identity.
+    /// Public HTTP retrieval must use [`Self::get_response_for_owner`].
     ///
     /// Two retrieval paths:
     ///
@@ -358,9 +406,6 @@ pub async fn fail_response<P: PoolProvider + Clone>(
 }
 
 /// Returns true if a fusillade request with this id already exists.
-///
-/// Used by `create-response` to skip work when `complete-response` has already
-/// raced ahead and inserted the row itself.
 pub async fn request_exists<P: PoolProvider + Clone>(
     request_manager: &PostgresRequestManager<P>,
     request_id: Uuid,
@@ -370,135 +415,6 @@ pub async fn request_exists<P: PoolProvider + Clone>(
         Err(fusillade::FusilladeError::RequestNotFound(_)) => Ok(false),
         Err(e) => Err(StoreError::StorageError(format!("Failed to check request existence: {e}"))),
     }
-}
-
-/// Context required to synthesize a fusillade request row.
-///
-/// Carried by `complete-response` so it can create-then-complete when it
-/// races ahead of `create-response`.
-pub struct CreateContext<'a> {
-    pub request_id: Uuid,
-    pub request_body: &'a str,
-    pub model: &'a str,
-    pub endpoint: &'a str,
-    pub base_url: &'a str,
-    pub api_key: Option<&'a str>,
-}
-
-/// Mark a response as completed, creating the row first if it doesn't exist.
-///
-/// The two-job lifecycle (create-response, complete-response) can race —
-/// they're enqueued within ~50ms of each other and run on independent
-/// underway queues. Worse, underway's heartbeat-based reclamation can
-/// produce zombie attempts: the original worker keeps running after
-/// underway has marked the attempt failed and started a fresh one, so
-/// two attempts may modify the same row concurrently.
-///
-/// This helper tolerates all of those orderings:
-///  - missing row → synthesize, then complete
-///  - row already in `completed`/`failed`/`canceled` → idempotent success
-///    (some other writer — typically a zombie attempt or a duplicate
-///    enqueue — has already done our work)
-///  - row in `processing` → straight UPDATE
-pub async fn complete_response_idempotent<P: PoolProvider + Clone>(
-    request_manager: &PostgresRequestManager<P>,
-    dwctl_pool: &sqlx::PgPool,
-    response_id: &str,
-    response_body: &str,
-    status_code: u16,
-    create_ctx: CreateContext<'_>,
-) -> Result<(), StoreError> {
-    let id = parse_response_id(response_id)?;
-
-    // Fast path: row exists in `processing` — UPDATE matches and we're done.
-    match request_manager.complete_request(RequestId(id), response_body, status_code).await {
-        Ok(()) => return Ok(()),
-        Err(fusillade::FusilladeError::RequestStateConflict { current_state, .. }) if is_terminal(&current_state) => {
-            tracing::info!(
-                response_id = %response_id,
-                final_state = %current_state,
-                "complete-response: row already in terminal state — idempotent success"
-            );
-            return Ok(());
-        }
-        Err(fusillade::FusilladeError::RequestStateConflict { current_state, .. }) => {
-            // Row exists in some non-terminal, non-processing state (e.g.
-            // 'pending' or 'claimed'). This shouldn't happen for the realtime
-            // path, but it's not our place to force-complete. Bubble up.
-            return Err(StoreError::StorageError(format!(
-                "Row exists for response {response_id} in unexpected state '{current_state}'"
-            )));
-        }
-        Err(fusillade::FusilladeError::RequestNotFound(_)) => {} // synthesize below
-        Err(e) => return Err(StoreError::StorageError(format!("Failed to complete request: {e}"))),
-    }
-
-    // Row doesn't exist — synthesize it. create-response may race us; if it
-    // wins between our failed UPDATE and our INSERT, the INSERT hits a PK
-    // conflict and the retry UPDATE below sorts it out.
-    tracing::info!(
-        response_id = %response_id,
-        model = %create_ctx.model,
-        endpoint = %create_ctx.endpoint,
-        "complete-response synthesizing row (create-response hasn't run yet)"
-    );
-    if create_ctx.endpoint.is_empty() {
-        // Empty endpoint means an upstream header is missing; better to fail
-        // loudly than silently insert a row the /responses lookup can't find.
-        return Err(StoreError::StorageError(
-            "Cannot synthesize request row: empty endpoint in CreateContext (x-onwards-endpoint header missing upstream)".into(),
-        ));
-    }
-    let created_by = lookup_created_by(dwctl_pool, create_ctx.api_key).await;
-    let realtime_input = fusillade::CreateRealtimeInput {
-        request_id: create_ctx.request_id,
-        body: create_ctx.request_body.to_string(),
-        model: create_ctx.model.to_string(),
-        endpoint: create_ctx.base_url.to_string(),
-        method: "POST".to_string(),
-        path: create_ctx.endpoint.to_string(),
-        api_key: create_ctx.api_key.unwrap_or("").to_string(),
-        created_by: created_by.unwrap_or_default(),
-    };
-    match request_manager.create_realtime(realtime_input).await {
-        Ok(_) => tracing::info!(
-            response_id = %response_id,
-            "Synthetic create from complete-response succeeded — row now exists in 'processing'"
-        ),
-        Err(e) => tracing::info!(
-            response_id = %response_id,
-            error = %e,
-            "Synthetic create from complete-response failed (likely create-response won the race) — proceeding to UPDATE"
-        ),
-    }
-
-    // Retry the UPDATE. Same idempotency rules as the fast path: another
-    // writer may have raced ahead to a terminal state in the window between
-    // our first UPDATE and this retry.
-    match request_manager.complete_request(RequestId(id), response_body, status_code).await {
-        Ok(()) => {
-            tracing::info!(response_id = %response_id, "Second-attempt UPDATE succeeded — row now 'completed'");
-            Ok(())
-        }
-        Err(fusillade::FusilladeError::RequestStateConflict { current_state, .. }) if is_terminal(&current_state) => {
-            tracing::info!(
-                response_id = %response_id,
-                final_state = %current_state,
-                "complete-response: row already terminal after synthesis — idempotent success"
-            );
-            Ok(())
-        }
-        Err(e) => {
-            tracing::warn!(response_id = %response_id, error = %e, "Second-attempt UPDATE failed");
-            Err(StoreError::StorageError(format!("Failed to complete after create: {e}")))
-        }
-    }
-}
-
-/// True when the row has reached a state where re-completing it would be a
-/// no-op — there's nothing left for us to do.
-fn is_terminal(state: &str) -> bool {
-    matches!(state, "completed" | "failed" | "canceled")
 }
 
 /// Poll a fusillade request until it reaches a terminal state, returning the raw `RequestDetail`.
@@ -1392,9 +1308,9 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> FusilladeResponseStore<P> 
     /// Returns the new row's id, which the caller writes into the
     /// `response_steps.request_id` column to wire the 1:1 link.
     ///
-    /// Uses `create_realtime` to insert the request row directly with no
-    /// parent batch. The listing query is scoped to head-step rows so
-    /// non-head sub-request rows don't surface in the dashboard view.
+    /// Admission is acknowledged by the singleton response writer before the
+    /// step row is created, so the subsequent model dispatch cannot outrun
+    /// its durable lifecycle row.
     async fn create_sub_request_row(&self, request_id: &str, descriptor: &StepDescriptor) -> Result<Uuid, StoreError> {
         let pending = self.pending_input(request_id)?;
         let model = descriptor
@@ -1425,8 +1341,8 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> FusilladeResponseStore<P> 
             api_key: pending.api_key.unwrap_or_default(),
             created_by: pending.created_by.unwrap_or_default(),
         };
-        self.request_manager
-            .create_realtime(input)
+        self.requests_writer
+            .admit_realtime(input)
             .await
             .map_err(|e| StoreError::StorageError(format!("create sub-request row: {e}")))?;
         Ok(sub_request_id)

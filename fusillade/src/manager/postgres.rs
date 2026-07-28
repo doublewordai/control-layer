@@ -32,6 +32,7 @@ impl From<&DaemonConfig> for fusillade_arsenal::PostgresStorageConfig {
         Self {
             pending_request_counts_timeout_ms: config.pending_request_counts_timeout_ms,
             max_concurrent_state_writes: config.max_concurrent_state_writes,
+            max_concurrent_response_reads: config.max_concurrent_response_reads,
             batch_metadata_fields: config.batch_metadata_fields.clone(),
             claim_timeout_ms: config.claim_timeout_ms,
             processing_timeout_ms: config.processing_timeout_ms,

@@ -19,7 +19,7 @@ use sqlx::QueryBuilder;
 use sqlx::Row;
 use sqlx::postgres::{PgListener, PgPool};
 use std::collections::{HashMap, HashSet};
-use tokio::sync::{Mutex, Semaphore, SemaphorePermit, mpsc};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
 
@@ -38,8 +38,9 @@ use crate::daemon::{
 use crate::error::{FusilladeError, Result};
 use crate::request::{
     Canceled, CascadeTargetState, Claimed, Completed, CreateFlexInput, CreateRealtimeInput,
-    DaemonId, Failed, FailureReason, LeakStamp, Pending, PersistCompletedRealtimeInput, Processing,
-    Request, RequestData, RequestId, RequestState, ServiceTierFilter,
+    CreateResponseInput, DaemonId, Failed, FailureReason, LeakStamp, Pending,
+    PersistCompletedRealtimeInput, Processing, Request, RequestData, RequestId, RequestState,
+    ServiceTierFilter,
 };
 
 use super::utils::{
@@ -125,7 +126,7 @@ impl Default for BatchInsertStrategy {
 pub struct PostgresRequestManager<P: PoolProvider> {
     pools: P,
     config: PostgresStorageConfig,
-    state_write_limiter: StateWriteLimiter,
+    response_admission: ResponseAdmission,
     db_retry_config: crate::DbRetryConfig,
     download_buffer_size: usize,
     batch_insert_strategy: BatchInsertStrategy,
@@ -133,56 +134,188 @@ pub struct PostgresRequestManager<P: PoolProvider> {
     /// error bodies before persistence; `None` is identity. Remove when stream
     /// reassembly moves into dwctl.
     response_transformer: std::sync::OnceLock<Arc<dyn crate::transform::ResponseTransformer>>,
+    #[cfg(test)]
+    admission_release_test_hook: Option<Arc<AdmissionReleaseTestHook>>,
 }
 
-struct StateWriteLimiter {
-    semaphore: Option<Semaphore>,
+#[cfg(test)]
+#[derive(Default)]
+struct AdmissionReleaseTestHook {
+    entered: tokio::sync::Notify,
+    resume: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+impl AdmissionReleaseTestHook {
+    async fn pause(&self) {
+        self.entered.notify_one();
+        self.resume.notified().await;
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum AdmissionClass {
+    Read,
+    Write,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum AdmissionLaneKind {
+    Total,
+    Read,
+    Write,
+}
+
+#[derive(Clone)]
+pub(crate) struct ResponseAdmission(Arc<ResponseAdmissionInner>);
+
+struct ResponseAdmissionInner {
+    total: Arc<AdmissionLane>,
+    reads: Arc<AdmissionLane>,
+    writes: Arc<AdmissionLane>,
+}
+
+struct AdmissionLane {
+    kind: AdmissionLaneKind,
+    #[cfg_attr(not(test), allow(dead_code))]
+    capacity: Option<usize>,
+    semaphore: Option<Arc<Semaphore>>,
     waiting: AtomicUsize,
     in_flight: AtomicUsize,
 }
 
-impl StateWriteLimiter {
-    fn new(limit: usize) -> Self {
-        Self {
-            semaphore: (limit > 0).then(|| Semaphore::new(limit)),
+impl AdmissionLane {
+    fn new(kind: AdmissionLaneKind, capacity: Option<usize>) -> Arc<Self> {
+        Arc::new(Self {
+            kind,
+            capacity,
+            semaphore: capacity.map(|limit| Arc::new(Semaphore::new(limit))),
             waiting: AtomicUsize::new(0),
             in_flight: AtomicUsize::new(0),
+        })
+    }
+
+    fn increment_waiting(&self, operation: &'static str) {
+        match self.kind {
+            AdmissionLaneKind::Total => {
+                metrics::gauge!("fusillade_response_traffic_waiting", "operation" => operation)
+                    .increment(1.0);
+            }
+            AdmissionLaneKind::Read => {
+                metrics::gauge!("fusillade_response_reads_waiting", "operation" => operation)
+                    .increment(1.0);
+            }
+            AdmissionLaneKind::Write => {
+                metrics::gauge!("fusillade_state_writes_waiting", "operation" => operation)
+                    .increment(1.0);
+            }
         }
     }
 
-    async fn acquire(&self, operation: &'static str) -> Result<StateWritePermit<'_>> {
+    fn decrement_waiting(&self, operation: &'static str) {
+        match self.kind {
+            AdmissionLaneKind::Total => {
+                metrics::gauge!("fusillade_response_traffic_waiting", "operation" => operation)
+                    .decrement(1.0);
+            }
+            AdmissionLaneKind::Read => {
+                metrics::gauge!("fusillade_response_reads_waiting", "operation" => operation)
+                    .decrement(1.0);
+            }
+            AdmissionLaneKind::Write => {
+                metrics::gauge!("fusillade_state_writes_waiting", "operation" => operation)
+                    .decrement(1.0);
+            }
+        }
+    }
+
+    fn record_wait(&self, operation: &'static str, elapsed: f64) {
+        match self.kind {
+            AdmissionLaneKind::Total => {
+                metrics::histogram!(
+                    "fusillade_response_traffic_wait_duration_seconds",
+                    "operation" => operation
+                )
+                .record(elapsed);
+            }
+            AdmissionLaneKind::Read => {
+                metrics::histogram!(
+                    "fusillade_response_read_wait_duration_seconds",
+                    "operation" => operation
+                )
+                .record(elapsed);
+            }
+            AdmissionLaneKind::Write => {
+                metrics::histogram!(
+                    "fusillade_state_write_wait_duration_seconds",
+                    "operation" => operation
+                )
+                .record(elapsed);
+            }
+        }
+    }
+
+    fn increment_in_flight(&self, operation: &'static str) {
+        match self.kind {
+            AdmissionLaneKind::Total => {
+                metrics::gauge!("fusillade_response_traffic_in_flight", "operation" => operation)
+                    .increment(1.0);
+            }
+            AdmissionLaneKind::Read => {
+                metrics::gauge!("fusillade_response_reads_in_flight", "operation" => operation)
+                    .increment(1.0);
+            }
+            AdmissionLaneKind::Write => {
+                metrics::gauge!("fusillade_state_writes_in_flight", "operation" => operation)
+                    .increment(1.0);
+            }
+        }
+    }
+
+    fn decrement_in_flight(&self, operation: &'static str) {
+        match self.kind {
+            AdmissionLaneKind::Total => {
+                metrics::gauge!("fusillade_response_traffic_in_flight", "operation" => operation)
+                    .decrement(1.0);
+            }
+            AdmissionLaneKind::Read => {
+                metrics::gauge!("fusillade_response_reads_in_flight", "operation" => operation)
+                    .decrement(1.0);
+            }
+            AdmissionLaneKind::Write => {
+                metrics::gauge!("fusillade_state_writes_in_flight", "operation" => operation)
+                    .decrement(1.0);
+            }
+        }
+    }
+
+    async fn acquire(self: &Arc<Self>, operation: &'static str) -> Result<AdmissionLanePermit> {
         let started = std::time::Instant::now();
         let waiting = self.semaphore.as_ref().map(|_| {
             self.waiting.fetch_add(1, Ordering::Relaxed);
-            metrics::gauge!("fusillade_state_writes_waiting", "operation" => operation)
-                .increment(1.0);
-            StateWriteWaitGuard {
+            self.increment_waiting(operation);
+            AdmissionWaitGuard {
+                lane: self.clone(),
                 operation,
-                waiting: &self.waiting,
             }
         });
 
         let permit = match &self.semaphore {
-            Some(semaphore) => Some(semaphore.acquire().await.map_err(|_| {
-                FusilladeError::Other(anyhow!("state write concurrency limiter closed"))
+            Some(semaphore) => Some(semaphore.clone().acquire_owned().await.map_err(|_| {
+                FusilladeError::Other(anyhow!("response admission semaphore closed"))
             })?),
             None => None,
         };
 
         drop(waiting);
-        metrics::histogram!(
-            "fusillade_state_write_wait_duration_seconds",
-            "operation" => operation
-        )
-        .record(started.elapsed().as_secs_f64());
-        metrics::gauge!("fusillade_state_writes_in_flight", "operation" => operation)
-            .increment(1.0);
+        self.record_wait(operation, started.elapsed().as_secs_f64());
+        self.increment_in_flight(operation);
         self.in_flight.fetch_add(1, Ordering::Relaxed);
 
-        Ok(StateWritePermit {
+        Ok(AdmissionLanePermit {
             _permit: permit,
+            lane: self.clone(),
             operation,
-            in_flight: &self.in_flight,
         })
     }
 
@@ -195,37 +328,120 @@ impl StateWriteLimiter {
     }
 }
 
-struct StateWriteWaitGuard<'a> {
-    operation: &'static str,
-    waiting: &'a AtomicUsize,
-}
+impl ResponseAdmission {
+    pub(crate) fn new(pool_max: usize, config: &PostgresStorageConfig) -> Self {
+        let total_capacity = pool_max.saturating_sub(2).max(1);
+        let write_capacity = (config.max_concurrent_state_writes != 0)
+            .then_some(config.max_concurrent_state_writes.min(total_capacity));
+        let read_capacity = (config.max_concurrent_response_reads != 0)
+            .then_some(config.max_concurrent_response_reads);
 
-impl Drop for StateWriteWaitGuard<'_> {
-    fn drop(&mut self) {
-        self.waiting.fetch_sub(1, Ordering::Relaxed);
-        metrics::gauge!(
-            "fusillade_state_writes_waiting",
-            "operation" => self.operation
+        Self(Arc::new(ResponseAdmissionInner {
+            total: AdmissionLane::new(AdmissionLaneKind::Total, Some(total_capacity)),
+            reads: AdmissionLane::new(AdmissionLaneKind::Read, read_capacity),
+            writes: AdmissionLane::new(AdmissionLaneKind::Write, write_capacity),
+        }))
+    }
+
+    pub(crate) fn read_request(&self, operation: &'static str) -> ResponseAdmissionRequest {
+        ResponseAdmissionRequest {
+            admission: self.clone(),
+            class: AdmissionClass::Read,
+            operation,
+        }
+    }
+
+    pub(crate) fn write_request(&self, operation: &'static str) -> ResponseAdmissionRequest {
+        ResponseAdmissionRequest {
+            admission: self.clone(),
+            class: AdmissionClass::Write,
+            operation,
+        }
+    }
+
+    #[cfg(test)]
+    async fn acquire_read(&self, operation: &'static str) -> Result<ResponseAdmissionPermit> {
+        self.read_request(operation).acquire().await
+    }
+
+    #[cfg(test)]
+    async fn acquire_write(&self, operation: &'static str) -> Result<ResponseAdmissionPermit> {
+        self.write_request(operation).acquire().await
+    }
+
+    #[cfg(test)]
+    fn capacities(&self) -> (usize, Option<usize>, Option<usize>) {
+        let total = self
+            .0
+            .total
+            .capacity
+            .expect("aggregate lane is always enabled");
+        (
+            total,
+            self.0.writes.capacity.map(|capacity| capacity.min(total)),
+            self.0.reads.capacity.map(|capacity| capacity.min(total)),
         )
-        .decrement(1.0);
+    }
+
+    #[cfg(test)]
+    fn counts(&self) -> ((usize, usize), (usize, usize), (usize, usize)) {
+        (
+            self.0.total.counts(),
+            self.0.reads.counts(),
+            self.0.writes.counts(),
+        )
     }
 }
 
-struct StateWritePermit<'a> {
-    _permit: Option<SemaphorePermit<'a>>,
+#[derive(Clone)]
+pub(crate) struct ResponseAdmissionRequest {
+    admission: ResponseAdmission,
+    class: AdmissionClass,
     operation: &'static str,
-    in_flight: &'a AtomicUsize,
 }
 
-impl Drop for StateWritePermit<'_> {
-    fn drop(&mut self) {
-        self.in_flight.fetch_sub(1, Ordering::Relaxed);
-        metrics::gauge!(
-            "fusillade_state_writes_in_flight",
-            "operation" => self.operation
-        )
-        .decrement(1.0);
+impl ResponseAdmissionRequest {
+    pub(crate) async fn acquire(&self) -> Result<ResponseAdmissionPermit> {
+        let total = self.admission.0.total.acquire(self.operation).await?;
+        let class = match self.class {
+            AdmissionClass::Read => self.admission.0.reads.acquire(self.operation).await?,
+            AdmissionClass::Write => self.admission.0.writes.acquire(self.operation).await?,
+        };
+        Ok(ResponseAdmissionPermit {
+            _total: total,
+            _class: class,
+        })
     }
+}
+
+struct AdmissionWaitGuard {
+    lane: Arc<AdmissionLane>,
+    operation: &'static str,
+}
+
+impl Drop for AdmissionWaitGuard {
+    fn drop(&mut self) {
+        self.lane.waiting.fetch_sub(1, Ordering::Relaxed);
+        self.lane.decrement_waiting(self.operation);
+    }
+}
+
+struct AdmissionLanePermit {
+    _permit: Option<OwnedSemaphorePermit>,
+    lane: Arc<AdmissionLane>,
+    operation: &'static str,
+}
+
+impl Drop for AdmissionLanePermit {
+    fn drop(&mut self) {
+        self.lane.in_flight.fetch_sub(1, Ordering::Relaxed);
+        self.lane.decrement_in_flight(self.operation);
+    }
+}
+
+pub(crate) struct ResponseAdmissionPermit {
+    _total: AdmissionLanePermit,
+    _class: AdmissionLanePermit,
 }
 
 struct ClaimedRequestRow {
@@ -319,15 +535,20 @@ macro_rules! batch_status_from_dynamic_row {
 impl<P: PoolProvider> PostgresRequestManager<P> {
     /// Create a new PostgreSQL storage manager.
     pub fn new(pools: P, config: PostgresStorageConfig) -> Self {
-        let state_write_limiter = StateWriteLimiter::new(config.max_concurrent_state_writes);
+        let response_admission = ResponseAdmission::new(
+            pools.write().options().get_max_connections() as usize,
+            &config,
+        );
         Self {
             pools,
             config,
-            state_write_limiter,
+            response_admission,
             db_retry_config: crate::DbRetryConfig::default(),
             download_buffer_size: 100,
             batch_insert_strategy: BatchInsertStrategy::default(),
             response_transformer: std::sync::OnceLock::new(),
+            #[cfg(test)]
+            admission_release_test_hook: None,
         }
     }
 
@@ -353,13 +574,34 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
     ///
     /// This is a builder method that can be chained after `new()`.
     pub fn with_config(mut self, config: PostgresStorageConfig) -> Self {
-        self.state_write_limiter = StateWriteLimiter::new(config.max_concurrent_state_writes);
+        assert_eq!(
+            Arc::strong_count(&self.response_admission.0),
+            1,
+            "response admission configuration is frozen after sharing",
+        );
+        self.response_admission = ResponseAdmission::new(
+            self.pools.write().options().get_max_connections() as usize,
+            &config,
+        );
         self.config = config;
         self
     }
 
+    /// Replace storage configuration before sharing response admission.
+    ///
+    /// Once [`Self::response_step_manager`] has cloned the admission handle,
+    /// replacing only this manager's handle would split the shared budget, so
+    /// reconfiguration is rejected.
     pub fn set_config(&mut self, config: PostgresStorageConfig) {
-        self.state_write_limiter = StateWriteLimiter::new(config.max_concurrent_state_writes);
+        assert_eq!(
+            Arc::strong_count(&self.response_admission.0),
+            1,
+            "response admission configuration is frozen after sharing",
+        );
+        self.response_admission = ResponseAdmission::new(
+            self.pools.write().options().get_max_connections() as usize,
+            &config,
+        );
         self.config = config;
     }
 
@@ -368,11 +610,21 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
     /// The manager retries errors that look like SQLx pool-acquire timeouts,
     /// including "pool timed out while waiting for an open connection".
     pub fn with_db_retry_config(mut self, config: crate::DbRetryConfig) -> Self {
+        assert_eq!(
+            Arc::strong_count(&self.response_admission.0),
+            1,
+            "database retry configuration is frozen after sharing",
+        );
         self.db_retry_config = config;
         self
     }
 
     pub fn set_db_retry_config(&mut self, config: crate::DbRetryConfig) {
+        assert_eq!(
+            Arc::strong_count(&self.response_admission.0),
+            1,
+            "database retry configuration is frozen after sharing",
+        );
         self.db_retry_config = config;
     }
 
@@ -388,6 +640,16 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
         crate::db::RetryingPgPool::new(self.pools.write(), &self.db_retry_config)
     }
 
+    fn admitted_read_executor(&self, operation: &'static str) -> crate::db::RetryingPgPool {
+        self.read_executor()
+            .with_admission(self.response_admission.read_request(operation))
+    }
+
+    fn admitted_write_executor(&self, operation: &'static str) -> crate::db::RetryingPgPool {
+        self.write_executor()
+            .with_admission(self.response_admission.write_request(operation))
+    }
+
     async fn begin_read(
         &self,
     ) -> std::result::Result<sqlx::Transaction<'static, sqlx::Postgres>, sqlx::Error> {
@@ -398,6 +660,39 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
         &self,
     ) -> std::result::Result<sqlx::Transaction<'static, sqlx::Postgres>, sqlx::Error> {
         crate::db::begin_transaction(self.pools.write(), &self.db_retry_config).await
+    }
+
+    async fn begin_admitted_write(
+        &self,
+        operation: &'static str,
+    ) -> std::result::Result<
+        (
+            sqlx::Transaction<'static, sqlx::Postgres>,
+            ResponseAdmissionPermit,
+        ),
+        sqlx::Error,
+    > {
+        crate::db::begin_admitted_transaction(
+            self.pools.write(),
+            &self.db_retry_config,
+            &self.response_admission.write_request(operation),
+        )
+        .await
+    }
+
+    pub fn response_step_manager(&self) -> crate::PostgresResponseStepManager<P> {
+        crate::PostgresResponseStepManager::with_admission(
+            self.pools.clone(),
+            self.db_retry_config.clone(),
+            self.response_admission.clone(),
+        )
+    }
+
+    #[cfg(test)]
+    async fn pause_for_admission_release_test(&self) {
+        if let Some(hook) = &self.admission_release_test_hook {
+            hook.pause().await;
+        }
     }
 
     pub fn config(&self) -> &PostgresStorageConfig {
@@ -648,6 +943,9 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
     /// Do not "fix" a state-conflict here by weakening the arm guards; the
     /// guards and this helper are two halves of the same matrix.
     async fn dropped_or_missing(&self, request_id: RequestId) -> Result<Option<RequestId>> {
+        #[cfg(test)]
+        self.pause_for_admission_release_test().await;
+
         let current: Option<String> =
             sqlx::query_scalar("SELECT state FROM requests WHERE id = $1")
                 .bind(*request_id as Uuid)
@@ -2233,10 +2531,6 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
             tracing::debug!(request_id = %request.data.id, "Persisting request state");
             let any_request = any_request.clone();
 
-            // Limit active database attempts, not retry backoff. A failed write
-            // releases its slot before sleeping and queues fairly for its next
-            // attempt alongside fresh lifecycle transitions.
-            let state_write_permit = self.state_write_limiter.acquire("persist").await?;
             let result: Result<Option<RequestId>> = async {
                 match any_request {
                     AnyRequest::Pending(req) => {
@@ -2262,7 +2556,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                             req.state.retry_attempt as i32,
                             req.state.not_before,
                         )
-                        .execute(self.write_executor())
+                        .execute(self.admitted_write_executor("persist"))
                         .await
                         .map_err(|e| {
                             FusilladeError::Other(anyhow!("Failed to update request: {}", e))
@@ -2291,7 +2585,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                             *req.state.daemon_id as Uuid,
                             req.state.claimed_at,
                         )
-                        .execute(self.write_executor())
+                        .execute(self.admitted_write_executor("persist"))
                         .await
                         .map_err(|e| {
                             FusilladeError::Other(anyhow!("Failed to update request: {}", e))
@@ -2303,12 +2597,13 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                         }
                     }
                     AnyRequest::Processing(req) => {
-                        let mut tx = self.begin_write().await.map_err(|e| {
-                            FusilladeError::Other(anyhow!(
-                                "Failed to begin processing transition: {}",
-                                e
-                            ))
-                        })?;
+                        let (mut tx, admission_permit) =
+                            self.begin_admitted_write("persist").await.map_err(|e| {
+                                FusilladeError::Other(anyhow!(
+                                    "Failed to begin processing transition: {}",
+                                    e
+                                ))
+                            })?;
                         let rows_affected = sqlx::query!(
                             r#"
                             UPDATE requests SET
@@ -2339,6 +2634,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                                     e
                                 ))
                             })?;
+                            drop(admission_permit);
                             return self.dropped_or_missing(req.data.id).await;
                         }
 
@@ -2430,7 +2726,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                             response_size,
                             req.state.routed_model,
                         )
-                        .fetch_optional(self.write_executor())
+                        .fetch_optional(self.admitted_write_executor("persist"))
                         .await
                         .map_err(|e| {
                             FusilladeError::Other(anyhow!("Failed to update request: {}", e))
@@ -2504,7 +2800,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                             response_size,
                             req.state.routed_model,
                         )
-                        .fetch_optional(self.write_executor())
+                        .fetch_optional(self.admitted_write_executor("persist"))
                         .await
                         .map_err(|e| {
                             FusilladeError::Other(anyhow!("Failed to update request: {}", e))
@@ -2534,7 +2830,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                             *req.data.id as Uuid,
                             req.state.canceled_at,
                         )
-                        .execute(self.write_executor())
+                        .execute(self.admitted_write_executor("persist"))
                         .await
                         .map_err(|e| {
                             FusilladeError::Other(anyhow!("Failed to update request: {}", e))
@@ -2550,7 +2846,6 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                 Ok(None)
             }
             .await;
-            drop(state_write_permit);
 
             match result {
                 Ok(val) => return Ok(val),
@@ -2584,8 +2879,6 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         retry_attempt: u32,
         not_before: Option<DateTime<Utc>>,
     ) -> Result<bool> {
-        let _state_write_permit = self.state_write_limiter.acquire("retry").await?;
-
         // Fenced retry: only re-pend the row if it is still the in-flight claim
         // held by `owner`. The `state = 'processing' AND daemon_id = $2` guard is
         // what distinguishes this from the manual retry path (which uses persist()
@@ -2611,7 +2904,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
             retry_attempt as i32,
             not_before,
         )
-        .execute(self.write_executor())
+        .execute(self.admitted_write_executor("retry"))
         .await
         .map_err(|e| {
             FusilladeError::Other(anyhow!("Failed to reschedule request for retry: {}", e))
@@ -4542,8 +4835,8 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         // write of response_steps will FK-violate (the row is gone) and
         // surface that as an error log without corrupting state. Both are
         // acceptable failure modes for an explicit user-initiated erasure.
-        let mut tx = self
-            .begin_write()
+        let (mut tx, admission_permit) = self
+            .begin_admitted_write("response_delete")
             .await
             .map_err(|e| FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e)))?;
 
@@ -4556,6 +4849,15 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to delete request: {}", e)))?;
 
         let Some(template_id) = template_id else {
+            tx.rollback().await.map_err(|e| {
+                FusilladeError::Other(anyhow!(
+                    "Failed to roll back missing request deletion: {}",
+                    e
+                ))
+            })?;
+            drop(admission_permit);
+            #[cfg(test)]
+            self.pause_for_admission_release_test().await;
             return Err(FusilladeError::RequestNotFound(request_id));
         };
 
@@ -4782,12 +5084,12 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                                       daemon_id, claimed_at, started_at, response_status, response_body,
                                       completed_at, error, failed_at, canceled_at, created_at, updated_at,
                                       custom_id, model, response_size, routed_model, service_tier, created_by)
-                SELECT id, batch_id, template_id, 'pending', 0, NULL,
+                SELECT a.id, a.batch_id, a.template_id, 'pending', 0, NULL,
                        NULL, NULL, NULL, NULL, NULL,
-                       NULL, NULL, NULL, NULL, created_at, NOW(),
-                       custom_id, model, 0, NULL, service_tier, created_by
-                FROM batch_requests_archive
-                WHERE id = ANY($1) AND state = 'failed'
+                       NULL, NULL, NULL, NULL, a.created_at, NOW(),
+                       a.custom_id, a.model, 0, NULL, a.service_tier, a.created_by
+                FROM batch_requests_archive a
+                WHERE a.id = ANY($1) AND a.state = 'failed'
                 ON CONFLICT (id) DO NOTHING
                 RETURNING id
                 "#,
@@ -4984,12 +5286,13 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                                       daemon_id, claimed_at, started_at, response_status, response_body,
                                       completed_at, error, failed_at, canceled_at, created_at, updated_at,
                                       custom_id, model, response_size, routed_model, service_tier, created_by)
-                SELECT id, batch_id, template_id, 'pending', 0, NULL,
+                SELECT a.id, a.batch_id, a.template_id, 'pending', 0, NULL,
                        NULL, NULL, NULL, NULL, NULL,
-                       NULL, NULL, NULL, NULL, created_at, NOW(),
-                       custom_id, model, 0, NULL, service_tier, created_by
-                FROM batch_requests_archive
-                WHERE archive_bucket = $2 AND batch_id = $1 AND state IN ('failed', 'canceled')
+                       NULL, NULL, NULL, NULL, a.created_at, NOW(),
+                       a.custom_id, a.model, 0, NULL, a.service_tier, a.created_by
+                FROM batch_requests_archive a
+                WHERE a.archive_bucket = $2 AND a.batch_id = $1
+                  AND a.state IN ('failed', 'canceled')
                 ON CONFLICT (id) DO NOTHING
                 "#,
                 *batch_id as Uuid,
@@ -5560,124 +5863,227 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         Ok(detail)
     }
 
+    #[tracing::instrument(
+        skip(self, owner_id),
+        fields(response_id = %response_id.0)
+    )]
+    async fn get_response_detail_for_owner(
+        &self,
+        response_id: crate::request::RequestId,
+        owner_id: &str,
+    ) -> Result<crate::request::ResolvedResponseDetail> {
+        let detail = sqlx::query_as::<_, crate::request::ResolvedResponseDetail>(
+            r#"
+            WITH resolved AS (
+                SELECT
+                    COALESCE(rs.id, input.response_id) AS public_response_id,
+                    COALESCE(rs.request_id, input.response_id) AS request_id
+                FROM (VALUES ($1::uuid)) AS input(response_id)
+                LEFT JOIN response_steps rs ON rs.id = input.response_id
+                WHERE rs.id IS NULL OR rs.request_id IS NOT NULL
+            )
+            SELECT
+                resolved.public_response_id,
+                r.id, r.batch_id, r.model, r.state, r.created_at,
+                r.completed_at, r.failed_at,
+                (CASE WHEN r.completed_at IS NOT NULL AND r.started_at IS NOT NULL
+                    THEN EXTRACT(EPOCH FROM (r.completed_at - r.started_at)) * 1000
+                    ELSE NULL END)::float8 AS duration_ms,
+                r.response_status,
+                CASE WHEN f.deleted_at IS NULL OR t.file_id IS NULL
+                    THEN t.body ELSE NULL END AS body,
+                r.response_body, r.error,
+                r.service_tier, r.created_by
+            FROM resolved
+            JOIN requests r ON r.id = resolved.request_id
+            LEFT JOIN request_templates t ON t.id = r.template_id
+            LEFT JOIN files f ON f.id = t.file_id
+            WHERE r.created_by = $2
+              AND r.batch_id IS NULL
+            "#,
+        )
+        .bind(response_id.0)
+        .bind(owner_id)
+        .fetch_optional(self.admitted_read_executor("response_get"))
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to get owned response detail: {}", e)))?
+        .ok_or(FusilladeError::RequestNotFound(response_id))?;
+
+        Ok(detail)
+    }
+
     #[tracing::instrument(level = "debug", skip(self, input), fields(request_id = %input.request_id))]
     async fn create_realtime(&self, input: CreateRealtimeInput) -> Result<RequestId> {
-        let template_id = Uuid::new_v4();
-        let now = Utc::now();
-
-        let mut tx = self
-            .begin_write()
-            .await
-            .map_err(|e| FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e)))?;
-
-        // Insert template row (file_id = NULL for daemon-managed requests)
-        let stored_body = sanitize_outbound_body(&input.body);
-        let body_byte_size = stored_body.len() as i64;
-        sqlx::query(
-            "INSERT INTO request_templates (id, file_id, custom_id, endpoint, method, path, body, model, api_key, body_byte_size)
-             VALUES ($1, NULL, NULL, $2, $3, $4, $5, $6, $7, $8)",
-        )
-        .bind(template_id)
-        .bind(&input.endpoint)
-        .bind(&input.method)
-        .bind(&input.path)
-        .bind(stored_body.as_ref())
-        .bind(&input.model)
-        .bind(&input.api_key)
-        .bind(body_byte_size)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| {
-            FusilladeError::Other(anyhow!("Failed to insert realtime template: {}", e))
-        })?;
-
-        // The proxy is already handling this request, so the row enters
-        // processing immediately. daemon_id = nil sentinel keeps the daemon
-        // from claiming or unclaiming it; service_tier = 'priority' matches
-        // the legacy "0s" completion_window mapping.
-        // Empty or whitespace-only created_by is a contract violation (the
-        // API guarantees a real user); trim then coerce to NULL so the XOR
-        // CHECK rejects it loudly rather than letting a phantom-user row
-        // slip into the listing. Matches the SQL `NULLIF(TRIM(...), '')`
-        // used by persist_completed_realtime_batch.
-        let created_by = Some(input.created_by.trim()).filter(|s| !s.is_empty());
-        sqlx::query(
-            "INSERT INTO requests (id, batch_id, template_id, model, custom_id, state, retry_attempt, service_tier, created_by, daemon_id, claimed_at, started_at)
-             VALUES ($1, NULL, $2, $3, NULL, 'processing', 0, 'priority', $4, $5, $6, $6)",
-        )
-        .bind(input.request_id)
-        .bind(template_id)
-        .bind(&input.model)
-        .bind(created_by)
-        .bind(Uuid::nil())
-        .bind(now)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| FusilladeError::Other(anyhow!("Failed to insert realtime request: {}", e)))?;
-
-        tx.commit().await.map_err(|e| {
-            FusilladeError::Other(anyhow!(
-                "Failed to commit realtime request transaction: {}",
-                e
-            ))
-        })?;
-
-        Ok(RequestId(input.request_id))
+        let ids = self
+            .create_responses_batch(std::slice::from_ref(&CreateResponseInput::Realtime(input)))
+            .await?;
+        Ok(ids
+            .into_iter()
+            .next()
+            .expect("singleton realtime create must return one ID"))
     }
 
     #[tracing::instrument(level = "debug", skip(self, input), fields(request_id = %input.request_id))]
     async fn create_flex(&self, input: CreateFlexInput) -> Result<RequestId> {
-        let template_id = Uuid::new_v4();
+        let ids = self
+            .create_responses_batch(std::slice::from_ref(&CreateResponseInput::Flex(input)))
+            .await?;
+        Ok(ids
+            .into_iter()
+            .next()
+            .expect("singleton flex create must return one ID"))
+    }
 
-        let mut tx = self
-            .begin_write()
+    #[tracing::instrument(level = "debug", skip(self, inputs), fields(input_count = inputs.len()))]
+    async fn create_responses_batch(
+        &self,
+        inputs: &[CreateResponseInput],
+    ) -> Result<Vec<RequestId>> {
+        if inputs.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        struct PreparedCreate<'a> {
+            request_id: Uuid,
+            template_id: Uuid,
+            endpoint: &'a str,
+            method: &'a str,
+            path: &'a str,
+            body: std::borrow::Cow<'a, str>,
+            model: &'a str,
+            api_key: &'a str,
+            created_by: &'a str,
+            realtime: bool,
+        }
+
+        // Body sanitisation and all per-row preparation happen before the
+        // transaction, keeping its lock/connection hold time to the two bulk
+        // statements and commit.
+        let prepared: Vec<PreparedCreate<'_>> = inputs
+            .iter()
+            .map(|input| {
+                let (input, realtime) = match input {
+                    CreateResponseInput::Flex(input) => (
+                        (
+                            input.request_id,
+                            input.endpoint.as_str(),
+                            input.method.as_str(),
+                            input.path.as_str(),
+                            input.body.as_str(),
+                            input.model.as_str(),
+                            input.api_key.as_str(),
+                            input.created_by.trim(),
+                        ),
+                        false,
+                    ),
+                    CreateResponseInput::Realtime(input) => (
+                        (
+                            input.request_id,
+                            input.endpoint.as_str(),
+                            input.method.as_str(),
+                            input.path.as_str(),
+                            input.body.as_str(),
+                            input.model.as_str(),
+                            input.api_key.as_str(),
+                            input.created_by.trim(),
+                        ),
+                        true,
+                    ),
+                };
+                PreparedCreate {
+                    request_id: input.0,
+                    template_id: Uuid::new_v4(),
+                    endpoint: input.1,
+                    method: input.2,
+                    path: input.3,
+                    body: sanitize_outbound_body(input.4),
+                    model: input.5,
+                    api_key: input.6,
+                    created_by: input.7,
+                    realtime,
+                }
+            })
+            .collect();
+        let now = Utc::now();
+
+        let template_ids: Vec<Uuid> = prepared.iter().map(|row| row.template_id).collect();
+        let endpoints: Vec<&str> = prepared.iter().map(|row| row.endpoint).collect();
+        let methods: Vec<&str> = prepared.iter().map(|row| row.method).collect();
+        let paths: Vec<&str> = prepared.iter().map(|row| row.path).collect();
+        let bodies: Vec<&str> = prepared.iter().map(|row| row.body.as_ref()).collect();
+        let body_sizes: Vec<i64> = prepared.iter().map(|row| row.body.len() as i64).collect();
+        let models: Vec<&str> = prepared.iter().map(|row| row.model).collect();
+        let api_keys: Vec<&str> = prepared.iter().map(|row| row.api_key).collect();
+        let request_ids: Vec<Uuid> = prepared.iter().map(|row| row.request_id).collect();
+        let created_bys: Vec<&str> = prepared.iter().map(|row| row.created_by).collect();
+        let realtime: Vec<bool> = prepared.iter().map(|row| row.realtime).collect();
+
+        let (mut tx, _admission_permit) = self
+            .begin_admitted_write("response_create")
             .await
             .map_err(|e| FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e)))?;
 
-        let stored_body = sanitize_outbound_body(&input.body);
-        let body_byte_size = stored_body.len() as i64;
-        sqlx::query(
-            "INSERT INTO request_templates (id, file_id, custom_id, endpoint, method, path, body, model, api_key, body_byte_size)
-             VALUES ($1, NULL, NULL, $2, $3, $4, $5, $6, $7, $8)",
+        sqlx::query!(
+            r#"
+            INSERT INTO request_templates
+                (id, file_id, custom_id, endpoint, method, path, body, model, api_key, body_byte_size)
+            SELECT id, NULL, NULL, endpoint, method, path, body, model, api_key, body_byte_size
+            FROM UNNEST(
+                $1::uuid[], $2::text[], $3::text[], $4::text[],
+                $5::text[], $6::text[], $7::text[], $8::bigint[]
+            ) AS t(id, endpoint, method, path, body, model, api_key, body_byte_size)
+            "#,
+            &template_ids as &[Uuid],
+            &endpoints as &[&str],
+            &methods as &[&str],
+            &paths as &[&str],
+            &bodies as &[&str],
+            &models as &[&str],
+            &api_keys as &[&str],
+            &body_sizes as &[i64],
         )
-        .bind(template_id)
-        .bind(&input.endpoint)
-        .bind(&input.method)
-        .bind(&input.path)
-        .bind(stored_body.as_ref())
-        .bind(&input.model)
-        .bind(&input.api_key)
-        .bind(body_byte_size)
         .execute(&mut *tx)
         .await
-        .map_err(|e| FusilladeError::Other(anyhow!("Failed to insert flex template: {}", e)))?;
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to insert response templates: {}", e)))?;
 
-        // Pending row — the daemon will claim and process it like any other
-        // pending request.
-        // Empty-string (or whitespace-only) created_by is a contract violation
-        // (the API guarantees a real user); coerce to NULL so the XOR CHECK
-        // rejects it loudly rather than letting a phantom-user row slip into
-        // the listing. Trim matches the SQL-side `NULLIF(TRIM(...), '')` used
-        // by `persist_completed_realtime_batch` so all three call sites
-        // normalise identically.
-        let created_by = Some(input.created_by.trim()).filter(|s| !s.is_empty());
-        sqlx::query(
-            "INSERT INTO requests (id, batch_id, template_id, model, custom_id, state, retry_attempt, service_tier, created_by)
-             VALUES ($1, NULL, $2, $3, NULL, 'pending', 0, 'flex', $4)",
+        sqlx::query!(
+            r#"
+            INSERT INTO requests (
+                id, batch_id, template_id, model, custom_id, state, retry_attempt,
+                service_tier, created_by, daemon_id, claimed_at, started_at
+            )
+            SELECT id, NULL, template_id, model, NULL,
+                   CASE WHEN realtime THEN 'processing' ELSE 'pending' END,
+                   0,
+                   CASE WHEN realtime THEN 'priority' ELSE 'flex' END,
+                   NULLIF(TRIM(created_by), ''),
+                   CASE WHEN realtime THEN $1::uuid ELSE NULL END,
+                   CASE WHEN realtime THEN $2::timestamptz ELSE NULL END,
+                   CASE WHEN realtime THEN $2::timestamptz ELSE NULL END
+            FROM UNNEST(
+                $3::uuid[], $4::uuid[], $5::text[], $6::text[], $7::bool[]
+            ) AS r(id, template_id, model, created_by, realtime)
+            "#,
+            Uuid::nil(),
+            now,
+            &request_ids as &[Uuid],
+            &template_ids as &[Uuid],
+            &models as &[&str],
+            &created_bys as &[&str],
+            &realtime as &[bool],
         )
-        .bind(input.request_id)
-        .bind(template_id)
-        .bind(&input.model)
-        .bind(created_by)
         .execute(&mut *tx)
         .await
-        .map_err(|e| FusilladeError::Other(anyhow!("Failed to insert flex request: {}", e)))?;
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to insert responses: {}", e)))?;
 
         tx.commit().await.map_err(|e| {
-            FusilladeError::Other(anyhow!("Failed to commit flex request transaction: {}", e))
+            FusilladeError::Other(anyhow!(
+                "Failed to commit response create transaction: {}",
+                e
+            ))
         })?;
 
-        Ok(RequestId(input.request_id))
+        Ok(request_ids.into_iter().map(RequestId).collect())
     }
 
     async fn complete_request(
@@ -5713,7 +6119,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         .bind(status_code as i16)
         .bind(response_body)
         .bind(size)
-        .fetch_optional(self.write_executor())
+        .fetch_optional(self.admitted_write_executor("response_complete"))
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to complete request: {}", e)))?;
 
@@ -5761,7 +6167,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         .bind(request_id.0)
         .bind(&error_json)
         .bind(error_size)
-        .fetch_optional(self.write_executor())
+        .fetch_optional(self.admitted_write_executor("response_fail"))
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to fail request: {}", e)))?;
 
@@ -5784,11 +6190,6 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         if records.is_empty() {
             return Ok(());
         }
-
-        let mut tx = self
-            .begin_write()
-            .await
-            .map_err(|e| FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e)))?;
 
         // Bulk UPDATE for rows that already exist in 'processing' state.
         // These are the background-realtime case: the caller invoked
@@ -5826,6 +6227,11 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
             }))
         };
         let errors: Vec<Option<String>> = records.iter().map(&to_failure_error).collect();
+
+        let (mut tx, _admission_permit) = self
+            .begin_admitted_write("response_realtime_complete_batch")
+            .await
+            .map_err(|e| FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e)))?;
 
         // Scope the UPDATE to realtime rows only: `service_tier = 'priority'`
         // and `batch_id IS NULL` together uniquely identify rows that
@@ -7696,14 +8102,22 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
             return Ok(ArchiveOutcome::SkippedResponseSteps);
         }
 
-        // Forward move. Positional alignment (`r.*, $bucket`) is guaranteed
-        // by the schema-parity test suite (archive = requests' columns +
-        // archive_bucket appended last). ON CONFLICT makes crash-resume
+        // Forward move. The named mapping allows the two tables' physical
+        // column order to evolve independently. ON CONFLICT makes crash-resume
         // replay a no-op for rows already copied.
         let inserted = sqlx::query(
             r#"
-            INSERT INTO batch_requests_archive
-            SELECT r.*, $2::date
+            INSERT INTO batch_requests_archive (
+                id, batch_id, template_id, state, retry_attempt, not_before, daemon_id,
+                claimed_at, started_at, response_status, response_body, completed_at,
+                error, failed_at, canceled_at, created_at, updated_at, custom_id, model,
+                response_size, routed_model, service_tier, created_by, archive_bucket
+            )
+            SELECT r.id, r.batch_id, r.template_id, r.state, r.retry_attempt, r.not_before,
+                   r.daemon_id, r.claimed_at, r.started_at, r.response_status, r.response_body,
+                   r.completed_at, r.error, r.failed_at, r.canceled_at, r.created_at,
+                   r.updated_at, r.custom_id, r.model, r.response_size, r.routed_model,
+                   r.service_tier, r.created_by, $2::date
             FROM requests r
             WHERE r.batch_id = $1
             ON CONFLICT (id, archive_bucket) DO NOTHING
@@ -7959,7 +8373,9 @@ mod tests {
         AnyDaemonRecord, DaemonConfig, DaemonData, DaemonRecord, DaemonStats, DaemonStatus, Dead,
         Initializing, Running,
     };
+    use crate::response_step::ResponseStepStore;
     use chrono::Timelike;
+    use sqlx::postgres::PgPoolOptions;
 
     #[derive(Debug, Clone, Default)]
     struct MockHttpClient;
@@ -7970,19 +8386,591 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn zero_state_write_limit_is_unbounded() {
-        let limiter = StateWriteLimiter::new(0);
-        let (first, second, third) = tokio::join!(
-            limiter.acquire("first"),
-            limiter.acquire("second"),
-            limiter.acquire("third")
-        );
-        let permits = (first.unwrap(), second.unwrap(), third.unwrap());
+    #[test]
+    fn state_write_limiter_caps_defaults_to_pool_headroom() {
+        for (pool_max, expected_total, expected_writes, expected_reads) in
+            [(1, 1, 1, 1), (4, 2, 2, 2), (20, 18, 18, 8)]
+        {
+            let admission = ResponseAdmission::new(pool_max, &PostgresStorageConfig::default());
+            assert_eq!(
+                admission.capacities(),
+                (expected_total, Some(expected_writes), Some(expected_reads)),
+                "unexpected capacities for max_connections({pool_max})",
+            );
+        }
+    }
 
-        assert_eq!(limiter.counts(), (0, 3));
-        drop(permits);
-        assert_eq!(limiter.counts(), (0, 0));
+    #[test]
+    fn response_admission_preserves_explicit_class_caps() {
+        let admission = ResponseAdmission::new(
+            20,
+            &PostgresStorageConfig {
+                max_concurrent_state_writes: 3,
+                max_concurrent_response_reads: 5,
+                ..Default::default()
+            },
+        );
+        assert_eq!(admission.capacities(), (18, Some(3), Some(5)));
+    }
+
+    #[tokio::test]
+    async fn response_read_acquires_total_before_class() {
+        let admission = ResponseAdmission::new(
+            4,
+            &PostgresStorageConfig {
+                max_concurrent_response_reads: 1,
+                ..Default::default()
+            },
+        );
+        let first = admission.acquire_read("response_get").await.unwrap();
+
+        let queued_admission = admission.clone();
+        let queued =
+            tokio::spawn(async move { queued_admission.acquire_read("response_get").await });
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if admission.counts() == ((0, 2), (1, 1), (0, 0)) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("second read never held total while waiting for its class");
+
+        drop(first);
+        drop(queued.await.unwrap().unwrap());
+        assert_eq!(admission.counts(), ((0, 0), (0, 0), (0, 0)));
+    }
+
+    #[tokio::test]
+    async fn zero_state_write_limit_disables_only_class_lane() {
+        let admission = ResponseAdmission::new(
+            4,
+            &PostgresStorageConfig {
+                max_concurrent_state_writes: 0,
+                ..Default::default()
+            },
+        );
+        assert_eq!(admission.capacities(), (2, None, Some(2)));
+
+        let first = admission.acquire_write("first").await.unwrap();
+        let second = admission.acquire_write("second").await.unwrap();
+        let queued_admission = admission.clone();
+        let queued = tokio::spawn(async move { queued_admission.acquire_write("third").await });
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let (total, _reads, writes) = admission.counts();
+                if total == (1, 2) && writes == (0, 2) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("aggregate lane did not bound writes with class limiter disabled");
+
+        drop(first);
+        drop(second);
+        drop(queued.await.unwrap().unwrap());
+        assert_eq!(admission.counts(), ((0, 0), (0, 0), (0, 0)));
+    }
+
+    #[tokio::test]
+    async fn zero_response_read_limit_disables_only_class_lane() {
+        let admission = ResponseAdmission::new(
+            4,
+            &PostgresStorageConfig {
+                max_concurrent_response_reads: 0,
+                ..Default::default()
+            },
+        );
+        assert_eq!(admission.capacities(), (2, Some(2), None));
+
+        let first = admission.acquire_read("first").await.unwrap();
+        let second = admission.acquire_read("second").await.unwrap();
+        let queued_admission = admission.clone();
+        let queued = tokio::spawn(async move { queued_admission.acquire_read("third").await });
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let (total, reads, _writes) = admission.counts();
+                if total == (1, 2) && reads == (0, 2) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("aggregate lane did not bound reads with class limiter disabled");
+
+        drop(first);
+        drop(second);
+        drop(queued.await.unwrap().unwrap());
+        assert_eq!(admission.counts(), ((0, 0), (0, 0), (0, 0)));
+    }
+
+    #[tokio::test]
+    async fn canceled_admission_wait_restores_counters_and_owned_permits() {
+        let admission = ResponseAdmission::new(
+            4,
+            &PostgresStorageConfig {
+                max_concurrent_response_reads: 1,
+                ..Default::default()
+            },
+        );
+        let first = admission.acquire_read("first").await.unwrap();
+
+        let class_wait_admission = admission.clone();
+        let class_wait =
+            tokio::spawn(async move { class_wait_admission.acquire_read("class_wait").await });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if admission.counts() == ((0, 2), (1, 1), (0, 0)) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("read never reached its class-lane wait");
+        class_wait.abort();
+        assert!(matches!(
+            class_wait.await,
+            Err(join_error) if join_error.is_cancelled()
+        ));
+        assert_eq!(admission.counts(), ((0, 1), (0, 1), (0, 0)));
+
+        let total_wait_admission = admission.clone();
+        let second_total = total_wait_admission
+            .acquire_write("fill_total")
+            .await
+            .unwrap();
+        let total_wait_admission = admission.clone();
+        let total_wait =
+            tokio::spawn(async move { total_wait_admission.acquire_write("total_wait").await });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if admission.counts() == ((1, 2), (0, 1), (0, 1)) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("write never reached its aggregate-lane wait");
+        total_wait.abort();
+        assert!(matches!(
+            total_wait.await,
+            Err(join_error) if join_error.is_cancelled()
+        ));
+        assert_eq!(admission.counts(), ((0, 2), (0, 1), (0, 1)));
+
+        drop(second_total);
+        drop(first);
+        assert_eq!(admission.counts(), ((0, 0), (0, 0), (0, 0)));
+    }
+
+    #[tokio::test]
+    async fn response_step_factory_shares_admission_identity() {
+        let pool = PgPoolOptions::new()
+            .max_connections(4)
+            .connect_lazy("postgres://postgres:password@localhost/fusillade")
+            .unwrap();
+        let manager = PostgresRequestManager::new(pool, PostgresStorageConfig::default());
+
+        assert_eq!(Arc::strong_count(&manager.response_admission.0), 1);
+        let _step_manager = manager.response_step_manager();
+        assert_eq!(Arc::strong_count(&manager.response_admission.0), 2);
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "response admission configuration is frozen after sharing")]
+    async fn response_configuration_setter_rejects_change_after_factory_sharing() {
+        let pool = PgPoolOptions::new()
+            .max_connections(4)
+            .connect_lazy("postgres://postgres:password@localhost/fusillade")
+            .unwrap();
+        let mut manager = PostgresRequestManager::new(pool, PostgresStorageConfig::default());
+        let _step_manager = manager.response_step_manager();
+
+        manager.set_config(PostgresStorageConfig {
+            max_concurrent_state_writes: 1,
+            ..Default::default()
+        });
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "response admission configuration is frozen after sharing")]
+    async fn response_configuration_builder_rejects_change_after_factory_sharing() {
+        let pool = PgPoolOptions::new()
+            .max_connections(4)
+            .connect_lazy("postgres://postgres:password@localhost/fusillade")
+            .unwrap();
+        let manager = PostgresRequestManager::new(pool, PostgresStorageConfig::default());
+        let _step_manager = manager.response_step_manager();
+        let _manager = manager.with_config(PostgresStorageConfig::default());
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "database retry configuration is frozen after sharing")]
+    async fn response_retry_builder_rejects_change_after_factory_sharing() {
+        let pool = PgPoolOptions::new()
+            .max_connections(4)
+            .connect_lazy("postgres://postgres:password@localhost/fusillade")
+            .unwrap();
+        let manager = PostgresRequestManager::new(pool, PostgresStorageConfig::default());
+        let _step_manager = manager.response_step_manager();
+        let _manager = manager.with_db_retry_config(crate::DbRetryConfig::disabled());
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "database retry configuration is frozen after sharing")]
+    async fn response_retry_setter_rejects_change_after_factory_sharing() {
+        let pool = PgPoolOptions::new()
+            .max_connections(4)
+            .connect_lazy("postgres://postgres:password@localhost/fusillade")
+            .unwrap();
+        let mut manager = PostgresRequestManager::new(pool, PostgresStorageConfig::default());
+        let _step_manager = manager.response_step_manager();
+        manager.set_db_retry_config(crate::DbRetryConfig::disabled());
+    }
+
+    #[sqlx::test]
+    async fn admitted_pool_retry_releases_permit_during_backoff(pool: sqlx::PgPool) {
+        let limited_pool = PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(std::time::Duration::from_millis(50))
+            .connect_with(pool.connect_options().as_ref().clone())
+            .await
+            .unwrap();
+        let manager =
+            PostgresRequestManager::new(limited_pool.clone(), PostgresStorageConfig::default())
+                .with_db_retry_config(crate::DbRetryConfig::fixed(
+                    1,
+                    std::time::Duration::from_secs(1),
+                ));
+        let step_manager = Arc::new(manager.response_step_manager());
+        let held_connection = limited_pool.acquire().await.unwrap();
+
+        let create = {
+            let step_manager = step_manager.clone();
+            tokio::spawn(async move {
+                step_manager
+                    .create_step(crate::response_step::CreateStepInput {
+                        id: Some(Uuid::new_v4()),
+                        request_id: None,
+                        prev_step_id: None,
+                        parent_step_id: None,
+                        step_kind: crate::response_step::StepKind::ToolCall,
+                        step_sequence: 0,
+                        request_payload: serde_json::json!({"test": "admitted retry"}),
+                    })
+                    .await
+            })
+        };
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let (total, _reads, writes) = manager.response_admission.counts();
+                if total.1 == 1 && writes.1 == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("admitted attempt never entered pool acquisition");
+
+        tokio::time::timeout(std::time::Duration::from_millis(500), async {
+            loop {
+                let (total, _reads, writes) = manager.response_admission.counts();
+                if total.1 == 0 && writes.1 == 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("permits remained held during pool retry backoff");
+        assert!(
+            !create.is_finished(),
+            "operation should still be sleeping in backoff"
+        );
+
+        drop(held_connection);
+        let step_id = tokio::time::timeout(std::time::Duration::from_secs(2), create)
+            .await
+            .expect("retry did not complete")
+            .unwrap()
+            .unwrap();
+        assert!(step_manager.get_step(step_id).await.unwrap().is_some());
+    }
+
+    fn response_test_input(request_id: Uuid, owner: &str) -> CreateRealtimeInput {
+        CreateRealtimeInput {
+            request_id,
+            body: "{}".to_string(),
+            model: "test-model".to_string(),
+            endpoint: "http://localhost".to_string(),
+            method: "POST".to_string(),
+            path: "/v1/responses".to_string(),
+            api_key: String::new(),
+            created_by: owner.to_string(),
+        }
+    }
+
+    #[sqlx::test]
+    async fn response_request_and_step_writes_share_pool_headroom(pool: sqlx::PgPool) {
+        let limited_pool = PgPoolOptions::new()
+            .max_connections(4)
+            .connect_with(pool.connect_options().as_ref().clone())
+            .await
+            .unwrap();
+        let manager = Arc::new(PostgresRequestManager::new(
+            limited_pool,
+            PostgresStorageConfig {
+                max_concurrent_state_writes: 2,
+                ..Default::default()
+            },
+        ));
+        let step_manager = Arc::new(manager.response_step_manager());
+
+        let request_ids = [Uuid::new_v4(), Uuid::new_v4()];
+        for request_id in request_ids {
+            manager
+                .create_realtime(response_test_input(request_id, "contention-owner"))
+                .await
+                .unwrap();
+        }
+        let mut step_ids = Vec::new();
+        for sequence in 0..2 {
+            step_ids.push(
+                step_manager
+                    .create_step(crate::response_step::CreateStepInput {
+                        id: Some(Uuid::new_v4()),
+                        request_id: None,
+                        prev_step_id: None,
+                        parent_step_id: None,
+                        step_kind: crate::response_step::StepKind::ToolCall,
+                        step_sequence: sequence,
+                        request_payload: serde_json::json!({}),
+                    })
+                    .await
+                    .unwrap(),
+            );
+        }
+
+        let mut blocker = pool.begin().await.unwrap();
+        sqlx::query("LOCK TABLE requests, response_steps IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *blocker)
+            .await
+            .unwrap();
+
+        let request_write = {
+            let manager = manager.clone();
+            tokio::spawn(async move {
+                manager
+                    .complete_request(RequestId(request_ids[0]), "{}", 200)
+                    .await
+            })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if manager.response_admission.counts().0.1 == 1 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("request write did not enter the shared admission budget");
+
+        let step_write = {
+            let step_manager = step_manager.clone();
+            let step_id = step_ids[0];
+            tokio::spawn(async move { step_manager.mark_step_processing(step_id).await })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let (total, _reads, writes) = manager.response_admission.counts();
+                assert!(total.1 <= 2, "aggregate response writes exceeded headroom");
+                assert!(writes.1 <= 2, "write class exceeded configured limit");
+                if total.1 == 2 && writes.1 == 2 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("request and step writes did not share admission");
+
+        let queued_request = {
+            let manager = manager.clone();
+            tokio::spawn(async move {
+                manager
+                    .fail_request(RequestId(request_ids[1]), "failed", 500)
+                    .await
+            })
+        };
+        let queued_step = {
+            let step_manager = step_manager.clone();
+            let step_id = step_ids[1];
+            tokio::spawn(async move { step_manager.mark_step_processing(step_id).await })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let (total, _reads, writes) = manager.response_admission.counts();
+                assert!(total.1 <= 2, "aggregate response writes exceeded headroom");
+                assert!(writes.1 <= 2, "write class exceeded configured limit");
+                if total.0 >= 2 && total.1 == 2 && writes.1 == 2 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("excess mixed writes did not queue at the aggregate lane");
+
+        blocker.rollback().await.unwrap();
+        for handle in [request_write, queued_request] {
+            tokio::time::timeout(std::time::Duration::from_secs(3), handle)
+                .await
+                .expect("request write did not complete")
+                .unwrap()
+                .unwrap();
+        }
+        for handle in [step_write, queued_step] {
+            tokio::time::timeout(std::time::Duration::from_secs(3), handle)
+                .await
+                .expect("step write did not complete")
+                .unwrap()
+                .unwrap();
+        }
+        assert_eq!(
+            manager.response_admission.counts(),
+            ((0, 0), (0, 0), (0, 0))
+        );
+    }
+
+    #[sqlx::test]
+    async fn response_reads_share_headroom_and_respect_class_limit(pool: sqlx::PgPool) {
+        let limited_pool = PgPoolOptions::new()
+            .max_connections(4)
+            .connect_with(pool.connect_options().as_ref().clone())
+            .await
+            .unwrap();
+        let manager = Arc::new(PostgresRequestManager::new(
+            limited_pool,
+            PostgresStorageConfig {
+                max_concurrent_response_reads: 1,
+                ..Default::default()
+            },
+        ));
+        let owner = "read-contention-owner";
+        let request_ids = [Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
+        for request_id in request_ids {
+            manager
+                .create_realtime(response_test_input(request_id, owner))
+                .await
+                .unwrap();
+        }
+
+        let mut blocker = pool.begin().await.unwrap();
+        sqlx::query("LOCK TABLE requests IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *blocker)
+            .await
+            .unwrap();
+
+        let handles: Vec<_> = request_ids
+            .into_iter()
+            .map(|request_id| {
+                let manager = manager.clone();
+                tokio::spawn(async move {
+                    manager
+                        .get_response_detail_for_owner(RequestId(request_id), owner)
+                        .await
+                })
+            })
+            .collect();
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let (total, reads, _writes) = manager.response_admission.counts();
+                assert!(total.1 <= 2, "response reads exceeded aggregate headroom");
+                assert!(reads.1 <= 1, "response reads exceeded their class limit");
+                if total == (1, 2) && reads == (1, 1) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("response reads did not queue total-before-class");
+
+        blocker.rollback().await.unwrap();
+        for handle in handles {
+            tokio::time::timeout(std::time::Duration::from_secs(3), handle)
+                .await
+                .expect("response read did not complete")
+                .unwrap()
+                .unwrap();
+        }
+        assert_eq!(
+            manager.response_admission.counts(),
+            ((0, 0), (0, 0), (0, 0))
+        );
+    }
+
+    #[sqlx::test]
+    async fn processing_conflict_releases_admission_before_diagnostic(pool: sqlx::PgPool) {
+        let (mut manager, claimed) = claim_one_processing(&pool, None).await;
+        sqlx::query("UPDATE requests SET state = 'canceled', canceled_at = NOW() WHERE id = $1")
+            .bind(*claimed.data.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let hook = Arc::new(AdmissionReleaseTestHook::default());
+        manager.admission_release_test_hook = Some(hook.clone());
+        let manager = Arc::new(manager);
+        let (_result_tx, result_rx) = tokio::sync::mpsc::channel(1);
+        let processing = Request {
+            data: claimed.data.clone(),
+            state: Processing {
+                daemon_id: claimed.state.daemon_id,
+                claimed_at: claimed.state.claimed_at,
+                started_at: Utc::now(),
+                retry_attempt: claimed.state.retry_attempt,
+                batch_expires_at: claimed.state.batch_expires_at,
+                result_rx: Arc::new(Mutex::new(result_rx)),
+                abort_handle: tokio::spawn(async {}).abort_handle(),
+            },
+        };
+
+        let persist = {
+            let manager = manager.clone();
+            tokio::spawn(async move { manager.persist(&processing).await })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(2), hook.entered.notified())
+            .await
+            .expect("persist miss never reached its diagnostic");
+
+        let (total, _reads, writes) = manager.response_admission.counts();
+        assert_eq!(
+            (total.1, writes.1),
+            (0, 0),
+            "processing conflict must release admission before its diagnostic await",
+        );
+
+        hook.resume.notify_one();
+        assert_eq!(
+            persist.await.unwrap().unwrap(),
+            None,
+            "terminal conflict should remain a dropped transition",
+        );
     }
 
     fn expect_stream_success(result: FileStreamResult) -> FileId {
@@ -9710,7 +10698,7 @@ mod tests {
 
         let blocked_writes = tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
-                let counts = manager.state_write_limiter.counts();
+                let (_total, _reads, counts) = manager.response_admission.counts();
                 if counts == (1, 2) {
                     let blocked = sqlx::query_scalar::<_, i64>(
                         r#"
@@ -11437,8 +12425,18 @@ mod tests {
         // DELETE/stamp committed: pre-copy a single row into the archive
         // exactly as the move would have.
         sqlx::query(
-            "INSERT INTO batch_requests_archive
-             SELECT r.*, date_trunc('week', (SELECT created_at FROM batches WHERE id = $1) AT TIME ZONE 'UTC')::date
+            "INSERT INTO batch_requests_archive (
+                 id, batch_id, template_id, state, retry_attempt, not_before, daemon_id,
+                 claimed_at, started_at, response_status, response_body, completed_at,
+                 error, failed_at, canceled_at, created_at, updated_at, custom_id, model,
+                 response_size, routed_model, service_tier, created_by, archive_bucket
+             )
+             SELECT r.id, r.batch_id, r.template_id, r.state, r.retry_attempt, r.not_before,
+                    r.daemon_id, r.claimed_at, r.started_at, r.response_status, r.response_body,
+                    r.completed_at, r.error, r.failed_at, r.canceled_at, r.created_at,
+                    r.updated_at, r.custom_id, r.model, r.response_size, r.routed_model,
+                    r.service_tier, r.created_by,
+                    date_trunc('week', (SELECT created_at FROM batches WHERE id = $1) AT TIME ZONE 'UTC')::date
              FROM requests r WHERE r.batch_id = $1
              ORDER BY r.id LIMIT 1",
         )
@@ -18267,15 +19265,34 @@ mod tests {
     #[sqlx::test]
     async fn test_delete_request_not_found(pool: sqlx::PgPool) {
         let http_client = Arc::new(MockHttpClient::new());
-        let manager = PostgresRequestManager::with_client(
+        let mut manager = PostgresRequestManager::with_client(
             TestDbPools::new(pool.clone()).await.unwrap(),
             http_client,
         );
+        let hook = Arc::new(AdmissionReleaseTestHook::default());
+        manager.admission_release_test_hook = Some(hook.clone());
+        let manager = Arc::new(manager);
 
         let bogus = crate::request::RequestId(uuid::Uuid::new_v4());
-        let err = manager
-            .delete_request(bogus)
+        let delete = {
+            let manager = manager.clone();
+            tokio::spawn(async move { manager.delete_request(bogus).await })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(2), hook.entered.notified())
             .await
+            .expect("missing delete never reached its return path");
+
+        let (total, _reads, writes) = manager.response_admission.counts();
+        assert_eq!(
+            (total.1, writes.1),
+            (0, 0),
+            "missing delete must roll back and release admission before returning",
+        );
+
+        hook.resume.notify_one();
+        let err = delete
+            .await
+            .unwrap()
             .expect_err("delete on non-existent id should error");
 
         assert!(
@@ -21079,6 +22096,232 @@ mod tests {
     }
 
     #[sqlx::test]
+    async fn test_get_response_detail_for_owner_resolves_single_and_multi_step_ids(
+        pool: sqlx::PgPool,
+    ) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+        let owner = "owned-response-user";
+
+        let single_id = uuid::Uuid::new_v4();
+        manager
+            .create_realtime(crate::request::CreateRealtimeInput {
+                request_id: single_id,
+                body: r#"{"input":"single"}"#.to_string(),
+                model: "single-model".to_string(),
+                endpoint: "http://localhost:3001/ai".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/responses".to_string(),
+                api_key: String::new(),
+                created_by: owner.to_string(),
+            })
+            .await
+            .unwrap();
+
+        let single = manager
+            .get_response_detail_for_owner(crate::request::RequestId(single_id), owner)
+            .await
+            .expect("owned single-step response should resolve");
+        assert_eq!(single.public_response_id, single_id);
+        assert_eq!(single.detail.id, single_id);
+        assert_eq!(single.detail.created_by, owner);
+        assert_eq!(single.detail.model, "single-model");
+        assert_eq!(single.detail.body.as_deref(), Some(r#"{"input":"single"}"#));
+
+        let backing_request_id = uuid::Uuid::new_v4();
+        manager
+            .create_realtime(crate::request::CreateRealtimeInput {
+                request_id: backing_request_id,
+                body: r#"{"input":"multi"}"#.to_string(),
+                model: "multi-model".to_string(),
+                endpoint: "http://localhost:3001/ai".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/responses".to_string(),
+                api_key: String::new(),
+                created_by: owner.to_string(),
+            })
+            .await
+            .unwrap();
+        let public_head_id = uuid::Uuid::new_v4();
+        sqlx::query(
+            r#"
+            INSERT INTO response_steps (
+                id, request_id, step_kind, step_sequence, request_payload, state
+            ) VALUES ($1, $2, 'model_call', 0, '{}'::jsonb, 'pending')
+            "#,
+        )
+        .bind(public_head_id)
+        .bind(backing_request_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let multi = manager
+            .get_response_detail_for_owner(crate::request::RequestId(public_head_id), owner)
+            .await
+            .expect("owned multi-step response should resolve through its backing request");
+        assert_eq!(multi.public_response_id, public_head_id);
+        assert_eq!(multi.detail.id, backing_request_id);
+        assert_eq!(multi.detail.created_by, owner);
+        assert_eq!(multi.detail.model, "multi-model");
+    }
+
+    #[sqlx::test]
+    async fn test_get_response_detail_for_owner_hides_unowned_unresolved_and_batched_rows(
+        pool: sqlx::PgPool,
+    ) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+        let owner = "response-owner";
+        let request_id = uuid::Uuid::new_v4();
+        manager
+            .create_realtime(crate::request::CreateRealtimeInput {
+                request_id,
+                body: "{}".to_string(),
+                model: "owned-model".to_string(),
+                endpoint: "http://localhost:3001/ai".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/responses".to_string(),
+                api_key: String::new(),
+                created_by: owner.to_string(),
+            })
+            .await
+            .unwrap();
+
+        let wrong_owner = manager
+            .get_response_detail_for_owner(crate::request::RequestId(request_id), "different-owner")
+            .await
+            .expect_err("cross-owner response must be hidden");
+        assert!(
+            matches!(
+                wrong_owner,
+                FusilladeError::RequestNotFound(id)
+                    if id == crate::request::RequestId(request_id)
+            ),
+            "wrong owner must be indistinguishable from a missing response: {wrong_owner:?}",
+        );
+
+        let missing_id = uuid::Uuid::new_v4();
+        let missing = manager
+            .get_response_detail_for_owner(crate::request::RequestId(missing_id), owner)
+            .await
+            .expect_err("unknown response must be hidden");
+        assert!(
+            matches!(
+                missing,
+                FusilladeError::RequestNotFound(id)
+                    if id == crate::request::RequestId(missing_id)
+            ),
+            "unknown response should return RequestNotFound: {missing:?}",
+        );
+
+        // A matched tool-call step has no backing request. Deliberately make
+        // its public UUID collide with a real request UUID: an unguarded
+        // COALESCE(response_steps.request_id, input_id) would expose that
+        // unrelated request as the tool-call response.
+        let colliding_id = uuid::Uuid::new_v4();
+        manager
+            .create_realtime(crate::request::CreateRealtimeInput {
+                request_id: colliding_id,
+                body: r#"{"must":"stay hidden"}"#.to_string(),
+                model: "collision-model".to_string(),
+                endpoint: "http://localhost:3001/ai".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/responses".to_string(),
+                api_key: String::new(),
+                created_by: owner.to_string(),
+            })
+            .await
+            .unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO response_steps (
+                id, request_id, step_kind, step_sequence, request_payload, state
+            ) VALUES ($1, NULL, 'tool_call', 0, '{}'::jsonb, 'pending')
+            "#,
+        )
+        .bind(colliding_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let unresolved = manager
+            .get_response_detail_for_owner(crate::request::RequestId(colliding_id), owner)
+            .await
+            .expect_err("a tool step without a backing request must not fall through");
+        assert!(
+            matches!(
+                unresolved,
+                FusilladeError::RequestNotFound(id)
+                    if id == crate::request::RequestId(colliding_id)
+            ),
+            "unresolved tool step should return RequestNotFound: {unresolved:?}",
+        );
+
+        let batch_id = setup_freeze_test_batch(&manager, "owned-detail-live-batch", 1).await;
+        let batched_request_id: uuid::Uuid =
+            sqlx::query_scalar("SELECT id FROM requests WHERE batch_id = $1")
+                .bind(*batch_id as uuid::Uuid)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let batched = manager
+            .get_response_detail_for_owner(crate::request::RequestId(batched_request_id), owner)
+            .await
+            .expect_err("live batched rows are outside the Responses API lookup");
+        assert!(matches!(batched, FusilladeError::RequestNotFound(_)));
+    }
+
+    #[sqlx::test]
+    async fn test_get_response_detail_for_owner_excludes_archived_rows(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+        let batch_id = setup_frozen_batch(&manager, &pool, "owned-detail-archive", 1).await;
+        let request_id: uuid::Uuid =
+            sqlx::query_scalar("SELECT id FROM requests WHERE batch_id = $1")
+                .bind(*batch_id as uuid::Uuid)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+
+        assert_eq!(
+            manager.archive_batch(batch_id).await.unwrap(),
+            ArchiveOutcome::Archived { rows: 1 },
+        );
+        let archived: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM batch_requests_archive WHERE id = $1)")
+                .bind(request_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(
+            archived,
+            "fixture must actually move the request to the archive"
+        );
+
+        let result = manager
+            .get_response_detail_for_owner(
+                crate::request::RequestId(request_id),
+                "irrelevant-owner",
+            )
+            .await
+            .expect_err("archived rows are outside the Responses API lookup");
+        assert!(
+            matches!(
+                result,
+                FusilladeError::RequestNotFound(id)
+                    if id == crate::request::RequestId(request_id)
+            ),
+            "archived response should return RequestNotFound: {result:?}",
+        );
+    }
+
+    #[sqlx::test]
     async fn test_purge_preserves_batchless_request_detail(pool: sqlx::PgPool) {
         let http_client = Arc::new(MockHttpClient::new());
         let manager = PostgresRequestManager::with_client(
@@ -21146,6 +22389,310 @@ mod tests {
     // =========================================================================
     // create_realtime / create_flex tests
     // =========================================================================
+
+    #[sqlx::test]
+    async fn test_create_responses_batch_empty_is_noop(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+
+        let ids = manager
+            .create_responses_batch(&[])
+            .await
+            .expect("empty create batch should succeed");
+
+        assert!(ids.is_empty());
+        let request_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM requests")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let template_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_templates")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!((request_count, template_count), (0, 0));
+    }
+
+    #[sqlx::test]
+    async fn test_create_responses_batch_mixed_shapes_and_stable_order(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+        let flex_id = uuid::Uuid::new_v4();
+        let realtime_id = uuid::Uuid::new_v4();
+        let inputs = vec![
+            crate::request::CreateResponseInput::Flex(crate::request::CreateFlexInput {
+                request_id: flex_id,
+                body: r#"{"input":"flex"}"#.to_string(),
+                model: "flex-model".to_string(),
+                endpoint: "http://flex.example".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/responses".to_string(),
+                api_key: "flex-key".to_string(),
+                created_by: "flex-user".to_string(),
+            }),
+            crate::request::CreateResponseInput::Realtime(crate::request::CreateRealtimeInput {
+                request_id: realtime_id,
+                body: r#"{"input":"realtime"}"#.to_string(),
+                model: "realtime-model".to_string(),
+                endpoint: "http://realtime.example".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/responses".to_string(),
+                api_key: "realtime-key".to_string(),
+                created_by: "realtime-user".to_string(),
+            }),
+        ];
+
+        let ids = manager
+            .create_responses_batch(&inputs)
+            .await
+            .expect("mixed create batch should succeed");
+        assert_eq!(
+            ids,
+            vec![
+                crate::request::RequestId(flex_id),
+                crate::request::RequestId(realtime_id)
+            ]
+        );
+
+        let rows = sqlx::query(
+            "SELECT id, batch_id, state, service_tier, daemon_id, claimed_at, started_at, created_by \
+             FROM requests WHERE id = ANY($1) ORDER BY id",
+        )
+        .bind(&[flex_id, realtime_id][..])
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 2);
+        for row in rows {
+            let id: uuid::Uuid = row.get("id");
+            assert!(row.get::<Option<uuid::Uuid>, _>("batch_id").is_none());
+            if id == flex_id {
+                assert_eq!(row.get::<String, _>("state"), "pending");
+                assert_eq!(
+                    row.get::<Option<String>, _>("service_tier").as_deref(),
+                    Some("flex")
+                );
+                assert!(row.get::<Option<uuid::Uuid>, _>("daemon_id").is_none());
+                assert!(
+                    row.get::<Option<chrono::DateTime<chrono::Utc>>, _>("claimed_at")
+                        .is_none()
+                );
+                assert!(
+                    row.get::<Option<chrono::DateTime<chrono::Utc>>, _>("started_at")
+                        .is_none()
+                );
+                assert_eq!(
+                    row.get::<Option<String>, _>("created_by").as_deref(),
+                    Some("flex-user")
+                );
+            } else {
+                assert_eq!(id, realtime_id);
+                assert_eq!(row.get::<String, _>("state"), "processing");
+                assert_eq!(
+                    row.get::<Option<String>, _>("service_tier").as_deref(),
+                    Some("priority")
+                );
+                assert_eq!(
+                    row.get::<Option<uuid::Uuid>, _>("daemon_id"),
+                    Some(uuid::Uuid::nil())
+                );
+                let claimed_at = row.get::<Option<chrono::DateTime<chrono::Utc>>, _>("claimed_at");
+                assert!(claimed_at.is_some());
+                assert_eq!(
+                    claimed_at,
+                    row.get::<Option<chrono::DateTime<chrono::Utc>>, _>("started_at")
+                );
+                assert_eq!(
+                    row.get::<Option<String>, _>("created_by").as_deref(),
+                    Some("realtime-user")
+                );
+            }
+        }
+    }
+
+    #[sqlx::test]
+    async fn test_create_responses_batch_sanitizes_bodies(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+        let request_id = uuid::Uuid::new_v4();
+        let inputs = [crate::request::CreateResponseInput::Flex(
+            crate::request::CreateFlexInput {
+                request_id,
+                body: r#"{"input":"hi","service_tier":"flex","background":true}"#.to_string(),
+                model: "model".to_string(),
+                endpoint: "http://example".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/responses".to_string(),
+                api_key: String::new(),
+                created_by: "user".to_string(),
+            },
+        )];
+
+        manager.create_responses_batch(&inputs).await.unwrap();
+
+        let row = sqlx::query(
+            "SELECT t.body, t.body_byte_size FROM request_templates t \
+             JOIN requests r ON r.template_id = t.id WHERE r.id = $1",
+        )
+        .bind(request_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let body: String = row.get("body");
+        assert_eq!(body, r#"{"input":"hi"}"#);
+        assert_eq!(row.get::<i64, _>("body_byte_size"), body.len() as i64);
+    }
+
+    #[sqlx::test]
+    async fn test_create_responses_batch_rejects_whitespace_created_by_atomically(
+        pool: sqlx::PgPool,
+    ) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+        let inputs = vec![
+            crate::request::CreateResponseInput::Flex(crate::request::CreateFlexInput {
+                request_id: uuid::Uuid::new_v4(),
+                body: "{}".to_string(),
+                model: "valid".to_string(),
+                endpoint: "http://example".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/responses".to_string(),
+                api_key: String::new(),
+                created_by: "valid-user".to_string(),
+            }),
+            crate::request::CreateResponseInput::Realtime(crate::request::CreateRealtimeInput {
+                request_id: uuid::Uuid::new_v4(),
+                body: "{}".to_string(),
+                model: "invalid".to_string(),
+                endpoint: "http://example".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/responses".to_string(),
+                api_key: String::new(),
+                created_by: "   ".to_string(),
+            }),
+        ];
+
+        assert!(manager.create_responses_batch(&inputs).await.is_err());
+        let request_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM requests")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let template_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_templates")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!((request_count, template_count), (0, 0));
+    }
+
+    #[sqlx::test]
+    async fn test_create_responses_batch_rejects_non_space_whitespace_created_by(
+        pool: sqlx::PgPool,
+    ) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+        let inputs = [crate::request::CreateResponseInput::Flex(
+            crate::request::CreateFlexInput {
+                request_id: uuid::Uuid::new_v4(),
+                body: "{}".to_string(),
+                model: "model".to_string(),
+                endpoint: "http://example".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/responses".to_string(),
+                api_key: String::new(),
+                created_by: "\t\n\u{2003}".to_string(),
+            },
+        )];
+
+        assert!(manager.create_responses_batch(&inputs).await.is_err());
+        let request_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM requests")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let template_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_templates")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!((request_count, template_count), (0, 0));
+    }
+
+    #[sqlx::test]
+    async fn test_create_responses_batch_normalizes_surrounding_non_space_whitespace(
+        pool: sqlx::PgPool,
+    ) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+        let request_id = uuid::Uuid::new_v4();
+        let inputs = [crate::request::CreateResponseInput::Realtime(
+            crate::request::CreateRealtimeInput {
+                request_id,
+                body: "{}".to_string(),
+                model: "model".to_string(),
+                endpoint: "http://example".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/responses".to_string(),
+                api_key: String::new(),
+                created_by: "\t\u{2003}user-123\u{2003}\n".to_string(),
+            },
+        )];
+
+        manager.create_responses_batch(&inputs).await.unwrap();
+
+        let created_by: String =
+            sqlx::query_scalar("SELECT created_by FROM requests WHERE id = $1")
+                .bind(request_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(created_by, "user-123");
+    }
+
+    #[sqlx::test]
+    async fn test_create_responses_batch_duplicate_id_rolls_back_templates(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+        let duplicate_id = uuid::Uuid::new_v4();
+        let make_input = |model: &str| {
+            crate::request::CreateResponseInput::Flex(crate::request::CreateFlexInput {
+                request_id: duplicate_id,
+                body: "{}".to_string(),
+                model: model.to_string(),
+                endpoint: "http://example".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/responses".to_string(),
+                api_key: String::new(),
+                created_by: "user".to_string(),
+            })
+        };
+
+        assert!(
+            manager
+                .create_responses_batch(&[make_input("one"), make_input("two")])
+                .await
+                .is_err()
+        );
+        let request_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM requests")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let template_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_templates")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!((request_count, template_count), (0, 0));
+    }
 
     #[sqlx::test]
     async fn test_create_flex_pending(pool: sqlx::PgPool) {

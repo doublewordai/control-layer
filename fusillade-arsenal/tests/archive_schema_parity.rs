@@ -1,50 +1,45 @@
 //! Schema-parity contract between `requests` and `batch_requests_archive`.
 //!
-//! The archive deliberately mirrors `requests` column-for-column, in the same
-//! order, with exactly one addition: `archive_bucket DATE NOT NULL`, appended
-//! LAST. That contract is what lets the per-batch move be
-//! `INSERT INTO batch_requests_archive SELECT r.*, $bucket FROM requests r`
-//! (positional alignment + appended partition key) and the retry move-back be
-//! the explicit `requests` column list — no per-column mapping code anywhere.
+//! The archive deliberately mirrors `requests` by column name, type, and
+//! nullability, with exactly one addition: `archive_bucket DATE NOT NULL`.
+//! Move queries use explicit named mappings, so physical column order may
+//! evolve independently between the two tables.
 //!
 //! If this test fails, the correct fix is ALWAYS to mirror the column change
-//! onto the twin table IN THE SAME MIGRATION (and update the move-back column
-//! list if it changed) — never to delete or weaken this test. See
+//! onto the twin table IN THE SAME MIGRATION (and update both move mappings if
+//! it changed) — never to delete or weaken this test. See
 //! fusillade-requests-phase3-plan.md §1 and
 //! fusillade-phase3-partitioning-decisions.md §6 (clay/core workspace root).
 
-use sqlx::PgPool;
+use std::collections::BTreeMap;
 
-#[derive(Debug, PartialEq)]
-struct ColumnShape {
-    name: String,
-    ordinal: i32,
-    data_type: String,
-    is_nullable: String,
-}
+use sqlx::{PgPool, Row};
 
-async fn column_shapes(pool: &PgPool, table: &str) -> Vec<ColumnShape> {
-    sqlx::query_as!(
-        ColumnShape,
+async fn column_shapes(pool: &PgPool, table: &str) -> BTreeMap<String, (String, String)> {
+    sqlx::query(
         r#"
-        SELECT column_name AS "name!",
-               ordinal_position::INT AS "ordinal!",
-               data_type AS "data_type!",
-               is_nullable AS "is_nullable!"
+        SELECT column_name, data_type, is_nullable
         FROM information_schema.columns
         WHERE table_name = $1
           AND table_schema = current_schema()
-        ORDER BY ordinal_position
         "#,
-        table
     )
+    .bind(table)
     .fetch_all(pool)
     .await
     .expect("failed to read information_schema.columns")
+    .into_iter()
+    .map(|row| {
+        (
+            row.get("column_name"),
+            (row.get("data_type"), row.get("is_nullable")),
+        )
+    })
+    .collect()
 }
 
 #[sqlx::test]
-async fn archive_mirrors_requests_columns_plus_trailing_bucket(pool: PgPool) {
+async fn archive_mirrors_requests_columns_by_name_and_shape(pool: PgPool) {
     let requests = column_shapes(&pool, "requests").await;
     let mut archive = column_shapes(&pool, "batch_requests_archive").await;
 
@@ -53,46 +48,22 @@ async fn archive_mirrors_requests_columns_plus_trailing_bucket(pool: PgPool) {
         "expected both tables to exist with columns"
     );
 
-    // Exactly one extra column, and it is archive_bucket, appended last.
-    let bucket = archive.pop().expect("archive has columns");
+    // Exactly one extra column, independent of its physical position.
+    let bucket = archive
+        .remove("archive_bucket")
+        .expect("archive must have archive_bucket");
     assert_eq!(
-        (
-            bucket.name.as_str(),
-            bucket.data_type.as_str(),
-            bucket.is_nullable.as_str()
-        ),
-        ("archive_bucket", "date", "NO"),
-        "archive's final column must be archive_bucket DATE NOT NULL; \
-         found {bucket:?}. If a migration appended a new column to the archive \
-         after archive_bucket, move archive_bucket back to last or update the \
-         forward-move SQL that relies on `SELECT r.*, $bucket` alignment."
+        bucket,
+        ("date".to_string(), "NO".to_string()),
+        "archive_bucket must remain DATE NOT NULL"
     );
 
-    // Remaining columns: identical names, order, types, and nullability.
+    // Remaining columns: identical names, types, and nullability.
     assert_eq!(
-        requests.len(),
-        archive.len(),
-        "requests and batch_requests_archive have diverged in column count. \
-         A migration changed one table's columns without mirroring the twin \
-         in the same migration. requests={:?} archive={:?}",
-        requests.iter().map(|c| &c.name).collect::<Vec<_>>(),
-        archive.iter().map(|c| &c.name).collect::<Vec<_>>(),
+        requests, archive,
+        "requests and batch_requests_archive have diverged by name, type, or nullability; \
+         mirror the change onto the twin table in the same migration"
     );
-    // Compare the SEQUENCE of columns, not raw ordinal_position values:
-    // `requests` carries attnum gaps from columns dropped over its migration
-    // history (information_schema exposes raw attnums), while the archive is
-    // gap-free. `SELECT r.*` alignment depends only on the visible-column
-    // sequence, which is exactly what this asserts.
-    for (position, (r, a)) in requests.iter().zip(archive.iter()).enumerate() {
-        assert_eq!(
-            (&r.name, &r.data_type, &r.is_nullable),
-            (&a.name, &a.data_type, &a.is_nullable),
-            "column mismatch between requests and batch_requests_archive at \
-             visible position {}: requests has {r:?}, archive has {a:?}. \
-             Mirror the change onto the twin table in the same migration.",
-            position + 1
-        );
-    }
 }
 
 #[sqlx::test]
@@ -118,10 +89,8 @@ async fn archive_has_no_foreign_keys(pool: PgPool) {
 
 #[sqlx::test]
 async fn forward_move_shape_compiles_and_round_trips(pool: PgPool) {
-    // The positional-alignment contract, exercised end to end: the exact
-    // `SELECT r.*, $bucket` forward shape and the explicit-column reverse
-    // shape used by the move code. Guards against a column being mirrored
-    // in name but not in position.
+    // Exercise the exact explicit forward and identity-reverse mappings end to
+    // end. This remains valid even when the tables' physical orders differ.
     sqlx::query(
         "INSERT INTO batches (id, endpoint, completion_window, created_by, total_requests, created_at, expires_at)
          VALUES ('11111111-1111-1111-1111-111111111111', '/v1/chat/completions', '24h', 'parity-test', 1, now(), now() + interval '1 day')",
@@ -139,13 +108,23 @@ async fn forward_move_shape_compiles_and_round_trips(pool: PgPool) {
     .unwrap();
 
     sqlx::query(
-        "INSERT INTO batch_requests_archive
-         SELECT r.*, date_trunc('week', now() AT TIME ZONE 'UTC')::date
+        "INSERT INTO batch_requests_archive (
+             id, batch_id, template_id, state, retry_attempt, not_before, daemon_id,
+             claimed_at, started_at, response_status, response_body, completed_at,
+             error, failed_at, canceled_at, created_at, updated_at, custom_id, model,
+             response_size, routed_model, service_tier, created_by, archive_bucket
+         )
+         SELECT r.id, r.batch_id, r.template_id, r.state, r.retry_attempt, r.not_before,
+                r.daemon_id, r.claimed_at, r.started_at, r.response_status, r.response_body,
+                r.completed_at, r.error, r.failed_at, r.canceled_at, r.created_at,
+                r.updated_at, r.custom_id, r.model, r.response_size, r.routed_model,
+                r.service_tier, r.created_by,
+                date_trunc('week', now() AT TIME ZONE 'UTC')::date
          FROM requests r WHERE r.batch_id = '11111111-1111-1111-1111-111111111111'",
     )
     .execute(&pool)
     .await
-    .expect("forward move shape must stay valid: SELECT r.*, $bucket");
+    .expect("explicit forward move mapping must stay valid");
 
     sqlx::query("DELETE FROM requests WHERE id = '22222222-2222-2222-2222-222222222222'")
         .execute(&pool)
@@ -155,13 +134,19 @@ async fn forward_move_shape_compiles_and_round_trips(pool: PgPool) {
     // Reverse shape: all requests columns, bucket omitted. This column list
     // is the same one the retry move-back uses; if this breaks, update BOTH.
     sqlx::query(
-        "INSERT INTO requests
-         SELECT id, batch_id, template_id, state, retry_attempt, not_before, daemon_id,
-                claimed_at, started_at, response_status, response_body, completed_at,
-                error, failed_at, canceled_at, created_at, updated_at, custom_id,
-                model, response_size, routed_model, service_tier, created_by
-         FROM batch_requests_archive
-         WHERE id = '22222222-2222-2222-2222-222222222222'",
+        "INSERT INTO requests (
+             id, batch_id, template_id, state, retry_attempt, not_before, daemon_id,
+             claimed_at, started_at, response_status, response_body, completed_at,
+             error, failed_at, canceled_at, created_at, updated_at, custom_id, model,
+             response_size, routed_model, service_tier, created_by
+         )
+         SELECT a.id, a.batch_id, a.template_id, a.state, a.retry_attempt, a.not_before,
+                a.daemon_id, a.claimed_at, a.started_at, a.response_status, a.response_body,
+                a.completed_at, a.error, a.failed_at, a.canceled_at, a.created_at,
+                a.updated_at, a.custom_id, a.model, a.response_size, a.routed_model,
+                a.service_tier, a.created_by
+         FROM batch_requests_archive a
+         WHERE a.id = '22222222-2222-2222-2222-222222222222'",
     )
     .execute(&pool)
     .await

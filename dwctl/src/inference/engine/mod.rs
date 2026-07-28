@@ -18,3 +18,5 @@ pub mod outlet_handler;
 pub mod processor;
 pub mod transition;
 pub mod writer;
+
+pub use writer::RequestsWriterHandle;

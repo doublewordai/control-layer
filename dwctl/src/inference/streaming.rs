@@ -6,9 +6,8 @@
 //! must stay open while tokens flow through. So this module owns the
 //! "inline" execution path:
 //!
-//! 1. Insert the fusillade `requests` row directly in `processing`
-//!    state with our daemon_id as owner, so the batch daemon doesn't
-//!    pick it up.
+//! 1. Await commit-backed admission of the fusillade `requests` row in
+//!    `processing` state, so the batch daemon doesn't pick it up.
 //! 2. Open an axum SSE response held by the caller.
 //! 3. Spawn a task that runs [`onwards::run_response_loop`] inline
 //!    with an [`SseEventSink`] wrapping a tokio mpsc.
@@ -133,6 +132,7 @@ impl ReplayFrame {
 /// and passes `false`.
 pub async fn flex_stream_response<P, F>(
     request_manager: Arc<fusillade_arsenal::PostgresRequestManager<P>>,
+    requests_writer: super::engine::RequestsWriterHandle,
     flex_input: fusillade::CreateFlexInput,
     request_id: uuid::Uuid,
     done_sentinel: bool,
@@ -147,7 +147,7 @@ where
 
     // Enqueue synchronously so an enqueue failure is a clean JSON 500 — it
     // happens before the stream opens, so we're not yet committed to a 200.
-    if let Err(e) = fusillade::Storage::create_flex(&*request_manager, flex_input).await {
+    if let Err(e) = requests_writer.admit_flex(flex_input).await {
         tracing::error!(error = %e, "Failed to create streaming flex batch in fusillade");
         return axum::response::Response::builder()
             .status(axum::http::StatusCode::INTERNAL_SERVER_ERROR)
@@ -398,4 +398,52 @@ where
         .finalize_head_request(request_id, 500, error.clone())
         .await
         .map_err(|e| format!("finalize head: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use sqlx_pool_router::TestDbPools;
+    use uuid::Uuid;
+
+    use super::*;
+
+    #[sqlx::test]
+    async fn streaming_flex_fails_before_opening_stream_when_writer_is_closed(pool: sqlx::PgPool) {
+        let fusillade_pool = crate::test::utils::setup_fusillade_pool(&pool).await;
+        let pools = TestDbPools::new(fusillade_pool.clone()).await.unwrap();
+        let request_manager = Arc::new(fusillade_arsenal::PostgresRequestManager::new(pools, Default::default()));
+        let (writer, writer_handle) =
+            crate::inference::engine::writer::RequestsWriter::new(request_manager.clone(), 1, std::time::Duration::ZERO);
+        drop(writer);
+
+        let request_id = Uuid::new_v4();
+        let response = flex_stream_response(
+            request_manager,
+            writer_handle,
+            fusillade::CreateFlexInput {
+                request_id,
+                body: r#"{"input":"hello"}"#.to_string(),
+                model: "test-model".to_string(),
+                endpoint: "http://example.invalid".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/responses".to_string(),
+                api_key: "test-key".to_string(),
+                created_by: "test-owner".to_string(),
+            },
+            request_id,
+            false,
+            None,
+            |_| Vec::new(),
+        )
+        .await;
+
+        assert_eq!(response.status(), axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM requests")
+            .fetch_one(&fusillade_pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 0);
+    }
 }

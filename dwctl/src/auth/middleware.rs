@@ -509,6 +509,7 @@ mod tests {
             metrics_recorder: None,
             is_leader: false,
             request_manager: state.request_manager,
+            requests_writer: state.requests_writer,
             task_runner: state.task_runner,
             limiters: state.limiters,
             connections_encryption_key: None,
@@ -516,6 +517,8 @@ mod tests {
             response_step_manager: state.response_step_manager,
             image_normalizer: state.image_normalizer.clone(),
             keystore: state.keystore.clone(),
+            api_key_cache: state.api_key_cache.clone(),
+            flex_batch_key_resolver: state.flex_batch_key_resolver.clone(),
         };
 
         let request = axum::http::Request::builder()
@@ -623,6 +626,7 @@ mod tests {
             metrics_recorder: None,
             is_leader: false,
             request_manager: state.request_manager,
+            requests_writer: state.requests_writer,
             task_runner: state.task_runner,
             limiters: state.limiters,
             connections_encryption_key: None,
@@ -630,6 +634,8 @@ mod tests {
             response_step_manager: state.response_step_manager,
             image_normalizer: state.image_normalizer.clone(),
             keystore: state.keystore.clone(),
+            api_key_cache: state.api_key_cache.clone(),
+            flex_batch_key_resolver: state.flex_batch_key_resolver.clone(),
         };
 
         let header_external_user_id = header_user.external_user_id.as_ref().unwrap_or(&header_user.username);
@@ -739,6 +745,7 @@ mod tests {
             metrics_recorder: None,
             is_leader: false,
             request_manager: state.request_manager,
+            requests_writer: state.requests_writer,
             task_runner: state.task_runner,
             limiters: state.limiters,
             connections_encryption_key: None,
@@ -746,6 +753,8 @@ mod tests {
             response_step_manager: state.response_step_manager,
             image_normalizer: state.image_normalizer.clone(),
             keystore: state.keystore.clone(),
+            api_key_cache: state.api_key_cache.clone(),
+            flex_batch_key_resolver: state.flex_batch_key_resolver.clone(),
         };
 
         // Request with JWT cookie - should be ignored since native auth is disabled
@@ -922,6 +931,7 @@ mod tests {
             metrics_recorder: None,
             is_leader: false,
             request_manager: state.request_manager,
+            requests_writer: state.requests_writer,
             task_runner: state.task_runner,
             limiters: state.limiters,
             connections_encryption_key: None,
@@ -929,6 +939,8 @@ mod tests {
             response_step_manager: state.response_step_manager,
             image_normalizer: state.image_normalizer.clone(),
             keystore: state.keystore.clone(),
+            api_key_cache: state.api_key_cache.clone(),
+            flex_batch_key_resolver: state.flex_batch_key_resolver.clone(),
         };
 
         let external_user_id = user.external_user_id.as_ref().unwrap_or(&user.username);
@@ -1038,6 +1050,7 @@ mod tests {
             metrics_recorder: None,
             is_leader: false,
             request_manager: state.request_manager,
+            requests_writer: state.requests_writer,
             task_runner: state.task_runner,
             limiters: state.limiters,
             connections_encryption_key: None,
@@ -1045,6 +1058,8 @@ mod tests {
             response_step_manager: state.response_step_manager,
             image_normalizer: state.image_normalizer.clone(),
             keystore: state.keystore.clone(),
+            api_key_cache: state.api_key_cache.clone(),
+            flex_batch_key_resolver: state.flex_batch_key_resolver.clone(),
         };
 
         let request = axum::http::Request::builder()

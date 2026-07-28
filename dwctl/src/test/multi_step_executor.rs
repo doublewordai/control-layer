@@ -25,7 +25,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use fusillade::ReqwestHttpClient;
-use fusillade_arsenal::{PoolProvider as FusilladePoolProvider, PostgresRequestManager, PostgresResponseStepManager, TestDbPools};
+use fusillade_arsenal::{PoolProvider as FusilladePoolProvider, PostgresRequestManager, TestDbPools};
 use onwards::traits::RequestContext;
 use onwards::{
     ChainStep, LoopConfig, MultiStepStore, NextAction, RecordedStep, StepDescriptor, StepKind, StepState, StoreError, UpstreamTarget,
@@ -199,11 +199,21 @@ fn http_client_for_tests() -> Arc<ReqwestHttpClient> {
     ))
 }
 
-async fn store_with_real_fusillade(pool: PgPool) -> FusilladeResponseStore<TestDbPools> {
+async fn store_with_real_fusillade(
+    pool: PgPool,
+) -> (
+    FusilladeResponseStore<TestDbPools>,
+    crate::inference::engine::writer::RequestsWriter<TestDbPools>,
+) {
     let pools = TestDbPools::new(pool).await.unwrap();
     let request_manager = Arc::new(PostgresRequestManager::new(pools.clone(), Default::default()));
-    let step_manager = Arc::new(PostgresResponseStepManager::new(pools));
-    FusilladeResponseStore::new(request_manager).with_step_manager(step_manager)
+    let step_manager = Arc::new(request_manager.response_step_manager());
+    let (writer, writer_handle) =
+        crate::inference::engine::writer::RequestsWriter::new(request_manager.clone(), 1, std::time::Duration::ZERO);
+    (
+        FusilladeResponseStore::new(request_manager, writer_handle).with_step_manager(step_manager),
+        writer,
+    )
 }
 
 #[sqlx::test]
@@ -267,30 +277,55 @@ async fn loop_drives_real_tool_and_model_calls_through_production_executor(pool:
 
     // Real fusillade-backed storage.
     let pool = setup_fusillade_pool(&pool).await;
-    let inner_store = store_with_real_fusillade(pool).await;
+    let (inner_store, requests_writer) = store_with_real_fusillade(pool).await;
     // Stand in for the warm path's side-channel registration. The
     // base_url here doesn't matter for this test (per-step rows use
     // it for analytics surface, not for routing — the loop fires to
     // `upstream.url` directly), but it must be present so
     // record_step can stamp it onto sub-request rows.
     let request_id = register_test_response(&inner_store, &model_server.uri()).await;
-    let store = TransitionStore { inner: inner_store };
+    let store = Arc::new(TransitionStore { inner: inner_store });
 
-    // Drive it.
-    let final_payload = run_response_loop(
-        &store,
-        &tool_executor,
-        &tool_ctx,
-        &upstream,
-        http_client,
-        None,
-        &request_id,
-        None,
-        LoopConfig::default(),
-        0,
-    )
+    // Drive the loop with the lifecycle writer deliberately withheld. The
+    // head model call reuses the already-committed response row, then the tool
+    // runs, but the descendant model call must block on durable admission.
+    let loop_store = store.clone();
+    let loop_request_id = request_id.clone();
+    let loop_task = tokio::spawn(async move {
+        run_response_loop(
+            &*loop_store,
+            &tool_executor,
+            &tool_ctx,
+            &upstream,
+            http_client,
+            None,
+            &loop_request_id,
+            None,
+            LoopConfig::default(),
+            0,
+        )
+        .await
+    });
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if tool_server.received_requests().await.unwrap().len() == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
     .await
-    .expect("loop should complete");
+    .expect("first model call and tool call should complete while writer is withheld");
+    assert_eq!(model_server.received_requests().await.unwrap().len(), 1);
+    assert!(
+        !loop_task.is_finished(),
+        "descendant model dispatch must wait for writer acknowledgement"
+    );
+
+    let writer_shutdown = tokio_util::sync::CancellationToken::new();
+    let writer_task = tokio::spawn(requests_writer.run(writer_shutdown.clone()));
+    let final_payload = loop_task.await.unwrap().expect("loop should complete");
 
     assert_eq!(final_payload["status"], json!("completed"));
     assert_eq!(final_payload["output_text"], json!("the answer is 42"));
@@ -322,6 +357,9 @@ async fn loop_drives_real_tool_and_model_calls_through_production_executor(pool:
     // Tool step's response_payload is the wiremock body verbatim — proves
     // the production HttpToolExecutor was invoked end-to-end.
     assert_eq!(chain[1].response_payload.as_ref().unwrap(), &json!({"echoed": {"x": 42}}));
+
+    writer_shutdown.cancel();
+    writer_task.await.unwrap();
 }
 
 // Removed: `agent_kind_tool_recurses_via_tool_schema`.
