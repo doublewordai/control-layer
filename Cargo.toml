@@ -8,3 +8,11 @@ members = [
 ]
 default-members = ["dwctl"]
 resolver = "2"
+
+# Coverage builds compile the entire test suite as one very large crate. Full
+# debug info and incremental state make that clean build slower and produce
+# several gigabytes of artifacts, while neither is needed for CI coverage.
+[profile.ci]
+inherits = "test"
+debug = 0
+incremental = false

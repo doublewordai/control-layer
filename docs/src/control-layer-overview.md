@@ -11,6 +11,7 @@ The Doubleword Control Layer is the world's fastest AI model gateway (450x less 
 ## Key Resources
 
 **[GitHub Repo](https://github.com/doublewordai/control-layer)** — Explore the open-source Control Layer code.  
+**[Onwards Documentation](https://doublewordai.github.io/control-layer/onwards/)** — Configure and run the standalone Onwards router.<br>
 **[Announcement Blog](https://www.doubleword.ai/resources/doubleword-open-sources-the-worlds-fastest-ai-gateway)** — Read the launch announcement and background story.  
 **[Demo Video](https://youtu.be/mJoScHrMpHg)** — Watch the Control Layer in action.  
 **[CTO Blog](https://fergusfinn.com/blog/control-layer)** — Technical deep dive by Fergus Finn.  

@@ -152,7 +152,7 @@ describe("API Keys Component - Functional Tests", () => {
         expect(screen.getByRole("dialog")).toBeInTheDocument();
         expect(
           screen.getByRole("heading", {
-            name: /create new api key/i,
+            name: /create api key/i,
           }),
         ).toBeInTheDocument();
       });
@@ -204,9 +204,11 @@ describe("API Keys Component - Functional Tests", () => {
         ).toBeInTheDocument();
       });
 
-      // Should show the key name and API key
-      expect(screen.getByText("Test API Key")).toBeInTheDocument();
-      expect(screen.getByText(/save this key/i)).toBeInTheDocument();
+      // Should show the key name and API key (scoped to the dialog: the
+      // created key is now also persisted into the mock list behind it)
+      const dialog = screen.getByRole("dialog");
+      expect(within(dialog).getByText("Test API Key")).toBeInTheDocument();
+      expect(within(dialog).getByText(/save this key/i)).toBeInTheDocument();
     });
 
     it("submits realtime purpose when a platform manager selects Inference in org context", async () => {
@@ -258,13 +260,10 @@ describe("API Keys Component - Functional Tests", () => {
       });
 
       await user.type(screen.getByLabelText(/name/i), "Org Inference Key");
-      await user.click(screen.getByRole("button", { name: /advanced settings/i }));
 
-      await user.click(screen.getByLabelText(/purpose/i));
-      await user.click(screen.getByRole("option", { name: /platform/i }));
-
-      await user.click(screen.getByLabelText(/purpose/i));
-      await user.click(screen.getByRole("option", { name: /^inference/i }));
+      // Key type is chosen via the card radio group (visible to everyone).
+      await user.click(screen.getByRole("radio", { name: /platform/i }));
+      await user.click(screen.getByRole("radio", { name: /inference/i }));
 
       await user.click(screen.getByRole("button", { name: /create key/i }));
 
@@ -617,7 +616,10 @@ describe("API Keys Component - Functional Tests", () => {
       const keyRow = keyName.closest("tr");
       expect(keyRow).not.toBeNull();
 
-      await user.click(within(keyRow!).getByRole("button"));
+      // Rows now carry both Edit and Delete actions; target Delete explicitly.
+      await user.click(
+        within(keyRow!).getByRole("button", { name: /delete/i }),
+      );
 
       await waitFor(() => {
         expect(
@@ -726,6 +728,277 @@ describe("API Keys Component - Functional Tests", () => {
       // Form should still be functional on mobile
       const nameInput = screen.getByLabelText(/name/i);
       expect(nameInput).toBeInTheDocument();
+    });
+  });
+
+  describe("Usage Limits", () => {
+    it("shows usage against the limit for capped keys and 'No limit' otherwise", async () => {
+      const { container } = render(<ApiKeys />, { wrapper: createWrapper() });
+
+      // key-1 in the mock data is capped at $50 monthly with $12.34 spent.
+      await waitFor(() => {
+        expect(
+          within(container).getByText(/\$12\.34 \/ \$50\.00/),
+        ).toBeInTheDocument();
+      });
+      // Period + calendar-aligned reset instant as subtext, plus the bar.
+      expect(
+        within(container).getByText(
+          /monthly limit · resets aug 1, 2026, 00:00 utc/i,
+        ),
+      ).toBeInTheDocument();
+      const bar = within(container).getByRole("progressbar");
+      expect(bar).toHaveAttribute("aria-valuenow", "25"); // 12.34 / 50 ≈ 25%
+      // Uncapped keys show the italic placeholder.
+      expect(
+        within(container).getAllByText("No limit").length,
+      ).toBeGreaterThanOrEqual(1);
+    });
+
+    it("hides the edit affordance for keys the user cannot manage", async () => {
+      // Non-PM user; one foreign-created key, one own key.
+      server.use(
+        http.get("/admin/api/v1/users/:id", ({ params }) => {
+          if (params.id === "current") {
+            return HttpResponse.json({
+              id: "user-nonpm",
+              username: "standard",
+              email: "standard@example.com",
+              roles: ["StandardUser"],
+            });
+          }
+          return HttpResponse.json({ error: "not found" }, { status: 404 });
+        }),
+        http.get("/admin/api/v1/users/:userId/api-keys", () => {
+          return HttpResponse.json({
+            data: [
+              {
+                id: "own-key",
+                name: "My Key",
+                purpose: "realtime",
+                created_at: "2026-01-01T00:00:00Z",
+                created_by: "user-nonpm",
+              },
+              {
+                id: "foreign-key",
+                name: "Colleague Key",
+                purpose: "realtime",
+                created_at: "2026-01-01T00:00:00Z",
+                created_by: "someone-else",
+              },
+            ],
+            total_count: 2,
+            skip: 0,
+            limit: 10,
+          });
+        }),
+      );
+
+      const { container } = render(<ApiKeys />, { wrapper: createWrapper() });
+
+      await waitFor(() => {
+        expect(within(container).getByText("My Key")).toBeInTheDocument();
+      });
+      expect(
+        within(container).getByRole("button", {
+          name: /edit usage limit for my key/i,
+        }),
+      ).toBeInTheDocument();
+      expect(
+        within(container).queryByRole("button", {
+          name: /edit usage limit for colleague key/i,
+        }),
+      ).not.toBeInTheDocument();
+    });
+
+
+
+    it("creates a key with a usage limit", async () => {
+      const user = userEvent.setup();
+      const { container } = render(<ApiKeys />, { wrapper: createWrapper() });
+
+      await user.click(
+        await within(container).findByRole("button", {
+          name: /create new api key/i,
+        }),
+      );
+      await waitFor(() => {
+        expect(screen.getByRole("dialog")).toBeInTheDocument();
+      });
+
+      await user.type(screen.getByLabelText(/name/i), "Budgeted Agent");
+      await user.type(screen.getByLabelText(/usage limit amount/i), "25");
+      await user.click(
+        screen.getByRole("combobox", { name: /usage limit reset period/i }),
+      );
+      await user.click(screen.getByRole("option", { name: /daily/i }));
+
+      // The helper text now carries the calendar-aligned reset preview.
+      expect(screen.getByText(/next resets .*, 00:00 utc\./i)).toBeInTheDocument();
+
+      await user.click(screen.getByRole("button", { name: /create key/i }));
+
+      // Success state shows the one-time key.
+      await waitFor(() => {
+        expect(
+          screen.getByText(/save this key - it won't be shown again/i),
+        ).toBeInTheDocument();
+      });
+    });
+
+    it("edits a limit through the edit dialog and PATCHes tri-state fields", async () => {
+      const user = userEvent.setup();
+      let patchBody: Record<string, unknown> | null = null;
+      server.use(
+        http.patch(
+          "/admin/api/v1/users/:userId/api-keys/:keyId",
+          async ({ request }) => {
+            patchBody = (await request.json()) as Record<string, unknown>;
+            return HttpResponse.json({
+              id: "key-1",
+              name: "CI/CD Pipeline",
+              created_at: "2025-04-01T10:00:00Z",
+              spend_limit: "75",
+              spend_limit_interval: "weekly",
+              spend: "12.34",
+              total_spend: "148.20",
+              resets_at: "2026-07-27T00:00:00Z",
+            });
+          },
+        ),
+      );
+
+      const { container } = render(<ApiKeys />, { wrapper: createWrapper() });
+
+      // Open the edit dialog for the capped key.
+      await user.click(
+        await within(container).findByRole("button", {
+          name: /edit usage limit for ci\/cd pipeline/i,
+        }),
+      );
+      await waitFor(() => {
+        expect(
+          screen.getByRole("heading", { name: /edit usage limit/i }),
+        ).toBeInTheDocument();
+      });
+
+      // Current usage summary is shown for capped keys, with the full UTC instant.
+      expect(
+        screen.getByText(
+          /spent \$12\.34 of \$50\.00 this window · resets aug 1, 2026, 00:00 utc/i,
+        ),
+      ).toBeInTheDocument();
+
+      // Fields are prefilled from the key's current limit.
+      const amount = screen.getByLabelText(/usage limit amount/i);
+      expect(amount).toHaveValue(50);
+
+      // Change the amount and period, then save.
+      await user.clear(amount);
+      await user.type(amount, "75");
+      await user.click(
+        screen.getByRole("combobox", { name: /usage limit reset period/i }),
+      );
+      await user.click(screen.getByRole("option", { name: /weekly/i }));
+      await user.click(screen.getByRole("button", { name: /save changes/i }));
+
+      await waitFor(() => {
+        expect(patchBody).not.toBeNull();
+      });
+      expect(patchBody).toMatchObject({
+        spend_limit: "75",
+        spend_limit_interval: "weekly",
+      });
+    });
+
+    it("removes a limit by clearing the amount (tri-state null PATCH)", async () => {
+      const user = userEvent.setup();
+      let patchBody: Record<string, unknown> | null = null;
+      server.use(
+        http.patch(
+          "/admin/api/v1/users/:userId/api-keys/:keyId",
+          async ({ request }) => {
+            patchBody = (await request.json()) as Record<string, unknown>;
+            return HttpResponse.json({
+              id: "key-1",
+              name: "CI/CD Pipeline",
+              created_at: "2025-04-01T10:00:00Z",
+              spend_limit: null,
+              spend_limit_interval: null,
+              spend: null,
+              total_spend: null,
+              resets_at: null,
+            });
+          },
+        ),
+      );
+
+      const { container } = render(<ApiKeys />, { wrapper: createWrapper() });
+
+      await user.click(
+        await within(container).findByRole("button", {
+          name: /edit usage limit for ci\/cd pipeline/i,
+        }),
+      );
+      await waitFor(() => {
+        expect(
+          screen.getByRole("heading", { name: /edit usage limit/i }),
+        ).toBeInTheDocument();
+      });
+
+      await user.clear(screen.getByLabelText(/usage limit amount/i));
+      await user.click(screen.getByRole("button", { name: /save changes/i }));
+
+      await waitFor(() => {
+        expect(patchBody).toEqual({
+          spend_limit: null,
+          spend_limit_interval: null,
+        });
+      });
+    });
+
+    it("resets the spend window from the edit dialog", async () => {
+      const user = userEvent.setup();
+      let patchBody: Record<string, unknown> | null = null;
+      server.use(
+        http.patch(
+          "/admin/api/v1/users/:userId/api-keys/:keyId",
+          async ({ request }) => {
+            patchBody = (await request.json()) as Record<string, unknown>;
+            return HttpResponse.json({
+              id: "key-1",
+              name: "CI/CD Pipeline",
+              created_at: "2025-04-01T10:00:00Z",
+              spend_limit: "50",
+              spend_limit_interval: "monthly",
+              spend: "0",
+              total_spend: "148.20",
+              resets_at: "2026-08-01T00:00:00Z",
+            });
+          },
+        ),
+      );
+
+      const { container } = render(<ApiKeys />, { wrapper: createWrapper() });
+
+      await user.click(
+        await within(container).findByRole("button", {
+          name: /edit usage limit for ci\/cd pipeline/i,
+        }),
+      );
+      await waitFor(() => {
+        expect(
+          screen.getByRole("heading", { name: /edit usage limit/i }),
+        ).toBeInTheDocument();
+      });
+
+      await user.click(
+        screen.getByRole("button", { name: /reset spend window now/i }),
+      );
+
+      await waitFor(() => {
+        expect(patchBody).toEqual({ reset_window: true });
+      });
     });
   });
 });

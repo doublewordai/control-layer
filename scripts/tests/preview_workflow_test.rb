@@ -14,7 +14,7 @@ class PreviewWorkflowTest < Minitest::Test
     assert_includes workflow, "DOCKER_METADATA_SHORT_SHA_LENGTH: 40"
     assert_includes workflow, "steps.preview-image.outputs.digest"
     assert_includes backend_gate,
-                    "needs: [backend-crate-test, backend-lint, frontend-test, build]"
+                    "needs: [backend-crate-test, backend-dwctl-test, backend-lint, frontend-test, build]"
     assert_includes backend_gate, "ruby scripts/tests/preview_workflow_test.rb"
     assert_includes backend_gate, "name: Publish preview artifact"
     assert_includes backend_gate, "startsWith(github.head_ref, 'preview/')"
@@ -62,6 +62,26 @@ class PreviewWorkflowTest < Minitest::Test
         assert_match(/\A[0-9a-f]{40}\z/, reference)
       end
     end
+  end
+
+  def test_dispatches_share_the_preview_token_and_opaque_deploy_target
+    %w[ci.yaml preview-close.yml release.yml].each do |filename|
+      workflow = File.read(File.join(ROOT, ".github", "workflows", filename))
+
+      assert_includes workflow, "github-token: ${{ secrets.PREVIEW_DISPATCH_TOKEN }}"
+      assert_includes workflow, "owner: '${{ secrets.DEPLOY_TARGET_OWNER }}'"
+      assert_includes workflow, "repo: '${{ secrets.DEPLOY_TARGET_REPO }}'"
+      refute_includes workflow, "PREVIEW_DISPATCH_OWNER"
+      refute_includes workflow, "PREVIEW_DISPATCH_REPOSITORY"
+      refute_includes workflow, "DEPLOY_PAT"
+    end
+
+    release_workflow = File.read(File.join(ROOT, ".github", "workflows", "release.yml"))
+    deployment_dispatch = release_workflow[/^  notify-deploy:\n.*?(?=^  \S)/m]
+    refute_nil deployment_dispatch
+    assert_includes deployment_dispatch,
+                    "uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9"
+    refute_includes deployment_dispatch, "uses: actions/github-script@v9"
   end
 
   def test_comment_driven_staging_build_is_removed

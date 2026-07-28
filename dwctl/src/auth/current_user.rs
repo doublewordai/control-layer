@@ -84,6 +84,7 @@ async fn try_jwt_session_auth(
                     payment_provider_id: user.payment_provider_id,
                     organizations: vec![],
                     active_organization: None,
+                    api_key_id: None,
                 },
                 last_login,
             )));
@@ -236,6 +237,7 @@ async fn try_proxy_header_auth<P: sqlx_pool_router::PoolProvider + Clone + Send 
                         payment_provider_id: user.payment_provider_id,
                         organizations: vec![],
                         active_organization: None,
+                        api_key_id: None,
                     },
                     last_login,
                 ))
@@ -261,6 +263,7 @@ async fn try_proxy_header_auth<P: sqlx_pool_router::PoolProvider + Clone + Send 
                         payment_provider_id: user.payment_provider_id,
                         organizations: vec![],
                         active_organization: None,
+                        api_key_id: None,
                     },
                     last_login,
                 ))
@@ -337,7 +340,7 @@ async fn try_api_key_auth(parts: &axum::http::request::Parts, db: &PgPool) -> Op
     // user_id may be an org (for org-scoped keys) — we only use it for active_organization.
     let api_key_result = match sqlx::query!(
         r#"
-        SELECT ak.user_id, ak.created_by, ak.purpose,
+        SELECT ak.id AS api_key_id, ak.user_id, ak.created_by, ak.purpose,
                u.username, u.email, u.is_admin, u.display_name, u.avatar_url,
                u.payment_provider_id, u.last_login
         FROM api_keys ak
@@ -437,6 +440,7 @@ async fn try_api_key_auth(parts: &axum::http::request::Parts, db: &PgPool) -> Op
             payment_provider_id: api_key_data.payment_provider_id,
             organizations: vec![],
             active_organization,
+            api_key_id: Some(api_key_data.api_key_id),
             // API-key-derived current users don't expose the opt-in
             // flag — it's surfaced by the dashboard session path that
             // hits Users::get_by_id (which carries the real value).
@@ -1218,6 +1222,7 @@ mod tests {
             payment_provider_id: None,
             organizations: vec![],
             active_organization: None,
+            api_key_id: None,
         };
 
         let result = require_admin(admin_user);
@@ -1235,6 +1240,7 @@ mod tests {
             payment_provider_id: None,
             organizations: vec![],
             active_organization: None,
+            api_key_id: None,
         };
 
         let result = require_admin(regular_user);
@@ -1265,6 +1271,7 @@ mod tests {
             payment_provider_id: None,
             organizations: vec![],
             active_organization: None,
+            api_key_id: None,
         };
         let jwt_token = session::create_session_token(&current_user, &config).unwrap();
 
@@ -1337,6 +1344,7 @@ mod tests {
             payment_provider_id: None,
             organizations: vec![],
             active_organization: None,
+            api_key_id: None,
         };
         let jwt_token = session::create_session_token(&current_user, &config).unwrap();
 

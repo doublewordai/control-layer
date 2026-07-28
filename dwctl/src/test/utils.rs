@@ -527,6 +527,8 @@ pub async fn create_test_api_key_for_user(pool: &PgPool, user_id: UserId) -> Api
             requests_per_second: None,
             burst_size: None,
             member_id: None,
+            spend_limit: None,
+            spend_limit_interval: None,
         },
     );
 

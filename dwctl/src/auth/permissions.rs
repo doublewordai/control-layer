@@ -477,6 +477,7 @@ mod tests {
             payment_provider_id: None,
             organizations: vec![],
             active_organization: None,
+            api_key_id: None,
         }
     }
 
@@ -763,6 +764,7 @@ mod tests {
             payment_provider_id: None,
             organizations: vec![],
             active_organization: None,
+            api_key_id: None,
         }
     }
 

@@ -1,5 +1,78 @@
 # Changelog
 
+## [8.102.0](https://github.com/doublewordai/control-layer/compare/v8.101.0...v8.102.0) (2026-07-23)
+
+
+### Features
+
+* UI for capped api keys ([#1355](https://github.com/doublewordai/control-layer/issues/1355)) ([56ac94e](https://github.com/doublewordai/control-layer/commit/56ac94e5de9351da4ced7d23f811dbf27f057de3))
+
+
+### Bug Fixes
+
+* simplify preview dispatch credentials ([#1342](https://github.com/doublewordai/control-layer/issues/1342)) ([d2b1929](https://github.com/doublewordai/control-layer/commit/d2b19293a2ea224af9ae1ecf7fa61f7d08e18126))
+
+## [8.101.0](https://github.com/doublewordai/control-layer/compare/v8.100.0...v8.101.0) (2026-07-23)
+
+
+### Features
+
+* capped api keys, api surface ([#1351](https://github.com/doublewordai/control-layer/issues/1351)) ([8129e1e](https://github.com/doublewordai/control-layer/commit/8129e1ed1a252d5aeee354ce1ac81a634d46690e))
+
+## [8.100.0](https://github.com/doublewordai/control-layer/compare/v8.99.0...v8.100.0) (2026-07-23)
+
+
+### Features
+
+* capped keys part 2 - enforcement and yanking ([#1346](https://github.com/doublewordai/control-layer/issues/1346)) ([c5d8670](https://github.com/doublewordai/control-layer/commit/c5d8670d899e51a38a52256b35229414879e5e0d))
+
+## [8.99.0](https://github.com/doublewordai/control-layer/compare/v8.98.0...v8.99.0) (2026-07-23)
+
+
+### Features
+
+* fusillade submission-epoch latency metrics and per-window completion labels ([#1347](https://github.com/doublewordai/control-layer/issues/1347)) ([9ce69d6](https://github.com/doublewordai/control-layer/commit/9ce69d6145d86819a90e34fe848d78cd1f612bda))
+
+## [8.98.0](https://github.com/doublewordai/control-layer/compare/v8.97.1...v8.98.0) (2026-07-22)
+
+
+### Features
+
+* api-key spend caps schema, cap-scope child keys, and execution-… ([#1344](https://github.com/doublewordai/control-layer/issues/1344)) ([c44557f](https://github.com/doublewordai/control-layer/commit/c44557f9ce9aa8c979bb0f471ca011f28d70972a))
+
+## [8.97.1](https://github.com/doublewordai/control-layer/compare/v8.97.0...v8.97.1) (2026-07-22)
+
+
+### Bug Fixes
+
+* retry cache-index ops once on connection errors (batch-pod burst… ([#1341](https://github.com/doublewordai/control-layer/issues/1341)) ([8d36a94](https://github.com/doublewordai/control-layer/commit/8d36a9412db193026a11ad6ef7920868f85d9a6b))
+
+## [8.97.0](https://github.com/doublewordai/control-layer/compare/v8.96.0...v8.97.0) (2026-07-22)
+
+
+### Features
+
+* add service_tier label to gen_ai metrics and extend TTFT/TPOT buckets ([#1332](https://github.com/doublewordai/control-layer/issues/1332)) ([6c6d459](https://github.com/doublewordai/control-layer/commit/6c6d4598eac3dd89071646ce579b46d2e43376d3))
+* **docs:** link Onwards from mdBook sidebar ([#1340](https://github.com/doublewordai/control-layer/issues/1340)) ([8628fdd](https://github.com/doublewordai/control-layer/commit/8628fddb70f5db2027ef217bbd61daa323e1e544))
+
+
+### Bug Fixes
+
+* **ci:** parallelize dwctl tests ([#1323](https://github.com/doublewordai/control-layer/issues/1323)) ([5191586](https://github.com/doublewordai/control-layer/commit/5191586c16cc54fb8142239618dc927989fbd387))
+
+## [8.96.0](https://github.com/doublewordai/control-layer/compare/v8.95.1...v8.96.0) (2026-07-22)
+
+
+### Features
+
+* publish immutable preview artifacts ([#1324](https://github.com/doublewordai/control-layer/issues/1324)) ([f231ffb](https://github.com/doublewordai/control-layer/commit/f231ffbf5c1892333b4a3a37a2e3cd6137b28417))
+
+
+### Bug Fixes
+
+* combined batch results stream (inout and output) was missing the… ([#1335](https://github.com/doublewordai/control-layer/issues/1335)) ([52fd53b](https://github.com/doublewordai/control-layer/commit/52fd53b965c8fc02abf6a58bceb4c0177f9ba6fb))
+* preserve release component identity ([#1333](https://github.com/doublewordai/control-layer/issues/1333)) ([ef5583d](https://github.com/doublewordai/control-layer/commit/ef5583da1afc73455141438d64dbb1e3da7c706f))
+
 ## [8.95.1](https://github.com/doublewordai/control-layer/compare/v8.95.0...v8.95.1) (2026-07-22)
 
 

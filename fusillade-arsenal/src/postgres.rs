@@ -478,6 +478,19 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
                     }
                 }
 
+                // Always present regardless of the configured forwarding list:
+                // the submission-epoch metrics (fusillade_request_time_to_first_
+                // token_seconds / pickup_delay) and window labels read these
+                // from the metadata map, and an SLO metric must not be silently
+                // disabled by trimming header-forwarding config. Operator-
+                // configured entries above are left untouched.
+                batch_metadata
+                    .entry("created_at".to_string())
+                    .or_insert_with(|| row.batch_created_at.clone());
+                batch_metadata
+                    .entry("completion_window".to_string())
+                    .or_insert_with(|| row.batch_completion_window.clone());
+
                 Request {
                     state: Claimed {
                         daemon_id,
