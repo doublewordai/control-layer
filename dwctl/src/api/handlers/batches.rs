@@ -632,9 +632,11 @@ pub async fn create_batch<P: PoolProvider>(
     let target_user_id = current_user.active_organization.unwrap_or(current_user.id);
 
     // Explicit key selection (org dashboard flows): validate the chosen key
-    // before it drives execution and attribution below.
+    // before it drives execution and attribution below. Primary pool: the
+    // managed-mode requirement must see a just-flipped org mode — replica lag
+    // here would let a member bypass key selection.
     let caps = {
-        let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
+        let mut conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
         resolve_key_capabilities(&current_user, target_user_id, &mut conn)
             .await
             .map_err(Error::Database)?
@@ -5144,21 +5146,19 @@ mod tests {
 
     /// Shared setup: org with owner + member (both batch-capable), a
     /// gpt-4 deployment the org can use, and an org-owned uploaded file.
-    /// Returns (app, owner, member, org, file_id).
+    /// Returns (app, bg_services, owner, member, org, file_id) — callers must
+    /// keep the BackgroundServices guard bound for the test's duration.
     async fn setup_org_batch_env(
         pool: &PgPool,
     ) -> (
         axum_test::TestServer,
+        crate::BackgroundServices,
         crate::api::models::users::UserResponse,
         crate::api::models::users::UserResponse,
         crate::api::models::users::UserResponse,
         String,
     ) {
         let (app, bg_services) = create_test_app(pool.clone(), false).await;
-        // Leak the background services guard: tests that share this helper
-        // only exercise request handlers, so keeping it alive for the test
-        // duration via leak is fine and keeps the return type simple.
-        std::mem::forget(bg_services);
 
         let owner = create_test_user_with_roles(pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
         let member = create_test_user_with_roles(pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
@@ -5193,7 +5193,7 @@ mod tests {
         let file: serde_json::Value = upload_resp.json();
         let file_id = file["id"].as_str().unwrap().to_string();
 
-        (app, owner, member, org, file_id)
+        (app, bg_services, owner, member, org, file_id)
     }
 
     fn batch_req(file_id: &str, api_key_id: Option<crate::types::ApiKeyId>) -> CreateBatchRequest {
@@ -5209,7 +5209,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_create_batch_with_selected_api_key(pool: PgPool) {
-        let (app, owner, member, org, file_id) = setup_org_batch_env(&pool).await;
+        let (app, _bg_services, owner, member, org, file_id) = setup_org_batch_env(&pool).await;
         let owner_auth = add_auth_headers(&owner);
         let org_cookie = format!("dw_active_org={}", org.id);
 
@@ -5287,7 +5287,7 @@ mod tests {
     #[sqlx::test]
     #[test_log::test]
     async fn test_managed_mode_batch_requires_key_selection(pool: PgPool) {
-        let (app, owner, member, org, file_id) = setup_org_batch_env(&pool).await;
+        let (app, _bg_services, owner, member, org, file_id) = setup_org_batch_env(&pool).await;
         sqlx::query("UPDATE users SET org_key_management_mode = 'managed' WHERE id = $1")
             .bind(org.id)
             .execute(&pool)

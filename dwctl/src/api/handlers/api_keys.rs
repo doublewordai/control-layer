@@ -286,8 +286,10 @@ pub async fn list_user_api_keys<P: PoolProvider>(
     // PlatformManagers (ReadAll) see all keys for a user; everyone else is scoped to created_by.
     // Governance context (org mode + caller's role) for the manager bypass
     // and managed-mode gating below.
+    // Primary pool: governance decisions must see a just-flipped org mode or a
+    // just-changed member role — replica lag here would mis-authorize.
     let caps = {
-        let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
+        let mut conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
         resolve_key_capabilities(&current_user, target_user_id, &mut conn)
             .await
             .map_err(Error::Database)?
@@ -392,8 +394,10 @@ pub async fn get_user_api_key<P: PoolProvider>(
 
     // Governance context (org mode + caller's role) for the manager bypass
     // and managed-mode gating below.
+    // Primary pool: governance decisions must see a just-flipped org mode or a
+    // just-changed member role — replica lag here would mis-authorize.
     let caps = {
-        let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
+        let mut conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
         resolve_key_capabilities(&current_user, target_user_id, &mut conn)
             .await
             .map_err(Error::Database)?
@@ -489,8 +493,10 @@ pub async fn update_user_api_key<P: PoolProvider>(
 
     // Governance context (org mode + caller's role) for the manager bypass
     // and managed-mode gating below.
+    // Primary pool: governance decisions must see a just-flipped org mode or a
+    // just-changed member role — replica lag here would mis-authorize.
     let caps = {
-        let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
+        let mut conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
         resolve_key_capabilities(&current_user, target_user_id, &mut conn)
             .await
             .map_err(Error::Database)?
@@ -675,15 +681,16 @@ pub async fn get_user_api_key_secret<P: PoolProvider>(
         }
     }
 
-    let caps = {
-        let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
-        resolve_key_capabilities(&current_user, target_user_id, &mut conn)
-            .await
-            .map_err(Error::Database)?
-    };
+    // One primary connection for both the governance check and the key row:
+    // the check must see a just-flipped org mode, and the secret must reflect
+    // a just-completed rotation or issuance — replica lag would serve stale
+    // values (or a 404) for either.
+    let mut pool_conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
+    let caps = resolve_key_capabilities(&current_user, target_user_id, &mut pool_conn)
+        .await
+        .map_err(Error::Database)?;
     let skip_created_by_filter = can_read_all || caps.is_org_manager;
 
-    let mut pool_conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
     let mut repo = ApiKeys::new(&mut pool_conn);
     let api_key = repo
         .get_by_id(api_key_id)
@@ -770,8 +777,10 @@ pub async fn rotate_user_api_key<P: PoolProvider>(
         }
     }
 
+    // Primary pool: governance decisions must see a just-flipped org mode or a
+    // just-changed member role — replica lag here would mis-authorize.
     let caps = {
-        let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
+        let mut conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
         resolve_key_capabilities(&current_user, target_user_id, &mut conn)
             .await
             .map_err(Error::Database)?
@@ -873,8 +882,10 @@ pub async fn delete_user_api_key<P: PoolProvider>(
 
     // Governance context (org mode + caller's role) for the manager bypass
     // and managed-mode gating below.
+    // Primary pool: governance decisions must see a just-flipped org mode or a
+    // just-changed member role — replica lag here would mis-authorize.
     let caps = {
-        let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
+        let mut conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
         resolve_key_capabilities(&current_user, target_user_id, &mut conn)
             .await
             .map_err(Error::Database)?
