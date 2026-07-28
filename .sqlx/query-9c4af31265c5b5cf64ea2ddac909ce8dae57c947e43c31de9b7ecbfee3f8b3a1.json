@@ -155,7 +155,8 @@
                       "STANDARDUSER",
                       "BILLINGMANAGER",
                       "BATCHAPIUSER",
-                      "CONNECTIONSUSER"
+                      "CONNECTIONSUSER",
+                      "BACKGROUNDINFERENCEUSER"
                     ]
                   }
                 }

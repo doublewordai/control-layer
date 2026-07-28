@@ -13,7 +13,7 @@ pub mod transform;
 mod utils;
 
 pub use fusillade_core::manager::{
-    ArchiveOutcome, DaemonStorage, ModelFilter, ModelFilterState, Storage,
+    ArchiveOutcome, BackgroundClaimKind, DaemonStorage, ModelFilter, ModelFilterState, Storage,
 };
 pub use fusillade_core::request::AnyRequest;
 pub use fusillade_core::response_step;
@@ -66,6 +66,13 @@ pub struct PostgresStorageConfig {
     pub urgency_weight: f64,
     #[serde(default)]
     pub batch_claim_require_live: bool,
+    /// Database-wide per-model foreground in-flight threshold below which
+    /// explicitly requested background backlog is claimable and exposed by
+    /// pending-count queries. Active background work does not consume this
+    /// threshold. Zero hides background demand and disables processing at the
+    /// daemon layer.
+    #[serde(default)]
+    pub background_concurrency_limit: usize,
     #[serde(default = "default_leaks_per_window")]
     pub leaks_per_window: f64,
     #[serde(default = "default_model_filters_keep_per_model")]
@@ -130,6 +137,7 @@ impl Default for PostgresStorageConfig {
             claim_ramp_exponent: default_claim_ramp_exponent(),
             urgency_weight: 0.0,
             batch_claim_require_live: false,
+            background_concurrency_limit: 0,
             leaks_per_window: default_leaks_per_window(),
             model_filters_keep_per_model: default_model_filters_keep_per_model(),
             model_filters_retention_ms: default_model_filters_retention_ms(),
@@ -218,7 +226,85 @@ pub fn migrator() -> &'static sqlx::migrate::Migrator {
 
 #[cfg(test)]
 mod tests {
+    use std::borrow::Cow;
+
     use super::*;
+
+    #[sqlx::test(migrations = false)]
+    async fn background_schema_migration_is_atomic(pool: sqlx::PgPool) {
+        let baseline = sqlx::migrate::Migrator {
+            migrations: Cow::Owned(
+                MIGRATOR
+                    .iter()
+                    .filter(|migration| migration.version < 20260722000000)
+                    .cloned()
+                    .collect(),
+            ),
+            ignore_missing: false,
+            locking: true,
+            no_tx: false,
+        };
+        baseline.run(&pool).await.unwrap();
+
+        // Relation names and index names share a PostgreSQL namespace. Force
+        // the migration's final index statement to fail after every preceding
+        // background schema statement has executed.
+        sqlx::query("CREATE TABLE idx_requests_active_sla_counts (id INTEGER)")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        MIGRATOR
+            .run(&pool)
+            .await
+            .expect_err("the conflicting relation must reject the background migration");
+
+        let service_tier_column_exists = sqlx::query_scalar::<_, bool>(
+            r#"
+            SELECT EXISTS (
+                SELECT 1
+                FROM information_schema.columns
+                WHERE table_schema = current_schema()
+                  AND table_name = 'batches'
+                  AND column_name = 'service_tier'
+            )
+            "#,
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(
+            !service_tier_column_exists,
+            "a late DDL failure must roll back the earlier background schema changes"
+        );
+
+        for index_name in [
+            "idx_requests_pending_background_batchless",
+            "idx_requests_pending_background_batched",
+            "idx_requests_pending_batchless_sla",
+        ] {
+            let index_exists = sqlx::query_scalar::<_, bool>("SELECT to_regclass($1) IS NOT NULL")
+                .bind(index_name)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert!(
+                !index_exists,
+                "a late DDL failure must roll back {index_name}"
+            );
+        }
+
+        let migration_applied = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT 1 FROM _sqlx_migrations WHERE version = 20260722000000)",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(
+            !migration_applied,
+            "an atomic failure must not record the migration as applied"
+        );
+    }
 
     #[test]
     fn state_write_concurrency_defaults_when_missing() {

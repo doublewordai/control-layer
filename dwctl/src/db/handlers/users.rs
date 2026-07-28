@@ -113,7 +113,7 @@ struct User {
     pub verified: bool,
     pub zero_data_retention: bool,
     /// Org key governance mode ('open'|'managed'); always 'open' for
-    /// individual accounts. See migration 124.
+    /// individual accounts. See migration 125.
     pub org_key_management_mode: String,
 }
 
