@@ -19,7 +19,7 @@ ALTER TABLE batch_requests_archive
     NOT VALID;
 
 ALTER TABLE batches
-    ADD COLUMN service_tier TEXT;
+    ADD COLUMN IF NOT EXISTS service_tier TEXT;
 
 ALTER TABLE batches
     ALTER COLUMN completion_window DROP NOT NULL,
@@ -41,13 +41,13 @@ ALTER TABLE batches
         END
     ) NOT VALID;
 
-CREATE INDEX idx_batches_background_active
+CREATE INDEX IF NOT EXISTS idx_batches_background_active
 ON batches (created_at, id)
 WHERE service_tier = 'background'
   AND deleted_at IS NULL;
 
 -- Background batchless requests have no batch parent and are claimed by model.
-CREATE INDEX idx_requests_pending_background_batchless
+CREATE INDEX IF NOT EXISTS idx_requests_pending_background_batchless
 ON requests (model, created_at, id)
 WHERE state = 'pending'
   AND batch_id IS NULL
@@ -56,7 +56,7 @@ WHERE state = 'pending'
 
 -- File-backed background requests retain their batch parent, so keep this hot
 -- claim path separate from the batchless source.
-CREATE INDEX idx_requests_pending_background_batched
+CREATE INDEX IF NOT EXISTS idx_requests_pending_background_batched
 ON requests (model, batch_id, created_at, id)
 WHERE state = 'pending'
   AND batch_id IS NOT NULL
@@ -65,7 +65,7 @@ WHERE state = 'pending'
 
 -- Keep the existing SLA batchless claim from scanning a large background
 -- backlog once background submission is enabled.
-CREATE INDEX idx_requests_pending_batchless_sla
+CREATE INDEX IF NOT EXISTS idx_requests_pending_batchless_sla
 ON requests (model, created_at, id)
 WHERE state = 'pending'
   AND batch_id IS NULL
@@ -74,7 +74,7 @@ WHERE state = 'pending'
 
 -- Background capacity is derived from active SLA work, excluding priority and
 -- background rows from that count.
-CREATE INDEX idx_requests_active_sla_counts
+CREATE INDEX IF NOT EXISTS idx_requests_active_sla_counts
 ON requests (batch_id, model)
 WHERE state IN ('pending', 'claimed', 'processing')
   AND template_id IS NOT NULL
