@@ -181,6 +181,12 @@ async fn setup_sentinel_fixture(pool: &PgPool) -> SentinelFixture {
 
 /// Send the sentinel-bearing realtime request, polling until onwards has the
 /// model (sync is asynchronous). Returns once a 200 is observed.
+///
+/// Onwards config sync is applied asynchronously through a watch channel, and
+/// every admin write in the fixture also triggers an automatic LISTEN/NOTIFY
+/// reload. Those reloads race, so before the config settles onwards can hold the
+/// model pool without the key grant yet - which answers 403, not 404. Both
+/// statuses are therefore treated as "not converged yet" and polled through.
 async fn send_sentinel_request(fixture: &SentinelFixture) {
     let body = serde_json::json!({
         "model": MODEL_ALIAS,
@@ -193,16 +199,16 @@ async fn send_sentinel_request(fixture: &SentinelFixture) {
             .add_header("authorization", format!("Bearer {}", fixture.realtime_key))
             .json(&body)
             .await;
-        if resp.status_code().as_u16() != 404 {
-            assert_eq!(
-                resp.status_code().as_u16(),
-                200,
-                "realtime request should succeed; body: {}",
-                resp.text()
-            );
+        let status = resp.status_code().as_u16();
+        if status == 200 {
             return;
         }
-        assert!(attempt < 99, "model never became routable after polling");
+        assert!(
+            matches!(status, 403 | 404),
+            "realtime request should succeed; got {status}, body: {}",
+            resp.text()
+        );
+        assert!(attempt < 99, "model never became routable after polling, last status: {status}");
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
 }
