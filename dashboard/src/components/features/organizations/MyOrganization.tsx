@@ -1,116 +1,9 @@
-import { useOrganization, useUpdateOrganization } from "@/api/control-layer/hooks";
-import type { KeyManagementMode } from "@/api/control-layer/types";
+import { useOrganization } from "@/api/control-layer/hooks";
 import { useOrganizationContext } from "@/contexts";
 import { MemberManagement } from "./MemberManagement";
 import { NotificationSettings } from "../notifications/NotificationSettings";
 import { Badge } from "@/components/ui/badge";
-import { Label } from "@/components/ui/label";
-import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
 import { Building, ShieldCheck } from "lucide-react";
-import { toast } from "sonner";
-
-const KEY_MANAGEMENT_OPTIONS: {
-  value: KeyManagementMode;
-  label: string;
-  description: string;
-}[] = [
-  {
-    value: "open",
-    label: "Self-serve (open)",
-    description: "Members create and manage their own API keys.",
-  },
-  {
-    value: "managed",
-    label: "Admin-managed",
-    description:
-      "Only owners and admins create keys and issue them to members; members can view and copy their issued keys but not change them.",
-  },
-];
-
-interface KeyManagementSettingsProps {
-  organizationId: string;
-  mode: KeyManagementMode;
-  readOnly: boolean;
-}
-
-function KeyManagementSettings({
-  organizationId,
-  mode,
-  readOnly,
-}: KeyManagementSettingsProps) {
-  const updateOrgMutation = useUpdateOrganization();
-
-  const handleModeChange = async (value: string) => {
-    const newMode = value as KeyManagementMode;
-    if (newMode === mode) return;
-    try {
-      await updateOrgMutation.mutateAsync({
-        id: organizationId,
-        data: { key_management_mode: newMode },
-      });
-      toast.success("API key management setting updated");
-    } catch (error) {
-      toast.error(
-        error instanceof Error
-          ? error.message
-          : "Failed to update API key management setting",
-      );
-    }
-  };
-
-  return (
-    <div className="bg-white rounded-lg shadow-sm border border-gray-200 p-6">
-      <h4 className="text-lg font-medium text-gray-900 mb-1">
-        API key management
-      </h4>
-      <p className="text-xs text-gray-500 mb-4">
-        {readOnly
-          ? "Controls who can create and manage the organization's API keys. Contact an owner or admin to make changes."
-          : "Controls who can create and manage the organization's API keys."}
-      </p>
-      <RadioGroup
-        value={mode}
-        onValueChange={handleModeChange}
-        disabled={readOnly || updateOrgMutation.isPending}
-        aria-label="API key management mode"
-      >
-        {KEY_MANAGEMENT_OPTIONS.map((option) => (
-          <div
-            key={option.value}
-            className={`flex items-start gap-3 rounded-lg border p-3 ${
-              mode === option.value
-                ? "border-doubleword-accent-blue bg-blue-50/50"
-                : "border-gray-200"
-            }`}
-          >
-            <RadioGroupItem
-              value={option.value}
-              id={`key-management-${option.value}`}
-              className="mt-0.5"
-            />
-            <div>
-              <Label
-                htmlFor={`key-management-${option.value}`}
-                className={`text-sm font-medium text-gray-900 ${
-                  readOnly ? "" : "cursor-pointer"
-                }`}
-              >
-                {option.label}
-              </Label>
-              <p className="text-xs text-gray-500 mt-0.5">
-                {option.description}
-              </p>
-            </div>
-          </div>
-        ))}
-      </RadioGroup>
-      <p className="text-xs text-gray-500 mt-3">
-        Changing this setting does not affect existing keys — only who can
-        create and edit keys from now on.
-      </p>
-    </div>
-  );
-}
 
 export function MyOrganization() {
   const { activeOrganizationId, activeOrganization } =
@@ -177,12 +70,6 @@ export function MyOrganization() {
 
       <MemberManagement
         organizationId={activeOrganizationId}
-        readOnly={!canManage}
-      />
-
-      <KeyManagementSettings
-        organizationId={activeOrganizationId}
-        mode={org?.key_management_mode ?? "open"}
         readOnly={!canManage}
       />
 

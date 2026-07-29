@@ -1,7 +1,7 @@
 "use client";
 
 import { type ColumnDef } from "@tanstack/react-table";
-import { ArrowUpDown, Trash2, Pencil, Eye, EyeOff, Copy, RefreshCw } from "lucide-react";
+import { ArrowUpDown, Trash2, Pencil, RefreshCw } from "lucide-react";
 import { Button } from "../../../ui/button";
 import { Checkbox } from "../../../ui/checkbox";
 import type { ApiKey } from "../../../../api/control-layer/types";
@@ -10,23 +10,23 @@ import { formatCredits, formatResetInstant, limitPeriodLabel } from "./spendCap"
 interface ColumnActions {
   onDelete: (apiKey: ApiKey) => void;
   onEdit: (apiKey: ApiKey) => void;
-  /** Whether the current user may manage this key (rename, edit caps, rotate,
+  /** Whether the current user may manage this key (rename, edit caps,
    *  delete). Mirrors what the server permits: PlatformManager, org
-   *  owner/admin in org context, or the key's creator — unless the org is in
-   *  managed key mode, where plain members hold their keys read-only. */
+   *  owner/admin in org context, or the key's creator when they hold
+   *  self-manage rights in the active context. */
   canManage: (apiKey: ApiKey) => boolean;
+  /** Whether the current user may rotate this key. Broader than canManage:
+   *  rotation is the secret-recovery path, so members without creation
+   *  rights can still rotate keys they hold. */
+  canRotate: (apiKey: ApiKey) => boolean;
   isPlatformManager?: boolean;
   /** Org context only: show the holder of each key, resolved from the org
    *  members list via created_by. */
   showAssignee?: boolean;
   resolveAssignee?: (createdBy: string) => string;
-  /** Secrets revealed via explicit user action, keyed by key id. Never part
-   *  of the list payload — fetched on demand from the secret endpoint. */
-  revealedSecrets?: Record<string, string>;
-  onRevealSecret: (apiKey: ApiKey) => void;
-  onCopySecret: (apiKey: ApiKey) => void;
   onRotate: (apiKey: ApiKey) => void;
-  /** Hide the bulk-select column (e.g. managed-mode members can't delete). */
+  /** Hide the bulk-select column (e.g. members without key-creation rights
+   *  can't delete). */
   showSelect?: boolean;
 }
 
@@ -108,47 +108,6 @@ export const createColumns = (actions: ColumnActions): ColumnDef<ApiKey>[] => {
               ? actions.resolveAssignee(apiKey.created_by)
               : apiKey.created_by}
           </span>
-        );
-      },
-    },
-    {
-      id: "secret",
-      header: "Secret",
-      cell: ({ row }) => {
-        const apiKey = row.original;
-        const revealed = actions.revealedSecrets?.[apiKey.id];
-        return (
-          <div className="flex items-center gap-1">
-            <code className="text-xs font-mono text-doubleword-neutral-600 max-w-48 overflow-x-auto whitespace-nowrap">
-              {revealed ?? "sk-••••••••"}
-            </code>
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={() => actions.onRevealSecret(apiKey)}
-              aria-label={
-                revealed
-                  ? `Hide secret for ${apiKey.name}`
-                  : `Reveal secret for ${apiKey.name}`
-              }
-              className="text-doubleword-neutral-600 hover:text-doubleword-neutral-900"
-            >
-              {revealed ? (
-                <EyeOff className="h-4 w-4" />
-              ) : (
-                <Eye className="h-4 w-4" />
-              )}
-            </Button>
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={() => actions.onCopySecret(apiKey)}
-              aria-label={`Copy secret for ${apiKey.name}`}
-              className="text-doubleword-neutral-600 hover:text-doubleword-neutral-900"
-            >
-              <Copy className="h-4 w-4" />
-            </Button>
-          </div>
         );
       },
     },
@@ -264,42 +223,49 @@ export const createColumns = (actions: ColumnActions): ColumnDef<ApiKey>[] => {
       header: "Actions",
       cell: ({ row }) => {
         const apiKey = row.original;
+        const canManage = actions.canManage(apiKey);
+        const canRotate = actions.canRotate(apiKey);
 
-        if (!actions.canManage(apiKey)) {
-          // View-only rows (e.g. managed-mode org members): secret
-          // reveal/copy lives on the Secret column; no mutating actions.
+        if (!canManage && !canRotate) {
+          // View-only rows: no mutating actions.
           return null;
         }
 
         return (
           <div className="flex items-center">
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={() => actions.onEdit(apiKey)}
-              aria-label={`Edit usage limit for ${apiKey.name}`}
-              className="text-doubleword-neutral-600 hover:text-doubleword-neutral-900"
-            >
-              <Pencil className="h-4 w-4" />
-            </Button>
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={() => actions.onRotate(apiKey)}
-              aria-label={`Rotate ${apiKey.name}`}
-              className="text-doubleword-neutral-600 hover:text-doubleword-neutral-900"
-            >
-              <RefreshCw className="h-4 w-4" />
-            </Button>
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={() => actions.onDelete(apiKey)}
-              aria-label={`Delete ${apiKey.name}`}
-              className="text-red-600 hover:text-red-700 hover:bg-red-50"
-            >
-              <Trash2 className="h-4 w-4" />
-            </Button>
+            {canManage && (
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => actions.onEdit(apiKey)}
+                aria-label={`Edit usage limit for ${apiKey.name}`}
+                className="text-doubleword-neutral-600 hover:text-doubleword-neutral-900"
+              >
+                <Pencil className="h-4 w-4" />
+              </Button>
+            )}
+            {canRotate && (
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => actions.onRotate(apiKey)}
+                aria-label={`Rotate ${apiKey.name}`}
+                className="text-doubleword-neutral-600 hover:text-doubleword-neutral-900"
+              >
+                <RefreshCw className="h-4 w-4" />
+              </Button>
+            )}
+            {canManage && (
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => actions.onDelete(apiKey)}
+                aria-label={`Delete ${apiKey.name}`}
+                className="text-red-600 hover:text-red-700 hover:bg-red-50"
+              >
+                <Trash2 className="h-4 w-4" />
+              </Button>
+            )}
           </div>
         );
       },

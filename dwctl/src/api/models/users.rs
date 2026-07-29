@@ -148,12 +148,6 @@ pub struct UserResponse {
     pub user_type: String,
     /// Account-wide zero-data-retention flag.
     pub zero_data_retention: bool,
-    /// Org key governance mode ('open' | 'managed'). Present only for
-    /// organizations: 'open' = members create and manage their own keys;
-    /// 'managed' = only org owners/admins issue keys, members hold them
-    /// read-only.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub key_management_mode: Option<String>,
     /// Organizations this user belongs to (only included if `include=organizations` is specified)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub organizations: Option<Vec<super::organizations::OrganizationSummary>>,
@@ -224,6 +218,9 @@ pub struct UserOrganizationContext {
     pub id: UserId,
     pub name: String,
     pub role: String,
+    /// Effective key-creation capability in this org: owners/admins always
+    /// true; members true only with the additive 'manage_keys' org role.
+    pub can_manage_keys: bool,
 }
 
 impl CurrentUser {
@@ -257,7 +254,6 @@ impl From<UserDBResponse> for UserResponse {
             auto_topup_threshold: db.auto_topup_threshold,
             has_auto_topup_payment_method: db.payment_provider_id.as_ref().is_some_and(|s| !s.is_empty()),
             auto_topup_monthly_limit: db.auto_topup_monthly_limit,
-            key_management_mode: (db.user_type == "organization").then_some(db.org_key_management_mode),
             user_type: db.user_type,
             zero_data_retention: db.zero_data_retention,
             organizations: None,

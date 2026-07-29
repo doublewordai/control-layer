@@ -14,7 +14,6 @@ vi.mock("../../../api/control-layer/hooks", () => ({
   useFiles: vi.fn(),
   useFileCostEstimate: vi.fn(),
   useApiKeys: vi.fn(),
-  useOrganization: vi.fn(),
   useUser: vi.fn(),
   useConfig: vi.fn(() => ({
     data: {
@@ -86,13 +85,14 @@ const personalContext = {
   setActiveOrganization: vi.fn(),
 };
 
-const orgContext = (role: string) => ({
+const orgContext = (role: string, canManageKeys = true) => ({
   activeOrganizationId: "org-1",
   activeOrganization: {
     id: "org-1",
     name: "Test Org",
     role,
     zero_data_retention: false,
+    can_manage_keys: canManageKeys,
   },
   isOrgContext: true,
   setActiveOrganization: vi.fn(),
@@ -211,14 +211,6 @@ describe("CreateBatchModal", () => {
     // Default mock for useUser (current user)
     vi.mocked(hooks.useUser).mockReturnValue({
       data: { id: CURRENT_USER_ID },
-      isLoading: false,
-      error: null,
-      refetch: vi.fn(),
-    } as any);
-
-    // Default mock for useOrganization (no active org)
-    vi.mocked(hooks.useOrganization).mockReturnValue({
-      data: undefined,
       isLoading: false,
       error: null,
       refetch: vi.fn(),
@@ -604,12 +596,6 @@ describe("CreateBatchModal", () => {
       vi.mocked(contexts.useOrganizationContext).mockReturnValue(
         orgContext("member"),
       );
-      vi.mocked(hooks.useOrganization).mockReturnValue({
-        data: { id: "org-1", key_management_mode: "open" },
-        isLoading: false,
-        error: null,
-        refetch: vi.fn(),
-      } as any);
 
       render(
         <CreateBatchModal
@@ -656,12 +642,6 @@ describe("CreateBatchModal", () => {
       vi.mocked(contexts.useOrganizationContext).mockReturnValue(
         orgContext("admin"),
       );
-      vi.mocked(hooks.useOrganization).mockReturnValue({
-        data: { id: "org-1", key_management_mode: "open" },
-        isLoading: false,
-        error: null,
-        refetch: vi.fn(),
-      } as any);
 
       render(
         <CreateBatchModal
@@ -681,18 +661,12 @@ describe("CreateBatchModal", () => {
       ).toBeInTheDocument();
     });
 
-    it("should require a key selection for managed-mode plain members", async () => {
+    it("should require a key selection for members without key management", async () => {
       const user = userEvent.setup();
       const mutateAsync = mockCreateBatch();
       vi.mocked(contexts.useOrganizationContext).mockReturnValue(
-        orgContext("member"),
+        orgContext("member", false),
       );
-      vi.mocked(hooks.useOrganization).mockReturnValue({
-        data: { id: "org-1", key_management_mode: "managed" },
-        isLoading: false,
-        error: null,
-        refetch: vi.fn(),
-      } as any);
 
       render(
         <CreateBatchModal
@@ -747,12 +721,6 @@ describe("CreateBatchModal", () => {
       vi.mocked(contexts.useOrganizationContext).mockReturnValue(
         orgContext("member"),
       );
-      vi.mocked(hooks.useOrganization).mockReturnValue({
-        data: { id: "org-1", key_management_mode: "open" },
-        isLoading: false,
-        error: null,
-        refetch: vi.fn(),
-      } as any);
 
       render(
         <CreateBatchModal
@@ -787,12 +755,6 @@ describe("CreateBatchModal", () => {
       vi.mocked(contexts.useOrganizationContext).mockReturnValue(
         orgContext("member"),
       );
-      vi.mocked(hooks.useOrganization).mockReturnValue({
-        data: { id: "org-1", key_management_mode: "open" },
-        isLoading: false,
-        error: null,
-        refetch: vi.fn(),
-      } as any);
 
       render(
         <CreateBatchModal

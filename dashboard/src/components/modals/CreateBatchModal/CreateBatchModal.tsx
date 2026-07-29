@@ -34,7 +34,6 @@ import {
   useConfig,
   useFileCostEstimate,
   useApiKeys,
-  useOrganization,
   useUser,
 } from "../../../api/control-layer/hooks";
 import { useOrganizationContext } from "../../../contexts";
@@ -106,7 +105,6 @@ export function CreateBatchModal({
   const { activeOrganizationId, isOrgContext, activeOrganization } =
     useOrganizationContext();
   const { data: currentUser } = useUser("current");
-  const { data: activeOrg } = useOrganization(activeOrganizationId ?? "");
   const { data: apiKeysResponse } = useApiKeys(
     activeOrganizationId ?? "current",
     { limit: 100 },
@@ -124,11 +122,11 @@ export function CreateBatchModal({
       (isOrgManager || key.created_by === currentUser?.id),
   );
 
-  // Managed-mode orgs require plain members to pick one of their issued keys.
+  // Members without the key-management capability must bill one of their
+  // issued keys (owners/admins always have the capability, so this never
+  // applies to them).
   const apiKeyRequired =
-    isOrgContext &&
-    activeOrg?.key_management_mode === "managed" &&
-    !isOrgManager;
+    isOrgContext && activeOrganization?.can_manage_keys === false;
 
   // Fetch available files for combobox (only input files with purpose "batch")
   // Only fetch when modal is open to avoid unnecessary queries on page load

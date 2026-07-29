@@ -1699,16 +1699,15 @@ export interface OrganizationSummary {
   name: string;
   role: string;
   zero_data_retention: boolean; // Whether the organization has zero data retention enabled
+  // Effective key-creation capability in this org: owners/admins always true;
+  // members true only with the additive 'manage_keys' org role. Drives the
+  // API-keys create/edit affordances and the batch key selection requirement.
+  can_manage_keys: boolean;
 }
-
-/** Org key governance mode: 'open' = members self-manage their keys;
- * 'managed' = only org owners/admins issue keys, members hold them read-only. */
-export type KeyManagementMode = "open" | "managed";
 
 /** Organization response — flattened User with org-specific fields */
 export interface Organization extends User {
   member_count?: number;
-  key_management_mode?: KeyManagementMode;
 }
 
 export interface OrganizationMember {
@@ -1718,6 +1717,8 @@ export interface OrganizationMember {
   status: "active" | "pending";
   created_at: string;
   invite_email?: string;
+  // Effective key-creation capability (owners/admins implicitly true).
+  can_manage_keys: boolean;
 }
 
 export interface OrganizationCreateRequest {
@@ -1733,12 +1734,13 @@ export interface OrganizationUpdateRequest {
   batch_notifications_enabled?: boolean;
   low_balance_threshold?: number | null;
   zero_data_retention?: boolean; // Account-wide zero-data-retention flag (admin-only)
-  key_management_mode?: KeyManagementMode; // Org owner/admin only
 }
 
 export interface InviteMemberRequest {
   email: string;
   role?: OrgMemberRole;
+  // For role 'member': may they create their own API keys? Defaults to true.
+  can_manage_keys?: boolean;
 }
 
 export interface InviteMemberResponse {
@@ -1759,6 +1761,9 @@ export interface InviteDetailsResponse {
 
 export interface UpdateMemberRoleRequest {
   role: OrgMemberRole;
+  // Grant/revoke the 'manage_keys' org role. Absent = unchanged; only
+  // meaningful for role 'member' (owners/admins are implicitly true).
+  can_manage_keys?: boolean;
 }
 
 export interface OrganizationsQuery {

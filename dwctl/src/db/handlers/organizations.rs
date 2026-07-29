@@ -113,7 +113,7 @@ impl<'c> Organizations<'c> {
                    is_admin, password_hash, external_user_id, payment_provider_id,
                    is_deleted, is_internal, batch_notifications_enabled, first_batch_email_sent,
                    low_balance_notification_sent, low_balance_threshold,
-                   auto_topup_amount, auto_topup_threshold, auto_topup_monthly_limit, user_type, zero_data_retention, org_key_management_mode
+                   auto_topup_amount, auto_topup_threshold, auto_topup_monthly_limit, user_type, zero_data_retention
             FROM users
             WHERE username = $1 AND user_type = 'organization' AND is_deleted = false
             "#,
@@ -152,7 +152,6 @@ impl<'c> Organizations<'c> {
                     auto_topup_monthly_limit: r.auto_topup_monthly_limit,
                     user_type: r.user_type,
                     zero_data_retention: r.zero_data_retention,
-                    org_key_management_mode: r.org_key_management_mode,
                 }))
             }
             None => Ok(None),
@@ -178,7 +177,7 @@ impl<'c> Organizations<'c> {
                       is_admin, password_hash, external_user_id, payment_provider_id,
                       is_deleted, is_internal, batch_notifications_enabled, first_batch_email_sent,
                       low_balance_notification_sent, low_balance_threshold,
-                      auto_topup_amount, auto_topup_threshold, auto_topup_monthly_limit, user_type, zero_data_retention, org_key_management_mode
+                      auto_topup_amount, auto_topup_threshold, auto_topup_monthly_limit, user_type, zero_data_retention
             "#,
             org_id,
             request.name,
@@ -237,7 +236,6 @@ impl<'c> Organizations<'c> {
             auto_topup_monthly_limit: row.auto_topup_monthly_limit,
             user_type: row.user_type,
             zero_data_retention: row.zero_data_retention,
-            org_key_management_mode: row.org_key_management_mode,
         })
     }
 
@@ -275,14 +273,13 @@ impl<'c> Organizations<'c> {
                     ELSE low_balance_notification_sent
                 END,
                 zero_data_retention = COALESCE($8, zero_data_retention),
-                org_key_management_mode = COALESCE($9, org_key_management_mode),
                 updated_at = NOW()
             WHERE id = $1 AND user_type = 'organization' AND is_deleted = false
             RETURNING id, username, email, display_name, avatar_url, auth_source, created_at, updated_at,
                       is_admin, password_hash, external_user_id, payment_provider_id,
                       batch_notifications_enabled, first_batch_email_sent,
                       low_balance_notification_sent, low_balance_threshold,
-                      auto_topup_amount, auto_topup_threshold, auto_topup_monthly_limit, user_type, zero_data_retention, org_key_management_mode
+                      auto_topup_amount, auto_topup_threshold, auto_topup_monthly_limit, user_type, zero_data_retention
             "#,
             id,
             request.display_name,
@@ -292,7 +289,6 @@ impl<'c> Organizations<'c> {
             request.low_balance_threshold.is_some() as bool,
             request.low_balance_threshold.flatten(),
             request.zero_data_retention,
-            request.key_management_mode.as_deref(),
         )
         .fetch_optional(&mut *self.db)
         .await?
@@ -326,7 +322,6 @@ impl<'c> Organizations<'c> {
             auto_topup_monthly_limit: row.auto_topup_monthly_limit,
             user_type: row.user_type,
             zero_data_retention: row.zero_data_retention,
-            org_key_management_mode: row.org_key_management_mode,
         })
     }
 
@@ -377,6 +372,77 @@ impl<'c> Organizations<'c> {
         .await?;
 
         Ok(row.into())
+    }
+
+    /// Grant or revoke the additive 'manage_keys' org role on a membership
+    /// row (organization_member_roles). Only meaningful for base role
+    /// 'member' — owners/admins hold the capability implicitly.
+    #[instrument(skip(self), fields(membership_id = %abbrev_uuid(&membership_id)), err)]
+    pub async fn set_membership_manage_keys(&mut self, membership_id: Uuid, granted: bool) -> Result<()> {
+        if granted {
+            sqlx::query!(
+                "INSERT INTO organization_member_roles (user_organization_id, role) VALUES ($1, 'manage_keys') ON CONFLICT DO NOTHING",
+                membership_id
+            )
+            .execute(&mut *self.db)
+            .await?;
+        } else {
+            sqlx::query!(
+                "DELETE FROM organization_member_roles WHERE user_organization_id = $1 AND role = 'manage_keys'",
+                membership_id
+            )
+            .execute(&mut *self.db)
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// Does this membership row carry the 'manage_keys' org role?
+    #[instrument(skip(self), fields(membership_id = %abbrev_uuid(&membership_id)), err)]
+    pub async fn membership_has_manage_keys(&mut self, membership_id: Uuid) -> Result<bool> {
+        let exists = sqlx::query_scalar!(
+            r#"SELECT EXISTS(SELECT 1 FROM organization_member_roles WHERE user_organization_id = $1 AND role = 'manage_keys') AS "exists!""#,
+            membership_id
+        )
+        .fetch_one(&mut *self.db)
+        .await?;
+        Ok(exists)
+    }
+
+    /// Membership row ids in this org that carry the 'manage_keys' role
+    /// (one query for member-list rendering).
+    #[instrument(skip(self), fields(org_id = %abbrev_uuid(&org_id)), err)]
+    pub async fn list_manage_keys_membership_ids(&mut self, org_id: UserId) -> Result<std::collections::HashSet<Uuid>> {
+        let ids = sqlx::query_scalar!(
+            r#"
+            SELECT omr.user_organization_id
+            FROM organization_member_roles omr
+            JOIN user_organizations uo ON uo.id = omr.user_organization_id
+            WHERE uo.organization_id = $1 AND omr.role = 'manage_keys'
+            "#,
+            org_id
+        )
+        .fetch_all(&mut *self.db)
+        .await?;
+        Ok(ids.into_iter().collect())
+    }
+
+    /// Org ids where this user's membership carries the 'manage_keys' role
+    /// (one query for the session's org-context capabilities).
+    #[instrument(skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
+    pub async fn user_manage_keys_org_ids(&mut self, user_id: UserId) -> Result<std::collections::HashSet<UserId>> {
+        let ids = sqlx::query_scalar!(
+            r#"
+            SELECT uo.organization_id
+            FROM user_organizations uo
+            JOIN organization_member_roles omr ON omr.user_organization_id = uo.id
+            WHERE uo.user_id = $1 AND omr.role = 'manage_keys'
+            "#,
+            user_id
+        )
+        .fetch_all(&mut *self.db)
+        .await?;
+        Ok(ids.into_iter().collect())
     }
 
     /// Remove a member from an organization
@@ -1038,7 +1104,6 @@ mod tests {
                     batch_notifications_enabled: None,
                     low_balance_threshold: None,
                     zero_data_retention: None,
-                    key_management_mode: None,
                 },
             )
             .await
@@ -1082,7 +1147,6 @@ mod tests {
                     batch_notifications_enabled: None,
                     low_balance_threshold: None,
                     zero_data_retention: None,
-                    key_management_mode: None,
                 },
             )
             .await
@@ -1129,7 +1193,6 @@ mod tests {
                     batch_notifications_enabled: Some(true),
                     low_balance_threshold: Some(Some(10.0)),
                     zero_data_retention: None,
-                    key_management_mode: None,
                 },
             )
             .await
@@ -1150,7 +1213,6 @@ mod tests {
                     batch_notifications_enabled: None,
                     low_balance_threshold: Some(Some(25.0)),
                     zero_data_retention: None,
-                    key_management_mode: None,
                 },
             )
             .await
@@ -1172,7 +1234,6 @@ mod tests {
                     batch_notifications_enabled: None,
                     low_balance_threshold: Some(None),
                     zero_data_retention: None,
-                    key_management_mode: None,
                 },
             )
             .await
@@ -1192,7 +1253,6 @@ mod tests {
                     batch_notifications_enabled: None,
                     low_balance_threshold: None,
                     zero_data_retention: None,
-                    key_management_mode: None,
                 },
             )
             .await

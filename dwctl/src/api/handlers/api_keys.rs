@@ -631,105 +631,6 @@ pub async fn update_user_api_key<P: PoolProvider>(
     ))
 }
 
-/// Fetch an API key's secret. The one endpoint (besides create/rotate) that
-/// ever exposes a secret — deliberately separate from list/get so every
-/// exposure is an explicit, permission-checked, audited event. This is what
-/// lets an org manager issue a key in-platform and the member retrieve it
-/// themselves (secrets are otherwise shown only once, at creation).
-#[utoipa::path(
-    get,
-    path = "/users/{user_id}/api-keys/{id}/secret",
-    tag = "api_keys",
-    summary = "Fetch API key secret",
-    description = "Retrieve the secret for an API key you can see (its creator, an org owner/admin of the owning organization, or a platform admin). Every fetch is audited.",
-    params(
-        ("user_id" = String, Path, description = "User ID (UUID) or 'current' for current user"),
-        ("id" = uuid::Uuid, Path, description = "API key ID"),
-    ),
-    responses(
-        (status = 200, description = "The API key secret", body = ApiKeySecretResponse),
-        (status = 401, description = "Unauthorized"),
-        (status = 403, description = "Forbidden"),
-        (status = 404, description = "API key not found"),
-        (status = 500, description = "Internal server error"),
-    ),
-    security(
-        ("BearerAuth" = []),
-        ("CookieAuth" = []),
-        ("X-Doubleword-User" = [])
-    )
-)]
-#[tracing::instrument(skip_all)]
-pub async fn get_user_api_key_secret<P: PoolProvider>(
-    State(state): State<AppState<P>>,
-    Path((user_id, api_key_id)): Path<(UserIdOrCurrent, ApiKeyId)>,
-    current_user: CurrentUser,
-) -> Result<Json<ApiKeySecretResponse>> {
-    let target_user_id = match user_id {
-        UserIdOrCurrent::Current(_) => current_user.id,
-        UserIdOrCurrent::Id(uuid) => uuid,
-    };
-
-    // Same access shape as reads: ReadAll, ReadOwn, or org membership.
-    let can_read_all = can_read_all_resources(&current_user, Resource::ApiKeys);
-    let can_read_own = can_read_own_resource(&current_user, Resource::ApiKeys, target_user_id);
-    if !can_read_all && !can_read_own {
-        // Primary pool: this is an authorization decision — a just-removed
-        // member must not pass via a lagging replica.
-        let mut conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
-        let member = is_org_member(&current_user, target_user_id, &mut conn)
-            .await
-            .map_err(Error::Database)?;
-        if !member {
-            return Err(Error::InsufficientPermissions {
-                required: Permission::Any(vec![
-                    Permission::Allow(Resource::ApiKeys, Operation::ReadAll),
-                    Permission::Allow(Resource::ApiKeys, Operation::ReadOwn),
-                ]),
-                action: Operation::ReadOwn,
-                resource: format!("API keys for user {target_user_id}"),
-            });
-        }
-    }
-
-    // One primary connection for both the governance check and the key row:
-    // the check must see a just-flipped org mode, and the secret must reflect
-    // a just-completed rotation or issuance — replica lag would serve stale
-    // values (or a 404) for either.
-    let mut pool_conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
-    let caps = resolve_key_capabilities(&current_user, target_user_id, &mut pool_conn)
-        .await
-        .map_err(Error::Database)?;
-    let skip_created_by_filter = can_read_all || caps.is_org_manager;
-
-    let mut repo = ApiKeys::new(&mut pool_conn);
-    let api_key = repo
-        .get_by_id(api_key_id)
-        .await?
-        .filter(|key| key.user_id == target_user_id)
-        .filter(|key| skip_created_by_filter || key.created_by == current_user.id)
-        // System-managed keys' secrets are never user-fetchable.
-        .filter(|key| !key.hidden)
-        .filter(|key| key.parent_api_key_id.is_none())
-        .filter(|key| matches!(key.purpose, ApiKeyPurpose::Realtime | ApiKeyPurpose::Platform))
-        .ok_or_else(|| Error::NotFound {
-            resource: "API key".to_string(),
-            id: api_key_id.to_string(),
-        })?;
-
-    // Audit every secret exposure: who fetched which key, owned by whom.
-    tracing::info!(
-        fetched_by = %current_user.id,
-        api_key_id = %api_key.id,
-        key_owner = %api_key.user_id,
-        key_created_by = %api_key.created_by,
-        "api key secret fetched"
-    );
-    metrics::counter!("dwctl_api_key_secret_fetches_total").increment(1);
-
-    Ok(Json(ApiKeySecretResponse { key: api_key.secret }))
-}
-
 /// Rotate an API key's secret in place: the old secret stops working within
 /// ~a second; the key keeps its id, usage limit, counted spend, and
 /// attribution. The holder fetches the new secret from the portal.
@@ -767,9 +668,10 @@ pub async fn rotate_user_api_key<P: PoolProvider>(
         UserIdOrCurrent::Id(uuid) => uuid,
     };
 
-    // Rotation is an update-shaped operation: same permission ladder and the
-    // same ownership rule as PATCH (managed-mode members hold issued keys
-    // read-only and cannot rotate them).
+    // Rotation uses the update permission ladder for org/PM scoping, but is
+    // deliberately NOT gated on the manage_keys grant: rotating a key you hold
+    // is the secret-recovery path (secrets are shown once at creation), so
+    // members without key-creation rights can still cycle their issued keys.
     let can_update_all = can_update_all_resources(&current_user, Resource::ApiKeys);
     let can_update_own = can_update_own_resource(&current_user, Resource::ApiKeys, target_user_id);
     if !can_update_all && !can_update_own {
@@ -799,13 +701,6 @@ pub async fn rotate_user_api_key<P: PoolProvider>(
             .await
             .map_err(Error::Database)?
     };
-    if !can_update_all && !caps.is_org_manager && !caps.can_self_manage_keys() {
-        return Err(Error::InsufficientPermissions {
-            required: Permission::Allow(Resource::ApiKeys, Operation::UpdateOwn),
-            action: Operation::UpdateOwn,
-            resource: "API keys in a managed-keys organization (ask an org owner/admin)".to_string(),
-        });
-    }
     let skip_created_by_filter = can_update_all || caps.is_org_manager;
 
     let mut tx = state.db.write().begin().await.map_err(|e| Error::Database(e.into()))?;
@@ -2486,15 +2381,20 @@ mod tests {
         assert_eq!(key.user_id, alice.id, "user_id should be the target user");
     }
 
-    // ── Org key management (issuing, managed mode, secret, rotation) ──────
+    // ── Org key management (issuing, manage_keys grant, rotation) ─────────
 
-    async fn set_org_mode(pool: &PgPool, org_id: crate::types::UserId, mode: &str) {
-        sqlx::query("UPDATE users SET org_key_management_mode = $1 WHERE id = $2")
-            .bind(mode)
-            .bind(org_id)
-            .execute(pool)
-            .await
-            .unwrap();
+    /// Revoke the additive 'manage_keys' org role from a member (memberships
+    /// are created with it granted by default).
+    async fn revoke_manage_keys(pool: &PgPool, org_id: crate::types::UserId, user_id: crate::types::UserId) {
+        sqlx::query(
+            "DELETE FROM organization_member_roles omr USING user_organizations uo \
+             WHERE uo.id = omr.user_organization_id AND uo.organization_id = $1 AND uo.user_id = $2 AND omr.role = 'manage_keys'",
+        )
+        .bind(org_id)
+        .bind(user_id)
+        .execute(pool)
+        .await
+        .unwrap();
     }
 
     #[sqlx::test]
@@ -2529,15 +2429,17 @@ mod tests {
         assert_eq!(paginated.data.len(), 1);
         assert_eq!(paginated.data[0].name, "Issued to Bob");
 
-        // And Bob can retrieve its secret in-platform.
+        // Secrets are shown once (to the issuer); Bob recovers a usable
+        // secret by rotating the key he holds.
         let response = app
-            .get(&format!("/admin/api/v1/users/{}/api-keys/{}/secret", org.id, key.id))
+            .post(&format!("/admin/api/v1/users/{}/api-keys/{}/rotate", org.id, key.id))
             .add_header(&add_auth_headers(&bob)[0].0, &add_auth_headers(&bob)[0].1)
             .add_header(&add_auth_headers(&bob)[1].0, &add_auth_headers(&bob)[1].1)
             .await;
         response.assert_status_ok();
         let secret: ApiKeySecretResponse = response.json();
-        assert_eq!(secret.key, key.key);
+        assert_ne!(secret.key, key.key);
+        assert!(secret.key.starts_with("sk-"));
     }
 
     #[sqlx::test]
@@ -2574,15 +2476,15 @@ mod tests {
 
     #[sqlx::test]
     #[test_log::test]
-    async fn test_managed_mode_member_cannot_create_keys(pool: PgPool) {
+    async fn test_member_without_manage_keys_cannot_create_keys(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let alice = create_test_user(&pool, Role::StandardUser).await;
         let bob = create_test_user(&pool, Role::StandardUser).await;
         let org = create_test_org(&pool, alice.id).await;
         add_org_member(&pool, org.id, bob.id, "member").await;
-        set_org_mode(&pool, org.id, "managed").await;
+        revoke_manage_keys(&pool, org.id, bob.id).await;
 
-        // Bob (member) can no longer self-serve a key.
+        // Bob (member without the manage_keys grant) cannot self-serve a key.
         let response = app
             .post(&format!("/admin/api/v1/users/{}/api-keys", org.id))
             .add_header(&add_auth_headers(&bob)[0].0, &add_auth_headers(&bob)[0].1)
@@ -2600,7 +2502,7 @@ mod tests {
             .await;
         response.assert_status(axum::http::StatusCode::CREATED);
 
-        // Bob's PERSONAL keys are unaffected by the org's mode.
+        // Bob's PERSONAL keys are unaffected by org grants.
         let response = app
             .post("/admin/api/v1/users/current/api-keys")
             .add_header(&add_auth_headers(&bob)[0].0, &add_auth_headers(&bob)[0].1)
@@ -2612,13 +2514,13 @@ mod tests {
 
     #[sqlx::test]
     #[test_log::test]
-    async fn test_managed_mode_issued_keys_are_read_only_for_members(pool: PgPool) {
+    async fn test_issued_keys_are_view_and_rotate_only_without_grant(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let alice = create_test_user(&pool, Role::StandardUser).await;
         let bob = create_test_user(&pool, Role::StandardUser).await;
         let org = create_test_org(&pool, alice.id).await;
         add_org_member(&pool, org.id, bob.id, "member").await;
-        set_org_mode(&pool, org.id, "managed").await;
+        revoke_manage_keys(&pool, org.id, bob.id).await;
 
         // Alice issues a capped key to Bob.
         let response = app
@@ -2632,20 +2534,21 @@ mod tests {
 
         let bob_hdrs = add_auth_headers(&bob);
 
-        // Bob can VIEW it (usage, window) and fetch the secret…
+        // Bob can VIEW it (usage, window)…
         app.get(&format!("/admin/api/v1/users/{}/api-keys/{}", org.id, key.id))
             .add_header(&bob_hdrs[0].0, &bob_hdrs[0].1)
             .add_header(&bob_hdrs[1].0, &bob_hdrs[1].1)
             .await
             .assert_status_ok();
-        app.get(&format!("/admin/api/v1/users/{}/api-keys/{}/secret", org.id, key.id))
+        // …and ROTATE it — rotation is secret recovery, open to the holder.
+        app.post(&format!("/admin/api/v1/users/{}/api-keys/{}/rotate", org.id, key.id))
             .add_header(&bob_hdrs[0].0, &bob_hdrs[0].1)
             .add_header(&bob_hdrs[1].0, &bob_hdrs[1].1)
             .await
             .assert_status_ok();
 
-        // …but every mutation is refused: rename, cap change, window reset,
-        // rotation, deletion.
+        // …but every other mutation is refused: rename, cap change, window
+        // reset, deletion.
         app.patch(&format!("/admin/api/v1/users/{}/api-keys/{}", org.id, key.id))
             .add_header(&bob_hdrs[0].0, &bob_hdrs[0].1)
             .add_header(&bob_hdrs[1].0, &bob_hdrs[1].1)
@@ -2656,11 +2559,6 @@ mod tests {
             .add_header(&bob_hdrs[0].0, &bob_hdrs[0].1)
             .add_header(&bob_hdrs[1].0, &bob_hdrs[1].1)
             .json(&json!({"reset_window": true}))
-            .await
-            .assert_status_forbidden();
-        app.post(&format!("/admin/api/v1/users/{}/api-keys/{}/rotate", org.id, key.id))
-            .add_header(&bob_hdrs[0].0, &bob_hdrs[0].1)
-            .add_header(&bob_hdrs[1].0, &bob_hdrs[1].1)
             .await
             .assert_status_forbidden();
         app.delete(&format!("/admin/api/v1/users/{}/api-keys/{}", org.id, key.id))
@@ -2676,76 +2574,6 @@ mod tests {
             .json(&json!({"name": "Renamed by manager"}))
             .await
             .assert_status_ok();
-    }
-
-    #[sqlx::test]
-    #[test_log::test]
-    async fn test_api_key_secret_endpoint_scoping(pool: PgPool) {
-        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
-        let user = create_test_user(&pool, Role::StandardUser).await;
-        let other = create_test_user(&pool, Role::StandardUser).await;
-        let auth = add_auth_headers(&user);
-
-        // Create a capped key so a hidden cap-scope child exists.
-        let response = app
-            .post("/admin/api/v1/users/current/api-keys")
-            .add_header(&auth[0].0, &auth[0].1)
-            .add_header(&auth[1].0, &auth[1].1)
-            .json(&json!({"name": "Mine", "spend_limit": "5"}))
-            .await;
-        response.assert_status(axum::http::StatusCode::CREATED);
-        let key: ApiKeyResponse = response.json();
-
-        // Creator fetches the secret and gets the same value shown at creation.
-        let response = app
-            .get(&format!("/admin/api/v1/users/current/api-keys/{}/secret", key.id))
-            .add_header(&auth[0].0, &auth[0].1)
-            .add_header(&auth[1].0, &auth[1].1)
-            .await;
-        response.assert_status_ok();
-        let secret: ApiKeySecretResponse = response.json();
-        assert_eq!(secret.key, key.key);
-
-        // A different user cannot reach it through the owner's path…
-        let response = app
-            .get(&format!("/admin/api/v1/users/{}/api-keys/{}/secret", user.id, key.id))
-            .add_header(&add_auth_headers(&other)[0].0, &add_auth_headers(&other)[0].1)
-            .add_header(&add_auth_headers(&other)[1].0, &add_auth_headers(&other)[1].1)
-            .await;
-        response.assert_status_forbidden();
-
-        // …and system-managed children are never fetchable, even by the owner.
-        let child_id: uuid::Uuid = sqlx::query_scalar("SELECT id FROM api_keys WHERE parent_api_key_id = $1")
-            .bind(key.id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        let response = app
-            .get(&format!("/admin/api/v1/users/current/api-keys/{}/secret", child_id))
-            .add_header(&auth[0].0, &auth[0].1)
-            .add_header(&auth[1].0, &auth[1].1)
-            .await;
-        response.assert_status_not_found();
-
-        // Hidden ROOT keys (the shared batch key: hidden = true, parent NULL)
-        // are equally unfetchable — the hidden filter, not just the parent
-        // filter, must hold.
-        let hidden_root_id = {
-            use crate::db::handlers::api_keys::ApiKeys;
-            use crate::db::models::api_keys::ApiKeyPurpose;
-            let mut conn = pool.acquire().await.unwrap();
-            let (_, id) = ApiKeys::new(&mut conn)
-                .get_or_create_hidden_key_with_id(user.id, ApiKeyPurpose::Batch, user.id)
-                .await
-                .unwrap();
-            id
-        };
-        let response = app
-            .get(&format!("/admin/api/v1/users/current/api-keys/{}/secret", hidden_root_id))
-            .add_header(&auth[0].0, &auth[0].1)
-            .add_header(&auth[1].0, &auth[1].1)
-            .await;
-        response.assert_status_not_found();
     }
 
     #[sqlx::test]
@@ -2784,15 +2612,14 @@ mod tests {
         assert_ne!(rotated.key, key.key);
         assert!(rotated.key.starts_with("sk-"));
 
-        // The secret endpoint now serves the new value.
-        let response = app
-            .get(&format!("/admin/api/v1/users/current/api-keys/{}/secret", key.id))
-            .add_header(&auth[0].0, &auth[0].1)
-            .add_header(&auth[1].0, &auth[1].1)
-            .await;
-        response.assert_status_ok();
-        let fetched: ApiKeySecretResponse = response.json();
-        assert_eq!(fetched.key, rotated.key);
+        // The stored secret is the new value (the old one is dead for new
+        // requests as soon as onwards syncs).
+        let stored: String = sqlx::query_scalar("SELECT secret FROM api_keys WHERE id = $1")
+            .bind(key.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(stored, rotated.key);
 
         // Cap, attribution, and id are untouched.
         let response = app
@@ -2814,6 +2641,26 @@ mod tests {
             .unwrap();
         let response = app
             .post(&format!("/admin/api/v1/users/current/api-keys/{}/rotate", child_id))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+        response.assert_status_not_found();
+
+        // Hidden ROOT keys (shared batch key: hidden = true, parent NULL) are
+        // equally unrotatable — the hidden filter, not just the parent
+        // filter, must hold.
+        let hidden_root_id = {
+            use crate::db::handlers::api_keys::ApiKeys;
+            use crate::db::models::api_keys::ApiKeyPurpose;
+            let mut conn = pool.acquire().await.unwrap();
+            let (_, id) = ApiKeys::new(&mut conn)
+                .get_or_create_hidden_key_with_id(user.id, ApiKeyPurpose::Batch, user.id)
+                .await
+                .unwrap();
+            id
+        };
+        let response = app
+            .post(&format!("/admin/api/v1/users/current/api-keys/{}/rotate", hidden_root_id))
             .add_header(&auth[0].0, &auth[0].1)
             .add_header(&auth[1].0, &auth[1].1)
             .await;

@@ -259,6 +259,7 @@ pub async fn get_user<P: PoolProvider>(
     if query.include.as_deref().is_some_and(|includes| includes.contains("organizations")) {
         let mut org_repo = Organizations::new(&mut pool_conn);
         let memberships = org_repo.list_user_organizations(target_user_id).await?;
+        let manage_keys_orgs = org_repo.user_manage_keys_org_ids(target_user_id).await?;
 
         let org_ids: Vec<UserId> = memberships.iter().map(|m| m.organization_id).collect();
         if !org_ids.is_empty() {
@@ -273,6 +274,8 @@ pub async fn get_user<P: PoolProvider>(
                         .map(|org| crate::api::models::organizations::OrganizationSummary {
                             id: m.organization_id,
                             name: org.display_name.clone().unwrap_or_else(|| org.username.clone()),
+                            can_manage_keys: matches!(m.role.as_str(), "owner" | "admin")
+                                || manage_keys_orgs.contains(&m.organization_id),
                             role: m.role.clone(),
                             zero_data_retention: org.zero_data_retention,
                         })

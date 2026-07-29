@@ -33,10 +33,6 @@ pub struct OrganizationUpdateDBRequest {
     pub low_balance_threshold: Option<Option<f32>>,
     /// Account-wide zero-data-retention flag. `None` = don't change.
     pub zero_data_retention: Option<bool>,
-    /// Org key governance mode: 'open' (members self-manage keys) or
-    /// 'managed' (keys are issued by org owners/admins; members hold them
-    /// read-only). Validated at the API layer. None = unchanged.
-    pub key_management_mode: Option<String>,
 }
 
 /// Database response for an organization membership

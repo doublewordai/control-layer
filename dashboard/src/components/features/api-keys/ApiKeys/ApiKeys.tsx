@@ -28,9 +28,7 @@ import {
 } from "./spendCap";
 import {
   useUser,
-  useFetchApiKeySecret,
   useRotateApiKey,
-  useOrganization,
   useOrganizationMembers,
 } from "../../../../api/control-layer/hooks";
 import { DataTable } from "../../../ui/data-table";
@@ -78,7 +76,6 @@ export const ApiKeys: React.FC = () => {
   // from the current user's membership summary on the org context.
   const isOrgManager =
     activeOrganization?.role === "owner" || activeOrganization?.role === "admin";
-  const { data: org } = useOrganization(activeOrganizationId ?? "");
   const { data: membersData } = useOrganizationMembers(
     activeOrganizationId ?? "",
   );
@@ -115,11 +112,6 @@ export const ApiKeys: React.FC = () => {
     name: string;
     key: string;
   } | null>(null);
-  // Secrets revealed via explicit user action only — never cached in the
-  // query cache and never part of the list payload.
-  const [revealedSecrets, setRevealedSecrets] = useState<
-    Record<string, string>
-  >({});
   // Manager-only view scoping (org context): tab + per-member filter,
   // applied client-side since the API already returns all org keys to
   // managers.
@@ -128,11 +120,11 @@ export const ApiKeys: React.FC = () => {
 
   // Check if user is a platform manager
   const isPlatformManager = user?.roles?.includes("PlatformManager") || false;
-  // Managed key mode: only org owners/admins issue keys; plain members hold
-  // their keys read-only (view usage + fetch secret only). Personal keys are
-  // never affected by any org's mode.
-  const managedMode = isOrgContext && org?.key_management_mode === "managed";
-  const managedModeReadOnly = managedMode && !isOrgManager && !isPlatformManager;
+  // Per-member key governance: can the current user create/manage their own
+  // keys in this context? Personal context is always true; in org context the
+  // server-computed can_manage_keys flag decides (owners/admins are always
+  // true, plain members only when granted the additive role).
+  const canSelfManage = !isOrgContext || !!activeOrganization?.can_manage_keys;
   const showScopingControls = isOrgContext && isOrgManager;
   const pagination = useServerPagination();
   const {
@@ -168,7 +160,6 @@ export const ApiKeys: React.FC = () => {
   const createApiKeyMutation = useCreateApiKey();
   const deleteApiKeyMutation = useDeleteApiKey();
   const updateApiKeyMutation = useUpdateApiKey();
-  const fetchSecretMutation = useFetchApiKeySecret();
   const rotateApiKeyMutation = useRotateApiKey();
 
   const resetCreateForm = () => {
@@ -321,45 +312,6 @@ export const ApiKeys: React.FC = () => {
     }
   };
 
-  // Fetch a key's secret on demand and reveal it inline (toggles off if
-  // already revealed). Secrets are only ever fetched on explicit user action.
-  const handleRevealSecret = async (apiKey: ApiKey) => {
-    if (revealedSecrets[apiKey.id]) {
-      setRevealedSecrets((prev) => {
-        const next = { ...prev };
-        delete next[apiKey.id];
-        return next;
-      });
-      return;
-    }
-    try {
-      const { key } = await fetchSecretMutation.mutateAsync({
-        keyId: apiKey.id,
-        userId: targetUserId,
-      });
-      setRevealedSecrets((prev) => ({ ...prev, [apiKey.id]: key }));
-    } catch (e) {
-      console.error("Failed to fetch API key secret:", e);
-      toast.error(
-        (e as Error)?.message ?? "Failed to fetch API key secret",
-      );
-    }
-  };
-
-  const handleCopySecret = async (apiKey: ApiKey) => {
-    try {
-      const { key } = await fetchSecretMutation.mutateAsync({
-        keyId: apiKey.id,
-        userId: targetUserId,
-      });
-      await navigator.clipboard.writeText(key);
-      toast.success("API key secret copied to clipboard");
-    } catch (e) {
-      console.error("Failed to copy API key secret:", e);
-      toast.error((e as Error)?.message ?? "Failed to copy API key secret");
-    }
-  };
-
   const handleRotateKey = async () => {
     if (!rotateModal) return;
     try {
@@ -370,42 +322,37 @@ export const ApiKeys: React.FC = () => {
       // One-time secret display, same pattern as creation.
       setRotatedKey({ name: rotateModal.name, key });
       setRotateModal(null);
-      // Any previously revealed secret for this key is now stale.
-      setRevealedSecrets((prev) => {
-        const next = { ...prev };
-        delete next[rotateModal.id];
-        return next;
-      });
     } catch (e) {
       console.error("Failed to rotate API key:", e);
       toast.error((e as Error)?.message ?? "Failed to rotate API key");
     }
   };
 
-  // Mirrors what the server permits for edit/rotate/delete: a
+  // Mirrors what the server permits for edit/rename/delete: a
   // PlatformManager, an org owner/admin acting on any key of the active org,
-  // or the key's creator — except that in managed key mode plain members
-  // hold their org keys read-only. Keep this gate in lockstep with the
-  // server.
+  // or the key's creator when they hold self-manage rights. Keep this gate in
+  // lockstep with the server.
   const canManageKey = (apiKey: ApiKey) =>
     isPlatformManager ||
     (isOrgContext && isOrgManager) ||
-    (!!apiKey.created_by &&
-      apiKey.created_by === user?.id &&
-      (!isOrgContext || !managedMode));
+    (!!apiKey.created_by && apiKey.created_by === user?.id && canSelfManage);
+
+  // Rotation is the secret-recovery path: members without creation rights can
+  // still rotate keys they hold to get a fresh secret (shown once).
+  const canRotateKey = (apiKey: ApiKey) =>
+    canManageKey(apiKey) ||
+    (!!apiKey.created_by && apiKey.created_by === user?.id);
 
   const columns = createColumns({
     onDelete: handleDeleteFromTable,
     onEdit: openEditModal,
     onRotate: setRotateModal,
-    onRevealSecret: handleRevealSecret,
-    onCopySecret: handleCopySecret,
-    revealedSecrets,
     canManage: canManageKey,
+    canRotate: canRotateKey,
     isPlatformManager,
     showAssignee: isOrgContext,
     resolveAssignee: isOrgContext ? resolveAssignee : undefined,
-    showSelect: !managedModeReadOnly,
+    showSelect: canSelfManage,
   });
 
   if (isLoading) {
@@ -437,7 +384,7 @@ export const ApiKeys: React.FC = () => {
               Manage your API keys for programmatic access
             </p>
           </div>
-          {apiKeys.length > 0 && !managedModeReadOnly && (
+          {apiKeys.length > 0 && canSelfManage && (
             <Button
               onClick={() => setShowCreateForm(true)}
               className="bg-doubleword-background-dark hover:bg-doubleword-neutral-900 w-full sm:w-auto"
@@ -450,15 +397,15 @@ export const ApiKeys: React.FC = () => {
         </div>
       </div>
 
-      {managedModeReadOnly && (
+      {!canSelfManage && (
         <div
           className="mb-6 flex items-center gap-2 rounded-lg border border-doubleword-neutral-200 bg-doubleword-neutral-50 px-4 py-3 text-sm text-doubleword-neutral-600"
           role="status"
         >
           <Info className="h-4 w-4 shrink-0" />
           <span>
-            API keys in this organization are issued by its admins. Contact an
-            org admin for a key.
+            API keys in this organization are issued by its admins. You can
+            rotate a key you hold to get a fresh secret.
           </span>
         </div>
       )}
@@ -570,11 +517,11 @@ export const ApiKeys: React.FC = () => {
             No API keys configured
           </h3>
           <p className="text-doubleword-neutral-600 mb-6">
-            {managedModeReadOnly
-              ? "An org admin can issue an API key for you"
-              : "Create your first API key to start using the API"}
+            {canSelfManage
+              ? "Create your first API key to start using the API"
+              : "An org admin can issue an API key for you"}
           </p>
-          {!managedModeReadOnly && (
+          {canSelfManage && (
             <Button
               onClick={() => setShowCreateForm(true)}
               className="bg-doubleword-background-dark hover:bg-doubleword-neutral-900"
@@ -735,8 +682,8 @@ export const ApiKeys: React.FC = () => {
                     </Select>
                     <p className="text-xs text-doubleword-neutral-500">
                       The key appears in the assigned member's view, and they
-                      can retrieve the secret themselves from their API Keys
-                      page.
+                      can rotate it from their API Keys page to get a secret
+                      of their own.
                     </p>
                   </div>
                 )}

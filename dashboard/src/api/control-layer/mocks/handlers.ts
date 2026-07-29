@@ -1115,24 +1115,6 @@ export const handlers = [
     return HttpResponse.json(null, { status: 204 });
   }),
 
-  http.get(
-    "/admin/api/v1/users/:userId/api-keys/:keyId/secret",
-    ({ params }) => {
-      const apiKey = apiKeysData.find((k) => k.id === params.keyId) as
-        | (ApiKey & { key?: string })
-        | undefined;
-      if (!apiKey) {
-        return HttpResponse.json(
-          { error: "API key not found" },
-          { status: 404 },
-        );
-      }
-      // Seed keys have no stored secret; mint a stable-ish demo one.
-      const key = apiKey.key ?? `sk-demo-${apiKey.id}`;
-      return HttpResponse.json({ key });
-    },
-  ),
-
   http.post(
     "/admin/api/v1/users/:userId/api-keys/:keyId/rotate",
     ({ params }) => {

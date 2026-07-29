@@ -24,6 +24,7 @@ const mockOrgContext = vi.hoisted(() => ({
       name: string;
       role: string;
       zero_data_retention: boolean;
+      can_manage_keys: boolean;
     } | null,
     isOrgContext: false,
     setActiveOrganization: async () => {},
@@ -224,7 +225,13 @@ describe("API Keys Component - Functional Tests", () => {
 
       mockOrgContext.value = {
         activeOrganizationId: orgId,
-        activeOrganization: null,
+        activeOrganization: {
+          id: orgId,
+          name: "Test Org",
+          role: "owner",
+          zero_data_retention: false,
+          can_manage_keys: true,
+        },
         isOrgContext: true,
         setActiveOrganization: async () => {},
       };
@@ -1007,7 +1014,7 @@ describe("API Keys Component - Functional Tests", () => {
     });
   });
 
-  describe("Secret Retrieval and Rotation", () => {
+  describe("Rotation", () => {
     it("rotate dialog warns about in-flight batches and shows the new secret on confirm", async () => {
       const user = userEvent.setup();
       let rotatedKeyId: string | undefined;
@@ -1060,71 +1067,27 @@ describe("API Keys Component - Functional Tests", () => {
       ).toBeInTheDocument();
     });
 
-    it("copy-secret action fetches the secret endpoint and copies to clipboard", async () => {
-      const user = userEvent.setup();
-      const testMockWrite = vi.fn().mockResolvedValue(undefined);
-      Object.defineProperty(navigator, "clipboard", {
-        value: { writeText: testMockWrite },
-        writable: true,
-        configurable: true,
-      });
-
-      let fetchedKeyId: string | undefined;
-      server.use(
-        http.get(
-          "/admin/api/v1/users/:userId/api-keys/:keyId/secret",
-          ({ params }) => {
-            fetchedKeyId = params.keyId as string;
-            return HttpResponse.json({ key: "sk-fetched-secret" });
-          },
-        ),
-      );
-
-      const { container } = render(<ApiKeys />, { wrapper: createWrapper() });
-
-      await user.click(
-        await within(container).findByRole("button", {
-          name: /copy secret for ci\/cd pipeline/i,
-        }),
-      );
-
-      await waitFor(() => {
-        expect(fetchedKeyId).toBe("key-1");
-        expect(testMockWrite).toHaveBeenCalledWith("sk-fetched-secret");
-        expect(toast.success as unknown as Mock).toHaveBeenCalledWith(
-          "API key secret copied to clipboard",
-        );
-      });
-    });
-
-    it("reveals a masked secret only after an explicit fetch", async () => {
-      const user = userEvent.setup();
+    it("never shows a secret in the list — no masked column or reveal/copy affordances", async () => {
       const { container } = render(<ApiKeys />, { wrapper: createWrapper() });
 
       const keyName = await within(container).findByText("CI/CD Pipeline");
       const keyRow = keyName.closest("tr");
       expect(keyRow).not.toBeNull();
 
-      // Masked until the user explicitly reveals.
-      expect(within(keyRow!).getByText("sk-••••••••")).toBeInTheDocument();
-
-      await user.click(
-        within(keyRow!).getByRole("button", {
+      expect(
+        within(container).queryByRole("columnheader", { name: /secret/i }),
+      ).not.toBeInTheDocument();
+      expect(within(keyRow!).queryByText("sk-••••••••")).not.toBeInTheDocument();
+      expect(
+        within(keyRow!).queryByRole("button", {
           name: /reveal secret for ci\/cd pipeline/i,
         }),
-      );
-
-      // Default mock handler mints a stable demo secret per key.
-      await waitFor(() => {
-        expect(within(keyRow!).getByText("sk-demo-key-1")).toBeInTheDocument();
-      });
-      // The affordance flips to hide it again.
-      await user.click(
-        within(keyRow!).getByRole("button", {
-          name: /hide secret for ci\/cd pipeline/i,
+      ).not.toBeInTheDocument();
+      expect(
+        within(keyRow!).queryByRole("button", {
+          name: /copy secret for ci\/cd pipeline/i,
         }),
-      );
-      expect(within(keyRow!).getByText("sk-••••••••")).toBeInTheDocument();
+      ).not.toBeInTheDocument();
     });
   });
 
@@ -1135,7 +1098,9 @@ describe("API Keys Component - Functional Tests", () => {
     // James Wilson — usersData[1], plain member of the org.
     const memberId = "550e8400-e29b-41d4-a716-446655440002";
 
-    function enterOrgContext(role: string) {
+    // can_manage_keys mirrors the server's effective flag: owners/admins are
+    // always true; plain members only when granted the additive role.
+    function enterOrgContext(role: string, canManageKeys = role !== "member") {
       mockOrgContext.value = {
         activeOrganizationId: orgId,
         activeOrganization: {
@@ -1143,6 +1108,7 @@ describe("API Keys Component - Functional Tests", () => {
           name: "Acme Corporation",
           role,
           zero_data_retention: false,
+          can_manage_keys: canManageKeys,
         },
         isOrgContext: true,
         setActiveOrganization: async () => {},
@@ -1280,7 +1246,7 @@ describe("API Keys Component - Functional Tests", () => {
         name: /assign to member/i,
       });
       expect(
-        screen.getByText(/retrieve the secret themselves/i),
+        screen.getByText(/rotate it from their api keys page/i),
       ).toBeInTheDocument();
       await user.click(assignSelect);
       await user.click(screen.getByRole("option", { name: "James Wilson" }));
@@ -1295,8 +1261,9 @@ describe("API Keys Component - Functional Tests", () => {
       });
     });
 
-    it("managed mode: plain member sees the banner and view-only rows", async () => {
-      enterOrgContext("member");
+    it("member without the key grant: banner, no create, rotate-only rows", async () => {
+      const user = userEvent.setup();
+      enterOrgContext("member", false);
 
       server.use(
         // Current user is James, a plain StandardUser member.
@@ -1310,15 +1277,6 @@ describe("API Keys Component - Functional Tests", () => {
             });
           }
           return HttpResponse.json({ error: "not found" }, { status: 404 });
-        }),
-        // The org is in managed key mode.
-        http.get("/admin/api/v1/organizations/:id", () => {
-          return HttpResponse.json({
-            id: orgId,
-            username: "acme-corp",
-            display_name: "Acme Corporation",
-            key_management_mode: "managed",
-          });
         }),
         // The member holds one org key (issued by an admin).
         http.get("/admin/api/v1/users/:userId/api-keys", () => {
@@ -1340,17 +1298,24 @@ describe("API Keys Component - Functional Tests", () => {
             limit: 10,
           });
         }),
+        http.post(
+          "/admin/api/v1/users/:userId/api-keys/:keyId/rotate",
+          () => {
+            return HttpResponse.json({ key: "sk-member-rotated-secret" });
+          },
+        ),
       );
 
       const { container } = render(<ApiKeys />, { wrapper: createWrapper() });
 
       await within(container).findByText("Issued Key");
 
-      // Info banner, and no create affordance anywhere.
+      // Info banner (rotation is the secret-recovery path), and no create
+      // affordance anywhere.
       await waitFor(() => {
         expect(
           within(container).getByText(
-            /api keys in this organization are issued by its admins/i,
+            /api keys in this organization are issued by its admins\. you can rotate a key you hold to get a fresh secret/i,
           ),
         ).toBeInTheDocument();
       });
@@ -1361,48 +1326,50 @@ describe("API Keys Component - Functional Tests", () => {
         within(container).queryByRole("button", { name: /create first api key/i }),
       ).not.toBeInTheDocument();
 
-      // No manage actions on the row: edit, rotate, delete are all gone,
-      // and so is bulk selection.
+      // No edit/delete or bulk selection — but rotate stays available on a
+      // key the member holds, since it's their route to a fresh secret.
       expect(
         within(container).queryByRole("button", {
           name: /edit usage limit for issued key/i,
         }),
       ).not.toBeInTheDocument();
       expect(
-        within(container).queryByRole("button", { name: /rotate issued key/i }),
-      ).not.toBeInTheDocument();
-      expect(
         within(container).queryByRole("button", { name: /delete issued key/i }),
       ).not.toBeInTheDocument();
       expect(within(container).queryByRole("checkbox")).not.toBeInTheDocument();
-
-      // View + secret retrieval remain available.
-      expect(
-        within(container).getByRole("button", {
-          name: /reveal secret for issued key/i,
-        }),
-      ).toBeInTheDocument();
-      expect(
-        within(container).getByRole("button", {
-          name: /copy secret for issued key/i,
-        }),
-      ).toBeInTheDocument();
       // No scoping tabs for non-managers.
       expect(within(container).queryByRole("tab")).not.toBeInTheDocument();
+
+      // Rotate flow: confirm dialog with the in-flight-batch warning, then
+      // the one-time display of the new secret.
+      await user.click(
+        within(container).getByRole("button", { name: /rotate issued key/i }),
+      );
+      await waitFor(() => {
+        expect(
+          screen.getByRole("heading", { name: /rotate api key/i }),
+        ).toBeInTheDocument();
+      });
+      expect(
+        screen.getByText(/batches already submitted with this key/i),
+      ).toBeInTheDocument();
+
+      await user.click(screen.getByRole("button", { name: /^rotate key$/i }));
+
+      await waitFor(() => {
+        expect(
+          screen.getByRole("heading", { name: /api key rotated/i }),
+        ).toBeInTheDocument();
+      });
+      expect(
+        screen.getByText("sk-member-rotated-secret"),
+      ).toBeInTheDocument();
     });
 
-    it("managed mode: org managers keep full management of all org keys", async () => {
+    it("org managers keep full management of all org keys", async () => {
       enterOrgContext("owner");
 
       server.use(
-        http.get("/admin/api/v1/organizations/:id", () => {
-          return HttpResponse.json({
-            id: orgId,
-            username: "acme-corp",
-            display_name: "Acme Corporation",
-            key_management_mode: "managed",
-          });
-        }),
         http.get("/admin/api/v1/users/:userId/api-keys", () => {
           return HttpResponse.json({
             data: [
@@ -1424,8 +1391,8 @@ describe("API Keys Component - Functional Tests", () => {
 
       await within(container).findByText("Member Key");
 
-      // Managers are unaffected by managed mode: create + full row actions,
-      // even on a key held by another member.
+      // Managers keep create + full row actions, even on a key held by
+      // another member.
       expect(
         within(container).getByRole("button", { name: /create new api key/i }),
       ).toBeInTheDocument();

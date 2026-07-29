@@ -768,23 +768,6 @@ export function useDeleteApiKey() {
 
 // Requests hooks
 /**
- * Fetch an API key's secret on demand. Deliberately a mutation, not a query:
- * secrets must never sit in the query cache, and every fetch is an audited
- * server-side event triggered by an explicit user action (reveal/copy).
- */
-export function useFetchApiKeySecret() {
-  return useMutation({
-    mutationFn: ({
-      keyId,
-      userId = "current",
-    }: {
-      keyId: string;
-      userId?: string;
-    }) => dwctlApi.users.apiKeys.getSecret(keyId, userId),
-  });
-}
-
-/**
  * Rotate an API key's secret in place. Returns the new secret; the key's id,
  * usage limit, and counted spend are unchanged. In-flight batches keep
  * running on their execution key — cancel them separately if the old secret

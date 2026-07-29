@@ -5306,13 +5306,19 @@ mod tests {
 
     #[sqlx::test]
     #[test_log::test]
-    async fn test_managed_mode_batch_requires_key_selection(pool: PgPool) {
+    async fn test_member_without_manage_keys_must_select_batch_key(pool: PgPool) {
         let (app, _bg_services, owner, member, org, file_id) = setup_org_batch_env(&pool).await;
-        sqlx::query("UPDATE users SET org_key_management_mode = 'managed' WHERE id = $1")
-            .bind(org.id)
-            .execute(&pool)
-            .await
-            .unwrap();
+        // Revoke the member's additive 'manage_keys' grant: without it they
+        // have no implicit key to bill, so UI batches must name an issued key.
+        sqlx::query(
+            "DELETE FROM organization_member_roles omr USING user_organizations uo \
+             WHERE uo.id = omr.user_organization_id AND uo.organization_id = $1 AND uo.user_id = $2 AND omr.role = 'manage_keys'",
+        )
+        .bind(org.id)
+        .bind(member.id)
+        .execute(&pool)
+        .await
+        .unwrap();
 
         let owner_auth = add_auth_headers(&owner);
         let member_auth = add_auth_headers(&member);
