@@ -41,6 +41,7 @@ import type { Transaction } from "@/api/control-layer";
 import { useUserBalance, useTransactions, useUser } from "@/api/control-layer";
 import { useSettings } from "@/contexts";
 import { formatDollars } from "@/utils/money.ts";
+import { getServiceTierLabel } from "@/utils/serviceTier";
 import { useDebounce } from "@/hooks/useDebounce";
 
 export type AddFundsConfig =
@@ -180,14 +181,11 @@ export function TransactionHistory({
       return baseDescription;
     }
 
-    // Human label for the service tier (realtime / flex / async / batch)
+    // Human label for the service tier.
     const tierKey = tx.service_tier ?? (tx.batch_id ? "batch" : "realtime");
-    const tierLabel =
-      { realtime: "Realtime", flex: "Flex", async: "Async", batch: "Batch" }[
-        tierKey
-      ] ?? (tx.batch_id ? "Batch" : "Realtime");
-    // Aggregated tiers (async / batch) have a batch_id — show the request count
-    // rather than a single model name.
+    const tierLabel = getServiceTierLabel(tierKey);
+    // Aggregated tiers have a batch_id — show the request count rather than a
+    // single model name.
     if (tx.batch_id) {
       const requestCount = tx.batch_request_count || 0;
       const requestsText = requestCount > 0 ? `: ${requestCount} requests` : "";

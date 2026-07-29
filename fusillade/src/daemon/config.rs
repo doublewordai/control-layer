@@ -117,6 +117,13 @@ pub struct DaemonConfig {
     pub model_escalations: Arc<dashmap::DashMap<String, ModelEscalationConfig>>,
     #[serde(default)]
     pub inject_deadline_priority: bool,
+    /// Database-wide per-model foreground in-flight threshold below which
+    /// background work may be dispatched. Already-dispatched background work
+    /// does not consume this threshold. Clamped to each process's ordinary
+    /// model concurrency limit. Zero disables background claim workers while
+    /// leaving submission APIs available.
+    #[serde(default)]
+    pub background_concurrency_limit: usize,
     pub claim_interval_ms: u64,
     #[serde(default = "default_batch_claim_size")]
     pub batch_claim_size: usize,
@@ -381,6 +388,7 @@ impl Default for DaemonConfig {
             model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
             model_escalations: default_model_escalations(),
             inject_deadline_priority: false,
+            background_concurrency_limit: 0,
             claim_interval_ms: 1000,
             batch_claim_size: default_batch_claim_size(),
             batch_claim_batch_size: default_batch_claim_batch_size(),

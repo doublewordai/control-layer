@@ -292,19 +292,19 @@ impl Request<Failed> {
             return Err(Box::new(self));
         }
 
-        // Determine the effective deadline (with or without buffer)
-        let effective_deadline = if let Some(stop_before_deadline_ms) =
-            config.stop_before_deadline_ms
-        {
-            self.state.batch_expires_at - chrono::Duration::milliseconds(stop_before_deadline_ms)
-        } else {
-            // No buffer configured - use the actual deadline
-            self.state.batch_expires_at
-        };
+        if let Some(batch_expires_at) = self.state.batch_expires_at {
+            // Determine the effective deadline (with or without buffer).
+            let effective_deadline =
+                if let Some(stop_before_deadline_ms) = config.stop_before_deadline_ms {
+                    batch_expires_at - chrono::Duration::milliseconds(stop_before_deadline_ms)
+                } else {
+                    batch_expires_at
+                };
 
-        // Check if the next retry would start before the effective deadline
-        if not_before >= effective_deadline {
-            return Err(Box::new(self));
+            // Check if the next retry would start before the effective deadline.
+            if not_before >= effective_deadline {
+                return Err(Box::new(self));
+            }
         }
 
         // state_transition span emitted by caller after persist
@@ -526,5 +526,74 @@ impl Request<Processing> {
         };
         storage.persist(&request).await?;
         Ok(request)
+    }
+}
+
+#[cfg(test)]
+mod background_tests {
+    use super::*;
+    use crate::batch::{BatchId, TemplateId};
+    use crate::request::{RequestData, RequestId};
+    use uuid::Uuid;
+
+    fn failed_request(deadline: Option<chrono::DateTime<chrono::Utc>>) -> Request<Failed> {
+        Request {
+            data: RequestData {
+                id: RequestId(Uuid::new_v4()),
+                batch_id: Some(BatchId(Uuid::new_v4())),
+                template_id: TemplateId(Uuid::new_v4()),
+                custom_id: None,
+                endpoint: "http://localhost:3001".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/responses".to_string(),
+                body: "{}".to_string(),
+                model: "model-a".to_string(),
+                api_key: "test-key".to_string(),
+                created_by: "user-a".to_string(),
+                batch_metadata: Default::default(),
+            },
+            state: Failed {
+                reason: FailureReason::TaskTerminated,
+                failed_at: chrono::Utc::now(),
+                retry_attempt: 0,
+                batch_expires_at: deadline,
+                routed_model: "model-a".to_string(),
+            },
+        }
+    }
+
+    fn retry_config() -> RetryConfig {
+        RetryConfig {
+            max_retries: Some(2),
+            stop_before_deadline_ms: Some(1_000),
+            backoff_ms: 1,
+            backoff_factor: 2,
+            max_backoff_ms: 10,
+        }
+    }
+
+    #[test]
+    fn background_retry_ignores_deadline_cutoff() {
+        let pending = failed_request(None)
+            .can_retry(0, retry_config())
+            .expect("background request should retry without a deadline");
+
+        assert_eq!(pending.state.batch_expires_at, None);
+        assert_eq!(pending.state.retry_attempt, 1);
+    }
+
+    #[test]
+    fn sla_retry_still_honors_deadline_cutoff() {
+        let expired = chrono::Utc::now() - chrono::Duration::seconds(1);
+        assert!(
+            failed_request(Some(expired))
+                .can_retry(0, retry_config())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn background_retry_still_honors_retry_count() {
+        assert!(failed_request(None).can_retry(2, retry_config()).is_err());
     }
 }

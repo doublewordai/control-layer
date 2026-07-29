@@ -240,6 +240,7 @@ auth:
   default_user_roles:
     - StandardUser
     - BatchAPIUser
+    - BackgroundInferenceUser
 ```
 
 Available roles:
@@ -247,6 +248,7 @@ Available roles:
 - `RequestViewer` - Read-only access to request logs
 - `BillingManager` - Credit and billing management
 - `BatchAPIUser` - Batch file and job management
+- `BackgroundInferenceUser` - Spare-capacity background inference submission
 
 ### Security Settings
 

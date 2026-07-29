@@ -40,6 +40,96 @@ struct UserThroughputStats {
 enum ClaimLoopKind {
     Request,
     Batch,
+    BackgroundRequest,
+    BackgroundBatch,
+}
+
+impl ClaimLoopKind {
+    fn is_background(self) -> bool {
+        matches!(self, Self::BackgroundRequest | Self::BackgroundBatch)
+    }
+
+    fn uses_foreground_accounting(self) -> bool {
+        !self.is_background()
+    }
+
+    fn emits_legacy_claim_metrics(self) -> bool {
+        self.uses_foreground_accounting()
+    }
+
+    fn claim_interval_ms(self, config: &DaemonConfig) -> u64 {
+        if matches!(self, Self::Batch | Self::BackgroundBatch) && config.batch_claim_interval_ms > 0
+        {
+            config.batch_claim_interval_ms
+        } else {
+            config.claim_interval_ms
+        }
+    }
+
+    fn claim_size(self, config: &DaemonConfig) -> usize {
+        if matches!(self, Self::Batch | Self::BackgroundBatch) && config.batch_claim_size > 0 {
+            config.batch_claim_size
+        } else {
+            config.claim_batch_size
+        }
+    }
+}
+
+/// Reserved NVIDIA Dynamo priority for background work. Higher integer values
+/// are more important, so this is strictly below every SLA priority.
+pub const BACKGROUND_DYNAMO_PRIORITY: i32 = i32::MIN;
+/// Lowest priority an SLA request may receive, reserving `i32::MIN` for
+/// background work.
+pub const MIN_SLA_DYNAMO_PRIORITY: i32 = i32::MIN + 1;
+
+fn background_capacity(ordinary_limit: usize, background_limit: usize, in_flight: usize) -> usize {
+    ordinary_limit
+        .min(background_limit)
+        .saturating_sub(in_flight)
+}
+
+fn sla_dynamo_priority(deadline: chrono::DateTime<chrono::Utc>) -> i32 {
+    deadline
+        .timestamp()
+        .saturating_neg()
+        .clamp(MIN_SLA_DYNAMO_PRIORITY as i64, i32::MAX as i64) as i32
+}
+
+fn inject_dynamo_priority(body: &mut String, priority: i32) {
+    let Ok(mut json) = serde_json::from_str::<serde_json::Value>(body) else {
+        return;
+    };
+    let Some(object) = json.as_object_mut() else {
+        return;
+    };
+
+    let nvext = object
+        .entry("nvext")
+        .or_insert_with(|| serde_json::json!({}));
+    if !nvext.is_object() {
+        *nvext = serde_json::json!({});
+    }
+    let Some(nvext_object) = nvext.as_object_mut() else {
+        return;
+    };
+
+    let agent_hints = nvext_object
+        .entry("agent_hints")
+        .or_insert_with(|| serde_json::json!({}));
+    if !agent_hints.is_object() {
+        *agent_hints = serde_json::json!({});
+    }
+    let Some(hints_object) = agent_hints.as_object_mut() else {
+        return;
+    };
+    hints_object.insert(
+        "priority".to_string(),
+        serde_json::Value::Number(priority.into()),
+    );
+
+    if let Ok(new_body) = serde_json::to_string(&json) {
+        *body = new_body;
+    }
 }
 
 /// Backoff before retrying a failed claim cycle: exponential in the number of
@@ -58,8 +148,24 @@ fn claim_failure_backoff(consecutive_failures: u32, claim_interval_ms: u64) -> D
 fn claim_loop_kinds_for_mode(
     mode: DaemonMode,
     supports_batch_claims: bool,
+    supports_background_claims: bool,
+    background_enabled: bool,
+    inject_deadline_priority: bool,
 ) -> Result<Vec<ClaimLoopKind>> {
-    match mode {
+    if background_enabled {
+        if !supports_background_claims {
+            return Err(FusilladeError::Other(anyhow::anyhow!(
+                "background processing requires storage support for background claims"
+            )));
+        }
+        if !inject_deadline_priority {
+            return Err(FusilladeError::Other(anyhow::anyhow!(
+                "background processing requires inject_deadline_priority=true"
+            )));
+        }
+    }
+
+    let mut kinds = match mode {
         DaemonMode::Both => {
             if supports_batch_claims {
                 Ok(vec![ClaimLoopKind::Request, ClaimLoopKind::Batch])
@@ -77,7 +183,21 @@ fn claim_loop_kinds_for_mode(
                 )))
             }
         }
+    }?;
+
+    if background_enabled {
+        match mode {
+            DaemonMode::RequestOnly => kinds.push(ClaimLoopKind::BackgroundRequest),
+            DaemonMode::BatchOnly => kinds.push(ClaimLoopKind::BackgroundBatch),
+            DaemonMode::Both => {
+                kinds.push(ClaimLoopKind::BackgroundRequest);
+                if supports_batch_claims {
+                    kinds.push(ClaimLoopKind::BackgroundBatch);
+                }
+            }
+        }
     }
+    Ok(kinds)
 }
 
 fn get_hostname() -> String {
@@ -165,6 +285,56 @@ where
     }
 }
 
+/// Daemon responsible for spare-capacity batchless background requests.
+struct BackgroundRequestDaemon<S, H>
+where
+    S: Storage + DaemonStorage,
+    H: HttpClient,
+{
+    core: Arc<Daemon<S, H>>,
+}
+
+impl<S, H> BackgroundRequestDaemon<S, H>
+where
+    S: Storage + DaemonStorage + 'static,
+    H: HttpClient + 'static,
+{
+    fn new(core: Arc<Daemon<S, H>>) -> Self {
+        Self { core }
+    }
+
+    async fn run(self) -> Result<()> {
+        self.core
+            .run_background_claim_loop(ClaimLoopKind::BackgroundRequest)
+            .await
+    }
+}
+
+/// Daemon responsible for spare-capacity file-backed background batches.
+struct BackgroundBatchDaemon<S, H>
+where
+    S: Storage + DaemonStorage,
+    H: HttpClient,
+{
+    core: Arc<Daemon<S, H>>,
+}
+
+impl<S, H> BackgroundBatchDaemon<S, H>
+where
+    S: Storage + DaemonStorage + 'static,
+    H: HttpClient + 'static,
+{
+    fn new(core: Arc<Daemon<S, H>>) -> Self {
+        Self { core }
+    }
+
+    async fn run(self) -> Result<()> {
+        self.core
+            .run_background_claim_loop(ClaimLoopKind::BackgroundBatch)
+            .await
+    }
+}
+
 /// Daemon that processes batched requests.
 ///
 /// The daemon continuously claims pending requests from storage, enforces
@@ -198,8 +368,9 @@ where
     leak_buckets: Arc<dashmap::DashMap<(String, String, String), std::time::Instant>>,
     /// Per-user throughput counters for periodic OTel emission.
     user_throughput: Arc<dashmap::DashMap<String, UserThroughputStats>>,
-    /// Serializes independent claim loops while they compute available
-    /// capacity, claim rows, and increment in-flight counters.
+    /// Serializes foreground request and batch claim loops while they compute
+    /// available capacity, claim rows, and increment foreground in-flight
+    /// counters. Background workers never acquire this mutex.
     claim_mutex: Arc<tokio::sync::Mutex<()>>,
     requests_processed: Arc<AtomicU64>,
     requests_failed: Arc<AtomicU64>,
@@ -305,6 +476,25 @@ where
             .collect()
     }
 
+    fn background_available_capacity(&self) -> HashMap<String, usize> {
+        let background_limit = self.config.background_concurrency_limit;
+        self.config
+            .model_concurrency_limits
+            .iter()
+            .filter_map(|entry| {
+                let model = entry.key().clone();
+                let ordinary_limit = *entry.value();
+                let in_flight = self
+                    .requests_in_flight
+                    .get(&model)
+                    .map(|count| count.value().load(Ordering::Relaxed))
+                    .unwrap_or(0);
+                let available = background_capacity(ordinary_limit, background_limit, in_flight);
+                (available > 0).then_some((model, available))
+            })
+            .collect()
+    }
+
     fn user_active_counts(&self) -> HashMap<String, usize> {
         self.user_requests_in_flight
             .iter()
@@ -371,19 +561,165 @@ where
         }
     }
 
-    async fn run_claim_loop(self: Arc<Self>, kind: ClaimLoopKind) -> Result<()> {
+    async fn run_background_claim_loop(self: Arc<Self>, kind: ClaimLoopKind) -> Result<()> {
+        debug_assert!(kind.is_background());
         let mut join_set: JoinSet<Result<()>> = JoinSet::new();
-        let (loop_name, interval_ms) = match kind {
-            ClaimLoopKind::Request => ("request_daemon", self.config.claim_interval_ms),
-            ClaimLoopKind::Batch => (
-                "batch_daemon",
-                if self.config.batch_claim_interval_ms == 0 {
-                    self.config.claim_interval_ms
-                } else {
-                    self.config.batch_claim_interval_ms
-                },
-            ),
+        let loop_name = match kind {
+            ClaimLoopKind::BackgroundRequest => "background_request_daemon",
+            ClaimLoopKind::BackgroundBatch => "background_batch_daemon",
+            _ => unreachable!("foreground kind passed to background claim loop"),
         };
+        let interval_ms = kind.claim_interval_ms(&self.config);
+
+        tracing::info!(
+            daemon_id = %self.daemon_id,
+            loop_name,
+            interval_ms,
+            "Claim loop started"
+        );
+
+        let mut consecutive_claim_failures: u32 = 0;
+
+        loop {
+            if self.shutdown_token.is_cancelled() {
+                tracing::info!(loop_name, "Shutdown signal received, stopping claim loop");
+                break Ok(());
+            }
+
+            Self::poll_processing_tasks(&mut join_set);
+
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_millis(interval_ms)) => {},
+                _ = self.shutdown_token.cancelled() => {
+                    tracing::info!(loop_name, "Shutdown signal received, stopping claim loop");
+                    break Ok(());
+                }
+            }
+
+            // Background reads foreground capacity but never reserves it and
+            // never waits for the foreground claim mutex.
+            let available_capacity = self.background_available_capacity();
+            if available_capacity.is_empty() {
+                tracing::trace!(
+                    loop_name,
+                    "No foreground headroom available for any model, skipping background claim"
+                );
+                continue;
+            }
+
+            let total_capacity: usize = available_capacity.values().sum();
+            if kind.emits_legacy_claim_metrics() {
+                gauge!("fusillade_claim_capacity").set(total_capacity as f64);
+            }
+            gauge!("fusillade_claim_capacity", "daemon" => loop_name).set(total_capacity as f64);
+
+            let user_active_counts = self.user_active_counts();
+            let claim_start = std::time::Instant::now();
+            let claim_timeout = Duration::from_millis(self.config.claim_query_timeout_ms);
+            let claim_size = kind.claim_size(&self.config);
+            let claim_result = match kind {
+                ClaimLoopKind::BackgroundRequest => {
+                    with_query_timeout(
+                        "background batchless claim query",
+                        claim_timeout,
+                        self.storage.claim_background_batchless_requests(
+                            claim_size,
+                            self.daemon_id,
+                            &available_capacity,
+                            &user_active_counts,
+                        ),
+                    )
+                    .await
+                }
+                ClaimLoopKind::BackgroundBatch => {
+                    with_query_timeout(
+                        "background batch claim query",
+                        claim_timeout,
+                        self.storage.claim_background_batch_requests(
+                            claim_size,
+                            self.config.batch_claim_batch_size,
+                            self.daemon_id,
+                            &available_capacity,
+                            &user_active_counts,
+                        ),
+                    )
+                    .await
+                }
+                _ => unreachable!("foreground kind passed to background claim loop"),
+            };
+
+            let mut claimed = match claim_result {
+                Ok(claimed) => {
+                    consecutive_claim_failures = 0;
+                    claimed
+                }
+                Err(e) => {
+                    consecutive_claim_failures += 1;
+                    counter!("fusillade_claim_loop_errors_total", "daemon" => loop_name)
+                        .increment(1);
+                    if consecutive_claim_failures >= self.config.claim_loop_max_consecutive_failures
+                    {
+                        tracing::error!(
+                            loop_name,
+                            consecutive_claim_failures,
+                            error = %e,
+                            "Claim loop giving up after repeated consecutive failures"
+                        );
+                        break Err(e);
+                    }
+
+                    let base_interval = Duration::from_millis(interval_ms);
+                    let backoff = claim_failure_backoff(consecutive_claim_failures, interval_ms);
+                    let retry_delay = base_interval.max(backoff);
+                    let backoff_sleep = retry_delay.saturating_sub(base_interval);
+                    tracing::warn!(
+                        loop_name,
+                        consecutive_claim_failures,
+                        backoff_ms = retry_delay.as_millis() as u64,
+                        sleep_ms = backoff_sleep.as_millis() as u64,
+                        error = %e,
+                        "Claim failed; backing off before retry"
+                    );
+                    tokio::select! {
+                        _ = tokio::time::sleep(backoff_sleep) => {},
+                        _ = self.shutdown_token.cancelled() => {
+                            tracing::info!(loop_name, "Shutdown signal received, stopping claim loop");
+                            break Ok(());
+                        }
+                    }
+                    continue;
+                }
+            };
+
+            if kind.emits_legacy_claim_metrics() {
+                histogram!("fusillade_claim_duration_seconds")
+                    .record(claim_start.elapsed().as_secs_f64());
+                histogram!("fusillade_claim_size").record(claimed.len() as f64);
+            }
+            histogram!("fusillade_claim_duration_seconds", "daemon" => loop_name)
+                .record(claim_start.elapsed().as_secs_f64());
+            histogram!("fusillade_claim_size", "daemon" => loop_name).record(claimed.len() as f64);
+
+            tracing::debug!(
+                loop_name,
+                claimed_count = claimed.len(),
+                "Claimed requests from storage"
+            );
+
+            self.prepare_claimed_requests(&mut claimed, kind);
+            self.dispatch_claimed_requests(&mut join_set, claimed, kind);
+        }
+    }
+
+    async fn run_claim_loop(self: Arc<Self>, kind: ClaimLoopKind) -> Result<()> {
+        debug_assert!(kind.uses_foreground_accounting());
+        let mut join_set: JoinSet<Result<()>> = JoinSet::new();
+        let loop_name = match kind {
+            ClaimLoopKind::Request => "request_daemon",
+            ClaimLoopKind::Batch => "batch_daemon",
+            _ => unreachable!("background kind passed to foreground claim loop"),
+        };
+        let interval_ms = kind.claim_interval_ms(&self.config);
 
         tracing::info!(
             daemon_id = %self.daemon_id,
@@ -461,17 +797,11 @@ where
                     .await
                 }
                 ClaimLoopKind::Batch => {
-                    // 0 = inherit the (often deployment-tuned) single-loop cap.
-                    let batch_claim_size = if self.config.batch_claim_size == 0 {
-                        self.config.claim_batch_size
-                    } else {
-                        self.config.batch_claim_size
-                    };
                     with_query_timeout(
                         "batch claim query",
                         claim_timeout,
                         self.storage.claim_batch_requests(
-                            batch_claim_size,
+                            kind.claim_size(&self.config),
                             self.config.batch_claim_batch_size,
                             self.daemon_id,
                             &available_capacity,
@@ -480,6 +810,7 @@ where
                     )
                     .await
                 }
+                _ => unreachable!("background kind passed to foreground claim loop"),
             };
 
             let mut claimed = match claim_result {
@@ -544,15 +875,21 @@ where
                 self.stamp_leaks(&claimed);
             }
 
-            self.prepare_claimed_requests(&mut claimed);
-            self.dispatch_claimed_requests(&mut join_set, claimed);
+            self.prepare_claimed_requests(&mut claimed, kind);
+            self.dispatch_claimed_requests(&mut join_set, claimed, kind);
         }
     }
 
-    fn prepare_claimed_requests(&self, claimed: &mut [Request<Claimed>]) {
+    fn prepare_claimed_requests(&self, claimed: &mut [Request<Claimed>], kind: ClaimLoopKind) {
         for request in claimed.iter_mut() {
+            if kind.is_background() {
+                continue;
+            }
+            let Some(batch_expires_at) = request.state.batch_expires_at else {
+                continue;
+            };
             if let Some(config) = self.config.model_escalations.get(&request.data.model) {
-                let time_remaining = request.state.batch_expires_at - chrono::Utc::now();
+                let time_remaining = batch_expires_at - chrono::Utc::now();
                 if time_remaining.num_seconds() < config.escalation_threshold_seconds {
                     let original_model = request.data.model.clone();
                     request.data.model = config.escalation_model.clone();
@@ -583,32 +920,18 @@ where
             }
         }
 
-        if self.config.inject_deadline_priority {
-            for request in claimed {
-                let priority: i32 = (-request.state.batch_expires_at.timestamp())
-                    .clamp(i32::MIN as i64, i32::MAX as i64)
-                    as i32;
-
-                if let Ok(mut json) = serde_json::from_str::<serde_json::Value>(&request.data.body)
-                    && let Some(obj) = json.as_object_mut()
-                {
-                    let nvext = obj.entry("nvext").or_insert_with(|| serde_json::json!({}));
-                    if let Some(nvext_obj) = nvext.as_object_mut() {
-                        let agent_hints = nvext_obj
-                            .entry("agent_hints")
-                            .or_insert_with(|| serde_json::json!({}));
-                        if let Some(hints_obj) = agent_hints.as_object_mut() {
-                            hints_obj.insert(
-                                "priority".to_string(),
-                                serde_json::Value::Number(priority.into()),
-                            );
-                            if let Ok(new_body) = serde_json::to_string(&json) {
-                                request.data.body = new_body;
-                            }
-                        }
-                    }
-                }
-            }
+        for request in claimed {
+            let priority = if kind.is_background() {
+                BACKGROUND_DYNAMO_PRIORITY
+            } else if self.config.inject_deadline_priority {
+                let Some(deadline) = request.state.batch_expires_at else {
+                    continue;
+                };
+                sla_dynamo_priority(deadline)
+            } else {
+                continue;
+            };
+            inject_dynamo_priority(&mut request.data.body, priority);
         }
     }
 
@@ -616,6 +939,7 @@ where
         self: &Arc<Self>,
         join_set: &mut JoinSet<Result<()>>,
         claimed: Vec<Request<Claimed>>,
+        kind: ClaimLoopKind,
     ) {
         let mut by_model: HashMap<String, Vec<_>> = HashMap::new();
         for request in claimed {
@@ -645,12 +969,18 @@ where
 
                 let model_clone = model.clone();
                 let user_id = request.data.created_by.clone();
-                let completion_window = request
-                    .data
-                    .batch_metadata
-                    .get("completion_window")
-                    .cloned()
-                    .unwrap_or_default();
+                let is_background = kind.is_background();
+                let uses_foreground_accounting = kind.uses_foreground_accounting();
+                let completion_window = if is_background {
+                    "background".to_string()
+                } else {
+                    request
+                        .data
+                        .batch_metadata
+                        .get("completion_window")
+                        .cloned()
+                        .unwrap_or_default()
+                };
 
                 // Pickup delay: submission (`created_at`) to first claim — the
                 // queue-wait component of submission-epoch TTFT. Re-claims after
@@ -683,19 +1013,24 @@ where
                     None => tokio_util::sync::CancellationToken::new(),
                 };
 
-                requests_in_flight
-                    .entry(model_clone.clone())
-                    .or_default()
-                    .fetch_add(1, Ordering::Relaxed);
-                gauge!("fusillade_requests_in_flight", "model" => model_clone.clone())
-                    .increment(1.0);
+                if is_background {
+                    gauge!("fusillade_background_requests_in_flight", "model" => model_clone.clone())
+                        .increment(1.0);
+                } else {
+                    requests_in_flight
+                        .entry(model_clone.clone())
+                        .or_default()
+                        .fetch_add(1, Ordering::Relaxed);
+                    gauge!("fusillade_requests_in_flight", "model" => model_clone.clone())
+                        .increment(1.0);
 
-                user_requests_in_flight
-                    .entry(user_id.clone())
-                    .or_default()
-                    .fetch_add(1, Ordering::Relaxed);
-                gauge!("fusillade_user_requests_in_flight", "user" => user_id.clone(), "completion_window" => completion_window.clone())
-                    .increment(1.0);
+                    user_requests_in_flight
+                        .entry(user_id.clone())
+                        .or_default()
+                        .fetch_add(1, Ordering::Relaxed);
+                    gauge!("fusillade_user_requests_in_flight", "user" => user_id.clone(), "completion_window" => completion_window.clone())
+                        .increment(1.0);
+                }
 
                 let process_span = tracing::info_span!(
                     parent: tracing::Span::none(),
@@ -721,17 +1056,24 @@ where
                     let cw_for_guard = completion_window.clone();
                     let in_flight_for_guard = requests_in_flight.clone();
                     let user_in_flight_for_guard = user_requests_in_flight.clone();
+                    let background_for_guard = is_background;
+                    let foreground_accounting_for_guard = uses_foreground_accounting;
+                    let background_model_for_guard = model_clone.clone();
                     let _guard = scopeguard::guard((), move |_| {
-                        if let Some(counter) = in_flight_for_guard.get(&model_for_guard) {
-                            counter.value().fetch_sub(1, Ordering::Relaxed);
-                        }
-                        gauge!("fusillade_requests_in_flight", "model" => model_for_guard).decrement(1.0);
-                        gauge!("fusillade_user_requests_in_flight", "user" => user_for_guard.clone(), "completion_window" => cw_for_guard).decrement(1.0);
-                        if let Some(counter) = user_in_flight_for_guard.get(&user_for_guard) {
-                            let prev = counter.value().fetch_sub(1, Ordering::Relaxed);
-                            drop(counter);
-                            if prev == 1 {
-                                user_in_flight_for_guard.remove(&user_for_guard);
+                        if background_for_guard {
+                            gauge!("fusillade_background_requests_in_flight", "model" => background_model_for_guard).decrement(1.0);
+                        } else if foreground_accounting_for_guard {
+                            if let Some(counter) = in_flight_for_guard.get(&model_for_guard) {
+                                counter.value().fetch_sub(1, Ordering::Relaxed);
+                            }
+                            gauge!("fusillade_requests_in_flight", "model" => model_for_guard).decrement(1.0);
+                            gauge!("fusillade_user_requests_in_flight", "user" => user_for_guard.clone(), "completion_window" => cw_for_guard).decrement(1.0);
+                            if let Some(counter) = user_in_flight_for_guard.get(&user_for_guard) {
+                                let prev = counter.value().fetch_sub(1, Ordering::Relaxed);
+                                drop(counter);
+                                if prev == 1 {
+                                    user_in_flight_for_guard.remove(&user_for_guard);
+                                }
                             }
                         }
                     });
@@ -776,17 +1118,19 @@ where
                             histogram!("fusillade_retry_attempts_on_success", "model" => model_clone.clone())
                                 .record(retry_attempt_at_completion as f64);
 
-                            let completed_at = completed.state.completed_at;
-                            let seconds_until_deadline = (batch_expires_at - completed_at).num_milliseconds() as f64 / 1000.0;
-                            gauge!("fusillade_request_deadline_margin_seconds", "model" => model_clone.clone(), "status" => "success")
-                                .set(seconds_until_deadline);
-                            if completed_at > batch_expires_at {
-                                counter!("fusillade_requests_completed_after_sla_total", "model" => model_clone.clone(), "status" => "success", "completion_window" => completion_window.clone()).increment(1);
-                                tracing::warn!(
-                                    request_id = %request_id,
-                                    batch_id = ?batch_id,
-                                    "Request completed successfully after SLA"
-                                );
+                            if let Some(batch_expires_at) = batch_expires_at {
+                                let completed_at = completed.state.completed_at;
+                                let seconds_until_deadline = (batch_expires_at - completed_at).num_milliseconds() as f64 / 1000.0;
+                                gauge!("fusillade_request_deadline_margin_seconds", "model" => model_clone.clone(), "status" => "success")
+                                    .set(seconds_until_deadline);
+                                if completed_at > batch_expires_at {
+                                    counter!("fusillade_requests_completed_after_sla_total", "model" => model_clone.clone(), "status" => "success", "completion_window" => completion_window.clone()).increment(1);
+                                    tracing::warn!(
+                                        request_id = %request_id,
+                                        batch_id = ?batch_id,
+                                        "Request completed successfully after SLA"
+                                    );
+                                }
                             }
                             Ok(())
                         }
@@ -844,7 +1188,9 @@ where
                                         counter!("fusillade_user_requests_completed_total", "user" => user_id.clone(), "status" => "failed", "completion_window" => completion_window.clone()).increment(1);
                                         histogram!("fusillade_request_duration_seconds", "model" => model_clone.clone(), "status" => "failed")
                                             .record(processing_start.elapsed().as_secs_f64());
-                                        if failed.state.failed_at > batch_expires_at {
+                                        if let Some(batch_expires_at) = batch_expires_at
+                                            && failed.state.failed_at > batch_expires_at
+                                        {
                                             counter!("fusillade_requests_completed_after_sla_total", "model" => model_clone.clone(), "status" => "failed", "completion_window" => completion_window.clone()).increment(1);
                                             tracing::warn!(
                                                 request_id = %request_id,
@@ -872,7 +1218,9 @@ where
                                 counter!("fusillade_user_requests_completed_total", "user" => user_id.clone(), "status" => "failed", "completion_window" => completion_window.clone()).increment(1);
                                 histogram!("fusillade_request_duration_seconds", "model" => model_clone.clone(), "status" => "failed")
                                     .record(processing_start.elapsed().as_secs_f64());
-                                if failed.state.failed_at > batch_expires_at {
+                                if let Some(batch_expires_at) = batch_expires_at
+                                    && failed.state.failed_at > batch_expires_at
+                                {
                                     counter!("fusillade_requests_completed_after_sla_total", "model" => model_clone.clone(), "status" => "failed", "completion_window" => completion_window.clone()).increment(1);
                                     tracing::warn!(
                                         request_id = %request_id,
@@ -936,6 +1284,21 @@ where
     #[tracing::instrument(name = "fusillade.daemon.run_with_mode", skip(self), fields(daemon_id = %self.daemon_id, mode = ?mode))]
     pub async fn run_with_mode(self: Arc<Self>, mode: DaemonMode) -> Result<()> {
         tracing::info!("Daemon starting main processing loop");
+
+        // Validate the configured claim topology before registering the daemon
+        // or spawning any maintenance tasks. Background workers read this
+        // process's foreground counters but run independently of its claim
+        // mutex.
+        let supports_batch_claims = self.storage.supports_batch_claims();
+        let supports_background_claims = self.storage.supports_background_claims();
+        let background_enabled = self.config.background_concurrency_limit > 0;
+        let claim_loop_kinds = claim_loop_kinds_for_mode(
+            mode,
+            supports_batch_claims,
+            supports_background_claims,
+            background_enabled,
+            self.config.inject_deadline_priority,
+        )?;
 
         // Register daemon in database
         let daemon_record = DaemonRecord {
@@ -1328,8 +1691,6 @@ where
         }
 
         let mut claim_daemons: JoinSet<Result<()>> = JoinSet::new();
-        let supports_batch_claims = self.storage.supports_batch_claims();
-        let claim_loop_kinds = claim_loop_kinds_for_mode(mode, supports_batch_claims)?;
 
         if mode == DaemonMode::Both && !supports_batch_claims {
             tracing::info!(
@@ -1534,6 +1895,14 @@ where
                     let batch_daemon = BatchDaemon::new(self.clone());
                     claim_daemons.spawn(async move { batch_daemon.run().await });
                 }
+                ClaimLoopKind::BackgroundRequest => {
+                    let background_daemon = BackgroundRequestDaemon::new(self.clone());
+                    claim_daemons.spawn(async move { background_daemon.run().await });
+                }
+                ClaimLoopKind::BackgroundBatch => {
+                    let background_daemon = BackgroundBatchDaemon::new(self.clone());
+                    claim_daemons.spawn(async move { background_daemon.run().await });
+                }
             }
         }
 
@@ -1614,8 +1983,10 @@ mod tests {
     fn daemon_mode_defaults_to_both_and_roundtrips_through_config() {
         assert_eq!(DaemonConfig::default().mode, DaemonMode::Both);
 
-        let mut config = DaemonConfig::default();
-        config.mode = DaemonMode::BatchOnly;
+        let config = DaemonConfig {
+            mode: DaemonMode::BatchOnly,
+            ..Default::default()
+        };
 
         let json = serde_json::to_value(&config).expect("config should serialize");
         assert_eq!(json["mode"], serde_json::json!("batch_only"));
@@ -1628,22 +1999,144 @@ mod tests {
     #[test]
     fn daemon_mode_selects_the_expected_claim_loops() {
         assert_eq!(
-            claim_loop_kinds_for_mode(DaemonMode::Both, true).expect("both should be supported"),
+            claim_loop_kinds_for_mode(DaemonMode::Both, true, false, false, false)
+                .expect("both should be supported"),
             vec![ClaimLoopKind::Request, ClaimLoopKind::Batch]
         );
         assert_eq!(
-            claim_loop_kinds_for_mode(DaemonMode::RequestOnly, true)
+            claim_loop_kinds_for_mode(DaemonMode::RequestOnly, true, false, false, false)
                 .expect("request-only should be supported"),
             vec![ClaimLoopKind::Request]
         );
         assert_eq!(
-            claim_loop_kinds_for_mode(DaemonMode::BatchOnly, true)
+            claim_loop_kinds_for_mode(DaemonMode::BatchOnly, true, false, false, false)
                 .expect("batch-only should be supported"),
             vec![ClaimLoopKind::Batch]
         );
         assert!(
-            claim_loop_kinds_for_mode(DaemonMode::BatchOnly, false).is_err(),
+            claim_loop_kinds_for_mode(DaemonMode::BatchOnly, false, false, false, false).is_err(),
             "batch-only mode should fail loudly when storage cannot claim batches"
+        );
+    }
+
+    #[test]
+    fn background_capacity_reserves_sla_headroom_per_model() {
+        assert_eq!(background_capacity(100, 50, 70), 0);
+        assert_eq!(background_capacity(100, 50, 40), 10);
+        assert_eq!(background_capacity(100, 50, 0), 50);
+        assert_eq!(background_capacity(20, 50, 0), 20);
+        assert_eq!(background_capacity(100, 0, 0), 0);
+    }
+
+    #[test]
+    fn background_workers_never_participate_in_foreground_accounting() {
+        assert!(ClaimLoopKind::Request.uses_foreground_accounting());
+        assert!(ClaimLoopKind::Batch.uses_foreground_accounting());
+        assert!(!ClaimLoopKind::BackgroundRequest.uses_foreground_accounting());
+        assert!(!ClaimLoopKind::BackgroundBatch.uses_foreground_accounting());
+
+        assert!(ClaimLoopKind::Request.emits_legacy_claim_metrics());
+        assert!(ClaimLoopKind::Batch.emits_legacy_claim_metrics());
+        assert!(!ClaimLoopKind::BackgroundRequest.emits_legacy_claim_metrics());
+        assert!(!ClaimLoopKind::BackgroundBatch.emits_legacy_claim_metrics());
+
+        assert!(!ClaimLoopKind::Request.is_background());
+        assert!(!ClaimLoopKind::Batch.is_background());
+        assert!(ClaimLoopKind::BackgroundRequest.is_background());
+        assert!(ClaimLoopKind::BackgroundBatch.is_background());
+    }
+
+    #[test]
+    fn background_workers_mirror_modality_claim_configuration() {
+        let config = DaemonConfig {
+            claim_interval_ms: 13,
+            batch_claim_interval_ms: 17,
+            claim_batch_size: 11,
+            batch_claim_size: 7,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            ClaimLoopKind::BackgroundRequest.claim_interval_ms(&config),
+            13
+        );
+        assert_eq!(
+            ClaimLoopKind::BackgroundBatch.claim_interval_ms(&config),
+            17
+        );
+        assert_eq!(ClaimLoopKind::BackgroundRequest.claim_size(&config), 11);
+        assert_eq!(ClaimLoopKind::BackgroundBatch.claim_size(&config), 7);
+
+        let inherited = DaemonConfig {
+            claim_interval_ms: 19,
+            batch_claim_interval_ms: 0,
+            claim_batch_size: 23,
+            batch_claim_size: 0,
+            ..Default::default()
+        };
+        assert_eq!(
+            ClaimLoopKind::BackgroundBatch.claim_interval_ms(&inherited),
+            19
+        );
+        assert_eq!(ClaimLoopKind::BackgroundBatch.claim_size(&inherited), 23);
+    }
+
+    #[test]
+    fn background_loop_requires_safe_shared_configuration() {
+        assert_eq!(DaemonConfig::default().background_concurrency_limit, 0);
+        assert_eq!(
+            claim_loop_kinds_for_mode(DaemonMode::Both, true, true, true, true).unwrap(),
+            vec![
+                ClaimLoopKind::Request,
+                ClaimLoopKind::Batch,
+                ClaimLoopKind::BackgroundRequest,
+                ClaimLoopKind::BackgroundBatch,
+            ]
+        );
+        assert_eq!(
+            claim_loop_kinds_for_mode(DaemonMode::RequestOnly, false, true, true, true).unwrap(),
+            vec![ClaimLoopKind::Request, ClaimLoopKind::BackgroundRequest]
+        );
+        assert_eq!(
+            claim_loop_kinds_for_mode(DaemonMode::BatchOnly, true, true, true, true).unwrap(),
+            vec![ClaimLoopKind::Batch, ClaimLoopKind::BackgroundBatch]
+        );
+        assert_eq!(
+            claim_loop_kinds_for_mode(DaemonMode::Both, false, true, true, true).unwrap(),
+            vec![ClaimLoopKind::Request, ClaimLoopKind::BackgroundRequest]
+        );
+        assert!(claim_loop_kinds_for_mode(DaemonMode::Both, true, false, true, true).is_err());
+        assert!(claim_loop_kinds_for_mode(DaemonMode::Both, true, true, true, false).is_err());
+    }
+
+    #[test]
+    fn background_priority_is_reserved_and_preserves_nvext_siblings() {
+        let mut body = serde_json::json!({
+            "input": "hello",
+            "nvext": {
+                "cache_control": {"enabled": true},
+                "agent_hints": {"priority": 123, "max_batch_size": 8}
+            }
+        })
+        .to_string();
+
+        inject_dynamo_priority(&mut body, BACKGROUND_DYNAMO_PRIORITY);
+
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            json["nvext"]["agent_hints"]["priority"],
+            serde_json::json!(i32::MIN)
+        );
+        assert_eq!(json["nvext"]["agent_hints"]["max_batch_size"], 8);
+        assert_eq!(json["nvext"]["cache_control"]["enabled"], true);
+
+        assert_eq!(
+            sla_dynamo_priority(chrono::DateTime::<chrono::Utc>::MAX_UTC),
+            MIN_SLA_DYNAMO_PRIORITY
+        );
+        assert!(
+            sla_dynamo_priority(chrono::DateTime::<chrono::Utc>::MAX_UTC)
+                > BACKGROUND_DYNAMO_PRIORITY
         );
     }
 

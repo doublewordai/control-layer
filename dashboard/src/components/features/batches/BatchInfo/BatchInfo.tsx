@@ -37,6 +37,7 @@ import {
   downloadFile,
 } from "../../../../utils/batch";
 import BatchResults from "./BatchResults";
+import { getCompletionWindowLabel } from "../../../../utils/serviceTier";
 
 const BatchInfo: React.FC = () => {
   const { batchId } = useParams<{ batchId: string }>();
@@ -605,6 +606,14 @@ const BatchInfo: React.FC = () => {
                         <p className="text-sm text-gray-600 mb-1">Endpoint</p>
                         <p className="font-medium font-mono text-sm">
                           {batch.endpoint}
+                        </p>
+                      </div>
+                      <div>
+                        <p className="text-sm text-gray-600 mb-1">
+                          Service tier
+                        </p>
+                        <p className="font-medium text-sm">
+                          {getCompletionWindowLabel(batch.completion_window)}
                         </p>
                       </div>
                       {batch.metadata?.created_by_email && (

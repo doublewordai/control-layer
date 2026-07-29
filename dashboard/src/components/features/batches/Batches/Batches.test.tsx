@@ -333,6 +333,7 @@ describe("Batches", () => {
       expect(useBatchesSpy).toHaveBeenCalledWith(
         expect.objectContaining({
           include: "analytics",
+          completion_window: "24h,background",
         }),
       );
     });
