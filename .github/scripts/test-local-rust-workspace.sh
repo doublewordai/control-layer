@@ -38,11 +38,16 @@ if workspace_packages != expected_packages:
     )
 
 packages_by_name = {package["name"]: package for package in metadata["packages"]}
-for package_name in expected_packages - {"onwards"}:
+for package_name in expected_packages - {
+    "onwards",
+    "fusillade-core",
+    "fusillade-arsenal",
+}:
     if packages_by_name[package_name]["publish"] != []:
         raise SystemExit(f"{package_name} must declare publish = false")
-if packages_by_name["onwards"]["publish"] is not None:
-    raise SystemExit("onwards must remain publishable to crates.io")
+for package_name in {"onwards", "fusillade-core", "fusillade-arsenal"}:
+    if packages_by_name[package_name]["publish"] is not None:
+        raise SystemExit(f"{package_name} must remain publishable to crates.io")
 
 workspace_manifest = tomllib.loads((root / "Cargo.toml").read_text())
 if "patch" in workspace_manifest:
@@ -76,13 +81,22 @@ for manifest_path, dependencies in local_dependencies.items():
                 f"{manifest_path}: {dependency} path must be {expected_path}, "
                 f"got {specification.get('path')}"
             )
-        if manifest_path == "onwards/Cargo.toml" and dependency == "fusillade":
+        registry_dependency = (
+            manifest_path == "onwards/Cargo.toml" and dependency == "fusillade"
+        ) or (
+            manifest_path == "fusillade-arsenal/Cargo.toml"
+            and dependency == "fusillade-core"
+        )
+        if registry_dependency:
             if not isinstance(specification.get("version"), str):
                 raise SystemExit(
-                    "onwards/Cargo.toml: fusillade must retain a registry fallback "
+                    f"{manifest_path}: {dependency} must retain a registry fallback "
                     "for crates.io packaging"
                 )
-            if specification.get("default-features") is not False:
+            if (
+                manifest_path == "onwards/Cargo.toml"
+                and specification.get("default-features") is not False
+            ):
                 raise SystemExit(
                     "Onwards must not pull Fusillade's PostgreSQL storage feature"
                 )
@@ -92,8 +106,15 @@ for manifest_path, dependencies in local_dependencies.items():
             )
 
 release_config = json.loads((root / "release-please-config.json").read_text())
-if set(release_config["packages"]) != {".", "onwards"}:
-    raise SystemExit("Release Please must manage the application and Onwards independently")
+if set(release_config["packages"]) != {
+    ".",
+    "onwards",
+    "fusillade-core",
+    "fusillade-arsenal",
+}:
+    raise SystemExit(
+        "Release Please must manage the application, Onwards, and Fusillade Arsenal independently"
+    )
 if release_config.get("separate-pull-requests") is not True:
     raise SystemExit(
         "Release Please must use component-specific PRs so single-component releases can be identified"
@@ -115,15 +136,51 @@ if onwards_release.get("component") != "onwards":
     raise SystemExit("Onwards releases must use component-prefixed tags")
 if onwards_release.get("include-component-in-tag") is not True:
     raise SystemExit("Onwards tags must use the onwards-v<version> namespace")
+arsenal_release = release_config["packages"]["fusillade-arsenal"]
+if arsenal_release.get("release-type") != "rust":
+    raise SystemExit("Fusillade Arsenal releases must use the Rust strategy")
+if arsenal_release.get("component") != "fusillade-arsenal":
+    raise SystemExit("Fusillade Arsenal releases must use component-prefixed tags")
+if arsenal_release.get("include-component-in-tag") is not True:
+    raise SystemExit(
+        "Fusillade Arsenal tags must use the fusillade-arsenal-v<version> namespace"
+    )
+core_release = release_config["packages"]["fusillade-core"]
+if core_release.get("release-type") != "rust":
+    raise SystemExit("Fusillade Core releases must use the Rust strategy")
+if core_release.get("component") != "fusillade-core":
+    raise SystemExit("Fusillade Core releases must use component-prefixed tags")
+if core_release.get("include-component-in-tag") is not True:
+    raise SystemExit(
+        "Fusillade Core tags must use the fusillade-core-v<version> namespace"
+    )
 
 release_manifest = json.loads((root / ".release-please-manifest.json").read_text())
-if set(release_manifest) != {".", "onwards"}:
-    raise SystemExit("release manifest must track dwctl and Onwards independently")
+if set(release_manifest) != {
+    ".",
+    "onwards",
+    "fusillade-core",
+    "fusillade-arsenal",
+}:
+    raise SystemExit(
+        "release manifest must track dwctl, Onwards, and Fusillade Arsenal independently"
+    )
+if release_manifest["fusillade-arsenal"] != "3.0.0":
+    raise SystemExit("Fusillade Arsenal release baseline must remain 3.0.0")
+if release_manifest["fusillade-core"] != "4.0.0":
+    raise SystemExit("Fusillade Core release baseline must remain 4.0.0")
 PY
 
 release_workflow=".github/workflows/release.yml"
 justfile="justfile"
 backfill_script="scripts/backfill_responses_to_batchless.sql"
+arsenal_sqlx_cache="fusillade-arsenal/.sqlx"
+
+if [[ ! -L "$arsenal_sqlx_cache" ]] || \
+   [[ "$(readlink "$arsenal_sqlx_cache")" != "../.sqlx" ]]; then
+  echo "Fusillade Arsenal must package the workspace SQLx offline cache" >&2
+  exit 1
+fi
 
 if [[ ! -f "$backfill_script" ]] || \
    [[ "$(shasum -a 256 "$backfill_script" | awk '{print $1}')" != \
@@ -132,7 +189,7 @@ if [[ ! -f "$backfill_script" ]] || \
   exit 1
 fi
 
-if grep -Eq 'publish-(dwctl|fusillade)|cargo publish (--package )?(dwctl|fusillade)( |$)' \
+if grep -Eq 'publish-(dwctl|fusillade):|cargo publish (--package )?(dwctl|fusillade)( |$)' \
   "$release_workflow" "$justfile"; then
   echo "application and Fusillade releases must not publish Rust crates" >&2
   exit 1
@@ -151,6 +208,24 @@ if ! grep -Fq 'path: .release-tools' "$release_workflow" || \
    ! grep -Fq '.release-tools/.github/scripts/publish-onwards-crate.sh' \
      "$release_workflow"; then
   echo "Onwards release retries must use current release tooling against tagged source" >&2
+  exit 1
+fi
+
+if ! grep -Fq 'publish-fusillade-crates:' "$release_workflow" || \
+   ! grep -Fq 'publish-fusillade-crate.sh' "$release_workflow" || \
+   ! grep -Fq 'cargo publish --locked' \
+     .github/scripts/publish-fusillade-crate.sh || \
+   ! grep -Fq -- '--package fusillade-core --registry crates-io' \
+     .github/scripts/publish-fusillade-crate.sh || \
+   ! grep -Fq -- '--package fusillade-arsenal --registry crates-io' \
+     .github/scripts/publish-fusillade-crate.sh; then
+  echo "Fusillade Core and Arsenal releases must publish their crates" >&2
+  exit 1
+fi
+
+if ! grep -Fq '.release-tools/.github/scripts/publish-fusillade-crate.sh' \
+  "$release_workflow"; then
+  echo "Fusillade crate retries must use current release tooling against tagged source" >&2
   exit 1
 fi
 
@@ -416,10 +491,7 @@ if ! grep -Fxq "    if: ${trusted_pull_request_condition}" <<< "$onwards_image_j
 fi
 
 for obsolete_script in \
-  .github/scripts/publish-fusillade-crate.sh \
-  .github/scripts/sync-fusillade-release-dependencies.py \
   .github/scripts/test-fusillade-publish.sh \
-  .github/scripts/test-sync-fusillade-release-dependencies.sh \
   .github/scripts/wait-for-fusillade-crates.sh; do
   if [[ -e "$obsolete_script" ]]; then
     echo "obsolete crates.io release script remains: $obsolete_script" >&2
