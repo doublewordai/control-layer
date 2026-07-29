@@ -47,7 +47,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # OpenTelemetry
 opentelemetry = "0.31.0"
-opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
+opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
 opentelemetry-otlp = { version = "0.31", default-features = false, features = [
   "http-proto",
   "reqwest-blocking-client",
