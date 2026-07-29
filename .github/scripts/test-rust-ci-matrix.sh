@@ -129,6 +129,11 @@ if grep -Fq -- '- package: dwctl' <<< "$crate_test_job"; then
   exit 1
 fi
 
+require_block_line "$crate_test_job" '    if: always()' 'expand the crate matrix for release-only changes'
+require_block_line "$crate_test_job" "      RUN_CI: \${{ needs.changes.outputs.run-ci }}" 'expose the release-only decision to crate test steps'
+crate_skip_step="$(extract_step "$crate_test_job" 'Skip crate tests for release-only changes')"
+require_block_line "$crate_skip_step" "        if: env.RUN_CI != 'true'" 'declare the no-op crate test path'
+
 if ! grep -Fxq '    needs: changes' <<< "$onwards_image_job" || \
    ! grep -Fxq '    needs: changes' <<< "$dwctl_image_job"; then
   echo "Onwards and dwctl image builds must start together after change classification" >&2
@@ -145,7 +150,7 @@ if grep -Fq 'git checkout fa29df5' <<< "$onwards_compliance_job"; then
   exit 1
 fi
 
-require_block_line "$onwards_compliance_job" "    if: always() && needs.changes.outputs.run-ci == 'true'" 'expand the Onwards compliance matrix after relevant change detection'
+require_block_line "$onwards_compliance_job" '    if: always()' 'expand the Onwards compliance matrix for release-only changes'
 require_block_line "$onwards_compliance_job" "    needs: [changes, onwards-compliance-changes]" 'wait for the change classifiers'
 trusted_pull_request_condition="github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]'"
 require_block_line "$onwards_compliance_job" "      RUN_STRICT_COMPLIANCE: \${{ needs.onwards-compliance-changes.outputs.strict == 'true' && ${trusted_pull_request_condition} }}" 'only run strict compliance for trusted pull requests'

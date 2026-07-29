@@ -238,7 +238,7 @@ jobs:
           fi
 
   backend-crate-test:
-    if: needs.changes.outputs.run-ci == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group')
+    if: always()
     needs: changes
     name: ${{ matrix.package }} / test
     strategy:
@@ -259,17 +259,24 @@ jobs:
             database: false
             cargo_args: --all-features
     runs-on: ${{ matrix.runner }}
+    env:
+      RUN_CI: ${{ needs.changes.outputs.run-ci }}
 
     # Postgres is started manually below (not via `services:`) so we can pass
     # `-c max_connections=300`. SQLx tests open their own pools and underway
     # PgListener connections, so the default 100 is insufficient.
 
     steps:
+      - name: Skip crate tests for release-only changes
+        if: env.RUN_CI != 'true'
+        run: echo "Skipping crate tests because this pull request only contains release metadata."
+
       - name: Checkout code
+        if: env.RUN_CI == 'true'
         uses: actions/checkout@v6
 
       - name: Start Postgres
-        if: matrix.database
+        if: env.RUN_CI == 'true' && matrix.database
         run: |
           docker run -d --name postgres \
             -e POSTGRES_DB=test \
@@ -285,21 +292,25 @@ jobs:
           done
 
       - name: Install Rust
+        if: env.RUN_CI == 'true'
         uses: dtolnay/rust-toolchain@stable
         with:
           components: llvm-tools-preview
 
       - name: Cache Rust build
+        if: env.RUN_CI == 'true'
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: backend-test-${{ matrix.package }}
 
       - name: Install just
+        if: env.RUN_CI == 'true'
         uses: extractions/setup-just@v3
         with:
           just-version: "1.46.0"
 
       - name: Install sqlx-cli and cargo-llvm-cov
+        if: env.RUN_CI == 'true'
         run: |
           cargo install cargo-llvm-cov --locked
           if [[ "${{ matrix.database }}" == "true" ]]; then
@@ -308,12 +319,13 @@ jobs:
           fi
 
       - name: Set up test databases
-        if: matrix.database
+        if: env.RUN_CI == 'true' && matrix.database
         env:
           DB_PASS: postgres
         run: just db-setup
 
       - name: Compile and test ${{ matrix.package }}
+        if: env.RUN_CI == 'true'
         run: |
           START_TIME=$(date +%s)
           cargo llvm-cov --package "${{ matrix.package }}" \
@@ -327,6 +339,7 @@ jobs:
             "https://charts.somnial.co/doubleword-control-layer/backend-${{ matrix.package }}-ci-duration?value=${CI_DURATION}" || true
 
       - name: Upload ${{ matrix.package }} coverage
+        if: env.RUN_CI == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: rust-coverage-${{ matrix.package }}
@@ -560,7 +573,7 @@ jobs:
           fi
 
   onwards-openresponses-compliance:
-    if: always() && needs.changes.outputs.run-ci == 'true'
+    if: always()
     needs: [changes, onwards-compliance-changes]
     runs-on: ubuntu-latest
     strategy:
