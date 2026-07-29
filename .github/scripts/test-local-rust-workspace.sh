@@ -38,11 +38,16 @@ if workspace_packages != expected_packages:
     )
 
 packages_by_name = {package["name"]: package for package in metadata["packages"]}
-for package_name in expected_packages - {"onwards"}:
+for package_name in expected_packages - {
+    "onwards",
+    "fusillade-core",
+    "fusillade-arsenal",
+}:
     if packages_by_name[package_name]["publish"] != []:
         raise SystemExit(f"{package_name} must declare publish = false")
-if packages_by_name["onwards"]["publish"] is not None:
-    raise SystemExit("onwards must remain publishable to crates.io")
+for package_name in {"onwards", "fusillade-core", "fusillade-arsenal"}:
+    if packages_by_name[package_name]["publish"] is not None:
+        raise SystemExit(f"{package_name} must remain publishable to crates.io")
 
 workspace_manifest = tomllib.loads((root / "Cargo.toml").read_text())
 if "patch" in workspace_manifest:
@@ -76,13 +81,22 @@ for manifest_path, dependencies in local_dependencies.items():
                 f"{manifest_path}: {dependency} path must be {expected_path}, "
                 f"got {specification.get('path')}"
             )
-        if manifest_path == "onwards/Cargo.toml" and dependency == "fusillade":
+        registry_dependency = (
+            manifest_path == "onwards/Cargo.toml" and dependency == "fusillade"
+        ) or (
+            manifest_path == "fusillade-arsenal/Cargo.toml"
+            and dependency == "fusillade-core"
+        )
+        if registry_dependency:
             if not isinstance(specification.get("version"), str):
                 raise SystemExit(
-                    "onwards/Cargo.toml: fusillade must retain a registry fallback "
+                    f"{manifest_path}: {dependency} must retain a registry fallback "
                     "for crates.io packaging"
                 )
-            if specification.get("default-features") is not False:
+            if (
+                manifest_path == "onwards/Cargo.toml"
+                and specification.get("default-features") is not False
+            ):
                 raise SystemExit(
                     "Onwards must not pull Fusillade's PostgreSQL storage feature"
                 )
@@ -92,8 +106,15 @@ for manifest_path, dependencies in local_dependencies.items():
             )
 
 release_config = json.loads((root / "release-please-config.json").read_text())
-if set(release_config["packages"]) != {".", "onwards"}:
-    raise SystemExit("Release Please must manage the application and Onwards independently")
+if set(release_config["packages"]) != {
+    ".",
+    "onwards",
+    "fusillade-core",
+    "fusillade-arsenal",
+}:
+    raise SystemExit(
+        "Release Please must manage the application, Onwards, and Fusillade Arsenal independently"
+    )
 if release_config.get("separate-pull-requests") is not True:
     raise SystemExit(
         "Release Please must use component-specific PRs so single-component releases can be identified"
@@ -115,15 +136,54 @@ if onwards_release.get("component") != "onwards":
     raise SystemExit("Onwards releases must use component-prefixed tags")
 if onwards_release.get("include-component-in-tag") is not True:
     raise SystemExit("Onwards tags must use the onwards-v<version> namespace")
+arsenal_release = release_config["packages"]["fusillade-arsenal"]
+if arsenal_release.get("release-type") != "rust":
+    raise SystemExit("Fusillade Arsenal releases must use the Rust strategy")
+if arsenal_release.get("component") != "fusillade-arsenal":
+    raise SystemExit("Fusillade Arsenal releases must use component-prefixed tags")
+if arsenal_release.get("include-component-in-tag") is not True:
+    raise SystemExit(
+        "Fusillade Arsenal tags must use the fusillade-arsenal-v<version> namespace"
+    )
+core_release = release_config["packages"]["fusillade-core"]
+if core_release.get("release-type") != "rust":
+    raise SystemExit("Fusillade Core releases must use the Rust strategy")
+if core_release.get("component") != "fusillade-core":
+    raise SystemExit("Fusillade Core releases must use component-prefixed tags")
+if core_release.get("include-component-in-tag") is not True:
+    raise SystemExit(
+        "Fusillade Core tags must use the fusillade-core-v<version> namespace"
+    )
 
 release_manifest = json.loads((root / ".release-please-manifest.json").read_text())
-if set(release_manifest) != {".", "onwards"}:
-    raise SystemExit("release manifest must track dwctl and Onwards independently")
+if set(release_manifest) != {
+    ".",
+    "onwards",
+    "fusillade-core",
+    "fusillade-arsenal",
+}:
+    raise SystemExit(
+        "release manifest must track dwctl, Onwards, and Fusillade Arsenal independently"
+    )
+# Release-please owns these versions (and release-only commits skip CI, so
+# exact pins here rot silently on main). Assert shape, not value.
+import re
+
+for crate in ("fusillade-arsenal", "fusillade-core"):
+    if not re.fullmatch(r"\d+\.\d+\.\d+", release_manifest[crate]):
+        raise SystemExit(f"{crate} release baseline must be a plain semver version")
 PY
 
 release_workflow=".github/workflows/release.yml"
 justfile="justfile"
 backfill_script="scripts/backfill_responses_to_batchless.sql"
+arsenal_sqlx_cache="fusillade-arsenal/.sqlx"
+
+if [[ ! -L "$arsenal_sqlx_cache" ]] || \
+   [[ "$(readlink "$arsenal_sqlx_cache")" != "../.sqlx" ]]; then
+  echo "Fusillade Arsenal must package the workspace SQLx offline cache" >&2
+  exit 1
+fi
 
 if [[ ! -f "$backfill_script" ]] || \
    [[ "$(shasum -a 256 "$backfill_script" | awk '{print $1}')" != \
@@ -132,7 +192,7 @@ if [[ ! -f "$backfill_script" ]] || \
   exit 1
 fi
 
-if grep -Eq 'publish-(dwctl|fusillade)|cargo publish (--package )?(dwctl|fusillade)( |$)' \
+if grep -Eq 'publish-(dwctl|fusillade):|cargo publish (--package )?(dwctl|fusillade)( |$)' \
   "$release_workflow" "$justfile"; then
   echo "application and Fusillade releases must not publish Rust crates" >&2
   exit 1
@@ -151,6 +211,24 @@ if ! grep -Fq 'path: .release-tools' "$release_workflow" || \
    ! grep -Fq '.release-tools/.github/scripts/publish-onwards-crate.sh' \
      "$release_workflow"; then
   echo "Onwards release retries must use current release tooling against tagged source" >&2
+  exit 1
+fi
+
+if ! grep -Fq 'publish-fusillade-crates:' "$release_workflow" || \
+   ! grep -Fq 'publish-fusillade-crate.sh' "$release_workflow" || \
+   ! grep -Fq 'cargo publish --locked' \
+     .github/scripts/publish-fusillade-crate.sh || \
+   ! grep -Fq -- '--package fusillade-core --registry crates-io' \
+     .github/scripts/publish-fusillade-crate.sh || \
+   ! grep -Fq -- '--package fusillade-arsenal --registry crates-io' \
+     .github/scripts/publish-fusillade-crate.sh; then
+  echo "Fusillade Core and Arsenal releases must publish their crates" >&2
+  exit 1
+fi
+
+if ! grep -Fq '.release-tools/.github/scripts/publish-fusillade-crate.sh' \
+  "$release_workflow"; then
+  echo "Fusillade crate retries must use current release tooling against tagged source" >&2
   exit 1
 fi
 
@@ -228,15 +306,11 @@ if ! grep -Fq 'onwards-pr-image:' <<< "$onwards_image_job" || \
   exit 1
 fi
 
-# The image jobs may depend ONLY on the cheap `changes` path filter (which
-# gates the whole pipeline) — never on tests/lint, so images still build in
-# the first wave.
-for image_job in "$onwards_image_job" "$dwctl_image_job"; do
-  if grep -E '^[[:space:]]+needs:' <<< "$image_job" | grep -Evq '^[[:space:]]+needs: changes$'; then
-    echo "Onwards and dwctl image builds must start together before tests finish" >&2
-    exit 1
-  fi
-done
+if ! grep -Fxq '    needs: changes' <<< "$onwards_image_job" || \
+   ! grep -Fxq '    needs: changes' <<< "$dwctl_image_job"; then
+  echo "Onwards and dwctl image builds must start together after change classification" >&2
+  exit 1
+fi
 
 for scoped_check in \
   '    name: dashboard / test' \
@@ -369,12 +443,15 @@ require_scoped_line "$semantic_title_step" "        if: github.event_name == 'pu
 require_scoped_line "$semantic_title_step" '        uses: amannn/action-semantic-pull-request@v6' 'PR title semantic action must stay in its pull-request step'
 require_scoped_line "$merge_group_title_step" "        if: github.event_name == 'merge_group'" 'PR title no-op must be scoped to merge groups'
 
+crate_test_job="$(extract_workflow_job .github/workflows/ci.yaml backend-crate-test)"
+require_scoped_line "$crate_test_job" '    if: always()' 'Crate test matrix must expand for release-only changes'
+require_scoped_line "$crate_test_job" "      RUN_CI: \${{ needs.changes.outputs.run-ci }}" 'Crate tests must consume the release-only decision at step level'
+crate_skip_step="$(extract_workflow_step "$crate_test_job" 'Skip crate tests for release-only changes')"
+require_scoped_line "$crate_skip_step" "        if: env.RUN_CI != 'true'" 'Crate tests must declare a release-only no-op path'
+
 onwards_compliance_job="$(extract_workflow_job .github/workflows/ci.yaml onwards-openresponses-compliance)"
-require_scoped_line "$onwards_compliance_job" "    if: always() && needs.changes.outputs.run-ci == 'true'" 'Onwards compliance matrix must always expand'
+require_scoped_line "$onwards_compliance_job" '    if: always()' 'Onwards compliance matrix must expand for release-only changes'
 trusted_pull_request_condition="github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]'"
-# The first-wave image jobs additionally gate on the run-ci change filter
-# (their only permitted `needs` — see the needs check below).
-gated_trusted_pull_request_condition="needs.changes.outputs.run-ci == 'true' && ${trusted_pull_request_condition}"
 require_scoped_line "$onwards_compliance_job" "      RUN_STRICT_COMPLIANCE: \${{ needs.onwards-compliance-changes.outputs.strict == 'true' && ${trusted_pull_request_condition} }}" 'Onwards strict compliance must gate secret use to trusted pull requests'
 if grep -Fq "github.event_name == 'merge_group'" <<< "$onwards_compliance_job" || \
    grep -Fq "github.actor != 'dependabot[bot]'" <<< "$onwards_compliance_job"; then
@@ -409,8 +486,8 @@ done
 
 onwards_image_job="$(extract_workflow_job .github/workflows/ci.yaml onwards-pr-image)"
 dwctl_image_job="$(extract_workflow_job .github/workflows/ci.yaml build)"
-if ! grep -Fxq "    if: ${gated_trusted_pull_request_condition}" <<< "$onwards_image_job" || \
-   ! grep -Fxq "    if: ${gated_trusted_pull_request_condition}" <<< "$dwctl_image_job" || \
+if ! grep -Fxq "    if: needs.changes.outputs.run-ci == 'true' && ${trusted_pull_request_condition}" <<< "$onwards_image_job" || \
+   ! grep -Fxq "    if: needs.changes.outputs.run-ci == 'true' && ${trusted_pull_request_condition}" <<< "$dwctl_image_job" || \
    ! grep -Fxq '          DOCKER_METADATA_PR_HEAD_SHA: true' <<< "$dwctl_image_job" || \
    ! grep -Fxq '            type=sha,prefix=sha-' <<< "$dwctl_image_job" || \
    grep -Fq 'type=raw,value=sha-' <<< "$dwctl_image_job" || \
@@ -423,10 +500,7 @@ if ! grep -Fxq "    if: ${gated_trusted_pull_request_condition}" <<< "$onwards_i
 fi
 
 for obsolete_script in \
-  .github/scripts/publish-fusillade-crate.sh \
-  .github/scripts/sync-fusillade-release-dependencies.py \
   .github/scripts/test-fusillade-publish.sh \
-  .github/scripts/test-sync-fusillade-release-dependencies.sh \
   .github/scripts/wait-for-fusillade-crates.sh; do
   if [[ -e "$obsolete_script" ]]; then
     echo "obsolete crates.io release script remains: $obsolete_script" >&2

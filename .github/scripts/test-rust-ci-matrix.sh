@@ -129,14 +129,16 @@ if grep -Fq -- '- package: dwctl' <<< "$crate_test_job"; then
   exit 1
 fi
 
-# The image jobs may depend ONLY on the cheap `changes` path filter — never
-# on tests/lint, so images still build in the first wave.
-for image_job in "$onwards_image_job" "$dwctl_image_job"; do
-  if grep -E '^[[:space:]]+needs:' <<< "$image_job" | grep -Evq '^[[:space:]]+needs: changes$'; then
-    echo "Onwards and dwctl image builds must start immediately instead of waiting for tests" >&2
-    exit 1
-  fi
-done
+require_block_line "$crate_test_job" '    if: always()' 'expand the crate matrix for release-only changes'
+require_block_line "$crate_test_job" "      RUN_CI: \${{ needs.changes.outputs.run-ci }}" 'expose the release-only decision to crate test steps'
+crate_skip_step="$(extract_step "$crate_test_job" 'Skip crate tests for release-only changes')"
+require_block_line "$crate_skip_step" "        if: env.RUN_CI != 'true'" 'declare the no-op crate test path'
+
+if ! grep -Fxq '    needs: changes' <<< "$onwards_image_job" || \
+   ! grep -Fxq '    needs: changes' <<< "$dwctl_image_job"; then
+  echo "Onwards and dwctl image builds must start together after change classification" >&2
+  exit 1
+fi
 
 if grep -Fq 'OPENAI_API_KEY' <<< "$onwards_compliance_job"; then
   echo "Standalone Onwards compliance must reuse the existing Gemini provider" >&2
@@ -148,11 +150,9 @@ if grep -Fq 'git checkout fa29df5' <<< "$onwards_compliance_job"; then
   exit 1
 fi
 
-require_block_line "$onwards_compliance_job" "    if: always() && needs.changes.outputs.run-ci == 'true'" 'always expand the Onwards compliance matrix after the change detector'
-require_block_line "$onwards_compliance_job" "    needs: [changes, onwards-compliance-changes]" 'wait for the Onwards compliance change detector'
+require_block_line "$onwards_compliance_job" '    if: always()' 'expand the Onwards compliance matrix for release-only changes'
+require_block_line "$onwards_compliance_job" "    needs: [changes, onwards-compliance-changes]" 'wait for the change classifiers'
 trusted_pull_request_condition="github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]'"
-# The first-wave image jobs additionally gate on the run-ci change filter.
-gated_trusted_pull_request_condition="needs.changes.outputs.run-ci == 'true' && ${trusted_pull_request_condition}"
 require_block_line "$onwards_compliance_job" "      RUN_STRICT_COMPLIANCE: \${{ needs.onwards-compliance-changes.outputs.strict == 'true' && ${trusted_pull_request_condition} }}" 'only run strict compliance for trusted pull requests'
 if grep -Fq "github.event_name == 'merge_group'" <<< "$onwards_compliance_job" || \
    grep -Fq "github.actor != 'dependabot[bot]'" <<< "$onwards_compliance_job"; then
@@ -188,9 +188,9 @@ for step_name in \
   require_block_line "$compliance_step" "        if: always() && env.RUN_STRICT_COMPLIANCE == 'true'" "guard Onwards compliance diagnostic step '${step_name}' with the trust gate"
 done
 
-require_block_line "$onwards_image_job" "    if: ${gated_trusted_pull_request_condition}" 'run Onwards image publishing only for trusted pull requests'
+require_block_line "$onwards_image_job" "    if: needs.changes.outputs.run-ci == 'true' && ${trusted_pull_request_condition}" 'run Onwards image publishing only for relevant trusted pull requests'
 require_block_line "$onwards_image_job" "          tags: ghcr.io/doublewordai/onwards:sha-\${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}" 'tag Onwards images with the PR head or merge-group SHA'
-require_block_line "$dwctl_image_job" "    if: ${gated_trusted_pull_request_condition}" 'run dwctl image publishing only for trusted pull requests'
+require_block_line "$dwctl_image_job" "    if: needs.changes.outputs.run-ci == 'true' && ${trusted_pull_request_condition}" 'run dwctl image publishing only for relevant trusted pull requests'
 require_block_line "$dwctl_image_job" '          DOCKER_METADATA_PR_HEAD_SHA: true' 'preserve PR-head metadata tagging for dwctl images'
 require_block_line "$dwctl_image_job" '            type=sha,prefix=sha-' 'preserve SHA metadata tagging for dwctl images'
 if grep -Fq 'type=raw,value=sha-' <<< "$dwctl_image_job"; then
@@ -254,8 +254,8 @@ while IFS= read -r name; do
       # `dwctl / test` context below remains the required branch-protection gate.
       ;;
     'release-only changes')
-      # The run-ci change detector gates the pipeline but is not itself a
-      # repository-required check context.
+      # Change classification is an internal fan-out job, not a required
+      # branch-protection context.
       ;;
     'onwards / open responses (${{ matrix.mode }})')
       actual_check_names+=(
