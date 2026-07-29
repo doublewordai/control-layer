@@ -3116,7 +3116,7 @@ impl Application {
             std::time::Duration::from_millis(fusillade_daemon_config.body_timeout_ms),
             fusillade_daemon_config.streamable_endpoints.clone(),
         ));
-        let multi_step_loop_config = onwards::LoopConfig {
+        let multi_step_loop_config = onwards_fusillade::LoopConfig {
             max_response_step_depth: config.responses.max_response_step_depth,
             max_response_iterations: config.responses.max_response_iterations,
         };

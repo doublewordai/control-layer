@@ -155,6 +155,7 @@ impl From<ExecutorError> for LoopError {
 /// `tool_ctx` is the `RequestContext` passed to `ToolExecutor::tools`
 /// and `::execute` — carries the per-request resolved tool set for
 /// dwctl's middleware-driven model.
+#[allow(clippy::too_many_arguments)]
 pub fn run_response_loop<'a, S, T, H>(
     store: &'a S,
     tool_executor: &'a T,
@@ -678,7 +679,7 @@ fn delta_loop_events(event: &StreamEvent, sequence: i64) -> Vec<crate::streaming
     use crate::streaming::{LoopEvent, LoopEventKind};
 
     let mut out = Vec::new();
-    let parsed: Value = match serde_json::from_str(&event.data) {
+    let parsed: Value = match serde_json::from_str(event.data) {
         Ok(v) => v,
         Err(_) => return out,
     };
