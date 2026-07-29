@@ -22,6 +22,7 @@ metadata = json.loads(
 expected_packages = {
     "dwctl",
     "onwards",
+    "onwards-fusillade",
     "fusillade",
     "fusillade-core",
     "fusillade-arsenal",
@@ -60,14 +61,24 @@ local_dependencies = {
         "fusillade": "../fusillade",
         "fusillade-arsenal": "../fusillade-arsenal",
         "onwards": "../onwards",
+        "onwards-fusillade": "../onwards-fusillade",
     },
-    "onwards/Cargo.toml": {"fusillade": "../fusillade"},
+    "onwards-fusillade/Cargo.toml": {
+        "fusillade": "../fusillade",
+        "onwards": "../onwards",
+    },
     "fusillade/Cargo.toml": {
         "fusillade-core": "../fusillade-core",
         "fusillade-arsenal": "../fusillade-arsenal",
     },
     "fusillade-arsenal/Cargo.toml": {"fusillade-core": "../fusillade-core"},
 }
+
+onwards_manifest = tomllib.loads((root / "onwards/Cargo.toml").read_text())
+if "fusillade" in onwards_manifest.get("dependencies", {}):
+    raise SystemExit("published Onwards must not depend on Fusillade")
+if "multi-step" in onwards_manifest.get("features", {}):
+    raise SystemExit("published Onwards must not expose the local multi-step integration")
 
 for manifest_path, dependencies in local_dependencies.items():
     manifest = tomllib.loads((root / manifest_path).read_text())
@@ -165,10 +176,10 @@ if set(release_manifest) != {
     raise SystemExit(
         "release manifest must track dwctl, Onwards, and Fusillade Arsenal independently"
     )
-if release_manifest["fusillade-arsenal"] != "3.0.0":
-    raise SystemExit("Fusillade Arsenal release baseline must remain 3.0.0")
-if release_manifest["fusillade-core"] != "4.0.0":
-    raise SystemExit("Fusillade Core release baseline must remain 4.0.0")
+if release_manifest["fusillade-arsenal"] != "3.1.0":
+    raise SystemExit("Fusillade Arsenal release baseline must remain 3.1.0")
+if release_manifest["fusillade-core"] != "4.1.0":
+    raise SystemExit("Fusillade Core release baseline must remain 4.1.0")
 PY
 
 release_workflow=".github/workflows/release.yml"
@@ -265,7 +276,7 @@ fi
 
 node .github/scripts/test-onwards-floating-tags.cjs
 
-for linted_package in dwctl fusillade fusillade-core fusillade-arsenal; do
+for linted_package in dwctl fusillade fusillade-core fusillade-arsenal onwards-fusillade; do
   if ! grep -Fq -- "--package $linted_package" "$justfile"; then
     echo "Rust linting must retain $linted_package" >&2
     exit 1
@@ -365,6 +376,12 @@ fi
 
 if [[ "$(grep -Fc 'COPY onwards/ onwards/' Dockerfile)" != 2 ]]; then
   echo "Docker planner and builder must both receive the local Onwards crate" >&2
+  exit 1
+fi
+
+if [[ "$(grep -Fc 'COPY onwards-fusillade/ onwards-fusillade/' Dockerfile)" != 2 ]] || \
+   [[ "$(grep -Fc 'COPY onwards-fusillade/ onwards-fusillade/' onwards/Dockerfile)" != 1 ]]; then
+  echo "Workspace Docker builds must receive the private Onwards Fusillade crate" >&2
   exit 1
 fi
 

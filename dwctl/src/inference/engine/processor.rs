@@ -38,8 +38,8 @@ use async_trait::async_trait;
 use fusillade::request::{Canceled, Claimed, Failed, FailureReason, Request, RequestCompletionResult};
 use fusillade::{CancellationFuture, DefaultRequestProcessor, HttpClient, RequestProcessor, ReqwestHttpClient, ShouldRetry, Storage};
 use fusillade_arsenal::PoolProvider as FusilladePool;
-use onwards::LoopConfig;
 use onwards::traits::ToolExecutor;
+use onwards_fusillade::LoopConfig;
 
 use crate::inference::engine::loop_http_client::ResponseLoopHttpClient;
 use crate::inference::store::FusilladeResponseStore;

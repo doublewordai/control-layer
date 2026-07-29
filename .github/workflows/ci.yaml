@@ -258,6 +258,9 @@ jobs:
             runner: depot-ubuntu-24.04-8
             database: false
             cargo_args: --all-features
+          - package: onwards-fusillade
+            runner: depot-ubuntu-24.04-8
+            database: false
     runs-on: ${{ matrix.runner }}
     env:
       RUN_CI: ${{ needs.changes.outputs.run-ci }}
@@ -445,8 +448,8 @@ jobs:
         run: |
           shopt -s nullglob
           coverage_files=(rust-coverage/*.info)
-          if (( ${#coverage_files[@]} != 8 )); then
-            echo "Expected 8 coverage files, found ${#coverage_files[@]}" >&2
+          if (( ${#coverage_files[@]} != 9 )); then
+            echo "Expected 9 coverage files, found ${#coverage_files[@]}" >&2
             exit 1
           fi
 

@@ -16,7 +16,7 @@
 //! `usage` if present in any model_call response.
 
 use chrono::Utc;
-use onwards::{ChainStep, StepKind, StepState};
+use onwards_fusillade::{ChainStep, StepKind, StepState};
 use serde_json::{Value, json};
 
 /// Build the final Response JSON for `request_id` from the top-level

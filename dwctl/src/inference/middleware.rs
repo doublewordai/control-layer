@@ -50,7 +50,7 @@ pub struct InferenceMiddlewareState<P: PoolProvider + Clone = sqlx_pool_router::
     pub response_store: Arc<super::store::FusilladeResponseStore<P>>,
     pub multi_step_tool_executor: Arc<crate::inference::tools::HttpToolExecutor>,
     pub multi_step_http_client: Arc<fusillade::ReqwestHttpClient>,
-    pub loop_config: onwards::LoopConfig,
+    pub loop_config: onwards_fusillade::LoopConfig,
     /// Image-input normaliser (content-addressed store). On the **Flex**
     /// path the request is persisted and dispatched later by the daemon, so
     /// images are normalised to `dw-img://` tokens here (when enabled) — the
@@ -1339,7 +1339,11 @@ async fn warm_path_setup<P: PoolProvider + Clone + Send + Sync + 'static>(
     request_value: &serde_json::Value,
     api_key: &str,
     model: &str,
-) -> Option<(uuid::Uuid, Arc<crate::inference::tools::ResolvedToolSet>, onwards::UpstreamTarget)> {
+) -> Option<(
+    uuid::Uuid,
+    Arc<crate::inference::tools::ResolvedToolSet>,
+    onwards_fusillade::UpstreamTarget,
+)> {
     let created_by = response_store::lookup_created_by(&state.dwctl_pool, Some(api_key)).await;
 
     let resolved = match crate::inference::tools::resolve_tools_for_request(&state.dwctl_pool, api_key, Some(model)).await {
@@ -1414,7 +1418,7 @@ async fn warm_path_setup<P: PoolProvider + Clone + Send + Sync + 'static>(
     // Endpoint + path are split (not pre-concatenated) so fusillade
     // can match `/v1/chat/completions` against its streamable_endpoints
     // list and pick the streaming branch when the user requested SSE.
-    let upstream = onwards::UpstreamTarget {
+    let upstream = onwards_fusillade::UpstreamTarget {
         endpoint: state.loopback_base_url.clone(),
         path: "/v1/chat/completions".to_string(),
         api_key: Some(api_key.to_string()),
