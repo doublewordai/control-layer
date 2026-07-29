@@ -125,6 +125,34 @@ pub enum LoadBalanceStrategy {
     Priority,
 }
 
+fn default_stream_continuation_attempts() -> usize {
+    1
+}
+
+fn default_stream_continuation_buffer_bytes() -> usize {
+    1024 * 1024
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StreamContinuationConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub endpoints: Vec<String>,
+    #[serde(default = "default_stream_continuation_attempts")]
+    pub max_attempts: usize,
+    #[serde(default = "default_stream_continuation_buffer_bytes")]
+    pub max_buffered_bytes: usize,
+    #[serde(default)]
+    pub idle_timeout_ms: Option<u64>,
+}
+
+impl StreamContinuationConfig {
+    pub fn enabled_for_path(&self, path: &str) -> bool {
+        self.enabled && self.endpoints.iter().any(|endpoint| endpoint == path)
+    }
+}
+
 /// Configuration for fallback behavior when requests fail
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct FallbackConfig {
@@ -166,6 +194,9 @@ pub struct FallbackConfig {
     /// Bounds only the inter-attempt sleeps, not upstream request time.
     #[serde(default)]
     pub max_total_backoff_ms: Option<u64>,
+
+    #[serde(default)]
+    pub stream_continuation: Option<StreamContinuationConfig>,
 }
 
 impl FallbackConfig {
@@ -1077,6 +1108,7 @@ impl Targets {
             // Convert provider specs to providers
             // Pool-level sanitize_response enables sanitization for all providers
             let pool_sanitize = pool_config.sanitize_response;
+            let pool_response_headers = pool_config.response_headers;
             let providers: Vec<Provider> = pool_config
                 .providers
                 .into_iter()
@@ -1088,6 +1120,12 @@ impl Targets {
                         .map(|cl| cl.max_concurrent_requests);
                     // Enable sanitization if either pool or provider level is true
                     spec.sanitize_response = pool_sanitize || spec.sanitize_response;
+                    let mut response_headers = pool_response_headers.clone().unwrap_or_default();
+                    if let Some(provider_headers) = spec.response_headers.take() {
+                        response_headers.extend(provider_headers);
+                    }
+                    spec.response_headers =
+                        (!response_headers.is_empty()).then_some(response_headers);
                     let target: Target = spec.into();
                     match concurrency_limit {
                         Some(limit) => Provider::with_concurrency_limit(target, weight, limit),
@@ -1254,6 +1292,37 @@ mod tests {
     use dashmap::DashMap;
     use std::collections::HashSet;
     use std::sync::Arc;
+
+    #[test]
+    fn stream_continuation_config_defaults_are_conservative() {
+        let config: FallbackConfig = serde_json::from_str(
+            r#"{
+            "enabled": true,
+            "stream_continuation": {"enabled": true}
+        }"#,
+        )
+        .unwrap();
+        let stream = config.stream_continuation.unwrap();
+        assert_eq!(stream.max_attempts, 1);
+        assert_eq!(stream.max_buffered_bytes, 1024 * 1024);
+        assert_eq!(stream.idle_timeout_ms, None);
+        assert!(!stream.enabled_for_path("/v1/completions"));
+    }
+
+    #[test]
+    fn stream_continuation_matches_only_configured_exact_path() {
+        let config: StreamContinuationConfig = serde_json::from_str(
+            r#"{
+            "enabled": true,
+            "endpoints": ["/v1/completions"]
+        }"#,
+        )
+        .unwrap();
+        assert!(config.enabled_for_path("/v1/completions"));
+        assert!(!config.enabled_for_path("/v1/chat/completions"));
+        assert!(!config.enabled_for_path("/v1/completions/extra"));
+    }
+
     pub struct MockConfigWatcher {
         configs: Vec<Result<Targets, String>>,
     }

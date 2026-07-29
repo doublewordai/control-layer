@@ -51,11 +51,90 @@ curl -X POST http://localhost:3000/v1/chat/completions \
 - Rate limiting and concurrency limiting (per-target and per-key)
 - Load balancing with weighted random and priority strategies
 - Automatic failover across multiple providers
+- Best-effort continuation of interrupted text-generation streams
 - Strict mode for request validation and error standardization
 - Response sanitization for OpenAI schema compliance
 - Prometheus metrics
 - Custom response headers
 - Optional multi-step Open Responses orchestration loop (`multi-step` feature)
+
+## Stream Continuation
+
+Stream continuation is an opt-in fallback mode for eligible streaming requests
+to `/v1/completions`, `/v1/chat/completions`, and `/v1/responses`. If an
+upstream stops before a terminal event, Onwards sends the text already emitted
+to another provider selected by the pool, which may be the same provider.
+
+Configure it inside the pool's `fallback` settings:
+
+```json
+{
+  "targets": {
+    "gpt-4": {
+      "fallback": {
+        "enabled": true,
+        "on_status": [429, 5],
+        "stream_continuation": {
+          "enabled": true,
+          "endpoints": [
+            "/v1/completions",
+            "/v1/chat/completions",
+            "/v1/responses"
+          ],
+          "max_attempts": 1,
+          "max_buffered_bytes": 1048576,
+          "idle_timeout_ms": 30000
+        }
+      },
+      "providers": [
+        { "url": "https://primary.example.com", "onwards_key": "sk-primary" },
+        { "url": "https://backup.example.com", "onwards_key": "sk-backup" }
+      ]
+    }
+  }
+}
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `enabled` | `false` | Enables continuation, subject to `fallback.enabled` |
+| `endpoints` | `[]` | Exact supported request paths eligible for continuation |
+| `max_attempts` | `1` | Fresh continuation-attempt budget after the response starts |
+| `max_buffered_bytes` | `1048576` | Maximum emitted-text bytes retained for a continuation request |
+| `idle_timeout_ms` | `null` | Maximum idle time between upstream events; `null` disables the timeout |
+
+`fallback.max_attempts` controls retries before response headers are committed.
+`stream_continuation.max_attempts` is a separate budget after streaming starts.
+Continuation reuses the pool's provider selection, request headers, status
+matching, local rate-limit behavior, and backoff configuration. Its cumulative
+backoff budget is also fresh.
+
+Only narrow, single-output text requests are eligible. Completions require a
+string prompt, one choice, no echo, and `stream: true`. Chat Completions require
+ordinary message content, one choice, no logprobs, and `stream: true`. Responses
+require string or message-only input, plain-text foreground output, no storage,
+and `stream: true`. Tool calls, reasoning, structured output, multi-choice or
+multi-item output, and provider-specific guided generation are excluded.
+Unsupported requests pass through normally. If an eligible stream later emits
+an unknown event shape, continuation is disabled rather than guessing how to
+splice it.
+
+Completions append emitted text to the original prompt. Chat Completions append
+one assistant message and suppress a repeated assistant-role chunk. Responses
+append an assistant `output_text` message while preserving response and item
+identities, sequence numbers, and the cumulative terminal text snapshot.
+
+Eligible upstream responses must be successful, identity-encoded SSE using the
+`text/event-stream` media type. Onwards requests `Accept-Encoding: identity` and
+rejects an encoded or non-SSE continuation response instead of splicing it.
+
+This is prompt-prefix continuation, not native token-offset resume. A provider
+may repeat text, add a preamble, or diverge. The emitted prefix is buffered only
+in process memory and is lost on restart. Exceeding the buffer cap disables
+continuation for that request. Exhausted retries can leave the client with a
+partial stream and no synthetic terminal event. Usage comes from the provider
+that supplies the terminal stream and is not aggregate usage or billing across
+attempts.
 
 ## Multi-Step Open Responses
 

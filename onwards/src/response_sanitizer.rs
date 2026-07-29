@@ -152,6 +152,39 @@ struct LenientStreamChoice {
     _extra: HashMap<String, serde_json::Value>,
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+struct LenientCompletionStreamChunk {
+    #[serde(default = "default_completion_id")]
+    id: String,
+    #[serde(default = "default_completion_object")]
+    object: String,
+    #[serde(default = "default_created")]
+    created: u32,
+    #[serde(default)]
+    model: String,
+    choices: Vec<LenientCompletionStreamChoice>,
+    #[serde(default)]
+    usage: Option<LenientUsage>,
+    #[serde(default)]
+    system_fingerprint: Option<String>,
+    #[serde(flatten, skip_serializing)]
+    _extra: HashMap<String, serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct LenientCompletionStreamChoice {
+    #[serde(default)]
+    text: String,
+    #[serde(default)]
+    index: u64,
+    #[serde(default)]
+    finish_reason: Option<String>,
+    #[serde(default)]
+    logprobs: Option<serde_json::Value>,
+    #[serde(flatten, skip_serializing)]
+    _extra: HashMap<String, serde_json::Value>,
+}
+
 fn default_id() -> String {
     "chatcmpl-unknown".to_string()
 }
@@ -162,6 +195,14 @@ fn default_object() -> String {
 
 fn default_stream_object() -> String {
     "chat.completion.chunk".to_string()
+}
+
+fn default_completion_id() -> String {
+    "cmpl-unknown".to_string()
+}
+
+fn default_completion_object() -> String {
+    "text_completion".to_string()
 }
 
 fn default_created() -> u32 {
@@ -211,7 +252,8 @@ impl ResponseSanitizer {
         let is_streaming = headers
             .get("content-type")
             .and_then(|v| v.to_str().ok())
-            .map(|v| v.contains("text/event-stream"))
+            .and_then(|v| v.split(';').next())
+            .map(|v| v.trim().eq_ignore_ascii_case("text/event-stream"))
             .unwrap_or(false);
 
         if is_streaming {
@@ -258,8 +300,8 @@ impl ResponseSanitizer {
         let mut sanitized_lines = Vec::new();
 
         for line in body_str.lines() {
-            if let Some(data_part) = line.strip_prefix("data: ") {
-                // Skip "data: " prefix
+            if let Some(data_part) = line.strip_prefix("data:") {
+                let data_part = data_part.strip_prefix(' ').unwrap_or(data_part);
 
                 if data_part.trim() == "[DONE]" {
                     // Preserve [DONE] marker as-is
@@ -320,6 +362,58 @@ impl ResponseSanitizer {
             .count();
 
         // Add the difference to match input's trailing newlines
+        for _ in output_trailing..input_trailing {
+            sanitized_body.push('\n');
+        }
+
+        Ok(Some(Bytes::from(sanitized_body)))
+    }
+
+    /// Sanitizes legacy completion SSE chunks while preserving `choices[].text`.
+    pub fn sanitize_completion_streaming(&self, body: &[u8]) -> Result<Option<Bytes>, String> {
+        let body_str = std::str::from_utf8(body)
+            .map_err(|e| format!("Invalid UTF-8 in streaming response: {}", e))?;
+        let mut sanitized_lines = Vec::new();
+
+        for line in body_str.lines() {
+            if let Some(data_part) = line.strip_prefix("data:") {
+                let data_part = data_part.strip_prefix(' ').unwrap_or(data_part);
+                if data_part.trim() == "[DONE]" {
+                    sanitized_lines.push(line.to_string());
+                    continue;
+                }
+
+                let value: serde_json::Value = serde_json::from_str(data_part)
+                    .map_err(|e| format!("Failed to parse stream chunk: {}", e))?;
+                if let Some(error_event) = extract_embedded_error_envelope(&value) {
+                    tracing::warn!(
+                        data_len = data_part.len(),
+                        "Provider returned error envelope in completion SSE stream"
+                    );
+                    sanitized_lines.push(error_event);
+                    continue;
+                }
+
+                let mut chunk: LenientCompletionStreamChunk = serde_json::from_value(value)
+                    .map_err(|e| format!("Failed to parse completion stream chunk: {}", e))?;
+                if let Some(ref original) = self.original_model {
+                    chunk.model = original.clone();
+                }
+                let sanitized_json = serde_json::to_string(&chunk)
+                    .map_err(|e| format!("Failed to serialize completion stream chunk: {}", e))?;
+                sanitized_lines.push(format!("data: {}", sanitized_json));
+            } else if line.is_empty() {
+                sanitized_lines.push(String::new());
+            }
+        }
+
+        let mut sanitized_body = sanitized_lines.join("\n");
+        let input_trailing = body_str.chars().rev().take_while(|&c| c == '\n').count();
+        let output_trailing = sanitized_body
+            .chars()
+            .rev()
+            .take_while(|&c| c == '\n')
+            .count();
         for _ in output_trailing..input_trailing {
             sanitized_body.push('\n');
         }
@@ -479,6 +573,20 @@ mod tests {
             "Should have exactly 2 trailing newlines, got {}",
             trailing_count
         );
+    }
+
+    #[test]
+    fn streaming_sanitizers_preserve_done_without_a_post_colon_space() {
+        let sanitizer = ResponseSanitizer {
+            original_model: None,
+        };
+
+        for result in [
+            sanitizer.sanitize_streaming(b"data:[DONE]\n\n"),
+            sanitizer.sanitize_completion_streaming(b"data:[DONE]\n\n"),
+        ] {
+            assert_eq!(result.unwrap().unwrap().as_ref(), b"data:[DONE]\n\n");
+        }
     }
 
     #[test]

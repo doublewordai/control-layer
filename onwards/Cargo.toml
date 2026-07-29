@@ -67,6 +67,7 @@ bon = "3.6.5"
 subtle = "2.6.1"
 axum-prometheus = "0.10.0"
 metrics = "0.24"
+mime = "0.3"
 governor = "0.10.1"
 rand = "0.9"
 uuid = { version = "1", features = ["v4"] }

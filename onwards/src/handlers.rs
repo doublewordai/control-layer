@@ -7,21 +7,26 @@ use crate::AppState;
 use crate::auth;
 use crate::client::HttpClient;
 use crate::errors::{ErrorResponseBody, OnwardsErrorResponse};
+use crate::load_balancer::ProviderPool;
 use crate::models::ListModelResponse;
-use crate::sse::SseBufferedStream;
+use crate::sse::{CheckedSseStream, SseStreamError};
 use crate::target::{ConcurrencyGuard, RoutingAction, Target};
 use axum::{
     Json,
     extract::Request,
     extract::State,
     http::{
-        HeaderMap, HeaderName, HeaderValue, StatusCode, Uri,
-        header::{CONTENT_LENGTH, TRANSFER_ENCODING},
+        HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri,
+        header::{
+            ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE,
+            TRAILER, TRANSFER_ENCODING,
+        },
     },
     response::{IntoResponse, Response},
 };
 use opentelemetry::propagation::{Extractor, Injector, TextMapPropagator};
 use serde_json::map::Entry;
+use std::collections::HashMap;
 use tracing::{Instrument, debug, error, instrument, trace, warn};
 
 /// Adapter to extract W3C trace context from an axum HeaderMap.
@@ -90,7 +95,7 @@ enum SseEventKind {
 }
 
 /// Classify a single SSE event (a complete frame already reassembled by
-/// [`SseBufferedStream`]).
+/// the checked SSE framer).
 ///
 /// Some providers open a `200 OK` stream and send the error as the
 /// first `data:` frame (`data: {"error":{"code":429,...}}`) rather than content.
@@ -99,24 +104,14 @@ enum SseEventKind {
 /// multi-line, and non-spaced (`data:{...}`) framing are all handled. A frame
 /// with no `data:` field is a comment/keep-alive.
 fn classify_sse_event(chunk: &[u8]) -> SseEventKind {
-    let Ok(text) = std::str::from_utf8(chunk) else {
-        // Non-UTF-8 can't be an error envelope we understand — forward as-is.
+    let data = match crate::sse::parse_sse_event(chunk) {
+        crate::sse::ParsedSseEvent::Comment => return SseEventKind::Comment,
+        crate::sse::ParsedSseEvent::Data { data, .. } => data,
+        crate::sse::ParsedSseEvent::Invalid => return SseEventKind::Data,
+    };
+    let Ok(data) = std::str::from_utf8(&data) else {
         return SseEventKind::Data;
     };
-    let mut data = String::new();
-    let mut has_data = false;
-    for line in text.lines() {
-        if let Some(rest) = line.strip_prefix("data:") {
-            has_data = true;
-            if !data.is_empty() {
-                data.push('\n');
-            }
-            data.push_str(rest.strip_prefix(' ').unwrap_or(rest));
-        }
-    }
-    if !has_data {
-        return SseEventKind::Comment;
-    }
     if data.trim() == "[DONE]" {
         return SseEventKind::Data;
     }
@@ -192,7 +187,7 @@ impl Drop for InflightGuard {
 /// outlives the handler.
 struct GuardedStream<S> {
     inner: S,
-    _guard: ConcurrencyGuard,
+    _guard: Option<ConcurrencyGuard>,
     _inflight_guard: InflightGuard,
 }
 
@@ -230,10 +225,12 @@ pub(crate) struct ResolvedTrust(pub(crate) bool);
 /// answered", not "the request succeeded" — check the status code for that.
 /// Absent when no upstream produced a response (auth/validation rejections,
 /// exhausted fallbacks, gateway-generated errors). For streaming tool loops the
-/// response is returned before follow-up iterations run, so it names the
-/// provider of the initial iteration. Integrators (e.g. request-logging
-/// middleware) can read it to attribute traffic to a concrete upstream without
-/// re-deriving the routing decision.
+/// response is returned before follow-up iterations run, and for stream
+/// continuation the response extensions are committed before the body can
+/// select another provider, so it names the provider of the initial stream in
+/// both cases. Integrators (e.g. request-logging middleware) can read it to
+/// attribute traffic to a concrete upstream without re-deriving the routing
+/// decision.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ServedBy {
     /// Full URL of the upstream target that served the request.
@@ -351,12 +348,301 @@ fn filter_headers_for_upstream(headers: &mut HeaderMap, target: &Target) {
     headers.insert("x-forwarded-proto", "https".parse().unwrap());
 }
 
-/// The main handler responsible for forwarding requests to targets
-/// TODO(fergus): Better error messages beyond raw status codes.
+#[derive(Clone)]
+pub(crate) struct UpstreamRequestMetadata {
+    method: Method,
+    path_and_query: String,
+    headers: HeaderMap,
+    trace_context: Option<opentelemetry::Context>,
+    pool_trusted: bool,
+}
+
+#[derive(Clone)]
+pub(crate) struct CanonicalRequestPath(pub(crate) &'static str);
+
+#[derive(Clone, Copy)]
+pub(crate) struct ContinuationEligibilityPath(pub(crate) &'static str);
+
+#[derive(Clone, Copy)]
+pub(crate) struct PreserveEncodedStream;
+
+#[derive(Clone, Copy)]
+pub(crate) struct SseBufferLimit(pub(crate) usize);
+
+#[derive(Clone)]
+struct CompositeResponsePolicy {
+    trusted: bool,
+    sanitize_response: bool,
+    response_headers: Option<HashMap<String, String>>,
+}
+
+impl CompositeResponsePolicy {
+    fn for_pool(pool: &ProviderPool) -> Self {
+        let mut response_headers = pool
+            .providers()
+            .first()
+            .and_then(|provider| provider.target.response_headers.clone())
+            .unwrap_or_default();
+        for provider in pool.providers().iter().skip(1) {
+            let provider_headers = provider.target.response_headers.as_ref();
+            response_headers.retain(|name, value| {
+                provider_headers.and_then(|headers| headers.get(name)) == Some(value)
+            });
+        }
+
+        Self {
+            trusted: pool
+                .providers()
+                .iter()
+                .all(|provider| provider.target.trusted.unwrap_or_else(|| pool.is_trusted())),
+            sanitize_response: pool
+                .providers()
+                .iter()
+                .any(|provider| provider.target.sanitize_response),
+            response_headers: (!response_headers.is_empty()).then_some(response_headers),
+        }
+    }
+}
+
+fn canonical_generation_path(path: &str) -> &str {
+    match path {
+        "/completions" | "/v1/completions" => "/v1/completions",
+        "/chat/completions" | "/v1/chat/completions" => "/v1/chat/completions",
+        "/responses" | "/v1/responses" => "/v1/responses",
+        _ => path,
+    }
+}
+
+impl UpstreamRequestMetadata {
+    fn new(method: Method, path_and_query: String, headers: HeaderMap, pool_trusted: bool) -> Self {
+        Self {
+            method,
+            path_and_query,
+            headers,
+            trace_context: None,
+            pool_trusted,
+        }
+    }
+
+    fn with_current_trace_context(mut self) -> Self {
+        use tracing_opentelemetry::OpenTelemetrySpanExt;
+        self.trace_context = Some(tracing::Span::current().context());
+        self
+    }
+
+    pub(crate) fn for_child_span(&self, span: &tracing::Span) -> Self {
+        use tracing_opentelemetry::OpenTelemetrySpanExt;
+        if let Some(parent) = self.trace_context.clone() {
+            let _ = span.set_parent(parent);
+        }
+        let mut child = self.clone();
+        child.trace_context = Some(span.context());
+        child
+    }
+
+    fn with_identity_encoding(mut self) -> Self {
+        self.headers
+            .insert(ACCEPT_ENCODING, HeaderValue::from_static("identity"));
+        self
+    }
+}
+
+fn clear_composite_representation_headers(headers: &mut HeaderMap) {
+    for name in [
+        CONTENT_LENGTH,
+        CONTENT_ENCODING,
+        CONTENT_RANGE,
+        TRANSFER_ENCODING,
+        TRAILER,
+    ] {
+        headers.remove(name);
+    }
+    for name in [
+        "connection",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "te",
+        "upgrade",
+        "content-md5",
+        "digest",
+        "content-digest",
+        "repr-digest",
+        "representation-digest",
+        "etag",
+        "accept-ranges",
+        "last-modified",
+    ] {
+        headers.remove(name);
+    }
+}
+
+pub(crate) fn build_upstream_request(
+    target: &Target,
+    metadata: &UpstreamRequestMetadata,
+    body: bytes::Bytes,
+) -> Result<(Request, String), OnwardsErrorResponse> {
+    let request_path = metadata
+        .path_and_query
+        .strip_prefix('/')
+        .unwrap_or(&metadata.path_and_query);
+    let target_path = target.url.path().trim_end_matches('/');
+    let path_to_join = if !target_path.is_empty() && target_path != "/" {
+        let target_path_no_slash = &target_path[1..];
+        if let Some(rest) = request_path.strip_prefix(target_path_no_slash) {
+            if rest.is_empty() || rest.starts_with('/') {
+                rest.strip_prefix('/').unwrap_or(rest)
+            } else {
+                request_path
+            }
+        } else {
+            request_path
+        }
+    } else {
+        request_path
+    };
+    let upstream_uri = target
+        .url
+        .join(path_to_join)
+        .map_err(|_| OnwardsErrorResponse::internal())?
+        .to_string();
+    let upstream_uri_parsed = Uri::try_from(&upstream_uri).map_err(|_| {
+        error!("Invalid URI: {}", upstream_uri);
+        OnwardsErrorResponse::internal()
+    })?;
+
+    let mut headers = metadata.headers.clone();
+    if let Some(host) = upstream_uri_parsed.host() {
+        let host_value = if let Some(port) = upstream_uri_parsed.port_u16() {
+            format!("{host}:{port}")
+        } else {
+            host.to_string()
+        };
+        headers.insert("host", host_value.parse().unwrap());
+    }
+    headers.insert(
+        CONTENT_LENGTH,
+        body.len()
+            .to_string()
+            .parse()
+            .expect("Content-Length should be valid"),
+    );
+    headers.remove(TRANSFER_ENCODING);
+    filter_headers_for_upstream(&mut headers, target);
+    if resolve_trace_propagation(target, metadata.pool_trusted) {
+        use tracing_opentelemetry::OpenTelemetrySpanExt;
+        let trace_context = metadata
+            .trace_context
+            .clone()
+            .unwrap_or_else(|| tracing::Span::current().context());
+        let propagator = opentelemetry_sdk::propagation::TraceContextPropagator::new();
+        propagator.inject_context(&trace_context, &mut HeaderInjector(&mut headers));
+    } else {
+        withhold_trace_context(&mut headers);
+    }
+
+    let request = Request::builder()
+        .method(metadata.method.clone())
+        .uri(upstream_uri_parsed)
+        .body(axum::body::Body::from(body))
+        .map_err(|_| OnwardsErrorResponse::internal())?;
+    let (mut parts, body) = request.into_parts();
+    parts.headers = headers;
+    Ok((Request::from_parts(parts, body), upstream_uri))
+}
+
+trait ContinuationBodyFactory<T: HttpClient> {
+    const ENABLED: bool;
+
+    fn wrap(
+        initial_body: axum::body::Body,
+        initial_guard: ConcurrencyGuard,
+        continuation: crate::stream_continuation::StreamContinuation,
+        config: crate::target::StreamContinuationConfig,
+        pool: ProviderPool,
+        http_client: T,
+        request_metadata: UpstreamRequestMetadata,
+    ) -> axum::body::Body;
+}
+
+struct ContinuationDisabled;
+
+impl<T: HttpClient> ContinuationBodyFactory<T> for ContinuationDisabled {
+    const ENABLED: bool = false;
+
+    fn wrap(
+        _initial_body: axum::body::Body,
+        _initial_guard: ConcurrencyGuard,
+        _continuation: crate::stream_continuation::StreamContinuation,
+        _config: crate::target::StreamContinuationConfig,
+        _pool: ProviderPool,
+        _http_client: T,
+        _request_metadata: UpstreamRequestMetadata,
+    ) -> axum::body::Body {
+        unreachable!("legacy handler never activates stream continuation")
+    }
+}
+
+struct ContinuationEnabled;
+
+impl<T> ContinuationBodyFactory<T> for ContinuationEnabled
+where
+    T: HttpClient + Send + 'static,
+{
+    const ENABLED: bool = true;
+
+    fn wrap(
+        initial_body: axum::body::Body,
+        initial_guard: ConcurrencyGuard,
+        continuation: crate::stream_continuation::StreamContinuation,
+        config: crate::target::StreamContinuationConfig,
+        pool: ProviderPool,
+        http_client: T,
+        request_metadata: UpstreamRequestMetadata,
+    ) -> axum::body::Body {
+        crate::stream_continuation::wrap_generation_stream(
+            initial_body,
+            initial_guard,
+            continuation,
+            config,
+            pool,
+            http_client,
+            request_metadata,
+        )
+    }
+}
+
+/// Forward a request using the legacy public handler contract.
+///
+/// Stream continuation is installed by the supported router entry points,
+/// whose client bounds allow the client to live inside the downstream body.
 pub async fn target_message_handler<T: HttpClient>(
+    state: State<AppState<T>>,
+    req: axum::extract::Request,
+) -> Result<Response, OnwardsErrorResponse> {
+    target_message_handler_core::<T, ContinuationDisabled>(state, req).await
+}
+
+pub(crate) async fn target_message_handler_with_continuation<T>(
+    state: State<AppState<T>>,
+    req: axum::extract::Request,
+) -> Result<Response, OnwardsErrorResponse>
+where
+    T: HttpClient + Send + 'static,
+{
+    target_message_handler_core::<T, ContinuationEnabled>(state, req).await
+}
+
+/// The shared handler core responsible for forwarding requests to targets.
+/// TODO(fergus): Better error messages beyond raw status codes.
+async fn target_message_handler_core<T, C>(
     State(state): State<AppState<T>>,
     mut req: axum::extract::Request,
-) -> Result<Response, OnwardsErrorResponse> {
+) -> Result<Response, OnwardsErrorResponse>
+where
+    T: HttpClient,
+    C: ContinuationBodyFactory<T>,
+{
     // Create the tracing span BEFORE entering it so that set_parent() correctly
     // updates the OTel parent context. With #[instrument], the OTel span is started
     // on the first enter() which happens before the function body runs — making
@@ -381,6 +667,8 @@ pub async fn target_message_handler<T: HttpClient>(
     }
 
     async move {
+
+    let mut http_client = Some(state.http_client);
 
     // Track inflight requests for observability. The guard is moved into GuardedStream
     // on the success path so the gauge stays incremented for the full lifetime of
@@ -654,10 +942,59 @@ pub async fn target_message_handler<T: HttpClient>(
         .map(|v| v.as_str())
         .unwrap_or(req.uri().path())
         .to_string();
+    let canonical_request_path = req
+        .extensions()
+        .get::<CanonicalRequestPath>()
+        .map(|path| path.0)
+        .unwrap_or(req.uri().path())
+        .to_string();
+    let continuation_eligibility_path = req
+        .extensions()
+        .get::<ContinuationEligibilityPath>()
+        .map(|path| path.0)
+        .unwrap_or(&canonical_request_path)
+        .to_string();
+    let continuation_protocol_path = canonical_generation_path(req.uri().path()).to_string();
+    let is_completion_path = canonical_request_path == "/v1/completions";
 
     // Prepare original headers and method for potential retries
     let original_headers = req.headers().clone();
     let method = req.method().clone();
+    let mut stream_continuation = if C::ENABLED {
+        pool.fallback()
+            .filter(|fallback| fallback.enabled)
+            .and_then(|fallback| fallback.stream_continuation.as_ref())
+            .and_then(|config| {
+                crate::stream_continuation::StreamContinuation::from_request_with_resolved_model(
+                    &continuation_eligibility_path,
+                    &continuation_protocol_path,
+                    &method,
+                    &body_bytes,
+                    config,
+                    Some(&model_name),
+                )
+                .map(|continuation| (continuation, config.clone()))
+            })
+    } else {
+        None
+    };
+    let composite_response_policy = stream_continuation
+        .as_ref()
+        .map(|_| CompositeResponsePolicy::for_pool(&pool));
+    let request_metadata = UpstreamRequestMetadata::new(
+        method.clone(),
+        path_and_query.clone(),
+        original_headers.clone(),
+        pool.is_trusted(),
+    )
+    .with_current_trace_context();
+    let request_metadata = if stream_continuation.is_some()
+        || (state.targets.strict_mode && is_completion_path)
+    {
+        request_metadata.with_identity_encoding()
+    } else {
+        request_metadata
+    };
 
     // Track last error for fallback scenarios
     let mut last_error: Option<OnwardsErrorResponse> = None;
@@ -671,6 +1008,7 @@ pub async fn target_message_handler<T: HttpClient>(
     let mut total_backoff_ms: u64 = 0;
     let pool_max_attempts = pool.fallback_max_attempts();
     for (_idx, target, connection_guard) in pool.select_iter() {
+        let mut connection_guard = Some(connection_guard);
         any_attempted = true;
         attempt_number += 1;
 
@@ -788,97 +1126,14 @@ pub async fn target_message_handler<T: HttpClient>(
             };
         }
 
-        // Build the upstream URI for this target
-        let request_path = path_and_query.strip_prefix('/').unwrap_or(&path_and_query);
-        let target_path = target.url.path().trim_end_matches('/');
-
-        let path_to_join = if !target_path.is_empty() && target_path != "/" {
-            let target_path_no_slash = &target_path[1..];
-            if let Some(rest) = request_path.strip_prefix(target_path_no_slash) {
-                if rest.is_empty() || rest.starts_with('/') {
-                    rest.strip_prefix('/').unwrap_or(rest)
-                } else {
-                    request_path
-                }
-            } else {
-                request_path
-            }
-        } else {
-            request_path
+        let (attempt_req, upstream_uri) = match build_upstream_request(
+            target,
+            &request_metadata,
+            attempt_body,
+        ) {
+            Ok(request) => request,
+            Err(error) => return LoopAction::Done(Err(error)),
         };
-
-        let upstream_uri = match target.url.join(path_to_join) {
-            Ok(url) => url.to_string(),
-            Err(_) => return LoopAction::Done(Err(OnwardsErrorResponse::internal())),
-        };
-        let upstream_uri_parsed = match Uri::try_from(&upstream_uri) {
-            Ok(uri) => uri,
-            Err(_) => {
-                error!("Invalid URI: {}", upstream_uri);
-                return LoopAction::Done(Err(OnwardsErrorResponse::internal()));
-            }
-        };
-
-        // Build request for this provider
-        let mut attempt_headers = original_headers.clone();
-
-        // Update host header
-        if let Some(host) = upstream_uri_parsed.host() {
-            let host_value = if let Some(port) = upstream_uri_parsed.port_u16() {
-                format!("{host}:{port}")
-            } else {
-                host.to_string()
-            };
-            attempt_headers.insert("host", host_value.parse().unwrap());
-        }
-
-        // Set Content-Length and remove Transfer-Encoding
-        attempt_headers.insert(
-            CONTENT_LENGTH,
-            attempt_body
-                .len()
-                .to_string()
-                .parse()
-                .expect("Content-Length should be valid"),
-        );
-        attempt_headers.remove(TRANSFER_ENCODING);
-
-        // Filter headers for upstream forwarding
-        filter_headers_for_upstream(&mut attempt_headers, target);
-
-        // Apply W3C trace-context policy for this upstream, gated on the
-        // per-target propagate_trace_context flag (defaults to the resolved
-        // trusted value).
-        //
-        // - Enabled: inject the current span context, propagating the trace to
-        //   upstreams that participate in our distributed tracing fabric
-        //   (typically self-hosted, marked trusted). inject_context overwrites
-        //   any inbound traceparent/tracestate.
-        // - Disabled: strip any *inbound* traceparent/tracestate so they are
-        //   not forwarded to an untrusted third party. These headers are not
-        //   in HEADERS_TO_STRIP (they're handled here, next to the inject
-        //   decision), so without this branch an inbound trace context from
-        //   the caller would pass straight through, defeating the opt-out and
-        //   letting the third party re-emit our trace IDs on its own outbound
-        //   calls.
-        if resolve_trace_propagation(target, pool.is_trusted()) {
-            use tracing_opentelemetry::OpenTelemetrySpanExt;
-            let ctx = tracing::Span::current().context();
-            let propagator = opentelemetry_sdk::propagation::TraceContextPropagator::new();
-            propagator.inject_context(&ctx, &mut HeaderInjector(&mut attempt_headers));
-        } else {
-            withhold_trace_context(&mut attempt_headers);
-        }
-
-        // Build the request
-        let attempt_req = axum::extract::Request::builder()
-            .method(method.clone())
-            .uri(upstream_uri_parsed)
-            .body(axum::body::Body::from(attempt_body))
-            .unwrap();
-        let (mut parts, body) = attempt_req.into_parts();
-        parts.headers = attempt_headers;
-        let attempt_req = axum::extract::Request::from_parts(parts, body);
 
         trace!(
             "Outgoing request to provider:\n  URI: {}",
@@ -899,7 +1154,13 @@ pub async fn target_message_handler<T: HttpClient>(
         let request_result = async {
             if let Some(timeout_secs) = target.request_timeout_secs {
                 let timeout_duration = std::time::Duration::from_secs(timeout_secs);
-                match tokio::time::timeout(timeout_duration, state.http_client.request(attempt_req))
+                match tokio::time::timeout(
+                    timeout_duration,
+                    http_client
+                        .as_ref()
+                        .expect("HTTP client remains available before response success")
+                        .request(attempt_req),
+                )
                     .await
                 {
                     Err(_) => {
@@ -914,7 +1175,12 @@ pub async fn target_message_handler<T: HttpClient>(
                 }
             } else {
                 // No timeout configured
-                state.http_client.request(attempt_req).await.map_err(UpstreamOutcome::Error)
+                http_client
+                    .as_ref()
+                    .expect("HTTP client remains available before response success")
+                    .request(attempt_req)
+                    .await
+                    .map_err(UpstreamOutcome::Error)
             }
         }
         .instrument(upstream_span.clone())
@@ -1015,7 +1281,19 @@ pub async fn target_message_handler<T: HttpClient>(
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .to_string();
-        let is_sse = content_type.contains("text/event-stream");
+        let is_sse = crate::stream_continuation::is_event_stream(response.headers());
+        let is_identity_encoded =
+            crate::stream_continuation::has_identity_content_encoding(response.headers());
+        let preserve_encoded_stream = (200..300).contains(&status)
+            && is_sse
+            && !is_identity_encoded
+            && (stream_continuation.is_some()
+                || (state.targets.strict_mode && is_completion_path));
+        if preserve_encoded_stream {
+            response
+                .extensions_mut()
+                .insert(PreserveEncodedStream);
+        }
 
         // Some upstreams return HTTP 200 while embedding the
         // real error in the body — `{"error":{"code":429,...}}` for a unary
@@ -1031,7 +1309,7 @@ pub async fn target_message_handler<T: HttpClient>(
         // the status-based fallback above.
         //
         // Gated to strict_mode: the only mode where the body is *already* buffered
-        // (unary) or routed through `SseBufferedStream` (streaming) by the strict
+        // (unary) or routed through checked SSE framing (streaming) by the strict
         // sanitizer downstream. So this adds no new buffering and no change to
         // streaming behaviour — it just inspects the body a little earlier so a
         // retry stays possible. Pure-passthrough / sanitize-without-transform
@@ -1050,9 +1328,14 @@ pub async fn target_message_handler<T: HttpClient>(
             /// 502. Keyed on stream termination, never a time budget, so a
             /// valid-but-slow stream is forwarded (Clean), not retried.
             EmptyBody,
+            /// Checked SSE framing failed before a content frame. The original
+            /// response is forwarded with its typed body error so neither the
+            /// pre-response fallback loop nor continuation can treat it as EOF.
+            Framing,
         }
         let scan: Scan2xx = if (200..300).contains(&status)
             && state.targets.strict_mode
+            && !preserve_encoded_stream
         {
             if is_sse {
                 // Peek the leading SSE events to find the first *real* frame,
@@ -1070,7 +1353,14 @@ pub async fn target_message_handler<T: HttpClient>(
                 const SSE_PEEK_MAX_EVENTS: usize = 4;
 
                 let (parts, body) = response.into_parts();
-                let mut events = SseBufferedStream::new(body.into_data_stream());
+                let body_stream = body.into_data_stream();
+                let mut events = match stream_continuation.as_ref() {
+                    Some(_) => CheckedSseStream::with_max_buffer_size(
+                        body_stream,
+                        crate::stream_continuation::event_buffer_size(),
+                    ),
+                    None => CheckedSseStream::new(body_stream),
+                };
                 // `peeked` / `embedded` live outside the peek future so a partial
                 // peek survives a budget timeout (consumed frames are not lost).
                 let mut peeked = Vec::new();
@@ -1080,6 +1370,7 @@ pub async fn target_message_handler<T: HttpClient>(
                 // before any content — a *terminal* empty, safe to retry.
                 let mut saw_data = false;
                 let mut stream_ended = false;
+                let mut framing_failed = false;
                 let peek = async {
                     for _ in 0..SSE_PEEK_MAX_EVENTS {
                         match events.next().await {
@@ -1099,7 +1390,10 @@ pub async fn target_message_handler<T: HttpClient>(
                                 SseEventKind::Comment => peeked.push(Ok(chunk)),
                             },
                             Some(Err(e)) => {
-                                stream_ended = true;
+                                match &e {
+                                    SseStreamError::Source(_) => stream_ended = true,
+                                    SseStreamError::Framing(_) => framing_failed = true,
+                                }
                                 peeked.push(Err(e));
                                 break;
                             }
@@ -1121,6 +1415,8 @@ pub async fn target_message_handler<T: HttpClient>(
                 response = Response::from_parts(parts, axum::body::Body::from_stream(rest));
                 if let Some(status) = embedded {
                     Scan2xx::Embedded(status)
+                } else if framing_failed {
+                    Scan2xx::Framing
                 } else if !timed_out && stream_ended && !saw_data {
                     // Stream closed/errored before any content frame: nothing was
                     // forwarded, so retrying is safe. A *timeout* (stream still open,
@@ -1239,15 +1535,63 @@ pub async fn target_message_handler<T: HttpClient>(
                 record_response_status(503);
                 return LoopAction::Done(Err(OnwardsErrorResponse::service_unavailable()));
             }
+            Scan2xx::Framing => {
+                warn!(
+                    http_status = status,
+                    upstream = %target.url,
+                    "Upstream returned malformed SSE framing; forwarding the checked body error"
+                );
+            }
             Scan2xx::Clean => {}
         }
+
+        let mut composite_content_type = None;
+        if is_sse
+            && is_identity_encoded
+            && (200..300).contains(&status)
+            && let Some((continuation, config)) = stream_continuation.take()
+        {
+            let (mut parts, body) = response.into_parts();
+            composite_content_type = parts.headers.get(CONTENT_TYPE).cloned();
+            clear_composite_representation_headers(&mut parts.headers);
+            let event_buffer_limit = crate::stream_continuation::event_buffer_size();
+            let body = C::wrap(
+                body,
+                connection_guard
+                    .take()
+                    .expect("initial provider guard moved once"),
+                continuation,
+                config,
+                pool.clone(),
+                http_client
+                    .take()
+                    .expect("HTTP client moved once into composite response"),
+                request_metadata.clone(),
+            );
+            response = Response::from_parts(parts, body);
+            response
+                .extensions_mut()
+                .insert(SseBufferLimit(event_buffer_limit));
+        }
+        let response_sanitize = composite_content_type
+            .as_ref()
+            .and(composite_response_policy.as_ref())
+            .map_or(target.sanitize_response, |policy| policy.sanitize_response);
+        let response_trusted = composite_content_type
+            .as_ref()
+            .and(composite_response_policy.as_ref())
+            .map_or_else(
+                || target.trusted.unwrap_or_else(|| pool.is_trusted()),
+                |policy| policy.trusted,
+            );
 
         // Determine if SSE buffering is needed for non-strict sanitization
         // Note: Strict mode handlers apply their own buffering before their sanitizers,
         // so we skip buffering here to avoid double-wrapping
         let needs_sse_buffering = !state.targets.strict_mode
             && state.response_transform_fn.is_some()
-            && target.sanitize_response
+            && response_sanitize
+            && !preserve_encoded_stream
             && (200..300).contains(&status);
 
         // Wrap SSE streams with buffering to ensure complete events (delimited by \n\n).
@@ -1255,9 +1599,16 @@ pub async fn target_message_handler<T: HttpClient>(
         // Providers may send partial chunks that split events across network packets.
         if is_sse && needs_sse_buffering {
             debug!("Wrapping SSE response with buffered stream for non-strict sanitization");
+            let buffer_limit = response
+                .extensions()
+                .get::<SseBufferLimit>()
+                .map(|limit| limit.0);
             let (parts, body) = response.into_parts();
             let byte_stream = body.into_data_stream();
-            let buffered = SseBufferedStream::new(byte_stream);
+            let buffered = match buffer_limit {
+                Some(limit) => CheckedSseStream::with_max_buffer_size(byte_stream, limit),
+                None => CheckedSseStream::new(byte_stream),
+            };
             let new_body = axum::body::Body::from_stream(buffered);
             response = Response::from_parts(parts, new_body);
         }
@@ -1266,9 +1617,10 @@ pub async fn target_message_handler<T: HttpClient>(
         // Per-target opt-in via sanitize_response flag, only for 2xx responses
         // Skip if strict mode is enabled - strict handlers do their own sanitization
         if let Some(ref transform_fn) = state.response_transform_fn
-            && target.sanitize_response
+            && response_sanitize
             && (200..300).contains(&status)
             && !state.targets.strict_mode
+            && !preserve_encoded_stream
         {
             debug!(
                 "Attempting response sanitization for status {}, path {}",
@@ -1295,7 +1647,12 @@ pub async fn target_message_handler<T: HttpClient>(
                     match chunk_result {
                         Ok(chunk) => {
                             // Sanitize this chunk
-                            match sanitizer.sanitize_streaming(&chunk) {
+                            let sanitized = if is_completion_path {
+                                sanitizer.sanitize_completion_streaming(&chunk)
+                            } else {
+                                sanitizer.sanitize_streaming(&chunk)
+                            };
+                            match sanitized {
                                 Ok(Some(sanitized)) => Ok::<_, std::io::Error>(sanitized),
                                 Ok(None) => Ok(chunk),
                                 Err(e) => {
@@ -1387,15 +1744,21 @@ pub async fn target_message_handler<T: HttpClient>(
         if let Some(ref header_name) = state.response_id_header
             && crate::response_id::path_supports_id_override(&path_and_query)
             && (200..300).contains(&status)
-        {
-            if let Some(override_id) =
+            && let Some(override_id) =
                 crate::response_id::extract_override_id(&original_headers, header_name)
-            {
-                crate::response_id::patch_response_body_id(&mut response, override_id).await;
-            }
+        {
+            crate::response_id::patch_response_body_id(&mut response, override_id).await;
         }
 
-        // Add custom response headers
+        // Composite streams can span providers, so only retain response headers
+        // whose values are identical for every provider in the pool.
+        let response_headers = if composite_content_type.is_some() {
+            composite_response_policy
+                .as_ref()
+                .and_then(|policy| policy.response_headers.as_ref())
+        } else {
+            response_headers.as_ref()
+        };
         if let Some(headers) = response_headers {
             for (key, value) in headers.iter() {
                 if let (Ok(header_name), Ok(header_value)) =
@@ -1411,6 +1774,11 @@ pub async fn target_message_handler<T: HttpClient>(
             );
         }
 
+        if let Some(content_type) = composite_content_type {
+            clear_composite_representation_headers(response.headers_mut());
+            response.headers_mut().insert(CONTENT_TYPE, content_type);
+        }
+
         record_response_status(response.status().as_u16());
         debug!(
             "Returning response with status {}, content-length: {:?}, strict_mode: {}",
@@ -1418,10 +1786,9 @@ pub async fn target_message_handler<T: HttpClient>(
             response.headers().get(CONTENT_LENGTH),
             state.targets.strict_mode
         );
-        let resolved_trust = target.trusted.unwrap_or_else(|| pool.is_trusted());
         response
             .extensions_mut()
-            .insert(ResolvedTrust(resolved_trust));
+            .insert(ResolvedTrust(response_trusted));
         response.extensions_mut().insert(ServedBy {
             url: target.url.to_string(),
             onwards_model: target.onwards_model.clone(),
@@ -1554,6 +1921,76 @@ pub async fn models<T: HttpClient>(
 mod tests {
     use super::*;
 
+    #[derive(Debug)]
+    struct NonCloneHttpClient;
+
+    #[async_trait::async_trait]
+    impl HttpClient for NonCloneHttpClient {
+        async fn request(
+            &self,
+            _req: axum::extract::Request,
+        ) -> Result<Response, Box<dyn std::error::Error + Send + Sync>> {
+            unreachable!("compile-time API compatibility test")
+        }
+    }
+
+    #[test]
+    fn target_message_handler_preserves_literal_http_client_bound() {
+        fn assert_literal_bound<T: HttpClient>() {
+            let _handler = target_message_handler::<T>;
+        }
+
+        assert_literal_bound::<NonCloneHttpClient>();
+    }
+
+    #[test]
+    fn continuation_attempt_metadata_injects_attempt_span_id() {
+        use opentelemetry::trace::{TraceContextExt, TracerProvider as _};
+        use tracing_opentelemetry::OpenTelemetrySpanExt;
+        use tracing_subscriber::prelude::*;
+
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder().build();
+        let tracer = provider.tracer("continuation-attempt-metadata-test");
+        let subscriber =
+            tracing_subscriber::registry().with(tracing_opentelemetry::layer().with_tracer(tracer));
+        let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+
+        let mut inbound_headers = HeaderMap::new();
+        inbound_headers.insert(
+            "traceparent",
+            "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"
+                .parse()
+                .unwrap(),
+        );
+        let propagator = opentelemetry_sdk::propagation::TraceContextPropagator::new();
+        let parent_context = propagator.extract(&HeaderExtractor(&inbound_headers));
+        let metadata = UpstreamRequestMetadata {
+            method: Method::POST,
+            path_and_query: "/v1/completions".to_string(),
+            headers: HeaderMap::new(),
+            trace_context: Some(parent_context),
+            pool_trusted: false,
+        };
+        let attempt_span = tracing::info_span!("test.continuation_attempt");
+        let attempt_metadata = metadata.for_child_span(&attempt_span);
+        let attempt_context = attempt_span.context();
+        let attempt_span_context = attempt_context.span().span_context().clone();
+        let target = target_with_trace_flags(Some(false), Some(true));
+
+        let (request, _) =
+            build_upstream_request(&target, &attempt_metadata, bytes::Bytes::new()).unwrap();
+        let traceparent = request
+            .headers()
+            .get("traceparent")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        let fields = traceparent.split('-').collect::<Vec<_>>();
+
+        assert_eq!(fields[1], attempt_span_context.trace_id().to_string());
+        assert_eq!(fields[2], attempt_span_context.span_id().to_string());
+    }
+
     #[test]
     fn embedded_error_status_detects_provider_envelope() {
         // Whole-body error envelope (the 200-with-error pattern).
@@ -1640,6 +2077,11 @@ mod tests {
             Data
         );
         assert_eq!(classify_sse_event(b"data: [DONE]\n\n"), Data);
+        assert_eq!(classify_sse_event(b"\xef\xbb\xbfdata:[DONE]\r\r"), Data);
+        assert_eq!(
+            classify_sse_event(b"\xef\xbb\xbfdata:{\"error\":\rdata:{\"code\":429}}\r\r"),
+            Error(429)
+        );
 
         // Comment / keep-alive frames carry no `data:` field.
         assert_eq!(classify_sse_event(b": keep-alive\n\n"), Comment);

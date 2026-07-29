@@ -159,11 +159,57 @@ impl ProviderPool {
 
         SelectIter {
             pool: self,
-            excluded: HashSet::new(),
-            max_attempts,
-            attempts: 0,
-            with_replacement,
+            state: SelectionState::new(max_attempts, with_replacement),
         }
+    }
+
+    /// Select the next provider using caller-owned fallback selection state.
+    pub(crate) fn select_next(
+        &self,
+        state: &mut SelectionState,
+    ) -> Option<(usize, &Target, ConcurrencyGuard)> {
+        if state.attempts >= state.max_attempts {
+            return None;
+        }
+        state.attempts += 1;
+
+        // Ask the LB strategy for the next eligible provider for the current
+        // exclusions. `select_excluding` returns `None` when no provider is
+        // eligible — either every provider has been tried in this pass, or the
+        // untried ones are all at their concurrency limit.
+        //
+        // If that happens but the attempt budget still allows it, start a fresh
+        // pass: clear the exclusions (re-including already-tried providers) and
+        // cascade through the strategy's options again. This is what puts the
+        // configured retry budget *above* the LB strategy — every strategy
+        // (including a single-provider Priority pool) keeps retrying until
+        // `max_attempts` is spent, rather than stopping after one cascade.
+        //
+        // When `excluded` is already empty there is nothing to re-include, so a
+        // `None` there means an empty pool or every provider at capacity: end
+        // the selection rather than re-running the same scan.
+        let result = match self.select_excluding(&state.excluded) {
+            Some(result) => result,
+            None if state.excluded.is_empty() => return None,
+            None => {
+                state.excluded.clear();
+                self.select_excluding(&state.excluded)?
+            }
+        };
+
+        // For priority strategy, exclude the provider just tried so the next
+        // step advances through the list within this pass. with_replacement
+        // only applies to weighted random selection (sample with replacement
+        // within a pass); cross-pass retries are driven by `max_attempts` above.
+        let should_exclude = match self.strategy {
+            LoadBalanceStrategy::Priority => true,
+            LoadBalanceStrategy::WeightedRandom => !state.with_replacement,
+        };
+        if should_exclude {
+            state.excluded.insert(result.0);
+        }
+
+        Some(result)
     }
 
     /// Internal: select excluding specific provider indices
@@ -413,58 +459,33 @@ impl ProviderPool {
 /// ensuring the most up-to-date load information is used for each attempt.
 pub struct SelectIter<'a> {
     pool: &'a ProviderPool,
+    state: SelectionState,
+}
+
+/// Owned state for repeated provider selection.
+pub(crate) struct SelectionState {
     excluded: HashSet<usize>,
     max_attempts: usize,
     attempts: usize,
     with_replacement: bool,
 }
 
+impl SelectionState {
+    pub(crate) fn new(max_attempts: usize, with_replacement: bool) -> Self {
+        Self {
+            excluded: HashSet::new(),
+            max_attempts,
+            attempts: 0,
+            with_replacement,
+        }
+    }
+}
+
 impl<'a> Iterator for SelectIter<'a> {
     type Item = (usize, &'a Target, ConcurrencyGuard);
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.attempts >= self.max_attempts {
-            return None;
-        }
-        self.attempts += 1;
-
-        // Ask the LB strategy for the next eligible provider for the current
-        // exclusions. `select_excluding` returns `None` when no provider is
-        // eligible — either every provider has been tried in this pass, or the
-        // untried ones are all at their concurrency limit.
-        //
-        // If that happens but the attempt budget still allows it, start a fresh
-        // pass: clear the exclusions (re-including already-tried providers) and
-        // cascade through the strategy's options again. This is what puts the
-        // configured retry budget *above* the LB strategy — every strategy
-        // (including a single-provider Priority pool) keeps retrying until
-        // `max_attempts` is spent, rather than stopping after one cascade.
-        //
-        // When `excluded` is already empty there is nothing to re-include, so a
-        // `None` there means an empty pool or every provider at capacity: end the
-        // iterator rather than re-running the same scan.
-        let result = match self.pool.select_excluding(&self.excluded) {
-            Some(result) => result,
-            None if self.excluded.is_empty() => return None,
-            None => {
-                self.excluded.clear();
-                self.pool.select_excluding(&self.excluded)?
-            }
-        };
-
-        // For priority strategy, exclude the provider just tried so the next step
-        // advances through the list within this pass. with_replacement only
-        // applies to weighted random selection (sample with replacement within a
-        // pass); cross-pass retries are driven by `max_attempts` above.
-        let should_exclude = match self.pool.strategy {
-            LoadBalanceStrategy::Priority => true,
-            LoadBalanceStrategy::WeightedRandom => !self.with_replacement,
-        };
-        if should_exclude {
-            self.excluded.insert(result.0);
-        }
-
-        Some(result)
+        self.pool.select_next(&mut self.state)
     }
 }
 
@@ -476,6 +497,33 @@ mod tests {
 
     fn create_test_target(url: &str) -> Target {
         Target::builder().url(url.parse().unwrap()).build()
+    }
+
+    fn priority_pool_with_three_targets() -> ProviderPool {
+        ProviderPool::with_config(
+            vec![
+                Provider::new(create_test_target("https://p0.example.com"), 1),
+                Provider::new(create_test_target("https://p1.example.com"), 1),
+                Provider::new(create_test_target("https://p2.example.com"), 1),
+            ],
+            None,
+            None,
+            None,
+            None,
+            LoadBalanceStrategy::Priority,
+            false,
+            Vec::new(),
+        )
+    }
+
+    #[test]
+    fn test_selection_state_uses_independent_attempt_budget() {
+        let pool = priority_pool_with_three_targets();
+        let mut state = SelectionState::new(2, false);
+        let first = pool.select_next(&mut state).unwrap().0;
+        let second = pool.select_next(&mut state).unwrap().0;
+        assert_eq!((first, second), (0, 1));
+        assert!(pool.select_next(&mut state).is_none());
     }
 
     #[test]
