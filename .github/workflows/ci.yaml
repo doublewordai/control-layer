@@ -7,8 +7,34 @@ on:
     types: [checks_requested]
 
 jobs:
+  changes:
+    name: release-only changes
+    runs-on: ubuntu-latest
+    outputs:
+      run-ci: ${{ steps.classify.outputs.run-ci }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 2
+
+      - name: Classify changes
+        id: classify
+        shell: bash
+        run: |
+          run_ci=true
+          changed_files=$(git diff --name-only HEAD^1...HEAD) || changed_files=
+
+          if [[ -n "$changed_files" ]] && ! grep -Evq '^(\.release-please-manifest\.json|(.+/)?CHANGELOG\.md|(.+/)?Cargo\.(toml|lock))$' <<< "$changed_files"; then
+            run_ci=false
+          fi
+
+          echo "run-ci=$run_ci" >> "$GITHUB_OUTPUT"
+
   frontend-test:
-    if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
+    if: needs.changes.outputs.run-ci == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group')
+    needs: changes
     name: dashboard / test
     runs-on: depot-ubuntu-24.04-8
 
@@ -101,7 +127,8 @@ jobs:
           curl -X POST "https://charts.somnial.co/doubleword-control-layer/gzipped-bundle-size?value=${GZIPPED_SIZE}" || true
 
   backend-dwctl-test-shard:
-    if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
+    if: needs.changes.outputs.run-ci == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group')
+    needs: changes
     name: dwctl / test (${{ matrix.partition }}/4)
     strategy:
       fail-fast: false
@@ -195,8 +222,8 @@ jobs:
           retention-days: 1
 
   backend-dwctl-test:
-    if: always() && (github.event_name == 'pull_request' || github.event_name == 'merge_group')
-    needs: backend-dwctl-test-shard
+    if: always() && needs.changes.outputs.run-ci == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group')
+    needs: [changes, backend-dwctl-test-shard]
     runs-on: ubuntu-latest
     name: dwctl / test
 
@@ -211,7 +238,8 @@ jobs:
           fi
 
   backend-crate-test:
-    if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
+    if: needs.changes.outputs.run-ci == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group')
+    needs: changes
     name: ${{ matrix.package }} / test
     strategy:
       fail-fast: false
@@ -307,7 +335,8 @@ jobs:
           retention-days: 1
 
   backend-lint:
-    if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
+    if: needs.changes.outputs.run-ci == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group')
+    needs: changes
     name: workspace / rust lint
     runs-on: depot-ubuntu-24.04-16
 
@@ -358,8 +387,8 @@ jobs:
         run: cargo package --locked --package onwards --all-features
 
   backend-test:
-    if: always() && (github.event_name == 'pull_request' || github.event_name == 'merge_group')
-    needs: [backend-crate-test, backend-dwctl-test, backend-lint, frontend-test, build]
+    if: always() && needs.changes.outputs.run-ci == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group')
+    needs: [changes, backend-crate-test, backend-dwctl-test, backend-lint, frontend-test, build]
     runs-on: ubuntu-latest
     name: workspace / rust gate
     env:
@@ -453,10 +482,11 @@ jobs:
               }
             })
 
-  # Image builds are first-wave jobs. Keep this and `build` free of `needs` so
-  # the independently published Onwards and dwctl images build in parallel.
+  # Image builds are first-wave jobs after change classification. Both depend
+  # only on `changes`, so the independently published images build in parallel.
   onwards-pr-image:
-    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]'
+    if: needs.changes.outputs.run-ci == 'true' && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]'
+    needs: changes
     name: onwards / image
     runs-on: depot-ubuntu-24.04
 
@@ -488,7 +518,8 @@ jobs:
           provenance: true
 
   onwards-compliance-changes:
-    if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
+    if: needs.changes.outputs.run-ci == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group')
+    needs: changes
     name: onwards / compliance changes
     runs-on: ubuntu-latest
     outputs:
@@ -529,8 +560,8 @@ jobs:
           fi
 
   onwards-openresponses-compliance:
-    if: always()
-    needs: onwards-compliance-changes
+    if: always() && needs.changes.outputs.run-ci == 'true'
+    needs: [changes, onwards-compliance-changes]
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -801,9 +832,10 @@ jobs:
             kill "$(cat /tmp/onwards-gemini-adapter.pid)" || true
           fi
 
-  # Sibling image build to `onwards-pr-image`; both start as soon as CI begins.
+  # Sibling image build to `onwards-pr-image`; both start after classification.
   build:
-    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]'
+    if: needs.changes.outputs.run-ci == 'true' && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]'
+    needs: changes
     name: dwctl / image
     runs-on: depot-ubuntu-24.04
 
@@ -872,9 +904,9 @@ jobs:
       image-digest: ${{ steps.preview-image.outputs.digest }}
 
   openresponses-compliance:
-    if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
+    if: needs.changes.outputs.run-ci == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group')
     runs-on: ubuntu-latest
-    needs: build
+    needs: [changes, build]
     name: dwctl / open responses
 
     permissions:
@@ -1361,10 +1393,10 @@ jobs:
         run: docker rm -f dwctl-openresponses-compliance || true
 
   security-scan:
-    if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
+    if: needs.changes.outputs.run-ci == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group')
     name: dwctl / security
     runs-on: depot-ubuntu-24.04
-    needs: build
+    needs: [changes, build]
 
     permissions:
       contents: read
@@ -1437,10 +1469,10 @@ jobs:
           curl -X POST "https://charts.somnial.co/doubleword-control-layer/high-vulnerabilities?value=${HIGH}" || echo "Failed to report high vulnerabilities"
 
   e2e-test-docker:
-    if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
+    if: needs.changes.outputs.run-ci == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group')
     name: workspace / e2e
     runs-on: depot-ubuntu-24.04
-    needs: build
+    needs: [changes, build]
 
     permissions:
       contents: read
