@@ -12,7 +12,7 @@ use crate::api::models::batches::{
     BatchAnalytics, BatchErrors, BatchListResponse, BatchObjectType, BatchResponse, BatchResultsQuery, CreateBatchRequest,
     ListBatchesQuery, ListObjectType, RequestCounts, RetryRequestsRequest,
 };
-use crate::api::models::users::CurrentUser;
+use crate::api::models::users::{CurrentUser, Role};
 use crate::auth::permissions::{
     RequiresPermission, can_read_all_resources, can_run_background_inference, has_permission, operation, resolve_key_capabilities, resource,
 };
@@ -206,15 +206,47 @@ pub async fn build_cascade_batch_state_job<P: sqlx_pool_router::PoolProvider + C
 
 // ---------------------------------------------------------------------------
 
+fn parse_comma_separated_filter(raw: Option<&str>) -> Option<Vec<String>> {
+    let raw = raw?;
+    let values: Vec<String> = raw.split(',').map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect();
+    if values.is_empty() { None } else { Some(values) }
+}
+
 /// Parse the comma-separated `completion_window` query param into the vec of
 /// values passed to fusillade. Returns `None` (no filter) when the param is
 /// missing or contains only whitespace. Values are forwarded as-is so callers
 /// can match any window string fusillade understands (e.g. `"24h"`, `"1h"`,
 /// `"0s"`, `"7d"`).
 fn parse_completion_window_filter(raw: Option<&str>) -> Option<Vec<String>> {
-    let raw = raw?;
-    let windows: Vec<String> = raw.split(',').map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect();
-    if windows.is_empty() { None } else { Some(windows) }
+    parse_comma_separated_filter(raw)
+}
+
+#[derive(Debug)]
+struct BatchClassFilter {
+    completion_windows: Option<Vec<String>>,
+    service_tiers: Option<Vec<String>>,
+}
+
+fn parse_batch_class_filter(raw: Option<&str>, is_platform_manager: bool) -> Result<BatchClassFilter> {
+    let Some(values) = parse_completion_window_filter(raw) else {
+        return Ok(BatchClassFilter {
+            completion_windows: None,
+            service_tiers: None,
+        });
+    };
+
+    let includes_background = values.iter().any(|value| value == "background");
+    if includes_background && !is_platform_manager {
+        return Err(Error::BadRequest {
+            message: "completion_window=background is only available to platform managers".to_string(),
+        });
+    }
+
+    let completion_windows: Vec<_> = values.into_iter().filter(|value| value != "background").collect();
+    Ok(BatchClassFilter {
+        completion_windows: (!completion_windows.is_empty()).then_some(completion_windows),
+        service_tiers: includes_background.then(|| vec!["background".to_string()]),
+    })
 }
 
 /// Check if the current user "owns" a batch, considering org context.
@@ -1838,7 +1870,8 @@ pub async fn list_batches<P: PoolProvider>(
     // Parse the comma-separated `completion_window` filter into the list
     // passed to fusillade. An empty/whitespace-only param is treated as "no
     // filter" so callers can send `completion_window=` to disable the default.
-    let completion_windows = parse_completion_window_filter(query.completion_window.as_deref());
+    let is_platform_manager = current_user.roles.contains(&Role::PlatformManager);
+    let batch_class_filter = parse_batch_class_filter(query.completion_window.as_deref(), is_platform_manager)?;
 
     // Fetch batches with ownership filtering, search, and cursor-based pagination
     let batches = state
@@ -1853,8 +1886,8 @@ pub async fn list_batches<P: PoolProvider>(
             created_after: query.created_after,
             created_before: query.created_before,
             active_first: query.active_first,
-            completion_windows,
-            service_tiers: None,
+            completion_windows: batch_class_filter.completion_windows,
+            service_tiers: batch_class_filter.service_tiers,
         })
         .await
         .map_err(|e| match &e {
@@ -2068,7 +2101,7 @@ pub async fn list_batches<P: PoolProvider>(
 
 #[cfg(test)]
 mod tests {
-    use super::{load_and_validate_batch_models, parse_completion_window_filter, to_batch_response_with_email};
+    use super::{load_and_validate_batch_models, parse_batch_class_filter, parse_completion_window_filter, to_batch_response_with_email};
     use crate::api::models::batches::CreateBatchRequest;
     use crate::api::models::users::Role;
     use crate::db::handlers::Credits;
@@ -2184,6 +2217,25 @@ mod tests {
             parse_completion_window_filter(Some(" 24h , , 1h ,   ")),
             Some(vec!["24h".to_string(), "1h".to_string()])
         );
+    }
+
+    #[test]
+    fn platform_manager_background_filter_maps_to_internal_service_tier() {
+        let filter = parse_batch_class_filter(Some("24h,background"), true).expect("platform manager filter should be valid");
+
+        assert_eq!(filter.completion_windows, Some(vec!["24h".to_string()]));
+        assert_eq!(filter.service_tiers, Some(vec!["background".to_string()]));
+    }
+
+    #[test]
+    fn non_platform_manager_background_filter_is_bad_request() {
+        let error = parse_batch_class_filter(Some("background"), false).expect_err("background filter should be restricted");
+
+        assert!(matches!(
+            error,
+            Error::BadRequest { message }
+                if message == "completion_window=background is only available to platform managers"
+        ));
     }
 
     #[sqlx::test]

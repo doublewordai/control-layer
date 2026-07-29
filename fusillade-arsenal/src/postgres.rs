@@ -4676,24 +4676,37 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
             }
         }
 
-        // Restrict to a specific set of completion windows (e.g., ["24h"] for
-        // batch tier, ["1h"] for flex, ["0s"] for realtime tracking rows).
-        // Uses idx_batches_completion_window. An empty vec returns no rows.
-        if let Some(ref windows) = completion_windows {
-            query_builder.push(" AND b.completion_window = ANY(");
-            query_builder.push_bind(windows.as_slice());
-            query_builder.push(")");
+        if let Some(ref tiers) = service_tiers
+            && let Some(unknown) = tiers.iter().find(|tier| tier.as_str() != "background")
+        {
+            return Err(FusilladeError::ValidationError(format!(
+                "Unknown batch service tier filter: '{unknown}'. Valid value: background"
+            )));
         }
 
-        if let Some(ref tiers) = service_tiers {
-            if let Some(unknown) = tiers.iter().find(|tier| tier.as_str() != "background") {
-                return Err(FusilladeError::ValidationError(format!(
-                    "Unknown batch service tier filter: '{unknown}'. Valid value: background"
-                )));
+        // Completion windows and service tiers are two representations of the
+        // same user-facing batch class filter. Combine them as a union when
+        // both are present so callers can request regular and background
+        // batches together.
+        match (&completion_windows, &service_tiers) {
+            (Some(windows), Some(tiers)) => {
+                query_builder.push(" AND (b.completion_window = ANY(");
+                query_builder.push_bind(windows.as_slice());
+                query_builder.push(") OR b.service_tier = ANY(");
+                query_builder.push_bind(tiers.as_slice());
+                query_builder.push("))");
             }
-            query_builder.push(" AND b.service_tier = ANY(");
-            query_builder.push_bind(tiers.as_slice());
-            query_builder.push(")");
+            (Some(windows), None) => {
+                query_builder.push(" AND b.completion_window = ANY(");
+                query_builder.push_bind(windows.as_slice());
+                query_builder.push(")");
+            }
+            (None, Some(tiers)) => {
+                query_builder.push(" AND b.service_tier = ANY(");
+                query_builder.push_bind(tiers.as_slice());
+                query_builder.push(")");
+            }
+            (None, None) => {}
         }
 
         // ORDER BY: when active_first is enabled, sort by the `priority` column
@@ -22486,6 +22499,19 @@ mod tests {
         );
         let created =
             create_background_batch_for_test(&manager, "filter-model", "filter-owner").await;
+        let sla = manager
+            .create_batch(BatchInput {
+                file_id: created.file_id.unwrap(),
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: Some("filter-owner".to_string()),
+                api_key_id: None,
+                api_key: None,
+                total_requests: Some(1),
+            })
+            .await
+            .unwrap();
 
         let background = manager
             .list_batches(ListBatchesFilter {
@@ -22507,7 +22533,20 @@ mod tests {
             })
             .await
             .unwrap();
-        assert!(sla_window.is_empty());
+        assert_eq!(sla_window.len(), 1);
+        assert_eq!(sla_window[0].id, sla.id);
+
+        let mixed = manager
+            .list_batches(ListBatchesFilter {
+                completion_windows: Some(vec!["24h".to_string()]),
+                service_tiers: Some(vec!["background".to_string()]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(mixed.len(), 2);
+        assert!(mixed.iter().any(|batch| batch.id == created.id));
+        assert!(mixed.iter().any(|batch| batch.id == sla.id));
 
         let error = manager
             .list_batches(ListBatchesFilter {
