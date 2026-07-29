@@ -65,9 +65,10 @@ for package in fusillade fusillade-core fusillade-arsenal onwards; do
 done
 
 require_text 'cargo_args: --all-features' 'exercise Onwards optional Fusillade integration'
+require_text 'package_spec: fusillade-core@4.1.0' 'select the local Fusillade Core package unambiguously'
 
 require_text 'runs-on: ${{ matrix.runner }}' 'run matrix entries independently'
-require_text 'cargo llvm-cov --package "${{ matrix.package }}"' 'compile and test one package per runner'
+require_text 'cargo llvm-cov --package "${{ matrix.package_spec || matrix.package }}"' 'compile and test one package per runner'
 require_text 'name: rust-coverage-${{ matrix.package }}' 'upload per-package coverage artifacts'
 require_text 'backend-dwctl-test-shard:' 'define parallel dwctl test partitions'
 require_text 'partition: [1, 2, 3, 4]' 'split dwctl tests into four partitions'

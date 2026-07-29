@@ -19,7 +19,7 @@ default = []
 # so per-step HTTP fires get fusillade's row-id header stamping +
 # reassembly machinery for free. Off by default — the simple
 # `/ai/v1/*` proxy path doesn't need any of it.
-multi-step = ["dep:fusillade"]
+multi-step = ["dep:fusillade", "dep:fusillade-core"]
 
 [dependencies]
 anyhow = { version = "1.0.98", features = ["backtrace"] }
@@ -71,6 +71,7 @@ governor = "0.10.1"
 rand = "0.9"
 uuid = { version = "1", features = ["v4"] }
 fusillade = { version = "24.0.0", path = "../fusillade", optional = true, default-features = false }
+fusillade-core = { version = "=4.0.0", optional = true }
 
 [dev-dependencies]
 axum-test = "18.0.0"

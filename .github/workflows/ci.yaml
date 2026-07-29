@@ -249,6 +249,7 @@ jobs:
             runner: depot-ubuntu-24.04-8
             database: true
           - package: fusillade-core
+            package_spec: fusillade-core@4.1.0
             runner: depot-ubuntu-24.04-8
             database: false
           - package: fusillade-arsenal
@@ -328,7 +329,7 @@ jobs:
         if: env.RUN_CI == 'true'
         run: |
           START_TIME=$(date +%s)
-          cargo llvm-cov --package "${{ matrix.package }}" \
+          cargo llvm-cov --package "${{ matrix.package_spec || matrix.package }}" \
             ${{ matrix.cargo_args }} \
             --lcov \
             --output-path "lcov-${{ matrix.package }}.info"

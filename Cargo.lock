@@ -2364,7 +2364,7 @@ dependencies = [
  "dashmap",
  "eventsource-stream",
  "fusillade-arsenal",
- "fusillade-core",
+ "fusillade-core 4.1.0",
  "futures",
  "hostname",
  "http-body 1.0.1",
@@ -2400,7 +2400,7 @@ dependencies = [
  "chrono",
  "dashmap",
  "either",
- "fusillade-core",
+ "fusillade-core 4.1.0",
  "futures",
  "humantime",
  "metrics",
@@ -2413,6 +2413,24 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tokio-util",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "fusillade-core"
+version = "4.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f335ed1e24e0510e131d8af71da3fa83a194410fed96d9d4dc6ab74ba0c3f114"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "futures",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
  "tracing",
  "uuid",
 ]
@@ -4287,6 +4305,7 @@ dependencies = [
  "eventsource-stream",
  "flate2",
  "fusillade",
+ "fusillade-core 4.0.0",
  "futures-util",
  "governor",
  "http-body-util",

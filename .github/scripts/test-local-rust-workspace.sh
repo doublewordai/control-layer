@@ -215,7 +215,7 @@ if ! grep -Fq 'publish-fusillade-crates:' "$release_workflow" || \
    ! grep -Fq 'publish-fusillade-crate.sh' "$release_workflow" || \
    ! grep -Fq 'cargo publish --locked' \
      .github/scripts/publish-fusillade-crate.sh || \
-   ! grep -Fq -- '--package fusillade-core --registry crates-io' \
+   ! grep -Fq -- '--manifest-path fusillade-core/Cargo.toml --registry crates-io' \
      .github/scripts/publish-fusillade-crate.sh || \
    ! grep -Fq -- '--package fusillade-arsenal --registry crates-io' \
      .github/scripts/publish-fusillade-crate.sh; then

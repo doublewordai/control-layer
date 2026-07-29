@@ -119,7 +119,7 @@ fi
 
 case "$package" in
   fusillade-core)
-    if ! cargo publish --locked --package fusillade-core --registry crates-io; then
+    if ! cargo publish --locked --manifest-path fusillade-core/Cargo.toml --registry crates-io; then
       if crate_version_available fusillade-core "$package_version"; then
         echo "fusillade-core ${package_version} was published concurrently; continuing."
         exit 0

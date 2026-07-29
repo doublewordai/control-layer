@@ -562,7 +562,7 @@ lint target *args="":
             cargo clippy \
                 --package dwctl \
                 --package fusillade \
-                --package fusillade-core \
+                --package fusillade-core@4.1.0 \
                 --package fusillade-arsenal \
                 --all-features \
                 --no-deps \
