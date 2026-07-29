@@ -715,80 +715,6 @@ async fn send_email_notifications(
 /// **Rate limit**: At most one charge per user per minute, enforced via a deterministic
 /// `source_id` of the form `auto_topup_{user_id}_{YYYY-MM-DDTHH:MM}` and the unique
 /// constraint on `credits_transactions.source_id`.
-/// Whether a user's auto top-up retry backoff has elapsed.
-///
-/// A failed charge writes no `credits_transactions` row, so nothing else stops
-/// the next poller tick from retrying immediately. Backoff is exponential in
-/// the consecutive failure count, `2^(n-1)` minutes, capped by
-/// `auto_topup_backoff_cap_secs`. At `auto_topup_max_failures` we stop
-/// retrying entirely: that count is also what records that the single failure
-/// email has been sent. A successful charge or a reconfiguration clears it.
-fn auto_topup_retry_due(user: &AutoTopupUser, credits_config: &crate::config::CreditsConfig, now: DateTime<Utc>) -> bool {
-    if user.auto_topup_failure_count <= 0 {
-        return true;
-    }
-    if user.auto_topup_failure_count >= credits_config.auto_topup_max_failures {
-        return false;
-    }
-    // Missing timestamp on a non-zero count shouldn't happen; retry rather
-    // than stranding the user.
-    let Some(failed_at) = user.auto_topup_failed_at else {
-        return true;
-    };
-    let shift = u32::try_from(user.auto_topup_failure_count - 1).unwrap_or(0).min(32);
-    let backoff_secs = 60u64.saturating_mul(1u64 << shift).min(credits_config.auto_topup_backoff_cap_secs);
-    now >= failed_at + Duration::from_secs(backoff_secs)
-}
-
-/// Record a failed auto top-up charge and, exactly once per failure streak,
-/// tell the customer.
-///
-/// The email fires when the count reaches `auto_topup_max_failures`, which is
-/// the same point we stop retrying, so the count doubles as the "already
-/// emailed" marker and needs no separate flag.
-async fn record_auto_topup_failure(
-    conn: &mut sqlx::pool::PoolConnection<sqlx::Postgres>,
-    user: &AutoTopupUser,
-    email_service: Option<&EmailService>,
-    credits_config: &crate::config::CreditsConfig,
-    terminal: bool,
-) {
-    // A hard decline jumps straight to the maximum: the card will not start
-    // working on its own, so backing off just delays telling the customer.
-    let min_count = if terminal { credits_config.auto_topup_max_failures } else { 0 };
-    let failures = {
-        let mut users = Users::new(&mut *conn);
-        match users.record_auto_topup_failure(user.id, min_count).await {
-            Ok(n) => n,
-            Err(e) => {
-                crate::background_error!(AUTO_TOPUP, "record_failure", Warning, user_id = %user.id, error = %e, "Failed to record auto top-up failure");
-                return;
-            }
-        }
-    };
-
-    if failures < credits_config.auto_topup_max_failures {
-        tracing::debug!(user_id = %user.id, failures, "Auto top-up failed, will retry after backoff");
-        return;
-    }
-
-    // Reaching the maximum happens once per streak: the retry filter excludes
-    // users at or above it, so we cannot land here twice without a successful
-    // charge or a reconfiguration resetting the count first.
-    tracing::warn!(user_id = %user.id, failures, "Auto top-up giving up after repeated failures");
-    counter!("dwctl_auto_topup_gave_up_total").increment(1);
-
-    if let Some(email_svc) = email_service {
-        let name = user.display_name.as_deref().unwrap_or(&user.username);
-        if let Err(e) = email_svc
-            .send_auto_topup_failed_email(&user.email, Some(name), &user.auto_topup_amount, &user.auto_topup_threshold)
-            .await
-        {
-            crate::background_error!(AUTO_TOPUP, "email_send", Warning, user_id = %user.id, error = %e, "Failed to send auto top-up failure email");
-        }
-    }
-}
-
 async fn process_auto_topups(
     provider: &dyn PaymentProvider,
     conn: &mut sqlx::pool::PoolConnection<sqlx::Postgres>,
@@ -813,12 +739,10 @@ async fn process_auto_topups(
     //    last committed charge.
     let balance_for = |u: &AutoTopupUser| -> Option<rust_decimal::Decimal> { u.checkpoint_balance };
 
-    // 3. Filter to users below their threshold whose retry backoff has elapsed
-    let now = Utc::now();
+    // 3. Filter to users below their threshold
     let to_charge: Vec<_> = candidates
         .iter()
         .filter(|u| balance_for(u).map(|b| b < u.auto_topup_threshold).unwrap_or(false))
-        .filter(|u| auto_topup_retry_due(u, credits_config, now))
         .collect();
 
     if to_charge.is_empty() {
@@ -945,8 +869,15 @@ async fn process_auto_topups(
             Ok(Some(pm_id)) => pm_id,
             Ok(None) => {
                 tracing::warn!(user_id = %user.id, "No default payment method found, skipping auto top-up");
-                // No card on file will not fix itself either.
-                record_auto_topup_failure(conn, user, email_service, credits_config, true).await;
+                if let Some(email_svc) = email_service {
+                    let name = user.display_name.as_deref().unwrap_or(&user.username);
+                    if let Err(e) = email_svc
+                        .send_auto_topup_failed_email(&user.email, Some(name), &user.auto_topup_amount, &user.auto_topup_threshold)
+                        .await
+                    {
+                        crate::background_error!(AUTO_TOPUP, "email_send", Warning, user_id = %user.id, error = %e, "Failed to send auto top-up failure email");
+                    }
+                }
                 continue;
             }
             Err(e) => {
@@ -969,15 +900,21 @@ async fn process_auto_topups(
                 continue;
             }
             Err(e) => {
-                let terminal = matches!(e, PaymentError::CardDeclined(_));
                 crate::background_error!(
                     AUTO_TOPUP, "charge", Warning,
                     user_id = %user.id,
                     error = %e,
-                    terminal,
                     "Failed to charge auto top-up"
                 );
-                record_auto_topup_failure(conn, user, email_service, credits_config, terminal).await;
+                if let Some(email_svc) = email_service {
+                    let name = user.display_name.as_deref().unwrap_or(&user.username);
+                    if let Err(e) = email_svc
+                        .send_auto_topup_failed_email(&user.email, Some(name), &user.auto_topup_amount, &user.auto_topup_threshold)
+                        .await
+                    {
+                        crate::background_error!(AUTO_TOPUP, "email_send", Warning, user_id = %user.id, error = %e, "Failed to send auto top-up failure email");
+                    }
+                }
                 continue;
             }
         };
@@ -998,15 +935,6 @@ async fn process_auto_topups(
         // below. Mark verified now for the onwards rate-limit tier.
         if let Err(e) = Users::new(&mut *conn).set_verified(user.id).await {
             crate::background_error!(AUTO_TOPUP, "mark_verified", Warning, user_id = %user.id, error = %e, "Failed to mark user verified after auto top-up");
-        }
-
-        // The card went through, so any failure streak is over — clear it here
-        // for the same reason as `set_verified` above, independently of whether
-        // the credit-transaction insert below succeeds.
-        if user.auto_topup_failure_count > 0 {
-            let _ = Users::new(&mut *conn).clear_auto_topup_failures(&[user.id]).await.inspect_err(
-                |e| crate::background_error!(AUTO_TOPUP, "clear_failures", Warning, user_id = %user.id, error = %e, "Failed to clear auto top-up failure state"),
-            );
         }
 
         let mut credits = Credits::new(&mut *conn);
@@ -1164,80 +1092,16 @@ mod tests {
         let _ = BatchNotificationInfo::try_from_batch(&notification);
     }
 
-    fn failing_user(failure_count: i32, failed_at: Option<DateTime<Utc>>) -> AutoTopupUser {
-        AutoTopupUser {
-            id: Uuid::new_v4(),
-            email: "a@b.c".to_string(),
-            username: "u".to_string(),
-            display_name: None,
-            payment_provider_id: "cus_x".to_string(),
-            auto_topup_threshold: Decimal::new(10, 0),
-            auto_topup_amount: Decimal::new(25, 0),
-            checkpoint_balance: Some(Decimal::ZERO),
-            auto_topup_monthly_limit: None,
-            auto_topup_limit_notification_sent: false,
-            auto_topup_failure_count: failure_count,
-            auto_topup_failed_at: failed_at,
-        }
-    }
-
-    #[test]
-    fn test_retry_due_with_no_failures() {
-        let cfg = CreditsConfig::default();
-        assert!(auto_topup_retry_due(&failing_user(0, None), &cfg, Utc::now()));
-    }
-
-    #[test]
-    fn test_retry_not_due_inside_backoff() {
-        let cfg = CreditsConfig::default();
-        let now = Utc::now();
-        // 3 failures means 4 minutes of backoff; only 1 has passed.
-        let user = failing_user(3, Some(now - chrono::Duration::minutes(1)));
-        assert!(!auto_topup_retry_due(&user, &cfg, now));
-    }
-
-    #[test]
-    fn test_retry_due_after_backoff_elapses() {
-        let cfg = CreditsConfig::default();
-        let now = Utc::now();
-        let user = failing_user(3, Some(now - chrono::Duration::minutes(5)));
-        assert!(auto_topup_retry_due(&user, &cfg, now));
-    }
-
-    #[test]
-    fn test_retry_never_due_at_max_failures() {
-        let cfg = CreditsConfig::default();
-        // Long past any backoff window: hitting the max is terminal until the
-        // user reconfigures or a charge succeeds.
-        let user = failing_user(cfg.auto_topup_max_failures, Some(Utc::now() - chrono::Duration::days(30)));
-        assert!(!auto_topup_retry_due(&user, &cfg, Utc::now()));
-    }
-
-    #[test]
-    fn test_backoff_is_capped() {
-        let cfg = CreditsConfig {
-            auto_topup_max_failures: 40,
-            auto_topup_backoff_cap_secs: 3600,
-            ..CreditsConfig::default()
-        };
-        let now = Utc::now();
-        // 2^29 minutes uncapped; the cap pulls it back to an hour.
-        let user = failing_user(30, Some(now - chrono::Duration::minutes(61)));
-        assert!(auto_topup_retry_due(&user, &cfg, now));
-    }
-
-    /// Payment provider double whose charge always fails with the error the
-    /// wrapped function produces.
+    /// Provider that reports the charge as already in flight elsewhere, the way
+    /// Stripe answers a duplicate idempotency key with 409 `idempotency_key_in_use`.
     ///
-    /// Only the two methods `process_auto_topups` actually calls are
-    /// implemented; the rest exist to satisfy the trait and panic if reached,
-    /// which also asserts we do not call the provider for anything else.
-    struct StubProvider(fn() -> PaymentError);
+    /// Only the two methods `process_auto_topups` actually calls are implemented.
+    struct AlreadyChargingProvider;
 
     #[async_trait::async_trait]
-    impl PaymentProvider for StubProvider {
+    impl PaymentProvider for AlreadyChargingProvider {
         async fn charge_auto_topup(&self, _: i64, _: &str, _: &str, _: &str) -> crate::payment_providers::Result<String> {
-            Err((self.0)())
+            Err(PaymentError::AlreadyProcessed)
         }
 
         async fn get_default_payment_method(&self, customer_id: &str) -> crate::payment_providers::Result<Option<String>> {
@@ -1301,88 +1165,6 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn test_hard_decline_stops_retrying_immediately(pool: PgPool) {
-        let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
-        sqlx::query!(
-            r#"UPDATE users SET
-                auto_topup_amount = 25.0,
-                auto_topup_threshold = 10.0,
-                payment_provider_id = 'cus_test_456'
-            WHERE id = $1"#,
-            user.id
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        let cfg = CreditsConfig::default();
-        let mut conn = pool.acquire().await.unwrap();
-        process_auto_topups(
-            &StubProvider(|| PaymentError::CardDeclined("insufficient_funds".to_string())),
-            &mut conn,
-            None,
-            &cfg,
-        )
-        .await;
-
-        // One declined attempt jumps straight to the max, rather than burning
-        // eight retries over two hours on a card that cannot succeed.
-        let row = sqlx::query!("SELECT auto_topup_failure_count FROM users WHERE id = $1", user.id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert_eq!(row.auto_topup_failure_count, cfg.auto_topup_max_failures);
-
-        // And a second sweep does not attempt again.
-        process_auto_topups(
-            &StubProvider(|| PaymentError::CardDeclined("insufficient_funds".to_string())),
-            &mut conn,
-            None,
-            &cfg,
-        )
-        .await;
-        let row = sqlx::query!("SELECT auto_topup_failure_count FROM users WHERE id = $1", user.id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert_eq!(
-            row.auto_topup_failure_count, cfg.auto_topup_max_failures,
-            "must not retry after a hard decline"
-        );
-    }
-
-    #[sqlx::test]
-    async fn test_transient_failure_increments_one_at_a_time(pool: PgPool) {
-        let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
-        sqlx::query!(
-            r#"UPDATE users SET
-                auto_topup_amount = 25.0,
-                auto_topup_threshold = 10.0,
-                payment_provider_id = 'cus_test_456'
-            WHERE id = $1"#,
-            user.id
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        let mut conn = pool.acquire().await.unwrap();
-        process_auto_topups(
-            &StubProvider(|| PaymentError::ProviderApi("stripe 500".to_string())),
-            &mut conn,
-            None,
-            &CreditsConfig::default(),
-        )
-        .await;
-
-        let row = sqlx::query!("SELECT auto_topup_failure_count FROM users WHERE id = $1", user.id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert_eq!(row.auto_topup_failure_count, 1, "a transient failure must not give up immediately");
-    }
-
-    #[sqlx::test]
     async fn test_process_auto_topups_skips_when_charge_already_in_flight(pool: PgPool) {
         // A concurrent sweep on another replica already owns this charge. We must
         // skip without crediting the user, rather than treating it as a failure.
@@ -1401,13 +1183,7 @@ mod tests {
         .unwrap();
 
         let mut conn = pool.acquire().await.unwrap();
-        process_auto_topups(
-            &StubProvider(|| PaymentError::AlreadyProcessed),
-            &mut conn,
-            None,
-            &CreditsConfig::default(),
-        )
-        .await;
+        process_auto_topups(&AlreadyChargingProvider, &mut conn, None, &CreditsConfig::default()).await;
 
         // No credit transaction: the replica that won the race writes it, not us.
         let count = sqlx::query!(

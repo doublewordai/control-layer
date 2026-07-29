@@ -48,53 +48,14 @@ pub struct StripeProvider {
 /// a failure. Returning `AlreadyProcessed` lets callers skip quietly instead of
 /// recording a payment failure for a charge that is going through elsewhere.
 fn map_stripe_error(context: &str, e: StripeError) -> PaymentError {
-    if let StripeError::Stripe(api_errors, _) = &e {
-        if api_errors.code == Some(ApiErrorsCode::IdempotencyKeyInUse) {
-            tracing::debug!("{context}: idempotency key already in use, another request is in flight");
-            return PaymentError::AlreadyProcessed;
-        }
-        if is_terminal_decline(api_errors) {
-            let code = api_errors
-                .decline_code
-                .clone()
-                .or_else(|| api_errors.code.as_ref().map(|c| c.to_string()))
-                .unwrap_or_else(|| "card_declined".to_string());
-            tracing::warn!("{context}: card declined ({code}), not retryable");
-            return PaymentError::CardDeclined(code);
-        }
+    if let StripeError::Stripe(api_errors, _) = &e
+        && api_errors.code == Some(ApiErrorsCode::IdempotencyKeyInUse)
+    {
+        tracing::debug!("{context}: idempotency key already in use, another request is in flight");
+        return PaymentError::AlreadyProcessed;
     }
     tracing::error!("{context}: {e:?}");
     PaymentError::ProviderApi(e.to_string())
-}
-
-/// Stripe decline codes that Stripe itself documents as worth retrying. Any
-/// other decline needs the customer to act, so retrying only wastes attempts
-/// and emails.
-const RETRYABLE_DECLINE_CODES: [&str; 2] = ["try_again_later", "processing_error"];
-
-/// Whether this error is a card refusal that retrying cannot fix.
-fn is_terminal_decline(api_errors: &stripe::ApiErrors) -> bool {
-    let refused = matches!(
-        api_errors.code,
-        Some(
-            ApiErrorsCode::CardDeclined
-                | ApiErrorsCode::InsufficientFunds
-                | ApiErrorsCode::ExpiredCard
-                | ApiErrorsCode::IncorrectNumber
-                | ApiErrorsCode::IncorrectCvc
-                | ApiErrorsCode::InvalidExpiryMonth
-                | ApiErrorsCode::InvalidExpiryYear
-        )
-    );
-
-    // `card_declined` carries a decline_code, and a couple of those are the
-    // issuer saying "transient, try again" — treating those as terminal would
-    // strand the customer until they manually re-enable auto top-up.
-    refused
-        && !api_errors
-            .decline_code
-            .as_deref()
-            .is_some_and(|d| RETRYABLE_DECLINE_CODES.contains(&d))
 }
 
 impl From<crate::config::StripeConfig> for StripeProvider {
@@ -804,40 +765,10 @@ mod tests {
         assert!(matches!(err, PaymentError::AlreadyProcessed), "got {err:?}");
     }
 
-    /// Build a decline carrying a specific Stripe `decline_code`.
-    fn stripe_decline_with_code(decline_code: &str) -> StripeError {
-        let StripeError::Stripe(mut api_errors, status) = stripe_api_error(ApiErrorsCode::CardDeclined) else {
-            unreachable!()
-        };
-        api_errors.decline_code = Some(decline_code.to_string());
-        StripeError::Stripe(api_errors, status)
-    }
-
     #[test]
-    fn test_card_declined_is_terminal() {
-        // A decline will not start working on its own, so callers must stop retrying.
+    fn test_card_declined_still_maps_to_provider_api_error() {
+        // A real decline must keep surfacing as a failure.
         let err = map_stripe_error("charge", stripe_api_error(ApiErrorsCode::CardDeclined));
-        assert!(matches!(err, PaymentError::CardDeclined(_)), "got {err:?}");
-    }
-
-    #[test]
-    fn test_insufficient_funds_is_terminal() {
-        let err = map_stripe_error("charge", stripe_api_error(ApiErrorsCode::InsufficientFunds));
-        assert!(matches!(err, PaymentError::CardDeclined(_)), "got {err:?}");
-    }
-
-    #[test]
-    fn test_try_again_later_decline_stays_retryable() {
-        // Stripe documents this decline_code as transient. Treating it as
-        // terminal would strand the customer until they re-enable auto top-up.
-        let err = map_stripe_error("charge", stripe_decline_with_code("try_again_later"));
-        assert!(matches!(err, PaymentError::ProviderApi(_)), "got {err:?}");
-    }
-
-    #[test]
-    fn test_generic_api_error_stays_retryable() {
-        // A provider-side failure is transient and must not burn the retry budget.
-        let err = map_stripe_error("charge", stripe_api_error(ApiErrorsCode::ProcessingError));
         assert!(matches!(err, PaymentError::ProviderApi(_)), "got {err:?}");
     }
 

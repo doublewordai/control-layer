@@ -52,12 +52,6 @@ pub enum PaymentError {
     #[error("Payment already processed")]
     AlreadyProcessed,
 
-    /// The card was refused in a way that retrying cannot fix: declined,
-    /// insufficient funds, expired, or bad card details. The customer has to
-    /// act, so callers should stop retrying rather than back off.
-    #[error("Card declined: {0}")]
-    CardDeclined(String),
-
     #[error("User does not have a payment provider customer ID")]
     NoCustomerId,
 }
@@ -65,7 +59,7 @@ pub enum PaymentError {
 impl From<PaymentError> for StatusCode {
     fn from(err: PaymentError) -> Self {
         match err {
-            PaymentError::PaymentNotCompleted | PaymentError::CardDeclined(_) => StatusCode::PAYMENT_REQUIRED,
+            PaymentError::PaymentNotCompleted => StatusCode::PAYMENT_REQUIRED,
             PaymentError::InvalidData(_) | PaymentError::NoCustomerId => StatusCode::BAD_REQUEST,
             PaymentError::AlreadyProcessed => StatusCode::OK,
             PaymentError::ProviderApi(_) | PaymentError::Database(_) => StatusCode::INTERNAL_SERVER_ERROR,

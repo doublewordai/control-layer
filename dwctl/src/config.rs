@@ -2304,14 +2304,6 @@ pub struct CreditsConfig {
     /// `purchase`), so existing paying customers are never matched.
     #[serde(default)]
     pub first_payment_match_up_to: rust_decimal::Decimal,
-    /// Consecutive failed auto top-up charges before we stop retrying and send
-    /// the customer a single failure email. Reaching this count is what marks
-    /// the email as sent, so it is also the "give up" point until they
-    /// reconfigure auto top-up or a charge succeeds.
-    pub auto_topup_max_failures: i32,
-    /// Upper bound on the exponential backoff between failed auto top-up
-    /// charges, in seconds. Backoff is 2^(failures-1) minutes, capped here.
-    pub auto_topup_backoff_cap_secs: u64,
 }
 
 impl Default for CreditsConfig {
@@ -2321,11 +2313,6 @@ impl Default for CreditsConfig {
             initial_credits_for_standard_users: rust_decimal::Decimal::ZERO,
             // Default to 0 (first-payment match promotion disabled)
             first_payment_match_up_to: rust_decimal::Decimal::ZERO,
-            // 8 failures spans roughly two hours of backoff before giving up,
-            // enough to ride out a provider outage without spamming the customer.
-            auto_topup_max_failures: 8,
-            // 24 hours
-            auto_topup_backoff_cap_secs: 86_400,
         }
     }
 }
