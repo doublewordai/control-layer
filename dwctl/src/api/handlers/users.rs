@@ -274,8 +274,7 @@ pub async fn get_user<P: PoolProvider>(
                         .map(|org| crate::api::models::organizations::OrganizationSummary {
                             id: m.organization_id,
                             name: org.display_name.clone().unwrap_or_else(|| org.username.clone()),
-                            can_manage_keys: matches!(m.role.as_str(), "owner" | "admin")
-                                || manage_keys_orgs.contains(&m.organization_id),
+                            can_manage_keys: matches!(m.role.as_str(), "owner" | "admin") || manage_keys_orgs.contains(&m.organization_id),
                             role: m.role.clone(),
                             zero_data_retention: org.zero_data_retention,
                         })
