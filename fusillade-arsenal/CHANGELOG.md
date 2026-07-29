@@ -1,5 +1,28 @@
 # Changelog
 
+## [3.1.0](https://github.com/doublewordai/control-layer/compare/fusillade-arsenal-v3.0.0...fusillade-arsenal-v3.1.0) (2026-07-29)
+
+
+### Features
+
+* add spare-capacity background workload processing ([#1337](https://github.com/doublewordai/control-layer/issues/1337)) ([5fc036d](https://github.com/doublewordai/control-layer/commit/5fc036dbf531e5adf754a13d94af6dfdffa12f11))
+* fusillade submission-epoch latency metrics and per-window completion labels ([#1347](https://github.com/doublewordai/control-layer/issues/1347)) ([9ce69d6](https://github.com/doublewordai/control-layer/commit/9ce69d6145d86819a90e34fe848d78cd1f612bda))
+* integrate Fusillade and Onwards into the Rust workspace ([#1325](https://github.com/doublewordai/control-layer/issues/1325)) ([6f712ba](https://github.com/doublewordai/control-layer/commit/6f712ba299eb1144d20e294b11ced08d3ef4224e))
+* restore fusillade storage crate releases ([#1375](https://github.com/doublewordai/control-layer/issues/1375)) ([dce6c1f](https://github.com/doublewordai/control-layer/commit/dce6c1f54f5e9e52984a46d79bee98b44d2d8789))
+
+
+### Bug Fixes
+
+* allow background indexes to be prebuilt ([#1365](https://github.com/doublewordai/control-layer/issues/1365)) ([5da8b9e](https://github.com/doublewordai/control-layer/commit/5da8b9e8d142c7d7f235920028a5563055ff85ec))
+* combined batch results stream (inout and output) was missing the… ([#1335](https://github.com/doublewordai/control-layer/issues/1335)) ([52fd53b](https://github.com/doublewordai/control-layer/commit/52fd53b965c8fc02abf6a58bceb4c0177f9ba6fb))
+* disambiguate scaled-down backend errors from upstream failures ([#819](https://github.com/doublewordai/control-layer/issues/819)) ([d9dc31f](https://github.com/doublewordai/control-layer/commit/d9dc31f10a1d1b44c8957a8021dde6cbb6986571))
+* **dwctl:** pick up onwards 0.21.0 opt-in server-side tool calling ([#888](https://github.com/doublewordai/control-layer/issues/888)) ([49494d3](https://github.com/doublewordai/control-layer/commit/49494d338166f562f528f6b59465dab71d46db69))
+* hide reasoning tokens if zero ([#970](https://github.com/doublewordai/control-layer/issues/970)) ([f647cd9](https://github.com/doublewordai/control-layer/commit/f647cd9a70fc5f9ce74a8d184adf1291ceb9118d))
+* show all pending background work ([#1373](https://github.com/doublewordai/control-layer/issues/1373)) ([81a8c3c](https://github.com/doublewordai/control-layer/commit/81a8c3c9f5a4a161bfbbe047103b78b401b3ec88))
+* show background batches in filtered lists ([#1376](https://github.com/doublewordai/control-layer/issues/1376)) ([18f1bf9](https://github.com/doublewordai/control-layer/commit/18f1bf96573e5da31f0e78f9b1b835db8440f228))
+* trigger release for fusillade 8.1.0 claim performance fix ([#844](https://github.com/doublewordai/control-layer/issues/844)) ([b04a194](https://github.com/doublewordai/control-layer/commit/b04a19406c0af84f8080367da7829623b279b785))
+* update cost names ([#963](https://github.com/doublewordai/control-layer/issues/963)) ([a671cde](https://github.com/doublewordai/control-layer/commit/a671cde8a491cecc3832b9c27e2a5ad9c810a70d))
+
 ## [3.0.0](https://github.com/doublewordai/fusillade/compare/fusillade-arsenal-v2.1.4...fusillade-arsenal-v3.0.0) (2026-07-21)
 
 
