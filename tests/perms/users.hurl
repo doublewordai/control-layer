@@ -16,7 +16,8 @@
 #   - Can see any user's credits with include=billing (has Credits::ReadAll)
 #   - Can create, update (including roles), and delete users
 #
-# Note: Users created via registration get both StandardUser and BatchAPIUser roles by default
+# Note: Users created via registration get StandardUser, BatchAPIUser, and
+# BackgroundInferenceUser roles by default
 # =============================================================================
 
 # -----------------------------------------------------------------------------
@@ -417,15 +418,16 @@ HTTP 403
 # Response should indicate insufficient permissions to modify roles
 body contains "roles"
 
-# Verify user1 still only has their default roles (StandardUser + BatchAPIUser)
+# Verify user1 still only has their configured default roles
 GET http://localhost:3001/admin/api/v1/users/{{user1_id}}
 [Cookies]
 dwctl_session: {{user_jwt}}
 HTTP 200
 [Asserts]
-jsonpath "$.roles" count == 2
+jsonpath "$.roles" count == 3
 jsonpath "$.roles" contains "StandardUser"
 jsonpath "$.roles" contains "BatchAPIUser"
+jsonpath "$.roles" contains "BackgroundInferenceUser"
 jsonpath "$.roles" not contains "PlatformManager"
 
 # User1 tries to remove their StandardUser role - should be forbidden
@@ -463,9 +465,10 @@ dwctl_session: {{user_jwt}}
 HTTP 200
 [Asserts]
 jsonpath "$.display_name" == "User1 Updated Display Name"
-jsonpath "$.roles" count == 2
+jsonpath "$.roles" count == 3
 jsonpath "$.roles" contains "StandardUser"
 jsonpath "$.roles" contains "BatchAPIUser"
+jsonpath "$.roles" contains "BackgroundInferenceUser"
 
 # -----------------------------------------------------------------------------
 # StandardUser CANNOT update other users

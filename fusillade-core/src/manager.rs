@@ -4,15 +4,16 @@
 //! for persisting requests, creating files, launching batches, and checking execution status.
 
 use crate::batch::{
-    Batch, BatchId, BatchInput, BatchStatus, File, FileContentItem, FileFilter, FileId,
-    FileStreamItem, FileStreamResult, ListBatchesFilter, OutputFileType, RequestTemplateInput,
+    BackgroundBatchInput, Batch, BatchId, BatchInput, BatchStatus, File, FileContentItem,
+    FileFilter, FileId, FileStreamItem, FileStreamResult, ListBatchesFilter, OutputFileType,
+    RequestTemplateInput,
 };
 use crate::daemon_record::{AnyDaemonRecord, DaemonRecord, DaemonState, DaemonStatus};
 use crate::error::Result;
 use crate::request::{
-    AnyRequest, CascadeTargetState, Claimed, CreateFlexInput, CreateRealtimeInput, DaemonId,
-    ListRequestsFilter, PersistCompletedRealtimeInput, Request, RequestDetail, RequestId,
-    RequestListResult, RequestState, ServiceTierFilter,
+    AnyRequest, CascadeTargetState, Claimed, CreateBackgroundInput, CreateFlexInput,
+    CreateRealtimeInput, DaemonId, ListRequestsFilter, PersistCompletedRealtimeInput, Request,
+    RequestDetail, RequestId, RequestListResult, RequestState, ServiceTierFilter,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -126,6 +127,15 @@ pub struct ModelFilter {
     pub expected_ready_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+/// Background queue modality selected by a dedicated daemon worker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackgroundClaimKind {
+    /// Requests submitted without a file-backed batch.
+    Batchless,
+    /// Requests belonging to a file-backed background batch.
+    Batch,
+}
+
 /// Storage trait for persisting and querying requests.
 ///
 /// This trait provides atomic operations for request lifecycle management.
@@ -213,6 +223,22 @@ pub trait Storage: Send + Sync {
     /// `total_requests` will be set from `input.total_requests` if provided, or `0` otherwise.
     /// Use [`populate_batch`] to copy templates into requests afterward.
     async fn create_batch_record(&self, input: BatchInput) -> Result<Batch>;
+
+    /// Create and populate a file-backed background batch with no completion SLA.
+    async fn create_background_batch(&self, input: BackgroundBatchInput) -> Result<Batch> {
+        let _ = input;
+        Err(crate::error::FusilladeError::Other(anyhow::anyhow!(
+            "background batch creation is not implemented for this storage backend"
+        )))
+    }
+
+    /// Create a background batch record without populating its requests.
+    async fn create_background_batch_record(&self, input: BackgroundBatchInput) -> Result<Batch> {
+        let _ = input;
+        Err(crate::error::FusilladeError::Other(anyhow::anyhow!(
+            "background batch creation is not implemented for this storage backend"
+        )))
+    }
 
     /// Populate an existing batch with requests from its file's templates.
     ///
@@ -447,9 +473,10 @@ pub trait Storage: Send + Sync {
     /// - `states`: request states to include (e.g. `["pending"]`, or
     ///   `["pending","claimed","processing"]`).
     /// - `model_filter`: optional model whitelist (empty = all).
-    /// - `service_tier_filter`: filter on `service_tier`. `Any` (default) applies
-    ///   no filter; `Include`/`Exclude` use `Option<String>` where `None`
-    ///   represents the batch tier (`service_tier IS NULL`).
+    /// - `service_tier_filter`: filter on `service_tier`. Background demand is
+    ///   isolated: `Any` and `Exclude` omit it, while `Include` returns it only
+    ///   when `Some("background")` is explicit. `None` represents the batch
+    ///   tier (`service_tier IS NULL`).
     /// - `priority_decay_window`: optional lookback in seconds. When set,
     ///   recently completed `service_tier = 'flex'` requests are added to
     ///   the `"1h"` bucket so realtime traffic can decay out of scheduling
@@ -684,6 +711,117 @@ pub trait Storage: Send + Sync {
         true
     }
 
+    /// Atomically claim pending background requests for one queue modality.
+    #[doc(hidden)]
+    async fn claim_background_requests_by_kind(
+        &self,
+        kind: BackgroundClaimKind,
+        limit: usize,
+        batch_limit: usize,
+        daemon_id: DaemonId,
+        available_capacity: &std::collections::HashMap<String, usize>,
+        user_active_counts: &std::collections::HashMap<String, usize>,
+    ) -> Result<Vec<Request<Claimed>>> {
+        let _ = (
+            kind,
+            limit,
+            batch_limit,
+            daemon_id,
+            available_capacity,
+            user_active_counts,
+        );
+        Err(crate::error::FusilladeError::Other(anyhow::anyhow!(
+            "background claims are not implemented for this storage backend"
+        )))
+    }
+
+    /// Atomically claim pending background requests from the batchless queue.
+    async fn claim_background_batchless_requests(
+        &self,
+        limit: usize,
+        daemon_id: DaemonId,
+        available_capacity: &std::collections::HashMap<String, usize>,
+        user_active_counts: &std::collections::HashMap<String, usize>,
+    ) -> Result<Vec<Request<Claimed>>> {
+        self.claim_background_requests_by_kind(
+            BackgroundClaimKind::Batchless,
+            limit,
+            0,
+            daemon_id,
+            available_capacity,
+            user_active_counts,
+        )
+        .await
+    }
+
+    /// Atomically claim pending requests from file-backed background batches.
+    async fn claim_background_batch_requests(
+        &self,
+        limit: usize,
+        batch_limit: usize,
+        daemon_id: DaemonId,
+        available_capacity: &std::collections::HashMap<String, usize>,
+        user_active_counts: &std::collections::HashMap<String, usize>,
+    ) -> Result<Vec<Request<Claimed>>> {
+        self.claim_background_requests_by_kind(
+            BackgroundClaimKind::Batch,
+            limit,
+            batch_limit,
+            daemon_id,
+            available_capacity,
+            user_active_counts,
+        )
+        .await
+    }
+
+    /// Combined helper that claims batchless background requests first, then
+    /// uses the remaining global and per-model cycle capacity for batches.
+    async fn claim_background_requests(
+        &self,
+        limit: usize,
+        batch_limit: usize,
+        daemon_id: DaemonId,
+        available_capacity: &std::collections::HashMap<String, usize>,
+        user_active_counts: &std::collections::HashMap<String, usize>,
+    ) -> Result<Vec<Request<Claimed>>> {
+        let mut claimed = self
+            .claim_background_batchless_requests(
+                limit,
+                daemon_id,
+                available_capacity,
+                user_active_counts,
+            )
+            .await?;
+        let remaining = limit.saturating_sub(claimed.len());
+        let mut remaining_capacity = available_capacity.clone();
+        for request in &claimed {
+            if let Some(capacity) = remaining_capacity.get_mut(&request.data.model) {
+                *capacity = capacity.saturating_sub(1);
+            }
+        }
+        if remaining > 0
+            && batch_limit > 0
+            && remaining_capacity.values().any(|capacity| *capacity > 0)
+        {
+            claimed.extend(
+                self.claim_background_batch_requests(
+                    remaining,
+                    batch_limit,
+                    daemon_id,
+                    &remaining_capacity,
+                    user_active_counts,
+                )
+                .await?,
+            );
+        }
+        Ok(claimed)
+    }
+
+    /// Whether this backend implements background claim methods.
+    fn supports_background_claims(&self) -> bool {
+        false
+    }
+
     /// Append a single event to the `model_filters` log. Used by the controller
     /// when a model's internal liveness CHANGES (live / coming / absent).
     ///
@@ -784,6 +922,14 @@ pub trait Storage: Send + Sync {
     /// `batch_id = NULL` in `pending` state. The daemon claims and processes
     /// it via the standard flex pipeline.
     async fn create_flex(&self, input: CreateFlexInput) -> Result<RequestId>;
+
+    /// Create a background response for spare-capacity daemon processing.
+    async fn create_background(&self, input: CreateBackgroundInput) -> Result<RequestId> {
+        let _ = input;
+        Err(crate::error::FusilladeError::Other(anyhow::anyhow!(
+            "background request creation is not implemented for this storage backend"
+        )))
+    }
 
     /// Complete a processing request with the response body.
     ///

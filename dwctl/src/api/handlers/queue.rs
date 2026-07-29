@@ -58,13 +58,16 @@ fn service_tiers_include_flex(tiers: &[Option<String>]) -> bool {
 
 /// Get pending, claimed, and processing request counts grouped by model and completion window
 ///
-/// Returns a nested map showing how many pending requests are queued for each
+/// Returns a nested map showing how many active requests exist for each
 /// model and completion window combination. By default it includes only the
 /// batch tier (`service_tier IS NULL`). Pass `service_tiers` to include other
 /// tiers, for example `service_tiers=batch,flex`. This always excludes:
 /// - Escalated requests (racing duplicate requests)
 /// - Requests without a template_id
 /// - Requests in batches being cancelled
+///
+/// Background counts include the complete active backlog, including work for
+/// models that are not currently live or dispatchable.
 ///
 /// When `batches.priority_decay_window_secs` is configured, recently completed
 /// flex requests are added back into the `1h` count for their model for that

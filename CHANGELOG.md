@@ -1,5 +1,39 @@
 # Changelog
 
+## [8.103.3](https://github.com/doublewordai/control-layer/compare/v8.103.2...v8.103.3) (2026-07-29)
+
+
+### Bug Fixes
+
+* show all pending background work ([#1373](https://github.com/doublewordai/control-layer/issues/1373)) ([81a8c3c](https://github.com/doublewordai/control-layer/commit/81a8c3c9f5a4a161bfbbe047103b78b401b3ec88))
+
+## [8.103.2](https://github.com/doublewordai/control-layer/compare/v8.103.1...v8.103.2) (2026-07-29)
+
+
+### Bug Fixes
+
+* **onwards:** canonicalise reasoning field on strict chat completions ([#1368](https://github.com/doublewordai/control-layer/issues/1368)) ([9a8cd1e](https://github.com/doublewordai/control-layer/commit/9a8cd1e27f0808906394944630d24e7c08ceaa04))
+* show background work throughout dashboard ([#1372](https://github.com/doublewordai/control-layer/issues/1372)) ([c37434a](https://github.com/doublewordai/control-layer/commit/c37434a3d677407518a30faff1ee16ab37e62758))
+
+## [8.103.1](https://github.com/doublewordai/control-layer/compare/v8.103.0...v8.103.1) (2026-07-28)
+
+
+### Bug Fixes
+
+* allow background indexes to be prebuilt ([#1365](https://github.com/doublewordai/control-layer/issues/1365)) ([5da8b9e](https://github.com/doublewordai/control-layer/commit/5da8b9e8d142c7d7f235920028a5563055ff85ec))
+
+## [8.103.0](https://github.com/doublewordai/control-layer/compare/v8.102.0...v8.103.0) (2026-07-28)
+
+
+### Features
+
+* add spare-capacity background workload processing ([#1337](https://github.com/doublewordai/control-layer/issues/1337)) ([5fc036d](https://github.com/doublewordai/control-layer/commit/5fc036dbf531e5adf754a13d94af6dfdffa12f11))
+
+
+### Bug Fixes
+
+* test race condition guard ([#1361](https://github.com/doublewordai/control-layer/issues/1361)) ([6966dd1](https://github.com/doublewordai/control-layer/commit/6966dd1eb92baf053657d32d615e9f0020b7d849))
+
 ## [8.102.0](https://github.com/doublewordai/control-layer/compare/v8.101.0...v8.102.0) (2026-07-23)
 
 

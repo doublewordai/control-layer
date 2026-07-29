@@ -42,6 +42,7 @@ impl From<&DaemonConfig> for fusillade_arsenal::PostgresStorageConfig {
             claim_ramp_exponent: config.claim_ramp_exponent,
             urgency_weight: config.urgency_weight,
             batch_claim_require_live: config.batch_claim_require_live,
+            background_concurrency_limit: config.background_concurrency_limit,
             leaks_per_window: config.leaks_per_window,
             model_filters_keep_per_model: config.model_filters_keep_per_model,
             model_filters_retention_ms: config.model_filters_retention_ms,

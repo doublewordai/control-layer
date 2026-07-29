@@ -26,6 +26,8 @@ pub enum Role {
     BillingManager,
     /// Access to batch processing API endpoints
     BatchAPIUser,
+    /// Access to spare-capacity background inference
+    BackgroundInferenceUser,
     /// Access to external data source connections and sync operations
     ConnectionsUser,
 }
