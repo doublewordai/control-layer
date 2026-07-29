@@ -22,6 +22,7 @@ metadata = json.loads(
 expected_packages = {
     "dwctl",
     "onwards",
+    "onwards-fusillade",
     "fusillade",
     "fusillade-core",
     "fusillade-arsenal",
@@ -60,14 +61,24 @@ local_dependencies = {
         "fusillade": "../fusillade",
         "fusillade-arsenal": "../fusillade-arsenal",
         "onwards": "../onwards",
+        "onwards-fusillade": "../onwards-fusillade",
     },
-    "onwards/Cargo.toml": {"fusillade": "../fusillade"},
+    "onwards-fusillade/Cargo.toml": {
+        "fusillade": "../fusillade",
+        "onwards": "../onwards",
+    },
     "fusillade/Cargo.toml": {
         "fusillade-core": "../fusillade-core",
         "fusillade-arsenal": "../fusillade-arsenal",
     },
     "fusillade-arsenal/Cargo.toml": {"fusillade-core": "../fusillade-core"},
 }
+
+onwards_manifest = tomllib.loads((root / "onwards/Cargo.toml").read_text())
+if "fusillade" in onwards_manifest.get("dependencies", {}):
+    raise SystemExit("published Onwards must not depend on Fusillade")
+if "multi-step" in onwards_manifest.get("features", {}):
+    raise SystemExit("published Onwards must not expose the local multi-step integration")
 
 for manifest_path, dependencies in local_dependencies.items():
     manifest = tomllib.loads((root / manifest_path).read_text())
@@ -215,7 +226,7 @@ if ! grep -Fq 'publish-fusillade-crates:' "$release_workflow" || \
    ! grep -Fq 'publish-fusillade-crate.sh' "$release_workflow" || \
    ! grep -Fq 'cargo publish --locked' \
      .github/scripts/publish-fusillade-crate.sh || \
-   ! grep -Fq -- '--manifest-path fusillade-core/Cargo.toml --registry crates-io' \
+   ! grep -Fq -- '--package fusillade-core --registry crates-io' \
      .github/scripts/publish-fusillade-crate.sh || \
    ! grep -Fq -- '--package fusillade-arsenal --registry crates-io' \
      .github/scripts/publish-fusillade-crate.sh; then
@@ -265,7 +276,7 @@ fi
 
 node .github/scripts/test-onwards-floating-tags.cjs
 
-for linted_package in dwctl fusillade fusillade-core fusillade-arsenal; do
+for linted_package in dwctl fusillade fusillade-core fusillade-arsenal onwards-fusillade; do
   if ! grep -Fq -- "--package $linted_package" "$justfile"; then
     echo "Rust linting must retain $linted_package" >&2
     exit 1
@@ -365,6 +376,12 @@ fi
 
 if [[ "$(grep -Fc 'COPY onwards/ onwards/' Dockerfile)" != 2 ]]; then
   echo "Docker planner and builder must both receive the local Onwards crate" >&2
+  exit 1
+fi
+
+if [[ "$(grep -Fc 'COPY onwards-fusillade/ onwards-fusillade/' Dockerfile)" != 2 ]] || \
+   [[ "$(grep -Fc 'COPY onwards-fusillade/ onwards-fusillade/' onwards/Dockerfile)" != 1 ]]; then
+  echo "Workspace Docker builds must receive the private Onwards Fusillade crate" >&2
   exit 1
 fi
 

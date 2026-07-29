@@ -60,15 +60,14 @@ require_text 'backend-crate-test:' 'define a per-crate test job'
 require_text 'name: ${{ matrix.package }} / test' 'scope every crate test check to its package'
 require_text 'fail-fast: false' 'allow every crate result to complete'
 
-for package in fusillade fusillade-core fusillade-arsenal onwards; do
+for package in fusillade fusillade-core fusillade-arsenal onwards onwards-fusillade; do
   require_text "- package: ${package}" "test ${package} in the matrix"
 done
 
 require_text 'cargo_args: --all-features' 'exercise Onwards optional Fusillade integration'
-require_text 'package_spec: fusillade-core@4.1.0' 'select the local Fusillade Core package unambiguously'
 
 require_text 'runs-on: ${{ matrix.runner }}' 'run matrix entries independently'
-require_text 'cargo llvm-cov --package "${{ matrix.package_spec || matrix.package }}"' 'compile and test one package per runner'
+require_text 'cargo llvm-cov --package "${{ matrix.package }}"' 'compile and test one package per runner'
 require_text 'name: rust-coverage-${{ matrix.package }}' 'upload per-package coverage artifacts'
 require_text 'backend-dwctl-test-shard:' 'define parallel dwctl test partitions'
 require_text 'partition: [1, 2, 3, 4]' 'split dwctl tests into four partitions'
@@ -90,7 +89,7 @@ require_exact_line '    name: workspace / rust gate' 'name the aggregate Rust ga
 require_text 'pattern: rust-coverage-*' 'download all per-package coverage artifacts'
 require_text 'MINIMUM_COVERAGE: "60"' 'preserve the aggregate line coverage threshold'
 require_text '.github/scripts/aggregate-rust-coverage.py' 'merge duplicate source lines before checking coverage'
-require_text 'Expected 8 coverage files' 'aggregate every workspace crate coverage artifact'
+require_text 'Expected 9 coverage files' 'aggregate every workspace crate coverage artifact'
 require_text 'cargo package --locked --package onwards --all-features' 'validate the publishable Onwards package'
 require_text 'onwards-openresponses-compliance:' 'define standalone Onwards compliance'
 require_text 'mode: [adapter, passthrough]' 'test Onwards adapter and passthrough modes'

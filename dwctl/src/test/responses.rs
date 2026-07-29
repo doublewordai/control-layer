@@ -297,7 +297,7 @@ async fn test_multi_step_chain_assembles_and_is_retrievable_via_get(pool: PgPool
     use crate::inference::store::{FusilladeResponseStore, PendingResponseInput};
     use crate::test::utils::setup_fusillade_pool;
     use fusillade_arsenal::{PostgresRequestManager, PostgresResponseStepManager, TestDbPools};
-    use onwards::{MultiStepStore, StepDescriptor, StepKind as OnwardsStepKind};
+    use onwards_fusillade::{MultiStepStore, StepDescriptor, StepKind as OnwardsStepKind};
     use serde_json::json;
     use std::sync::Arc;
 
@@ -438,10 +438,10 @@ async fn test_multi_step_chain_assembles_and_is_retrievable_via_get(pool: PgPool
     assert_eq!(chain[0].id, head.id);
     assert_eq!(chain[1].id, tool.id);
     assert_eq!(chain[2].id, summary.id);
-    assert!(matches!(chain[0].kind, onwards::StepKind::ModelCall));
-    assert!(matches!(chain[1].kind, onwards::StepKind::ToolCall));
-    assert!(matches!(chain[2].kind, onwards::StepKind::ModelCall));
-    assert!(chain.iter().all(|s| matches!(s.state, onwards::StepState::Completed)));
+    assert!(matches!(chain[0].kind, onwards_fusillade::StepKind::ModelCall));
+    assert!(matches!(chain[1].kind, onwards_fusillade::StepKind::ToolCall));
+    assert!(matches!(chain[2].kind, onwards_fusillade::StepKind::ModelCall));
+    assert!(chain.iter().all(|s| matches!(s.state, onwards_fusillade::StepState::Completed)));
 }
 
 /// Test that GET /v1/responses/{id} returns 404 for non-existent IDs.

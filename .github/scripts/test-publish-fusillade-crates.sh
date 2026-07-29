@@ -77,7 +77,7 @@ CARGO_LOG="$fixture/core-cargo.log" \
   PATH="$fixture:$PATH" \
   .github/scripts/publish-fusillade-crate.sh "fusillade-core-v${core_version}"
 grep -Fq \
-  "publish --locked --manifest-path fusillade-core/Cargo.toml --registry crates-io" \
+  "publish --locked --package fusillade-core --registry crates-io" \
   "$fixture/core-cargo.log"
 if grep -Fq -- "--token" "$fixture/core-cargo.log"; then
   echo "publisher exposed the registry token in process arguments" >&2
