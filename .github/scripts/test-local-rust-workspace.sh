@@ -440,8 +440,14 @@ require_scoped_line "$semantic_title_step" "        if: github.event_name == 'pu
 require_scoped_line "$semantic_title_step" '        uses: amannn/action-semantic-pull-request@v6' 'PR title semantic action must stay in its pull-request step'
 require_scoped_line "$merge_group_title_step" "        if: github.event_name == 'merge_group'" 'PR title no-op must be scoped to merge groups'
 
+crate_test_job="$(extract_workflow_job .github/workflows/ci.yaml backend-crate-test)"
+require_scoped_line "$crate_test_job" '    if: always()' 'Crate test matrix must expand for release-only changes'
+require_scoped_line "$crate_test_job" "      RUN_CI: \${{ needs.changes.outputs.run-ci }}" 'Crate tests must consume the release-only decision at step level'
+crate_skip_step="$(extract_workflow_step "$crate_test_job" 'Skip crate tests for release-only changes')"
+require_scoped_line "$crate_skip_step" "        if: env.RUN_CI != 'true'" 'Crate tests must declare a release-only no-op path'
+
 onwards_compliance_job="$(extract_workflow_job .github/workflows/ci.yaml onwards-openresponses-compliance)"
-require_scoped_line "$onwards_compliance_job" "    if: always() && needs.changes.outputs.run-ci == 'true'" 'Onwards compliance matrix must expand after relevant change detection'
+require_scoped_line "$onwards_compliance_job" '    if: always()' 'Onwards compliance matrix must expand for release-only changes'
 trusted_pull_request_condition="github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]'"
 require_scoped_line "$onwards_compliance_job" "      RUN_STRICT_COMPLIANCE: \${{ needs.onwards-compliance-changes.outputs.strict == 'true' && ${trusted_pull_request_condition} }}" 'Onwards strict compliance must gate secret use to trusted pull requests'
 if grep -Fq "github.event_name == 'merge_group'" <<< "$onwards_compliance_job" || \
