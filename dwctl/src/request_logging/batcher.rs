@@ -262,9 +262,10 @@ fn compute_total_cost(
     // legitimately disagree by a small margin — on fully-marked prompts (agent traffic)
     // the classifier's sum routinely lands a percent or so ABOVE prompt_tokens. That is
     // drift, not corruption: CAP the split to the prompt by removing the excess from the
-    // read count (the cheapest-rate bucket — deterministic and audit-simple; billing a
-    // request as fully-read still charges more than the same tokens under the discount
-    // it was promised, so the cap slightly favors the house, never the reverse).
+    // read count (the cheapest-rate bucket — deterministic and audit-simple; keeping the
+    // premium-billed write buckets intact means the reduction lands where it lowers the
+    // bill the least, so the cap is conservative: it slightly favors the house, never the
+    // reverse).
     //
     // Only when the WRITE counts alone exceed the whole prompt is the split genuinely
     // corrupt (writes bill at a premium, so trusting them could overcharge): distrust it
