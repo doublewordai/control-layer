@@ -58,7 +58,7 @@ fn service_tiers_include_flex(tiers: &[Option<String>]) -> bool {
 
 /// Get pending, claimed, and processing request counts grouped by model and completion window
 ///
-/// Returns a nested map showing how many active requests are queued for each
+/// Returns a nested map showing how many active requests exist for each
 /// model and completion window combination. By default it includes only the
 /// batch tier (`service_tier IS NULL`). Pass `service_tiers` to include other
 /// tiers, for example `service_tiers=batch,flex`. This always excludes:
