@@ -1007,6 +1007,30 @@ impl<'c> Users<'c> {
         Ok(result.rows_affected() == 1)
     }
 
+    /// Pause auto top-up after a transient provider failure without counting
+    /// it as a card decline.
+    ///
+    /// Returns false when another poller already applied the pause.
+    #[instrument(skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
+    pub async fn pause_auto_topup_after_provider_failure(&mut self, user_id: UserId) -> Result<bool> {
+        let result = sqlx::query!(
+            r#"
+            UPDATE users
+            SET auto_topup_retry_after = NOW() + INTERVAL '24 hours',
+                updated_at = NOW()
+            WHERE id = $1
+              AND auto_topup_amount IS NOT NULL
+              AND auto_topup_threshold IS NOT NULL
+              AND (auto_topup_retry_after IS NULL OR auto_topup_retry_after <= NOW())
+            "#,
+            user_id,
+        )
+        .execute(&mut *self.db)
+        .await?;
+
+        Ok(result.rows_affected() == 1)
+    }
+
     /// Disable auto top-up after a hard card decline.
     ///
     /// Returns false when auto top-up was already disabled by another poller.

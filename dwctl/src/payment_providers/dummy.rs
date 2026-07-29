@@ -237,6 +237,15 @@ impl PaymentProvider for DummyProvider {
     }
 
     async fn get_default_payment_method(&self, customer_id: &str) -> Result<Option<String>> {
+        #[cfg(test)]
+        match customer_id {
+            "cus_test_no_payment_method" => return Ok(None),
+            "cus_test_payment_method_lookup_error" => {
+                return Err(PaymentError::ProviderApi("simulated payment method lookup failure".to_string()));
+            }
+            _ => {}
+        }
+
         Ok(Some(format!("dummy_pm_{}", customer_id)))
     }
 
