@@ -346,6 +346,7 @@ pub struct ListBatchesQuery {
     /// - `24h` — long-running batch jobs
     /// - `1h` — async flex requests
     /// - `0s` — realtime tracking rows for the Open Responses API
+    /// - `background` — best-effort background batches (platform managers only)
     ///
     /// When omitted the server returns batches with any completion window; the
     /// dashboard sends `completion_window=24h` by default so realtime tracking
