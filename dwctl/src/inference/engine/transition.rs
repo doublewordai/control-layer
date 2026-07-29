@@ -58,7 +58,7 @@
 
 use std::collections::HashSet;
 
-use onwards::{ChainStep, NextAction, StepDescriptor, StepKind, StepState};
+use onwards_fusillade::{ChainStep, NextAction, StepDescriptor, StepKind, StepState};
 use serde_json::{Value, json};
 
 /// Decode the parent fusillade request body into the Responses-API shape

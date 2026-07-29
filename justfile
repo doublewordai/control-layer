@@ -564,6 +564,7 @@ lint target *args="":
                 --package fusillade \
                 --package fusillade-core \
                 --package fusillade-arsenal \
+                --package onwards-fusillade \
                 --all-features \
                 --no-deps \
                 {{args}}
@@ -579,6 +580,8 @@ lint target *args="":
             bash .github/scripts/test-local-rust-workspace.sh
             .github/scripts/test-fusillade-migration-checksums.py
             .github/scripts/test-publish-onwards.sh
+            .github/scripts/test-publish-fusillade-crates.sh
+            .github/scripts/test-sync-fusillade-release-dependencies.sh
             .github/scripts/test-rust-ci-matrix.sh
             .github/scripts/test-aggregate-rust-coverage.sh
             ;;
@@ -622,6 +625,7 @@ fmt target *args="":
                 --package fusillade \
                 --package fusillade-core \
                 --package fusillade-arsenal \
+                --package onwards-fusillade \
                 {{args}}
             ;;
         *)

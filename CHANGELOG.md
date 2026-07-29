@@ -1,5 +1,27 @@
 # Changelog
 
+## [8.104.0](https://github.com/doublewordai/control-layer/compare/v8.103.4...v8.104.0) (2026-07-29)
+
+
+### Features
+
+* restore fusillade storage crate releases ([#1375](https://github.com/doublewordai/control-layer/issues/1375)) ([dce6c1f](https://github.com/doublewordai/control-layer/commit/dce6c1f54f5e9e52984a46d79bee98b44d2d8789))
+
+
+### Bug Fixes
+
+* cap drifted cache splits to prompt_tokens instead of discarding … ([#1386](https://github.com/doublewordai/control-layer/issues/1386)) ([f324633](https://github.com/doublewordai/control-layer/commit/f32463385170193fcd217409b3c0fbc29f9d0c5d))
+* emit required checks for release-only changes ([#1384](https://github.com/doublewordai/control-layer/issues/1384)) ([56a144f](https://github.com/doublewordai/control-layer/commit/56a144f40a51d424b1222807ff035f1729e6ebb8))
+* gracefully handle provider icon fetch failures ([#1378](https://github.com/doublewordai/control-layer/issues/1378)) ([0cd52a2](https://github.com/doublewordai/control-layer/commit/0cd52a2ea0029cd0ba59e0fa004f8059360401b3))
+* publish onwards without fusillade ([#1385](https://github.com/doublewordai/control-layer/issues/1385)) ([97472b7](https://github.com/doublewordai/control-layer/commit/97472b79a4fa34023e3222936f75bb4acc5116d3))
+
+## [8.103.4](https://github.com/doublewordai/control-layer/compare/v8.103.3...v8.103.4) (2026-07-29)
+
+
+### Bug Fixes
+
+* show background batches in filtered lists ([#1376](https://github.com/doublewordai/control-layer/issues/1376)) ([18f1bf9](https://github.com/doublewordai/control-layer/commit/18f1bf96573e5da31f0e78f9b1b835db8440f228))
+
 ## [8.103.3](https://github.com/doublewordai/control-layer/compare/v8.103.2...v8.103.3) (2026-07-29)
 
 

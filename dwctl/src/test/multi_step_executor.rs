@@ -26,10 +26,10 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use fusillade::ReqwestHttpClient;
 use fusillade_arsenal::{PoolProvider as FusilladePoolProvider, PostgresRequestManager, PostgresResponseStepManager, TestDbPools};
+use onwards::StoreError;
 use onwards::traits::RequestContext;
-use onwards::{
-    ChainStep, LoopConfig, MultiStepStore, NextAction, RecordedStep, StepDescriptor, StepKind, StepState, StoreError, UpstreamTarget,
-    run_response_loop,
+use onwards_fusillade::{
+    ChainStep, LoopConfig, MultiStepStore, NextAction, RecordedStep, StepDescriptor, StepKind, StepState, UpstreamTarget, run_response_loop,
 };
 use serde_json::{Value, json};
 use sqlx::PgPool;

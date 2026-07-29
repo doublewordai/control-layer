@@ -306,6 +306,59 @@ const ICON_FETCH_TIMEOUT: Duration = Duration::from_secs(5);
 /// keeps the list response cached for 30 minutes, so an hour here is conservative.
 const ICON_CACHE_CONTROL: &str = "public, max-age=3600";
 
+/// Cache upstream failures briefly so a broken optional icon does not trigger
+/// a new fetch on every dashboard render.
+const ICON_NOT_FOUND_CACHE_CONTROL: &str = "public, max-age=60";
+
+/// Initial request plus two retries for transient upstream failures.
+const ICON_FETCH_ATTEMPTS: usize = 3;
+
+fn is_retryable_icon_status(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
+}
+
+async fn fetch_icon_with_retries(client: &reqwest::Client, icon_url: &Url) -> Option<reqwest::Response> {
+    for attempt in 1..=ICON_FETCH_ATTEMPTS {
+        match client.get(icon_url.clone()).send().await {
+            Ok(upstream) if upstream.status().is_success() => return Some(upstream),
+            Ok(upstream) if is_retryable_icon_status(upstream.status()) && attempt < ICON_FETCH_ATTEMPTS => {}
+            Ok(upstream) => {
+                tracing::debug!(
+                    status = %upstream.status(),
+                    attempts = attempt,
+                    "Provider icon upstream returned no usable response"
+                );
+                return None;
+            }
+            Err(error) if attempt < ICON_FETCH_ATTEMPTS => {
+                tracing::debug!(
+                    error = %error,
+                    attempt,
+                    "Transient provider icon fetch failed; retrying"
+                );
+            }
+            Err(error) => {
+                tracing::debug!(
+                    error = %error,
+                    attempts = attempt,
+                    "Provider icon fetch attempts exhausted"
+                );
+                return None;
+            }
+        }
+    }
+
+    None
+}
+
+fn icon_not_found_response() -> Response {
+    Response::builder()
+        .status(StatusCode::NOT_FOUND)
+        .header(axum::http::header::CACHE_CONTROL, ICON_NOT_FOUND_CACHE_CONTROL)
+        .body(Body::empty())
+        .expect("static provider icon not-found response is valid")
+}
+
 /// Returns `false` for any IP we don't want the icon proxy to reach:
 /// RFC1918 (`10.*`, `172.16/12`, `192.168.*`), loopback, link-local
 /// (including the cloud metadata address `169.254.169.254`), CGNAT
@@ -481,11 +534,9 @@ fn icon_http_client() -> &'static reqwest::Client {
 ///
 /// Returns:
 ///   - **200** with the upstream bytes and `Content-Type` (must be `image/*`)
-///   - **404** if the provider has no config, no icon set, or the configured
-///     value isn't an absolute `https://` URL (relative paths and registry-key
-///     shortcuts are handled client-side and bypass this endpoint)
-///   - **500** if the upstream fetch fails, times out, exceeds 2 MiB, returns
-///     non-2xx, or serves a non-image Content-Type
+///   - **404** if the provider has no proxyable icon or the upstream icon is
+///     unavailable or invalid (relative paths and registry-key shortcuts are
+///     handled client-side and bypass this endpoint)
 #[utoipa::path(
     get,
     path = "/provider-display-configs/{provider_key}/icon",
@@ -495,8 +546,7 @@ fn icon_http_client() -> &'static reqwest::Client {
     params(("provider_key" = String, Path)),
     responses(
         (status = 200, description = "Icon bytes"),
-        (status = 404, description = "Provider or icon not found / not proxyable"),
-        (status = 500, description = "Upstream icon fetch failed"),
+        (status = 404, description = "Provider icon not found, unavailable, or invalid"),
     ),
     security(
         ("BearerAuth" = []),
@@ -545,18 +595,9 @@ pub async fn get_provider_display_config_icon<P: PoolProvider>(
         }
     };
 
-    let resp = icon_http_client()
-        .get(icon_url)
-        .send()
-        .await
-        .map_err(|e| Error::Other(anyhow::anyhow!("fetch provider icon: {e}")))?;
-
-    let upstream_status = resp.status();
-    if !upstream_status.is_success() {
-        return Err(Error::Other(anyhow::anyhow!(
-            "upstream icon host returned status {upstream_status}",
-        )));
-    }
+    let Some(resp) = fetch_icon_with_retries(icon_http_client(), &icon_url).await else {
+        return Ok(icon_not_found_response());
+    };
 
     let content_type = resp
         .headers()
@@ -569,14 +610,17 @@ pub async fn get_provider_display_config_icon<P: PoolProvider>(
     // upstream returning an HTML error page that the browser would then try
     // to render in an <img> tag.
     if !content_type.to_ascii_lowercase().starts_with("image/") {
-        return Err(Error::Other(anyhow::anyhow!(
-            "upstream icon content-type {content_type:?} is not image/*",
-        )));
+        tracing::debug!(%content_type, "Provider icon upstream returned a non-image response");
+        return Ok(icon_not_found_response());
     }
 
-    let body_bytes = read_capped_body(resp, MAX_ICON_SIZE_BYTES)
-        .await
-        .map_err(|e| Error::Other(anyhow::anyhow!("read provider icon body: {e}")))?;
+    let body_bytes = match read_capped_body(resp, MAX_ICON_SIZE_BYTES).await {
+        Ok(body) => body,
+        Err(error) => {
+            tracing::debug!(%error, "Provider icon upstream returned an unusable body");
+            return Ok(icon_not_found_response());
+        }
+    };
 
     Response::builder()
         .status(StatusCode::OK)
@@ -727,6 +771,101 @@ mod ssrf_filter_tests {
     fn url_helper_allows_ip_literal_public() {
         assert!(url_ok("https://1.1.1.1/foo"));
         assert!(url_ok("https://[2606:4700:4700::1111]/foo"));
+    }
+}
+
+#[cfg(test)]
+mod icon_fetch_tests {
+    use super::{fetch_icon_with_retries, icon_not_found_response, is_retryable_icon_status};
+    use axum::http::header::CACHE_CONTROL;
+    use reqwest::StatusCode;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use url::Url;
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+    #[test]
+    fn test_retryable_icon_status() {
+        for status in [
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::SERVICE_UNAVAILABLE,
+        ] {
+            assert!(is_retryable_icon_status(status), "{status} should be retryable");
+        }
+
+        for status in [StatusCode::BAD_REQUEST, StatusCode::FORBIDDEN, StatusCode::NOT_FOUND] {
+            assert!(!is_retryable_icon_status(status), "{status} should not be retryable");
+        }
+    }
+
+    async fn sequence_server(statuses: Vec<u16>) -> (MockServer, Arc<AtomicUsize>) {
+        let server = MockServer::start().await;
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let responder_attempts = attempts.clone();
+
+        Mock::given(method("GET"))
+            .respond_with(move |_: &Request| {
+                let attempt = responder_attempts.fetch_add(1, Ordering::SeqCst);
+                let status = statuses.get(attempt).copied().unwrap_or(*statuses.last().unwrap());
+                let response = ResponseTemplate::new(status);
+                if status == 200 {
+                    response
+                        .insert_header("content-type", "image/png")
+                        .set_body_bytes(b"image".to_vec())
+                } else {
+                    response
+                }
+            })
+            .mount(&server)
+            .await;
+
+        (server, attempts)
+    }
+
+    #[tokio::test]
+    async fn retries_two_transient_failures_before_success() {
+        let (server, attempts) = sequence_server(vec![503, 429, 200]).await;
+        let client = reqwest::Client::new();
+        let url = Url::parse(&server.uri()).unwrap();
+
+        let response = fetch_icon_with_retries(&client, &url).await;
+
+        assert_eq!(response.unwrap().status(), StatusCode::OK);
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn exhausts_transient_retries() {
+        let (server, attempts) = sequence_server(vec![503]).await;
+        let client = reqwest::Client::new();
+        let url = Url::parse(&server.uri()).unwrap();
+
+        let response = fetch_icon_with_retries(&client, &url).await;
+
+        assert!(response.is_none());
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn does_not_retry_permanent_upstream_failure() {
+        let (server, attempts) = sequence_server(vec![403]).await;
+        let client = reqwest::Client::new();
+        let url = Url::parse(&server.uri()).unwrap();
+
+        let response = fetch_icon_with_retries(&client, &url).await;
+
+        assert!(response.is_none());
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn icon_not_found_response_is_negatively_cached() {
+        let response = icon_not_found_response();
+
+        assert_eq!(response.status(), axum::http::StatusCode::NOT_FOUND);
+        assert_eq!(response.headers()[CACHE_CONTROL], "public, max-age=60");
     }
 }
 
