@@ -35,6 +35,13 @@
       "release-type": "rust",
       "changelog-path": "CHANGELOG.md",
       "include-component-in-tag": true
+    },
+    "onwards-fusillade": {
+      "component": "onwards-fusillade",
+      "package-name": "onwards-fusillade",
+      "release-type": "rust",
+      "changelog-path": "CHANGELOG.md",
+      "include-component-in-tag": true
     }
   }
 }

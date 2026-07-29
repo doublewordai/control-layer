@@ -2,5 +2,6 @@
   ".": "8.104.0",
   "fusillade-arsenal": "3.1.0",
   "fusillade-core": "4.1.0",
-  "onwards": "0.37.0"
+  "onwards": "0.37.0",
+  "onwards-fusillade": "0.1.0"
 }
