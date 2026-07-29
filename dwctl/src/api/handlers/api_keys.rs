@@ -107,7 +107,9 @@ pub async fn create_user_api_key<P: PoolProvider>(
     let can_create_own = can_create_own_resource(&current_user, Resource::ApiKeys, target_user_id);
 
     if !can_create_all && !can_create_own {
-        let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
+        // Primary pool: this is an authorization decision — a just-removed
+        // member must not pass via a lagging replica.
+        let mut conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
         let member = is_org_member(&current_user, target_user_id, &mut conn)
             .await
             .map_err(Error::Database)?;
@@ -267,7 +269,9 @@ pub async fn list_user_api_keys<P: PoolProvider>(
     let can_read_own = can_read_own_resource(&current_user, Resource::ApiKeys, target_user_id);
 
     if !can_read_all && !can_read_own {
-        let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
+        // Primary pool: this is an authorization decision — a just-removed
+        // member must not pass via a lagging replica.
+        let mut conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
         let member = is_org_member(&current_user, target_user_id, &mut conn)
             .await
             .map_err(Error::Database)?;
@@ -376,7 +380,9 @@ pub async fn get_user_api_key<P: PoolProvider>(
     let can_read_own = can_read_own_resource(&current_user, Resource::ApiKeys, target_user_id);
 
     if !can_read_all && !can_read_own {
-        let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
+        // Primary pool: this is an authorization decision — a just-removed
+        // member must not pass via a lagging replica.
+        let mut conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
         let member = is_org_member(&current_user, target_user_id, &mut conn)
             .await
             .map_err(Error::Database)?;
@@ -475,7 +481,9 @@ pub async fn update_user_api_key<P: PoolProvider>(
     let can_update_own = can_update_own_resource(&current_user, Resource::ApiKeys, target_user_id);
 
     if !can_update_all && !can_update_own {
-        let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
+        // Primary pool: this is an authorization decision — a just-removed
+        // member must not pass via a lagging replica.
+        let mut conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
         let member = is_org_member(&current_user, target_user_id, &mut conn)
             .await
             .map_err(Error::Database)?;
@@ -666,7 +674,9 @@ pub async fn get_user_api_key_secret<P: PoolProvider>(
     let can_read_all = can_read_all_resources(&current_user, Resource::ApiKeys);
     let can_read_own = can_read_own_resource(&current_user, Resource::ApiKeys, target_user_id);
     if !can_read_all && !can_read_own {
-        let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
+        // Primary pool: this is an authorization decision — a just-removed
+        // member must not pass via a lagging replica.
+        let mut conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
         let member = is_org_member(&current_user, target_user_id, &mut conn)
             .await
             .map_err(Error::Database)?;
@@ -763,7 +773,9 @@ pub async fn rotate_user_api_key<P: PoolProvider>(
     let can_update_all = can_update_all_resources(&current_user, Resource::ApiKeys);
     let can_update_own = can_update_own_resource(&current_user, Resource::ApiKeys, target_user_id);
     if !can_update_all && !can_update_own {
-        let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
+        // Primary pool: this is an authorization decision — a just-removed
+        // member must not pass via a lagging replica.
+        let mut conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
         let member = is_org_member(&current_user, target_user_id, &mut conn)
             .await
             .map_err(Error::Database)?;
@@ -867,7 +879,9 @@ pub async fn delete_user_api_key<P: PoolProvider>(
     let can_delete_own = can_delete_own_resource(&current_user, Resource::ApiKeys, target_user_id);
 
     if !can_delete_all && !can_delete_own {
-        let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
+        // Primary pool: this is an authorization decision — a just-removed
+        // member must not pass via a lagging replica.
+        let mut conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
         let member = is_org_member(&current_user, target_user_id, &mut conn)
             .await
             .map_err(Error::Database)?;

@@ -1,5 +1,20 @@
 # Changelog
 
+## [8.103.3](https://github.com/doublewordai/control-layer/compare/v8.103.2...v8.103.3) (2026-07-29)
+
+
+### Bug Fixes
+
+* show all pending background work ([#1373](https://github.com/doublewordai/control-layer/issues/1373)) ([81a8c3c](https://github.com/doublewordai/control-layer/commit/81a8c3c9f5a4a161bfbbe047103b78b401b3ec88))
+
+## [8.103.2](https://github.com/doublewordai/control-layer/compare/v8.103.1...v8.103.2) (2026-07-29)
+
+
+### Bug Fixes
+
+* **onwards:** canonicalise reasoning field on strict chat completions ([#1368](https://github.com/doublewordai/control-layer/issues/1368)) ([9a8cd1e](https://github.com/doublewordai/control-layer/commit/9a8cd1e27f0808906394944630d24e7c08ceaa04))
+* show background work throughout dashboard ([#1372](https://github.com/doublewordai/control-layer/issues/1372)) ([c37434a](https://github.com/doublewordai/control-layer/commit/c37434a3d677407518a30faff1ee16ab37e62758))
+
 ## [8.103.1](https://github.com/doublewordai/control-layer/compare/v8.103.0...v8.103.1) (2026-07-28)
 
 

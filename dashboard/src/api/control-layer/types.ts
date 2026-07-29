@@ -1102,7 +1102,7 @@ export interface Transaction {
   source_id: string;
   description?: string;
   created_at: string; // ISO 8601 timestamp
-  /** Service tier: "realtime", "flex", "async", or "batch" */
+  /** Service tier: "realtime", "flex", "async", "batch", or "background" */
   service_tier?: string;
   /** Number of requests in this batch (only present for batch transactions) */
   batch_request_count?: number;
