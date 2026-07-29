@@ -68,7 +68,11 @@ import { cn } from "@/lib/utils";
 // the UI selector — they're queryable via the API but live on the Responses
 // page in the dashboard.
 const BATCH_COMPLETION_WINDOW = "24h";
-const DEFAULT_COMPLETION_WINDOWS: string[] = [BATCH_COMPLETION_WINDOW];
+const BACKGROUND_COMPLETION_WINDOW = "background";
+const DEFAULT_COMPLETION_WINDOWS: string[] = [
+  BATCH_COMPLETION_WINDOW,
+  BACKGROUND_COMPLETION_WINDOW,
+];
 
 const PERSIST_SCOPE = "batches";
 
@@ -886,6 +890,8 @@ export function Batches({
                                 .map((w) =>
                                   w === asyncCompletionWindow
                                     ? "Async"
+                                    : w === BACKGROUND_COMPLETION_WINDOW
+                                      ? "Background"
                                     : w === BATCH_COMPLETION_WINDOW
                                       ? "Batch"
                                       : w,
@@ -900,6 +906,10 @@ export function Batches({
                     {(
                       [
                         { window: BATCH_COMPLETION_WINDOW, label: "Batch" },
+                        {
+                          window: BACKGROUND_COMPLETION_WINDOW,
+                          label: "Background",
+                        },
                         { window: asyncCompletionWindow, label: "Async" },
                       ] as const
                     ).map(({ window, label }) => (
