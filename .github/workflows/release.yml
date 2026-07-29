@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: Onwards release tag to retry
+        description: Component release tag to retry
         required: true
         type: string
 
@@ -149,6 +149,72 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
           RELEASE_TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.release_tag }}
         run: .release-tools/.github/scripts/publish-onwards-crate.sh "$RELEASE_TAG"
+
+  publish-fusillade-crates:
+    if: >-
+      ${{
+        (github.event_name == 'release' &&
+          !github.event.release.prerelease &&
+          (startsWith(github.event.release.tag_name, 'fusillade-core-v') ||
+            startsWith(github.event.release.tag_name, 'fusillade-arsenal-v'))) ||
+        (github.event_name == 'workflow_dispatch' &&
+          (startsWith(inputs.release_tag, 'fusillade-core-v') ||
+            startsWith(inputs.release_tag, 'fusillade-arsenal-v')))
+      }}
+    runs-on: depot-ubuntu-24.04
+    concurrency:
+      group: >-
+        fusillade-crates-${{
+          github.event_name == 'release' &&
+          github.event.release.tag_name ||
+          inputs.release_tag
+        }}
+      cancel-in-progress: false
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout Fusillade crate release
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.release_tag }}
+
+      - name: Checkout current release tooling
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          path: .release-tools
+
+      - name: Keep the application release marked latest
+        uses: actions/github-script@v9
+        env:
+          RELEASE_TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.release_tag }}
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const {data: release} = await github.rest.repos.getReleaseByTag({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              tag: process.env.RELEASE_TAG
+            })
+            await github.rest.repos.updateRelease({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              release_id: release.id,
+              make_latest: 'false'
+            })
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Publish Fusillade crate to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          RELEASE_TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.release_tag }}
+        run: .release-tools/.github/scripts/publish-fusillade-crate.sh "$RELEASE_TAG"
 
   onwards-image:
     if: >-

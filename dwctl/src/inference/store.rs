@@ -13,9 +13,9 @@ use fusillade::{
     StepKind as FusilladeStepKind, StepState as FusilladeStepState, Storage,
 };
 use fusillade_arsenal::{PostgresRequestManager, PostgresResponseStepManager};
-use onwards::{
-    ChainStep, MultiStepStore, RecordedStep, ResponseStore, StepDescriptor, StepKind as OnwardsStepKind, StepState as OnwardsStepState,
-    StoreError,
+use onwards::{ResponseStore, StoreError};
+use onwards_fusillade::{
+    ChainStep, MultiStepStore, RecordedStep, StepDescriptor, StepKind as OnwardsStepKind, StepState as OnwardsStepState,
 };
 use sqlx_pool_router::PoolProvider;
 use uuid::Uuid;
@@ -1211,7 +1211,7 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> ResponseStore for Fusillad
 //     will be modeled via `prev_step_id` branching instead.
 #[async_trait]
 impl<P: PoolProvider + Clone + Send + Sync + 'static> MultiStepStore for FusilladeResponseStore<P> {
-    async fn next_action_for(&self, request_id: &str, scope_parent: Option<&str>) -> Result<onwards::NextAction, StoreError> {
+    async fn next_action_for(&self, request_id: &str, scope_parent: Option<&str>) -> Result<onwards_fusillade::NextAction, StoreError> {
         // The original /v1/responses body lives in the side-channel
         // populated by the warm path. There is no longer a parent
         // fusillade row to fetch it from.

@@ -10,9 +10,9 @@
 //!    state with our daemon_id as owner, so the batch daemon doesn't
 //!    pick it up.
 //! 2. Open an axum SSE response held by the caller.
-//! 3. Spawn a task that runs [`onwards::run_response_loop`] inline
+//! 3. Spawn a task that runs [`onwards_fusillade::run_response_loop`] inline
 //!    with an [`SseEventSink`] wrapping a tokio mpsc.
-//! 4. Each [`onwards::LoopEvent`] from the loop becomes one
+//! 4. Each [`onwards_fusillade::LoopEvent`] from the loop becomes one
 //!    `axum::response::sse::Event` on the SSE response.
 //! 5. When the loop terminates, transition the parent row to
 //!    `completed` (or `failed`), close the SSE channel.
@@ -35,7 +35,7 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use fusillade::ReqwestHttpClient;
 use futures::stream::Stream;
 use onwards::traits::RequestContext;
-use onwards::{EventSink, EventSinkError, LoopConfig, LoopError, LoopEvent, MultiStepStore, UpstreamTarget};
+use onwards_fusillade::{EventSink, EventSinkError, LoopConfig, LoopError, LoopEvent, MultiStepStore, UpstreamTarget};
 use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -232,7 +232,7 @@ where
             .with_model(model_alias)
             .with_extension(crate::inference::tools::ResolvedTools(tool_resolved));
 
-        let result = onwards::run_response_loop(
+        let result = onwards_fusillade::run_response_loop(
             &*response_store,
             &*tool_executor,
             &tool_ctx,
@@ -341,7 +341,7 @@ where
         .with_model(model_alias)
         .with_extension(crate::inference::tools::ResolvedTools(tool_resolved));
 
-    let result = onwards::run_response_loop(
+    let result = onwards_fusillade::run_response_loop(
         &*response_store,
         &*tool_executor,
         &tool_ctx,
