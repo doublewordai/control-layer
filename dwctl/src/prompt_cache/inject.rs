@@ -149,19 +149,40 @@ pub fn strip_cache_control(body: &[u8], telemetry: &TelemetryPolicy) -> (Option<
 
 /// Splice the OpenAI-shaped cache fields into a `usage` object in place.
 /// `prompt_tokens` is left as the full input count; only the cache breakdown is added.
+///
+/// The classifier's counts come from tokenizing request CONTENT while `prompt_tokens` is
+/// the engine's count of its chat-template rendering, so the two can drift by a small
+/// margin — and on fully-marked prompts the classifier's sum can land above
+/// `prompt_tokens`. A customer must never see `read + creation > prompt_tokens` (it is
+/// arithmetically impossible from their side, and on the Anthropic ingress it would push
+/// the derived `input_tokens` negative), so the split is capped here with EXACTLY the
+/// billing semantics (request_logging::batcher::compute_total_cost): drift caps the READ
+/// count to fit; write counts alone exceeding the prompt is corrupt and reports no cache
+/// activity at all — matching the list-price bill for that case.
 fn splice_cache_fields(usage: &mut serde_json::Map<String, Value>, stats: &CacheStats) {
+    let creations = stats.creation_total();
+    let mut read = stats.read;
+    let (mut c5, mut c1, mut c24) = (stats.creation_5m, stats.creation_1h, stats.creation_24h);
+    if let Some(prompt) = usage.get("prompt_tokens").and_then(Value::as_u64) {
+        if creations > prompt {
+            (read, c5, c1, c24) = (0, 0, 0, 0);
+        } else if read + creations > prompt {
+            read = prompt - creations;
+        }
+    }
+
     let details = usage.entry("prompt_tokens_details").or_insert_with(|| serde_json::json!({}));
     if let Some(details_obj) = details.as_object_mut() {
-        details_obj.insert("cached_tokens".to_string(), serde_json::json!(stats.read));
+        details_obj.insert("cached_tokens".to_string(), serde_json::json!(read));
     }
-    usage.insert("cache_read_input_tokens".to_string(), serde_json::json!(stats.read));
-    usage.insert("cache_creation_input_tokens".to_string(), serde_json::json!(stats.creation_total()));
+    usage.insert("cache_read_input_tokens".to_string(), serde_json::json!(read));
+    usage.insert("cache_creation_input_tokens".to_string(), serde_json::json!(c5 + c1 + c24));
     usage.insert(
         "cache_creation".to_string(),
         serde_json::json!({
-            "ephemeral_5m_input_tokens": stats.creation_5m,
-            "ephemeral_1h_input_tokens": stats.creation_1h,
-            "ephemeral_24h_input_tokens": stats.creation_24h,
+            "ephemeral_5m_input_tokens": c5,
+            "ephemeral_1h_input_tokens": c1,
+            "ephemeral_24h_input_tokens": c24,
         }),
     );
 }
@@ -587,6 +608,34 @@ mod tests {
         assert_eq!(v["usage"]["cache_read_input_tokens"], 1024);
         assert_eq!(v["usage"]["cache_creation_input_tokens"], 60);
         assert_eq!(v["usage"]["cache_creation"]["ephemeral_1h_input_tokens"], 20);
+    }
+
+    #[test]
+    fn drifted_split_is_capped_to_prompt_in_reported_usage() {
+        // The tokenizer-drift shape: the classifier's read (1024) + creation (60) exceeds
+        // the engine's prompt_tokens (1000). The customer must never see an impossible
+        // split — the read is capped to fit, mirroring the billing cap exactly.
+        let body = serde_json::json!({"usage":{"prompt_tokens":1000,"completion_tokens":5}}).to_string();
+        let out = inject_into_usage_json(body.as_bytes(), &stats()).unwrap();
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["usage"]["prompt_tokens"], 1000, "engine total preserved");
+        assert_eq!(v["usage"]["cache_read_input_tokens"], 940, "read capped to prompt - creations");
+        assert_eq!(v["usage"]["prompt_tokens_details"]["cached_tokens"], 940);
+        assert_eq!(v["usage"]["cache_creation_input_tokens"], 60, "creations untouched by drift cap");
+    }
+
+    #[test]
+    fn corrupt_writes_report_no_cache_activity() {
+        // Write counts alone exceed the prompt: billing distrusts the split and bills at
+        // list price, so the reported usage shows no cache activity either — the two views
+        // must agree.
+        let body = serde_json::json!({"usage":{"prompt_tokens":50,"completion_tokens":5}}).to_string();
+        let out = inject_into_usage_json(body.as_bytes(), &stats()).unwrap();
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["usage"]["cache_read_input_tokens"], 0);
+        assert_eq!(v["usage"]["cache_creation_input_tokens"], 0);
+        assert_eq!(v["usage"]["cache_creation"]["ephemeral_1h_input_tokens"], 0);
+        assert_eq!(v["usage"]["prompt_tokens_details"]["cached_tokens"], 0);
     }
 
     #[test]
