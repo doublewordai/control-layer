@@ -1,0 +1,25 @@
+-- Why the model stopped: 'stop', 'length', 'tool_calls', 'content_filter', ...
+--
+-- Added to make CLIENT-side tool calling measurable. The client executes the tool itself
+-- and sends a fresh request, so the follow-up arrives with its own fusillade_request_id
+-- and is otherwise indistinguishable from an ordinary multi-turn message —
+-- 'tool_calls' here is the only signal that a tool loop is happening at all.
+--
+-- This is NOT a replacement for tool_iterations, which counts how many internal inference
+-- steps a SERVER-side tool loop drove for one user request. The two are complementary and
+-- stay separable: server-side steps carry a response_step_id and detail rows in
+-- tool_call_analytics, so client-side tool use is finish_reason = 'tool_calls' on a row
+-- with response_step_id IS NULL.
+--
+-- Also independently useful: 'length' vs 'stop' identifies truncated generations, which
+-- has so far had to be inferred.
+--
+-- Nullable with no default and no backfill, so existing rows stay NULL. Note for the
+-- warehouse: ClickPipe lands every column non-Nullable, so NULL arrives in ClickHouse as
+-- '' — treat empty string as "not recorded", not as a finish reason. Every successful chat
+-- response carries one, so that distinction is unambiguous in practice.
+ALTER TABLE http_analytics ADD COLUMN IF NOT EXISTS finish_reason TEXT;
+
+-- Deliberately no index. The column is written on every request and read only by
+-- aggregate analytics scans, which the existing timestamp ordering already serves; an
+-- extra index on a table this size costs write throughput for no read we make today.

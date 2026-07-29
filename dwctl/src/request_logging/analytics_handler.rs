@@ -243,6 +243,7 @@ impl RequestHandler for AnalyticsHandler {
                 cache_creation_1h_input_tokens: metrics.cache_creation_1h_input_tokens,
                 cache_creation_24h_input_tokens: metrics.cache_creation_24h_input_tokens,
                 response_type: metrics.response_type,
+                finish_reason: metrics.finish_reason,
                 server_address: metrics.server_address,
                 server_port: metrics.server_port,
                 served_by: metrics.served_by,

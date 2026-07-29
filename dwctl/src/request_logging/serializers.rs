@@ -147,6 +147,10 @@ pub struct UsageMetrics {
     pub cache_creation_1h_input_tokens: i64,
     pub cache_creation_24h_input_tokens: i64,
     pub response_type: String,
+    /// Why the model stopped — `stop`, `length`, `tool_calls`, ... `None` when the
+    /// response shape has no such concept (embeddings, the Responses API) or couldn't be
+    /// read. See `extract_finish_reason`.
+    pub finish_reason: Option<String>,
     pub server_address: String,
     pub server_port: u16,
     /// URL of the upstream that actually served the request, read from the
@@ -418,6 +422,7 @@ impl UsageMetrics {
             cache_creation_1h_input_tokens: cache_tokens.creation_1h,
             cache_creation_24h_input_tokens: cache_tokens.creation_24h,
             response_type: response_metrics.response_type,
+            finish_reason: extract_finish_reason(parsed_response),
             server_address: config.host.clone(),
             server_port: config.port,
             served_by: response_data.extensions.get::<onwards::ServedBy>().map(|s| s.url.clone()),
@@ -541,6 +546,56 @@ impl Auth {
             .and_then(|values| values.first())
             .and_then(|bytes| str::from_utf8(bytes).ok())
             .map(|s| s.to_string())
+    }
+}
+
+/// Why the model stopped: `stop`, `length`, `tool_calls`, `content_filter`, ...
+///
+/// `tool_calls` is the only signal we have that the caller is running a CLIENT-side tool
+/// loop. The client executes the tool itself and sends a fresh request, so the follow-up
+/// arrives with its own `fusillade_request_id` and is otherwise indistinguishable from an
+/// ordinary multi-turn message. Without this the whole class of usage is invisible.
+/// (Server-side tool loops are a different thing entirely, counted by `tool_iterations`
+/// and detailed in `tool_call_analytics`.)
+///
+/// Deliberately a free function over the already-deserialised `AiResponse` rather than a
+/// field on `TokenMetrics`: nothing new is parsed, and none of the nine `TokenMetrics`
+/// arms have to change.
+///
+/// **Scanned independently of usage, on purpose.** It is tempting to read this off the
+/// same chunk `TokenMetrics` already found (the last one carrying `usage`), and on the
+/// local stack that happens to work — the terminal chunk carries `usage` AND a populated
+/// `choices[0].finish_reason`. It is not safe in general: OpenAI's own convention is a
+/// final usage chunk with `choices: []`, and self-hosted GLM-5.2 is on record returning
+/// `usage: null` on precisely the `tool_calls` finishes we care about. Either shape would
+/// silently yield NULL for the one case this column exists to catch, so the scan is its
+/// own reverse pass for the last non-null `finish_reason`.
+fn extract_finish_reason(response: &AiResponse) -> Option<String> {
+    /// The enums derive `Serialize` with the wire spelling, so this stays in step with
+    /// the API rather than hard-coding a match that a new variant would silently skip.
+    fn as_wire<T: serde::Serialize>(v: &T) -> Option<String> {
+        match serde_json::to_value(v).ok()? {
+            serde_json::Value::String(s) => Some(s),
+            _ => None,
+        }
+    }
+    match response {
+        AiResponse::ChatCompletions(r) => r.choices.first()?.finish_reason.as_ref().and_then(as_wire),
+        AiResponse::ChatCompletionsStream(chunks) => chunks.iter().rev().find_map(|c| match c {
+            ChatCompletionChunk::Normal(n) => n.choices.first()?.finish_reason.as_ref().and_then(as_wire),
+            _ => None,
+        }),
+        AiResponse::Completions(r) => r.choices.first()?.finish_reason.as_ref().and_then(as_wire),
+        AiResponse::CompletionsStream(chunks) => chunks.iter().rev().find_map(|c| match c {
+            CompletionChunk::Normal(n) => n.choices.first()?.finish_reason.as_ref().and_then(as_wire),
+            _ => None,
+        }),
+        // The Responses API has no finish_reason. Its equivalent is the terminal status
+        // plus the shape of `output[]`, which is a different mapping job — left for a
+        // follow-up rather than guessed at here, so a NULL means "not extracted yet"
+        // rather than "no tool call".
+        AiResponse::Responses(_) | AiResponse::ResponsesStream(_) => None,
+        AiResponse::Embeddings(_) | AiResponse::Base64Embeddings(_) | AiResponse::Other(_) => None,
     }
 }
 
