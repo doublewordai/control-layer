@@ -1289,7 +1289,7 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
 
 // Implement Storage trait directly (no delegation)
 #[async_trait]
-/// Returns counts of **claimable** pending requests grouped by model and expiry window.
+/// Returns active request counts grouped by model and expiry window.
 /// When `priority_decay_window` is set, recently completed flex requests
 /// are added to the `1h` bucket as an explicit realtime-load decay signal.
 ///
@@ -1300,12 +1300,13 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
 /// `DaemonConfig.service_tier_completion_windows_ms` (`'flex'` → 1h) or
 /// `default_completion_window_ms` (24h) for a NULL/unmapped tier.
 ///
-/// This intentionally excludes:
+/// Foreground tiers retain claimability filtering. The background tier reports
+/// all active work regardless of model liveness, foreground headroom, or due
+/// SLA work so monitoring reflects the complete backlog.
+///
+/// All tiers intentionally exclude:
 /// - Requests without a template (`template_id IS NULL`), which are not claimable.
 /// - Requests from batches that are being cancelled (`b.cancelling_at IS NOT NULL`).
-///
-/// If you need counts of all pending requests regardless of claimability, adjust the query
-/// to remove these filters.
 impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
     async fn sum_owner_batch_requests_in_window(
         &self,
@@ -1671,62 +1672,18 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
             ))
         })?;
 
-        if include_background && self.config.background_concurrency_limit > 0 {
+        if include_background {
             let background_rows = sqlx::query(
                 r#"
-                WITH latest_model_filters AS (
-                    SELECT DISTINCT ON (mf.model) mf.model, mf.state
-                    FROM model_filters mf
-                    WHERE cardinality($2::TEXT[]) = 0 OR mf.model = ANY($2)
-                    ORDER BY mf.model, mf.created_at DESC, mf.id DESC
-                ),
-                active_counts AS (
-                    SELECT r.model, COUNT(*)::BIGINT AS count
-                    FROM requests r
-                    WHERE r.state IN ('claimed', 'processing')
-                      AND r.template_id IS NOT NULL
-                      AND r.service_tier IS DISTINCT FROM 'background'
-                      AND (cardinality($2::TEXT[]) = 0 OR r.model = ANY($2))
-                    GROUP BY r.model
-                ),
-                eligible_models AS (
-                    SELECT latest.model
-                    FROM latest_model_filters latest
-                    LEFT JOIN active_counts active ON active.model = latest.model
-                    WHERE latest.state = 'live'
-                      AND COALESCE(active.count, 0) < $3::BIGINT
-                      AND NOT EXISTS (
-                          SELECT 1
-                          FROM requests sla
-                          LEFT JOIN batches parent ON parent.id = sla.batch_id
-                          WHERE sla.model = latest.model
-                            AND sla.state = 'pending'
-                            AND sla.template_id IS NOT NULL
-                            AND sla.service_tier IS DISTINCT FROM 'background'
-                            AND (sla.not_before IS NULL OR sla.not_before <= NOW())
-                            AND (
-                                sla.batch_id IS NULL
-                                OR (
-                                    parent.id IS NOT NULL
-                                    AND parent.service_tier IS DISTINCT FROM 'background'
-                                    AND parent.cancelling_at IS NULL
-                                    AND parent.deleted_at IS NULL
-                                    AND parent.completed_at IS NULL
-                                    AND parent.failed_at IS NULL
-                                    AND parent.cancelled_at IS NULL
-                                )
-                            )
-                      )
-                )
                 SELECT r.model,
                        'background'::TEXT AS window_label,
                        COUNT(*)::BIGINT AS count
-                FROM eligible_models eligible
-                JOIN requests r ON r.model = eligible.model
+                FROM requests r
                 LEFT JOIN batches b ON b.id = r.batch_id
                 WHERE r.service_tier = 'background'
                   AND r.state = ANY($1)
                   AND r.template_id IS NOT NULL
+                  AND (cardinality($2::TEXT[]) = 0 OR r.model = ANY($2))
                   AND (
                       r.batch_id IS NULL
                       OR (
@@ -1744,7 +1701,6 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
             )
             .bind(states)
             .bind(model_filter)
-            .bind(self.config.background_concurrency_limit as i64)
             .fetch_all(&mut *tx)
             .await
             .map_err(|e| {
@@ -10170,7 +10126,34 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn background_pending_counts_require_headroom_and_no_due_sla(pool: sqlx::PgPool) {
+    async fn background_pending_counts_include_non_live_models(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        )
+        .with_config(DaemonConfig {
+            background_concurrency_limit: 0,
+            ..Default::default()
+        });
+        create_background_request_for_test(&manager, "absent-model", "request-owner").await;
+
+        let result = manager
+            .get_pending_request_counts_by_model_and_window(
+                &[],
+                &["pending".to_string()],
+                &[],
+                &ServiceTierFilter::Include(vec![Some("background".to_string())]),
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result["absent-model"]["background"], 1);
+    }
+
+    #[sqlx::test]
+    async fn background_pending_counts_ignore_dispatch_capacity_and_due_sla(pool: sqlx::PgPool) {
         let manager = PostgresRequestManager::with_client(
             TestDbPools::new(pool.clone()).await.unwrap(),
             Arc::new(MockHttpClient::new()),
@@ -10258,8 +10241,8 @@ mod tests {
             result["background-active-model"]["background"], 1,
             "active background work must not hide remaining background demand"
         );
-        assert!(!result.contains_key("full-model"));
-        assert!(!result.contains_key("sla-blocked-model"));
+        assert_eq!(result["full-model"]["background"], 1);
+        assert_eq!(result["sla-blocked-model"]["background"], 1);
     }
 
     #[sqlx::test]
