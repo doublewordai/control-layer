@@ -15,6 +15,7 @@ COPY fusillade/ fusillade/
 COPY fusillade-core/ fusillade-core/
 COPY fusillade-arsenal/ fusillade-arsenal/
 COPY onwards/ onwards/
+COPY onwards-fusillade/ onwards-fusillade/
 
 RUN cargo build --locked --release --package onwards
 

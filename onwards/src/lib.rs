@@ -54,12 +54,8 @@ pub mod load_balancer;
 pub mod models;
 pub mod reasoning;
 pub mod response_id;
-#[cfg(feature = "multi-step")]
-pub mod response_loop;
 pub mod response_sanitizer;
 pub mod sse;
-#[cfg(feature = "multi-step")]
-pub mod streaming;
 pub mod strict;
 pub mod target;
 pub mod telemetry;
@@ -69,15 +65,6 @@ use client::{HttpClient, HyperClient};
 pub use handlers::ServedBy;
 use handlers::{models as models_handler, target_message_handler};
 use models::ExtractedModel;
-#[cfg(feature = "multi-step")]
-pub use response_loop::{LoopConfig, LoopError, UpstreamTarget, run_response_loop};
-#[cfg(feature = "multi-step")]
-pub use streaming::{EventSink, EventSinkError, LoopEvent, LoopEventKind};
-#[cfg(feature = "multi-step")]
-pub use traits::{
-    ChainStep, ExecutorError, MultiStepStore, NextAction, RecordedStep, StepDescriptor, StepKind,
-    StepState,
-};
 pub use traits::{
     NoOpResponseStore, NoOpToolExecutor, RequestContext, ResponseStore, StoreError, ToolError,
     ToolExecutor, ToolKind, ToolSchema,

@@ -42,5 +42,6 @@ case "$crate_status" in
     ;;
 esac
 
+cargo metadata --format-version 1 > /dev/null
 cargo publish --locked --package onwards --all-features --registry crates-io \
   --token "${CARGO_REGISTRY_TOKEN:?CARGO_REGISTRY_TOKEN is required}"
