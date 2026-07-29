@@ -783,6 +783,42 @@ mod tests {
     }
 
     #[test]
+    fn background_tariff_is_not_filtered_by_foreground_completion_windows() {
+        let mut model = create_test_model();
+        model.allowed_batch_completion_windows = Some(vec!["1h".to_string()]);
+        model.tariffs = Some(vec![
+            create_test_tariff(Some(ApiKeyPurpose::Batch), Some("1h")),
+            create_test_tariff(Some(ApiKeyPurpose::Batch), Some("24h")),
+            create_test_tariff(Some(ApiKeyPurpose::Batch), Some("background")),
+        ]);
+
+        let tariffs = model.filter_disabled_batch_tariffs().tariffs.unwrap();
+        assert_eq!(tariffs.len(), 2);
+        assert!(
+            tariffs
+                .iter()
+                .any(|tariff| tariff.completion_window.as_deref() == Some("background"))
+        );
+    }
+
+    #[test]
+    fn background_pricing_fallback_is_not_filtered_by_foreground_completion_windows() {
+        let mut model = create_test_model();
+        model.allowed_batch_completion_windows = Some(vec!["1h".to_string()]);
+        model.tariffs = Some(vec![
+            create_test_tariff(Some(ApiKeyPurpose::Batch), Some("1h")),
+            create_test_tariff(Some(ApiKeyPurpose::Batch), Some("24h")),
+        ]);
+
+        let tariffs = model.filter_disabled_batch_tariffs().tariffs.unwrap();
+        assert_eq!(tariffs.len(), 2);
+        assert!(
+            tariffs.iter().any(|tariff| tariff.completion_window.as_deref() == Some("24h")),
+            "the 24h tariff is the background pricing fallback"
+        );
+    }
+
+    #[test]
     fn test_filter_disabled_batch_tariffs_none_allowed() {
         let mut model = create_test_model();
         model.allowed_batch_completion_windows = None;
@@ -798,7 +834,7 @@ mod tests {
     }
 
     #[test]
-    fn test_filter_disabled_batch_tariffs_empty_allowed() {
+    fn test_filter_disabled_batch_tariffs_empty_foreground_keeps_background_fallback() {
         let mut model = create_test_model();
         model.allowed_batch_completion_windows = Some(vec![]);
         model.tariffs = Some(vec![
@@ -809,10 +845,11 @@ mod tests {
 
         let result = model.filter_disabled_batch_tariffs();
 
-        // Empty allowed list means no batch windows allowed — all batch tariffs removed, realtime kept
+        // Empty foreground list still keeps the 24h tariff used to price background.
         let tariffs = result.tariffs.unwrap();
-        assert_eq!(tariffs.len(), 1);
-        assert_eq!(tariffs[0].api_key_purpose, Some(ApiKeyPurpose::Realtime));
+        assert_eq!(tariffs.len(), 2);
+        assert_eq!(tariffs[0].completion_window.as_deref(), Some("24h"));
+        assert_eq!(tariffs[1].api_key_purpose, Some(ApiKeyPurpose::Realtime));
     }
 
     #[test]

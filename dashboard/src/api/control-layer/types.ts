@@ -190,7 +190,7 @@ export interface ModelTariff {
   valid_from: string; // ISO 8601 timestamp
   valid_until?: string | null; // ISO 8601 timestamp, null means currently active
   api_key_purpose?: TariffApiKeyPurpose | null;
-  completion_window?: string | null; // Completion window like "24h", "1h"
+  completion_window?: string | null; // Completion window like "24h", "1h", "background"
   is_active: boolean;
 }
 
@@ -222,7 +222,7 @@ export interface TariffDefinition {
   input_price_per_token: string; // Decimal string to preserve precision
   output_price_per_token: string; // Decimal string to preserve precision
   api_key_purpose?: TariffApiKeyPurpose | null;
-  completion_window?: string | null; // Completion window like "24h", "1h" (display as priority in UI)
+  completion_window?: string | null; // Completion window like "24h", "1h", "background" (display as priority in UI)
 }
 
 // Model metadata (enriched model information from provider data)
@@ -1313,7 +1313,7 @@ export interface Batch {
   endpoint: string;
   errors?: BatchErrors | null;
   input_file_id: string;
-  completion_window: string; // Completion window like "24h", "1h"
+  completion_window: string; // Completion window like "24h", "1h", "background"
   status: BatchStatus;
   output_file_id?: string | null;
   error_file_id?: string | null;
@@ -1359,7 +1359,7 @@ export interface BatchListResponse {
 export interface BatchCreateRequest {
   input_file_id: string;
   endpoint: string;
-  completion_window: string; // Completion window like "24h", "1h"
+  completion_window: string; // Completion window like "24h", "1h", "background"
   metadata?: Record<string, string>;
   output_expires_after?: {
     anchor: "created_at";

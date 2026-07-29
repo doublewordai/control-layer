@@ -75,6 +75,9 @@ export const ModelTariffTable: React.FC<ModelTariffTableProps> = ({
   const [editingId, setEditingId] = useState<string | null>(null);
   const [formData, setFormData] = useState<TariffFormData>(EMPTY_FORM);
   const [errors, setErrors] = useState<{ [key: string]: string }>({});
+  const availableTariffWindows = Array.from(
+    new Set([...availableSLAs, "background"]),
+  );
 
   // Initialize local state from props (only active tariffs)
   useEffect(() => {
@@ -108,7 +111,7 @@ export const ModelTariffTable: React.FC<ModelTariffTableProps> = ({
   ): string => {
     if (purpose === "none") return "";
     if (purpose === "batch" && priority) {
-      return priority; // Completion window value like "24h", "1h"
+      return priority === "background" ? "Background" : priority;
     }
     return API_KEY_PURPOSE_LABELS[purpose];
   };
@@ -358,9 +361,9 @@ export const ModelTariffTable: React.FC<ModelTariffTableProps> = ({
                     <SelectValue placeholder="Select completion window" />
                   </SelectTrigger>
                   <SelectContent>
-                    {availableSLAs.map((sla) => (
+                    {availableTariffWindows.map((sla) => (
                       <SelectItem key={sla} value={sla}>
-                        {sla}
+                        {sla === "background" ? "Background" : sla}
                       </SelectItem>
                     ))}
                   </SelectContent>
@@ -605,9 +608,9 @@ export const ModelTariffTable: React.FC<ModelTariffTableProps> = ({
                           <SelectValue placeholder="Select completion window" />
                         </SelectTrigger>
                         <SelectContent>
-                          {availableSLAs.map((sla) => (
+                          {availableTariffWindows.map((sla) => (
                             <SelectItem key={sla} value={sla}>
-                              {sla}
+                              {sla === "background" ? "Background" : sla}
                             </SelectItem>
                           ))}
                         </SelectContent>
@@ -653,7 +656,8 @@ export const ModelTariffTable: React.FC<ModelTariffTableProps> = ({
 
       <p className="text-sm text-gray-500">
         Prices are in dollars per million tokens. Different purposes allow you
-        to charge different rates for Realtime, Batch, and playground usage.
+        to charge different rates for Realtime, Batch, Background, and
+        playground usage.
       </p>
     </div>
   );

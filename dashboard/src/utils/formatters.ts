@@ -177,17 +177,19 @@ export function getTariffDisplayName(
   if (apiKeyPurpose === "realtime") return "Realtime";
   if (apiKeyPurpose === "batch") {
     if (completionWindow === "1h") return "Async";
+    if (completionWindow === "background") return "Background";
     return "Batch"; // 24h or any other batch window
   }
   return "Realtime"; // fallback for null/undefined purpose
 }
 
-/** Tariff sort order for consistent display: Realtime → Async → Batch */
+/** Tariff sort order for consistent display: Realtime → Async → Batch → Background */
 const TARIFF_SORT_ORDER: Record<string, number> = {
   realtime: 0,
   "batch:1h": 1,
   "batch:24h": 2,
-  batch: 3,
+  "batch:background": 3,
+  batch: 4,
 };
 
 function tariffSortKey(
@@ -195,7 +197,7 @@ function tariffSortKey(
   completionWindow: string | null | undefined,
 ): number {
   if (apiKeyPurpose === "batch" && completionWindow) {
-    return TARIFF_SORT_ORDER[`batch:${completionWindow}`] ?? 3;
+    return TARIFF_SORT_ORDER[`batch:${completionWindow}`] ?? 4;
   }
   return TARIFF_SORT_ORDER[apiKeyPurpose ?? "realtime"] ?? 0;
 }

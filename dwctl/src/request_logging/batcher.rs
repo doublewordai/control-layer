@@ -916,8 +916,9 @@ where
     ///
     /// Implements fallback logic:
     /// 1. Try exact match (purpose + completion_window + timestamp)
-    /// 2. Fall back to generic tariff for that purpose (completion_window = None)
-    /// 3. Fall back to realtime purpose (generic)
+    /// 2. For background work, fall back only to the 24h batch tariff
+    /// 3. For other work, fall back to a generic tariff for that purpose
+    /// 4. For other work, fall back to the generic realtime tariff
     fn find_best_tariff(
         &self,
         tariffs: &[TariffInfo],
@@ -925,43 +926,7 @@ where
         completion_window: Option<&str>,
         timestamp: DateTime<Utc>,
     ) -> (Option<Decimal>, Option<Decimal>) {
-        let purpose = api_key_purpose.unwrap_or(&ApiKeyPurpose::Realtime);
-
-        // Filter tariffs valid at timestamp:
-        // effective_from <= timestamp AND (valid_until IS NULL OR valid_until > timestamp)
-        let valid_tariffs: Vec<_> = tariffs
-            .iter()
-            .filter(|t| t.effective_from <= timestamp && t.valid_until.is_none_or(|valid_until| valid_until > timestamp))
-            .collect();
-
-        // Try exact match with completion_window (for batch tariffs with specific priority)
-        if let Some(cw) = completion_window
-            && let Some(tariff) = valid_tariffs
-                .iter()
-                .find(|t| &t.purpose == purpose && t.completion_window.as_deref() == Some(cw))
-        {
-            return (Some(tariff.input_price_per_token), Some(tariff.output_price_per_token));
-        }
-
-        // Try generic tariff for this purpose (completion_window = None)
-        // This ensures we don't accidentally match a different priority tier
-        if let Some(tariff) = valid_tariffs
-            .iter()
-            .find(|t| &t.purpose == purpose && t.completion_window.is_none())
-        {
-            return (Some(tariff.input_price_per_token), Some(tariff.output_price_per_token));
-        }
-
-        // Fall back to generic realtime tariff
-        if purpose != &ApiKeyPurpose::Realtime
-            && let Some(tariff) = valid_tariffs
-                .iter()
-                .find(|t| t.purpose == ApiKeyPurpose::Realtime && t.completion_window.is_none())
-        {
-            return (Some(tariff.input_price_per_token), Some(tariff.output_price_per_token));
-        }
-
-        (None, None)
+        resolve_tariff_prices(tariffs, api_key_purpose, completion_window, timestamp)
     }
 
     /// Write enriched records to the database in a single transaction.
@@ -1217,7 +1182,7 @@ where
         let mut served_bys: Vec<String> = Vec::new();
         let mut api_key_ids_credit: Vec<Option<Uuid>> = Vec::new();
         // Service tier, computed in memory from the fusillade metadata, so the
-        // transactions list can label each row (realtime / flex / async / batch)
+        // transactions list can label each row (realtime / flex / async / batch / background)
         // without joining http_analytics.
         let mut service_tiers: Vec<String> = Vec::new();
         // Denormalized per-request id so the responses view can read cost off the ledger
@@ -1340,7 +1305,7 @@ where
             count: i32,
             max_seq: i64,
             min_created_at: chrono::DateTime<chrono::Utc>,
-            // Constant per batch (async or batch); captured from the first folded row
+            // Constant per batch (async, batch, or background); captured from the first folded row
             // and denormalized onto batch_aggregates so the list needn't join http_analytics.
             service_tier: String,
         }
@@ -1835,6 +1800,53 @@ struct TariffInfo {
     completion_window: Option<String>,
 }
 
+fn resolve_tariff_prices(
+    tariffs: &[TariffInfo],
+    api_key_purpose: Option<&ApiKeyPurpose>,
+    completion_window: Option<&str>,
+    timestamp: DateTime<Utc>,
+) -> (Option<Decimal>, Option<Decimal>) {
+    let purpose = api_key_purpose.unwrap_or(&ApiKeyPurpose::Realtime);
+    let valid_tariffs: Vec<_> = tariffs
+        .iter()
+        .filter(|tariff| tariff.effective_from <= timestamp && tariff.valid_until.is_none_or(|valid_until| valid_until > timestamp))
+        .collect();
+
+    let prices = |tariff: &&TariffInfo| (Some(tariff.input_price_per_token), Some(tariff.output_price_per_token));
+
+    if let Some(window) = completion_window
+        && let Some(tariff) = valid_tariffs
+            .iter()
+            .find(|tariff| &tariff.purpose == purpose && tariff.completion_window.as_deref() == Some(window))
+    {
+        return prices(tariff);
+    }
+
+    if purpose == &ApiKeyPurpose::Batch && completion_window == Some("background") {
+        return valid_tariffs
+            .iter()
+            .find(|tariff| tariff.purpose == ApiKeyPurpose::Batch && tariff.completion_window.as_deref() == Some("24h"))
+            .map_or((None, None), prices);
+    }
+
+    if let Some(tariff) = valid_tariffs
+        .iter()
+        .find(|tariff| &tariff.purpose == purpose && tariff.completion_window.is_none())
+    {
+        return prices(tariff);
+    }
+
+    if purpose != &ApiKeyPurpose::Realtime
+        && let Some(tariff) = valid_tariffs
+            .iter()
+            .find(|tariff| tariff.purpose == ApiKeyPurpose::Realtime && tariff.completion_window.is_none())
+    {
+        return prices(tariff);
+    }
+
+    (None, None)
+}
+
 /// Parse API key purpose from string
 fn parse_api_key_purpose(s: &str) -> ApiKeyPurpose {
     match s {
@@ -1877,8 +1889,13 @@ fn compute_request_origin(api_key_purpose: Option<&ApiKeyPurpose>, fusillade_bat
 /// - `flex`     — 1h SLA, no batch id (async single request)
 /// - `async`    — 1h SLA with a batch id
 /// - `batch`    — 24h SLA with a batch id (the /v1/batches API)
+/// - `background` — best-effort work, with or without a batch id
 pub(crate) fn compute_billing_tier(fusillade_batch_id: Option<Uuid>, completion_window: Option<&str>) -> &'static str {
     let window = completion_window.filter(|w| !w.is_empty());
+    if window == Some("background") {
+        return "background";
+    }
+
     match (fusillade_batch_id.is_some(), window) {
         (false, None) => "realtime",
         (false, _) => "flex",
@@ -1897,8 +1914,10 @@ mod tests {
         assert_eq!(compute_billing_tier(None, None), "realtime");
         assert_eq!(compute_billing_tier(None, Some("")), "realtime");
         assert_eq!(compute_billing_tier(None, Some("1h")), "flex");
+        assert_eq!(compute_billing_tier(None, Some("background")), "background");
         assert_eq!(compute_billing_tier(Some(batch_id), Some("1h")), "async");
         assert_eq!(compute_billing_tier(Some(batch_id), Some("24h")), "batch");
+        assert_eq!(compute_billing_tier(Some(batch_id), Some("background")), "background");
     }
 
     #[test]
@@ -2201,37 +2220,7 @@ mod tests {
         completion_window: Option<&str>,
         timestamp: DateTime<Utc>,
     ) -> (Option<Decimal>, Option<Decimal>) {
-        let purpose = api_key_purpose.unwrap_or(&ApiKeyPurpose::Realtime);
-
-        let valid_tariffs: Vec<_> = tariffs
-            .iter()
-            .filter(|t| t.effective_from <= timestamp && t.valid_until.is_none_or(|valid_until| valid_until > timestamp))
-            .collect();
-
-        if let Some(cw) = completion_window
-            && let Some(tariff) = valid_tariffs
-                .iter()
-                .find(|t| &t.purpose == purpose && t.completion_window.as_deref() == Some(cw))
-        {
-            return (Some(tariff.input_price_per_token), Some(tariff.output_price_per_token));
-        }
-
-        if let Some(tariff) = valid_tariffs
-            .iter()
-            .find(|t| &t.purpose == purpose && t.completion_window.is_none())
-        {
-            return (Some(tariff.input_price_per_token), Some(tariff.output_price_per_token));
-        }
-
-        if purpose != &ApiKeyPurpose::Realtime
-            && let Some(tariff) = valid_tariffs
-                .iter()
-                .find(|t| t.purpose == ApiKeyPurpose::Realtime && t.completion_window.is_none())
-        {
-            return (Some(tariff.input_price_per_token), Some(tariff.output_price_per_token));
-        }
-
-        (None, None)
+        resolve_tariff_prices(tariffs, api_key_purpose, completion_window, timestamp)
     }
 
     #[test]
@@ -2478,9 +2467,10 @@ mod integration_tests {
     use super::*;
     use crate::api::models::transactions::TransactionFilters;
     use crate::api::models::users::Role;
-    use crate::db::handlers::Repository;
     use crate::db::handlers::credits::Credits;
+    use crate::db::handlers::{Repository, Tariffs};
     use crate::db::models::credits::CreditTransactionType;
+    use crate::db::models::tariffs::TariffCreateDBRequest;
     use crate::test::utils::create_test_user;
     use rust_decimal::prelude::FromStr;
     use sqlx::PgPool;
@@ -3024,6 +3014,123 @@ mod integration_tests {
         assert_eq!(
             final_balance, expected_balance,
             "Batch request should fall back to realtime pricing"
+        );
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn background_batcher_uses_explicit_tariff_and_ledger_tier(pool: PgPool) {
+        let model_id = create_test_model(&pool, "background-explicit-test").await;
+        let mut conn = pool.acquire().await.unwrap();
+        Tariffs::new(&mut conn)
+            .create(&TariffCreateDBRequest {
+                deployed_model_id: model_id,
+                name: "Background".to_string(),
+                input_price_per_token: Decimal::from_str("0.00002").unwrap(),
+                output_price_per_token: Decimal::from_str("0.00004").unwrap(),
+                api_key_purpose: Some(ApiKeyPurpose::Batch),
+                completion_window: Some("background".to_string()),
+                valid_from: None,
+            })
+            .await
+            .unwrap();
+        drop(conn);
+
+        let user_id = setup_user_with_balance(&pool, Decimal::from_str("100.00").unwrap()).await;
+        let batch_key = create_api_key_for_user(&pool, user_id, ApiKeyPurpose::Batch).await;
+        let mut record = create_raw_record("background-explicit-test", Some(batch_key), 1000, 500);
+        record.batch_completion_window = Some("background".to_string());
+
+        run_batcher_with_records(&pool, vec![record]).await;
+
+        let row = sqlx::query!(
+            r#"
+            SELECT amount, service_tier
+            FROM credits_transactions
+            WHERE user_id = $1 AND transaction_type = 'usage'
+            "#,
+            user_id
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.amount, Decimal::from_str("0.04").unwrap());
+        assert_eq!(row.service_tier.as_deref(), Some("background"));
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn background_batcher_falls_back_to_24h_price_but_keeps_background_tier(pool: PgPool) {
+        let model_id = create_test_model(&pool, "background-fallback-test").await;
+        setup_tariff(
+            &pool,
+            model_id,
+            Decimal::from_str("0.00005").unwrap(),
+            Decimal::from_str("0.00010").unwrap(),
+            ApiKeyPurpose::Batch,
+        )
+        .await;
+
+        let user_id = setup_user_with_balance(&pool, Decimal::from_str("100.00").unwrap()).await;
+        let batch_key = create_api_key_for_user(&pool, user_id, ApiKeyPurpose::Batch).await;
+        let batch_id = Uuid::new_v4();
+        let mut record = create_raw_record("background-fallback-test", Some(batch_key), 1000, 500);
+        record.batch_completion_window = Some("background".to_string());
+        record.fusillade_batch_id = Some(batch_id);
+
+        run_batcher_with_records(&pool, vec![record]).await;
+
+        let credit = sqlx::query!(
+            r#"
+            SELECT amount, service_tier
+            FROM credits_transactions
+            WHERE user_id = $1 AND transaction_type = 'usage'
+            "#,
+            user_id
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(credit.amount, Decimal::from_str("0.10").unwrap());
+        assert_eq!(credit.service_tier.as_deref(), Some("background"));
+
+        let aggregate_tier: Option<String> = sqlx::query_scalar("SELECT service_tier FROM batch_aggregates WHERE fusillade_batch_id = $1")
+            .bind(batch_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(aggregate_tier.as_deref(), Some("background"));
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn background_batcher_never_falls_back_to_realtime_price(pool: PgPool) {
+        let model_id = create_test_model(&pool, "background-no-price-test").await;
+        setup_tariff(
+            &pool,
+            model_id,
+            Decimal::from_str("0.00015").unwrap(),
+            Decimal::from_str("0.00030").unwrap(),
+            ApiKeyPurpose::Realtime,
+        )
+        .await;
+
+        let user_id = setup_user_with_balance(&pool, Decimal::from_str("100.00").unwrap()).await;
+        let batch_key = create_api_key_for_user(&pool, user_id, ApiKeyPurpose::Batch).await;
+        let mut record = create_raw_record("background-no-price-test", Some(batch_key), 1000, 500);
+        record.batch_completion_window = Some("background".to_string());
+
+        run_batcher_with_records(&pool, vec![record]).await;
+
+        let usage_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM credits_transactions WHERE user_id = $1 AND transaction_type = 'usage'")
+                .bind(user_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            usage_count, 0,
+            "background work without background or 24h pricing must remain unbilled"
         );
     }
 

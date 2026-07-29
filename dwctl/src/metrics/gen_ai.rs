@@ -474,6 +474,7 @@ mod tests {
         let cases = [
             (None, "", "api", "realtime"),
             (None, "1h", "fusillade", "flex"),
+            (None, "background", "fusillade", "background"),
             (Some(batch_id), "1h", "fusillade", "async"),
             (Some(batch_id), "24h", "fusillade", "batch"),
         ];
