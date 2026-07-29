@@ -140,6 +140,7 @@ const orgMembersData: Record<string, OrganizationMember[]> = {
       role: "owner",
       status: "active",
       created_at: "2025-01-15T10:00:00Z",
+      can_manage_keys: true,
     },
     {
       id: "mem-002",
@@ -147,6 +148,7 @@ const orgMembersData: Record<string, OrganizationMember[]> = {
       role: "member",
       status: "active",
       created_at: "2025-02-01T10:00:00Z",
+      can_manage_keys: false,
     },
     {
       id: "mem-003",
@@ -154,6 +156,7 @@ const orgMembersData: Record<string, OrganizationMember[]> = {
       status: "pending",
       created_at: "2025-06-01T10:00:00Z",
       invite_email: "newuser@acme.com",
+      can_manage_keys: false,
     },
   ],
   "org-550e8400-0002": [
@@ -163,6 +166,7 @@ const orgMembersData: Record<string, OrganizationMember[]> = {
       role: "owner",
       status: "active",
       created_at: "2025-03-20T14:00:00Z",
+      can_manage_keys: true,
     },
   ],
 };
