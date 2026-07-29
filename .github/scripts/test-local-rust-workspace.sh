@@ -228,11 +228,15 @@ if ! grep -Fq 'onwards-pr-image:' <<< "$onwards_image_job" || \
   exit 1
 fi
 
-if grep -Eq '^[[:space:]]+needs:' <<< "$onwards_image_job" || \
-   grep -Eq '^[[:space:]]+needs:' <<< "$dwctl_image_job"; then
-  echo "Onwards and dwctl image builds must start together before tests finish" >&2
-  exit 1
-fi
+# The image jobs may depend ONLY on the cheap `changes` path filter (which
+# gates the whole pipeline) — never on tests/lint, so images still build in
+# the first wave.
+for image_job in "$onwards_image_job" "$dwctl_image_job"; do
+  if grep -E '^[[:space:]]+needs:' <<< "$image_job" | grep -Evq '^[[:space:]]+needs: changes$'; then
+    echo "Onwards and dwctl image builds must start together before tests finish" >&2
+    exit 1
+  fi
+done
 
 for scoped_check in \
   '    name: dashboard / test' \
@@ -366,8 +370,11 @@ require_scoped_line "$semantic_title_step" '        uses: amannn/action-semantic
 require_scoped_line "$merge_group_title_step" "        if: github.event_name == 'merge_group'" 'PR title no-op must be scoped to merge groups'
 
 onwards_compliance_job="$(extract_workflow_job .github/workflows/ci.yaml onwards-openresponses-compliance)"
-require_scoped_line "$onwards_compliance_job" '    if: always()' 'Onwards compliance matrix must always expand'
+require_scoped_line "$onwards_compliance_job" "    if: always() && needs.changes.outputs.run-ci == 'true'" 'Onwards compliance matrix must always expand'
 trusted_pull_request_condition="github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]'"
+# The first-wave image jobs additionally gate on the run-ci change filter
+# (their only permitted `needs` — see the needs check below).
+gated_trusted_pull_request_condition="needs.changes.outputs.run-ci == 'true' && ${trusted_pull_request_condition}"
 require_scoped_line "$onwards_compliance_job" "      RUN_STRICT_COMPLIANCE: \${{ needs.onwards-compliance-changes.outputs.strict == 'true' && ${trusted_pull_request_condition} }}" 'Onwards strict compliance must gate secret use to trusted pull requests'
 if grep -Fq "github.event_name == 'merge_group'" <<< "$onwards_compliance_job" || \
    grep -Fq "github.actor != 'dependabot[bot]'" <<< "$onwards_compliance_job"; then
@@ -402,8 +409,8 @@ done
 
 onwards_image_job="$(extract_workflow_job .github/workflows/ci.yaml onwards-pr-image)"
 dwctl_image_job="$(extract_workflow_job .github/workflows/ci.yaml build)"
-if ! grep -Fxq "    if: ${trusted_pull_request_condition}" <<< "$onwards_image_job" || \
-   ! grep -Fxq "    if: ${trusted_pull_request_condition}" <<< "$dwctl_image_job" || \
+if ! grep -Fxq "    if: ${gated_trusted_pull_request_condition}" <<< "$onwards_image_job" || \
+   ! grep -Fxq "    if: ${gated_trusted_pull_request_condition}" <<< "$dwctl_image_job" || \
    ! grep -Fxq '          DOCKER_METADATA_PR_HEAD_SHA: true' <<< "$dwctl_image_job" || \
    ! grep -Fxq '            type=sha,prefix=sha-' <<< "$dwctl_image_job" || \
    grep -Fq 'type=raw,value=sha-' <<< "$dwctl_image_job" || \
