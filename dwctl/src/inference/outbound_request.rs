@@ -26,7 +26,7 @@ use axum::response::{IntoResponse, Response};
 use serde_json::Value;
 
 pub async fn outbound_request_middleware(request: Request, next: Next) -> Response {
-    let (parts, body) = request.into_parts();
+    let (mut parts, body) = request.into_parts();
 
     let path = parts.uri.path();
     // `/chat/completions` also ends with `/completions`; both take the stream flags.
@@ -45,7 +45,15 @@ pub async fn outbound_request_middleware(request: Request, next: Next) -> Respon
     };
 
     match transform(&bytes, fusillade_stream) {
-        Some(edited) => next.run(Request::from_parts(parts, Body::from(edited))).await,
+        Some(edited) => {
+            // The body changed size, so the inbound Content-Length is now stale.
+            // Drop it (as the Anthropic translator does) so it is recomputed
+            // downstream — otherwise onwards forwards a wrong length to the upstream,
+            // which can truncate or hang the read.
+            parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+            next.run(Request::from_parts(parts, Body::from(edited))).await
+        }
+        // Unchanged: forwarding the original bytes, so the original Content-Length still matches.
         None => next.run(Request::from_parts(parts, Body::from(bytes))).await,
     }
 }
