@@ -1,5 +1,17 @@
 # Changelog
 
+## [9.1.0](https://github.com/doublewordai/control-layer/compare/v9.0.0...v9.1.0) (2026-07-30)
+
+
+### Features
+
+* capture finish_reason and user_agent on http_analytics ([#1389](https://github.com/doublewordai/control-layer/issues/1389)) ([baec631](https://github.com/doublewordai/control-layer/commit/baec6318dc49788ee4b4fe77f950610a93558dc6))
+
+
+### Bug Fixes
+
+* raise test postgres max_connections to 400 ([#1397](https://github.com/doublewordai/control-layer/issues/1397)) ([5196f47](https://github.com/doublewordai/control-layer/commit/5196f47c2584442da0aa5c4f53e26d4f3fbb05c4))
+
 ## [9.0.0](https://github.com/doublewordai/control-layer/compare/v8.105.0...v9.0.0) (2026-07-30)
 
 
