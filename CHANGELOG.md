@@ -1,5 +1,12 @@
 # Changelog
 
+## [9.2.1](https://github.com/doublewordai/control-layer/compare/v9.2.0...v9.2.1) (2026-07-30)
+
+
+### Bug Fixes
+
+* bind trailing demand window bounds as scalar timestamps ([#1403](https://github.com/doublewordai/control-layer/issues/1403)) ([ff156a6](https://github.com/doublewordai/control-layer/commit/ff156a6a01d3398c55e8d0b932303d3f292c0b85))
+
 ## [9.2.0](https://github.com/doublewordai/control-layer/compare/v9.1.0...v9.2.0) (2026-07-30)
 
 
