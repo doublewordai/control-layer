@@ -1827,11 +1827,14 @@ const monitoringApi = {
     options?: PendingRequestCountsQuery,
   ): Promise<PendingRequestCountsByModelAndWindow> {
     const params = new URLSearchParams();
+    // The demand endpoint takes explicit deadline windows and echoes them
+    // back as response keys; 1h,24h matches the completion windows the UI
+    // displays.
+    params.set("window", options?.window ?? "1h,24h");
     if (options?.service_tiers)
       params.set("service_tiers", options.service_tiers);
-    const qs = params.toString() ? `?${params.toString()}` : "";
     const response = await fetch(
-      `/admin/api/v1/monitoring/pending-request-counts${qs}`,
+      `/admin/api/v1/monitoring/demand?${params.toString()}`,
     );
     if (!response.ok) {
       throw new Error(

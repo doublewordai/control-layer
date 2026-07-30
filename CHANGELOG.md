@@ -1,5 +1,63 @@
 # Changelog
 
+## [9.2.0](https://github.com/doublewordai/control-layer/compare/v9.1.0...v9.2.0) (2026-07-30)
+
+
+### Features
+
+* signed demand windows with trailing outcome counts on /monitoring/demand ([#1399](https://github.com/doublewordai/control-layer/issues/1399)) ([24105ac](https://github.com/doublewordai/control-layer/commit/24105ac236c855dd9e4d928ad703a6a7868abf43))
+
+## [9.1.0](https://github.com/doublewordai/control-layer/compare/v9.0.0...v9.1.0) (2026-07-30)
+
+
+### Features
+
+* capture finish_reason and user_agent on http_analytics ([#1389](https://github.com/doublewordai/control-layer/issues/1389)) ([baec631](https://github.com/doublewordai/control-layer/commit/baec6318dc49788ee4b4fe77f950610a93558dc6))
+
+
+### Bug Fixes
+
+* raise test postgres max_connections to 400 ([#1397](https://github.com/doublewordai/control-layer/issues/1397)) ([5196f47](https://github.com/doublewordai/control-layer/commit/5196f47c2584442da0aa5c4f53e26d4f3fbb05c4))
+
+## [9.0.0](https://github.com/doublewordai/control-layer/compare/v8.105.0...v9.0.0) (2026-07-30)
+
+
+### ⚠ BREAKING CHANGES
+
+* remove /monitoring/pending-request-counts, superseded by /demand ([#1395](https://github.com/doublewordai/control-layer/issues/1395))
+
+### Features
+
+* remove /monitoring/pending-request-counts, superseded by /demand ([#1395](https://github.com/doublewordai/control-layer/issues/1395)) ([ec0d108](https://github.com/doublewordai/control-layer/commit/ec0d108e129f4d5e4c1da41b74dafb6460dfdfdd))
+
+## [8.105.0](https://github.com/doublewordai/control-layer/compare/v8.104.0...v8.105.0) (2026-07-30)
+
+
+### Features
+
+* monitoring demand endpoint decoupled from completion windows ([#987](https://github.com/doublewordai/control-layer/issues/987)) ([1b9fcd0](https://github.com/doublewordai/control-layer/commit/1b9fcd0712b09013fac6192488a5941fadb31d10))
+
+
+### Bug Fixes
+
+* cap the customer-visible cache split to prompt_tokens ([#1390](https://github.com/doublewordai/control-layer/issues/1390)) ([e8cb8c9](https://github.com/doublewordai/control-layer/commit/e8cb8c977c201e48108fefec8b4327c2c76f5f16))
+* stop auto top-up charging from non-leader replicas ([#1371](https://github.com/doublewordai/control-layer/issues/1371)) ([3459363](https://github.com/doublewordai/control-layer/commit/3459363d3918a7cd304ccfceb67d4e6371cf4505))
+
+## [8.104.0](https://github.com/doublewordai/control-layer/compare/v8.103.4...v8.104.0) (2026-07-29)
+
+
+### Features
+
+* restore fusillade storage crate releases ([#1375](https://github.com/doublewordai/control-layer/issues/1375)) ([dce6c1f](https://github.com/doublewordai/control-layer/commit/dce6c1f54f5e9e52984a46d79bee98b44d2d8789))
+
+
+### Bug Fixes
+
+* cap drifted cache splits to prompt_tokens instead of discarding … ([#1386](https://github.com/doublewordai/control-layer/issues/1386)) ([f324633](https://github.com/doublewordai/control-layer/commit/f32463385170193fcd217409b3c0fbc29f9d0c5d))
+* emit required checks for release-only changes ([#1384](https://github.com/doublewordai/control-layer/issues/1384)) ([56a144f](https://github.com/doublewordai/control-layer/commit/56a144f40a51d424b1222807ff035f1729e6ebb8))
+* gracefully handle provider icon fetch failures ([#1378](https://github.com/doublewordai/control-layer/issues/1378)) ([0cd52a2](https://github.com/doublewordai/control-layer/commit/0cd52a2ea0029cd0ba59e0fa004f8059360401b3))
+* publish onwards without fusillade ([#1385](https://github.com/doublewordai/control-layer/issues/1385)) ([97472b7](https://github.com/doublewordai/control-layer/commit/97472b79a4fa34023e3222936f75bb4acc5116d3))
+
 ## [8.103.4](https://github.com/doublewordai/control-layer/compare/v8.103.3...v8.103.4) (2026-07-29)
 
 
