@@ -1,5 +1,16 @@
 # Changelog
 
+## [9.0.0](https://github.com/doublewordai/control-layer/compare/v8.105.0...v9.0.0) (2026-07-30)
+
+
+### ⚠ BREAKING CHANGES
+
+* remove /monitoring/pending-request-counts, superseded by /demand ([#1395](https://github.com/doublewordai/control-layer/issues/1395))
+
+### Features
+
+* remove /monitoring/pending-request-counts, superseded by /demand ([#1395](https://github.com/doublewordai/control-layer/issues/1395)) ([ec0d108](https://github.com/doublewordai/control-layer/commit/ec0d108e129f4d5e4c1da41b74dafb6460dfdfdd))
+
 ## [8.105.0](https://github.com/doublewordai/control-layer/compare/v8.104.0...v8.105.0) (2026-07-30)
 
 
