@@ -1468,10 +1468,7 @@ pub async fn build_router(
         .route("/probes/{id}/results", get(api::handlers::probes::get_probe_results))
         .route("/probes/{id}/statistics", get(api::handlers::probes::get_statistics))
         // Queue monitoring
-        .route(
-            "/monitoring/pending-request-counts",
-            get(api::handlers::queue::get_pending_request_counts),
-        )
+        .route("/monitoring/demand", get(api::handlers::queue::get_demand))
         // Tool sources CRUD
         .route("/tool-sources", get(api::handlers::tool_sources::list_tool_sources))
         .route("/tool-sources", post(api::handlers::tool_sources::create_tool_source))
@@ -3112,7 +3109,7 @@ impl Application {
             std::time::Duration::from_millis(fusillade_daemon_config.body_timeout_ms),
             fusillade_daemon_config.streamable_endpoints.clone(),
         ));
-        let multi_step_loop_config = onwards::LoopConfig {
+        let multi_step_loop_config = onwards_fusillade::LoopConfig {
             max_response_step_depth: config.responses.max_response_step_depth,
             max_response_iterations: config.responses.max_response_iterations,
         };

@@ -123,7 +123,7 @@ impl Modify for AdminSecurityAddon {
         api::handlers::requests::list_requests,
         api::handlers::requests::aggregate_requests,
         api::handlers::requests::aggregate_by_user,
-        api::handlers::queue::get_pending_request_counts,
+        api::handlers::queue::get_demand,
     ),
     components(
         schemas(

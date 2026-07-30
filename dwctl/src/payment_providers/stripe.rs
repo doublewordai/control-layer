@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use rust_decimal::Decimal;
 use sqlx::PgPool;
 use std::collections::HashMap;
-use stripe::Client;
+use stripe::{ApiErrorsCode, Client, StripeError};
 use stripe_billing::billing_portal_session::CreateBillingPortalSession;
 use stripe_checkout::checkout_session::{
     CreateCheckoutSessionConsentCollection, CreateCheckoutSessionConsentCollectionPaymentMethodReuseAgreement,
@@ -38,6 +38,24 @@ use crate::{
 pub struct StripeProvider {
     config: crate::config::StripeConfig,
     client: Client,
+}
+
+/// Convert a Stripe SDK error into a `PaymentError`.
+///
+/// Stripe answers a request whose idempotency key is already in flight with a
+/// 409 `idempotency_key_in_use`. That is the key doing its job: another caller
+/// is already performing this exact charge, so this one is a no-op rather than
+/// a failure. Returning `AlreadyProcessed` lets callers skip quietly instead of
+/// recording a payment failure for a charge that is going through elsewhere.
+fn map_stripe_error(context: &str, e: StripeError) -> PaymentError {
+    if let StripeError::Stripe(api_errors, _) = &e
+        && api_errors.code == Some(ApiErrorsCode::IdempotencyKeyInUse)
+    {
+        tracing::debug!("{context}: idempotency key already in use, another request is in flight");
+        return PaymentError::AlreadyProcessed;
+    }
+    tracing::error!("{context}: {e:?}");
+    PaymentError::ProviderApi(e.to_string())
 }
 
 impl From<crate::config::StripeConfig> for StripeProvider {
@@ -79,10 +97,7 @@ impl StripeProvider {
             .request_strategy(RequestStrategy::Idempotent(tax_idem_key))
             .send(&self.client)
             .await
-            .map_err(|e| {
-                tracing::error!("Failed to create tax calculation: {:?}", e);
-                PaymentError::ProviderApi(e.to_string())
-            })?;
+            .map_err(|e| map_stripe_error("Failed to create tax calculation", e))?;
 
         let tax_calc_id = tax_calc
             .id
@@ -108,10 +123,7 @@ impl StripeProvider {
             .request_strategy(RequestStrategy::Idempotent(idem_key))
             .send(&self.client)
             .await
-            .map_err(|e| {
-                tracing::error!("Failed to create auto top-up payment intent: {:?}", e);
-                PaymentError::ProviderApi(e.to_string())
-            })
+            .map_err(|e| map_stripe_error("Failed to create auto top-up payment intent", e))
     }
 
     async fn get_setup_session(&self, session_id: &str) -> Result<stripe_checkout::CheckoutSession> {
@@ -719,6 +731,45 @@ mod tests {
     async fn create_test_user(pool: &PgPool) -> Uuid {
         let user = crate::test::utils::create_test_user(pool, crate::api::models::users::Role::StandardUser).await;
         user.id
+    }
+
+    /// Build a Stripe API error carrying `code`, as returned on a 409/402.
+    fn stripe_api_error(code: ApiErrorsCode) -> StripeError {
+        StripeError::Stripe(
+            Box::new(stripe::ApiErrors {
+                advice_code: None,
+                charge: None,
+                code: Some(code),
+                decline_code: None,
+                doc_url: None,
+                message: None,
+                network_advice_code: None,
+                network_decline_code: None,
+                param: None,
+                payment_intent: None,
+                payment_method: None,
+                payment_method_type: None,
+                request_log_url: None,
+                setup_intent: None,
+                source: None,
+                type_: stripe::ApiErrorsType::InvalidRequestError,
+            }),
+            409,
+        )
+    }
+
+    #[test]
+    fn test_idempotency_key_in_use_maps_to_already_processed() {
+        // Another replica is mid-charge on the same key — a no-op, not a failure.
+        let err = map_stripe_error("charge", stripe_api_error(ApiErrorsCode::IdempotencyKeyInUse));
+        assert!(matches!(err, PaymentError::AlreadyProcessed), "got {err:?}");
+    }
+
+    #[test]
+    fn test_card_declined_still_maps_to_provider_api_error() {
+        // A real decline must keep surfacing as a failure.
+        let err = map_stripe_error("charge", stripe_api_error(ApiErrorsCode::CardDeclined));
+        assert!(matches!(err, PaymentError::ProviderApi(_)), "got {err:?}");
     }
 
     #[test]
