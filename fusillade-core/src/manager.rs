@@ -535,6 +535,14 @@ pub trait Storage: Send + Sync {
     /// bookkeeping exclusion as the pending method); priority rows are
     /// identified by `service_tier = 'priority' AND batch_id IS NULL` instead,
     /// because the orphan purger may null `template_id` on old realtime rows.
+    ///
+    /// Reads the live `requests` table only. Batchless tiers (flex/priority)
+    /// are exact; batch-tier rows are moved to `batch_requests_archive` once
+    /// their parent batch is terminal and frozen, so batch-tier counts cover
+    /// only not-yet-archived rows (a lower bound that decays with sweep
+    /// latency). The archive is deliberately not unioned in: its query
+    /// contract requires an explicit `archive_bucket` predicate for partition
+    /// pruning, which an outcome-time range over all batches cannot supply.
     async fn get_completed_request_counts_by_model_and_window(
         &self,
         windows: &[(String, i64, i64)],

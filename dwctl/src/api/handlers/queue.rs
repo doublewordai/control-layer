@@ -11,7 +11,7 @@ use fusillade::{Storage, TrailingDemandCount};
 use serde::{Deserialize, Serialize};
 use sqlx_pool_router::PoolProvider;
 use std::collections::HashMap;
-use utoipa::IntoParams;
+use utoipa::{IntoParams, ToSchema};
 
 use crate::{
     AppState,
@@ -31,10 +31,12 @@ type GroupedDemandByModelAndWindow = HashMap<String, HashMap<String, HashMap<Str
 
 /// Response body for [`get_demand`]: the flat shape by default, the cube when
 /// `group_by=service_tier` is requested.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 #[serde(untagged)]
 pub enum DemandResponse {
+    /// `model -> window -> count` (the default shape).
     Flat(PendingCountsByModelAndWindow),
+    /// `model -> window -> tier -> outcome -> count` (`group_by=service_tier`).
     Grouped(GroupedDemandByModelAndWindow),
 }
 
@@ -94,12 +96,13 @@ fn parse_demand_duration(raw: &str) -> Option<i64> {
 /// Query parameters for the demand endpoint.
 #[derive(Debug, Deserialize, IntoParams)]
 pub struct DemandQuery {
-    /// Comma-separated windows, each either `<end>` (shorthand for
-    /// `0s:<end>`, or `<end>:0s` when negative) or `<start>:<end>`. Both
-    /// `start` and `end` are signed offsets from `now` and accept the same
-    /// `<int><unit>` form as batch completion-window strings (`h`, `m`,
-    /// `s`); negative offsets reach into the past (`-1h` = the trailing
-    /// hour, `-1h:1h` spans now). Required.
+    /// Comma-separated windows, each either `<end>` or `<start>:<end>`.
+    /// Bare positive `<end>` means "due by `now + end`" with no lower bound
+    /// (overdue included); bare negative `<end>` is shorthand for
+    /// `<end>:0s`. Both `start` and `end` are signed offsets from `now` and
+    /// accept the same `<int><unit>` form as batch completion-window
+    /// strings (`h`, `m`, `s`); negative offsets reach into the past
+    /// (`-1h` = the trailing hour, `-1h:1h` spans now). Required.
     pub window: String,
     /// Comma-separated service tiers to include. Use `batch` for the null batch tier;
     /// `priority` is the realtime tier. Defaults to `batch`. Examples: `batch`,
@@ -157,10 +160,16 @@ fn parse_demand_window(raw: &str) -> Result<Option<(String, Option<i64>, i64)>, 
 /// explicit negative bound) it additionally means terminal requests bucketed
 /// by when they completed or failed — observed demand, the persistence
 /// forecast input for autoscaling. Failed rows count on purpose: refused
-/// realtime traffic is unserved demand. Each window is either `<end>`
-/// (shorthand for "due within N", overdue included; or `<end>:0s` when
-/// negative) or `<start>:<end>` for a disjoint range. Both bounds are signed
-/// offsets from `now`.
+/// realtime traffic is unserved demand. Each window is either `<end>` (bare
+/// positive: "due by `now + end`", no lower bound, overdue included; bare
+/// negative: shorthand for `<end>:0s`) or `<start>:<end>` for a disjoint
+/// range. Both bounds are signed offsets from `now`.
+///
+/// Trailing counts read the live `requests` table only. Batchless tiers
+/// (`flex`, `priority`) are exact — their rows are never archived. Batch-tier
+/// rows move to the archive once their parent batch is terminal and frozen,
+/// so batch-tier trailing counts cover only not-yet-archived rows and decay
+/// as the sweeper runs; treat them as a lower bound, not an exact history.
 ///
 /// Windows can overlap or be disjoint — the caller chooses. The windows are
 /// deliberately decoupled from `config.batches.allowed_completion_windows`
@@ -181,7 +190,7 @@ fn parse_demand_window(raw: &str) -> Result<Option<(String, Option<i64>, i64)>, 
     path = "/admin/api/v1/monitoring/demand",
     params(DemandQuery),
     responses(
-        (status = 200, description = "Demand counts by model and window: `model -> window -> count`, or `model -> window -> tier -> outcome -> count` with `group_by=service_tier`", body = HashMap<String, HashMap<String, i64>>),
+        (status = 200, description = "Demand counts by model and window: `model -> window -> count`, or `model -> window -> tier -> outcome -> count` with `group_by=service_tier`", body = DemandResponse),
         (status = 400, description = "Missing or malformed window parameter"),
         (status = 500, description = "Internal server error"),
     ),

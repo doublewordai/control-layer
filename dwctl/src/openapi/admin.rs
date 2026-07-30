@@ -127,6 +127,7 @@ impl Modify for AdminSecurityAddon {
     ),
     components(
         schemas(
+            api::handlers::queue::DemandResponse,
             api::models::auth::RegisterRequest,
             api::models::auth::LoginRequest,
             api::models::auth::AuthResponse,
