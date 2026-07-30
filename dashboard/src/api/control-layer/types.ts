@@ -1739,7 +1739,8 @@ export interface OrganizationUpdateRequest {
 export interface InviteMemberRequest {
   email: string;
   role?: OrgMemberRole;
-  // For role 'member': may they create their own API keys? Defaults to true.
+  // For role 'member': may they create their own API keys? Defaults to
+  // FALSE server-side (new members are strict until opted in).
   can_manage_keys?: boolean;
 }
 

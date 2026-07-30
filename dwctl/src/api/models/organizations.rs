@@ -139,7 +139,8 @@ pub struct InviteMemberRequest {
     /// Role to assign: 'owner', 'admin', or 'member' (defaults to 'member')
     pub role: Option<String>,
     /// For base role 'member': may they create and manage their own API keys?
-    /// Defaults to true. Ignored for owner/admin (implicitly true).
+    /// Defaults to FALSE — new members hold issued keys only until an org
+    /// admin opts them in. Ignored for owner/admin (implicitly true).
     pub can_manage_keys: Option<bool>,
 }
 
@@ -183,7 +184,8 @@ pub struct AddMemberRequest {
     /// Role to assign: 'owner', 'admin', or 'member' (defaults to 'member')
     pub role: Option<String>,
     /// For base role 'member': may they create and manage their own API keys?
-    /// Defaults to true. Ignored for owner/admin (implicitly true).
+    /// Defaults to FALSE — new members hold issued keys only until an org
+    /// admin opts them in. Ignored for owner/admin (implicitly true).
     pub can_manage_keys: Option<bool>,
 }
 

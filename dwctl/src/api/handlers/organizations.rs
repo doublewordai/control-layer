@@ -883,11 +883,13 @@ pub async fn add_member<P: PoolProvider>(
 
     let membership = repo.add_member(id, data.user_id, role).await?;
 
-    // Additive 'manage_keys' role: defaults to granted (preserves the
-    // pre-roles behavior for API callers and auto-join flows); the dashboard
-    // sends an explicit choice. Owners/admins hold it implicitly — no row.
+    // Additive 'manage_keys' role: defaults to NOT granted — new members
+    // can't self-serve keys until an admin opts them in (blast-radius
+    // minimization; existing members were backfilled with the grant in
+    // migration 125, so nobody lost capabilities). Owners/admins hold it
+    // implicitly — no row.
     let is_manager_role = matches!(role, "owner" | "admin");
-    let granted = data.can_manage_keys.unwrap_or(true);
+    let granted = data.can_manage_keys.unwrap_or(false);
     if !is_manager_role && granted {
         repo.set_membership_manage_keys(membership.id, true).await?;
     }
@@ -1398,9 +1400,9 @@ pub async fn invite_member<P: PoolProvider>(
 
     // Invite-time pre-configuration of the additive 'manage_keys' role: the
     // grant attaches to the pending membership row and is already in place
-    // when the invite is accepted. Defaults to granted; owner/admin invites
-    // hold the capability implicitly.
-    if !matches!(role, "owner" | "admin") && data.can_manage_keys.unwrap_or(true) {
+    // when the invite is accepted. Defaults to NOT granted (blast-radius
+    // minimization); owner/admin invites hold the capability implicitly.
+    if !matches!(role, "owner" | "admin") && data.can_manage_keys.unwrap_or(false) {
         org_repo.set_membership_manage_keys(invite.id, true).await?;
     }
 
@@ -3450,25 +3452,27 @@ mod tests {
         resp.assert_status(axum::http::StatusCode::CREATED);
         let org_id = resp.json::<serde_json::Value>()["id"].as_str().unwrap().to_string();
         let org_uuid: uuid::Uuid = org_id.parse().unwrap();
-        // Adding a member WITHOUT specifying the toggle defaults to granted…
+        // Adding a member WITHOUT specifying the toggle defaults to NOT
+        // granted (blast-radius minimization — the intern can't self-serve a
+        // key until an admin opts them in)…
         let resp = server
             .post(&format!("/admin/api/v1/organizations/{org_id}/members"))
             .add_header(&owner_headers[0].0, &owner_headers[0].1)
             .add_header(&owner_headers[1].0, &owner_headers[1].1)
-            .json(&json!({ "user_id": defaulted.id, "role": "member" }))
-            .await;
-        resp.assert_status(axum::http::StatusCode::CREATED);
-        assert_eq!(resp.json::<serde_json::Value>()["can_manage_keys"].as_bool(), Some(true));
-
-        // …while an explicit opt-out withholds it.
-        let resp = server
-            .post(&format!("/admin/api/v1/organizations/{org_id}/members"))
-            .add_header(&owner_headers[0].0, &owner_headers[0].1)
-            .add_header(&owner_headers[1].0, &owner_headers[1].1)
-            .json(&json!({ "user_id": restricted.id, "role": "member", "can_manage_keys": false }))
+            .json(&json!({ "user_id": restricted.id, "role": "member" }))
             .await;
         resp.assert_status(axum::http::StatusCode::CREATED);
         assert_eq!(resp.json::<serde_json::Value>()["can_manage_keys"].as_bool(), Some(false));
+
+        // …while an explicit opt-in grants it.
+        let resp = server
+            .post(&format!("/admin/api/v1/organizations/{org_id}/members"))
+            .add_header(&owner_headers[0].0, &owner_headers[0].1)
+            .add_header(&owner_headers[1].0, &owner_headers[1].1)
+            .json(&json!({ "user_id": defaulted.id, "role": "member", "can_manage_keys": true }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::CREATED);
+        assert_eq!(resp.json::<serde_json::Value>()["can_manage_keys"].as_bool(), Some(true));
 
         // The member list reports the effective capability per member; the
         // owner is implicitly true.

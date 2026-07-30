@@ -701,8 +701,10 @@ pub async fn add_org_member(pool: &PgPool, org_id: UserId, user_id: UserId, role
     let mut conn = pool.acquire().await.expect("Failed to acquire connection");
     let mut orgs = Organizations::new(&mut conn);
     let membership = orgs.add_member(org_id, user_id, role).await.expect("Failed to add org member");
-    // Mirror the API-layer default: plain members get the additive
-    // 'manage_keys' org role unless a test revokes it explicitly.
+    // Mirror the migration-125 backfill (existing members keep self-serve):
+    // plain members get the additive 'manage_keys' org role unless a test
+    // revokes it explicitly. NOTE: the API-layer default for NEW members is
+    // the opposite (deny) — tests exercising that path go through the API.
     if role == "member" {
         orgs.set_membership_manage_keys(membership.id, true)
             .await
