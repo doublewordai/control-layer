@@ -1,5 +1,12 @@
 # Changelog
 
+## [9.3.0](https://github.com/doublewordai/control-layer/compare/v9.2.1...v9.3.0) (2026-07-30)
+
+
+### Features
+
+* expose cache pricing in admin model responses ([#1405](https://github.com/doublewordai/control-layer/issues/1405)) ([9032b84](https://github.com/doublewordai/control-layer/commit/9032b842af1c269db664dcf2d910833e69361c40))
+
 ## [9.2.1](https://github.com/doublewordai/control-layer/compare/v9.2.0...v9.2.1) (2026-07-30)
 
 
