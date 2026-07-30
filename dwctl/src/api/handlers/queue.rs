@@ -13,8 +13,6 @@ use sqlx_pool_router::PoolProvider;
 use std::collections::HashMap;
 use utoipa::IntoParams;
 
-use crate::api::handlers::sla_capacity::parse_window_to_seconds;
-
 use crate::{
     AppState,
     auth::permissions::{RequiresPermission, operation, resource},
@@ -23,14 +21,6 @@ use crate::{
 
 /// Nested map of pending request counts: model -> completion_window -> count
 type PendingCountsByModelAndWindow = HashMap<String, HashMap<String, i64>>;
-
-/// Query params for pending request counts.
-#[derive(Debug, Default, Deserialize, IntoParams)]
-pub struct PendingRequestCountsQuery {
-    /// Comma-separated service tiers to include. Use `batch` for the null batch tier.
-    /// Defaults to `batch`. Examples: `batch`, `batch,flex`, `flex`.
-    pub service_tiers: Option<String>,
-}
 
 fn parse_service_tiers(raw: Option<&str>) -> Vec<Option<String>> {
     let mut tiers = Vec::new();
@@ -56,80 +46,10 @@ fn service_tiers_include_flex(tiers: &[Option<String>]) -> bool {
     tiers.iter().any(|tier| tier.as_deref() == Some("flex"))
 }
 
-/// Get pending, claimed, and processing request counts grouped by model and completion window
-///
-/// Returns a nested map showing how many active requests exist for each
-/// model and completion window combination. By default it includes only the
-/// batch tier (`service_tier IS NULL`). Pass `service_tiers` to include other
-/// tiers, for example `service_tiers=batch,flex`. This always excludes:
-/// - Escalated requests (racing duplicate requests)
-/// - Requests without a template_id
-/// - Requests in batches being cancelled
-///
-/// Background counts include the complete active backlog, including work for
-/// models that are not currently live or dispatchable.
-///
-/// When `batches.priority_decay_window_secs` is configured, recently completed
-/// flex requests are added back into the `1h` count for their model for that
-/// many seconds only when `flex` is included in `service_tiers`.
-///
-/// Useful for monitoring queue depth and load distribution across models.
-#[utoipa::path(
-    get,
-    path = "/admin/api/v1/monitoring/pending-request-counts",
-    params(PendingRequestCountsQuery),
-    responses(
-        (status = 200, description = "Pending request counts by model and completion window", body = HashMap<String, HashMap<String, i64>>),
-        (status = 500, description = "Internal server error"),
-    ),
-    tag = "monitoring",
-)]
-#[tracing::instrument(skip_all)]
-pub async fn get_pending_request_counts<P: PoolProvider>(
-    State(state): State<AppState<P>>,
-    Query(query): Query<PendingRequestCountsQuery>,
-    _: RequiresPermission<resource::System, operation::ReadAll>,
-) -> Result<Json<PendingCountsByModelAndWindow>, Error> {
-    let config = state.current_config();
-
-    // Call fusillade storage API to get pending request counts
-    let windows = config
-        .batches
-        .allowed_completion_windows
-        .iter()
-        .map(|window| (window.clone(), None, parse_window_to_seconds(window)))
-        .collect::<Vec<_>>();
-    let states = vec!["pending".to_string(), "claimed".to_string(), "processing".to_string()]; // Include claimed and processing to get a more complete picture of queue depth
-    let model_filter: Vec<String> = Vec::new();
-    let service_tiers = parse_service_tiers(query.service_tiers.as_deref());
-    let priority_decay_window_secs = if service_tiers_include_flex(&service_tiers) {
-        config.batches.priority_decay_window_secs
-    } else {
-        None
-    };
-    let service_tier_filter = ServiceTierFilter::Include(service_tiers);
-
-    let counts = state
-        .request_manager
-        .get_pending_request_counts_by_model_and_window(
-            &windows,
-            &states,
-            &model_filter,
-            &service_tier_filter,
-            priority_decay_window_secs,
-            false,
-        )
-        .await
-        .map_err(|e| Error::Internal {
-            operation: format!("get pending request counts: {}", e),
-        })?;
-
-    Ok(Json(counts))
-}
-
 /// Strict duration parser for `/demand` window entries.
 ///
-/// Unlike [`parse_window_to_seconds`] — which is forgiving on purpose for
+/// Unlike [`crate::api::handlers::sla_capacity::parse_window_to_seconds`] —
+/// which is forgiving on purpose for
 /// the batch API (zero/negative/malformed input defaults to 24h) — this
 /// returns `None` for anything malformed so the handler can reject the
 /// request with 400. Zero is accepted; it's a meaningful lower bound
@@ -167,8 +87,8 @@ pub struct DemandQuery {
 ///
 /// Returns `Ok(None)` for an empty (skipped) entry, `Ok(Some(...))` for a
 /// valid entry, or `Err` for malformed input. Shorthand `<end>` returns
-/// `start = None` (no lower bound, including overdue — matches the legacy
-/// `<= now + N` behaviour of `/pending-request-counts`). Explicit
+/// `start = None` (no lower bound: counts everything due by `now + end`,
+/// including overdue). Explicit
 /// `<start>:<end>` returns `start = Some(...)` and enforces the lower bound
 /// strictly; explicit ranges must satisfy `start < end`, so inverted or
 /// empty ranges are rejected rather than silently returning zero counts.
@@ -201,23 +121,24 @@ fn parse_demand_window(raw: &str) -> Result<Option<(String, Option<i64>, i64)>, 
 /// Returns, per model, counts of pending/claimed/processing requests whose
 /// deadline (`submitted_at + completion_window`) falls within each
 /// caller-specified window. Each window is either `<end>` (shorthand for
-/// `0s:<end>`, matching the legacy "due within N" semantic) or
+/// "due within N", overdue included) or
 /// `<start>:<end>` for a disjoint range. Both bounds are offsets from
 /// `now`.
 ///
-/// Windows can overlap or be disjoint — the caller chooses. This endpoint
-/// is deliberately decoupled from `config.batches.allowed_completion_windows`
+/// Windows can overlap or be disjoint — the caller chooses. The windows are
+/// deliberately decoupled from `config.batches.allowed_completion_windows`
 /// so replica-allocation consumers can pick the lookahead shape they care
 /// about independently of whatever completion-window SLAs the batch API
 /// exposes to users.
 ///
-/// Service-tier filtering matches `/pending-request-counts`: only the batch
-/// tier by default, `service_tiers=batch,flex` to widen, and the
-/// priority-decay top-up applies to the `1h` label when `flex` is included.
+/// Service-tier filtering: only the batch tier (`service_tier IS NULL`) by
+/// default, `service_tiers=batch,flex` to widen. When
+/// `batches.priority_decay_window_secs` is configured and `flex` is
+/// included, recently completed flex requests are added back into the `1h`
+/// label for that many seconds.
 ///
-/// Excludes the same categories as `/pending-request-counts`: escalated
-/// requests, requests without a template_id, and requests in batches being
-/// cancelled.
+/// Always excludes: escalated requests (racing duplicates), requests
+/// without a template_id, and requests in batches being cancelled.
 #[utoipa::path(
     get,
     path = "/admin/api/v1/monitoring/demand",
@@ -290,13 +211,13 @@ mod tests {
     use sqlx::PgPool;
 
     #[sqlx::test]
-    async fn test_pending_request_counts_requires_system_permission(pool: sqlx::PgPool) {
+    async fn test_demand_endpoint_requires_system_permission(pool: sqlx::PgPool) {
         let (server, _bg): (TestServer, _) = create_test_app(pool.clone(), false).await;
 
         // StandardUser should NOT have System::ReadAll permission
         let standard_user = create_test_user(&pool, Role::StandardUser).await;
         let response = server
-            .get("/admin/api/v1/monitoring/pending-request-counts")
+            .get("/admin/api/v1/monitoring/demand?window=1h,24h")
             .add_header(&add_auth_headers(&standard_user)[0].0, &add_auth_headers(&standard_user)[0].1)
             .add_header(&add_auth_headers(&standard_user)[1].0, &add_auth_headers(&standard_user)[1].1)
             .await;
@@ -305,7 +226,7 @@ mod tests {
         // PlatformManager should have System::ReadAll permission
         let platform_manager = create_test_user(&pool, Role::PlatformManager).await;
         let response = server
-            .get("/admin/api/v1/monitoring/pending-request-counts")
+            .get("/admin/api/v1/monitoring/demand?window=1h,24h")
             .add_header(&add_auth_headers(&platform_manager)[0].0, &add_auth_headers(&platform_manager)[0].1)
             .add_header(&add_auth_headers(&platform_manager)[1].0, &add_auth_headers(&platform_manager)[1].1)
             .await;
@@ -313,13 +234,13 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn test_pending_request_counts_returns_empty_when_no_requests(pool: PgPool) {
+    async fn test_demand_returns_empty_when_no_requests(pool: PgPool) {
         let (server, _bg): (TestServer, _) = create_test_app(pool.clone(), false).await;
         let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
 
         // Query the endpoint
         let response = server
-            .get("/admin/api/v1/monitoring/pending-request-counts")
+            .get("/admin/api/v1/monitoring/demand?window=1h,24h")
             .add_header(&add_auth_headers(&admin)[0].0, &add_auth_headers(&admin)[0].1)
             .add_header(&add_auth_headers(&admin)[1].0, &add_auth_headers(&admin)[1].1)
             .await;
@@ -332,7 +253,7 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn test_pending_request_counts_defaults_to_batch_tier_only(pool: PgPool) {
+    async fn test_demand_defaults_to_batch_tier_only(pool: PgPool) {
         use fusillade::{BatchInput, RequestTemplateInput, Storage};
         use sqlx::postgres::PgConnectOptions;
         use sqlx_pool_router::TestDbPools;
@@ -414,7 +335,7 @@ mod tests {
         }
 
         let response = server
-            .get("/admin/api/v1/monitoring/pending-request-counts")
+            .get("/admin/api/v1/monitoring/demand?window=1h,24h")
             .add_header(&add_auth_headers(&admin)[0].0, &add_auth_headers(&admin)[0].1)
             .add_header(&add_auth_headers(&admin)[1].0, &add_auth_headers(&admin)[1].1)
             .await;
@@ -436,7 +357,7 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn test_pending_request_counts_service_tiers_query_includes_requested_tiers(pool: PgPool) {
+    async fn test_demand_service_tiers_query_includes_requested_tiers(pool: PgPool) {
         use fusillade::{BatchInput, RequestTemplateInput, Storage};
         use sqlx::postgres::PgConnectOptions;
         use sqlx_pool_router::TestDbPools;
@@ -509,7 +430,7 @@ mod tests {
         }
 
         let response = server
-            .get("/admin/api/v1/monitoring/pending-request-counts?service_tiers=batch,flex")
+            .get("/admin/api/v1/monitoring/demand?window=1h,24h&service_tiers=batch,flex")
             .add_header(&add_auth_headers(&admin)[0].0, &add_auth_headers(&admin)[0].1)
             .add_header(&add_auth_headers(&admin)[1].0, &add_auth_headers(&admin)[1].1)
             .await;
@@ -528,7 +449,7 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn test_pending_request_counts_priority_decay_window_requires_flex_tier(pool: PgPool) {
+    async fn test_demand_priority_decay_window_requires_flex_tier(pool: PgPool) {
         use fusillade::{CreateFlexInput, RequestId, Storage};
         use sqlx::postgres::PgConnectOptions;
         use sqlx_pool_router::TestDbPools;
@@ -653,7 +574,7 @@ mod tests {
             .expect("cancel request");
 
         let response = server
-            .get("/admin/api/v1/monitoring/pending-request-counts")
+            .get("/admin/api/v1/monitoring/demand?window=1h,24h")
             .add_header(&add_auth_headers(&admin)[0].0, &add_auth_headers(&admin)[0].1)
             .add_header(&add_auth_headers(&admin)[1].0, &add_auth_headers(&admin)[1].1)
             .await;
@@ -666,7 +587,7 @@ mod tests {
         );
 
         let response = server
-            .get("/admin/api/v1/monitoring/pending-request-counts?service_tiers=flex")
+            .get("/admin/api/v1/monitoring/demand?window=1h,24h&service_tiers=flex")
             .add_header(&add_auth_headers(&admin)[0].0, &add_auth_headers(&admin)[0].1)
             .add_header(&add_auth_headers(&admin)[1].0, &add_auth_headers(&admin)[1].1)
             .await;
@@ -806,7 +727,6 @@ mod tests {
 
     #[sqlx::test]
     async fn test_demand_accepts_service_tiers(pool: PgPool) {
-        // service_tiers filtering matches /pending-request-counts semantics;
         // scouter sends `none,flex` today and must keep working via /demand.
         let (server, _bg): (TestServer, _) = create_test_app(pool.clone(), false).await;
         let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
