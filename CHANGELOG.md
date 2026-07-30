@@ -1,5 +1,18 @@
 # Changelog
 
+## [8.105.0](https://github.com/doublewordai/control-layer/compare/v8.104.0...v8.105.0) (2026-07-30)
+
+
+### Features
+
+* monitoring demand endpoint decoupled from completion windows ([#987](https://github.com/doublewordai/control-layer/issues/987)) ([1b9fcd0](https://github.com/doublewordai/control-layer/commit/1b9fcd0712b09013fac6192488a5941fadb31d10))
+
+
+### Bug Fixes
+
+* cap the customer-visible cache split to prompt_tokens ([#1390](https://github.com/doublewordai/control-layer/issues/1390)) ([e8cb8c9](https://github.com/doublewordai/control-layer/commit/e8cb8c977c201e48108fefec8b4327c2c76f5f16))
+* stop auto top-up charging from non-leader replicas ([#1371](https://github.com/doublewordai/control-layer/issues/1371)) ([3459363](https://github.com/doublewordai/control-layer/commit/3459363d3918a7cd304ccfceb67d4e6371cf4505))
+
 ## [8.104.0](https://github.com/doublewordai/control-layer/compare/v8.103.4...v8.104.0) (2026-07-29)
 
 
