@@ -27,6 +27,21 @@ use std::pin::Pin;
 /// retry un-froze it, another sweeper archived it, a partition is missing).
 /// Callers log/alert per variant; only `SkippedNoPartition` warrants an
 /// alert (partitions-ahead runway failed), the rest are informational.
+/// One cell of trailing demand: requests of one model and service tier that
+/// reached one terminal outcome inside one window. Returned by
+/// [`Storage::get_completed_request_counts_by_model_and_window`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrailingDemandCount {
+    pub model: String,
+    /// The caller's window label, echoed back for key matching.
+    pub window_label: String,
+    /// `None` is the batch tier (`service_tier IS NULL`).
+    pub service_tier: Option<String>,
+    /// `"completed"` or `"failed"`.
+    pub outcome: String,
+    pub count: i64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArchiveOutcome {
     /// Rows moved and location stamped; carries the row count moved.
@@ -497,6 +512,35 @@ pub trait Storage: Send + Sync {
         priority_decay_window: Option<i64>,
         strict: bool,
     ) -> Result<HashMap<String, HashMap<String, i64>>>;
+
+    /// Count terminal requests whose outcome timestamp falls inside trailing
+    /// (past) windows, broken out by service tier and outcome.
+    ///
+    /// The trailing counterpart of
+    /// [`Storage::get_pending_request_counts_by_model_and_window`]: where that
+    /// method windows *anticipated* demand by deadline, this windows *observed*
+    /// demand by when each request reached a terminal state — `completed_at`
+    /// for completed rows, `failed_at` for failed rows. Failed rows count as
+    /// demand on purpose: a realtime request that was refused upstream is
+    /// exactly the unserved demand a capacity planner needs to see.
+    ///
+    /// - `windows`: `(label, start_secs, end_secs)` offsets from now, with
+    ///   `start_secs < end_secs <= 0` (e.g. `(-3600, 0)` = the last hour).
+    /// - `model_filter`: optional model whitelist (empty = all).
+    /// - `service_tier_filter`: same semantics as the pending method; `None`
+    ///   in an `Include` set is the batch tier. Background rows are always
+    ///   excluded.
+    ///
+    /// Row scoping: batch/flex rows require `template_id IS NOT NULL` (same
+    /// bookkeeping exclusion as the pending method); priority rows are
+    /// identified by `service_tier = 'priority' AND batch_id IS NULL` instead,
+    /// because the orphan purger may null `template_id` on old realtime rows.
+    async fn get_completed_request_counts_by_model_and_window(
+        &self,
+        windows: &[(String, i64, i64)],
+        model_filter: &[String],
+        service_tier_filter: &ServiceTierFilter,
+    ) -> Result<Vec<TrailingDemandCount>>;
 
     /// Sum the `total_requests` of a creditor's batches for a given completion
     /// window created on or after `cutoff`.
