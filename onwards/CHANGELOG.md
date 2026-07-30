@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.37.1](https://github.com/doublewordai/control-layer/compare/onwards-v0.37.0...onwards-v0.37.1) (2026-07-30)
+
+
+### Bug Fixes
+
+* publish onwards without fusillade ([#1385](https://github.com/doublewordai/control-layer/issues/1385)) ([97472b7](https://github.com/doublewordai/control-layer/commit/97472b79a4fa34023e3222936f75bb4acc5116d3))
+
 ## [0.37.0](https://github.com/doublewordai/control-layer/compare/onwards-v0.36.0...onwards-v0.37.0) (2026-07-29)
 
 
