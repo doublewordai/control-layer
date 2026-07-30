@@ -886,7 +886,7 @@ pub async fn add_member<P: PoolProvider>(
     // Additive 'manage_keys' role: defaults to NOT granted — new members
     // can't self-serve keys until an admin opts them in (blast-radius
     // minimization; existing members were backfilled with the grant in
-    // migration 125, so nobody lost capabilities). Owners/admins hold it
+    // migration 127, so nobody lost capabilities). Owners/admins hold it
     // implicitly — no row.
     let is_manager_role = matches!(role, "owner" | "admin");
     let granted = data.can_manage_keys.unwrap_or(false);
