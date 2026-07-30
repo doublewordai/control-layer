@@ -60,7 +60,7 @@ require_text 'backend-crate-test:' 'define a per-crate test job'
 require_text 'name: ${{ matrix.package }} / test' 'scope every crate test check to its package'
 require_text 'fail-fast: false' 'allow every crate result to complete'
 
-for package in fusillade fusillade-core fusillade-arsenal onwards; do
+for package in fusillade fusillade-core fusillade-arsenal onwards onwards-fusillade; do
   require_text "- package: ${package}" "test ${package} in the matrix"
 done
 
@@ -89,7 +89,7 @@ require_exact_line '    name: workspace / rust gate' 'name the aggregate Rust ga
 require_text 'pattern: rust-coverage-*' 'download all per-package coverage artifacts'
 require_text 'MINIMUM_COVERAGE: "60"' 'preserve the aggregate line coverage threshold'
 require_text '.github/scripts/aggregate-rust-coverage.py' 'merge duplicate source lines before checking coverage'
-require_text 'Expected 8 coverage files' 'aggregate every workspace crate coverage artifact'
+require_text 'Expected 9 coverage files' 'aggregate every workspace crate coverage artifact'
 require_text 'cargo package --locked --package onwards --all-features' 'validate the publishable Onwards package'
 require_text 'onwards-openresponses-compliance:' 'define standalone Onwards compliance'
 require_text 'mode: [adapter, passthrough]' 'test Onwards adapter and passthrough modes'

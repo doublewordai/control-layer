@@ -13,8 +13,6 @@ use sqlx_pool_router::PoolProvider;
 use std::collections::HashMap;
 use utoipa::IntoParams;
 
-use crate::api::handlers::sla_capacity::parse_window_to_seconds;
-
 use crate::{
     AppState,
     auth::permissions::{RequiresPermission, operation, resource},
@@ -23,14 +21,6 @@ use crate::{
 
 /// Nested map of pending request counts: model -> completion_window -> count
 type PendingCountsByModelAndWindow = HashMap<String, HashMap<String, i64>>;
-
-/// Query params for pending request counts.
-#[derive(Debug, Default, Deserialize, IntoParams)]
-pub struct PendingRequestCountsQuery {
-    /// Comma-separated service tiers to include. Use `batch` for the null batch tier.
-    /// Defaults to `batch`. Examples: `batch`, `batch,flex`, `flex`.
-    pub service_tiers: Option<String>,
-}
 
 fn parse_service_tiers(raw: Option<&str>) -> Vec<Option<String>> {
     let mut tiers = Vec::new();
@@ -56,52 +46,137 @@ fn service_tiers_include_flex(tiers: &[Option<String>]) -> bool {
     tiers.iter().any(|tier| tier.as_deref() == Some("flex"))
 }
 
-/// Get pending, claimed, and processing request counts grouped by model and completion window
+/// Strict duration parser for `/demand` window entries.
 ///
-/// Returns a nested map showing how many active requests exist for each
-/// model and completion window combination. By default it includes only the
-/// batch tier (`service_tier IS NULL`). Pass `service_tiers` to include other
-/// tiers, for example `service_tiers=batch,flex`. This always excludes:
-/// - Escalated requests (racing duplicate requests)
-/// - Requests without a template_id
-/// - Requests in batches being cancelled
+/// Unlike [`crate::api::handlers::sla_capacity::parse_window_to_seconds`] —
+/// which is forgiving on purpose for
+/// the batch API (zero/negative/malformed input defaults to 24h) — this
+/// returns `None` for anything malformed so the handler can reject the
+/// request with 400. Zero is accepted; it's a meaningful lower bound
+/// (`0s:1h` = "strictly future 0..1h").
+fn parse_demand_duration(raw: &str) -> Option<i64> {
+    let s = raw.trim();
+    let (digits, mult): (&str, i64) = if let Some(d) = s.strip_suffix('h') {
+        (d, 3600)
+    } else if let Some(d) = s.strip_suffix('m') {
+        (d, 60)
+    } else {
+        (s.strip_suffix('s')?, 1)
+    };
+    let n: i64 = digits.parse().ok()?;
+    if n < 0 {
+        return None;
+    }
+    n.checked_mul(mult)
+}
+
+/// Query parameters for the demand endpoint.
+#[derive(Debug, Deserialize, IntoParams)]
+pub struct DemandQuery {
+    /// Comma-separated windows, each either `<end>` (shorthand for
+    /// `0s:<end>`) or `<start>:<end>`. Both `start` and `end` are offsets
+    /// from `now` and accept the same `<int><unit>` form as batch
+    /// completion-window strings (`h`, `m`, `s`). Required.
+    pub window: String,
+    /// Comma-separated service tiers to include. Use `batch` for the null batch tier.
+    /// Defaults to `batch`. Examples: `batch`, `batch,flex`, `flex`.
+    pub service_tiers: Option<String>,
+}
+
+/// Parse one entry from the `window=` query list.
 ///
-/// Background counts include the complete active backlog, including work for
-/// models that are not currently live or dispatchable.
+/// Returns `Ok(None)` for an empty (skipped) entry, `Ok(Some(...))` for a
+/// valid entry, or `Err` for malformed input. Shorthand `<end>` returns
+/// `start = None` (no lower bound: counts everything due by `now + end`,
+/// including overdue). Explicit
+/// `<start>:<end>` returns `start = Some(...)` and enforces the lower bound
+/// strictly; explicit ranges must satisfy `start < end`, so inverted or
+/// empty ranges are rejected rather than silently returning zero counts.
+/// The label is the caller's raw input so scouter can send
+/// `window=1h,24h` and still match `"1h"` / `"24h"` keys on the response.
+fn parse_demand_window(raw: &str) -> Result<Option<(String, Option<i64>, i64)>, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let (start_secs, end_secs) = match trimmed.split_once(':') {
+        Some((start, end)) => {
+            let s = parse_demand_duration(start).ok_or_else(|| format!("malformed window start in {:?}", trimmed))?;
+            let e = parse_demand_duration(end).ok_or_else(|| format!("malformed window end in {:?}", trimmed))?;
+            if s >= e {
+                return Err(format!("window start must be before end in {:?}", trimmed));
+            }
+            (Some(s), e)
+        }
+        None => {
+            let e = parse_demand_duration(trimmed).ok_or_else(|| format!("malformed window {:?}", trimmed))?;
+            (None, e)
+        }
+    };
+    Ok(Some((trimmed.to_string(), start_secs, end_secs)))
+}
+
+/// Get pending request demand bucketed by deadline window.
 ///
-/// When `batches.priority_decay_window_secs` is configured, recently completed
-/// flex requests are added back into the `1h` count for their model for that
-/// many seconds only when `flex` is included in `service_tiers`.
+/// Returns, per model, counts of pending/claimed/processing requests whose
+/// deadline (`submitted_at + completion_window`) falls within each
+/// caller-specified window. Each window is either `<end>` (shorthand for
+/// "due within N", overdue included) or
+/// `<start>:<end>` for a disjoint range. Both bounds are offsets from
+/// `now`.
 ///
-/// Useful for monitoring queue depth and load distribution across models.
+/// Windows can overlap or be disjoint — the caller chooses. The windows are
+/// deliberately decoupled from `config.batches.allowed_completion_windows`
+/// so replica-allocation consumers can pick the lookahead shape they care
+/// about independently of whatever completion-window SLAs the batch API
+/// exposes to users.
+///
+/// Service-tier filtering: only the batch tier (`service_tier IS NULL`) by
+/// default, `service_tiers=batch,flex` to widen. When
+/// `batches.priority_decay_window_secs` is configured and `flex` is
+/// included, recently completed flex requests are added back into the `1h`
+/// label for that many seconds.
+///
+/// Always excludes: escalated requests (racing duplicates), requests
+/// without a template_id, and requests in batches being cancelled.
 #[utoipa::path(
     get,
-    path = "/admin/api/v1/monitoring/pending-request-counts",
-    params(PendingRequestCountsQuery),
+    path = "/admin/api/v1/monitoring/demand",
+    params(DemandQuery),
     responses(
-        (status = 200, description = "Pending request counts by model and completion window", body = HashMap<String, HashMap<String, i64>>),
+        (status = 200, description = "Pending request counts by model and window", body = HashMap<String, HashMap<String, i64>>),
+        (status = 400, description = "Missing or malformed window parameter"),
         (status = 500, description = "Internal server error"),
     ),
     tag = "monitoring",
 )]
 #[tracing::instrument(skip_all)]
-pub async fn get_pending_request_counts<P: PoolProvider>(
+pub async fn get_demand<P: PoolProvider>(
     State(state): State<AppState<P>>,
-    Query(query): Query<PendingRequestCountsQuery>,
+    Query(params): Query<DemandQuery>,
     _: RequiresPermission<resource::System, operation::ReadAll>,
 ) -> Result<Json<PendingCountsByModelAndWindow>, Error> {
     let config = state.current_config();
 
-    // Call fusillade storage API to get pending request counts
-    let windows = config
-        .batches
-        .allowed_completion_windows
-        .iter()
-        .map(|window| (window.clone(), None, parse_window_to_seconds(window)))
-        .collect::<Vec<_>>();
-    let states = vec!["pending".to_string(), "claimed".to_string(), "processing".to_string()]; // Include claimed and processing to get a more complete picture of queue depth
+    let windows: Vec<(String, Option<i64>, i64)> = params
+        .window
+        .split(',')
+        .map(parse_demand_window)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|message| Error::BadRequest { message })?
+        .into_iter()
+        .flatten()
+        .collect();
+
+    if windows.is_empty() {
+        return Err(Error::BadRequest {
+            message: "window query parameter must list at least one window (e.g. `window=1h,24h` or `window=0s:1h,1h:24h`)".to_string(),
+        });
+    }
+
+    let states = vec!["pending".to_string(), "claimed".to_string(), "processing".to_string()];
     let model_filter: Vec<String> = Vec::new();
-    let service_tiers = parse_service_tiers(query.service_tiers.as_deref());
+    let service_tiers = parse_service_tiers(params.service_tiers.as_deref());
     let priority_decay_window_secs = if service_tiers_include_flex(&service_tiers) {
         config.batches.priority_decay_window_secs
     } else {
@@ -121,7 +196,7 @@ pub async fn get_pending_request_counts<P: PoolProvider>(
         )
         .await
         .map_err(|e| Error::Internal {
-            operation: format!("get pending request counts: {}", e),
+            operation: format!("get demand by window: {}", e),
         })?;
 
     Ok(Json(counts))
@@ -136,13 +211,13 @@ mod tests {
     use sqlx::PgPool;
 
     #[sqlx::test]
-    async fn test_pending_request_counts_requires_system_permission(pool: sqlx::PgPool) {
+    async fn test_demand_endpoint_requires_system_permission(pool: sqlx::PgPool) {
         let (server, _bg): (TestServer, _) = create_test_app(pool.clone(), false).await;
 
         // StandardUser should NOT have System::ReadAll permission
         let standard_user = create_test_user(&pool, Role::StandardUser).await;
         let response = server
-            .get("/admin/api/v1/monitoring/pending-request-counts")
+            .get("/admin/api/v1/monitoring/demand?window=1h,24h")
             .add_header(&add_auth_headers(&standard_user)[0].0, &add_auth_headers(&standard_user)[0].1)
             .add_header(&add_auth_headers(&standard_user)[1].0, &add_auth_headers(&standard_user)[1].1)
             .await;
@@ -151,7 +226,7 @@ mod tests {
         // PlatformManager should have System::ReadAll permission
         let platform_manager = create_test_user(&pool, Role::PlatformManager).await;
         let response = server
-            .get("/admin/api/v1/monitoring/pending-request-counts")
+            .get("/admin/api/v1/monitoring/demand?window=1h,24h")
             .add_header(&add_auth_headers(&platform_manager)[0].0, &add_auth_headers(&platform_manager)[0].1)
             .add_header(&add_auth_headers(&platform_manager)[1].0, &add_auth_headers(&platform_manager)[1].1)
             .await;
@@ -159,13 +234,13 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn test_pending_request_counts_returns_empty_when_no_requests(pool: PgPool) {
+    async fn test_demand_returns_empty_when_no_requests(pool: PgPool) {
         let (server, _bg): (TestServer, _) = create_test_app(pool.clone(), false).await;
         let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
 
         // Query the endpoint
         let response = server
-            .get("/admin/api/v1/monitoring/pending-request-counts")
+            .get("/admin/api/v1/monitoring/demand?window=1h,24h")
             .add_header(&add_auth_headers(&admin)[0].0, &add_auth_headers(&admin)[0].1)
             .add_header(&add_auth_headers(&admin)[1].0, &add_auth_headers(&admin)[1].1)
             .await;
@@ -178,7 +253,7 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn test_pending_request_counts_defaults_to_batch_tier_only(pool: PgPool) {
+    async fn test_demand_defaults_to_batch_tier_only(pool: PgPool) {
         use fusillade::{BatchInput, RequestTemplateInput, Storage};
         use sqlx::postgres::PgConnectOptions;
         use sqlx_pool_router::TestDbPools;
@@ -260,7 +335,7 @@ mod tests {
         }
 
         let response = server
-            .get("/admin/api/v1/monitoring/pending-request-counts")
+            .get("/admin/api/v1/monitoring/demand?window=1h,24h")
             .add_header(&add_auth_headers(&admin)[0].0, &add_auth_headers(&admin)[0].1)
             .add_header(&add_auth_headers(&admin)[1].0, &add_auth_headers(&admin)[1].1)
             .await;
@@ -282,7 +357,7 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn test_pending_request_counts_service_tiers_query_includes_requested_tiers(pool: PgPool) {
+    async fn test_demand_service_tiers_query_includes_requested_tiers(pool: PgPool) {
         use fusillade::{BatchInput, RequestTemplateInput, Storage};
         use sqlx::postgres::PgConnectOptions;
         use sqlx_pool_router::TestDbPools;
@@ -355,7 +430,7 @@ mod tests {
         }
 
         let response = server
-            .get("/admin/api/v1/monitoring/pending-request-counts?service_tiers=batch,flex")
+            .get("/admin/api/v1/monitoring/demand?window=1h,24h&service_tiers=batch,flex")
             .add_header(&add_auth_headers(&admin)[0].0, &add_auth_headers(&admin)[0].1)
             .add_header(&add_auth_headers(&admin)[1].0, &add_auth_headers(&admin)[1].1)
             .await;
@@ -374,7 +449,7 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn test_pending_request_counts_priority_decay_window_requires_flex_tier(pool: PgPool) {
+    async fn test_demand_priority_decay_window_requires_flex_tier(pool: PgPool) {
         use fusillade::{CreateFlexInput, RequestId, Storage};
         use sqlx::postgres::PgConnectOptions;
         use sqlx_pool_router::TestDbPools;
@@ -499,7 +574,7 @@ mod tests {
             .expect("cancel request");
 
         let response = server
-            .get("/admin/api/v1/monitoring/pending-request-counts")
+            .get("/admin/api/v1/monitoring/demand?window=1h,24h")
             .add_header(&add_auth_headers(&admin)[0].0, &add_auth_headers(&admin)[0].1)
             .add_header(&add_auth_headers(&admin)[1].0, &add_auth_headers(&admin)[1].1)
             .await;
@@ -512,7 +587,7 @@ mod tests {
         );
 
         let response = server
-            .get("/admin/api/v1/monitoring/pending-request-counts?service_tiers=flex")
+            .get("/admin/api/v1/monitoring/demand?window=1h,24h&service_tiers=flex")
             .add_header(&add_auth_headers(&admin)[0].0, &add_auth_headers(&admin)[0].1)
             .add_header(&add_auth_headers(&admin)[1].0, &add_auth_headers(&admin)[1].1)
             .await;
@@ -567,5 +642,122 @@ mod tests {
         .await?;
 
         Ok(())
+    }
+
+    #[sqlx::test]
+    async fn test_demand_requires_system_permission(pool: sqlx::PgPool) {
+        let (server, _bg): (TestServer, _) = create_test_app(pool.clone(), false).await;
+
+        let standard_user = create_test_user(&pool, Role::StandardUser).await;
+        let response = server
+            .get("/admin/api/v1/monitoring/demand?window=1h,24h")
+            .add_header(&add_auth_headers(&standard_user)[0].0, &add_auth_headers(&standard_user)[0].1)
+            .add_header(&add_auth_headers(&standard_user)[1].0, &add_auth_headers(&standard_user)[1].1)
+            .await;
+        response.assert_status(axum::http::StatusCode::FORBIDDEN);
+
+        let platform_manager = create_test_user(&pool, Role::PlatformManager).await;
+        let response = server
+            .get("/admin/api/v1/monitoring/demand?window=1h,24h")
+            .add_header(&add_auth_headers(&platform_manager)[0].0, &add_auth_headers(&platform_manager)[0].1)
+            .add_header(&add_auth_headers(&platform_manager)[1].0, &add_auth_headers(&platform_manager)[1].1)
+            .await;
+        response.assert_status_ok();
+    }
+
+    #[sqlx::test]
+    async fn test_demand_rejects_missing_window(pool: PgPool) {
+        let (server, _bg): (TestServer, _) = create_test_app(pool.clone(), false).await;
+        let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
+
+        let response = server
+            .get("/admin/api/v1/monitoring/demand")
+            .add_header(&add_auth_headers(&admin)[0].0, &add_auth_headers(&admin)[0].1)
+            .add_header(&add_auth_headers(&admin)[1].0, &add_auth_headers(&admin)[1].1)
+            .await;
+        response.assert_status(axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    #[sqlx::test]
+    async fn test_demand_rejects_empty_window(pool: PgPool) {
+        let (server, _bg): (TestServer, _) = create_test_app(pool.clone(), false).await;
+        let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
+
+        let response = server
+            .get("/admin/api/v1/monitoring/demand?window=")
+            .add_header(&add_auth_headers(&admin)[0].0, &add_auth_headers(&admin)[0].1)
+            .add_header(&add_auth_headers(&admin)[1].0, &add_auth_headers(&admin)[1].1)
+            .await;
+        response.assert_status(axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    #[sqlx::test]
+    async fn test_demand_accepts_arbitrary_windows(pool: PgPool) {
+        // Caller-supplied windows don't need to match
+        // config.batches.allowed_completion_windows — the point of this
+        // endpoint is to decouple the two. Mixing cumulative (`2h`) and
+        // disjoint (`1h:72h`) shapes should work in the same request.
+        let (server, _bg): (TestServer, _) = create_test_app(pool.clone(), false).await;
+        let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
+
+        let response = server
+            .get("/admin/api/v1/monitoring/demand?window=15m,2h,1h:72h")
+            .add_header(&add_auth_headers(&admin)[0].0, &add_auth_headers(&admin)[0].1)
+            .add_header(&add_auth_headers(&admin)[1].0, &add_auth_headers(&admin)[1].1)
+            .await;
+        response.assert_status_ok();
+        let counts: HashMap<String, HashMap<String, i64>> = response.json();
+        assert_eq!(counts.len(), 0, "no pending requests exist in a clean database");
+    }
+
+    #[sqlx::test]
+    async fn test_demand_accepts_zero_start(pool: PgPool) {
+        // `0s:1h` must parse `0s` as zero seconds (not coerce to 24h like
+        // the lenient batch-window parser does). Regression guard.
+        let (server, _bg): (TestServer, _) = create_test_app(pool.clone(), false).await;
+        let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
+
+        let response = server
+            .get("/admin/api/v1/monitoring/demand?window=0s:1h")
+            .add_header(&add_auth_headers(&admin)[0].0, &add_auth_headers(&admin)[0].1)
+            .add_header(&add_auth_headers(&admin)[1].0, &add_auth_headers(&admin)[1].1)
+            .await;
+        response.assert_status_ok();
+    }
+
+    #[sqlx::test]
+    async fn test_demand_accepts_service_tiers(pool: PgPool) {
+        // scouter sends `none,flex` today and must keep working via /demand.
+        let (server, _bg): (TestServer, _) = create_test_app(pool.clone(), false).await;
+        let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
+
+        let response = server
+            .get("/admin/api/v1/monitoring/demand?window=1h,24h&service_tiers=none,flex")
+            .add_header(&add_auth_headers(&admin)[0].0, &add_auth_headers(&admin)[0].1)
+            .add_header(&add_auth_headers(&admin)[1].0, &add_auth_headers(&admin)[1].1)
+            .await;
+        response.assert_status_ok();
+    }
+
+    #[sqlx::test]
+    async fn test_demand_rejects_malformed_window(pool: PgPool) {
+        let (server, _bg): (TestServer, _) = create_test_app(pool.clone(), false).await;
+        let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
+
+        for bad in [
+            "window=foo",
+            "window=1x",
+            "window=1h,bad",
+            "window=-1h:1h",
+            "window=2h:1h",
+            "window=1h:1h",
+        ] {
+            let response = server
+                .get(&format!("/admin/api/v1/monitoring/demand?{}", bad))
+                .add_header(&add_auth_headers(&admin)[0].0, &add_auth_headers(&admin)[0].1)
+                .add_header(&add_auth_headers(&admin)[1].0, &add_auth_headers(&admin)[1].1)
+                .await;
+            response.assert_status(axum::http::StatusCode::BAD_REQUEST);
+        }
     }
 }

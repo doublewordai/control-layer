@@ -267,28 +267,48 @@ fn compute_total_cost(
     let inp = input_price.unwrap_or(Decimal::ZERO);
     let outp = output_price.unwrap_or(Decimal::ZERO);
 
-    let read = Decimal::from(raw.cache_read_input_tokens.max(0));
+    let mut read = Decimal::from(raw.cache_read_input_tokens.max(0));
     let c5 = Decimal::from(raw.cache_creation_5m_input_tokens.max(0));
     let c1 = Decimal::from(raw.cache_creation_1h_input_tokens.max(0));
     let c24 = Decimal::from(raw.cache_creation_24h_input_tokens.max(0));
     let prompt = Decimal::from(raw.prompt_tokens.max(0));
-    let cached_total = read + c5 + c1 + c24;
+    let creations = c5 + c1 + c24;
 
-    // Billing safety: the cached split can never exceed the prompt. If it does, the
-    // classifier/provider reported a corrupt count — and since writes bill at a premium,
-    // trusting it could massively overcharge. Distrust the split entirely and bill the whole
-    // input at the base rate (= the list price), surfacing it so a classifier bug is visible.
-    if cached_total > prompt {
+    // Billing safety, two tiers. The classifier's tokenizer counts the request CONTENT
+    // while the engine's prompt_tokens counts its chat-template rendering, so the two
+    // legitimately disagree by a small margin — on fully-marked prompts (agent traffic)
+    // the classifier's sum routinely lands a percent or so ABOVE prompt_tokens. That is
+    // drift, not corruption: CAP the split to the prompt by removing the excess from the
+    // read count (the cheapest-rate bucket — deterministic and audit-simple; keeping the
+    // premium-billed write buckets intact means the reduction lands where it lowers the
+    // bill the least, so the cap is conservative: it slightly favors the house, never the
+    // reverse).
+    //
+    // Only when the WRITE counts alone exceed the whole prompt is the split genuinely
+    // corrupt (writes bill at a premium, so trusting them could overcharge): distrust it
+    // entirely and bill the input at base rate, loudly.
+    if creations > prompt {
         crate::background_error!(
             ANALYTICS_BATCHER,
             "cache_split_exceeds_prompt",
             Warning,
             model = raw.request_model.as_deref().unwrap_or("?"),
             prompt_tokens = raw.prompt_tokens,
-            "cached token split exceeds prompt_tokens; ignoring the split and billing at base rate"
+            "cache write counts alone exceed prompt_tokens; ignoring the split and billing at base rate"
         );
         return list_price(raw.prompt_tokens, raw.completion_tokens, input_price, output_price);
     }
+    if read + creations > prompt {
+        metrics::counter!("dwctl_cache_split_capped_total").increment(1);
+        tracing::debug!(
+            model = raw.request_model.as_deref().unwrap_or("?"),
+            prompt_tokens = raw.prompt_tokens,
+            overrun = %(read + creations - prompt),
+            "cached token split exceeds prompt_tokens; capping the read count to fit"
+        );
+        read = prompt - creations;
+    }
+    let cached_total = read + creations;
 
     // Uncached = full input minus the cached portion, floored at zero (our tokenizer and
     // the provider's can differ; never let the cached count drive uncached negative).
@@ -2033,17 +2053,54 @@ mod tests {
     }
 
     #[test]
-    fn corrupt_split_exceeding_prompt_bills_at_base_rate() {
-        // Cached tokens (1000) exceed the prompt (100) — an impossible, corrupt count from
-        // the classifier/provider. The split is distrusted and the whole input is billed at
-        // base rate (the list price), never at the cache write premium that would massively
-        // overcharge on a mistake.
-        let r = cost_record(100, 5, 1000, 0, 0, 0);
+    fn corrupt_writes_exceeding_prompt_bill_at_base_rate() {
+        // WRITE counts alone (150) exceed the prompt (100) — impossible, corrupt. The
+        // split is distrusted and the whole input is billed at base rate (the list
+        // price), never at the cache write premium that would overcharge on a mistake.
+        let r = cost_record(100, 5, 0, 150, 0, 0);
         let cost = compute_total_cost(&r, Some(inp()), Some(outp()), &CacheMultipliers::default()).unwrap();
         // list price = 100*0.001 + 5*0.002 = 0.11
         assert_eq!(cost, Decimal::new(11, 2));
         // No savings shown for a distrusted split: total == un-discounted list price.
         assert_eq!(cost, compute_list_price(&r, Some(inp()), Some(outp())).unwrap());
+    }
+
+    #[test]
+    fn drifted_split_is_capped_by_reducing_read_not_discarded() {
+        // The tokenizer-drift shape (detail.dev, 2026-07): markers cover the whole prompt
+        // and the classifier's count lands ~1% above the engine's prompt_tokens
+        // (10_000 read + 200 write vs 10_100 prompt = 100-token overrun). The overrun
+        // comes off the READ count; the discount survives.
+        let m = CacheMultipliers::default(); // read 0.1, write_5m 1.25
+        let r = cost_record(10_100, 5, 10_000, 200, 0, 0);
+        let cost = compute_total_cost(&r, Some(inp()), Some(outp()), &m).unwrap();
+        // capped read = 10_100 - 200 = 9_900; uncached = 0
+        // input = 9_900*0.001*0.1 + 200*0.001*1.25 = 0.99 + 0.25 = 1.24; output = 5*0.002 = 0.01
+        assert_eq!(cost, Decimal::new(125, 2));
+        // The whole point: massively cheaper than the discarded-split list price.
+        assert!(cost < compute_list_price(&r, Some(inp()), Some(outp())).unwrap());
+    }
+
+    #[test]
+    fn split_exactly_at_prompt_is_untouched() {
+        // cached_total == prompt: no cap, no distrust — billed exactly as reported.
+        let m = CacheMultipliers::default();
+        let r = cost_record(10_000, 0, 9_800, 200, 0, 0);
+        let cost = compute_total_cost(&r, Some(inp()), Some(outp()), &m).unwrap();
+        // 9_800*0.001*0.1 + 200*0.001*1.25 = 0.98 + 0.25
+        assert_eq!(cost, Decimal::new(123, 2));
+    }
+
+    #[test]
+    fn cap_can_consume_the_entire_read() {
+        // Writes fill the whole prompt and read overruns entirely: read caps to zero and
+        // the writes bill at their premium — still a trusted, capped split (writes alone
+        // do NOT exceed the prompt, so this is drift, not corruption).
+        let m = CacheMultipliers::default();
+        let r = cost_record(1_000, 0, 50, 1_000, 0, 0);
+        let cost = compute_total_cost(&r, Some(inp()), Some(outp()), &m).unwrap();
+        // read capped to 0; 1_000*0.001*1.25 = 1.25
+        assert_eq!(cost, Decimal::new(125, 2));
     }
 
     #[test]

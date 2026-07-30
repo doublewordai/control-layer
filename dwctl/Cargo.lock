@@ -1882,7 +1882,7 @@ checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
 
 [[package]]
 name = "dwctl"
-version = "8.94.2"
+version = "8.104.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -1938,6 +1938,7 @@ dependencies = [
  "notify",
  "once_cell",
  "onwards",
+ "onwards-fusillade",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
@@ -2355,8 +2356,6 @@ checksum = "e6d5a32815ae3f33302d95fdcb2ce17862f8c65363dcfd29360480ba1001fc9c"
 [[package]]
 name = "fusillade"
 version = "24.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1f9c53b88361ccafb9d8cc483c1eff776fbee515f85f3a63e9c28d7fa25ac3b8"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2390,9 +2389,7 @@ dependencies = [
 
 [[package]]
 name = "fusillade-arsenal"
-version = "3.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fae1c3be5660435191bce4657fb04e90041e8eb01a84037686b0fa4ea57e7c0a"
+version = "3.1.0"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -2418,9 +2415,7 @@ dependencies = [
 
 [[package]]
 name = "fusillade-core"
-version = "4.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f335ed1e24e0510e131d8af71da3fa83a194410fed96d9d4dc6ab74ba0c3f114"
+version = "4.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3720,9 +3715,9 @@ dependencies = [
 
 [[package]]
 name = "lettre"
-version = "0.11.21"
+version = "0.11.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dabda5859ee7c06b995b9d1165aa52c39110e079ef609db97178d86aeb051fa7"
+checksum = "0da65617f6cb926332d039cb578aad56178da86e128db6a1b09f4c94fa5b3349"
 dependencies = [
  "async-trait",
  "base64",
@@ -4265,9 +4260,7 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "onwards"
-version = "0.35.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fff26aa9acd1e23db37fc96e8ef6f3dc97ae57606639f0f13d44c159c07efb72"
+version = "0.37.0"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -4281,7 +4274,6 @@ dependencies = [
  "dashmap",
  "eventsource-stream",
  "flate2",
- "fusillade",
  "futures-util",
  "governor",
  "http-body-util",
@@ -4304,6 +4296,20 @@ dependencies = [
  "tracing-opentelemetry",
  "tracing-subscriber",
  "url",
+ "uuid",
+]
+
+[[package]]
+name = "onwards-fusillade"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "fusillade",
+ "futures-util",
+ "onwards",
+ "serde_json",
+ "tokio",
+ "tracing",
  "uuid",
 ]
 

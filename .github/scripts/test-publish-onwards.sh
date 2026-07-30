@@ -53,6 +53,12 @@ CARGO_LOG="$fixture/cargo.log" \
 
 grep -Fq "publish --locked --package onwards --all-features --registry crates-io --token test-token" \
   "$fixture/cargo.log"
+grep -Fq "metadata --format-version 1" "$fixture/cargo.log"
+
+if [[ "$(sed -n '1p' "$fixture/cargo.log")" != "metadata --format-version 1" ]]; then
+  echo "publisher did not refresh Cargo.lock before publishing" >&2
+  exit 1
+fi
 
 if CARGO_LOG="$fixture/unexpected-cargo.log" \
   CARGO_REGISTRY_TOKEN="test-token" \

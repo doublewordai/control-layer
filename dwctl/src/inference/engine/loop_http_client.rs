@@ -22,7 +22,7 @@ use fusillade::http::{HttpClient as FusilladeHttpClient, HttpResponse};
 use fusillade::{FusilladeError, RequestData, ReqwestHttpClient, Result as FusilladeResult};
 use fusillade_arsenal::PoolProvider as FusilladePool;
 use onwards::traits::{RequestContext, ToolExecutor};
-use onwards::{LoopConfig, LoopError, MultiStepStore, UpstreamTarget};
+use onwards_fusillade::{LoopConfig, LoopError, MultiStepStore, UpstreamTarget};
 
 use crate::inference::engine::processor::DaemonToolResolver;
 use crate::inference::store::{FusilladeResponseStore, PendingResponseInput};
@@ -191,7 +191,7 @@ where
         // Daemon path: no event sink. Streaming requests run inline on the
         // warm path (responses::streaming) with a sink wired to the SSE
         // response.
-        let result = onwards::run_response_loop(
+        let result = onwards_fusillade::run_response_loop(
             &*self.response_store,
             &*self.tool_executor,
             &tool_ctx,
