@@ -14,6 +14,14 @@
 -- Also independently useful: 'length' vs 'stop' identifies truncated generations, which
 -- has so far had to be inferred.
 --
+-- FORWARD-ONLY BY DECISION, not by omission. The value is recoverable for historical rows
+-- (fusillade stores response bodies), and an early version of this change shipped a script
+-- to do it. That was dropped deliberately: a bulk UPDATE of tens of millions of rows
+-- generates WAL far faster than normal load and every touched row arrives over CDC as a new
+-- row version, which the ClickHouse copy counts twice until a background merge collapses it.
+-- The signal is only interesting as a trend, and it becomes one within days of deploying, so
+-- paying that cost to reach back over history was not worth it.
+--
 -- Nullable with no default and no backfill, so existing rows stay NULL. Note for the
 -- warehouse: ClickPipe lands every column non-Nullable, so NULL arrives in ClickHouse as
 -- '' — treat empty string as "not recorded", not as a finish reason. Every successful chat

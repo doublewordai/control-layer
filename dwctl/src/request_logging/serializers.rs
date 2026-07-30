@@ -844,7 +844,7 @@ impl From<&AiResponse> for TokenMetrics {
 
 #[cfg(test)]
 mod tests {
-    use super::{UsageMetrics, extract_cache_tokens, parse_ai_request, parse_ai_response};
+    use super::{UsageMetrics, extract_cache_tokens, extract_finish_reason, parse_ai_request, parse_ai_response};
     use crate::request_logging::models::{AiRequest, AiResponse};
     use async_openai::types::chat::{CreateChatCompletionResponse, CreateChatCompletionStreamResponse};
     use async_openai::types::completions::CreateCompletionResponse;
@@ -2158,5 +2158,133 @@ mod tests {
         let err = serde_json::json!({"error": {"message": "bad"}}).to_string();
         let c = extract_cache_tokens(&response_with_body(err));
         assert_eq!(c.read, 0);
+    }
+
+    // ---- finish_reason extraction ----------------------------------------------------
+    //
+    // `finish_reason = 'tool_calls'` is the only signal that a caller is running a
+    // client-side tool loop, so a silent None here means that whole class of usage goes
+    // unmeasured. These cover the shapes that would produce one.
+
+    /// Build a POST /v1/chat/completions request + response pair from a raw body.
+    ///
+    /// `stream` has to be declared on the REQUEST: parse_ai_response picks the SSE parser
+    /// from the request's `stream: true` (or the x-fusillade-stream header), not by sniffing
+    /// the response. Getting this wrong makes an SSE body fail to parse rather than
+    /// producing a wrong finish_reason, which is how the first draft of these tests failed.
+    fn chat_pair(body: &'static str, stream: bool) -> (RequestData, ResponseData) {
+        let request_json = if stream {
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"stream":true}"#
+        } else {
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#
+        };
+        let request_data = RequestData {
+            correlation_id: 1,
+            timestamp: SystemTime::now(),
+            method: Method::POST,
+            uri: "/v1/chat/completions".parse::<Uri>().unwrap(),
+            headers: HashMap::new(),
+            body: Some(Bytes::from(request_json)),
+            trace_id: None,
+            span_id: None,
+        };
+        let response_data = ResponseData {
+            extensions: Default::default(),
+            correlation_id: 1,
+            timestamp: SystemTime::now(),
+            status: StatusCode::OK,
+            headers: HashMap::new(),
+            body: Some(Bytes::from(body)),
+            duration: Duration::from_millis(10),
+            duration_to_first_byte: Duration::from_millis(5),
+        };
+        (request_data, response_data)
+    }
+
+    /// Mirrors what analytics_handler does with an unparseable body: fall back to
+    /// `AiResponse::Other` rather than propagating the error, so extraction is still
+    /// exercised on the shape production would actually hand it.
+    fn finish_reason_of(body: &'static str, stream: bool) -> Option<String> {
+        let (req, res) = chat_pair(body, stream);
+        let parsed = parse_ai_response(&req, &res).unwrap_or(AiResponse::Other(serde_json::Value::Null));
+        extract_finish_reason(&parsed)
+    }
+
+    #[test]
+    fn finish_reason_from_non_streamed_chat_completion() {
+        let body = r#"{"id":"c1","object":"chat.completion","created":1,"model":"m","choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"id":"t1","type":"function","function":{"name":"f","arguments":"{}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#;
+        assert_eq!(finish_reason_of(body, false).as_deref(), Some("tool_calls"));
+    }
+
+    /// THE case this function is scanned independently of usage for.
+    ///
+    /// OpenAI's convention is a terminal usage chunk carrying `choices: []`, so the chunk
+    /// `TokenMetrics` selects (the last one WITH usage) has no finish_reason at all — it is
+    /// on the penultimate chunk. Reading finish_reason off the usage chunk, which is the
+    /// obvious implementation, returns None here and silently loses every tool_calls signal
+    /// from any provider following that convention.
+    #[test]
+    fn finish_reason_survives_a_terminal_usage_chunk_with_no_choices() {
+        let body = concat!(
+            "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"tool_calls\"}],\"usage\":null}\n\n",
+            "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        assert_eq!(finish_reason_of(body, true).as_deref(), Some("tool_calls"));
+    }
+
+    /// The other half of the same problem: a provider that omits usage entirely on a
+    /// tool_calls finish (self-hosted GLM-5.2 does exactly this). There is no chunk with
+    /// usage to read from, so a usage-anchored implementation has nothing at all.
+    #[test]
+    fn finish_reason_present_when_no_chunk_carries_usage() {
+        let body = concat!(
+            "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n",
+            "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        assert_eq!(finish_reason_of(body, true).as_deref(), Some("tool_calls"));
+    }
+
+    /// Scanning in reverse must not stop at the [DONE] marker or a trailing error frame —
+    /// neither is a Normal chunk, and both appear after the one carrying the value.
+    #[test]
+    fn finish_reason_skips_done_and_error_frames() {
+        let body = concat!(
+            "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"length\"}]}\n\n",
+            "data: {\"error\":{\"message\":\"boom\",\"type\":\"internal_server_error\",\"code\":500}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        assert_eq!(finish_reason_of(body, true).as_deref(), Some("length"));
+    }
+
+    /// A stream that never finished (client hung up, upstream died) has no finish_reason.
+    /// None must mean "not stated", never a fabricated 'stop'.
+    #[test]
+    fn finish_reason_none_when_stream_never_terminated() {
+        let body = concat!(
+            "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n",
+        );
+        assert_eq!(finish_reason_of(body, true), None);
+    }
+
+    #[test]
+    fn finish_reason_none_for_shapes_without_the_concept() {
+        // Embeddings have no finish_reason, and neither does an unparseable body. Both must
+        // come back None rather than picking something up out of the JSON by accident.
+        let embeddings = r#"{"object":"list","model":"m","data":[{"object":"embedding","index":0,"embedding":[0.1]}],"usage":{"prompt_tokens":1,"total_tokens":1}}"#;
+        assert_eq!(finish_reason_of(embeddings, false), None);
+        assert_eq!(finish_reason_of("not json at all", false), None);
+    }
+
+    #[test]
+    fn finish_reason_round_trips_through_usage_metrics() {
+        // The column is only useful if it survives the hop onto UsageMetrics, which is what
+        // analytics_handler copies onto RawAnalyticsRecord.
+        let body = r#"{"id":"c1","object":"chat.completion","created":1,"model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"x"},"finish_reason":"length"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#;
+        let (req, res) = chat_pair(body, false);
+        let parsed = parse_ai_response(&req, &res).unwrap();
+        let metrics = UsageMetrics::extract(Uuid::nil(), &req, &res, &parsed, &crate::config::Config::default());
+        assert_eq!(metrics.finish_reason.as_deref(), Some("length"));
     }
 }

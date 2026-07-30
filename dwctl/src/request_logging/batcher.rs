@@ -1033,8 +1033,8 @@ where
         let mut total_cost_vec: Vec<Option<Decimal>> = Vec::with_capacity(records.len());
         let mut uncached_cost_vec: Vec<Option<Decimal>> = Vec::with_capacity(records.len());
         let mut served_by_vec: Vec<Option<String>> = Vec::with_capacity(records.len());
-        let mut finish_reasons: Vec<Option<String>> = Vec::with_capacity(records.len());
-        let mut user_agents: Vec<Option<String>> = Vec::with_capacity(records.len());
+        let mut finish_reason_vec: Vec<Option<String>> = Vec::with_capacity(records.len());
+        let mut user_agent_vec: Vec<Option<String>> = Vec::with_capacity(records.len());
 
         for record in records {
             instance_ids.push(record.raw.instance_id);
@@ -1080,8 +1080,8 @@ where
             total_cost_vec.push(record.total_cost);
             uncached_cost_vec.push(record.uncached_cost);
             served_by_vec.push(record.raw.served_by.clone());
-            finish_reasons.push(record.raw.finish_reason.clone());
-            user_agents.push(record.raw.user_agent.clone());
+            finish_reason_vec.push(record.raw.finish_reason.clone());
+            user_agent_vec.push(record.raw.user_agent.clone());
         }
 
         let rows = sqlx::query!(
@@ -1174,8 +1174,8 @@ where
             &total_cost_vec as &[Option<Decimal>],
             &uncached_cost_vec as &[Option<Decimal>],
             &served_by_vec as &[Option<String>],
-            &finish_reasons as &[Option<String>],
-            &user_agents as &[Option<String>],
+            &finish_reason_vec as &[Option<String>],
+            &user_agent_vec as &[Option<String>],
         )
         .fetch_all(&mut **tx)
         .await?;
