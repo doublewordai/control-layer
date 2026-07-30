@@ -2112,9 +2112,8 @@ mod tests {
     // ----- Anthropic /v1/messages billing (the original goal: Anthropic charged) -----
 
     fn messages_request_data(stream: bool) -> RequestData {
-        let body = format!(
-            r#"{{"model":"claude-3-5-sonnet","max_tokens":100,"messages":[{{"role":"user","content":"hi"}}],"stream":{stream}}}"#
-        );
+        let body =
+            format!(r#"{{"model":"claude-3-5-sonnet","max_tokens":100,"messages":[{{"role":"user","content":"hi"}}],"stream":{stream}}}"#);
         RequestData {
             correlation_id: 1,
             timestamp: SystemTime::now(),
@@ -2198,7 +2197,10 @@ mod tests {
         let response_data = ok_response(sse);
 
         let parsed = parse_ai_response(&request_data, &response_data).unwrap();
-        assert!(matches!(parsed, AiResponse::AnthropicStream(_)), "streaming /messages should parse as AnthropicStream");
+        assert!(
+            matches!(parsed, AiResponse::AnthropicStream(_)),
+            "streaming /messages should parse as AnthropicStream"
+        );
 
         let metrics = UsageMetrics::extract(
             Uuid::new_v4(),
