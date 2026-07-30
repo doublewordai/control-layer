@@ -23,12 +23,14 @@ use tokio::sync::{Mutex, Semaphore, SemaphorePermit, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
 
-use super::{ArchiveOutcome, DaemonStorage, ModelFilter, ModelFilterState, Storage};
+use super::{
+    ArchiveOutcome, BackgroundClaimKind, DaemonStorage, ModelFilter, ModelFilterState, Storage,
+};
 use crate::PostgresStorageConfig;
 use crate::batch::{
-    Batch, BatchErrorDetails, BatchErrorItem, BatchId, BatchInput, BatchNotification,
-    BatchOutputItem, BatchResponseDetails, BatchStatus, File, FileContentItem, FileId,
-    FileMetadata, FileStreamItem, FileStreamResult, ListBatchesFilter, OutputFileType,
+    BackgroundBatchInput, Batch, BatchErrorDetails, BatchErrorItem, BatchId, BatchInput,
+    BatchNotification, BatchOutputItem, BatchResponseDetails, BatchStatus, File, FileContentItem,
+    FileId, FileMetadata, FileStreamItem, FileStreamResult, ListBatchesFilter, OutputFileType,
     RequestTemplateInput, TemplateId,
 };
 use crate::daemon::{
@@ -37,9 +39,10 @@ use crate::daemon::{
 };
 use crate::error::{FusilladeError, Result};
 use crate::request::{
-    Canceled, CascadeTargetState, Claimed, Completed, CreateFlexInput, CreateRealtimeInput,
-    DaemonId, Failed, FailureReason, LeakStamp, Pending, PersistCompletedRealtimeInput, Processing,
-    Request, RequestData, RequestId, RequestState, ServiceTierFilter,
+    Canceled, CascadeTargetState, Claimed, Completed, CreateBackgroundInput, CreateFlexInput,
+    CreateRealtimeInput, DaemonId, Failed, FailureReason, LeakStamp, Pending,
+    PersistCompletedRealtimeInput, Processing, Request, RequestData, RequestId, RequestState,
+    ServiceTierFilter,
 };
 
 use super::utils::{
@@ -228,6 +231,31 @@ impl Drop for StateWritePermit<'_> {
     }
 }
 
+struct NewBatchRecord {
+    file_id: FileId,
+    endpoint: String,
+    service_tier: Option<String>,
+    completion_window: Option<String>,
+    metadata: Option<serde_json::Value>,
+    created_by: Option<String>,
+    expires_at: Option<DateTime<Utc>>,
+    api_key_id: Option<Uuid>,
+    api_key: Option<String>,
+    total_requests: i64,
+}
+
+struct NewPendingRequest {
+    request_id: Uuid,
+    body: String,
+    model: String,
+    endpoint: String,
+    method: String,
+    path: String,
+    api_key: String,
+    created_by: String,
+    service_tier: &'static str,
+}
+
 struct ClaimedRequestRow {
     id: Uuid,
     batch_id: Option<Uuid>,
@@ -240,11 +268,11 @@ struct ClaimedRequestRow {
     body: String,
     model: String,
     api_key: String,
-    batch_expires_at: DateTime<Utc>,
+    batch_expires_at: Option<DateTime<Utc>>,
     batch_id_str: String,
     batch_file_id: String,
     batch_endpoint: String,
-    batch_completion_window: String,
+    batch_completion_window: Option<String>,
     batch_metadata: Option<String>,
     batch_output_file_id: Option<String>,
     batch_error_file_id: Option<String>,
@@ -269,6 +297,7 @@ macro_rules! batch_from_dynamic_row {
             id: BatchId($row.get("id")),
             file_id: $row.get::<Option<Uuid>, _>("file_id").map(FileId),
             endpoint: $row.get("endpoint"),
+            service_tier: $row.get("service_tier"),
             completion_window: $row.get("completion_window"),
             metadata: $row.get("metadata"),
             output_file_id: $row.get::<Option<Uuid>, _>("output_file_id").map(FileId),
@@ -400,6 +429,149 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
         crate::db::begin_transaction(self.pools.write(), &self.db_retry_config).await
     }
 
+    async fn insert_batch_record(&self, input: NewBatchRecord) -> Result<Batch> {
+        let mut tx = self
+            .begin_write()
+            .await
+            .map_err(|e| FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e)))?;
+
+        let row = sqlx::query!(
+            r#"
+            INSERT INTO batches (
+                file_id, endpoint, service_tier, completion_window, metadata,
+                created_by, expires_at, api_key_id, api_key, total_requests
+            )
+            VALUES ($1, $2, $3, $4, $5, COALESCE($6, ''), $7, $8, NULLIF(TRIM($9), ''), $10)
+            RETURNING id, created_at
+            "#,
+            *input.file_id as Uuid,
+            input.endpoint,
+            input.service_tier,
+            input.completion_window,
+            input.metadata,
+            input.created_by,
+            input.expires_at,
+            input.api_key_id,
+            input.api_key,
+            input.total_requests,
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to create batch record: {}", e)))?;
+
+        let created_by = input.created_by.as_deref().unwrap_or("");
+        let output_file_id = self
+            .create_virtual_output_file(&mut tx, row.id, created_by)
+            .await?;
+        let error_file_id = self
+            .create_virtual_error_file(&mut tx, row.id, created_by)
+            .await?;
+
+        sqlx::query!(
+            r#"
+            UPDATE batches SET output_file_id = $2, error_file_id = $3 WHERE id = $1
+            "#,
+            row.id,
+            output_file_id,
+            error_file_id,
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| {
+            FusilladeError::Other(anyhow!("Failed to update batch with file IDs: {}", e))
+        })?;
+
+        tx.commit()
+            .await
+            .map_err(|e| FusilladeError::Other(anyhow!("Failed to commit transaction: {}", e)))?;
+
+        Ok(Batch {
+            id: BatchId(row.id),
+            file_id: Some(input.file_id),
+            created_at: row.created_at,
+            metadata: input.metadata,
+            service_tier: input.service_tier,
+            completion_window: input.completion_window,
+            endpoint: input.endpoint,
+            output_file_id: Some(FileId(output_file_id)),
+            error_file_id: Some(FileId(error_file_id)),
+            created_by: input.created_by.unwrap_or_default(),
+            expires_at: input.expires_at,
+            cancelling_at: None,
+            errors: None,
+            total_requests: input.total_requests,
+            pending_requests: 0,
+            in_progress_requests: 0,
+            completed_requests: 0,
+            failed_requests: 0,
+            canceled_requests: 0,
+            requests_started_at: None,
+            finalizing_at: None,
+            completed_at: None,
+            failed_at: None,
+            cancelled_at: None,
+            deleted_at: None,
+            notification_sent_at: None,
+            api_key_id: input.api_key_id,
+        })
+    }
+
+    async fn insert_batchless_pending_request(
+        &self,
+        input: NewPendingRequest,
+    ) -> Result<RequestId> {
+        let template_id = Uuid::new_v4();
+        let mut tx = self
+            .begin_write()
+            .await
+            .map_err(|e| FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e)))?;
+
+        let stored_body = sanitize_outbound_body(&input.body);
+        let body_byte_size = stored_body.len() as i64;
+        sqlx::query(
+            "INSERT INTO request_templates (id, file_id, custom_id, endpoint, method, path, body, model, api_key, body_byte_size)
+             VALUES ($1, NULL, NULL, $2, $3, $4, $5, $6, $7, $8)",
+        )
+        .bind(template_id)
+        .bind(&input.endpoint)
+        .bind(&input.method)
+        .bind(&input.path)
+        .bind(stored_body.as_ref())
+        .bind(&input.model)
+        .bind(&input.api_key)
+        .bind(body_byte_size)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| {
+            FusilladeError::Other(anyhow!("Failed to insert pending request template: {}", e))
+        })?;
+
+        let created_by = Some(input.created_by.trim()).filter(|owner| !owner.is_empty());
+        sqlx::query(
+            "INSERT INTO requests (id, batch_id, template_id, model, custom_id, state, retry_attempt, service_tier, created_by)
+             VALUES ($1, NULL, $2, $3, NULL, 'pending', 0, $4, $5)",
+        )
+        .bind(input.request_id)
+        .bind(template_id)
+        .bind(&input.model)
+        .bind(input.service_tier)
+        .bind(created_by)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| {
+            FusilladeError::Other(anyhow!("Failed to insert pending request: {}", e))
+        })?;
+
+        tx.commit().await.map_err(|e| {
+            FusilladeError::Other(anyhow!(
+                "Failed to commit pending request transaction: {}",
+                e
+            ))
+        })?;
+
+        Ok(RequestId(input.request_id))
+    }
+
     pub fn config(&self) -> &PostgresStorageConfig {
         &self.config
     }
@@ -449,7 +621,7 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
                             "id" => Some(&row.batch_id_str),
                             "file_id" => Some(&row.batch_file_id),
                             "endpoint" => Some(&row.batch_endpoint),
-                            "completion_window" => Some(&row.batch_completion_window),
+                            "completion_window" => row.batch_completion_window.as_deref(),
                             "metadata" => row.batch_metadata.as_deref(),
                             "output_file_id" => row.batch_output_file_id.as_deref(),
                             "error_file_id" => row.batch_error_file_id.as_deref(),
@@ -464,7 +636,7 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
                     } else {
                         match field_name.as_str() {
                             "created_at" => Some(&row.batch_created_at),
-                            "completion_window" => Some(&row.batch_completion_window),
+                            "completion_window" => row.batch_completion_window.as_deref(),
                             _ => None,
                         }
                     };
@@ -487,9 +659,11 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
                 batch_metadata
                     .entry("created_at".to_string())
                     .or_insert_with(|| row.batch_created_at.clone());
-                batch_metadata
-                    .entry("completion_window".to_string())
-                    .or_insert_with(|| row.batch_completion_window.clone());
+                if let Some(completion_window) = row.batch_completion_window.clone() {
+                    batch_metadata
+                        .entry("completion_window".to_string())
+                        .or_insert(completion_window);
+                }
 
                 Request {
                     state: Claimed {
@@ -1115,7 +1289,7 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
 
 // Implement Storage trait directly (no delegation)
 #[async_trait]
-/// Returns counts of **claimable** pending requests grouped by model and expiry window.
+/// Returns active request counts grouped by model and expiry window.
 /// When `priority_decay_window` is set, recently completed flex requests
 /// are added to the `1h` bucket as an explicit realtime-load decay signal.
 ///
@@ -1126,12 +1300,13 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
 /// `DaemonConfig.service_tier_completion_windows_ms` (`'flex'` → 1h) or
 /// `default_completion_window_ms` (24h) for a NULL/unmapped tier.
 ///
-/// This intentionally excludes:
+/// Foreground tiers retain claimability filtering. The background tier reports
+/// all active work regardless of model liveness, foreground headroom, or due
+/// SLA work so monitoring reflects the complete backlog.
+///
+/// All tiers intentionally exclude:
 /// - Requests without a template (`template_id IS NULL`), which are not claimable.
 /// - Requests from batches that are being cancelled (`b.cancelling_at IS NOT NULL`).
-///
-/// If you need counts of all pending requests regardless of claimability, adjust the query
-/// to remove these filters.
 impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
     async fn sum_owner_batch_requests_in_window(
         &self,
@@ -1228,7 +1403,13 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         priority_decay_window: Option<i64>,
         strict: bool,
     ) -> Result<HashMap<String, HashMap<String, i64>>> {
-        if windows.is_empty() || states.is_empty() {
+        let include_background = matches!(
+            service_tier_filter,
+            ServiceTierFilter::Include(tiers)
+                if tiers.iter().any(|tier| tier.as_deref() == Some("background"))
+        );
+
+        if (windows.is_empty() && !include_background) || states.is_empty() {
             return Ok(HashMap::new());
         }
 
@@ -1342,7 +1523,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                 .unwrap_or(self.config.default_completion_window_ms) as i64;
         let default_window_ms = self.config.default_completion_window_ms as i64;
 
-        let rows = sqlx::query(
+        let mut rows = sqlx::query(
             r#"
             WITH windows(label, start_seconds, has_start, end_seconds) AS (
                 SELECT * FROM UNNEST($1::text[], $2::bigint[], $3::int2[], $4::bigint[])
@@ -1359,6 +1540,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                 -- scanning them here and keep the two CTEs disjoint.
                 AND r.batch_id IS NOT NULL
                 AND r.template_id IS NOT NULL
+                AND r.service_tier IS DISTINCT FROM 'background'
                 AND (cardinality($6::text[]) = 0 OR r.model = ANY($6))
                 AND (
                     $9 = 'any'
@@ -1421,6 +1603,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                 WHERE r.batch_id IS NULL
                 AND r.state = ANY($5)
                 AND r.template_id IS NOT NULL
+                AND r.service_tier IS DISTINCT FROM 'background'
                 AND (cardinality($6::text[]) = 0 OR r.model = ANY($6))
                 AND (
                     $9 = 'any'
@@ -1488,6 +1671,46 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                 e
             ))
         })?;
+
+        if include_background {
+            let background_rows = sqlx::query(
+                r#"
+                SELECT r.model,
+                       'background'::TEXT AS window_label,
+                       COUNT(*)::BIGINT AS count
+                FROM requests r
+                LEFT JOIN batches b ON b.id = r.batch_id
+                WHERE r.service_tier = 'background'
+                  AND r.state = ANY($1)
+                  AND r.template_id IS NOT NULL
+                  AND (cardinality($2::TEXT[]) = 0 OR r.model = ANY($2))
+                  AND (
+                      r.batch_id IS NULL
+                      OR (
+                          b.id IS NOT NULL
+                          AND b.service_tier = 'background'
+                          AND b.cancelling_at IS NULL
+                          AND b.deleted_at IS NULL
+                          AND b.completed_at IS NULL
+                          AND b.failed_at IS NULL
+                          AND b.cancelled_at IS NULL
+                      )
+                  )
+                GROUP BY r.model
+                "#,
+            )
+            .bind(states)
+            .bind(model_filter)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(|e| {
+                FusilladeError::Other(anyhow!(
+                    "Failed to get background pending request counts: {}",
+                    e
+                ))
+            })?;
+            rows.extend(background_rows);
+        }
 
         // Read-only transaction; commit promptly returns the connection (with
         // its SET LOCAL settings discarded) to the pool.
@@ -1664,7 +1887,9 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                                         * LEAST(GREATEST(EXTRACT(EPOCH FROM e.eff - $3), 0.0) / 86400.0, 1.0) AS blend
                             ) calc
                             WHERE r.state = 'pending' AND r.model = m.model AND r.batch_id IS NULL
-                              AND r.template_id IS NOT NULL AND (r.not_before IS NULL OR r.not_before <= $3)
+                              AND r.template_id IS NOT NULL
+                              AND r.service_tier IS DISTINCT FROM 'background'
+                              AND (r.not_before IS NULL OR r.not_before <= $3)
                               AND ((mf.state IS NULL OR mf.state = 'live')
                                    OR (EXTRACT(EPOCH FROM (e.eff - $3))
                                        <= power(GREATEST(e.w_secs, 0.0) / 60.0, $9::DOUBLE PRECISION) * 60.0))
@@ -1718,7 +1943,9 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                                                 * LEAST(GREATEST(EXTRACT(EPOCH FROM e.eff - $3), 0.0) / 86400.0, 1.0) AS blend
                                     ) calc
                                     WHERE r.state = 'pending' AND r.model = m.model AND r.batch_id IS NULL
-                                      AND r.template_id IS NOT NULL AND (r.not_before IS NULL OR r.not_before <= $3)
+                                      AND r.template_id IS NOT NULL
+                                      AND r.service_tier IS DISTINCT FROM 'background'
+                                      AND (r.not_before IS NULL OR r.not_before <= $3)
                                       AND NOT ((mf.state IS NULL OR mf.state = 'live')
                                                OR (EXTRACT(EPOCH FROM (e.eff - $3))
                                                    <= power(GREATEST(e.w_secs, 0.0) / 60.0, $9::DOUBLE PRECISION) * 60.0))
@@ -1757,11 +1984,11 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                       r.template_id as "template_id!", r.retry_attempt,
                       t.custom_id, t.endpoint as "endpoint!", t.method as "method!", t.path as "path!",
                       t.body as "body!", t.model as "model!", t.api_key as "api_key!",
-                      tc.effective_expires_at as "batch_expires_at!",
+                      tc.effective_expires_at as "batch_expires_at?",
                       ''::TEXT as "batch_id_str!",
                       ''::TEXT as "batch_file_id!",
                       t.endpoint as "batch_endpoint!",
-                      '1h'::TEXT as "batch_completion_window!",
+                      '1h'::TEXT as "batch_completion_window?",
                       NULL::TEXT as "batch_metadata",
                       NULL::TEXT as "batch_output_file_id",
                       NULL::TEXT as "batch_error_file_id",
@@ -1893,6 +2120,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                        (SELECT r.batch_id FROM requests r
                         WHERE r.state = 'pending' AND r.model = m.model
                           AND r.template_id IS NOT NULL AND r.batch_id IS NOT NULL
+                          AND r.service_tier IS DISTINCT FROM 'background'
                         ORDER BY r.batch_id LIMIT 1) AS batch_id
                 FROM all_models m
               UNION ALL
@@ -1900,6 +2128,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                        (SELECT r.batch_id FROM requests r
                         WHERE r.state = 'pending' AND r.model = g.model
                           AND r.template_id IS NOT NULL AND r.batch_id IS NOT NULL
+                          AND r.service_tier IS DISTINCT FROM 'background'
                           AND r.batch_id > g.batch_id
                         ORDER BY r.batch_id LIMIT 1) AS batch_id
                 FROM batch_groups g WHERE g.batch_id IS NOT NULL
@@ -1923,6 +2152,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                      AND b.completed_at IS NULL
                      AND b.failed_at IS NULL
                      AND b.cancelled_at IS NULL
+                     AND b.service_tier IS DISTINCT FROM 'background'
                     -- Liveness gate: models whose latest filter event is `live`
                     -- are always eligible. Models with NO filter event (external /
                     -- always-on providers that scouter does not manage) are only
@@ -1965,6 +2195,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                           AND r.model = g.model
                           AND r.batch_id = g.batch_id
                           AND r.template_id IS NOT NULL
+                          AND r.service_tier IS DISTINCT FROM 'background'
                           AND (r.not_before IS NULL OR r.not_before <= $3)
                     )
                 ) ranked
@@ -1982,6 +2213,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                       AND r.model = sb.model
                       AND r.batch_id = sb.batch_id
                       AND r.template_id IS NOT NULL
+                      AND r.service_tier IS DISTINCT FROM 'background'
                       AND (r.not_before IS NULL OR r.not_before <= $3)
                     ORDER BY r.created_at ASC
                     LIMIT sb.capacity
@@ -2017,11 +2249,11 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                       r.template_id as "template_id!", r.retry_attempt,
                       t.custom_id, t.endpoint as "endpoint!", t.method as "method!", t.path as "path!",
                       t.body as "body!", t.model as "model!", COALESCE(b.api_key, t.api_key) as "api_key!",
-                      tc.effective_expires_at as "batch_expires_at!",
+                      tc.effective_expires_at as "batch_expires_at?",
                       b.id::TEXT as "batch_id_str!",
                       COALESCE(b.file_id::TEXT, '') as "batch_file_id!",
                       b.endpoint as "batch_endpoint!",
-                      COALESCE(b.completion_window, '24h') as "batch_completion_window!",
+                      b.completion_window as "batch_completion_window?",
                       b.metadata::TEXT as "batch_metadata",
                       b.output_file_id::TEXT as "batch_output_file_id",
                       b.error_file_id::TEXT as "batch_error_file_id",
@@ -2057,6 +2289,259 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         }
 
         Ok(self.claimed_rows_to_requests(rows, daemon_id, now))
+    }
+
+    #[tracing::instrument(
+        skip(self, available_capacity, user_active_counts),
+        fields(limit, batch_limit)
+    )]
+    async fn claim_background_requests_by_kind(
+        &self,
+        kind: BackgroundClaimKind,
+        limit: usize,
+        batch_limit: usize,
+        daemon_id: DaemonId,
+        available_capacity: &HashMap<String, usize>,
+        user_active_counts: &HashMap<String, usize>,
+    ) -> Result<Vec<Request<Claimed>>> {
+        let now = Utc::now();
+        let claim_batches = kind == BackgroundClaimKind::Batch;
+        let mut model_capacity_pairs: Vec<(String, i64)> = available_capacity
+            .iter()
+            .filter(|(_, capacity)| **capacity > 0)
+            .map(|(model, capacity)| (model.clone(), *capacity as i64))
+            .collect();
+        {
+            use rand::seq::SliceRandom;
+            let mut rng = rand::rng();
+            model_capacity_pairs.shuffle(&mut rng);
+        }
+
+        if model_capacity_pairs.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let models_arr: Vec<String> = model_capacity_pairs
+            .iter()
+            .map(|(model, _)| model.clone())
+            .collect();
+        let capacities_arr: Vec<i64> = model_capacity_pairs
+            .iter()
+            .map(|(_, capacity)| *capacity)
+            .collect();
+        let user_ids_arr: Vec<String> = user_active_counts.keys().cloned().collect();
+        let user_counts_arr: Vec<i64> = user_ids_arr
+            .iter()
+            .map(|owner| *user_active_counts.get(owner).unwrap_or(&0) as i64)
+            .collect();
+
+        let rows = sqlx::query_as!(
+            ClaimedRequestRow,
+            r#"
+            WITH locked_models AS (
+                SELECT model, capacity, model_order
+                FROM unnest($4::TEXT[], $5::BIGINT[]) WITH ORDINALITY
+                     AS m(model, capacity, model_order)
+            ),
+            user_priority AS (
+                SELECT *
+                FROM unnest($6::TEXT[], $7::BIGINT[]) AS u(user_id, active_count)
+            ),
+            active_counts AS (
+                SELECT locked.model, COUNT(active.id)::BIGINT AS active_count
+                FROM locked_models locked
+                LEFT JOIN requests active
+                  ON active.model = locked.model
+                 AND active.state IN ('claimed', 'processing')
+                 AND active.template_id IS NOT NULL
+                 AND active.service_tier IS DISTINCT FROM 'background'
+                GROUP BY locked.model
+            ),
+            eligible_models AS (
+                SELECT m.model,
+                       LEAST(
+                           m.capacity,
+                           GREATEST($9::BIGINT - active.active_count, 0)
+                       ) AS capacity,
+                       m.model_order
+                FROM locked_models m
+                JOIN active_counts active ON active.model = m.model
+                JOIN LATERAL (
+                    SELECT mf.state
+                    FROM model_filters mf
+                    WHERE mf.model = m.model
+                    ORDER BY mf.created_at DESC, mf.id DESC
+                    LIMIT 1
+                ) latest ON latest.state = 'live'
+                WHERE active.active_count < $9::BIGINT
+                  AND NOT EXISTS (
+                    SELECT 1
+                    FROM requests sla
+                    LEFT JOIN batches parent ON parent.id = sla.batch_id
+                    WHERE sla.model = m.model
+                      AND sla.state = 'pending'
+                      AND sla.template_id IS NOT NULL
+                      AND sla.service_tier IS DISTINCT FROM 'background'
+                      AND (sla.not_before IS NULL OR sla.not_before <= $3)
+                      AND (
+                          sla.batch_id IS NULL
+                          OR (
+                              parent.id IS NOT NULL
+                              AND parent.service_tier IS DISTINCT FROM 'background'
+                              AND parent.cancelling_at IS NULL
+                              AND parent.deleted_at IS NULL
+                              AND parent.completed_at IS NULL
+                              AND parent.failed_at IS NULL
+                              AND parent.cancelled_at IS NULL
+                          )
+                      )
+                )
+            ),
+            selected_batches AS (
+                SELECT em.model, selected.id AS batch_id
+                FROM eligible_models em
+                CROSS JOIN LATERAL (
+                    SELECT b.id
+                    FROM batches b
+                    WHERE $10::BOOLEAN
+                      AND b.service_tier = 'background'
+                      AND b.cancelling_at IS NULL
+                      AND b.deleted_at IS NULL
+                      AND b.completed_at IS NULL
+                      AND b.failed_at IS NULL
+                      AND b.cancelled_at IS NULL
+                      AND EXISTS (
+                          SELECT 1
+                          FROM requests pending
+                          WHERE pending.batch_id = b.id
+                            AND pending.model = em.model
+                            AND pending.state = 'pending'
+                            AND pending.template_id IS NOT NULL
+                            AND pending.service_tier = 'background'
+                            AND (pending.not_before IS NULL OR pending.not_before <= $3)
+                      )
+                    ORDER BY b.created_at, b.id
+                    LIMIT $8::BIGINT
+                ) selected
+            ),
+            candidate_rows AS (
+                SELECT r.id, r.template_id, r.batch_id, r.model, r.created_at,
+                       r.created_by AS owner, em.capacity, em.model_order
+                FROM eligible_models em
+                JOIN requests r
+                  ON r.model = em.model
+                 AND r.batch_id IS NULL
+                 AND r.state = 'pending'
+                 AND r.template_id IS NOT NULL
+                 AND r.service_tier = 'background'
+                 AND (r.not_before IS NULL OR r.not_before <= $3)
+                WHERE NOT $10::BOOLEAN
+
+                UNION ALL
+
+                SELECT r.id, r.template_id, r.batch_id, r.model, r.created_at,
+                       b.created_by AS owner, em.capacity, em.model_order
+                FROM eligible_models em
+                JOIN selected_batches sb ON sb.model = em.model
+                JOIN batches b ON b.id = sb.batch_id
+                JOIN requests r
+                  ON r.batch_id = b.id
+                 AND r.model = em.model
+                 AND r.state = 'pending'
+                 AND r.template_id IS NOT NULL
+                 AND r.service_tier = 'background'
+                 AND (r.not_before IS NULL OR r.not_before <= $3)
+            ),
+            owner_ranked AS (
+                SELECT c.*,
+                       COALESCE(up.active_count, 0) AS active_count,
+                       row_number() OVER (
+                           PARTITION BY c.model, c.owner
+                           ORDER BY c.created_at, c.id
+                       ) AS owner_rank
+                FROM candidate_rows c
+                LEFT JOIN user_priority up ON up.user_id = c.owner
+            ),
+            model_ranked AS (
+                SELECT o.*,
+                       row_number() OVER (
+                           PARTITION BY o.model
+                           ORDER BY o.active_count + o.owner_rank - 1,
+                                    o.created_at, o.id
+                       ) AS model_rank
+                FROM owner_ranked o
+            ),
+            locked AS (
+                SELECT ranked.id, ranked.template_id, ranked.batch_id,
+                       ranked.model_rank, ranked.model_order, ranked.created_at
+                FROM model_ranked ranked
+                JOIN requests lock_row
+                  ON lock_row.id = ranked.id
+                 AND lock_row.state = 'pending'
+                 AND lock_row.service_tier = 'background'
+                 AND (lock_row.not_before IS NULL OR lock_row.not_before <= $3)
+                WHERE ranked.model_rank <= ranked.capacity
+                ORDER BY ranked.model_rank, ranked.model_order, ranked.created_at, ranked.id
+                LIMIT $2::BIGINT
+                FOR UPDATE OF lock_row SKIP LOCKED
+            )
+            UPDATE requests r
+            SET state = 'claimed',
+                daemon_id = $1,
+                claimed_at = $3
+            FROM locked claimed
+            JOIN active_request_templates t ON t.id = claimed.template_id
+            LEFT JOIN batches b ON b.id = claimed.batch_id
+            WHERE r.id = claimed.id
+            RETURNING r.id,
+                      r.batch_id,
+                      r.template_id as "template_id!", r.retry_attempt,
+                      t.custom_id, t.endpoint as "endpoint!", t.method as "method!", t.path as "path!",
+                      t.body as "body!", t.model as "model!", COALESCE(b.api_key, t.api_key) as "api_key!",
+                      NULL::TIMESTAMPTZ as "batch_expires_at?",
+                      COALESCE(b.id::TEXT, '') as "batch_id_str!",
+                      COALESCE(b.file_id::TEXT, '') as "batch_file_id!",
+                      COALESCE(b.endpoint, t.endpoint) as "batch_endpoint!",
+                      'background'::TEXT as "batch_completion_window?",
+                      b.metadata::TEXT as "batch_metadata",
+                      b.output_file_id::TEXT as "batch_output_file_id",
+                      b.error_file_id::TEXT as "batch_error_file_id",
+                      COALESCE(b.created_by, r.created_by, '') as "batch_created_by!",
+                      to_char(COALESCE(b.created_at, r.created_at) AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') as "batch_created_at!",
+                      NULL::TEXT as "batch_expires_at_str",
+                      to_char(b.cancelling_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') as "batch_cancelling_at",
+                      b.errors::TEXT as "batch_errors",
+                      COALESCE(b.total_requests::TEXT, '1') as "batch_total_requests!",
+                      FALSE as "leaked!",
+                      'background'::TEXT as "window_class!",
+                      0::DOUBLE PRECISION as "window_secs!"
+            "#,
+            *daemon_id as Uuid,
+            limit as i64,
+            now,
+            &models_arr,
+            &capacities_arr,
+            &user_ids_arr,
+            &user_counts_arr,
+            batch_limit as i64,
+            self.config.background_concurrency_limit as i64,
+            claim_batches,
+        )
+        .fetch_all(self.write_executor())
+        .await
+        .map_err(|e| {
+            FusilladeError::Other(anyhow!("Failed to claim background requests: {}", e))
+        })?;
+
+        if !rows.is_empty() {
+            tracing::debug!(claimed = rows.len(), "Claimed background requests");
+        }
+
+        Ok(self.claimed_rows_to_requests(rows, daemon_id, now))
+    }
+
+    fn supports_background_claims(&self) -> bool {
+        true
     }
 
     async fn claim_requests(
@@ -3626,86 +4111,48 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
             ))
         })?;
 
-        let total_requests = input.total_requests.unwrap_or(0);
-
-        let mut tx = self
-            .begin_write()
-            .await
-            .map_err(|e| FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e)))?;
-
-        let row = sqlx::query!(
-            r#"
-            INSERT INTO batches (file_id, endpoint, completion_window, metadata, created_by, expires_at, api_key_id, api_key, total_requests)
-            VALUES ($1, $2, $3, $4, COALESCE($5, ''), $6, $7, NULLIF(TRIM($8), ''), $9)
-            RETURNING id, created_at
-            "#,
-            *input.file_id as Uuid,
-            input.endpoint,
-            input.completion_window,
-            input.metadata,
-            input.created_by,
-            expires_at,
-            input.api_key_id,
-            input.api_key,
-            total_requests,
-        )
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(|e| FusilladeError::Other(anyhow!("Failed to create batch record: {}", e)))?;
-
-        let output_file_id = self
-            .create_virtual_output_file(&mut tx, row.id, input.created_by.as_deref().unwrap_or(""))
-            .await?;
-        let error_file_id = self
-            .create_virtual_error_file(&mut tx, row.id, input.created_by.as_deref().unwrap_or(""))
-            .await?;
-
-        sqlx::query!(
-            r#"
-            UPDATE batches SET output_file_id = $2, error_file_id = $3 WHERE id = $1
-            "#,
-            row.id,
-            output_file_id,
-            error_file_id,
-        )
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| {
-            FusilladeError::Other(anyhow!("Failed to update batch with file IDs: {}", e))
-        })?;
-
-        tx.commit()
-            .await
-            .map_err(|e| FusilladeError::Other(anyhow!("Failed to commit transaction: {}", e)))?;
-
-        Ok(Batch {
-            id: BatchId(row.id),
-            file_id: Some(input.file_id),
-            created_at: row.created_at,
-            metadata: input.metadata,
-            completion_window: input.completion_window,
+        self.insert_batch_record(NewBatchRecord {
+            file_id: input.file_id,
             endpoint: input.endpoint,
-            output_file_id: Some(FileId(output_file_id)),
-            error_file_id: Some(FileId(error_file_id)),
-            created_by: input.created_by.unwrap_or_default(),
-            expires_at,
-            cancelling_at: None,
-            errors: None,
-            total_requests,
-            pending_requests: 0,
-            in_progress_requests: 0,
-            completed_requests: 0,
-            failed_requests: 0,
-            canceled_requests: 0,
-            requests_started_at: None,
-            finalizing_at: None,
-            completed_at: None,
-            failed_at: None,
-            cancelled_at: None,
-            deleted_at: None,
-            notification_sent_at: None,
+            service_tier: None,
+            completion_window: Some(input.completion_window),
+            metadata: input.metadata,
+            created_by: input.created_by,
+            expires_at: Some(expires_at),
             api_key_id: input.api_key_id,
+            api_key: input.api_key,
+            total_requests: input.total_requests.unwrap_or(0),
         })
+        .await
+    }
+
+    #[tracing::instrument(level = "debug", skip(self, input), fields(file_id = %input.file_id))]
+    async fn create_background_batch(&self, input: BackgroundBatchInput) -> Result<Batch> {
+        let file_id = input.file_id;
+        let batch = self.create_background_batch_record(input).await?;
+        if let Err(e) = self.populate_batch(batch.id, file_id).await {
+            let _ = self.mark_batch_failed(batch.id, &e.to_string()).await;
+            return Err(e);
+        }
+        self.get_batch_from_pool(batch.id, self.write_executor())
+            .await
+    }
+
+    #[tracing::instrument(level = "debug", skip(self))]
+    async fn create_background_batch_record(&self, input: BackgroundBatchInput) -> Result<Batch> {
+        self.insert_batch_record(NewBatchRecord {
+            file_id: input.file_id,
+            endpoint: input.endpoint,
+            service_tier: Some("background".to_string()),
+            completion_window: None,
+            metadata: input.metadata,
+            created_by: input.created_by,
+            expires_at: None,
+            api_key_id: input.api_key_id,
+            api_key: input.api_key,
+            total_requests: input.total_requests.unwrap_or(0),
+        })
+        .await
     }
 
     #[tracing::instrument(level = "debug", skip(self), fields(batch_id = %batch_id))]
@@ -3742,6 +4189,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         let row = sqlx::query!(
             r#"
             SELECT
+                b.service_tier,
                 b.completion_window,
                 b.cancelling_at,
                 b.requests_started_at,
@@ -3796,9 +4244,22 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
             ));
         }
 
-        let completion_window = row.completion_window;
-        let service_tier =
-            crate::request::query::service_tier_from_completion_window(&completion_window);
+        let service_tier = match row.service_tier.as_deref() {
+            Some("background") => Some("background"),
+            None => {
+                let completion_window = row.completion_window.as_deref().ok_or_else(|| {
+                    FusilladeError::ValidationError(
+                        "SLA batches require a completion_window".to_string(),
+                    )
+                })?;
+                crate::request::query::service_tier_from_completion_window(completion_window)
+            }
+            Some(other) => {
+                return Err(FusilladeError::ValidationError(format!(
+                    "Unsupported batch service_tier '{other}'"
+                )));
+            }
+        };
 
         // Bulk insert requests from templates
         let rows_affected = sqlx::query!(
@@ -3920,7 +4381,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         let mut query_builder = QueryBuilder::new(
             r#"
             SELECT
-                b.id, b.file_id, b.endpoint, b.completion_window, b.metadata,
+                b.id, b.file_id, b.endpoint, b.service_tier, b.completion_window, b.metadata,
                 b.output_file_id, b.error_file_id, b.created_by, b.created_at,
                 b.expires_at, b.cancelling_at, b.errors,
                 b.total_requests,
@@ -4006,6 +4467,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
             created_before,
             active_first,
             completion_windows,
+            service_tiers,
         } = filter;
         let limit = limit.unwrap_or(100);
 
@@ -4214,13 +4676,37 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
             }
         }
 
-        // Restrict to a specific set of completion windows (e.g., ["24h"] for
-        // batch tier, ["1h"] for flex, ["0s"] for realtime tracking rows).
-        // Uses idx_batches_completion_window. An empty vec returns no rows.
-        if let Some(ref windows) = completion_windows {
-            query_builder.push(" AND b.completion_window = ANY(");
-            query_builder.push_bind(windows.as_slice());
-            query_builder.push(")");
+        if let Some(ref tiers) = service_tiers
+            && let Some(unknown) = tiers.iter().find(|tier| tier.as_str() != "background")
+        {
+            return Err(FusilladeError::ValidationError(format!(
+                "Unknown batch service tier filter: '{unknown}'. Valid value: background"
+            )));
+        }
+
+        // Completion windows and service tiers are two representations of the
+        // same user-facing batch class filter. Combine them as a union when
+        // both are present so callers can request regular and background
+        // batches together.
+        match (&completion_windows, &service_tiers) {
+            (Some(windows), Some(tiers)) => {
+                query_builder.push(" AND (b.completion_window = ANY(");
+                query_builder.push_bind(windows.as_slice());
+                query_builder.push(") OR b.service_tier = ANY(");
+                query_builder.push_bind(tiers.as_slice());
+                query_builder.push("))");
+            }
+            (Some(windows), None) => {
+                query_builder.push(" AND b.completion_window = ANY(");
+                query_builder.push_bind(windows.as_slice());
+                query_builder.push(")");
+            }
+            (None, Some(tiers)) => {
+                query_builder.push(" AND b.service_tier = ANY(");
+                query_builder.push_bind(tiers.as_slice());
+                query_builder.push(")");
+            }
+            (None, None) => {}
         }
 
         // ORDER BY: when active_first is enabled, sort by the `priority` column
@@ -4245,7 +4731,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
             r#"
             )
             SELECT
-                b.id, b.file_id, b.endpoint, b.completion_window, b.metadata,
+                b.id, b.file_id, b.endpoint, b.service_tier, b.completion_window, b.metadata,
                 b.output_file_id, b.error_file_id, b.created_by, b.created_at,
                 b.expires_at, b.cancelling_at, b.errors,
                 b.total_requests,
@@ -5627,57 +6113,34 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
 
     #[tracing::instrument(level = "debug", skip(self, input), fields(request_id = %input.request_id))]
     async fn create_flex(&self, input: CreateFlexInput) -> Result<RequestId> {
-        let template_id = Uuid::new_v4();
-
-        let mut tx = self
-            .begin_write()
-            .await
-            .map_err(|e| FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e)))?;
-
-        let stored_body = sanitize_outbound_body(&input.body);
-        let body_byte_size = stored_body.len() as i64;
-        sqlx::query(
-            "INSERT INTO request_templates (id, file_id, custom_id, endpoint, method, path, body, model, api_key, body_byte_size)
-             VALUES ($1, NULL, NULL, $2, $3, $4, $5, $6, $7, $8)",
-        )
-        .bind(template_id)
-        .bind(&input.endpoint)
-        .bind(&input.method)
-        .bind(&input.path)
-        .bind(stored_body.as_ref())
-        .bind(&input.model)
-        .bind(&input.api_key)
-        .bind(body_byte_size)
-        .execute(&mut *tx)
+        self.insert_batchless_pending_request(NewPendingRequest {
+            request_id: input.request_id,
+            body: input.body,
+            model: input.model,
+            endpoint: input.endpoint,
+            method: input.method,
+            path: input.path,
+            api_key: input.api_key,
+            created_by: input.created_by,
+            service_tier: "flex",
+        })
         .await
-        .map_err(|e| FusilladeError::Other(anyhow!("Failed to insert flex template: {}", e)))?;
+    }
 
-        // Pending row — the daemon will claim and process it like any other
-        // pending request.
-        // Empty-string (or whitespace-only) created_by is a contract violation
-        // (the API guarantees a real user); coerce to NULL so the XOR CHECK
-        // rejects it loudly rather than letting a phantom-user row slip into
-        // the listing. Trim matches the SQL-side `NULLIF(TRIM(...), '')` used
-        // by `persist_completed_realtime_batch` so all three call sites
-        // normalise identically.
-        let created_by = Some(input.created_by.trim()).filter(|s| !s.is_empty());
-        sqlx::query(
-            "INSERT INTO requests (id, batch_id, template_id, model, custom_id, state, retry_attempt, service_tier, created_by)
-             VALUES ($1, NULL, $2, $3, NULL, 'pending', 0, 'flex', $4)",
-        )
-        .bind(input.request_id)
-        .bind(template_id)
-        .bind(&input.model)
-        .bind(created_by)
-        .execute(&mut *tx)
+    #[tracing::instrument(level = "debug", skip(self, input), fields(request_id = %input.request_id))]
+    async fn create_background(&self, input: CreateBackgroundInput) -> Result<RequestId> {
+        self.insert_batchless_pending_request(NewPendingRequest {
+            request_id: input.request_id,
+            body: input.body,
+            model: input.model,
+            endpoint: input.endpoint,
+            method: input.method,
+            path: input.path,
+            api_key: input.api_key,
+            created_by: input.created_by,
+            service_tier: "background",
+        })
         .await
-        .map_err(|e| FusilladeError::Other(anyhow!("Failed to insert flex request: {}", e)))?;
-
-        tx.commit().await.map_err(|e| {
-            FusilladeError::Other(anyhow!("Failed to commit flex request transaction: {}", e))
-        })?;
-
-        Ok(RequestId(input.request_id))
     }
 
     async fn complete_request(
@@ -6039,7 +6502,7 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
         let mut query_builder = QueryBuilder::new(
             r#"
             SELECT
-                b.id, b.file_id, b.endpoint, b.completion_window, b.metadata,
+                b.id, b.file_id, b.endpoint, b.service_tier, b.completion_window, b.metadata,
                 b.output_file_id, b.error_file_id, b.created_by, b.created_at,
                 b.expires_at, b.cancelling_at, b.errors,
                 b.total_requests,
@@ -6285,6 +6748,7 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
             file_id: row.get::<Option<Uuid>, _>("file_id").map(FileId),
             created_at: row.get("created_at"),
             metadata: row.get("metadata"),
+            service_tier: row.get("service_tier"),
             completion_window: row.get("completion_window"),
             endpoint: row.get("endpoint"),
             output_file_id: row.get::<Option<Uuid>, _>("output_file_id").map(FileId),
@@ -6407,7 +6871,7 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
                   -- state and bumps retry_version; target-row condition, so it
                   -- holds even when this UPDATE resumes from a lock wait.
                   AND b.retry_version = c.retry_version
-                RETURNING b.id, b.file_id, b.endpoint, b.completion_window, b.metadata,
+                RETURNING b.id, b.file_id, b.endpoint, b.service_tier, b.completion_window, b.metadata,
                           b.output_file_id, b.error_file_id, b.created_by, b.created_at,
                           b.expires_at, b.cancelling_at, b.errors, b.total_requests,
                           b.requests_started_at, b.finalizing_at, b.completed_at,
@@ -6416,9 +6880,10 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
                           c.pending_requests, c.in_progress_requests
             )
             SELECT u.id AS "id!", u.file_id, u.endpoint AS "endpoint!",
-                   u.completion_window AS "completion_window!", u.metadata,
+                   u.service_tier AS "service_tier?",
+                   u.completion_window AS "completion_window?", u.metadata,
                    u.output_file_id, u.error_file_id, u.created_by AS "created_by!",
-                   u.created_at AS "created_at!", u.expires_at AS "expires_at!", u.cancelling_at,
+                   u.created_at AS "created_at!", u.expires_at AS "expires_at?", u.cancelling_at,
                    u.errors, u.total_requests AS "total_requests!",
                    u.requests_started_at, u.finalizing_at, u.completed_at,
                    u.failed_at, u.cancelled_at, u.deleted_at,
@@ -6448,6 +6913,7 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
                     id: BatchId(row.id),
                     file_id: row.file_id.map(FileId),
                     endpoint: row.endpoint,
+                    service_tier: row.service_tier,
                     completion_window: row.completion_window,
                     metadata: row.metadata,
                     output_file_id: row.output_file_id.map(FileId),
@@ -8008,6 +8474,63 @@ mod tests {
         manager.append_model_filter_events(&filters).await.unwrap();
     }
 
+    async fn create_background_batch_for_test(
+        manager: &PostgresRequestManager<TestDbPools>,
+        model: &str,
+        owner: &str,
+    ) -> Batch {
+        let file_id = manager
+            .create_file(
+                format!("{model}-background"),
+                None,
+                vec![RequestTemplateInput {
+                    custom_id: Some(format!("{model}-batch")),
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/test".to_string(),
+                    body: "{}".to_string(),
+                    model: model.to_string(),
+                    api_key: "key".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        manager
+            .create_background_batch(BackgroundBatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                metadata: None,
+                created_by: Some(owner.to_string()),
+                api_key_id: None,
+                api_key: None,
+                total_requests: Some(1),
+            })
+            .await
+            .unwrap()
+    }
+
+    async fn create_background_request_for_test(
+        manager: &PostgresRequestManager<TestDbPools>,
+        model: &str,
+        owner: &str,
+    ) -> RequestId {
+        let request_id = Uuid::new_v4();
+        manager
+            .create_background(CreateBackgroundInput {
+                request_id,
+                body: "{}".to_string(),
+                model: model.to_string(),
+                endpoint: "https://api.example.com".to_string(),
+                method: "POST".to_string(),
+                path: "/test".to_string(),
+                api_key: "key".to_string(),
+                created_by: owner.to_string(),
+            })
+            .await
+            .unwrap()
+    }
+
     async fn claim_batch_requests_for_test(
         manager: &PostgresRequestManager<TestDbPools>,
         limit: usize,
@@ -8883,6 +9406,107 @@ mod tests {
         }
     }
 
+    #[sqlx::test]
+    async fn background_creation_batch_populates_without_a_deadline(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+        let file_id = manager
+            .create_file(
+                "background-batch.jsonl".to_string(),
+                None,
+                vec![RequestTemplateInput {
+                    custom_id: Some("background-1".to_string()),
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/v1/responses".to_string(),
+                    body: r#"{"model":"model-a","input":"hello"}"#.to_string(),
+                    model: "model-a".to_string(),
+                    api_key: "template-key".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        let batch = manager
+            .create_background_batch(crate::batch::BackgroundBatchInput {
+                file_id,
+                endpoint: "/v1/responses".to_string(),
+                metadata: Some(serde_json::json!({"kind": "background"})),
+                created_by: Some("user-a".to_string()),
+                api_key_id: None,
+                api_key: Some("batch-key".to_string()),
+                total_requests: Some(1),
+            })
+            .await
+            .expect("background batch should be created");
+
+        assert_eq!(batch.service_tier.as_deref(), Some("background"));
+        assert_eq!(batch.completion_window, None);
+        assert_eq!(batch.expires_at, None);
+        assert!(batch.output_file_id.is_some());
+        assert!(batch.error_file_id.is_some());
+        assert_eq!(batch.total_requests, 1);
+        assert_eq!(batch.pending_requests, 1);
+
+        let stored = manager.get_batch(batch.id).await.unwrap();
+        assert_eq!(stored.service_tier.as_deref(), Some("background"));
+        assert_eq!(stored.completion_window, None);
+        assert_eq!(stored.expires_at, None);
+
+        let tiers: Vec<Option<String>> = sqlx::query_scalar(
+            "SELECT service_tier FROM requests WHERE batch_id = $1 ORDER BY created_at, id",
+        )
+        .bind(*batch.id as Uuid)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(tiers, vec![Some("background".to_string())]);
+    }
+
+    #[sqlx::test]
+    async fn background_creation_rejects_mixed_batch_deadline_fields(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+        let file_id = manager
+            .create_file("background-constraint.jsonl".to_string(), None, vec![])
+            .await
+            .unwrap();
+        let batch = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/responses".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: Some("user-a".to_string()),
+                api_key_id: None,
+                api_key: None,
+                total_requests: Some(0),
+            })
+            .await;
+        assert!(batch.is_err(), "empty source file should fail population");
+
+        let batch_id: Uuid = sqlx::query_scalar(
+            "SELECT id FROM batches WHERE file_id = $1 ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(*file_id as Uuid)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let result = sqlx::query("UPDATE batches SET service_tier = 'background' WHERE id = $1")
+            .bind(batch_id)
+            .execute(&pool)
+            .await;
+        assert!(
+            result.is_err(),
+            "background tier with an SLA deadline must violate the cross-field constraint"
+        );
+    }
+
     // populate_batch is invoked from a background task in dwctl, so the batch
     // and the source file may have been deleted between batch creation and
     // population. Without these guards, a concurrent purge of templates whose
@@ -9013,6 +9637,626 @@ mod tests {
     // =========================================================================
     // Tests for queue claiming, cancel_requests, get_requests
     // Request claiming, cancellation, and retrieval
+
+    #[sqlx::test]
+    async fn background_claims_require_explicit_live_and_separate_modalities(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        )
+        .with_config(DaemonConfig {
+            background_concurrency_limit: 10,
+            ..Default::default()
+        });
+        let batch =
+            create_background_batch_for_test(&manager, "background-model", "batch-owner").await;
+        let batchless =
+            create_background_request_for_test(&manager, "background-model", "request-owner").await;
+        let capacity = HashMap::from([("background-model".to_string(), 10)]);
+        let daemon_id = DaemonId::from(Uuid::new_v4());
+
+        let unmanaged = manager
+            .claim_background_batchless_requests(10, daemon_id, &capacity, &HashMap::new())
+            .await
+            .expect("background claim should be supported");
+        assert!(
+            unmanaged.is_empty(),
+            "a missing liveness event is ineligible"
+        );
+
+        manager
+            .append_model_filter_events(&[ModelFilter {
+                model: "background-model".to_string(),
+                state: ModelFilterState::Coming,
+                expected_ready_at: None,
+            }])
+            .await
+            .unwrap();
+        let coming = manager
+            .claim_background_batch_requests(10, 10, daemon_id, &capacity, &HashMap::new())
+            .await
+            .unwrap();
+        assert!(coming.is_empty());
+
+        mark_models_live_for_test(&manager, ["background-model"]).await;
+        let batchless_claimed = manager
+            .claim_background_batchless_requests(10, daemon_id, &capacity, &HashMap::new())
+            .await
+            .unwrap();
+        assert_eq!(batchless_claimed.len(), 1);
+        assert_eq!(batchless_claimed[0].data.id, batchless);
+        assert_eq!(batchless_claimed[0].data.batch_id, None);
+
+        let batch_claimed = manager
+            .claim_background_batch_requests(10, 10, daemon_id, &capacity, &HashMap::new())
+            .await
+            .unwrap();
+        assert_eq!(batch_claimed.len(), 1);
+        assert_eq!(batch_claimed[0].data.batch_id, Some(batch.id));
+
+        assert!(
+            batchless_claimed
+                .iter()
+                .chain(batch_claimed.iter())
+                .all(|request| request.state.batch_expires_at.is_none())
+        );
+        assert!(
+            batchless_claimed
+                .iter()
+                .chain(batch_claimed.iter())
+                .all(|request| {
+                    request
+                        .data
+                        .batch_metadata
+                        .get("completion_window")
+                        .map(String::as_str)
+                        == Some("background")
+                })
+        );
+    }
+
+    #[sqlx::test]
+    async fn background_batch_constraint_rejects_missing_tier_and_deadline(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+        let file_id = manager
+            .create_file("invalid-background-shape".to_string(), None, Vec::new())
+            .await
+            .unwrap();
+
+        let error = sqlx::query!(
+            r#"
+            INSERT INTO batches (
+                file_id, endpoint, created_by, service_tier,
+                completion_window, expires_at
+            )
+            VALUES ($1, '/v1/responses', 'owner', NULL, NULL, NULL)
+            "#,
+            *file_id as Uuid,
+        )
+        .execute(&pool)
+        .await
+        .expect_err("an SLA batch without a completion window or expiry must be rejected");
+
+        let constraint = error
+            .as_database_error()
+            .and_then(|error| error.constraint());
+        assert_eq!(constraint, Some("batches_background_deadline_check"));
+    }
+
+    #[sqlx::test]
+    async fn background_claim_threshold_counts_only_foreground_work(pool: sqlx::PgPool) {
+        let config = DaemonConfig {
+            background_concurrency_limit: 1,
+            ..Default::default()
+        };
+        let first_manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        )
+        .with_config(config.clone());
+        let second_manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        )
+        .with_config(config);
+
+        create_background_request_for_test(&first_manager, "global-model", "owner-a").await;
+        create_background_request_for_test(&first_manager, "global-model", "owner-b").await;
+        mark_models_live_for_test(&first_manager, ["global-model"]).await;
+
+        let capacity = HashMap::from([("global-model".to_string(), 1)]);
+        let first = first_manager
+            .claim_background_batchless_requests(
+                10,
+                DaemonId::from(Uuid::new_v4()),
+                &capacity,
+                &HashMap::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.len(), 1);
+
+        let second = second_manager
+            .claim_background_batchless_requests(
+                10,
+                DaemonId::from(Uuid::new_v4()),
+                &capacity,
+                &HashMap::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            second.len(),
+            1,
+            "active background work must not consume foreground headroom"
+        );
+
+        create_background_request_for_test(
+            &first_manager,
+            "foreground-saturated-model",
+            "background-owner",
+        )
+        .await;
+        first_manager
+            .create_flex(CreateFlexInput {
+                request_id: Uuid::new_v4(),
+                body: "{}".to_string(),
+                model: "foreground-saturated-model".to_string(),
+                endpoint: "https://api.example.com".to_string(),
+                method: "POST".to_string(),
+                path: "/test".to_string(),
+                api_key: "key".to_string(),
+                created_by: "foreground-owner".to_string(),
+            })
+            .await
+            .unwrap();
+        mark_models_live_for_test(&first_manager, ["foreground-saturated-model"]).await;
+        let foreground_capacity = HashMap::from([("foreground-saturated-model".to_string(), 1)]);
+        let foreground = first_manager
+            .claim_batchless_requests(
+                1,
+                DaemonId::from(Uuid::new_v4()),
+                &foreground_capacity,
+                &HashMap::new(),
+                &HashSet::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(foreground.len(), 1);
+
+        let blocked = second_manager
+            .claim_background_batchless_requests(
+                10,
+                DaemonId::from(Uuid::new_v4()),
+                &foreground_capacity,
+                &HashMap::new(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            blocked.is_empty(),
+            "active foreground work must consume background-admission headroom"
+        );
+    }
+
+    #[sqlx::test]
+    async fn background_claim_waits_for_due_sla_work(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        )
+        .with_config(DaemonConfig {
+            // Leave one shared slot after the SLA row is claimed so this test
+            // isolates the due-SLA gate from the global headroom gate.
+            background_concurrency_limit: 2,
+            ..Default::default()
+        });
+        let background_id =
+            create_background_request_for_test(&manager, "shared-model", "background-owner").await;
+        let flex_id = manager
+            .create_flex(CreateFlexInput {
+                request_id: Uuid::new_v4(),
+                body: "{}".to_string(),
+                model: "shared-model".to_string(),
+                endpoint: "https://api.example.com".to_string(),
+                method: "POST".to_string(),
+                path: "/test".to_string(),
+                api_key: "key".to_string(),
+                created_by: "sla-owner".to_string(),
+            })
+            .await
+            .unwrap();
+        mark_models_live_for_test(&manager, ["shared-model"]).await;
+        let capacity = HashMap::from([("shared-model".to_string(), 1)]);
+        let daemon_id = DaemonId::from(Uuid::new_v4());
+
+        let blocked = manager
+            .claim_background_requests(10, 10, daemon_id, &capacity, &HashMap::new())
+            .await
+            .unwrap();
+        assert!(
+            blocked.is_empty(),
+            "due SLA work must block background claims"
+        );
+
+        let sla = manager
+            .claim_batchless_requests(10, daemon_id, &capacity, &HashMap::new(), &HashSet::new())
+            .await
+            .unwrap();
+        assert_eq!(sla.len(), 1);
+        assert_eq!(sla[0].data.id, flex_id);
+
+        let background = manager
+            .claim_background_requests(10, 10, daemon_id, &capacity, &HashMap::new())
+            .await
+            .unwrap();
+        assert_eq!(background.len(), 1);
+        assert_eq!(background[0].data.id, background_id);
+    }
+
+    #[sqlx::test]
+    async fn background_claim_ignores_future_sla_retry_but_not_due_batch(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        )
+        .with_config(DaemonConfig {
+            background_concurrency_limit: 1,
+            ..Default::default()
+        });
+        let background_id =
+            create_background_request_for_test(&manager, "retry-model", "background-owner").await;
+        let future_flex = manager
+            .create_flex(CreateFlexInput {
+                request_id: Uuid::new_v4(),
+                body: "{}".to_string(),
+                model: "retry-model".to_string(),
+                endpoint: "https://api.example.com".to_string(),
+                method: "POST".to_string(),
+                path: "/test".to_string(),
+                api_key: "key".to_string(),
+                created_by: "sla-owner".to_string(),
+            })
+            .await
+            .unwrap();
+        sqlx::query!(
+            "UPDATE requests SET not_before = NOW() + interval '1 hour' WHERE id = $1",
+            *future_flex as Uuid,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        mark_models_live_for_test(&manager, ["retry-model"]).await;
+        let capacity = HashMap::from([("retry-model".to_string(), 1)]);
+
+        let claimed = manager
+            .claim_background_requests(
+                10,
+                10,
+                DaemonId::from(Uuid::new_v4()),
+                &capacity,
+                &HashMap::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].data.id, background_id);
+
+        create_background_request_for_test(&manager, "batch-blocked-model", "background-owner")
+            .await;
+        let file_id = manager
+            .create_file(
+                "due-sla-batch".to_string(),
+                None,
+                vec![RequestTemplateInput {
+                    custom_id: None,
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/test".to_string(),
+                    body: "{}".to_string(),
+                    model: "batch-blocked-model".to_string(),
+                    api_key: "key".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+        manager
+            .create_batch(BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: Some("sla-owner".to_string()),
+                api_key_id: None,
+                api_key: None,
+                total_requests: Some(1),
+            })
+            .await
+            .unwrap();
+        mark_models_live_for_test(&manager, ["batch-blocked-model"]).await;
+        let blocked = manager
+            .claim_background_requests(
+                10,
+                10,
+                DaemonId::from(Uuid::new_v4()),
+                &HashMap::from([("batch-blocked-model".to_string(), 1)]),
+                &HashMap::new(),
+            )
+            .await
+            .unwrap();
+        assert!(blocked.is_empty());
+    }
+
+    #[sqlx::test]
+    async fn background_claim_enforces_capacity_batch_bound_and_owner_fairness(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        )
+        .with_config(DaemonConfig {
+            background_concurrency_limit: 10,
+            ..Default::default()
+        });
+        let batch =
+            create_background_batch_for_test(&manager, "bounded-model", "batch-owner").await;
+        let busy_owner =
+            create_background_request_for_test(&manager, "bounded-model", "busy-owner").await;
+        let idle_owner =
+            create_background_request_for_test(&manager, "bounded-model", "idle-owner").await;
+        mark_models_live_for_test(&manager, ["bounded-model"]).await;
+        let capacity = HashMap::from([("bounded-model".to_string(), 1)]);
+        let active = HashMap::from([("busy-owner".to_string(), 5)]);
+
+        let first = manager
+            .claim_background_requests(10, 0, DaemonId::from(Uuid::new_v4()), &capacity, &active)
+            .await
+            .unwrap();
+        assert_eq!(first.len(), 1, "per-model capacity must cap the claim");
+        assert_eq!(first[0].data.id, idle_owner, "the less-active owner wins");
+        assert_eq!(
+            first[0].data.batch_id, None,
+            "batch_limit=0 excludes batches"
+        );
+
+        let second = manager
+            .claim_background_requests(
+                1,
+                10,
+                DaemonId::from(Uuid::new_v4()),
+                &HashMap::from([("bounded-model".to_string(), 10)]),
+                &HashMap::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.len(), 1, "the global cycle limit must be enforced");
+        assert!(second[0].data.id == busy_owner || second[0].data.batch_id == Some(batch.id));
+    }
+
+    #[sqlx::test]
+    async fn combined_background_claim_shares_model_capacity_between_modalities(
+        pool: sqlx::PgPool,
+    ) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        )
+        .with_config(DaemonConfig {
+            background_concurrency_limit: 10,
+            ..Default::default()
+        });
+        create_background_request_for_test(&manager, "shared-capacity-model", "request-owner")
+            .await;
+        create_background_batch_for_test(&manager, "shared-capacity-model", "batch-owner").await;
+        mark_models_live_for_test(&manager, ["shared-capacity-model"]).await;
+
+        let claimed = manager
+            .claim_background_requests(
+                10,
+                10,
+                DaemonId::from(Uuid::new_v4()),
+                &HashMap::from([("shared-capacity-model".to_string(), 1)]),
+                &HashMap::new(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            claimed.len(),
+            1,
+            "the combined claim must share per-model capacity between modalities"
+        );
+    }
+
+    #[sqlx::test]
+    async fn ordinary_claims_never_return_background_rows(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+        create_background_batch_for_test(&manager, "isolated-model", "batch-owner").await;
+        create_background_request_for_test(&manager, "isolated-model", "request-owner").await;
+        mark_models_live_for_test(&manager, ["isolated-model"]).await;
+        let capacity = HashMap::from([("isolated-model".to_string(), 10)]);
+        let daemon_id = DaemonId::from(Uuid::new_v4());
+
+        let batchless = manager
+            .claim_batchless_requests(10, daemon_id, &capacity, &HashMap::new(), &HashSet::new())
+            .await
+            .unwrap();
+        assert!(batchless.is_empty());
+
+        let batched = manager
+            .claim_batch_requests(10, 10, daemon_id, &capacity, &HashMap::new())
+            .await
+            .unwrap();
+        assert!(batched.is_empty());
+    }
+
+    #[sqlx::test]
+    async fn background_pending_counts_are_explicit_and_isolated(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        )
+        .with_config(DaemonConfig {
+            background_concurrency_limit: 10,
+            ..Default::default()
+        });
+        create_background_batch_for_test(&manager, "count-model", "batch-owner").await;
+        create_background_request_for_test(&manager, "count-model", "request-owner").await;
+        mark_models_live_for_test(&manager, ["count-model"]).await;
+
+        let windows = vec![("24h".to_string(), None, 86_400)];
+        let states = vec!["pending".to_string()];
+        let ordinary = manager
+            .get_pending_request_counts_by_model_and_window(
+                &windows,
+                &states,
+                &[],
+                &ServiceTierFilter::Any,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        assert!(!ordinary.contains_key("count-model"));
+
+        let background = manager
+            .get_pending_request_counts_by_model_and_window(
+                &[],
+                &states,
+                &[],
+                &ServiceTierFilter::Include(vec![Some("background".to_string())]),
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(background["count-model"]["background"], 2);
+    }
+
+    #[sqlx::test]
+    async fn background_pending_counts_include_non_live_models(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        )
+        .with_config(DaemonConfig {
+            background_concurrency_limit: 0,
+            ..Default::default()
+        });
+        create_background_request_for_test(&manager, "absent-model", "request-owner").await;
+
+        let result = manager
+            .get_pending_request_counts_by_model_and_window(
+                &[],
+                &["pending".to_string()],
+                &[],
+                &ServiceTierFilter::Include(vec![Some("background".to_string())]),
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result["absent-model"]["background"], 1);
+    }
+
+    #[sqlx::test]
+    async fn background_pending_counts_ignore_dispatch_capacity_and_due_sla(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        )
+        .with_config(DaemonConfig {
+            background_concurrency_limit: 1,
+            ..Default::default()
+        });
+
+        for model in [
+            "available-model",
+            "background-active-model",
+            "full-model",
+            "sla-blocked-model",
+        ] {
+            create_background_request_for_test(&manager, model, "background-owner").await;
+        }
+        create_background_request_for_test(
+            &manager,
+            "background-active-model",
+            "second-background-owner",
+        )
+        .await;
+        manager
+            .create_realtime(CreateRealtimeInput {
+                request_id: Uuid::new_v4(),
+                body: "{}".to_string(),
+                model: "full-model".to_string(),
+                endpoint: "https://api.example.com".to_string(),
+                method: "POST".to_string(),
+                path: "/test".to_string(),
+                api_key: "key".to_string(),
+                created_by: "active-owner".to_string(),
+            })
+            .await
+            .unwrap();
+        manager
+            .create_flex(CreateFlexInput {
+                request_id: Uuid::new_v4(),
+                body: "{}".to_string(),
+                model: "sla-blocked-model".to_string(),
+                endpoint: "https://api.example.com".to_string(),
+                method: "POST".to_string(),
+                path: "/test".to_string(),
+                api_key: "key".to_string(),
+                created_by: "sla-owner".to_string(),
+            })
+            .await
+            .unwrap();
+        mark_models_live_for_test(
+            &manager,
+            [
+                "available-model",
+                "background-active-model",
+                "full-model",
+                "sla-blocked-model",
+            ],
+        )
+        .await;
+        let claimed_background = manager
+            .claim_background_batchless_requests(
+                1,
+                DaemonId::from(Uuid::new_v4()),
+                &HashMap::from([("background-active-model".to_string(), 1)]),
+                &HashMap::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(claimed_background.len(), 1);
+
+        let result = manager
+            .get_pending_request_counts_by_model_and_window(
+                &[],
+                &["pending".to_string()],
+                &[],
+                &ServiceTierFilter::Include(vec![Some("background".to_string())]),
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result["available-model"]["background"], 1);
+        assert_eq!(
+            result["background-active-model"]["background"], 1,
+            "active background work must not hide remaining background demand"
+        );
+        assert_eq!(result["full-model"]["background"], 1);
+        assert_eq!(result["sla-blocked-model"]["background"], 1);
+    }
 
     #[sqlx::test]
     async fn test_claim_batchless_requests_ignores_batched_rows(pool: sqlx::PgPool) {
@@ -10994,6 +12238,36 @@ mod tests {
         .unwrap();
         let batch = manager.get_batch(batch_id).await.unwrap();
         assert_eq!(batch.completed_requests, 2);
+    }
+
+    #[sqlx::test]
+    async fn test_poller_returns_background_batch_without_sla_fields(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+        let batch = create_background_batch_for_test(&manager, "background-poller", "owner").await;
+
+        sqlx::query!(
+            "UPDATE requests SET state = 'completed', completed_at = NOW(), response_status = 200, response_body = '{}' WHERE batch_id = $1",
+            *batch.id as Uuid
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let notifications = manager.poll_completed_batches().await.unwrap();
+        let notification = notifications
+            .iter()
+            .find(|notification| notification.batch.id == batch.id)
+            .expect("background batch should be returned by the completion poller");
+
+        assert_eq!(
+            notification.batch.service_tier.as_deref(),
+            Some("background")
+        );
+        assert!(notification.batch.completion_window.is_none());
+        assert!(notification.batch.expires_at.is_none());
     }
 
     /// One chunk of the OPERATIONAL BACKFILL — the same SQL run by the
@@ -14253,7 +15527,7 @@ mod tests {
         assert_eq!(retrieved_batch.id, created_batch.id);
         assert_eq!(retrieved_batch.file_id, Some(file_id));
         assert_eq!(retrieved_batch.endpoint, "/v1/chat/completions");
-        assert_eq!(retrieved_batch.completion_window, "24h");
+        assert_eq!(retrieved_batch.completion_window.as_deref(), Some("24h"));
         assert_eq!(
             retrieved_batch.metadata,
             Some(serde_json::json!({"project": "test"}))
@@ -20811,7 +22085,7 @@ mod tests {
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].id, batch_1h.id);
-        assert_eq!(result[0].completion_window, "1h");
+        assert_eq!(result[0].completion_window.as_deref(), Some("1h"));
 
         // Restrict to 24h — should only return the 24h batch
         let result = manager
@@ -20823,7 +22097,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].completion_window, "24h");
+        assert_eq!(result[0].completion_window.as_deref(), Some("24h"));
 
         // Allow both windows — both returned
         let result = manager
@@ -21179,6 +22453,109 @@ mod tests {
         assert_eq!(detail.batch_id, None);
         assert_eq!(detail.created_by, "user-123");
         assert!(detail.body.is_some());
+    }
+
+    #[sqlx::test]
+    async fn background_creation_batchless_persists_pending_request(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+        let request_id = Uuid::new_v4();
+
+        manager
+            .create_background(crate::request::CreateBackgroundInput {
+                request_id,
+                body: r#"{"model":"model-a","input":"hello","service_tier":"flex"}"#.to_string(),
+                model: "model-a".to_string(),
+                endpoint: "http://localhost:3001/ai".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/responses".to_string(),
+                api_key: String::new(),
+                created_by: "user-a".to_string(),
+            })
+            .await
+            .expect("background request should be created");
+
+        let detail = manager
+            .get_request_detail(crate::request::RequestId(request_id))
+            .await
+            .unwrap();
+        assert_eq!(detail.status, "pending");
+        assert_eq!(detail.service_tier.as_deref(), Some("background"));
+        assert_eq!(detail.batch_id, None);
+        assert_eq!(detail.created_by, "user-a");
+        assert!(
+            !detail.body.unwrap().contains("service_tier"),
+            "routing fields must be stripped from the persisted outbound body"
+        );
+    }
+
+    #[sqlx::test]
+    async fn background_creation_is_exposed_by_its_own_batch_filter(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+        let created =
+            create_background_batch_for_test(&manager, "filter-model", "filter-owner").await;
+        let sla = manager
+            .create_batch(BatchInput {
+                file_id: created.file_id.unwrap(),
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: Some("filter-owner".to_string()),
+                api_key_id: None,
+                api_key: None,
+                total_requests: Some(1),
+            })
+            .await
+            .unwrap();
+
+        let background = manager
+            .list_batches(ListBatchesFilter {
+                service_tiers: Some(vec!["background".to_string()]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(background.len(), 1);
+        assert_eq!(background[0].id, created.id);
+        assert_eq!(background[0].service_tier.as_deref(), Some("background"));
+        assert_eq!(background[0].completion_window, None);
+        assert_eq!(background[0].expires_at, None);
+
+        let sla_window = manager
+            .list_batches(ListBatchesFilter {
+                completion_windows: Some(vec!["24h".to_string()]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(sla_window.len(), 1);
+        assert_eq!(sla_window[0].id, sla.id);
+
+        let mixed = manager
+            .list_batches(ListBatchesFilter {
+                completion_windows: Some(vec!["24h".to_string()]),
+                service_tiers: Some(vec!["background".to_string()]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(mixed.len(), 2);
+        assert!(mixed.iter().any(|batch| batch.id == created.id));
+        assert!(mixed.iter().any(|batch| batch.id == sla.id));
+
+        let error = manager
+            .list_batches(ListBatchesFilter {
+                service_tiers: Some(vec!["unknown".to_string()]),
+                ..Default::default()
+            })
+            .await
+            .expect_err("unknown service tiers must be rejected");
+        assert!(matches!(error, FusilladeError::ValidationError(_)));
     }
 
     #[sqlx::test]

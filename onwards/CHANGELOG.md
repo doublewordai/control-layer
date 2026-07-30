@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.37.1](https://github.com/doublewordai/control-layer/compare/onwards-v0.37.0...onwards-v0.37.1) (2026-07-30)
+
+
+### Bug Fixes
+
+* publish onwards without fusillade ([#1385](https://github.com/doublewordai/control-layer/issues/1385)) ([97472b7](https://github.com/doublewordai/control-layer/commit/97472b79a4fa34023e3222936f75bb4acc5116d3))
+
+## [0.37.0](https://github.com/doublewordai/control-layer/compare/onwards-v0.36.0...onwards-v0.37.0) (2026-07-29)
+
+
+### Features
+
+* capped keys part 2 - enforcement and yanking ([#1346](https://github.com/doublewordai/control-layer/issues/1346)) ([c5d8670](https://github.com/doublewordai/control-layer/commit/c5d8670d899e51a38a52256b35229414879e5e0d))
+
+
+### Bug Fixes
+
+* **onwards:** canonicalise reasoning field on strict chat completions ([#1368](https://github.com/doublewordai/control-layer/issues/1368)) ([9a8cd1e](https://github.com/doublewordai/control-layer/commit/9a8cd1e27f0808906394944630d24e7c08ceaa04))
+
 ## [0.36.0](https://github.com/doublewordai/control-layer/compare/onwards-v0.35.6...onwards-v0.36.0) (2026-07-22)
 
 

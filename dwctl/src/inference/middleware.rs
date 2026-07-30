@@ -230,6 +230,21 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
     } else {
         requested_tier
     };
+    // Upstream Background-tier request-contract validation + the daemon-processed
+    // flag (Flex | Background). The multi-step warm-path loop that used to sit here
+    // (has_tools / warm_path_branch / try_warm_path_*) was removed on this branch, so
+    // only the tier validation survives.
+    if let Some(message) = background_contract_error(service_tier, is_responses_api, background) {
+        return Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({"error": {"message": message, "type": "invalid_request_error"}}).to_string(),
+            ))
+            .unwrap();
+    }
+    let is_daemon_processed = matches!(service_tier, ServiceTier::Flex | ServiceTier::Background);
+
     tracing::debug!(
         model = %model,
         service_tier = %service_tier,
@@ -244,10 +259,10 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
     let request_id = uuid::Uuid::new_v4();
     let resp_id = format!("resp_{request_id}");
 
-    // Validate API key for flex requests (realtime is validated by onwards).
-    // Flex requests bypass onwards entirely — the daemon processes them later —
-    // so we must enforce auth here.
-    if matches!(service_tier, ServiceTier::Flex) {
+    // Validate API keys for daemon-processed requests (realtime is validated
+    // by onwards). Queued requests bypass onwards at submission time, so auth
+    // and model access must be enforced here.
+    if is_daemon_processed {
         match api_key.as_deref() {
             None => {
                 return Response::builder()
@@ -272,19 +287,25 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
         }
     }
 
-    // Resolve created_by upfront for background realtime responses (row must
-    // exist before returning 202). Flex uses the key owner's hidden batch key
-    // below, so resolving it there also supplies the attribution target.
-    let created_by = if background && matches!(service_tier, ServiceTier::Realtime) {
-        response_store::lookup_created_by(&state.dwctl_pool, api_key.as_deref()).await
-    } else {
-        None
-    };
-    let flex_batch_key = if matches!(service_tier, ServiceTier::Flex) {
-        match resolve_flex_batch_api_key(&state.dwctl_pool, api_key.as_deref()).await {
-            Ok(Some(key)) => Some(key),
+    if matches!(service_tier, ServiceTier::Background) {
+        match api_key_creator_can_run_background(&state.dwctl_pool, api_key.as_deref()).await {
+            Ok(Some(true)) => {}
+            Ok(Some(false)) => {
+                return Response::builder()
+                    .status(StatusCode::FORBIDDEN)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "error": {
+                                "message": "Background inference requires the BackgroundInferenceUser role for the API key creator.",
+                                "type": "invalid_request_error"
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap();
+            }
             Ok(None) => {
-                tracing::warn!("Flex API key disappeared before hidden batch-key resolution");
                 return Response::builder()
                     .status(StatusCode::FORBIDDEN)
                     .header("content-type", "application/json")
@@ -294,14 +315,48 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                     .unwrap();
             }
             Err(e) => {
-                tracing::error!(error = %e, "Failed to resolve flex hidden batch key");
+                tracing::error!(error = %e, "Failed to resolve background-inference role");
+                return Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"error": {"message": "Failed to authorize background inference", "type": "server_error", "code": 500}}).to_string(),
+                    ))
+                    .unwrap();
+            }
+        }
+    }
+
+    // Resolve created_by upfront for background realtime responses (row must
+    // exist before returning 202). Flex uses the key owner's hidden batch key
+    // below, so resolving it there also supplies the attribution target.
+    let created_by = if background && matches!(service_tier, ServiceTier::Realtime) {
+        response_store::lookup_created_by(&state.dwctl_pool, api_key.as_deref()).await
+    } else {
+        None
+    };
+    let queued_batch_key = if is_daemon_processed {
+        match resolve_flex_batch_api_key(&state.dwctl_pool, api_key.as_deref()).await {
+            Ok(Some(key)) => Some(key),
+            Ok(None) => {
+                tracing::warn!(service_tier = %service_tier, "Queued API key disappeared before hidden batch-key resolution");
+                return Response::builder()
+                    .status(StatusCode::FORBIDDEN)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"error": {"message": "Invalid API key", "type": "invalid_request_error"}}).to_string(),
+                    ))
+                    .unwrap();
+            }
+            Err(e) => {
+                tracing::error!(error = %e, service_tier = %service_tier, "Failed to resolve queued hidden batch key");
                 return Response::builder()
                     .status(StatusCode::INTERNAL_SERVER_ERROR)
                     .header("content-type", "application/json")
                     .body(Body::from(
                         serde_json::json!({
                             "error": {
-                                "message": "Failed to prepare flex request",
+                                "message": "Failed to prepare queued request",
                                 "type": "server_error",
                                 "code": 500,
                             }
@@ -324,7 +379,8 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
     // and its resolution already failed closed (403/500) on lookup errors above,
     // so an unresolved creditor never reaches enforcement. No-op for verified
     // creditors or a disabled cap.
-    if let Some(key) = flex_batch_key.as_ref()
+    if matches!(service_tier, ServiceTier::Flex)
+        && let Some(key) = queued_batch_key.as_ref()
         && let Err(err) = crate::api::handlers::unverified_volume::enforce_unverified_volume_limit(
             &*state.request_manager,
             state.unverified_requests_per_completion_hour,
@@ -366,7 +422,8 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
             };
             handle_realtime(&state, realtime_input, &resp_id, model, background, zdr, parts, body_bytes, next).await
         }
-        ServiceTier::Flex => {
+        ServiceTier::Flex | ServiceTier::Background => {
+            let is_background_tier = matches!(service_tier, ServiceTier::Background);
             // ZDR is decided once here at submit (per-key policy); dispatch and
             // retrieve key off the stored body's sentinel instead of re-checking.
             // The tool-using case is already rejected above, before the warm-path
@@ -406,11 +463,11 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                 match normalize_value_to_tokens(&mut request_value, &state.image_normalizer, access_pool, attribution).await {
                     Ok(n) => {
                         if n > 0 {
-                            tracing::debug!(substituted = n, "flex image normalisation replaced image inputs with tokens");
+                            tracing::debug!(substituted = n, service_tier = %service_tier, "Queued image normalisation replaced image inputs with tokens");
                         }
                     }
                     Err(e) => {
-                        tracing::warn!(error = %e, "flex image normalisation failed");
+                        tracing::warn!(error = %e, service_tier = %service_tier, "Queued image normalisation failed");
                         return normalize_error_response(e);
                     }
                 }
@@ -470,15 +527,29 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                 request_value.to_string()
             };
 
-            let flex_api_key = flex_batch_key
+            let queued_api_key = queued_batch_key
                 .as_ref()
                 .map(|key| key.secret.clone())
                 .unwrap_or_else(|| api_key.clone().unwrap_or_default());
-            let flex_created_by = flex_batch_key
+            let queued_created_by = queued_batch_key
                 .as_ref()
                 .map(|key| key.key_owner_id.to_string())
                 .or_else(|| created_by.clone())
                 .unwrap_or_default();
+            if is_background_tier {
+                let background_input = fusillade::CreateBackgroundInput {
+                    request_id,
+                    body: flex_body,
+                    model: model.to_string(),
+                    endpoint: state.loopback_base_url.clone(),
+                    method: "POST".to_string(),
+                    path: endpoint.clone(),
+                    api_key: queued_api_key,
+                    created_by: queued_created_by,
+                };
+                return handle_background(&state, background_input, &resp_id, model).await;
+            }
+
             // INVARIANT: the daemon dispatches this job back through the loopback
             // (`endpoint` = `.../ai`), so it re-enters the FULL dwctl stack,
             // including the edge translation layer. That is load-bearing for
@@ -496,8 +567,8 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                 endpoint: state.loopback_base_url.clone(),
                 method: "POST".to_string(),
                 path: endpoint.clone(),
-                api_key: flex_api_key,
-                created_by: flex_created_by,
+                api_key: queued_api_key,
+                created_by: queued_created_by,
             };
 
             match (is_chat_completions_api, flex_stream) {
@@ -512,11 +583,14 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
 }
 
 /// Resolved service tier.
+#[derive(Clone, Copy)]
 enum ServiceTier {
     /// Realtime: direct proxy via onwards.
     Realtime,
     /// Flex: batch of 1 with 1h completion window, processed by fusillade daemon.
     Flex,
+    /// Background: no-SLA spare-capacity processing by background workers.
+    Background,
 }
 
 #[derive(Debug, Clone)]
@@ -596,23 +670,74 @@ async fn resolve_flex_batch_api_key(pool: &sqlx::PgPool, api_key: Option<&str>) 
     }))
 }
 
+/// Resolve the background capability from the human who created an API key.
+///
+/// For organization-owned keys, `api_keys.user_id` is the organization while
+/// `api_keys.created_by` is the acting member. Background authorization follows
+/// the latter so an organization role cannot accidentally grant the capability.
+async fn api_key_creator_can_run_background(pool: &sqlx::PgPool, api_key: Option<&str>) -> Result<Option<bool>, DbError> {
+    let Some(api_key) = api_key else {
+        return Ok(None);
+    };
+
+    sqlx::query_scalar(
+        r#"
+        SELECT EXISTS (
+            SELECT 1
+            FROM user_roles ur
+            WHERE ur.user_id = ak.created_by
+              AND ur.role = 'BACKGROUNDINFERENCEUSER'
+        )
+        FROM api_keys ak
+        WHERE ak.secret = $1 AND ak.is_deleted = false
+        LIMIT 1
+        "#,
+    )
+    .bind(api_key)
+    .fetch_optional(pool)
+    .await
+    .map_err(Into::into)
+}
+
 impl std::fmt::Display for ServiceTier {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ServiceTier::Realtime => write!(f, "realtime"),
             ServiceTier::Flex => write!(f, "flex"),
+            ServiceTier::Background => write!(f, "background"),
         }
     }
 }
 
 /// Map the service_tier string to a resolved tier.
-/// Only "flex" gets async processing. Everything else is realtime.
+/// The `flex` and provider-extension `background` values get queued daemon
+/// processing. Everything else is realtime.
 fn resolve_service_tier(tier: Option<&str>) -> ServiceTier {
     match tier {
         Some("flex") => ServiceTier::Flex,
+        Some("background") => ServiceTier::Background,
         // "priority", "default", "auto", None → realtime
         _ => ServiceTier::Realtime,
     }
+}
+
+/// Return a user-actionable validation error when the background tier is used
+/// outside its asynchronous Responses API contract.
+fn background_contract_error(service_tier: ServiceTier, is_responses_api: bool, background: bool) -> Option<&'static str> {
+    if !matches!(service_tier, ServiceTier::Background) {
+        return None;
+    }
+    if !is_responses_api {
+        return Some(
+            "service_tier: \"background\" is only supported by /v1/responses. Submit the request to /v1/responses with background: true, or choose a foreground service_tier.",
+        );
+    }
+    if !background {
+        return Some(
+            "service_tier: \"background\" is asynchronous and requires background: true. Set background: true and poll GET /v1/responses/{id}, or choose a foreground service_tier.",
+        );
+    }
+    None
 }
 
 /// Handle a realtime request (priority/default/auto).
@@ -785,6 +910,48 @@ async fn handle_flex<P: PoolProvider + Clone + Send + Sync + 'static>(
             }
         }
     }
+}
+
+fn background_submission_body(resp_id: &str, model: &str) -> serde_json::Value {
+    serde_json::json!({
+        "id": resp_id,
+        "object": "response",
+        "status": "queued",
+        "model": model,
+        "background": true,
+        "service_tier": "background",
+        "output": [],
+    })
+}
+
+/// Enqueue a no-SLA Responses API request for spare-capacity processing.
+async fn handle_background<P: PoolProvider + Clone + Send + Sync + 'static>(
+    state: &InferenceMiddlewareState<P>,
+    input: fusillade::CreateBackgroundInput,
+    resp_id: &str,
+    model: &str,
+) -> Response {
+    if let Err(e) = fusillade::Storage::create_background(&*state.request_manager, input).await {
+        tracing::error!(error = %e, "Failed to create background row in fusillade");
+        return Response::builder()
+            .status(StatusCode::INTERNAL_SERVER_ERROR)
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "error": {
+                        "message": "Failed to enqueue background request",
+                        "type": "server_error",
+                        "code": 500,
+                    }
+                })
+                .to_string(),
+            ))
+            .unwrap();
+    }
+
+    let response_body = background_submission_body(resp_id, model);
+    tracing::debug!(response_id = %resp_id, "Enqueued background request");
+    (StatusCode::ACCEPTED, Json(response_body)).into_response()
 }
 
 /// Handle a flex `/v1/chat/completions` request.
@@ -1084,6 +1251,47 @@ mod tests {
         assert!(matches!(resolve_service_tier(Some("flex")), ServiceTier::Flex));
     }
 
+    #[test]
+    fn test_resolve_service_tier_background() {
+        assert!(matches!(resolve_service_tier(Some("background")), ServiceTier::Background));
+    }
+
+    #[test]
+    fn background_submission_is_queued_before_the_daemon_claims_it() {
+        let response = background_submission_body("resp_background", "test-model");
+
+        assert_eq!(
+            response,
+            serde_json::json!({
+                "id": "resp_background",
+                "object": "response",
+                "status": "queued",
+                "model": "test-model",
+                "background": true,
+                "service_tier": "background",
+                "output": [],
+            })
+        );
+    }
+
+    #[test]
+    fn background_service_tier_requires_async_responses() {
+        assert_eq!(background_contract_error(ServiceTier::Background, true, true), None);
+
+        let foreground_error =
+            background_contract_error(ServiceTier::Background, true, false).expect("foreground background-tier request must be rejected");
+        assert!(foreground_error.contains("background: true"));
+        assert!(foreground_error.contains("service_tier"));
+
+        let unsupported_endpoint_error = background_contract_error(ServiceTier::Background, false, false)
+            .expect("non-Responses background-tier request must be rejected");
+        assert!(unsupported_endpoint_error.contains("/v1/responses"));
+        assert!(unsupported_endpoint_error.contains("background: true"));
+
+        assert_eq!(background_contract_error(ServiceTier::Flex, true, false), None);
+        assert_eq!(background_contract_error(ServiceTier::Realtime, false, false), None);
+    }
+
     #[sqlx::test]
     async fn resolve_flex_batch_key_uses_hidden_batch_key_for_key_owner(pool: sqlx::PgPool) {
         use crate::api::models::{api_keys::ApiKeyCreate, users::Role};
@@ -1145,5 +1353,101 @@ mod tests {
         assert_eq!(row_created_by, user.id);
         assert_eq!(row_purpose, "batch");
         assert!(row_hidden);
+    }
+
+    #[sqlx::test]
+    async fn background_role_is_resolved_from_organization_key_creator(pool: sqlx::PgPool) {
+        use crate::api::models::{api_keys::ApiKeyCreate, users::Role};
+        use crate::db::{
+            handlers::{Repository, api_keys::ApiKeys},
+            models::api_keys::{ApiKeyCreateDBRequest, ApiKeyPurpose},
+        };
+
+        let creator = crate::test::utils::create_test_user(&pool, Role::BackgroundInferenceUser).await;
+        let org = crate::test::utils::create_test_org(&pool, creator.id).await;
+        let org_key = {
+            let mut conn = pool.acquire().await.expect("acquire connection");
+            ApiKeys::new(&mut conn)
+                .create(&ApiKeyCreateDBRequest::new(
+                    org.id,
+                    creator.id,
+                    ApiKeyCreate {
+                        name: "Org background key".to_string(),
+                        description: None,
+                        purpose: ApiKeyPurpose::Realtime,
+                        requests_per_second: None,
+                        burst_size: None,
+                        member_id: None,
+                        spend_limit: None,
+                        spend_limit_interval: None,
+                    },
+                ))
+                .await
+                .expect("create organization key")
+                .secret
+        };
+
+        assert_eq!(
+            api_key_creator_can_run_background(&pool, Some(&org_key))
+                .await
+                .expect("resolve creator role"),
+            Some(true)
+        );
+
+        let org_has_background_role: bool =
+            sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM user_roles WHERE user_id = $1 AND role = 'BACKGROUNDINFERENCEUSER')")
+                .bind(org.id)
+                .fetch_one(&pool)
+                .await
+                .expect("query organization roles");
+        assert!(
+            !org_has_background_role,
+            "the organization owner row must not provide authorization"
+        );
+    }
+
+    #[sqlx::test]
+    async fn background_role_rejects_api_key_creator_without_capability(pool: sqlx::PgPool) {
+        use crate::api::models::{api_keys::ApiKeyCreate, users::Role};
+        use crate::db::{
+            handlers::{Repository, api_keys::ApiKeys},
+            models::api_keys::{ApiKeyCreateDBRequest, ApiKeyPurpose},
+        };
+
+        let creator = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+        let key = {
+            let mut conn = pool.acquire().await.expect("acquire connection");
+            ApiKeys::new(&mut conn)
+                .create(&ApiKeyCreateDBRequest::new(
+                    creator.id,
+                    creator.id,
+                    ApiKeyCreate {
+                        name: "Foreground-only key".to_string(),
+                        description: None,
+                        purpose: ApiKeyPurpose::Realtime,
+                        requests_per_second: None,
+                        burst_size: None,
+                        member_id: None,
+                        spend_limit: None,
+                        spend_limit_interval: None,
+                    },
+                ))
+                .await
+                .expect("create key")
+                .secret
+        };
+
+        assert_eq!(
+            api_key_creator_can_run_background(&pool, Some(&key))
+                .await
+                .expect("resolve creator role"),
+            Some(false)
+        );
+        assert_eq!(
+            api_key_creator_can_run_background(&pool, Some("unknown-key"))
+                .await
+                .expect("resolve unknown key"),
+            None
+        );
     }
 }

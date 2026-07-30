@@ -190,9 +190,10 @@ auth:
   #   - RequestViewer: Read-only access to request logs and analytics
   #   - BillingManager: Full access to credit system and user billing
   #   - BatchAPIUser: Can manage files and batches for batch processing
+  #   - BackgroundInferenceUser: Can submit spare-capacity background inference
   # Example: To give all new users request viewing capabilities:
   #   default_user_roles: ["StandardUser", "RequestViewer"]
-  default_user_roles: ["StandardUser", "BatchAPIUser"]
+  default_user_roles: ["StandardUser", "BatchAPIUser", "BackgroundInferenceUser"]
 
   # Security settings
   security:
@@ -321,7 +322,7 @@ batches:
 
   # Optional realtime priority decay window for queue monitoring (seconds).
   # When set, completed FLEX requests within this lookback are included in
-  # the 1h pending-request-counts bucket. Omit or set null to disable.
+  # the 1h demand bucket. Omit or set null to disable.
   priority_decay_window_secs: 600
   pending_capacity_counts_enabled: false # Include committed pending requests in batch submission capacity checks (default: false)
 
@@ -543,6 +544,10 @@ background_services:
     #                                 # false treats no-event models (external providers) as live
     # claim_ramp_exponent: 0.56      # Deadline-ramp curve: not-live batches become claimable within
     #                                 # window_minutes^exponent minutes of deadline (~59m/24h, ~10m/1h)
+    # background_concurrency_limit: 0 # Per-model foreground in-flight threshold below which
+    #                                 # background workers may send; background work does not
+    #                                 # consume it. 0 disables processing, and a nonzero value requires
+    #                                 # inject_deadline_priority: true below
 
     # Retry & Backoff Settings
     # All retry parameters are optional and default to fusillade's built-in defaults

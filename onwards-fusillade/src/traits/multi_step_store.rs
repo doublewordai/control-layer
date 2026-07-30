@@ -29,7 +29,7 @@ use async_trait::async_trait;
 use fusillade::RequestId;
 use std::fmt;
 
-use super::response_store::StoreError;
+use onwards::StoreError;
 
 /// Discrete kinds of work a response step can represent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

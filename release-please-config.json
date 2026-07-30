@@ -15,6 +15,20 @@
         }
       ]
     },
+    "fusillade-arsenal": {
+      "component": "fusillade-arsenal",
+      "package-name": "fusillade-arsenal",
+      "release-type": "rust",
+      "changelog-path": "CHANGELOG.md",
+      "include-component-in-tag": true
+    },
+    "fusillade-core": {
+      "component": "fusillade-core",
+      "package-name": "fusillade-core",
+      "release-type": "rust",
+      "changelog-path": "CHANGELOG.md",
+      "include-component-in-tag": true
+    },
     "onwards": {
       "component": "onwards",
       "package-name": "onwards",

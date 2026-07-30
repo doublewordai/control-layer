@@ -1,6 +1,6 @@
 [package]
 name = "onwards"
-version = "0.36.0"
+version = "0.37.1"
 edition = "2024"
 rust-version = "1.88.0"
 description = "A flexible LLM proxy library"
@@ -10,16 +10,6 @@ homepage = "https://github.com/doublewordai/control-layer"
 documentation = "https://docs.rs/onwards"
 keywords = ["llm", "proxy", "ai", "openai", "anthropic"]
 categories = ["web-programming", "api-bindings"]
-
-[features]
-default = []
-# Enables the multi-step Open Responses orchestration loop, the
-# `MultiStepStore` trait, and the `streaming` event-sink machinery.
-# Pulls in `fusillade` for `HttpClient` / `RequestData` / `StreamEvent`
-# so per-step HTTP fires get fusillade's row-id header stamping +
-# reassembly machinery for free. Off by default — the simple
-# `/ai/v1/*` proxy path doesn't need any of it.
-multi-step = ["dep:fusillade"]
 
 [dependencies]
 anyhow = { version = "1.0.98", features = ["backtrace"] }
@@ -70,8 +60,6 @@ metrics = "0.24"
 governor = "0.10.1"
 rand = "0.9"
 uuid = { version = "1", features = ["v4"] }
-fusillade = { version = "24.0.0", path = "../fusillade", optional = true, default-features = false }
-
 [dev-dependencies]
 axum-test = "18.0.0"
 futures-util = "0.3"

@@ -12,6 +12,7 @@ import { dwImgLinkRenderer } from "../../ui/dw-img-linkify";
 import { copyToClipboard } from "../../../utils";
 import { formatTimestamp } from "../../../utils";
 import { extractErrorMessage } from "./errorMessage";
+import { getServiceTierLabel } from "../../../utils/serviceTier";
 
 
 const getStatusColor = (status: string): string => {
@@ -313,6 +314,12 @@ export function AsyncRequestDetail() {
                   <p className="text-sm text-gray-600 mb-1">Model</p>
                   <p className="font-medium text-sm">{request.model}</p>
                 </div>
+                <div>
+                  <p className="text-sm text-gray-600 mb-1">Service tier</p>
+                  <p className="font-medium text-sm">
+                    {getServiceTierLabel(request.service_tier)}
+                  </p>
+                </div>
                 {request.created_by_email && (
                   <div>
                     <p className="text-sm text-gray-600 mb-1">Created by</p>
@@ -321,14 +328,16 @@ export function AsyncRequestDetail() {
                     </p>
                   </div>
                 )}
-                <div className="border-t border-doubleword-border-light pt-4">
-                  <Link
-                    to={`/batches/${request.batch_id}`}
-                    className="text-sm text-doubleword-neutral-600 hover:text-doubleword-neutral-900 hover:underline"
-                  >
-                    View related batch →
-                  </Link>
-                </div>
+                {request.batch_id && (
+                  <div className="border-t border-doubleword-border-light pt-4">
+                    <Link
+                      to={`/batches/${request.batch_id}`}
+                      className="text-sm text-doubleword-neutral-600 hover:text-doubleword-neutral-900 hover:underline"
+                    >
+                      View related batch →
+                    </Link>
+                  </div>
+                )}
               </div>
             </CardContent>
           </Card>

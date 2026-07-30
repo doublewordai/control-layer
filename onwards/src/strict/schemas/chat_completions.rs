@@ -256,6 +256,39 @@ pub struct ChatMessage {
     pub extra: Option<serde_json::Value>,
 }
 
+/// Collapse OpenRouter's `reasoning` spelling onto the vLLM / DeepSeek
+/// `reasoning_content` field.
+///
+/// A model alias can be served by several upstreams that disagree on the field
+/// name (vLLM emits `reasoning_content`, OpenRouter emits `reasoning`), so
+/// without this a caller sees the field move depending on which upstream
+/// happened to serve the request. `reasoning_content` is canonical because it is
+/// what the great majority of our fleet already emits.
+///
+/// `reasoning_details` is deliberately left alone: it carries structured data
+/// with no equivalent in the flat field, so it is additive rather than a
+/// competing spelling.
+fn collapse_reasoning_fields(
+    reasoning: &mut Option<String>,
+    reasoning_content: &mut Option<String>,
+) {
+    // `reasoning` is always cleared, whether or not its text is needed: it is
+    // the spelling we are collapsing away, so it must never reach the caller.
+    let taken = reasoning.take();
+
+    if reasoning_content.is_none() {
+        *reasoning_content = taken;
+    }
+}
+
+impl ChatMessage {
+    /// Canonicalise the reasoning spelling on a non-streaming message.
+    /// See [`collapse_reasoning_fields`].
+    pub fn canonicalise_reasoning(&mut self) {
+        collapse_reasoning_fields(&mut self.reasoning, &mut self.reasoning_content);
+    }
+}
+
 /// Message content - either a string or array of content parts
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -444,6 +477,14 @@ pub struct ChunkDelta {
     /// Reasoning details array (OpenRouter format)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_details: Option<Vec<serde_json::Value>>,
+}
+
+impl ChunkDelta {
+    /// Canonicalise the reasoning spelling on a streaming delta.
+    /// See [`collapse_reasoning_fields`].
+    pub fn canonicalise_reasoning(&mut self) {
+        collapse_reasoning_fields(&mut self.reasoning, &mut self.reasoning_content);
+    }
 }
 
 /// Tool call in a streaming chunk
@@ -658,6 +699,134 @@ mod tests {
         let serialized = serde_json::to_string(&chunk).unwrap();
         assert!(serialized.contains("reasoning_content"));
         assert!(!serialized.contains("\"reasoning\""));
+    }
+
+    #[test]
+    fn canonicalise_moves_openrouter_reasoning_onto_reasoning_content() {
+        let mut msg = ChatMessage {
+            role: "assistant".to_string(),
+            content: None,
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning: Some("thinking...".to_string()),
+            reasoning_content: None,
+            reasoning_details: None,
+            extra: None,
+        };
+
+        msg.canonicalise_reasoning();
+
+        assert_eq!(msg.reasoning_content.as_deref(), Some("thinking..."));
+        assert!(
+            msg.reasoning.is_none(),
+            "the OpenRouter spelling should not survive canonicalisation"
+        );
+    }
+
+    #[test]
+    fn canonicalise_leaves_vllm_reasoning_content_untouched() {
+        let mut msg = ChatMessage {
+            role: "assistant".to_string(),
+            content: None,
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning: None,
+            reasoning_content: Some("let me reason...".to_string()),
+            reasoning_details: None,
+            extra: None,
+        };
+
+        msg.canonicalise_reasoning();
+
+        assert_eq!(msg.reasoning_content.as_deref(), Some("let me reason..."));
+        assert!(msg.reasoning.is_none());
+    }
+
+    #[test]
+    fn canonicalise_prefers_reasoning_content_when_both_present() {
+        let mut msg = ChatMessage {
+            role: "assistant".to_string(),
+            content: None,
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning: Some("openrouter copy".to_string()),
+            reasoning_content: Some("vllm copy".to_string()),
+            reasoning_details: None,
+            extra: None,
+        };
+
+        msg.canonicalise_reasoning();
+
+        assert_eq!(msg.reasoning_content.as_deref(), Some("vllm copy"));
+        assert!(msg.reasoning.is_none());
+    }
+
+    #[test]
+    fn canonicalise_preserves_reasoning_details() {
+        let mut msg = ChatMessage {
+            role: "assistant".to_string(),
+            content: None,
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning: Some("thinking...".to_string()),
+            reasoning_content: None,
+            reasoning_details: Some(vec![serde_json::json!({"type": "text", "text": "step 1"})]),
+            extra: None,
+        };
+
+        msg.canonicalise_reasoning();
+
+        assert_eq!(msg.reasoning_content.as_deref(), Some("thinking..."));
+        assert!(
+            msg.reasoning_details.is_some(),
+            "structured details carry data the flat field cannot represent"
+        );
+    }
+
+    #[test]
+    fn canonicalise_on_delta_matches_message_behaviour() {
+        let mut delta = ChunkDelta {
+            role: None,
+            content: None,
+            tool_calls: None,
+            reasoning: Some("streaming fragment".to_string()),
+            reasoning_content: None,
+            reasoning_details: None,
+        };
+
+        delta.canonicalise_reasoning();
+
+        assert_eq!(
+            delta.reasoning_content.as_deref(),
+            Some("streaming fragment")
+        );
+        assert!(delta.reasoning.is_none());
+
+        let serialized = serde_json::to_string(&delta).unwrap();
+        assert!(serialized.contains("reasoning_content"));
+        assert!(!serialized.contains("\"reasoning\""));
+    }
+
+    #[test]
+    fn canonicalise_is_a_noop_without_reasoning() {
+        let mut delta = ChunkDelta {
+            role: None,
+            content: Some("hello".to_string()),
+            tool_calls: None,
+            reasoning: None,
+            reasoning_content: None,
+            reasoning_details: None,
+        };
+
+        delta.canonicalise_reasoning();
+
+        assert!(delta.reasoning.is_none());
+        assert!(delta.reasoning_content.is_none());
+        assert_eq!(delta.content.as_deref(), Some("hello"));
     }
 
     #[test]

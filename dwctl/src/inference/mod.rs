@@ -13,8 +13,9 @@
 //! - **handler**: `GET /ai/v1/responses/{id}` HTTP handler.
 //! - **image_normalizer_middleware**: body-rewriting image normalisation shared
 //!   by the chat-completions and responses surfaces.
-//! - **outbound_request**: last-mile request-body prep before onwards (id-scrub +
-//!   streaming usage flags), so onwards forwards the body untouched.
+//! - **outbound_request**: last-mile streaming usage-flag injection
+//!   (`stream_options` / `x-fusillade-stream`) before onwards. The id-scrub lives
+//!   in this module's own request parse (`scrub_request_id_fields`), not here.
 //! - **tools**: server-side tool resolution (injection) and execution (executor).
 //! - **engine**: the multi-step Open Responses orchestration loop and the
 //!   daemon-side request processor.
