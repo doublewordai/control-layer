@@ -46,28 +46,13 @@
 
 use crate::config::Config;
 use crate::metrics::errors::component::ANALYTICS;
-use crate::request_logging::AiResponse;
 use crate::request_logging::batcher::{AnalyticsSender, RawAnalyticsRecord};
+use crate::request_logging::models::AiResponse;
 use crate::request_logging::serializers::{Auth, UsageMetrics, parse_ai_response};
 use crate::request_logging::utils::{extract_header_as_string, extract_header_as_uuid};
-use axum::http::Uri;
 use outlet::{RequestData, RequestHandler, ResponseData};
-use serde_json::Value;
 use tracing::{Instrument, info_span};
 use uuid::Uuid;
-
-/// ZDR-safe descriptor for a payload (de)serialization error.
-///
-/// Logs only the underlying JSON error's location and category, never its
-/// `Display` message — serde messages can echo a fragment of the request or
-/// response body (e.g. `invalid type: string "<content>"`), which must never
-/// reach logs.
-fn zdr_safe_parse_error(err: &(dyn std::error::Error + Send + Sync + 'static)) -> String {
-    match err.downcast_ref::<serde_json::Error>() {
-        Some(e) => format!("json parse error ({:?}) at line {} column {}", e.classify(), e.line(), e.column()),
-        None => "parse error".to_string(),
-    }
-}
 
 /// A request handler that sends analytics data to a background batcher.
 ///
@@ -99,15 +84,6 @@ impl AnalyticsHandler {
             sender,
             instance_id,
             config,
-        }
-    }
-
-    fn usage_required_endpoint(uri: &Uri) -> Option<&'static str> {
-        match uri.path() {
-            path if path.ends_with("/v1/chat/completions") || path.ends_with("/chat/completions") => Some("/v1/chat/completions"),
-            path if path.ends_with("/v1/completions") || path.ends_with("/completions") => Some("/v1/completions"),
-            path if path.ends_with("/v1/responses") || path.ends_with("/responses") => Some("/v1/responses"),
-            _ => None,
         }
     }
 
@@ -144,54 +120,46 @@ impl RequestHandler for AnalyticsHandler {
         );
 
         async {
-            let usage_required_endpoint = Self::usage_required_endpoint(&request_data.uri);
             let fusillade_stream = Self::is_fusillade_stream(&request_data);
 
-            // Try to parse the response - may fail for error responses (4xx, 5xx)
-            let parse_result = parse_ai_response(&request_data, &response_data);
+            // Whether this is a token-bearing generative endpoint. Gates the
+            // parse / zero-token alarms only, so non-generative routes (e.g.
+            // /models) never trip them.
+            let usage_bearing = is_usage_bearing_path(request_data.uri.path());
 
-            // Use parsed response for metrics, or fallback to Other for error responses
-            let metrics_response = match &parse_result {
-                Ok(response) => response.clone(),
-                Err(e) => {
-                    if response_data.status.is_success() {
-                        tracing::warn!(
-                            correlation_id = correlation_id,
-                            uri = %request_data.uri,
-                            error = %zdr_safe_parse_error(e.error.as_ref()),
-                            "Failed to parse successful AI response — tokens will be zero"
-                        );
-                        if let Some(endpoint) = usage_required_endpoint {
-                            crate::background_error!(
-                                ANALYTICS, "parse_error", Error,
-                                correlation_id = correlation_id,
-                                uri = %request_data.uri,
-                                endpoint,
-                                fusillade_stream,
-                                error = %zdr_safe_parse_error(e.error.as_ref()),
-                                "Failed to parse usage from a successful generative response"
-                            );
-                        }
-                    }
-                    AiResponse::Other(Value::Null)
-                }
-            };
+            // Single parse: the response body -> AiResponse (the same value the
+            // request-logging handler stores). Billing derives from it below via
+            // UsageMetrics::extract -> TokenMetrics::from.
+            let parsed = parse_ai_response(&request_data, &response_data);
 
-            // Extract basic metrics - captures status_code, duration, model from request, etc.
-            let metrics = UsageMetrics::extract(self.instance_id, &request_data, &response_data, &metrics_response, &self.config);
+            // A usage-bearing endpoint whose successful response we could not even
+            // parse records zero tokens - surface it (mirrors the old parse failure
+            // alarm), unless the response itself was an error.
+            if usage_bearing && parsed.is_err() && response_data.status.is_success() {
+                crate::background_error!(
+                    ANALYTICS, "parse_error", Error,
+                    correlation_id = correlation_id,
+                    uri = %request_data.uri,
+                    fusillade_stream,
+                    "Failed to parse a successful generative response"
+                );
+            }
+
+            // A parse failure (base64 fallback) bills zero, exactly as the old
+            // no-usage path did; keep going so the row (status, duration) still lands.
+            let parsed = parsed.unwrap_or(AiResponse::Other(serde_json::Value::Null));
+
+            // Extract basic metrics - captures status_code, duration, model from request, tokens, etc.
+            let metrics = UsageMetrics::extract(self.instance_id, &request_data, &response_data, &parsed, &self.config);
 
             // Gate on the (possibly reclassified) status from metrics, not the raw upstream
             // status — streams that opened 200 but ended with an embedded error frame have
-            // already been rewritten to 502 by UsageMetrics::extract and shouldn't trip this.
-            if (200..300).contains(&metrics.status_code)
-                && metrics.total_tokens == 0
-                && let Some(endpoint) = usage_required_endpoint
-            {
+            // already been rewritten to 500 by UsageMetrics::extract and shouldn't trip this.
+            if (200..300).contains(&metrics.status_code) && metrics.total_tokens == 0 && usage_bearing {
                 crate::background_error!(
                     ANALYTICS, "missing_usage", Error,
                     correlation_id = correlation_id,
                     uri = %request_data.uri,
-                    endpoint,
                     response_type = %metrics.response_type,
                     fusillade_stream,
                     request_model = ?metrics.request_model,
@@ -271,6 +239,18 @@ impl RequestHandler for AnalyticsHandler {
     }
 }
 
+/// Whether a path is a token-bearing generative endpoint (the routes billing reads
+/// usage from). Used only to gate the parse / zero-token alarms so non-generative
+/// routes (e.g. `/models`) never trip them. `/chat/completions` also ends with
+/// `/completions`, which is fine - both are usage-bearing.
+fn is_usage_bearing_path(path: &str) -> bool {
+    path.ends_with("/chat/completions")
+        || path.ends_with("/completions")
+        || path.ends_with("/embeddings")
+        || path.ends_with("/responses")
+        || path.ends_with("/messages")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -278,25 +258,6 @@ mod tests {
     use std::collections::HashMap;
     use std::time::{Duration, SystemTime};
     use tokio::sync::mpsc;
-
-    /// ZDR: the serialization-error descriptor used in the parse-failure
-    /// logs must report only the JSON error's location/category, never a fragment
-    /// of the offending body that serde's `Display` can echo.
-    #[test]
-    fn zdr_safe_parse_error_omits_body_fragment() {
-        const SENTINEL: &str = "ZDR-SENTINEL-BODY-FRAGMENT-8d2c";
-        // A type mismatch makes serde's Display echo the offending value
-        // (`invalid type: string "<content>"`), which is exactly what we must drop.
-        let err: serde_json::Error =
-            serde_json::from_str::<std::collections::HashMap<String, u32>>(&format!("{{\"k\": \"{SENTINEL}\"}}")).unwrap_err();
-        // Sanity: the raw serde message really does contain the sentinel.
-        assert!(err.to_string().contains(SENTINEL));
-
-        let boxed: Box<dyn std::error::Error + Send + Sync> = Box::new(err);
-        let safe = zdr_safe_parse_error(boxed.as_ref());
-        assert!(!safe.contains(SENTINEL), "body fragment leaked: {safe}");
-        assert!(safe.contains("line") && safe.contains("column"), "expected location: {safe}");
-    }
 
     fn create_test_request_data() -> RequestData {
         RequestData {
@@ -346,35 +307,6 @@ mod tests {
         let data = create_test_response_data();
         assert_eq!(data.correlation_id, 123);
         assert_eq!(data.status, StatusCode::OK);
-    }
-
-    #[test]
-    fn test_usage_required_endpoint_matches_proxied_and_v1_paths() {
-        assert_eq!(
-            AnalyticsHandler::usage_required_endpoint(&Uri::from_static("/v1/chat/completions")),
-            Some("/v1/chat/completions")
-        );
-        assert_eq!(
-            AnalyticsHandler::usage_required_endpoint(&Uri::from_static("/chat/completions")),
-            Some("/v1/chat/completions")
-        );
-        assert_eq!(
-            AnalyticsHandler::usage_required_endpoint(&Uri::from_static("/v1/completions")),
-            Some("/v1/completions")
-        );
-        assert_eq!(
-            AnalyticsHandler::usage_required_endpoint(&Uri::from_static("/completions")),
-            Some("/v1/completions")
-        );
-        assert_eq!(
-            AnalyticsHandler::usage_required_endpoint(&Uri::from_static("/v1/responses")),
-            Some("/v1/responses")
-        );
-        assert_eq!(
-            AnalyticsHandler::usage_required_endpoint(&Uri::from_static("/responses")),
-            Some("/v1/responses")
-        );
-        assert_eq!(AnalyticsHandler::usage_required_endpoint(&Uri::from_static("/embeddings")), None);
     }
 
     #[tokio::test]

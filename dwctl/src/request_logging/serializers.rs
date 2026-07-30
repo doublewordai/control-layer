@@ -41,7 +41,6 @@
 
 use crate::config::Config;
 use crate::request_logging::models::{AiRequest, AiResponse, ChatCompletionChunk, CompletionChunk, ParsedAIRequest, ResponsesRequest};
-use async_openai::types::responses::ResponseStreamEvent;
 use outlet::{RequestData, ResponseData};
 use outlet_postgres::SerializationError;
 use serde_json::Value;
@@ -285,32 +284,54 @@ pub fn parse_ai_response(request_data: &RequestData, response_data: &ResponseDat
         .and_then(|bytes| std::str::from_utf8(bytes).ok())
         == Some("true");
 
-    // Parse response based on request type
-    let result = match parse_ai_request(request_data) {
-        Ok(parsed_request) => {
-            // /v1/responses has its own SSE event format distinct from chat completions.
-            if let Some(responses_req) = &parsed_request.responses_request {
-                if responses_req.stream.unwrap_or(false) || fusillade_stream {
-                    utils::parse_responses_streaming_response(&body_str)
+    // /v1/messages (Anthropic) has its own SSE event lifecycle and a distinct
+    // blocking shape, both produced by dwctl's edge translator. Detect it by path
+    // (like /responses) - stream is signalled by the request body's `stream` flag
+    // or the fusillade header.
+    let result = if request_data.uri.path().ends_with("/messages") {
+        let anthropic_stream = request_data
+            .body
+            .as_ref()
+            .and_then(|b| serde_json::from_slice::<Value>(b).ok())
+            .and_then(|v| v.get("stream").and_then(Value::as_bool))
+            .unwrap_or(false)
+            || fusillade_stream;
+        if anthropic_stream {
+            utils::parse_anthropic_streaming_response(&body_str)
+        } else {
+            // Typed MessagesResponse first; fall back to the generic untagged parser so
+            // error bodies (4xx/5xx JSON) are captured as AiResponse::Other rather than
+            // a base64 SerializationError.
+            utils::parse_anthropic_non_streaming_response(&body_str).or_else(|_| utils::parse_non_streaming_response(&body_str))
+        }
+    } else {
+        // Parse response based on request type
+        match parse_ai_request(request_data) {
+            Ok(parsed_request) => {
+                // /v1/responses has its own SSE event format distinct from chat completions.
+                if let Some(responses_req) = &parsed_request.responses_request {
+                    if responses_req.stream.unwrap_or(false) || fusillade_stream {
+                        utils::parse_responses_streaming_response(&body_str)
+                    } else {
+                        // Try the typed Response parser first. Fall back to the generic untagged
+                        // parser so that error bodies (4xx/5xx JSON) are captured as
+                        // AiResponse::Other rather than becoming a base64 SerializationError.
+                        utils::parse_responses_non_streaming_response(&body_str).or_else(|_| utils::parse_non_streaming_response(&body_str))
+                    }
                 } else {
-                    // Try the typed Response parser first. Fall back to the generic untagged
-                    // parser so that error bodies (4xx/5xx JSON) are captured as
-                    // AiResponse::Other rather than becoming a base64 SerializationError.
-                    utils::parse_responses_non_streaming_response(&body_str).or_else(|_| utils::parse_non_streaming_response(&body_str))
-                }
-            } else {
-                match parsed_request.request {
-                    AiRequest::ChatCompletions(chat_req) if chat_req.stream.unwrap_or(false) || fusillade_stream => {
-                        utils::parse_streaming_response(&body_str)
+                    match parsed_request.request {
+                        AiRequest::ChatCompletions(chat_req) if chat_req.stream.unwrap_or(false) || fusillade_stream => {
+                            utils::parse_streaming_response(&body_str)
+                        }
+                        AiRequest::Completions(completion_req) if completion_req.stream.unwrap_or(false) || fusillade_stream => {
+                            utils::parse_completions_streaming_response(&body_str)
+                        }
+                        _ => utils::parse_non_streaming_response(&body_str),
                     }
-                    AiRequest::Completions(completion_req) if completion_req.stream.unwrap_or(false) || fusillade_stream => {
-                        utils::parse_completions_streaming_response(&body_str)
-                    }
-                    _ => utils::parse_non_streaming_response(&body_str),
                 }
             }
+            _ => utils::parse_non_streaming_response(&body_str),
         }
-        _ => utils::parse_non_streaming_response(&body_str),
     };
 
     result.map_err(|_| SerializationError {
@@ -373,8 +394,9 @@ impl UsageMetrics {
             _ => None,
         };
 
-        // Extract token metrics and response model from response
-        let response_metrics = TokenMetrics::from(parsed_response);
+        // Token metrics come from the single parse of the response into `AiResponse`
+        // (the same value request logging stores), normalised to one currency here.
+        let metrics = TokenMetrics::from(parsed_response);
 
         // The cache split lives in extension fields the typed parse drops, so read it from
         // the raw `usage` object. It only exists on a successful response that carried a
@@ -387,12 +409,7 @@ impl UsageMetrics {
         // 500 matches what fusillade reclassifies these to in its HTTP layer, so the two views
         // (analytics row, fusillade request state) agree on a number for the same logical event.
         let upstream_status = response_data.status.as_u16() as i32;
-        let stream_errored = match parsed_response {
-            AiResponse::ChatCompletionsStream(chunks) => chunks.iter().any(|c| matches!(c, ChatCompletionChunk::Error(_))),
-            AiResponse::CompletionsStream(chunks) => chunks.iter().any(|c| matches!(c, CompletionChunk::Error(_))),
-            _ => false,
-        };
-        let status_code = if upstream_status < 400 && stream_errored {
+        let status_code = if upstream_status < 400 && ai_response_stream_errored(parsed_response) {
             500
         } else {
             upstream_status
@@ -405,23 +422,36 @@ impl UsageMetrics {
             method: request_data.method.to_string(),
             uri: request_data.uri.to_string(),
             request_model,
-            response_model: response_metrics.response_model,
+            response_model: metrics.response_model,
             status_code,
             duration_ms: response_data.duration.as_millis() as i64,
             duration_to_first_byte_ms: Some(response_data.duration_to_first_byte.as_millis() as i64),
-            prompt_tokens: response_metrics.prompt_tokens,
-            completion_tokens: response_metrics.completion_tokens,
-            reasoning_tokens: response_metrics.reasoning_tokens,
-            total_tokens: response_metrics.total_tokens,
+            prompt_tokens: metrics.prompt_tokens,
+            completion_tokens: metrics.completion_tokens,
+            reasoning_tokens: metrics.reasoning_tokens,
+            total_tokens: metrics.total_tokens,
             cache_read_input_tokens: cache_tokens.read,
             cache_creation_5m_input_tokens: cache_tokens.creation_5m,
             cache_creation_1h_input_tokens: cache_tokens.creation_1h,
             cache_creation_24h_input_tokens: cache_tokens.creation_24h,
-            response_type: response_metrics.response_type,
+            response_type: metrics.response_type,
             server_address: config.host.clone(),
             server_port: config.port,
             served_by: response_data.extensions.get::<onwards::ServedBy>().map(|s| s.url.clone()),
         }
+    }
+}
+
+/// Whether a streamed response opened 2xx but ended with an embedded error frame.
+/// [`UsageMetrics::extract`] reclassifies these to 500, matching how fusillade's
+/// HTTP layer scores the same event. Blocking responses are never stream-errored.
+fn ai_response_stream_errored(response: &AiResponse) -> bool {
+    match response {
+        AiResponse::ChatCompletionsStream(chunks) => chunks.iter().any(|c| matches!(c, ChatCompletionChunk::Error(_))),
+        AiResponse::CompletionsStream(chunks) => chunks.iter().any(|c| matches!(c, CompletionChunk::Error(_))),
+        AiResponse::AnthropicStream(events) => events.iter().any(|e| e.get("type").and_then(|v| v.as_str()) == Some("error")),
+        AiResponse::ResponsesStream(events) => events.iter().any(|e| matches!(e.event_type.as_str(), "response.failed" | "error")),
+        _ => false,
     }
 }
 
@@ -564,8 +594,40 @@ fn extract_completion_reasoning_tokens(usage: &async_openai::types::chat::Comple
         .unwrap_or(0)
 }
 
-fn extract_response_reasoning_tokens(usage: &async_openai::types::responses::ResponseUsage) -> i64 {
-    usage.output_tokens_details.reasoning_tokens as i64
+/// Build [`TokenMetrics`] from a /v1/responses `usage` object (dwctl's own
+/// [`ResponseUsage`]), shared by the blocking and streaming arms. Falls back to
+/// `input + output` when the provider reported a zero/absent `total_tokens`.
+fn token_metrics_from_responses_usage(
+    usage: Option<&crate::inference::translation::responses::types::ResponseUsage>,
+    response_model: Option<String>,
+    response_type: &str,
+) -> TokenMetrics {
+    match usage {
+        Some(usage) => {
+            let prompt_tokens = usage.input_tokens as i64;
+            let completion_tokens = usage.output_tokens as i64;
+            TokenMetrics {
+                prompt_tokens,
+                completion_tokens,
+                reasoning_tokens: usage.output_tokens_details.reasoning_tokens as i64,
+                total_tokens: if usage.total_tokens == 0 {
+                    prompt_tokens + completion_tokens
+                } else {
+                    usage.total_tokens as i64
+                },
+                response_type: response_type.to_string(),
+                response_model,
+            }
+        }
+        None => TokenMetrics {
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            reasoning_tokens: 0,
+            total_tokens: 0,
+            response_type: response_type.to_string(),
+            response_model,
+        },
+    }
 }
 
 impl From<&AiResponse> for TokenMetrics {
@@ -723,56 +785,67 @@ impl From<&AiResponse> for TokenMetrics {
                 }
             }
             AiResponse::Responses(response) => {
-                if let Some(usage) = &response.usage {
-                    Self {
-                        prompt_tokens: usage.input_tokens as i64,
-                        completion_tokens: usage.output_tokens as i64,
-                        reasoning_tokens: extract_response_reasoning_tokens(usage),
-                        total_tokens: usage.total_tokens as i64,
-                        response_type: "response".to_string(),
-                        response_model: Some(response.model.clone()),
-                    }
-                } else {
-                    Self {
-                        prompt_tokens: 0,
-                        completion_tokens: 0,
-                        reasoning_tokens: 0,
-                        total_tokens: 0,
-                        response_type: "response".to_string(),
-                        response_model: Some(response.model.clone()),
-                    }
-                }
+                token_metrics_from_responses_usage(response.usage.as_ref(), Some(response.model.clone()), "response")
             }
             AiResponse::ResponsesStream(events) => {
-                // Usage is reported in the response.completed event.
-                let completed = events.iter().find_map(|e| {
-                    if let ResponseStreamEvent::ResponseCompleted(ev) = e {
-                        Some(&ev.response)
-                    } else {
-                        None
+                // Usage is reported in the terminal response snapshot (response.completed).
+                let snapshot = events.iter().rev().find_map(|e| e.response.as_ref().filter(|r| r.usage.is_some()));
+                let model = events.iter().rev().find_map(|e| e.response.as_ref().map(|r| r.model.clone()));
+                token_metrics_from_responses_usage(snapshot.and_then(|r| r.usage.as_ref()), model, "response_stream")
+            }
+            AiResponse::Anthropic(response) => {
+                // Anthropic reports no `total_tokens` (sum the two) and folds any thinking
+                // tokens into `output_tokens`, so there is no separate reasoning count.
+                let prompt_tokens = response.usage.input_tokens as i64;
+                let completion_tokens = response.usage.output_tokens as i64;
+                Self {
+                    prompt_tokens,
+                    completion_tokens,
+                    reasoning_tokens: 0,
+                    total_tokens: prompt_tokens + completion_tokens,
+                    response_type: "anthropic_message".to_string(),
+                    response_model: Some(response.model.clone()),
+                }
+            }
+            AiResponse::AnthropicStream(events) => {
+                // Anthropic splits usage across the stream: `message_start` carries the
+                // model and input tokens; the reframer also puts both input and output on
+                // `message_delta` (non-standard, see the streaming module), so prefer it.
+                let mut input = 0i64;
+                let mut output = 0i64;
+                let mut model = None;
+                for event in events {
+                    match event.get("type").and_then(|v| v.as_str()).unwrap_or_default() {
+                        "message_start" => {
+                            if let Some(m) = event.pointer("/message/model").and_then(|v| v.as_str()) {
+                                model = Some(m.to_string());
+                            }
+                            if let Some(i) = event
+                                .pointer("/message/usage/input_tokens")
+                                .and_then(Value::as_i64)
+                                .filter(|i| *i > 0)
+                            {
+                                input = i;
+                            }
+                        }
+                        "message_delta" => {
+                            if let Some(usage) = event.get("usage").filter(|u| !u.is_null()) {
+                                if let Some(i) = usage.get("input_tokens").and_then(Value::as_i64).filter(|i| *i > 0) {
+                                    input = i;
+                                }
+                                output = usage.get("output_tokens").and_then(Value::as_i64).unwrap_or(output);
+                            }
+                        }
+                        _ => {}
                     }
-                });
-
-                let model = completed.map(|r| r.model.clone());
-
-                if let Some(usage) = completed.and_then(|r| r.usage.as_ref()) {
-                    Self {
-                        prompt_tokens: usage.input_tokens as i64,
-                        completion_tokens: usage.output_tokens as i64,
-                        reasoning_tokens: extract_response_reasoning_tokens(usage),
-                        total_tokens: usage.total_tokens as i64,
-                        response_type: "response_stream".to_string(),
-                        response_model: model,
-                    }
-                } else {
-                    Self {
-                        prompt_tokens: 0,
-                        completion_tokens: 0,
-                        reasoning_tokens: 0,
-                        total_tokens: 0,
-                        response_type: "response_stream".to_string(),
-                        response_model: model,
-                    }
+                }
+                Self {
+                    prompt_tokens: input,
+                    completion_tokens: output,
+                    reasoning_tokens: 0,
+                    total_tokens: input + output,
+                    response_type: "anthropic_message_stream".to_string(),
+                    response_model: model,
                 }
             }
             AiResponse::Other(_) => Self {
@@ -1825,7 +1898,9 @@ mod tests {
         assert_eq!(metrics.response_type, "base64_embeddings");
     }
 
-    // Minimal valid Response JSON (only non-Option fields filled in)
+    // A full dwctl `ResponsesResponse` body. The response is produced by dwctl's
+    // edge translator (which backfills every field), so the logging/billing parse
+    // uses the strict dwctl schema - the test body must carry all required fields.
     fn responses_api_body(usage: bool) -> String {
         let usage_json = if usage {
             r#","usage":{"input_tokens":15,"input_tokens_details":{"cached_tokens":0},"output_tokens":25,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":40}"#
@@ -1833,7 +1908,7 @@ mod tests {
             ""
         };
         format!(
-            r#"{{"id":"resp_123","object":"response","created_at":1234567890,"model":"gpt-4o","status":"completed","output":[]{usage_json}}}"#
+            r#"{{"id":"resp_123","object":"response","created_at":1234567890,"status":"completed","model":"gpt-4o","output":[],"tools":[],"tool_choice":"auto","truncation":"disabled","parallel_tool_calls":true,"text":{{"format":{{"type":"text"}}}},"top_p":1.0,"presence_penalty":0.0,"frequency_penalty":0.0,"top_logprobs":0,"temperature":1.0,"reasoning":null,"store":false,"background":false,"service_tier":"default"{usage_json}}}"#
         )
     }
 
@@ -1917,7 +1992,7 @@ mod tests {
         let instance_id = Uuid::new_v4();
         let request_data = responses_request_data(None);
         let response_data = responses_response_data(
-            r#"{"id":"resp_123","object":"response","created_at":1234567890,"model":"gpt-4o","status":"completed","output":[],"usage":{"input_tokens":15,"input_tokens_details":{"cached_tokens":0},"output_tokens":25,"output_tokens_details":{"reasoning_tokens":9},"total_tokens":40}}"#
+            r#"{"id":"resp_123","object":"response","created_at":1234567890,"status":"completed","model":"gpt-4o","output":[],"tools":[],"tool_choice":"auto","truncation":"disabled","parallel_tool_calls":true,"text":{"format":{"type":"text"}},"top_p":1.0,"presence_penalty":0.0,"frequency_penalty":0.0,"top_logprobs":0,"temperature":1.0,"reasoning":null,"store":false,"background":false,"service_tier":"default","usage":{"input_tokens":15,"input_tokens_details":{"cached_tokens":0},"output_tokens":25,"output_tokens_details":{"reasoning_tokens":9},"total_tokens":40}}"#
                 .to_string(),
         );
 
@@ -1976,10 +2051,8 @@ mod tests {
         match result {
             AiResponse::ResponsesStream(events) => {
                 assert!(!events.is_empty(), "should have parsed at least the completed event");
-                let has_completed = events
-                    .iter()
-                    .any(|e| matches!(e, async_openai::types::responses::ResponseStreamEvent::ResponseCompleted(_)));
-                assert!(has_completed, "should contain a ResponseCompleted event");
+                let has_completed = events.iter().any(|e| e.event_type == "response.completed");
+                assert!(has_completed, "should contain a response.completed event");
             }
             _ => panic!("expected AiResponse::ResponsesStream"),
         }
@@ -2034,6 +2107,138 @@ mod tests {
         assert_eq!(metrics.completion_tokens, 25);
         assert_eq!(metrics.total_tokens, 40);
         assert_eq!(metrics.response_type, "response_stream");
+    }
+
+    // ----- Anthropic /v1/messages billing (the original goal: Anthropic charged) -----
+
+    fn messages_request_data(stream: bool) -> RequestData {
+        let body = format!(
+            r#"{{"model":"claude-3-5-sonnet","max_tokens":100,"messages":[{{"role":"user","content":"hi"}}],"stream":{stream}}}"#
+        );
+        RequestData {
+            correlation_id: 1,
+            timestamp: SystemTime::now(),
+            method: Method::POST,
+            uri: "/v1/messages".parse::<Uri>().unwrap(),
+            headers: HashMap::new(),
+            body: Some(Bytes::from(body)),
+            trace_id: None,
+            span_id: None,
+        }
+    }
+
+    fn ok_response(body: impl Into<Bytes>) -> ResponseData {
+        ResponseData {
+            extensions: Default::default(),
+            correlation_id: 1,
+            timestamp: SystemTime::now(),
+            status: StatusCode::OK,
+            headers: HashMap::new(),
+            body: Some(body.into()),
+            duration: Duration::from_millis(100),
+            duration_to_first_byte: Duration::from_millis(50),
+        }
+    }
+
+    #[test]
+    fn test_parse_ai_response_anthropic_blocking() {
+        let request_data = messages_request_data(false);
+        let body = r#"{"id":"msg_1","type":"message","role":"assistant","model":"claude-3-5-sonnet","content":[{"type":"text","text":"hello"}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":12,"output_tokens":8}}"#;
+        let response_data = ok_response(body);
+
+        let result = parse_ai_response(&request_data, &response_data).unwrap();
+        match result {
+            AiResponse::Anthropic(resp) => {
+                assert_eq!(resp.model, "claude-3-5-sonnet");
+                assert_eq!(resp.usage.input_tokens, 12);
+                assert_eq!(resp.usage.output_tokens, 8);
+            }
+            _ => panic!("expected AiResponse::Anthropic"),
+        }
+    }
+
+    #[test]
+    fn test_analytics_metrics_extract_anthropic_blocking_tokens() {
+        let request_data = messages_request_data(false);
+        let body = r#"{"id":"msg_1","type":"message","role":"assistant","model":"claude-3-5-sonnet","content":[],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":12,"output_tokens":8}}"#;
+        let response_data = ok_response(body);
+
+        let parsed = parse_ai_response(&request_data, &response_data).unwrap();
+        let metrics = UsageMetrics::extract(
+            Uuid::new_v4(),
+            &request_data,
+            &response_data,
+            &parsed,
+            &crate::test::utils::create_test_config(),
+        );
+
+        assert_eq!(metrics.response_model, Some("claude-3-5-sonnet".to_string()));
+        assert_eq!(metrics.prompt_tokens, 12);
+        assert_eq!(metrics.completion_tokens, 8);
+        // Anthropic has no total_tokens; billed as input + output.
+        assert_eq!(metrics.total_tokens, 20);
+        assert_eq!(metrics.reasoning_tokens, 0);
+        assert_eq!(metrics.response_type, "anthropic_message");
+        assert_eq!(metrics.status_code, 200);
+    }
+
+    #[test]
+    fn test_analytics_metrics_extract_anthropic_streaming_tokens() {
+        // Anthropic splits usage: message_start carries input, message_delta carries the
+        // final counts (the reframer puts both input and output there). Billing must sum them.
+        let request_data = messages_request_data(true);
+        let sse = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-3-5-sonnet\",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":12,\"output_tokens\":0}}}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"input_tokens\":12,\"output_tokens\":8}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        let response_data = ok_response(sse);
+
+        let parsed = parse_ai_response(&request_data, &response_data).unwrap();
+        assert!(matches!(parsed, AiResponse::AnthropicStream(_)), "streaming /messages should parse as AnthropicStream");
+
+        let metrics = UsageMetrics::extract(
+            Uuid::new_v4(),
+            &request_data,
+            &response_data,
+            &parsed,
+            &crate::test::utils::create_test_config(),
+        );
+
+        assert_eq!(metrics.response_model, Some("claude-3-5-sonnet".to_string()));
+        assert_eq!(metrics.prompt_tokens, 12);
+        assert_eq!(metrics.completion_tokens, 8);
+        assert_eq!(metrics.total_tokens, 20);
+        assert_eq!(metrics.response_type, "anthropic_message_stream");
+        assert_eq!(metrics.status_code, 200);
+    }
+
+    #[test]
+    fn test_anthropic_stream_error_event_reclassifies_to_500() {
+        // A stream that opened 200 then emitted an `error` event is reclassified to 500,
+        // matching native OpenAI streams, so it is excluded from success/credit accounting.
+        let request_data = messages_request_data(true);
+        let sse = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-3-5-sonnet\",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":5,\"output_tokens\":0}}}\n\n",
+            "event: error\n",
+            "data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"overloaded\"}}\n\n",
+        );
+        let response_data = ok_response(sse);
+
+        let parsed = parse_ai_response(&request_data, &response_data).unwrap();
+        let metrics = UsageMetrics::extract(
+            Uuid::new_v4(),
+            &request_data,
+            &response_data,
+            &parsed,
+            &crate::test::utils::create_test_config(),
+        );
+
+        assert_eq!(metrics.status_code, 500);
     }
 
     fn response_with_body(body: impl Into<Bytes>) -> ResponseData {

@@ -1183,6 +1183,10 @@ pub async fn build_router(
         // Add AnalyticsHandler for analytics/billing if enabled
         // The batcher is spawned in setup_background_services and managed by BackgroundServices
         if let Some(sender) = analytics_sender {
+            // Billing reads usage from the single `parse_ai_response -> AiResponse`
+            // parse (the same value request logging stores), via `TokenMetrics::from`.
+            // The outlet sits outer to translation, so it captures the foreign
+            // response body; `AiResponse` covers each protocol's own shape.
             let analytics_handler = request_logging::AnalyticsHandler::new(sender, uuid::Uuid::new_v4(), config.as_ref().clone());
             multi_handler = multi_handler.with(analytics_handler);
         }

@@ -205,6 +205,7 @@ mod tests {
     use super::*;
     use crate::inference::translation::TranslationRegistry;
     use crate::inference::translation::middleware::translation_middleware;
+
     use axum::body::Body;
     use axum::response::Response;
     use axum::{Router, extract::Request, routing::post};

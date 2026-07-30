@@ -833,18 +833,26 @@ pub struct ResponseUsage {
     pub input_tokens: u32,
     pub output_tokens: u32,
     pub total_tokens: u32,
+    // The detail objects are `serde(default)` so this type doubles as the billing
+    // usage parser (`OpenResponses::extract_usage`) - a provider that omits the
+    // cached/reasoning breakdown still deserializes, rather than failing and
+    // recording zero tokens. Serialization is unaffected (still always emitted).
+    #[serde(default)]
     pub input_tokens_details: InputTokensDetails,
+    #[serde(default)]
     pub output_tokens_details: OutputTokensDetails,
 }
 
 /// Details about input tokens
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct InputTokensDetails {
     pub cached_tokens: u32,
 }
 
 /// Details about output tokens
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct OutputTokensDetails {
     pub reasoning_tokens: u32,
 }
