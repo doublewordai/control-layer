@@ -13,6 +13,8 @@
 //! - **handler**: `GET /ai/v1/responses/{id}` HTTP handler.
 //! - **image_normalizer_middleware**: body-rewriting image normalisation shared
 //!   by the chat-completions and responses surfaces.
+//! - **outbound_request**: last-mile request-body prep before onwards (id-scrub +
+//!   streaming usage flags), so onwards forwards the body untouched.
 //! - **tools**: server-side tool resolution (injection) and execution (executor).
 //! - **engine**: the multi-step Open Responses orchestration loop and the
 //!   daemon-side request processor.
@@ -20,6 +22,7 @@
 pub mod handler;
 pub mod image_normalizer_middleware;
 pub mod middleware;
+pub mod outbound_request;
 pub mod response_store;
 pub mod store;
 pub mod streaming;

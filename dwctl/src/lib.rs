@@ -1639,6 +1639,12 @@ pub async fn build_router(
         .route("/models", get(api::handlers::ai_models::list_ai_models))
         .fallback_service(onwards_router);
 
+    // Last-mile request-body prep, applied innermost so it runs right before onwards
+    // (inner to cache, which must hash the original body). Does the id-scrub and the
+    // streaming usage-flag injection that onwards / the BodyTransformFn hook used to
+    // do, so onwards can forward the body untouched.
+    let onwards_router = onwards_router.layer(middleware::from_fn(crate::inference::outbound_request::outbound_request_middleware));
+
     // Apply tool injection middleware to the onwards router so that per-request tool
     // schemas are resolved and injected into the request body before onwards processes it.
     let tool_injection_state = crate::inference::tools::ToolInjectionState {
@@ -3094,20 +3100,6 @@ impl Application {
         })
         .await?;
 
-        // Enforce `stream_options.include_usage` for streaming chat completions.
-        //
-        // For streaming requests, upstream providers only report token usage in the final
-        // SSE chunk when `stream_options: { include_usage: true }` is set. Without it,
-        // the response contains no usage data and the request logs record 0 tokens — meaning
-        // the request can't be billed. The dashboard sets this automatically, but direct API
-        // callers may not.
-        //
-        // This applies to /chat/completions and the legacy /completions endpoint (both
-        // support `stream_options`). The Responses API (/responses) always includes usage
-        // in its response object regardless of streaming, so no transform is needed there.
-        // Embeddings don't support streaming.
-        let body_transform: onwards::BodyTransformFn = Arc::new(request_logging::stream_usage::stream_usage_transform);
-
         // Register onwards as a fusillade daemon so realtime requests get a valid daemon_id.
         let onwards_daemon_id = uuid::Uuid::new_v4();
         let fusillade_write_pool = bg_services.request_manager.pool().clone();
@@ -3222,7 +3214,9 @@ impl Application {
         // onwards stays cache-agnostic: cached-input pricing now lives entirely in
         // the dwctl cache tower layer (wired in `build_router`, gated on `cache.enabled`).
         // No classifier is injected here.
-        let onwards_app_state = onwards::AppState::with_transform(bg_services.onwards_targets.clone(), body_transform)
+        // Request-body edits (id-scrub, streaming usage flags) now live in dwctl's own
+        // `outbound_request` middleware, so onwards needs no BodyTransformFn.
+        let onwards_app_state = onwards::AppState::new(bg_services.onwards_targets.clone())
             .with_response_transform(onwards::create_openai_sanitizer())
             .with_streaming_header("x-fusillade-stream")
             .with_response_id_header("x-fusillade-request-id")

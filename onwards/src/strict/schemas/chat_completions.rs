@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
-use super::utils::{ensure_field, scrub_request_id_fields_from_extra};
+use super::utils::ensure_field;
 
 pub(crate) fn generated_chat_completion_id() -> String {
     format!("chatcmpl-{}", Uuid::new_v4())
@@ -215,13 +215,6 @@ pub struct ChatCompletionRequest {
     /// Additional fields not explicitly modeled
     #[serde(flatten)]
     pub extra: Option<serde_json::Value>,
-}
-
-impl ChatCompletionRequest {
-    /// Remove caller-controlled request identifier fields before proxying.
-    pub(crate) fn scrub_request_id_fields(&mut self) {
-        scrub_request_id_fields_from_extra(&mut self.extra);
-    }
 }
 
 /// A message in the conversation
