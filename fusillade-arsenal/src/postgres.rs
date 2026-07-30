@@ -1749,9 +1749,6 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
             return Ok(Vec::new());
         }
 
-        let mut labels: Vec<String> = Vec::with_capacity(windows.len());
-        let mut starts: Vec<i64> = Vec::with_capacity(windows.len());
-        let mut ends: Vec<i64> = Vec::with_capacity(windows.len());
         for (label, start, end) in windows {
             if start >= end || *end > 0 {
                 return Err(FusilladeError::ValidationError(format!(
@@ -1759,9 +1756,6 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                     label, start, end
                 )));
             }
-            labels.push(label.clone());
-            starts.push(*start);
-            ends.push(*end);
         }
 
         let (tier_names, tier_include_null, tier_mode): (Vec<String>, bool, &str) =
@@ -1812,7 +1806,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
             ))
         })?;
 
-        // Two symmetric CTEs, one per terminal state, because the outcome
+        // Two symmetric branches, one per terminal state, because the outcome
         // timestamp lives in a different column for each (completed_at /
         // failed_at, exclusive per state via the *_fields_check constraints).
         //
@@ -1820,93 +1814,115 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         // `template_id IS NOT NULL` bookkeeping exclusion; priority rows are
         // identified by tier + `batch_id IS NULL` instead, since the orphan
         // purger may null their template_id.
-        let rows = sqlx::query(
-            r#"
-            WITH windows(label, start_seconds, end_seconds) AS (
-                SELECT * FROM UNNEST($1::text[], $2::bigint[], $3::bigint[])
-            ),
-            completed_counts AS (
+        //
+        // One query PER WINDOW with the bounds bound as scalar timestamptz
+        // params — deliberately not the UNNEST-array shape the pending method
+        // uses. Bounds that arrive through an UNNEST join are opaque to the
+        // planner (generic range selectivity, ~10% of the table), and at
+        // production row counts that misestimate flips the plan to a parallel
+        // seq scan over every terminal row, which eats the whole statement
+        // timeout (observed on staging: 16M completed rows, 60s cancel).
+        // Scalar params + force_custom_plan get real histogram selectivity,
+        // which keeps the trailing partial indexes in play. Trailing windows
+        // are few (typically one), so per-window round trips are cheap.
+        let now = Utc::now();
+        let mut result: Vec<TrailingDemandCount> = Vec::new();
+        for (label, start, end) in windows {
+            let start_ts = now + chrono::Duration::seconds(*start);
+            let end_ts = now + chrono::Duration::seconds(*end);
+            let rows = sqlx::query(
+                r#"
                 SELECT
                     r.model,
-                    w.label AS window_label,
                     r.service_tier,
                     'completed'::text AS outcome,
                     COUNT(*)::BIGINT AS count
                 FROM requests r
-                CROSS JOIN windows w
                 WHERE r.state = 'completed'
-                AND r.completed_at >= NOW() + make_interval(secs => w.start_seconds)
-                AND r.completed_at < NOW() + make_interval(secs => w.end_seconds)
-                AND (cardinality($4::text[]) = 0 OR r.model = ANY($4))
+                AND r.completed_at >= $1
+                AND r.completed_at < $2
+                AND (cardinality($3::text[]) = 0 OR r.model = ANY($3))
                 AND r.service_tier IS DISTINCT FROM 'background'
                 AND (
                     r.template_id IS NOT NULL
                     OR (r.service_tier = 'priority' AND r.batch_id IS NULL)
                 )
                 AND (
-                    $7 = 'any'
-                    OR ($7 = 'include' AND (
-                        (r.service_tier IS NOT NULL AND r.service_tier = ANY($5))
-                        OR ($6 AND r.service_tier IS NULL)
+                    $6 = 'any'
+                    OR ($6 = 'include' AND (
+                        (r.service_tier IS NOT NULL AND r.service_tier = ANY($4))
+                        OR ($5 AND r.service_tier IS NULL)
                     ))
-                    OR ($7 = 'exclude' AND (
-                        (r.service_tier IS NULL AND NOT $6)
-                        OR (r.service_tier IS NOT NULL AND r.service_tier <> ALL($5))
+                    OR ($6 = 'exclude' AND (
+                        (r.service_tier IS NULL AND NOT $5)
+                        OR (r.service_tier IS NOT NULL AND r.service_tier <> ALL($4))
                     ))
                 )
-                GROUP BY r.model, w.label, r.service_tier
-            ),
-            failed_counts AS (
+                GROUP BY r.model, r.service_tier
+                UNION ALL
                 SELECT
                     r.model,
-                    w.label AS window_label,
                     r.service_tier,
                     'failed'::text AS outcome,
                     COUNT(*)::BIGINT AS count
                 FROM requests r
-                CROSS JOIN windows w
                 WHERE r.state = 'failed'
-                AND r.failed_at >= NOW() + make_interval(secs => w.start_seconds)
-                AND r.failed_at < NOW() + make_interval(secs => w.end_seconds)
-                AND (cardinality($4::text[]) = 0 OR r.model = ANY($4))
+                AND r.failed_at >= $1
+                AND r.failed_at < $2
+                AND (cardinality($3::text[]) = 0 OR r.model = ANY($3))
                 AND r.service_tier IS DISTINCT FROM 'background'
                 AND (
                     r.template_id IS NOT NULL
                     OR (r.service_tier = 'priority' AND r.batch_id IS NULL)
                 )
                 AND (
-                    $7 = 'any'
-                    OR ($7 = 'include' AND (
-                        (r.service_tier IS NOT NULL AND r.service_tier = ANY($5))
-                        OR ($6 AND r.service_tier IS NULL)
+                    $6 = 'any'
+                    OR ($6 = 'include' AND (
+                        (r.service_tier IS NOT NULL AND r.service_tier = ANY($4))
+                        OR ($5 AND r.service_tier IS NULL)
                     ))
-                    OR ($7 = 'exclude' AND (
-                        (r.service_tier IS NULL AND NOT $6)
-                        OR (r.service_tier IS NOT NULL AND r.service_tier <> ALL($5))
+                    OR ($6 = 'exclude' AND (
+                        (r.service_tier IS NULL AND NOT $5)
+                        OR (r.service_tier IS NOT NULL AND r.service_tier <> ALL($4))
                     ))
                 )
-                GROUP BY r.model, w.label, r.service_tier
+                GROUP BY r.model, r.service_tier
+                "#,
             )
-            SELECT model, window_label, service_tier, outcome, count FROM completed_counts
-            UNION ALL
-            SELECT model, window_label, service_tier, outcome, count FROM failed_counts
-            "#,
-        )
-        .bind(&labels)
-        .bind(&starts)
-        .bind(&ends)
-        .bind(model_filter)
-        .bind(&tier_names)
-        .bind(tier_include_null)
-        .bind(tier_mode)
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(|e| {
-            FusilladeError::Other(anyhow!(
-                "Failed to get trailing request counts by model and window: {}",
-                e
-            ))
-        })?;
+            .bind(start_ts)
+            .bind(end_ts)
+            .bind(model_filter)
+            .bind(&tier_names)
+            .bind(tier_include_null)
+            .bind(tier_mode)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(|e| {
+                FusilladeError::Other(anyhow!(
+                    "Failed to get trailing request counts for window {:?}: {}",
+                    label,
+                    e
+                ))
+            })?;
+
+            for row in rows {
+                result.push(TrailingDemandCount {
+                    model: row.try_get("model").map_err(|e| {
+                        FusilladeError::Other(anyhow!("Failed to read model: {}", e))
+                    })?,
+                    window_label: label.clone(),
+                    service_tier: row.try_get("service_tier").map_err(|e| {
+                        FusilladeError::Other(anyhow!("Failed to read service_tier: {}", e))
+                    })?,
+                    outcome: row.try_get("outcome").map_err(|e| {
+                        FusilladeError::Other(anyhow!("Failed to read outcome: {}", e))
+                    })?,
+                    count: row.try_get("count").map_err(|e| {
+                        FusilladeError::Other(anyhow!("Failed to read count: {}", e))
+                    })?,
+                });
+            }
+        }
 
         tx.commit().await.map_err(|e| {
             FusilladeError::Other(anyhow!(
@@ -1914,27 +1930,6 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                 e
             ))
         })?;
-
-        let mut result = Vec::with_capacity(rows.len());
-        for row in rows {
-            result.push(TrailingDemandCount {
-                model: row
-                    .try_get("model")
-                    .map_err(|e| FusilladeError::Other(anyhow!("Failed to read model: {}", e)))?,
-                window_label: row.try_get("window_label").map_err(|e| {
-                    FusilladeError::Other(anyhow!("Failed to read window_label: {}", e))
-                })?,
-                service_tier: row.try_get("service_tier").map_err(|e| {
-                    FusilladeError::Other(anyhow!("Failed to read service_tier: {}", e))
-                })?,
-                outcome: row
-                    .try_get("outcome")
-                    .map_err(|e| FusilladeError::Other(anyhow!("Failed to read outcome: {}", e)))?,
-                count: row
-                    .try_get("count")
-                    .map_err(|e| FusilladeError::Other(anyhow!("Failed to read count: {}", e)))?,
-            });
-        }
 
         Ok(result)
     }
