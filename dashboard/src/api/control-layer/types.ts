@@ -972,6 +972,8 @@ export interface RequestsAggregateResponse {
 }
 
 export interface PendingRequestCountsQuery {
+  /** Comma-separated deadline windows, e.g. "1h,24h" (default). */
+  window?: string;
   service_tiers?: string;
 }
 

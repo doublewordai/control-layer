@@ -2462,7 +2462,7 @@ export const handlers = [
   }),
 
   // Monitoring: pending request counts
-  http.get("/admin/api/v1/monitoring/pending-request-counts", () => {
+  http.get("/admin/api/v1/monitoring/demand", () => {
     // Demo mode: static example data (real data comes from fusillade)
     return HttpResponse.json({
       "Qwen/Qwen3.5-397B-A17B-FP8": { "1h": 12, "24h": 87 },

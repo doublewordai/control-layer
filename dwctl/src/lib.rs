@@ -1468,10 +1468,6 @@ pub async fn build_router(
         .route("/probes/{id}/results", get(api::handlers::probes::get_probe_results))
         .route("/probes/{id}/statistics", get(api::handlers::probes::get_statistics))
         // Queue monitoring
-        .route(
-            "/monitoring/pending-request-counts",
-            get(api::handlers::queue::get_pending_request_counts),
-        )
         .route("/monitoring/demand", get(api::handlers::queue::get_demand))
         // Tool sources CRUD
         .route("/tool-sources", get(api::handlers::tool_sources::list_tool_sources))
