@@ -1456,10 +1456,10 @@ mod tests {
             .expect("unpriced model should be listed");
         let cache_pricing = &priced_model["cache_pricing"];
         assert_eq!(cache_pricing["enabled"], true);
-        assert_eq!(cache_pricing["write_multiplier_5m"], "1.25");
-        assert_eq!(cache_pricing["write_multiplier_1h"], "2.0");
-        assert_eq!(cache_pricing["write_multiplier_24h"], "2.5");
-        assert_eq!(cache_pricing["read_multiplier"], "0.1");
+        assert_eq!(cache_pricing["write_multiplier_5m"], "1.2500");
+        assert_eq!(cache_pricing["write_multiplier_1h"], "2.0000");
+        assert_eq!(cache_pricing["write_multiplier_24h"], "2.5000");
+        assert_eq!(cache_pricing["read_multiplier"], "0.1000");
         assert_eq!(cache_pricing["min_prefix_tokens"], 2048);
         assert!(cache_pricing["valid_from"].is_string());
         assert_eq!(cache_pricing["valid_until"], serde_json::Value::Null);
