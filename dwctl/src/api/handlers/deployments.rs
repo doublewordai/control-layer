@@ -186,7 +186,7 @@ fn db_component_to_response(c: DeploymentComponentDBResponse) -> ModelComponentR
         ("endpoint" = Option<i32>, Query, description = "Filter by inference endpoint ID"),
         ("group" = Option<String>, Query, description = "Filter by group IDs (comma-separated UUIDs)"),
         ("accessible" = Option<bool>, Query, description = "Filter to only models the current user can access (defaults to false for admins, true for users)"),
-        ("include" = Option<String>, Query, description = "Include additional data (comma-separated: 'groups', 'metrics', 'status', 'pricing', 'endpoints', 'facets', 'reasoning_capabilities'). Only platform managers can include groups. Status shows probe monitoring information. Pricing shows simple customer rates for regular users, full pricing structure including current active tariffs for users with Pricing::ReadAll permission. Endpoints includes full inference endpoint details. Facets returns distinct providers, capabilities, and model types for filter dropdowns. Reasoning capabilities shows efforts supported by every provider behind each model."),
+        ("include" = Option<String>, Query, description = "Include additional data (comma-separated: 'groups', 'metrics', 'status', 'pricing', 'endpoints', 'facets', 'reasoning_capabilities'). Only platform managers can include groups. Status shows probe monitoring information. Pricing includes active customer tariffs and prompt-cache pricing; provider pricing remains restricted to users with Pricing::ReadAll permission. Endpoints includes full inference endpoint details. Facets returns distinct providers, capabilities, and model types for filter dropdowns. Reasoning capabilities shows efforts supported by every provider behind each model."),
         ("provider" = Option<String>, Query, description = "Filter by provider name (case-insensitive exact match against metadata.provider)"),
         ("model_type" = Option<String>, Query, description = "Filter by model type (CHAT, EMBEDDINGS, RERANKER)"),
         ("capability" = Option<String>, Query, description = "Filter by capability (returns models that have this capability)"),
@@ -907,7 +907,7 @@ pub async fn update_deployed_model<P: PoolProvider>(
     path = "/models/{id}",
     tag = "models",
     summary = "Get deployed model",
-    description = "Get a specific deployed model",
+    description = "Get a specific deployed model. include=pricing includes active customer tariffs and prompt-cache pricing.",
     params(
         ("id" = uuid::Uuid, Path, description = "Deployment ID to retrieve"),
         GetModelQuery
@@ -1381,7 +1381,7 @@ mod tests {
             models::{pagination::PaginatedResponse, users::Role},
         },
         db::{
-            handlers::{Deployments, Groups, Repository},
+            handlers::{CacheTariffOverrides, CacheTariffs, Deployments, Groups, Repository},
             models::{api_keys::ApiKeyPurpose, deployments::TrafficRuleAction, groups::GroupCreateDBRequest},
         },
         test::utils::*,
@@ -1412,6 +1412,89 @@ mod tests {
         let response_body: PaginatedResponse<DeployedModelResponse> = response.json();
         // Should be empty initially, but test that it returns proper structure
         assert!(response_body.data.is_empty() || !response_body.data.is_empty());
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn admin_models_include_pricing_exposes_cache_tariffs(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let priced = create_test_deployment(&pool, admin.id, "priced-model", "priced-model").await;
+        let unpriced = create_test_deployment(&pool, admin.id, "unpriced-model", "unpriced-model").await;
+
+        let mut conn = pool.acquire().await.unwrap();
+        CacheTariffs::new(&mut conn)
+            .enable(
+                priced.id,
+                &crate::config::CachePricingConfig::default(),
+                CacheTariffOverrides {
+                    write_multiplier_5m: Some(rust_decimal::Decimal::new(125, 2)),
+                    write_multiplier_1h: Some(rust_decimal::Decimal::new(2, 0)),
+                    write_multiplier_24h: Some(rust_decimal::Decimal::new(25, 1)),
+                    read_multiplier: Some(rust_decimal::Decimal::new(1, 1)),
+                    min_prefix_tokens: Some(2048),
+                },
+            )
+            .await
+            .unwrap();
+
+        let response = app
+            .get("/admin/api/v1/models?include=pricing")
+            .add_header(&add_auth_headers(&admin)[0].0, &add_auth_headers(&admin)[0].1)
+            .add_header(&add_auth_headers(&admin)[1].0, &add_auth_headers(&admin)[1].1)
+            .await;
+        response.assert_status_ok();
+        let body: serde_json::Value = response.json();
+        let models = body["data"].as_array().expect("list response should contain data");
+        let priced_model = models
+            .iter()
+            .find(|model| model["id"] == priced.id.to_string())
+            .expect("priced model should be listed");
+        let unpriced_model = models
+            .iter()
+            .find(|model| model["id"] == unpriced.id.to_string())
+            .expect("unpriced model should be listed");
+        let cache_pricing = &priced_model["cache_pricing"];
+        assert_eq!(cache_pricing["enabled"], true);
+        assert_eq!(cache_pricing["write_multiplier_5m"], "1.25");
+        assert_eq!(cache_pricing["write_multiplier_1h"], "2.0");
+        assert_eq!(cache_pricing["write_multiplier_24h"], "2.5");
+        assert_eq!(cache_pricing["read_multiplier"], "0.1");
+        assert_eq!(cache_pricing["min_prefix_tokens"], 2048);
+        assert!(cache_pricing["valid_from"].is_string());
+        assert_eq!(cache_pricing["valid_until"], serde_json::Value::Null);
+        assert_eq!(
+            unpriced_model["cache_pricing"],
+            json!({
+                "enabled": false,
+                "write_multiplier_5m": null,
+                "write_multiplier_1h": null,
+                "write_multiplier_24h": null,
+                "read_multiplier": null,
+                "min_prefix_tokens": null,
+                "valid_from": null,
+                "valid_until": null,
+            })
+        );
+
+        let response = app
+            .get(&format!("/admin/api/v1/models/{}?include=pricing", priced.id))
+            .add_header(&add_auth_headers(&admin)[0].0, &add_auth_headers(&admin)[0].1)
+            .add_header(&add_auth_headers(&admin)[1].0, &add_auth_headers(&admin)[1].1)
+            .await;
+        response.assert_status_ok();
+        let model: serde_json::Value = response.json();
+        assert_eq!(model["cache_pricing"]["enabled"], true);
+        assert_eq!(model["cache_pricing"]["min_prefix_tokens"], 2048);
+
+        let response = app
+            .get(&format!("/admin/api/v1/models/{}", priced.id))
+            .add_header(&add_auth_headers(&admin)[0].0, &add_auth_headers(&admin)[0].1)
+            .add_header(&add_auth_headers(&admin)[1].0, &add_auth_headers(&admin)[1].1)
+            .await;
+        response.assert_status_ok();
+        let model: serde_json::Value = response.json();
+        assert!(model.get("cache_pricing").is_none());
     }
 
     #[sqlx::test]
