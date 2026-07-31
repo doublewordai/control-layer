@@ -89,8 +89,8 @@ axum-prometheus = "0.10"
 # Metrics facade and exporter (same versions as axum-prometheus uses)
 metrics = "0.24"
 metrics-exporter-prometheus = "0.18"
-outlet = "0.9.1"
-outlet-postgres = "0.6.0"
+outlet = { git = "https://github.com/doublewordai/outlet", rev = "6206a0bedc0c9a5d1ad77b837ec334642d06eea8" }
+outlet-postgres = { git = "https://github.com/doublewordai/outlet-postgres", rev = "e7c8d8ee7c633183eb52ea533ef0bbdb19120a59" }
 async-openai = { version = "0.34.0", default-features = false, features = [
   "chat-completion-types",
   "completion-types",
