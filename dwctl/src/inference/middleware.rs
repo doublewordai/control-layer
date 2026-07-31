@@ -5,13 +5,20 @@
 //!
 //! ## Routing
 //!
-//! - `priority` / `default` / `auto` (realtime): creates a batch of 1 with
-//!   `completion_window=0s` in `processing` state, proxies via onwards.
+//! Every tier here writes a BATCHLESS request — one `requests` row with
+//! `batch_id = NULL`, distinguished by `service_tier`. None of them creates a
+//! batch, and none of them has a completion window; the tier column carries what
+//! the legacy `completion_window` values ("0s", "1h") used to encode.
+//!
+//! - `priority` / `default` / `auto` (realtime): writes `service_tier='priority'`
+//!   straight into `processing` (the proxy is already handling it, and a nil
+//!   `daemon_id` keeps the daemon from claiming it), proxies via onwards.
 //!   With `background=true`, returns 202 and spawns the proxy as a background task.
-//! - `flex` (async): creates a batch of 1 with `completion_window=1h` in
-//!   `pending` state. The fusillade daemon picks it up. With `background=false`,
-//!   holds the connection and polls until complete. With `background=true`,
-//!   returns 202 immediately.
+//! - `flex`: writes `service_tier='flex'` in `pending` state for the fusillade
+//!   daemon to claim. With `background=false`, holds the connection and polls
+//!   until complete. With `background=true`, returns 202 immediately.
+//! - `background`: writes `service_tier='background'` in `pending` state, run on
+//!   spare capacity with no deadline.
 
 use std::sync::Arc;
 
@@ -602,7 +609,7 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
 enum ServiceTier {
     /// Realtime: direct proxy via onwards.
     Realtime,
-    /// Flex: batch of 1 with 1h completion window, processed by fusillade daemon.
+    /// Flex: a batchless `service_tier='flex'` request, claimed by the fusillade daemon.
     Flex,
     /// Background: no-SLA spare-capacity processing by background workers.
     Background,
