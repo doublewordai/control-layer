@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use rust_decimal::Decimal;
 use sqlx::PgPool;
 use std::collections::HashMap;
-use stripe::{ApiErrorsCode, Client, StripeError};
+use stripe::{ApiErrorsCode, Client};
 use stripe_billing::billing_portal_session::CreateBillingPortalSession;
 use stripe_checkout::checkout_session::{
     CreateCheckoutSessionConsentCollection, CreateCheckoutSessionConsentCollectionPaymentMethodReuseAgreement,
@@ -772,8 +772,8 @@ mod tests {
     /// Build a Stripe API error, as returned on a 409/402. `type_` matters:
     /// the idempotency conflict arrives as an `invalid_request_error`, declines
     /// as a `card_error`, and the mapper dispatches on both.
-    fn stripe_api_error(code: Option<ApiErrorsCode>, type_: stripe::ApiErrorsType) -> StripeError {
-        StripeError::Stripe(
+    fn stripe_api_error(code: Option<ApiErrorsCode>, type_: stripe::ApiErrorsType) -> stripe::StripeError {
+        stripe::StripeError::Stripe(
             Box::new(stripe::ApiErrors {
                 advice_code: None,
                 charge: None,
