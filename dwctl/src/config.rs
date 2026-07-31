@@ -1855,6 +1855,14 @@ where
     }
 }
 
+/// Batch metadata keys fusillade forwards to dwctl as `x-fusillade-batch-<key>`
+/// headers on every dispatched request.
+///
+/// THIS LIST IS THE WHOLE MECHANISM. Storing a key in a batch's metadata does
+/// nothing on its own — `claimed_rows_to_requests` only copies the keys named
+/// here onto the claimed request, so an unlisted key is written, persisted, and
+/// silently never sent. Anything that has to reach `http_analytics` has to be
+/// added here as well as at the write site.
 fn default_batch_metadata_fields_dwctl() -> Vec<String> {
     vec![
         "id".to_string(),
@@ -1862,6 +1870,10 @@ fn default_batch_metadata_fields_dwctl() -> Vec<String> {
         "created_at".to_string(),
         "completion_window".to_string(),
         "request_source".to_string(),
+        // The submitter's User-Agent, stamped at creation by `create_batch`. Without
+        // it the analytics row for a dispatched batch request has no client at all:
+        // fusillade's own HTTP client sends no User-Agent.
+        "dw_user_agent".to_string(),
     ]
 }
 
@@ -2977,6 +2989,30 @@ mod tests {
     #[test]
     fn default_auth_roles_include_background_inference() {
         assert!(AuthConfig::default().default_user_roles.contains(&Role::BackgroundInferenceUser));
+    }
+
+    /// Stamping a key into a batch's metadata does NOTHING unless the key is also on this
+    /// list: fusillade copies only the listed keys onto each claimed request, so an
+    /// unlisted one is written, persisted, and silently never sent as a header — and the
+    /// `http_analytics` column it feeds stays empty with no error anywhere. Every column
+    /// fed this way is asserted here, so removing one from the list fails the build rather
+    /// than the dashboard.
+    #[test]
+    fn forwarded_batch_metadata_covers_every_column_analytics_fills_from_it() {
+        let forwarded = DaemonConfig::default().batch_metadata_fields;
+        // (metadata key, the http_analytics column it lands in)
+        for (key, column) in [
+            ("id", "fusillade_batch_id"),
+            ("completion_window", "batch_sla"),
+            ("created_at", "batch_created_at (batch-creation pricing)"),
+            ("request_source", "batch_request_source"),
+            ("dw_user_agent", "user_agent"),
+        ] {
+            assert!(
+                forwarded.contains(&key.to_string()),
+                "batch metadata key '{key}' is not forwarded, so http_analytics.{column} will never be populated for batch requests"
+            );
+        }
     }
 
     #[test]
