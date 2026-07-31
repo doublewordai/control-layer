@@ -350,7 +350,9 @@ export const ApiKeys: React.FC = () => {
     canManage: canManageKey,
     canRotate: canRotateKey,
     isPlatformManager,
-    showAssignee: isOrgContext,
+    // Assignee is a manager's concept: members' views are isolated to their
+    // own keys, so the column would only ever echo their own name.
+    showAssignee: isOrgContext && (isOrgManager || isPlatformManager),
     resolveAssignee: isOrgContext ? resolveAssignee : undefined,
     showSelect: canSelfManage,
   });
@@ -675,7 +677,7 @@ export const ApiKeys: React.FC = () => {
                               key={member.user!.id}
                               value={member.user!.id}
                             >
-                              {memberLabel(member.user!)}
+                              {member.user!.email}
                             </SelectItem>
                           ))}
                       </SelectContent>
@@ -1120,17 +1122,15 @@ export const ApiKeys: React.FC = () => {
 
           <div className="space-y-4 py-2">
             <p className="text-sm text-gray-700">
-              The new secret is live immediately, and the old secret stops
-              working for new requests within about a second. The key itself
-              is unchanged — its usage limit, counted spend, and attribution
-              all carry over.
+              The current secret stops working immediately and a new one is
+              generated. The key's usage limit and usage history are
+              unaffected.
             </p>
             <div className="p-3 bg-yellow-50 border border-yellow-200 rounded-lg">
               <p className="text-sm text-yellow-800">
                 <strong>Note:</strong> batches already submitted with this key
-                will keep running — they execute on an internal system key. If
-                this key was compromised, cancel any in-flight batches
-                separately.
+                will keep running. If this key was compromised, cancel any
+                in-flight batches separately.
               </p>
             </div>
           </div>

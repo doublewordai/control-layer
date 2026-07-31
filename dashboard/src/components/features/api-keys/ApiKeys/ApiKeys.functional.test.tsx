@@ -1249,7 +1249,11 @@ describe("API Keys Component - Functional Tests", () => {
         screen.getByText(/rotate it from their api keys page/i),
       ).toBeInTheDocument();
       await user.click(assignSelect);
-      await user.click(screen.getByRole("option", { name: "James Wilson" }));
+      // The assign dropdown shows EMAILS — admins know their members' email
+      // addresses, not their generated usernames or display names.
+      await user.click(
+        screen.getByRole("option", { name: "james.wilson@acme.com" }),
+      );
 
       await user.click(screen.getByRole("button", { name: /create key/i }));
 
