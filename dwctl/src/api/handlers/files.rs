@@ -2143,11 +2143,19 @@ pub async fn get_file_cost_estimate<P: PoolProvider>(
 mod tests {
     use crate::api::models::files::FileResponse;
     use crate::api::models::users::Role;
+    use crate::db::handlers::RequestAllowances;
     use crate::db::models::api_keys::ApiKeyPurpose;
     use crate::test::utils::*;
     use sqlx::PgPool;
     use std::sync::{Arc, Mutex};
     use uuid::Uuid;
+
+    async fn create_test_user_with_roles(pool: &PgPool, roles: Vec<Role>) -> crate::api::models::users::UserResponse {
+        let user = crate::test::utils::create_test_user_with_roles(pool, roles).await;
+        let mut conn = pool.acquire().await.unwrap();
+        RequestAllowances::new(&mut conn).provision(user.id, 0, 1_000_000).await.unwrap();
+        user
+    }
 
     async fn upload_batch_jsonl(
         app: &axum_test::TestServer,

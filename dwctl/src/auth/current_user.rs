@@ -5,7 +5,7 @@ use crate::{
     AppState,
     api::models::users::{CurrentUser, Role},
     auth::session,
-    db::handlers::{Repository, Users},
+    db::handlers::{Repository, RequestAllowances, Users},
     errors::{Error, Result},
 };
 use axum::{extract::FromRequestParts, http::request::Parts};
@@ -172,6 +172,18 @@ async fn try_proxy_header_auth<P: sqlx_pool_router::PoolProvider + Clone + Send 
                 // Grant initial credits for newly created users
                 if was_created {
                     is_new_user = true;
+                    if user.roles.contains(&Role::StandardUser)
+                        && let Err(e) = RequestAllowances::new(&mut tx)
+                            .provision(
+                                user.id,
+                                config.credits.initial_playground_requests_for_standard_users,
+                                config.credits.initial_batch_requests_for_standard_users,
+                            )
+                            .await
+                    {
+                        return Some(Err(Error::Database(e)));
+                    }
+
                     let initial_credits = config.credits.initial_credits_for_standard_users;
                     if initial_credits > rust_decimal::Decimal::ZERO && user.roles.contains(&Role::StandardUser) {
                         use crate::db::handlers::credits::Credits;
@@ -1439,6 +1451,36 @@ mod tests {
         // Verify balance is correct via get_user_balance
         let balance = credits_repo.get_user_balance(current_user.id).await.unwrap();
         assert_eq!(balance, rust_decimal::Decimal::new(10000, 2));
+    }
+
+    #[sqlx::test]
+    async fn proxy_header_new_user_receives_request_allowances_once(pool: PgPool) {
+        let mut config = create_test_config();
+        config.auth.proxy_header.enabled = true;
+        config.auth.proxy_header.auto_create_users = true;
+        config.credits.initial_playground_requests_for_standard_users = 4;
+        config.credits.initial_batch_requests_for_standard_users = 9;
+        let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
+
+        let mut first = create_test_parts_with_auth("proxy-allowance", "proxy-allowance@example.com");
+        let user = CurrentUser::from_request_parts(&mut first, &state).await.unwrap();
+        let mut second = create_test_parts_with_auth("proxy-allowance", "proxy-allowance@example.com");
+        CurrentUser::from_request_parts(&mut second, &state).await.unwrap();
+
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            r#"
+            SELECT ak.purpose, allowance.remaining_requests
+            FROM api_key_request_allowances allowance
+            JOIN api_keys ak ON ak.id = allowance.api_key_id
+            WHERE ak.user_id = $1
+            ORDER BY ak.purpose
+            "#,
+        )
+        .bind(user.id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rows, vec![("batch".to_string(), 9), ("playground".to_string(), 4)]);
     }
 
     #[sqlx::test]

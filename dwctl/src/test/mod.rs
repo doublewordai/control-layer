@@ -1495,6 +1495,13 @@ async fn test_dedicated_databases_for_components(pool: PgPool) {
     use axum_test::multipart::MultipartForm;
 
     let batch_user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+    {
+        let mut conn = pool.acquire().await.expect("acquire allowance connection");
+        crate::db::handlers::RequestAllowances::new(&mut conn)
+            .provision(batch_user.id, 0, 1)
+            .await
+            .expect("provision test batch allowance");
+    }
     let auth_headers = add_auth_headers(&batch_user);
 
     // Set up a model for batch validation

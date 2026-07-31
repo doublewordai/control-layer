@@ -11,7 +11,7 @@ use crate::{
     },
     auth::permissions::{self as permissions, RequiresPermission, can_read_all_resources, can_read_own_resource, operation, resource},
     db::{
-        handlers::{Credits, Groups, Organizations, Repository, Users, users::UserFilter},
+        handlers::{Credits, Groups, Organizations, Repository, RequestAllowances, Users, users::UserFilter},
         models::users::{UserCreateDBRequest, UserUpdateDBRequest},
     },
     errors::{Error, Result},
@@ -333,12 +333,23 @@ pub async fn create_user<P: PoolProvider>(
     _: RequiresPermission<resource::Users, operation::CreateAll>,
     Json(user_data): Json<UserCreate>,
 ) -> Result<(StatusCode, Json<UserResponse>)> {
+    let config = state.current_config();
     let mut tx = state.db.write().begin().await.map_err(|e| Error::Database(e.into()))?;
 
     let mut repo = Users::new(&mut tx);
     let db_request = UserCreateDBRequest::from(user_data);
 
     let user = repo.create(&db_request).await?;
+
+    if user.roles.contains(&crate::api::models::users::Role::StandardUser) {
+        RequestAllowances::new(&mut tx)
+            .provision(
+                user.id,
+                config.credits.initial_playground_requests_for_standard_users,
+                config.credits.initial_batch_requests_for_standard_users,
+            )
+            .await?;
+    }
 
     // Note: Batch and playground hidden API keys are pre-created by the create() method
     // to avoid race conditions with onwards sync. Realtime keys are created by users
@@ -681,8 +692,11 @@ mod tests {
 
     #[sqlx::test]
     #[test_log::test]
-    async fn test_create_user_as_admin(pool: PgPool) {
-        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+    async fn test_create_user_as_admin_provisions_request_allowances(pool: PgPool) {
+        let mut config = create_test_config();
+        config.credits.initial_playground_requests_for_standard_users = 2;
+        config.credits.initial_batch_requests_for_standard_users = 5;
+        let (app, _bg_services) = create_test_app_with_config(pool.clone(), config, false).await;
         let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
 
         let new_user = json!({
@@ -704,6 +718,21 @@ mod tests {
         let created_user: UserResponse = response.json();
         assert_eq!(created_user.username, "newuser");
         assert_eq!(created_user.email, "newuser@example.com");
+
+        let allowances: Vec<(String, i64)> = sqlx::query_as(
+            r#"
+            SELECT ak.purpose, allowance.remaining_requests
+            FROM api_key_request_allowances allowance
+            JOIN api_keys ak ON ak.id = allowance.api_key_id
+            WHERE ak.user_id = $1
+            ORDER BY ak.purpose
+            "#,
+        )
+        .bind(created_user.id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(allowances, vec![("batch".to_string(), 5), ("playground".to_string(), 2)]);
     }
 
     #[sqlx::test]

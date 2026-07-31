@@ -31,12 +31,17 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use fusillade_arsenal::PostgresRequestManager;
+use rust_decimal::Decimal;
 use sqlx_pool_router::PoolProvider;
 
 use super::image_normalizer_middleware::{normalize_error_response, normalize_value_to_tokens};
 use super::store::{self as response_store, ONWARDS_RESPONSE_ID_HEADER, OnwardsDaemonId};
 use super::streaming::{ReplayFrame, flex_stream_response};
-use crate::db::{errors::DbError, handlers::api_keys::ApiKeys, models::api_keys::ApiKeyPurpose};
+use crate::db::{
+    errors::DbError,
+    handlers::{AllowanceReservation, RequestAllowances, api_keys::ApiKeys},
+    models::api_keys::ApiKeyPurpose,
+};
 use crate::image_normalizer::ImageNormalizer;
 
 /// State for the inference middleware.
@@ -581,6 +586,42 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                 .map(|ua| ua.chars().take(256).collect::<String>())
                 .filter(|ua| !ua.is_empty())
                 .map(|ua| serde_json::json!({ "dw_user_agent": ua }));
+
+            // Reserve only after every fallible validation and preprocessing
+            // step has succeeded. From this point onward the request is being
+            // accepted for queue persistence, so a later storage failure does
+            // not refund the lifetime allowance.
+            if !is_background_tier && let Some(key) = queued_batch_key.as_ref() {
+                match reserve_flex_request_allowance(&state.dwctl_pool, key).await {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        return Response::builder()
+                            .status(StatusCode::PAYMENT_REQUIRED)
+                            .header("content-type", "application/json")
+                            .body(Body::from(
+                                serde_json::json!({
+                                    "error": {
+                                        "message": "Account balance and batch request allowance are exhausted. Please add credits to continue.",
+                                        "type": "insufficient_credits"
+                                    }
+                                })
+                                .to_string(),
+                            ))
+                            .unwrap();
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "Failed to reserve flex request allowance");
+                        return Response::builder()
+                            .status(StatusCode::INTERNAL_SERVER_ERROR)
+                            .header("content-type", "application/json")
+                            .body(Body::from(
+                                serde_json::json!({"error": {"message": "Failed to authorize queued request", "type": "server_error"}})
+                                    .to_string(),
+                            ))
+                            .unwrap();
+                    }
+                }
+            }
             if is_background_tier {
                 let background_input = fusillade::CreateBackgroundInput {
                     request_id,
@@ -633,11 +674,15 @@ enum ServiceTier {
 #[derive(Debug, Clone)]
 struct FlexBatchApiKey {
     secret: String,
+    api_key_id: uuid::Uuid,
     key_owner_id: uuid::Uuid,
     /// The key owner's `users.verified` flag (organizations are `users` rows
     /// too). Rides along on this lookup so the unverified upload-volume cap on
     /// the flex path needs no extra query. `false` when no user row matches.
     verified: bool,
+    authenticating_purpose: String,
+    authenticating_hidden: bool,
+    balance: Decimal,
 }
 
 async fn resolve_flex_batch_api_key(pool: &sqlx::PgPool, api_key: Option<&str>) -> Result<Option<FlexBatchApiKey>, DbError> {
@@ -653,16 +698,24 @@ async fn resolve_flex_batch_api_key(pool: &sqlx::PgPool, api_key: Option<&str>) 
     // removal). If no child exists, fall back to the shared hidden batch key
     // as before.
     //
-    // Invariant: the bearer here is always an external, user-visible key. The
-    // only traffic that carries hidden batch keys (shared or cap-scope child)
-    // is the fusillade daemon loopback, which bypasses this middleware via the
-    // `x-fusillade-request-id` guard at the top of `inference_middleware`, and
-    // hidden-key secrets are never exposed to clients.
+    // The bearer is normally an external key, but dashboard flex submissions
+    // arrive under the hidden playground key. Hidden batch keys themselves are
+    // carried only by fusillade loopback traffic, which bypasses this
+    // middleware via the `x-fusillade-request-id` guard at the top.
     let row = sqlx::query(
         r#"
-        SELECT ak.user_id, ak.created_by, u.verified, child.secret AS child_secret
+        SELECT
+            ak.user_id,
+            ak.created_by,
+            ak.purpose AS authenticating_purpose,
+            ak.hidden AS authenticating_hidden,
+            u.verified,
+            COALESCE(ub.balance, 0) AS balance,
+            child.id AS child_id,
+            child.secret AS child_secret
         FROM api_keys ak
         LEFT JOIN users u ON u.id = ak.user_id
+        LEFT JOIN user_balance_checkpoints ub ON ub.user_id = ak.user_id
         LEFT JOIN api_keys child
                ON child.parent_api_key_id = ak.id
               AND child.purpose = 'batch'
@@ -684,27 +737,51 @@ async fn resolve_flex_batch_api_key(pool: &sqlx::PgPool, api_key: Option<&str>) 
     // NULL when the LEFT JOIN found no user row; a missing row counts as
     // unverified, matching `Users::is_verified`.
     let verified: bool = sqlx::Row::try_get(&row, "verified").ok().flatten().unwrap_or(false);
+    let authenticating_purpose: String = sqlx::Row::try_get(&row, "authenticating_purpose")?;
+    let authenticating_hidden: bool = sqlx::Row::try_get(&row, "authenticating_hidden")?;
+    let balance: Decimal = sqlx::Row::try_get(&row, "balance")?;
     // NULL (no child) decodes as None via the Option; genuine decode errors
     // propagate rather than silently downgrading a capped key to the shared
     // (uncapped) execution key.
     let child_secret: Option<String> = sqlx::Row::try_get(&row, "child_secret")?;
+    let child_id: Option<uuid::Uuid> = sqlx::Row::try_get(&row, "child_id")?;
 
-    let secret = match child_secret {
-        Some(secret) => secret,
-        None => {
+    let (secret, api_key_id) = match (child_secret, child_id) {
+        (Some(secret), Some(api_key_id)) => (secret, api_key_id),
+        (None, None) => {
             let mut conn = pool.acquire().await?;
             let mut api_keys_repo = ApiKeys::new(&mut conn);
             api_keys_repo
-                .get_or_create_hidden_key(key_owner_id, ApiKeyPurpose::Batch, created_by)
+                .get_or_create_hidden_key_with_id(key_owner_id, ApiKeyPurpose::Batch, created_by)
                 .await?
         }
+        _ => unreachable!("batch child key id and secret must be selected together"),
     };
 
     Ok(Some(FlexBatchApiKey {
         secret,
+        api_key_id,
         key_owner_id,
         verified,
+        authenticating_purpose,
+        authenticating_hidden,
+        balance,
     }))
+}
+
+async fn reserve_flex_request_allowance(pool: &sqlx::PgPool, key: &FlexBatchApiKey) -> Result<bool, DbError> {
+    if key.balance > Decimal::ZERO {
+        return Ok(true);
+    }
+    if !key.authenticating_hidden || key.authenticating_purpose != "playground" {
+        return Ok(false);
+    }
+
+    let mut conn = pool.acquire().await?;
+    Ok(matches!(
+        RequestAllowances::new(&mut conn).reserve(key.api_key_id, 1).await?,
+        AllowanceReservation::CreditsAvailable | AllowanceReservation::Reserved { .. }
+    ))
 }
 
 /// Resolve the background capability from the human who created an API key.
@@ -1617,6 +1694,49 @@ mod tests {
         assert_eq!(row_created_by, user.id);
         assert_eq!(row_purpose, "batch");
         assert!(row_hidden);
+    }
+
+    #[sqlx::test]
+    async fn flex_allowance_is_only_available_to_hidden_playground_bearer(pool: sqlx::PgPool) {
+        use crate::api::models::{api_keys::ApiKeyCreate, users::Role};
+        use crate::db::{
+            handlers::{Repository, RequestAllowances, api_keys::ApiKeys},
+            models::api_keys::{ApiKeyCreateDBRequest, ApiKeyPurpose},
+        };
+
+        let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+        let mut conn = pool.acquire().await.unwrap();
+        let (playground_secret, _) = ApiKeys::new(&mut conn)
+            .get_or_create_hidden_key_with_id(user.id, ApiKeyPurpose::Playground, user.id)
+            .await
+            .unwrap();
+        RequestAllowances::new(&mut conn).provision(user.id, 0, 1).await.unwrap();
+        let visible_secret = ApiKeys::new(&mut conn)
+            .create(&ApiKeyCreateDBRequest::new(
+                user.id,
+                user.id,
+                ApiKeyCreate {
+                    name: "Visible realtime key".to_string(),
+                    description: None,
+                    purpose: ApiKeyPurpose::Realtime,
+                    requests_per_second: None,
+                    burst_size: None,
+                    member_id: None,
+                    spend_limit: None,
+                    spend_limit_interval: None,
+                },
+            ))
+            .await
+            .unwrap()
+            .secret;
+        drop(conn);
+
+        let playground_key = resolve_flex_batch_api_key(&pool, Some(&playground_secret)).await.unwrap().unwrap();
+        assert!(reserve_flex_request_allowance(&pool, &playground_key).await.unwrap());
+        assert!(!reserve_flex_request_allowance(&pool, &playground_key).await.unwrap());
+
+        let visible_key = resolve_flex_batch_api_key(&pool, Some(&visible_secret)).await.unwrap().unwrap();
+        assert!(!reserve_flex_request_allowance(&pool, &visible_key).await.unwrap());
     }
 
     #[sqlx::test]

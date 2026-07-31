@@ -568,6 +568,49 @@ async fn test_cache_shape_metered_model_requires_positive_balance(pool: sqlx::Pg
     assert!(!pool_has_key(metered_pool, KEY_BATCH_SECRET));
 }
 
+#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base", "cache_tariff_metered")))]
+async fn hidden_key_allowance_keeps_metered_routing_until_revoked(pool: sqlx::PgPool) {
+    sqlx::query("UPDATE api_keys SET hidden = true WHERE secret = $1")
+        .bind(KEY_BATCH_SECRET)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        r#"
+        INSERT INTO api_key_request_allowances (api_key_id, initial_requests, remaining_requests)
+        SELECT id, 1, 1 FROM api_keys WHERE secret = $1
+        "#,
+    )
+    .bind(KEY_BATCH_SECRET)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let tiers = RateLimitTiersConfig::default();
+    let targets = super::load_targets_from_db(&pool, &[], false, &tiers).await.unwrap();
+    assert!(pool_has_key(
+        targets.targets.get("metered-public").unwrap().value(),
+        KEY_BATCH_SECRET
+    ));
+
+    sqlx::query("UPDATE api_key_request_allowances SET remaining_requests = 0")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let targets = super::load_targets_from_db(&pool, &[], false, &tiers).await.unwrap();
+    assert!(
+        pool_has_key(targets.targets.get("metered-public").unwrap().value(), KEY_BATCH_SECRET),
+        "the final accepted request keeps routing while its allowance row exists"
+    );
+
+    sqlx::query("DELETE FROM api_key_request_allowances").execute(&pool).await.unwrap();
+    let targets = super::load_targets_from_db(&pool, &[], false, &tiers).await.unwrap();
+    assert!(!pool_has_key(
+        targets.targets.get("metered-public").unwrap().value(),
+        KEY_BATCH_SECRET
+    ));
+}
+
 #[sqlx::test(fixtures(path = "fixtures", scripts("cache_base", "cache_tariff_metered", "cache_balance_user_a_positive")))]
 async fn test_balance_change_toggles_paid_access_on_reload(pool: sqlx::PgPool) {
     let user_a: uuid::Uuid = "00000000-0000-0000-0000-0000000000a1".parse().unwrap();

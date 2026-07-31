@@ -2287,6 +2287,12 @@ where
 pub struct CreditsConfig {
     /// Initial credits given to standard users when they are created (default: 0)
     pub initial_credits_for_standard_users: rust_decimal::Decimal,
+    /// Lifetime playground requests attached to a new standard user's hidden
+    /// playground key. Zero disables the allowance.
+    pub initial_playground_requests_for_standard_users: i64,
+    /// Lifetime batch requests attached to a new standard user's hidden batch
+    /// key. Zero disables the allowance.
+    pub initial_batch_requests_for_standard_users: i64,
     /// First-payment match promotion: a user's first ever payment (checkout or
     /// auto-topup) is matched with bonus credits, up to this amount (in dollars).
     /// 0 disables the promotion. Eligibility is derived from the ledger (no prior
@@ -2300,6 +2306,8 @@ impl Default for CreditsConfig {
         Self {
             // Default to 0 credits (no credits given on creation)
             initial_credits_for_standard_users: rust_decimal::Decimal::ZERO,
+            initial_playground_requests_for_standard_users: 0,
+            initial_batch_requests_for_standard_users: 0,
             // Default to 0 (first-payment match promotion disabled)
             first_payment_match_up_to: rust_decimal::Decimal::ZERO,
         }
@@ -2688,6 +2696,12 @@ impl Config {
 
     /// Validate the configuration for consistency and required fields
     pub fn validate(&self) -> Result<(), Error> {
+        if self.credits.initial_playground_requests_for_standard_users < 0 || self.credits.initial_batch_requests_for_standard_users < 0 {
+            return Err(Error::Internal {
+                operation: "Config validation: initial request allowances must be non-negative".to_string(),
+            });
+        }
+
         // Validate native authentication requirements
         if self.auth.native.enabled {
             if self.secret_key.is_none() {
@@ -3202,6 +3216,15 @@ auth:
         let result = config.validate();
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("min_length"));
+    }
+
+    #[test]
+    fn test_config_validation_rejects_negative_request_allowances() {
+        let mut config = Config::default();
+        config.credits.initial_batch_requests_for_standard_users = -1;
+
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("request allowances must be non-negative"));
     }
 
     #[test]

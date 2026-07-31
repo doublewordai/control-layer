@@ -17,7 +17,10 @@ use crate::auth::permissions::{
     RequiresPermission, can_read_all_resources, can_run_background_inference, has_permission, operation, resource,
 };
 use crate::db::handlers::deployments::BatchModelInfo;
-use crate::db::handlers::{BatchTemplates, Connections, Credits, Deployments, Users, api_keys::ApiKeys, repository::Repository};
+use crate::db::handlers::{
+    AllowanceReservation, BatchTemplates, Connections, Credits, Deployments, RequestAllowances, Users, api_keys::ApiKeys,
+    repository::Repository,
+};
 use crate::db::models::api_keys::ApiKeyPurpose;
 use crate::errors::{Error, Result};
 use crate::types::{Operation, Permission, Resource};
@@ -513,7 +516,7 @@ The batch will begin processing immediately. Use `GET /batches/{batch_id}` to mo
     responses(
         (status = 201, description = "Batch created and queued for processing.", body = BatchResponse),
         (status = 400, description = "Invalid request — check that the endpoint and completion_window are valid."),
-        (status = 402, description = "Insufficient credits — account balance is below zero."),
+        (status = 402, description = "Insufficient credits — API callers require positive credits; eligible UI callers may use a hidden-key request allowance."),
         (status = 404, description = "Input file not found or you don't have access to it."),
         (status = 422, description = "A reasoning effort maps to an absolute token budget but the request does not provide a sufficient output-token limit."),
         (status = 500, description = "An unexpected error occurred. Retry the request or contact support if the issue persists.")
@@ -567,26 +570,60 @@ pub async fn create_batch<P: PoolProvider>(
         message: "Invalid input_file_id format".to_string(),
     })?;
 
-    // Reject batches from users/orgs with negative credit balance.
+    // Visible API keys require positive credits. Session-authenticated UI
+    // submissions at a non-positive balance may continue to the hidden batch-key
+    // allowance gate after the file's request count is known.
     // In org context, check the org's balance rather than the user's personal balance.
     let balance_check_id = current_user.active_organization.unwrap_or(current_user.id);
-    {
+    let balance = {
         let mut conn = state.db.write().acquire().await.map_err(|e| Error::Internal {
             operation: format!("get db connection for credit check: {}", e),
         })?;
-        let balance = Credits::new(&mut conn)
+        Credits::new(&mut conn)
             .get_user_balance(balance_check_id)
             .await
             .map_err(|e| Error::Internal {
                 operation: format!("check credit balance: {}", e),
-            })?;
-        if balance < rust_decimal::Decimal::ZERO {
+            })?
+    };
+    if has_api_key.0 && balance <= rust_decimal::Decimal::ZERO {
+        return Err(Error::InsufficientCredits {
+            current_balance: balance,
+            message: "Account balance too low. Please add credits to continue.".to_string(),
+        });
+    }
+
+    // Resolve the execution key before reading the input file so a session
+    // with neither paid credits nor trial capacity fails the payment preflight
+    // without learning whether an arbitrary file exists. The exact request
+    // count is reserved later, immediately before batch creation.
+    let target_user_id = current_user.active_organization.unwrap_or(current_user.id);
+    let (batch_api_key, api_key_id, target_verified) = {
+        let mut conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
+        let (secret, key_id) = ApiKeys::new(&mut conn)
+            .resolve_batch_execution_key(target_user_id, current_user.id, current_user.api_key_id)
+            .await
+            .map_err(Error::Database)?;
+        if ApiKeys::new(&mut conn).is_scope_exhausted(key_id).await.map_err(Error::Database)? {
+            return Err(Error::SpendCapExceeded {
+                message: "The API key used for this batch has reached its spending cap. Raise or remove the cap, or wait for the cap window to reset, then resubmit.".to_string(),
+            });
+        }
+        if !has_api_key.0
+            && balance <= rust_decimal::Decimal::ZERO
+            && !RequestAllowances::new(&mut conn)
+                .has_remaining(key_id)
+                .await
+                .map_err(Error::Database)?
+        {
             return Err(Error::InsufficientCredits {
                 current_balance: balance,
                 message: "Account balance too low. Please add credits to continue.".to_string(),
             });
         }
-    }
+        let verified = Users::new(&mut conn).is_verified(target_user_id).await?;
+        (secret, key_id, verified)
+    };
 
     // Verify file exists and user has access
     // Use primary pool to avoid read-after-write consistency issues with replicas
@@ -660,6 +697,7 @@ pub async fn create_batch<P: PoolProvider>(
     // against any reasoning mapping or composite membership changes made
     // since upload.
     let (file_model_counts, batch_model_info) = load_and_validate_batch_models(&state, file_id).await?;
+    let total_requests: i64 = file_model_counts.values().sum();
 
     let model_aliases: Vec<String> = file_model_counts.keys().cloned().collect();
 
@@ -711,36 +749,6 @@ pub async fn create_batch<P: PoolProvider>(
         .map(|ua| ua.chars().take(256).collect::<String>())
         .filter(|ua| !ua.is_empty());
 
-    // When in org context, attribute batch ownership to the org
-    let target_user_id = current_user.active_organization.unwrap_or(current_user.id);
-
-    // Get the hidden API key for batch execution and per-member attribution.
-    // The secret is stored on the batch so the daemon uses the batch creator's
-    // credentials, not the file uploader's key from request_templates.
-    // If the request was authenticated with a capped API key, this resolves to
-    // that key's cap-scope child instead of the shared member key, so the
-    // batch's spend counts against the authenticating key's spending cap.
-    let (batch_api_key, api_key_id, target_verified) = {
-        let mut conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
-        let (secret, key_id) = ApiKeys::new(&mut conn)
-            .resolve_batch_execution_key(target_user_id, current_user.id, current_user.api_key_id)
-            .await
-            .map_err(Error::Database)?;
-        // Spending-cap pre-flight, beside the balance gate above: if the
-        // execution key's cap scope is already exhausted, reject up front
-        // instead of accepting a batch whose every request would be refused
-        // request-by-request at the proxy.
-        if ApiKeys::new(&mut conn).is_scope_exhausted(key_id).await.map_err(Error::Database)? {
-            return Err(Error::SpendCapExceeded {
-                message: "The API key used for this batch has reached its spending cap. Raise or remove the cap, or wait for the cap window to reset, then resubmit.".to_string(),
-            });
-        }
-        // Resolve the creditor's verified flag on the same connection (the org in
-        // org context, else the user) for the volume cap below — no extra acquire.
-        let verified = Users::new(&mut conn).is_verified(target_user_id).await?;
-        (secret, key_id, verified)
-    };
-
     // Convert metadata to HashMap and inject request_source and user info.
     // Strip reserved keys that are injected server-side during response enrichment
     // to prevent user-supplied values from colliding with system fields.
@@ -769,12 +777,10 @@ pub async fn create_batch<P: PoolProvider>(
     }
     let metadata = serde_json::to_value(metadata_map).ok();
 
-    // Create batch input — created_by uses org ID when in org context for ownership scoping
-    let total_requests: i64 = file_model_counts.values().sum();
-
     // Batch record (fusillade DB) and job enqueue (dwctl DB) are on separate databases,
     // so true atomicity isn't possible. Each is a single independent write.
     let batch = if is_background {
+        reserve_batch_request_allowance(&state, api_key_id, total_requests, balance).await?;
         state
             .request_manager
             .create_background_batch_record(fusillade::BackgroundBatchInput {
@@ -842,6 +848,8 @@ pub async fn create_batch<P: PoolProvider>(
             });
         });
 
+        reserve_batch_request_allowance(&state, api_key_id, total_requests, balance).await?;
+
         state
             .request_manager
             .create_batch_record(batch_input)
@@ -880,6 +888,32 @@ pub async fn create_batch<P: PoolProvider>(
         StatusCode::CREATED,
         Json(to_batch_response_with_email(batch, Some(&current_user.email))),
     ))
+}
+
+async fn reserve_batch_request_allowance<P: PoolProvider>(
+    state: &AppState<P>,
+    api_key_id: Uuid,
+    total_requests: i64,
+    balance: rust_decimal::Decimal,
+) -> Result<()> {
+    if balance > rust_decimal::Decimal::ZERO {
+        return Ok(());
+    }
+
+    let mut conn = state.db.write().acquire().await.map_err(|e| Error::Internal {
+        operation: format!("get db connection for batch request allowance: {e}"),
+    })?;
+    match RequestAllowances::new(&mut conn)
+        .reserve(api_key_id, total_requests)
+        .await
+        .map_err(Error::Database)?
+    {
+        AllowanceReservation::CreditsAvailable | AllowanceReservation::Reserved { .. } => Ok(()),
+        AllowanceReservation::NotProvisioned | AllowanceReservation::Unavailable => Err(Error::InsufficientCredits {
+            current_balance: balance,
+            message: "Batch request allowance exhausted. Please add credits to continue.".to_string(),
+        }),
+    }
 }
 
 async fn load_and_validate_batch_models<P: PoolProvider>(
@@ -2122,7 +2156,7 @@ mod tests {
     };
     use crate::api::models::batches::CreateBatchRequest;
     use crate::api::models::users::Role;
-    use crate::db::handlers::Credits;
+    use crate::db::handlers::{Credits, Repository};
     use crate::db::models::credits::{CreditTransactionCreateDBRequest, CreditTransactionType};
     use crate::errors::Error;
     use crate::test::utils::*;
@@ -2135,6 +2169,32 @@ mod tests {
     use std::collections::HashMap;
     use std::time::Duration;
     use uuid::Uuid;
+
+    async fn create_test_user_with_roles(pool: &PgPool, roles: Vec<Role>) -> crate::api::models::users::UserResponse {
+        let user = crate::test::utils::create_test_user_with_roles(pool, roles).await;
+        let mut conn = pool.acquire().await.unwrap();
+        super::RequestAllowances::new(&mut conn)
+            .provision(user.id, 0, 1_000_000)
+            .await
+            .unwrap();
+        user
+    }
+
+    async fn grant_test_credits(pool: &PgPool, user_id: Uuid) {
+        let mut conn = pool.acquire().await.unwrap();
+        Credits::new(&mut conn)
+            .create_transaction(&CreditTransactionCreateDBRequest {
+                user_id,
+                transaction_type: CreditTransactionType::AdminGrant,
+                amount: Decimal::new(1000, 2),
+                source_id: Uuid::new_v4().to_string(),
+                description: Some("Test credits".to_string()),
+                fusillade_batch_id: None,
+                api_key_id: None,
+            })
+            .await
+            .unwrap();
+    }
 
     fn background_batch() -> fusillade::Batch {
         let now = chrono::Utc::now();
@@ -2429,6 +2489,34 @@ mod tests {
             metadata: None,
         };
 
+        let visible_api_key = {
+            let mut conn = pool.acquire().await.unwrap();
+            crate::db::handlers::api_keys::ApiKeys::new(&mut conn)
+                .create(&crate::db::models::api_keys::ApiKeyCreateDBRequest::new(
+                    user.id,
+                    user.id,
+                    crate::api::models::api_keys::ApiKeyCreate {
+                        name: "Visible batch submission key".to_string(),
+                        description: None,
+                        purpose: crate::db::models::api_keys::ApiKeyPurpose::Realtime,
+                        requests_per_second: None,
+                        burst_size: None,
+                        member_id: None,
+                        spend_limit: None,
+                        spend_limit_interval: None,
+                    },
+                ))
+                .await
+                .unwrap()
+                .secret
+        };
+        let api_response = app
+            .post("/ai/v1/batches")
+            .json(&create_req)
+            .add_header("authorization", format!("Bearer {visible_api_key}"))
+            .await;
+        api_response.assert_status(StatusCode::PAYMENT_REQUIRED);
+
         let resp = app
             .post("/ai/v1/batches")
             .json(&create_req)
@@ -2446,6 +2534,7 @@ mod tests {
         // Create a user with batch permissions and an org they belong to
         let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
         let org = create_test_org(&pool, user.id).await;
+        grant_test_credits(&pool, org.id).await;
 
         // Create a group and give the org access to a model
         let group = create_test_group(&pool).await;
@@ -4222,6 +4311,7 @@ mod tests {
 
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user = setup_batch_user(&pool).await;
+        grant_test_credits(&pool, user.id).await;
 
         // A capped realtime key for the user, its cap scope provisioned as the
         // cap-set path would (child + zeroed window), then exhausted.
@@ -4391,17 +4481,31 @@ mod tests {
 
     #[sqlx::test]
     #[test_log::test]
-    async fn test_create_batch_allowed_with_zero_balance(pool: PgPool) {
+    async fn test_create_batch_allowed_with_zero_balance_and_request_allowance(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
         let group = create_test_group(&pool).await;
         add_user_to_group(&pool, user.id, group.id).await;
+        sqlx::query(
+            r#"
+            UPDATE api_key_request_allowances allowance
+            SET initial_requests = 1, remaining_requests = 1
+            FROM api_keys ak
+            WHERE ak.id = allowance.api_key_id
+              AND ak.user_id = $1
+              AND ak.purpose = 'batch'
+            "#,
+        )
+        .bind(user.id)
+        .execute(&pool)
+        .await
+        .unwrap();
 
         // Create a deployment and add to group so user has access to the model
         let deployment = create_test_deployment(&pool, user.id, "gpt-4-model", "gpt-4").await;
         add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
 
-        // User has zero balance (no credits granted) — should still be allowed
+        // User has zero balance and one hidden-key batch request.
 
         // Upload a batch file
         let jsonl_content = r#"{"custom_id":"request-1","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}}"#;
@@ -4433,8 +4537,20 @@ mod tests {
             .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
             .await;
 
-        // Zero balance should be accepted (only negative is rejected)
         resp.assert_status(StatusCode::CREATED);
+        let remaining: i64 = sqlx::query_scalar(
+            r#"
+            SELECT allowance.remaining_requests
+            FROM api_key_request_allowances allowance
+            JOIN api_keys ak ON ak.id = allowance.api_key_id
+            WHERE ak.user_id = $1 AND ak.purpose = 'batch'
+            "#,
+        )
+        .bind(user.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(remaining, 0);
     }
 
     #[sqlx::test]
@@ -4576,6 +4692,7 @@ mod tests {
 
         let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
         let org = create_test_org(&pool, user.id).await;
+        grant_test_credits(&pool, org.id).await;
 
         let group = create_test_group(&pool).await;
         add_user_to_group(&pool, org.id, group.id).await;

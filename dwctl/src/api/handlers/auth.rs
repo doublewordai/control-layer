@@ -19,7 +19,7 @@ use crate::{
     },
     auth::{password, session},
     db::{
-        handlers::{Deployments, PasswordResetTokens, Repository, Users, api_keys::ApiKeys, credits::Credits},
+        handlers::{Deployments, PasswordResetTokens, Repository, RequestAllowances, Users, api_keys::ApiKeys, credits::Credits},
         models::{
             api_keys::ApiKeyPurpose, credits::CreditTransactionCreateDBRequest, deployments::ModelStatus, users::UserCreateDBRequest,
         },
@@ -145,6 +145,16 @@ pub async fn register<P: PoolProvider>(
     };
 
     let created_user = user_repo.create(&create_request).await?;
+
+    if created_user.roles.contains(&Role::StandardUser) {
+        RequestAllowances::new(&mut tx)
+            .provision(
+                created_user.id,
+                config.credits.initial_playground_requests_for_standard_users,
+                config.credits.initial_batch_requests_for_standard_users,
+            )
+            .await?;
+    }
 
     // Give initial credits to standard users if configured
     let initial_credits = config.credits.initial_credits_for_standard_users;
@@ -1064,6 +1074,92 @@ mod tests {
         // Verify balance is correct via get_user_balance
         let balance = credits_repo.get_user_balance(body.user.id).await.unwrap();
         assert_eq!(balance, rust_decimal::Decimal::new(10000, 2));
+    }
+
+    #[sqlx::test]
+    async fn initial_request_allowance_registration_provisions_independent_hidden_keys(pool: PgPool) {
+        let mut config = create_test_config();
+        config.auth.native.enabled = true;
+        config.auth.native.allow_registration = true;
+        config.credits.initial_playground_requests_for_standard_users = 3;
+        config.credits.initial_batch_requests_for_standard_users = 8;
+
+        let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
+        let app = axum::Router::new()
+            .route("/auth/register", axum::routing::post(register))
+            .with_state(state);
+        let server = TestServer::new(app).unwrap();
+
+        let response = server
+            .post("/auth/register")
+            .json(&RegisterRequest {
+                username: "allowance-user".to_string(),
+                email: "allowance-user@example.com".to_string(),
+                password: "password123".to_string(),
+                display_name: None,
+            })
+            .await;
+        response.assert_status(axum::http::StatusCode::CREATED);
+        let body: AuthResponse = response.json();
+
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            r#"
+            SELECT ak.purpose, allowance.remaining_requests
+            FROM api_key_request_allowances allowance
+            JOIN api_keys ak ON ak.id = allowance.api_key_id
+            WHERE ak.user_id = $1
+            ORDER BY ak.purpose
+            "#,
+        )
+        .bind(body.user.id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(rows, vec![("batch".to_string(), 8), ("playground".to_string(), 3)]);
+    }
+
+    #[sqlx::test]
+    async fn initial_request_allowance_registration_is_revoked_by_initial_credits(pool: PgPool) {
+        let mut config = create_test_config();
+        config.auth.native.enabled = true;
+        config.auth.native.allow_registration = true;
+        config.credits.initial_playground_requests_for_standard_users = 3;
+        config.credits.initial_batch_requests_for_standard_users = 8;
+        config.credits.initial_credits_for_standard_users = rust_decimal::Decimal::ONE;
+
+        let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
+        let app = axum::Router::new()
+            .route("/auth/register", axum::routing::post(register))
+            .with_state(state);
+        let server = TestServer::new(app).unwrap();
+
+        let response = server
+            .post("/auth/register")
+            .json(&RegisterRequest {
+                username: "credited-allowance-user".to_string(),
+                email: "credited-allowance-user@example.com".to_string(),
+                password: "password123".to_string(),
+                display_name: None,
+            })
+            .await;
+        response.assert_status(axum::http::StatusCode::CREATED);
+        let body: AuthResponse = response.json();
+
+        let allowance_count: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM api_key_request_allowances allowance
+            JOIN api_keys ak ON ak.id = allowance.api_key_id
+            WHERE ak.user_id = $1
+            "#,
+        )
+        .bind(body.user.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(allowance_count, 0);
     }
 
     #[sqlx::test]
