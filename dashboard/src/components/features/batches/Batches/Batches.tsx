@@ -336,9 +336,16 @@ export function Batches({
 
   // Empty selection means "no filter" — same UX as AsyncRequests so the user
   // can't accidentally end up with a query that matches nothing.
+  // Sanitize persisted values against the current role: 'background' is
+  // PM-only server-side, and a filter persisted while the user held that
+  // role would otherwise 400 every list request after demotion (rendering
+  // as a misleading empty state). Same defensive shape as the member_id drop.
+  const allowedWindowFilter = isPlatformManager
+    ? completionWindowFilter
+    : completionWindowFilter.filter((w) => w !== "background");
   const completionWindowParam =
-    completionWindowFilter.length > 0
-      ? completionWindowFilter.join(",")
+    allowedWindowFilter.length > 0
+      ? allowedWindowFilter.join(",")
       : undefined;
 
   // Paginated batches query - include analytics to avoid N+1 requests
