@@ -480,6 +480,27 @@ async fn fetch_creator_email(db: &sqlx::PgPool, batch: &fusillade::Batch) -> Opt
     Users::new(&mut conn).get_by_id(user_id).await.ok().flatten().map(|u| u.email)
 }
 
+/// Metadata keys the server owns. A caller-supplied value for any of these is dropped at
+/// creation rather than merged: they are either injected server-side during response
+/// enrichment, or they are provenance, which is worth nothing if the caller can set it.
+const RESERVED_METADATA_KEYS: [&str; 6] = [
+    "created_by_email",
+    "context_name",
+    "context_type",
+    "request_source",
+    "created_by",
+    "dw_user_agent",
+];
+
+/// Whether a caller-supplied metadata key collides with a reserved one, comparing the
+/// normalised form so `dw-user-agent` and `DW_USER_AGENT` are caught with `dw_user_agent`.
+/// `-` and `_` are the same character by the time fusillade has built a header name out of
+/// the key, so they are treated as the same key here.
+fn is_reserved_metadata_key(key: &str) -> bool {
+    let normalised = key.to_ascii_lowercase().replace('-', "_");
+    RESERVED_METADATA_KEYS.contains(&normalised.as_str())
+}
+
 #[utoipa::path(
     post,
     path = "/batches",
@@ -726,17 +747,17 @@ pub async fn create_batch<P: PoolProvider>(
     // `dw_user_agent` is stripped for a sharper reason than collision: it is provenance,
     // and provenance a caller can set is worthless. Only the value read off the wire above
     // is ever stored.
+    //
+    // Matched on the NORMALISED key — lower-cased, `-` folded to `_` — so `dw-user-agent`
+    // and `DW_User_Agent` are stripped alongside `dw_user_agent`. Nothing honours those
+    // spellings today: fusillade looks each metadata key up by its exact configured name,
+    // so only `dw_user_agent` is ever read. But it turns `_` into `-` when it builds the
+    // header, meaning both spellings are one header on the wire, and a forwarding loop that
+    // walked the caller's keys instead of the configured ones would let their spelling win.
+    // Folding here costs nothing and makes the invariant hold by construction rather than
+    // by the current shape of a loop two crates away.
     let mut metadata_map = req.metadata.unwrap_or_default();
-    for key in &[
-        "created_by_email",
-        "context_name",
-        "context_type",
-        "request_source",
-        "created_by",
-        "dw_user_agent",
-    ] {
-        metadata_map.remove(*key);
-    }
+    metadata_map.retain(|key, _| !is_reserved_metadata_key(key));
     metadata_map.insert("request_source".to_string(), request_source.to_string());
     metadata_map.insert("created_by".to_string(), current_user.id.to_string());
     // `dw_` prefix: fusillade replays every metadata key onto dispatched requests as
@@ -2095,7 +2116,10 @@ pub async fn list_batches<P: PoolProvider>(
 
 #[cfg(test)]
 mod tests {
-    use super::{load_and_validate_batch_models, parse_batch_class_filter, parse_completion_window_filter, to_batch_response_with_email};
+    use super::{
+        is_reserved_metadata_key, load_and_validate_batch_models, parse_batch_class_filter, parse_completion_window_filter,
+        to_batch_response_with_email,
+    };
     use crate::api::models::batches::CreateBatchRequest;
     use crate::api::models::users::Role;
     use crate::db::handlers::Credits;
@@ -2553,6 +2577,10 @@ mod tests {
             completion_window: "24h".to_string(),
             metadata: Some(HashMap::from([
                 ("dw_user_agent".to_string(), "spoofed/9.9.9".to_string()),
+                // Same key once fusillade has folded `_` to `-` building the header name,
+                // so it has to be stripped by the same rule rather than by exact match.
+                ("dw-user-agent".to_string(), "spoofed-hyphenated/9.9.9".to_string()),
+                ("DW_USER_AGENT".to_string(), "spoofed-shouty/9.9.9".to_string()),
                 ("team".to_string(), "research".to_string()),
             ])),
         };
@@ -2591,6 +2619,31 @@ mod tests {
             "the wire User-Agent should be stored for fusillade to replay on dispatch"
         );
         assert_eq!(metadata["team"], "research", "caller metadata should survive alongside it");
+        for spelling in ["dw-user-agent", "DW_USER_AGENT"] {
+            assert!(
+                metadata.get(spelling).is_none(),
+                "a reserved key must be stripped in every spelling that normalises to it, not just the exact one ({spelling} survived)"
+            );
+        }
+    }
+
+    /// The strip rule, on its own. `-` and `_` are the same character by the time fusillade
+    /// has built a header name out of the key, so they must be the same key here.
+    #[test]
+    fn reserved_metadata_keys_are_matched_on_their_normalised_form() {
+        for reserved in [
+            "dw_user_agent",
+            "dw-user-agent",
+            "DW_USER_AGENT",
+            "Dw-User-Agent",
+            "request_source",
+            "created_by",
+        ] {
+            assert!(is_reserved_metadata_key(reserved), "{reserved} should be reserved");
+        }
+        for allowed in ["team", "dw_user_agent_note", "user_agent", "dwuseragent"] {
+            assert!(!is_reserved_metadata_key(allowed), "{allowed} is the caller's to set");
+        }
     }
 
     #[sqlx::test]
