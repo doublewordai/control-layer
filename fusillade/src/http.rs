@@ -1634,6 +1634,24 @@ mod tests {
                     Some("24h"),
                     "Missing or incorrect x-fusillade-batch-completion-window header"
                 );
+                // The submitter's client, which dwctl reads back into
+                // `http_analytics.user_agent`: this dispatch is the only place a batch's
+                // caller is recoverable, since the client below sends no User-Agent of its
+                // own. Pinned here because the underscore-to-hyphen rewrite happens in this
+                // function, so the key stored at creation and the header dwctl looks for
+                // are only equal by this line.
+                assert_eq!(
+                    headers
+                        .get("x-fusillade-batch-dw-user-agent")
+                        .and_then(|h| h.to_str().ok()),
+                    Some("claude-cli/1.2.3"),
+                    "Missing or incorrect x-fusillade-batch-dw-user-agent header"
+                );
+                assert!(
+                    headers.get("user-agent").is_none(),
+                    "the dispatching client must not add a User-Agent of its own — if it \
+                     ever does, analytics must keep preferring the batch header"
+                );
 
                 // Also verify standard headers
                 assert_eq!(
@@ -1666,6 +1684,8 @@ mod tests {
         batch_metadata.insert("endpoint".to_string(), "/v1/completions".to_string());
         batch_metadata.insert("created_at".to_string(), "2025-12-19T13:00:00Z".to_string());
         batch_metadata.insert("completion_window".to_string(), "24h".to_string());
+        // Underscored at rest (it is a metadata key), hyphenated on the wire.
+        batch_metadata.insert("dw_user_agent".to_string(), "claude-cli/1.2.3".to_string());
 
         let request = RequestData {
             id: RequestId::from(uuid::Uuid::new_v4()),

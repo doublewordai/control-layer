@@ -10624,6 +10624,77 @@ mod tests {
         );
     }
 
+    /// The batch half of the same contract. A key stored in `batches.metadata` reaches the
+    /// dispatched request only if it is on the forwarding list — which is exactly what was
+    /// wrong the first time this shipped: the key was stored, and silently never sent.
+    #[sqlx::test]
+    async fn batch_claim_forwards_listed_batch_metadata(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        )
+        .with_config(PostgresStorageConfig {
+            batch_metadata_fields: vec!["id".to_string(), "dw_user_agent".to_string()],
+            ..Default::default()
+        });
+
+        let file_id = manager
+            .create_file(
+                "ua-batch".to_string(),
+                None,
+                vec![RequestTemplateInput {
+                    custom_id: Some("ua".to_string()),
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/test".to_string(),
+                    body: "{}".to_string(),
+                    model: "test".to_string(),
+                    api_key: "key".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+        manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: Some(serde_json::json!({
+                    "dw_user_agent": "OpenAI/Python 1.2.3",
+                    "dw_unlisted": "must not be forwarded",
+                })),
+                created_by: None,
+                api_key_id: None,
+                api_key: None,
+                total_requests: None,
+            })
+            .await
+            .unwrap();
+
+        let claimed = manager
+            .claim_batch_requests(
+                10,
+                10,
+                DaemonId::from(Uuid::new_v4()),
+                &HashMap::from([("test".to_string(), 10)]),
+                &HashMap::new(),
+            )
+            .await
+            .expect("Failed to claim batch requests");
+
+        assert_eq!(claimed.len(), 1);
+        let metadata = &claimed[0].data.batch_metadata;
+        assert_eq!(
+            metadata.get("dw_user_agent").map(String::as_str),
+            Some("OpenAI/Python 1.2.3"),
+            "a listed batch metadata key must reach the dispatched request"
+        );
+        assert!(
+            !metadata.contains_key("dw_unlisted"),
+            "an unlisted key must not be forwarded: the allow-list is the contract"
+        );
+    }
+
     /// Batchless metadata is optional, and the common case (no metadata at all) must not
     /// disturb the fields the claim path synthesizes for every batchless row.
     #[sqlx::test]

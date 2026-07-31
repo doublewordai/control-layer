@@ -478,4 +478,28 @@ mod tests {
         assert_eq!(record.method, "POST");
         assert!(record.uri.contains("chat/completions"));
     }
+
+    /// `resolve_user_agent` being correct is not the same as it being CALLED. This drives
+    /// the handler the way outlet does — a dispatched batch request, carrying the creator's
+    /// User-Agent as a header and nothing on the wire — and asserts the value lands on the
+    /// record that goes to the batcher.
+    #[tokio::test]
+    async fn a_dispatched_batch_request_reports_the_batchs_creator_as_its_client() {
+        let (tx, mut rx) = mpsc::channel::<RawAnalyticsRecord>(100);
+        let handler = AnalyticsHandler::new(tx, Uuid::new_v4(), Config::default());
+
+        handler
+            .handle_response(
+                request_data_with_headers(&[(BATCH_CREATOR_USER_AGENT_HEADER, "OpenAI/Python 1.2.3")]),
+                create_test_response_data(),
+            )
+            .await;
+
+        let record = rx.try_recv().expect("Should have received a record");
+        assert_eq!(
+            record.user_agent.as_deref(),
+            Some("OpenAI/Python 1.2.3"),
+            "the batch creator's client must reach the analytics record"
+        );
+    }
 }
