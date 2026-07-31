@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use rust_decimal::Decimal;
 use sqlx::PgPool;
 use std::collections::HashMap;
-use stripe::{ApiErrorsCode, Client, StripeError};
+use stripe::{ApiErrorsCode, Client};
 use stripe_billing::billing_portal_session::CreateBillingPortalSession;
 use stripe_checkout::checkout_session::{
     CreateCheckoutSessionConsentCollection, CreateCheckoutSessionConsentCollectionPaymentMethodReuseAgreement,
@@ -30,32 +30,68 @@ use crate::{
         handlers::{credits::Credits, repository::Repository},
         models::credits::{CreditTransactionCreateDBRequest, CreditTransactionType},
     },
-    payment_providers::{AutoTopupSetupResult, CheckoutPayer, PaymentError, PaymentProvider, PaymentSession, Result, WebhookEvent},
+    payment_providers::{
+        AutoTopupDeclineKind, AutoTopupSetupResult, CheckoutPayer, PaymentError, PaymentProvider, PaymentSession, Result, WebhookEvent,
+    },
     types::UserId,
 };
+
+fn classify_card_decline(advice_code: Option<&str>, decline_code: Option<&str>) -> AutoTopupDeclineKind {
+    const HARD_DECLINE_CODES: &[&str] = &[
+        "do_not_honor",
+        "fraudulent",
+        "lost_card",
+        "merchant_blacklist",
+        "pickup_card",
+        "restricted_card",
+        "revocation_of_all_authorizations",
+        "revocation_of_authorization",
+        "security_violation",
+        "stolen_card",
+        "stop_payment_order",
+        "transaction_not_allowed",
+    ];
+
+    if advice_code == Some("do_not_try_again") || decline_code.is_some_and(|code| HARD_DECLINE_CODES.contains(&code)) {
+        AutoTopupDeclineKind::Hard
+    } else {
+        AutoTopupDeclineKind::Soft
+    }
+}
+
+fn map_auto_topup_charge_error(error: stripe::StripeError) -> PaymentError {
+    match error {
+        // Another caller is already performing this exact charge. Checked first:
+        // it arrives as an invalid_request_error, not a CardError, so it would
+        // otherwise fall through and be counted as a charge failure.
+        stripe::StripeError::Stripe(api_error, _) if api_error.code == Some(ApiErrorsCode::IdempotencyKeyInUse) => {
+            PaymentError::AlreadyProcessed
+        }
+        stripe::StripeError::Stripe(api_error, _) if matches!(api_error.type_, stripe::ApiErrorsType::CardError) => {
+            PaymentError::AutoTopupDeclined(classify_card_decline(
+                api_error.advice_code.as_deref(),
+                api_error.decline_code.as_deref(),
+            ))
+        }
+        stripe::StripeError::Stripe(api_error, status) => {
+            tracing::error!(
+                status,
+                error_type = %api_error.type_,
+                "Stripe rejected the auto top-up payment request"
+            );
+            PaymentError::ProviderApi(format!("Stripe {} error (HTTP {status})", api_error.type_))
+        }
+        other => {
+            tracing::error!(error = %other, "Failed to create auto top-up payment intent");
+            PaymentError::ProviderApi(other.to_string())
+        }
+    }
+}
 
 /// Stripe payment provider
 pub struct StripeProvider {
     config: crate::config::StripeConfig,
     client: Client,
-}
-
-/// Convert a Stripe SDK error into a `PaymentError`.
-///
-/// Stripe answers a request whose idempotency key is already in flight with a
-/// 409 `idempotency_key_in_use`. That is the key doing its job: another caller
-/// is already performing this exact charge, so this one is a no-op rather than
-/// a failure. Returning `AlreadyProcessed` lets callers skip quietly instead of
-/// recording a payment failure for a charge that is going through elsewhere.
-fn map_stripe_error(context: &str, e: StripeError) -> PaymentError {
-    if let StripeError::Stripe(api_errors, _) = &e
-        && api_errors.code == Some(ApiErrorsCode::IdempotencyKeyInUse)
-    {
-        tracing::debug!("{context}: idempotency key already in use, another request is in flight");
-        return PaymentError::AlreadyProcessed;
-    }
-    tracing::error!("{context}: {e:?}");
-    PaymentError::ProviderApi(e.to_string())
 }
 
 impl From<crate::config::StripeConfig> for StripeProvider {
@@ -97,7 +133,7 @@ impl StripeProvider {
             .request_strategy(RequestStrategy::Idempotent(tax_idem_key))
             .send(&self.client)
             .await
-            .map_err(|e| map_stripe_error("Failed to create tax calculation", e))?;
+            .map_err(map_auto_topup_charge_error)?;
 
         let tax_calc_id = tax_calc
             .id
@@ -123,7 +159,7 @@ impl StripeProvider {
             .request_strategy(RequestStrategy::Idempotent(idem_key))
             .send(&self.client)
             .await
-            .map_err(|e| map_stripe_error("Failed to create auto top-up payment intent", e))
+            .map_err(map_auto_topup_charge_error)
     }
 
     async fn get_setup_session(&self, session_id: &str) -> Result<stripe_checkout::CheckoutSession> {
@@ -733,13 +769,15 @@ mod tests {
         user.id
     }
 
-    /// Build a Stripe API error carrying `code`, as returned on a 409/402.
-    fn stripe_api_error(code: ApiErrorsCode) -> StripeError {
-        StripeError::Stripe(
+    /// Build a Stripe API error, as returned on a 409/402. `type_` matters:
+    /// the idempotency conflict arrives as an `invalid_request_error`, declines
+    /// as a `card_error`, and the mapper dispatches on both.
+    fn stripe_api_error(code: Option<ApiErrorsCode>, type_: stripe::ApiErrorsType) -> stripe::StripeError {
+        stripe::StripeError::Stripe(
             Box::new(stripe::ApiErrors {
                 advice_code: None,
                 charge: None,
-                code: Some(code),
+                code,
                 decline_code: None,
                 doc_url: None,
                 message: None,
@@ -752,7 +790,7 @@ mod tests {
                 request_log_url: None,
                 setup_intent: None,
                 source: None,
-                type_: stripe::ApiErrorsType::InvalidRequestError,
+                type_,
             }),
             409,
         )
@@ -760,16 +798,22 @@ mod tests {
 
     #[test]
     fn test_idempotency_key_in_use_maps_to_already_processed() {
-        // Another replica is mid-charge on the same key — a no-op, not a failure.
-        let err = map_stripe_error("charge", stripe_api_error(ApiErrorsCode::IdempotencyKeyInUse));
+        // Another replica is mid-charge on the same key: a no-op, not a failure.
+        let err = map_auto_topup_charge_error(stripe_api_error(
+            Some(ApiErrorsCode::IdempotencyKeyInUse),
+            stripe::ApiErrorsType::InvalidRequestError,
+        ));
         assert!(matches!(err, PaymentError::AlreadyProcessed), "got {err:?}");
     }
 
     #[test]
-    fn test_card_declined_still_maps_to_provider_api_error() {
-        // A real decline must keep surfacing as a failure.
-        let err = map_stripe_error("charge", stripe_api_error(ApiErrorsCode::CardDeclined));
-        assert!(matches!(err, PaymentError::ProviderApi(_)), "got {err:?}");
+    fn test_card_error_still_classifies_as_a_decline() {
+        // The idempotency check must not shadow real declines.
+        let err = map_auto_topup_charge_error(stripe_api_error(
+            Some(ApiErrorsCode::CardDeclined),
+            stripe::ApiErrorsType::CardError,
+        ));
+        assert!(matches!(err, PaymentError::AutoTopupDeclined(_)), "got {err:?}");
     }
 
     #[test]
@@ -803,6 +847,36 @@ mod tests {
         let provider = StripeProvider::from(config);
 
         assert!(provider.config.enable_invoice_creation);
+    }
+
+    #[test]
+    fn classifies_auto_topup_do_not_retry_advice_as_hard_decline() {
+        assert_eq!(
+            classify_card_decline(Some("do_not_try_again"), Some("insufficient_funds")),
+            AutoTopupDeclineKind::Hard
+        );
+    }
+
+    #[test]
+    fn classifies_auto_topup_terminal_codes_as_hard_declines() {
+        for decline_code in ["do_not_honor", "fraudulent", "lost_card", "pickup_card", "stolen_card"] {
+            assert_eq!(
+                classify_card_decline(None, Some(decline_code)),
+                AutoTopupDeclineKind::Hard,
+                "{decline_code} should disable auto top-up immediately"
+            );
+        }
+    }
+
+    #[test]
+    fn classifies_auto_topup_retryable_card_errors_as_soft_declines() {
+        for decline_code in [Some("insufficient_funds"), Some("processing_error"), None] {
+            assert_eq!(
+                classify_card_decline(None, decline_code),
+                AutoTopupDeclineKind::Soft,
+                "{decline_code:?} should receive one retry after 24 hours"
+            );
+        }
     }
 
     #[sqlx::test]
