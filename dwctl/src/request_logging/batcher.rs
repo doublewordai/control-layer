@@ -3096,6 +3096,27 @@ mod integration_tests {
         assert_eq!(usage_txs.len(), 0, "Should have no usage transactions");
     }
 
+    /// The last hop, against a real table: a record carrying a client must persist it to
+    /// `http_analytics.user_agent`. Everything upstream of here — stamping the batch,
+    /// forwarding the key on claim, emitting the header, reading it back off the request —
+    /// is worth nothing if the column ends up empty, and this is the column every dashboard
+    /// reads.
+    #[sqlx::test]
+    #[test_log::test]
+    async fn batcher_persists_the_user_agent_to_http_analytics(pool: PgPool) {
+        create_test_model(&pool, "ua-persist-test").await;
+
+        let mut record = create_raw_record("ua-persist-test", None, 10, 5);
+        record.user_agent = Some("claude-cli/1.2.3".to_string());
+        run_batcher_with_records(&pool, vec![record]).await;
+
+        let stored: Option<String> = sqlx::query_scalar("SELECT user_agent FROM http_analytics WHERE model = 'ua-persist-test'")
+            .fetch_one(&pool)
+            .await
+            .expect("the analytics row should exist");
+        assert_eq!(stored.as_deref(), Some("claude-cli/1.2.3"));
+    }
+
     #[sqlx::test]
     #[test_log::test]
     async fn test_batcher_skip_deduction_for_unauthenticated_requests(pool: PgPool) {

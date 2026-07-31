@@ -1,5 +1,13 @@
 # Changelog
 
+## [10.1.0](https://github.com/doublewordai/control-layer/compare/v10.0.0...v10.1.0) (2026-07-31)
+
+
+### Features
+
+* attribute batch traffic to the client that submitted it ([#1410](https://github.com/doublewordai/control-layer/issues/1410)) ([2dde662](https://github.com/doublewordai/control-layer/commit/2dde6620ced2d283d1efffa376aa3a86dc7b66c0))
+* back off auto top-up card declines ([#1358](https://github.com/doublewordai/control-layer/issues/1358)) ([c1b26df](https://github.com/doublewordai/control-layer/commit/c1b26dfe1c3840e1f633709b195c673d5d2de335))
+
 ## [10.0.0](https://github.com/doublewordai/control-layer/compare/v9.3.0...v10.0.0) (2026-07-31)
 
 
