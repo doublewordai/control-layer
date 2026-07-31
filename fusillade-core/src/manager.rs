@@ -1146,6 +1146,11 @@ pub trait DaemonStorage: Send + Sync {
     /// sweep-backlog gauge. Index-only on the partial sweep index.
     async fn count_archivable_batches(&self, cancel_grace_secs: f64) -> Result<i64>;
 
+    /// Count of terminal batches (a terminal timestamp set) whose counters
+    /// have not been frozen — the finalization-lag gauge. Sustained nonzero
+    /// means batches are stuck on the recount path and cannot archive.
+    async fn count_unfrozen_terminal_batches(&self) -> Result<i64>;
+
     /// Ensure weekly archive partitions exist through now + `weeks_ahead`
     /// (create -> bounds CHECK -> attach; advisory-locked; idempotent).
     /// Returns `(created, ahead)`: partitions created this call, and how

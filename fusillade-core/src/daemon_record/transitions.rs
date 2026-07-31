@@ -149,6 +149,10 @@ mod tests {
             Ok(0)
         }
 
+        async fn count_unfrozen_terminal_batches(&self) -> Result<i64> {
+            Ok(0)
+        }
+
         async fn ensure_archive_partitions(&self, _weeks_ahead: i32) -> Result<(i64, i64)> {
             Ok((0, 0))
         }
