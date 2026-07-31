@@ -255,6 +255,10 @@ struct NewPendingRequest {
     api_key: String,
     created_by: String,
     service_tier: &'static str,
+    /// Provenance stored on the template, standing in for the batch metadata a
+    /// batchless request doesn't have. Read back by the claim queries and
+    /// forwarded under the same header names.
+    metadata: Option<serde_json::Value>,
 }
 
 struct ClaimedRequestRow {
@@ -530,8 +534,8 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
         let stored_body = sanitize_outbound_body(&input.body);
         let body_byte_size = stored_body.len() as i64;
         sqlx::query(
-            "INSERT INTO request_templates (id, file_id, custom_id, endpoint, method, path, body, model, api_key, body_byte_size)
-             VALUES ($1, NULL, NULL, $2, $3, $4, $5, $6, $7, $8)",
+            "INSERT INTO request_templates (id, file_id, custom_id, endpoint, method, path, body, model, api_key, body_byte_size, metadata)
+             VALUES ($1, NULL, NULL, $2, $3, $4, $5, $6, $7, $8, $9)",
         )
         .bind(template_id)
         .bind(&input.endpoint)
@@ -541,6 +545,7 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
         .bind(&input.model)
         .bind(&input.api_key)
         .bind(body_byte_size)
+        .bind(&input.metadata)
         .execute(&mut *tx)
         .await
         .map_err(|e| {
@@ -604,17 +609,21 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
             .map(|row| {
                 let mut batch_metadata = std::collections::HashMap::new();
 
-                let parsed_metadata = row.batch_id.and_then(|batch_uuid| {
-                    parsed_metadata_cache
+                let parse_metadata = |raw: Option<&str>| {
+                    raw.and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+                        .map(Arc::new)
+                };
+                let parsed_metadata = match row.batch_id {
+                    // One batch, many requests: parse its metadata once per claim.
+                    Some(batch_uuid) => parsed_metadata_cache
                         .entry(batch_uuid)
-                        .or_insert_with(|| {
-                            row.batch_metadata
-                                .as_deref()
-                                .and_then(|s| serde_json::from_str(s).ok())
-                                .map(Arc::new)
-                        })
-                        .clone()
-                });
+                        .or_insert_with(|| parse_metadata(row.batch_metadata.as_deref()))
+                        .clone(),
+                    // Batchless (flex, background): the metadata is the request's own, off
+                    // its template, so there is nothing to dedupe against and no batch id
+                    // to key a cache by. Parsed per row - 1:1 with the request.
+                    None => parse_metadata(row.batch_metadata.as_deref()),
+                };
 
                 for field_name in &self.config.batch_metadata_fields {
                     let value: Option<&str> = if row.batch_id.is_some() {
@@ -2200,7 +2209,10 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                       ''::TEXT as "batch_file_id!",
                       t.endpoint as "batch_endpoint!",
                       '1h'::TEXT as "batch_completion_window?",
-                      NULL::TEXT as "batch_metadata",
+                      -- A batchless request's metadata lives on its template; it is read
+                      -- through the same allow-list and forwarded under the same header
+                      -- names as a batch's, so the claim path treats both alike.
+                      t.metadata::TEXT as "batch_metadata",
                       NULL::TEXT as "batch_output_file_id",
                       NULL::TEXT as "batch_error_file_id",
                       COALESCE(r.created_by, '') as "batch_created_by!",
@@ -2714,7 +2726,11 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                       COALESCE(b.file_id::TEXT, '') as "batch_file_id!",
                       COALESCE(b.endpoint, t.endpoint) as "batch_endpoint!",
                       'background'::TEXT as "batch_completion_window?",
-                      b.metadata::TEXT as "batch_metadata",
+                      -- This query claims both batched and batchless background rows, so
+                      -- take the batch's metadata when there is a batch and the template's
+                      -- when there isn't. b.metadata is NULL for batchless rows and
+                      -- t.metadata is NULL for file-ingested ones, so the two never race.
+                      COALESCE(b.metadata, t.metadata)::TEXT as "batch_metadata",
                       b.output_file_id::TEXT as "batch_output_file_id",
                       b.error_file_id::TEXT as "batch_error_file_id",
                       COALESCE(b.created_by, r.created_by, '') as "batch_created_by!",
@@ -6334,6 +6350,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
             api_key: input.api_key,
             created_by: input.created_by,
             service_tier: "flex",
+            metadata: input.metadata,
         })
         .await
     }
@@ -6350,6 +6367,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
             api_key: input.api_key,
             created_by: input.created_by,
             service_tier: "background",
+            metadata: input.metadata,
         })
         .await
     }
@@ -8737,6 +8755,7 @@ mod tests {
                 path: "/test".to_string(),
                 api_key: "key".to_string(),
                 created_by: owner.to_string(),
+                metadata: None,
             })
             .await
             .unwrap()
@@ -8856,6 +8875,7 @@ mod tests {
                 path: "/v1/responses".to_string(),
                 api_key: "test-key".to_string(),
                 created_by: "user-123".to_string(),
+                metadata: None,
             })
             .await
             .expect("create_flex should succeed");
@@ -10021,6 +10041,7 @@ mod tests {
                 path: "/test".to_string(),
                 api_key: "key".to_string(),
                 created_by: "foreground-owner".to_string(),
+                metadata: None,
             })
             .await
             .unwrap();
@@ -10077,6 +10098,7 @@ mod tests {
                 path: "/test".to_string(),
                 api_key: "key".to_string(),
                 created_by: "sla-owner".to_string(),
+                metadata: None,
             })
             .await
             .unwrap();
@@ -10130,6 +10152,7 @@ mod tests {
                 path: "/test".to_string(),
                 api_key: "key".to_string(),
                 created_by: "sla-owner".to_string(),
+                metadata: None,
             })
             .await
             .unwrap();
@@ -10421,6 +10444,7 @@ mod tests {
                 path: "/test".to_string(),
                 api_key: "key".to_string(),
                 created_by: "sla-owner".to_string(),
+                metadata: None,
             })
             .await
             .unwrap();
@@ -10513,6 +10537,7 @@ mod tests {
                 path: "/test".to_string(),
                 api_key: "key".to_string(),
                 created_by: "user".to_string(),
+                metadata: None,
             })
             .await
             .unwrap();
@@ -10527,6 +10552,124 @@ mod tests {
         assert_eq!(claimed.len(), 1);
         assert_eq!(claimed[0].data.id, flex_id);
         assert_eq!(claimed[0].data.batch_id, None);
+    }
+
+    /// A batchless request has no batch to hang provenance on, so it goes on the template —
+    /// but storing it is only half the path. The dispatcher builds its headers from the
+    /// CLAIMED request's metadata map, and that map is filled from an allow-list, so a key
+    /// that is written and never listed is silently never sent. That is exactly how the
+    /// batch side of this shipped broken, so this asserts on what came back from the claim
+    /// rather than on the row that went in.
+    #[sqlx::test]
+    async fn batchless_claim_forwards_listed_template_metadata(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        )
+        .with_config(PostgresStorageConfig {
+            // `dw_user_agent` is forwarded; `dw_unlisted` is not, and proves the gate is
+            // the list rather than the mere presence of the key.
+            batch_metadata_fields: vec![
+                "completion_window".to_string(),
+                "dw_user_agent".to_string(),
+            ],
+            ..Default::default()
+        });
+
+        let request_id = Uuid::new_v4();
+        manager
+            .create_flex(CreateFlexInput {
+                request_id,
+                body: r#"{"model":"test","service_tier":"flex"}"#.to_string(),
+                model: "test".to_string(),
+                endpoint: "https://api.example.com".to_string(),
+                method: "POST".to_string(),
+                path: "/test".to_string(),
+                api_key: "key".to_string(),
+                created_by: "user".to_string(),
+                metadata: Some(serde_json::json!({
+                    "dw_user_agent": "claude-cli/1.2.3",
+                    "dw_unlisted": "must not be forwarded",
+                })),
+            })
+            .await
+            .unwrap();
+
+        let claimed = manager
+            .claim_batchless_requests(
+                10,
+                DaemonId::from(Uuid::new_v4()),
+                &HashMap::from([("test".to_string(), 10)]),
+                &HashMap::new(),
+                &HashSet::new(),
+            )
+            .await
+            .expect("Failed to claim batchless requests");
+
+        assert_eq!(claimed.len(), 1);
+        let metadata = &claimed[0].data.batch_metadata;
+        assert_eq!(
+            metadata.get("dw_user_agent").map(String::as_str),
+            Some("claude-cli/1.2.3"),
+            "a listed template metadata key must reach the dispatched request"
+        );
+        assert!(
+            !metadata.contains_key("dw_unlisted"),
+            "an unlisted key must not be forwarded: the allow-list is the contract"
+        );
+        // The synthesized batchless fields still work alongside the parsed metadata.
+        assert_eq!(
+            metadata.get("completion_window").map(String::as_str),
+            Some("1h")
+        );
+    }
+
+    /// Batchless metadata is optional, and the common case (no metadata at all) must not
+    /// disturb the fields the claim path synthesizes for every batchless row.
+    #[sqlx::test]
+    async fn batchless_claim_without_metadata_keeps_synthesized_fields(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+
+        manager
+            .create_flex(CreateFlexInput {
+                request_id: Uuid::new_v4(),
+                body: r#"{"model":"test","service_tier":"flex"}"#.to_string(),
+                model: "test".to_string(),
+                endpoint: "https://api.example.com".to_string(),
+                method: "POST".to_string(),
+                path: "/test".to_string(),
+                api_key: "key".to_string(),
+                created_by: "user".to_string(),
+                metadata: None,
+            })
+            .await
+            .unwrap();
+
+        let claimed = manager
+            .claim_batchless_requests(
+                10,
+                DaemonId::from(Uuid::new_v4()),
+                &HashMap::from([("test".to_string(), 10)]),
+                &HashMap::new(),
+                &HashSet::new(),
+            )
+            .await
+            .expect("Failed to claim batchless requests");
+
+        assert_eq!(claimed.len(), 1);
+        let metadata = &claimed[0].data.batch_metadata;
+        assert!(!metadata.contains_key("dw_user_agent"));
+        assert_eq!(
+            metadata.get("completion_window").map(String::as_str),
+            Some("1h")
+        );
+        assert!(
+            metadata.contains_key("created_at"),
+            "submission epoch drives the SLO metrics"
+        );
     }
 
     #[sqlx::test]
@@ -10841,6 +10984,7 @@ mod tests {
                     path: "/test".to_string(),
                     api_key: "key".to_string(),
                     created_by: "user".to_string(),
+                    metadata: None,
                 })
                 .await
                 .unwrap();
@@ -18138,6 +18282,7 @@ mod tests {
                 path: "/test".to_string(),
                 api_key: "key".to_string(),
                 created_by: user.to_string(),
+                metadata: None,
             })
             .await
             .unwrap();
@@ -20591,6 +20736,7 @@ mod tests {
                 path: "/v1/responses".to_string(),
                 api_key: String::new(),
                 created_by: "queue-user".to_string(),
+                metadata: None,
             })
             .await
             .unwrap();
@@ -20653,6 +20799,7 @@ mod tests {
                 path: "/v1/responses".to_string(),
                 api_key: String::new(),
                 created_by: "queue-user".to_string(),
+                metadata: None,
             })
             .await
             .unwrap();
@@ -22364,6 +22511,7 @@ mod tests {
                 path: "/v1/responses".to_string(),
                 api_key: String::new(),
                 created_by: "user-123".to_string(),
+                metadata: None,
             })
             .await
             .expect("create_flex should succeed");
@@ -22397,6 +22545,7 @@ mod tests {
                 path: "/v1/responses".to_string(),
                 api_key: String::new(),
                 created_by: "user-a".to_string(),
+                metadata: None,
             })
             .await
             .expect("background request should be created");

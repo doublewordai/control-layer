@@ -145,6 +145,7 @@ async fn background_tier_end_to_end(pool: sqlx::PgPool) {
                 path: "/v1/background-test".to_string(),
                 api_key: "key".to_string(),
                 created_by: format!("sla-owner-{sequence}"),
+                metadata: None,
             })
             .await
             .unwrap();
@@ -191,6 +192,7 @@ async fn background_tier_end_to_end(pool: sqlx::PgPool) {
             path: "/v1/background-test".to_string(),
             api_key: "key".to_string(),
             created_by: "background-request-owner".to_string(),
+            metadata: None,
         })
         .await
         .unwrap();
@@ -248,6 +250,7 @@ async fn background_tier_end_to_end(pool: sqlx::PgPool) {
             path: "/v1/background-test".to_string(),
             api_key: "key".to_string(),
             created_by: "late-sla-owner".to_string(),
+            metadata: None,
         })
         .await
         .unwrap();
@@ -2679,6 +2682,7 @@ mod service_tier {
                 path: "/v1/responses".to_string(),
                 api_key: String::new(),
                 created_by: "tier-user".to_string(),
+                metadata: None,
             })
             .await
             .unwrap();
@@ -2775,6 +2779,7 @@ mod unverified_volume_counts {
                 path: "/v1/responses".to_string(),
                 api_key: String::new(),
                 created_by: creditor.to_string(),
+                metadata: None,
             })
             .await
             .unwrap();

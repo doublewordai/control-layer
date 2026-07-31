@@ -568,6 +568,19 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                 .map(|key| key.key_owner_id.to_string())
                 .or_else(|| created_by.clone())
                 .unwrap_or_default();
+            // Provenance for the dispatched request. This is the last moment the caller's
+            // client is knowable: the daemon picks this request up minutes to hours from
+            // now, over an HTTP client that sends no User-Agent, so without stashing it
+            // here the analytics row for the dispatch has no client at all. Same key and
+            // same 256-char truncation as the batch path (`batches::create_batch`), so both
+            // arrive as `x-fusillade-batch-dw-user-agent` and read identically downstream.
+            let queued_metadata = parts
+                .headers
+                .get(axum::http::header::USER_AGENT)
+                .and_then(|value| value.to_str().ok())
+                .map(|ua| ua.chars().take(256).collect::<String>())
+                .filter(|ua| !ua.is_empty())
+                .map(|ua| serde_json::json!({ "dw_user_agent": ua }));
             if is_background_tier {
                 let background_input = fusillade::CreateBackgroundInput {
                     request_id,
@@ -578,6 +591,7 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                     path: endpoint.clone(),
                     api_key: queued_api_key,
                     created_by: queued_created_by,
+                    metadata: queued_metadata,
                 };
                 return handle_background(&state, background_input, &resp_id, model).await;
             }
@@ -591,6 +605,7 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                 path: endpoint.clone(),
                 api_key: queued_api_key,
                 created_by: queued_created_by,
+                metadata: queued_metadata,
             };
 
             match (is_chat_completions_api, flex_stream) {
