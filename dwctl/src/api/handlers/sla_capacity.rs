@@ -237,14 +237,7 @@ pub(crate) async fn reserve_capacity<P: sqlx_pool_router::PoolProvider>(
         // realtime rows are batchless service tiers and should not consume
         // batch capacity.
         request_manager
-            .get_pending_request_counts_by_model_and_window(
-                &windows,
-                &states,
-                &model_filter,
-                &ServiceTierFilter::Include(vec![None]),
-                None,
-                true,
-            )
+            .get_pending_request_counts_by_model_and_window(&windows, &states, &model_filter, &ServiceTierFilter::Include(vec![None]), true)
             .await
             .map_err(|e| CapacityError::Internal(format!("get pending counts: {e}")))?
     } else {

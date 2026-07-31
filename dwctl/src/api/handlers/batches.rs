@@ -323,7 +323,16 @@ fn to_batch_response_enriched(batch: fusillade::Batch, creator_email: Option<&st
 
     // Build user-facing metadata: filter out internal dw_* keys.
     // Keep request_source, created_by_email, context_name, context_type for backwards compat.
-    let internal_keys = ["dw_source_id", "dw_source_name", "dw_sync_id", "dw_external_key", "created_by"];
+    let internal_keys = [
+        "dw_source_id",
+        "dw_source_name",
+        "dw_sync_id",
+        "dw_external_key",
+        "created_by",
+        // Recorded for analytics, not for the caller: echoing a client's own User-Agent
+        // back at it tells it nothing it didn't just send us.
+        "dw_user_agent",
+    ];
     let mut metadata: HashMap<String, String> = raw_metadata
         .into_iter()
         .filter(|(k, _)| !internal_keys.contains(&k.as_str()))
@@ -471,6 +480,27 @@ async fn fetch_creator_email(db: &sqlx::PgPool, batch: &fusillade::Batch) -> Opt
     Users::new(&mut conn).get_by_id(user_id).await.ok().flatten().map(|u| u.email)
 }
 
+/// Metadata keys the server owns. A caller-supplied value for any of these is dropped at
+/// creation rather than merged: they are either injected server-side during response
+/// enrichment, or they are provenance, which is worth nothing if the caller can set it.
+const RESERVED_METADATA_KEYS: [&str; 6] = [
+    "created_by_email",
+    "context_name",
+    "context_type",
+    "request_source",
+    "created_by",
+    "dw_user_agent",
+];
+
+/// Whether a caller-supplied metadata key collides with a reserved one, comparing the
+/// normalised form so `dw-user-agent` and `DW_USER_AGENT` are caught with `dw_user_agent`.
+/// `-` and `_` are the same character by the time fusillade has built a header name out of
+/// the key, so they are treated as the same key here.
+fn is_reserved_metadata_key(key: &str) -> bool {
+    let normalised = key.to_ascii_lowercase().replace('-', "_");
+    RESERVED_METADATA_KEYS.contains(&normalised.as_str())
+}
+
 #[utoipa::path(
     post,
     path = "/batches",
@@ -494,6 +524,8 @@ pub async fn create_batch<P: PoolProvider>(
     State(state): State<AppState<P>>,
     current_user: RequiresPermission<resource::Batches, operation::CreateOwn>,
     has_api_key: crate::auth::current_user::HasApiKey,
+    // Before `Json`, which consumes the body and so must come last.
+    headers: axum::http::HeaderMap,
     Json(req): Json<CreateBatchRequest>,
 ) -> Result<(StatusCode, Json<BatchResponse>)> {
     let config = state.current_config();
@@ -660,6 +692,25 @@ pub async fn create_batch<P: PoolProvider>(
     // - No API key (cookie auth) -> "frontend"
     let request_source = if has_api_key.0 { "api" } else { "frontend" };
 
+    // The creating call's User-Agent, which is the only moment a batch's CLIENT is
+    // knowable. Every request the batch goes on to make is dispatched by the fusillade
+    // daemon minutes-to-hours later, over its own HTTP client, which sends no User-Agent at
+    // all - so `http_analytics.user_agent` is empty on 100% of batch rows and the client
+    // that submitted the work is unrecoverable from them. Stashing it here and replaying it
+    // on dispatch (see `request_logging::analytics_handler`) is what makes "which SDKs and
+    // CLIs submit batch work" answerable, the same question `request_source` answers only
+    // as far as "an API key of some kind".
+    //
+    // Truncated to 256 chars exactly as the analytics writer does, so a pathological client
+    // can't push kilobytes through batch metadata into every dispatched request's headers.
+    // Sliced on a char boundary, not a byte one, so a multi-byte UA can't be cut into
+    // invalid UTF-8.
+    let creator_user_agent = headers
+        .get(axum::http::header::USER_AGENT)
+        .and_then(|value| value.to_str().ok())
+        .map(|ua| ua.chars().take(256).collect::<String>())
+        .filter(|ua| !ua.is_empty());
+
     // When in org context, attribute batch ownership to the org
     let target_user_id = current_user.active_organization.unwrap_or(current_user.id);
 
@@ -693,12 +744,29 @@ pub async fn create_batch<P: PoolProvider>(
     // Convert metadata to HashMap and inject request_source and user info.
     // Strip reserved keys that are injected server-side during response enrichment
     // to prevent user-supplied values from colliding with system fields.
+    // `dw_user_agent` is stripped for a sharper reason than collision: it is provenance,
+    // and provenance a caller can set is worthless. Only the value read off the wire above
+    // is ever stored.
+    //
+    // Matched on the NORMALISED key — lower-cased, `-` folded to `_` — so `dw-user-agent`
+    // and `DW_User_Agent` are stripped alongside `dw_user_agent`. Nothing honours those
+    // spellings today: fusillade looks each metadata key up by its exact configured name,
+    // so only `dw_user_agent` is ever read. But it turns `_` into `-` when it builds the
+    // header, meaning both spellings are one header on the wire, and a forwarding loop that
+    // walked the caller's keys instead of the configured ones would let their spelling win.
+    // Folding here costs nothing and makes the invariant hold by construction rather than
+    // by the current shape of a loop two crates away.
     let mut metadata_map = req.metadata.unwrap_or_default();
-    for key in &["created_by_email", "context_name", "context_type", "request_source", "created_by"] {
-        metadata_map.remove(*key);
-    }
+    metadata_map.retain(|key, _| !is_reserved_metadata_key(key));
     metadata_map.insert("request_source".to_string(), request_source.to_string());
     metadata_map.insert("created_by".to_string(), current_user.id.to_string());
+    // `dw_` prefix: fusillade replays every metadata key onto dispatched requests as
+    // `x-fusillade-batch-<key>`, and `to_batch_response_with_email` filters `dw_*` out of
+    // the user-facing metadata. So the header arrives at analytics as
+    // `x-fusillade-batch-dw-user-agent` and the batch object doesn't echo it back.
+    if let Some(user_agent) = creator_user_agent {
+        metadata_map.insert("dw_user_agent".to_string(), user_agent);
+    }
     let metadata = serde_json::to_value(metadata_map).ok();
 
     // Create batch input — created_by uses org ID when in org context for ownership scoping
@@ -2048,7 +2116,10 @@ pub async fn list_batches<P: PoolProvider>(
 
 #[cfg(test)]
 mod tests {
-    use super::{load_and_validate_batch_models, parse_batch_class_filter, parse_completion_window_filter, to_batch_response_with_email};
+    use super::{
+        is_reserved_metadata_key, load_and_validate_batch_models, parse_batch_class_filter, parse_completion_window_filter,
+        to_batch_response_with_email,
+    };
     use crate::api::models::batches::CreateBatchRequest;
     use crate::api::models::users::Role;
     use crate::db::handlers::Credits;
@@ -2465,6 +2536,114 @@ mod tests {
         resp.assert_status(StatusCode::BAD_REQUEST);
         let error_text = resp.text();
         assert!(error_text.contains("Unsupported completion_window"));
+    }
+
+    /// The batch's requests are dispatched by the fusillade daemon hours later, over an
+    /// HTTP client that sends no User-Agent — so creation time is the only moment the
+    /// client is knowable, and the batch metadata is how it reaches the dispatched rows.
+    ///
+    /// Also covers the spoof: provenance a caller can set is worthless, so a
+    /// `dw_user_agent` in the submitted metadata must be dropped rather than merged.
+    #[sqlx::test]
+    #[test_log::test]
+    async fn batch_creation_stores_the_submitters_user_agent_and_drops_a_supplied_one(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+        let deployment = create_test_deployment(&pool, user.id, "gpt-4-model", "gpt-4").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
+
+        let jsonl_content = r#"{"custom_id":"request-1","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}}"#;
+        let multipart = axum_test::multipart::MultipartForm::new()
+            .add_part(
+                "file",
+                axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("test-batch.jsonl"),
+            )
+            .add_part("purpose", axum_test::multipart::Part::text("batch"));
+        let upload_resp = app
+            .post("/ai/v1/files")
+            .multipart(multipart)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        upload_resp.assert_status(StatusCode::CREATED);
+        let file: serde_json::Value = upload_resp.json();
+        let file_id = file["id"].as_str().unwrap().to_string();
+
+        let create_req = CreateBatchRequest {
+            input_file_id: file_id,
+            endpoint: "/v1/chat/completions".to_string(),
+            completion_window: "24h".to_string(),
+            metadata: Some(HashMap::from([
+                ("dw_user_agent".to_string(), "spoofed/9.9.9".to_string()),
+                // Same key once fusillade has folded `_` to `-` building the header name,
+                // so it has to be stripped by the same rule rather than by exact match.
+                ("dw-user-agent".to_string(), "spoofed-hyphenated/9.9.9".to_string()),
+                ("DW_USER_AGENT".to_string(), "spoofed-shouty/9.9.9".to_string()),
+                ("team".to_string(), "research".to_string()),
+            ])),
+        };
+        let resp = app
+            .post("/ai/v1/batches")
+            .json(&create_req)
+            .add_header("user-agent", "claude-cli/1.2.3")
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        resp.assert_status(StatusCode::CREATED);
+        let batch: crate::api::models::batches::BatchResponse = resp.json();
+
+        // Internal provenance, not part of the caller's own metadata: echoing a client's
+        // User-Agent back at it tells it nothing, and the caller's own keys must survive.
+        let returned = batch.metadata.clone().unwrap_or_default();
+        assert!(!returned.contains_key("dw_user_agent"), "dw_user_agent leaked into the response");
+        assert_eq!(returned.get("team").map(String::as_str), Some("research"));
+
+        let base_options: PgConnectOptions = pool.connect_options().as_ref().clone();
+        let fusillade_pool = PgPoolOptions::new()
+            .max_connections(1)
+            .min_connections(0)
+            .connect_with(base_options.options([("search_path", "fusillade")]))
+            .await
+            .unwrap();
+        let metadata: serde_json::Value = sqlx::query_scalar("SELECT metadata FROM batches WHERE id = $1")
+            .bind(Uuid::parse_str(&batch.id).unwrap())
+            .fetch_one(&fusillade_pool)
+            .await
+            .expect("the batch should be stored with its metadata");
+        fusillade_pool.close().await;
+
+        assert_eq!(
+            metadata["dw_user_agent"], "claude-cli/1.2.3",
+            "the wire User-Agent should be stored for fusillade to replay on dispatch"
+        );
+        assert_eq!(metadata["team"], "research", "caller metadata should survive alongside it");
+        for spelling in ["dw-user-agent", "DW_USER_AGENT"] {
+            assert!(
+                metadata.get(spelling).is_none(),
+                "a reserved key must be stripped in every spelling that normalises to it, not just the exact one ({spelling} survived)"
+            );
+        }
+    }
+
+    /// The strip rule, on its own. `-` and `_` are the same character by the time fusillade
+    /// has built a header name out of the key, so they must be the same key here.
+    #[test]
+    fn reserved_metadata_keys_are_matched_on_their_normalised_form() {
+        for reserved in [
+            "dw_user_agent",
+            "dw-user-agent",
+            "DW_USER_AGENT",
+            "Dw-User-Agent",
+            "request_source",
+            "created_by",
+        ] {
+            assert!(is_reserved_metadata_key(reserved), "{reserved} should be reserved");
+        }
+        for allowed in ["team", "dw_user_agent_note", "user_agent", "dwuseragent"] {
+            assert!(!is_reserved_metadata_key(allowed), "{allowed} is the caller's to set");
+        }
     }
 
     #[sqlx::test]

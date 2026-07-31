@@ -14,6 +14,7 @@ use crate::types::DeploymentId;
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use sqlx::{Connection, PgConnection};
+use std::collections::HashMap;
 use tracing::instrument;
 
 /// Optional per-tier overrides for [`CacheTariffs::enable`]. Any `None` field is filled
@@ -38,6 +39,18 @@ pub struct ActiveTariff {
     pub min_prefix_tokens: i32,
     pub valid_from: DateTime<Utc>,
     pub valid_until: Option<DateTime<Utc>>,
+}
+
+#[derive(sqlx::FromRow)]
+struct ActiveTariffRow {
+    deployed_model_id: DeploymentId,
+    write_multiplier_5m: Decimal,
+    write_multiplier_1h: Decimal,
+    write_multiplier_24h: Decimal,
+    read_multiplier: Decimal,
+    min_prefix_tokens: i32,
+    valid_from: DateTime<Utc>,
+    valid_until: Option<DateTime<Utc>>,
 }
 
 pub struct CacheTariffs<'c> {
@@ -130,6 +143,47 @@ impl<'c> CacheTariffs<'c> {
         .fetch_optional(&mut *self.db)
         .await?;
         Ok(row)
+    }
+
+    /// Active tariff versions effective now, keyed by deployment ID. Models without an
+    /// active row are omitted from the map.
+    #[instrument(skip(self, model_ids), fields(model_count = model_ids.len()), err)]
+    pub async fn get_active_bulk(&mut self, model_ids: &[DeploymentId]) -> Result<HashMap<DeploymentId, ActiveTariff>> {
+        if model_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let rows = sqlx::query_as::<_, ActiveTariffRow>(
+            r#"SELECT DISTINCT ON (deployed_model_id)
+                      deployed_model_id, write_multiplier_5m, write_multiplier_1h, write_multiplier_24h,
+                      read_multiplier, min_prefix_tokens, valid_from, valid_until
+               FROM model_cache_tariffs
+               WHERE deployed_model_id = ANY($1)
+                 AND valid_from <= now()
+                 AND (valid_until IS NULL OR valid_until > now())
+               ORDER BY deployed_model_id, valid_from DESC"#,
+        )
+        .bind(model_ids)
+        .fetch_all(&mut *self.db)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                (
+                    row.deployed_model_id,
+                    ActiveTariff {
+                        write_multiplier_5m: row.write_multiplier_5m,
+                        write_multiplier_1h: row.write_multiplier_1h,
+                        write_multiplier_24h: row.write_multiplier_24h,
+                        read_multiplier: row.read_multiplier,
+                        min_prefix_tokens: row.min_prefix_tokens,
+                        valid_from: row.valid_from,
+                        valid_until: row.valid_until,
+                    },
+                )
+            })
+            .collect())
     }
 }
 
