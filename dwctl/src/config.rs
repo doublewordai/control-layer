@@ -1277,12 +1277,6 @@ pub struct BatchConfig {
         deserialize_with = "deserialize_positive_reservation_ttl"
     )]
     pub reservation_ttl_secs: i64,
-    /// Optional realtime priority decay window (seconds) for queue monitoring.
-    /// When set, completed FLEX requests within this lookback are included
-    /// in the 1h demand bucket. When null or omitted, no decay
-    /// count is applied.
-    #[serde(default, deserialize_with = "deserialize_non_negative_optional_i64")]
-    pub priority_decay_window_secs: Option<i64>,
     /// Upload-volume cap for *unverified* creditors, expressed as requests per
     /// hour of completion window. The effective cap for a submission scales with
     /// its completion window: `unverified_requests_per_completion_hour *
@@ -1383,22 +1377,6 @@ where
     }
 }
 
-fn deserialize_non_negative_optional_i64<'de, D>(deserializer: D) -> Result<Option<i64>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    use serde::de::Error;
-
-    let opt: Option<i64> = Option::deserialize(deserializer)?;
-    match opt {
-        Some(value) if value < 0 => Err(D::Error::custom(format!(
-            "priority_decay_window_secs must be non-negative, got {}",
-            value
-        ))),
-        value => Ok(value),
-    }
-}
-
 /// Custom deserializer that validates throughput is positive, with null/missing defaulting to 100.0
 fn deserialize_positive_throughput<'de, D>(deserializer: D) -> Result<f32, D::Error>
 where
@@ -1436,7 +1414,6 @@ impl Default for BatchConfig {
             files: FilesConfig::default(),
             default_throughput: default_batch_throughput(),
             reservation_ttl_secs: default_reservation_ttl_secs(),
-            priority_decay_window_secs: None,
             unverified_requests_per_completion_hour: 1000,
             pending_capacity_counts_enabled: false,
         }
@@ -3719,62 +3696,9 @@ batches:
     }
 
     #[test]
-    fn test_priority_decay_window_default_disabled() {
-        let config = Config::default();
-        assert_eq!(config.batches.priority_decay_window_secs, None);
-    }
-
-    #[test]
     fn test_pending_capacity_counts_default_disabled() {
         let config = Config::default();
         assert!(!config.batches.pending_capacity_counts_enabled);
-    }
-
-    #[test]
-    fn test_priority_decay_window_explicit_value() {
-        Jail::expect_with(|jail| {
-            jail.create_file(
-                "test.yaml",
-                r#"
-secret_key: "test-secret-key"
-batches:
-  priority_decay_window_secs: 600
-"#,
-            )?;
-
-            let args = Args {
-                config: "test.yaml".into(),
-                validate: false,
-            };
-            let config = Config::load(&args)?;
-            assert_eq!(config.batches.priority_decay_window_secs, Some(600));
-
-            Ok(())
-        });
-    }
-
-    #[test]
-    fn test_priority_decay_window_negative_rejected() {
-        Jail::expect_with(|jail| {
-            jail.create_file(
-                "test.yaml",
-                r#"
-secret_key: "test-secret-key"
-batches:
-  priority_decay_window_secs: -1
-"#,
-            )?;
-
-            let args = Args {
-                config: "test.yaml".into(),
-                validate: false,
-            };
-            let result = Config::load(&args);
-            assert!(result.is_err());
-            assert!(result.unwrap_err().to_string().contains("priority_decay_window_secs"));
-
-            Ok(())
-        });
     }
 
     #[test]
