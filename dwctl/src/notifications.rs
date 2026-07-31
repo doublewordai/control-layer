@@ -355,7 +355,15 @@ pub async fn run_notification_poller(
         }
 
         // === Step 7: Auto top-up charges ===
-        if let Some(ref provider) = payment_provider {
+        // Gated on `config.enabled`, like the email steps above, rather than on
+        // payment config alone. Replicas that run this poller purely for batch
+        // finalization and webhooks (fusillade, which disables leader election so
+        // its own daemon always runs) set `enabled: false`, and must not also be
+        // charging customers — several replicas sweeping at once race each other
+        // onto the same idempotency key.
+        if config.enabled
+            && let Some(ref provider) = payment_provider
+        {
             process_auto_topups(provider.as_ref(), &mut conn, email_service.as_ref(), &app_config.credits).await;
         }
 
@@ -913,6 +921,13 @@ async fn process_auto_topups(
             .await
         {
             Ok(id) => id,
+            // Another caller is already charging this exact source_id (the provider
+            // rejected our idempotency key as in-flight). That charge will land, so
+            // this is a no-op, not a payment failure - don't count it or email the user.
+            Err(PaymentError::AlreadyProcessed) => {
+                tracing::debug!(user_id = %user.id, "Auto top-up already in flight elsewhere, skipping");
+                continue;
+            }
             Err(PaymentError::AutoTopupDeclined(kind)) => {
                 tracing::warn!(
                     user_id = %user.id,
@@ -1417,6 +1432,111 @@ mod tests {
         notification.batch.expires_at = Some(Utc::now());
 
         let _ = BatchNotificationInfo::try_from_batch(&notification);
+    }
+
+    /// Provider that reports the charge as already in flight elsewhere, the way
+    /// Stripe answers a duplicate idempotency key with 409 `idempotency_key_in_use`.
+    ///
+    /// Only the two methods `process_auto_topups` actually calls are implemented.
+    struct AlreadyChargingProvider;
+
+    #[async_trait::async_trait]
+    impl PaymentProvider for AlreadyChargingProvider {
+        async fn charge_auto_topup(&self, _: i64, _: &str, _: &str, _: &str) -> crate::payment_providers::Result<String> {
+            Err(PaymentError::AlreadyProcessed)
+        }
+
+        async fn get_default_payment_method(&self, customer_id: &str) -> crate::payment_providers::Result<Option<String>> {
+            Ok(Some(format!("pm_{customer_id}")))
+        }
+
+        async fn create_checkout_session(
+            &self,
+            _: &crate::payment_providers::CheckoutPayer,
+            _: Option<&str>,
+            _: &str,
+            _: &str,
+        ) -> crate::payment_providers::Result<String> {
+            unimplemented!("not called by process_auto_topups")
+        }
+        async fn get_payment_session(&self, _: &str) -> crate::payment_providers::Result<crate::payment_providers::PaymentSession> {
+            unimplemented!("not called by process_auto_topups")
+        }
+        async fn process_payment_session(&self, _: &PgPool, _: &str, _: &CreditsConfig) -> crate::payment_providers::Result<()> {
+            unimplemented!("not called by process_auto_topups")
+        }
+        async fn validate_webhook(
+            &self,
+            _: &axum::http::HeaderMap,
+            _: &str,
+        ) -> crate::payment_providers::Result<Option<crate::payment_providers::WebhookEvent>> {
+            unimplemented!("not called by process_auto_topups")
+        }
+        async fn process_webhook_event(
+            &self,
+            _: &PgPool,
+            _: &crate::payment_providers::WebhookEvent,
+            _: &CreditsConfig,
+        ) -> crate::payment_providers::Result<()> {
+            unimplemented!("not called by process_auto_topups")
+        }
+        async fn create_billing_portal_session(&self, _: &str, _: &str) -> crate::payment_providers::Result<String> {
+            unimplemented!("not called by process_auto_topups")
+        }
+        async fn create_auto_topup_checkout_session(
+            &self,
+            _: &crate::payment_providers::CheckoutPayer,
+            _: &str,
+            _: &str,
+        ) -> crate::payment_providers::Result<String> {
+            unimplemented!("not called by process_auto_topups")
+        }
+        async fn process_auto_topup_session(
+            &self,
+            _: &PgPool,
+            _: &str,
+        ) -> crate::payment_providers::Result<crate::payment_providers::AutoTopupSetupResult> {
+            unimplemented!("not called by process_auto_topups")
+        }
+        async fn customer_has_address(&self, _: &str) -> crate::payment_providers::Result<bool> {
+            unimplemented!("not called by process_auto_topups")
+        }
+        async fn create_customer(&self, _: &str, _: Option<&str>) -> crate::payment_providers::Result<String> {
+            unimplemented!("not called by process_auto_topups")
+        }
+    }
+
+    #[sqlx::test]
+    async fn test_process_auto_topups_skips_when_charge_already_in_flight(pool: PgPool) {
+        // A concurrent sweep on another replica already owns this charge. We must
+        // skip without crediting the user, rather than treating it as a failure.
+        let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+
+        sqlx::query!(
+            r#"UPDATE users SET
+                auto_topup_amount = 25.0,
+                auto_topup_threshold = 10.0,
+                payment_provider_id = 'cus_test_456'
+            WHERE id = $1"#,
+            user.id
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mut conn = pool.acquire().await.unwrap();
+        process_auto_topups(&AlreadyChargingProvider, &mut conn, None, &CreditsConfig::default()).await;
+
+        // No credit transaction: the replica that won the race writes it, not us.
+        let count = sqlx::query!(
+            "SELECT COUNT(*) as \"count!\" FROM credits_transactions WHERE user_id = $1",
+            user.id
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(count.count, 0, "must not credit the user when another replica owns the charge");
     }
 
     #[sqlx::test]

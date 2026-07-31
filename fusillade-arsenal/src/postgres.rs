@@ -38,6 +38,7 @@ use crate::daemon::{
     Running,
 };
 use crate::error::{FusilladeError, Result};
+use crate::manager::TrailingDemandCount;
 use crate::request::{
     Canceled, CascadeTargetState, Claimed, Completed, CreateBackgroundInput, CreateFlexInput,
     CreateRealtimeInput, DaemonId, Failed, FailureReason, LeakStamp, Pending,
@@ -1734,6 +1735,201 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                 .map_err(|e| FusilladeError::Other(anyhow!("Failed to read count: {}", e)))?;
             result.entry(model).or_default().insert(window_label, count);
         }
+
+        Ok(result)
+    }
+
+    async fn get_completed_request_counts_by_model_and_window(
+        &self,
+        windows: &[(String, i64, i64)],
+        model_filter: &[String],
+        service_tier_filter: &ServiceTierFilter,
+    ) -> Result<Vec<TrailingDemandCount>> {
+        if windows.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        for (label, start, end) in windows {
+            if start >= end || *end > 0 {
+                return Err(FusilladeError::ValidationError(format!(
+                    "trailing window {:?} must satisfy start < end <= 0 (got {}s..{}s)",
+                    label, start, end
+                )));
+            }
+        }
+
+        let (tier_names, tier_include_null, tier_mode): (Vec<String>, bool, &str) =
+            match service_tier_filter {
+                ServiceTierFilter::Any => (Vec::new(), true, "any"),
+                ServiceTierFilter::Include(tiers) => {
+                    let (names, has_null) = ServiceTierFilter::split(tiers);
+                    (names, has_null, "include")
+                }
+                ServiceTierFilter::Exclude(tiers) => {
+                    let (names, has_null) = ServiceTierFilter::split(tiers);
+                    (names, has_null, "exclude")
+                }
+            };
+
+        // Same pooled-connection hazard as the pending method above: force a
+        // per-execution plan so the timestamp ranges resolve to index scans on
+        // the trailing partial indexes (idx_requests_completed_trailing /
+        // idx_requests_failed_trailing), and bound the damage with the same
+        // statement timeout.
+        let mut tx = self.begin_read().await.map_err(|e| {
+            FusilladeError::Other(anyhow!(
+                "Failed to begin transaction for trailing request counts: {}",
+                e
+            ))
+        })?;
+
+        sqlx::query("SET LOCAL plan_cache_mode = force_custom_plan")
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| {
+                FusilladeError::Other(anyhow!(
+                    "Failed to force custom plan for trailing request counts: {}",
+                    e
+                ))
+            })?;
+
+        sqlx::query(&format!(
+            "SET LOCAL statement_timeout = {}",
+            self.pending_counts_statement_timeout_ms()
+        ))
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| {
+            FusilladeError::Other(anyhow!(
+                "Failed to set statement_timeout for trailing request counts: {}",
+                e
+            ))
+        })?;
+
+        // Two symmetric branches, one per terminal state, because the outcome
+        // timestamp lives in a different column for each (completed_at /
+        // failed_at, exclusive per state via the *_fields_check constraints).
+        //
+        // Row scoping mirrors the doc on the trait: batch/flex rows keep the
+        // `template_id IS NOT NULL` bookkeeping exclusion; priority rows are
+        // identified by tier + `batch_id IS NULL` instead, since the orphan
+        // purger may null their template_id.
+        //
+        // One query PER WINDOW with the bounds bound as scalar timestamptz
+        // params — deliberately not the UNNEST-array shape the pending method
+        // uses. Bounds that arrive through an UNNEST join are opaque to the
+        // planner (generic range selectivity, ~10% of the table), and at
+        // production row counts that misestimate flips the plan to a parallel
+        // seq scan over every terminal row, which eats the whole statement
+        // timeout (observed on staging: 16M completed rows, 60s cancel).
+        // Scalar params + force_custom_plan get real histogram selectivity,
+        // which keeps the trailing partial indexes in play. Trailing windows
+        // are few (typically one), so per-window round trips are cheap.
+        let now = Utc::now();
+        let mut result: Vec<TrailingDemandCount> = Vec::new();
+        for (label, start, end) in windows {
+            let start_ts = now + chrono::Duration::seconds(*start);
+            let end_ts = now + chrono::Duration::seconds(*end);
+            let rows = sqlx::query(
+                r#"
+                SELECT
+                    r.model,
+                    r.service_tier,
+                    'completed'::text AS outcome,
+                    COUNT(*)::BIGINT AS count
+                FROM requests r
+                WHERE r.state = 'completed'
+                AND r.completed_at >= $1
+                AND r.completed_at < $2
+                AND (cardinality($3::text[]) = 0 OR r.model = ANY($3))
+                AND r.service_tier IS DISTINCT FROM 'background'
+                AND (
+                    r.template_id IS NOT NULL
+                    OR (r.service_tier = 'priority' AND r.batch_id IS NULL)
+                )
+                AND (
+                    $6 = 'any'
+                    OR ($6 = 'include' AND (
+                        (r.service_tier IS NOT NULL AND r.service_tier = ANY($4))
+                        OR ($5 AND r.service_tier IS NULL)
+                    ))
+                    OR ($6 = 'exclude' AND (
+                        (r.service_tier IS NULL AND NOT $5)
+                        OR (r.service_tier IS NOT NULL AND r.service_tier <> ALL($4))
+                    ))
+                )
+                GROUP BY r.model, r.service_tier
+                UNION ALL
+                SELECT
+                    r.model,
+                    r.service_tier,
+                    'failed'::text AS outcome,
+                    COUNT(*)::BIGINT AS count
+                FROM requests r
+                WHERE r.state = 'failed'
+                AND r.failed_at >= $1
+                AND r.failed_at < $2
+                AND (cardinality($3::text[]) = 0 OR r.model = ANY($3))
+                AND r.service_tier IS DISTINCT FROM 'background'
+                AND (
+                    r.template_id IS NOT NULL
+                    OR (r.service_tier = 'priority' AND r.batch_id IS NULL)
+                )
+                AND (
+                    $6 = 'any'
+                    OR ($6 = 'include' AND (
+                        (r.service_tier IS NOT NULL AND r.service_tier = ANY($4))
+                        OR ($5 AND r.service_tier IS NULL)
+                    ))
+                    OR ($6 = 'exclude' AND (
+                        (r.service_tier IS NULL AND NOT $5)
+                        OR (r.service_tier IS NOT NULL AND r.service_tier <> ALL($4))
+                    ))
+                )
+                GROUP BY r.model, r.service_tier
+                "#,
+            )
+            .bind(start_ts)
+            .bind(end_ts)
+            .bind(model_filter)
+            .bind(&tier_names)
+            .bind(tier_include_null)
+            .bind(tier_mode)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(|e| {
+                FusilladeError::Other(anyhow!(
+                    "Failed to get trailing request counts for window {:?}: {}",
+                    label,
+                    e
+                ))
+            })?;
+
+            for row in rows {
+                result.push(TrailingDemandCount {
+                    model: row.try_get("model").map_err(|e| {
+                        FusilladeError::Other(anyhow!("Failed to read model: {}", e))
+                    })?,
+                    window_label: label.clone(),
+                    service_tier: row.try_get("service_tier").map_err(|e| {
+                        FusilladeError::Other(anyhow!("Failed to read service_tier: {}", e))
+                    })?,
+                    outcome: row.try_get("outcome").map_err(|e| {
+                        FusilladeError::Other(anyhow!("Failed to read outcome: {}", e))
+                    })?,
+                    count: row.try_get("count").map_err(|e| {
+                        FusilladeError::Other(anyhow!("Failed to read count: {}", e))
+                    })?,
+                });
+            }
+        }
+
+        tx.commit().await.map_err(|e| {
+            FusilladeError::Other(anyhow!(
+                "Failed to commit trailing request counts transaction: {}",
+                e
+            ))
+        })?;
 
         Ok(result)
     }
@@ -22556,6 +22752,39 @@ mod tests {
             .await
             .expect_err("unknown service tiers must be rejected");
         assert!(matches!(error, FusilladeError::ValidationError(_)));
+    }
+
+    #[sqlx::test]
+    async fn test_trailing_demand_window_validation(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            http_client,
+        );
+
+        // No windows is a no-op, not an error.
+        let rows = manager
+            .get_completed_request_counts_by_model_and_window(
+                &[],
+                &[],
+                &crate::request::ServiceTierFilter::Any,
+            )
+            .await
+            .unwrap();
+        assert!(rows.is_empty());
+
+        // Trailing windows must satisfy start < end <= 0.
+        for (start, end) in [(-10, 10), (0, 0), (-5, -10), (-5, -5), (5, 10)] {
+            let error = manager
+                .get_completed_request_counts_by_model_and_window(
+                    &[("w".to_string(), start, end)],
+                    &[],
+                    &crate::request::ServiceTierFilter::Any,
+                )
+                .await
+                .expect_err("trailing window with start >= end or end > 0 must be rejected");
+            assert!(matches!(error, FusilladeError::ValidationError(_)));
+        }
     }
 
     #[sqlx::test]

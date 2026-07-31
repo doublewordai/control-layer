@@ -1,5 +1,62 @@
 # Changelog
 
+## [9.3.0](https://github.com/doublewordai/control-layer/compare/v9.2.1...v9.3.0) (2026-07-30)
+
+
+### Features
+
+* expose cache pricing in admin model responses ([#1405](https://github.com/doublewordai/control-layer/issues/1405)) ([9032b84](https://github.com/doublewordai/control-layer/commit/9032b842af1c269db664dcf2d910833e69361c40))
+
+## [9.2.1](https://github.com/doublewordai/control-layer/compare/v9.2.0...v9.2.1) (2026-07-30)
+
+
+### Bug Fixes
+
+* bind trailing demand window bounds as scalar timestamps ([#1403](https://github.com/doublewordai/control-layer/issues/1403)) ([ff156a6](https://github.com/doublewordai/control-layer/commit/ff156a6a01d3398c55e8d0b932303d3f292c0b85))
+
+## [9.2.0](https://github.com/doublewordai/control-layer/compare/v9.1.0...v9.2.0) (2026-07-30)
+
+
+### Features
+
+* signed demand windows with trailing outcome counts on /monitoring/demand ([#1399](https://github.com/doublewordai/control-layer/issues/1399)) ([24105ac](https://github.com/doublewordai/control-layer/commit/24105ac236c855dd9e4d928ad703a6a7868abf43))
+
+## [9.1.0](https://github.com/doublewordai/control-layer/compare/v9.0.0...v9.1.0) (2026-07-30)
+
+
+### Features
+
+* capture finish_reason and user_agent on http_analytics ([#1389](https://github.com/doublewordai/control-layer/issues/1389)) ([baec631](https://github.com/doublewordai/control-layer/commit/baec6318dc49788ee4b4fe77f950610a93558dc6))
+
+
+### Bug Fixes
+
+* raise test postgres max_connections to 400 ([#1397](https://github.com/doublewordai/control-layer/issues/1397)) ([5196f47](https://github.com/doublewordai/control-layer/commit/5196f47c2584442da0aa5c4f53e26d4f3fbb05c4))
+
+## [9.0.0](https://github.com/doublewordai/control-layer/compare/v8.105.0...v9.0.0) (2026-07-30)
+
+
+### ⚠ BREAKING CHANGES
+
+* remove /monitoring/pending-request-counts, superseded by /demand ([#1395](https://github.com/doublewordai/control-layer/issues/1395))
+
+### Features
+
+* remove /monitoring/pending-request-counts, superseded by /demand ([#1395](https://github.com/doublewordai/control-layer/issues/1395)) ([ec0d108](https://github.com/doublewordai/control-layer/commit/ec0d108e129f4d5e4c1da41b74dafb6460dfdfdd))
+
+## [8.105.0](https://github.com/doublewordai/control-layer/compare/v8.104.0...v8.105.0) (2026-07-30)
+
+
+### Features
+
+* monitoring demand endpoint decoupled from completion windows ([#987](https://github.com/doublewordai/control-layer/issues/987)) ([1b9fcd0](https://github.com/doublewordai/control-layer/commit/1b9fcd0712b09013fac6192488a5941fadb31d10))
+
+
+### Bug Fixes
+
+* cap the customer-visible cache split to prompt_tokens ([#1390](https://github.com/doublewordai/control-layer/issues/1390)) ([e8cb8c9](https://github.com/doublewordai/control-layer/commit/e8cb8c977c201e48108fefec8b4327c2c76f5f16))
+* stop auto top-up charging from non-leader replicas ([#1371](https://github.com/doublewordai/control-layer/issues/1371)) ([3459363](https://github.com/doublewordai/control-layer/commit/3459363d3918a7cd304ccfceb67d4e6371cf4505))
+
 ## [8.104.0](https://github.com/doublewordai/control-layer/compare/v8.103.4...v8.104.0) (2026-07-29)
 
 

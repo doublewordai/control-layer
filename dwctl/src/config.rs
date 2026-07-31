@@ -1279,7 +1279,7 @@ pub struct BatchConfig {
     pub reservation_ttl_secs: i64,
     /// Optional realtime priority decay window (seconds) for queue monitoring.
     /// When set, completed FLEX requests within this lookback are included
-    /// in the 1h pending-request-counts bucket. When null or omitted, no decay
+    /// in the 1h demand bucket. When null or omitted, no decay
     /// count is applied.
     #[serde(default, deserialize_with = "deserialize_non_negative_optional_i64")]
     pub priority_decay_window_secs: Option<i64>,

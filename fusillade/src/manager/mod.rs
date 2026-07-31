@@ -15,6 +15,7 @@ pub use postgres::PostgresDaemon;
 
 pub use fusillade_core::manager::{
     ArchiveOutcome, BackgroundClaimKind, DaemonStorage, ModelFilter, ModelFilterState, Storage,
+    TrailingDemandCount,
 };
 
 /// Daemon executor trait for runtime orchestration.

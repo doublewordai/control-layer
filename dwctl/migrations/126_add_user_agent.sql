@@ -1,0 +1,25 @@
+-- The inbound User-Agent, so we can tell HOW a caller reached us.
+--
+-- `uri` already says which PROTOCOL was used (/chat/completions, /responses,
+-- /v1/messages) and `request_origin` says which dispatch path (direct api, the dashboard
+-- frontend, or via fusillade). Neither says which CLIENT: the official Anthropic or OpenAI
+-- SDK, a coding CLI, a raw curl, or someone's own HTTP code. That distinction is the one
+-- people actually ask about ("are customers using the Anthropic SDK?"), and User-Agent is
+-- where it lives -- e.g. "Anthropic/Python 0.x", "OpenAI/Python 1.x", "claude-cli/x.y.z",
+-- "curl/8.x".
+--
+-- TRUNCATED to 256 characters by the writer, not here. This lands on every row of a table
+-- that is already ~176M rows, and a pathological client can send kilobytes of
+-- User-Agent; 256 covers every real SDK string with room to spare while capping the
+-- worst case. Postgres will TOAST-compress the rest, and repeated values compress
+-- extremely well in the ClickHouse copy, so the steady-state cost is small -- but it is
+-- not zero, and it is worth remembering next to the COR-509 retention work.
+--
+-- Nullable with no default and no backfill: historical rows stay NULL, because the header
+-- was never recorded and cannot be recovered. Note for the warehouse: ClickPipe lands
+-- every column non-Nullable, so NULL arrives in ClickHouse as '' -- read empty as "not
+-- recorded", which for this column is the same thing as "predates migration 126".
+ALTER TABLE http_analytics ADD COLUMN IF NOT EXISTS user_agent TEXT;
+
+-- No index: written on every request, read only by aggregate scans that already filter on
+-- timestamp. An index here would tax every insert for a read we don't make.

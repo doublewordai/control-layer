@@ -84,6 +84,23 @@ pub struct RawAnalyticsRecord {
     pub cache_creation_1h_input_tokens: i64,
     pub cache_creation_24h_input_tokens: i64,
     pub response_type: String,
+    /// Why the model stopped — `stop`, `length`, `tool_calls`, ... `None` when the
+    /// response shape has no such concept (embeddings, the Responses API) or it could not
+    /// be read. `tool_calls` is what makes CLIENT-side tool loops visible; server-side
+    /// loops are counted separately by `tool_iterations` / `tool_call_analytics`.
+    ///
+    /// Extracted by `serializers::extract_finish_reason`, like every other field on this
+    /// struct that comes off the payload. The batcher deliberately never sees a request or
+    /// response body: `AnalyticsHandler::handle_response` parses once via
+    /// `parse_ai_response` (which also does SSE reassembly and decompression) and sends
+    /// only flat scalars down the channel. Re-deriving anything payload-shaped here would
+    /// mean a second parse on the write path and would put prompt/response bodies into the
+    /// queue — see the module docs on `serializers`.
+    pub finish_reason: Option<String>,
+    /// Inbound `User-Agent`, truncated to 256 chars — which CLIENT the caller used (SDK,
+    /// CLI, curl, own code), as opposed to `uri` (which protocol) and `request_origin`
+    /// (which dispatch path). Read straight off the request headers, not the payload.
+    pub user_agent: Option<String>,
     pub server_address: String,
     pub server_port: u16,
     /// URL of the upstream that served the request (onwards `ServedBy`
@@ -1036,6 +1053,8 @@ where
         let mut total_cost_vec: Vec<Option<Decimal>> = Vec::with_capacity(records.len());
         let mut uncached_cost_vec: Vec<Option<Decimal>> = Vec::with_capacity(records.len());
         let mut served_by_vec: Vec<Option<String>> = Vec::with_capacity(records.len());
+        let mut finish_reason_vec: Vec<Option<String>> = Vec::with_capacity(records.len());
+        let mut user_agent_vec: Vec<Option<String>> = Vec::with_capacity(records.len());
 
         for record in records {
             instance_ids.push(record.raw.instance_id);
@@ -1081,6 +1100,8 @@ where
             total_cost_vec.push(record.total_cost);
             uncached_cost_vec.push(record.uncached_cost);
             served_by_vec.push(record.raw.served_by.clone());
+            finish_reason_vec.push(record.raw.finish_reason.clone());
+            user_agent_vec.push(record.raw.user_agent.clone());
         }
 
         let rows = sqlx::query!(
@@ -1093,7 +1114,7 @@ where
                 request_origin, batch_sla, batch_request_source, api_key_id, trace_id,
                 cache_read_input_tokens, cache_creation_input_tokens,
                 cache_creation_5m_input_tokens, cache_creation_1h_input_tokens, cache_creation_24h_input_tokens,
-                total_cost, uncached_cost, served_by
+                total_cost, uncached_cost, served_by, finish_reason, user_agent
             )
             SELECT * FROM UNNEST(
                 $1::uuid[], $2::bigint[], $3::timestamptz[], $4::text[], $5::text[], $6::text[],
@@ -1103,7 +1124,7 @@ where
                 $22::text[], $23::text[], $24::text[], $25::uuid[], $26::text[],
                 $27::bigint[], $28::bigint[],
                 $29::bigint[], $30::bigint[], $31::bigint[],
-                $32::numeric[], $33::numeric[], $34::text[]
+                $32::numeric[], $33::numeric[], $34::text[], $35::text[], $36::text[]
             )
             ON CONFLICT (instance_id, correlation_id)
             DO UPDATE SET
@@ -1134,7 +1155,9 @@ where
                 cache_creation_24h_input_tokens = EXCLUDED.cache_creation_24h_input_tokens,
                 total_cost = EXCLUDED.total_cost,
                 uncached_cost = EXCLUDED.uncached_cost,
-                served_by = EXCLUDED.served_by
+                served_by = EXCLUDED.served_by,
+                finish_reason = EXCLUDED.finish_reason,
+                user_agent = EXCLUDED.user_agent
             RETURNING id, instance_id, correlation_id, (xmax = 0) AS "newly_inserted!"
             "#,
             &instance_ids,
@@ -1171,6 +1194,8 @@ where
             &total_cost_vec as &[Option<Decimal>],
             &uncached_cost_vec as &[Option<Decimal>],
             &served_by_vec as &[Option<String>],
+            &finish_reason_vec as &[Option<String>],
+            &user_agent_vec as &[Option<String>],
         )
         .fetch_all(&mut **tx)
         .await?;
@@ -1924,6 +1949,8 @@ mod tests {
             cache_creation_1h_input_tokens: 0,
             cache_creation_24h_input_tokens: 0,
             response_type: "chat_completion".to_string(),
+            finish_reason: None,
+            user_agent: None,
             server_address: "localhost".to_string(),
             server_port: 8080,
             bearer_token: Some("test-token".to_string()),
@@ -1972,6 +1999,8 @@ mod tests {
             cache_creation_1h_input_tokens: c1,
             cache_creation_24h_input_tokens: c24,
             response_type: "chat_completion".to_string(),
+            finish_reason: None,
+            user_agent: None,
             server_address: "x".to_string(),
             server_port: 1,
             bearer_token: None,
@@ -2667,6 +2696,8 @@ mod integration_tests {
             cache_creation_1h_input_tokens: 0,
             cache_creation_24h_input_tokens: 0,
             response_type: "chat_completion".to_string(),
+            finish_reason: None,
+            user_agent: None,
             server_address: "api.test.com".to_string(),
             server_port: 443,
             bearer_token,

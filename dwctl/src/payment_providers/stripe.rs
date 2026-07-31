@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use rust_decimal::Decimal;
 use sqlx::PgPool;
 use std::collections::HashMap;
-use stripe::Client;
+use stripe::{ApiErrorsCode, Client, StripeError};
 use stripe_billing::billing_portal_session::CreateBillingPortalSession;
 use stripe_checkout::checkout_session::{
     CreateCheckoutSessionConsentCollection, CreateCheckoutSessionConsentCollectionPaymentMethodReuseAgreement,
@@ -61,6 +61,12 @@ fn classify_card_decline(advice_code: Option<&str>, decline_code: Option<&str>) 
 
 fn map_auto_topup_charge_error(error: stripe::StripeError) -> PaymentError {
     match error {
+        // Another caller is already performing this exact charge. Checked first:
+        // it arrives as an invalid_request_error, not a CardError, so it would
+        // otherwise fall through and be counted as a charge failure.
+        stripe::StripeError::Stripe(api_error, _) if api_error.code == Some(ApiErrorsCode::IdempotencyKeyInUse) => {
+            PaymentError::AlreadyProcessed
+        }
         stripe::StripeError::Stripe(api_error, _) if matches!(api_error.type_, stripe::ApiErrorsType::CardError) => {
             PaymentError::AutoTopupDeclined(classify_card_decline(
                 api_error.advice_code.as_deref(),
@@ -127,10 +133,7 @@ impl StripeProvider {
             .request_strategy(RequestStrategy::Idempotent(tax_idem_key))
             .send(&self.client)
             .await
-            .map_err(|e| {
-                tracing::error!("Failed to create tax calculation: {:?}", e);
-                PaymentError::ProviderApi(e.to_string())
-            })?;
+            .map_err(map_auto_topup_charge_error)?;
 
         let tax_calc_id = tax_calc
             .id
@@ -764,6 +767,53 @@ mod tests {
     async fn create_test_user(pool: &PgPool) -> Uuid {
         let user = crate::test::utils::create_test_user(pool, crate::api::models::users::Role::StandardUser).await;
         user.id
+    }
+
+    /// Build a Stripe API error, as returned on a 409/402. `type_` matters:
+    /// the idempotency conflict arrives as an `invalid_request_error`, declines
+    /// as a `card_error`, and the mapper dispatches on both.
+    fn stripe_api_error(code: Option<ApiErrorsCode>, type_: stripe::ApiErrorsType) -> StripeError {
+        StripeError::Stripe(
+            Box::new(stripe::ApiErrors {
+                advice_code: None,
+                charge: None,
+                code,
+                decline_code: None,
+                doc_url: None,
+                message: None,
+                network_advice_code: None,
+                network_decline_code: None,
+                param: None,
+                payment_intent: None,
+                payment_method: None,
+                payment_method_type: None,
+                request_log_url: None,
+                setup_intent: None,
+                source: None,
+                type_,
+            }),
+            409,
+        )
+    }
+
+    #[test]
+    fn test_idempotency_key_in_use_maps_to_already_processed() {
+        // Another replica is mid-charge on the same key: a no-op, not a failure.
+        let err = map_auto_topup_charge_error(stripe_api_error(
+            Some(ApiErrorsCode::IdempotencyKeyInUse),
+            stripe::ApiErrorsType::InvalidRequestError,
+        ));
+        assert!(matches!(err, PaymentError::AlreadyProcessed), "got {err:?}");
+    }
+
+    #[test]
+    fn test_card_error_still_classifies_as_a_decline() {
+        // The idempotency check must not shadow real declines.
+        let err = map_auto_topup_charge_error(stripe_api_error(
+            Some(ApiErrorsCode::CardDeclined),
+            stripe::ApiErrorsType::CardError,
+        ));
+        assert!(matches!(err, PaymentError::AutoTopupDeclined(_)), "got {err:?}");
     }
 
     #[test]

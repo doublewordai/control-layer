@@ -243,6 +243,12 @@ impl RequestHandler for AnalyticsHandler {
                 cache_creation_1h_input_tokens: metrics.cache_creation_1h_input_tokens,
                 cache_creation_24h_input_tokens: metrics.cache_creation_24h_input_tokens,
                 response_type: metrics.response_type,
+                finish_reason: metrics.finish_reason,
+                // Truncated here rather than in the DB: this lands on every row of a
+                // ~176M-row table and a misbehaving client can send kilobytes. 256 covers
+                // every real SDK/CLI string. Sliced on a char boundary, not a byte one, so
+                // a multi-byte UA can't be cut mid-codepoint into invalid UTF-8.
+                user_agent: extract_header_as_string(&request_data, "user-agent").map(|ua| ua.chars().take(256).collect()),
                 server_address: metrics.server_address,
                 server_port: metrics.server_port,
                 served_by: metrics.served_by,
