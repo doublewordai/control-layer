@@ -16,6 +16,11 @@ use super::index::{CacheEntry, IndexScope, PrefixHash, TtlTier};
 pub struct CacheStats {
     /// Cached input tokens read back from a prior write (the discounted span).
     pub read: u64,
+    /// Exact chat-templated token count of the FULL prompt (generation prompt included),
+    /// when this request was counted via tokenizer-svc `/v1/render`. Compared against the
+    /// engine-reported `usage.prompt_tokens` at the billing join — the per-request drift
+    /// measurement that turns template parity from assumption into an alarm.
+    pub render_total: Option<u64>,
     /// New tokens written under each TTL tier (write premiums differ per tier).
     pub creation_5m: u64,
     pub creation_1h: u64,

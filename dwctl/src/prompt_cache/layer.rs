@@ -572,6 +572,7 @@ mod tests {
             Arc::new(PostgresIndex::new(pool.clone(), 1)),
             all_tiers(),
             TelemetryPolicy::default(),
+            false,
         );
         let app = Router::new()
             .route("/v1/chat/completions", post(mock_upstream))
@@ -691,6 +692,7 @@ mod tests {
             Arc::new(PostgresIndex::new(pool.clone(), 1)),
             all_tiers(),
             TelemetryPolicy::default(),
+            false,
         );
         let app = Router::new()
             .route("/v1/chat/completions", post(mock_upstream_streaming))
@@ -803,6 +805,7 @@ mod tests {
             Arc::new(PostgresIndex::new(pool.clone(), 1)),
             all_tiers(),
             TelemetryPolicy::default(),
+            false,
         );
         let app = Router::new()
             .route("/v1/chat/completions", post(mock_upstream_streaming_error))
@@ -855,6 +858,7 @@ mod tests {
             Arc::new(PostgresIndex::new(pool.clone(), 1)),
             all_tiers(),
             TelemetryPolicy::default(),
+            false,
         );
         let app = Router::new().route("/v1/embeddings", post(mock_upstream)).layer(from_fn_with_state(
             CacheLayerState::new(classifier, usize::MAX, Duration::from_secs(5)),
@@ -880,6 +884,7 @@ mod tests {
             Arc::new(PostgresIndex::new(pool.clone(), 1)),
             TierPolicy::from_config(&["5m".to_string()], "5m"),
             TelemetryPolicy::default(),
+            false,
         );
         let app = Router::new()
             .route("/v1/chat/completions", post(mock_upstream)) // must NOT be reached

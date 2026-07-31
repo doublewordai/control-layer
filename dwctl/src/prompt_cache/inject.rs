@@ -160,6 +160,18 @@ pub fn strip_cache_control(body: &[u8], telemetry: &TelemetryPolicy) -> (Option<
 /// count to fit; write counts alone exceeding the prompt is corrupt and reports no cache
 /// activity at all — matching the list-price bill for that case.
 fn splice_cache_fields(usage: &mut serde_json::Map<String, Value>, stats: &CacheStats) {
+    // Drift alarm (exact counting only): our chat-templated full-prompt count vs the
+    // engine-reported prompt_tokens. This turns template parity from an assumption into a
+    // per-request measurement — the alert that catches template drift between the
+    // tokenizer-svc bake and the serving engine.
+    if let (Some(render_total), Some(prompt)) = (stats.render_total, usage.get("prompt_tokens").and_then(Value::as_u64)) {
+        let drift = render_total as i64 - prompt as i64;
+        metrics::histogram!("dwctl_cache_render_drift_tokens").record(drift as f64);
+        if drift.unsigned_abs() > (prompt / 100).max(16) {
+            metrics::counter!("dwctl_cache_render_drift_exceeded_total").increment(1);
+        }
+    }
+
     let creations = stats.creation_total();
     let mut read = stats.read;
     let (mut c5, mut c1, mut c24) = (stats.creation_5m, stats.creation_1h, stats.creation_24h);
@@ -399,6 +411,7 @@ mod tests {
     fn stats() -> CacheStats {
         CacheStats {
             read: 1024,
+            render_total: None,
             creation_5m: 10,
             creation_1h: 20,
             creation_24h: 30,

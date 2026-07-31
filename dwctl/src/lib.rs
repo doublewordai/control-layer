@@ -1683,6 +1683,7 @@ pub async fn build_router(
                     cfg.cache.telemetry_blocks.strip_from_prompt,
                     &cfg.cache.telemetry_blocks.prefixes,
                 ),
+                cfg.cache.render_counting,
             );
             // Bound the cache layer's body buffer by the same limit onwards uses (0 =
             // unlimited), so it's never more restrictive than the entry point.

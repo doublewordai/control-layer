@@ -1088,6 +1088,18 @@ pub struct CacheConfig {
     /// Set via environment: `DWCTL_CACHE__INDEX_CONN_RETRIES=3`
     pub index_conn_retries: u32,
 
+    /// Exact chat-templated token counting via tokenizer-svc `/v1/render` (svc ≥ 0.3.0).
+    /// When true, cache splits are counted against the model's real chat-template
+    /// rendering — the same bytes the engine tokenizes — instead of raw content-block
+    /// text, eliminating the classifier-vs-engine drift that forces the billing caps to
+    /// engage. Per-alias it additionally requires a `template_version` from `/v1/models`;
+    /// aliases without one (and render failures) keep raw-segment counting. Rollout:
+    /// staging first, watch `dwctl_cache_render_drift_tokens` ≈ 0, then prod.
+    ///
+    /// Set via environment: `DWCTL_CACHE__RENDER_COUNTING=true`
+    #[serde(default)]
+    pub render_counting: bool,
+
     /// Handling of provider-injected per-request *telemetry* blocks (e.g. the Claude Code SDK's
     /// `x-anthropic-billing-header` line, whose nonce changes every request). Such a block sits
     /// ahead of the caller's `cache_control` breakpoint, so leaving it in would change the prefix
@@ -1107,6 +1119,7 @@ impl Default for CacheConfig {
             default_ttl: "5m".to_string(),
             classify_deadline_secs: 5,
             index_conn_retries: 1,
+            render_counting: false,
             telemetry_blocks: TelemetryBlockConfig::default(),
         }
     }
