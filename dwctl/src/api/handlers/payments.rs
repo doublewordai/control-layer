@@ -1428,10 +1428,20 @@ mod tests {
         let user = crate::test::utils::create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
 
         // Set up a payment provider ID (dummy provider always returns a payment method)
-        sqlx::query!("UPDATE users SET payment_provider_id = $1 WHERE id = $2", "cus_test_123", user.id)
-            .execute(&pool)
-            .await
-            .unwrap();
+        sqlx::query!(
+            r#"
+            UPDATE users
+            SET payment_provider_id = $1,
+                auto_topup_soft_failure_count = 1,
+                auto_topup_retry_after = NOW() + INTERVAL '24 hours'
+            WHERE id = $2
+            "#,
+            "cus_test_123",
+            user.id
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
 
         let auth_headers = crate::test::utils::add_auth_headers(&user);
 
@@ -1455,13 +1465,22 @@ mod tests {
         assert_eq!(body["amount"], 25.0);
 
         // Verify settings saved in DB
-        let row = sqlx::query!("SELECT auto_topup_amount, auto_topup_threshold FROM users WHERE id = $1", user.id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let row = sqlx::query!(
+            r#"
+            SELECT auto_topup_amount, auto_topup_threshold,
+                   auto_topup_soft_failure_count, auto_topup_retry_after
+            FROM users WHERE id = $1
+            "#,
+            user.id
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
 
         assert_eq!(row.auto_topup_amount, Some(25.0));
         assert_eq!(row.auto_topup_threshold, Some(5.0));
+        assert_eq!(row.auto_topup_soft_failure_count, 0);
+        assert_eq!(row.auto_topup_retry_after, None);
     }
 
     #[sqlx::test]

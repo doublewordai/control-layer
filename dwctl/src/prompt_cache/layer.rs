@@ -10,8 +10,17 @@
 //!   5. on a billing-success completion, **commits** the `PendingWrite` to the index (off path).
 //!
 //! Everything lives in one scope, so the pending write is a local value — no
-//! correlation id, no trait injected into onwards. Failures degrade to "no caching"
-//! (the response is forwarded untouched); the commit is success-gated.
+//! correlation id, no trait injected into onwards. Failures degrade to "no caching"; the
+//! commit is success-gated.
+//!
+//! Inactive requests (cache-disabled model, degraded classify) are NOT forwarded untouched:
+//! their usage still gets provider-written cache fields scrubbed
+//! ([`super::inject::scrub_provider_cache_fields`]). This layer is the sole writer of
+//! customer-visible cache accounting — an upstream's own `cached_tokens` (e.g. OpenRouter
+//! implicit caching on a model without cache pricing) must never reach a customer we billed
+//! at full price. Onwards itself stays a faithful pass-through (the standalone gateway in
+//! front of dynamo must forward engine cache stats for internal capture); the scrub decision
+//! lives here, next to billing.
 //!
 //! Placed **inner to outlet** in the stack so the analytics/billing capture sees the
 //! injected cache fields.
@@ -30,11 +39,10 @@ use http_body_util::BodyExt;
 
 use super::classifier::{Classifier, ClassifyOutcome, ClassifyRequest};
 use super::index::{CacheResult, TierPolicy};
-use super::inject::{inject_into_response_nonstreaming, scan_inject_sse, strip_cache_control};
+use super::inject::{UsageEdit, inject_into_response_nonstreaming, scan_edit_sse, scrub_response_nonstreaming, strip_cache_control};
 use super::metrics as cache_metrics;
 use super::parse::{ParseError, validate_markers};
 use super::sse::SseBufferedStream;
-use super::stats::CacheStats;
 
 /// Bound on the index commit (off the response path). A slow/hung DB can't leak the
 /// spawned task or hold a pool connection indefinitely; a miss just drops the write
@@ -218,8 +226,11 @@ pub async fn cache_middleware(State(state): State<CacheLayerState>, request: Req
 
     let outcome = join_classify(&mut handle, state.deadline, &model_label).await;
     if !outcome.active {
-        // Disabled model (or a degraded classify) → leave the response untouched.
-        return response;
+        // Disabled model (or a degraded classify) → no injection, but the upstream's own cache
+        // accounting must still be scrubbed: this module is the only writer of customer-visible
+        // cache fields, and a provider-reported `cached_tokens` on a model we bill at full price
+        // reads as a discount we didn't give.
+        return scrub_response_nonstreaming(response).await;
     }
     let (response, billing_ok) = inject_into_response_nonstreaming(response, &outcome.stats).await;
     if !outcome.pending.is_empty() {
@@ -392,7 +403,7 @@ fn defer_classify_into_stream(
                 }
             };
             // Detect the billing signals on this chunk (no injection yet).
-            let probe = scan_inject_sse(&chunk, &CacheStats::default(), true);
+            let probe = scan_edit_sse(&chunk, UsageEdit::Probe);
             saw_error |= probe.saw_error;
             // The terminal usage frame is the only place the stats are needed: resolve classify now
             // — the single blocking await, on the *last* frame, bounded by the deadline. Borrow the
@@ -405,12 +416,19 @@ fn defer_classify_into_stream(
                 handle.take();
             }
             saw_usage |= probe.saw_usage;
-            // Inject into the (single) usage frame, but only for an active (cache-enabled) request.
-            let out = if !edited && probe.saw_usage && outcome.as_ref().is_some_and(|o| o.active) {
-                let stats = outcome.as_ref().map(|o| o.stats).unwrap_or_default();
-                let scan = scan_inject_sse(&chunk, &stats, false);
-                // Only mark done once it *actually* rewrote — a (rare) reserialize failure
-                // shouldn't permanently disable injection for a later usage frame.
+            // Edit the (single) usage frame: inject the stats for an active (cache-enabled)
+            // request, otherwise scrub the upstream's own cache accounting — this module is the
+            // only writer of customer-visible cache fields, and a provider-reported
+            // `cached_tokens` on a model we bill at full price reads as a discount we didn't give.
+            let out = if !edited && probe.saw_usage {
+                let scan = match outcome.as_ref() {
+                    Some(o) if o.active => scan_edit_sse(&chunk, UsageEdit::Inject(&o.stats)),
+                    // Inactive — and `None` can't happen (the classify join above runs on the
+                    // first usage frame), so it degrades to the safe edit.
+                    _ => scan_edit_sse(&chunk, UsageEdit::Scrub),
+                };
+                // Only mark done once it *actually* rewrote — a (rare) reserialize failure (or a
+                // scrub with nothing to remove) shouldn't disable editing a later usage frame.
                 edited |= scan.rewritten.is_some();
                 scan.rewritten.unwrap_or(chunk)
             } else {
@@ -906,5 +924,102 @@ mod tests {
         let msg = v["error"]["message"].as_str().unwrap();
         assert!(msg.contains("24h"), "message names the rejected tier: {msg}");
         assert!(msg.contains("available tiers: 5m"), "message names the available tiers: {msg}");
+    }
+
+    /// Upstream stand-in that reports ITS OWN cache accounting — the OpenRouter implicit-cache
+    /// shape observed in prod on kimi-k3 (provider cached 687 of 985 prompt tokens on a model
+    /// with no cache tariff, i.e. billed at full price).
+    async fn mock_upstream_with_provider_cache() -> Json<serde_json::Value> {
+        Json(serde_json::json!({
+            "id": "chatcmpl-1", "object": "chat.completion",
+            "choices": [{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}],
+            "usage": {
+                "prompt_tokens": 985, "completion_tokens": 2, "total_tokens": 987,
+                "prompt_tokens_details": {"cached_tokens": 687},
+                "cache_read_input_tokens": 687
+            }
+        }))
+    }
+
+    #[sqlx::test]
+    async fn inactive_model_scrubs_provider_cache_fields(pool: PgPool) {
+        // No deployed model / cache tariff → classify resolves inactive. The provider's own
+        // cache accounting must still be scrubbed: the customer is billed full price, so a
+        // forwarded `cached_tokens: 687` would read as a discount we didn't give.
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        let key = create_test_api_key_for_user(&pool, user.id).await;
+        let classifier = Classifier::new(
+            PrincipalResolver::new(pool.clone()),
+            ModelConfigResolver::new(pool.clone()),
+            TokenizerClient::new("http://127.0.0.1:1"),
+            Arc::new(PostgresIndex::new(pool.clone(), 1)),
+            all_tiers(),
+            TelemetryPolicy::default(),
+        );
+        let app = Router::new()
+            .route("/v1/chat/completions", post(mock_upstream_with_provider_cache))
+            .layer(from_fn_with_state(
+                CacheLayerState::new(classifier, usize::MAX, Duration::from_secs(5)),
+                cache_middleware,
+            ));
+        let server = axum_test::TestServer::new(app).unwrap();
+
+        let r = server
+            .post("/v1/chat/completions")
+            .add_header("authorization", format!("Bearer {}", key.secret))
+            .json(&serde_json::json!({"model": ALIAS, "messages": [{"role":"user","content":"hi"}]}))
+            .await;
+        r.assert_status_ok();
+        let v: serde_json::Value = r.json();
+        assert_eq!(v["usage"]["prompt_tokens"], 985, "token totals untouched");
+        assert_eq!(v["usage"]["prompt_tokens_details"]["cached_tokens"], 0, "provider hit zeroed");
+        assert!(
+            v["usage"].get("cache_read_input_tokens").is_none(),
+            "provider extension field removed: {v}"
+        );
+    }
+
+    /// Streaming variant of [`mock_upstream_with_provider_cache`].
+    async fn mock_upstream_streaming_with_provider_cache() -> Response {
+        let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n\
+                   data: {\"choices\":[],\"usage\":{\"prompt_tokens\":985,\"completion_tokens\":2,\"total_tokens\":987,\"prompt_tokens_details\":{\"cached_tokens\":687}}}\n\n\
+                   data: [DONE]\n\n";
+        Response::builder()
+            .header("content-type", "text/event-stream")
+            .body(Body::from(sse))
+            .unwrap()
+    }
+
+    #[sqlx::test]
+    async fn inactive_model_scrubs_streaming_terminal_frame(pool: PgPool) {
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        let key = create_test_api_key_for_user(&pool, user.id).await;
+        let classifier = Classifier::new(
+            PrincipalResolver::new(pool.clone()),
+            ModelConfigResolver::new(pool.clone()),
+            TokenizerClient::new("http://127.0.0.1:1"),
+            Arc::new(PostgresIndex::new(pool.clone(), 1)),
+            all_tiers(),
+            TelemetryPolicy::default(),
+        );
+        let app = Router::new()
+            .route("/v1/chat/completions", post(mock_upstream_streaming_with_provider_cache))
+            .layer(from_fn_with_state(
+                CacheLayerState::new(classifier, usize::MAX, Duration::from_secs(5)),
+                cache_middleware,
+            ));
+        let server = axum_test::TestServer::new(app).unwrap();
+
+        let r = server
+            .post("/v1/chat/completions")
+            .add_header("authorization", format!("Bearer {}", key.secret))
+            .json(&serde_json::json!({"model": ALIAS, "stream": true, "messages": [{"role":"user","content":"hi"}]}))
+            .await;
+        r.assert_status_ok();
+        let t = r.text();
+        assert!(t.contains("\"cached_tokens\":0"), "provider hit zeroed in terminal frame: {t}");
+        assert!(!t.contains("687"), "provider value gone: {t}");
+        assert!(t.contains("\"content\":\"hi\""), "delta preserved: {t}");
+        assert!(t.contains("data: [DONE]"), "DONE preserved: {t}");
     }
 }

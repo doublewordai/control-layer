@@ -3,6 +3,7 @@
 pub mod enrichment;
 
 use super::pagination::Pagination;
+use crate::api::models::cache_pricing::CachePricingResponse;
 use crate::api::models::groups::GroupResponse;
 use crate::db::models::api_keys::ApiKeyPurpose;
 use crate::db::models::deployments::{
@@ -118,7 +119,8 @@ pub struct GetModelQuery {
     pub deleted: Option<bool>,
     /// Show inactive model when true, 404 when false/unspecified if model is inactive
     pub inactive: Option<bool>,
-    /// Include related data (comma-separated: "groups", "metrics", "status", "pricing", "endpoints")
+    /// Include related data (comma-separated: "groups", "metrics", "status", "pricing", "endpoints").
+    /// Pricing includes active customer tariffs and prompt-cache pricing.
     pub include: Option<String>,
 }
 
@@ -544,6 +546,9 @@ pub struct DeployedModelResponse {
     /// Provider/downstream pricing details (only included if requested and user has Pricing::ReadAll)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider_pricing: Option<ProviderPricing>,
+    /// Active customer prompt-cache pricing (only included when include=pricing)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_pricing: Option<CachePricingResponse>,
     /// Inference endpoint information (only included if requested)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<super::inference_endpoints::InferenceEndpointResponse>,
@@ -635,6 +640,7 @@ impl From<DeploymentDBResponse> for DeployedModelResponse {
             metrics: None,          // By default, metrics are not included
             status: None,           // By default, probe status is not included
             provider_pricing: None, // By default, provider pricing is not included
+            cache_pricing: None,    // By default, cache pricing is not included
             endpoint: None,         // By default, endpoint is not included
             tariffs: None,          // By default, tariffs are not included
             // Composite model fields
@@ -683,6 +689,12 @@ impl DeployedModelResponse {
     /// Create a response with provider pricing included (admin only)
     pub fn with_provider_pricing(mut self, provider_pricing: Option<ProviderPricing>) -> Self {
         self.provider_pricing = provider_pricing;
+        self
+    }
+
+    /// Create a response with cache pricing included.
+    pub fn with_cache_pricing(mut self, cache_pricing: CachePricingResponse) -> Self {
+        self.cache_pricing = Some(cache_pricing);
         self
     }
 

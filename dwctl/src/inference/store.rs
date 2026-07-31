@@ -9,8 +9,8 @@ use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
 use fusillade::{
-    BatchInput, CreateRealtimeInput, CreateStepInput, RequestId, RequestTemplateInput, ResponseStep, ResponseStepStore, StepId,
-    StepKind as FusilladeStepKind, StepState as FusilladeStepState, Storage,
+    CreateRealtimeInput, CreateStepInput, RequestId, ResponseStep, ResponseStepStore, StepId, StepKind as FusilladeStepKind,
+    StepState as FusilladeStepState, Storage,
 };
 use fusillade_arsenal::{PostgresRequestManager, PostgresResponseStepManager};
 use onwards::{ResponseStore, StoreError};
@@ -591,76 +591,6 @@ pub async fn lookup_created_by(pool: &sqlx::PgPool, api_key: Option<&str>) -> Op
             None
         }
     }
-}
-
-/// Create a batch of 1 in fusillade for async/flex processing.
-///
-/// Uses fusillade's `create_file` + `create_batch` methods.
-/// The fusillade daemon will pick up the pending request and process it.
-///
-/// Returns `(response_id, request_id)` where response_id is `resp_<uuid>`.
-pub async fn create_batch_of_1<P: PoolProvider + Clone>(
-    request_manager: &PostgresRequestManager<P>,
-    request: &serde_json::Value,
-    model: &str,
-    base_url: &str,
-    path: &str,
-    completion_window: &str,
-    api_key: Option<&str>,
-) -> Result<(String, Uuid), StoreError> {
-    let pool = request_manager.pool();
-    let body = request.to_string();
-
-    let created_by = lookup_created_by(pool, api_key).await.unwrap_or_default();
-
-    let template = RequestTemplateInput {
-        custom_id: None,
-        endpoint: base_url.to_string(),
-        method: "POST".to_string(),
-        path: path.to_string(),
-        body,
-        model: model.to_string(),
-        api_key: String::new(),
-    };
-
-    let file_id = request_manager
-        .create_file("responses_api_single".into(), None, vec![template])
-        .await
-        .map_err(|e| StoreError::StorageError(format!("Failed to create file: {e}")))?;
-
-    let batch = request_manager
-        .create_batch(BatchInput {
-            file_id,
-            endpoint: path.to_string(),
-            completion_window: completion_window.to_string(),
-            metadata: None,
-            created_by: if created_by.is_empty() { None } else { Some(created_by) },
-            api_key_id: None,
-            api_key: api_key.map(|s| s.to_string()),
-            total_requests: Some(1),
-        })
-        .await
-        .map_err(|e| StoreError::StorageError(format!("Failed to create batch: {e}")))?;
-
-    let requests = request_manager
-        .get_batch_requests(batch.id)
-        .await
-        .map_err(|e| StoreError::StorageError(format!("Failed to get batch requests: {e}")))?;
-
-    let request_id = requests
-        .first()
-        .map(|r| *r.id())
-        .ok_or_else(|| StoreError::StorageError("Batch created with no requests".into()))?;
-
-    let response_id = format!("resp_{request_id}");
-    tracing::debug!(
-        response_id = %response_id,
-        batch_id = %batch.id,
-        completion_window = %completion_window,
-        "Created batch of 1 for async processing"
-    );
-
-    Ok((response_id, request_id))
 }
 
 /// Extract error type and message from an upstream response body and status code.

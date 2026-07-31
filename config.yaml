@@ -320,10 +320,6 @@ batches:
   # method / make a payment). Set to 0 to disable. Default: 1000.
   unverified_requests_per_completion_hour: 1000
 
-  # Optional realtime priority decay window for queue monitoring (seconds).
-  # When set, completed FLEX requests within this lookback are included in
-  # the 1h demand bucket. Omit or set null to disable.
-  priority_decay_window_secs: 600
   pending_capacity_counts_enabled: false # Include committed pending requests in batch submission capacity checks (default: false)
 
   # Allowed completion windows for batch processing

@@ -255,6 +255,10 @@ struct NewPendingRequest {
     api_key: String,
     created_by: String,
     service_tier: &'static str,
+    /// Provenance stored on the template, standing in for the batch metadata a
+    /// batchless request doesn't have. Read back by the claim queries and
+    /// forwarded under the same header names.
+    metadata: Option<serde_json::Value>,
 }
 
 struct ClaimedRequestRow {
@@ -530,8 +534,8 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
         let stored_body = sanitize_outbound_body(&input.body);
         let body_byte_size = stored_body.len() as i64;
         sqlx::query(
-            "INSERT INTO request_templates (id, file_id, custom_id, endpoint, method, path, body, model, api_key, body_byte_size)
-             VALUES ($1, NULL, NULL, $2, $3, $4, $5, $6, $7, $8)",
+            "INSERT INTO request_templates (id, file_id, custom_id, endpoint, method, path, body, model, api_key, body_byte_size, metadata)
+             VALUES ($1, NULL, NULL, $2, $3, $4, $5, $6, $7, $8, $9)",
         )
         .bind(template_id)
         .bind(&input.endpoint)
@@ -541,6 +545,7 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
         .bind(&input.model)
         .bind(&input.api_key)
         .bind(body_byte_size)
+        .bind(&input.metadata)
         .execute(&mut *tx)
         .await
         .map_err(|e| {
@@ -604,17 +609,21 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
             .map(|row| {
                 let mut batch_metadata = std::collections::HashMap::new();
 
-                let parsed_metadata = row.batch_id.and_then(|batch_uuid| {
-                    parsed_metadata_cache
+                let parse_metadata = |raw: Option<&str>| {
+                    raw.and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+                        .map(Arc::new)
+                };
+                let parsed_metadata = match row.batch_id {
+                    // One batch, many requests: parse its metadata once per claim.
+                    Some(batch_uuid) => parsed_metadata_cache
                         .entry(batch_uuid)
-                        .or_insert_with(|| {
-                            row.batch_metadata
-                                .as_deref()
-                                .and_then(|s| serde_json::from_str(s).ok())
-                                .map(Arc::new)
-                        })
-                        .clone()
-                });
+                        .or_insert_with(|| parse_metadata(row.batch_metadata.as_deref()))
+                        .clone(),
+                    // Batchless (flex, background): the metadata is the request's own, off
+                    // its template, so there is nothing to dedupe against and no batch id
+                    // to key a cache by. Parsed per row - 1:1 with the request.
+                    None => parse_metadata(row.batch_metadata.as_deref()),
+                };
 
                 for field_name in &self.config.batch_metadata_fields {
                     let value: Option<&str> = if row.batch_id.is_some() {
@@ -1291,8 +1300,6 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
 // Implement Storage trait directly (no delegation)
 #[async_trait]
 /// Returns active request counts grouped by model and expiry window.
-/// When `priority_decay_window` is set, recently completed flex requests
-/// are added to the `1h` bucket as an explicit realtime-load decay signal.
 ///
 /// Batch requests are windowed by their batch's `expires_at`. Batchless rows
 /// (flex/async responses, `batch_id IS NULL`) have no batch expiry, so they
@@ -1401,9 +1408,39 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         states: &[String], // e.g. ["pending"] or ["pending","claimed","processing"]
         model_filter: &[String], // empty = all models
         service_tier_filter: &ServiceTierFilter,
-        priority_decay_window: Option<i64>,
         strict: bool,
     ) -> Result<HashMap<String, HashMap<String, i64>>> {
+        // The tier-grouped query is the single source of truth; the flat
+        // shape is its tier-summed fold.
+        let rows = self
+            .get_pending_request_counts_by_model_window_and_tier(
+                windows,
+                states,
+                model_filter,
+                service_tier_filter,
+                strict,
+            )
+            .await?;
+
+        let mut result: HashMap<String, HashMap<String, i64>> = HashMap::new();
+        for row in rows {
+            *result
+                .entry(row.model)
+                .or_default()
+                .entry(row.window_label)
+                .or_insert(0) += row.count;
+        }
+        Ok(result)
+    }
+
+    async fn get_pending_request_counts_by_model_window_and_tier(
+        &self,
+        windows: &[(String, Option<i64>, i64)], // (label, start_secs, end_secs)
+        states: &[String], // e.g. ["pending"] or ["pending","claimed","processing"]
+        model_filter: &[String], // empty = all models
+        service_tier_filter: &ServiceTierFilter,
+        strict: bool,
+    ) -> Result<Vec<TrailingDemandCount>> {
         let include_background = matches!(
             service_tier_filter,
             ServiceTierFilter::Include(tiers)
@@ -1411,15 +1448,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         );
 
         if (windows.is_empty() && !include_background) || states.is_empty() {
-            return Ok(HashMap::new());
-        }
-
-        if let Some(priority_decay_window) = priority_decay_window
-            && priority_decay_window < 0
-        {
-            return Err(FusilladeError::ValidationError(
-                "priority_decay_window must be non-negative".to_string(),
-            ));
+            return Ok(Vec::new());
         }
 
         // Indicator: i16 instead of bool because `Vec<bool>` doesn't have a
@@ -1472,10 +1501,10 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         //
         // Forcing a custom (per-execution) plan lets the planner substitute the
         // actual parameter values and pick the partial indexes
-        // (idx_requests_active_non_priority_counts, idx_requests_state_model,
-        // idx_requests_completed_flex_decay), turning the scan into a
-        // sub-second index scan. `SET LOCAL` scopes both settings to this
-        // transaction, leaving the pooled connection untouched afterwards.
+        // (idx_requests_active_non_priority_counts, idx_requests_state_model),
+        // turning the scan into a sub-second index scan. `SET LOCAL` scopes
+        // both settings to this transaction, leaving the pooled connection
+        // untouched afterwards.
         let mut tx = if strict {
             self.begin_write().await
         } else {
@@ -1533,6 +1562,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                 SELECT
                     r.batch_id,
                     r.model,
+                    r.service_tier,
                     COUNT(*)::BIGINT AS request_count
                 FROM requests r
                 WHERE r.state = ANY($5)
@@ -1554,12 +1584,13 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                         OR (r.service_tier IS NOT NULL AND r.service_tier <> ALL($7))
                     ))
                 )
-                GROUP BY r.batch_id, r.model
+                GROUP BY r.batch_id, r.model, r.service_tier
             ),
             batch_counts AS (
                 SELECT
                     arc.model as model,
                     w.label as window_label,
+                    arc.service_tier as service_tier,
                     COALESCE(SUM(arc.request_count) FILTER (
                         WHERE (w.has_start = 0 OR b.expires_at >= NOW() + make_interval(secs => w.start_seconds))
                           AND b.expires_at < NOW() + make_interval(secs => w.end_seconds)
@@ -1584,20 +1615,21 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                 -- here. Without this, the join reads every active+templated
                 -- request and only filters inside the aggregate.
                 AND b.expires_at < NOW() + make_interval(secs => (SELECT MAX(end_seconds) FROM windows))
-                GROUP BY arc.model, w.label
+                GROUP BY arc.model, w.label, arc.service_tier
             ),
             batchless_counts AS (
                 -- Daemon-claimable rows with no parent batch (flex/async
                 -- responses). They carry no batch expiry, so window them by
                 -- the deadline the claim path synthesizes for them:
                 -- created_at + the service_tier completion window
-                -- (flex => $11, NULL/other => $12; milliseconds).
+                -- (flex => $10, NULL/other => $11; milliseconds).
                 SELECT
                     r.model as model,
                     w.label as window_label,
+                    r.service_tier as service_tier,
                     COUNT(*) FILTER (
-                        WHERE (w.has_start = 0 OR r.created_at + ((CASE WHEN r.service_tier = 'flex' THEN $11::BIGINT ELSE $12::BIGINT END) * interval '1 millisecond') >= NOW() + make_interval(secs => w.start_seconds))
-                          AND r.created_at + ((CASE WHEN r.service_tier = 'flex' THEN $11::BIGINT ELSE $12::BIGINT END) * interval '1 millisecond') < NOW() + make_interval(secs => w.end_seconds)
+                        WHERE (w.has_start = 0 OR r.created_at + ((CASE WHEN r.service_tier = 'flex' THEN $10::BIGINT ELSE $11::BIGINT END) * interval '1 millisecond') >= NOW() + make_interval(secs => w.start_seconds))
+                          AND r.created_at + ((CASE WHEN r.service_tier = 'flex' THEN $10::BIGINT ELSE $11::BIGINT END) * interval '1 millisecond') < NOW() + make_interval(secs => w.end_seconds)
                     )::BIGINT as count
                 FROM requests r
                 CROSS JOIN windows w
@@ -1619,37 +1651,20 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                 )
                 -- Same row-level upper bound as batch_counts: rows whose
                 -- deadline is past every window's end can't contribute.
-                AND r.created_at + ((CASE WHEN r.service_tier = 'flex' THEN $11::BIGINT ELSE $12::BIGINT END) * interval '1 millisecond') < NOW() + make_interval(secs => (SELECT MAX(end_seconds) FROM windows))
-                GROUP BY r.model, w.label
-            ),
-            priority_decay_counts AS (
-                SELECT
-                    r.model as model,
-                    '1h'::text as window_label,
-                    COUNT(*)::BIGINT as count
-                FROM requests r
-                WHERE $10::bigint IS NOT NULL
-                AND EXISTS (SELECT 1 FROM windows WHERE label = '1h')
-                AND r.service_tier = 'flex'
-                AND r.state = 'completed'
-                AND r.template_id IS NOT NULL
-                AND r.completed_at >= NOW() - make_interval(secs => $10::bigint)
-                AND r.completed_at <= NOW()
-                AND (cardinality($6::text[]) = 0 OR r.model = ANY($6))
-                GROUP BY r.model
+                AND r.created_at + ((CASE WHEN r.service_tier = 'flex' THEN $10::BIGINT ELSE $11::BIGINT END) * interval '1 millisecond') < NOW() + make_interval(secs => (SELECT MAX(end_seconds) FROM windows))
+                GROUP BY r.model, w.label, r.service_tier
             )
             SELECT
                 model,
                 window_label,
+                service_tier,
                 SUM(count)::BIGINT as count
             FROM (
                 SELECT * FROM batch_counts
                 UNION ALL
                 SELECT * FROM batchless_counts
-                UNION ALL
-                SELECT * FROM priority_decay_counts
             ) counts
-            GROUP BY model, window_label
+            GROUP BY model, window_label, service_tier
             "#,
         )
         .bind(&labels)
@@ -1661,7 +1676,6 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         .bind(&tier_names)
         .bind(tier_include_null)
         .bind(tier_mode)
-        .bind(priority_decay_window)
         .bind(flex_window_ms)
         .bind(default_window_ms)
         .fetch_all(&mut *tx)
@@ -1678,6 +1692,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                 r#"
                 SELECT r.model,
                        'background'::TEXT AS window_label,
+                       'background'::TEXT AS service_tier,
                        COUNT(*)::BIGINT AS count
                 FROM requests r
                 LEFT JOIN batches b ON b.id = r.batch_id
@@ -1722,7 +1737,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
             ))
         })?;
 
-        let mut result: HashMap<String, HashMap<String, i64>> = HashMap::new();
+        let mut result = Vec::with_capacity(rows.len());
         for row in rows {
             let model: String = row
                 .try_get("model")
@@ -1730,10 +1745,19 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
             let window_label: String = row.try_get("window_label").map_err(|e| {
                 FusilladeError::Other(anyhow!("Failed to read window_label: {}", e))
             })?;
+            let service_tier: Option<String> = row.try_get("service_tier").map_err(|e| {
+                FusilladeError::Other(anyhow!("Failed to read service_tier: {}", e))
+            })?;
             let count: i64 = row
                 .try_get("count")
                 .map_err(|e| FusilladeError::Other(anyhow!("Failed to read count: {}", e)))?;
-            result.entry(model).or_default().insert(window_label, count);
+            result.push(TrailingDemandCount {
+                model,
+                window_label,
+                service_tier,
+                outcome: "pending".to_string(),
+                count,
+            });
         }
 
         Ok(result)
@@ -2185,7 +2209,10 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                       ''::TEXT as "batch_file_id!",
                       t.endpoint as "batch_endpoint!",
                       '1h'::TEXT as "batch_completion_window?",
-                      NULL::TEXT as "batch_metadata",
+                      -- A batchless request's metadata lives on its template; it is read
+                      -- through the same allow-list and forwarded under the same header
+                      -- names as a batch's, so the claim path treats both alike.
+                      t.metadata::TEXT as "batch_metadata",
                       NULL::TEXT as "batch_output_file_id",
                       NULL::TEXT as "batch_error_file_id",
                       COALESCE(r.created_by, '') as "batch_created_by!",
@@ -2699,7 +2726,11 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                       COALESCE(b.file_id::TEXT, '') as "batch_file_id!",
                       COALESCE(b.endpoint, t.endpoint) as "batch_endpoint!",
                       'background'::TEXT as "batch_completion_window?",
-                      b.metadata::TEXT as "batch_metadata",
+                      -- This query claims both batched and batchless background rows, so
+                      -- take the batch's metadata when there is a batch and the template's
+                      -- when there isn't. b.metadata is NULL for batchless rows and
+                      -- t.metadata is NULL for file-ingested ones, so the two never race.
+                      COALESCE(b.metadata, t.metadata)::TEXT as "batch_metadata",
                       b.output_file_id::TEXT as "batch_output_file_id",
                       b.error_file_id::TEXT as "batch_error_file_id",
                       COALESCE(b.created_by, r.created_by, '') as "batch_created_by!",
@@ -6319,6 +6350,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
             api_key: input.api_key,
             created_by: input.created_by,
             service_tier: "flex",
+            metadata: input.metadata,
         })
         .await
     }
@@ -6335,6 +6367,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
             api_key: input.api_key,
             created_by: input.created_by,
             service_tier: "background",
+            metadata: input.metadata,
         })
         .await
     }
@@ -8722,6 +8755,7 @@ mod tests {
                 path: "/test".to_string(),
                 api_key: "key".to_string(),
                 created_by: owner.to_string(),
+                metadata: None,
             })
             .await
             .unwrap()
@@ -8841,6 +8875,7 @@ mod tests {
                 path: "/v1/responses".to_string(),
                 api_key: "test-key".to_string(),
                 created_by: "user-123".to_string(),
+                metadata: None,
             })
             .await
             .expect("create_flex should succeed");
@@ -10006,6 +10041,7 @@ mod tests {
                 path: "/test".to_string(),
                 api_key: "key".to_string(),
                 created_by: "foreground-owner".to_string(),
+                metadata: None,
             })
             .await
             .unwrap();
@@ -10062,6 +10098,7 @@ mod tests {
                 path: "/test".to_string(),
                 api_key: "key".to_string(),
                 created_by: "sla-owner".to_string(),
+                metadata: None,
             })
             .await
             .unwrap();
@@ -10115,6 +10152,7 @@ mod tests {
                 path: "/test".to_string(),
                 api_key: "key".to_string(),
                 created_by: "sla-owner".to_string(),
+                metadata: None,
             })
             .await
             .unwrap();
@@ -10313,7 +10351,6 @@ mod tests {
                 &states,
                 &[],
                 &ServiceTierFilter::Any,
-                None,
                 false,
             )
             .await
@@ -10326,7 +10363,6 @@ mod tests {
                 &states,
                 &[],
                 &ServiceTierFilter::Include(vec![Some("background".to_string())]),
-                None,
                 false,
             )
             .await
@@ -10352,7 +10388,6 @@ mod tests {
                 &["pending".to_string()],
                 &[],
                 &ServiceTierFilter::Include(vec![Some("background".to_string())]),
-                None,
                 false,
             )
             .await
@@ -10409,6 +10444,7 @@ mod tests {
                 path: "/test".to_string(),
                 api_key: "key".to_string(),
                 created_by: "sla-owner".to_string(),
+                metadata: None,
             })
             .await
             .unwrap();
@@ -10439,7 +10475,6 @@ mod tests {
                 &["pending".to_string()],
                 &[],
                 &ServiceTierFilter::Include(vec![Some("background".to_string())]),
-                None,
                 false,
             )
             .await
@@ -10502,6 +10537,7 @@ mod tests {
                 path: "/test".to_string(),
                 api_key: "key".to_string(),
                 created_by: "user".to_string(),
+                metadata: None,
             })
             .await
             .unwrap();
@@ -10516,6 +10552,195 @@ mod tests {
         assert_eq!(claimed.len(), 1);
         assert_eq!(claimed[0].data.id, flex_id);
         assert_eq!(claimed[0].data.batch_id, None);
+    }
+
+    /// A batchless request has no batch to hang provenance on, so it goes on the template —
+    /// but storing it is only half the path. The dispatcher builds its headers from the
+    /// CLAIMED request's metadata map, and that map is filled from an allow-list, so a key
+    /// that is written and never listed is silently never sent. That is exactly how the
+    /// batch side of this shipped broken, so this asserts on what came back from the claim
+    /// rather than on the row that went in.
+    #[sqlx::test]
+    async fn batchless_claim_forwards_listed_template_metadata(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        )
+        .with_config(PostgresStorageConfig {
+            // `dw_user_agent` is forwarded; `dw_unlisted` is not, and proves the gate is
+            // the list rather than the mere presence of the key.
+            batch_metadata_fields: vec![
+                "completion_window".to_string(),
+                "dw_user_agent".to_string(),
+            ],
+            ..Default::default()
+        });
+
+        let request_id = Uuid::new_v4();
+        manager
+            .create_flex(CreateFlexInput {
+                request_id,
+                body: r#"{"model":"test","service_tier":"flex"}"#.to_string(),
+                model: "test".to_string(),
+                endpoint: "https://api.example.com".to_string(),
+                method: "POST".to_string(),
+                path: "/test".to_string(),
+                api_key: "key".to_string(),
+                created_by: "user".to_string(),
+                metadata: Some(serde_json::json!({
+                    "dw_user_agent": "claude-cli/1.2.3",
+                    "dw_unlisted": "must not be forwarded",
+                })),
+            })
+            .await
+            .unwrap();
+
+        let claimed = manager
+            .claim_batchless_requests(
+                10,
+                DaemonId::from(Uuid::new_v4()),
+                &HashMap::from([("test".to_string(), 10)]),
+                &HashMap::new(),
+                &HashSet::new(),
+            )
+            .await
+            .expect("Failed to claim batchless requests");
+
+        assert_eq!(claimed.len(), 1);
+        let metadata = &claimed[0].data.batch_metadata;
+        assert_eq!(
+            metadata.get("dw_user_agent").map(String::as_str),
+            Some("claude-cli/1.2.3"),
+            "a listed template metadata key must reach the dispatched request"
+        );
+        assert!(
+            !metadata.contains_key("dw_unlisted"),
+            "an unlisted key must not be forwarded: the allow-list is the contract"
+        );
+        // The synthesized batchless fields still work alongside the parsed metadata.
+        assert_eq!(
+            metadata.get("completion_window").map(String::as_str),
+            Some("1h")
+        );
+    }
+
+    /// The batch half of the same contract. A key stored in `batches.metadata` reaches the
+    /// dispatched request only if it is on the forwarding list — which is exactly what was
+    /// wrong the first time this shipped: the key was stored, and silently never sent.
+    #[sqlx::test]
+    async fn batch_claim_forwards_listed_batch_metadata(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        )
+        .with_config(PostgresStorageConfig {
+            batch_metadata_fields: vec!["id".to_string(), "dw_user_agent".to_string()],
+            ..Default::default()
+        });
+
+        let file_id = manager
+            .create_file(
+                "ua-batch".to_string(),
+                None,
+                vec![RequestTemplateInput {
+                    custom_id: Some("ua".to_string()),
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/test".to_string(),
+                    body: "{}".to_string(),
+                    model: "test".to_string(),
+                    api_key: "key".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+        manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: Some(serde_json::json!({
+                    "dw_user_agent": "OpenAI/Python 1.2.3",
+                    "dw_unlisted": "must not be forwarded",
+                })),
+                created_by: None,
+                api_key_id: None,
+                api_key: None,
+                total_requests: None,
+            })
+            .await
+            .unwrap();
+
+        let claimed = manager
+            .claim_batch_requests(
+                10,
+                10,
+                DaemonId::from(Uuid::new_v4()),
+                &HashMap::from([("test".to_string(), 10)]),
+                &HashMap::new(),
+            )
+            .await
+            .expect("Failed to claim batch requests");
+
+        assert_eq!(claimed.len(), 1);
+        let metadata = &claimed[0].data.batch_metadata;
+        assert_eq!(
+            metadata.get("dw_user_agent").map(String::as_str),
+            Some("OpenAI/Python 1.2.3"),
+            "a listed batch metadata key must reach the dispatched request"
+        );
+        assert!(
+            !metadata.contains_key("dw_unlisted"),
+            "an unlisted key must not be forwarded: the allow-list is the contract"
+        );
+    }
+
+    /// Batchless metadata is optional, and the common case (no metadata at all) must not
+    /// disturb the fields the claim path synthesizes for every batchless row.
+    #[sqlx::test]
+    async fn batchless_claim_without_metadata_keeps_synthesized_fields(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+
+        manager
+            .create_flex(CreateFlexInput {
+                request_id: Uuid::new_v4(),
+                body: r#"{"model":"test","service_tier":"flex"}"#.to_string(),
+                model: "test".to_string(),
+                endpoint: "https://api.example.com".to_string(),
+                method: "POST".to_string(),
+                path: "/test".to_string(),
+                api_key: "key".to_string(),
+                created_by: "user".to_string(),
+                metadata: None,
+            })
+            .await
+            .unwrap();
+
+        let claimed = manager
+            .claim_batchless_requests(
+                10,
+                DaemonId::from(Uuid::new_v4()),
+                &HashMap::from([("test".to_string(), 10)]),
+                &HashMap::new(),
+                &HashSet::new(),
+            )
+            .await
+            .expect("Failed to claim batchless requests");
+
+        assert_eq!(claimed.len(), 1);
+        let metadata = &claimed[0].data.batch_metadata;
+        assert!(!metadata.contains_key("dw_user_agent"));
+        assert_eq!(
+            metadata.get("completion_window").map(String::as_str),
+            Some("1h")
+        );
+        assert!(
+            metadata.contains_key("created_at"),
+            "submission epoch drives the SLO metrics"
+        );
     }
 
     #[sqlx::test]
@@ -10830,6 +11055,7 @@ mod tests {
                     path: "/test".to_string(),
                     api_key: "key".to_string(),
                     created_by: "user".to_string(),
+                    metadata: None,
                 })
                 .await
                 .unwrap();
@@ -11712,7 +11938,6 @@ mod tests {
                 &states,
                 &model_filter,
                 &ServiceTierFilter::Any,
-                None,
                 false,
             )
             .await
@@ -11737,7 +11962,6 @@ mod tests {
                 &states,
                 &model_filter,
                 &ServiceTierFilter::Any,
-                None,
                 false,
             )
             .await
@@ -18129,6 +18353,7 @@ mod tests {
                 path: "/test".to_string(),
                 api_key: "key".to_string(),
                 created_by: user.to_string(),
+                metadata: None,
             })
             .await
             .unwrap();
@@ -20165,7 +20390,6 @@ mod tests {
                 &states,
                 &model_filter,
                 &ServiceTierFilter::Any,
-                None,
                 false,
             )
             .await
@@ -20187,7 +20411,6 @@ mod tests {
                 &states,
                 &model_filter,
                 &ServiceTierFilter::Any,
-                None,
                 false,
             )
             .await
@@ -20202,7 +20425,6 @@ mod tests {
                 &states,
                 &model_filter,
                 &ServiceTierFilter::Any,
-                None,
                 false,
             )
             .await
@@ -20228,7 +20450,6 @@ mod tests {
                 &states,
                 &model_filter,
                 &ServiceTierFilter::Any,
-                None,
                 false,
             )
             .await
@@ -20241,7 +20462,6 @@ mod tests {
                 &states,
                 &model_filter,
                 &ServiceTierFilter::Any,
-                None,
                 false,
             )
             .await
@@ -20340,7 +20560,6 @@ mod tests {
                 &states,
                 &model_filter,
                 &ServiceTierFilter::Any,
-                None,
                 false,
             )
             .await
@@ -20360,7 +20579,6 @@ mod tests {
                 &states,
                 &model_filter,
                 &ServiceTierFilter::Any,
-                None,
                 false,
             )
             .await
@@ -20384,7 +20602,6 @@ mod tests {
                 &states,
                 &model_filter,
                 &ServiceTierFilter::Any,
-                None,
                 false,
             )
             .await
@@ -20405,7 +20622,6 @@ mod tests {
                 &["pending".to_string()],
                 &[],
                 &ServiceTierFilter::Any,
-                None,
                 false,
             )
             .await
@@ -20418,7 +20634,6 @@ mod tests {
                 &[],
                 &[],
                 &ServiceTierFilter::Any,
-                None,
                 false,
             )
             .await
@@ -20501,7 +20716,6 @@ mod tests {
                 &states,
                 &model_filter,
                 &ServiceTierFilter::Any,
-                None,
                 false,
             )
             .await
@@ -20515,7 +20729,6 @@ mod tests {
                 &states,
                 &model_filter,
                 &ServiceTierFilter::Exclude(vec![Some("priority".to_string())]),
-                None,
                 false,
             )
             .await
@@ -20529,7 +20742,6 @@ mod tests {
                 &states,
                 &model_filter,
                 &ServiceTierFilter::Include(vec![None]),
-                None,
                 false,
             )
             .await
@@ -20543,7 +20755,6 @@ mod tests {
                 &states,
                 &model_filter,
                 &ServiceTierFilter::Include(vec![None, Some("flex".to_string())]),
-                None,
                 false,
             )
             .await
@@ -20557,7 +20768,6 @@ mod tests {
                 &states,
                 &model_filter,
                 &ServiceTierFilter::Exclude(vec![None]),
-                None,
                 false,
             )
             .await
@@ -20571,7 +20781,6 @@ mod tests {
                 &states,
                 &model_filter,
                 &ServiceTierFilter::Include(vec![]),
-                None,
                 false,
             )
             .await
@@ -20580,318 +20789,64 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn test_pending_request_counts_priority_decay_window(pool: sqlx::PgPool) {
+    async fn test_pending_counts_by_tier_carries_tier_and_folds_to_flat(pool: sqlx::PgPool) {
         let http_client = Arc::new(MockHttpClient::new());
         let manager = PostgresRequestManager::with_client(
             TestDbPools::new(pool.clone()).await.unwrap(),
             http_client,
         );
 
-        let model = "flex-model";
-        let recent_id = Uuid::new_v4();
+        let flex_id = Uuid::new_v4();
         manager
             .create_flex(CreateFlexInput {
-                request_id: recent_id,
-                body: r#"{"input":"recent"}"#.to_string(),
-                model: model.to_string(),
-                endpoint: "http://localhost".to_string(),
-                method: "POST".to_string(),
-                path: "/v1/responses".to_string(),
-                api_key: String::new(),
-                created_by: "flex-user".to_string(),
-            })
-            .await
-            .unwrap();
-        sqlx::query(
-            "UPDATE requests
-             SET state = 'processing',
-                 daemon_id = gen_random_uuid(),
-                 claimed_at = NOW(),
-                 started_at = NOW()
-             WHERE id = $1",
-        )
-        .bind(recent_id)
-        .execute(&pool)
-        .await
-        .unwrap();
-        manager
-            .complete_request(RequestId(recent_id), r#"{"output":"recent"}"#, 200)
-            .await
-            .unwrap();
-
-        let old_id = Uuid::new_v4();
-        manager
-            .create_flex(CreateFlexInput {
-                request_id: old_id,
-                body: r#"{"input":"old"}"#.to_string(),
-                model: model.to_string(),
-                endpoint: "http://localhost".to_string(),
-                method: "POST".to_string(),
-                path: "/v1/responses".to_string(),
-                api_key: String::new(),
-                created_by: "flex-user".to_string(),
-            })
-            .await
-            .unwrap();
-        sqlx::query(
-            "UPDATE requests
-             SET state = 'processing',
-                 daemon_id = gen_random_uuid(),
-                 claimed_at = NOW(),
-                 started_at = NOW()
-             WHERE id = $1",
-        )
-        .bind(old_id)
-        .execute(&pool)
-        .await
-        .unwrap();
-        manager
-            .complete_request(RequestId(old_id), r#"{"output":"old"}"#, 200)
-            .await
-            .unwrap();
-
-        let failed_id = Uuid::new_v4();
-        manager
-            .create_flex(CreateFlexInput {
-                request_id: failed_id,
-                body: r#"{"input":"failed"}"#.to_string(),
-                model: model.to_string(),
-                endpoint: "http://localhost".to_string(),
-                method: "POST".to_string(),
-                path: "/v1/responses".to_string(),
-                api_key: String::new(),
-                created_by: "flex-user".to_string(),
-            })
-            .await
-            .unwrap();
-        sqlx::query(
-            "UPDATE requests
-             SET state = 'processing',
-                 daemon_id = gen_random_uuid(),
-                 claimed_at = NOW(),
-                 started_at = NOW()
-             WHERE id = $1",
-        )
-        .bind(failed_id)
-        .execute(&pool)
-        .await
-        .unwrap();
-        manager
-            .fail_request(RequestId(failed_id), r#"{"error":"failed"}"#, 500)
-            .await
-            .unwrap();
-
-        let canceled_id = Uuid::new_v4();
-        manager
-            .create_flex(CreateFlexInput {
-                request_id: canceled_id,
-                body: r#"{"input":"canceled"}"#.to_string(),
-                model: model.to_string(),
-                endpoint: "http://localhost".to_string(),
-                method: "POST".to_string(),
-                path: "/v1/responses".to_string(),
-                api_key: String::new(),
-                created_by: "flex-user".to_string(),
-            })
-            .await
-            .unwrap();
-
-        sqlx::query(
-            "UPDATE requests SET completed_at = NOW() - INTERVAL '5 minutes' WHERE id = $1",
-        )
-        .bind(recent_id)
-        .execute(&pool)
-        .await
-        .unwrap();
-        sqlx::query("UPDATE requests SET failed_at = NOW() - INTERVAL '5 minutes' WHERE id = $1")
-            .bind(failed_id)
-            .execute(&pool)
-            .await
-            .unwrap();
-        sqlx::query(
-            "UPDATE requests SET state = 'canceled', canceled_at = NOW() - INTERVAL '5 minutes' WHERE id = $1",
-        )
-        .bind(canceled_id)
-        .execute(&pool)
-        .await
-        .unwrap();
-        sqlx::query(
-            "UPDATE requests SET completed_at = NOW() - INTERVAL '11 minutes' WHERE id = $1",
-        )
-        .bind(old_id)
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        let windows = vec![
-            ("1h".to_string(), None, 3600),
-            ("24h".to_string(), None, 86_400),
-        ];
-        let states = vec![
-            "pending".to_string(),
-            "claimed".to_string(),
-            "processing".to_string(),
-        ];
-        let model_filter: Vec<String> = vec![];
-        let exclude_priority = ServiceTierFilter::Exclude(vec![Some("priority".to_string())]);
-
-        let counts_without_decay = manager
-            .get_pending_request_counts_by_model_and_window(
-                &windows,
-                &states,
-                &model_filter,
-                &exclude_priority,
-                None,
-                false,
-            )
-            .await
-            .unwrap();
-        assert!(counts_without_decay.is_empty());
-
-        let counts = manager
-            .get_pending_request_counts_by_model_and_window(
-                &windows,
-                &states,
-                &model_filter,
-                &exclude_priority,
-                Some(600),
-                false,
-            )
-            .await
-            .unwrap();
-        let model_counts = counts.get(model).unwrap();
-        assert_eq!(*model_counts.get("1h").unwrap(), 1);
-        assert_eq!(model_counts.get("24h").copied().unwrap_or(0), 0);
-
-        let no_1h_counts = manager
-            .get_pending_request_counts_by_model_and_window(
-                &[("24h".to_string(), None, 86_400)],
-                &states,
-                &model_filter,
-                &exclude_priority,
-                Some(600),
-                false,
-            )
-            .await
-            .unwrap();
-        assert!(no_1h_counts.is_empty());
-
-        let err = manager
-            .get_pending_request_counts_by_model_and_window(
-                &windows,
-                &states,
-                &model_filter,
-                &exclude_priority,
-                Some(-1),
-                false,
-            )
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("non-negative"));
-    }
-
-    /// Regression for running the pending-counts query on a forced custom plan
-    /// inside its own transaction (so the bound `state`/`service_tier` params
-    /// don't trap it on a sequential-scan generic plan). Drives the active and
-    /// completed-flex *decay* arms together in a single call: the transactional
-    /// wrapper must keep every arm intact and aggregate them correctly.
-    #[sqlx::test]
-    async fn test_pending_counts_active_and_decay_in_one_call(pool: sqlx::PgPool) {
-        let http_client = Arc::new(MockHttpClient::new());
-        let manager = PostgresRequestManager::with_client(
-            TestDbPools::new(pool.clone()).await.unwrap(),
-            http_client,
-        );
-        let model = "flex-model";
-
-        // Active arm: a queued (pending) batchless flex request, due ~55min out.
-        let pending_id = Uuid::new_v4();
-        manager
-            .create_flex(CreateFlexInput {
-                request_id: pending_id,
-                body: r#"{"input":"pending"}"#.to_string(),
-                model: model.to_string(),
+                request_id: flex_id,
+                body: r#"{"input":"flex"}"#.to_string(),
+                model: "tier-model".to_string(),
                 endpoint: "http://localhost".to_string(),
                 method: "POST".to_string(),
                 path: "/v1/responses".to_string(),
                 api_key: String::new(),
                 created_by: "queue-user".to_string(),
+                metadata: None,
             })
             .await
             .unwrap();
-        sqlx::query("UPDATE requests SET created_at = NOW() - INTERVAL '5 minutes' WHERE id = $1")
-            .bind(pending_id)
-            .execute(&pool)
-            .await
-            .unwrap();
 
-        // Decay arm: a recently-completed flex request (5min ago, inside the
-        // 600s decay window).
-        let done_id = Uuid::new_v4();
-        manager
-            .create_flex(CreateFlexInput {
-                request_id: done_id,
-                body: r#"{"input":"done"}"#.to_string(),
-                model: model.to_string(),
-                endpoint: "http://localhost".to_string(),
-                method: "POST".to_string(),
-                path: "/v1/responses".to_string(),
-                api_key: String::new(),
-                created_by: "queue-user".to_string(),
-            })
-            .await
-            .unwrap();
-        sqlx::query(
-            "UPDATE requests
-             SET state = 'processing', daemon_id = gen_random_uuid(),
-                 claimed_at = NOW(), started_at = NOW()
-             WHERE id = $1",
-        )
-        .bind(done_id)
-        .execute(&pool)
-        .await
-        .unwrap();
-        manager
-            .complete_request(RequestId(done_id), r#"{"output":"done"}"#, 200)
-            .await
-            .unwrap();
-        sqlx::query(
-            "UPDATE requests SET completed_at = NOW() - INTERVAL '5 minutes' WHERE id = $1",
-        )
-        .bind(done_id)
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        let windows = vec![
-            ("1h".to_string(), None, 3600),
-            ("24h".to_string(), None, 86_400),
-        ];
-        let states = vec![
-            "pending".to_string(),
-            "claimed".to_string(),
-            "processing".to_string(),
-        ];
+        let windows = vec![("1h".to_string(), None, 3600)];
+        let states = vec!["pending".to_string()];
         let model_filter: Vec<String> = vec![];
-        let exclude_priority = ServiceTierFilter::Exclude(vec![Some("priority".to_string())]);
 
-        let counts = manager
-            .get_pending_request_counts_by_model_and_window(
+        let rows = manager
+            .get_pending_request_counts_by_model_window_and_tier(
                 &windows,
                 &states,
                 &model_filter,
-                &exclude_priority,
-                Some(600),
+                &ServiceTierFilter::Any,
                 false,
             )
             .await
             .unwrap();
+        let row = rows
+            .iter()
+            .find(|row| row.model == "tier-model" && row.count > 0)
+            .expect("flex row must appear in tier-grouped counts");
+        assert_eq!(row.window_label, "1h");
+        assert_eq!(row.service_tier.as_deref(), Some("flex"));
+        assert_eq!(row.outcome, "pending");
+        assert_eq!(row.count, 1);
 
-        let model_counts = counts.get(model).expect("model must be present");
-        // 1h bucket: active pending (1) + completed-flex decay (1).
-        assert_eq!(*model_counts.get("1h").unwrap(), 2);
-        // 24h bucket: active pending only; decay contributes solely to 1h.
-        assert_eq!(*model_counts.get("24h").unwrap(), 1);
+        // The flat shape is the tier-summed fold of the grouped rows.
+        let flat = manager
+            .get_pending_request_counts_by_model_and_window(
+                &windows,
+                &states,
+                &model_filter,
+                &ServiceTierFilter::Any,
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(*flat.get("tier-model").unwrap().get("1h").unwrap(), 1);
     }
 
     #[sqlx::test]
@@ -20915,6 +20870,7 @@ mod tests {
                 path: "/v1/responses".to_string(),
                 api_key: String::new(),
                 created_by: "queue-user".to_string(),
+                metadata: None,
             })
             .await
             .unwrap();
@@ -20942,7 +20898,6 @@ mod tests {
                 &pending,
                 &model_filter,
                 &ServiceTierFilter::Any,
-                None,
                 false,
             )
             .await
@@ -20960,7 +20915,6 @@ mod tests {
                 &pending,
                 &model_filter,
                 &ServiceTierFilter::Any,
-                None,
                 false,
             )
             .await
@@ -20981,7 +20935,6 @@ mod tests {
                 &pending,
                 &model_filter,
                 &ServiceTierFilter::Any,
-                None,
                 false,
             )
             .await
@@ -20993,7 +20946,6 @@ mod tests {
                 &pending,
                 &model_filter,
                 &ServiceTierFilter::Any,
-                None,
                 false,
             )
             .await
@@ -21025,7 +20977,6 @@ mod tests {
                 &pending,
                 &model_filter,
                 &ServiceTierFilter::Any,
-                None,
                 false,
             )
             .await
@@ -21043,7 +20994,6 @@ mod tests {
                 &active_states,
                 &model_filter,
                 &ServiceTierFilter::Any,
-                None,
                 false,
             )
             .await
@@ -21079,7 +21029,6 @@ mod tests {
                 &active_states,
                 &model_filter,
                 &ServiceTierFilter::Exclude(vec![Some("priority".to_string())]),
-                None,
                 false,
             )
             .await
@@ -21096,7 +21045,6 @@ mod tests {
                 &active_states,
                 &model_filter,
                 &ServiceTierFilter::Any,
-                None,
                 false,
             )
             .await
@@ -21113,7 +21061,6 @@ mod tests {
                 &active_states,
                 &model_filter,
                 &ServiceTierFilter::Exclude(vec![Some("flex".to_string())]),
-                None,
                 false,
             )
             .await
@@ -21127,7 +21074,6 @@ mod tests {
                 &active_states,
                 &["other-model".to_string()],
                 &ServiceTierFilter::Any,
-                None,
                 false,
             )
             .await
@@ -22636,6 +22582,7 @@ mod tests {
                 path: "/v1/responses".to_string(),
                 api_key: String::new(),
                 created_by: "user-123".to_string(),
+                metadata: None,
             })
             .await
             .expect("create_flex should succeed");
@@ -22669,6 +22616,7 @@ mod tests {
                 path: "/v1/responses".to_string(),
                 api_key: String::new(),
                 created_by: "user-a".to_string(),
+                metadata: None,
             })
             .await
             .expect("background request should be created");
