@@ -1,5 +1,16 @@
 # Changelog
 
+## [10.0.0](https://github.com/doublewordai/control-layer/compare/v9.3.0...v10.0.0) (2026-07-31)
+
+
+### ⚠ BREAKING CHANGES
+
+* tier-grouped pending demand in one query; remove the priority-decay top-up ([#1408](https://github.com/doublewordai/control-layer/issues/1408))
+
+### Features
+
+* tier-grouped pending demand in one query; remove the priority-decay top-up ([#1408](https://github.com/doublewordai/control-layer/issues/1408)) ([52fa075](https://github.com/doublewordai/control-layer/commit/52fa075cf7e0faa502e8b72af3a5cae73034c771))
+
 ## [9.3.0](https://github.com/doublewordai/control-layer/compare/v9.2.1...v9.3.0) (2026-07-30)
 
 
