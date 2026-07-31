@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE users\n            SET auto_topup_amount = NULL,\n                auto_topup_threshold = NULL,\n                auto_topup_monthly_limit = NULL,\n                auto_topup_soft_failure_count = 0,\n                auto_topup_retry_after = NULL,\n                updated_at = NOW()\n            WHERE id = $1\n              AND auto_topup_amount IS NOT NULL\n              AND auto_topup_threshold IS NOT NULL\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "336285bd86388c578e7c1bb68f24a3153f9f4af9fd1bfd56660a05195a97efb7"
+}

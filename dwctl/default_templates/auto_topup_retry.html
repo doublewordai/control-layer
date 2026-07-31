@@ -1,0 +1,16 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"></head>
+<body style="font-family: system-ui, sans-serif; max-width: 600px; margin: 40px auto; padding: 20px; color: #333;">
+    <p>Hi {{ to_name }},</p>
+
+    <p>We couldn't top up your Doubleword account with <strong>${{ amount }}</strong> because the payment was declined.</p>
+
+    <p>We'll try again tomorrow, or you can <a href="{{ dashboard_link }}">update your card now</a>.</p>
+
+    <p style="font-size: 12px; color: #888; margin-top: 30px; border-top: 1px solid #eee; padding-top: 15px;">
+        You're receiving this because you have auto top-up enabled on your account.
+        <a href="{{ profile_link }}">Manage your auto top-up settings</a>
+    </p>
+</body>
+</html>
