@@ -176,6 +176,9 @@ pub(crate) fn scrub_provider_cache_fields(usage: &mut serde_json::Map<String, Va
     for key in PROVIDER_CACHE_FIELDS {
         changed |= usage.remove(key).is_some();
     }
+    // Any present value that isn't already the canonical integer 0 gets overwritten — including
+    // non-numeric shapes (string/float), for which `as_u64()` is `None` and the `!= Some(0)`
+    // guard passes. The guard exists only to avoid re-serializing already-clean bodies.
     if let Some(cached) = usage
         .get_mut("prompt_tokens_details")
         .and_then(Value::as_object_mut)
@@ -479,9 +482,16 @@ pub async fn inject_into_response_nonstreaming(response: Response, stats: &Cache
 /// Scrub provider cache fields from a **non-streaming** response on the inactive (cache-disabled)
 /// path. Same buffering/framing rules as [`inject_into_response_nonstreaming`], but the body is
 /// only rewritten when scrubbing actually changed it, and there is no billing gate — an inactive
-/// request never commits an index write. Error bodies and non-completion JSON pass through
-/// (no `usage` object → nothing to scrub).
+/// request never commits an index write. Non-2xx responses return unbuffered (onwards error
+/// envelopes carry no usage); non-completion JSON passes through (no `usage` object → nothing
+/// to scrub).
 pub async fn scrub_response_nonstreaming(response: Response) -> Response {
+    // Non-2xx bodies are onwards-shaped error envelopes (third-party error bodies are replaced
+    // before they reach this layer) — no usage to scrub, so skip the buffering entirely rather
+    // than risk masking an upstream failure with the body-read 500 below.
+    if !response.status().is_success() {
+        return response;
+    }
     let is_json = response
         .headers()
         .get("content-type")
@@ -944,6 +954,34 @@ mod tests {
         assert!(scrub_sse_body(clean.as_bytes()).is_none());
         let no_usage = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n";
         assert!(scrub_sse_body(no_usage.as_bytes()).is_none());
+    }
+
+    #[test]
+    fn scrub_zeroes_non_numeric_cached_tokens() {
+        // Defensive: a provider emitting cached_tokens as a string or float must still be
+        // scrubbed — `as_u64()` is None for those shapes, which takes the overwrite branch.
+        for weird in [serde_json::json!("687"), serde_json::json!(687.5)] {
+            let body = serde_json::json!({"usage":{"prompt_tokens_details":{"cached_tokens": weird}}}).to_string();
+            let out = scrub_usage_json(body.as_bytes()).expect("non-zero value → rewritten");
+            let v: Value = serde_json::from_slice(&out).unwrap();
+            assert_eq!(v["usage"]["prompt_tokens_details"]["cached_tokens"], 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn scrub_nonstreaming_passes_error_responses_through() {
+        use axum::body::Body;
+        // A non-2xx is an onwards error envelope — returned unbuffered, byte-identical.
+        let body = serde_json::json!({"error":{"message":"upstream failed"}}).to_string();
+        let resp = Response::builder()
+            .status(502)
+            .header("content-type", "application/json")
+            .body(Body::from(body.clone()))
+            .unwrap();
+        let out = scrub_response_nonstreaming(resp).await;
+        assert_eq!(out.status(), 502, "status preserved");
+        let collected = axum::body::to_bytes(out.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(collected, body.as_bytes(), "error body untouched");
     }
 
     #[tokio::test]
