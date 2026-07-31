@@ -1938,6 +1938,7 @@ dependencies = [
  "notify",
  "once_cell",
  "onwards",
+ "onwards-fusillade",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
