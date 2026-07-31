@@ -2,7 +2,10 @@
 
 use crate::{
     api::models::users::CurrentUser,
-    db::{handlers::api_keys::ApiKeys, models::api_keys::ApiKeyPurpose},
+    db::{
+        handlers::{AllowanceReservation, Credits, RequestAllowances, api_keys::ApiKeys},
+        models::api_keys::ApiKeyPurpose,
+    },
     errors::Error,
 };
 use anyhow::Context;
@@ -53,13 +56,27 @@ pub(crate) async fn admin_ai_proxy<P: sqlx_pool_router::PoolProvider + Clone>(
     })?;
 
     debug!("Model name extracted from request: {}", model_name);
+    let is_flex = serde_json::from_slice::<serde_json::Value>(&body_bytes)
+        .ok()
+        .and_then(|body| body.get("service_tier").and_then(|tier| tier.as_str()).map(str::to_owned))
+        .is_some_and(|tier| tier == "flex");
 
     // Get or create user-specific hidden playground API key for this request
     let target_user_id = current_user.active_organization.unwrap_or(current_user.id);
+    let authenticated_by_api_key = current_user.api_key_id.is_some();
     let mut api_key_conn = state.db.write().acquire().await.unwrap();
+    if authenticated_by_api_key {
+        let balance = Credits::new(&mut api_key_conn).get_user_balance(target_user_id).await?;
+        if balance <= rust_decimal::Decimal::ZERO {
+            return Err(Error::InsufficientCredits {
+                current_balance: balance,
+                message: "API-key-authenticated playground requests require positive credits.".to_string(),
+            });
+        }
+    }
     let mut api_keys_repo = ApiKeys::new(&mut api_key_conn);
-    let user_api_key = api_keys_repo
-        .get_or_create_hidden_key(target_user_id, ApiKeyPurpose::Playground, current_user.id)
+    let (user_api_key, user_api_key_id) = api_keys_repo
+        .get_or_create_hidden_key_with_id(target_user_id, ApiKeyPurpose::Playground, current_user.id)
         .await
         .with_context(|| {
             format!(
@@ -67,6 +84,21 @@ pub(crate) async fn admin_ai_proxy<P: sqlx_pool_router::PoolProvider + Clone>(
                 target_user_id, current_user.id
             )
         })?;
+
+    // Flex is queued through the hidden batch key and consumes the independent
+    // batch allowance in the inference middleware. All other playground
+    // submissions reserve one request here, at acceptance time.
+    if !authenticated_by_api_key && !is_flex {
+        match RequestAllowances::new(&mut api_key_conn).reserve(user_api_key_id, 1).await? {
+            AllowanceReservation::CreditsAvailable | AllowanceReservation::Reserved { .. } | AllowanceReservation::NotProvisioned => {}
+            AllowanceReservation::Unavailable => {
+                return Err(Error::InsufficientCredits {
+                    current_balance: rust_decimal::Decimal::ZERO,
+                    message: "Playground request allowance exhausted. Please add credits to continue.".to_string(),
+                });
+            }
+        }
+    }
 
     // Rewrite the path from /admin/api/v1/ai/* to /ai/*
     debug!("User has access to model: {}", model_name);
@@ -121,18 +153,124 @@ mod tests {
 
     use crate::{
         api::models::{
+            api_keys::ApiKeyCreate,
             groups::GroupCreate,
             users::{CurrentUser, Role},
         },
         auth::{middleware::admin_ai_proxy, session},
         db::{
-            handlers::{Deployments, Groups, InferenceEndpoints, Repository as _},
+            handlers::{Deployments, Groups, InferenceEndpoints, Repository as _, RequestAllowances},
             models::{
-                deployments::DeploymentCreateDBRequest, groups::GroupCreateDBRequest, inference_endpoints::InferenceEndpointCreateDBRequest,
+                api_keys::{ApiKeyCreateDBRequest, ApiKeyPurpose},
+                deployments::DeploymentCreateDBRequest,
+                groups::GroupCreateDBRequest,
+                inference_endpoints::InferenceEndpointCreateDBRequest,
             },
         },
+        errors::Error,
         test::utils::{create_test_config, create_test_user},
     };
+
+    #[sqlx::test]
+    async fn playground_allowance_is_consumed_once_and_flex_uses_the_batch_allowance(pool: PgPool) {
+        let config = create_test_config();
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        let mut conn = pool.acquire().await.unwrap();
+        RequestAllowances::new(&mut conn).provision(user.id, 1, 2).await.unwrap();
+        drop(conn);
+
+        let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
+        let external_user_id = user.external_user_id.as_ref().unwrap_or(&user.username);
+        let request = |service_tier: Option<&str>| {
+            let mut body = json!({"model": "test-model"});
+            if let Some(tier) = service_tier {
+                body["service_tier"] = tier.into();
+            }
+            axum::http::Request::builder()
+                .uri("/admin/api/v1/ai/v1/chat/completions")
+                .header("x-doubleword-user", external_user_id)
+                .header("x-doubleword-email", &user.email)
+                .body(body.to_string().into())
+                .unwrap()
+        };
+
+        admin_ai_proxy(state.clone(), request(None)).await.unwrap();
+        let err = admin_ai_proxy(state.clone(), request(None)).await.unwrap_err();
+        assert!(matches!(err, Error::InsufficientCredits { .. }));
+
+        admin_ai_proxy(state, request(Some("flex"))).await.unwrap();
+        let remaining: i64 = sqlx::query_scalar(
+            r#"
+            SELECT allowance.remaining_requests
+            FROM api_key_request_allowances allowance
+            JOIN api_keys ak ON ak.id = allowance.api_key_id
+            WHERE ak.user_id = $1 AND ak.purpose = 'batch'
+            "#,
+        )
+        .bind(user.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(remaining, 2, "flex admission must leave consumption to the batch-key path");
+    }
+
+    #[sqlx::test]
+    async fn visible_platform_key_cannot_use_playground_or_flex_allowances(pool: PgPool) {
+        let config = create_test_config();
+        let user = crate::test::utils::create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::PlatformManager]).await;
+        let mut conn = pool.acquire().await.unwrap();
+        RequestAllowances::new(&mut conn).provision(user.id, 1, 1).await.unwrap();
+        let platform_key = crate::db::handlers::api_keys::ApiKeys::new(&mut conn)
+            .create(&ApiKeyCreateDBRequest::new(
+                user.id,
+                user.id,
+                ApiKeyCreate {
+                    name: "Visible platform key".to_string(),
+                    description: None,
+                    purpose: ApiKeyPurpose::Platform,
+                    requests_per_second: None,
+                    burst_size: None,
+                    member_id: None,
+                    spend_limit: None,
+                    spend_limit_interval: None,
+                },
+            ))
+            .await
+            .unwrap()
+            .secret;
+        drop(conn);
+
+        let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
+        for service_tier in [None, Some("flex")] {
+            let mut body = json!({"model": "test-model"});
+            if let Some(tier) = service_tier {
+                body["service_tier"] = tier.into();
+            }
+            let request = axum::http::Request::builder()
+                .uri("/admin/api/v1/ai/v1/chat/completions")
+                .header("authorization", format!("Bearer {platform_key}"))
+                .body(body.to_string().into())
+                .unwrap();
+
+            let err = admin_ai_proxy(state.clone(), request).await.unwrap_err();
+            assert!(matches!(err, Error::InsufficientCredits { .. }));
+        }
+
+        let remaining: Vec<i64> = sqlx::query_scalar(
+            r#"
+            SELECT allowance.remaining_requests
+            FROM api_key_request_allowances allowance
+            JOIN api_keys ak ON ak.id = allowance.api_key_id
+            WHERE ak.user_id = $1
+            ORDER BY ak.purpose
+            "#,
+        )
+        .bind(user.id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(remaining, vec![1, 1]);
+    }
 
     #[sqlx::test]
     async fn test_user_no_access_auth_error(pool: PgPool) {

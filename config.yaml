@@ -249,6 +249,13 @@ credits:
   # Set to 0 to disable initial credits (users start with no credits)
   # Example: 100.00 gives users 100 credits on registration
   initial_credits_for_standard_users: 0
+  # Lifetime requests available only through a new standard user's hidden
+  # playground key. Set to 0 to disable. Existing users are not backfilled.
+  initial_playground_requests_for_standard_users: 0
+  # Lifetime requests available only through a new standard user's hidden
+  # batch key. File batches consume one request per contained request. Set to 0
+  # to disable. Existing users are not backfilled.
+  initial_batch_requests_for_standard_users: 0
   # First-payment match promotion: a user's first ever payment (checkout or
   # auto-topup) is matched with bonus credits, up to this amount (in dollars).
   # A first payment below this is matched in full; above it is capped here.

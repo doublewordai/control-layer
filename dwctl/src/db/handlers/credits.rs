@@ -141,6 +141,13 @@ impl<'c> Credits<'c> {
                     updated_at = NOW()
                 RETURNING balance
             ),
+            revoked_allowances AS (
+                DELETE FROM api_key_request_allowances allowance
+                USING api_keys ak
+                WHERE allowance.api_key_id = ak.id
+                  AND ak.user_id = $1
+                  AND $8 > 0
+            ),
             aggregated AS (
                 INSERT INTO batch_aggregates (fusillade_batch_id, user_id, total_amount, transaction_count, max_seq, created_at, updated_at)
                 SELECT $6::uuid, user_id, amount, 1, seq, created_at, NOW()
@@ -873,6 +880,69 @@ mod tests {
             .await
             .expect("checkpoint row must exist from the user-creation trigger");
         assert_eq!(row_balance, Decimal::ZERO);
+    }
+
+    #[sqlx::test]
+    async fn positive_credit_gain_permanently_revokes_request_allowances(pool: PgPool) {
+        let user_id = create_test_user(&pool).await;
+        let key_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO api_keys (id, name, secret, purpose, user_id, created_by, hidden) \
+             VALUES ($1, 'Internal Playground Key', $2, 'playground', $3, $3, true)",
+        )
+        .bind(key_id)
+        .bind(format!("sk-{key_id}"))
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO api_key_request_allowances (api_key_id, initial_requests, remaining_requests) VALUES ($1, 3, 3)")
+            .bind(key_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE user_balance_checkpoints SET balance = 5 WHERE user_id = $1")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let mut conn = pool.acquire().await.unwrap();
+        let mut credits = Credits::new(&mut conn);
+        credits
+            .create_transaction(&CreditTransactionCreateDBRequest {
+                user_id,
+                transaction_type: CreditTransactionType::Usage,
+                amount: Decimal::ONE,
+                source_id: Uuid::new_v4().to_string(),
+                description: None,
+                fusillade_batch_id: None,
+                api_key_id: Some(key_id),
+            })
+            .await
+            .unwrap();
+        let after_usage: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM api_key_request_allowances WHERE api_key_id = $1")
+            .bind(key_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(after_usage, 1, "spending credits must not revoke the allowance");
+
+        credits
+            .create_transaction(&CreditTransactionCreateDBRequest::admin_grant(
+                user_id,
+                Uuid::new_v4(),
+                Decimal::ONE,
+                None,
+            ))
+            .await
+            .unwrap();
+        let after_gain: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM api_key_request_allowances WHERE api_key_id = $1")
+            .bind(key_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(after_gain, 0, "any positive credit gain must revoke the allowance");
     }
 
     #[sqlx::test]

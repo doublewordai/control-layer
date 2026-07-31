@@ -618,6 +618,19 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                     SELECT 1 FROM user_balance_checkpoints ub
                     WHERE ub.user_id = ak.user_id AND ub.balance > 0
                 ))
+                -- New-account request allowances only admit the internal UI
+                -- execution keys. The row deliberately remains at zero until
+                -- the first positive credit gain so the last accepted queued
+                -- request cannot race a cache reload and lose routing access.
+                OR (
+                    u.is_deleted = false
+                    AND ak.hidden = true
+                    AND ak.purpose IN ('playground', 'batch')
+                    AND EXISTS (
+                        SELECT 1 FROM api_key_request_allowances allowance
+                        WHERE allowance.api_key_id = ak.id
+                    )
+                )
                 OR (
                     NOT EXISTS (
                         SELECT 1 FROM model_tariffs mt
@@ -1364,6 +1377,15 @@ pub async fn load_targets_from_db(
                     SELECT 1 FROM user_balance_checkpoints ub
                     WHERE ub.user_id = ak.user_id AND ub.balance > 0
                 ))
+                OR (
+                    u.is_deleted = false
+                    AND ak.hidden = true
+                    AND ak.purpose IN ('playground', 'batch')
+                    AND EXISTS (
+                        SELECT 1 FROM api_key_request_allowances allowance
+                        WHERE allowance.api_key_id = ak.id
+                    )
+                )
                 OR (
                     NOT EXISTS (
                         SELECT 1 FROM model_tariffs mt
