@@ -249,4 +249,47 @@ describe("MemberManagement", () => {
       expect(within(container).getByText("Members (2)")).toBeInTheDocument();
     });
   });
+
+  it("exposes an org roles info control with role descriptions", async () => {
+    const user = userEvent.setup();
+    const { container } = render(
+      <MemberManagement organizationId="org-550e8400-0001" />,
+      { wrapper: createWrapper() },
+    );
+
+    await waitFor(() => {
+      expect(within(container).getByText("Members (2)")).toBeInTheDocument();
+    });
+
+    const infoButton = within(container).getByRole("button", {
+      name: /about organization roles/i,
+    });
+    expect(infoButton).toBeInTheDocument();
+
+    await user.hover(infoButton);
+
+    await waitFor(() => {
+      expect(screen.getByText("Organization roles")).toBeInTheDocument();
+    });
+    expect(
+      screen.getByText(/cannot promote others to Owner/i),
+    ).toBeInTheDocument();
+  });
+
+  it("shows org roles info even in readOnly mode", async () => {
+    const { container } = render(
+      <MemberManagement organizationId="org-550e8400-0001" readOnly />,
+      { wrapper: createWrapper() },
+    );
+
+    await waitFor(() => {
+      expect(within(container).getByText("Sarah Chen")).toBeInTheDocument();
+    });
+
+    expect(
+      within(container).getByRole("button", {
+        name: /about organization roles/i,
+      }),
+    ).toBeInTheDocument();
+  });
 });

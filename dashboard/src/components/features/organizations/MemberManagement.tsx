@@ -13,13 +13,14 @@ import { useOrganizationContext } from "@/contexts";
 import type { OrgMemberRole, OrganizationMember } from "@/api/control-layer/types";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import * as SelectPrimitive from "@radix-ui/react-select";
 import {
   Select,
   SelectContent,
-  SelectItem,
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { cn } from "@/lib/utils";
 import {
   Dialog,
   DialogContent,
@@ -29,8 +30,72 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { UserAvatar } from "@/components/ui";
-import { UserPlus, Trash2, Mail, X, LogOut } from "lucide-react";
+import {
+  HoverCard,
+  HoverCardContent,
+  HoverCardTrigger,
+} from "@/components/ui/hover-card";
+import { UserPlus, Trash2, Mail, X, LogOut, Info, CheckIcon } from "lucide-react";
 import { toast } from "sonner";
+import {
+  ORG_MEMBER_ROLES,
+  formatOrgRoleForDisplay,
+  getOrgRoleDescription,
+} from "@/utils/roles";
+
+// Custom select item so the dropdown can show a role description while the
+// trigger only mirrors the role name (Radix mirrors `ItemText` into the value).
+function OrgRoleSelectItem({ role }: { role: OrgMemberRole }) {
+  return (
+    <SelectPrimitive.Item
+      value={role}
+      className={cn(
+        "focus:bg-accent focus:text-accent-foreground relative flex w-full cursor-default flex-col items-start rounded-sm py-1.5 pr-8 pl-2 text-sm outline-hidden select-none data-disabled:pointer-events-none data-disabled:opacity-50",
+      )}
+    >
+      <span className="absolute right-2 top-2 flex size-3.5 items-center justify-center">
+        <SelectPrimitive.ItemIndicator>
+          <CheckIcon className="size-4" />
+        </SelectPrimitive.ItemIndicator>
+      </span>
+      <SelectPrimitive.ItemText>
+        {formatOrgRoleForDisplay(role)}
+      </SelectPrimitive.ItemText>
+      <span className="text-xs text-muted-foreground max-w-[18rem] whitespace-normal">
+        {getOrgRoleDescription(role)}
+      </span>
+    </SelectPrimitive.Item>
+  );
+}
+
+function OrgRolesInfo() {
+  return (
+    <HoverCard openDelay={150} closeDelay={200}>
+      <HoverCardTrigger asChild>
+        <button
+          type="button"
+          className="text-muted-foreground hover:text-foreground transition-colors"
+          aria-label="About organization roles"
+        >
+          <Info className="h-4 w-4" />
+        </button>
+      </HoverCardTrigger>
+      <HoverCardContent side="bottom" align="start" className="w-80 space-y-3">
+        <p className="text-sm font-medium">Organization roles</p>
+        {ORG_MEMBER_ROLES.map((role) => (
+          <div key={role} className="space-y-0.5">
+            <p className="text-xs font-semibold">
+              {formatOrgRoleForDisplay(role)}
+            </p>
+            <p className="text-xs text-muted-foreground">
+              {getOrgRoleDescription(role)}
+            </p>
+          </div>
+        ))}
+      </HoverCardContent>
+    </HoverCard>
+  );
+}
 
 interface MemberManagementProps {
   organizationId: string;
@@ -153,9 +218,12 @@ export function MemberManagement({ organizationId, readOnly = false }: MemberMan
     <div className="space-y-4">
       <div className="bg-white rounded-lg shadow-sm border border-gray-200 p-6">
         <div className="flex items-center justify-between mb-4">
-          <h4 className="text-lg font-medium text-gray-900">
-            Members ({activeMembers.length})
-          </h4>
+          <div className="flex items-center gap-2">
+            <h4 className="text-lg font-medium text-gray-900">
+              Members ({activeMembers.length})
+            </h4>
+            <OrgRolesInfo />
+          </div>
           {!readOnly && (
             <Button
               variant="outline"
@@ -187,9 +255,9 @@ export function MemberManagement({ organizationId, readOnly = false }: MemberMan
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="member">Member</SelectItem>
-                  <SelectItem value="admin">Admin</SelectItem>
-                  <SelectItem value="owner">Owner</SelectItem>
+                  {ORG_MEMBER_ROLES.map((role) => (
+                    <OrgRoleSelectItem key={role} role={role} />
+                  ))}
                 </SelectContent>
               </Select>
               <Button
@@ -264,9 +332,9 @@ export function MemberManagement({ organizationId, readOnly = false }: MemberMan
                           <SelectValue />
                         </SelectTrigger>
                         <SelectContent>
-                          <SelectItem value="member">Member</SelectItem>
-                          <SelectItem value="admin">Admin</SelectItem>
-                          <SelectItem value="owner">Owner</SelectItem>
+                          {ORG_MEMBER_ROLES.map((role) => (
+                            <OrgRoleSelectItem key={role} role={role} />
+                          ))}
                         </SelectContent>
                       </Select>
                       <button
