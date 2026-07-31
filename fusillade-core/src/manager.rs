@@ -27,9 +27,12 @@ use std::pin::Pin;
 /// retry un-froze it, another sweeper archived it, a partition is missing).
 /// Callers log/alert per variant; only `SkippedNoPartition` warrants an
 /// alert (partitions-ahead runway failed), the rest are informational.
-/// One cell of trailing demand: requests of one model and service tier that
-/// reached one terminal outcome inside one window. Returned by
-/// [`Storage::get_completed_request_counts_by_model_and_window`].
+/// One cell of demand: requests of one model and service tier counted in
+/// one window for one outcome. Returned by
+/// [`Storage::get_completed_request_counts_by_model_and_window`] (trailing
+/// windows, outcomes `"completed"` / `"failed"`) and
+/// [`Storage::get_pending_request_counts_by_model_window_and_tier`]
+/// (deadline windows, outcome `"pending"`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrailingDemandCount {
     pub model: String,
@@ -37,7 +40,7 @@ pub struct TrailingDemandCount {
     pub window_label: String,
     /// `None` is the batch tier (`service_tier IS NULL`).
     pub service_tier: Option<String>,
-    /// `"completed"` or `"failed"`.
+    /// `"pending"`, `"completed"`, or `"failed"`.
     pub outcome: String,
     pub count: i64,
 }
@@ -492,11 +495,6 @@ pub trait Storage: Send + Sync {
     ///   isolated: `Any` and `Exclude` omit it, while `Include` returns it only
     ///   when `Some("background")` is explicit. `None` represents the batch
     ///   tier (`service_tier IS NULL`).
-    /// - `priority_decay_window`: optional lookback in seconds. When set,
-    ///   recently completed `service_tier = 'flex'` requests are added to
-    ///   the `"1h"` bucket so realtime traffic can decay out of scheduling
-    ///   pressure after successful completion. No effect if the requested
-    ///   windows do not include a `"1h"` label.
     /// - `strict`: bool. For critical/sensitive operations, set `true` to
     ///   use the write pool and avoid read lags.
     ///
@@ -509,9 +507,25 @@ pub trait Storage: Send + Sync {
         states: &[String],
         model_filter: &[String],
         service_tier_filter: &ServiceTierFilter,
-        priority_decay_window: Option<i64>,
         strict: bool,
     ) -> Result<HashMap<String, HashMap<String, i64>>>;
+
+    /// [`Storage::get_pending_request_counts_by_model_and_window`] with the
+    /// service tier broken out: one row per (model, window, tier) instead of
+    /// tier-summed counts, so grouped consumers (the demand cube) get tier
+    /// attribution from a single query instead of one call per tier. Every
+    /// row's `outcome` is `"pending"`. Parameters and row scoping are
+    /// identical to the flat method — including the `background` special case
+    /// (rows labeled with window `"background"`) — and the flat method is
+    /// the tier-summed fold of this one.
+    async fn get_pending_request_counts_by_model_window_and_tier(
+        &self,
+        windows: &[(String, Option<i64>, i64)],
+        states: &[String],
+        model_filter: &[String],
+        service_tier_filter: &ServiceTierFilter,
+        strict: bool,
+    ) -> Result<Vec<TrailingDemandCount>>;
 
     /// Count terminal requests whose outcome timestamp falls inside trailing
     /// (past) windows, broken out by service tier and outcome.

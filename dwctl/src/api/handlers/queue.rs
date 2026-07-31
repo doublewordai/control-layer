@@ -60,10 +60,6 @@ fn parse_service_tiers(raw: Option<&str>) -> Vec<Option<String>> {
     tiers
 }
 
-fn service_tiers_include_flex(tiers: &[Option<String>]) -> bool {
-    tiers.iter().any(|tier| tier.as_deref() == Some("flex"))
-}
-
 /// Strict duration parser for `/demand` window entries.
 ///
 /// Unlike [`crate::api::handlers::sla_capacity::parse_window_to_seconds`] —
@@ -110,9 +106,7 @@ pub struct DemandQuery {
     pub service_tiers: Option<String>,
     /// When set to `service_tier`, the response is the demand cube
     /// `model -> window -> tier -> outcome -> count` instead of the flat
-    /// `model -> window -> count` map. Grouped responses skip the
-    /// priority-decay top-up: ask for an explicit trailing flex window
-    /// instead.
+    /// `model -> window -> count` map.
     pub group_by: Option<String>,
 }
 
@@ -178,10 +172,7 @@ fn parse_demand_window(raw: &str) -> Result<Option<(String, Option<i64>, i64)>, 
 /// exposes to users.
 ///
 /// Service-tier filtering: only the batch tier (`service_tier IS NULL`) by
-/// default, `service_tiers=batch,flex` to widen. When
-/// `batches.priority_decay_window_secs` is configured and `flex` is
-/// included, recently completed flex requests are added back into the `1h`
-/// label for that many seconds.
+/// default, `service_tiers=batch,flex` to widen.
 ///
 /// Always excludes: escalated requests (racing duplicates), requests
 /// without a template_id, and requests in batches being cancelled.
@@ -202,8 +193,6 @@ pub async fn get_demand<P: PoolProvider>(
     Query(params): Query<DemandQuery>,
     _: RequiresPermission<resource::System, operation::ReadAll>,
 ) -> Result<Json<DemandResponse>, Error> {
-    let config = state.current_config();
-
     let grouped = match params.group_by.as_deref() {
         None => false,
         Some("service_tier") => true,
@@ -250,23 +239,11 @@ pub async fn get_demand<P: PoolProvider>(
     let service_tiers = parse_service_tiers(params.service_tiers.as_deref());
 
     if !grouped {
-        let priority_decay_window_secs = if service_tiers_include_flex(&service_tiers) {
-            config.batches.priority_decay_window_secs
-        } else {
-            None
-        };
         let service_tier_filter = ServiceTierFilter::Include(service_tiers);
 
         let mut counts = state
             .request_manager
-            .get_pending_request_counts_by_model_and_window(
-                &windows,
-                &states,
-                &model_filter,
-                &service_tier_filter,
-                priority_decay_window_secs,
-                false,
-            )
+            .get_pending_request_counts_by_model_and_window(&windows, &states, &model_filter, &service_tier_filter, false)
             .await
             .map_err(|e| Error::Internal {
                 operation: format!("get demand by window: {}", e),
@@ -288,44 +265,31 @@ pub async fn get_demand<P: PoolProvider>(
         return Ok(Json(DemandResponse::Flat(counts)));
     }
 
-    // Grouped: the pending query returns tier-summed counts, so tier
-    // attribution comes from running it once per included tier; the trailing
-    // query carries tiers natively, so it runs once. No priority-decay
-    // top-up here — it would smuggle completed rows into a `pending` cell,
-    // and a trailing flex window expresses the same thing honestly.
+    // Grouped: both queries carry tiers natively, so each runs once
+    // regardless of how many tiers are requested.
     let mut cube: GroupedDemandByModelAndWindow = HashMap::new();
-    let mut seen_tiers: Vec<Option<String>> = Vec::new();
-    for tier in &service_tiers {
-        if seen_tiers.contains(tier) {
-            continue;
-        }
-        seen_tiers.push(tier.clone());
-        let tier_key = tier.as_deref().unwrap_or("batch").to_string();
-        let counts = state
-            .request_manager
-            .get_pending_request_counts_by_model_and_window(
-                &windows,
-                &states,
-                &model_filter,
-                &ServiceTierFilter::Include(vec![tier.clone()]),
-                None,
-                false,
-            )
-            .await
-            .map_err(|e| Error::Internal {
-                operation: format!("get demand by window for tier {}: {}", tier_key, e),
-            })?;
-        for (model, by_window) in counts {
-            for (window_label, count) in by_window {
-                cube.entry(model.clone())
-                    .or_default()
-                    .entry(window_label)
-                    .or_default()
-                    .entry(tier_key.clone())
-                    .or_default()
-                    .insert("pending".to_string(), count);
-            }
-        }
+    let pending: Vec<TrailingDemandCount> = state
+        .request_manager
+        .get_pending_request_counts_by_model_window_and_tier(
+            &windows,
+            &states,
+            &model_filter,
+            &ServiceTierFilter::Include(service_tiers.clone()),
+            false,
+        )
+        .await
+        .map_err(|e| Error::Internal {
+            operation: format!("get demand by window and tier: {}", e),
+        })?;
+    for row in pending {
+        let tier_key = row.service_tier.as_deref().unwrap_or("batch").to_string();
+        cube.entry(row.model)
+            .or_default()
+            .entry(row.window_label)
+            .or_default()
+            .entry(tier_key)
+            .or_default()
+            .insert(row.outcome, row.count);
     }
 
     if !trailing_windows.is_empty() {
@@ -597,161 +561,6 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
-    async fn test_demand_priority_decay_window_requires_flex_tier(pool: PgPool) {
-        use fusillade::{CreateFlexInput, RequestId, Storage};
-        use sqlx::postgres::PgConnectOptions;
-        use sqlx_pool_router::TestDbPools;
-
-        let mut config = create_test_config();
-        config.batches.allowed_completion_windows = vec!["1h".to_string(), "24h".to_string()];
-        config.batches.priority_decay_window_secs = Some(600);
-        let (server, _bg): (TestServer, _) = create_test_app_with_config(pool.clone(), config, false).await;
-        let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
-
-        let base_opts: PgConnectOptions = pool.connect_options().as_ref().clone();
-        let fusillade_pool = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(2)
-            .min_connections(0)
-            .connect_with(base_opts.options([("search_path", "fusillade")]))
-            .await
-            .expect("Failed to create fusillade pool");
-        let fusillade_pools = TestDbPools::new(fusillade_pool.clone()).await.expect("TestDbPools");
-        let request_manager = fusillade_arsenal::PostgresRequestManager::new(fusillade_pools, Default::default());
-
-        let model = "flex-decay-model";
-        let recent_id = uuid::Uuid::new_v4();
-        request_manager
-            .create_flex(CreateFlexInput {
-                request_id: recent_id,
-                body: r#"{"input":"recent"}"#.to_string(),
-                model: model.to_string(),
-                endpoint: "http://localhost".to_string(),
-                method: "POST".to_string(),
-                path: "/v1/responses".to_string(),
-                api_key: String::new(),
-                created_by: "queue-user".to_string(),
-            })
-            .await
-            .expect("create recent flex");
-        mark_fusillade_request_processing(&fusillade_pool, recent_id)
-            .await
-            .expect("start recent flex");
-        request_manager
-            .complete_request(RequestId(recent_id), r#"{"output":"recent"}"#, 200)
-            .await
-            .expect("complete recent flex");
-
-        let old_id = uuid::Uuid::new_v4();
-        request_manager
-            .create_flex(CreateFlexInput {
-                request_id: old_id,
-                body: r#"{"input":"old"}"#.to_string(),
-                model: model.to_string(),
-                endpoint: "http://localhost".to_string(),
-                method: "POST".to_string(),
-                path: "/v1/responses".to_string(),
-                api_key: String::new(),
-                created_by: "queue-user".to_string(),
-            })
-            .await
-            .expect("create old flex");
-        mark_fusillade_request_processing(&fusillade_pool, old_id)
-            .await
-            .expect("start old flex");
-        request_manager
-            .complete_request(RequestId(old_id), r#"{"output":"old"}"#, 200)
-            .await
-            .expect("complete old flex");
-
-        let failed_id = uuid::Uuid::new_v4();
-        request_manager
-            .create_flex(CreateFlexInput {
-                request_id: failed_id,
-                body: r#"{"input":"failed"}"#.to_string(),
-                model: model.to_string(),
-                endpoint: "http://localhost".to_string(),
-                method: "POST".to_string(),
-                path: "/v1/responses".to_string(),
-                api_key: String::new(),
-                created_by: "queue-user".to_string(),
-            })
-            .await
-            .expect("create failed flex");
-        mark_fusillade_request_processing(&fusillade_pool, failed_id)
-            .await
-            .expect("start failed flex");
-        request_manager
-            .fail_request(RequestId(failed_id), r#"{"error":"failed"}"#, 500)
-            .await
-            .expect("fail flex");
-
-        let canceled_id = uuid::Uuid::new_v4();
-        request_manager
-            .create_flex(CreateFlexInput {
-                request_id: canceled_id,
-                body: r#"{"input":"canceled"}"#.to_string(),
-                model: model.to_string(),
-                endpoint: "http://localhost".to_string(),
-                method: "POST".to_string(),
-                path: "/v1/responses".to_string(),
-                api_key: String::new(),
-                created_by: "queue-user".to_string(),
-            })
-            .await
-            .expect("create canceled flex");
-
-        sqlx::query("UPDATE requests SET completed_at = NOW() - INTERVAL '5 minutes' WHERE id = $1")
-            .bind(recent_id)
-            .execute(&fusillade_pool)
-            .await
-            .expect("age recent completion");
-        sqlx::query("UPDATE requests SET completed_at = NOW() - INTERVAL '20 minutes' WHERE id = $1")
-            .bind(old_id)
-            .execute(&fusillade_pool)
-            .await
-            .expect("age old completion");
-        sqlx::query("UPDATE requests SET failed_at = NOW() - INTERVAL '5 minutes' WHERE id = $1")
-            .bind(failed_id)
-            .execute(&fusillade_pool)
-            .await
-            .expect("age failed request");
-        sqlx::query("UPDATE requests SET state = 'canceled', canceled_at = NOW() - INTERVAL '5 minutes' WHERE id = $1")
-            .bind(canceled_id)
-            .execute(&fusillade_pool)
-            .await
-            .expect("cancel request");
-
-        let response = server
-            .get("/admin/api/v1/monitoring/demand?window=1h,24h")
-            .add_header(&add_auth_headers(&admin)[0].0, &add_auth_headers(&admin)[0].1)
-            .add_header(&add_auth_headers(&admin)[1].0, &add_auth_headers(&admin)[1].1)
-            .await;
-        response.assert_status_ok();
-        let counts: HashMap<String, HashMap<String, i64>> = response.json();
-
-        assert!(
-            !counts.contains_key(model),
-            "default batch-tier counts should not include completed flex decay"
-        );
-
-        let response = server
-            .get("/admin/api/v1/monitoring/demand?window=1h,24h&service_tiers=flex")
-            .add_header(&add_auth_headers(&admin)[0].0, &add_auth_headers(&admin)[0].1)
-            .add_header(&add_auth_headers(&admin)[1].0, &add_auth_headers(&admin)[1].1)
-            .await;
-        response.assert_status_ok();
-        let counts: HashMap<String, HashMap<String, i64>> = response.json();
-        let model_counts = counts
-            .get(model)
-            .unwrap_or_else(|| panic!("expected '{model}' in response, got {counts:?}"));
-        assert_eq!(
-            *model_counts.get("1h").unwrap_or(&0),
-            1,
-            "only completed flex requests within the 10 minute decay window should count"
-        );
-    }
-
     #[test]
     fn test_parse_service_tiers_defaults_to_batch_tier() {
         assert_eq!(parse_service_tiers(None), vec![None]);
@@ -771,8 +580,6 @@ mod tests {
             parse_service_tiers(Some("batch, flex, PRIORITY")),
             vec![None, Some("flex".to_string()), Some("priority".to_string())]
         );
-        assert!(service_tiers_include_flex(&parse_service_tiers(Some("batch,flex"))));
-        assert!(!service_tiers_include_flex(&parse_service_tiers(Some("batch,priority"))));
     }
 
     async fn mark_fusillade_request_processing(pool: &PgPool, id: uuid::Uuid) -> sqlx::Result<()> {
