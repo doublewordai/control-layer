@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT EXISTS (\n                SELECT 1 FROM credits_transactions\n                WHERE user_id = $1\n                  AND transaction_type = 'admin_grant'\n                  AND source_id LIKE '%:verification-credits'\n            ) AS \"already_granted!\"\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "already_granted!",
+        "type_info": "Bool"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "2646d7eb84cc72318cfb02cae8003d737ed88062dde5752dc18a653647dff89e"
+}
