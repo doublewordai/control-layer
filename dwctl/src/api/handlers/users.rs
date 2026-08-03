@@ -646,6 +646,39 @@ mod tests {
         assert_eq!(current_user.id, user.id);
         assert_eq!(current_user.email, user.email);
         assert_eq!(current_user.roles, user.roles);
+        assert!(!current_user.verified, "a fresh account has not proven a payment method");
+    }
+
+    /// `verified` has to reach the client, not just the database: the onboarding
+    /// ZDR gate reads it off `/users/current` to decide whether the account may
+    /// turn on zero data retention.
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_current_user_reports_verified_once_set(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user(&pool, Role::StandardUser).await;
+
+        let fetch_verified = async |app: &axum_test::TestServer| -> bool {
+            let response = app
+                .get("/admin/api/v1/users/current")
+                .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+                .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+                .await;
+            response.assert_status_ok();
+            response.json::<UserResponse>().verified
+        };
+
+        assert!(!fetch_verified(&app).await, "starts unverified");
+
+        // The same call the Stripe payment and card-verification paths make.
+        let mut conn = pool.acquire().await.unwrap();
+        crate::db::handlers::users::Users::new(&mut conn)
+            .set_verified(user.id)
+            .await
+            .unwrap();
+        drop(conn);
+
+        assert!(fetch_verified(&app).await, "verification is visible to the client");
     }
 
     #[sqlx::test]
