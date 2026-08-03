@@ -1,5 +1,12 @@
 # Changelog
 
+## [10.2.1](https://github.com/doublewordai/control-layer/compare/v10.2.0...v10.2.1) (2026-08-03)
+
+
+### Bug Fixes
+
+* PM org key view controls and batches error state ([#1419](https://github.com/doublewordai/control-layer/issues/1419)) ([744e035](https://github.com/doublewordai/control-layer/commit/744e035229546dbd86fdb66cd4487b2859c1ef0a))
+
 ## [10.2.0](https://github.com/doublewordai/control-layer/compare/v10.1.0...v10.2.0) (2026-08-03)
 
 
