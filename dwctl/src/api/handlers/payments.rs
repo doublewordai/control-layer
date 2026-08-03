@@ -1863,7 +1863,7 @@ mod tests {
         assert!(after.payment_provider_id.is_some(), "customer ID should be persisted");
 
         let grant: Option<Decimal> = sqlx::query_scalar!(
-            "SELECT amount FROM credits_transactions WHERE user_id = $1 AND source_id LIKE '%:verification-credits'",
+            "SELECT amount FROM credits_transactions WHERE user_id = $1 AND source_id LIKE 'verification-credits:%'",
             user.id
         )
         .fetch_optional(&pool)
@@ -1913,7 +1913,7 @@ mod tests {
         }
 
         let count: Option<i64> = sqlx::query_scalar!(
-            "SELECT COUNT(*) FROM credits_transactions WHERE user_id = $1 AND source_id LIKE '%:verification-credits'",
+            "SELECT COUNT(*) FROM credits_transactions WHERE user_id = $1 AND source_id LIKE 'verification-credits:%'",
             user.id
         )
         .fetch_one(&pool)
@@ -1954,7 +1954,7 @@ mod tests {
         assert!(verified, "verification is independent of the credits promotion");
 
         let count: Option<i64> = sqlx::query_scalar!(
-            "SELECT COUNT(*) FROM credits_transactions WHERE user_id = $1 AND source_id LIKE '%:verification-credits'",
+            "SELECT COUNT(*) FROM credits_transactions WHERE user_id = $1 AND source_id LIKE 'verification-credits:%'",
             user.id
         )
         .fetch_one(&pool)
