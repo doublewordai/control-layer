@@ -2640,6 +2640,7 @@ mod tests {
                 ("DW_USER_AGENT".to_string(), "spoofed-shouty/9.9.9".to_string()),
                 ("team".to_string(), "research".to_string()),
             ])),
+            api_key_id: None,
         };
         let resp = app
             .post("/ai/v1/batches")
