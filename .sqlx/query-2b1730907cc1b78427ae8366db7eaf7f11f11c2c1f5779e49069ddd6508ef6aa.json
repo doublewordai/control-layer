@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT uo.organization_id\n            FROM user_organizations uo\n            JOIN organization_member_roles omr ON omr.user_organization_id = uo.id\n            WHERE uo.user_id = $1 AND omr.role = 'manage_keys'\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "organization_id",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "2b1730907cc1b78427ae8366db7eaf7f11f11c2c1f5779e49069ddd6508ef6aa"
+}

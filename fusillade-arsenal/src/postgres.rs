@@ -4384,6 +4384,9 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
 
     #[tracing::instrument(level = "debug", skip(self), fields(batch_id = %batch_id))]
     async fn populate_batch(&self, batch_id: BatchId, file_id: FileId) -> Result<()> {
+        // Timed from entry so advisory-lock waits (serialized duplicate
+        // deliveries) show up in the histogram, not just the insert itself.
+        let populate_started = std::time::Instant::now();
         let mut tx = self
             .begin_write()
             .await
@@ -4530,6 +4533,11 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         tx.commit()
             .await
             .map_err(|e| FusilladeError::Other(anyhow!("Failed to commit transaction: {}", e)))?;
+
+        // Committed populates only: skips/no-ops would drown the signal.
+        metrics::histogram!("fusillade_populate_duration_seconds")
+            .record(populate_started.elapsed().as_secs_f64());
+        metrics::counter!("fusillade_populate_rows_total").increment(rows_affected);
 
         Ok(())
     }
@@ -8566,6 +8574,21 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
         .fetch_one(self.read_executor())
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to count archivable batches: {}", e)))
+    }
+
+    async fn count_unfrozen_terminal_batches(&self) -> Result<i64> {
+        sqlx::query_scalar!(
+            r#"
+            SELECT COUNT(*) AS "count!" FROM batches
+            WHERE deleted_at IS NULL AND counts_frozen_at IS NULL
+              AND (completed_at IS NOT NULL OR failed_at IS NOT NULL OR cancelled_at IS NOT NULL)
+            "#,
+        )
+        .fetch_one(self.read_executor())
+        .await
+        .map_err(|e| {
+            FusilladeError::Other(anyhow!("Failed to count unfrozen terminal batches: {}", e))
+        })
     }
 
     async fn ensure_archive_partitions(&self, weeks_ahead: i32) -> Result<(i64, i64)> {

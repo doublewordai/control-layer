@@ -120,6 +120,11 @@ pub struct OrganizationMemberResponse {
     pub status: String,
     /// When the membership was created
     pub created_at: DateTime<Utc>,
+    /// Effective key-creation capability: owners/admins always true; members
+    /// true only when their membership carries the additive 'manage_keys'
+    /// org role. Governs whether the member can create/edit their own API
+    /// keys (without it they hold issued keys: view + rotate only).
+    pub can_manage_keys: bool,
     /// Email address for pending invites
     #[serde(skip_serializing_if = "Option::is_none")]
     pub invite_email: Option<String>,
@@ -133,6 +138,10 @@ pub struct InviteMemberRequest {
     pub email: String,
     /// Role to assign: 'owner', 'admin', or 'member' (defaults to 'member')
     pub role: Option<String>,
+    /// For base role 'member': may they create and manage their own API keys?
+    /// Defaults to FALSE — new members hold issued keys only until an org
+    /// admin opts them in. Ignored for owner/admin (implicitly true).
+    pub can_manage_keys: Option<bool>,
 }
 
 /// Response after creating an invite
@@ -174,6 +183,10 @@ pub struct AddMemberRequest {
     pub user_id: UserId,
     /// Role to assign: 'owner', 'admin', or 'member' (defaults to 'member')
     pub role: Option<String>,
+    /// For base role 'member': may they create and manage their own API keys?
+    /// Defaults to FALSE — new members hold issued keys only until an org
+    /// admin opts them in. Ignored for owner/admin (implicitly true).
+    pub can_manage_keys: Option<bool>,
 }
 
 /// Request body for updating a member's role
@@ -181,6 +194,10 @@ pub struct AddMemberRequest {
 pub struct UpdateMemberRoleRequest {
     /// New role: 'owner', 'admin', or 'member'
     pub role: String,
+    /// Grant/revoke the 'manage_keys' org role alongside the base role.
+    /// Absent = leave unchanged. Only meaningful for base role 'member'
+    /// (owners/admins hold the capability implicitly).
+    pub can_manage_keys: Option<bool>,
 }
 
 /// Query parameters for listing organizations
@@ -224,4 +241,9 @@ pub struct OrganizationSummary {
     /// Whether the organization is flagged for zero data retention. Account-wide
     /// flag on the org; surfaced here so a member can see their org's ZDR status.
     pub zero_data_retention: bool,
+    /// Effective key-creation capability in this org: owners/admins always
+    /// true; members true only with the additive 'manage_keys' org role.
+    /// Drives the dashboard's create/edit affordances and the batch key
+    /// selection requirement.
+    pub can_manage_keys: bool,
 }

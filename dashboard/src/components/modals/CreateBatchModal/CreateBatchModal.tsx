@@ -21,12 +21,23 @@ import { Label } from "../../ui/label";
 import { Input } from "../../ui/input";
 import { Combobox } from "../../ui/combobox";
 import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "../../ui/select";
+import {
   useCreateBatch,
   useFiles,
   useUploadFileWithProgress,
   useConfig,
   useFileCostEstimate,
+  useApiKeys,
+  useUser,
 } from "../../../api/control-layer/hooks";
+import { useOrganizationContext } from "../../../contexts";
+import { formatCredits } from "../../features/api-keys/ApiKeys/spendCap";
 import { dwctlApi } from "../../../api/control-layer/client";
 import { useDebounce } from "../../../hooks/useDebounce";
 import { toast } from "sonner";
@@ -40,6 +51,10 @@ import {
 import { validateBatchFile, FILE_SIZE_LIMITS } from "../../../utils/files";
 
 import { formatBytes } from "../../../utils/formatters";
+
+// Radix SelectItem values must be non-empty, so the "no specific key" choice
+// uses a sentinel that cannot collide with a key UUID.
+const ACCOUNT_DEFAULT_KEY = "__account_default__";
 
 interface CreateBatchModalProps {
   isOpen: boolean;
@@ -75,6 +90,8 @@ export function CreateBatchModal({
   const [fileSearchQuery, setFileSearchQuery] = useState<string>("");
   const debouncedFileSearch = useDebounce(fileSearchQuery, 300);
   const [hasLoadedFiles, setHasLoadedFiles] = useState(false);
+  // "" = account default (no api_key_id sent)
+  const [selectedApiKeyId, setSelectedApiKeyId] = useState<string>("");
 
   const createBatchMutation = useCreateBatch();
   const uploadMutation = useUploadFileWithProgress();
@@ -82,6 +99,33 @@ export function CreateBatchModal({
   // Fetch config to get available completion windows
   const { data: config } = useConfig();
 
+  // API key attribution (org context only). In org context the batch's spend
+  // can be billed against a specific org API key; in personal context the
+  // backend rejects api_key_id, so the selector is not shown at all.
+  const { activeOrganizationId, isOrgContext, activeOrganization } =
+    useOrganizationContext();
+  const { data: currentUser } = useUser("current");
+  const { data: apiKeysResponse } = useApiKeys(
+    activeOrganizationId ?? "current",
+    { limit: 100 },
+  );
+
+  // Only realtime/platform keys are usable for batch attribution, and the
+  // dropdown offers ONLY the caller's own keys — for managers too. Admins can
+  // MANAGE other members' keys (cap, rotate, delete), but billing a batch to
+  // someone else's key is a confusing non-standard flow we deliberately don't
+  // surface; the server would allow it for managers, the UI doesn't offer it.
+  const selectableApiKeys = (apiKeysResponse?.data || []).filter(
+    (key) =>
+      (key.purpose === "realtime" || key.purpose === "platform") &&
+      key.created_by === currentUser?.id,
+  );
+
+  // Members without the key-management capability must bill one of their
+  // issued keys (owners/admins always have the capability, so this never
+  // applies to them).
+  const apiKeyRequired =
+    isOrgContext && activeOrganization?.can_manage_keys === false;
 
   // Fetch available files for combobox (only input files with purpose "batch")
   // Only fetch when modal is open to avoid unnecessary queries on page load
@@ -291,6 +335,11 @@ export function CreateBatchModal({
         endpoint,
         completion_window: completionWindow,
         metadata: Object.keys(metadata).length > 0 ? metadata : undefined,
+        // Only ever send api_key_id in org context (backend rejects it
+        // otherwise), and only when a specific key was chosen.
+        ...(isOrgContext && selectedApiKeyId
+          ? { api_key_id: selectedApiKeyId }
+          : {}),
       });
 
       const fileName =
@@ -306,6 +355,7 @@ export function CreateBatchModal({
       setDescription("");
       setExpirationSeconds(2592000);
       setFilename("");
+      setSelectedApiKeyId("");
       setUploadProgress(0);
       setIsProcessing(false);
       setError(null);
@@ -326,6 +376,7 @@ export function CreateBatchModal({
     setDescription("");
     setExpirationSeconds(2592000);
     setFilename("");
+    setSelectedApiKeyId("");
     setUploadProgress(0);
     setIsProcessing(false);
     setFileSearchQuery("");
@@ -351,6 +402,8 @@ export function CreateBatchModal({
   }));
 
   const isPending = createBatchMutation.isPending || isUploading;
+
+  const isMissingRequiredApiKey = apiKeyRequired && !selectedApiKeyId;
 
   const isLargeFile =
     fileToUpload &&
@@ -590,6 +643,7 @@ export function CreateBatchModal({
                   if (
                     e.key === "Enter" &&
                     !isPending &&
+                    !isMissingRequiredApiKey &&
                     (selectedFileId || fileToUpload)
                   ) {
                     e.preventDefault();
@@ -603,6 +657,62 @@ export function CreateBatchModal({
                 Add a description to help identify this batch later
               </p>
             </div>
+
+            {/* API Key Attribution (org context only) */}
+            {isOrgContext && (
+              <div className="space-y-2">
+                <Label htmlFor="bill-to-api-key">
+                  Bill to API key{" "}
+                  {!apiKeyRequired && (
+                    <span className="text-gray-400">(optional)</span>
+                  )}
+                </Label>
+                <Select
+                  value={
+                    selectedApiKeyId ||
+                    (apiKeyRequired ? "" : ACCOUNT_DEFAULT_KEY)
+                  }
+                  onValueChange={(value) => {
+                    setSelectedApiKeyId(
+                      value === ACCOUNT_DEFAULT_KEY ? "" : value,
+                    );
+                    setError(null);
+                  }}
+                  disabled={isPending}
+                >
+                  <SelectTrigger
+                    id="bill-to-api-key"
+                    className="w-full"
+                    aria-label="Bill to API key"
+                  >
+                    <SelectValue placeholder="Select an API key..." />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {!apiKeyRequired && (
+                      <SelectItem value={ACCOUNT_DEFAULT_KEY}>
+                        Account default
+                      </SelectItem>
+                    )}
+                    {selectableApiKeys.map((key) => (
+                      <SelectItem key={key.id} value={key.id}>
+                        {key.name}
+                        {key.spend_limit != null && (
+                          <span className="text-xs text-gray-500 ml-2">
+                            {formatCredits(key.spend)} of{" "}
+                            {formatCredits(key.spend_limit)} used
+                          </span>
+                        )}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                <p className="text-xs text-gray-500">
+                  {apiKeyRequired
+                    ? "Your organization requires selecting one of your issued API keys."
+                    : "Spend is attributed to the selected key and its holder; the account default bills the batch to you."}
+                </p>
+              </div>
+            )}
 
             {/* Cost Estimate */}
             {(selectedFileId || fileToUpload) && (
@@ -733,7 +843,11 @@ export function CreateBatchModal({
             type="button"
             variant="outline"
             onClick={handleSubmit}
-            disabled={(!selectedFileId && !fileToUpload) || isPending}
+            disabled={
+              (!selectedFileId && !fileToUpload) ||
+              isPending ||
+              isMissingRequiredApiKey
+            }
             className="group"
           >
             {isPending ? (

@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM organization_member_roles WHERE user_organization_id = $1 AND role = 'manage_keys'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "c08cda5f249cb7fbd55a54c60d1d4f20162f016656e62a149801c759853cf36a"
+}

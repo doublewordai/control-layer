@@ -1,4 +1,5 @@
-import { render, within, waitFor } from "@testing-library/react";
+import { render, screen, within, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { http, HttpResponse } from "msw";
@@ -173,6 +174,315 @@ describe("MyOrganization", () => {
     });
 
     expect(container.textContent).not.toMatch(/zero data retention/i);
+  });
+
+  const CURRENT_USER_ID = "550e8400-e29b-41d4-a716-446655440001";
+
+  const sarahUser = {
+    id: CURRENT_USER_ID,
+    username: "github|109540503",
+    email: "sarah.chen@acme.com",
+    display_name: "Sarah Chen",
+  };
+
+  const jamesUser = {
+    id: "550e8400-e29b-41d4-a716-446655440002",
+    username: "james.wilson",
+    email: "james.wilson@acme.com",
+    display_name: "James Wilson",
+  };
+
+  const membersHandler = (members: Record<string, unknown>[]) =>
+    http.get("/admin/api/v1/organizations/:orgId/members", () =>
+      HttpResponse.json(members),
+    );
+
+  describe("member key management", () => {
+    it("sends can_manage_keys: false when inviting a member with the toggle off", async () => {
+      server.use(userWithOrg("owner"), orgDetail(false));
+      let inviteBody: Record<string, unknown> | null = null;
+      server.use(
+        http.post(
+          "/admin/api/v1/organizations/:orgId/invites",
+          async ({ request }) => {
+            inviteBody = (await request.json()) as Record<string, unknown>;
+            return HttpResponse.json({
+              id: "inv-100",
+              email: inviteBody.email,
+              role: inviteBody.role,
+              status: "pending",
+              created_at: "2026-07-01T00:00:00Z",
+              expires_at: "2026-07-08T00:00:00Z",
+            });
+          },
+        ),
+      );
+
+      const user = userEvent.setup();
+      const { container } = render(<MyOrganization />, {
+        wrapper: createWrapper(),
+      });
+
+      await waitFor(() => {
+        expect(
+          within(container).getByRole("button", { name: /invite member/i }),
+        ).toBeInTheDocument();
+      });
+      await user.click(
+        within(container).getByRole("button", { name: /invite member/i }),
+      );
+
+      const dialog = await screen.findByRole("dialog");
+      await user.type(
+        within(dialog).getByLabelText("Email"),
+        "newmember@acme.com",
+      );
+
+      // Member is the default role, with the API keys toggle shown and off.
+      expect(
+        within(dialog).getByRole("radio", { name: "Member" }),
+      ).toBeChecked();
+      expect(
+        within(dialog).getByRole("switch", { name: "Can generate API keys" }),
+      ).not.toBeChecked();
+      // Owner is not offered at invite time.
+      expect(
+        within(dialog).queryByRole("radio", { name: "Owner" }),
+      ).not.toBeInTheDocument();
+
+      await user.click(
+        within(dialog).getByRole("button", { name: "Send Invite" }),
+      );
+
+      await waitFor(() => {
+        expect(inviteBody).toEqual({
+          email: "newmember@acme.com",
+          role: "member",
+          can_manage_keys: false,
+        });
+      });
+    });
+
+    it("omits can_manage_keys when inviting an admin", async () => {
+      server.use(userWithOrg("owner"), orgDetail(false));
+      let inviteBody: Record<string, unknown> | null = null;
+      server.use(
+        http.post(
+          "/admin/api/v1/organizations/:orgId/invites",
+          async ({ request }) => {
+            inviteBody = (await request.json()) as Record<string, unknown>;
+            return HttpResponse.json({
+              id: "inv-101",
+              email: inviteBody.email,
+              role: inviteBody.role,
+              status: "pending",
+              created_at: "2026-07-01T00:00:00Z",
+              expires_at: "2026-07-08T00:00:00Z",
+            });
+          },
+        ),
+      );
+
+      const user = userEvent.setup();
+      const { container } = render(<MyOrganization />, {
+        wrapper: createWrapper(),
+      });
+
+      await waitFor(() => {
+        expect(
+          within(container).getByRole("button", { name: /invite member/i }),
+        ).toBeInTheDocument();
+      });
+      await user.click(
+        within(container).getByRole("button", { name: /invite member/i }),
+      );
+
+      const dialog = await screen.findByRole("dialog");
+      await user.type(
+        within(dialog).getByLabelText("Email"),
+        "newadmin@acme.com",
+      );
+      await user.click(within(dialog).getByRole("radio", { name: "Admin" }));
+
+      // The API keys toggle only applies to the member role.
+      expect(
+        within(dialog).queryByRole("switch", {
+          name: "Can generate API keys",
+        }),
+      ).not.toBeInTheDocument();
+
+      await user.click(
+        within(dialog).getByRole("button", { name: "Send Invite" }),
+      );
+
+      await waitFor(() => {
+        expect(inviteBody).toEqual({
+          email: "newadmin@acme.com",
+          role: "admin",
+        });
+      });
+      expect(inviteBody).not.toHaveProperty("can_manage_keys");
+    });
+
+    it("pre-populates the role modal and PATCHes can_manage_keys", async () => {
+      server.use(userWithOrg("owner"), orgDetail(false));
+      server.use(
+        membersHandler([
+          {
+            id: "mem-1",
+            user: sarahUser,
+            role: "owner",
+            status: "active",
+            created_at: "2025-01-15T10:00:00Z",
+            can_manage_keys: true,
+          },
+          {
+            id: "mem-2",
+            user: jamesUser,
+            role: "member",
+            status: "active",
+            created_at: "2025-02-01T10:00:00Z",
+            can_manage_keys: false,
+          },
+        ]),
+      );
+      let patchBody: Record<string, unknown> | null = null;
+      server.use(
+        http.patch(
+          "/admin/api/v1/organizations/:orgId/members/:userId",
+          async ({ request }) => {
+            patchBody = (await request.json()) as Record<string, unknown>;
+            return HttpResponse.json({
+              id: "mem-2",
+              user: jamesUser,
+              role: patchBody.role,
+              status: "active",
+              created_at: "2025-02-01T10:00:00Z",
+              can_manage_keys: patchBody.can_manage_keys === true,
+            });
+          },
+        ),
+      );
+
+      const user = userEvent.setup();
+      const { container } = render(<MyOrganization />, {
+        wrapper: createWrapper(),
+      });
+
+      await waitFor(() => {
+        expect(
+          within(container).getByText("James Wilson"),
+        ).toBeInTheDocument();
+      });
+
+      await user.click(
+        within(container).getByRole("button", {
+          name: "Change role for James Wilson",
+        }),
+      );
+
+      const dialog = await screen.findByRole("dialog");
+      // Pre-populated from the member's current role and capability.
+      expect(
+        within(dialog).getByRole("radio", { name: "Member" }),
+      ).toBeChecked();
+      const toggle = within(dialog).getByRole("switch", {
+        name: "Can generate API keys",
+      });
+      expect(toggle).not.toBeChecked();
+      // Owner is offered when changing an existing member's role.
+      expect(
+        within(dialog).getByRole("radio", { name: "Owner" }),
+      ).toBeInTheDocument();
+
+      await user.click(toggle);
+      await user.click(within(dialog).getByRole("button", { name: "Save" }));
+
+      await waitFor(() => {
+        expect(patchBody).toEqual({ role: "member", can_manage_keys: true });
+      });
+    });
+
+    it("shows the key icon only for members who can create API keys", async () => {
+      server.use(userWithOrg("owner"), orgDetail(false));
+      server.use(
+        membersHandler([
+          {
+            id: "mem-1",
+            user: sarahUser,
+            role: "owner",
+            status: "active",
+            created_at: "2025-01-15T10:00:00Z",
+            can_manage_keys: true,
+          },
+          {
+            id: "mem-2",
+            user: jamesUser,
+            role: "member",
+            status: "active",
+            created_at: "2025-02-01T10:00:00Z",
+            can_manage_keys: false,
+          },
+        ]),
+      );
+
+      const { container } = render(<MyOrganization />, {
+        wrapper: createWrapper(),
+      });
+
+      await waitFor(() => {
+        expect(
+          within(container).getByText("James Wilson"),
+        ).toBeInTheDocument();
+      });
+
+      // Only Sarah (can_manage_keys: true) gets the key icon; James does not.
+      expect(
+        within(container).getAllByRole("img", {
+          name: "Can create API keys",
+        }),
+      ).toHaveLength(1);
+    });
+
+    it("shows key icons for every member with the capability", async () => {
+      server.use(userWithOrg("owner"), orgDetail(false));
+      server.use(
+        membersHandler([
+          {
+            id: "mem-1",
+            user: sarahUser,
+            role: "owner",
+            status: "active",
+            created_at: "2025-01-15T10:00:00Z",
+            can_manage_keys: true,
+          },
+          {
+            id: "mem-2",
+            user: jamesUser,
+            role: "member",
+            status: "active",
+            created_at: "2025-02-01T10:00:00Z",
+            can_manage_keys: true,
+          },
+        ]),
+      );
+
+      const { container } = render(<MyOrganization />, {
+        wrapper: createWrapper(),
+      });
+
+      await waitFor(() => {
+        expect(
+          within(container).getByText("James Wilson"),
+        ).toBeInTheDocument();
+      });
+
+      expect(
+        within(container).getAllByRole("img", {
+          name: "Can create API keys",
+        }),
+      ).toHaveLength(2);
+    });
   });
 
   it("passes the org ID to NotificationSettings", async () => {
