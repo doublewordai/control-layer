@@ -176,6 +176,196 @@ impl StripeProvider {
                 PaymentError::ProviderApi(e.to_string())
             })
     }
+
+    /// Retrieve a session with the expansions both checkout modes need.
+    ///
+    /// `process_payment_session` doesn't know the mode until it has the session,
+    /// so it fetches once with the union of the expansions rather than paying a
+    /// second Stripe round trip after dispatching. Stripe ignores expansions that
+    /// don't apply to the session's mode.
+    async fn get_session_for_processing(&self, session_id: &str) -> Result<stripe_checkout::CheckoutSession> {
+        let session_id: CheckoutSessionId = session_id
+            .parse()
+            .map_err(|_| PaymentError::InvalidData("Invalid Stripe session ID".to_string()))?;
+
+        RetrieveCheckoutSession::new(session_id)
+            .expand(vec![
+                "line_items".to_string(),
+                "setup_intent".to_string(),
+                "setup_intent.payment_method".to_string(),
+            ])
+            .send(&self.client)
+            .await
+            .map_err(|e| {
+                tracing::error!("Failed to retrieve Stripe checkout session: {:?}", e);
+                PaymentError::ProviderApi(e.to_string())
+            })
+    }
+
+    /// Fulfil a completed `setup`-mode session: save the verified card, mark the
+    /// billing target verified, and pay out signup credits.
+    ///
+    /// No money moved, so there is no purchase to record - the only ledger entry
+    /// is the (optional, once-per-target) verification grant.
+    async fn fulfil_setup_session(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        session: &stripe_checkout::CheckoutSession,
+        session_id: &str,
+        credits_config: &crate::config::CreditsConfig,
+    ) -> Result<()> {
+        if session.status != Some(CheckoutSessionStatus::Complete) {
+            tracing::trace!("Setup session {} is not complete yet, skipping", session_id);
+            return Err(PaymentError::PaymentNotCompleted);
+        }
+
+        // Who was being verified. Set from `payer.id` at creation, i.e. the
+        // resolved billing target (the org when acting as an org, else self).
+        let target_id: UserId = session
+            .client_reference_id
+            .as_deref()
+            .ok_or_else(|| {
+                tracing::error!("Setup session {} missing client_reference_id", session_id);
+                PaymentError::InvalidData("Missing client_reference_id".to_string())
+            })?
+            .parse()
+            .map_err(|e| {
+                tracing::error!("Failed to parse setup session target ID: {:?}", e);
+                PaymentError::InvalidData(format!("Invalid target user ID: {}", e))
+            })?;
+
+        let customer_id = match &session.customer {
+            Some(stripe_types::Expandable::Id(id)) => Some(id.to_string()),
+            Some(stripe_types::Expandable::Object(c)) => Some(c.id.to_string()),
+            None => None,
+        };
+
+        let setup_intent = match &session.setup_intent {
+            Some(stripe_types::Expandable::Object(si)) => si.as_ref(),
+            _ => {
+                tracing::error!("Setup session {} has no expanded setup_intent", session_id);
+                return Err(PaymentError::InvalidData("Setup intent not found or not expanded".to_string()));
+            }
+        };
+
+        // A complete session whose SetupIntent didn't succeed means the card was
+        // not actually verified - never treat that as proof of payment ability.
+        if setup_intent.status.as_str() != "succeeded" {
+            tracing::warn!(
+                session_id,
+                status = setup_intent.status.as_str(),
+                "Setup session completed but the SetupIntent did not succeed"
+            );
+            return Err(PaymentError::InvalidData("Payment method setup failed".to_string()));
+        }
+
+        // Checkout attaches the payment method but doesn't make it the default;
+        // auto top-up charges look it up via invoice_settings, so set it here.
+        // Best-effort: the card is verified either way, and
+        // `get_default_payment_method` falls back to listing attached methods.
+        if let (Some(cust_id), Some(pm)) = (&customer_id, &setup_intent.payment_method) {
+            let pm_id = pm.id().to_string();
+            let mut invoice_settings = stripe_core::customer::UpdateCustomerInvoiceSettings::new();
+            invoice_settings.default_payment_method = Some(pm_id.clone());
+
+            if let Err(e) = stripe_core::customer::UpdateCustomer::new(cust_id.as_str())
+                .invoice_settings(invoice_settings)
+                .send(&self.client)
+                .await
+            {
+                tracing::warn!("Failed to set default payment method {} on customer {}: {:?}", pm_id, cust_id, e);
+            }
+        }
+
+        {
+            let mut users = crate::db::handlers::users::Users::new(&mut *conn);
+
+            if users.get_by_id(target_id).await?.is_none() {
+                tracing::error!(
+                    "Target user {} not found for setup session {}. This indicates a data integrity issue.",
+                    target_id,
+                    session_id
+                );
+                return Err(PaymentError::InvalidData("Setup session target user not found".to_string()));
+            }
+
+            // Stripe may have created the customer during checkout; persist it so
+            // the billing portal and auto top-up can find it later.
+            if let Some(ref provider_id) = customer_id
+                && users.set_payment_provider_id_if_empty(target_id, provider_id).await?
+            {
+                tracing::debug!("Saved newly created stripe ID {} for user ID {}", provider_id, target_id);
+            }
+
+            // A verified card clears the unverified rate-limit tier in onwards,
+            // same as a completed purchase does.
+            users.set_verified(target_id).await?;
+        }
+
+        // Signup credits. Best-effort by the same reasoning as the first-payment
+        // match: verification is the thing that must stick, and a failed freebie
+        // is not worth undoing it. This path isn't retried once verification has
+        // landed, so the error log is the signal to grant manually.
+        if let Err(e) = Credits::new(&mut *conn)
+            .grant_verification_credits(credits_config.verification_credits, target_id, session_id)
+            .await
+        {
+            tracing::error!(
+                session_id,
+                target_id = %target_id,
+                error = %e,
+                "Verification credits grant failed; card verification unaffected, grant manually if needed"
+            );
+        }
+
+        tracing::debug!("Successfully fulfilled setup session {} for user {}", session_id, target_id);
+        Ok(())
+    }
+}
+
+/// Parse a retrieved `payment`-mode checkout session into a `PaymentSession`.
+///
+/// Expects `line_items` expanded (falls back to the session-level subtotal).
+fn parse_payment_session(checkout_session: &stripe_checkout::CheckoutSession) -> Result<PaymentSession> {
+    // Parse creditor ID from client_reference_id
+    let creditor_id: UserId = checkout_session
+        .client_reference_id
+        .as_deref()
+        .ok_or_else(|| {
+            tracing::error!("Checkout session missing client_reference_id");
+            PaymentError::InvalidData("Missing client_reference_id".to_string())
+        })?
+        .parse()
+        .map_err(|e| {
+            tracing::error!("Failed to parse creditor ID: {:?}", e);
+            PaymentError::InvalidData(format!("Invalid creditor user ID: {}", e))
+        })?;
+
+    // Parse creditee ID from metadata, or use creditor_id if not present (self-payment)
+    let creditee_id: UserId = checkout_session
+        .metadata
+        .as_ref()
+        .and_then(|m| m.get("creditee_id"))
+        .map(|s| s.parse())
+        .transpose()
+        .map_err(|e| {
+            tracing::error!("Failed to parse creditee ID: {:?}", e);
+            PaymentError::InvalidData(format!("Invalid creditee user ID: {}", e))
+        })?
+        .unwrap_or(creditor_id);
+
+    let price = pretax_credit_cents(checkout_session).ok_or_else(|| {
+        tracing::error!("Checkout session missing both line_items and amount_subtotal");
+        PaymentError::InvalidData("Missing payment amount".to_string())
+    })? / 100; // Convert cents to dollars
+
+    Ok(PaymentSession {
+        creditee_id,
+        amount: Decimal::from(price),
+        is_paid: checkout_session.payment_status == CheckoutSessionPaymentStatus::Paid,
+        creditor_id,
+        payment_provider_id: checkout_session.customer.as_ref().map(|c| c.id().to_string()),
+    })
 }
 
 /// Pre-tax amount (in cents) to credit for a completed checkout session.
@@ -291,45 +481,7 @@ impl PaymentProvider for StripeProvider {
                 PaymentError::ProviderApi(e.to_string())
             })?;
 
-        // Parse creditor ID from client_reference_id
-        let creditor_id: UserId = checkout_session
-            .client_reference_id
-            .as_deref()
-            .ok_or_else(|| {
-                tracing::error!("Checkout session missing client_reference_id");
-                PaymentError::InvalidData("Missing client_reference_id".to_string())
-            })?
-            .parse()
-            .map_err(|e| {
-                tracing::error!("Failed to parse creditor ID: {:?}", e);
-                PaymentError::InvalidData(format!("Invalid creditor user ID: {}", e))
-            })?;
-
-        // Parse creditee ID from metadata, or use creditor_id if not present (self-payment)
-        let creditee_id: UserId = checkout_session
-            .metadata
-            .as_ref()
-            .and_then(|m| m.get("creditee_id"))
-            .map(|s| s.parse())
-            .transpose()
-            .map_err(|e| {
-                tracing::error!("Failed to parse creditee ID: {:?}", e);
-                PaymentError::InvalidData(format!("Invalid creditee user ID: {}", e))
-            })?
-            .unwrap_or(creditor_id);
-
-        let price = pretax_credit_cents(&checkout_session).ok_or_else(|| {
-            tracing::error!("Checkout session missing both line_items and amount_subtotal");
-            PaymentError::InvalidData("Missing payment amount".to_string())
-        })? / 100; // Convert cents to dollars
-
-        Ok(PaymentSession {
-            creditee_id,
-            amount: Decimal::from(price),
-            is_paid: checkout_session.payment_status == CheckoutSessionPaymentStatus::Paid,
-            creditor_id,
-            payment_provider_id: checkout_session.customer.as_ref().map(|c| c.id().to_string()),
-        })
+        parse_payment_session(&checkout_session)
     }
 
     async fn process_payment_session(
@@ -352,8 +504,17 @@ impl PaymentProvider for StripeProvider {
             }
         }
 
-        // Get payment session details
-        let payment_session = self.get_payment_session(session_id).await?;
+        // One retrieve, then dispatch on mode. Callers hand us a bare session id
+        // (the front-channel `PATCH /payments/{id}` and `checkout.session.completed`
+        // webhooks alike) and cannot tell a top-up from a card verification, so the
+        // mode has to be read off the session itself.
+        let session = self.get_session_for_processing(session_id).await?;
+
+        if session.mode == CheckoutSessionMode::Setup {
+            return self.fulfil_setup_session(&mut conn, &session, session_id, credits_config).await;
+        }
+
+        let payment_session = parse_payment_session(&session)?;
 
         // Verify payment status
         if !payment_session.is_paid {
@@ -521,6 +682,80 @@ impl PaymentProvider for StripeProvider {
 
         // Use the existing process_payment_session method
         self.process_payment_session(db_pool, session_id, credits_config).await
+    }
+
+    async fn create_setup_checkout_session(&self, payer: &CheckoutPayer, cancel_url: &str, success_url: &str) -> Result<String> {
+        let mut checkout_params = CreateCheckoutSession::new()
+            .cancel_url(cancel_url)
+            .success_url(success_url)
+            // Read back as the billing target in `fulfil_setup_session`.
+            .client_reference_id(payer.id.to_string())
+            .mode(CheckoutSessionMode::Setup)
+            .ui_mode(CheckoutSessionUiMode::HostedPage)
+            // Collected here rather than later: automatic tax on the first real
+            // top-up needs an address on the customer, and the billing portal
+            // detour to add one is exactly the onboarding friction this removes.
+            .tax_id_collection(CreateCheckoutSessionTaxIdCollection::new(true))
+            .name_collection(CreateCheckoutSessionNameCollection {
+                business: Some(CreateCheckoutSessionNameCollectionBusiness::new(true)),
+                individual: None,
+            })
+            .consent_collection(CreateCheckoutSessionConsentCollection {
+                terms_of_service: Some(CreateCheckoutSessionConsentCollectionTermsOfService::Required),
+                payment_method_reuse_agreement: Some(CreateCheckoutSessionConsentCollectionPaymentMethodReuseAgreement::new(
+                    CreateCheckoutSessionConsentCollectionPaymentMethodReuseAgreementPosition::Auto,
+                )),
+                promotions: None,
+            })
+            .custom_text(CreateCheckoutSessionCustomText {
+                terms_of_service_acceptance: self
+                    .config
+                    .setup_terms_of_service_text
+                    .as_ref()
+                    .or(self.config.auto_topup_terms_of_service_text.as_ref())
+                    .map(CustomTextPositionParam::new),
+                submit: Some(CustomTextPositionParam::new("Verify payment method")),
+                after_submit: None,
+                shipping_address: None,
+            })
+            .payment_method_types(vec![
+                CreateCheckoutSessionPaymentMethodTypes::Card,
+                CreateCheckoutSessionPaymentMethodTypes::Link,
+                CreateCheckoutSessionPaymentMethodTypes::SepaDebit,
+            ])
+            .setup_intent_data(CreateCheckoutSessionSetupIntentData {
+                description: Some("Payment method verification".to_string()),
+                metadata: None,
+                on_behalf_of: None,
+            });
+
+        if let Some(existing_id) = &payer.payment_provider_id {
+            tracing::debug!("Using existing Stripe customer ID {} for payer {}", existing_id, payer.id);
+            checkout_params = checkout_params
+                .customer(existing_id)
+                .customer_update(CreateCheckoutSessionCustomerUpdate {
+                    address: Some(CreateCheckoutSessionCustomerUpdateAddress::Auto),
+                    name: Some(CreateCheckoutSessionCustomerUpdateName::Auto),
+                    shipping: None,
+                })
+        } else {
+            tracing::debug!("No customer ID found for payer {}, Stripe will create one", payer.id);
+            checkout_params = checkout_params
+                .customer_email(&payer.email)
+                .customer_creation(CreateCheckoutSessionCustomerCreation::Always);
+        }
+
+        let checkout_session = checkout_params.send(&self.client).await.map_err(|e| {
+            tracing::error!("Failed to create Stripe setup checkout session: {:?}", e);
+            PaymentError::ProviderApi(e.to_string())
+        })?;
+
+        tracing::debug!("Created setup checkout session {} for payer {}", checkout_session.id, payer.id);
+
+        checkout_session.url.ok_or_else(|| {
+            tracing::error!("Setup checkout session missing URL");
+            PaymentError::ProviderApi("Checkout session missing URL".to_string())
+        })
     }
 
     async fn create_auto_topup_checkout_session(&self, payer: &CheckoutPayer, cancel_url: &str, success_url: &str) -> Result<String> {
@@ -824,6 +1059,7 @@ mod tests {
             webhook_secret: "whsec_fake".to_string(),
             enable_invoice_creation: false,
             auto_topup_terms_of_service_text: None,
+            setup_terms_of_service_text: None,
             tax_code: None,
         };
         let provider = StripeProvider::from(config);
@@ -842,6 +1078,7 @@ mod tests {
             webhook_secret: "whsec_fake".to_string(),
             enable_invoice_creation: true,
             auto_topup_terms_of_service_text: None,
+            setup_terms_of_service_text: None,
             tax_code: None,
         };
         let provider = StripeProvider::from(config);
@@ -907,6 +1144,7 @@ mod tests {
             webhook_secret: "whsec_fake".to_string(),
             enable_invoice_creation: false,
             auto_topup_terms_of_service_text: None,
+            setup_terms_of_service_text: None,
             tax_code: None,
         };
         let provider = StripeProvider::from(config);

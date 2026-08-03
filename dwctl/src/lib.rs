@@ -1288,6 +1288,9 @@ pub async fn build_router(
         .route("/transactions", get(api::handlers::transactions::list_transactions))
         // Payment processing
         .route("/payments", post(api::handlers::payments::create_payment))
+        // Registered before `/payments/{id}` for clarity; axum matches the
+        // static segment first regardless, and the methods differ anyway.
+        .route("/payments/setup", post(api::handlers::payments::create_payment_setup))
         .route("/payments/{id}", patch(api::handlers::payments::process_payment))
         .route("/billing-portal", post(api::handlers::payments::create_billing_portal_session))
         .route("/auto-topup/enable", post(api::handlers::payments::enable_auto_topup))

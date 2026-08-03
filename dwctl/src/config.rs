@@ -604,6 +604,12 @@ pub struct StripeConfig {
     /// Custom text displayed for terms of service acceptance during auto top-up setup.
     /// If not set, no terms of service acceptance text is shown.
     pub auto_topup_terms_of_service_text: Option<String>,
+    /// Custom text displayed for terms of service acceptance during onboarding
+    /// card verification (`POST /payments/setup`). Falls back to
+    /// `auto_topup_terms_of_service_text` when unset, since both are setup-mode
+    /// checkouts saving a card for later off-session use.
+    #[serde(default)]
+    pub setup_terms_of_service_text: Option<String>,
     /// Stripe tax code for auto top-up tax calculations (e.g. "txcd_10000000").
     /// If not set, falls back to the account-level default tax code in Stripe Tax settings.
     pub tax_code: Option<String>,
@@ -2293,6 +2299,17 @@ pub struct CreditsConfig {
     /// `purchase`), so existing paying customers are never matched.
     #[serde(default)]
     pub first_payment_match_up_to: rust_decimal::Decimal,
+    /// Signup credits granted the first time a billing target verifies a payment
+    /// method through setup-mode checkout (`POST /payments/setup`), in dollars.
+    /// 0 disables the grant.
+    ///
+    /// Distinct from `initial_credits_for_standard_users`, which lands at account
+    /// creation for everyone. This one is the onboarding carrot that only pays out
+    /// once a real card has been verified, so it is not farmable by signing up
+    /// repeatedly. Idempotent per checkout session, and granted at most once per
+    /// billing target (see `Credits::grant_verification_credits`).
+    #[serde(default)]
+    pub verification_credits: rust_decimal::Decimal,
 }
 
 impl Default for CreditsConfig {
@@ -2302,6 +2319,8 @@ impl Default for CreditsConfig {
             initial_credits_for_standard_users: rust_decimal::Decimal::ZERO,
             // Default to 0 (first-payment match promotion disabled)
             first_payment_match_up_to: rust_decimal::Decimal::ZERO,
+            // Default to 0 (no signup credits on card verification)
+            verification_credits: rust_decimal::Decimal::ZERO,
         }
     }
 }
