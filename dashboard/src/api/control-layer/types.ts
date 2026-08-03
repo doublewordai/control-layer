@@ -491,6 +491,13 @@ export interface ApiKeyCreateResponse extends ApiKey {
   key: string; // The actual API key - only returned on creation
 }
 
+// Response of the dedicated secret-fetch and rotate endpoints. The only
+// places (besides creation) a secret ever appears — every fetch is audited
+// server-side.
+export interface ApiKeySecretResponse {
+  key: string;
+}
+
 // Request payload types for CRUD operations Certain endpoints can have query
 // parameters that trigger additional data returns. For example, GET
 // /admin/api/v1/groups?include=users,models will return user ids and model ids
@@ -585,6 +592,9 @@ export interface ApiKeyCreateRequest {
   burst_size?: number | null;
   spend_limit?: string | null; // Spending cap in credits (decimal string)
   spend_limit_interval?: SpendLimitInterval | null; // Requires spend_limit; null = one-off
+  // Issue the key to another org member (org targets only; PlatformManager or
+  // org owner/admin). The key is attributed to — and visible to — the member.
+  member_id?: string;
 }
 
 // PATCH /users/{id}/api-keys/{keyId}. Cap fields are tri-state: omit the field
@@ -1363,6 +1373,10 @@ export interface BatchCreateRequest {
   endpoint: string;
   completion_window: string; // Completion window like "24h", "1h"
   metadata?: Record<string, string>;
+  // Attribute the batch to a specific API key (org context only). Spend
+  // counts against the key's usage limit; usage is attributed to the key's
+  // holder. Required for members of managed-keys orgs.
+  api_key_id?: string;
   output_expires_after?: {
     anchor: "created_at";
     seconds: number;
@@ -1687,6 +1701,10 @@ export interface OrganizationSummary {
   name: string;
   role: string;
   zero_data_retention: boolean; // Whether the organization has zero data retention enabled
+  // Effective key-creation capability in this org: owners/admins always true;
+  // members true only with the additive 'manage_keys' org role. Drives the
+  // API-keys create/edit affordances and the batch key selection requirement.
+  can_manage_keys: boolean;
 }
 
 /** Organization response — flattened User with org-specific fields */
@@ -1701,6 +1719,8 @@ export interface OrganizationMember {
   status: "active" | "pending";
   created_at: string;
   invite_email?: string;
+  // Effective key-creation capability (owners/admins implicitly true).
+  can_manage_keys: boolean;
 }
 
 export interface OrganizationCreateRequest {
@@ -1721,6 +1741,9 @@ export interface OrganizationUpdateRequest {
 export interface InviteMemberRequest {
   email: string;
   role?: OrgMemberRole;
+  // For role 'member': may they create their own API keys? Defaults to
+  // FALSE server-side (new members are strict until opted in).
+  can_manage_keys?: boolean;
 }
 
 export interface InviteMemberResponse {
@@ -1741,6 +1764,9 @@ export interface InviteDetailsResponse {
 
 export interface UpdateMemberRoleRequest {
   role: OrgMemberRole;
+  // Grant/revoke the 'manage_keys' org role. Absent = unchanged; only
+  // meaningful for role 'member' (owners/admins are implicitly true).
+  can_manage_keys?: boolean;
 }
 
 export interface OrganizationsQuery {

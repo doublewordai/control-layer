@@ -218,6 +218,9 @@ pub struct UserOrganizationContext {
     pub id: UserId,
     pub name: String,
     pub role: String,
+    /// Effective key-creation capability in this org: owners/admins always
+    /// true; members true only with the additive 'manage_keys' org role.
+    pub can_manage_keys: bool,
 }
 
 impl CurrentUser {

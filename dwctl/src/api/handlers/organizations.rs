@@ -779,6 +779,10 @@ pub async fn list_members<P: PoolProvider>(
 
     let mut repo = Organizations::new(&mut pool_conn);
     let memberships = repo.list_members(id).await?;
+    let manage_keys_ids = repo.list_manage_keys_membership_ids(id).await?;
+    let effective_manage_keys = |m: &crate::db::models::organizations::OrganizationMemberDBResponse| {
+        matches!(m.role.as_str(), "owner" | "admin") || manage_keys_ids.contains(&m.id)
+    };
 
     // Fetch user details for members that have a user_id (excludes pending invites without accounts)
     let user_ids: Vec<UserId> = memberships.iter().filter_map(|m| m.user_id).collect();
@@ -797,6 +801,7 @@ pub async fn list_members<P: PoolProvider>(
                     status: m.status.clone(),
                     created_at: m.created_at,
                     invite_email: m.invite_email.clone(),
+                    can_manage_keys: effective_manage_keys(m),
                 })
             } else {
                 // Pending invite for user who hasn't signed up yet
@@ -807,6 +812,7 @@ pub async fn list_members<P: PoolProvider>(
                     status: m.status.clone(),
                     created_at: m.created_at,
                     invite_email: m.invite_email.clone(),
+                    can_manage_keys: effective_manage_keys(m),
                 })
             }
         })
@@ -877,6 +883,17 @@ pub async fn add_member<P: PoolProvider>(
 
     let membership = repo.add_member(id, data.user_id, role).await?;
 
+    // Additive 'manage_keys' role: defaults to NOT granted — new members
+    // can't self-serve keys until an admin opts them in (blast-radius
+    // minimization; existing members were backfilled with the grant in
+    // migration 128, so nobody lost capabilities). Owners/admins hold it
+    // implicitly — no row.
+    let is_manager_role = matches!(role, "owner" | "admin");
+    let granted = data.can_manage_keys.unwrap_or(false);
+    if !is_manager_role && granted {
+        repo.set_membership_manage_keys(membership.id, true).await?;
+    }
+
     // Fetch user details for response
     let mut users_repo = Users::new(&mut pool_conn);
     let user = users_repo.get_by_id(data.user_id).await?.ok_or_else(|| Error::NotFound {
@@ -893,6 +910,7 @@ pub async fn add_member<P: PoolProvider>(
             status: membership.status,
             created_at: membership.created_at,
             invite_email: None,
+            can_manage_keys: is_manager_role || granted,
         }),
     ))
 }
@@ -966,6 +984,18 @@ pub async fn update_member_role<P: PoolProvider>(
 
     let membership = repo.update_member_role(id, user_id, &data.role).await?;
 
+    // Grant/revoke the additive 'manage_keys' role alongside the base role.
+    // Rows are kept only for plain members; a promotion to owner/admin makes
+    // the capability implicit (any leftover row is harmless but we take the
+    // explicit instruction when given).
+    let is_manager_role = matches!(membership.role.as_str(), "owner" | "admin");
+    let effective_manage_keys = if let Some(granted) = data.can_manage_keys {
+        repo.set_membership_manage_keys(membership.id, granted).await?;
+        is_manager_role || granted
+    } else {
+        is_manager_role || repo.membership_has_manage_keys(membership.id).await?
+    };
+
     // Fetch user details for response
     let mut users_repo = Users::new(&mut tx);
     let user = users_repo.get_by_id(user_id).await?.ok_or_else(|| Error::NotFound {
@@ -981,6 +1011,7 @@ pub async fn update_member_role<P: PoolProvider>(
         status: membership.status,
         created_at: membership.created_at,
         invite_email: None,
+        can_manage_keys: effective_manage_keys,
     }))
 }
 
@@ -1177,6 +1208,7 @@ pub async fn list_user_organizations<P: PoolProvider>(
     let mut pool_conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
     let mut repo = Organizations::new(&mut pool_conn);
     let memberships = repo.list_user_organizations(target_user_id).await?;
+    let manage_keys_orgs = repo.user_manage_keys_org_ids(target_user_id).await?;
 
     // Fetch org details
     let org_ids: Vec<UserId> = memberships.iter().map(|m| m.organization_id).collect();
@@ -1191,6 +1223,7 @@ pub async fn list_user_organizations<P: PoolProvider>(
                 .map(|o| crate::api::models::organizations::OrganizationSummary {
                     id: o.id,
                     name: o.username.clone(),
+                    can_manage_keys: matches!(m.role.as_str(), "owner" | "admin") || manage_keys_orgs.contains(&o.id),
                     role: m.role.clone(),
                     zero_data_retention: o.zero_data_retention,
                 })
@@ -1364,6 +1397,14 @@ pub async fn invite_member<P: PoolProvider>(
     let invite = org_repo
         .create_invite(id, existing_user_id, &email, role, current_user.id, &token_hash, expires_at)
         .await?;
+
+    // Invite-time pre-configuration of the additive 'manage_keys' role: the
+    // grant attaches to the pending membership row and is already in place
+    // when the invite is accepted. Defaults to NOT granted (blast-radius
+    // minimization); owner/admin invites hold the capability implicitly.
+    if !matches!(role, "owner" | "admin") && data.can_manage_keys.unwrap_or(false) {
+        org_repo.set_membership_manage_keys(invite.id, true).await?;
+    }
 
     // Get org name and inviter name for the email
     let mut users_repo = Users::new(&mut pool_conn);
@@ -3389,5 +3430,115 @@ mod tests {
             "next@example.com",
             "non-email PATCH must still surface the in-flight change; got: {body}",
         );
+    }
+
+    // ── Additive manage_keys org role (per-member key governance) ─────────
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_member_manage_keys_grant_lifecycle(pool: PgPool) {
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let owner = create_test_user(&pool, Role::StandardUser).await;
+        let defaulted = create_test_user(&pool, Role::StandardUser).await;
+        let restricted = create_test_user(&pool, Role::StandardUser).await;
+        let owner_headers = add_auth_headers(&owner);
+
+        let resp = server
+            .post("/admin/api/v1/organizations")
+            .add_header(&owner_headers[0].0, &owner_headers[0].1)
+            .add_header(&owner_headers[1].0, &owner_headers[1].1)
+            .json(&json!({ "name": "keyrole-org", "email": "contact@keyrole-org.com" }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::CREATED);
+        let org_id = resp.json::<serde_json::Value>()["id"].as_str().unwrap().to_string();
+        let org_uuid: uuid::Uuid = org_id.parse().unwrap();
+        // Adding a member WITHOUT specifying the toggle defaults to NOT
+        // granted (blast-radius minimization — the intern can't self-serve a
+        // key until an admin opts them in)…
+        let resp = server
+            .post(&format!("/admin/api/v1/organizations/{org_id}/members"))
+            .add_header(&owner_headers[0].0, &owner_headers[0].1)
+            .add_header(&owner_headers[1].0, &owner_headers[1].1)
+            .json(&json!({ "user_id": restricted.id, "role": "member" }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::CREATED);
+        assert_eq!(resp.json::<serde_json::Value>()["can_manage_keys"].as_bool(), Some(false));
+
+        // …while an explicit opt-in grants it.
+        let resp = server
+            .post(&format!("/admin/api/v1/organizations/{org_id}/members"))
+            .add_header(&owner_headers[0].0, &owner_headers[0].1)
+            .add_header(&owner_headers[1].0, &owner_headers[1].1)
+            .json(&json!({ "user_id": defaulted.id, "role": "member", "can_manage_keys": true }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::CREATED);
+        assert_eq!(resp.json::<serde_json::Value>()["can_manage_keys"].as_bool(), Some(true));
+
+        // The member list reports the effective capability per member; the
+        // owner is implicitly true.
+        let resp = server
+            .get(&format!("/admin/api/v1/organizations/{org_id}/members"))
+            .add_header(&owner_headers[0].0, &owner_headers[0].1)
+            .add_header(&owner_headers[1].0, &owner_headers[1].1)
+            .await;
+        resp.assert_status(axum::http::StatusCode::OK);
+        let members = resp.json::<Vec<serde_json::Value>>();
+        let by_user = |uid: &str| {
+            members
+                .iter()
+                .find(|m| m["user"]["id"].as_str() == Some(uid))
+                .unwrap_or_else(|| panic!("member {uid} missing"))
+        };
+        assert_eq!(by_user(&owner.id.to_string())["can_manage_keys"].as_bool(), Some(true));
+        assert_eq!(by_user(&defaulted.id.to_string())["can_manage_keys"].as_bool(), Some(true));
+        assert_eq!(by_user(&restricted.id.to_string())["can_manage_keys"].as_bool(), Some(false));
+
+        // The grant gates key creation for real.
+        let restricted_headers = add_auth_headers(&restricted);
+        server
+            .post(&format!("/admin/api/v1/users/{org_uuid}/api-keys"))
+            .add_header(&restricted_headers[0].0, &restricted_headers[0].1)
+            .add_header(&restricted_headers[1].0, &restricted_headers[1].1)
+            .json(&json!({ "name": "Nope", "purpose": "realtime" }))
+            .await
+            .assert_status_forbidden();
+
+        // PATCHing the member role can grant it back…
+        let resp = server
+            .patch(&format!("/admin/api/v1/organizations/{org_id}/members/{}", restricted.id))
+            .add_header(&owner_headers[0].0, &owner_headers[0].1)
+            .add_header(&owner_headers[1].0, &owner_headers[1].1)
+            .json(&json!({ "role": "member", "can_manage_keys": true }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::OK);
+        assert_eq!(resp.json::<serde_json::Value>()["can_manage_keys"].as_bool(), Some(true));
+
+        server
+            .post(&format!("/admin/api/v1/users/{org_uuid}/api-keys"))
+            .add_header(&restricted_headers[0].0, &restricted_headers[0].1)
+            .add_header(&restricted_headers[1].0, &restricted_headers[1].1)
+            .json(&json!({ "name": "Now allowed", "purpose": "realtime" }))
+            .await
+            .assert_status(axum::http::StatusCode::CREATED);
+
+        // …and revoke it again without touching the base role. A promotion to
+        // admin makes the capability implicit regardless of grant rows.
+        let resp = server
+            .patch(&format!("/admin/api/v1/organizations/{org_id}/members/{}", restricted.id))
+            .add_header(&owner_headers[0].0, &owner_headers[0].1)
+            .add_header(&owner_headers[1].0, &owner_headers[1].1)
+            .json(&json!({ "role": "member", "can_manage_keys": false }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::OK);
+        assert_eq!(resp.json::<serde_json::Value>()["can_manage_keys"].as_bool(), Some(false));
+
+        let resp = server
+            .patch(&format!("/admin/api/v1/organizations/{org_id}/members/{}", restricted.id))
+            .add_header(&owner_headers[0].0, &owner_headers[0].1)
+            .add_header(&owner_headers[1].0, &owner_headers[1].1)
+            .json(&json!({ "role": "admin" }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::OK);
+        assert_eq!(resp.json::<serde_json::Value>()["can_manage_keys"].as_bool(), Some(true));
     }
 }

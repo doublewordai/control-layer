@@ -1,7 +1,7 @@
 "use client";
 
 import { type ColumnDef } from "@tanstack/react-table";
-import { ArrowUpDown, Trash2, Pencil } from "lucide-react";
+import { ArrowUpDown, Trash2, Pencil, RefreshCw } from "lucide-react";
 import { Button } from "../../../ui/button";
 import { Checkbox } from "../../../ui/checkbox";
 import type { ApiKey } from "../../../../api/control-layer/types";
@@ -10,10 +10,24 @@ import { formatCredits, formatResetInstant, limitPeriodLabel } from "./spendCap"
 interface ColumnActions {
   onDelete: (apiKey: ApiKey) => void;
   onEdit: (apiKey: ApiKey) => void;
-  /** Whether the current user may edit this key's usage limit (creator or
-   *  PlatformManager — mirrors what the PATCH endpoint permits). */
+  /** Whether the current user may manage this key (rename, edit caps,
+   *  delete). Mirrors what the server permits: PlatformManager, org
+   *  owner/admin in org context, or the key's creator when they hold
+   *  self-manage rights in the active context. */
   canManage: (apiKey: ApiKey) => boolean;
+  /** Whether the current user may rotate this key. Broader than canManage:
+   *  rotation is the secret-recovery path, so members without creation
+   *  rights can still rotate keys they hold. */
+  canRotate: (apiKey: ApiKey) => boolean;
   isPlatformManager?: boolean;
+  /** Org context only: show the holder of each key, resolved from the org
+   *  members list via created_by. */
+  showAssignee?: boolean;
+  resolveAssignee?: (createdBy: string) => string;
+  onRotate: (apiKey: ApiKey) => void;
+  /** Hide the bulk-select column (e.g. members without key-creation rights
+   *  can't delete). */
+  showSelect?: boolean;
 }
 
 export const createColumns = (actions: ColumnActions): ColumnDef<ApiKey>[] => {
@@ -80,6 +94,20 @@ export const createColumns = (actions: ColumnActions): ColumnDef<ApiKey>[] => {
               </span>
             )}
           </div>
+        );
+      },
+    },
+    {
+      id: "assignee",
+      header: "Assignee",
+      cell: ({ row }) => {
+        const apiKey = row.original;
+        return (
+          <span className="text-sm text-doubleword-neutral-700">
+            {actions.resolveAssignee
+              ? actions.resolveAssignee(apiKey.created_by)
+              : apiKey.created_by}
+          </span>
         );
       },
     },
@@ -195,10 +223,17 @@ export const createColumns = (actions: ColumnActions): ColumnDef<ApiKey>[] => {
       header: "Actions",
       cell: ({ row }) => {
         const apiKey = row.original;
+        const canManage = actions.canManage(apiKey);
+        const canRotate = actions.canRotate(apiKey);
+
+        if (!canManage && !canRotate) {
+          // View-only rows: no mutating actions.
+          return null;
+        }
 
         return (
           <div className="flex items-center">
-            {actions.canManage(apiKey) && (
+            {canManage && (
               <Button
                 variant="ghost"
                 size="sm"
@@ -209,22 +244,40 @@ export const createColumns = (actions: ColumnActions): ColumnDef<ApiKey>[] => {
                 <Pencil className="h-4 w-4" />
               </Button>
             )}
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={() => actions.onDelete(apiKey)}
-              aria-label={`Delete ${apiKey.name}`}
-              className="text-red-600 hover:text-red-700 hover:bg-red-50"
-            >
-              <Trash2 className="h-4 w-4" />
-            </Button>
+            {canRotate && (
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => actions.onRotate(apiKey)}
+                aria-label={`Rotate ${apiKey.name}`}
+                className="text-doubleword-neutral-600 hover:text-doubleword-neutral-900"
+              >
+                <RefreshCw className="h-4 w-4" />
+              </Button>
+            )}
+            {canManage && (
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => actions.onDelete(apiKey)}
+                aria-label={`Delete ${apiKey.name}`}
+                className="text-red-600 hover:text-red-700 hover:bg-red-50"
+              >
+                <Trash2 className="h-4 w-4" />
+              </Button>
+            )}
           </div>
         );
       },
     },
   ];
 
-  // The key-type badge now rides inline on the Name column for everyone,
-  // matching the design; there is no separate purpose column to gate.
-  return allColumns;
+  // The key-type badge rides inline on the Name column for everyone; the
+  // Assignee column only appears in org context, and the bulk-select column
+  // is dropped for users who can't delete anything anyway.
+  return allColumns.filter((col) => {
+    if (col.id === "assignee" && !actions.showAssignee) return false;
+    if (col.id === "select" && actions.showSelect === false) return false;
+    return true;
+  });
 };

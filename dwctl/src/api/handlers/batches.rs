@@ -14,7 +14,7 @@ use crate::api::models::batches::{
 };
 use crate::api::models::users::{CurrentUser, Role};
 use crate::auth::permissions::{
-    RequiresPermission, can_read_all_resources, can_run_background_inference, has_permission, operation, resource,
+    RequiresPermission, can_read_all_resources, can_run_background_inference, has_permission, operation, resolve_key_capabilities, resource,
 };
 use crate::db::handlers::deployments::BatchModelInfo;
 use crate::db::handlers::{BatchTemplates, Connections, Credits, Deployments, Users, api_keys::ApiKeys, repository::Repository};
@@ -714,6 +714,59 @@ pub async fn create_batch<P: PoolProvider>(
     // When in org context, attribute batch ownership to the org
     let target_user_id = current_user.active_organization.unwrap_or(current_user.id);
 
+    // Explicit key selection (org dashboard flows): validate the chosen key
+    // before it drives execution and attribution below. Primary pool: the
+    // managed-mode requirement must see a just-flipped org mode — replica lag
+    // here would let a member bypass key selection.
+    let caps = {
+        let mut conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
+        resolve_key_capabilities(&current_user, target_user_id, &mut conn)
+            .await
+            .map_err(Error::Database)?
+    };
+    let selected_key = if let Some(selected_id) = req.api_key_id {
+        if current_user.active_organization.is_none() {
+            return Err(Error::BadRequest {
+                message: "api_key_id selection is only available in organization context".to_string(),
+            });
+        }
+        let mut conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
+        let key = ApiKeys::new(&mut conn)
+            .get_by_id(selected_id)
+            .await
+            .map_err(Error::Database)?
+            .filter(|key| key.user_id == target_user_id)
+            // Hidden/system keys are not selectable.
+            .filter(|key| !key.hidden)
+            .filter(|key| key.parent_api_key_id.is_none())
+            .filter(|key| matches!(key.purpose, ApiKeyPurpose::Realtime | ApiKeyPurpose::Platform))
+            // Usable by the caller: their own key, or any org key for org managers.
+            .filter(|key| caps.is_org_manager || key.created_by == current_user.id)
+            .ok_or_else(|| Error::NotFound {
+                resource: "API key".to_string(),
+                id: selected_id.to_string(),
+            })?;
+        Some(key)
+    } else {
+        None
+    };
+    // Managed-keys orgs: members hold issued keys rather than owning an
+    // implicit one, so a dashboard submission must name the key that will
+    // carry the batch's spend.
+    if selected_key.is_none() && current_user.api_key_id.is_none() && caps.requires_batch_key_selection() {
+        return Err(Error::BadRequest {
+            message: "This organization manages API keys centrally: select one of your issued API keys (api_key_id) to create a batch."
+                .to_string(),
+        });
+    }
+    // Attribution follows the selected key's creator (not the submitter), so
+    // an org manager running a batch on a member's key attributes the usage to
+    // that member — matching how API-authenticated submissions behave.
+    let (attribution_user_id, authenticating_key_id) = match &selected_key {
+        Some(key) => (key.created_by, Some(key.id)),
+        None => (current_user.id, current_user.api_key_id),
+    };
+
     // Get the hidden API key for batch execution and per-member attribution.
     // The secret is stored on the batch so the daemon uses the batch creator's
     // credentials, not the file uploader's key from request_templates.
@@ -723,7 +776,7 @@ pub async fn create_batch<P: PoolProvider>(
     let (batch_api_key, api_key_id, target_verified) = {
         let mut conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
         let (secret, key_id) = ApiKeys::new(&mut conn)
-            .resolve_batch_execution_key(target_user_id, current_user.id, current_user.api_key_id)
+            .resolve_batch_execution_key(target_user_id, attribution_user_id, authenticating_key_id)
             .await
             .map_err(Error::Database)?;
         // Spending-cap pre-flight, beside the balance gate above: if the
@@ -2373,6 +2426,7 @@ mod tests {
                 endpoint: "/v1/chat/completions".to_string(),
                 completion_window: "24h".to_string(),
                 metadata: None,
+                api_key_id: None,
             })
             .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
             .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
@@ -2427,6 +2481,7 @@ mod tests {
             endpoint: "/v1/chat/completions".to_string(),
             completion_window: "24h".to_string(),
             metadata: None,
+            api_key_id: None,
         };
 
         let resp = app
@@ -2479,6 +2534,7 @@ mod tests {
             endpoint: "/v1/chat/completions".to_string(),
             completion_window: "24h".to_string(),
             metadata: None,
+            api_key_id: None,
         };
 
         let resp = app
@@ -2525,6 +2581,7 @@ mod tests {
             endpoint: "/v1/chat/completions".to_string(),
             completion_window: "1h".to_string(),
             metadata: None,
+            api_key_id: None,
         };
 
         let resp = app
@@ -2583,6 +2640,7 @@ mod tests {
                 ("DW_USER_AGENT".to_string(), "spoofed-shouty/9.9.9".to_string()),
                 ("team".to_string(), "research".to_string()),
             ])),
+            api_key_id: None,
         };
         let resp = app
             .post("/ai/v1/batches")
@@ -2684,6 +2742,7 @@ mod tests {
             endpoint: "/v1/chat/completions".to_string(),
             completion_window: "1h".to_string(),
             metadata: None,
+            api_key_id: None,
         };
 
         let resp = app
@@ -2717,6 +2776,7 @@ mod tests {
             endpoint: "/v1/chat/completions".to_string(),
             completion_window: "48h".to_string(),
             metadata: None,
+            api_key_id: None,
         };
 
         let resp2 = app
@@ -2762,6 +2822,7 @@ mod tests {
             endpoint: "/v1/responses".to_string(),
             completion_window: "24h".to_string(),
             metadata: None,
+            api_key_id: None,
         };
 
         let resp = app
@@ -2810,6 +2871,7 @@ mod tests {
             endpoint: "/v1/chat/completions".to_string(),
             completion_window: "24h".to_string(),
             metadata: None,
+            api_key_id: None,
         };
 
         let resp = app
@@ -2884,6 +2946,7 @@ mod tests {
             endpoint: "/v1/chat/completions".to_string(),
             completion_window: "1h".to_string(),
             metadata: None,
+            api_key_id: None,
         };
 
         let resp = app
@@ -2951,6 +3014,7 @@ mod tests {
             endpoint: "/v1/chat/completions".to_string(),
             completion_window: "24h".to_string(),
             metadata: None,
+            api_key_id: None,
         };
 
         let create_resp = app
@@ -3027,6 +3091,7 @@ mod tests {
             endpoint: "/v1/chat/completions".to_string(),
             completion_window: "24h".to_string(),
             metadata: None,
+            api_key_id: None,
         };
 
         let resp = app
@@ -3684,6 +3749,7 @@ mod tests {
             endpoint: "/v1/chat/completions".to_string(),
             completion_window: "1h".to_string(),
             metadata: None,
+            api_key_id: None,
         };
 
         let resp = app
@@ -3733,6 +3799,7 @@ mod tests {
             endpoint: "/v1/chat/completions".to_string(),
             completion_window: "24h".to_string(),
             metadata: None,
+            api_key_id: None,
         };
 
         let resp = app
@@ -3786,6 +3853,7 @@ mod tests {
             endpoint: "/v1/chat/completions".to_string(),
             completion_window: "1h".to_string(),
             metadata: None,
+            api_key_id: None,
         };
 
         let resp = app
@@ -3835,6 +3903,7 @@ mod tests {
             endpoint: "/v1/chat/completions".to_string(),
             completion_window: "invalid".to_string(),
             metadata: None,
+            api_key_id: None,
         };
 
         let resp = app
@@ -3881,6 +3950,7 @@ mod tests {
             endpoint: "/v1/chat/completions".to_string(),
             completion_window: "0s".to_string(),
             metadata: None,
+            api_key_id: None,
         };
 
         let resp = app
@@ -3934,6 +4004,7 @@ mod tests {
             endpoint: "/v1/chat/completions".to_string(),
             completion_window: "24h".to_string(),
             metadata: None,
+            api_key_id: None,
         };
 
         let resp = app
@@ -4069,6 +4140,7 @@ mod tests {
             endpoint: "/v1/chat/completions".to_string(),
             completion_window: "24h".to_string(),
             metadata: None,
+            api_key_id: None,
         };
 
         let resp = app
@@ -4121,6 +4193,7 @@ mod tests {
             endpoint: "/v1/chat/completions".to_string(),
             completion_window: completion_window.to_string(),
             metadata: None,
+            api_key_id: None,
         };
         app.post("/ai/v1/batches")
             .json(&create_req)
@@ -4274,6 +4347,7 @@ mod tests {
             endpoint: "/v1/chat/completions".to_string(),
             completion_window: "24h".to_string(),
             metadata: None,
+            api_key_id: None,
         };
         let resp = app
             .post("/ai/v1/batches")
@@ -4374,6 +4448,7 @@ mod tests {
             endpoint: "/v1/chat/completions".to_string(),
             completion_window: "24h".to_string(),
             metadata: None,
+            api_key_id: None,
         };
 
         let auth = add_auth_headers(&user);
@@ -4424,6 +4499,7 @@ mod tests {
             endpoint: "/v1/chat/completions".to_string(),
             completion_window: "24h".to_string(),
             metadata: None,
+            api_key_id: None,
         };
 
         let resp = app
@@ -4511,6 +4587,7 @@ mod tests {
             endpoint: "/v1/chat/completions".to_string(),
             completion_window: "24h".to_string(),
             metadata: None,
+            api_key_id: None,
         };
 
         let resp = app
@@ -4609,6 +4686,7 @@ mod tests {
             endpoint: "/v1/chat/completions".to_string(),
             completion_window: "24h".to_string(),
             metadata: None,
+            api_key_id: None,
         };
         let create_resp = app
             .post("/ai/v1/batches")
@@ -4660,6 +4738,7 @@ mod tests {
             endpoint: "/v1/chat/completions".to_string(),
             completion_window: "24h".to_string(),
             metadata: None,
+            api_key_id: None,
         };
         let personal_create_resp = app
             .post("/ai/v1/batches")
@@ -4943,6 +5022,7 @@ mod tests {
             endpoint: "/v1/chat/completions".to_string(),
             completion_window: "24h".to_string(),
             metadata: None,
+            api_key_id: None,
         };
 
         let create_resp = app
@@ -5293,5 +5373,238 @@ mod tests {
             .add_header(&auth[1].0, &auth[1].1)
             .await;
         resp.assert_status(StatusCode::BAD_REQUEST);
+    }
+
+    // ── Explicit API key selection for dashboard batch creation ───────────
+
+    /// Shared setup: org with owner + member (both batch-capable), a
+    /// gpt-4 deployment the org can use, and an org-owned uploaded file.
+    /// Returns (app, bg_services, owner, member, org, file_id) — callers must
+    /// keep the BackgroundServices guard bound for the test's duration.
+    async fn setup_org_batch_env(
+        pool: &PgPool,
+    ) -> (
+        axum_test::TestServer,
+        crate::BackgroundServices,
+        crate::api::models::users::UserResponse,
+        crate::api::models::users::UserResponse,
+        crate::api::models::users::UserResponse,
+        String,
+    ) {
+        let (app, bg_services) = create_test_app(pool.clone(), false).await;
+
+        let owner = create_test_user_with_roles(pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let member = create_test_user_with_roles(pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let org = create_test_org(pool, owner.id).await;
+        add_org_member(pool, org.id, member.id, "member").await;
+
+        let group = create_test_group(pool).await;
+        add_user_to_group(pool, org.id, group.id).await;
+        // The owner also gets personal model access so tests can exercise
+        // personal-context uploads alongside org-context ones.
+        add_user_to_group(pool, owner.id, group.id).await;
+        let deployment = create_test_deployment(pool, owner.id, "gpt-4-model", "gpt-4").await;
+        add_deployment_to_group(pool, deployment.id, group.id, owner.id).await;
+
+        let auth = add_auth_headers(&owner);
+        let org_cookie = format!("dw_active_org={}", org.id);
+        let jsonl_content = r#"{"custom_id":"request-1","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}}"#;
+        let multipart = axum_test::multipart::MultipartForm::new()
+            .add_part(
+                "file",
+                axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("test-batch.jsonl"),
+            )
+            .add_part("purpose", axum_test::multipart::Part::text("batch"));
+        let upload_resp = app
+            .post("/ai/v1/files")
+            .multipart(multipart)
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .add_header("cookie", &org_cookie)
+            .await;
+        upload_resp.assert_status(StatusCode::CREATED);
+        let file: serde_json::Value = upload_resp.json();
+        let file_id = file["id"].as_str().unwrap().to_string();
+
+        (app, bg_services, owner, member, org, file_id)
+    }
+
+    fn batch_req(file_id: &str, api_key_id: Option<crate::types::ApiKeyId>) -> CreateBatchRequest {
+        CreateBatchRequest {
+            input_file_id: file_id.to_string(),
+            endpoint: "/v1/chat/completions".to_string(),
+            completion_window: "24h".to_string(),
+            metadata: None,
+            api_key_id,
+        }
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_create_batch_with_selected_api_key(pool: PgPool) {
+        let (app, _bg_services, owner, member, org, file_id) = setup_org_batch_env(&pool).await;
+        let owner_auth = add_auth_headers(&owner);
+        let org_cookie = format!("dw_active_org={}", org.id);
+
+        // Owner creates a CAPPED visible org key.
+        let resp = app
+            .post(&format!("/admin/api/v1/users/{}/api-keys", org.id))
+            .add_header(&owner_auth[0].0, &owner_auth[0].1)
+            .add_header(&owner_auth[1].0, &owner_auth[1].1)
+            .json(&serde_json::json!({"name": "Capped Org Key", "purpose": "realtime", "spend_limit": "10"}))
+            .await;
+        resp.assert_status(StatusCode::CREATED);
+        let key: serde_json::Value = resp.json();
+        let key_id: crate::types::ApiKeyId = key["id"].as_str().unwrap().parse().unwrap();
+
+        // Selecting a key in personal context is rejected. Needs a personally
+        // owned file — the org file would 403 on ownership before the
+        // selection check is reached.
+        let jsonl_content = r#"{"custom_id":"request-1","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}}"#;
+        let upload_resp = app
+            .post("/ai/v1/files")
+            .multipart(
+                axum_test::multipart::MultipartForm::new()
+                    .add_part(
+                        "file",
+                        axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("personal.jsonl"),
+                    )
+                    .add_part("purpose", axum_test::multipart::Part::text("batch")),
+            )
+            .add_header(&owner_auth[0].0, &owner_auth[0].1)
+            .add_header(&owner_auth[1].0, &owner_auth[1].1)
+            .await;
+        upload_resp.assert_status(StatusCode::CREATED);
+        let personal_file: serde_json::Value = upload_resp.json();
+        let personal_file_id = personal_file["id"].as_str().unwrap().to_string();
+        app.post("/ai/v1/batches")
+            .json(&batch_req(&personal_file_id, Some(key_id)))
+            .add_header(&owner_auth[0].0, &owner_auth[0].1)
+            .add_header(&owner_auth[1].0, &owner_auth[1].1)
+            .await
+            .assert_status(StatusCode::BAD_REQUEST);
+
+        // A plain member cannot select someone else's key.
+        let member_auth = add_auth_headers(&member);
+        app.post("/ai/v1/batches")
+            .json(&batch_req(&file_id, Some(key_id)))
+            .add_header(&member_auth[0].0, &member_auth[0].1)
+            .add_header(&member_auth[1].0, &member_auth[1].1)
+            .add_header("cookie", &org_cookie)
+            .await
+            .assert_status(StatusCode::NOT_FOUND);
+
+        // The key's creator selects it in org context → the batch executes on
+        // the key's cap-scope child, so its spend counts against the cap.
+        let resp = app
+            .post("/ai/v1/batches")
+            .json(&batch_req(&file_id, Some(key_id)))
+            .add_header(&owner_auth[0].0, &owner_auth[0].1)
+            .add_header(&owner_auth[1].0, &owner_auth[1].1)
+            .add_header("cookie", &org_cookie)
+            .await;
+        resp.assert_status(StatusCode::CREATED);
+
+        let batch_key_id: Option<Uuid> = sqlx::query_scalar("SELECT api_key_id FROM fusillade.batches ORDER BY created_at DESC LIMIT 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let child_id: Uuid = sqlx::query_scalar("SELECT id FROM api_keys WHERE parent_api_key_id = $1")
+            .bind(key_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(batch_key_id, Some(child_id), "capped selection must execute on the cap-scope child");
+
+        // Hidden root keys (e.g. the shared batch key minted by the create
+        // above: hidden = true, parent NULL) are not selectable even by their
+        // holder — the hidden filter, not just the parent filter, must hold.
+        let hidden_root_id: Uuid = sqlx::query_scalar(
+            "SELECT id FROM api_keys WHERE hidden = true AND parent_api_key_id IS NULL AND user_id = $1 AND created_by = $2 LIMIT 1",
+        )
+        .bind(org.id)
+        .bind(owner.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        app.post("/ai/v1/batches")
+            .json(&batch_req(&file_id, Some(hidden_root_id)))
+            .add_header(&owner_auth[0].0, &owner_auth[0].1)
+            .add_header(&owner_auth[1].0, &owner_auth[1].1)
+            .add_header("cookie", &org_cookie)
+            .await
+            .assert_status(StatusCode::NOT_FOUND);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_member_without_manage_keys_must_select_batch_key(pool: PgPool) {
+        let (app, _bg_services, owner, member, org, file_id) = setup_org_batch_env(&pool).await;
+        // Revoke the member's additive 'manage_keys' grant: without it they
+        // have no implicit key to bill, so UI batches must name an issued key.
+        sqlx::query(
+            "DELETE FROM organization_member_roles omr USING user_organizations uo \
+             WHERE uo.id = omr.user_organization_id AND uo.organization_id = $1 AND uo.user_id = $2 AND omr.role = 'manage_keys'",
+        )
+        .bind(org.id)
+        .bind(member.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let owner_auth = add_auth_headers(&owner);
+        let member_auth = add_auth_headers(&member);
+        let org_cookie = format!("dw_active_org={}", org.id);
+
+        // Member submitting from the dashboard (cookie auth) with no key → 400.
+        let resp = app
+            .post("/ai/v1/batches")
+            .json(&batch_req(&file_id, None))
+            .add_header(&member_auth[0].0, &member_auth[0].1)
+            .add_header(&member_auth[1].0, &member_auth[1].1)
+            .add_header("cookie", &org_cookie)
+            .await;
+        resp.assert_status(StatusCode::BAD_REQUEST);
+        assert!(resp.text().contains("select"), "error should tell the member to select a key");
+
+        // Owner issues a key to the member…
+        let resp = app
+            .post(&format!("/admin/api/v1/users/{}/api-keys", org.id))
+            .add_header(&owner_auth[0].0, &owner_auth[0].1)
+            .add_header(&owner_auth[1].0, &owner_auth[1].1)
+            .json(&serde_json::json!({"name": "Issued", "purpose": "realtime", "member_id": member.id}))
+            .await;
+        resp.assert_status(StatusCode::CREATED);
+        let issued: serde_json::Value = resp.json();
+        let issued_id: crate::types::ApiKeyId = issued["id"].as_str().unwrap().parse().unwrap();
+
+        // …and the member can now create a batch with it, attributed to them.
+        let resp = app
+            .post("/ai/v1/batches")
+            .json(&batch_req(&file_id, Some(issued_id)))
+            .add_header(&member_auth[0].0, &member_auth[0].1)
+            .add_header(&member_auth[1].0, &member_auth[1].1)
+            .add_header("cookie", &org_cookie)
+            .await;
+        resp.assert_status(StatusCode::CREATED);
+        let batch_key_id: Uuid = sqlx::query_scalar("SELECT api_key_id FROM fusillade.batches ORDER BY created_at DESC LIMIT 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let attributed_to: Uuid = sqlx::query_scalar("SELECT created_by FROM api_keys WHERE id = $1")
+            .bind(batch_key_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(attributed_to, member.id, "batch usage is attributed to the issued key's holder");
+
+        // Org managers are exempt from the selection requirement.
+        app.post("/ai/v1/batches")
+            .json(&batch_req(&file_id, None))
+            .add_header(&owner_auth[0].0, &owner_auth[0].1)
+            .add_header(&owner_auth[1].0, &owner_auth[1].1)
+            .add_header("cookie", &org_cookie)
+            .await
+            .assert_status(StatusCode::CREATED);
     }
 }
