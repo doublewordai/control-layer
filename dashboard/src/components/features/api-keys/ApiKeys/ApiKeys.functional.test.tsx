@@ -1115,6 +1115,27 @@ describe("API Keys Component - Functional Tests", () => {
       };
     }
 
+    it("shows scoping controls to a PlatformManager who is only a plain org member", async () => {
+      // The default mock current user carries the PlatformManager role. A PM
+      // whose org membership is 'member' still receives an UNscoped key list
+      // server-side (ReadAll bypasses created_by scoping), so the UI must
+      // offer the same tabs/filter as managers — otherwise they get
+      // everyone's keys with no way to narrow the view.
+      enterOrgContext("member", false);
+
+      const { container } = render(<ApiKeys />, { wrapper: createWrapper() });
+
+      expect(
+        await within(container).findByRole("tab", { name: /all keys/i }),
+      ).toBeInTheDocument();
+      expect(
+        within(container).getByRole("tab", { name: /my keys/i }),
+      ).toBeInTheDocument();
+      expect(
+        within(container).getByRole("combobox", { name: /filter by member/i }),
+      ).toBeInTheDocument();
+    });
+
     it("shows scope tabs, member filter, and assignee column to an org manager", async () => {
       enterOrgContext("owner");
 

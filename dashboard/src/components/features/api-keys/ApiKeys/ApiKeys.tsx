@@ -125,7 +125,12 @@ export const ApiKeys: React.FC = () => {
   // server-computed can_manage_keys flag decides (owners/admins are always
   // true, plain members only when granted the additive role).
   const canSelfManage = !isOrgContext || !!activeOrganization?.can_manage_keys;
-  const showScopingControls = isOrgContext && isOrgManager;
+  // Anyone whose LIST is unscoped (org managers, and PlatformManagers whose
+  // ReadAll bypasses created_by scoping server-side) gets the scoping
+  // controls — otherwise a PM who is a plain member of the org sees
+  // everyone's keys with no way to narrow them.
+  const showScopingControls =
+    isOrgContext && (isOrgManager || isPlatformManager);
   const pagination = useServerPagination();
   const {
     data: apiKeysData,
