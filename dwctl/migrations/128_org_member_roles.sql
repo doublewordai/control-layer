@@ -20,7 +20,7 @@ CREATE TABLE organization_member_roles (
 );
 
 -- Existing plain members (and pending invites) keep today's self-serve
--- behavior; new memberships default to granted at the API layer unless the
--- inviter opts out.
+-- behavior; NEW memberships default to NOT granted at the API layer unless
+-- the inviter/admin explicitly opts them in (blast-radius minimization).
 INSERT INTO organization_member_roles (user_organization_id, role)
 SELECT id, 'manage_keys' FROM user_organizations WHERE role = 'member';

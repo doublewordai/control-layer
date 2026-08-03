@@ -416,12 +416,19 @@ pub async fn get_user_api_key<P: PoolProvider>(
     let mut pool_conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
     let mut repo = ApiKeys::new(&mut pool_conn);
 
-    // Get the specific API key, verify ownership and created_by visibility
+    // Get the specific API key, verify ownership and created_by visibility.
+    // System-managed keys (hidden batch/playground and cap-scope children)
+    // are never addressable through the user-facing API — same wall as
+    // update/delete/rotate, so their existence and metadata don't leak to
+    // anyone who learns a UUID from e.g. batch attribution fields.
     let api_key = repo
         .get_by_id(api_key_id)
         .await?
         .filter(|key| key.user_id == target_user_id)
         .filter(|key| skip_created_by_filter || key.created_by == current_user.id)
+        .filter(|key| !key.hidden)
+        .filter(|key| key.parent_api_key_id.is_none())
+        .filter(|key| matches!(key.purpose, ApiKeyPurpose::Realtime | ApiKeyPurpose::Platform))
         .ok_or_else(|| Error::NotFound {
             resource: "API key".to_string(),
             id: api_key_id.to_string(),
@@ -2665,6 +2672,18 @@ mod tests {
             .add_header(&auth[1].0, &auth[1].1)
             .await;
         response.assert_status_not_found();
+
+        // Plain GET is walled identically: system keys aren't addressable
+        // even by their creator, so their metadata can't be probed from
+        // UUIDs leaked via attribution fields.
+        for system_key in [child_id, hidden_root_id] {
+            let response = app
+                .get(&format!("/admin/api/v1/users/current/api-keys/{}", system_key))
+                .add_header(&auth[0].0, &auth[0].1)
+                .add_header(&auth[1].0, &auth[1].1)
+                .await;
+            response.assert_status_not_found();
+        }
     }
 
     #[sqlx::test]

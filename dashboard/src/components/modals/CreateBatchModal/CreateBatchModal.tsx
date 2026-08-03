@@ -110,16 +110,15 @@ export function CreateBatchModal({
     { limit: 100 },
   );
 
-  const isOrgManager =
-    activeOrganization?.role === "owner" || activeOrganization?.role === "admin";
-
-  // Only realtime/platform keys are usable for batch attribution, and plain
-  // members may only bill keys they hold (the list API already scopes to own
-  // keys for non-managers; the created_by filter is defensive).
+  // Only realtime/platform keys are usable for batch attribution, and the
+  // dropdown offers ONLY the caller's own keys — for managers too. Admins can
+  // MANAGE other members' keys (cap, rotate, delete), but billing a batch to
+  // someone else's key is a confusing non-standard flow we deliberately don't
+  // surface; the server would allow it for managers, the UI doesn't offer it.
   const selectableApiKeys = (apiKeysResponse?.data || []).filter(
     (key) =>
       (key.purpose === "realtime" || key.purpose === "platform") &&
-      (isOrgManager || key.created_by === currentUser?.id),
+      key.created_by === currentUser?.id,
   );
 
   // Members without the key-management capability must bill one of their

@@ -636,7 +636,7 @@ describe("CreateBatchModal", () => {
       ).not.toBeInTheDocument();
     });
 
-    it("should offer other members' keys to org owners/admins", async () => {
+    it("offers admins only their OWN keys — managing others' keys never means billing to them", async () => {
       const user = userEvent.setup();
       mockCreateBatch();
       vi.mocked(contexts.useOrganizationContext).mockReturnValue(
@@ -657,8 +657,8 @@ describe("CreateBatchModal", () => {
       );
 
       expect(
-        screen.getByRole("option", { name: /other member key/i }),
-      ).toBeInTheDocument();
+        screen.queryByRole("option", { name: /other member key/i }),
+      ).not.toBeInTheDocument();
     });
 
     it("should require a key selection for members without key management", async () => {
