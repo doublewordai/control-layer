@@ -1,5 +1,18 @@
 # Changelog
 
+## [10.2.0](https://github.com/doublewordai/control-layer/compare/v10.1.0...v10.2.0) (2026-08-03)
+
+
+### Features
+
+* org key management (preview) ([#1381](https://github.com/doublewordai/control-layer/issues/1381)) ([124ad97](https://github.com/doublewordai/control-layer/commit/124ad97ce9e741a0afa0ce6819d8f237861296e4))
+
+
+### Bug Fixes
+
+* **fusillade:** add populate-duration histogram and unfrozen-termina… ([#1413](https://github.com/doublewordai/control-layer/issues/1413)) ([081f4d5](https://github.com/doublewordai/control-layer/commit/081f4d52644c8d2ad0c53b78b2e21927db306456))
+* scrub provider-written cache fields from inactive cache-layer re… ([#1411](https://github.com/doublewordai/control-layer/issues/1411)) ([85e5976](https://github.com/doublewordai/control-layer/commit/85e5976f81b71b702f189ae3c6b3040db6f7aa5e))
+
 ## [10.1.0](https://github.com/doublewordai/control-layer/compare/v10.0.0...v10.1.0) (2026-07-31)
 
 
