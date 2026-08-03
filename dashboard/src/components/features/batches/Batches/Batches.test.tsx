@@ -819,4 +819,31 @@ describe("Batches", () => {
       expect(lastCall?.member_id).toBeUndefined();
     });
   });
+
+  describe("error state", () => {
+    it("renders a query failure as an error, not as 'No batches found'", async () => {
+      vi.mocked(hooks.useBatches).mockReturnValue({
+        data: undefined,
+        isLoading: false,
+        error: new Error(
+          "completion_window=background is only available to platform managers",
+        ),
+        refetch: vi.fn(),
+      } as any);
+
+      const { container } = render(<Batches {...defaultProps} />, {
+        wrapper: createWrapper(),
+      });
+
+      expect(
+        await within(container).findByText("Couldn't load batches"),
+      ).toBeInTheDocument();
+      expect(
+        within(container).getByText(/only available to platform managers/),
+      ).toBeInTheDocument();
+      expect(
+        within(container).queryByText("No batches found"),
+      ).not.toBeInTheDocument();
+    });
+  });
 });
