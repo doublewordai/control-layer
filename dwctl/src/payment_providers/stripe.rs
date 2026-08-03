@@ -101,7 +101,111 @@ impl From<crate::config::StripeConfig> for StripeProvider {
     }
 }
 
+/// The only things that differ between our two setup-mode checkouts.
+///
+/// Both save a card for later off-session use and are otherwise identical
+/// (hosted page, tax id + business name collection, ToS + reuse consent, the
+/// same payment method types, the same customer handling), so the shape of the
+/// session lives in `create_setup_mode_session` and only the wording varies.
+struct SetupSessionCopy<'a> {
+    /// Custom terms-of-service acceptance text. `None` shows no ToS copy.
+    terms_of_service_text: Option<&'a str>,
+    /// Label on the submit button.
+    submit_label: &'a str,
+    /// Description recorded on the SetupIntent, for reconciliation in Stripe.
+    setup_intent_description: &'a str,
+}
+
 impl StripeProvider {
+    /// Build a `mode: setup` hosted Checkout Session: verifies and saves a
+    /// payment method without charging it.
+    ///
+    /// Shared by onboarding card verification and auto-top-up enrolment, which
+    /// want the same session with different copy.
+    async fn create_setup_mode_session(
+        &self,
+        payer: &CheckoutPayer,
+        cancel_url: &str,
+        success_url: &str,
+        copy: SetupSessionCopy<'_>,
+    ) -> Result<String> {
+        let mut checkout_params = CreateCheckoutSession::new()
+            .cancel_url(cancel_url)
+            .success_url(success_url)
+            // Read back as the billing target when the session is fulfilled.
+            .client_reference_id(payer.id.to_string())
+            .mode(CheckoutSessionMode::Setup)
+            .ui_mode(CheckoutSessionUiMode::HostedPage)
+            // Collected here rather than later: automatic tax on the first real
+            // charge needs an address on the customer, and the billing portal
+            // detour to add one is exactly the friction this removes.
+            .tax_id_collection(CreateCheckoutSessionTaxIdCollection::new(true))
+            .name_collection(CreateCheckoutSessionNameCollection {
+                business: Some(CreateCheckoutSessionNameCollectionBusiness::new(true)),
+                individual: None,
+            })
+            .consent_collection(CreateCheckoutSessionConsentCollection {
+                terms_of_service: Some(CreateCheckoutSessionConsentCollectionTermsOfService::Required),
+                payment_method_reuse_agreement: Some(CreateCheckoutSessionConsentCollectionPaymentMethodReuseAgreement::new(
+                    CreateCheckoutSessionConsentCollectionPaymentMethodReuseAgreementPosition::Auto,
+                )),
+                promotions: None,
+            })
+            .custom_text(CreateCheckoutSessionCustomText {
+                terms_of_service_acceptance: copy.terms_of_service_text.map(CustomTextPositionParam::new),
+                submit: Some(CustomTextPositionParam::new(copy.submit_label)),
+                after_submit: None,
+                shipping_address: None,
+            })
+            .payment_method_types(vec![
+                CreateCheckoutSessionPaymentMethodTypes::Card,
+                CreateCheckoutSessionPaymentMethodTypes::Link,
+                CreateCheckoutSessionPaymentMethodTypes::SepaDebit,
+            ])
+            .setup_intent_data(CreateCheckoutSessionSetupIntentData {
+                description: Some(copy.setup_intent_description.to_string()),
+                metadata: None,
+                on_behalf_of: None,
+            });
+
+        if let Some(existing_id) = &payer.payment_provider_id {
+            tracing::debug!("Using existing Stripe customer ID {} for payer {}", existing_id, payer.id);
+            checkout_params = checkout_params
+                .customer(existing_id)
+                .customer_update(CreateCheckoutSessionCustomerUpdate {
+                    address: Some(CreateCheckoutSessionCustomerUpdateAddress::Auto),
+                    name: Some(CreateCheckoutSessionCustomerUpdateName::Auto),
+                    shipping: None,
+                })
+        } else {
+            tracing::debug!("No customer ID found for payer {}, Stripe will create one", payer.id);
+            checkout_params = checkout_params
+                .customer_email(&payer.email)
+                .customer_creation(CreateCheckoutSessionCustomerCreation::Always);
+        }
+
+        let checkout_session = checkout_params.send(&self.client).await.map_err(|e| {
+            tracing::error!(
+                purpose = copy.setup_intent_description,
+                "Failed to create Stripe setup checkout session: {:?}",
+                e
+            );
+            PaymentError::ProviderApi(e.to_string())
+        })?;
+
+        tracing::debug!(
+            purpose = copy.setup_intent_description,
+            "Created setup checkout session {} for payer {}",
+            checkout_session.id,
+            payer.id
+        );
+
+        checkout_session.url.ok_or_else(|| {
+            tracing::error!("Setup checkout session missing URL");
+            PaymentError::ProviderApi("Checkout session missing URL".to_string())
+        })
+    }
+
     /// Internal Stripe implementation of charge_auto_topup that returns the full PaymentIntent.
     async fn charge_auto_topup_internal(
         &self,
@@ -354,14 +458,19 @@ fn parse_payment_session(checkout_session: &stripe_checkout::CheckoutSession) ->
         })?
         .unwrap_or(creditor_id);
 
-    let price = pretax_credit_cents(checkout_session).ok_or_else(|| {
+    let cents = pretax_credit_cents(checkout_session).ok_or_else(|| {
         tracing::error!("Checkout session missing both line_items and amount_subtotal");
         PaymentError::InvalidData("Missing payment amount".to_string())
-    })? / 100; // Convert cents to dollars
+    })?;
+
+    // Scale the cents rather than dividing: integer division truncated the
+    // remainder, so a $10.50 checkout credited $10 and silently pocketed the
+    // 50c. Credits are stored as DECIMAL, so there's no reason to lose them.
+    let amount = Decimal::new(cents, 2);
 
     Ok(PaymentSession {
         creditee_id,
-        amount: Decimal::from(price),
+        amount,
         is_paid: checkout_session.payment_status == CheckoutSessionPaymentStatus::Paid,
         creditor_id,
         payment_provider_id: checkout_session.customer.as_ref().map(|c| c.id().to_string()),
@@ -685,149 +794,35 @@ impl PaymentProvider for StripeProvider {
     }
 
     async fn create_setup_checkout_session(&self, payer: &CheckoutPayer, cancel_url: &str, success_url: &str) -> Result<String> {
-        let mut checkout_params = CreateCheckoutSession::new()
-            .cancel_url(cancel_url)
-            .success_url(success_url)
-            // Read back as the billing target in `fulfil_setup_session`.
-            .client_reference_id(payer.id.to_string())
-            .mode(CheckoutSessionMode::Setup)
-            .ui_mode(CheckoutSessionUiMode::HostedPage)
-            // Collected here rather than later: automatic tax on the first real
-            // top-up needs an address on the customer, and the billing portal
-            // detour to add one is exactly the onboarding friction this removes.
-            .tax_id_collection(CreateCheckoutSessionTaxIdCollection::new(true))
-            .name_collection(CreateCheckoutSessionNameCollection {
-                business: Some(CreateCheckoutSessionNameCollectionBusiness::new(true)),
-                individual: None,
-            })
-            .consent_collection(CreateCheckoutSessionConsentCollection {
-                terms_of_service: Some(CreateCheckoutSessionConsentCollectionTermsOfService::Required),
-                payment_method_reuse_agreement: Some(CreateCheckoutSessionConsentCollectionPaymentMethodReuseAgreement::new(
-                    CreateCheckoutSessionConsentCollectionPaymentMethodReuseAgreementPosition::Auto,
-                )),
-                promotions: None,
-            })
-            .custom_text(CreateCheckoutSessionCustomText {
-                terms_of_service_acceptance: self
+        self.create_setup_mode_session(
+            payer,
+            cancel_url,
+            success_url,
+            SetupSessionCopy {
+                terms_of_service_text: self
                     .config
                     .setup_terms_of_service_text
-                    .as_ref()
-                    .or(self.config.auto_topup_terms_of_service_text.as_ref())
-                    .map(CustomTextPositionParam::new),
-                submit: Some(CustomTextPositionParam::new("Verify payment method")),
-                after_submit: None,
-                shipping_address: None,
-            })
-            .payment_method_types(vec![
-                CreateCheckoutSessionPaymentMethodTypes::Card,
-                CreateCheckoutSessionPaymentMethodTypes::Link,
-                CreateCheckoutSessionPaymentMethodTypes::SepaDebit,
-            ])
-            .setup_intent_data(CreateCheckoutSessionSetupIntentData {
-                description: Some("Payment method verification".to_string()),
-                metadata: None,
-                on_behalf_of: None,
-            });
-
-        if let Some(existing_id) = &payer.payment_provider_id {
-            tracing::debug!("Using existing Stripe customer ID {} for payer {}", existing_id, payer.id);
-            checkout_params = checkout_params
-                .customer(existing_id)
-                .customer_update(CreateCheckoutSessionCustomerUpdate {
-                    address: Some(CreateCheckoutSessionCustomerUpdateAddress::Auto),
-                    name: Some(CreateCheckoutSessionCustomerUpdateName::Auto),
-                    shipping: None,
-                })
-        } else {
-            tracing::debug!("No customer ID found for payer {}, Stripe will create one", payer.id);
-            checkout_params = checkout_params
-                .customer_email(&payer.email)
-                .customer_creation(CreateCheckoutSessionCustomerCreation::Always);
-        }
-
-        let checkout_session = checkout_params.send(&self.client).await.map_err(|e| {
-            tracing::error!("Failed to create Stripe setup checkout session: {:?}", e);
-            PaymentError::ProviderApi(e.to_string())
-        })?;
-
-        tracing::debug!("Created setup checkout session {} for payer {}", checkout_session.id, payer.id);
-
-        checkout_session.url.ok_or_else(|| {
-            tracing::error!("Setup checkout session missing URL");
-            PaymentError::ProviderApi("Checkout session missing URL".to_string())
-        })
+                    .as_deref()
+                    .or(self.config.auto_topup_terms_of_service_text.as_deref()),
+                submit_label: "Verify payment method",
+                setup_intent_description: "Payment method verification",
+            },
+        )
+        .await
     }
 
     async fn create_auto_topup_checkout_session(&self, payer: &CheckoutPayer, cancel_url: &str, success_url: &str) -> Result<String> {
-        let mut checkout_params = CreateCheckoutSession::new()
-            .cancel_url(cancel_url)
-            .success_url(success_url)
-            .client_reference_id(payer.id.to_string())
-            .mode(CheckoutSessionMode::Setup)
-            .ui_mode(CheckoutSessionUiMode::HostedPage)
-            .tax_id_collection(CreateCheckoutSessionTaxIdCollection::new(true))
-            .name_collection(CreateCheckoutSessionNameCollection {
-                business: Some(CreateCheckoutSessionNameCollectionBusiness::new(true)),
-                individual: None,
-            })
-            .consent_collection(CreateCheckoutSessionConsentCollection {
-                terms_of_service: Some(CreateCheckoutSessionConsentCollectionTermsOfService::Required),
-                payment_method_reuse_agreement: Some(CreateCheckoutSessionConsentCollectionPaymentMethodReuseAgreement::new(
-                    CreateCheckoutSessionConsentCollectionPaymentMethodReuseAgreementPosition::Auto,
-                )),
-                promotions: None,
-            })
-            .custom_text(CreateCheckoutSessionCustomText {
-                terms_of_service_acceptance: self
-                    .config
-                    .auto_topup_terms_of_service_text
-                    .as_ref()
-                    .map(CustomTextPositionParam::new),
-                submit: Some(CustomTextPositionParam::new("Set up auto top-up")),
-                after_submit: None,
-                shipping_address: None,
-            })
-            .payment_method_types(vec![
-                CreateCheckoutSessionPaymentMethodTypes::Card,
-                CreateCheckoutSessionPaymentMethodTypes::Link,
-                CreateCheckoutSessionPaymentMethodTypes::SepaDebit,
-            ])
-            .setup_intent_data(CreateCheckoutSessionSetupIntentData {
-                description: Some("Auto top-up setup".to_string()),
-                metadata: None,
-                on_behalf_of: None,
-            });
-
-        // Include existing customer ID if we have one
-        if let Some(existing_id) = &payer.payment_provider_id {
-            tracing::debug!("Using existing Stripe customer ID {} for payer {}", existing_id, payer.id);
-            checkout_params = checkout_params
-                .customer(existing_id)
-                .customer_update(CreateCheckoutSessionCustomerUpdate {
-                    address: Some(CreateCheckoutSessionCustomerUpdateAddress::Auto),
-                    name: Some(CreateCheckoutSessionCustomerUpdateName::Auto),
-                    shipping: None,
-                })
-        } else {
-            tracing::debug!("No customer ID found for payer {}, Stripe will create one", payer.id);
-            checkout_params = checkout_params
-                .customer_email(&payer.email)
-                .customer_creation(CreateCheckoutSessionCustomerCreation::Always);
-        }
-
-        // Create checkout session
-        let checkout_session = checkout_params.send(&self.client).await.map_err(|e| {
-            tracing::error!("Failed to create Stripe checkout session: {:?}", e);
-            PaymentError::ProviderApi(e.to_string())
-        })?;
-
-        tracing::debug!("Created checkout session {} for payer {} ", checkout_session.id, payer.id);
-
-        // Return checkout URL for hosted checkout
-        checkout_session.url.ok_or_else(|| {
-            tracing::error!("Checkout session missing URL");
-            PaymentError::ProviderApi("Checkout session missing URL".to_string())
-        })
+        self.create_setup_mode_session(
+            payer,
+            cancel_url,
+            success_url,
+            SetupSessionCopy {
+                terms_of_service_text: self.config.auto_topup_terms_of_service_text.as_deref(),
+                submit_label: "Set up auto top-up",
+                setup_intent_description: "Auto top-up setup",
+            },
+        )
+        .await
     }
 
     async fn process_auto_topup_session(&self, _db_pool: &PgPool, session_id: &str) -> Result<AutoTopupSetupResult> {
@@ -1187,6 +1182,27 @@ mod tests {
         // We must credit the pre-tax subtotal (2500), never the tax-inclusive
         // total (3000) - crediting the total would gift users the tax.
         assert_eq!(pretax_credit_cents(&session), Some(2500));
+
+        // ...and the subtotal must survive the conversion to dollars intact.
+        assert_eq!(
+            parse_payment_session(&session).expect("fixture parses").amount,
+            Decimal::new(2500, 2)
+        );
+    }
+
+    /// Integer division used to truncate the cents here, so a $10.50 checkout
+    /// credited $10 and quietly kept the remaining 50c.
+    #[test]
+    fn test_parse_payment_session_keeps_partial_dollars() {
+        let mut session: stripe_checkout::CheckoutSession =
+            serde_json::from_str(include_str!("test_fixtures/checkout_session_with_tax.json"))
+                .expect("fixture should deserialize into a Stripe CheckoutSession");
+        session.line_items = None;
+        session.amount_subtotal = Some(1050);
+
+        let parsed = parse_payment_session(&session).expect("session parses");
+        assert_eq!(parsed.amount, Decimal::new(1050, 2), "$10.50 must credit 10.50, not 10");
+        assert_ne!(parsed.amount, Decimal::from(10));
     }
 
     #[test]

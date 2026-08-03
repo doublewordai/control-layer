@@ -281,17 +281,30 @@ impl<'c> Credits<'c> {
             api_key_id: None,
         };
 
-        match self.create_transaction(&request).await {
-            Ok(_) => {
-                trace!("Granted first-payment match of {} to payee {}", match_amount, payee);
-                Ok(())
-            }
-            // Another concurrent payment path already granted the match for this
-            // source: idempotent no-op.
+        // Another concurrent payment path may already have granted the match for
+        // this source; `grant_once` makes that an idempotent no-op.
+        if self.grant_once(&request).await? {
+            trace!("Granted first-payment match of {} to payee {}", match_amount, payee);
+        }
+        Ok(())
+    }
+
+    /// Record a grant that must happen at most once, keyed by `source_id`.
+    ///
+    /// The `credits_transactions_source_id_unique` constraint is the whole
+    /// mechanism: a losing concurrent insert surfaces as a unique violation,
+    /// which we treat as "someone else already granted it". Letting the
+    /// database arbitrate is what makes this safe under the webhook racing the
+    /// front-channel confirmation - a read-then-insert check cannot be.
+    ///
+    /// Returns `true` if this call was the one that recorded the grant.
+    async fn grant_once(&mut self, request: &CreditTransactionCreateDBRequest) -> Result<bool> {
+        match self.create_transaction(request).await {
+            Ok(_) => Ok(true),
             Err(crate::db::errors::DbError::UniqueViolation { constraint, .. })
                 if constraint.as_deref() == Some("credits_transactions_source_id_unique") =>
             {
-                Ok(())
+                Ok(false)
             }
             Err(e) => Err(e),
         }
@@ -303,14 +316,16 @@ impl<'c> Credits<'c> {
     /// (`POST /payments/setup`) return path, where the user proved a real card
     /// without being charged.
     ///
-    /// Guarded twice, because both guards catch a different failure:
+    /// The `source_id` is derived from the *payee*, not the checkout session,
+    /// which is what makes "once per account" true rather than merely likely.
+    /// Keying on the session would only stop the webhook and the front-channel
+    /// `PATCH /payments/{id}` double-granting the *same* session; verifying a
+    /// second card produces a second session id and would pay out again. A
+    /// read-then-insert guard doesn't close that either - two concurrent
+    /// sessions can both observe no prior grant before either inserts. Keyed on
+    /// the payee, the unique constraint settles it atomically.
     ///
-    /// * `source_id` is derived from the checkout session, so the front-channel
-    ///   `PATCH /payments/{id}` racing the Stripe webhook cannot double-grant -
-    ///   the second insert hits the `source_id` unique constraint and no-ops.
-    /// * The ledger scan rejects a payee who already has *any* verification
-    ///   grant, so re-running setup checkout with a second card (a new session
-    ///   id, therefore a new `source_id`) doesn't pay out again.
+    /// The triggering session is recorded in the description for reconciliation.
     ///
     /// Recorded as an `admin_grant` via `create_transaction`, so it fires the
     /// balance-restored notify like any other credit.
@@ -320,52 +335,22 @@ impl<'c> Credits<'c> {
             return Ok(());
         }
 
-        let source_id = format!("{setup_source_id}:verification-credits");
-
-        // Already granted for a previous verification? The LIKE anchors on the
-        // suffix this method owns, so it only ever matches its own grants.
-        let already_granted = sqlx::query_scalar!(
-            r#"
-            SELECT EXISTS (
-                SELECT 1 FROM credits_transactions
-                WHERE user_id = $1
-                  AND transaction_type = 'admin_grant'
-                  AND source_id LIKE '%:verification-credits'
-            ) AS "already_granted!"
-            "#,
-            payee
-        )
-        .fetch_one(&mut *self.db)
-        .await?;
-
-        if already_granted {
-            trace!("Payee {} already received verification credits, skipping", payee);
-            return Ok(());
-        }
-
         let request = CreditTransactionCreateDBRequest {
             user_id: payee,
             transaction_type: CreditTransactionType::AdminGrant,
             amount,
-            source_id,
-            description: Some("Signup credits for verifying a payment method".to_string()),
+            source_id: format!("verification-credits:{payee}"),
+            description: Some(format!("Signup credits for verifying a payment method ({setup_source_id})")),
             fusillade_batch_id: None,
             api_key_id: None,
         };
 
-        match self.create_transaction(&request).await {
-            Ok(_) => {
-                trace!("Granted {} verification credits to payee {}", amount, payee);
-                Ok(())
-            }
-            // The webhook and the front-channel PATCH both landed: idempotent no-op.
-            Err(crate::db::errors::DbError::UniqueViolation { constraint, .. })
-                if constraint.as_deref() == Some("credits_transactions_source_id_unique") =>
-            {
-                Ok(())
-            }
-            Err(e) => Err(e),
+        if self.grant_once(&request).await? {
+            trace!("Granted {} verification credits to payee {}", amount, payee);
+        } else {
+            trace!("Payee {} already received verification credits, skipping", payee);
         }
+        Ok(())
     }
 
     /// Send a pg_notify so the onwards config sync re-evaluates key
@@ -2231,11 +2216,13 @@ mod tests {
         assert_eq!(count, Some(1));
     }
 
-    /// Amount granted as verification credits for a given setup session, if any.
-    async fn verification_grant_amount(pool: &PgPool, setup_source_id: &str) -> Option<Decimal> {
+    /// Amount granted as verification credits to a payee, if any. Keyed on the
+    /// payee because that - not the checkout session - is what the grant's
+    /// `source_id` is derived from.
+    async fn verification_grant_amount(pool: &PgPool, payee: UserId) -> Option<Decimal> {
         sqlx::query_scalar!(
             "SELECT amount FROM credits_transactions WHERE source_id = $1",
-            format!("{setup_source_id}:verification-credits")
+            format!("verification-credits:{payee}")
         )
         .fetch_optional(pool)
         .await
@@ -2244,7 +2231,7 @@ mod tests {
 
     async fn verification_grant_count(pool: &PgPool, user: UserId) -> i64 {
         sqlx::query_scalar!(
-            "SELECT COUNT(*) FROM credits_transactions WHERE user_id = $1 AND source_id LIKE '%:verification-credits'",
+            "SELECT COUNT(*) FROM credits_transactions WHERE user_id = $1 AND source_id LIKE 'verification-credits:%'",
             user
         )
         .fetch_one(pool)
@@ -2259,7 +2246,7 @@ mod tests {
         let mut conn = pool.acquire().await.unwrap();
         let mut credits = Credits::new(&mut conn);
 
-        assert_eq!(verification_grant_amount(&pool, "cs_setup_1").await, None);
+        assert_eq!(verification_grant_amount(&pool, user).await, None);
 
         credits
             .grant_verification_credits(Decimal::from_str("25.0").unwrap(), user, "cs_setup_1")
@@ -2267,7 +2254,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            verification_grant_amount(&pool, "cs_setup_1").await,
+            verification_grant_amount(&pool, user).await,
             Some(Decimal::from_str("25.0").unwrap())
         );
     }
@@ -2280,7 +2267,7 @@ mod tests {
 
         credits.grant_verification_credits(Decimal::ZERO, user, "cs_setup_1").await.unwrap();
 
-        assert_eq!(verification_grant_amount(&pool, "cs_setup_1").await, None);
+        assert_eq!(verification_grant_amount(&pool, user).await, None);
     }
 
     /// The webhook and the front-channel `PATCH /payments/{id}` both fulfil the
@@ -2301,8 +2288,8 @@ mod tests {
         assert_eq!(verification_grant_count(&pool, user).await, 1);
     }
 
-    /// Verifying a *second* card produces a different session id, so the
-    /// source_id constraint can't catch it - the ledger scan has to.
+    /// Verifying a *second* card produces a different session id. Keying the
+    /// grant on the payee is what stops it paying out twice.
     #[sqlx::test]
     async fn test_verification_credits_granted_only_once_per_user(pool: PgPool) {
         let user = create_test_user(&pool).await;
@@ -2319,7 +2306,43 @@ mod tests {
             .unwrap();
 
         assert_eq!(verification_grant_count(&pool, user).await, 1);
-        assert_eq!(verification_grant_amount(&pool, "cs_setup_2").await, None);
+        // The one grant that exists is from the first session.
+        let description: Option<String> = sqlx::query_scalar!(
+            "SELECT description FROM credits_transactions WHERE source_id = $1",
+            format!("verification-credits:{user}")
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(
+            description.unwrap_or_default().contains("cs_setup_1"),
+            "the triggering session should be recorded for reconciliation"
+        );
+    }
+
+    /// Two sessions landing at once - the webhook for one card racing the
+    /// front-channel confirmation of another. A read-then-insert guard lets
+    /// both observe "no prior grant" and pay out twice; the unique constraint
+    /// on a payee-keyed source_id cannot.
+    #[sqlx::test]
+    async fn test_verification_credits_survive_concurrent_sessions(pool: PgPool) {
+        let user = create_test_user(&pool).await;
+
+        let results = futures::future::join_all((0..5).map(|i| {
+            let pool = pool.clone();
+            async move {
+                let mut conn = pool.acquire().await.unwrap();
+                Credits::new(&mut conn)
+                    .grant_verification_credits(Decimal::from_str("25.0").unwrap(), user, &format!("cs_setup_{i}"))
+                    .await
+            }
+        }))
+        .await;
+
+        for result in results {
+            result.expect("a losing racer must no-op, not error");
+        }
+        assert_eq!(verification_grant_count(&pool, user).await, 1);
     }
 
     #[sqlx::test]
