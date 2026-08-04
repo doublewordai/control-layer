@@ -1,5 +1,13 @@
 # Changelog
 
+## [10.3.1](https://github.com/doublewordai/control-layer/compare/v10.3.0...v10.3.1) (2026-08-04)
+
+
+### Bug Fixes
+
+* missed a comp ([#1427](https://github.com/doublewordai/control-layer/issues/1427)) ([84b0be7](https://github.com/doublewordai/control-layer/commit/84b0be7c3c6a24c988c897520feb7d7d78ea5380))
+* pin Scalar docs renderer to a versioned, integrity-checked URL ([#1426](https://github.com/doublewordai/control-layer/issues/1426)) ([bbf3c24](https://github.com/doublewordai/control-layer/commit/bbf3c24323da982b2a9830090efb0619097f3a46))
+
 ## [10.3.0](https://github.com/doublewordai/control-layer/compare/v10.2.1...v10.3.0) (2026-08-04)
 
 
