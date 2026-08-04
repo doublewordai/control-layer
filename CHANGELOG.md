@@ -1,5 +1,12 @@
 # Changelog
 
+## [10.4.0](https://github.com/doublewordai/control-layer/compare/v10.3.1...v10.4.0) (2026-08-04)
+
+
+### Features
+
+* **organizations:** replace silent domain auto-join with join requests ([#1431](https://github.com/doublewordai/control-layer/issues/1431)) ([c64b8da](https://github.com/doublewordai/control-layer/commit/c64b8da0de4f75df8f26c6b572540c19b979a801))
+
 ## [10.3.1](https://github.com/doublewordai/control-layer/compare/v10.3.0...v10.3.1) (2026-08-04)
 
 
