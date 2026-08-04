@@ -984,7 +984,7 @@ pub async fn list_join_requests<P: PoolProvider>(
     ),
     request_body(content = ApproveJoinRequestRequest, description = "Optional role to grant; defaults to 'member'"),
     responses(
-        (status = 200, description = "Request approved"),
+        (status = 204, description = "Request approved"),
         (status = 403, description = "Forbidden"),
         (status = 404, description = "Join request not found"),
     ),

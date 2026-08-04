@@ -731,8 +731,6 @@ impl<'c> Organizations<'c> {
         Ok(row.into())
     }
 
-    /// Cancel (delete) a pending invite by row ID
-    #[instrument(skip(self), fields(org_id = %abbrev_uuid(&org_id), invite_id = %abbrev_uuid(&invite_id)), err)]
     /// Re-issue a pending invite: new token, fresh expiry.
     ///
     /// The original token is only stored as a hash, so it can't be recovered to
@@ -768,6 +766,8 @@ impl<'c> Organizations<'c> {
         Ok(row.and_then(|r| r.invite_email.map(|email| (email, r.role))))
     }
 
+    /// Cancel (delete) a pending invite by row ID
+    #[instrument(skip(self), fields(org_id = %abbrev_uuid(&org_id), invite_id = %abbrev_uuid(&invite_id)), err)]
     pub async fn cancel_invite(&mut self, org_id: UserId, invite_id: UserId) -> Result<bool> {
         let result = sqlx::query!(
             "DELETE FROM user_organizations WHERE id = $1 AND organization_id = $2 AND status = 'pending'",
