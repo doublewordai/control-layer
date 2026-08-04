@@ -879,8 +879,7 @@ impl PaymentProvider for StripeProvider {
         use stripe::{IdempotencyKey, RequestStrategy, StripeRequest};
         use stripe_billing::invoice_item::CreateInvoiceItem;
 
-        let idem = IdempotencyKey::new(idempotency_key.to_string())
-            .map_err(|e| PaymentError::InvalidData(format!("Invalid idempotency key: {e}")))?;
+        let idem = IdempotencyKey::new(idempotency_key).map_err(|e| PaymentError::InvalidData(format!("Invalid idempotency key: {e}")))?;
 
         // Deliberately a *pending* invoice item: no `invoice` field, so Stripe
         // parks it on the customer and sweeps it onto their next invoice rather
