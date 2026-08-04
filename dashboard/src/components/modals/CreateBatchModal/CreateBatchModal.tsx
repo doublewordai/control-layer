@@ -110,15 +110,14 @@ export function CreateBatchModal({
     { limit: 100 },
   );
 
-  // Only realtime/platform keys are usable for batch attribution, and the
-  // dropdown offers ONLY the caller's own keys — for managers too. Admins can
+  // Inference (realtime) keys only — batches are inference, so platform keys
+  // would muddy the picker even though the server accepts them as billing
+  // anchors. And ONLY the caller's own keys — for managers too: admins can
   // MANAGE other members' keys (cap, rotate, delete), but billing a batch to
   // someone else's key is a confusing non-standard flow we deliberately don't
   // surface; the server would allow it for managers, the UI doesn't offer it.
   const selectableApiKeys = (apiKeysResponse?.data || []).filter(
-    (key) =>
-      (key.purpose === "realtime" || key.purpose === "platform") &&
-      key.created_by === currentUser?.id,
+    (key) => key.purpose === "realtime" && key.created_by === currentUser?.id,
   );
 
   // Members without the key-management capability must bill one of their
