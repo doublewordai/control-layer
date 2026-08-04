@@ -18,6 +18,10 @@ use crate::{
 #[cfg(test)]
 use crate::payment_providers::AutoTopupDeclineKind;
 
+/// Marks a dummy session as setup-mode (card verification, no charge), standing
+/// in for Stripe's `CheckoutSessionMode::Setup`.
+const DUMMY_SETUP_SESSION_PREFIX: &str = "dummy_setup_";
+
 /// Dummy payment provider that adds credits automatically
 pub struct DummyProvider {
     config: crate::config::DummyConfig,
@@ -107,6 +111,38 @@ impl PaymentProvider for DummyProvider {
             }
         }
 
+        // Setup-mode sessions carry their own prefix, mirroring the Stripe
+        // provider's dispatch on `CheckoutSessionMode`.
+        if let Some(rest) = session_id.strip_prefix(DUMMY_SETUP_SESSION_PREFIX) {
+            let target_id: crate::types::UserId = rest
+                .split('_')
+                .next()
+                .unwrap_or_default()
+                .parse()
+                .map_err(|e| PaymentError::InvalidData(format!("Invalid dummy setup target user ID: {}", e)))?;
+
+            {
+                let mut users = crate::db::handlers::users::Users::new(&mut conn);
+                if users.get_by_id(target_id).await?.is_none() {
+                    return Err(PaymentError::InvalidData("Setup session target user not found".to_string()));
+                }
+                users
+                    .set_payment_provider_id_if_empty(target_id, &format!("dummy_cus_{}", target_id))
+                    .await?;
+                users.set_verified(target_id).await?;
+            }
+
+            if let Err(e) = Credits::new(&mut conn)
+                .grant_verification_credits(credits_config.verification_credits, target_id, session_id)
+                .await
+            {
+                tracing::error!(session_id, target_id = %target_id, error = %e, "Verification credits grant failed");
+            }
+
+            tracing::info!("Successfully fulfilled dummy setup session {} for user {}", session_id, target_id);
+            return Ok(());
+        }
+
         // Get payment session details to extract user_id
         let payment_session = self.get_payment_session(session_id).await?;
 
@@ -185,6 +221,13 @@ impl PaymentProvider for DummyProvider {
     async fn process_webhook_event(&self, _db_pool: &PgPool, _event: &WebhookEvent, _credits_config: &CreditsConfig) -> Result<()> {
         // Dummy provider doesn't use webhooks
         Ok(())
+    }
+
+    async fn create_setup_checkout_session(&self, payer: &CheckoutPayer, _cancel_url: &str, success_url: &str) -> Result<String> {
+        // Distinct prefix from the payment/auto-topup sessions so
+        // `process_payment_session` can dispatch on it.
+        let session_id = format!("{}{}_{}", DUMMY_SETUP_SESSION_PREFIX, payer.id, uuid::Uuid::new_v4());
+        Ok(success_url.replace("{CHECKOUT_SESSION_ID}", &session_id))
     }
 
     async fn create_auto_topup_checkout_session(&self, payer: &CheckoutPayer, _cancel_url: &str, success_url: &str) -> Result<String> {

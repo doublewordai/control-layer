@@ -1483,6 +1483,14 @@ mod tests {
         async fn create_billing_portal_session(&self, _: &str, _: &str) -> crate::payment_providers::Result<String> {
             unimplemented!("not called by process_auto_topups")
         }
+        async fn create_setup_checkout_session(
+            &self,
+            _: &crate::payment_providers::CheckoutPayer,
+            _: &str,
+            _: &str,
+        ) -> crate::payment_providers::Result<String> {
+            unimplemented!("not called by process_auto_topups")
+        }
         async fn create_auto_topup_checkout_session(
             &self,
             _: &crate::payment_providers::CheckoutPayer,

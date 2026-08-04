@@ -146,6 +146,15 @@ pub struct UserResponse {
     pub auto_topup_monthly_limit: Option<f32>,
     /// User type: 'individual' or 'organization'
     pub user_type: String,
+    /// Whether this account has proven a real payment method — either a
+    /// completed purchase or a setup-mode card verification
+    /// (`POST /payments/setup`). Distinct from `has_payment_provider_id`,
+    /// which only says a customer record exists at the provider and is true
+    /// even for a customer created just to collect a billing address.
+    ///
+    /// Clients gating a capability on "this account can pay" (the onboarding
+    /// ZDR step, for one) should read this, not `has_payment_provider_id`.
+    pub verified: bool,
     /// Account-wide zero-data-retention flag.
     pub zero_data_retention: bool,
     /// Organizations this user belongs to (only included if `include=organizations` is specified)
@@ -255,6 +264,7 @@ impl From<UserDBResponse> for UserResponse {
             has_auto_topup_payment_method: db.payment_provider_id.as_ref().is_some_and(|s| !s.is_empty()),
             auto_topup_monthly_limit: db.auto_topup_monthly_limit,
             user_type: db.user_type,
+            verified: db.verified,
             zero_data_retention: db.zero_data_retention,
             organizations: None,
             active_organization_id: None,

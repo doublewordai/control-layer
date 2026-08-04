@@ -147,6 +147,7 @@ impl From<(Vec<Role>, User)> for UserDBResponse {
             auto_topup_threshold: user.auto_topup_threshold,
             auto_topup_monthly_limit: user.auto_topup_monthly_limit,
             user_type: user.user_type,
+            verified: user.verified,
             zero_data_retention: user.zero_data_retention,
         }
     }
