@@ -199,9 +199,16 @@ async fn try_proxy_header_auth<P: sqlx_pool_router::PoolProvider + Clone + Send 
                         let mut org_repo = Organizations::new(&mut tx);
                         match org_repo.find_by_domain(domain).await {
                             Ok(Some(org)) => {
-                                // Org exists — add user as member
-                                if let Err(e) = org_repo.add_member(org.id, user.id, "member").await {
-                                    tracing::warn!("Failed to auto-add user to org {}: {e}", domain);
+                                // Org exists — ask to join rather than joining.
+                                //
+                                // This used to call `add_member` directly, so anyone who
+                                // could receive mail at a company's domain landed inside
+                                // the organization that owns its billing account, with no
+                                // approval and no notice to either side. Now an owner or
+                                // admin decides. Sharing an email domain is evidence that
+                                // someone probably belongs, not that they do.
+                                if let Err(e) = org_repo.create_join_request(org.id, user.id).await {
+                                    tracing::warn!("Failed to record join request for org {}: {e}", domain);
                                 }
                             }
                             Ok(None) => {
@@ -1771,18 +1778,22 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn test_proxy_header_signup_joins_existing_org(pool: PgPool) {
+    /// Sharing an email domain gets you a request, not a membership.
+    ///
+    /// This used to add the second user straight in as a member. Anyone who
+    /// could receive mail at a company's domain landed inside the organization
+    /// that owns its billing account, with nobody asked and nobody told.
+    async fn test_proxy_header_signup_requests_to_join_existing_org(pool: PgPool) {
         let mut config = create_test_config();
         config.auth.proxy_header.enabled = true;
         config.auth.proxy_header.auto_create_users = true;
 
         let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
 
-        // First user creates the org
+        // First user still claims the unclaimed domain and owns the org.
         let mut parts1 = create_test_parts_with_auth("auth0|first", "first@widgets.io");
         let first = CurrentUser::from_request_parts(&mut parts1, &state).await.unwrap();
 
-        // Second user from same domain should auto-join
         let mut parts2 = create_test_parts_with_auth("auth0|second", "second@widgets.io");
         let second = CurrentUser::from_request_parts(&mut parts2, &state).await.unwrap();
 
@@ -1790,12 +1801,55 @@ mod tests {
         let mut org_repo = Organizations::new(&mut conn);
         let org = org_repo.find_by_domain("widgets.io").await.unwrap().unwrap();
 
-        // First user is owner, second is member
-        let first_role = org_repo.get_user_org_role(first.id, org.id).await.unwrap();
-        assert_eq!(first_role, Some("owner".to_string()));
+        assert_eq!(
+            org_repo.get_user_org_role(first.id, org.id).await.unwrap(),
+            Some("owner".to_string())
+        );
 
-        let second_role = org_repo.get_user_org_role(second.id, org.id).await.unwrap();
-        assert_eq!(second_role, Some("member".to_string()));
+        // The second user is NOT a member - `get_user_org_role` only counts
+        // active memberships, so this is the check that would have failed
+        // before the change.
+        assert_eq!(
+            org_repo.get_user_org_role(second.id, org.id).await.unwrap(),
+            None,
+            "sharing a domain must not grant membership"
+        );
+
+        // They're waiting in the queue instead.
+        let requests = org_repo.list_join_requests(org.id).await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].user_id, Some(second.id));
+        assert_eq!(requests[0].status, "requested");
+
+        // And the queue doesn't leak into the members list.
+        let members = org_repo.list_members(org.id).await.unwrap();
+        assert_eq!(members.len(), 1, "only the owner is a member");
+        assert_eq!(members[0].user_id, Some(first.id));
+    }
+
+    /// Logging in repeatedly must not pile up duplicate requests.
+    #[sqlx::test]
+    async fn test_proxy_header_repeat_login_does_not_duplicate_join_request(pool: PgPool) {
+        let mut config = create_test_config();
+        config.auth.proxy_header.enabled = true;
+        config.auth.proxy_header.auto_create_users = true;
+
+        let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
+
+        let mut owner_parts = create_test_parts_with_auth("auth0|owner", "owner@widgets.io");
+        CurrentUser::from_request_parts(&mut owner_parts, &state).await.unwrap();
+
+        for i in 0..3 {
+            let mut parts = create_test_parts_with_auth("auth0|joiner", "joiner@widgets.io");
+            CurrentUser::from_request_parts(&mut parts, &state)
+                .await
+                .unwrap_or_else(|_| panic!("login {i} should succeed"));
+        }
+
+        let mut conn = pool.acquire().await.unwrap();
+        let mut org_repo = Organizations::new(&mut conn);
+        let org = org_repo.find_by_domain("widgets.io").await.unwrap().unwrap();
+        assert_eq!(org_repo.list_join_requests(org.id).await.unwrap().len(), 1);
     }
 
     #[sqlx::test]

@@ -1422,6 +1422,24 @@ pub async fn build_router(
             delete(api::handlers::organizations::cancel_invite),
         )
         .route(
+            "/organizations/{id}/invites/{invite_id}/resend",
+            post(api::handlers::organizations::resend_invite),
+        )
+        // Join requests: the mirror of invites, for users asking to join an
+        // organization that matches their email domain.
+        .route(
+            "/organizations/{id}/join-requests",
+            get(api::handlers::organizations::list_join_requests),
+        )
+        .route(
+            "/organizations/{id}/join-requests/{request_id}/approve",
+            post(api::handlers::organizations::approve_join_request),
+        )
+        .route(
+            "/organizations/{id}/join-requests/{request_id}/decline",
+            post(api::handlers::organizations::decline_join_request),
+        )
+        .route(
             "/organizations/invites/{token}",
             get(api::handlers::organizations::get_invite_details),
         )
