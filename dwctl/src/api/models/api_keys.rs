@@ -143,6 +143,15 @@ pub struct ApiKeyInfoResponse {
     pub resets_at: Option<DateTime<Utc>>,
 }
 
+/// Response carrying an API key's secret — returned ONLY by the dedicated
+/// secret-fetch and rotate endpoints (never by list/get), so every exposure
+/// of a secret is an explicit, audited event.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ApiKeySecretResponse {
+    /// The API key secret.
+    pub key: String,
+}
+
 #[derive(Debug, Deserialize, IntoParams, ToSchema)]
 pub struct ListApiKeysQuery {
     /// Pagination parameters

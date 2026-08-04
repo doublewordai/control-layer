@@ -313,6 +313,14 @@ pub struct CreateFlexInput {
     pub api_key: String,
     /// User/org ID that owns this request.
     pub created_by: String,
+    /// Provenance for the dispatched request, stored on the template.
+    ///
+    /// The batchless equivalent of `BatchInput::metadata`: keys named in the
+    /// daemon's `batch_metadata_fields` are replayed onto the dispatched request
+    /// as `x-fusillade-batch-<key>` headers. A flex request is dispatched long
+    /// after the caller submitted it, over a client that sends no User-Agent, so
+    /// this is the only way anything about the submitter reaches the far side.
+    pub metadata: Option<serde_json::Value>,
 }
 
 /// Input for creating a background response that the daemon will process only
@@ -338,6 +346,9 @@ pub struct CreateBackgroundInput {
     pub api_key: String,
     /// User/org ID that owns this request.
     pub created_by: String,
+    /// Provenance for the dispatched request, stored on the template. See
+    /// [`CreateFlexInput::metadata`].
+    pub metadata: Option<serde_json::Value>,
 }
 
 /// Result of a paginated request list query.
@@ -369,6 +380,7 @@ mod background_tests {
             path: "/v1/responses".to_string(),
             api_key: "test-key".to_string(),
             created_by: "user-a".to_string(),
+            metadata: None,
         };
 
         assert_eq!(input.request_id, request_id);

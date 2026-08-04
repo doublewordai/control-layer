@@ -225,8 +225,19 @@ pub async fn get_user<P: PoolProvider>(
         }
     };
 
-    // Use read replica for this read-only operation
-    let mut pool_conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
+    // Primary pool, not the replica, despite being a read.
+    //
+    // Clients chain writes here straight into a re-read: finishing checkout
+    // (`PATCH /payments/{id}`) sets `verified` and the payment-provider id on
+    // the primary, then the SPA immediately refetches this endpoint to decide
+    // whether the account earned zero data retention. Served from a lagging
+    // replica that read returns `verified: false` for a user who just verified
+    // a card, and the compliance choice is silently dropped — the exact
+    // inter-endpoint consistency trap called out in CLAUDE.md.
+    //
+    // Costs the primary a single-row primary-key lookup. `list_users` still
+    // uses the replica: nothing chains a write into a list view.
+    let mut pool_conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
     let mut repo = Users::new(&mut pool_conn);
 
     let user = repo.get_by_id(target_user_id).await?.ok_or_else(|| Error::NotFound {
@@ -259,6 +270,7 @@ pub async fn get_user<P: PoolProvider>(
     if query.include.as_deref().is_some_and(|includes| includes.contains("organizations")) {
         let mut org_repo = Organizations::new(&mut pool_conn);
         let memberships = org_repo.list_user_organizations(target_user_id).await?;
+        let manage_keys_orgs = org_repo.user_manage_keys_org_ids(target_user_id).await?;
 
         let org_ids: Vec<UserId> = memberships.iter().map(|m| m.organization_id).collect();
         if !org_ids.is_empty() {
@@ -273,6 +285,7 @@ pub async fn get_user<P: PoolProvider>(
                         .map(|org| crate::api::models::organizations::OrganizationSummary {
                             id: m.organization_id,
                             name: org.display_name.clone().unwrap_or_else(|| org.username.clone()),
+                            can_manage_keys: matches!(m.role.as_str(), "owner" | "admin") || manage_keys_orgs.contains(&m.organization_id),
                             role: m.role.clone(),
                             zero_data_retention: org.zero_data_retention,
                         })
@@ -644,6 +657,71 @@ mod tests {
         assert_eq!(current_user.id, user.id);
         assert_eq!(current_user.email, user.email);
         assert_eq!(current_user.roles, user.roles);
+        assert!(!current_user.verified, "a fresh account has not proven a payment method");
+    }
+
+    /// `verified` has to reach the client, not just the database: the onboarding
+    /// ZDR gate reads it off `/users/current` to decide whether the account may
+    /// turn on zero data retention.
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_current_user_reports_verified_once_set(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user(&pool, Role::StandardUser).await;
+
+        let fetch_verified = async |app: &axum_test::TestServer| -> bool {
+            let response = app
+                .get("/admin/api/v1/users/current")
+                .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+                .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+                .await;
+            response.assert_status_ok();
+            response.json::<UserResponse>().verified
+        };
+
+        assert!(!fetch_verified(&app).await, "starts unverified");
+
+        // The same call the Stripe payment and card-verification paths make.
+        let mut conn = pool.acquire().await.unwrap();
+        crate::db::handlers::users::Users::new(&mut conn)
+            .set_verified(user.id)
+            .await
+            .unwrap();
+        drop(conn);
+
+        assert!(fetch_verified(&app).await, "verification is visible to the client");
+    }
+
+    /// `TestDbPools` backs `.read()` with a genuinely read-only replica handle,
+    /// so a handler serving `verified` off the replica can hand back a stale
+    /// value the instant after checkout writes it. The onboarding ZDR gate
+    /// reads this endpoint immediately after `PATCH /payments/{id}` returns, so
+    /// it has to be read-after-write consistent, not eventually consistent.
+    ///
+    /// Deliberately no polling or retry: the very next read must already see it.
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_current_user_verified_is_read_after_write_consistent(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user(&pool, Role::StandardUser).await;
+
+        let mut conn = pool.acquire().await.unwrap();
+        crate::db::handlers::users::Users::new(&mut conn)
+            .set_verified(user.id)
+            .await
+            .unwrap();
+        drop(conn);
+
+        let response = app
+            .get("/admin/api/v1/users/current")
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        response.assert_status_ok();
+        assert!(
+            response.json::<UserResponse>().verified,
+            "a read immediately after set_verified must not be served stale"
+        );
     }
 
     #[sqlx::test]

@@ -114,6 +114,10 @@ pub struct ApiKeyDBResponse {
     /// Set only on hidden cap-scope child keys; see migration 122. Spend
     /// accounting/enforcement group by COALESCE(parent_api_key_id, id).
     pub parent_api_key_id: Option<ApiKeyId>,
+    /// System-managed internal key (shared batch/playground keys and cap-scope
+    /// children). Handlers must never expose, mutate, or select hidden keys —
+    /// `get_by_id` returns them, so every user-facing path filters on this.
+    pub hidden: bool,
 }
 
 /// Spend display state for one cap scope (read from `api_key_spend_checkpoints`

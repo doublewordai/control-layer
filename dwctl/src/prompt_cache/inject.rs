@@ -1,7 +1,7 @@
 //! OpenAI-shaped request sanitisation and response usage injection,
 //! relocated into dwctl for the dwctl-owned cache layer.
 //!
-//! Two jobs, both run by the cache tower layer (only when a cacheable request is
+//! Three jobs, all run by the cache tower layer (only when a cacheable request is
 //! classified):
 //!
 //! 1. **Outbound request sanitisation** ([`strip_cache_control`]): remove `cache_control`
@@ -9,12 +9,16 @@
 //!    tool objects) — NOT recursively — and ensure
 //!    `stream_options.include_usage = true` so a streaming response carries a terminal
 //!    usage frame to edit. Markers are a billing signal consumed here, not forwarded.
-//! 2. **Response usage injection**: splice the neutral [`CacheStats`] into the OpenAI `usage`
-//!    object — `prompt_tokens_details.cached_tokens` plus the doubleword extension fields.
-//!    Non-streaming ([`inject_into_response_nonstreaming`]) buffers + edits the JSON body;
-//!    streaming ([`scan_inject_sse`]) edits *only* the terminal usage frame before `[DONE]`,
-//!    never buffering the whole stream (the cache layer drives it so the classify-await is
-//!    deferred to that frame and never holds the first token).
+//! 2. **Response usage injection** (active requests): splice the neutral [`CacheStats`] into the
+//!    OpenAI `usage` object — `prompt_tokens_details.cached_tokens` plus the doubleword
+//!    extension fields. Non-streaming ([`inject_into_response_nonstreaming`]) buffers + edits
+//!    the JSON body; streaming ([`scan_edit_sse`]) edits *only* the terminal usage frame before
+//!    `[DONE]`, never buffering the whole stream (the cache layer drives it so the
+//!    classify-await is deferred to that frame and never holds the first token).
+//! 3. **Provider cache-field scrubbing** (inactive requests): remove the upstream's own cache
+//!    accounting ([`scrub_provider_cache_fields`]) so customers only ever see cache numbers this
+//!    module wrote — i.e. numbers billing actually charged. Injection scrubs implicitly (it
+//!    overwrites the same fields and deletes the rest).
 
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -147,6 +151,58 @@ pub fn strip_cache_control(body: &[u8], telemetry: &TelemetryPolicy) -> (Option<
     (body, had_markers)
 }
 
+/// Provider-written cache-accounting fields that must never reach a customer. The customer-visible
+/// cache numbers are written by this module from what billing charges; an upstream's own cache
+/// accounting (DeepSeek's `prompt_cache_{hit,miss}_tokens`, an Anthropic-style upstream's
+/// `cache_read_input_tokens`/`cache_creation*`, OpenRouter's `cache_discount`) reflects *their*
+/// cache, not our billing — a customer reading it would reasonably conclude they got a discount
+/// we didn't give. (`prompt_tokens_details.cached_tokens` is handled separately: zeroed, not
+/// removed, because it's part of the standard OpenAI usage shape.)
+const PROVIDER_CACHE_FIELDS: [&str; 6] = [
+    "cache_read_input_tokens",
+    "cache_creation_input_tokens",
+    "cache_creation",
+    "prompt_cache_hit_tokens",
+    "prompt_cache_miss_tokens",
+    "cache_discount",
+];
+
+/// Remove provider-written cache accounting from a `usage` object in place: extension fields are
+/// deleted outright, `prompt_tokens_details.cached_tokens` is zeroed (deleting it would be a
+/// schema change — OpenAI always emits it, cached or not). Returns whether anything changed so
+/// callers can skip re-serializing bodies that were already clean.
+pub(crate) fn scrub_provider_cache_fields(usage: &mut serde_json::Map<String, Value>) -> bool {
+    let mut changed = false;
+    for key in PROVIDER_CACHE_FIELDS {
+        changed |= usage.remove(key).is_some();
+    }
+    // Any present value that isn't already the canonical integer 0 gets overwritten — including
+    // non-numeric shapes (string/float), for which `as_u64()` is `None` and the `!= Some(0)`
+    // guard passes. The guard exists only to avoid re-serializing already-clean bodies.
+    if let Some(cached) = usage
+        .get_mut("prompt_tokens_details")
+        .and_then(Value::as_object_mut)
+        .and_then(|d| d.get_mut("cached_tokens"))
+        && cached.as_u64() != Some(0)
+    {
+        *cached = serde_json::json!(0);
+        changed = true;
+    }
+    changed
+}
+
+/// Scrub provider cache fields from a non-streaming chat-completion JSON body. Returns the
+/// rewritten body, or `None` when nothing needed to change (not JSON, no `usage` object, or the
+/// usage was already clean).
+pub fn scrub_usage_json(body: &[u8]) -> Option<Bytes> {
+    let mut json: Value = serde_json::from_slice(body).ok()?;
+    let usage = json.as_object_mut()?.get_mut("usage")?.as_object_mut()?;
+    if !scrub_provider_cache_fields(usage) {
+        return None;
+    }
+    serde_json::to_vec(&json).ok().map(Bytes::from)
+}
+
 /// Splice the OpenAI-shaped cache fields into a `usage` object in place.
 /// `prompt_tokens` is left as the full input count; only the cache breakdown is added.
 ///
@@ -160,6 +216,10 @@ pub fn strip_cache_control(body: &[u8], telemetry: &TelemetryPolicy) -> (Option<
 /// count to fit; write counts alone exceeding the prompt is corrupt and reports no cache
 /// activity at all — matching the list-price bill for that case.
 fn splice_cache_fields(usage: &mut serde_json::Map<String, Value>, stats: &CacheStats) {
+    // Scrub first so nothing an upstream reported (e.g. DeepSeek's `prompt_cache_hit_tokens`
+    // on an unsanitized model) survives alongside the fields we're about to write.
+    scrub_provider_cache_fields(usage);
+
     // Drift alarm (exact counting only): our chat-templated full-prompt count vs the
     // engine-reported prompt_tokens. This turns template parity from an assumption into a
     // per-request measurement — the alert that catches template drift between the
@@ -171,7 +231,6 @@ fn splice_cache_fields(usage: &mut serde_json::Map<String, Value>, stats: &Cache
             metrics::counter!("dwctl_cache_render_drift_exceeded_total").increment(1);
         }
     }
-
     let creations = stats.creation_total();
     let mut read = stats.read;
     let (mut c5, mut c1, mut c24) = (stats.creation_5m, stats.creation_1h, stats.creation_24h);
@@ -221,10 +280,23 @@ pub(crate) struct SseScan {
     pub saw_usage: bool,
 }
 
-/// Scan an SSE body for error/usage frames and, unless `already_edited`, inject the cache
-/// fields into the first usage frame found. Editing touches only that one frame; every
-/// other line (deltas, `[DONE]`) is preserved byte-for-byte. Assumes uncompressed UTF-8
-/// `text/event-stream`; non-UTF-8 bodies are a graceful no-op (no scan, no edit).
+/// How [`scan_edit_sse`] treats the (single) usage frame it finds.
+#[derive(Clone, Copy)]
+pub(crate) enum UsageEdit<'a> {
+    /// Collect the billing signals only, never rewrite — used by the streaming layer to probe
+    /// frames before/after the one it edits.
+    Probe,
+    /// Splice the caching module's stats into the usage frame (active, cache-enabled request).
+    Inject(&'a CacheStats),
+    /// Remove provider-written cache fields from the usage frame (inactive request — the
+    /// customer must not see an upstream's own cache accounting).
+    Scrub,
+}
+
+/// Scan an SSE body for error/usage frames and apply `edit` to the first usage frame found.
+/// Editing touches only that one frame; every other line (deltas, `[DONE]`) is preserved
+/// byte-for-byte. Assumes uncompressed UTF-8 `text/event-stream`; non-UTF-8 bodies are a
+/// graceful no-op (no scan, no edit).
 ///
 /// Each `data:` line is parsed as a complete JSON object. The SSE spec permits one object
 /// to span several `data:` lines (joined by `\n`), but every OpenAI-compatible
@@ -234,7 +306,7 @@ pub(crate) struct SseScan {
 /// billing's "found usage" must make the *same* call, or the cache could commit a write for
 /// a frame billing reads as zero. If a multi-line provider ever appears, both must learn to
 /// reassemble together — not this one alone.
-pub(crate) fn scan_inject_sse(body: &[u8], stats: &CacheStats, already_edited: bool) -> SseScan {
+pub(crate) fn scan_edit_sse(body: &[u8], edit: UsageEdit) -> SseScan {
     let Ok(body_str) = std::str::from_utf8(body) else {
         return SseScan {
             rewritten: None,
@@ -243,10 +315,10 @@ pub(crate) fn scan_inject_sse(body: &[u8], stats: &CacheStats, already_edited: b
         };
     };
 
-    // Fast path: the streaming layer probes every frame with `already_edited=true` purely to
-    // collect the commit-gate signals — it can never rewrite, so skip the output-buffer rebuild
+    // Fast path: the streaming layer probes every frame with `Probe` purely to collect the
+    // commit-gate signals — it can never rewrite, so skip the output-buffer rebuild
     // (an allocation + full-body copy per SSE frame otherwise).
-    if already_edited {
+    if matches!(edit, UsageEdit::Probe) {
         let mut saw_error = false;
         let mut saw_usage = false;
         for line in body_str.split('\n') {
@@ -289,8 +361,17 @@ pub(crate) fn scan_inject_sse(body: &[u8], stats: &CacheStats, already_edited: b
                     // (split on '\n') ends with '\r', which the reserialized JSON drops —
                     // re-append it so we don't emit a lone '\n' amid '\r\n' framing.
                     let has_cr = line.ends_with('\r');
-                    splice_cache_fields(usage_obj, stats);
-                    if let Ok(reserialized) = serde_json::to_string(&chunk) {
+                    let changed = match edit {
+                        // Probe returned on the fast path above; a frame can't reach here.
+                        UsageEdit::Probe => false,
+                        UsageEdit::Inject(stats) => {
+                            splice_cache_fields(usage_obj, stats);
+                            true
+                        }
+                        // A clean frame needs no rewrite — keep the original bytes.
+                        UsageEdit::Scrub => scrub_provider_cache_fields(usage_obj),
+                    };
+                    if changed && let Ok(reserialized) = serde_json::to_string(&chunk) {
                         out.push_str("data: ");
                         out.push_str(&reserialized);
                         if has_cr {
@@ -328,10 +409,16 @@ fn sse_data_json(line: &str) -> Option<Value> {
 }
 
 /// Inject the cache stats into the terminal usage frame of an SSE body. `None` if no usage
-/// frame is found. (Thin wrapper over [`scan_inject_sse`]; the streaming path uses the
+/// frame is found. (Thin wrapper over [`scan_edit_sse`]; the streaming path uses the
 /// scan directly to also collect the commit-gate signals.)
 pub fn inject_into_sse_body(body: &[u8], stats: &CacheStats) -> Option<Bytes> {
-    scan_inject_sse(body, stats, false).rewritten
+    scan_edit_sse(body, UsageEdit::Inject(stats)).rewritten
+}
+
+/// Scrub provider cache fields from the terminal usage frame of an SSE body. `None` when the
+/// frame was already clean (or no usage frame exists) — the stream passes through untouched.
+pub fn scrub_sse_body(body: &[u8]) -> Option<Bytes> {
+    scan_edit_sse(body, UsageEdit::Scrub).rewritten
 }
 
 /// Inject the cache stats into a **non-streaming** chat-completion JSON response. Buffers the
@@ -402,6 +489,62 @@ pub async fn inject_into_response_nonstreaming(response: Response, stats: &Cache
             (Response::from_parts(parts, axum::body::Body::from(body_bytes)), false)
         }
     }
+}
+
+/// Scrub provider cache fields from a **non-streaming** response on the inactive (cache-disabled)
+/// path. Same buffering/framing rules as [`inject_into_response_nonstreaming`], but the body is
+/// only rewritten when scrubbing actually changed it, and there is no billing gate — an inactive
+/// request never commits an index write. Non-2xx responses return unbuffered (onwards error
+/// envelopes carry no usage); non-completion JSON passes through (no `usage` object → nothing
+/// to scrub).
+pub async fn scrub_response_nonstreaming(response: Response) -> Response {
+    // Non-2xx bodies are onwards-shaped error envelopes (third-party error bodies are replaced
+    // before they reach this layer) — no usage to scrub, so skip the buffering entirely rather
+    // than risk masking an upstream failure with the body-read 500 below.
+    if !response.status().is_success() {
+        return response;
+    }
+    let is_json = response
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| {
+            v.split(';')
+                .next()
+                .map(str::trim)
+                .is_some_and(|ct| ct.eq_ignore_ascii_case("application/json"))
+        })
+        .unwrap_or(true);
+    if !is_json {
+        return response;
+    }
+    let (mut parts, body) = response.into_parts();
+    let body_bytes = match axum::body::to_bytes(body, usize::MAX).await {
+        Ok(b) => b,
+        Err(e) => {
+            error!("Failed to buffer response body for cache scrub: {}", e);
+            let err_body = serde_json::json!({
+                "error": {
+                    "message": format!("failed to read upstream response body: {e}"),
+                    "type": "internal_error",
+                    "code": "response_body_read_failed",
+                }
+            });
+            return (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(err_body)).into_response();
+        }
+    };
+
+    let rewritten = scrub_usage_json(&body_bytes);
+    if rewritten.is_some() {
+        // We emit plain JSON (parse succeeded), so drop any stale Content-Encoding.
+        parts.headers.remove(axum::http::header::CONTENT_ENCODING);
+    }
+    let body = rewritten.unwrap_or(body_bytes);
+    parts.headers.remove(axum::http::header::TRANSFER_ENCODING);
+    parts
+        .headers
+        .insert(axum::http::header::CONTENT_LENGTH, axum::http::HeaderValue::from(body.len() as u64));
+    Response::from_parts(parts, axum::body::Body::from(body))
 }
 
 #[cfg(test)]
@@ -743,5 +886,137 @@ mod tests {
         let collected = axum::body::to_bytes(out.into_body(), usize::MAX).await.unwrap();
         let s = std::str::from_utf8(&collected).unwrap();
         assert!(s.contains("\"cached_tokens\":1024"), "got: {s}");
+    }
+
+    #[test]
+    fn scrub_removes_provider_fields_and_zeroes_cached_tokens() {
+        // The kimi-k3 shape: OpenRouter reports its own implicit-cache hit on a model whose
+        // caching (and cache billing) is off — the customer must not see it. Extension fields
+        // from other provider dialects go too; non-cache detail (audio_tokens) survives.
+        let body = serde_json::json!({"usage":{
+            "prompt_tokens": 985,
+            "prompt_tokens_details": {"cached_tokens": 687, "audio_tokens": 3},
+            "prompt_cache_hit_tokens": 687,
+            "prompt_cache_miss_tokens": 298,
+            "cache_read_input_tokens": 687,
+            "cache_creation": {"ephemeral_5m_input_tokens": 10},
+            "cache_discount": 0.9
+        }})
+        .to_string();
+        let out = scrub_usage_json(body.as_bytes()).expect("dirty usage → rewritten");
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        let usage = v["usage"].as_object().unwrap();
+        assert_eq!(usage["prompt_tokens"], 985, "token totals untouched");
+        assert_eq!(usage["prompt_tokens_details"]["cached_tokens"], 0, "zeroed, not removed");
+        assert_eq!(usage["prompt_tokens_details"]["audio_tokens"], 3, "non-cache detail preserved");
+        for key in PROVIDER_CACHE_FIELDS {
+            assert!(!usage.contains_key(key), "{key} must be removed");
+        }
+    }
+
+    #[test]
+    fn scrub_none_when_usage_already_clean() {
+        // Already-clean bodies (incl. an explicit cached_tokens of 0, the standard OpenAI shape)
+        // must not be re-serialized — the original bytes pass through.
+        let body = serde_json::json!({"usage":{
+            "prompt_tokens": 100,
+            "prompt_tokens_details": {"cached_tokens": 0}
+        }})
+        .to_string();
+        assert!(scrub_usage_json(body.as_bytes()).is_none());
+        assert!(scrub_usage_json(br#"{"choices":[]}"#).is_none(), "no usage object → no-op");
+        assert!(scrub_usage_json(b"not json").is_none());
+    }
+
+    #[test]
+    fn inject_also_scrubs_provider_only_fields() {
+        // Active path: an unsanitized upstream's own cache dialect must not survive alongside
+        // the fields we write.
+        let body = serde_json::json!({"usage":{
+            "prompt_tokens": 2000,
+            "prompt_cache_hit_tokens": 500,
+            "cache_discount": 0.5
+        }})
+        .to_string();
+        let out = inject_into_usage_json(body.as_bytes(), &stats()).unwrap();
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        let usage = v["usage"].as_object().unwrap();
+        assert!(!usage.contains_key("prompt_cache_hit_tokens"));
+        assert!(!usage.contains_key("cache_discount"));
+        assert_eq!(usage["cache_read_input_tokens"], 1024, "our fields written");
+    }
+
+    #[test]
+    fn scrub_sse_zeroes_cached_tokens_in_terminal_frame() {
+        let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":985,\"prompt_tokens_details\":{\"cached_tokens\":687}}}\n\ndata: [DONE]\n\n";
+        let out = scrub_sse_body(sse.as_bytes()).expect("dirty usage frame → rewritten");
+        let s = std::str::from_utf8(&out).unwrap();
+        assert!(s.contains("\"cached_tokens\":0"), "got: {s}");
+        assert!(!s.contains("687"), "provider value gone, got: {s}");
+        assert!(
+            s.contains("data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}"),
+            "delta byte-identical"
+        );
+        assert!(s.contains("data: [DONE]"));
+    }
+
+    #[test]
+    fn scrub_sse_none_when_clean() {
+        // A clean terminal frame (or no usage frame at all) → no rewrite, stream passes through.
+        let clean = "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":100}}\n\ndata: [DONE]\n\n";
+        assert!(scrub_sse_body(clean.as_bytes()).is_none());
+        let no_usage = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n";
+        assert!(scrub_sse_body(no_usage.as_bytes()).is_none());
+    }
+
+    #[test]
+    fn scrub_zeroes_non_numeric_cached_tokens() {
+        // Defensive: a provider emitting cached_tokens as a string or float must still be
+        // scrubbed — `as_u64()` is None for those shapes, which takes the overwrite branch.
+        for weird in [serde_json::json!("687"), serde_json::json!(687.5)] {
+            let body = serde_json::json!({"usage":{"prompt_tokens_details":{"cached_tokens": weird}}}).to_string();
+            let out = scrub_usage_json(body.as_bytes()).expect("non-zero value → rewritten");
+            let v: Value = serde_json::from_slice(&out).unwrap();
+            assert_eq!(v["usage"]["prompt_tokens_details"]["cached_tokens"], 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn scrub_nonstreaming_passes_error_responses_through() {
+        use axum::body::Body;
+        // A non-2xx is an onwards error envelope — returned unbuffered, byte-identical.
+        let body = serde_json::json!({"error":{"message":"upstream failed"}}).to_string();
+        let resp = Response::builder()
+            .status(502)
+            .header("content-type", "application/json")
+            .body(Body::from(body.clone()))
+            .unwrap();
+        let out = scrub_response_nonstreaming(resp).await;
+        assert_eq!(out.status(), 502, "status preserved");
+        let collected = axum::body::to_bytes(out.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(collected, body.as_bytes(), "error body untouched");
+    }
+
+    #[tokio::test]
+    async fn scrub_nonstreaming_response_removes_provider_cache_fields() {
+        use axum::body::Body;
+        let resp = Response::builder()
+            .status(200)
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({"usage":{
+                    "prompt_tokens": 985,
+                    "prompt_tokens_details": {"cached_tokens": 687},
+                    "cache_read_input_tokens": 687
+                }})
+                .to_string(),
+            ))
+            .unwrap();
+        let out = scrub_response_nonstreaming(resp).await;
+        assert_eq!(out.status(), 200);
+        let collected = axum::body::to_bytes(out.into_body(), usize::MAX).await.unwrap();
+        let v: Value = serde_json::from_slice(&collected).unwrap();
+        assert_eq!(v["usage"]["prompt_tokens_details"]["cached_tokens"], 0);
+        assert!(!v["usage"].as_object().unwrap().contains_key("cache_read_input_tokens"));
     }
 }

@@ -491,6 +491,16 @@ async fn populate_org_context(user: &mut CurrentUser, parts: &Parts, db: &PgPool
 
     let mut org_repo = crate::db::handlers::Organizations::new(&mut conn);
 
+    // One query for the additive 'manage_keys' grants across all memberships;
+    // owners/admins hold the capability implicitly.
+    let manage_keys_orgs = match org_repo.user_manage_keys_org_ids(user.id).await {
+        Ok(ids) => ids,
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to load manage_keys org roles");
+            return;
+        }
+    };
+
     // Get the user's organization memberships
     match org_repo.list_user_organizations(user.id).await {
         Ok(memberships) => {
@@ -498,6 +508,7 @@ async fn populate_org_context(user: &mut CurrentUser, parts: &Parts, db: &PgPool
                 .into_iter()
                 .map(|m| crate::api::models::users::UserOrganizationContext {
                     id: m.organization_id,
+                    can_manage_keys: matches!(m.role.as_str(), "owner" | "admin") || manage_keys_orgs.contains(&m.organization_id),
                     name: String::new(), // Will be populated below
                     role: m.role,
                 })

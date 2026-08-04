@@ -105,6 +105,10 @@ pub struct UserDBResponse {
     pub auto_topup_monthly_limit: Option<f32>,
     /// User type: 'individual' or 'organization'
     pub user_type: String,
+    /// Whether this account has proven a real payment method (a completed
+    /// purchase or a setup-mode card verification). Drives the onwards
+    /// rate-limit tier.
+    pub verified: bool,
     /// Account-wide zero-data-retention flag.
     pub zero_data_retention: bool,
 }

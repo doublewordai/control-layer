@@ -1,5 +1,46 @@
 # Changelog
 
+## [10.3.0](https://github.com/doublewordai/control-layer/compare/v10.2.1...v10.3.0) (2026-08-04)
+
+
+### Features
+
+* **payments:** add setup-mode checkout for onboarding card verification ([#1421](https://github.com/doublewordai/control-layer/issues/1421)) ([aa18ac7](https://github.com/doublewordai/control-layer/commit/aa18ac72276edebe22f4da332bfb5ea7abc22107))
+* **users:** expose the verified flag on the user API ([#1423](https://github.com/doublewordai/control-layer/issues/1423)) ([15bcee2](https://github.com/doublewordai/control-layer/commit/15bcee2f30fa486bb2791096b758da9156822c8d))
+
+
+### Bug Fixes
+
+* **keystore:** enable TLS for Redis connections ([#1425](https://github.com/doublewordai/control-layer/issues/1425)) ([2d54147](https://github.com/doublewordai/control-layer/commit/2d54147ee2aedae80cf92a98c566014377e2b389))
+
+## [10.2.1](https://github.com/doublewordai/control-layer/compare/v10.2.0...v10.2.1) (2026-08-03)
+
+
+### Bug Fixes
+
+* PM org key view controls and batches error state ([#1419](https://github.com/doublewordai/control-layer/issues/1419)) ([744e035](https://github.com/doublewordai/control-layer/commit/744e035229546dbd86fdb66cd4487b2859c1ef0a))
+
+## [10.2.0](https://github.com/doublewordai/control-layer/compare/v10.1.0...v10.2.0) (2026-08-03)
+
+
+### Features
+
+* org key management (preview) ([#1381](https://github.com/doublewordai/control-layer/issues/1381)) ([124ad97](https://github.com/doublewordai/control-layer/commit/124ad97ce9e741a0afa0ce6819d8f237861296e4))
+
+
+### Bug Fixes
+
+* **fusillade:** add populate-duration histogram and unfrozen-termina… ([#1413](https://github.com/doublewordai/control-layer/issues/1413)) ([081f4d5](https://github.com/doublewordai/control-layer/commit/081f4d52644c8d2ad0c53b78b2e21927db306456))
+* scrub provider-written cache fields from inactive cache-layer re… ([#1411](https://github.com/doublewordai/control-layer/issues/1411)) ([85e5976](https://github.com/doublewordai/control-layer/commit/85e5976f81b71b702f189ae3c6b3040db6f7aa5e))
+
+## [10.1.0](https://github.com/doublewordai/control-layer/compare/v10.0.0...v10.1.0) (2026-07-31)
+
+
+### Features
+
+* attribute batch traffic to the client that submitted it ([#1410](https://github.com/doublewordai/control-layer/issues/1410)) ([2dde662](https://github.com/doublewordai/control-layer/commit/2dde6620ced2d283d1efffa376aa3a86dc7b66c0))
+* back off auto top-up card declines ([#1358](https://github.com/doublewordai/control-layer/issues/1358)) ([c1b26df](https://github.com/doublewordai/control-layer/commit/c1b26dfe1c3840e1f633709b195c673d5d2de335))
+
 ## [10.0.0](https://github.com/doublewordai/control-layer/compare/v9.3.0...v10.0.0) (2026-07-31)
 
 

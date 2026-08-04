@@ -470,6 +470,95 @@ pub async fn is_org_member(
     Ok(repo.get_user_org_role(current_user.id, target_user_id).await?.is_some())
 }
 
+/// Resolved key-management capabilities of `current_user` acting on keys
+/// owned by `target_user_id` (a personal account or an organization).
+///
+/// This is the single place the ownership rule lives (see
+/// working-docs/api-keys/org-key-management-plan.md): edit rights follow
+/// creation rights, and creation rights in an org are the per-membership
+/// additive `manage_keys` role (organization_member_roles). Owners/admins
+/// and personal accounts hold that role implicitly. PlatformManager checks
+/// remain the caller's concern (PMs bypass everything via the existing
+/// can_*_all helpers).
+#[derive(Debug, Clone, Copy)]
+pub struct KeyCapabilities {
+    /// Target is an organization (vs a personal account).
+    pub target_is_org: bool,
+    /// current_user is an owner/admin of the target org.
+    pub is_org_manager: bool,
+    /// current_user's membership carries the `manage_keys` org role. Always
+    /// false for personal targets and non-members (both are covered by the
+    /// implicit grants in [`Self::can_self_manage_keys`]).
+    pub has_manage_keys_role: bool,
+}
+
+impl KeyCapabilities {
+    /// May the user create keys of their own under this target?
+    /// (Also gates editing/capping/deleting keys they created — ownership
+    /// follows creation. Members WITHOUT the grant hold issued keys: they can
+    /// view and ROTATE them — rotation doubles as secret recovery — but not
+    /// create, re-cap, or delete.)
+    pub fn can_self_manage_keys(&self) -> bool {
+        !self.target_is_org || self.is_org_manager || self.has_manage_keys_role
+    }
+
+    /// Must a dashboard-created batch for this target select an API key?
+    /// (Members without key-creation rights have no implicit key to bill, so
+    /// their UI batches must name an issued key; org managers are exempt —
+    /// unkeyed admin batches are their prerogative.)
+    pub fn requires_batch_key_selection(&self) -> bool {
+        self.target_is_org && !self.is_org_manager && !self.has_manage_keys_role
+    }
+}
+
+/// Resolve `KeyCapabilities` in one round trip: target's type joined with the
+/// caller's membership role and org-scoped role grants.
+pub async fn resolve_key_capabilities(
+    current_user: &CurrentUser,
+    target_user_id: UserId,
+    db: &mut sqlx::PgConnection,
+) -> std::result::Result<KeyCapabilities, crate::db::errors::DbError> {
+    let row = sqlx::query!(
+        r#"
+        SELECT u.user_type AS "user_type!",
+               uo.role AS "role?",
+               EXISTS(
+                   SELECT 1 FROM organization_member_roles omr
+                   WHERE omr.user_organization_id = uo.id AND omr.role = 'manage_keys'
+               ) AS "has_manage_keys!"
+        FROM users u
+        LEFT JOIN user_organizations uo
+               ON uo.organization_id = u.id
+              AND uo.user_id = $2
+              AND uo.status = 'active'
+        WHERE u.id = $1
+        "#,
+        target_user_id,
+        current_user.id
+    )
+    .fetch_optional(&mut *db)
+    .await?;
+
+    let Some(row) = row else {
+        // Unknown target: no capabilities; callers' existing permission
+        // checks will reject before this matters.
+        return Ok(KeyCapabilities {
+            target_is_org: false,
+            is_org_manager: false,
+            has_manage_keys_role: false,
+        });
+    };
+
+    let target_is_org = row.user_type == "organization";
+    let is_org_manager = target_is_org && matches!(row.role.as_deref(), Some("owner") | Some("admin"));
+
+    Ok(KeyCapabilities {
+        target_is_org,
+        is_org_manager,
+        has_manage_keys_role: target_is_org && row.has_manage_keys,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

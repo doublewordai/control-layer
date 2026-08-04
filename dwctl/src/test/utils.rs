@@ -498,6 +498,7 @@ pub async fn get_system_user(pool: &mut PgConnection) -> UserResponse {
         has_auto_topup_payment_method: false,
         auto_topup_monthly_limit: None,
         user_type: "individual".to_string(),
+        verified: false,
         zero_data_retention: false,
         organizations: None,
         active_organization_id: None,
@@ -687,6 +688,7 @@ pub async fn create_test_org(pool: &PgPool, created_by: UserId) -> UserResponse 
         has_auto_topup_payment_method: false,
         auto_topup_monthly_limit: None,
         user_type: org.user_type,
+        verified: org.verified,
         zero_data_retention: org.zero_data_retention,
         organizations: None,
         active_organization_id: None,
@@ -700,7 +702,16 @@ pub async fn add_org_member(pool: &PgPool, org_id: UserId, user_id: UserId, role
 
     let mut conn = pool.acquire().await.expect("Failed to acquire connection");
     let mut orgs = Organizations::new(&mut conn);
-    orgs.add_member(org_id, user_id, role).await.expect("Failed to add org member");
+    let membership = orgs.add_member(org_id, user_id, role).await.expect("Failed to add org member");
+    // Mirror the migration-128 backfill (existing members keep self-serve):
+    // plain members get the additive 'manage_keys' org role unless a test
+    // revokes it explicitly. NOTE: the API-layer default for NEW members is
+    // the opposite (deny) — tests exercising that path go through the API.
+    if role == "member" {
+        orgs.set_membership_manage_keys(membership.id, true)
+            .await
+            .expect("Failed to grant manage_keys");
+    }
 }
 
 pub async fn create_test_model(pool: &PgPool, model_name: &str, alias: &str, endpoint_id: uuid::Uuid, created_by: UserId) -> uuid::Uuid {

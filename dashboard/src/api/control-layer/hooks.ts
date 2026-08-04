@@ -767,6 +767,31 @@ export function useDeleteApiKey() {
 }
 
 // Requests hooks
+/**
+ * Rotate an API key's secret in place. Returns the new secret; the key's id,
+ * usage limit, and counted spend are unchanged. In-flight batches keep
+ * running on their execution key — cancel them separately if the old secret
+ * was compromised.
+ */
+export function useRotateApiKey() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: ({
+      keyId,
+      userId = "current",
+    }: {
+      keyId: string;
+      userId?: string;
+    }) => dwctlApi.users.apiKeys.rotate(keyId, userId),
+    onSuccess: () => {
+      queryClient.invalidateQueries({
+        queryKey: queryKeys.apiKeys.all,
+      });
+    },
+  });
+}
+
 export function useRequests(
   options?: ListRequestsQuery,
   queryOptions?: { enabled?: boolean },

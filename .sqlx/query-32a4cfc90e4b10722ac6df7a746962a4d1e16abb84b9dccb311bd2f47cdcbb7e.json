@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            INSERT INTO users (id, username, email, display_name, avatar_url, auth_source, user_type, is_admin)\n            VALUES ($1, $2, $3, $4, $5, 'organization', 'organization', false)\n            RETURNING id, username, email, display_name, avatar_url, auth_source, created_at, updated_at,\n                      is_admin, password_hash, external_user_id, payment_provider_id,\n                      is_deleted, is_internal, batch_notifications_enabled, first_batch_email_sent,\n                      low_balance_notification_sent, low_balance_threshold,\n                      auto_topup_amount, auto_topup_threshold, auto_topup_monthly_limit, user_type, zero_data_retention\n            ",
+  "query": "\n            SELECT id, username, email, display_name, avatar_url, auth_source, created_at, updated_at,\n                   is_admin, password_hash, external_user_id, payment_provider_id,\n                   is_deleted, is_internal, batch_notifications_enabled, first_batch_email_sent,\n                   low_balance_notification_sent, low_balance_threshold,\n                   auto_topup_amount, auto_topup_threshold, auto_topup_monthly_limit, user_type, verified, zero_data_retention\n            FROM users\n            WHERE username = $1 AND user_type = 'organization' AND is_deleted = false\n            ",
   "describe": {
     "columns": [
       {
@@ -115,17 +115,18 @@
       },
       {
         "ordinal": 22,
+        "name": "verified",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 23,
         "name": "zero_data_retention",
         "type_info": "Bool"
       }
     ],
     "parameters": {
       "Left": [
-        "Uuid",
-        "Varchar",
-        "Varchar",
-        "Varchar",
-        "Varchar"
+        "Text"
       ]
     },
     "nullable": [
@@ -151,8 +152,9 @@
       true,
       true,
       false,
+      false,
       false
     ]
   },
-  "hash": "754cfd7ffe6988a0b51b0e912d9fff4af0fc2b579939488b380980e5279b43b5"
+  "hash": "32a4cfc90e4b10722ac6df7a746962a4d1e16abb84b9dccb311bd2f47cdcbb7e"
 }
