@@ -105,6 +105,14 @@ impl From<crate::db::models::organizations::PendingOrgEmailChangeDBResponse> for
     }
 }
 
+/// Optional body for approving a join request.
+#[derive(Debug, Clone, Deserialize, Serialize, ToSchema, Default)]
+pub struct ApproveJoinRequestRequest {
+    /// Role to grant on approval. Defaults to 'member'.
+    #[serde(default)]
+    pub role: Option<String>,
+}
+
 /// Organization member details
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct OrganizationMemberResponse {
@@ -116,7 +124,9 @@ pub struct OrganizationMemberResponse {
     pub user: Option<UserResponse>,
     /// Role in the organization: 'owner', 'admin', or 'member'
     pub role: String,
-    /// Membership status: 'active' or 'pending'
+    /// Membership status: 'active' for current members, 'pending' for an
+    /// invite the organization sent, or 'requested' for someone asking to
+    /// join and awaiting a decision.
     pub status: String,
     /// When the membership was created
     pub created_at: DateTime<Utc>,

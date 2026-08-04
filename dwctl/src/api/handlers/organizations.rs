@@ -4,9 +4,9 @@ use crate::{
     AppState,
     api::models::{
         organizations::{
-            AddMemberRequest, InviteDetailsResponse, InviteMemberRequest, InviteMemberResponse, ListOrganizationsQuery, OrganizationCreate,
-            OrganizationMemberResponse, OrganizationResponse, OrganizationUpdate, PendingEmailChangeResponse, SetActiveOrganizationRequest,
-            SetActiveOrganizationResponse, UpdateMemberRoleRequest,
+            AddMemberRequest, ApproveJoinRequestRequest, InviteDetailsResponse, InviteMemberRequest, InviteMemberResponse,
+            ListOrganizationsQuery, OrganizationCreate, OrganizationMemberResponse, OrganizationResponse, OrganizationUpdate,
+            PendingEmailChangeResponse, SetActiveOrganizationRequest, SetActiveOrganizationResponse, UpdateMemberRoleRequest,
         },
         pagination::PaginatedResponse,
         users::{CurrentUser, UserResponse},
@@ -819,6 +819,266 @@ pub async fn list_members<P: PoolProvider>(
         .collect();
 
     Ok(Json(members))
+}
+
+/// Re-send a pending organization invite
+#[utoipa::path(
+    post,
+    path = "/organizations/{id}/invites/{invite_id}/resend",
+    tag = "organizations",
+    summary = "Resend invite",
+    description = "Issue a fresh token for a pending invite and email it again. The previous link stops working. Requires owner/admin role or platform manager access.",
+    params(
+        ("id" = String, Path, description = "Organization ID"),
+        ("invite_id" = String, Path, description = "Invite (membership row) ID"),
+    ),
+    responses(
+        (status = 204, description = "Invite re-sent"),
+        (status = 403, description = "Forbidden"),
+        (status = 404, description = "Pending invite not found"),
+    ),
+    security(("BearerAuth" = []), ("CookieAuth" = []), ("X-Doubleword-User" = [])),
+)]
+#[tracing::instrument(skip_all)]
+pub async fn resend_invite<P: PoolProvider>(
+    State(state): State<AppState<P>>,
+    Path((id, invite_id)): Path<(UserId, uuid::Uuid)>,
+    current_user: CurrentUser,
+) -> Result<StatusCode> {
+    let can_all = crate::auth::permissions::has_permission(&current_user, Resource::Organizations, Operation::UpdateAll);
+
+    let mut pool_conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
+
+    if !can_all {
+        let can_org = can_manage_org_resource(&current_user, id, &mut pool_conn).await?;
+        if !can_org {
+            return Err(Error::InsufficientPermissions {
+                required: Permission::Allow(Resource::Organizations, Operation::UpdateOwn),
+                action: Operation::UpdateOwn,
+                resource: format!("Organization {id} invites"),
+            });
+        }
+    }
+
+    // A resend necessarily mints a new token: the original is only stored as a
+    // hash, so it can't be recovered to send again.
+    let token = crate::auth::password::generate_reset_token();
+    let token_hash = hash_invite_token(&token);
+    let expires_at = chrono::Utc::now() + Duration::days(7);
+
+    let mut org_repo = Organizations::new(&mut pool_conn);
+    let Some((email, role)) = org_repo.refresh_invite_token(id, invite_id, &token_hash, expires_at).await? else {
+        return Err(Error::NotFound {
+            resource: "Pending invite".to_string(),
+            id: format!("{invite_id} in organization {id}"),
+        });
+    };
+
+    let mut users_repo = Users::new(&mut pool_conn);
+    let org_user = users_repo.get_by_id(id).await?;
+    let org_name = org_user
+        .as_ref()
+        .and_then(|u| u.display_name.clone())
+        .unwrap_or_else(|| org_user.as_ref().map(|u| u.username.clone()).unwrap_or_default());
+
+    let sender = users_repo.get_by_id(current_user.id).await?;
+    let sender_name = sender
+        .as_ref()
+        .and_then(|u| u.display_name.clone())
+        .unwrap_or_else(|| sender.as_ref().map(|u| u.username.clone()).unwrap_or_default());
+
+    // The token is already rotated in the database. Treat a send failure as a
+    // warning rather than an error, matching `invite_member`: failing the
+    // request would imply nothing happened, when in fact the old link is now
+    // dead and the admin would need to resend anyway.
+    let config = state.current_config();
+    let invite_link = format!("{}/org-invite?token={}", config.dashboard_url.trim_end_matches('/'), token);
+    let email_service = EmailService::new(&config)?;
+    if let Err(e) = email_service
+        .send_org_invite_email(&email, &org_name, &sender_name, &role, &invite_link)
+        .await
+    {
+        tracing::warn!("Failed to re-send invite email to {email}: {e}");
+    }
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// List outstanding join requests for an organization
+#[utoipa::path(
+    get,
+    path = "/organizations/{id}/join-requests",
+    tag = "organizations",
+    summary = "List join requests",
+    description = "List users who have asked to join this organization and are awaiting a decision. Requires owner/admin role or platform manager access.",
+    params(("id" = String, Path, description = "Organization ID")),
+    responses(
+        (status = 200, description = "Outstanding join requests", body = [OrganizationMemberResponse]),
+        (status = 403, description = "Forbidden"),
+        (status = 404, description = "Organization not found"),
+    ),
+    security(("BearerAuth" = []), ("CookieAuth" = []), ("X-Doubleword-User" = [])),
+)]
+#[tracing::instrument(skip_all)]
+pub async fn list_join_requests<P: PoolProvider>(
+    State(state): State<AppState<P>>,
+    Path(id): Path<UserId>,
+    current_user: CurrentUser,
+) -> Result<Json<Vec<OrganizationMemberResponse>>> {
+    let can_all = crate::auth::permissions::has_permission(&current_user, Resource::Organizations, Operation::UpdateAll);
+
+    // Primary pool: a user's first login records their request, and an admin
+    // may well be looking at this queue moments later.
+    let mut pool_conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
+
+    // Deliberately gated on *manage*, not read: the queue exposes the identities
+    // of people who share your email domain, which ordinary members shouldn't see.
+    if !can_all {
+        let can_org = can_manage_org_resource(&current_user, id, &mut pool_conn).await?;
+        if !can_org {
+            return Err(Error::InsufficientPermissions {
+                required: Permission::Allow(Resource::Organizations, Operation::UpdateOwn),
+                action: Operation::UpdateOwn,
+                resource: format!("Organization {id} join requests"),
+            });
+        }
+    }
+
+    let mut repo = Organizations::new(&mut pool_conn);
+    let requests = repo.list_join_requests(id).await?;
+
+    let user_ids: Vec<UserId> = requests.iter().filter_map(|m| m.user_id).collect();
+    let mut users_repo = Users::new(&mut pool_conn);
+    let user_map = users_repo.get_bulk(user_ids).await?;
+
+    let responses: Vec<OrganizationMemberResponse> = requests
+        .iter()
+        .filter_map(|m| {
+            let uid = m.user_id?;
+            user_map.get(&uid).map(|u| OrganizationMemberResponse {
+                id: m.id,
+                user: Some(UserResponse::from(u.clone())),
+                role: m.role.clone(),
+                status: m.status.clone(),
+                created_at: m.created_at,
+                invite_email: m.invite_email.clone(),
+                // A request carries no capability until it's approved.
+                can_manage_keys: false,
+            })
+        })
+        .collect();
+
+    Ok(Json(responses))
+}
+
+/// Approve a join request
+#[utoipa::path(
+    post,
+    path = "/organizations/{id}/join-requests/{request_id}/approve",
+    tag = "organizations",
+    summary = "Approve join request",
+    description = "Approve a pending join request, making the requester an active member. Requires owner/admin role or platform manager access.",
+    params(
+        ("id" = String, Path, description = "Organization ID"),
+        ("request_id" = String, Path, description = "Join request ID"),
+    ),
+    request_body(content = ApproveJoinRequestRequest, description = "Optional role to grant; defaults to 'member'"),
+    responses(
+        (status = 204, description = "Request approved"),
+        (status = 403, description = "Forbidden"),
+        (status = 404, description = "Join request not found"),
+    ),
+    security(("BearerAuth" = []), ("CookieAuth" = []), ("X-Doubleword-User" = [])),
+)]
+#[tracing::instrument(skip_all)]
+pub async fn approve_join_request<P: PoolProvider>(
+    State(state): State<AppState<P>>,
+    Path((id, request_id)): Path<(UserId, uuid::Uuid)>,
+    current_user: CurrentUser,
+    body: Option<Json<ApproveJoinRequestRequest>>,
+) -> Result<StatusCode> {
+    let can_all = crate::auth::permissions::has_permission(&current_user, Resource::Organizations, Operation::UpdateAll);
+
+    let mut pool_conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
+
+    if !can_all {
+        let can_org = can_manage_org_resource(&current_user, id, &mut pool_conn).await?;
+        if !can_org {
+            return Err(Error::InsufficientPermissions {
+                required: Permission::Allow(Resource::Organizations, Operation::UpdateOwn),
+                action: Operation::UpdateOwn,
+                resource: format!("Organization {id} join requests"),
+            });
+        }
+    }
+
+    let role = body.and_then(|b| b.0.role).unwrap_or_else(|| "member".to_string());
+    validate_role(&role)?;
+    // Approving straight to owner would let an admin promote past themselves,
+    // so the same guard as invites applies.
+    check_role_assignment_privilege(&current_user, id, &role, can_all, &mut pool_conn).await?;
+
+    let mut repo = Organizations::new(&mut pool_conn);
+    let approved = repo.approve_join_request(id, request_id, &role).await?;
+    if !approved {
+        return Err(Error::NotFound {
+            resource: "Join request".to_string(),
+            id: format!("{request_id} in organization {id}"),
+        });
+    }
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Decline a join request
+#[utoipa::path(
+    post,
+    path = "/organizations/{id}/join-requests/{request_id}/decline",
+    tag = "organizations",
+    summary = "Decline join request",
+    description = "Decline a pending join request. The requester may ask again later. Requires owner/admin role or platform manager access.",
+    params(
+        ("id" = String, Path, description = "Organization ID"),
+        ("request_id" = String, Path, description = "Join request ID"),
+    ),
+    responses(
+        (status = 204, description = "Request declined"),
+        (status = 403, description = "Forbidden"),
+        (status = 404, description = "Join request not found"),
+    ),
+    security(("BearerAuth" = []), ("CookieAuth" = []), ("X-Doubleword-User" = [])),
+)]
+#[tracing::instrument(skip_all)]
+pub async fn decline_join_request<P: PoolProvider>(
+    State(state): State<AppState<P>>,
+    Path((id, request_id)): Path<(UserId, uuid::Uuid)>,
+    current_user: CurrentUser,
+) -> Result<StatusCode> {
+    let can_all = crate::auth::permissions::has_permission(&current_user, Resource::Organizations, Operation::UpdateAll);
+
+    let mut pool_conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
+
+    if !can_all {
+        let can_org = can_manage_org_resource(&current_user, id, &mut pool_conn).await?;
+        if !can_org {
+            return Err(Error::InsufficientPermissions {
+                required: Permission::Allow(Resource::Organizations, Operation::UpdateOwn),
+                action: Operation::UpdateOwn,
+                resource: format!("Organization {id} join requests"),
+            });
+        }
+    }
+
+    let mut repo = Organizations::new(&mut pool_conn);
+    let declined = repo.decline_join_request(id, request_id).await?;
+    if !declined {
+        return Err(Error::NotFound {
+            resource: "Join request".to_string(),
+            id: format!("{request_id} in organization {id}"),
+        });
+    }
+
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// Add a member to an organization
@@ -2115,6 +2375,218 @@ mod tests {
     }
 
     // ── Leave organization ────────────────────────────────────────────────
+
+    /// Resending necessarily rotates the token: the original is only stored as
+    /// a hash and can't be recovered, so the old link must stop working.
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_resend_invite_rotates_the_token(pool: PgPool) {
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let owner = create_test_user(&pool, Role::StandardUser).await;
+        let owner_headers = add_auth_headers(&owner);
+
+        let resp = server
+            .post("/admin/api/v1/organizations")
+            .add_header(&owner_headers[0].0, &owner_headers[0].1)
+            .add_header(&owner_headers[1].0, &owner_headers[1].1)
+            .json(&json!({ "name": "resend-org", "email": "resend@example.com" }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::CREATED);
+        let org_id = resp.json::<serde_json::Value>()["id"].as_str().unwrap().to_string();
+
+        let resp = server
+            .post(&format!("/admin/api/v1/organizations/{org_id}/invites"))
+            .add_header(&owner_headers[0].0, &owner_headers[0].1)
+            .add_header(&owner_headers[1].0, &owner_headers[1].1)
+            .json(&json!({ "email": "invitee@example.com", "role": "member" }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::CREATED);
+        let invite_id = resp.json::<serde_json::Value>()["id"].as_str().unwrap().to_string();
+
+        let hash_before: Option<String> = sqlx::query_scalar!(
+            "SELECT invite_token_hash FROM user_organizations WHERE id = $1",
+            uuid::Uuid::parse_str(&invite_id).unwrap()
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let resp = server
+            .post(&format!("/admin/api/v1/organizations/{org_id}/invites/{invite_id}/resend"))
+            .add_header(&owner_headers[0].0, &owner_headers[0].1)
+            .add_header(&owner_headers[1].0, &owner_headers[1].1)
+            .await;
+        resp.assert_status(axum::http::StatusCode::NO_CONTENT);
+
+        let hash_after: Option<String> = sqlx::query_scalar!(
+            "SELECT invite_token_hash FROM user_organizations WHERE id = $1",
+            uuid::Uuid::parse_str(&invite_id).unwrap()
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert!(hash_before.is_some() && hash_after.is_some());
+        assert_ne!(hash_before, hash_after, "the old invite link must stop working");
+    }
+
+    // ── Join requests ──────────────────────────────────────────────────────
+
+    /// Create an org owned by `owner` and park a join request from `joiner`.
+    async fn org_with_join_request(pool: &PgPool, owner_id: uuid::Uuid, joiner_id: uuid::Uuid) -> (uuid::Uuid, uuid::Uuid) {
+        let mut conn = pool.acquire().await.unwrap();
+        let mut repo = crate::db::handlers::Organizations::new(&mut conn);
+        let org = repo
+            .create(
+                &crate::db::models::organizations::OrganizationCreateDBRequest {
+                    name: format!("jr-{}", &owner_id.to_string()[..8]),
+                    email: format!("org-{}@example.com", &owner_id.to_string()[..8]),
+                    display_name: None,
+                    avatar_url: None,
+                    created_by: owner_id,
+                },
+                &[Role::StandardUser],
+            )
+            .await
+            .unwrap();
+        let request = repo.create_join_request(org.id, joiner_id).await.unwrap();
+        (org.id, request.id)
+    }
+
+    /// The queue names people who share your email domain, so it's gated on
+    /// managing the org — being a member of it isn't enough.
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_join_requests_hidden_from_ordinary_members(pool: PgPool) {
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let owner = create_test_user(&pool, Role::StandardUser).await;
+        let joiner = create_test_user(&pool, Role::StandardUser).await;
+        let (org_id, _) = org_with_join_request(&pool, owner.id, joiner.id).await;
+
+        let member = create_test_user(&pool, Role::StandardUser).await;
+        {
+            let mut conn = pool.acquire().await.unwrap();
+            crate::db::handlers::Organizations::new(&mut conn)
+                .add_member(org_id, member.id, "member")
+                .await
+                .unwrap();
+        }
+        let member_headers = add_auth_headers(&member);
+
+        let resp = server
+            .get(&format!("/admin/api/v1/organizations/{org_id}/join-requests"))
+            .add_header(&member_headers[0].0, &member_headers[0].1)
+            .add_header(&member_headers[1].0, &member_headers[1].1)
+            .await;
+        resp.assert_status(axum::http::StatusCode::FORBIDDEN);
+
+        let owner_headers = add_auth_headers(&owner);
+        let resp = server
+            .get(&format!("/admin/api/v1/organizations/{org_id}/join-requests"))
+            .add_header(&owner_headers[0].0, &owner_headers[0].1)
+            .add_header(&owner_headers[1].0, &owner_headers[1].1)
+            .await;
+        resp.assert_status_ok();
+        assert_eq!(resp.json::<serde_json::Value>().as_array().unwrap().len(), 1);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_approve_join_request_makes_an_active_member(pool: PgPool) {
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let owner = create_test_user(&pool, Role::StandardUser).await;
+        let joiner = create_test_user(&pool, Role::StandardUser).await;
+        let (org_id, request_id) = org_with_join_request(&pool, owner.id, joiner.id).await;
+        let owner_headers = add_auth_headers(&owner);
+
+        // Not a member while the request is outstanding.
+        {
+            let mut conn = pool.acquire().await.unwrap();
+            let role = crate::db::handlers::Organizations::new(&mut conn)
+                .get_user_org_role(joiner.id, org_id)
+                .await
+                .unwrap();
+            assert_eq!(role, None);
+        }
+
+        let resp = server
+            .post(&format!("/admin/api/v1/organizations/{org_id}/join-requests/{request_id}/approve"))
+            .add_header(&owner_headers[0].0, &owner_headers[0].1)
+            .add_header(&owner_headers[1].0, &owner_headers[1].1)
+            .await;
+        resp.assert_status(axum::http::StatusCode::NO_CONTENT);
+
+        let mut conn = pool.acquire().await.unwrap();
+        let mut repo = crate::db::handlers::Organizations::new(&mut conn);
+        assert_eq!(repo.get_user_org_role(joiner.id, org_id).await.unwrap(), Some("member".to_string()));
+        assert!(repo.list_join_requests(org_id).await.unwrap().is_empty(), "queue is cleared");
+
+        // Approving twice must not double-add.
+        let resp = server
+            .post(&format!("/admin/api/v1/organizations/{org_id}/join-requests/{request_id}/approve"))
+            .add_header(&owner_headers[0].0, &owner_headers[0].1)
+            .add_header(&owner_headers[1].0, &owner_headers[1].1)
+            .await;
+        resp.assert_status(axum::http::StatusCode::NOT_FOUND);
+    }
+
+    /// Declining removes the row rather than tombstoning it, so the user can
+    /// ask again - a permanent record would silently block them forever via
+    /// the unique constraint on (user_id, organization_id).
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_decline_join_request_allows_asking_again(pool: PgPool) {
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let owner = create_test_user(&pool, Role::StandardUser).await;
+        let joiner = create_test_user(&pool, Role::StandardUser).await;
+        let (org_id, request_id) = org_with_join_request(&pool, owner.id, joiner.id).await;
+        let owner_headers = add_auth_headers(&owner);
+
+        let resp = server
+            .post(&format!("/admin/api/v1/organizations/{org_id}/join-requests/{request_id}/decline"))
+            .add_header(&owner_headers[0].0, &owner_headers[0].1)
+            .add_header(&owner_headers[1].0, &owner_headers[1].1)
+            .await;
+        resp.assert_status(axum::http::StatusCode::NO_CONTENT);
+
+        let mut conn = pool.acquire().await.unwrap();
+        let mut repo = crate::db::handlers::Organizations::new(&mut conn);
+        assert!(repo.list_join_requests(org_id).await.unwrap().is_empty());
+        assert_eq!(repo.get_user_org_role(joiner.id, org_id).await.unwrap(), None);
+
+        // The door isn't bolted: they can request again.
+        repo.create_join_request(org_id, joiner.id).await.expect("can ask again");
+    }
+
+    /// Managing one org must not grant authority over another's queue.
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_join_request_decisions_are_scoped_to_their_org(pool: PgPool) {
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let owner_a = create_test_user(&pool, Role::StandardUser).await;
+        let owner_b = create_test_user(&pool, Role::StandardUser).await;
+        let joiner = create_test_user(&pool, Role::StandardUser).await;
+
+        let (_org_a, _) = org_with_join_request(&pool, owner_a.id, joiner.id).await;
+        let other = create_test_user(&pool, Role::StandardUser).await;
+        let (org_b, request_b) = org_with_join_request(&pool, owner_b.id, other.id).await;
+
+        // Owner A tries to approve a request belonging to org B, via org B's path.
+        let a_headers = add_auth_headers(&owner_a);
+        let resp = server
+            .post(&format!("/admin/api/v1/organizations/{org_b}/join-requests/{request_b}/approve"))
+            .add_header(&a_headers[0].0, &a_headers[0].1)
+            .add_header(&a_headers[1].0, &a_headers[1].1)
+            .await;
+        resp.assert_status(axum::http::StatusCode::FORBIDDEN);
+
+        let mut conn = pool.acquire().await.unwrap();
+        let role = crate::db::handlers::Organizations::new(&mut conn)
+            .get_user_org_role(other.id, org_b)
+            .await
+            .unwrap();
+        assert_eq!(role, None, "the request must still be outstanding");
+    }
 
     #[sqlx::test]
     #[test_log::test]
