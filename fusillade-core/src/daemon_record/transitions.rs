@@ -153,6 +153,14 @@ mod tests {
             Ok(0)
         }
 
+        async fn finalize_terminal_batches(&self) -> Result<i64> {
+            Ok(0)
+        }
+
+        async fn finalize_cancelled_batches(&self, _grace_secs: f64, _limit: i64) -> Result<i64> {
+            Ok(0)
+        }
+
         async fn ensure_archive_partitions(&self, _weeks_ahead: i32) -> Result<(i64, i64)> {
             Ok((0, 0))
         }

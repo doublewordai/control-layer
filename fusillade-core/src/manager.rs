@@ -1151,6 +1151,20 @@ pub trait DaemonStorage: Send + Sync {
     /// means batches are stuck on the recount path and cannot archive.
     async fn count_unfrozen_terminal_batches(&self) -> Result<i64>;
 
+    /// Stamp terminal timestamps and freeze final counts for non-cancelled
+    /// batches whose rows have all reached terminal state. The sweep half of
+    /// what `get_batch` does lazily on read; notification delivery consumes
+    /// the frozen batches separately. Returns batches finalized.
+    async fn finalize_terminal_batches(&self) -> Result<i64>;
+
+    /// Settle-and-freeze cancelled batches past the grace window: physically
+    /// cancels any leftover pending/claimed/processing rows, then freezes
+    /// counts — atomically per batch, batch-row locked first (uniform
+    /// batch→requests lock order). Batches whose settled row count disagrees
+    /// with `total_requests` (cancel-during-populate zombies) are skipped and
+    /// left unfrozen. Returns batches finalized.
+    async fn finalize_cancelled_batches(&self, grace_secs: f64, limit: i64) -> Result<i64>;
+
     /// Ensure weekly archive partitions exist through now + `weeks_ahead`
     /// (create -> bounds CHECK -> attach; advisory-locked; idempotent).
     /// Returns `(created, ahead)`: partitions created this call, and how

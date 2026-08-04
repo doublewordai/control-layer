@@ -7011,110 +7011,39 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
         })
     }
 
-    /// Find terminal batches that need notification, finalize if needed, and claim atomically.
+    /// Claim finalized batches for notification delivery — a pure consumer.
     ///
-    /// Handles both batches already finalized by `get_batch()` API calls and batches that
-    /// are terminal by count but not yet finalized. Sets `notification_sent_at` atomically
-    /// to prevent duplicate notifications across replicas polling concurrently.
-    ///
-    /// Request counts are frozen into the batches counter columns in the same
-    /// UPDATE that stamps the terminal timestamps (counts_frozen_at marks
-    /// them valid), so subsequent reads serve the stored values and never
-    /// recount this batch's request rows. Batches already frozen by
-    /// get_batch()'s lazy finalization skip the recount here too.
-    ///
-    /// Also writes terminal timestamps (completed_at/failed_at/cancelled_at) via
-    /// COALESCE. Currently these are almost always already set by get_batch()'s
-    /// lazy finalization (triggered as a side-effect of the daemon's cancellation
-    /// poller), but the finalization logic is kept here so this poller remains
-    /// self-contained and correct regardless of how callers of get_batch() change.
-    pub async fn poll_completed_batches(&self) -> Result<Vec<BatchNotification>> {
+    /// Finalization (terminal timestamps + frozen counts) happens elsewhere:
+    /// in the daemon's batch-finalizer loop and lazily in `get_batch`. This
+    /// method only selects batches that are already frozen and unnotified,
+    /// claiming them by stamping `notification_sent_at` atomically so
+    /// concurrent pollers on other replicas cannot double-send. Cancelled
+    /// batches are excluded — user-initiated cancellations are deliberately
+    /// never emailed (the finalizer stamps their claim marker without any
+    /// notification being sent).
+    pub async fn claim_batch_notifications(&self) -> Result<Vec<BatchNotification>> {
         let rows = sqlx::query!(
             r#"
-            -- Step 1: Find candidate batches that are terminal by count.
-            -- Batches already frozen (counts_frozen_at set) skip the recount
-            -- and serve their persisted counters.
-            WITH candidates AS (
-                SELECT b.id,
-                       b.retry_version,
-                       CASE WHEN b.counts_frozen_at IS NOT NULL THEN b.completed_requests
-                            ELSE COALESCE(counts.completed, 0) + COALESCE(arch.completed, 0) END::BIGINT as completed_requests,
-                       CASE WHEN b.counts_frozen_at IS NOT NULL THEN b.failed_requests
-                            ELSE COALESCE(counts.failed, 0) + COALESCE(arch.failed, 0) END::BIGINT as failed_requests,
-                       CASE WHEN b.counts_frozen_at IS NOT NULL THEN b.canceled_requests
-                            ELSE COALESCE(counts.canceled, 0) + COALESCE(arch.canceled, 0) END::BIGINT as canceled_requests,
-                       CASE WHEN b.counts_frozen_at IS NOT NULL THEN 0
-                            ELSE COALESCE(counts.pending, 0) END::BIGINT as pending_requests,
-                       CASE WHEN b.counts_frozen_at IS NOT NULL THEN 0
-                            ELSE COALESCE(counts.in_progress, 0) END::BIGINT as in_progress_requests
-                FROM batches b
-                -- Count requests by state for each batch
-                LEFT JOIN LATERAL (
-                    SELECT
-                        COUNT(*) FILTER (WHERE state = 'completed') as completed,
-                        COUNT(*) FILTER (WHERE state = 'failed') as failed,
-                        -- Canceled = explicitly canceled OR will be canceled (pending/in-progress with cancelling_at set)
-                        COUNT(*) FILTER (WHERE state = 'canceled' OR (state IN ('pending', 'claimed', 'processing') AND b.cancelling_at IS NOT NULL)) as canceled,
-                        COUNT(*) FILTER (WHERE state = 'pending' AND b.cancelling_at IS NULL) as pending,
-                        COUNT(*) FILTER (WHERE state IN ('claimed', 'processing') AND b.cancelling_at IS NULL) as in_progress
-                    FROM requests WHERE batch_id = b.id
-                      AND b.counts_frozen_at IS NULL
-                ) counts ON TRUE
-                -- Split batches: archived (already-done) rows count toward
-                -- terminal-by-count, same as in get_batch (see there).
-                LEFT JOIN LATERAL (
-                    SELECT
-                        COUNT(*) FILTER (WHERE state = 'completed') as completed,
-                        COUNT(*) FILTER (WHERE state = 'failed') as failed,
-                        COUNT(*) FILTER (WHERE state = 'canceled') as canceled
-                    FROM batch_requests_archive a
-                    WHERE b.location = 'split'
-                      AND b.counts_frozen_at IS NULL
-                      AND a.archive_bucket = b.archive_bucket
-                      AND a.batch_id = b.id
-                ) arch ON TRUE
-                WHERE b.notification_sent_at IS NULL  -- Not yet notified
-                  AND b.deleted_at IS NULL            -- Not deleted
-                  AND b.cancelling_at IS NULL         -- Not canceled (don't email on user-canceled batches)
-                  AND b.total_requests > 0            -- Has requests
-                  AND (
-                      -- Already frozen (terminal by definition), or terminal
-                      -- by count: all requests reached terminal state
-                      b.counts_frozen_at IS NOT NULL
-                      OR COALESCE(counts.completed, 0) + COALESCE(counts.failed, 0) + COALESCE(counts.canceled, 0)
-                         + COALESCE(arch.completed, 0) + COALESCE(arch.failed, 0) + COALESCE(arch.canceled, 0) = b.total_requests
-                  )
-            ),
-            -- Step 2: Atomically claim batches, set terminal timestamps, and
-            -- freeze the final counts (cancelling_at is NULL for candidates,
-            -- so the projected and actual counts coincide and are final).
-            updated AS (
+            WITH claimed AS (
                 UPDATE batches b
-                SET notification_sent_at = NOW(),  -- Claim for notification (prevents duplicates)
-                    -- Set terminal timestamps via COALESCE (no-op if already set by get_batch)
-                    finalizing_at = COALESCE(b.finalizing_at, NOW()),
-                    completed_at = COALESCE(b.completed_at,
-                        CASE WHEN c.completed_requests > 0 THEN NOW() END),
-                    failed_at = COALESCE(b.failed_at,
-                        CASE WHEN c.completed_requests = 0 THEN NOW() END),
-                    completed_requests = c.completed_requests,
-                    failed_requests = c.failed_requests,
-                    canceled_requests = c.canceled_requests,
-                    counts_frozen_at = COALESCE(b.counts_frozen_at, NOW())
-                FROM candidates c
-                WHERE b.id = c.id
+                SET notification_sent_at = NOW()
+                WHERE b.id IN (
+                    SELECT id FROM batches
+                    WHERE counts_frozen_at IS NOT NULL
+                      AND notification_sent_at IS NULL
+                      AND cancelling_at IS NULL
+                      AND deleted_at IS NULL
+                      AND total_requests > 0
+                    LIMIT 100
+                )
                   AND b.notification_sent_at IS NULL  -- Re-check to handle concurrent pollers
-                  -- retry_version CAS: a concurrent batch retry resets terminal
-                  -- state and bumps retry_version; target-row condition, so it
-                  -- holds even when this UPDATE resumes from a lock wait.
-                  AND b.retry_version = c.retry_version
                 RETURNING b.id, b.file_id, b.endpoint, b.service_tier, b.completion_window, b.metadata,
                           b.output_file_id, b.error_file_id, b.created_by, b.created_at,
                           b.expires_at, b.cancelling_at, b.errors, b.total_requests,
                           b.requests_started_at, b.finalizing_at, b.completed_at,
                           b.failed_at, b.cancelled_at, b.deleted_at, b.notification_sent_at, b.api_key_id,
-                          c.completed_requests, c.failed_requests, c.canceled_requests,
-                          c.pending_requests, c.in_progress_requests
+                          b.completed_requests, b.failed_requests, b.canceled_requests,
+                          b.archive_bucket
             )
             SELECT u.id AS "id!", u.file_id, u.endpoint AS "endpoint!",
                    u.service_tier AS "service_tier?",
@@ -7128,12 +7057,19 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
                    u.completed_requests AS "completed_requests!",
                    u.failed_requests AS "failed_requests!",
                    u.canceled_requests AS "canceled_requests!",
-                   u.pending_requests AS "pending_requests!",
-                   u.in_progress_requests AS "in_progress_requests!",
+                   0::BIGINT AS "pending_requests!",
+                   0::BIGINT AS "in_progress_requests!",
                    f.name AS "input_file_name?",
                    f.description as input_file_description,
-                   (SELECT string_agg(DISTINCT r.model, ', ') FROM requests r WHERE r.batch_id = u.id) as model
-            FROM updated u
+                   -- Frozen batches may already have archived their rows out
+                   -- of `requests` by claim time; fall back to the archive
+                   -- for the model summary.
+                   COALESCE(
+                       (SELECT string_agg(DISTINCT r.model, ', ') FROM requests r WHERE r.batch_id = u.id),
+                       (SELECT string_agg(DISTINCT a.model, ', ') FROM batch_requests_archive a
+                        WHERE a.archive_bucket = u.archive_bucket AND a.batch_id = u.id)
+                   ) as model
+            FROM claimed u
             LEFT JOIN files f ON f.id = u.file_id
             "#
         )
@@ -8589,6 +8525,232 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
         .map_err(|e| {
             FusilladeError::Other(anyhow!("Failed to count unfrozen terminal batches: {}", e))
         })
+    }
+
+    async fn finalize_terminal_batches(&self) -> Result<i64> {
+        // The sweep twin of get_batch's lazy finalization, for batches nobody
+        // reads: stamp terminal timestamps and freeze counts once every row
+        // is terminal. Candidates are unfrozen only — frozen batches leave
+        // the population by definition, which is also this sweep's dedup.
+        // Cancelled batches are the other arm's job (they need row
+        // settlement first); notification is a downstream consumer of
+        // counts_frozen_at and is not touched here.
+        let result = sqlx::query!(
+            r#"
+            WITH candidates AS (
+                SELECT b.id, b.retry_version,
+                       COALESCE(counts.completed, 0) + COALESCE(arch.completed, 0) AS completed,
+                       COALESCE(counts.failed, 0) + COALESCE(arch.failed, 0) AS failed,
+                       COALESCE(counts.canceled, 0) + COALESCE(arch.canceled, 0) AS canceled
+                FROM batches b
+                LEFT JOIN LATERAL (
+                    SELECT
+                        COUNT(*) FILTER (WHERE state = 'completed') AS completed,
+                        COUNT(*) FILTER (WHERE state = 'failed') AS failed,
+                        COUNT(*) FILTER (WHERE state = 'canceled') AS canceled,
+                        COUNT(*) FILTER (WHERE state NOT IN ('completed', 'failed', 'canceled')) AS live
+                    FROM requests WHERE batch_id = b.id
+                ) counts ON TRUE
+                -- Split batches: archived (already-done) rows count toward
+                -- terminal-by-count, same as in get_batch.
+                LEFT JOIN LATERAL (
+                    SELECT
+                        COUNT(*) FILTER (WHERE state = 'completed') AS completed,
+                        COUNT(*) FILTER (WHERE state = 'failed') AS failed,
+                        COUNT(*) FILTER (WHERE state = 'canceled') AS canceled
+                    FROM batch_requests_archive a
+                    WHERE b.location = 'split'
+                      AND a.archive_bucket = b.archive_bucket
+                      AND a.batch_id = b.id
+                ) arch ON TRUE
+                WHERE b.counts_frozen_at IS NULL
+                  AND b.deleted_at IS NULL
+                  AND b.cancelling_at IS NULL
+                  AND b.total_requests > 0
+                  AND COALESCE(counts.live, 0) = 0
+                  AND COALESCE(counts.completed, 0) + COALESCE(counts.failed, 0) + COALESCE(counts.canceled, 0)
+                      + COALESCE(arch.completed, 0) + COALESCE(arch.failed, 0) + COALESCE(arch.canceled, 0)
+                      = b.total_requests
+            )
+            UPDATE batches b
+            SET finalizing_at = COALESCE(b.finalizing_at, NOW()),
+                completed_at = COALESCE(b.completed_at,
+                    CASE WHEN c.completed > 0 THEN NOW() END),
+                failed_at = COALESCE(b.failed_at,
+                    CASE WHEN c.completed = 0 THEN NOW() END),
+                completed_requests = c.completed,
+                failed_requests = c.failed,
+                canceled_requests = c.canceled,
+                counts_frozen_at = NOW()
+            FROM candidates c
+            WHERE b.id = c.id
+              -- Re-checks against concurrent writers: get_batch's lazy freeze
+              -- (counts_frozen_at) and batch retry (retry_version CAS; a
+              -- target-row condition, so it holds even when this UPDATE
+              -- resumes from a lock wait).
+              AND b.counts_frozen_at IS NULL
+              AND b.retry_version = c.retry_version
+            "#,
+        )
+        .execute(self.write_executor())
+        .await
+        .map_err(|e| {
+            FusilladeError::Other(anyhow!("Failed to finalize terminal batches: {}", e))
+        })?;
+        Ok(result.rows_affected() as i64)
+    }
+
+    async fn finalize_cancelled_batches(&self, grace_secs: f64, limit: i64) -> Result<i64> {
+        // Cancelled batches never finalize on their own: cancellation stamps
+        // the batch row eagerly and leaves rows to settle asynchronously
+        // (daemon aborts for in-flight, nothing at all for pending), and the
+        // cancel-and-walk-away case means no read ever triggers the lazy
+        // freeze. This arm makes physical state match the long-displayed
+        // projection (pending-under-cancel already reads as canceled
+        // everywhere) and freezes the result.
+        let candidates = sqlx::query_scalar!(
+            r#"
+            SELECT id FROM batches
+            WHERE cancelled_at IS NOT NULL
+              AND counts_frozen_at IS NULL
+              AND deleted_at IS NULL
+              AND cancelled_at < NOW() - make_interval(secs => $1)
+            ORDER BY cancelled_at
+            LIMIT $2
+            "#,
+            grace_secs,
+            limit,
+        )
+        .fetch_all(self.read_executor())
+        .await
+        .map_err(|e| {
+            FusilladeError::Other(anyhow!(
+                "Failed to list cancelled finalizer candidates: {}",
+                e
+            ))
+        })?;
+
+        let mut finalized = 0i64;
+        for batch_id in candidates {
+            let mut tx = self.begin_write().await.map_err(|e| {
+                FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e))
+            })?;
+
+            // Lock the batch row FIRST (uniform batch->requests lock order;
+            // the retry path locks in the same order, so the two serialize
+            // instead of deadlocking) and re-check state under the lock — a
+            // concurrent retry may have revived the batch, or a concurrent
+            // reader may have frozen it, since the candidate SELECT.
+            let batch = sqlx::query!(
+                r#"
+                SELECT retry_version, total_requests
+                FROM batches
+                WHERE id = $1
+                  AND cancelled_at IS NOT NULL
+                  AND counts_frozen_at IS NULL
+                  AND deleted_at IS NULL
+                FOR UPDATE
+                "#,
+                batch_id,
+            )
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| FusilladeError::Other(anyhow!("Failed to lock cancelled batch: {}", e)))?;
+            let Some(batch) = batch else {
+                // Revived, frozen, or deleted since the candidate scan.
+                continue;
+            };
+
+            // Physically settle leftover rows. This cannot change any
+            // user-visible count: every count path already projects
+            // pending/claimed/processing rows of a cancelling batch as
+            // canceled.
+            sqlx::query!(
+                r#"
+                UPDATE requests
+                SET state = 'canceled',
+                    canceled_at = COALESCE(canceled_at, NOW())
+                WHERE batch_id = $1
+                  AND state IN ('pending', 'claimed', 'processing')
+                "#,
+                batch_id,
+            )
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| {
+                FusilladeError::Other(anyhow!("Failed to settle cancelled batch rows: {}", e))
+            })?;
+
+            // Freeze, guarded by the terminal-by-count equality. A
+            // cancel-during-populate zombie (total_requests > 0 with missing
+            // rows) fails the equality and stays unfrozen — freezing it would
+            // stamp counters that contradict total_requests; it is parked for
+            // the populate-resume fix. notification_sent_at is stamped
+            // (without any notification being sent) to keep cancelled batches
+            // out of the notifier's pending set permanently — user-initiated
+            // cancellations are deliberately never emailed.
+            let froze = sqlx::query!(
+                r#"
+                UPDATE batches b
+                SET finalizing_at = COALESCE(b.finalizing_at, NOW()),
+                    completed_requests = c.completed,
+                    failed_requests = c.failed,
+                    canceled_requests = c.canceled,
+                    counts_frozen_at = NOW(),
+                    notification_sent_at = COALESCE(b.notification_sent_at, NOW())
+                FROM (
+                    SELECT
+                        COALESCE(live.completed, 0) + COALESCE(arch.completed, 0) AS completed,
+                        COALESCE(live.failed, 0) + COALESCE(arch.failed, 0) AS failed,
+                        COALESCE(live.canceled, 0) + COALESCE(arch.canceled, 0) AS canceled
+                    FROM (
+                        SELECT
+                            COUNT(*) FILTER (WHERE state = 'completed') AS completed,
+                            COUNT(*) FILTER (WHERE state = 'failed') AS failed,
+                            COUNT(*) FILTER (WHERE state = 'canceled') AS canceled
+                        FROM requests WHERE batch_id = $1
+                    ) live
+                    LEFT JOIN LATERAL (
+                        SELECT
+                            COUNT(*) FILTER (WHERE state = 'completed') AS completed,
+                            COUNT(*) FILTER (WHERE state = 'failed') AS failed,
+                            COUNT(*) FILTER (WHERE state = 'canceled') AS canceled
+                        FROM batch_requests_archive a, batches bb
+                        WHERE bb.id = $1
+                          AND bb.location = 'split'
+                          AND a.archive_bucket = bb.archive_bucket
+                          AND a.batch_id = $1
+                    ) arch ON TRUE
+                ) c
+                WHERE b.id = $1
+                  AND b.retry_version = $2
+                  AND b.counts_frozen_at IS NULL
+                  AND b.cancelled_at IS NOT NULL
+                  AND c.completed + c.failed + c.canceled = b.total_requests
+                "#,
+                batch_id,
+                batch.retry_version,
+            )
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| {
+                FusilladeError::Other(anyhow!("Failed to freeze cancelled batch: {}", e))
+            })?;
+
+            if froze.rows_affected() > 0 {
+                tx.commit().await.map_err(|e| {
+                    FusilladeError::Other(anyhow!("Failed to commit finalization: {}", e))
+                })?;
+                finalized += 1;
+            } else {
+                // Zombie (count mismatch) — roll the settle back too; the
+                // batch stays exactly as it was.
+                tx.rollback().await.map_err(|e| {
+                    FusilladeError::Other(anyhow!("Failed to roll back finalization: {}", e))
+                })?;
+            }
+        }
+        Ok(finalized)
     }
 
     async fn ensure_archive_partitions(&self, weeks_ahead: i32) -> Result<(i64, i64)> {
@@ -12643,10 +12805,11 @@ mod tests {
         assert_eq!(version_after, version, "no retry_version churn on no-op");
     }
 
-    /// The notification poller is the other lazy-finalization site: it must
-    /// freeze counts in its stamping UPDATE, without any get_batch call.
+    /// The finalizer sweep freezes counts without any get_batch call, and the
+    /// notifier then claims the frozen batch — the two halves of what the old
+    /// combined poller did.
     #[sqlx::test]
-    async fn test_poller_freezes_counts(pool: sqlx::PgPool) {
+    async fn test_finalizer_freezes_counts_and_notifier_claims(pool: sqlx::PgPool) {
         let manager = PostgresRequestManager::with_client(
             TestDbPools::new(pool.clone()).await.unwrap(),
             Arc::new(MockHttpClient::new()),
@@ -12661,16 +12824,31 @@ mod tests {
         .await
         .unwrap();
 
-        let notifications = manager.poll_completed_batches().await.unwrap();
+        // Nothing to claim before finalization: the notifier only consumes
+        // frozen batches.
+        let premature = manager.claim_batch_notifications().await.unwrap();
+        assert!(
+            !premature.iter().any(|n| n.batch.id == batch_id),
+            "notifier must not see unfinalized batches"
+        );
+
+        let finalized = manager.finalize_terminal_batches().await.unwrap();
+        assert!(finalized >= 1, "finalizer must pick up the settled batch");
+        assert!(
+            frozen_at(&pool, batch_id).await.is_some(),
+            "finalizer must freeze counts"
+        );
+
+        let notifications = manager.claim_batch_notifications().await.unwrap();
         let n = notifications
             .iter()
             .find(|n| n.batch.id == batch_id)
             .unwrap();
         assert_eq!(n.batch.completed_requests, 2);
-        assert!(
-            frozen_at(&pool, batch_id).await.is_some(),
-            "poller finalization must freeze counts"
-        );
+
+        // Claim is single-shot: a second poll returns nothing for this batch.
+        let again = manager.claim_batch_notifications().await.unwrap();
+        assert!(!again.iter().any(|n| n.batch.id == batch_id));
 
         sqlx::query!(
             "DELETE FROM requests WHERE batch_id = $1",
@@ -12681,6 +12859,86 @@ mod tests {
         .unwrap();
         let batch = manager.get_batch(batch_id).await.unwrap();
         assert_eq!(batch.completed_requests, 2);
+    }
+
+    /// The cancelled arm: settle leftover rows physically, freeze the counts,
+    /// and never notify — all without anyone reading the batch.
+    #[sqlx::test]
+    async fn test_finalizer_settles_and_freezes_cancelled_batch(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+        let batch_id = setup_freeze_test_batch(&manager, "freeze-cancelled", 3).await;
+
+        // One row settles as completed; two stay pending — the
+        // cancel-and-walk-away shape that previously never froze.
+        sqlx::query!(
+            "UPDATE requests SET state = 'completed', completed_at = NOW(), response_status = 200, response_body = '{}' WHERE id = (SELECT id FROM requests WHERE batch_id = $1 LIMIT 1)",
+            *batch_id as Uuid
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        manager.cancel_batch(batch_id).await.unwrap();
+
+        // Grace window not yet elapsed: untouched.
+        let finalized = manager
+            .finalize_cancelled_batches(3600.0, 10)
+            .await
+            .unwrap();
+        assert_eq!(finalized, 0, "grace window must be respected");
+        assert!(frozen_at(&pool, batch_id).await.is_none());
+
+        // Past grace: settle + freeze in one pass.
+        let finalized = manager.finalize_cancelled_batches(0.0, 10).await.unwrap();
+        assert_eq!(finalized, 1);
+        assert!(
+            frozen_at(&pool, batch_id).await.is_some(),
+            "cancelled batch must freeze once settled"
+        );
+        let stuck: i64 = sqlx::query_scalar!(
+            r#"SELECT COUNT(*) AS "count!" FROM requests WHERE batch_id = $1 AND state IN ('pending', 'claimed', 'processing')"#,
+            *batch_id as Uuid
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(stuck, 0, "leftover rows must be physically settled");
+
+        let batch = manager.get_batch(batch_id).await.unwrap();
+        assert_eq!(batch.completed_requests, 1);
+        assert_eq!(batch.canceled_requests, 2);
+
+        // User-initiated cancellations are never emailed: already claimed,
+        // and excluded from the notifier's population regardless.
+        let notifications = manager.claim_batch_notifications().await.unwrap();
+        assert!(!notifications.iter().any(|n| n.batch.id == batch_id));
+    }
+
+    /// A cancel-during-populate zombie (total_requests set, rows missing)
+    /// must NOT be frozen — its counters could never agree with
+    /// total_requests. It stays parked for the populate-resume fix.
+    #[sqlx::test]
+    async fn test_finalizer_skips_populate_race_zombie(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+        let batch_id = setup_freeze_test_batch(&manager, "freeze-zombie", 2).await;
+        manager.cancel_batch(batch_id).await.unwrap();
+        // Simulate the populate-race shape: rows vanished, total stands.
+        sqlx::query!(
+            "DELETE FROM requests WHERE batch_id = $1",
+            *batch_id as Uuid
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let finalized = manager.finalize_cancelled_batches(0.0, 10).await.unwrap();
+        assert_eq!(finalized, 0, "zombie must be skipped, not frozen");
+        assert!(frozen_at(&pool, batch_id).await.is_none());
     }
 
     #[sqlx::test]
@@ -12699,11 +12957,12 @@ mod tests {
         .await
         .unwrap();
 
-        let notifications = manager.poll_completed_batches().await.unwrap();
+        manager.finalize_terminal_batches().await.unwrap();
+        let notifications = manager.claim_batch_notifications().await.unwrap();
         let notification = notifications
             .iter()
             .find(|notification| notification.batch.id == batch.id)
-            .expect("background batch should be returned by the completion poller");
+            .expect("background batch should be claimed once finalized");
 
         assert_eq!(
             notification.batch.service_tier.as_deref(),
