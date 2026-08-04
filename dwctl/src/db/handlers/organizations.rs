@@ -113,7 +113,7 @@ impl<'c> Organizations<'c> {
                    is_admin, password_hash, external_user_id, payment_provider_id,
                    is_deleted, is_internal, batch_notifications_enabled, first_batch_email_sent,
                    low_balance_notification_sent, low_balance_threshold,
-                   auto_topup_amount, auto_topup_threshold, auto_topup_monthly_limit, user_type, verified, zero_data_retention
+                   auto_topup_amount, auto_topup_threshold, auto_topup_monthly_limit, user_type, verified, invoicing_enabled, zero_data_retention
             FROM users
             WHERE username = $1 AND user_type = 'organization' AND is_deleted = false
             "#,
@@ -152,6 +152,7 @@ impl<'c> Organizations<'c> {
                     auto_topup_monthly_limit: r.auto_topup_monthly_limit,
                     user_type: r.user_type,
                     verified: r.verified,
+                    invoicing_enabled: r.invoicing_enabled,
                     zero_data_retention: r.zero_data_retention,
                 }))
             }
@@ -178,7 +179,7 @@ impl<'c> Organizations<'c> {
                       is_admin, password_hash, external_user_id, payment_provider_id,
                       is_deleted, is_internal, batch_notifications_enabled, first_batch_email_sent,
                       low_balance_notification_sent, low_balance_threshold,
-                      auto_topup_amount, auto_topup_threshold, auto_topup_monthly_limit, user_type, verified, zero_data_retention
+                      auto_topup_amount, auto_topup_threshold, auto_topup_monthly_limit, user_type, verified, invoicing_enabled, zero_data_retention
             "#,
             org_id,
             request.name,
@@ -237,6 +238,7 @@ impl<'c> Organizations<'c> {
             auto_topup_monthly_limit: row.auto_topup_monthly_limit,
             user_type: row.user_type,
             verified: row.verified,
+            invoicing_enabled: row.invoicing_enabled,
             zero_data_retention: row.zero_data_retention,
         })
     }
@@ -281,7 +283,7 @@ impl<'c> Organizations<'c> {
                       is_admin, password_hash, external_user_id, payment_provider_id,
                       batch_notifications_enabled, first_batch_email_sent,
                       low_balance_notification_sent, low_balance_threshold,
-                      auto_topup_amount, auto_topup_threshold, auto_topup_monthly_limit, user_type, verified, zero_data_retention
+                      auto_topup_amount, auto_topup_threshold, auto_topup_monthly_limit, user_type, verified, invoicing_enabled, zero_data_retention
             "#,
             id,
             request.display_name,
@@ -324,6 +326,7 @@ impl<'c> Organizations<'c> {
             auto_topup_monthly_limit: row.auto_topup_monthly_limit,
             user_type: row.user_type,
             verified: row.verified,
+            invoicing_enabled: row.invoicing_enabled,
             zero_data_retention: row.zero_data_retention,
         })
     }

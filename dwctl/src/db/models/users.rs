@@ -111,4 +111,6 @@ pub struct UserDBResponse {
     pub verified: bool,
     /// Account-wide zero-data-retention flag.
     pub zero_data_retention: bool,
+    /// Bill this account by emailed invoice rather than an immediate card charge.
+    pub invoicing_enabled: bool,
 }

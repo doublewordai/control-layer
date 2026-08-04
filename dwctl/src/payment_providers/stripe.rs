@@ -875,6 +875,42 @@ impl PaymentProvider for StripeProvider {
         })
     }
 
+    async fn accrue_invoice_item(&self, amount_cents: i64, customer_id: &str, description: &str, idempotency_key: &str) -> Result<String> {
+        use stripe::{IdempotencyKey, RequestStrategy, StripeRequest};
+        use stripe_billing::invoice_item::CreateInvoiceItem;
+
+        let idem = IdempotencyKey::new(idempotency_key.to_string())
+            .map_err(|e| PaymentError::InvalidData(format!("Invalid idempotency key: {e}")))?;
+
+        // Deliberately a *pending* invoice item: no `invoice` field, so Stripe
+        // parks it on the customer and sweeps it onto their next invoice rather
+        // than billing it now. Raising one invoice per top-up would put an
+        // invoice per auto-top-up through the customer's AP department, which
+        // is the exact thing monthly invoicing exists to avoid.
+        let item = CreateInvoiceItem::new()
+            .customer(customer_id)
+            .amount(amount_cents)
+            .currency(Currency::USD)
+            .description(description)
+            .customize()
+            .request_strategy(RequestStrategy::Idempotent(idem))
+            .send(&self.client)
+            .await
+            .map_err(|e| {
+                tracing::error!("Failed to create Stripe invoice item: {:?}", e);
+                PaymentError::ProviderApi(e.to_string())
+            })?;
+
+        tracing::info!(
+            invoice_item_id = %item.id,
+            customer_id,
+            amount_cents,
+            "Accrued charge onto the customer's next invoice"
+        );
+
+        Ok(item.id.to_string())
+    }
+
     async fn charge_auto_topup(
         &self,
         amount_cents: i64,
