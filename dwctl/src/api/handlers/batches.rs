@@ -739,7 +739,13 @@ pub async fn create_batch<P: PoolProvider>(
             // Hidden/system keys are not selectable.
             .filter(|key| !key.hidden)
             .filter(|key| key.parent_api_key_id.is_none())
-            .filter(|key| matches!(key.purpose, ApiKeyPurpose::Realtime | ApiKeyPurpose::Platform))
+            // Explicit billing selection is an inference-key choice: batches
+            // are inference, so only realtime keys are selectable (matching
+            // the dashboard picker). Implicit attribution needs no such
+            // check — the auth middleware already refuses non-inference
+            // keys on every /ai/* path, so an authenticating key here is
+            // inference-purpose by construction.
+            .filter(|key| matches!(key.purpose, ApiKeyPurpose::Realtime))
             // Usable by the caller: their own key, or any org key for org managers.
             .filter(|key| caps.is_org_manager || key.created_by == current_user.id)
             .ok_or_else(|| Error::NotFound {
@@ -5516,6 +5522,26 @@ mod tests {
             .unwrap();
         assert_eq!(batch_key_id, Some(child_id), "capped selection must execute on the cap-scope child");
 
+        // Platform-purpose keys are not selectable for batch billing — the
+        // explicit api_key_id choice is inference-only (implicit attribution
+        // via an authenticating platform key remains allowed elsewhere).
+        let resp = app
+            .post(&format!("/admin/api/v1/users/{}/api-keys", org.id))
+            .add_header(&owner_auth[0].0, &owner_auth[0].1)
+            .add_header(&owner_auth[1].0, &owner_auth[1].1)
+            .json(&serde_json::json!({"name": "Platform Org Key", "purpose": "platform"}))
+            .await;
+        resp.assert_status(StatusCode::CREATED);
+        let platform_key: serde_json::Value = resp.json();
+        let platform_key_id: crate::types::ApiKeyId = platform_key["id"].as_str().unwrap().parse().unwrap();
+        app.post("/ai/v1/batches")
+            .json(&batch_req(&file_id, Some(platform_key_id)))
+            .add_header(&owner_auth[0].0, &owner_auth[0].1)
+            .add_header(&owner_auth[1].0, &owner_auth[1].1)
+            .add_header("cookie", &org_cookie)
+            .await
+            .assert_status(StatusCode::NOT_FOUND);
+
         // Hidden root keys (e.g. the shared batch key minted by the create
         // above: hidden = true, parent NULL) are not selectable even by their
         // holder — the hidden filter, not just the parent filter, must hold.
@@ -5534,6 +5560,44 @@ mod tests {
             .add_header("cookie", &org_cookie)
             .await
             .assert_status(StatusCode::NOT_FOUND);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_batch_creation_rejects_platform_key_auth(pool: PgPool) {
+        let (app, _bg_services, owner, _member, org, file_id) = setup_org_batch_env(&pool).await;
+        let owner_auth = add_auth_headers(&owner);
+
+        // Owner mints one key of each purpose in the org.
+        let mut secrets = std::collections::HashMap::new();
+        for (name, purpose) in [("infer-key", "realtime"), ("mgmt-key", "platform")] {
+            let resp = app
+                .post(&format!("/admin/api/v1/users/{}/api-keys", org.id))
+                .add_header(&owner_auth[0].0, &owner_auth[0].1)
+                .add_header(&owner_auth[1].0, &owner_auth[1].1)
+                .json(&serde_json::json!({"name": name, "purpose": purpose}))
+                .await;
+            resp.assert_status(StatusCode::CREATED);
+            let key: serde_json::Value = resp.json();
+            secrets.insert(purpose, key["key"].as_str().unwrap().to_string());
+        }
+
+        // Platform keys cannot even AUTHENTICATE /ai/* paths — the auth
+        // middleware requires an inference-purpose key there, so implicit
+        // platform attribution is impossible by construction. Pin that wall.
+        let resp = app
+            .post("/ai/v1/batches")
+            .json(&batch_req(&file_id, None))
+            .add_header("authorization", format!("Bearer {}", secrets["platform"]))
+            .await;
+        resp.assert_status_unauthorized();
+
+        // Inference-key Bearer auth: same request succeeds.
+        app.post("/ai/v1/batches")
+            .json(&batch_req(&file_id, None))
+            .add_header("authorization", format!("Bearer {}", secrets["realtime"]))
+            .await
+            .assert_status(StatusCode::CREATED);
     }
 
     #[sqlx::test]
