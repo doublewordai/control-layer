@@ -27,9 +27,13 @@ use crate::{
 ///
 /// Deployments that enforce a Content-Security-Policy (via a fronting
 /// proxy or `auth.security.headers`) should allowlist this exact URL in
-/// `script-src` rather than the whole CDN host. If your CSP pins the
-/// verbatim URL, bump it in the same change as this constant or the docs
-/// pages render blank.
+/// `script-src` rather than the whole CDN host. CSP Level 2 host-sources
+/// match the full path (exact match for paths not ending in `/`), so this
+/// works in all modern browsers — but only because this versioned URL is
+/// served directly: CSP skips path matching after a redirect, and the
+/// unversioned `@scalar/api-reference` URL redirects. If your CSP pins
+/// the verbatim URL, bump it in the same change as this constant or the
+/// docs pages render blank.
 const SCALAR_JS_URL: &str = "https://cdn.jsdelivr.net/npm/@scalar/api-reference@1.64.0/dist/browser/standalone.js";
 /// SRI hash of [`SCALAR_JS_URL`]. Recompute on version bumps:
 /// `curl -sL <url> | openssl dgst -sha384 -binary | base64`
@@ -101,7 +105,9 @@ mod tests {
             .custom_html(scalar_html("AI API"))
             .to_html();
 
-        assert!(html.contains(&format!(r#"src="{SCALAR_JS_URL}" integrity="{SCALAR_JS_SRI}" crossorigin="anonymous""#)));
+        assert!(html.contains(&format!(
+            r#"src="{SCALAR_JS_URL}" integrity="{SCALAR_JS_SRI}" crossorigin="anonymous""#
+        )));
         assert!(!html.contains("$spec"));
         assert!(html.contains(r#""openapi""#));
         // The unversioned floating URL must not sneak back in.
