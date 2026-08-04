@@ -215,7 +215,7 @@ pub fn scrub_usage_json(body: &[u8]) -> Option<Bytes> {
 /// billing semantics (request_logging::batcher::compute_total_cost): drift caps the READ
 /// count to fit; write counts alone exceeding the prompt is corrupt and reports no cache
 /// activity at all — matching the list-price bill for that case.
-fn splice_cache_fields(usage: &mut serde_json::Map<String, Value>, stats: &CacheStats) {
+fn splice_cache_fields(usage: &mut serde_json::Map<String, Value>, stats: &CacheStats, model: Option<&str>) {
     // Scrub first so nothing an upstream reported (e.g. DeepSeek's `prompt_cache_hit_tokens`
     // on an unsanitized model) survives alongside the fields we're about to write.
     scrub_provider_cache_fields(usage);
@@ -227,8 +227,14 @@ fn splice_cache_fields(usage: &mut serde_json::Map<String, Value>, stats: &Cache
     if let (Some(render_total), Some(prompt)) = (stats.render_total, usage.get("prompt_tokens").and_then(Value::as_u64)) {
         let drift = render_total as i64 - prompt as i64;
         metrics::histogram!("dwctl_cache_render_drift_tokens").record(drift as f64);
-        if drift.unsigned_abs() > (prompt / 100).max(16) {
-            metrics::counter!("dwctl_cache_render_drift_exceeded_total").increment(1);
+        // Small constant seams are expected; alarm only on >1% AND >20 tokens, per-model
+        // so a single drifting template is visible amid healthy traffic.
+        if drift.unsigned_abs() > 20 && drift.unsigned_abs() * 100 > prompt {
+            metrics::counter!(
+                "dwctl_cache_render_drift_exceeded_total",
+                "model" => model.unwrap_or("unknown").to_string()
+            )
+            .increment(1);
         }
     }
     let creations = stats.creation_total();
@@ -263,8 +269,9 @@ fn splice_cache_fields(usage: &mut serde_json::Map<String, Value>, stats: &Cache
 pub fn inject_into_usage_json(body: &[u8], stats: &CacheStats) -> Option<Bytes> {
     let mut json: Value = serde_json::from_slice(body).ok()?;
     let obj = json.as_object_mut()?;
+    let model = obj.get("model").and_then(Value::as_str).map(String::from);
     let usage = obj.get_mut("usage")?.as_object_mut()?;
-    splice_cache_fields(usage, stats);
+    splice_cache_fields(usage, stats, model.as_deref());
     serde_json::to_vec(&json).ok().map(Bytes::from)
 }
 
@@ -352,6 +359,7 @@ pub(crate) fn scan_edit_sse(body: &[u8], edit: UsageEdit) -> SseScan {
             if chunk_obj.contains_key("error") {
                 saw_error = true;
             }
+            let model = chunk_obj.get("model").and_then(Value::as_str).map(String::from);
             if let Some(usage) = chunk_obj.get_mut("usage")
                 && let Some(usage_obj) = usage.as_object_mut()
             {
@@ -365,7 +373,7 @@ pub(crate) fn scan_edit_sse(body: &[u8], edit: UsageEdit) -> SseScan {
                         // Probe returned on the fast path above; a frame can't reach here.
                         UsageEdit::Probe => false,
                         UsageEdit::Inject(stats) => {
-                            splice_cache_fields(usage_obj, stats);
+                            splice_cache_fields(usage_obj, stats, model.as_deref());
                             true
                         }
                         // A clean frame needs no rewrite — keep the original bytes.

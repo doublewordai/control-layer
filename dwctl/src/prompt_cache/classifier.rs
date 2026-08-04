@@ -23,7 +23,7 @@ use super::model_config::ModelConfigResolver;
 use super::parse::{ParseError, TelemetryPolicy, parse_chat_completions};
 use super::principal::PrincipalResolver;
 use super::stats::{CacheStats, PendingWrite};
-use super::tokenizer::{TokenizerClient, TokenizerError};
+use super::tokenizer::{TokenizerClient, TokenizerError, WirePrefix};
 
 /// What `classify` needs from the request.
 pub struct ClassifyRequest<'a> {
@@ -262,7 +262,7 @@ impl Classifier {
         // under exact counting (no create at it; its span merges into the next priceable
         // one). Exact counting can fall back to raw counting per the error ladder.
         let counts = if render_mode {
-            match self.render_counts(&req, &parsed, read_block).await? {
+            match self.render_counts(&req, &parsed, read_block, read_tokens as u64).await? {
                 RenderCountsOutcome::Counts { per_breakpoint, total } => {
                     stats.render_total = (total > 0).then_some(total);
                     Some(per_breakpoint)
@@ -378,110 +378,139 @@ impl Classifier {
         ))
     }
 
-    /// Exact chat-templated counting (`/v1/render`): one render per breakpoint, each a
-    /// RECONSTRUCTED prefix (its tools subset + full messages + any partial message),
-    /// generation prompt OFF — precisely what the marker covers, for every marker
-    /// position we price today (tool definitions and mid-message markers included).
-    /// Plus one render of the FULL body (generation prompt on) for the drift total.
+    /// Exact chat-templated counting (`/v1/render`): ONE call carrying the transmitted
+    /// body (markers stripped, telemetry per the live policy) plus every breakpoint
+    /// beyond the read as a structured prefix. The response prices each marker
+    /// (`prefix_counts`) and the engine-view total (generation prompt on, for the drift
+    /// alarm) in a single hop.
     ///
-    /// Per-breakpoint failures fall back to that breakpoint's raw-segment count, so no
-    /// marker position can regress below today's accuracy; whole-request failures follow
-    /// the ladder (unsupported → raw counting; transport → no caching).
+    /// Per-prefix `null`s (a template refusing a degenerate view, e.g. Qwen tools-only)
+    /// are backfilled from the nearest non-null neighbour plus the raw-tokenized delta
+    /// of the intervening blocks, so no marker position regresses below today's
+    /// accuracy. Whole-request failures follow the ladder: unsupported → raw counting;
+    /// transport/5xx → no caching; malformed prefixes (a dwctl bug, never runtime
+    /// input) → log loudly + raw counting.
     async fn render_counts(
         &self,
         req: &ClassifyRequest<'_>,
         parsed: &crate::prompt_cache::parse::ParsedPrompt,
         read_block: Option<usize>,
+        read_tokens: u64,
     ) -> CacheResult<RenderCountsOutcome> {
-        // Slice the marker-stripped body. Telemetry blocks stay in place here so the
-        // PrefixSpec ordinals (recorded against the original arrays) line up; the drift
-        // render below uses the fully-stripped body (the engine's exact bytes). The
-        // difference is a telemetry line or two — acceptable approximation.
-        let keep_telemetry = super::parse::TelemetryPolicy::from_config(false, &[] as &[String]);
-        let stripped = super::inject::strip_cache_control(req.body, &keep_telemetry).0;
+        // The transmitted view: markers stripped, telemetry per the live policy — the
+        // same bytes the engine will see. PrefixSpec ordinals are recorded against this
+        // view in parse, so prefixes and the drift total share one body upload.
+        let stripped = super::inject::strip_cache_control(req.body, &self.telemetry).0;
         let body: &[u8] = stripped.as_deref().unwrap_or(req.body);
         let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) else {
             metrics::counter!("dwctl_cache_render_fallback_total", "reason" => "unparseable").increment(1);
             return Ok(RenderCountsOutcome::Fallback);
         };
-        let empty = Vec::new();
-        let messages = v.get("messages").and_then(|m| m.as_array()).unwrap_or(&empty);
-        let tools = v.get("tools").and_then(|t| t.as_array());
+        let messages = v.get("messages").cloned().unwrap_or(serde_json::Value::Array(Vec::new()));
+        let tools = v.get("tools");
 
+        // Breakpoints at or before the matched read need no count: the read entry's
+        // stored count already prices that prefix, and the write loop skips them.
         let read_block_idx: isize = read_block.map(|b| b as isize).unwrap_or(-1);
-        let mut per_breakpoint: Vec<Option<u64>> = Vec::with_capacity(parsed.breakpoints.len());
+        let mut slots: Vec<Option<usize>> = Vec::with_capacity(parsed.breakpoints.len());
+        let mut prefixes: Vec<WirePrefix> = Vec::new();
         for bp in &parsed.breakpoints {
-            // Breakpoints at or before the matched read need no count: the read entry's
-            // stored count already prices that prefix, and the write loop skips them.
             if bp.block_index as isize <= read_block_idx {
-                per_breakpoint.push(None);
-                continue;
+                slots.push(None);
+            } else {
+                slots.push(Some(prefixes.len()));
+                prefixes.push(bp.prefix.to_wire());
             }
-            let spec = &bp.prefix;
-            // Reconstruct the prefix request.
-            let prefix_tools: Option<serde_json::Value> = tools.and_then(|t| {
-                let kept = spec.tools_kept.min(t.len());
-                (kept > 0).then(|| serde_json::Value::Array(t[..kept].to_vec()))
-            });
-            let mut prefix_messages: Vec<serde_json::Value> = messages.iter().take(spec.full_messages).cloned().collect();
-            if let Some(partial) = &spec.partial
-                && let Some(msg) = messages.get(spec.full_messages)
-            {
-                let mut truncated = msg.clone();
-                if let Some(obj) = truncated.as_object_mut() {
-                    if let Some(serde_json::Value::Array(parts)) = obj.get_mut("content") {
-                        parts.truncate(partial.content_parts);
-                    }
-                    if partial.tool_calls == 0 {
-                        obj.remove("tool_calls");
-                    } else if let Some(serde_json::Value::Array(calls)) = obj.get_mut("tool_calls") {
-                        calls.truncate(partial.tool_calls);
-                    }
-                }
-                prefix_messages.push(truncated);
-            }
-
-            let count = match self
-                .tokenizer
-                .render(
-                    req.virtual_model,
-                    &serde_json::Value::Array(prefix_messages),
-                    prefix_tools.as_ref(),
-                    false, // a prefix is not a generation view
-                )
-                .await
-            {
-                Ok(r) => Some(u64::from(r.total)),
-                Err(TokenizerError::Unmapped(_)) => {
-                    cache_metrics::record_skip("tokenizer_unmapped");
-                    return Ok(RenderCountsOutcome::Skip);
-                }
-                Err(TokenizerError::RenderUnsupported(..)) => {
-                    // e.g. a tools-only prefix the template can't express, or a shape it
-                    // rejects: this BREAKPOINT falls back to its raw-segment count below.
-                    metrics::counter!("dwctl_cache_render_fallback_total", "reason" => "prefix_unsupported").increment(1);
-                    None
-                }
-                Err(e) => {
-                    // Transport/5xx: degrade exactly as tokenize failures do — no caching.
-                    cache_metrics::record_skip("render_failed");
-                    tracing::debug!(error = %e, virtual_model = req.virtual_model, "cache classify: render failed, degrading to no write");
-                    return Ok(RenderCountsOutcome::Skip);
-                }
-            };
-            per_breakpoint.push(count);
         }
 
-        // Raw-segment backfill for any breakpoint the template couldn't price: one
-        // tokenize of all blocks gives cumulative raw counts (today's accuracy).
-        if per_breakpoint.iter().any(Option::is_none) {
+        let resp = match self.tokenizer.render(req.virtual_model, &messages, tools, true, &prefixes).await {
+            Ok(r) => r,
+            Err(TokenizerError::Unmapped(_)) => {
+                cache_metrics::record_skip("tokenizer_unmapped");
+                return Ok(RenderCountsOutcome::Skip);
+            }
+            Err(TokenizerError::RenderUnsupported(..)) => {
+                // NO_CHAT_TEMPLATE / TEMPLATE_RENDER_FAILED: fall back to raw-segment
+                // counting for this request (today's accuracy, not an outage).
+                metrics::counter!("dwctl_cache_render_fallback_total", "reason" => "render_unsupported").increment(1);
+                return Ok(RenderCountsOutcome::Fallback);
+            }
+            Err(TokenizerError::Status { status: 400, body }) => {
+                // Malformed prefixes — runtime input can't cause this; it's a dwctl bug.
+                tracing::error!(
+                    virtual_model = req.virtual_model,
+                    body,
+                    "cache classify: /v1/render rejected our prefixes (dwctl bug) — falling back to raw counting"
+                );
+                metrics::counter!("dwctl_cache_render_fallback_total", "reason" => "bad_request").increment(1);
+                return Ok(RenderCountsOutcome::Fallback);
+            }
+            Err(e) => {
+                // Transport/5xx/shed: degrade exactly as tokenize failures do — no caching.
+                cache_metrics::record_skip("render_failed");
+                tracing::debug!(error = %e, virtual_model = req.virtual_model, "cache classify: render failed, degrading to no write");
+                return Ok(RenderCountsOutcome::Skip);
+            }
+        };
+        if resp.prefix_counts.len() != prefixes.len() {
+            tracing::error!(
+                virtual_model = req.virtual_model,
+                expected = prefixes.len(),
+                got = resp.prefix_counts.len(),
+                "cache classify: /v1/render returned misaligned prefix_counts — falling back to raw counting"
+            );
+            metrics::counter!("dwctl_cache_render_fallback_total", "reason" => "misaligned_response").increment(1);
+            return Ok(RenderCountsOutcome::Fallback);
+        }
+        let total = u64::from(resp.total);
+
+        let mut per_breakpoint: Vec<Option<u64>> = slots.iter().map(|s| s.and_then(|i| resp.prefix_counts[i].map(u64::from))).collect();
+
+        // Monotonicity: prefixes are nested, so non-null counts must be non-decreasing
+        // and ≤ the full-render total. A violation would indicate a template/impl bug —
+        // catch it here rather than billing on it.
+        let mut prev = 0u64;
+        for count in per_breakpoint.iter().flatten() {
+            if *count < prev || *count > total {
+                tracing::warn!(
+                    virtual_model = req.virtual_model,
+                    ?per_breakpoint,
+                    total,
+                    "cache classify: non-monotonic prefix_counts — falling back to raw counting"
+                );
+                metrics::counter!("dwctl_cache_render_fallback_total", "reason" => "non_monotonic").increment(1);
+                return Ok(RenderCountsOutcome::Fallback);
+            }
+            prev = *count;
+        }
+
+        // Hybrid backfill for null prefix_counts (only slots we actually asked for): the
+        // nearest non-null neighbour — the matched read counts as one — plus the
+        // raw-tokenized delta of the blocks between them, so the approximation is
+        // confined to the span the template refused.
+        if slots.iter().zip(per_breakpoint.iter()).any(|(s, c)| s.is_some() && c.is_none()) {
             let segments: Vec<String> = parsed.blocks.iter().map(|b| b.text.clone()).collect();
             match self.tokenizer.tokenize(req.virtual_model, &segments).await {
                 Ok(tok) if tok.cumulative.len() == segments.len() => {
-                    for (slot, bp) in per_breakpoint.iter_mut().zip(parsed.breakpoints.iter()) {
-                        if slot.is_none() {
-                            *slot = Some(u64::from(tok.cumulative[bp.block_index]));
+                    let raw_at = |block: usize| u64::from(tok.cumulative[block]);
+                    for i in 0..per_breakpoint.len() {
+                        if slots[i].is_none() || per_breakpoint[i].is_some() {
+                            continue;
                         }
+                        let block_i = parsed.breakpoints[i].block_index;
+                        // Previous neighbour first (deltas only add, preserving
+                        // monotonicity), else next, else pure raw.
+                        let prev_n = (0..i)
+                            .rev()
+                            .find_map(|j| per_breakpoint[j].map(|c| (parsed.breakpoints[j].block_index, c)))
+                            .or(read_block.map(|b| (b, read_tokens)));
+                        let next_n =
+                            (i + 1..per_breakpoint.len()).find_map(|j| per_breakpoint[j].map(|c| (parsed.breakpoints[j].block_index, c)));
+                        per_breakpoint[i] = Some(match (prev_n, next_n) {
+                            (Some((b, c)), _) => c + (raw_at(block_i) - raw_at(b)),
+                            (None, Some((b, c))) => c.saturating_sub(raw_at(b) - raw_at(block_i)),
+                            (None, None) => raw_at(block_i),
+                        });
                     }
                 }
                 _ => {
@@ -490,22 +519,6 @@ impl Classifier {
                 }
             }
         }
-
-        // The FULL body (engine bytes: telemetry-stripped, generation prompt on) for the
-        // drift measurement against the engine-reported prompt_tokens.
-        let full_stripped = super::inject::strip_cache_control(req.body, &self.telemetry).0;
-        let full_body: &[u8] = full_stripped.as_deref().unwrap_or(req.body);
-        let total = match serde_json::from_slice::<serde_json::Value>(full_body) {
-            Ok(fv) => {
-                let msgs = fv.get("messages").cloned().unwrap_or(serde_json::Value::Array(vec![]));
-                let tls = fv.get("tools").cloned();
-                match self.tokenizer.render(req.virtual_model, &msgs, tls.as_ref(), true).await {
-                    Ok(r) => u64::from(r.total),
-                    Err(_) => 0, // drift sample unavailable; counts above still stand
-                }
-            }
-            Err(_) => 0,
-        };
 
         Ok(RenderCountsOutcome::Counts { per_breakpoint, total })
     }
@@ -617,7 +630,7 @@ mod tests {
     use crate::prompt_cache::{CacheEntry, IndexScope, PostgresIndex, TtlTier, parse_chat_completions};
     use crate::test::utils::{create_test_api_key_for_user, create_test_endpoint, create_test_model, create_test_user};
     use sqlx::PgPool;
-    use wiremock::matchers::{method, path};
+    use wiremock::matchers::{body_partial_json, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     const ALIAS: &str = "cache-model";
@@ -714,8 +727,17 @@ mod tests {
     const TMPL_VER: &str = "sha256:tmpl1";
 
     /// Harness with a render-capable alias: `/v1/models` advertises a template_version and
-    /// `/v1/render` responds as given. `/v1/tokenize` stays mounted (fallback path).
-    async fn render_harness(pool: &PgPool, min_prefix: i32, tokenize_total: u32, render_response: ResponseTemplate) -> H {
+    /// `/v1/render` responds as given — only to requests whose `prefixes` match
+    /// `expected_prefixes` when given (a mismatch 404s → no-cache → the test's count
+    /// assertions fail, so wrong wire prefixes can't pass silently). `/v1/tokenize`
+    /// stays mounted (fallback + null-backfill path).
+    async fn render_harness(
+        pool: &PgPool,
+        min_prefix: i32,
+        tokenize_total: u32,
+        expected_prefixes: Option<serde_json::Value>,
+        render_response: ResponseTemplate,
+    ) -> H {
         let user = create_test_user(pool, Role::StandardUser).await;
         let key = create_test_api_key_for_user(pool, user.id).await;
         let endpoint = create_test_endpoint(pool, "ep", user.id).await;
@@ -739,21 +761,42 @@ mod tests {
             })))
             .mount(&server)
             .await;
-        Mock::given(method("POST"))
-            .and(path("/v1/render"))
-            .respond_with(render_response)
-            .mount(&server)
-            .await;
-        // The raw-segment backfill tokenizes ALL blocks (body() has two: the marked
-        // system block and the user block) — respond with matching per-segment counts.
+        let render_mock = Mock::given(method("POST")).and(path("/v1/render"));
+        let render_mock = match expected_prefixes {
+            Some(prefixes) => render_mock.and(body_partial_json(serde_json::json!({ "prefixes": prefixes }))),
+            None => render_mock,
+        };
+        render_mock.respond_with(render_response).mount(&server).await;
+        // Raw counting reaches /v1/tokenize two ways with different segment counts:
+        // whole-request fallback (segment_counts: the write SPAN — 1 segment for
+        // `body()`) and null-prefix backfill (ALL blocks — 2). Answer per request:
+        // first segment costs `tokenize_total` tokens, each further segment 10.
+        struct SegmentTokenizer {
+            first: u32,
+        }
+        impl wiremock::Respond for SegmentTokenizer {
+            fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
+                let v: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                let n = v["segments"].as_array().map(|a| a.len()).unwrap_or(0);
+                let counts: Vec<u32> = (0..n).map(|i| if i == 0 { self.first } else { 10 }).collect();
+                let cumulative: Vec<u32> = counts
+                    .iter()
+                    .scan(0u32, |acc, c| {
+                        *acc += c;
+                        Some(*acc)
+                    })
+                    .collect();
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "virtual_model": ALIAS, "tokenizer_version": TOK_VER,
+                    "segment_counts": counts,
+                    "total": cumulative.last().copied().unwrap_or(0),
+                    "cumulative": cumulative,
+                }))
+            }
+        }
         Mock::given(method("POST"))
             .and(path("/v1/tokenize"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "virtual_model": ALIAS, "tokenizer_version": TOK_VER,
-                "segment_counts": [tokenize_total, 10],
-                "cumulative": [tokenize_total, tokenize_total + 10],
-                "total": tokenize_total + 10
-            })))
+            .respond_with(SegmentTokenizer { first: tokenize_total })
             .mount(&server)
             .await;
 
@@ -777,24 +820,26 @@ mod tests {
 
     #[sqlx::test]
     async fn render_mode_counts_exact_boundaries(pool: PgPool) {
-        // The marked system block is the last block of message 0 → boundary 1. Exact
-        // count at the boundary (1600) drives the write; `total` (1900) feeds the drift
-        // alarm; the scope folds the template version so raw-era entries can't match.
+        // The marker sits on message 0's final block → wire prefix {"message": 0}. ONE
+        // render call returns the marker's count (prefix_counts[0] = 1600, the write)
+        // and the full-prompt total (1900, the drift sample); the scope folds the
+        // template version so raw-era entries can't match.
         let h = render_harness(
             &pool,
             1024,
             0, // tokenize must not be consulted
+            Some(serde_json::json!([{"message": 0}])),
             ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "virtual_model": ALIAS, "tokenizer_version": TOK_VER, "template_version": TMPL_VER,
-                "total": 1600
+                "total": 1900, "prefix_counts": [1600]
             })),
         )
         .await;
         let b = body();
         let ClassifyOutcome { stats, pending, active } = h.classifier.classify(req(&h.secret, &b)).await.unwrap();
         assert!(active);
-        assert_eq!(stats.creation_1h, 1600, "the prefix render's exact count is the write");
-        assert_eq!(stats.render_total, Some(1600), "full-render total feeds the drift alarm");
+        assert_eq!(stats.creation_1h, 1600, "the marker's prefix count is the write");
+        assert_eq!(stats.render_total, Some(1900), "full-render total feeds the drift alarm");
         assert_eq!(pending.writes.len(), 1);
         assert_eq!(pending.writes[0].cumulative_token_count, 1600);
         assert_eq!(
@@ -806,15 +851,17 @@ mod tests {
 
     #[sqlx::test]
     async fn render_prices_tool_definition_markers(pool: PgPool) {
-        // A marker on a tool DEFINITION is priced by rendering the tools-only prefix —
-        // every marker position raw counting prices, exact counting prices too.
+        // A marker on a tool DEFINITION becomes the wire prefix {"tools": 1} (first
+        // definition, no messages) — every marker position raw counting prices, exact
+        // counting prices too.
         let h = render_harness(
             &pool,
             1024,
             0,
+            Some(serde_json::json!([{"tools": 1}])),
             ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "virtual_model": ALIAS, "tokenizer_version": TOK_VER, "template_version": TMPL_VER,
-                "total": 1400
+                "total": 1900, "prefix_counts": [1400]
             })),
         )
         .await;
@@ -840,6 +887,7 @@ mod tests {
             &pool,
             1024,
             1500,
+            None,
             ResponseTemplate::new(400).set_body_string(r#"{"error":"TEMPLATE_RENDER_FAILED"}"#),
         )
         .await;
@@ -854,7 +902,7 @@ mod tests {
     #[sqlx::test]
     async fn render_transport_error_degrades_to_no_cache(pool: PgPool) {
         // 503 → exactly like a tokenize outage: no caching for this request.
-        let h = render_harness(&pool, 1024, 1500, ResponseTemplate::new(503)).await;
+        let h = render_harness(&pool, 1024, 1500, None, ResponseTemplate::new(503)).await;
         let b = body();
         let out = h.classifier.classify(req(&h.secret, &b)).await.unwrap();
         assert!(out.active);
@@ -869,9 +917,10 @@ mod tests {
             &pool,
             1024,
             5000,
+            None,
             ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "virtual_model": ALIAS, "tokenizer_version": TOK_VER, "template_version": TMPL_VER,
-                "total": 800
+                "total": 900, "prefix_counts": [800]
             })),
         )
         .await;
@@ -880,6 +929,54 @@ mod tests {
         assert!(out.active);
         assert!(out.stats.is_zero(), "800 < 1024 floor under exact counting");
         assert!(out.pending.is_empty());
+    }
+
+    #[sqlx::test]
+    async fn render_null_prefix_backfills_from_raw_counts(pool: PgPool) {
+        // A null prefix_counts entry (template refused that truncated view) backfills
+        // from raw tokenize — with no non-null neighbour, the marker's raw cumulative
+        // count (1500 at block 0). The render total still stands as the drift sample.
+        let h = render_harness(
+            &pool,
+            1024,
+            1500,
+            None,
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "virtual_model": ALIAS, "tokenizer_version": TOK_VER, "template_version": TMPL_VER,
+                "total": 1900, "prefix_counts": [null]
+            })),
+        )
+        .await;
+        let b = body();
+        let ClassifyOutcome { stats, pending, active } = h.classifier.classify(req(&h.secret, &b)).await.unwrap();
+        assert!(active);
+        assert_eq!(stats.creation_1h, 1500, "null prefix backfilled from raw cumulative");
+        assert_eq!(stats.render_total, Some(1900), "drift sample survives a null prefix");
+        assert_eq!(pending.writes.len(), 1);
+        assert_eq!(pending.writes[0].cumulative_token_count, 1500);
+    }
+
+    #[sqlx::test]
+    async fn render_non_monotonic_counts_fall_back_to_raw(pool: PgPool) {
+        // A prefix count above the full-render total means the template/impl is lying —
+        // fall back to raw counting rather than bill on it.
+        let h = render_harness(
+            &pool,
+            1024,
+            1500,
+            None,
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "virtual_model": ALIAS, "tokenizer_version": TOK_VER, "template_version": TMPL_VER,
+                "total": 1000, "prefix_counts": [2000]
+            })),
+        )
+        .await;
+        let b = body();
+        let ClassifyOutcome { stats, pending, active } = h.classifier.classify(req(&h.secret, &b)).await.unwrap();
+        assert!(active);
+        assert_eq!(stats.creation_1h, 1500, "raw-segment fallback count");
+        assert_eq!(stats.render_total, None, "a rejected render contributes no drift sample");
+        assert_eq!(pending.writes.len(), 1);
     }
 
     fn req<'a>(secret: &'a str, body: &'a [u8]) -> ClassifyRequest<'a> {

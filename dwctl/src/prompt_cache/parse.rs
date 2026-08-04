@@ -26,6 +26,7 @@
 //! excluded from this view (see [`TelemetryPolicy`]) so they don't poison the prefix hash and
 //! force write-only caching. In strip mode they're also removed from the forwarded request.
 
+use super::tokenizer::WirePrefix;
 use sha2::{Digest, Sha256};
 
 use super::index::{TierPolicy, TtlTier};
@@ -116,12 +117,43 @@ pub struct PrefixSpec {
 }
 
 /// The kept portion of a partially-included message.
+///
+/// Ordinals count the request AS TRANSMITTED: in telemetry strip mode the sanitiser
+/// removes excluded blocks from the forwarded body, so kept parts are numbered over
+/// the surviving blocks (the view the tokenizer-svc renders).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PartialMessage {
     /// Leading `content[]` parts kept (array-form content).
     pub content_parts: usize,
     /// Leading `tool_calls[]` kept (assistant messages; ordered after content).
     pub tool_calls: usize,
+}
+
+impl PrefixSpec {
+    /// This prefix in the tokenizer-svc `/v1/render` wire shape. `tools` is a COUNT
+    /// (first n definitions); `message`/`block`/`tool_call` are inclusive indices —
+    /// per the svc contract.
+    pub fn to_wire(&self) -> WirePrefix {
+        if let Some(partial) = &self.partial {
+            if partial.tool_calls > 0 {
+                WirePrefix::ToolCall {
+                    message: self.full_messages,
+                    tool_call: partial.tool_calls - 1,
+                }
+            } else {
+                WirePrefix::Block {
+                    message: self.full_messages,
+                    block: partial.content_parts - 1,
+                }
+            }
+        } else if self.full_messages > 0 {
+            WirePrefix::Message {
+                message: self.full_messages - 1,
+            }
+        } else {
+            WirePrefix::Tools { tools: self.tools_kept }
+        }
+    }
 }
 
 /// The parsed cache view of a request.
@@ -204,8 +236,18 @@ pub fn parse_chat_completions(body: &[u8], policy: &TierPolicy, telemetry: &Tele
     if let Some(messages) = v.get("messages").and_then(|m| m.as_array()) {
         for (message_index, msg) in messages.iter().enumerate() {
             let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("").to_string();
-            // Original-array sizes for this message, for breakpoint prefix construction.
-            let content_len = msg.get("content").and_then(|c| c.as_array()).map(|a| a.len()).unwrap_or(0);
+            // Transmitted-view sizes for this message, for breakpoint prefix construction:
+            // in strip mode telemetry blocks are removed from the forwarded body, so they
+            // don't occupy content ordinals in the view the tokenizer-svc will render.
+            let content_len = msg
+                .get("content")
+                .and_then(|c| c.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter(|b| !(telemetry.strip_from_prompt && telemetry.excludes_block(&role, b)))
+                        .count()
+                })
+                .unwrap_or(0);
             let calls_len = if role == "assistant" {
                 msg.get("tool_calls").and_then(|t| t.as_array()).map(|a| a.len()).unwrap_or(0)
             } else {
@@ -227,14 +269,21 @@ pub fn parse_chat_completions(body: &[u8], policy: &TierPolicy, telemetry: &Tele
                 }
                 // Array content: a sequence of blocks, each possibly marked.
                 Some(serde_json::Value::Array(arr)) => {
-                    for (part_ordinal, block) in arr.iter().enumerate() {
+                    // Ordinal of the current part in the TRANSMITTED body (strip mode
+                    // removes telemetry blocks, shifting later parts down).
+                    let mut fwd_ordinal = 0usize;
+                    for block in arr.iter() {
                         // Exclude provider-injected telemetry blocks (e.g. the Claude Code SDK's
                         // `x-anthropic-billing-header` line with its per-request `cch` nonce) from the
                         // cache prefix: left in, they'd change the prefix hash every turn and force
                         // write-only caching. `excludes_block` only matches UNMARKED blocks, so a
                         // caller's `cache_control` breakpoint is never dropped. (In strip mode the
-                        // outbound sanitiser also removes them from the forwarded request.)
+                        // outbound sanitiser also removes them from the forwarded request; otherwise
+                        // they still occupy a transmitted ordinal.)
                         if telemetry.excludes_block(&role, block) {
+                            if !telemetry.strip_from_prompt {
+                                fwd_ordinal += 1;
+                            }
                             continue;
                         }
                         let ttl = match block.get("cache_control") {
@@ -264,12 +313,13 @@ pub fn parse_chat_completions(body: &[u8], policy: &TierPolicy, telemetry: &Tele
                                     tools_kept: tools_total,
                                     full_messages: message_index,
                                     partial: Some(PartialMessage {
-                                        content_parts: part_ordinal + 1,
+                                        content_parts: fwd_ordinal + 1,
                                         tool_calls: 0,
                                     }),
                                 },
                             });
                         }
+                        fwd_ordinal += 1;
                     }
                 }
                 _ => {}
@@ -754,6 +804,94 @@ mod tests {
                 full_messages: 2,
                 partial: None
             }
+        );
+    }
+
+    #[test]
+    fn wire_prefix_maps_every_marker_shape() {
+        // `tools` is a count; `message`/`block`/`tool_call` are inclusive indices.
+        let cases = [
+            (
+                PrefixSpec {
+                    tools_kept: 2,
+                    full_messages: 0,
+                    partial: None,
+                },
+                WirePrefix::Tools { tools: 2 },
+                serde_json::json!({"tools": 2}),
+            ),
+            (
+                PrefixSpec {
+                    tools_kept: 2,
+                    full_messages: 3,
+                    partial: None,
+                },
+                WirePrefix::Message { message: 2 },
+                serde_json::json!({"message": 2}),
+            ),
+            (
+                PrefixSpec {
+                    tools_kept: 0,
+                    full_messages: 1,
+                    partial: Some(PartialMessage {
+                        content_parts: 2,
+                        tool_calls: 0,
+                    }),
+                },
+                WirePrefix::Block { message: 1, block: 1 },
+                serde_json::json!({"message": 1, "block": 1}),
+            ),
+            (
+                PrefixSpec {
+                    tools_kept: 0,
+                    full_messages: 1,
+                    partial: Some(PartialMessage {
+                        content_parts: 2,
+                        tool_calls: 1,
+                    }),
+                },
+                WirePrefix::ToolCall { message: 1, tool_call: 0 },
+                serde_json::json!({"message": 1, "tool_call": 0}),
+            ),
+        ];
+        for (spec, wire, json) in cases {
+            assert_eq!(spec.to_wire(), wire);
+            assert_eq!(serde_json::to_value(&wire).unwrap(), json, "wire serialization");
+        }
+    }
+
+    #[test]
+    fn telemetry_strip_mode_renumbers_wire_ordinals() {
+        // A telemetry block ahead of the marked part: in strip mode the sanitiser
+        // removes it from the forwarded body, so the marker's transmitted content
+        // ordinal shifts down by one; in keep mode the block still occupies index 0.
+        let body = serde_json::json!({
+            "messages": [
+                {"role": "system", "content": [
+                    {"type":"text","text":"x-anthropic-billing-header: cch=1"},
+                    {"type":"text","text":"kept","cache_control":{"type":"ephemeral"}},
+                    {"type":"text","text":"tail"}
+                ]}
+            ]
+        });
+        let strip = parse_with(body.clone(), &telemetry());
+        assert_eq!(
+            strip.breakpoints[0].prefix.partial,
+            Some(PartialMessage {
+                content_parts: 1,
+                tool_calls: 0
+            })
+        );
+        let keep = parse_with(
+            body,
+            &TelemetryPolicy::from_config(false, &["x-anthropic-billing-header:".to_string()]),
+        );
+        assert_eq!(
+            keep.breakpoints[0].prefix.partial,
+            Some(PartialMessage {
+                content_parts: 2,
+                tool_calls: 0
+            })
         );
     }
 

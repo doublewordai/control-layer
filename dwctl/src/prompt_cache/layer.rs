@@ -960,6 +960,7 @@ mod tests {
             Arc::new(PostgresIndex::new(pool.clone(), 1)),
             all_tiers(),
             TelemetryPolicy::default(),
+            false,
         );
         let app = Router::new()
             .route("/v1/chat/completions", post(mock_upstream_with_provider_cache))
@@ -1006,6 +1007,7 @@ mod tests {
             Arc::new(PostgresIndex::new(pool.clone(), 1)),
             all_tiers(),
             TelemetryPolicy::default(),
+            false,
         );
         let app = Router::new()
             .route("/v1/chat/completions", post(mock_upstream_streaming_with_provider_cache))

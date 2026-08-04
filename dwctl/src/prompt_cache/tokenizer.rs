@@ -58,11 +58,34 @@ struct RenderRequest<'a> {
     messages: &'a serde_json::Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<&'a serde_json::Value>,
-    /// ON for the full-prompt (engine-view) render; OFF for breakpoint-prefix renders —
-    /// a prefix up to a marker is not a generation view.
+    /// Applies to the MAIN render only; prefix renders are always generation-prompt-off
+    /// server-side (a prefix up to a marker is not a generation view).
     add_generation_prompt: bool,
+    /// Truncation points to also count (≤5, canonical tools→messages order). The svc
+    /// renders each truncated view independently and returns `prefix_counts` in request
+    /// order. Cache-agnostic: dwctl translates markers into these; the svc never sees
+    /// `cache_control`.
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    prefixes: &'a [WirePrefix],
     /// The classifier only needs counts; echoing a 64k-token render would be waste.
     return_rendered: bool,
+}
+
+/// One truncation point, in the svc's wire shape. Indices are INCLUSIVE and refer to the
+/// request as transmitted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+pub enum WirePrefix {
+    /// `tools[0..=tools]`, no messages.
+    Tools { tools: usize },
+    /// All tools + `messages[0..=message]` complete.
+    Message { message: usize },
+    /// All tools + `messages[0..message]` + message `message` truncated to
+    /// `content[0..=block]`, tool_calls removed.
+    Block { message: usize, block: usize },
+    /// All tools + `messages[0..message]` + message `message` with full content +
+    /// `tool_calls[0..=tool_call]`.
+    ToolCall { message: usize, tool_call: usize },
 }
 
 /// tokenizer-svc `/v1/render` response (0.3.0+): exact chat-templated counts — the
@@ -72,8 +95,12 @@ pub struct RenderResponse {
     pub virtual_model: String,
     pub tokenizer_version: String,
     pub template_version: String,
-    /// Token count of the render (generation prompt included when requested).
+    /// Token count of the MAIN render (generation prompt included when requested).
     pub total: u32,
+    /// One count per requested prefix, in request order. `None` = the template refused
+    /// that truncated view (the caller backfills from raw counts).
+    #[serde(default)]
+    pub prefix_counts: Vec<Option<u32>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -156,10 +183,13 @@ impl TokenizerClient {
         messages: &serde_json::Value,
         tools: Option<&serde_json::Value>,
         add_generation_prompt: bool,
+        prefixes: &[WirePrefix],
     ) -> TokenizerResult<RenderResponse> {
         let start = std::time::Instant::now();
         let size = cache_metrics::tokenize_size_bucket(messages.to_string().len() + tools.map(|t| t.to_string().len()).unwrap_or(0));
-        let result = self.render_inner(virtual_model, messages, tools, add_generation_prompt).await;
+        let result = self
+            .render_inner(virtual_model, messages, tools, add_generation_prompt, prefixes)
+            .await;
         let model_label = match &result {
             Ok(_) => virtual_model,
             Err(TokenizerError::Unmapped(_)) => "unmapped",
@@ -183,6 +213,7 @@ impl TokenizerClient {
         messages: &serde_json::Value,
         tools: Option<&serde_json::Value>,
         add_generation_prompt: bool,
+        prefixes: &[WirePrefix],
     ) -> TokenizerResult<RenderResponse> {
         let resp = self
             .http
@@ -192,6 +223,7 @@ impl TokenizerClient {
                 messages,
                 tools,
                 add_generation_prompt,
+                prefixes,
                 return_rendered: false,
             })
             .send()
