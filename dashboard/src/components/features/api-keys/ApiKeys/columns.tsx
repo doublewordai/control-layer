@@ -4,12 +4,7 @@ import { type ColumnDef } from "@tanstack/react-table";
 import { ArrowUpDown, Trash2, Pencil, RefreshCw, Eye } from "lucide-react";
 import { Button } from "../../../ui/button";
 import { Checkbox } from "../../../ui/checkbox";
-import {
-  Tooltip,
-  TooltipContent,
-  TooltipProvider,
-  TooltipTrigger,
-} from "../../../ui/tooltip";
+import { Tooltip, TooltipContent, TooltipTrigger } from "../../../ui/tooltip";
 import type { ApiKey } from "../../../../api/control-layer/types";
 import {
   formatCredits,
@@ -277,76 +272,76 @@ export const createColumns = (actions: ColumnActions): ColumnDef<ApiKey>[] => {
         }
 
         // Icon-only buttons need hover tooltips — Reveal vs Rotate are
-        // both circular-arrow-adjacent glyphs and easily confused.
+        // both circular-arrow-adjacent glyphs and easily confused. No
+        // TooltipProvider here: the ui/tooltip Tooltip wraps itself in one
+        // (delay 0), so an outer provider is inert.
         return (
-          <TooltipProvider delayDuration={150}>
-            <div className="flex items-center">
-              {canManage && (
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      onClick={() => actions.onEdit(apiKey)}
-                      aria-label={`Edit usage limit for ${apiKey.name}`}
-                      className="text-doubleword-neutral-600 hover:text-doubleword-neutral-900"
-                    >
-                      <Pencil className="h-4 w-4" />
-                    </Button>
-                  </TooltipTrigger>
-                  <TooltipContent>Edit usage limit</TooltipContent>
-                </Tooltip>
-              )}
-              {canReveal && (
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      onClick={() => actions.onReveal(apiKey)}
-                      aria-label={`Reveal ${apiKey.name}`}
-                      className="text-doubleword-neutral-600 hover:text-doubleword-neutral-900"
-                    >
-                      <Eye className="h-4 w-4" />
-                    </Button>
-                  </TooltipTrigger>
-                  <TooltipContent>Reveal secret (one-off)</TooltipContent>
-                </Tooltip>
-              )}
-              {canRotate && (
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      onClick={() => actions.onRotate(apiKey)}
-                      aria-label={`Rotate ${apiKey.name}`}
-                      className="text-doubleword-neutral-600 hover:text-doubleword-neutral-900"
-                    >
-                      <RefreshCw className="h-4 w-4" />
-                    </Button>
-                  </TooltipTrigger>
-                  <TooltipContent>Rotate secret</TooltipContent>
-                </Tooltip>
-              )}
-              {canManage && (
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      onClick={() => actions.onDelete(apiKey)}
-                      aria-label={`Delete ${apiKey.name}`}
-                      className="text-red-600 hover:text-red-700 hover:bg-red-50"
-                    >
-                      <Trash2 className="h-4 w-4" />
-                    </Button>
-                  </TooltipTrigger>
-                  <TooltipContent>Delete key</TooltipContent>
-                </Tooltip>
-              )}
-            </div>
-          </TooltipProvider>
+          <div className="flex items-center">
+            {canManage && (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => actions.onEdit(apiKey)}
+                    aria-label={`Edit usage limit for ${apiKey.name}`}
+                    className="text-doubleword-neutral-600 hover:text-doubleword-neutral-900"
+                  >
+                    <Pencil className="h-4 w-4" />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent>Edit usage limit</TooltipContent>
+              </Tooltip>
+            )}
+            {canReveal && (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => actions.onReveal(apiKey)}
+                    aria-label={`Reveal ${apiKey.name}`}
+                    className="text-doubleword-neutral-600 hover:text-doubleword-neutral-900"
+                  >
+                    <Eye className="h-4 w-4" />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent>Reveal secret (one-off)</TooltipContent>
+              </Tooltip>
+            )}
+            {canRotate && (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => actions.onRotate(apiKey)}
+                    aria-label={`Rotate ${apiKey.name}`}
+                    className="text-doubleword-neutral-600 hover:text-doubleword-neutral-900"
+                  >
+                    <RefreshCw className="h-4 w-4" />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent>Rotate secret</TooltipContent>
+              </Tooltip>
+            )}
+            {canManage && (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => actions.onDelete(apiKey)}
+                    aria-label={`Delete ${apiKey.name}`}
+                    className="text-red-600 hover:text-red-700 hover:bg-red-50"
+                  >
+                    <Trash2 className="h-4 w-4" />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent>Delete key</TooltipContent>
+              </Tooltip>
+            )}
+          </div>
         );
       },
     },
