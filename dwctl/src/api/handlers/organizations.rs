@@ -1486,6 +1486,7 @@ pub async fn list_user_organizations<P: PoolProvider>(
                     can_manage_keys: matches!(m.role.as_str(), "owner" | "admin") || manage_keys_orgs.contains(&o.id),
                     role: m.role.clone(),
                     zero_data_retention: o.zero_data_retention,
+                    verified: o.verified,
                 })
         })
         .collect();
@@ -2182,6 +2183,66 @@ mod tests {
         assert_eq!(members.len(), 1);
         assert_eq!(members[0]["role"].as_str().unwrap(), "owner");
         assert_eq!(members[0]["user"]["id"].as_str().unwrap(), user.id.to_string());
+    }
+
+    /// The org's verification is its own, not the member's.
+    ///
+    /// Paying as an org admin verifies the organization rather than the human
+    /// who clicked, so a client asking "can this workspace pay" has to read the
+    /// summary. This pins that the two never get conflated.
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_user_organizations_summary_reflects_org_verification(pool: PgPool) {
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        let user_headers = add_auth_headers(&user);
+
+        let resp = server
+            .post("/admin/api/v1/organizations")
+            .add_header(&user_headers[0].0, &user_headers[0].1)
+            .add_header(&user_headers[1].0, &user_headers[1].1)
+            .json(&json!({ "name": "verify-org", "email": "contact@verify-org.com" }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::CREATED);
+        let org_id: uuid::Uuid = resp.json::<serde_json::Value>()["id"].as_str().unwrap().parse().unwrap();
+
+        let orgs_url = format!("/admin/api/v1/users/{}/organizations", user.id);
+        let fetch_summary = async |server: &axum_test::TestServer| -> serde_json::Value {
+            let resp = server
+                .get(&orgs_url)
+                .add_header(&user_headers[0].0, &user_headers[0].1)
+                .add_header(&user_headers[1].0, &user_headers[1].1)
+                .await;
+            resp.assert_status(axum::http::StatusCode::OK);
+            resp.json::<Vec<serde_json::Value>>().into_iter().next().expect("one org")
+        };
+
+        // A newly created org has never paid for anything.
+        assert_eq!(fetch_summary(&server).await["verified"].as_bool(), Some(false));
+
+        // The same call the payment and card-verification paths make.
+        let mut conn = pool.acquire().await.unwrap();
+        crate::db::handlers::users::Users::new(&mut conn)
+            .set_verified(org_id)
+            .await
+            .unwrap();
+        drop(conn);
+
+        assert_eq!(fetch_summary(&server).await["verified"].as_bool(), Some(true));
+
+        // Verifying the organization must not have verified the member, or the
+        // topbar would clear its badge for the wrong entity.
+        let resp = server
+            .get("/admin/api/v1/users/current")
+            .add_header(&user_headers[0].0, &user_headers[0].1)
+            .add_header(&user_headers[1].0, &user_headers[1].1)
+            .await;
+        resp.assert_status(axum::http::StatusCode::OK);
+        assert_eq!(
+            resp.json::<serde_json::Value>()["verified"].as_bool(),
+            Some(false),
+            "the member is still unverified in their own right"
+        );
     }
 
     #[sqlx::test]
