@@ -1,5 +1,12 @@
 # Changelog
 
+## [10.7.2](https://github.com/doublewordai/control-layer/compare/v10.7.1...v10.7.2) (2026-08-05)
+
+
+### Bug Fixes
+
+* hover tooltips on API key action buttons ([#1443](https://github.com/doublewordai/control-layer/issues/1443)) ([a8ecab1](https://github.com/doublewordai/control-layer/commit/a8ecab1ccf914eba2769a001ba260770e0698bb0))
+
 ## [10.7.1](https://github.com/doublewordai/control-layer/compare/v10.7.0...v10.7.1) (2026-08-05)
 
 
