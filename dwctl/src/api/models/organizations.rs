@@ -256,4 +256,13 @@ pub struct OrganizationSummary {
     /// Drives the dashboard's create/edit affordances and the batch key
     /// selection requirement.
     pub can_manage_keys: bool,
+    /// Whether the organization has proven a payment method - a completed
+    /// purchase or a setup-mode card verification. Surfaced alongside the
+    /// other org-wide flags so a member can see their organization's status
+    /// without a second request per organization.
+    ///
+    /// Distinct from the same field on the *user*: paying as an org admin
+    /// verifies the organization, not you, so a client showing "is this
+    /// workspace able to pay" must read it from here when acting as an org.
+    pub verified: bool,
 }
