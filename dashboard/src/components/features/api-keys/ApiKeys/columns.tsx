@@ -123,9 +123,16 @@ export const createColumns = (actions: ColumnActions): ColumnDef<ApiKey>[] => {
             ) : (
               <span className="text-xs text-doubleword-neutral-400">
                 Opened{" "}
+                {/* Fixed to UTC: local-tz rendering shifts dates around
+                    midnight per viewer and makes tests flaky. */}
                 {new Date(apiKey.secret_revealed_at).toLocaleDateString(
                   "en-US",
-                  { year: "numeric", month: "short", day: "numeric" },
+                  {
+                    year: "numeric",
+                    month: "short",
+                    day: "numeric",
+                    timeZone: "UTC",
+                  },
                 )}
               </span>
             )}

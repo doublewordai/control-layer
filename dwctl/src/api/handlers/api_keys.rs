@@ -200,9 +200,20 @@ pub async fn create_user_api_key<P: PoolProvider>(
         current_user.id
     };
 
-    let mut repo = ApiKeys::new(&mut pool_conn);
+    // The validation reads above used a plain connection; release it before
+    // the write sequence takes its own.
+    drop(pool_conn);
+
     let has_cap = data.spend_limit.is_some();
     let db_request = ApiKeyCreateDBRequest::new(target_user_id, created_by, data);
+
+    // One transaction for the whole create sequence (insert → reveal-pending
+    // flag → cap-scope provisioning): a crash or transient error mid-way
+    // must not leave a half-provisioned key — e.g. an issued key stuck
+    // "born revealed" that its holder can never reveal, or a capped key
+    // whose batch/flex traffic escapes its cap scope.
+    let mut tx = state.db.write().begin().await.map_err(|e| Error::Database(e.into()))?;
+    let mut repo = ApiKeys::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
 
     let mut api_key = repo.create(&db_request).await?;
 
@@ -227,9 +238,10 @@ pub async fn create_user_api_key<P: PoolProvider>(
 
     let key_id = api_key.id;
     let spend_states = repo.get_spend_states(&[key_id]).await?;
+    tx.commit().await.map_err(|e| Error::Database(e.into()))?;
 
     // api_key.created webhook deliveries are created by the notification poller
-    // via PG LISTEN/NOTIFY on the api_keys table.
+    // via PG LISTEN/NOTIFY on the api_keys table (NOTIFY fires on commit).
 
     Ok((
         StatusCode::CREATED,
@@ -792,8 +804,8 @@ pub async fn rotate_user_api_key<P: PoolProvider>(
     responses(
         (status = 200, description = "The API key secret", body = ApiKeySecretResponse),
         (status = 401, description = "Unauthorized"),
-        (status = 403, description = "Forbidden - only the key's holder may reveal it"),
-        (status = 404, description = "API key not found"),
+        (status = 403, description = "Forbidden - insufficient permissions"),
+        (status = 404, description = "API key not found (or not held by the current user)"),
         (status = 409, description = "Conflict - the one-off reveal was already used"),
         (status = 500, description = "Internal server error"),
     ),
