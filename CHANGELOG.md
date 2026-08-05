@@ -1,5 +1,12 @@
 # Changelog
 
+## [10.7.0](https://github.com/doublewordai/control-layer/compare/v10.6.0...v10.7.0) (2026-08-05)
+
+
+### Features
+
+* org key filter and reveal ([#1436](https://github.com/doublewordai/control-layer/issues/1436)) ([78a7e37](https://github.com/doublewordai/control-layer/commit/78a7e373de56f389250932bd3f83abc838c3d7ca))
+
 ## [10.6.0](https://github.com/doublewordai/control-layer/compare/v10.5.0...v10.6.0) (2026-08-05)
 
 
