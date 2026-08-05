@@ -520,7 +520,10 @@ export const ApiKeys: React.FC = () => {
         </div>
       )}
 
-      {showScopingControls && apiKeys.length > 0 && (
+      {/* Keep the scoping controls mounted whenever a filter is active —
+          a member with zero keys must leave the admin a way to back out,
+          not dump them on the unscoped empty state. */}
+      {showScopingControls && (apiKeys.length > 0 || createdByFilter != null) && (
         <div className="mb-4 flex flex-wrap items-center gap-3">
           <Tabs
             value={keyScope}
@@ -551,7 +554,29 @@ export const ApiKeys: React.FC = () => {
         </div>
       )}
 
-      {apiKeys.length > 0 ? (
+      {apiKeys.length === 0 && createdByFilter != null ? (
+        <div
+          className="text-center py-12"
+          role="status"
+          aria-label="No keys for this filter"
+        >
+          <div className="p-4 bg-doubleword-neutral-100 rounded-full w-16 h-16 mx-auto mb-4 flex items-center justify-center">
+            <Key className="w-8 h-8 text-doubleword-neutral-600" />
+          </div>
+          <h3
+            className="text-lg font-medium text-doubleword-neutral-900 mb-2"
+            role="heading"
+            aria-level={3}
+          >
+            No keys match this filter
+          </h3>
+          <p className="text-doubleword-neutral-600">
+            {keyScope === "mine"
+              ? "You don't hold any keys in this organization yet."
+              : "The selected member holds no API keys in this organization. Try another member or switch back to all members."}
+          </p>
+        </div>
+      ) : apiKeys.length > 0 ? (
         <DataTable
           columns={columns}
           data={apiKeys}
