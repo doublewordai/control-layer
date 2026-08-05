@@ -226,7 +226,7 @@ fn splice_cache_fields(usage: &mut serde_json::Map<String, Value>, stats: &Cache
     // tokenizer-svc bake and the serving engine.
     if let (Some(render_total), Some(prompt)) = (stats.render_total, usage.get("prompt_tokens").and_then(Value::as_u64)) {
         let drift = render_total as i64 - prompt as i64;
-        metrics::histogram!("dwctl_cache_render_drift_tokens").record(drift as f64);
+        metrics::histogram!("dwctl_cache_render_drift_tokens", "model" => model.unwrap_or("unknown").to_string()).record(drift as f64);
         // Small constant seams are expected; alarm only on >1% AND >20 tokens, per-model
         // so a single drifting template is visible amid healthy traffic.
         if drift.unsigned_abs() > 20 && drift.unsigned_abs() * 100 > prompt {
