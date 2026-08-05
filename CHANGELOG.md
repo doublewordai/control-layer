@@ -1,5 +1,17 @@
 # Changelog
 
+## [10.6.0](https://github.com/doublewordai/control-layer/compare/v10.5.0...v10.6.0) (2026-08-05)
+
+
+### Features
+
+* **organizations:** claim the owner's domain, several workspaces allowed ([#1435](https://github.com/doublewordai/control-layer/issues/1435)) ([3d75ff0](https://github.com/doublewordai/control-layer/commit/3d75ff051ce137be93944bdfa20d15b632e2892e))
+
+
+### Bug Fixes
+
+* **ci:** track the fusillade-core 5.0.0 release baseline ([#1437](https://github.com/doublewordai/control-layer/issues/1437)) ([5a8cf30](https://github.com/doublewordai/control-layer/commit/5a8cf30658e3fdfb406147ba7f4d7c56504e854a))
+
 ## [10.5.0](https://github.com/doublewordai/control-layer/compare/v10.4.0...v10.5.0) (2026-08-05)
 
 
