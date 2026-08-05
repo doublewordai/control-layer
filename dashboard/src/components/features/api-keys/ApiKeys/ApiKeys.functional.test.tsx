@@ -1239,6 +1239,76 @@ describe("API Keys Component - Functional Tests", () => {
       ).not.toBeInTheDocument();
     });
 
+    it("keeps the scoping controls when a member filter matches no keys", async () => {
+      const user = userEvent.setup();
+      enterOrgContext("owner");
+
+      server.use(
+        // Server-side filter emulation: James holds no keys, so filtering
+        // by him yields an empty page.
+        http.get("/admin/api/v1/users/:userId/api-keys", ({ request }) => {
+          const url = new URL(request.url);
+          const createdBy = url.searchParams.get("created_by");
+          const all = [
+            {
+              id: "mgr-key",
+              name: "Manager Key",
+              created_at: "2026-01-01T00:00:00Z",
+              created_by: managerId,
+              secret_revealed_at: "2026-01-01T00:00:00Z",
+            },
+          ];
+          const data = createdBy
+            ? all.filter((k) => k.created_by === createdBy)
+            : all;
+          return HttpResponse.json({
+            data,
+            total_count: data.length,
+            skip: 0,
+            limit: 10,
+          });
+        }),
+      );
+
+      const { container } = render(<ApiKeys />, { wrapper: createWrapper() });
+      await within(container).findByText("Manager Key");
+
+      await user.click(
+        within(container).getByRole("combobox", { name: /filter by member/i }),
+      );
+      await user.click(
+        screen.getByRole("option", { name: "james.wilson@acme.com" }),
+      );
+
+      // Filtered-empty state: NOT the unscoped "create your first key"
+      // onboarding, and the controls stay mounted so the admin can back
+      // out of the filter.
+      await waitFor(() => {
+        expect(
+          within(container).getByText(/no keys match this filter/i),
+        ).toBeInTheDocument();
+      });
+      expect(
+        within(container).getByText(/holds no api keys in this organization/i),
+      ).toBeInTheDocument();
+      expect(
+        within(container).queryByText(/no api keys configured/i),
+      ).not.toBeInTheDocument();
+      expect(
+        within(container).getByRole("tab", { name: /all keys/i }),
+      ).toBeInTheDocument();
+      expect(
+        within(container).getByRole("combobox", { name: /filter by member/i }),
+      ).toBeInTheDocument();
+
+      // Backing out restores the list without leaving the page.
+      await user.click(
+        within(container).getByRole("combobox", { name: /filter by member/i }),
+      );
+      await user.click(screen.getByRole("option", { name: "All members" }));
+      await within(container).findByText("Manager Key");
+    });
+
     it("bulk-rotates the selected keys and shows the new secrets once", async () => {
       const user = userEvent.setup();
       enterOrgContext("owner");
