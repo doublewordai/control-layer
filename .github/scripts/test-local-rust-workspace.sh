@@ -206,8 +206,8 @@ if set(release_manifest) != {
     )
 if release_manifest["fusillade-arsenal"] != "3.1.0":
     raise SystemExit("Fusillade Arsenal release baseline must remain 3.1.0")
-if release_manifest["fusillade-core"] != "4.1.0":
-    raise SystemExit("Fusillade Core release baseline must remain 4.1.0")
+if release_manifest["fusillade-core"] != "5.0.0":
+    raise SystemExit("Fusillade Core release baseline must remain 5.0.0")
 PY
 
 release_workflow=".github/workflows/release.yml"
