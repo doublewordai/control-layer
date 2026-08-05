@@ -108,6 +108,12 @@ export const ApiKeys: React.FC = () => {
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
   const [selectedKeys, setSelectedKeys] = useState<any[]>([]);
   const [showBulkDeleteModal, setShowBulkDeleteModal] = useState(false);
+  const [showBulkRotateModal, setShowBulkRotateModal] = useState(false);
+  const [bulkRotating, setBulkRotating] = useState(false);
+  // One-time display of the replacement secrets from a bulk rotation.
+  const [bulkRotatedKeys, setBulkRotatedKeys] = useState<
+    { id: string; name: string; key: string }[] | null
+  >(null);
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const [rotateModal, setRotateModal] = useState<ApiKey | null>(null);
   const [revealModal, setRevealModal] = useState<ApiKey | null>(null);
@@ -324,6 +330,31 @@ export const ApiKeys: React.FC = () => {
     }
   };
 
+  const handleBulkRotate = async () => {
+    setBulkRotating(true);
+    const rotated: { id: string; name: string; key: string }[] = [];
+    const failed: string[] = [];
+    for (const key of selectedKeys) {
+      try {
+        const { key: secret } = await rotateApiKeyMutation.mutateAsync({
+          keyId: key.id,
+          userId: targetUserId,
+        });
+        rotated.push({ id: key.id, name: key.name, key: secret });
+      } catch (e) {
+        console.error("Failed to rotate API key:", e);
+        failed.push(key.name);
+      }
+    }
+    setBulkRotating(false);
+    setShowBulkRotateModal(false);
+    setSelectedKeys([]);
+    if (failed.length > 0) {
+      toast.error(`Rotated ${rotated.length}, failed for: ${failed.join(", ")}`);
+    }
+    if (rotated.length > 0) setBulkRotatedKeys(rotated);
+  };
+
   const copyToClipboard = async (text: string) => {
     try {
       await navigator.clipboard.writeText(text);
@@ -509,7 +540,9 @@ export const ApiKeys: React.FC = () => {
                 <SelectItem value="all">All members</SelectItem>
                 {orgMembers.map((member) => (
                   <SelectItem key={member.user!.id} value={member.user!.id}>
-                    {memberLabel(member.user!)}
+                    {/* Emails, not display names/usernames — matching the
+                        assign dropdown; nobody remembers usernames. */}
+                    {member.user!.email}
                   </SelectItem>
                 ))}
               </SelectContent>
@@ -534,6 +567,14 @@ export const ApiKeys: React.FC = () => {
                 </span>
               </div>
               <div className="flex items-center gap-2">
+                <button
+                  onClick={() => setShowBulkRotateModal(true)}
+                  className="flex items-center gap-1 px-3 py-1.5 bg-white border border-blue-300 text-blue-900 text-sm rounded-md hover:bg-blue-100 transition-colors"
+                  aria-label={`Rotate ${selectedKeys.length} selected API key${selectedKeys.length !== 1 ? "s" : ""}`}
+                >
+                  <RefreshCw className="w-4 h-4" />
+                  Rotate Selected
+                </button>
                 <button
                   onClick={() => setShowBulkDeleteModal(true)}
                   className="flex items-center gap-1 px-3 py-1.5 bg-red-600 text-white text-sm rounded-md hover:bg-red-700 transition-colors"
@@ -1433,6 +1474,161 @@ export const ApiKeys: React.FC = () => {
                   {selectedKeys.length !== 1 ? "s" : ""}
                 </>
               )}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Bulk Rotate Confirmation Modal */}
+      <Dialog open={showBulkRotateModal} onOpenChange={setShowBulkRotateModal}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <div className="flex items-center gap-3">
+              <div className="w-10 h-10 bg-doubleword-neutral-100 rounded-full flex items-center justify-center">
+                <RefreshCw className="w-5 h-5 text-doubleword-neutral-700" />
+              </div>
+              <div>
+                <DialogTitle>Rotate API Keys</DialogTitle>
+                <DialogDescription>
+                  Generate new secrets for {selectedKeys.length} key
+                  {selectedKeys.length !== 1 ? "s" : ""}
+                </DialogDescription>
+              </div>
+            </div>
+          </DialogHeader>
+
+          <div className="space-y-4">
+            <p className="text-sm text-gray-700">
+              Each key's current secret stops working immediately and a new
+              one is generated. Usage limits and usage history are
+              unaffected. The new secrets are shown once afterwards.
+            </p>
+            <div className="bg-gray-50 rounded-lg p-3 max-h-32 overflow-y-auto">
+              <p className="text-sm font-medium text-gray-600 mb-2">
+                Keys to be rotated:
+              </p>
+              <ul className="text-sm text-gray-700 space-y-1">
+                {selectedKeys.map((key) => (
+                  <li key={key.id}>{key.name}</li>
+                ))}
+              </ul>
+            </div>
+            <div className="p-3 bg-yellow-50 border border-yellow-200 rounded-lg">
+              <p className="text-sm text-yellow-800">
+                <strong>Note:</strong> batches already submitted with these
+                keys will keep running. If a key was compromised, cancel any
+                in-flight batches separately.
+              </p>
+            </div>
+          </div>
+
+          <DialogFooter>
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => setShowBulkRotateModal(false)}
+              disabled={bulkRotating}
+            >
+              Cancel
+            </Button>
+            <Button type="button" onClick={handleBulkRotate} disabled={bulkRotating}>
+              {bulkRotating ? (
+                <>
+                  <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                  Rotating...
+                </>
+              ) : (
+                <>
+                  <RefreshCw className="w-4 h-4 mr-2" />
+                  Rotate {selectedKeys.length} Key
+                  {selectedKeys.length !== 1 ? "s" : ""}
+                </>
+              )}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Bulk Rotated Secrets Modal — one-time display, same pattern as
+          single rotation but listing every replacement secret */}
+      <Dialog
+        open={!!bulkRotatedKeys}
+        onOpenChange={(open) => {
+          if (!open) setBulkRotatedKeys(null);
+        }}
+      >
+        <DialogContent className="sm:max-w-lg">
+          <DialogHeader>
+            <DialogTitle>API Keys Rotated</DialogTitle>
+            <DialogDescription>
+              {bulkRotatedKeys?.length} key
+              {bulkRotatedKeys?.length !== 1 ? "s" : ""} rotated. The old
+              secrets no longer work for new requests.
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="space-y-4">
+            <div
+              className="p-3 bg-green-50 border border-green-200 rounded-lg"
+              role="alert"
+            >
+              <div className="flex items-center gap-2">
+                <Key className="w-4 h-4 text-green-600" />
+                <p className="text-sm text-green-800 font-medium">
+                  Save these keys now - they won't be shown again
+                </p>
+              </div>
+            </div>
+
+            <div className="space-y-3 max-h-64 overflow-y-auto">
+              {(bulkRotatedKeys ?? []).map((entry) => (
+                <div key={entry.id} className="space-y-1">
+                  <Label>{entry.name}</Label>
+                  <div className="flex items-center gap-2">
+                    <div className="flex-1 overflow-hidden rounded border bg-gray-50">
+                      <code className="block text-xs font-mono px-3 py-2 overflow-x-auto whitespace-nowrap">
+                        {entry.key}
+                      </code>
+                    </div>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="icon"
+                      onClick={() => copyToClipboard(entry.key)}
+                      aria-label={
+                        copiedKey === entry.key
+                          ? `Copied secret for ${entry.name}`
+                          : `Copy secret for ${entry.name}`
+                      }
+                    >
+                      {copiedKey === entry.key ? (
+                        <Check className="w-4 h-4" />
+                      ) : (
+                        <Copy className="w-4 h-4" />
+                      )}
+                    </Button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          <DialogFooter>
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() =>
+                copyToClipboard(
+                  (bulkRotatedKeys ?? [])
+                    .map((entry) => `${entry.name}: ${entry.key}`)
+                    .join("\n"),
+                )
+              }
+            >
+              Copy all
+            </Button>
+            <Button type="button" onClick={() => setBulkRotatedKeys(null)}>
+              I've saved them
             </Button>
           </DialogFooter>
         </DialogContent>

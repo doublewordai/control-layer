@@ -1214,7 +1214,11 @@ describe("API Keys Component - Functional Tests", () => {
       await user.click(
         within(container).getByRole("combobox", { name: /filter by member/i }),
       );
-      await user.click(screen.getByRole("option", { name: "James Wilson" }));
+      // The filter dropdown lists EMAILS (matching the assign dropdown) —
+      // admins know their members' addresses, not their usernames.
+      await user.click(
+        screen.getByRole("option", { name: "james.wilson@acme.com" }),
+      );
       await waitFor(() => {
         expect(
           within(container).queryByText("Manager Key"),
@@ -1233,6 +1237,80 @@ describe("API Keys Component - Functional Tests", () => {
       expect(
         within(container).queryByText("Member Key"),
       ).not.toBeInTheDocument();
+    });
+
+    it("bulk-rotates the selected keys and shows the new secrets once", async () => {
+      const user = userEvent.setup();
+      enterOrgContext("owner");
+
+      const rotatedIds: string[] = [];
+      server.use(
+        http.get("/admin/api/v1/users/:userId/api-keys", () => {
+          return HttpResponse.json({
+            data: [
+              {
+                id: "key-a",
+                name: "Key A",
+                created_at: "2026-01-01T00:00:00Z",
+                created_by: managerId,
+                secret_revealed_at: "2026-01-01T00:00:00Z",
+              },
+              {
+                id: "key-b",
+                name: "Key B",
+                created_at: "2026-01-02T00:00:00Z",
+                created_by: memberId,
+                secret_revealed_at: "2026-01-02T00:00:00Z",
+              },
+            ],
+            total_count: 2,
+            skip: 0,
+            limit: 10,
+          });
+        }),
+        http.post(
+          "/admin/api/v1/users/:userId/api-keys/:keyId/rotate",
+          ({ params }) => {
+            rotatedIds.push(params.keyId as string);
+            return HttpResponse.json({
+              key: `sk-bulk-${params.keyId}`,
+            });
+          },
+        ),
+      );
+
+      const { container } = render(<ApiKeys />, { wrapper: createWrapper() });
+      await within(container).findByText("Key A");
+
+      // Select both rows → the action bar offers Rotate Selected.
+      await user.click(
+        within(container).getByRole("checkbox", { name: /select all/i }),
+      );
+      await user.click(
+        within(container).getByRole("button", {
+          name: /rotate 2 selected api keys/i,
+        }),
+      );
+
+      // Confirmation lists the keys, then performs one rotation per key.
+      await waitFor(() => {
+        expect(
+          screen.getByRole("heading", { name: /rotate api keys/i }),
+        ).toBeInTheDocument();
+      });
+      await user.click(
+        screen.getByRole("button", { name: /^rotate 2 keys$/i }),
+      );
+
+      // One-time multi-secret display with per-key copy.
+      await waitFor(() => {
+        expect(
+          screen.getByRole("heading", { name: /api keys rotated/i }),
+        ).toBeInTheDocument();
+      });
+      expect(rotatedIds.sort()).toEqual(["key-a", "key-b"]);
+      expect(screen.getByText("sk-bulk-key-a")).toBeInTheDocument();
+      expect(screen.getByText("sk-bulk-key-b")).toBeInTheDocument();
     });
 
     it("lets a manager issue a key to another member", async () => {
