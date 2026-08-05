@@ -1,5 +1,12 @@
 # Changelog
 
+## [10.5.0](https://github.com/doublewordai/control-layer/compare/v10.4.0...v10.5.0) (2026-08-05)
+
+
+### Features
+
+* **organizations:** expose the verified flag on org membership summaries ([#1433](https://github.com/doublewordai/control-layer/issues/1433)) ([2deda3b](https://github.com/doublewordai/control-layer/commit/2deda3beb572559a298e50b6181e1b05bcc1dd29))
+
 ## [10.4.0](https://github.com/doublewordai/control-layer/compare/v10.3.1...v10.4.0) (2026-08-04)
 
 
