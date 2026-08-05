@@ -20,14 +20,23 @@
 -- reveal (of the then-current secret). Once revealed, no rotation ever
 -- makes the key revealable again.
 --
--- DEFAULT NOW() makes every insert path fail closed (born revealed = no
--- reveal available): self-created keys, hidden system keys, and cap-scope
--- children. The ONLY path that clears it is the create handler when a
--- manager issues a key to a DIFFERENT user (ApiKeys::mark_secret_reveal_pending).
-ALTER TABLE api_keys ADD COLUMN secret_revealed_at TIMESTAMPTZ DEFAULT NOW();
+-- The DEFAULT NOW() (set LAST, below) makes every insert path fail closed
+-- (born revealed = no reveal available): self-created keys, hidden system
+-- keys, and cap-scope children. The ONLY path that clears it is the create
+-- handler when a manager issues a key to a DIFFERENT user
+-- (ApiKeys::mark_secret_reveal_pending).
+--
+-- Deliberately split into add-nullable → backfill → set-default rather than
+-- ADD COLUMN ... DEFAULT NOW(): the bare ADD COLUMN is a pure metadata
+-- change (no rewrite under any Postgres version or default-volatility
+-- rules), the backfill only touches rows that need it, and the default then
+-- applies to new rows only.
+ALTER TABLE api_keys ADD COLUMN secret_revealed_at TIMESTAMPTZ;
 
 -- Existing keys: their secrets were shown at creation under the old flow, so
 -- no key becomes retroactively revealable. Backfill with created_at rather
 -- than the migration timestamp so the admin-facing "opened at" display stays
 -- sensible for old keys.
-UPDATE api_keys SET secret_revealed_at = created_at;
+UPDATE api_keys SET secret_revealed_at = created_at WHERE secret_revealed_at IS NULL;
+
+ALTER TABLE api_keys ALTER COLUMN secret_revealed_at SET DEFAULT NOW();
