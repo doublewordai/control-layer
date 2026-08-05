@@ -236,19 +236,16 @@ pub async fn create_user_api_key<P: PoolProvider>(
         repo.reset_spend_window(api_key.id).await?;
     }
 
-    // Commit as soon as the writes are done — the api_keys NOTIFY fires at
-    // commit, and every microsecond before this response returns is head
-    // start for the onwards listener to admit the new key. The spend-state
-    // read below is display-only and reads committed data (primary pool:
-    // read-after-write).
+    let key_id = api_key.id;
+    let spend_states = repo.get_spend_states(&[key_id]).await?;
     tx.commit().await.map_err(|e| Error::Database(e.into()))?;
 
-    let key_id = api_key.id;
-    let spend_states = {
-        let mut conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
-        ApiKeys::new(&mut conn).get_spend_states(&[key_id]).await?
-    };
-
+    // NOTE: the api_keys NOTIFY fires at commit, and onwards admits the key
+    // asynchronously after that — a client using a brand-new key immediately
+    // can catch one 401/403 before the cache updates. That eventual
+    // consistency is the CONTRACT (tests must poll for admission, not
+    // assume it); nothing here should be arranged to widen the margin.
+    //
     // api_key.created webhook deliveries are created by the notification poller
     // via PG LISTEN/NOTIFY on the api_keys table (NOTIFY fires on commit).
 
