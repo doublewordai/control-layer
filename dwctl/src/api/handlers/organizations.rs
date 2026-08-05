@@ -235,10 +235,41 @@ pub async fn create_organization<P: PoolProvider>(
         current_user.id
     };
 
+    // The organization's username IS its email domain, which is what makes an
+    // organization findable by the people who belong to it: a later signup from
+    // the same domain is offered a join request instead of a second workspace.
+    // `users.username` is already UNIQUE, so that also enforces one
+    // organization per domain without a separate claim table.
+    //
+    // Derived from the owner's own address rather than the submitted name, so a
+    // caller can't claim a domain they don't have mail at. The name the user
+    // typed becomes the display name.
+    //
+    // Falls back to the submitted name when the owner is on a personal email
+    // domain (gmail and friends) - there's no meaningful domain to claim, and
+    // claiming "gmail.com" would swallow every consumer signup into one org.
+    let owner_email = if owner_id == current_user.id {
+        current_user.email.clone()
+    } else {
+        let mut conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
+        Users::new(&mut conn)
+            .get_by_id(owner_id)
+            .await?
+            .ok_or(Error::NotFound {
+                resource: "User".to_string(),
+                id: owner_id.to_string(),
+            })?
+            .email
+    };
+    let claimable_domain = crate::auth::utils::email_domain(&owner_email)
+        .filter(|d| !crate::auth::utils::is_personal_email_domain(d))
+        .map(str::to_string);
+
+    let display_name = data.display_name.clone().or_else(|| Some(data.name.clone()));
     let db_request = OrganizationCreateDBRequest {
-        name: data.name,
+        name: claimable_domain.clone().unwrap_or_else(|| data.name.clone()),
         email,
-        display_name: data.display_name,
+        display_name,
         avatar_url: None,
         created_by: owner_id,
     };
@@ -246,6 +277,19 @@ pub async fn create_organization<P: PoolProvider>(
     let config = state.current_config();
     let mut pool_conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
     let mut repo = Organizations::new(&mut pool_conn);
+
+    // One workspace per domain. Checked explicitly so the caller gets a reason
+    // and the name of the organization to ask for, rather than a bare unique
+    // violation on `users.username` - the constraint still backstops races.
+    if let Some(domain) = claimable_domain.as_deref()
+        && let Some(existing) = repo.find_by_domain(domain).await?
+    {
+        let existing_name = existing.display_name.unwrap_or(existing.username);
+        return Err(Error::Conflict {
+            message: format!("{domain} already has a workspace ({existing_name}). Request to join it instead of creating another."),
+            conflicts: None,
+        });
+    }
 
     // Check org membership limit for the owner
     let org_count = repo.count_user_organizations(owner_id).await?;
@@ -2132,6 +2176,7 @@ mod tests {
     use crate::api::models::users::Role;
     use crate::test::utils::{
         add_auth_headers, create_test_admin_user, create_test_app, create_test_app_with_config, create_test_config, create_test_user,
+        create_test_user_on_domain,
     };
     use serde_json::json;
     use sqlx::PgPool;
@@ -2153,7 +2198,44 @@ mod tests {
             .await;
         resp.assert_status(axum::http::StatusCode::CREATED);
         let body = resp.json::<serde_json::Value>();
-        assert_eq!(body["username"].as_str().unwrap(), "my-org");
+        // The username is the owner's email domain, not the submitted name:
+        // that's what makes the workspace findable by colleagues. The submitted
+        // name becomes the display name.
+        assert_eq!(body["username"].as_str().unwrap(), "example.com");
+        assert_eq!(body["display_name"].as_str().unwrap(), "my-org");
+    }
+
+    /// One workspace per domain, with a reason the caller can act on.
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_second_org_for_the_same_domain_is_refused(pool: PgPool) {
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let first = create_test_user(&pool, Role::StandardUser).await;
+        let first_headers = add_auth_headers(&first);
+
+        let resp = server
+            .post("/admin/api/v1/organizations")
+            .add_header(&first_headers[0].0, &first_headers[0].1)
+            .add_header(&first_headers[1].0, &first_headers[1].1)
+            .json(&json!({ "name": "Acme Engineering", "email": "eng@acme.test" }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::CREATED);
+
+        // A colleague - same email domain - can't stand up a second one.
+        let second = create_test_user(&pool, Role::StandardUser).await;
+        let second_headers = add_auth_headers(&second);
+        let resp = server
+            .post("/admin/api/v1/organizations")
+            .add_header(&second_headers[0].0, &second_headers[0].1)
+            .add_header(&second_headers[1].0, &second_headers[1].1)
+            .json(&json!({ "name": "Acme Sales", "email": "sales@acme.test" }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::CONFLICT);
+        let text = resp.text();
+        assert!(
+            text.contains("already has a workspace") && text.contains("Acme Engineering"),
+            "the refusal should name the workspace to ask for, got: {text}"
+        );
     }
 
     #[sqlx::test]
@@ -2332,7 +2414,7 @@ mod tests {
         let owner = create_test_user(&pool, Role::StandardUser).await;
         let org_admin = create_test_user(&pool, Role::StandardUser).await;
         let member = create_test_user(&pool, Role::StandardUser).await;
-        let other_owner = create_test_user(&pool, Role::StandardUser).await;
+        let other_owner = create_test_user_on_domain(&pool, Role::StandardUser, "other-tenant.test").await;
         let other_owner_headers = add_auth_headers(&other_owner);
 
         let resp = server
@@ -2405,25 +2487,37 @@ mod tests {
 
     // ── Org membership limit ──────────────────────────────────────────────
 
+    /// The cap counts *memberships*, not authorship.
+    ///
+    /// This used to have one user create MAX_ORGS_PER_USER organizations back
+    /// to back, which is no longer possible: an organization claims its owner's
+    /// email domain, so a user can self-serve at most one. The cap still bites
+    /// via invitations, so that's the route it's exercised through now.
     #[sqlx::test]
     #[test_log::test]
     async fn test_cannot_create_org_when_at_limit(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
-        let user = create_test_user(&pool, Role::StandardUser).await;
+        let pm = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let pm_headers = add_auth_headers(&pm);
+
+        // The user is on a domain nobody has claimed, so nothing but the cap
+        // stands between them and their own workspace.
+        let user = create_test_user_on_domain(&pool, Role::StandardUser, "at-limit.test").await;
         let user_headers = add_auth_headers(&user);
 
-        // Create MAX_ORGS_PER_USER orgs
         for i in 0..super::MAX_ORGS_PER_USER {
+            let owner = create_test_user_on_domain(&pool, Role::StandardUser, &format!("host-{i}.test")).await;
+            let org_id = create_org_for(&server, &pm_headers, &format!("org-{i}"), &format!("org{i}@example.com"), owner.id).await;
+
             let resp = server
-                .post("/admin/api/v1/organizations")
-                .add_header(&user_headers[0].0, &user_headers[0].1)
-                .add_header(&user_headers[1].0, &user_headers[1].1)
-                .json(&json!({ "name": format!("org-{i}"), "email": format!("org{i}@example.com") }))
+                .post(&format!("/admin/api/v1/organizations/{org_id}/members"))
+                .add_header(&pm_headers[0].0, &pm_headers[0].1)
+                .add_header(&pm_headers[1].0, &pm_headers[1].1)
+                .json(&json!({ "user_id": user.id, "role": "member" }))
                 .await;
             resp.assert_status(axum::http::StatusCode::CREATED);
         }
 
-        // Next one should fail
         let resp = server
             .post("/admin/api/v1/organizations")
             .add_header(&user_headers[0].0, &user_headers[0].1)
@@ -2431,8 +2525,7 @@ mod tests {
             .json(&json!({ "name": "one-too-many", "email": "extra@example.com" }))
             .await;
         resp.assert_status(axum::http::StatusCode::BAD_REQUEST);
-        let body = resp.text();
-        assert!(body.contains("maximum"));
+        assert!(resp.text().contains("maximum"));
     }
 
     // ── Leave organization ────────────────────────────────────────────────
@@ -3399,10 +3492,10 @@ mod tests {
             let (server, _bg) = create_test_app(pool.clone(), false).await;
             let pm = create_test_admin_user(&pool, Role::PlatformManager).await;
             let pm_headers = add_auth_headers(&pm);
-            let owner = create_test_user(&pool, Role::StandardUser).await;
-            let owner_headers = add_auth_headers(&owner);
-
             let label = if new_first { "new-first" } else { "old-first" };
+            // Each iteration needs its own domain; the organization claims it.
+            let owner = create_test_user_on_domain(&pool, Role::StandardUser, &format!("{label}.test")).await;
+            let owner_headers = add_auth_headers(&owner);
             let org_id = create_org_for(&server, &pm_headers, &format!("apply-{label}-org"), "billing@example.com", owner.id).await;
             let org_uuid = uuid::Uuid::parse_str(&org_id).unwrap();
 
@@ -3717,9 +3810,11 @@ mod tests {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
         let pm = create_test_admin_user(&pool, Role::PlatformManager).await;
         let pm_headers = add_auth_headers(&pm);
-        let owner_a = create_test_user(&pool, Role::StandardUser).await;
+        // Distinct domains: an organization claims its owner's domain, so two
+        // owners on one domain can't hold two organizations.
+        let owner_a = create_test_user_on_domain(&pool, Role::StandardUser, "tenant-a.test").await;
         let owner_a_headers = add_auth_headers(&owner_a);
-        let owner_b = create_test_user(&pool, Role::StandardUser).await;
+        let owner_b = create_test_user_on_domain(&pool, Role::StandardUser, "tenant-b.test").await;
         let owner_b_headers = add_auth_headers(&owner_b);
 
         let org_a_id = create_org_for(&server, &pm_headers, "tenancy-org-a", "a@example.com", owner_a.id).await;
