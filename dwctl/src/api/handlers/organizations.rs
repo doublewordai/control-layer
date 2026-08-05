@@ -261,9 +261,8 @@ pub async fn create_organization<P: PoolProvider>(
             })?
             .email
     };
-    let claimable_domain = crate::auth::utils::email_domain(&owner_email)
-        .filter(|d| !crate::auth::utils::is_personal_email_domain(d))
-        .map(str::to_string);
+    let claimable_domain =
+        crate::auth::utils::email_domain(&owner_email).filter(|d| !crate::auth::utils::is_personal_email_domain(d));
 
     // `{domain}~{suffix}`: the domain is what a colleague's signup matches on,
     // and the suffix keeps `users.username` unique so one company can hold
@@ -2212,6 +2211,38 @@ mod tests {
         let username = body["username"].as_str().unwrap();
         assert!(username.starts_with("example.com~"), "got {username}");
         assert_eq!(body["display_name"].as_str().unwrap(), "my-org");
+    }
+
+    /// Domains are case-insensitive; the things we compare them against are
+    /// not. Without normalising, `Alice@Acme.test` claims `Acme.test` and a
+    /// later `bob@acme.test` matches nothing.
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_domain_claim_is_case_insensitive(pool: PgPool) {
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_on_domain(&pool, Role::StandardUser, "MixedCase.test").await;
+        let headers = add_auth_headers(&user);
+
+        let resp = server
+            .post("/admin/api/v1/organizations")
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .json(&json!({ "name": "Mixed Case Ltd", "email": "billing@mixedcase.test" }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::CREATED);
+        let username = resp.json::<serde_json::Value>()["username"].as_str().unwrap().to_string();
+        assert!(username.starts_with("mixedcase.test~"), "claim should be lowercased, got {username}");
+
+        // A colleague whose address is cased differently still finds it.
+        let mut conn = pool.acquire().await.unwrap();
+        assert!(
+            crate::db::handlers::Organizations::new(&mut conn)
+                .find_by_domain("mixedcase.test")
+                .await
+                .unwrap()
+                .is_some(),
+            "a differently-cased colleague must still match the workspace"
+        );
     }
 
     /// A domain can hold several workspaces - prod and dev, say - and a join

@@ -191,12 +191,12 @@ async fn try_proxy_header_auth<P: sqlx_pool_router::PoolProvider + Clone + Send 
 
                     // Auto-org: join or create organization based on email domain
                     if let Some(domain) = crate::auth::utils::email_domain(&user.email)
-                        && !crate::auth::utils::is_personal_email_domain(domain)
+                        && !crate::auth::utils::is_personal_email_domain(&domain)
                     {
                         use crate::db::handlers::Organizations;
 
                         let mut org_repo = Organizations::new(&mut tx);
-                        match org_repo.find_by_domain(domain).await {
+                        match org_repo.find_by_domain(&domain).await {
                             Ok(Some(org)) => {
                                 // Org exists — ask to join rather than joining.
                                 //
@@ -207,7 +207,7 @@ async fn try_proxy_header_auth<P: sqlx_pool_router::PoolProvider + Clone + Send 
                                 // admin decides. Sharing an email domain is evidence that
                                 // someone probably belongs, not that they do.
                                 if let Err(e) = org_repo.create_join_request(org.id, user.id).await {
-                                    tracing::warn!("Failed to record join request for org {}: {e}", domain);
+                                    tracing::warn!("Failed to record join request for org {domain}: {e}");
                                 }
                             }
                             Ok(None) => {
