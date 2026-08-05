@@ -736,9 +736,9 @@ export const ApiKeys: React.FC = () => {
                       </SelectContent>
                     </Select>
                     <p className="text-xs text-doubleword-neutral-500">
-                      The key appears in the assigned member's view, and they
-                      can rotate it from their API Keys page to get a secret
-                      of their own.
+                      The key appears in the assigned member's view. You'll
+                      still see the secret once on creation, and the member
+                      can separately reveal it once from their API Keys page.
                     </p>
                   </div>
                 )}

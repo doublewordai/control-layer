@@ -1277,7 +1277,7 @@ describe("API Keys Component - Functional Tests", () => {
         name: /assign to member/i,
       });
       expect(
-        screen.getByText(/rotate it from their api keys page/i),
+        screen.getByText(/reveal it once from their api keys page/i),
       ).toBeInTheDocument();
       await user.click(assignSelect);
       // The assign dropdown shows EMAILS — admins know their members' email
