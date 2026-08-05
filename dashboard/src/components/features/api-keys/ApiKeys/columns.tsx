@@ -4,8 +4,18 @@ import { type ColumnDef } from "@tanstack/react-table";
 import { ArrowUpDown, Trash2, Pencil, RefreshCw, Eye } from "lucide-react";
 import { Button } from "../../../ui/button";
 import { Checkbox } from "../../../ui/checkbox";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "../../../ui/tooltip";
 import type { ApiKey } from "../../../../api/control-layer/types";
-import { formatCredits, formatResetInstant, limitPeriodLabel } from "./spendCap";
+import {
+  formatCredits,
+  formatResetInstant,
+  limitPeriodLabel,
+} from "./spendCap";
 
 interface ColumnActions {
   onDelete: (apiKey: ApiKey) => void;
@@ -189,7 +199,10 @@ export const createColumns = (actions: ColumnActions): ColumnDef<ApiKey>[] => {
         const pct =
           limit > 0 ? Math.min(100, Math.round((spent / limit) * 100)) : 0;
         return (
-          <div className="min-w-40 flex flex-col gap-0.5" aria-label="Usage limit">
+          <div
+            className="min-w-40 flex flex-col gap-0.5"
+            aria-label="Usage limit"
+          >
             <span className="flex items-center gap-2 text-sm font-medium text-doubleword-neutral-900">
               {formatCredits(apiKey.spend ?? "0")} /{" "}
               {formatCredits(apiKey.spend_limit)}
@@ -263,53 +276,77 @@ export const createColumns = (actions: ColumnActions): ColumnDef<ApiKey>[] => {
           return null;
         }
 
+        // Icon-only buttons need hover tooltips — Reveal vs Rotate are
+        // both circular-arrow-adjacent glyphs and easily confused.
         return (
-          <div className="flex items-center">
-            {canManage && (
-              <Button
-                variant="ghost"
-                size="sm"
-                onClick={() => actions.onEdit(apiKey)}
-                aria-label={`Edit usage limit for ${apiKey.name}`}
-                className="text-doubleword-neutral-600 hover:text-doubleword-neutral-900"
-              >
-                <Pencil className="h-4 w-4" />
-              </Button>
-            )}
-            {canReveal && (
-              <Button
-                variant="ghost"
-                size="sm"
-                onClick={() => actions.onReveal(apiKey)}
-                aria-label={`Reveal ${apiKey.name}`}
-                className="text-doubleword-neutral-600 hover:text-doubleword-neutral-900"
-              >
-                <Eye className="h-4 w-4" />
-              </Button>
-            )}
-            {canRotate && (
-              <Button
-                variant="ghost"
-                size="sm"
-                onClick={() => actions.onRotate(apiKey)}
-                aria-label={`Rotate ${apiKey.name}`}
-                className="text-doubleword-neutral-600 hover:text-doubleword-neutral-900"
-              >
-                <RefreshCw className="h-4 w-4" />
-              </Button>
-            )}
-            {canManage && (
-              <Button
-                variant="ghost"
-                size="sm"
-                onClick={() => actions.onDelete(apiKey)}
-                aria-label={`Delete ${apiKey.name}`}
-                className="text-red-600 hover:text-red-700 hover:bg-red-50"
-              >
-                <Trash2 className="h-4 w-4" />
-              </Button>
-            )}
-          </div>
+          <TooltipProvider delayDuration={150}>
+            <div className="flex items-center">
+              {canManage && (
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      onClick={() => actions.onEdit(apiKey)}
+                      aria-label={`Edit usage limit for ${apiKey.name}`}
+                      className="text-doubleword-neutral-600 hover:text-doubleword-neutral-900"
+                    >
+                      <Pencil className="h-4 w-4" />
+                    </Button>
+                  </TooltipTrigger>
+                  <TooltipContent>Edit usage limit</TooltipContent>
+                </Tooltip>
+              )}
+              {canReveal && (
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      onClick={() => actions.onReveal(apiKey)}
+                      aria-label={`Reveal ${apiKey.name}`}
+                      className="text-doubleword-neutral-600 hover:text-doubleword-neutral-900"
+                    >
+                      <Eye className="h-4 w-4" />
+                    </Button>
+                  </TooltipTrigger>
+                  <TooltipContent>Reveal secret (one-off)</TooltipContent>
+                </Tooltip>
+              )}
+              {canRotate && (
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      onClick={() => actions.onRotate(apiKey)}
+                      aria-label={`Rotate ${apiKey.name}`}
+                      className="text-doubleword-neutral-600 hover:text-doubleword-neutral-900"
+                    >
+                      <RefreshCw className="h-4 w-4" />
+                    </Button>
+                  </TooltipTrigger>
+                  <TooltipContent>Rotate secret</TooltipContent>
+                </Tooltip>
+              )}
+              {canManage && (
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      onClick={() => actions.onDelete(apiKey)}
+                      aria-label={`Delete ${apiKey.name}`}
+                      className="text-red-600 hover:text-red-700 hover:bg-red-50"
+                    >
+                      <Trash2 className="h-4 w-4" />
+                    </Button>
+                  </TooltipTrigger>
+                  <TooltipContent>Delete key</TooltipContent>
+                </Tooltip>
+              )}
+            </div>
+          </TooltipProvider>
         );
       },
     },
