@@ -191,31 +191,38 @@ async fn try_proxy_header_auth<P: sqlx_pool_router::PoolProvider + Clone + Send 
 
                     // Auto-org: join or create organization based on email domain
                     if let Some(domain) = crate::auth::utils::email_domain(&user.email)
-                        && !crate::auth::utils::is_personal_email_domain(domain)
+                        && !crate::auth::utils::is_personal_email_domain(&domain)
                     {
                         use crate::db::handlers::Organizations;
-                        use crate::db::models::organizations::OrganizationCreateDBRequest;
 
                         let mut org_repo = Organizations::new(&mut tx);
-                        match org_repo.find_by_domain(domain).await {
+                        match org_repo.find_by_domain(&domain).await {
                             Ok(Some(org)) => {
-                                // Org exists — add user as member
-                                if let Err(e) = org_repo.add_member(org.id, user.id, "member").await {
-                                    tracing::warn!("Failed to auto-add user to org {}: {e}", domain);
+                                // Org exists — ask to join rather than joining.
+                                //
+                                // This used to call `add_member` directly, so anyone who
+                                // could receive mail at a company's domain landed inside
+                                // the organization that owns its billing account, with no
+                                // approval and no notice to either side. Now an owner or
+                                // admin decides. Sharing an email domain is evidence that
+                                // someone probably belongs, not that they do.
+                                if let Err(e) = org_repo.create_join_request(org.id, user.id).await {
+                                    tracing::warn!("Failed to record join request for org {domain}: {e}");
                                 }
                             }
                             Ok(None) => {
-                                // No org for this domain — create one with user as owner
-                                let org_request = OrganizationCreateDBRequest {
-                                    name: domain.to_string(),
-                                    email: user.email.clone(),
-                                    display_name: None,
-                                    avatar_url: None,
-                                    created_by: user.id,
-                                };
-                                if let Err(e) = org_repo.create(&org_request, &config.auth.default_user_roles).await {
-                                    tracing::warn!("Failed to auto-create org for domain {domain}: {e}");
-                                }
+                                // Nobody has claimed this domain yet, so there is nothing
+                                // to join and we deliberately don't invent one.
+                                //
+                                // Signing up used to auto-create an organization named
+                                // after the domain, which made the first person through
+                                // the door its owner by accident - typically whichever
+                                // engineer tried the product first, not whoever should
+                                // hold the billing account. The user starts in Personal
+                                // context and claims the domain if and when they create
+                                // a workspace, which is where the name is chosen and the
+                                // ownership is deliberate.
+                                tracing::debug!("No organization claims domain {domain}; leaving user in personal context");
                             }
                             Err(e) => {
                                 tracing::warn!("Failed to look up org by domain {domain}: {e}");
@@ -1740,49 +1747,74 @@ mod tests {
 
     // ── Auto-org on SSO signup ──────────────────────────────────────────
 
+    /// Signing up no longer conjures an organization.
+    ///
+    /// It used to create one named after the email domain, which made whoever
+    /// tried the product first its owner by accident - typically an engineer
+    /// evaluating it, not whoever should hold the billing account. The user
+    /// now starts in Personal context and claims the domain deliberately, by
+    /// creating a workspace.
     #[sqlx::test]
-    async fn test_proxy_header_signup_creates_org_for_business_email(pool: PgPool) {
+    async fn test_proxy_header_signup_does_not_create_an_org(pool: PgPool) {
         let mut config = create_test_config();
         config.auth.proxy_header.enabled = true;
         config.auth.proxy_header.auto_create_users = true;
 
         let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
 
-        let email = "alice@acme.com";
-        let external_id = "auth0|alice-acme";
-        let mut parts = create_test_parts_with_auth(external_id, email);
+        let mut parts = create_test_parts_with_auth("auth0|alice-acme", "alice@acme.com");
+        let current_user = CurrentUser::from_request_parts(&mut parts, &state).await.unwrap();
 
-        let result = CurrentUser::from_request_parts(&mut parts, &state).await;
-        assert!(result.is_ok());
-        let current_user = result.unwrap();
-
-        // Verify an org was created with username = domain
         let mut conn = pool.acquire().await.unwrap();
         let mut org_repo = Organizations::new(&mut conn);
-        let org = org_repo.find_by_domain("acme.com").await.unwrap();
-        assert!(org.is_some(), "Org should have been auto-created for acme.com");
+        assert!(
+            org_repo.find_by_domain("acme.com").await.unwrap().is_none(),
+            "signup must not claim the domain on the user's behalf"
+        );
+        assert!(
+            org_repo.list_user_organizations(current_user.id).await.unwrap().is_empty(),
+            "the user starts in personal context"
+        );
+    }
 
-        let org = org.unwrap();
-        assert_eq!(org.username, "acme.com");
-
-        // User should be owner
-        let role = org_repo.get_user_org_role(current_user.id, org.id).await.unwrap();
-        assert_eq!(role, Some("owner".to_string()));
+    /// Claim a domain the way creating a workspace does: an organization whose
+    /// username is the domain, owned by `owner`.
+    async fn claim_domain(pool: &PgPool, domain: &str, owner: crate::types::UserId) -> crate::types::UserId {
+        let mut conn = pool.acquire().await.unwrap();
+        let org = Organizations::new(&mut conn)
+            .create(
+                &crate::db::models::organizations::OrganizationCreateDBRequest {
+                    name: domain.to_string(),
+                    email: format!("billing@{domain}"),
+                    display_name: Some(domain.to_string()),
+                    avatar_url: None,
+                    created_by: owner,
+                },
+                &[crate::api::models::users::Role::StandardUser],
+            )
+            .await
+            .unwrap();
+        org.id
     }
 
     #[sqlx::test]
-    async fn test_proxy_header_signup_joins_existing_org(pool: PgPool) {
+    /// Sharing an email domain gets you a request, not a membership.
+    ///
+    /// This used to add the second user straight in as a member. Anyone who
+    /// could receive mail at a company's domain landed inside the organization
+    /// that owns its billing account, with nobody asked and nobody told.
+    async fn test_proxy_header_signup_requests_to_join_existing_org(pool: PgPool) {
         let mut config = create_test_config();
         config.auth.proxy_header.enabled = true;
         config.auth.proxy_header.auto_create_users = true;
 
         let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
 
-        // First user creates the org
+        // Someone has already claimed the domain by creating a workspace.
         let mut parts1 = create_test_parts_with_auth("auth0|first", "first@widgets.io");
         let first = CurrentUser::from_request_parts(&mut parts1, &state).await.unwrap();
+        claim_domain(&pool, "widgets.io", first.id).await;
 
-        // Second user from same domain should auto-join
         let mut parts2 = create_test_parts_with_auth("auth0|second", "second@widgets.io");
         let second = CurrentUser::from_request_parts(&mut parts2, &state).await.unwrap();
 
@@ -1790,12 +1822,56 @@ mod tests {
         let mut org_repo = Organizations::new(&mut conn);
         let org = org_repo.find_by_domain("widgets.io").await.unwrap().unwrap();
 
-        // First user is owner, second is member
-        let first_role = org_repo.get_user_org_role(first.id, org.id).await.unwrap();
-        assert_eq!(first_role, Some("owner".to_string()));
+        assert_eq!(
+            org_repo.get_user_org_role(first.id, org.id).await.unwrap(),
+            Some("owner".to_string())
+        );
 
-        let second_role = org_repo.get_user_org_role(second.id, org.id).await.unwrap();
-        assert_eq!(second_role, Some("member".to_string()));
+        // The second user is NOT a member - `get_user_org_role` only counts
+        // active memberships, so this is the check that would have failed
+        // before the change.
+        assert_eq!(
+            org_repo.get_user_org_role(second.id, org.id).await.unwrap(),
+            None,
+            "sharing a domain must not grant membership"
+        );
+
+        // They're waiting in the queue instead.
+        let requests = org_repo.list_join_requests(org.id).await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].user_id, Some(second.id));
+        assert_eq!(requests[0].status, "requested");
+
+        // And the queue doesn't leak into the members list.
+        let members = org_repo.list_members(org.id).await.unwrap();
+        assert_eq!(members.len(), 1, "only the owner is a member");
+        assert_eq!(members[0].user_id, Some(first.id));
+    }
+
+    /// Logging in repeatedly must not pile up duplicate requests.
+    #[sqlx::test]
+    async fn test_proxy_header_repeat_login_does_not_duplicate_join_request(pool: PgPool) {
+        let mut config = create_test_config();
+        config.auth.proxy_header.enabled = true;
+        config.auth.proxy_header.auto_create_users = true;
+
+        let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
+
+        let mut owner_parts = create_test_parts_with_auth("auth0|owner", "owner@widgets.io");
+        let owner = CurrentUser::from_request_parts(&mut owner_parts, &state).await.unwrap();
+        claim_domain(&pool, "widgets.io", owner.id).await;
+
+        for i in 0..3 {
+            let mut parts = create_test_parts_with_auth("auth0|joiner", "joiner@widgets.io");
+            CurrentUser::from_request_parts(&mut parts, &state)
+                .await
+                .unwrap_or_else(|_| panic!("login {i} should succeed"));
+        }
+
+        let mut conn = pool.acquire().await.unwrap();
+        let mut org_repo = Organizations::new(&mut conn);
+        let org = org_repo.find_by_domain("widgets.io").await.unwrap().unwrap();
+        assert_eq!(org_repo.list_join_requests(org.id).await.unwrap().len(), 1);
     }
 
     #[sqlx::test]

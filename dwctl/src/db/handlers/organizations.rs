@@ -106,6 +106,22 @@ impl<'c> Organizations<'c> {
     /// Find an organization by its domain (stored as username).
     /// Returns `None` if no active (non-deleted) organization exists with that domain.
     #[instrument(skip(self), fields(domain = %domain), err)]
+    /// The organization a join request for `domain` should go to.
+    ///
+    /// Organization usernames are `{domain}~{suffix}`, so one company can hold
+    /// several workspaces - prod and dev being the obvious pair - while
+    /// `users.username` stays unique. The bare `username = $1` arm matches
+    /// organizations created before the suffix existed, whose username is the
+    /// domain alone.
+    ///
+    /// `~` is the separator precisely because it can't occur in a domain, so
+    /// the prefix match is exact: "acme.com" cannot match an organization for
+    /// "acme.com.au", which a plain `LIKE 'acme.com%'` would have done and
+    /// routed a join request to the wrong company.
+    ///
+    /// Several may match; the oldest surviving one wins. That's the workspace a
+    /// colleague signing up is most likely to mean, and it stays stable as
+    /// later ones come and go.
     pub async fn find_by_domain(&mut self, domain: &str) -> Result<Option<UserDBResponse>> {
         let row = sqlx::query!(
             r#"
@@ -115,7 +131,14 @@ impl<'c> Organizations<'c> {
                    low_balance_notification_sent, low_balance_threshold,
                    auto_topup_amount, auto_topup_threshold, auto_topup_monthly_limit, user_type, verified, zero_data_retention
             FROM users
-            WHERE username = $1 AND user_type = 'organization' AND is_deleted = false
+            WHERE (username = $1 OR username LIKE $1 || '~%')
+              AND user_type = 'organization'
+              -- A soft-deleted workspace must never receive join requests:
+              -- nobody is left to approve them, so the requester would sit on a
+              -- queue no one can see.
+              AND is_deleted = false
+            ORDER BY created_at ASC
+            LIMIT 1
             "#,
             domain
         )
@@ -495,6 +518,7 @@ impl<'c> Organizations<'c> {
             FROM user_organizations uo
             LEFT JOIN users u ON u.id = uo.user_id
             WHERE uo.organization_id = $1
+              AND uo.status <> 'requested'
               AND (uo.user_id IS NULL OR u.is_deleted = false)
             ORDER BY uo.status ASC, uo.created_at ASC
             "#,
@@ -504,6 +528,97 @@ impl<'c> Organizations<'c> {
         .await?;
 
         Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    /// Record a request to join an organization, awaiting owner/admin approval.
+    ///
+    /// The mirror of an invite: same table, same lifecycle, opposite direction.
+    /// `UNIQUE (user_id, organization_id)` means a second request while one is
+    /// outstanding - or while the user is already a member - conflicts rather
+    /// than creating a duplicate, so callers should treat that as "already
+    /// requested" rather than an error.
+    #[instrument(skip(self), fields(org_id = %abbrev_uuid(&org_id), user_id = %abbrev_uuid(&user_id)), err)]
+    pub async fn create_join_request(&mut self, org_id: UserId, user_id: UserId) -> Result<OrganizationMemberDBResponse> {
+        let row = sqlx::query_as!(
+            MemberRow,
+            r#"
+            INSERT INTO user_organizations (user_id, organization_id, role, status)
+            VALUES ($1, $2, 'member', 'requested')
+            RETURNING id, user_id, organization_id, role, status, created_at,
+                      invite_email, invited_by, expires_at
+            "#,
+            user_id,
+            org_id,
+        )
+        .fetch_one(&mut *self.db)
+        .await?;
+
+        Ok(row.into())
+    }
+
+    /// Outstanding join requests for an organization, oldest first.
+    #[instrument(skip(self), fields(org_id = %abbrev_uuid(&org_id)), err)]
+    pub async fn list_join_requests(&mut self, org_id: UserId) -> Result<Vec<OrganizationMemberDBResponse>> {
+        let rows = sqlx::query_as!(
+            MemberRow,
+            r#"
+            SELECT uo.id, uo.user_id, uo.organization_id, uo.role, uo.status,
+                   uo.created_at, uo.invite_email, uo.invited_by, uo.expires_at
+            FROM user_organizations uo
+            INNER JOIN users u ON u.id = uo.user_id
+            WHERE uo.organization_id = $1
+              AND uo.status = 'requested'
+              AND u.is_deleted = false
+            ORDER BY uo.created_at ASC
+            "#,
+            org_id
+        )
+        .fetch_all(&mut *self.db)
+        .await?;
+
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    /// Approve a join request: the requester becomes an active member.
+    ///
+    /// Scoped to `org_id` as well as the request id so a caller who can manage
+    /// one organization can't approve a request belonging to another. Returns
+    /// false if the request no longer exists or was already decided, which
+    /// makes concurrent approvals a no-op rather than a double-add.
+    #[instrument(skip(self), fields(org_id = %abbrev_uuid(&org_id), request_id = %abbrev_uuid(&request_id)), err)]
+    pub async fn approve_join_request(&mut self, org_id: UserId, request_id: Uuid, role: &str) -> Result<bool> {
+        let result = sqlx::query!(
+            r#"
+            UPDATE user_organizations
+            SET status = 'active', role = $3
+            WHERE id = $1 AND organization_id = $2 AND status = 'requested'
+            "#,
+            request_id,
+            org_id,
+            role,
+        )
+        .execute(&mut *self.db)
+        .await?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Decline a join request, removing the row.
+    ///
+    /// Deleted rather than kept in a `declined` state so the user can ask again
+    /// later - a permanent tombstone would silently block them forever via the
+    /// unique constraint.
+    #[instrument(skip(self), fields(org_id = %abbrev_uuid(&org_id), request_id = %abbrev_uuid(&request_id)), err)]
+    pub async fn decline_join_request(&mut self, org_id: UserId, request_id: Uuid) -> Result<bool> {
+        let result = sqlx::query!(
+            "DELETE FROM user_organizations WHERE id = $1 AND organization_id = $2 AND status = 'requested'",
+            request_id,
+            org_id,
+        )
+        .execute(&mut *self.db)
+        .await?;
+
+        Ok(result.rows_affected() > 0)
     }
 
     /// List organizations a user belongs to (active memberships only)
@@ -637,6 +752,41 @@ impl<'c> Organizations<'c> {
         .ok_or(DbError::NotFound)?;
 
         Ok(row.into())
+    }
+
+    /// Re-issue a pending invite: new token, fresh expiry.
+    ///
+    /// The original token is only stored as a hash, so it can't be recovered to
+    /// re-send - a resend necessarily mints a new one. That also invalidates
+    /// the old link, which is the behaviour you want if the first was sent to
+    /// the wrong place or has leaked.
+    ///
+    /// Returns the invite's email and role so the caller can send the mail,
+    /// or None if there's no pending invite by that id in this organization.
+    #[instrument(skip(self, token_hash), fields(org_id = %abbrev_uuid(&org_id), invite_id = %abbrev_uuid(&invite_id)), err)]
+    pub async fn refresh_invite_token(
+        &mut self,
+        org_id: UserId,
+        invite_id: Uuid,
+        token_hash: &str,
+        expires_at: DateTime<Utc>,
+    ) -> Result<Option<(String, String)>> {
+        let row = sqlx::query!(
+            r#"
+            UPDATE user_organizations
+            SET invite_token_hash = $3, expires_at = $4
+            WHERE id = $1 AND organization_id = $2 AND status = 'pending'
+            RETURNING invite_email, role
+            "#,
+            invite_id,
+            org_id,
+            token_hash,
+            expires_at,
+        )
+        .fetch_optional(&mut *self.db)
+        .await?;
+
+        Ok(row.and_then(|r| r.invite_email.map(|email| (email, r.role))))
     }
 
     /// Cancel (delete) a pending invite by row ID

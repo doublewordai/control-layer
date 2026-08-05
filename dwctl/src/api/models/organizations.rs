@@ -105,6 +105,14 @@ impl From<crate::db::models::organizations::PendingOrgEmailChangeDBResponse> for
     }
 }
 
+/// Optional body for approving a join request.
+#[derive(Debug, Clone, Deserialize, Serialize, ToSchema, Default)]
+pub struct ApproveJoinRequestRequest {
+    /// Role to grant on approval. Defaults to 'member'.
+    #[serde(default)]
+    pub role: Option<String>,
+}
+
 /// Organization member details
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct OrganizationMemberResponse {
@@ -116,7 +124,9 @@ pub struct OrganizationMemberResponse {
     pub user: Option<UserResponse>,
     /// Role in the organization: 'owner', 'admin', or 'member'
     pub role: String,
-    /// Membership status: 'active' or 'pending'
+    /// Membership status: 'active' for current members, 'pending' for an
+    /// invite the organization sent, or 'requested' for someone asking to
+    /// join and awaiting a decision.
     pub status: String,
     /// When the membership was created
     pub created_at: DateTime<Utc>,
@@ -246,4 +256,13 @@ pub struct OrganizationSummary {
     /// Drives the dashboard's create/edit affordances and the batch key
     /// selection requirement.
     pub can_manage_keys: bool,
+    /// Whether the organization has proven a payment method - a completed
+    /// purchase or a setup-mode card verification. Surfaced alongside the
+    /// other org-wide flags so a member can see their organization's status
+    /// without a second request per organization.
+    ///
+    /// Distinct from the same field on the *user*: paying as an org admin
+    /// verifies the organization, not you, so a client showing "is this
+    /// workspace able to pay" must read it from here when acting as an org.
+    pub verified: bool,
 }

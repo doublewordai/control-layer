@@ -1025,12 +1025,18 @@ export const handlers = [
     const url = new URL(request.url);
     const skip = parseInt(url.searchParams.get("skip") || "0", 10);
     const limit = parseInt(url.searchParams.get("limit") || "10", 10);
+    // Server-side holder filter: pagination/total_count cover the filtered
+    // set, mirroring the real API.
+    const createdBy = url.searchParams.get("created_by");
+    const filtered = createdBy
+      ? apiKeysData.filter((k) => k.created_by === createdBy)
+      : apiKeysData;
 
-    const paginatedData = apiKeysData.slice(skip, skip + limit);
+    const paginatedData = filtered.slice(skip, skip + limit);
 
     return HttpResponse.json({
       data: paginatedData,
-      total_count: apiKeysData.length,
+      total_count: filtered.length,
       skip,
       limit,
     });
@@ -1139,6 +1145,28 @@ export const handlers = [
   ),
 
   // Webhooks under users
+  // One-off reveal of an issued key's secret (holder only; consumed forever).
+  http.post(
+    "/admin/api/v1/users/:userId/api-keys/:keyId/reveal",
+    ({ params }) => {
+      const apiKey = apiKeysData.find((k) => k.id === params.keyId);
+      if (!apiKey) {
+        return HttpResponse.json(
+          { error: "API key not found" },
+          { status: 404 },
+        );
+      }
+      if (apiKey.secret_revealed_at != null) {
+        return HttpResponse.json(
+          { error: "This key's one-off reveal has already been used." },
+          { status: 409 },
+        );
+      }
+      apiKey.secret_revealed_at = new Date().toISOString();
+      return HttpResponse.json({ key: `sk-revealed-${params.keyId}` });
+    },
+  ),
+
   http.get("/admin/api/v1/users/:userId/webhooks", () => {
     return HttpResponse.json([]);
   }),
