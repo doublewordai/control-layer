@@ -261,8 +261,7 @@ pub async fn create_organization<P: PoolProvider>(
             })?
             .email
     };
-    let claimable_domain =
-        crate::auth::utils::email_domain(&owner_email).filter(|d| !crate::auth::utils::is_personal_email_domain(d));
+    let claimable_domain = crate::auth::utils::email_domain(&owner_email).filter(|d| !crate::auth::utils::is_personal_email_domain(d));
 
     // `{domain}~{suffix}`: the domain is what a colleague's signup matches on,
     // and the suffix keeps `users.username` unique so one company can hold
@@ -2231,7 +2230,10 @@ mod tests {
             .await;
         resp.assert_status(axum::http::StatusCode::CREATED);
         let username = resp.json::<serde_json::Value>()["username"].as_str().unwrap().to_string();
-        assert!(username.starts_with("mixedcase.test~"), "claim should be lowercased, got {username}");
+        assert!(
+            username.starts_with("mixedcase.test~"),
+            "claim should be lowercased, got {username}"
+        );
 
         // A colleague whose address is cased differently still finds it.
         let mut conn = pool.acquire().await.unwrap();
