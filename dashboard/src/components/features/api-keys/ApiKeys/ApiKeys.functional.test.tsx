@@ -1170,24 +1170,34 @@ describe("API Keys Component - Functional Tests", () => {
       const user = userEvent.setup();
       enterOrgContext("owner");
 
+      // Scoping is server-side (?created_by) — emulate the real API's
+      // filtering so the test exercises the request the UI actually makes.
       server.use(
-        http.get("/admin/api/v1/users/:userId/api-keys", () => {
+        http.get("/admin/api/v1/users/:userId/api-keys", ({ request }) => {
+          const url = new URL(request.url);
+          const createdBy = url.searchParams.get("created_by");
+          const all = [
+            {
+              id: "mgr-key",
+              name: "Manager Key",
+              created_at: "2026-01-01T00:00:00Z",
+              created_by: managerId,
+              secret_revealed_at: "2026-01-01T00:00:00Z",
+            },
+            {
+              id: "mem-key",
+              name: "Member Key",
+              created_at: "2026-01-02T00:00:00Z",
+              created_by: memberId,
+              secret_revealed_at: "2026-01-02T00:00:00Z",
+            },
+          ];
+          const data = createdBy
+            ? all.filter((k) => k.created_by === createdBy)
+            : all;
           return HttpResponse.json({
-            data: [
-              {
-                id: "mgr-key",
-                name: "Manager Key",
-                created_at: "2026-01-01T00:00:00Z",
-                created_by: managerId,
-              },
-              {
-                id: "mem-key",
-                name: "Member Key",
-                created_at: "2026-01-02T00:00:00Z",
-                created_by: memberId,
-              },
-            ],
-            total_count: 2,
+            data,
+            total_count: data.length,
             skip: 0,
             limit: 10,
           });
@@ -1316,6 +1326,9 @@ describe("API Keys Component - Functional Tests", () => {
                 spend_limit_interval: "monthly",
                 spend: "1",
                 resets_at: "2026-08-01T00:00:00Z",
+                // Already opened — so the row shows plain Rotate, not the
+                // one-off Reveal (covered by its own test below).
+                secret_revealed_at: "2026-01-02T00:00:00Z",
               },
             ],
             total_count: 1,
@@ -1388,6 +1401,140 @@ describe("API Keys Component - Functional Tests", () => {
       });
       expect(
         screen.getByText("sk-member-rotated-secret"),
+      ).toBeInTheDocument();
+    });
+
+    it("holder of an unopened issued key gets the one-off Reveal instead of Rotate", async () => {
+      const user = userEvent.setup();
+      enterOrgContext("member", false);
+
+      let revealedKeyId: string | undefined;
+      server.use(
+        http.get("/admin/api/v1/users/:id", ({ params }) => {
+          if (params.id === "current") {
+            return HttpResponse.json({
+              id: memberId,
+              username: "github|87234156",
+              email: "james.wilson@acme.com",
+              roles: ["StandardUser"],
+            });
+          }
+          return HttpResponse.json({ error: "not found" }, { status: 404 });
+        }),
+        // Freshly-issued key: secret_revealed_at is null until the holder
+        // consumes their one-off reveal.
+        http.get("/admin/api/v1/users/:userId/api-keys", () => {
+          return HttpResponse.json({
+            data: [
+              {
+                id: "fresh-key",
+                name: "Fresh Key",
+                created_at: "2026-01-01T00:00:00Z",
+                created_by: memberId,
+                secret_revealed_at: null,
+              },
+            ],
+            total_count: 1,
+            skip: 0,
+            limit: 10,
+          });
+        }),
+        http.post(
+          "/admin/api/v1/users/:userId/api-keys/:keyId/reveal",
+          ({ params }) => {
+            revealedKeyId = params.keyId as string;
+            return HttpResponse.json({ key: "sk-revealed-once" });
+          },
+        ),
+      );
+
+      const { container } = render(<ApiKeys />, { wrapper: createWrapper() });
+
+      await within(container).findByText("Fresh Key");
+
+      // Reveal REPLACES Rotate while the one-off is pending — rotating a
+      // secret you've never seen makes no sense.
+      expect(
+        within(container).queryByRole("button", { name: /rotate fresh key/i }),
+      ).not.toBeInTheDocument();
+      await user.click(
+        within(container).getByRole("button", { name: /reveal fresh key/i }),
+      );
+
+      // Confirm dialog warns the reveal is one-off before consuming it.
+      await waitFor(() => {
+        expect(
+          screen.getByRole("heading", { name: /reveal api key/i }),
+        ).toBeInTheDocument();
+      });
+      expect(
+        screen.getByText(/view its secret exactly once/i),
+      ).toBeInTheDocument();
+
+      await user.click(screen.getByRole("button", { name: /^reveal key$/i }));
+
+      // One-time secret display.
+      await waitFor(() => {
+        expect(
+          screen.getByRole("heading", { name: /api key revealed/i }),
+        ).toBeInTheDocument();
+      });
+      expect(revealedKeyId).toBe("fresh-key");
+      expect(screen.getByText("sk-revealed-once")).toBeInTheDocument();
+    });
+
+    it("managers see whether the holder has opened an issued key", async () => {
+      enterOrgContext("owner");
+
+      server.use(
+        http.get("/admin/api/v1/users/:userId/api-keys", () => {
+          return HttpResponse.json({
+            data: [
+              {
+                id: "unopened-key",
+                name: "Unopened Key",
+                created_at: "2026-01-01T00:00:00Z",
+                created_by: memberId,
+                secret_revealed_at: null,
+              },
+              {
+                id: "opened-key",
+                name: "Opened Key",
+                created_at: "2026-01-01T00:00:00Z",
+                created_by: memberId,
+                secret_revealed_at: "2026-02-03T00:00:00Z",
+              },
+            ],
+            total_count: 2,
+            skip: 0,
+            limit: 10,
+          });
+        }),
+      );
+
+      const { container } = render(<ApiKeys />, { wrapper: createWrapper() });
+
+      await within(container).findByText("Unopened Key");
+
+      // Engagement signal in the Assignee column: an unopened key hasn't
+      // been picked up by its holder yet (safe to rotate/reissue); an
+      // opened one is live on their side.
+      expect(
+        within(container).getByText(/not opened yet/i),
+      ).toBeInTheDocument();
+      expect(
+        within(container).getByText(/opened\s+feb 3, 2026/i),
+      ).toBeInTheDocument();
+
+      // The manager is NOT the holder, so neither row offers Reveal — only
+      // plain Rotate (which never consumes the holder's one-off).
+      expect(
+        within(container).queryByRole("button", { name: /reveal/i }),
+      ).not.toBeInTheDocument();
+      expect(
+        within(container).getByRole("button", {
+          name: /rotate unopened key/i,
+        }),
       ).toBeInTheDocument();
     });
 

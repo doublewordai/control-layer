@@ -204,7 +204,17 @@ pub async fn create_user_api_key<P: PoolProvider>(
     let has_cap = data.spend_limit.is_some();
     let db_request = ApiKeyCreateDBRequest::new(target_user_id, created_by, data);
 
-    let api_key = repo.create(&db_request).await?;
+    let mut api_key = repo.create(&db_request).await?;
+
+    // Issued to a DIFFERENT user (manager issuing to a member, or a PM
+    // creating on a user's behalf): the holder gets a one-off "reveal" of
+    // the secret from their own account (migration 131). The issuer still
+    // receives the secret in this response — that is deliberate (e.g. to
+    // stash it in a vault) and does not count as the reveal.
+    if created_by != current_user.id {
+        repo.mark_secret_reveal_pending(api_key.id).await?;
+        api_key.secret_revealed_at = None;
+    }
 
     // Capped keys need their cap scope provisioned up front: the hidden batch
     // child (so batch/flex traffic executes inside the scope, and is in
@@ -313,11 +323,31 @@ pub async fn list_user_api_keys<P: PoolProvider>(
     // Scope to keys created by this user, unless they have ReadAll (PlatformManager).
     // PM-created keys on behalf of users have created_by = target_user_id, so the target
     // user can always see them. PMs bypass the filter to see all keys for any user.
+    //
+    // ?created_by narrows the list to one holder SERVER-SIDE, so pagination
+    // and total_count cover the filtered set ("all of member X's keys" — an
+    // admin cleaning up after a member must not have keys hiding on other
+    // pages). Only unscoped callers (org managers, PMs) may name another
+    // holder; everyone else is pinned to their own scope regardless.
+    let created_by = if skip_created_by_filter {
+        query.created_by
+    } else {
+        if let Some(requested) = query.created_by
+            && requested != current_user.id
+        {
+            return Err(Error::InsufficientPermissions {
+                required: Permission::Allow(Resource::ApiKeys, Operation::ReadAll),
+                action: Operation::ReadAll,
+                resource: format!("API keys held by user {requested}"),
+            });
+        }
+        Some(current_user.id)
+    };
     let filter = ApiKeyFilter {
         skip,
         limit,
         user_id: Some(target_user_id),
-        created_by: if skip_created_by_filter { None } else { Some(current_user.id) },
+        created_by,
     };
 
     // Get total count and list of items
@@ -738,6 +768,110 @@ pub async fn rotate_user_api_key<P: PoolProvider>(
     metrics::counter!("dwctl_api_key_rotations_total").increment(1);
 
     Ok(Json(ApiKeySecretResponse { key: new_secret }))
+}
+
+/// One-off reveal of an issued key's secret, by its holder only.
+///
+/// When a manager issues a key to another member, the holder may fetch the
+/// secret exactly once from their own account (migration 131). This is
+/// HOLDER-only by design — org managers and PlatformManagers are refused
+/// even though they can rotate: the reveal is the holder's proof that they,
+/// and only they, synced on the current secret. Once consumed (or for
+/// self-created keys, which are born revealed) the endpoint returns 409 and
+/// rotation is the only way to see a secret.
+#[utoipa::path(
+    post,
+    path = "/users/{user_id}/api-keys/{id}/reveal",
+    tag = "api_keys",
+    summary = "Reveal an issued API key's secret (one-off)",
+    description = "Fetch the secret of a key issued to you, exactly once. Only the key's holder may call this; afterwards (and for self-created keys) the secret is only obtainable by rotation.",
+    params(
+        ("user_id" = String, Path, description = "User ID (UUID) or 'current' for current user"),
+        ("id" = uuid::Uuid, Path, description = "API key ID to reveal"),
+    ),
+    responses(
+        (status = 200, description = "The API key secret", body = ApiKeySecretResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden - only the key's holder may reveal it"),
+        (status = 404, description = "API key not found"),
+        (status = 409, description = "Conflict - the one-off reveal was already used"),
+        (status = 500, description = "Internal server error"),
+    ),
+    security(
+        ("BearerAuth" = []),
+        ("CookieAuth" = []),
+        ("X-Doubleword-User" = [])
+    )
+)]
+#[tracing::instrument(skip_all)]
+pub async fn reveal_user_api_key<P: PoolProvider>(
+    State(state): State<AppState<P>>,
+    Path((user_id, api_key_id)): Path<(UserIdOrCurrent, ApiKeyId)>,
+    current_user: CurrentUser,
+) -> Result<Json<ApiKeySecretResponse>> {
+    let target_user_id = match user_id {
+        UserIdOrCurrent::Current(_) => current_user.id,
+        UserIdOrCurrent::Id(uuid) => uuid,
+    };
+
+    // Same access ladder as rotation (and like rotation, deliberately NOT
+    // gated on the manage_keys grant — reveal IS the issued-key secret
+    // handover for members without self-serve rights).
+    let can_update_all = can_update_all_resources(&current_user, Resource::ApiKeys);
+    let can_update_own = can_update_own_resource(&current_user, Resource::ApiKeys, target_user_id);
+    if !can_update_all && !can_update_own {
+        // Primary pool: this is an authorization decision — a just-removed
+        // member must not pass via a lagging replica.
+        let mut conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
+        let member = is_org_member(&current_user, target_user_id, &mut conn)
+            .await
+            .map_err(Error::Database)?;
+        if !member {
+            return Err(Error::InsufficientPermissions {
+                required: Permission::Any(vec![
+                    Permission::Allow(Resource::ApiKeys, Operation::UpdateAll),
+                    Permission::Allow(Resource::ApiKeys, Operation::UpdateOwn),
+                ]),
+                action: Operation::UpdateOwn,
+                resource: format!("API keys for user {target_user_id}"),
+            });
+        }
+    }
+
+    let mut tx = state.db.write().begin().await.map_err(|e| Error::Database(e.into()))?;
+    let mut repo = ApiKeys::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
+    // HOLDER only — no manager/PM bypass here, unlike rotate/delete. A
+    // non-holder (or a key outside the target scope) gets 404, not 403, so
+    // probing can't distinguish "exists but not yours" from "doesn't exist".
+    let api_key = repo
+        .get_by_id(api_key_id)
+        .await?
+        .filter(|key| key.user_id == target_user_id)
+        .filter(|key| key.created_by == current_user.id)
+        .filter(|key| !key.hidden)
+        .filter(|key| key.parent_api_key_id.is_none())
+        .ok_or_else(|| Error::NotFound {
+            resource: "API key".to_string(),
+            id: api_key_id.to_string(),
+        })?;
+
+    // Atomic consume: the IS NULL guard in the UPDATE means exactly one
+    // reveal ever succeeds, even under concurrent requests.
+    let secret = repo.reveal_secret_once(api_key.id).await?.ok_or_else(|| Error::Conflict {
+        message: "This key's one-off reveal has already been used. Rotate the key to get a fresh secret.".to_string(),
+        conflicts: None,
+    })?;
+    tx.commit().await.map_err(|e| Error::Database(e.into()))?;
+
+    tracing::info!(
+        revealed_by = %current_user.id,
+        api_key_id = %api_key.id,
+        key_owner = %api_key.user_id,
+        "api key secret revealed (one-off)"
+    );
+    metrics::counter!("dwctl_api_key_reveals_total").increment(1);
+
+    Ok(Json(ApiKeySecretResponse { key: secret }))
 }
 
 /// Delete a specific API key for the current user or a specified user.
@@ -2085,6 +2219,182 @@ mod tests {
         let paginated: PaginatedResponse<ApiKeyInfoResponse> = response.json();
         assert_eq!(paginated.data.len(), 1);
         assert_eq!(paginated.data[0].name, "Bob Key");
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_org_created_by_filter_server_side(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let alice = create_test_user(&pool, Role::StandardUser).await;
+        let bob = create_test_user(&pool, Role::StandardUser).await;
+        let carol = create_test_user(&pool, Role::StandardUser).await;
+        let org = create_test_org(&pool, alice.id).await;
+        add_org_member(&pool, org.id, bob.id, "member").await;
+        add_org_member(&pool, org.id, carol.id, "member").await;
+
+        // Alice (owner) issues two keys to Bob and one to Carol.
+        for (name, member) in [("Bob 1", bob.id), ("Bob 2", bob.id), ("Carol 1", carol.id)] {
+            let response = app
+                .post(&format!("/admin/api/v1/users/{}/api-keys", org.id))
+                .add_header(&add_auth_headers(&alice)[0].0, &add_auth_headers(&alice)[0].1)
+                .add_header(&add_auth_headers(&alice)[1].0, &add_auth_headers(&alice)[1].1)
+                .json(&json!({"name": name, "purpose": "realtime", "member_id": member}))
+                .await;
+            response.assert_status(axum::http::StatusCode::CREATED);
+        }
+        // Bob also holds a PERSONAL key — it must never surface in org lists.
+        let response = app
+            .post("/admin/api/v1/users/current/api-keys")
+            .add_header(&add_auth_headers(&bob)[0].0, &add_auth_headers(&bob)[0].1)
+            .add_header(&add_auth_headers(&bob)[1].0, &add_auth_headers(&bob)[1].1)
+            .json(&json!({"name": "Bob personal", "purpose": "realtime"}))
+            .await;
+        response.assert_status(axum::http::StatusCode::CREATED);
+
+        // Owner filters by Bob server-side: exactly Bob's two ORG keys, and
+        // total_count covers the filtered set (the admin-cleanup guarantee —
+        // no keys lurking on other pages).
+        let response = app
+            .get(&format!("/admin/api/v1/users/{}/api-keys?created_by={}", org.id, bob.id))
+            .add_header(&add_auth_headers(&alice)[0].0, &add_auth_headers(&alice)[0].1)
+            .add_header(&add_auth_headers(&alice)[1].0, &add_auth_headers(&alice)[1].1)
+            .await;
+        response.assert_status_ok();
+        let paginated: PaginatedResponse<ApiKeyInfoResponse> = response.json();
+        assert_eq!(paginated.total_count, 2);
+        assert_eq!(paginated.data.len(), 2);
+        assert!(paginated.data.iter().all(|k| k.created_by == bob.id));
+        assert!(paginated.data.iter().all(|k| k.name.starts_with("Bob ")));
+
+        // Pagination applies AFTER the filter: limit=1&skip=1 yields Bob's
+        // other key, not an unrelated org key.
+        let response = app
+            .get(&format!(
+                "/admin/api/v1/users/{}/api-keys?created_by={}&limit=1&skip=1",
+                org.id, bob.id
+            ))
+            .add_header(&add_auth_headers(&alice)[0].0, &add_auth_headers(&alice)[0].1)
+            .add_header(&add_auth_headers(&alice)[1].0, &add_auth_headers(&alice)[1].1)
+            .await;
+        response.assert_status_ok();
+        let paginated: PaginatedResponse<ApiKeyInfoResponse> = response.json();
+        assert_eq!(paginated.total_count, 2);
+        assert_eq!(paginated.data.len(), 1);
+        assert_eq!(paginated.data[0].created_by, bob.id);
+
+        // A plain member may name themselves (no-op — already their scope)…
+        let response = app
+            .get(&format!("/admin/api/v1/users/{}/api-keys?created_by={}", org.id, carol.id))
+            .add_header(&add_auth_headers(&carol)[0].0, &add_auth_headers(&carol)[0].1)
+            .add_header(&add_auth_headers(&carol)[1].0, &add_auth_headers(&carol)[1].1)
+            .await;
+        response.assert_status_ok();
+        let paginated: PaginatedResponse<ApiKeyInfoResponse> = response.json();
+        assert_eq!(paginated.data.len(), 1);
+        assert_eq!(paginated.data[0].name, "Carol 1");
+
+        // …but naming anyone else is forbidden, not silently ignored.
+        let response = app
+            .get(&format!("/admin/api/v1/users/{}/api-keys?created_by={}", org.id, bob.id))
+            .add_header(&add_auth_headers(&carol)[0].0, &add_auth_headers(&carol)[0].1)
+            .add_header(&add_auth_headers(&carol)[1].0, &add_auth_headers(&carol)[1].1)
+            .await;
+        response.assert_status_forbidden();
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_issued_key_first_reveal_flow(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let alice = create_test_user(&pool, Role::StandardUser).await;
+        let bob = create_test_user(&pool, Role::StandardUser).await;
+        let org = create_test_org(&pool, alice.id).await;
+        add_org_member(&pool, org.id, bob.id, "member").await;
+
+        // Alice issues a key to Bob. SHE still receives the secret (to stash
+        // in a vault) — but the key is born unrevealed: Bob's one-off reveal
+        // is untouched by the issuer seeing the secret.
+        let response = app
+            .post(&format!("/admin/api/v1/users/{}/api-keys", org.id))
+            .add_header(&add_auth_headers(&alice)[0].0, &add_auth_headers(&alice)[0].1)
+            .add_header(&add_auth_headers(&alice)[1].0, &add_auth_headers(&alice)[1].1)
+            .json(&json!({"name": "Issued", "purpose": "realtime", "member_id": bob.id}))
+            .await;
+        response.assert_status(axum::http::StatusCode::CREATED);
+        let issued: ApiKeyResponse = response.json();
+        assert!(issued.key.starts_with("sk-"), "issuer still gets the secret at creation");
+        assert!(issued.secret_revealed_at.is_none(), "issued key must be born unrevealed");
+
+        // Bob sees the pending reveal on his org list.
+        let response = app
+            .get(&format!("/admin/api/v1/users/{}/api-keys", org.id))
+            .add_header(&add_auth_headers(&bob)[0].0, &add_auth_headers(&bob)[0].1)
+            .add_header(&add_auth_headers(&bob)[1].0, &add_auth_headers(&bob)[1].1)
+            .await;
+        response.assert_status_ok();
+        let listed: PaginatedResponse<ApiKeyInfoResponse> = response.json();
+        assert!(listed.data[0].secret_revealed_at.is_none());
+
+        // Reveal is HOLDER-only: the issuing admin gets 404 (not 409 — the
+        // holder filter hides the key before the consumed-check runs).
+        let response = app
+            .post(&format!("/admin/api/v1/users/{}/api-keys/{}/reveal", org.id, issued.id))
+            .add_header(&add_auth_headers(&alice)[0].0, &add_auth_headers(&alice)[0].1)
+            .add_header(&add_auth_headers(&alice)[1].0, &add_auth_headers(&alice)[1].1)
+            .await;
+        response.assert_status_not_found();
+
+        // Admin rotation does NOT consume the reveal…
+        let response = app
+            .post(&format!("/admin/api/v1/users/{}/api-keys/{}/rotate", org.id, issued.id))
+            .add_header(&add_auth_headers(&alice)[0].0, &add_auth_headers(&alice)[0].1)
+            .add_header(&add_auth_headers(&alice)[1].0, &add_auth_headers(&alice)[1].1)
+            .await;
+        response.assert_status_ok();
+        let rotated: ApiKeySecretResponse = response.json();
+
+        // …and Bob's reveal returns the CURRENT (post-rotation) secret.
+        let response = app
+            .post(&format!("/admin/api/v1/users/{}/api-keys/{}/reveal", org.id, issued.id))
+            .add_header(&add_auth_headers(&bob)[0].0, &add_auth_headers(&bob)[0].1)
+            .add_header(&add_auth_headers(&bob)[1].0, &add_auth_headers(&bob)[1].1)
+            .await;
+        response.assert_status_ok();
+        let revealed: ApiKeySecretResponse = response.json();
+        assert_eq!(revealed.key, rotated.key);
+
+        // The reveal is consumed: stamped on the list, and a second attempt
+        // conflicts.
+        let response = app
+            .get(&format!("/admin/api/v1/users/{}/api-keys", org.id))
+            .add_header(&add_auth_headers(&bob)[0].0, &add_auth_headers(&bob)[0].1)
+            .add_header(&add_auth_headers(&bob)[1].0, &add_auth_headers(&bob)[1].1)
+            .await;
+        let listed: PaginatedResponse<ApiKeyInfoResponse> = response.json();
+        assert!(listed.data[0].secret_revealed_at.is_some());
+        let response = app
+            .post(&format!("/admin/api/v1/users/{}/api-keys/{}/reveal", org.id, issued.id))
+            .add_header(&add_auth_headers(&bob)[0].0, &add_auth_headers(&bob)[0].1)
+            .add_header(&add_auth_headers(&bob)[1].0, &add_auth_headers(&bob)[1].1)
+            .await;
+        response.assert_status(axum::http::StatusCode::CONFLICT);
+
+        // Self-created keys are born revealed — no reveal ever exists.
+        let response = app
+            .post(&format!("/admin/api/v1/users/{}/api-keys", org.id))
+            .add_header(&add_auth_headers(&bob)[0].0, &add_auth_headers(&bob)[0].1)
+            .add_header(&add_auth_headers(&bob)[1].0, &add_auth_headers(&bob)[1].1)
+            .json(&json!({"name": "Self", "purpose": "realtime"}))
+            .await;
+        response.assert_status(axum::http::StatusCode::CREATED);
+        let self_key: ApiKeyResponse = response.json();
+        assert!(self_key.secret_revealed_at.is_some());
+        let response = app
+            .post(&format!("/admin/api/v1/users/{}/api-keys/{}/reveal", org.id, self_key.id))
+            .add_header(&add_auth_headers(&bob)[0].0, &add_auth_headers(&bob)[0].1)
+            .add_header(&add_auth_headers(&bob)[1].0, &add_auth_headers(&bob)[1].1)
+            .await;
+        response.assert_status(axum::http::StatusCode::CONFLICT);
     }
 
     #[sqlx::test]

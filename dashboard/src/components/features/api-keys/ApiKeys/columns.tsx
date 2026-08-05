@@ -1,7 +1,7 @@
 "use client";
 
 import { type ColumnDef } from "@tanstack/react-table";
-import { ArrowUpDown, Trash2, Pencil, RefreshCw } from "lucide-react";
+import { ArrowUpDown, Trash2, Pencil, RefreshCw, Eye } from "lucide-react";
 import { Button } from "../../../ui/button";
 import { Checkbox } from "../../../ui/checkbox";
 import type { ApiKey } from "../../../../api/control-layer/types";
@@ -25,6 +25,12 @@ interface ColumnActions {
   showAssignee?: boolean;
   resolveAssignee?: (createdBy: string) => string;
   onRotate: (apiKey: ApiKey) => void;
+  /** Whether the current user may use the ONE-OFF reveal on this key: they
+   *  are its holder and the reveal hasn't been consumed. While true, Reveal
+   *  replaces Rotate for them (rotating before ever seeing the secret makes
+   *  no sense); admins keep plain Rotate throughout. */
+  canReveal: (apiKey: ApiKey) => boolean;
+  onReveal: (apiKey: ApiKey) => void;
   /** Hide the bulk-select column (e.g. members without key-creation rights
    *  can't delete). */
   showSelect?: boolean;
@@ -103,11 +109,27 @@ export const createColumns = (actions: ColumnActions): ColumnDef<ApiKey>[] => {
       cell: ({ row }) => {
         const apiKey = row.original;
         return (
-          <span className="text-sm text-doubleword-neutral-700">
-            {actions.resolveAssignee
-              ? actions.resolveAssignee(apiKey.created_by)
-              : apiKey.created_by}
-          </span>
+          <div className="flex flex-col gap-0.5">
+            <span className="text-sm text-doubleword-neutral-700">
+              {actions.resolveAssignee
+                ? actions.resolveAssignee(apiKey.created_by)
+                : apiKey.created_by}
+            </span>
+            {/* Issued-key engagement signal for managers: once the holder
+                has opened (revealed) the key it's live on their side —
+                don't rotate it without cause. */}
+            {apiKey.secret_revealed_at == null ? (
+              <span className="text-xs text-amber-700">Not opened yet</span>
+            ) : (
+              <span className="text-xs text-doubleword-neutral-400">
+                Opened{" "}
+                {new Date(apiKey.secret_revealed_at).toLocaleDateString(
+                  "en-US",
+                  { year: "numeric", month: "short", day: "numeric" },
+                )}
+              </span>
+            )}
+          </div>
         );
       },
     },
@@ -224,9 +246,12 @@ export const createColumns = (actions: ColumnActions): ColumnDef<ApiKey>[] => {
       cell: ({ row }) => {
         const apiKey = row.original;
         const canManage = actions.canManage(apiKey);
-        const canRotate = actions.canRotate(apiKey);
+        const canReveal = actions.canReveal(apiKey);
+        // While the holder's one-off reveal is pending, it REPLACES rotate
+        // for them — rotating a secret you've never seen makes no sense.
+        const canRotate = !canReveal && actions.canRotate(apiKey);
 
-        if (!canManage && !canRotate) {
+        if (!canManage && !canRotate && !canReveal) {
           // View-only rows: no mutating actions.
           return null;
         }
@@ -242,6 +267,17 @@ export const createColumns = (actions: ColumnActions): ColumnDef<ApiKey>[] => {
                 className="text-doubleword-neutral-600 hover:text-doubleword-neutral-900"
               >
                 <Pencil className="h-4 w-4" />
+              </Button>
+            )}
+            {canReveal && (
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => actions.onReveal(apiKey)}
+                aria-label={`Reveal ${apiKey.name}`}
+                className="text-doubleword-neutral-600 hover:text-doubleword-neutral-900"
+              >
+                <Eye className="h-4 w-4" />
               </Button>
             )}
             {canRotate && (
