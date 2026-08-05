@@ -400,6 +400,12 @@ impl Classifier {
         // The transmitted view: markers stripped, telemetry per the live policy — the
         // same bytes the engine will see. PrefixSpec ordinals are recorded against this
         // view in parse, so prefixes and the drift total share one body upload.
+        //
+        // Telemetry keep mode (non-default): kept telemetry blocks are excluded from the
+        // cache hash but ARE transmitted, so prefix counts include their tokens and they
+        // land in the discounted span. That's deliberate — we count what the engine
+        // actually processes; the skew is a few tokens per block toward UNDERcharging,
+        // and the read+creation ≤ prompt caps bound it either way.
         let stripped = super::inject::strip_cache_control(req.body, &self.telemetry).0;
         let body: &[u8] = stripped.as_deref().unwrap_or(req.body);
         let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) else {
@@ -506,11 +512,17 @@ impl Classifier {
                             .or(read_block.map(|b| (b, read_tokens)));
                         let next_n =
                             (i + 1..per_breakpoint.len()).find_map(|j| per_breakpoint[j].map(|c| (parsed.breakpoints[j].block_index, c)));
-                        per_breakpoint[i] = Some(match (prev_n, next_n) {
+                        let estimate = match (prev_n, next_n) {
                             (Some((b, c)), _) => c + (raw_at(block_i) - raw_at(b)),
                             (None, Some((b, c))) => c.saturating_sub(raw_at(b) - raw_at(block_i)),
                             (None, None) => raw_at(block_i),
-                        });
+                        };
+                        // The raw delta counts serialized JSON, which can run high on
+                        // tool-heavy spans — clamp to the next EXACT count (a longer
+                        // prefix can't cost less than a shorter one says) and the full
+                        // render total, so a hot delta can't overprice the span.
+                        let ceiling = next_n.map(|(_, c)| c).unwrap_or(total).min(total);
+                        per_breakpoint[i] = Some(estimate.min(ceiling));
                     }
                 }
                 _ => {

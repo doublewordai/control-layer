@@ -226,15 +226,13 @@ fn splice_cache_fields(usage: &mut serde_json::Map<String, Value>, stats: &Cache
     // tokenizer-svc bake and the serving engine.
     if let (Some(render_total), Some(prompt)) = (stats.render_total, usage.get("prompt_tokens").and_then(Value::as_u64)) {
         let drift = render_total as i64 - prompt as i64;
-        metrics::histogram!("dwctl_cache_render_drift_tokens", "model" => model.unwrap_or("unknown").to_string()).record(drift as f64);
+        let model_label = model.unwrap_or("unknown").to_string();
+        metrics::histogram!("dwctl_cache_render_drift_tokens", "model" => model_label.clone()).record(drift as f64);
         // Small constant seams are expected; alarm only on >1% AND >20 tokens, per-model
-        // so a single drifting template is visible amid healthy traffic.
-        if drift.unsigned_abs() > 20 && drift.unsigned_abs() * 100 > prompt {
-            metrics::counter!(
-                "dwctl_cache_render_drift_exceeded_total",
-                "model" => model.unwrap_or("unknown").to_string()
-            )
-            .increment(1);
+        // so a single drifting template is visible amid healthy traffic. A zero prompt
+        // count is upstream nonsense, not template drift — don't let it trip the alarm.
+        if prompt > 0 && drift.unsigned_abs() > 20 && drift.unsigned_abs() * 100 > prompt {
+            metrics::counter!("dwctl_cache_render_drift_exceeded_total", "model" => model_label).increment(1);
         }
     }
     let creations = stats.creation_total();

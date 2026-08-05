@@ -71,12 +71,13 @@ struct RenderRequest<'a> {
     return_rendered: bool,
 }
 
-/// One truncation point, in the svc's wire shape. Indices are INCLUSIVE and refer to the
-/// request as transmitted.
+/// One truncation point, in the svc's wire shape. `message`/`block`/`tool_call` are
+/// INCLUSIVE indices into the request as transmitted; `tools` is a COUNT (the first n
+/// definitions) — per the svc contract.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(untagged)]
 pub enum WirePrefix {
-    /// `tools[0..=tools]`, no messages.
+    /// The first `tools` definitions from `tools[]`, no messages.
     Tools { tools: usize },
     /// All tools + `messages[0..=message]` complete.
     Message { message: usize },

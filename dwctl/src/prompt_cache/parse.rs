@@ -895,8 +895,6 @@ mod tests {
         );
     }
 
-    use super::*;
-
     fn all_tiers() -> TierPolicy {
         TierPolicy::from_config(&["5m".to_string(), "1h".to_string(), "24h".to_string()], "5m")
     }
