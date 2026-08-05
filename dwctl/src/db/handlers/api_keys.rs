@@ -125,6 +125,7 @@ impl<'c> Repository for ApiKeys<'c> {
             ApiKeyPurpose::Realtime => "realtime",
             ApiKeyPurpose::Batch => "batch",
             ApiKeyPurpose::Playground => "playground",
+            ApiKeyPurpose::Continuation => "continuation",
         };
 
         let api_key = sqlx::query_as!(
@@ -344,6 +345,7 @@ impl<'c> ApiKeys<'c> {
             ApiKeyPurpose::Realtime => "realtime",
             ApiKeyPurpose::Batch => "batch",
             ApiKeyPurpose::Playground => "playground",
+            ApiKeyPurpose::Continuation => "continuation",
         };
 
         // Upsert: insert a hidden key or return the existing one.
@@ -406,6 +408,7 @@ impl<'c> ApiKeys<'c> {
             ApiKeyPurpose::Realtime => "realtime",
             ApiKeyPurpose::Batch => "batch",
             ApiKeyPurpose::Playground => "playground",
+            ApiKeyPurpose::Continuation => "continuation",
         };
 
         // Upsert: insert a hidden key or return the existing one.
@@ -801,6 +804,7 @@ impl<'c> ApiKeys<'c> {
             ApiKeyPurpose::Realtime => "realtime",
             ApiKeyPurpose::Batch => "batch",
             ApiKeyPurpose::Playground => "playground",
+            ApiKeyPurpose::Continuation => "continuation",
         };
 
         let key_ids = sqlx::query_scalar!(
@@ -831,6 +835,7 @@ impl<'c> ApiKeys<'c> {
             ApiKeyPurpose::Realtime => "realtime",
             ApiKeyPurpose::Batch => "batch",
             ApiKeyPurpose::Playground => "playground",
+            ApiKeyPurpose::Continuation => "continuation",
         };
 
         let key_ids = sqlx::query_scalar!(
