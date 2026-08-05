@@ -106,6 +106,22 @@ impl<'c> Organizations<'c> {
     /// Find an organization by its domain (stored as username).
     /// Returns `None` if no active (non-deleted) organization exists with that domain.
     #[instrument(skip(self), fields(domain = %domain), err)]
+    /// The organization a join request for `domain` should go to.
+    ///
+    /// Organization usernames are `{domain}~{suffix}`, so one company can hold
+    /// several workspaces - prod and dev being the obvious pair - while
+    /// `users.username` stays unique. The bare `username = $1` arm matches
+    /// organizations created before the suffix existed, whose username is the
+    /// domain alone.
+    ///
+    /// `~` is the separator precisely because it can't occur in a domain, so
+    /// the prefix match is exact: "acme.com" cannot match an organization for
+    /// "acme.com.au", which a plain `LIKE 'acme.com%'` would have done and
+    /// routed a join request to the wrong company.
+    ///
+    /// Several may match; the oldest surviving one wins. That's the workspace a
+    /// colleague signing up is most likely to mean, and it stays stable as
+    /// later ones come and go.
     pub async fn find_by_domain(&mut self, domain: &str) -> Result<Option<UserDBResponse>> {
         let row = sqlx::query!(
             r#"
@@ -115,7 +131,14 @@ impl<'c> Organizations<'c> {
                    low_balance_notification_sent, low_balance_threshold,
                    auto_topup_amount, auto_topup_threshold, auto_topup_monthly_limit, user_type, verified, zero_data_retention
             FROM users
-            WHERE username = $1 AND user_type = 'organization' AND is_deleted = false
+            WHERE (username = $1 OR username LIKE $1 || '~%')
+              AND user_type = 'organization'
+              -- A soft-deleted workspace must never receive join requests:
+              -- nobody is left to approve them, so the requester would sit on a
+              -- queue no one can see.
+              AND is_deleted = false
+            ORDER BY created_at ASC
+            LIMIT 1
             "#,
             domain
         )

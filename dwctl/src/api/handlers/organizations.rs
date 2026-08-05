@@ -235,10 +235,52 @@ pub async fn create_organization<P: PoolProvider>(
         current_user.id
     };
 
+    // The organization's username IS its email domain, which is what makes an
+    // organization findable by the people who belong to it: a later signup from
+    // the same domain is offered a join request instead of a second workspace.
+    // `users.username` is already UNIQUE, so that also enforces one
+    // organization per domain without a separate claim table.
+    //
+    // Derived from the owner's own address rather than the submitted name, so a
+    // caller can't claim a domain they don't have mail at. The name the user
+    // typed becomes the display name.
+    //
+    // Falls back to the submitted name when the owner is on a personal email
+    // domain (gmail and friends) - there's no meaningful domain to claim, and
+    // claiming "gmail.com" would swallow every consumer signup into one org.
+    let owner_email = if owner_id == current_user.id {
+        current_user.email.clone()
+    } else {
+        let mut conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
+        Users::new(&mut conn)
+            .get_by_id(owner_id)
+            .await?
+            .ok_or(Error::NotFound {
+                resource: "User".to_string(),
+                id: owner_id.to_string(),
+            })?
+            .email
+    };
+    let claimable_domain = crate::auth::utils::email_domain(&owner_email).filter(|d| !crate::auth::utils::is_personal_email_domain(d));
+
+    // `{domain}~{suffix}`: the domain is what a colleague's signup matches on,
+    // and the suffix keeps `users.username` unique so one company can hold
+    // several workspaces - prod and dev being the obvious pair. `~` can't occur
+    // in a domain, which is what makes the match exact on the way back out.
+    //
+    // Falls back to the submitted name when the owner is on a personal email
+    // domain: there's nothing worth matching on, and an organization claiming
+    // "gmail.com" would catch every consumer signup.
+    let username = match claimable_domain.as_deref() {
+        Some(domain) => format!("{domain}~{}", &uuid::Uuid::new_v4().simple().to_string()[..8]),
+        None => data.name.clone(),
+    };
+
+    let display_name = data.display_name.clone().or_else(|| Some(data.name.clone()));
     let db_request = OrganizationCreateDBRequest {
-        name: data.name,
+        name: username,
         email,
-        display_name: data.display_name,
+        display_name,
         avatar_url: None,
         created_by: owner_id,
     };
@@ -1465,7 +1507,14 @@ pub async fn list_user_organizations<P: PoolProvider>(
         });
     }
 
-    let mut pool_conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
+    // Primary, not the replica: these summaries carry `verified`, and clients
+    // read it straight after a write that sets it - the card-verification
+    // return path marks the organization verified, then the UI re-reads to drop
+    // its "Verification pending" badge. Off the replica that read can land
+    // before the flag has propagated, so the badge stays up on an account that
+    // has just paid. Same inter-endpoint consistency trap `get_user` already
+    // avoids for the equivalent reason (see CLAUDE.md).
+    let mut pool_conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
     let mut repo = Organizations::new(&mut pool_conn);
     let memberships = repo.list_user_organizations(target_user_id).await?;
     let manage_keys_orgs = repo.user_manage_keys_org_ids(target_user_id).await?;
@@ -2132,6 +2181,7 @@ mod tests {
     use crate::api::models::users::Role;
     use crate::test::utils::{
         add_auth_headers, create_test_admin_user, create_test_app, create_test_app_with_config, create_test_config, create_test_user,
+        create_test_user_on_domain,
     };
     use serde_json::json;
     use sqlx::PgPool;
@@ -2153,7 +2203,132 @@ mod tests {
             .await;
         resp.assert_status(axum::http::StatusCode::CREATED);
         let body = resp.json::<serde_json::Value>();
-        assert_eq!(body["username"].as_str().unwrap(), "my-org");
+        // The username is the owner's email domain plus a suffix - the domain
+        // is what makes the workspace findable by colleagues, the suffix keeps
+        // it unique so they can have more than one. The submitted name becomes
+        // the display name.
+        let username = body["username"].as_str().unwrap();
+        assert!(username.starts_with("example.com~"), "got {username}");
+        assert_eq!(body["display_name"].as_str().unwrap(), "my-org");
+    }
+
+    /// Domains are case-insensitive; the things we compare them against are
+    /// not. Without normalising, `Alice@Acme.test` claims `Acme.test` and a
+    /// later `bob@acme.test` matches nothing.
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_domain_claim_is_case_insensitive(pool: PgPool) {
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_on_domain(&pool, Role::StandardUser, "MixedCase.test").await;
+        let headers = add_auth_headers(&user);
+
+        let resp = server
+            .post("/admin/api/v1/organizations")
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .json(&json!({ "name": "Mixed Case Ltd", "email": "billing@mixedcase.test" }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::CREATED);
+        let username = resp.json::<serde_json::Value>()["username"].as_str().unwrap().to_string();
+        assert!(
+            username.starts_with("mixedcase.test~"),
+            "claim should be lowercased, got {username}"
+        );
+
+        // A colleague whose address is cased differently still finds it.
+        let mut conn = pool.acquire().await.unwrap();
+        assert!(
+            crate::db::handlers::Organizations::new(&mut conn)
+                .find_by_domain("mixedcase.test")
+                .await
+                .unwrap()
+                .is_some(),
+            "a differently-cased colleague must still match the workspace"
+        );
+    }
+
+    /// A domain can hold several workspaces - prod and dev, say - and a join
+    /// request goes to the oldest surviving one.
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_domain_can_hold_several_workspaces(pool: PgPool) {
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_on_domain(&pool, Role::StandardUser, "acme.test").await;
+        let headers = add_auth_headers(&user);
+
+        let mut ids = Vec::new();
+        for name in ["Acme Prod", "Acme Dev"] {
+            let resp = server
+                .post("/admin/api/v1/organizations")
+                .add_header(&headers[0].0, &headers[0].1)
+                .add_header(&headers[1].0, &headers[1].1)
+                .json(&json!({ "name": name, "email": "billing@acme.test" }))
+                .await;
+            resp.assert_status(axum::http::StatusCode::CREATED);
+            let body = resp.json::<serde_json::Value>();
+            assert!(body["username"].as_str().unwrap().starts_with("acme.test~"));
+            ids.push(body["id"].as_str().unwrap().to_string());
+        }
+        assert_ne!(ids[0], ids[1], "both workspaces exist independently");
+
+        // A colleague's join request goes to the first one created.
+        let mut conn = pool.acquire().await.unwrap();
+        let matched = crate::db::handlers::Organizations::new(&mut conn)
+            .find_by_domain("acme.test")
+            .await
+            .unwrap()
+            .expect("a workspace matches the domain");
+        assert_eq!(matched.id.to_string(), ids[0], "the oldest surviving workspace wins");
+    }
+
+    /// A soft-deleted workspace must never receive join requests - nobody is
+    /// left to approve them.
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_deleted_workspace_is_not_matched_by_domain(pool: PgPool) {
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let pm = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let pm_headers = add_auth_headers(&pm);
+        let user = create_test_user_on_domain(&pool, Role::StandardUser, "gone.test").await;
+        let headers = add_auth_headers(&user);
+
+        let resp = server
+            .post("/admin/api/v1/organizations")
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .json(&json!({ "name": "Gone Ltd", "email": "billing@gone.test" }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::CREATED);
+        let org_id = resp.json::<serde_json::Value>()["id"].as_str().unwrap().to_string();
+
+        {
+            let mut conn = pool.acquire().await.unwrap();
+            assert!(
+                crate::db::handlers::Organizations::new(&mut conn)
+                    .find_by_domain("gone.test")
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "matches while it exists"
+            );
+        }
+
+        let resp = server
+            .delete(&format!("/admin/api/v1/organizations/{org_id}"))
+            .add_header(&pm_headers[0].0, &pm_headers[0].1)
+            .add_header(&pm_headers[1].0, &pm_headers[1].1)
+            .await;
+        assert!(resp.status_code().is_success(), "delete failed: {}", resp.text());
+
+        let mut conn = pool.acquire().await.unwrap();
+        assert!(
+            crate::db::handlers::Organizations::new(&mut conn)
+                .find_by_domain("gone.test")
+                .await
+                .unwrap()
+                .is_none(),
+            "a deleted workspace must not collect join requests"
+        );
     }
 
     #[sqlx::test]
@@ -2435,10 +2610,6 @@ mod tests {
         assert!(body.contains("maximum"));
     }
 
-    // ── Leave organization ────────────────────────────────────────────────
-
-    /// Resending necessarily rotates the token: the original is only stored as
-    /// a hash and can't be recovered, so the old link must stop working.
     #[sqlx::test]
     #[test_log::test]
     async fn test_resend_invite_rotates_the_token(pool: PgPool) {
