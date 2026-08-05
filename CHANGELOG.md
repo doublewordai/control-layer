@@ -1,5 +1,12 @@
 # Changelog
 
+## [10.7.1](https://github.com/doublewordai/control-layer/compare/v10.7.0...v10.7.1) (2026-08-05)
+
+
+### Bug Fixes
+
+* filtered-empty key list keeps scoping controls and correct empty… ([#1440](https://github.com/doublewordai/control-layer/issues/1440)) ([5b29ab9](https://github.com/doublewordai/control-layer/commit/5b29ab969063687b22f856167e6b0ae28c3ca0e8))
+
 ## [10.7.0](https://github.com/doublewordai/control-layer/compare/v10.6.0...v10.7.0) (2026-08-05)
 
 
