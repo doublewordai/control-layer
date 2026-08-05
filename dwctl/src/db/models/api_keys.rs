@@ -118,6 +118,10 @@ pub struct ApiKeyDBResponse {
     /// children). Handlers must never expose, mutate, or select hidden keys —
     /// `get_by_id` returns them, so every user-facing path filters on this.
     pub hidden: bool,
+    /// When the key's holder first fetched the secret (migration 131). NULL =
+    /// an issued key awaiting its holder's one-off reveal; self-created keys
+    /// are born revealed. Rotation never touches this.
+    pub secret_revealed_at: Option<DateTime<Utc>>,
 }
 
 /// Spend display state for one cap scope (read from `api_key_spend_checkpoints`

@@ -314,22 +314,31 @@ async fn test_strict_mode_allows_chat_completions(pool: PgPool) {
     }
     assert!(model_available, "Model gpt-4 should be available in onwards within 3 seconds");
 
-    // Make chat completion request
-    let chat_response = server
-        .post("/ai/v1/chat/completions")
-        .add_header("Authorization", &format!("Bearer {}", api_key))
-        .add_header("Content-Type", "application/json")
-        .json(&serde_json::json!({
-            "model": "gpt-4",
-            "messages": [{
-                "role": "user",
-                "content": "Hello, test strict mode"
-            }]
-        }))
-        .await;
-
-    let status = chat_response.status_code();
-    let body_text = chat_response.text();
+    // Make the chat completion request. The models poll above is answered
+    // by dwctl from the DB, so it does NOT prove onwards' key cache has
+    // processed the NOTIFY yet — in strict mode a not-yet-admitted key gets
+    // 403 from onwards. Poll through that startup race and assert the
+    // terminal state.
+    let start = std::time::Instant::now();
+    let (status, body_text) = loop {
+        let chat_response = server
+            .post("/ai/v1/chat/completions")
+            .add_header("Authorization", &format!("Bearer {}", api_key))
+            .add_header("Content-Type", "application/json")
+            .json(&serde_json::json!({
+                "model": "gpt-4",
+                "messages": [{
+                    "role": "user",
+                    "content": "Hello, test strict mode"
+                }]
+            }))
+            .await;
+        let status = chat_response.status_code();
+        if status != 403 || start.elapsed() > std::time::Duration::from_secs(3) {
+            break (status, chat_response.text());
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
+    };
     assert_eq!(
         status, 200,
         "Expected 200 for chat completions in strict mode. Got {}: {}",

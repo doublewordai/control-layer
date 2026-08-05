@@ -1256,6 +1256,10 @@ pub async fn build_router(
             post(api::handlers::api_keys::rotate_user_api_key),
         )
         .route(
+            "/users/{user_id}/api-keys/{id}/reveal",
+            post(api::handlers::api_keys::reveal_user_api_key),
+        )
+        .route(
             "/users/{user_id}/api-keys/{id}",
             delete(api::handlers::api_keys::delete_user_api_key),
         )
