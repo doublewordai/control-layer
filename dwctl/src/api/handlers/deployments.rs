@@ -1416,12 +1416,12 @@ fn db_group_to_response(g: DeploymentComponentGroup, components: Vec<ModelCompon
 
 #[utoipa::path(
     post,
-    path = "/models/{id}/groups",
+    path = "/models/{deployment_id}/groups",
     tag = "composite-models",
     summary = "Create component group on composite model",
     description = "Create a named component group with its own load balancing strategy. The group is appended to the composite root sequence, which it shares with direct components.",
     params(
-        ("id" = String, Path, description = "The composite model ID", format = "uuid"),
+        ("deployment_id" = String, Path, description = "The composite model ID", format = "uuid"),
     ),
     request_body = ModelGroupCreate,
     responses(
