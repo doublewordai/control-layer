@@ -1491,12 +1491,12 @@ pub async fn create_model_group<P: PoolProvider>(
 
 #[utoipa::path(
     patch,
-    path = "/models/{id}/groups/{group_id}",
+    path = "/models/{deployment_id}/groups/{group_id}",
     tag = "composite-models",
     summary = "Update component group",
     description = "Update a component group's name, load balancing strategy, weight or enabled status, and/or move it to a new position in the composite root sequence.",
     params(
-        ("id" = String, Path, description = "The composite model ID", format = "uuid"),
+        ("deployment_id" = String, Path, description = "The composite model ID", format = "uuid"),
         ("group_id" = String, Path, description = "The component group ID", format = "uuid"),
     ),
     request_body = ModelGroupUpdate,
@@ -1575,12 +1575,12 @@ pub async fn update_model_group<P: PoolProvider>(
 
 #[utoipa::path(
     delete,
-    path = "/models/{id}/groups/{group_id}",
+    path = "/models/{deployment_id}/groups/{group_id}",
     tag = "composite-models",
     summary = "Delete component group",
     description = "Delete a component group. By default its members are promoted to direct components at the end of the composite root sequence; with cascade=true the member components are removed as well.",
     params(
-        ("id" = String, Path, description = "The composite model ID", format = "uuid"),
+        ("deployment_id" = String, Path, description = "The composite model ID", format = "uuid"),
         ("group_id" = String, Path, description = "The component group ID", format = "uuid"),
         ("cascade" = Option<bool>, Query, description = "When true, delete the group's member components too (default: false, members are promoted to direct components)"),
     ),

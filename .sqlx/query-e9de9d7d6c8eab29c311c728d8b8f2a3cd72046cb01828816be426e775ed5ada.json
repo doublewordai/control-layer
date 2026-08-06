@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT\n                dmc.id,\n                dmc.composite_model_id,\n                dmc.deployed_model_id,\n                dmc.weight,\n                dmc.enabled,\n                dmc.sort_order,\n                dmc.created_at,\n                dmc.group_id as \"group_id?\",\n                g.name as \"group_name?\",\n                dm.alias as model_alias,\n                dm.model_name,\n                dm.description as model_description,\n                dm.type as model_type,\n                dm.trusted as model_trusted,\n                dm.open_responses_adapter as \"model_open_responses_adapter?\",\n                dm.hosted_on as endpoint_id,\n                e.name as \"endpoint_name?\"\n            FROM deployed_model_components dmc\n            JOIN deployed_models dm ON dm.id = dmc.deployed_model_id\n            LEFT JOIN inference_endpoints e ON e.id = dm.hosted_on\n            LEFT JOIN deployed_model_component_groups g ON g.id = dmc.group_id\n            WHERE dmc.composite_model_id = ANY($1)\n            ORDER BY dmc.composite_model_id, dmc.group_id NULLS FIRST, dmc.sort_order ASC, dmc.weight DESC, dmc.created_at ASC\n            ",
+  "query": "\n            SELECT\n                dmc.id,\n                dmc.composite_model_id,\n                dmc.deployed_model_id,\n                dmc.weight,\n                dmc.enabled,\n                dmc.sort_order,\n                dmc.created_at,\n                dmc.group_id as \"group_id?\",\n                g.name as \"group_name?\",\n                dm.alias as model_alias,\n                dm.model_name,\n                dm.description as model_description,\n                dm.type as model_type,\n                dm.trusted as model_trusted,\n                dm.open_responses_adapter as \"model_open_responses_adapter?\",\n                dm.hosted_on as endpoint_id,\n                e.name as \"endpoint_name?\"\n            FROM deployed_model_components dmc\n            JOIN deployed_models dm ON dm.id = dmc.deployed_model_id\n            LEFT JOIN inference_endpoints e ON e.id = dm.hosted_on\n            LEFT JOIN deployed_model_component_groups g ON g.id = dmc.group_id\n            WHERE dmc.composite_model_id = ANY($1)\n            -- See get_components: root failover order, not group UUID order.\n            ORDER BY dmc.composite_model_id, COALESCE(g.sort_order, dmc.sort_order) ASC, dmc.sort_order ASC, dmc.weight DESC, dmc.created_at ASC\n            ",
   "describe": {
     "columns": [
       {
@@ -114,5 +114,5 @@
       false
     ]
   },
-  "hash": "60e0291cd9f871790ffb80a519731d96e7cc47831c1cdf4b3255b98952ac60c3"
+  "hash": "e9de9d7d6c8eab29c311c728d8b8f2a3cd72046cb01828816be426e775ed5ada"
 }

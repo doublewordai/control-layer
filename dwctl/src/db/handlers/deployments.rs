@@ -1082,7 +1082,12 @@ impl<'c> Deployments<'c> {
             LEFT JOIN inference_endpoints e ON e.id = dm.hosted_on
             LEFT JOIN deployed_model_component_groups g ON g.id = dmc.group_id
             WHERE dmc.composite_model_id = $1
-            ORDER BY dmc.group_id NULLS FIRST, dmc.sort_order ASC, dmc.weight DESC, dmc.created_at ASC
+            -- Root failover order: direct components and groups share one
+            -- sequence, so a grouped component's root position is its group's
+            -- sort_order. Within a group, member sort_order applies. This
+            -- mirrors the ordering the onwards sync layer uses, so the list
+            -- order matches the order requests actually fail over in.
+            ORDER BY COALESCE(g.sort_order, dmc.sort_order) ASC, dmc.sort_order ASC, dmc.weight DESC, dmc.created_at ASC
             "#,
             composite_model_id
         )
@@ -1148,7 +1153,8 @@ impl<'c> Deployments<'c> {
             LEFT JOIN inference_endpoints e ON e.id = dm.hosted_on
             LEFT JOIN deployed_model_component_groups g ON g.id = dmc.group_id
             WHERE dmc.composite_model_id = ANY($1)
-            ORDER BY dmc.composite_model_id, dmc.group_id NULLS FIRST, dmc.sort_order ASC, dmc.weight DESC, dmc.created_at ASC
+            -- See get_components: root failover order, not group UUID order.
+            ORDER BY dmc.composite_model_id, COALESCE(g.sort_order, dmc.sort_order) ASC, dmc.sort_order ASC, dmc.weight DESC, dmc.created_at ASC
             "#,
             &composite_model_ids
         )
