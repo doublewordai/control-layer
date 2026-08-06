@@ -2310,12 +2310,64 @@ impl BackgroundServices {
             crate::sync::onwards_config::load_targets_from_db(pool, &[], self.strict_mode, &crate::config::RateLimitTiersConfig::default())
                 .await?;
 
+        // Snapshot the routing table this update should produce, before the
+        // config is handed to the channel.
+        //
+        // `send` only queues the config for `Targets::receive_updates`, which
+        // applies it on its own task, so returning as soon as it succeeds does
+        // not mean the proxy can serve the new config yet. A test that goes
+        // straight from here to a proxied request can beat the apply and get a
+        // 403 for an API key that is already committed to the database.
+        //
+        // Both the alias set and each pool's authorised-key count are checked:
+        // a stale pool that already has the right alias but not yet the new key
+        // is exactly what produces the spurious 403.
+        let expected: Vec<(String, usize)> = new_targets
+            .targets
+            .iter()
+            .map(|entry| (entry.key().clone(), entry.value().keys().map_or(0, |keys| keys.len())))
+            .collect();
+
         // Send through the watch channel (same as automatic sync)
         sender
             .send(new_targets)
             .map_err(|_| anyhow::anyhow!("Failed to send targets update"))?;
 
-        Ok(())
+        // `onwards_targets` shares its maps with the router's `AppState`, so
+        // polling it observes exactly what a proxied request would resolve
+        // against. Reaching this point means the sender exists, which in turn
+        // means `receive_updates` was wired for this app, so an update that
+        // never lands is a real failure rather than a disabled-sync no-op.
+        //
+        // Note this cannot detect an update that changes nothing structural
+        // (e.g. only an endpoint URL) - such an update matches immediately and
+        // returns without waiting, exactly as before.
+        //
+        // The budget is deliberately longer than the config listener's periodic
+        // fallback sync: the listener shares this watch channel, so a periodic
+        // reload that started loading just before the test's own write could
+        // land after this send and briefly apply the older config. The next
+        // fallback sync corrects that, and waiting past one interval means the
+        // helper rides it out instead of failing the test.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            let live = &self.onwards_targets.targets;
+            let applied = live.len() == expected.len()
+                && expected.iter().all(|(alias, key_count)| {
+                    live.get(alias)
+                        .is_some_and(|pool| pool.keys().map_or(0, |keys| keys.len()) == *key_count)
+                });
+
+            if applied {
+                return Ok(());
+            }
+
+            if std::time::Instant::now() >= deadline {
+                anyhow::bail!("onwards did not apply the config update within 5s");
+            }
+
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
     }
 
     /// Manually refresh the per-key ZDR cache from the database (for testing).
