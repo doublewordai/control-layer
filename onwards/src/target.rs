@@ -3114,30 +3114,30 @@ mod tests {
 
         let json = r#"{
             "targets": {
-                "glm": {
+                "pooled-model": {
                     "strategy": "priority",
                     "providers": [
-                        {"url": "https://dynamo.internal/v1/"}
+                        {"url": "https://primary.example.com/v1/"}
                     ],
                     "groups": [
                         {
-                            "name": "third-party",
+                            "name": "secondary",
                             "strategy": "weighted_random",
                             "weight": 2,
                             "providers": [
-                                {"url": "https://openrouter.ai/api/v1/", "weight": 40},
-                                {"url": "https://api.fireworks.ai/v1/", "weight": 40}
+                                {"url": "https://a.example.com/v1/", "weight": 40},
+                                {"url": "https://b.example.com/v1/", "weight": 40}
                             ]
                         }
                     ],
-                    "member_order": [{"group": "third-party"}, {"provider": 0}]
+                    "member_order": [{"group": "secondary"}, {"provider": 0}]
                 }
             }
         }"#;
 
         let config: ConfigFile = serde_json::from_str(json).unwrap();
         let targets = Targets::from_config(config).unwrap();
-        let pool = targets.targets.get("glm").unwrap();
+        let pool = targets.targets.get("pooled-model").unwrap();
 
         assert_eq!(pool.leaf_count(), 3);
         let members = pool.providers();
@@ -3152,20 +3152,20 @@ mod tests {
         else {
             panic!("expected group first per member_order");
         };
-        assert_eq!(name, "third-party");
+        assert_eq!(name, "secondary");
         assert_eq!(*strategy, LoadBalanceStrategy::WeightedRandom);
         assert_eq!(members[0].weight, 2);
         assert_eq!(group_members.len(), 2);
         assert_eq!(group_members[0].weight, 40);
         assert_eq!(
             members[1].target().unwrap().url.host_str(),
-            Some("dynamo.internal")
+            Some("primary.example.com")
         );
 
         // First leaf depth-first is inside the group
         assert_eq!(
             pool.first_target().unwrap().url.host_str(),
-            Some("openrouter.ai")
+            Some("a.example.com")
         );
     }
 
