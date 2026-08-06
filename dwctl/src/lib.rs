@@ -352,6 +352,12 @@ fn get_or_install_prometheus_handle() -> PrometheusHandle {
             // classify, tokenizer-svc call, commit, and index lookup (cache read).
             const CACHE_LATENCY_BUCKETS: &[f64] = &[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0];
 
+            // Render-drift histogram buckets, in TOKENS (signed: render_total − engine
+            // prompt_tokens). Edges double as alert thresholds: the share of requests
+            // with |drift| beyond ±5/±20/±50/±100/±500 is exact at these edges, so
+            // Grafana alert rules can be tuned across them without a code release.
+            const RENDER_DRIFT_TOKEN_BUCKETS: &[f64] = &[-500.0, -100.0, -50.0, -20.0, -5.0, 0.0, 5.0, 20.0, 50.0, 100.0, 500.0];
+
             // Custom histogram buckets for fusillade retry attempts (0-10 retries)
             const RETRY_ATTEMPTS_BUCKETS: &[f64] = &[0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0];
 
@@ -386,6 +392,11 @@ fn get_or_install_prometheus_handle() -> PrometheusHandle {
                     CACHE_LATENCY_BUCKETS,
                 )
                 .expect("Failed to set custom buckets for dwctl_cache_lookup_duration_seconds")
+                .set_buckets_for_metric(
+                    Matcher::Full("dwctl_cache_render_drift_tokens".to_string()),
+                    RENDER_DRIFT_TOKEN_BUCKETS,
+                )
+                .expect("Failed to set custom buckets for dwctl_cache_render_drift_tokens")
                 .set_buckets_for_metric(
                     Matcher::Full("fusillade_retry_attempts_on_success".to_string()),
                     RETRY_ATTEMPTS_BUCKETS,
@@ -1728,6 +1739,7 @@ pub async fn build_router(
                     cfg.cache.telemetry_blocks.strip_from_prompt,
                     &cfg.cache.telemetry_blocks.prefixes,
                 ),
+                cfg.cache.render_counting,
             );
             // Bound the cache layer's body buffer by the same limit onwards uses (0 =
             // unlimited), so it's never more restrictive than the entry point.

@@ -26,6 +26,7 @@
 //! excluded from this view (see [`TelemetryPolicy`]) so they don't poison the prefix hash and
 //! force write-only caching. In strip mode they're also removed from the forwarded request.
 
+use super::tokenizer::WirePrefix;
 use sha2::{Digest, Sha256};
 
 use super::index::{TierPolicy, TtlTier};
@@ -83,6 +84,10 @@ pub struct Block {
     /// Text content for tokenization (the write-side segment). Empty for non-text
     /// blocks (e.g. images), which then bill as uncached.
     pub text: String,
+    /// Ordinal of the containing `messages[]` entry; `None` for tool-definition blocks
+    /// (which precede messages). Drives the block→message-boundary mapping for exact
+    /// (chat-templated) counting.
+    pub message_index: Option<usize>,
 }
 
 /// An explicit cache breakpoint (a `cache_control`-marked block).
@@ -91,6 +96,64 @@ pub struct Breakpoint {
     /// Index into `blocks` of the marked block (the inclusive prefix end).
     pub block_index: usize,
     pub ttl_tier: TtlTier,
+    /// How to reconstruct this breakpoint's prefix as a request for exact
+    /// (chat-templated) counting. Every marker position is constructible.
+    pub prefix: PrefixSpec,
+}
+
+/// A breakpoint's prefix, in request terms: which tools and how much of which messages
+/// are inside it. Exact counting renders this reconstructed prefix (generation prompt
+/// off) to count precisely what the marker covers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrefixSpec {
+    /// Number of leading `tools[]` entries in the prefix (tools precede messages in the
+    /// canonical order; a marker on tools[j] keeps j+1 and no messages).
+    pub tools_kept: usize,
+    /// Number of COMPLETE leading messages in the prefix.
+    pub full_messages: usize,
+    /// For a mid-message marker: how much of the next (partial) message is kept.
+    /// `None` = the marker sits exactly on a message end.
+    pub partial: Option<PartialMessage>,
+}
+
+/// The kept portion of a partially-included message.
+///
+/// Ordinals count the request AS TRANSMITTED: in telemetry strip mode the sanitiser
+/// removes excluded blocks from the forwarded body, so kept parts are numbered over
+/// the surviving blocks (the view the tokenizer-svc renders).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartialMessage {
+    /// Leading `content[]` parts kept (array-form content).
+    pub content_parts: usize,
+    /// Leading `tool_calls[]` kept (assistant messages; ordered after content).
+    pub tool_calls: usize,
+}
+
+impl PrefixSpec {
+    /// This prefix in the tokenizer-svc `/v1/render` wire shape. `tools` is a COUNT
+    /// (first n definitions); `message`/`block`/`tool_call` are inclusive indices —
+    /// per the svc contract.
+    pub fn to_wire(&self) -> WirePrefix {
+        if let Some(partial) = &self.partial {
+            if partial.tool_calls > 0 {
+                WirePrefix::ToolCall {
+                    message: self.full_messages,
+                    tool_call: partial.tool_calls - 1,
+                }
+            } else {
+                WirePrefix::Block {
+                    message: self.full_messages,
+                    block: partial.content_parts - 1,
+                }
+            }
+        } else if self.full_messages > 0 {
+            WirePrefix::Message {
+                message: self.full_messages - 1,
+            }
+        } else {
+            WirePrefix::Tools { tools: self.tools_kept }
+        }
+    }
 }
 
 /// The parsed cache view of a request.
@@ -132,8 +195,9 @@ pub fn parse_chat_completions(body: &[u8], policy: &TierPolicy, telemetry: &Tele
     // (`tools[i].cache_control` — the slot OpenAI clients set directly and the Anthropic
     // ingress translation maps its native tool marker to) marks a breakpoint. The block text
     // is the tool's JSON, tokenized as an estimate of the tool's contribution.
+    let tools_total = v.get("tools").and_then(|t| t.as_array()).map(|a| a.len()).unwrap_or(0);
     if let Some(tools) = v.get("tools").and_then(|t| t.as_array()) {
-        for tool in tools {
+        for (tool_ordinal, tool) in tools.iter().enumerate() {
             let ttl = match tool.get("cache_control") {
                 Some(cc) if !cc.is_null() => Some(parse_ttl(cc, policy)?),
                 _ => None,
@@ -153,16 +217,43 @@ pub fn parse_chat_completions(body: &[u8], policy: &TierPolicy, telemetry: &Tele
             blocks.push(Block {
                 role: TOOL_DEFINITION_ROLE.to_string(),
                 text,
+                message_index: None,
             });
             if let Some(ttl_tier) = ttl {
-                breakpoints.push(Breakpoint { block_index, ttl_tier });
+                breakpoints.push(Breakpoint {
+                    block_index,
+                    ttl_tier,
+                    prefix: PrefixSpec {
+                        tools_kept: tool_ordinal + 1,
+                        full_messages: 0,
+                        partial: None,
+                    },
+                });
             }
         }
     }
 
     if let Some(messages) = v.get("messages").and_then(|m| m.as_array()) {
-        for msg in messages {
+        for (message_index, msg) in messages.iter().enumerate() {
             let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("").to_string();
+            // Transmitted-view sizes for this message, for breakpoint prefix construction:
+            // in strip mode telemetry blocks are removed from the forwarded body, so they
+            // don't occupy content ordinals in the view the tokenizer-svc will render.
+            let content_len = msg
+                .get("content")
+                .and_then(|c| c.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter(|b| !(telemetry.strip_from_prompt && telemetry.excludes_block(&role, b)))
+                        .count()
+                })
+                .unwrap_or(0);
+            let calls_len = if role == "assistant" {
+                msg.get("tool_calls").and_then(|t| t.as_array()).map(|a| a.len()).unwrap_or(0)
+            } else {
+                0
+            };
+            let bp_watermark = breakpoints.len();
 
             match msg.get("content") {
                 // String content: one implicit text block, no marker possible.
@@ -173,18 +264,26 @@ pub fn parse_chat_completions(body: &[u8], policy: &TierPolicy, telemetry: &Tele
                     blocks.push(Block {
                         role: role.clone(),
                         text: s.clone(),
+                        message_index: Some(message_index),
                     });
                 }
                 // Array content: a sequence of blocks, each possibly marked.
                 Some(serde_json::Value::Array(arr)) => {
-                    for block in arr {
+                    // Ordinal of the current part in the TRANSMITTED body (strip mode
+                    // removes telemetry blocks, shifting later parts down).
+                    let mut fwd_ordinal = 0usize;
+                    for block in arr.iter() {
                         // Exclude provider-injected telemetry blocks (e.g. the Claude Code SDK's
                         // `x-anthropic-billing-header` line with its per-request `cch` nonce) from the
                         // cache prefix: left in, they'd change the prefix hash every turn and force
                         // write-only caching. `excludes_block` only matches UNMARKED blocks, so a
                         // caller's `cache_control` breakpoint is never dropped. (In strip mode the
-                        // outbound sanitiser also removes them from the forwarded request.)
+                        // outbound sanitiser also removes them from the forwarded request; otherwise
+                        // they still occupy a transmitted ordinal.)
                         if telemetry.excludes_block(&role, block) {
+                            if !telemetry.strip_from_prompt {
+                                fwd_ordinal += 1;
+                            }
                             continue;
                         }
                         let ttl = match block.get("cache_control") {
@@ -201,10 +300,26 @@ pub fn parse_chat_completions(body: &[u8], policy: &TierPolicy, telemetry: &Tele
                         cumulative_hashes.push(hasher.clone().finalize().to_vec());
 
                         let block_index = blocks.len();
-                        blocks.push(Block { role: role.clone(), text });
+                        blocks.push(Block {
+                            role: role.clone(),
+                            text,
+                            message_index: Some(message_index),
+                        });
                         if let Some(ttl_tier) = ttl {
-                            breakpoints.push(Breakpoint { block_index, ttl_tier });
+                            breakpoints.push(Breakpoint {
+                                block_index,
+                                ttl_tier,
+                                prefix: PrefixSpec {
+                                    tools_kept: tools_total,
+                                    full_messages: message_index,
+                                    partial: Some(PartialMessage {
+                                        content_parts: fwd_ordinal + 1,
+                                        tool_calls: 0,
+                                    }),
+                                },
+                            });
                         }
+                        fwd_ordinal += 1;
                     }
                 }
                 _ => {}
@@ -225,7 +340,7 @@ pub fn parse_chat_completions(body: &[u8], policy: &TierPolicy, telemetry: &Tele
             if role == "assistant"
                 && let Some(tool_calls) = msg.get("tool_calls").and_then(|t| t.as_array())
             {
-                for call in tool_calls {
+                for (call_ordinal, call) in tool_calls.iter().enumerate() {
                     let ttl = match call.get("cache_control") {
                         Some(cc) if !cc.is_null() => Some(parse_ttl(cc, policy)?),
                         _ => None,
@@ -240,10 +355,35 @@ pub fn parse_chat_completions(body: &[u8], policy: &TierPolicy, telemetry: &Tele
                     blocks.push(Block {
                         role: TOOL_CALL_ROLE.to_string(),
                         text,
+                        message_index: Some(message_index),
                     });
                     if let Some(ttl_tier) = ttl {
-                        breakpoints.push(Breakpoint { block_index, ttl_tier });
+                        breakpoints.push(Breakpoint {
+                            block_index,
+                            ttl_tier,
+                            prefix: PrefixSpec {
+                                tools_kept: tools_total,
+                                full_messages: message_index,
+                                partial: Some(PartialMessage {
+                                    content_parts: content_len,
+                                    tool_calls: call_ordinal + 1,
+                                }),
+                            },
+                        });
                     }
+                }
+            }
+
+            // Normalize this message's breakpoints: a marker on its FINAL element (last
+            // content part with no tool_calls, or last tool_call) covers the whole
+            // message — the prefix is simply messages[0..=message_index], no partial.
+            for bp in breakpoints[bp_watermark..].iter_mut() {
+                if let Some(partial) = &bp.prefix.partial
+                    && partial.content_parts == content_len
+                    && partial.tool_calls == calls_len
+                {
+                    bp.prefix.full_messages = message_index + 1;
+                    bp.prefix.partial = None;
                 }
             }
         }
@@ -261,9 +401,17 @@ pub fn parse_chat_completions(body: &[u8], policy: &TierPolicy, telemetry: &Tele
         let last_index = blocks.len().saturating_sub(1);
         let last_marker = breakpoints.iter().find(|bp| bp.block_index == last_index).map(|bp| bp.ttl_tier);
         if let AutoAction::Synthesize(tier) = resolve_auto_action(auto_ttl, !blocks.is_empty(), last_marker, breakpoints.len())? {
+            // The automatic breakpoint is the very last block — its prefix is the entire
+            // conversation (all tools, all messages, nothing partial).
+            let full_messages = v.get("messages").and_then(|m| m.as_array()).map(|a| a.len()).unwrap_or(0);
             breakpoints.push(Breakpoint {
                 block_index: last_index,
                 ttl_tier: tier,
+                prefix: PrefixSpec {
+                    tools_kept: tools_total,
+                    full_messages,
+                    partial: None,
+                },
             });
         }
     }
@@ -403,7 +551,7 @@ pub fn validate_markers(body: &serde_json::Value, policy: &TierPolicy, telemetry
                     last_marker = None;
                 }
                 Some(serde_json::Value::Array(arr)) => {
-                    for block in arr {
+                    for block in arr.iter() {
                         // Skip provider telemetry blocks so the "last block" matches parse's view.
                         if telemetry.excludes_block(role, block) {
                             continue;
@@ -436,7 +584,7 @@ pub fn validate_markers(body: &serde_json::Value, policy: &TierPolicy, telemetry
             if role == "assistant"
                 && let Some(tool_calls) = msg.get("tool_calls").and_then(|t| t.as_array())
             {
-                for call in tool_calls {
+                for call in tool_calls.iter() {
                     saw_block = true;
                     match call.get("cache_control") {
                         Some(cc) if !cc.is_null() => {
@@ -547,6 +695,205 @@ fn canonical_block_bytes(role: &str, stripped_block: &serde_json::Value) -> Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prefix_spec_end_of_message_is_whole_messages() {
+        let body = serde_json::json!({
+            "messages": [
+                {"role": "system", "content": [{"type":"text","text":"sys","cache_control":{"type":"ephemeral"}}]},
+                {"role": "user", "content": [
+                    {"type":"text","text":"a"},
+                    {"type":"text","text":"b","cache_control":{"type":"ephemeral"}}
+                ]}
+            ]
+        })
+        .to_string();
+        let p = parse_chat_completions(
+            body.as_bytes(),
+            &TierPolicy::from_config(&["5m".to_string()], "5m"),
+            &TelemetryPolicy::default(),
+        )
+        .unwrap();
+        // Marker on the only block of message 0 → the whole first message, no partial.
+        assert_eq!(
+            p.breakpoints[0].prefix,
+            PrefixSpec {
+                tools_kept: 0,
+                full_messages: 1,
+                partial: None
+            }
+        );
+        // Marker on the last block of message 1 → both messages whole.
+        assert_eq!(
+            p.breakpoints[1].prefix,
+            PrefixSpec {
+                tools_kept: 0,
+                full_messages: 2,
+                partial: None
+            }
+        );
+    }
+
+    #[test]
+    fn prefix_spec_mid_message_keeps_partial_content() {
+        let body = serde_json::json!({
+            "messages": [
+                {"role": "user", "content": [
+                    {"type":"text","text":"c","cache_control":{"type":"ephemeral"}},
+                    {"type":"text","text":"d"}
+                ]}
+            ]
+        })
+        .to_string();
+        let p = parse_chat_completions(
+            body.as_bytes(),
+            &TierPolicy::from_config(&["5m".to_string()], "5m"),
+            &TelemetryPolicy::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            p.breakpoints[0].prefix,
+            PrefixSpec {
+                tools_kept: 0,
+                full_messages: 0,
+                partial: Some(PartialMessage {
+                    content_parts: 1,
+                    tool_calls: 0
+                }),
+            },
+            "mid-message marker keeps exactly the marked parts"
+        );
+    }
+
+    #[test]
+    fn prefix_spec_tool_definition_and_tool_call_markers() {
+        let body = serde_json::json!({
+            "tools": [
+                {"type":"function","function":{"name":"f"},"cache_control":{"type":"ephemeral"}},
+                {"type":"function","function":{"name":"g"}}
+            ],
+            "messages": [
+                {"role":"user","content":[{"type":"text","text":"hi"}]},
+                {"role":"assistant","content":[{"type":"text","text":"t"}],
+                 "tool_calls":[{"id":"c1","type":"function","function":{"name":"f","arguments":"{}"},
+                                "cache_control":{"type":"ephemeral"}}]}
+            ]
+        })
+        .to_string();
+        let p = parse_chat_completions(
+            body.as_bytes(),
+            &TierPolicy::from_config(&["5m".to_string()], "5m"),
+            &TelemetryPolicy::default(),
+        )
+        .unwrap();
+        // tools[0] marker → the first tool only, no messages.
+        assert_eq!(
+            p.breakpoints[0].prefix,
+            PrefixSpec {
+                tools_kept: 1,
+                full_messages: 0,
+                partial: None
+            }
+        );
+        // Marker on the LAST tool_call of the last message → both messages whole (all
+        // tools included: they precede messages in canonical order).
+        assert_eq!(
+            p.breakpoints[1].prefix,
+            PrefixSpec {
+                tools_kept: 2,
+                full_messages: 2,
+                partial: None
+            }
+        );
+    }
+
+    #[test]
+    fn wire_prefix_maps_every_marker_shape() {
+        // `tools` is a count; `message`/`block`/`tool_call` are inclusive indices.
+        let cases = [
+            (
+                PrefixSpec {
+                    tools_kept: 2,
+                    full_messages: 0,
+                    partial: None,
+                },
+                WirePrefix::Tools { tools: 2 },
+                serde_json::json!({"tools": 2}),
+            ),
+            (
+                PrefixSpec {
+                    tools_kept: 2,
+                    full_messages: 3,
+                    partial: None,
+                },
+                WirePrefix::Message { message: 2 },
+                serde_json::json!({"message": 2}),
+            ),
+            (
+                PrefixSpec {
+                    tools_kept: 0,
+                    full_messages: 1,
+                    partial: Some(PartialMessage {
+                        content_parts: 2,
+                        tool_calls: 0,
+                    }),
+                },
+                WirePrefix::Block { message: 1, block: 1 },
+                serde_json::json!({"message": 1, "block": 1}),
+            ),
+            (
+                PrefixSpec {
+                    tools_kept: 0,
+                    full_messages: 1,
+                    partial: Some(PartialMessage {
+                        content_parts: 2,
+                        tool_calls: 1,
+                    }),
+                },
+                WirePrefix::ToolCall { message: 1, tool_call: 0 },
+                serde_json::json!({"message": 1, "tool_call": 0}),
+            ),
+        ];
+        for (spec, wire, json) in cases {
+            assert_eq!(spec.to_wire(), wire);
+            assert_eq!(serde_json::to_value(&wire).unwrap(), json, "wire serialization");
+        }
+    }
+
+    #[test]
+    fn telemetry_strip_mode_renumbers_wire_ordinals() {
+        // A telemetry block ahead of the marked part: in strip mode the sanitiser
+        // removes it from the forwarded body, so the marker's transmitted content
+        // ordinal shifts down by one; in keep mode the block still occupies index 0.
+        let body = serde_json::json!({
+            "messages": [
+                {"role": "system", "content": [
+                    {"type":"text","text":"x-anthropic-billing-header: cch=1"},
+                    {"type":"text","text":"kept","cache_control":{"type":"ephemeral"}},
+                    {"type":"text","text":"tail"}
+                ]}
+            ]
+        });
+        let strip = parse_with(body.clone(), &telemetry());
+        assert_eq!(
+            strip.breakpoints[0].prefix.partial,
+            Some(PartialMessage {
+                content_parts: 1,
+                tool_calls: 0
+            })
+        );
+        let keep = parse_with(
+            body,
+            &TelemetryPolicy::from_config(false, &["x-anthropic-billing-header:".to_string()]),
+        );
+        assert_eq!(
+            keep.breakpoints[0].prefix.partial,
+            Some(PartialMessage {
+                content_parts: 2,
+                tool_calls: 0
+            })
+        );
+    }
 
     fn all_tiers() -> TierPolicy {
         TierPolicy::from_config(&["5m".to_string(), "1h".to_string(), "24h".to_string()], "5m")
