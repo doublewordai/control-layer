@@ -1,6 +1,6 @@
 [package]
 name = "dwctl"
-version = "10.2.1" # x-release-please-version
+version = "10.8.0" # x-release-please-version
 edition = "2024"
 publish = false
 description = "The Doubleword Control Layer - A self-hostable observability and analytics platform for LLM applications"
@@ -114,6 +114,9 @@ hickory-resolver = { version = "0.26", default-features = false, features = [
 aes-gcm = "0.10.3"
 # Redis-backed keystore for zero-data-retention flex request keys.
 deadpool-redis = "0.18"
+redis = { version = "0.27", default-features = false, features = [
+  "tokio-rustls-comp",
+] }
 paste = "1.0"
 serde_with = "3.14.1"
 rust_decimal = { version = "1.38.0", features = ["serde"] }

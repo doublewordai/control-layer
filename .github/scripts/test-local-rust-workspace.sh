@@ -74,6 +74,34 @@ local_dependencies = {
     "fusillade-arsenal/Cargo.toml": {"fusillade-core": "../fusillade-core"},
 }
 
+dwctl_dependencies = tomllib.loads((root / "dwctl/Cargo.toml").read_text())[
+    "dependencies"
+]
+redis_dependency = dwctl_dependencies.get("redis")
+if not isinstance(redis_dependency, dict):
+    raise SystemExit(
+        "dwctl must declare redis directly so TLS support is explicit"
+    )
+if redis_dependency.get("default-features") is not False:
+    raise SystemExit("dwctl's redis dependency must disable unused default features")
+if "tokio-rustls-comp" not in redis_dependency.get("features", []):
+    raise SystemExit(
+        "dwctl's redis dependency must enable tokio-rustls-comp for rediss URLs"
+    )
+
+lockfile = tomllib.loads((root / "Cargo.lock").read_text())
+resolved_redis_packages = [
+    package for package in lockfile["package"] if package["name"] == "redis"
+]
+if len(resolved_redis_packages) != 1:
+    resolved_versions = sorted(
+        package["version"] for package in resolved_redis_packages
+    )
+    raise SystemExit(
+        "workspace must resolve exactly one redis package so deadpool-redis "
+        f"inherits TLS support; resolved versions: {resolved_versions}"
+    )
+
 onwards_manifest = tomllib.loads((root / "onwards/Cargo.toml").read_text())
 if "fusillade" in onwards_manifest.get("dependencies", {}):
     raise SystemExit("published Onwards must not depend on Fusillade")
@@ -178,8 +206,8 @@ if set(release_manifest) != {
     )
 if release_manifest["fusillade-arsenal"] != "3.1.0":
     raise SystemExit("Fusillade Arsenal release baseline must remain 3.1.0")
-if release_manifest["fusillade-core"] != "4.1.0":
-    raise SystemExit("Fusillade Core release baseline must remain 4.1.0")
+if release_manifest["fusillade-core"] != "5.0.0":
+    raise SystemExit("Fusillade Core release baseline must remain 5.0.0")
 PY
 
 release_workflow=".github/workflows/release.yml"

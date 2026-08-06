@@ -483,6 +483,10 @@ export interface ApiKey {
   spend?: string | null; // Spend counted against the cap in the current window (decimal string; null when uncapped)
   total_spend?: string | null; // Lifetime tracked spend for the cap scope (null when uncapped)
   resets_at?: string | null; // ISO 8601: next calendar reset (null for one-off caps / uncapped)
+  // When the HOLDER first fetched the secret. null = an issued key whose
+  // one-off reveal is still pending; self-created keys are born revealed.
+  // Rotation never changes this. Admins render it as "opened at".
+  secret_revealed_at?: string | null;
   // Note: actual key value only returned on creation
 }
 
@@ -610,6 +614,9 @@ export interface ApiKeyUpdateRequest {
 export interface ApiKeysQuery {
   skip?: number;
   limit?: number;
+  // Server-side holder filter (org managers/PMs only): pagination and
+  // total_count then cover just that member's keys.
+  created_by?: string;
 }
 
 // Update endpoint bodies

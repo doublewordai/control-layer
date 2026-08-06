@@ -1,5 +1,80 @@
 # Changelog
 
+## [10.8.0](https://github.com/doublewordai/control-layer/compare/v10.7.2...v10.8.0) (2026-08-06)
+
+
+### Features
+
+* cache template render counting ([#1441](https://github.com/doublewordai/control-layer/issues/1441)) ([61adf92](https://github.com/doublewordai/control-layer/commit/61adf92618efd8c24e432e375bfde58f9dc7fb07))
+
+## [10.7.2](https://github.com/doublewordai/control-layer/compare/v10.7.1...v10.7.2) (2026-08-05)
+
+
+### Bug Fixes
+
+* hover tooltips on API key action buttons ([#1443](https://github.com/doublewordai/control-layer/issues/1443)) ([a8ecab1](https://github.com/doublewordai/control-layer/commit/a8ecab1ccf914eba2769a001ba260770e0698bb0))
+
+## [10.7.1](https://github.com/doublewordai/control-layer/compare/v10.7.0...v10.7.1) (2026-08-05)
+
+
+### Bug Fixes
+
+* filtered-empty key list keeps scoping controls and correct empty… ([#1440](https://github.com/doublewordai/control-layer/issues/1440)) ([5b29ab9](https://github.com/doublewordai/control-layer/commit/5b29ab969063687b22f856167e6b0ae28c3ca0e8))
+
+## [10.7.0](https://github.com/doublewordai/control-layer/compare/v10.6.0...v10.7.0) (2026-08-05)
+
+
+### Features
+
+* org key filter and reveal ([#1436](https://github.com/doublewordai/control-layer/issues/1436)) ([78a7e37](https://github.com/doublewordai/control-layer/commit/78a7e373de56f389250932bd3f83abc838c3d7ca))
+
+## [10.6.0](https://github.com/doublewordai/control-layer/compare/v10.5.0...v10.6.0) (2026-08-05)
+
+
+### Features
+
+* **organizations:** claim the owner's domain, several workspaces allowed ([#1435](https://github.com/doublewordai/control-layer/issues/1435)) ([3d75ff0](https://github.com/doublewordai/control-layer/commit/3d75ff051ce137be93944bdfa20d15b632e2892e))
+
+
+### Bug Fixes
+
+* **ci:** track the fusillade-core 5.0.0 release baseline ([#1437](https://github.com/doublewordai/control-layer/issues/1437)) ([5a8cf30](https://github.com/doublewordai/control-layer/commit/5a8cf30658e3fdfb406147ba7f4d7c56504e854a))
+
+## [10.5.0](https://github.com/doublewordai/control-layer/compare/v10.4.0...v10.5.0) (2026-08-05)
+
+
+### Features
+
+* **organizations:** expose the verified flag on org membership summaries ([#1433](https://github.com/doublewordai/control-layer/issues/1433)) ([2deda3b](https://github.com/doublewordai/control-layer/commit/2deda3beb572559a298e50b6181e1b05bcc1dd29))
+
+## [10.4.0](https://github.com/doublewordai/control-layer/compare/v10.3.1...v10.4.0) (2026-08-04)
+
+
+### Features
+
+* **organizations:** replace silent domain auto-join with join requests ([#1431](https://github.com/doublewordai/control-layer/issues/1431)) ([c64b8da](https://github.com/doublewordai/control-layer/commit/c64b8da0de4f75df8f26c6b572540c19b979a801))
+
+## [10.3.1](https://github.com/doublewordai/control-layer/compare/v10.3.0...v10.3.1) (2026-08-04)
+
+
+### Bug Fixes
+
+* missed a comp ([#1427](https://github.com/doublewordai/control-layer/issues/1427)) ([84b0be7](https://github.com/doublewordai/control-layer/commit/84b0be7c3c6a24c988c897520feb7d7d78ea5380))
+* pin Scalar docs renderer to a versioned, integrity-checked URL ([#1426](https://github.com/doublewordai/control-layer/issues/1426)) ([bbf3c24](https://github.com/doublewordai/control-layer/commit/bbf3c24323da982b2a9830090efb0619097f3a46))
+
+## [10.3.0](https://github.com/doublewordai/control-layer/compare/v10.2.1...v10.3.0) (2026-08-04)
+
+
+### Features
+
+* **payments:** add setup-mode checkout for onboarding card verification ([#1421](https://github.com/doublewordai/control-layer/issues/1421)) ([aa18ac7](https://github.com/doublewordai/control-layer/commit/aa18ac72276edebe22f4da332bfb5ea7abc22107))
+* **users:** expose the verified flag on the user API ([#1423](https://github.com/doublewordai/control-layer/issues/1423)) ([15bcee2](https://github.com/doublewordai/control-layer/commit/15bcee2f30fa486bb2791096b758da9156822c8d))
+
+
+### Bug Fixes
+
+* **keystore:** enable TLS for Redis connections ([#1425](https://github.com/doublewordai/control-layer/issues/1425)) ([2d54147](https://github.com/doublewordai/control-layer/commit/2d54147ee2aedae80cf92a98c566014377e2b389))
+
 ## [10.2.1](https://github.com/doublewordai/control-layer/compare/v10.2.0...v10.2.1) (2026-08-03)
 
 

@@ -314,15 +314,17 @@ async fn test_strict_mode_allows_chat_completions(pool: PgPool) {
     }
     assert!(model_available, "Model gpt-4 should be available in onwards within 3 seconds");
 
-    // Make chat completion request.
+    // Make the chat completion request.
     //
     // The `/ai/v1/models` poll above is NOT a sufficient guard on its own:
-    // dwctl serves model discovery from the control-layer database, so it flips
-    // to 200 as soon as the row is committed, whereas `/chat/completions` routes
-    // through onwards' asynchronously-synced config cache. The two become
-    // consistent a moment apart, so proxying can still 404 with `model_not_found`
-    // right after discovery reports the model. Retry until onwards' cache has
-    // caught up (or we give up) rather than asserting on the first attempt.
+    // dwctl answers model discovery from the control-layer DB, so it flips to
+    // 200 as soon as the row is committed, whereas `/chat/completions` routes
+    // through onwards' asynchronously-synced caches. Two distinct startup races
+    // can still bite right after discovery reports the model:
+    //   - 404 `model_not_found` until onwards' config cache catches up, and
+    //   - 403 until onwards' key cache has processed the admission NOTIFY
+    //     (strict mode rejects a not-yet-admitted key).
+    // Poll through both and assert the terminal state.
     let chat_request = serde_json::json!({
         "model": "gpt-4",
         "messages": [{
@@ -339,15 +341,15 @@ async fn test_strict_mode_allows_chat_completions(pool: PgPool) {
             .await
     };
 
-    let routing_deadline = std::time::Instant::now();
-    let mut chat_response = send_chat(&chat_request).await;
-    while chat_response.status_code() == 404 && routing_deadline.elapsed() < std::time::Duration::from_secs(5) {
+    let start = std::time::Instant::now();
+    let (status, body_text) = loop {
+        let chat_response = send_chat(&chat_request).await;
+        let status = chat_response.status_code();
+        if (status != 403 && status != 404) || start.elapsed() > std::time::Duration::from_secs(5) {
+            break (status, chat_response.text());
+        }
         tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
-        chat_response = send_chat(&chat_request).await;
-    }
-
-    let status = chat_response.status_code();
-    let body_text = chat_response.text();
+    };
     assert_eq!(
         status, 200,
         "Expected 200 for chat completions in strict mode. Got {}: {}",

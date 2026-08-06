@@ -214,12 +214,14 @@ const userApi = {
   apiKeys: {
     async getAll(
       userId: string = "current",
-      options: { skip?: number; limit?: number } = {},
+      options: { skip?: number; limit?: number; created_by?: string } = {},
     ): Promise<PaginatedResponse<ApiKey>> {
       const params = new URLSearchParams();
       if (options.skip !== undefined) params.set("skip", String(options.skip));
       if (options.limit !== undefined)
         params.set("limit", String(options.limit));
+      if (options.created_by !== undefined)
+        params.set("created_by", options.created_by);
 
       const queryString = params.toString();
       const url = `/admin/api/v1/users/${userId}/api-keys${queryString ? `?${queryString}` : ""}`;
@@ -311,6 +313,28 @@ const userApi = {
           text
             ? `Failed to rotate API key: ${response.status} - ${text}`
             : `Failed to rotate API key: ${response.status}`,
+        );
+      }
+      return response.json();
+    },
+
+    // One-off reveal of an issued key's secret — holder only, consumed
+    // forever on first success (409 afterwards; rotation is the only path
+    // to a secret from then on).
+    async reveal(
+      keyId: string,
+      userId: string = "current",
+    ): Promise<ApiKeySecretResponse> {
+      const response = await fetch(
+        `/admin/api/v1/users/${userId}/api-keys/${keyId}/reveal`,
+        { method: "POST" },
+      );
+      if (!response.ok) {
+        const text = await response.text().catch(() => "");
+        throw new Error(
+          text
+            ? `Failed to reveal API key: ${response.status} - ${text}`
+            : `Failed to reveal API key: ${response.status}`,
         );
       }
       return response.json();

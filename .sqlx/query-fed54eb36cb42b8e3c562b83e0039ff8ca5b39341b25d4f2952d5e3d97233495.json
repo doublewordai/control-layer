@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            INSERT INTO users (id, username, email, display_name, avatar_url, auth_source, user_type, is_admin)\n            VALUES ($1, $2, $3, $4, $5, 'organization', 'organization', false)\n            RETURNING id, username, email, display_name, avatar_url, auth_source, created_at, updated_at,\n                      is_admin, password_hash, external_user_id, payment_provider_id,\n                      is_deleted, is_internal, batch_notifications_enabled, first_batch_email_sent,\n                      low_balance_notification_sent, low_balance_threshold,\n                      auto_topup_amount, auto_topup_threshold, auto_topup_monthly_limit, user_type, zero_data_retention\n            ",
+  "query": "\n            INSERT INTO users (id, username, email, display_name, avatar_url, auth_source, user_type, is_admin)\n            VALUES ($1, $2, $3, $4, $5, 'organization', 'organization', false)\n            RETURNING id, username, email, display_name, avatar_url, auth_source, created_at, updated_at,\n                      is_admin, password_hash, external_user_id, payment_provider_id,\n                      is_deleted, is_internal, batch_notifications_enabled, first_batch_email_sent,\n                      low_balance_notification_sent, low_balance_threshold,\n                      auto_topup_amount, auto_topup_threshold, auto_topup_monthly_limit, user_type, verified, zero_data_retention\n            ",
   "describe": {
     "columns": [
       {
@@ -115,6 +115,11 @@
       },
       {
         "ordinal": 22,
+        "name": "verified",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 23,
         "name": "zero_data_retention",
         "type_info": "Bool"
       }
@@ -151,8 +156,9 @@
       true,
       true,
       false,
+      false,
       false
     ]
   },
-  "hash": "754cfd7ffe6988a0b51b0e912d9fff4af0fc2b579939488b380980e5279b43b5"
+  "hash": "fed54eb36cb42b8e3c562b83e0039ff8ca5b39341b25d4f2952d5e3d97233495"
 }
