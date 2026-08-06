@@ -2401,6 +2401,359 @@ async fn test_remove_component(pool: PgPool) {
     assert!(components.is_empty(), "Component list should be empty after removal");
 }
 
+/// Create an endpoint, `n` standard models and a composite model over the API.
+/// Returns (composite id, [component model ids]); components are not linked.
+async fn setup_composite_via_api(server: &axum_test::TestServer, headers: &[(String, String)], n: usize) -> (String, Vec<String>) {
+    let endpoint_response = server
+        .post("/admin/api/v1/endpoints")
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .json(&serde_json::json!({
+            "name": "Group Test Endpoint",
+            "url": "https://api.example.com/v1"
+        }))
+        .await;
+    assert_eq!(endpoint_response.status_code(), 201);
+    let endpoint: serde_json::Value = endpoint_response.json();
+
+    let mut component_ids = Vec::new();
+    for i in 0..n {
+        let response = server
+            .post("/admin/api/v1/models")
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .json(&serde_json::json!({
+                "type": "standard",
+                "model_name": format!("provider-{i}"),
+                "hosted_on": endpoint["id"]
+            }))
+            .await;
+        assert_eq!(response.status_code(), 200);
+        let model: serde_json::Value = response.json();
+        component_ids.push(model["id"].as_str().unwrap().to_string());
+    }
+
+    let composite_response = server
+        .post("/admin/api/v1/models")
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .json(&serde_json::json!({
+            "type": "composite",
+            "model_name": "grouped-composite"
+        }))
+        .await;
+    assert_eq!(composite_response.status_code(), 200);
+    let composite: serde_json::Value = composite_response.json();
+
+    (composite["id"].as_str().unwrap().to_string(), component_ids)
+}
+
+/// Component group creation: validations, duplicate names, non-composite targets
+#[sqlx::test]
+#[test_log::test]
+async fn test_create_component_group(pool: PgPool) {
+    let (server, _bg) = utils::create_test_app(pool.clone(), false).await;
+    let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
+    let headers = add_auth_headers(&admin);
+    let (composite_id, component_ids) = setup_composite_via_api(&server, &headers, 1).await;
+
+    // Create a group with defaults
+    let create_response = server
+        .post(&format!("/admin/api/v1/models/{composite_id}/groups"))
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .json(&serde_json::json!({ "name": "third-party" }))
+        .await;
+    assert_eq!(create_response.status_code(), 200, "Should create group");
+    let group: serde_json::Value = create_response.json();
+    assert_eq!(group["name"], "third-party");
+    assert_eq!(group["lb_strategy"], "weighted_random");
+    assert_eq!(group["weight"], 1);
+    assert_eq!(group["enabled"], true);
+    assert_eq!(group["sort_order"], 0);
+    assert!(group["components"].as_array().unwrap().is_empty());
+
+    // Duplicate name → 409
+    let duplicate_response = server
+        .post(&format!("/admin/api/v1/models/{composite_id}/groups"))
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .json(&serde_json::json!({ "name": "third-party" }))
+        .await;
+    assert_eq!(duplicate_response.status_code(), 409, "Duplicate group name should conflict");
+
+    // Group on a non-composite model → 400
+    let standard_response = server
+        .post(&format!("/admin/api/v1/models/{}/groups", component_ids[0]))
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .json(&serde_json::json!({ "name": "nope" }))
+        .await;
+    assert_eq!(standard_response.status_code(), 400, "Standard models cannot have groups");
+
+    // Invalid weight → 400
+    let weight_response = server
+        .post(&format!("/admin/api/v1/models/{composite_id}/groups"))
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .json(&serde_json::json!({ "name": "heavy", "weight": 101 }))
+        .await;
+    assert_eq!(weight_response.status_code(), 400);
+
+    // Missing model → 404
+    let missing_response = server
+        .post(&format!("/admin/api/v1/models/{}/groups", uuid::Uuid::new_v4()))
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .json(&serde_json::json!({ "name": "ghost" }))
+        .await;
+    assert_eq!(missing_response.status_code(), 404);
+}
+
+/// Group membership over the API: add-into-group, move between scopes, and
+/// visibility in GET /components and GET /models/{id}?include=components
+#[sqlx::test]
+#[test_log::test]
+async fn test_component_group_membership_flow(pool: PgPool) {
+    let (server, _bg) = utils::create_test_app(pool.clone(), false).await;
+    let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
+    let headers = add_auth_headers(&admin);
+    let (composite_id, component_ids) = setup_composite_via_api(&server, &headers, 3).await;
+
+    // c0 direct, then a group, then c1 added straight into the group
+    let add0 = server
+        .post(&format!("/admin/api/v1/models/{composite_id}/components/{}", component_ids[0]))
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .json(&serde_json::json!({ "weight": 50 }))
+        .await;
+    assert_eq!(add0.status_code(), 200);
+
+    let group: serde_json::Value = server
+        .post(&format!("/admin/api/v1/models/{composite_id}/groups"))
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .json(&serde_json::json!({ "name": "third-party", "lb_strategy": "priority" }))
+        .await
+        .json();
+    let group_id = group["id"].as_str().unwrap().to_string();
+    assert_eq!(group["sort_order"], 1, "Group appends to the root sequence after c0");
+
+    let add1 = server
+        .post(&format!("/admin/api/v1/models/{composite_id}/components/{}", component_ids[1]))
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .json(&serde_json::json!({ "weight": 40, "group_id": group_id }))
+        .await;
+    assert_eq!(add1.status_code(), 200);
+    let added1: serde_json::Value = add1.json();
+    assert_eq!(added1["group_id"], group_id.as_str());
+    assert_eq!(added1["group_name"], "third-party");
+    assert_eq!(added1["sort_order"], 0, "First member of the group starts its own sequence");
+
+    // Adding into a group of a different composite → 400
+    let (other_composite, _) = {
+        let composite_response = server
+            .post("/admin/api/v1/models")
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .json(&serde_json::json!({ "type": "composite", "model_name": "other-composite" }))
+            .await;
+        let composite: serde_json::Value = composite_response.json();
+        (composite["id"].as_str().unwrap().to_string(), ())
+    };
+    let cross_add = server
+        .post(&format!("/admin/api/v1/models/{other_composite}/components/{}", component_ids[2]))
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .json(&serde_json::json!({ "group_id": group_id }))
+        .await;
+    assert_eq!(cross_add.status_code(), 400, "Foreign group must be rejected");
+
+    // Move c0 into the group via PATCH; it appends after c1's slot
+    let move_in = server
+        .patch(&format!("/admin/api/v1/models/{composite_id}/components/{}", component_ids[0]))
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .json(&serde_json::json!({ "group_id": group_id }))
+        .await;
+    assert_eq!(move_in.status_code(), 200);
+    let moved: serde_json::Value = move_in.json();
+    assert_eq!(moved["group_id"], group_id.as_str());
+    assert_eq!(moved["sort_order"], 1);
+
+    // The flat component list shows group membership
+    let list: Vec<serde_json::Value> = server
+        .get(&format!("/admin/api/v1/models/{composite_id}/components"))
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .await
+        .json();
+    assert_eq!(list.len(), 2);
+    assert!(list.iter().all(|c| c["group_id"] == group_id.as_str()));
+
+    // include=components: direct list is empty, component_groups carries members
+    let model: serde_json::Value = server
+        .get(&format!("/admin/api/v1/models/{composite_id}?include=components"))
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .await
+        .json();
+    assert!(model["components"].as_array().unwrap().is_empty(), "No direct members left");
+    let groups = model["component_groups"].as_array().unwrap();
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0]["name"], "third-party");
+    assert_eq!(groups[0]["lb_strategy"], "priority");
+    let members = groups[0]["components"].as_array().unwrap();
+    assert_eq!(members.len(), 2);
+    assert_eq!(members[0]["model"]["id"], component_ids[1].as_str());
+    assert_eq!(members[1]["model"]["id"], component_ids[0].as_str());
+
+    // Move c0 back to the root via PATCH group_id: null
+    let move_out = server
+        .patch(&format!("/admin/api/v1/models/{composite_id}/components/{}", component_ids[0]))
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .json(&serde_json::json!({ "group_id": null }))
+        .await;
+    assert_eq!(move_out.status_code(), 200);
+    let moved_out: serde_json::Value = move_out.json();
+    assert!(moved_out["group_id"].is_null());
+    assert_eq!(moved_out["sort_order"], 1, "Appends to the root after the group's slot");
+
+    // PATCH the group: rename + move to root front
+    let patch_group = server
+        .patch(&format!("/admin/api/v1/models/{composite_id}/groups/{group_id}"))
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .json(&serde_json::json!({ "name": "fallbacks", "weight": 60, "sort_order": 0 }))
+        .await;
+    assert_eq!(patch_group.status_code(), 200);
+    let patched: serde_json::Value = patch_group.json();
+    assert_eq!(patched["name"], "fallbacks");
+    assert_eq!(patched["weight"], 60);
+    assert_eq!(patched["sort_order"], 0);
+    assert_eq!(patched["components"].as_array().unwrap().len(), 1);
+
+    // PATCH a missing group → 404
+    let missing_patch = server
+        .patch(&format!("/admin/api/v1/models/{composite_id}/groups/{}", uuid::Uuid::new_v4()))
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .json(&serde_json::json!({ "name": "ghost" }))
+        .await;
+    assert_eq!(missing_patch.status_code(), 404);
+}
+
+/// Deleting a group promotes members by default and removes them with cascade
+#[sqlx::test]
+#[test_log::test]
+async fn test_delete_component_group_promote_and_cascade(pool: PgPool) {
+    let (server, _bg) = utils::create_test_app(pool.clone(), false).await;
+    let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
+    let headers = add_auth_headers(&admin);
+    let (composite_id, component_ids) = setup_composite_via_api(&server, &headers, 3).await;
+
+    // Root: [c0, group(c1, c2)]
+    server
+        .post(&format!("/admin/api/v1/models/{composite_id}/components/{}", component_ids[0]))
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .json(&serde_json::json!({ "weight": 50 }))
+        .await
+        .assert_status_ok();
+    let group: serde_json::Value = server
+        .post(&format!("/admin/api/v1/models/{composite_id}/groups"))
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .json(&serde_json::json!({ "name": "pool" }))
+        .await
+        .json();
+    let group_id = group["id"].as_str().unwrap().to_string();
+    for component_id in &component_ids[1..] {
+        server
+            .post(&format!("/admin/api/v1/models/{composite_id}/components/{component_id}"))
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .json(&serde_json::json!({ "weight": 50, "group_id": group_id }))
+            .await
+            .assert_status_ok();
+    }
+
+    // Default delete: members promoted to the root tail in-group order
+    let delete_response = server
+        .delete(&format!("/admin/api/v1/models/{composite_id}/groups/{group_id}"))
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .await;
+    assert_eq!(delete_response.status_code(), 200);
+
+    let list: Vec<serde_json::Value> = server
+        .get(&format!("/admin/api/v1/models/{composite_id}/components"))
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .await
+        .json();
+    assert_eq!(list.len(), 3, "Members survive a default group delete");
+    assert!(list.iter().all(|c| c["group_id"].is_null()));
+    let order: Vec<(&str, i64)> = list
+        .iter()
+        .map(|c| (c["model"]["id"].as_str().unwrap(), c["sort_order"].as_i64().unwrap()))
+        .collect();
+    assert_eq!(
+        order,
+        vec![
+            (component_ids[0].as_str(), 0),
+            (component_ids[1].as_str(), 1),
+            (component_ids[2].as_str(), 2),
+        ]
+    );
+
+    // Deleting again → 404
+    let gone_response = server
+        .delete(&format!("/admin/api/v1/models/{composite_id}/groups/{group_id}"))
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .await;
+    assert_eq!(gone_response.status_code(), 404);
+
+    // Cascade delete: rebuild a group with c1+c2 and delete with ?cascade=true
+    let group: serde_json::Value = server
+        .post(&format!("/admin/api/v1/models/{composite_id}/groups"))
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .json(&serde_json::json!({ "name": "pool" }))
+        .await
+        .json();
+    let group_id = group["id"].as_str().unwrap().to_string();
+    for component_id in &component_ids[1..] {
+        server
+            .patch(&format!("/admin/api/v1/models/{composite_id}/components/{component_id}"))
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .json(&serde_json::json!({ "group_id": group_id }))
+            .await
+            .assert_status_ok();
+    }
+
+    let cascade_response = server
+        .delete(&format!("/admin/api/v1/models/{composite_id}/groups/{group_id}?cascade=true"))
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .await;
+    assert_eq!(cascade_response.status_code(), 200);
+
+    let list: Vec<serde_json::Value> = server
+        .get(&format!("/admin/api/v1/models/{composite_id}/components"))
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .await
+        .json();
+    assert_eq!(list.len(), 1, "Cascade removes the group's members");
+    assert_eq!(list[0]["model"]["id"], component_ids[0].as_str());
+    assert_eq!(list[0]["sort_order"], 0, "Root sequence compacts after cascade");
+}
+
 /// Test weight validation (must be 1-100)
 #[sqlx::test]
 #[test_log::test]

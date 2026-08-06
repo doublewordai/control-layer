@@ -6,8 +6,9 @@ use std::{collections::HashMap, num::NonZeroU32, sync::Arc};
 use metrics::histogram;
 use onwards::target::{
     Auth, BackoffConfig as OnwardsBackoffConfig, ConcurrencyLimitParameters, ConfigFile, FallbackConfig as OnwardsFallbackConfig,
-    JitterStrategy as OnwardsJitterStrategy, KeyDefinition, LoadBalanceStrategy as OnwardsLoadBalanceStrategy, OpenResponsesConfig,
-    PoolSpec, ProviderSpec, RateLimitParameters, RoutingAction, RoutingRule, TargetSpecOrList, Targets, WatchTargetsStream,
+    GroupSpec, JitterStrategy as OnwardsJitterStrategy, KeyDefinition, LoadBalanceStrategy as OnwardsLoadBalanceStrategy, MemberRef,
+    OpenResponsesConfig, PoolSpec, ProviderSpec, RateLimitParameters, RoutingAction, RoutingRule, TargetSpecOrList, Targets,
+    WatchTargetsStream,
 };
 use sqlx::{PgPool, postgres::PgListener};
 use tokio::sync::{mpsc, watch};
@@ -441,10 +442,22 @@ impl OnwardsConfigSync {
 // Composite models are stored in the deployed_models table with is_composite = TRUE.
 // They have NULL hosted_on and instead have components in deployed_model_components.
 
+/// Group a component belongs to within its composite model. Components with
+/// `None` are direct members of the pool (today's flat behavior).
+#[derive(Debug, Clone)]
+struct ComponentGroupRef {
+    id: uuid::Uuid,
+    name: String,
+    strategy: LoadBalancingStrategy,
+    weight: i32,
+}
+
 /// Data structure for composite model components (prepared for onwards integration)
 #[derive(Debug, Clone)]
 struct CompositeModelComponent {
     weight: i32,
+    /// Group membership; `None` = direct member of the composite's pool.
+    group: Option<ComponentGroupRef>,
     // Component target info (from the underlying deployed_model)
     target: OnwardsTarget,
 }
@@ -524,6 +537,11 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
             -- Component info
             dmc.deployed_model_id,
             dmc.weight,
+            -- Group membership (NULL group_id = direct member)
+            dmc.group_id,
+            g.name as "group_name?",
+            g.lb_strategy as "group_lb_strategy?",
+            g.weight as "group_weight?",
             -- Underlying deployment info
             dm.model_name,
             dm.alias as deployment_alias,
@@ -544,16 +562,22 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
         INNER JOIN deployed_model_components dmc ON cm.id = dmc.composite_model_id
         INNER JOIN deployed_models dm ON dmc.deployed_model_id = dm.id
         INNER JOIN inference_endpoints ie ON dm.hosted_on = ie.id
+        LEFT JOIN deployed_model_component_groups g ON dmc.group_id = g.id
         WHERE cm.is_composite = TRUE
           AND cm.deleted = FALSE
           AND dmc.enabled = TRUE
           AND dm.deleted = FALSE
-        -- Deterministic priority order: sort_order is the failover order onwards
-        -- uses (Priority strategy iterates providers in definition order). The
+          -- A disabled group removes all its members from routing (the group
+          -- occupies one slot in the failover order, so it is all-or-nothing).
+          AND (dmc.group_id IS NULL OR g.enabled = TRUE)
+        -- Deterministic priority order: the root sequence is shared between
+        -- direct components and groups (a group occupies one slot at its own
+        -- sort_order), so the failover position of a grouped component is its
+        -- group's position. Within a group, member sort_order applies. The
         -- weight/created_at keys break any residual sort_order tie the same way
         -- the admin API does, so the provider shown as "Primary" is the one
         -- onwards actually tries first.
-        ORDER BY cm.id, dmc.sort_order ASC, dmc.weight DESC, dmc.created_at ASC
+        ORDER BY cm.id, COALESCE(g.sort_order, dmc.sort_order) ASC, dmc.sort_order ASC, dmc.weight DESC, dmc.created_at ASC
         "#
     )
     .fetch_all(db)
@@ -763,8 +787,18 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
         };
 
         if let Some(composite) = composite_map.get_mut(&row.composite_model_id) {
+            let group = match (row.group_id, row.group_name, row.group_lb_strategy, row.group_weight) {
+                (Some(id), Some(name), strategy, Some(weight)) => Some(ComponentGroupRef {
+                    id,
+                    name,
+                    strategy: strategy.as_deref().and_then(LoadBalancingStrategy::try_parse).unwrap_or_default(),
+                    weight,
+                }),
+                _ => None,
+            };
             composite.components.push(CompositeModelComponent {
                 weight: row.weight,
+                group,
                 target: OnwardsTarget {
                     model_name: row.model_name.clone(),
                     alias: row.deployment_alias.clone(),
@@ -943,11 +977,12 @@ fn convert_composite_to_target_spec(
         None
     };
 
-    // Build provider specs from components
-    let providers: Vec<ProviderSpec> = composite
-        .components
-        .iter()
-        .map(|component| {
+    // Build provider specs from components, partitioning direct members from
+    // grouped ones. The components are already in root order (the query sorts
+    // by the shared root sequence), so first-seen order of groups and the
+    // interleaving of direct providers is exactly onwards' member_order.
+    let build_provider_spec = |component: &CompositeModelComponent| {
+        {
             let target = &component.target;
 
             // Build provider-level rate limiting (from underlying deployment)
@@ -1010,13 +1045,48 @@ fn convert_composite_to_target_spec(
                     reasoning_translation: target.reasoning_translation.clone().map(Into::into),
                 }
             }
-        })
-        .collect();
+        }
+    };
+
+    let mut providers: Vec<ProviderSpec> = Vec::new();
+    let mut groups: Vec<GroupSpec> = Vec::new();
+    let mut member_order: Vec<MemberRef> = Vec::new();
+    let mut group_positions: HashMap<uuid::Uuid, usize> = HashMap::new();
+
+    for component in &composite.components {
+        let spec = build_provider_spec(component);
+        match &component.group {
+            None => {
+                member_order.push(MemberRef::Provider(providers.len()));
+                providers.push(spec);
+            }
+            Some(group) => {
+                let position = *group_positions.entry(group.id).or_insert_with(|| {
+                    member_order.push(MemberRef::Group(group.name.clone()));
+                    groups.push(GroupSpec {
+                        name: group.name.clone(),
+                        strategy: match group.strategy {
+                            LoadBalancingStrategy::WeightedRandom => OnwardsLoadBalanceStrategy::WeightedRandom,
+                            LoadBalancingStrategy::Priority => OnwardsLoadBalanceStrategy::Priority,
+                        },
+                        weight: group.weight.max(1) as u32,
+                        providers: Vec::new(),
+                    });
+                    groups.len() - 1
+                });
+                groups[position].providers.push(spec);
+            }
+        }
+    }
+    // member_order is only meaningful when groups interleave with direct
+    // providers; a flat pool keeps the legacy shape (no new keys emitted).
+    let member_order = if groups.is_empty() { None } else { Some(member_order) };
 
     debug!(
-        "Composite model '{}' configured with {} providers, strategy: {:?}, fallback: {}, sanitize_responses: {}",
+        "Composite model '{}' configured with {} direct providers and {} groups, strategy: {:?}, fallback: {}, sanitize_responses: {}",
         composite.alias,
         providers.len(),
+        groups.len(),
         strategy,
         composite.fallback_enabled,
         composite.sanitize_responses
@@ -1032,6 +1102,8 @@ fn convert_composite_to_target_spec(
         fallback,
         strategy,
         providers,
+        groups,
+        member_order,
         response_headers: None,
         sanitize_response: composite.sanitize_responses,
         trusted: false, // Pool-level trusted defaults to false; providers set their own
@@ -1215,6 +1287,8 @@ fn convert_to_config_file(
                 fallback,
                 strategy: OnwardsLoadBalanceStrategy::default(),
                 providers: vec![provider],
+                groups: Vec::new(),
+                member_order: None,
                 response_headers: None,
                 open_responses: None,
                 sanitize_response: target.sanitize_responses,

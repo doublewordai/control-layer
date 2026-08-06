@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE deployed_model_components SET sort_order = sort_order + $2 WHERE group_id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int4"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "a20b5ffa63c7d2821400198492fed386d43fdaeef6e4ad403ce2c8defa30da4a"
+}

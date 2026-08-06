@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT is_group as \"is_group!\", row_id as \"row_id!\"\n            FROM (\n                SELECT FALSE AS is_group, dmc.id AS row_id, dmc.weight, dmc.created_at\n                FROM deployed_model_components dmc\n                WHERE dmc.composite_model_id = $1 AND dmc.group_id IS NULL\n                UNION ALL\n                SELECT TRUE, g.id, g.weight, g.created_at\n                FROM deployed_model_component_groups g\n                WHERE g.composite_model_id = $1\n            ) members\n            ORDER BY weight DESC, created_at ASC\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "is_group!",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 1,
+        "name": "row_id!",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null,
+      null
+    ]
+  },
+  "hash": "2db75471038a171e7dbdea0b17b0281b5c48dbb7e9d526bd3560b057e126826b"
+}

@@ -8,14 +8,17 @@ use crate::{
     api::models::{
         cache_pricing::CachePricingResponse,
         deployments::{
-            ComponentEndpointSummary, ComponentModelSummary, DeployedModelResponse, ModelComponentResponse, ModelMetrics, ModelProbeStatus,
-            ModelType,
+            ComponentEndpointSummary, ComponentModelSummary, DeployedModelResponse, ModelComponentResponse, ModelGroupResponse,
+            ModelMetrics, ModelProbeStatus, ModelType,
         },
         inference_endpoints::InferenceEndpointResponse,
     },
     db::{
         handlers::{CacheTariffs, Groups, InferenceEndpoints, Repository, analytics::get_model_metrics},
-        models::{deployments::DeploymentComponentDBResponse, groups::GroupDBResponse},
+        models::{
+            deployments::{DeploymentComponentDBResponse, DeploymentComponentGroup},
+            groups::GroupDBResponse,
+        },
     },
     errors::{Error, Result},
     types::{DeploymentId, GroupId, InferenceEndpointId},
@@ -52,6 +55,12 @@ pub struct DeployedModelEnricher<'a> {
 }
 
 type ProbeStatusTuple = (Option<Uuid>, bool, Option<i32>, Option<DateTime<Utc>>, Option<bool>, Option<f64>);
+
+/// Per-composite component rows and group rows, keyed by composite model id.
+type ComponentsWithGroups = (
+    HashMap<DeploymentId, Vec<DeploymentComponentDBResponse>>,
+    HashMap<DeploymentId, Vec<DeploymentComponentGroup>>,
+);
 
 impl<'a> DeployedModelEnricher<'a> {
     /// Enriches multiple models in bulk with requested additional data.
@@ -180,7 +189,7 @@ impl<'a> DeployedModelEnricher<'a> {
                     Ok(None)
                 }
             },
-            // Components query (for composite models)
+            // Components + component groups query (for composite models)
             async {
                 if self.include_components && self.can_read_composite_info {
                     use crate::db::handlers::Deployments;
@@ -189,12 +198,14 @@ impl<'a> DeployedModelEnricher<'a> {
                     let composite_ids: Vec<DeploymentId> = models.iter().filter(|m| m.is_composite == Some(true)).map(|m| m.id).collect();
 
                     if composite_ids.is_empty() {
-                        return Some(HashMap::new());
+                        return Some((HashMap::new(), HashMap::new()));
                     }
 
                     let mut conn = self.db.acquire().await.map_err(|e| Error::Database(e.into())).ok()?;
                     let mut repo = Deployments::new(&mut conn);
-                    repo.get_components_bulk(composite_ids).await.ok()
+                    let components = repo.get_components_bulk(composite_ids.clone()).await.ok()?;
+                    let groups = repo.get_component_groups_bulk(composite_ids).await.ok()?;
+                    Some((components, groups))
                 } else {
                     None
                 }
@@ -405,17 +416,41 @@ impl<'a> DeployedModelEnricher<'a> {
         model.with_cache_pricing(cache_pricing)
     }
 
-    /// Apply components to a model response (for composite models)
-    fn apply_components(
-        mut model: DeployedModelResponse,
-        components_map: &Option<HashMap<DeploymentId, Vec<DeploymentComponentDBResponse>>>,
-    ) -> DeployedModelResponse {
-        if let Some(components_map) = components_map
-            && let Some(components) = components_map.get(&model.id)
-        {
-            let component_responses: Vec<ModelComponentResponse> =
-                components.iter().map(|c| Self::db_component_to_response(c.clone())).collect();
-            model = model.with_components(component_responses);
+    /// Apply components and component groups to a model response (for composite
+    /// models). `components` lists direct members only; grouped members appear
+    /// inline under their group in `component_groups`.
+    fn apply_components(mut model: DeployedModelResponse, components_map: &Option<ComponentsWithGroups>) -> DeployedModelResponse {
+        if let Some((components_map, groups_map)) = components_map {
+            let components = components_map.get(&model.id).map(Vec::as_slice).unwrap_or_default();
+            let has_data = components_map.contains_key(&model.id) || groups_map.contains_key(&model.id);
+            if has_data {
+                let direct: Vec<ModelComponentResponse> = components
+                    .iter()
+                    .filter(|c| c.group_id.is_none())
+                    .map(|c| Self::db_component_to_response(c.clone()))
+                    .collect();
+                let groups: Vec<ModelGroupResponse> = groups_map
+                    .get(&model.id)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|g| ModelGroupResponse {
+                        id: g.id,
+                        name: g.name.clone(),
+                        lb_strategy: g.lb_strategy,
+                        weight: g.weight,
+                        sort_order: g.sort_order,
+                        enabled: g.enabled,
+                        created_at: g.created_at,
+                        components: components
+                            .iter()
+                            .filter(|c| c.group_id == Some(g.id))
+                            .map(|c| Self::db_component_to_response(c.clone()))
+                            .collect(),
+                    })
+                    .collect();
+                model = model.with_components(direct).with_component_groups(groups);
+            }
         }
         model
     }
@@ -427,6 +462,8 @@ impl<'a> DeployedModelEnricher<'a> {
             enabled: c.enabled,
             sort_order: c.sort_order,
             created_at: c.created_at,
+            group_id: c.group_id,
+            group_name: c.group_name,
             model: ComponentModelSummary {
                 id: c.deployed_model_id,
                 alias: c.model_alias,
@@ -490,6 +527,7 @@ mod tests {
             lb_strategy: None,
             fallback: None,
             components: None,
+            component_groups: None,
             sanitize_responses: None,
             trusted: None,
             open_responses_adapter: None,

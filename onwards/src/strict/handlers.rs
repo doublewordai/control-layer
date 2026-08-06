@@ -282,7 +282,6 @@ pub async fn responses_handler<T: HttpClient + Clone + Send + Sync + 'static>(
 
     // OpenAI requires additionalProperties: false in tool schemas even for /v1/responses
     // Add it if missing to ensure compatibility
-    let mut request = request;
     if let Some(ref mut tools) = request.tools {
         for tool in tools.iter_mut() {
             if let super::schemas::responses::Tool::Function { parameters, .. } = tool
@@ -954,14 +953,13 @@ async fn handle_adapter_request<T: HttpClient + Clone + Send + Sync + 'static>(
         );
 
         // Mark as completed in the response store
-        if let Ok(response_value) = serde_json::to_value(&responses_response) {
-            if let Err(e) = state
+        if let Ok(response_value) = serde_json::to_value(&responses_response)
+            && let Err(e) = state
                 .response_store
                 .complete(&response_id, &response_value, parts.status.as_u16())
                 .await
-            {
-                warn!(error = %e, response_id = %response_id, "Failed to mark response as completed");
-            }
+        {
+            warn!(error = %e, response_id = %response_id, "Failed to mark response as completed");
         }
 
         // Return the converted response

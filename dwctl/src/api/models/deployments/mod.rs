@@ -566,9 +566,14 @@ pub struct DeployedModelResponse {
     /// Fallback configuration for composite models
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fallback: Option<FallbackConfig>,
-    /// Components of this composite model (only included if requested for composite models)
+    /// Components of this composite model (only included if requested for composite models).
+    /// Lists direct members only; grouped members appear under `component_groups`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub components: Option<Vec<ModelComponentResponse>>,
+    /// Component groups of this composite model with their members inline
+    /// (only included if requested for composite models)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub component_groups: Option<Vec<ModelGroupResponse>>,
     /// Whether to sanitize/filter sensitive data from model responses (used when strict_mode=false)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sanitize_responses: Option<bool>,
@@ -647,7 +652,8 @@ impl From<DeploymentDBResponse> for DeployedModelResponse {
             is_composite: Some(db.is_composite),
             lb_strategy: if db.is_composite { Some(db.lb_strategy) } else { None },
             fallback,
-            components: None, // By default, components are not included
+            components: None,       // By default, components are not included
+            component_groups: None, // By default, component groups are not included
             sanitize_responses: Some(db.sanitize_responses),
             trusted: Some(db.trusted),
             open_responses_adapter: Some(db.open_responses_adapter),
@@ -731,6 +737,7 @@ impl DeployedModelResponse {
         self.lb_strategy = None;
         self.fallback = None;
         self.components = None;
+        self.component_groups = None;
         self
     }
 
@@ -806,6 +813,12 @@ impl DeployedModelResponse {
         self
     }
 
+    /// Create a response with component groups included (for composite models)
+    pub fn with_component_groups(mut self, component_groups: Vec<ModelGroupResponse>) -> Self {
+        self.component_groups = Some(component_groups);
+        self
+    }
+
     /// Create a response with traffic routing rules included
     pub fn with_traffic_rules(mut self, rules: Vec<TrafficRuleDBRow>) -> Self {
         self.traffic_routing_rules = if rules.is_empty() {
@@ -852,6 +865,11 @@ pub struct ModelComponentCreate {
     /// PATCH endpoint's `sort_order` to reorder. Retained for API compatibility.
     #[serde(default)]
     pub sort_order: i32,
+    /// Component group to add this component to (must belong to the same
+    /// composite model). Omit for a direct member of the composite.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<String>, format = "uuid")]
+    pub group_id: Option<Uuid>,
 }
 
 fn default_weight() -> i32 {
@@ -869,11 +887,20 @@ pub struct ModelComponentUpdate {
     pub weight: Option<i32>,
     /// Whether this component is enabled
     pub enabled: Option<bool>,
-    /// Target priority position (0 = highest priority / tried first). When set, the
-    /// component is moved to this position and the composite is renumbered to a
-    /// dense, unique 0..n-1 sequence — two components can never share a position.
-    /// Out-of-range values are clamped. Omit to leave the order unchanged.
+    /// Target priority position (0 = highest priority / tried first) within the
+    /// component's sequence: the composite root when it is a direct member, or
+    /// its group otherwise. When set, the component is moved to this position and
+    /// the sequence is renumbered to a dense, unique 0..n-1 run — two members can
+    /// never share a position. Out-of-range values are clamped. Omit to leave the
+    /// order unchanged.
     pub sort_order: Option<i32>,
+    /// Group membership change: omit for no change, `null` to move the component
+    /// back to the composite root (direct membership), or a group id to move it
+    /// into that group. Moved components are appended to the destination
+    /// sequence; source and destination sequences are renumbered dense.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]
+    #[schema(value_type = Option<Option<String>>, format = "uuid")]
+    pub group_id: Option<Option<Uuid>>,
 }
 
 /// Summary of a model used as a component in a composite model
@@ -915,10 +942,86 @@ pub struct ModelComponentResponse {
     pub weight: i32,
     /// Whether this component is enabled
     pub enabled: bool,
-    /// Sort order for priority-based routing (lower = higher priority)
+    /// Sort order for priority-based routing (lower = higher priority) within
+    /// the component's sequence (composite root, or its group)
     pub sort_order: i32,
     /// When this component was added
     pub created_at: DateTime<Utc>,
+    /// Group this component belongs to (omitted for direct members)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<String>, format = "uuid")]
+    pub group_id: Option<Uuid>,
+    /// Name of the group this component belongs to (omitted for direct members)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_name: Option<String>,
     /// The underlying model details
     pub model: ComponentModelSummary,
+}
+
+// ===== Composite Model Component Group Types =====
+
+/// Request to create a component group on a composite model
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ModelGroupCreate {
+    /// Group name (unique within the composite model)
+    pub name: String,
+    /// Load balancing strategy among the group's members (defaults to weighted_random)
+    #[serde(default)]
+    pub lb_strategy: LoadBalancingStrategy,
+    /// Weight of the group within the composite root sequence (1-100)
+    #[serde(default = "default_weight")]
+    pub weight: i32,
+    /// Whether this group is enabled
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+}
+
+/// Request to update a component group's configuration
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+pub struct ModelGroupUpdate {
+    /// New group name (unique within the composite model)
+    pub name: Option<String>,
+    /// New load balancing strategy among the group's members
+    pub lb_strategy: Option<LoadBalancingStrategy>,
+    /// New weight of the group within the composite root sequence (1-100)
+    pub weight: Option<i32>,
+    /// Whether this group is enabled
+    pub enabled: Option<bool>,
+    /// Target position (0 = highest priority) within the composite root
+    /// sequence, which groups share with direct components. When set, the group
+    /// is moved there and the root sequence is renumbered to a dense, unique
+    /// 0..n-1 run. Out-of-range values are clamped. Omit to leave the order
+    /// unchanged.
+    pub sort_order: Option<i32>,
+}
+
+/// Query parameters for deleting a component group
+#[derive(Debug, Deserialize, IntoParams, ToSchema)]
+pub struct ModelGroupDeleteQuery {
+    /// When true, delete the group's member components too. Defaults to false:
+    /// members are promoted to direct components, appended to the end of the
+    /// composite root sequence in their in-group order.
+    pub cascade: Option<bool>,
+}
+
+/// Response for a composite model component group
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ModelGroupResponse {
+    /// The group ID
+    #[schema(value_type = String, format = "uuid")]
+    pub id: Uuid,
+    /// Group name (unique within the composite model)
+    pub name: String,
+    /// Load balancing strategy among the group's members
+    pub lb_strategy: LoadBalancingStrategy,
+    /// Weight of the group within the composite root sequence (1-100)
+    pub weight: i32,
+    /// Position within the composite root sequence (shared with direct components)
+    pub sort_order: i32,
+    /// Whether this group is enabled
+    pub enabled: bool,
+    /// When this group was created
+    pub created_at: DateTime<Utc>,
+    /// The group's member components in group-sequence order
+    pub components: Vec<ModelComponentResponse>,
 }

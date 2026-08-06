@@ -1,0 +1,64 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT id, composite_model_id, name, lb_strategy, weight, sort_order, enabled, created_at\n            FROM deployed_model_component_groups\n            WHERE composite_model_id = ANY($1)\n            ORDER BY composite_model_id, sort_order ASC, weight DESC, created_at ASC\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "composite_model_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "name",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 3,
+        "name": "lb_strategy",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 4,
+        "name": "weight",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 5,
+        "name": "sort_order",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 6,
+        "name": "enabled",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 7,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "UuidArray"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "439e3f34896fea3bb03bb196ea92026d7ee2c44853b0287d93468c6d9021389a"
+}

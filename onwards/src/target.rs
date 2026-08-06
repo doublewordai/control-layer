@@ -114,6 +114,39 @@ pub struct OpenResponsesConfig {
     pub adapter: bool,
 }
 
+/// A named group of providers nested inside a pool. The group occupies one
+/// slot in the pool's member order and load balances across its own providers
+/// with its own strategy, so e.g. a priority pool can fail over from a direct
+/// provider into a weighted_random group. Groups cannot contain groups.
+#[derive(Debug, Clone, Serialize, Deserialize, Builder)]
+pub struct GroupSpec {
+    pub name: String,
+
+    /// Load balancing strategy within the group (defaults to weighted_random)
+    #[serde(default)]
+    #[builder(default)]
+    pub strategy: LoadBalanceStrategy,
+
+    /// Weight of the group as a single pool member (used when the pool-level
+    /// strategy is weighted_random). Defaults to 1.
+    #[serde(default = "default_weight")]
+    #[builder(default = default_weight())]
+    pub weight: u32,
+
+    /// The providers within this group
+    pub providers: Vec<ProviderSpec>,
+}
+
+/// Reference to a pool member for explicit ordering: a direct provider by its
+/// index into `providers`, or a group by name.
+/// Deserializes from `{"provider": 0}` or `{"group": "name"}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemberRef {
+    Provider(usize),
+    Group(String),
+}
+
 /// Load balancing strategy for selecting providers
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -331,6 +364,20 @@ pub struct PoolSpec {
 
     /// The list of providers to load balance across
     pub providers: Vec<ProviderSpec>,
+
+    /// Nested provider groups. Each group is one member of the pool (ordered
+    /// after the direct providers unless `member_order` says otherwise) and
+    /// load balances across its own providers with its own strategy.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[builder(default)]
+    pub groups: Vec<GroupSpec>,
+
+    /// Explicit ordering of the pool's members across direct providers and
+    /// groups (matters for the priority strategy). Every direct provider and
+    /// group must be referenced exactly once. When absent, direct providers
+    /// come first (in declaration order) followed by groups.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub member_order: Option<Vec<MemberRef>>,
 }
 
 /// Legacy single-provider configuration (backwards compatible).
@@ -424,6 +471,8 @@ pub struct PoolConfig {
     pub trusted: bool,
     pub routing_rules: Vec<RoutingRule>,
     pub providers: Vec<ProviderSpec>,
+    pub groups: Vec<GroupSpec>,
+    pub member_order: Option<Vec<MemberRef>>,
 }
 
 impl TargetSpecOrList {
@@ -442,6 +491,8 @@ impl TargetSpecOrList {
                 trusted: pool.trusted,
                 routing_rules: pool.routing_rules,
                 providers: pool.providers,
+                groups: pool.groups,
+                member_order: pool.member_order,
             }),
             TargetSpecOrList::List(list) => {
                 // Legacy list format: no pool-level config, convert TargetSpecs to ProviderSpecs
@@ -493,6 +544,8 @@ impl TargetSpecOrList {
                     trusted,
                     routing_rules: Vec::new(),
                     providers,
+                    groups: Vec::new(),
+                    member_order: None,
                 })
             }
             TargetSpecOrList::Single(spec) => {
@@ -533,6 +586,8 @@ impl TargetSpecOrList {
                     trusted,
                     routing_rules: Vec::new(),
                     providers: vec![provider],
+                    groups: Vec::new(),
+                    member_order: None,
                 })
             }
         }
@@ -968,6 +1023,122 @@ impl TargetsStream for WatchTargetsStream {
     }
 }
 
+/// Build a pool's member list from provider and group specs.
+///
+/// Pool-level `sanitize_response` is OR'd into every provider, including group
+/// members. Without `member_order`, direct providers come first (declaration
+/// order) followed by groups in declaration order; with it, every direct
+/// provider and group must be referenced exactly once.
+fn build_pool_members(
+    name: &str,
+    pool_sanitize: bool,
+    providers: Vec<ProviderSpec>,
+    groups: Vec<GroupSpec>,
+    member_order: Option<Vec<MemberRef>>,
+) -> Result<Vec<Provider>, anyhow::Error> {
+    // Convert a provider spec to a leaf provider.
+    // Enable sanitization if either pool or provider level is true.
+    let build_provider = |mut spec: ProviderSpec| {
+        let weight = spec.weight;
+        let concurrency_limit = spec
+            .concurrency_limit
+            .as_ref()
+            .map(|cl| cl.max_concurrent_requests);
+        spec.sanitize_response = pool_sanitize || spec.sanitize_response;
+        let target: Target = spec.into();
+        match concurrency_limit {
+            Some(limit) => Provider::with_concurrency_limit(target, weight, limit),
+            None => Provider::new(target, weight),
+        }
+    };
+
+    {
+        let mut seen = std::collections::HashSet::new();
+        for group in &groups {
+            if !seen.insert(group.name.as_str()) {
+                return Err(anyhow!(
+                    "Duplicate group name '{}' in target '{}'",
+                    group.name,
+                    name
+                ));
+            }
+        }
+    }
+
+    let direct: Vec<Provider> = providers.into_iter().map(build_provider).collect();
+    let groups: Vec<(String, Provider)> = groups
+        .into_iter()
+        .map(|group| {
+            let members: Vec<Provider> = group.providers.into_iter().map(build_provider).collect();
+            let provider =
+                Provider::group(group.name.clone(), group.strategy, group.weight, members);
+            (group.name, provider)
+        })
+        .collect();
+
+    let Some(order) = member_order else {
+        // Default order: direct providers first, then groups in declaration order
+        return Ok(direct
+            .into_iter()
+            .chain(groups.into_iter().map(|(_, provider)| provider))
+            .collect());
+    };
+
+    if order.len() != direct.len() + groups.len() {
+        return Err(anyhow!(
+            "member_order for target '{}' has {} entries but the pool has {} members ({} providers + {} groups); every member must be referenced exactly once",
+            name,
+            order.len(),
+            direct.len() + groups.len(),
+            direct.len(),
+            groups.len()
+        ));
+    }
+
+    let provider_count = direct.len();
+    let mut direct: Vec<Option<Provider>> = direct.into_iter().map(Some).collect();
+    let mut groups_by_name: HashMap<String, Provider> = groups.into_iter().collect();
+
+    let mut ordered = Vec::with_capacity(order.len());
+    for member_ref in order {
+        match member_ref {
+            MemberRef::Provider(index) => {
+                let provider = direct
+                    .get_mut(index)
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "member_order for target '{}' references provider index {} but there are only {} providers",
+                            name,
+                            index,
+                            provider_count
+                        )
+                    })?
+                    .take()
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "member_order for target '{}' references provider index {} more than once",
+                            name,
+                            index
+                        )
+                    })?;
+                ordered.push(provider);
+            }
+            MemberRef::Group(group_name) => {
+                let provider = groups_by_name.remove(&group_name).ok_or_else(|| {
+                    anyhow!(
+                        "member_order for target '{}' references group '{}' which is unknown or already referenced",
+                        name,
+                        group_name
+                    )
+                })?;
+                ordered.push(provider);
+            }
+        }
+    }
+
+    Ok(ordered)
+}
+
 impl Targets {
     pub async fn from_config_file(config_path: &PathBuf) -> Result<Self, anyhow::Error> {
         let contents = tokio::fs::read_to_string(config_path).await.map_err(|e| {
@@ -1049,6 +1220,21 @@ impl Targets {
                     })?;
                 }
             }
+            for group in &pool_config.groups {
+                for (index, provider) in group.providers.iter().enumerate() {
+                    if let Some(config) = provider.reasoning_translation.as_ref() {
+                        config.validate().map_err(|error| {
+                            anyhow!(
+                                "Invalid reasoning translation for target '{}' group '{}' provider {}: {}",
+                                name,
+                                group.name,
+                                index,
+                                error.message()
+                            )
+                        })?;
+                    }
+                }
+            }
 
             // Merge global keys with pool-level keys
             let merged_keys = if let Some(mut keys) = pool_config.keys {
@@ -1074,27 +1260,15 @@ impl Targets {
                 .concurrency_limit
                 .map(|cl| ConcurrencyLimiter::with_limit(cl.max_concurrent_requests));
 
-            // Convert provider specs to providers
-            // Pool-level sanitize_response enables sanitization for all providers
-            let pool_sanitize = pool_config.sanitize_response;
-            let providers: Vec<Provider> = pool_config
-                .providers
-                .into_iter()
-                .map(|mut spec| {
-                    let weight = spec.weight;
-                    let concurrency_limit = spec
-                        .concurrency_limit
-                        .as_ref()
-                        .map(|cl| cl.max_concurrent_requests);
-                    // Enable sanitization if either pool or provider level is true
-                    spec.sanitize_response = pool_sanitize || spec.sanitize_response;
-                    let target: Target = spec.into();
-                    match concurrency_limit {
-                        Some(limit) => Provider::with_concurrency_limit(target, weight, limit),
-                        None => Provider::new(target, weight),
-                    }
-                })
-                .collect();
+            // Convert provider and group specs into the pool's member list,
+            // honoring member_order when present
+            let providers = build_pool_members(
+                &name,
+                pool_config.sanitize_response,
+                pool_config.providers,
+                pool_config.groups,
+                pool_config.member_order,
+            )?;
 
             let pool = ProviderPool::with_config(
                 providers,
@@ -2307,6 +2481,8 @@ mod tests {
                 propagate_trace_context: None,
                 reasoning_translation: None,
             }],
+            groups: Vec::new(),
+            member_order: None,
         };
 
         let pool_config = TargetSpecOrList::Pool(pool_spec)
@@ -2465,16 +2641,16 @@ mod tests {
         // First provider should have 30 second timeout
         let provider1 = providers
             .iter()
-            .find(|p| p.target.url.host_str() == Some("api.openai.com"))
+            .find(|p| p.target().unwrap().url.host_str() == Some("api.openai.com"))
             .unwrap();
-        assert_eq!(provider1.target.request_timeout_secs, Some(30));
+        assert_eq!(provider1.target().unwrap().request_timeout_secs, Some(30));
 
         // Second provider should have 60 second timeout
         let provider2 = providers
             .iter()
-            .find(|p| p.target.url.host_str() == Some("api.azure.com"))
+            .find(|p| p.target().unwrap().url.host_str() == Some("api.azure.com"))
             .unwrap();
-        assert_eq!(provider2.target.request_timeout_secs, Some(60));
+        assert_eq!(provider2.target().unwrap().request_timeout_secs, Some(60));
     }
 
     #[test]
@@ -2510,13 +2686,13 @@ mod tests {
         assert!(
             providers
                 .iter()
-                .any(|p| p.target.request_timeout_secs == Some(30))
+                .any(|p| p.target().unwrap().request_timeout_secs == Some(30))
         );
         // One provider without timeout
         assert!(
             providers
                 .iter()
-                .any(|p| p.target.request_timeout_secs.is_none())
+                .any(|p| p.target().unwrap().request_timeout_secs.is_none())
         );
     }
 
@@ -2633,12 +2809,13 @@ mod tests {
 
         let providers = pool.providers();
         assert_eq!(
-            providers[0].target.trusted,
+            providers[0].target().unwrap().trusted,
             Some(true),
             "First provider should have trusted=Some(true)"
         );
         assert_eq!(
-            providers[1].target.trusted, None,
+            providers[1].target().unwrap().trusted,
+            None,
             "Second provider should have trusted=None (inherits pool)"
         );
     }
@@ -2901,5 +3078,202 @@ mod tests {
 
         assert!(error.to_string().contains("thinking_token_budget"));
         assert!(error.to_string().contains("reasoning_effort"));
+    }
+
+    #[test]
+    fn test_member_ref_serde() {
+        let refs: Vec<MemberRef> =
+            serde_json::from_str(r#"[{"provider": 1}, {"group": "x"}]"#).unwrap();
+        assert_eq!(
+            refs,
+            vec![MemberRef::Provider(1), MemberRef::Group("x".to_string())]
+        );
+        assert_eq!(
+            serde_json::to_string(&refs).unwrap(),
+            r#"[{"provider":1},{"group":"x"}]"#
+        );
+    }
+
+    #[test]
+    fn test_pool_spec_without_groups_round_trips_unchanged() {
+        // Old flat configs deserialize with the new fields at their defaults,
+        // and serializing them back does not introduce the new keys
+        let json = r#"{"providers": [{"url": "https://api.example.com"}]}"#;
+        let spec: PoolSpec = serde_json::from_str(json).unwrap();
+        assert!(spec.groups.is_empty());
+        assert!(spec.member_order.is_none());
+
+        let value = serde_json::to_value(&spec).unwrap();
+        assert!(value.get("groups").is_none());
+        assert!(value.get("member_order").is_none());
+    }
+
+    #[test]
+    fn test_from_config_with_groups_and_member_order() {
+        use crate::load_balancer::ProviderNode;
+
+        let json = r#"{
+            "targets": {
+                "glm": {
+                    "strategy": "priority",
+                    "providers": [
+                        {"url": "https://dynamo.internal/v1/"}
+                    ],
+                    "groups": [
+                        {
+                            "name": "third-party",
+                            "strategy": "weighted_random",
+                            "weight": 2,
+                            "providers": [
+                                {"url": "https://openrouter.ai/api/v1/", "weight": 40},
+                                {"url": "https://api.fireworks.ai/v1/", "weight": 40}
+                            ]
+                        }
+                    ],
+                    "member_order": [{"group": "third-party"}, {"provider": 0}]
+                }
+            }
+        }"#;
+
+        let config: ConfigFile = serde_json::from_str(json).unwrap();
+        let targets = Targets::from_config(config).unwrap();
+        let pool = targets.targets.get("glm").unwrap();
+
+        assert_eq!(pool.leaf_count(), 3);
+        let members = pool.providers();
+        assert_eq!(members.len(), 2);
+
+        // member_order puts the group first
+        let ProviderNode::Group {
+            name,
+            strategy,
+            members: group_members,
+        } = &members[0].node
+        else {
+            panic!("expected group first per member_order");
+        };
+        assert_eq!(name, "third-party");
+        assert_eq!(*strategy, LoadBalanceStrategy::WeightedRandom);
+        assert_eq!(members[0].weight, 2);
+        assert_eq!(group_members.len(), 2);
+        assert_eq!(group_members[0].weight, 40);
+        assert_eq!(
+            members[1].target().unwrap().url.host_str(),
+            Some("dynamo.internal")
+        );
+
+        // First leaf depth-first is inside the group
+        assert_eq!(
+            pool.first_target().unwrap().url.host_str(),
+            Some("openrouter.ai")
+        );
+    }
+
+    #[test]
+    fn test_from_config_groups_default_order_after_providers() {
+        use crate::load_balancer::ProviderNode;
+
+        let json = r#"{
+            "targets": {
+                "m": {
+                    "providers": [{"url": "https://a.example.com"}],
+                    "groups": [
+                        {"name": "g", "providers": [{"url": "https://b.example.com"}]}
+                    ]
+                }
+            }
+        }"#;
+
+        let config: ConfigFile = serde_json::from_str(json).unwrap();
+        let targets = Targets::from_config(config).unwrap();
+        let pool = targets.targets.get("m").unwrap();
+
+        let members = pool.providers();
+        assert_eq!(members.len(), 2);
+        assert!(matches!(members[0].node, ProviderNode::Leaf(_)));
+        assert!(matches!(members[1].node, ProviderNode::Group { .. }));
+        assert_eq!(pool.leaf_count(), 2);
+    }
+
+    #[test]
+    fn test_from_config_pool_sanitize_applies_to_group_members() {
+        let json = r#"{
+            "targets": {
+                "m": {
+                    "sanitize_response": true,
+                    "providers": [],
+                    "groups": [
+                        {"name": "g", "providers": [{"url": "https://b.example.com"}]}
+                    ]
+                }
+            }
+        }"#;
+
+        let config: ConfigFile = serde_json::from_str(json).unwrap();
+        let targets = Targets::from_config(config).unwrap();
+        let pool = targets.targets.get("m").unwrap();
+
+        let target = pool.first_target().unwrap();
+        assert!(
+            target.sanitize_response,
+            "pool-level sanitize_response should be OR'd into group members"
+        );
+    }
+
+    #[test]
+    fn test_from_config_rejects_duplicate_group_names() {
+        let json = r#"{
+            "targets": {
+                "m": {
+                    "providers": [],
+                    "groups": [
+                        {"name": "g", "providers": [{"url": "https://a.example.com"}]},
+                        {"name": "g", "providers": [{"url": "https://b.example.com"}]}
+                    ]
+                }
+            }
+        }"#;
+
+        let config: ConfigFile = serde_json::from_str(json).unwrap();
+        let error = Targets::from_config(config).unwrap_err();
+        assert!(error.to_string().contains("Duplicate group name"));
+    }
+
+    #[test]
+    fn test_from_config_rejects_bad_member_order() {
+        let base = |member_order: &str| {
+            format!(
+                r#"{{
+                    "targets": {{
+                        "m": {{
+                            "providers": [{{"url": "https://a.example.com"}}],
+                            "groups": [
+                                {{"name": "g", "providers": [{{"url": "https://b.example.com"}}]}}
+                            ],
+                            "member_order": {member_order}
+                        }}
+                    }}
+                }}"#
+            )
+        };
+
+        for bad in [
+            r#"[{"provider": 5}, {"group": "g"}]"#, // index out of range
+            r#"[{"provider": 0}, {"group": "nope"}]"#, // unknown group
+            r#"[{"provider": 0}, {"provider": 0}]"#, // duplicate ref
+            r#"[{"provider": 0}]"#,                 // incomplete
+            r#"[{"provider": 0}, {"group": "g"}, {"group": "g"}]"#, // too many
+        ] {
+            let config: ConfigFile = serde_json::from_str(&base(bad)).unwrap();
+            assert!(
+                Targets::from_config(config).is_err(),
+                "member_order {bad} should be rejected"
+            );
+        }
+
+        // The valid ordering parses fine
+        let config: ConfigFile =
+            serde_json::from_str(&base(r#"[{"group": "g"}, {"provider": 0}]"#)).unwrap();
+        assert!(Targets::from_config(config).is_ok());
     }
 }

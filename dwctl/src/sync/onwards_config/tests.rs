@@ -186,11 +186,11 @@ async fn test_cache_shape_regular_public_and_private_access(pool: sqlx::PgPool) 
     assert!(!pool_has_key(private_pool, KEY_BATCH_SECRET));
 
     let provider = &private_pool.providers()[0];
-    assert_eq!(provider.target.onwards_model.as_deref(), Some("regular-private-model"));
-    assert_eq!(provider.target.upstream_auth_header_name.as_deref(), Some("X-API-Key"));
-    assert_eq!(provider.target.upstream_auth_header_prefix.as_deref(), Some("Token "));
+    assert_eq!(provider.target().unwrap().onwards_model.as_deref(), Some("regular-private-model"));
+    assert_eq!(provider.target().unwrap().upstream_auth_header_name.as_deref(), Some("X-API-Key"));
+    assert_eq!(provider.target().unwrap().upstream_auth_header_prefix.as_deref(), Some("Token "));
     assert!(
-        provider.target.sanitize_response,
+        provider.target().unwrap().sanitize_response,
         "sanitize flag should be propagated to regular target"
     );
 }
@@ -219,7 +219,8 @@ async fn test_endpoint_reasoning_default_reaches_standard_provider(pool: sqlx::P
     let provider = &target.value().providers()[0];
     assert_eq!(
         provider
-            .target
+            .target()
+            .unwrap()
             .reasoning_translation
             .as_ref()
             .unwrap()
@@ -285,7 +286,8 @@ async fn test_chat_override_preserves_endpoint_responses_default(pool: sqlx::PgP
     let provider = &target.value().providers()[0];
     assert_eq!(
         provider
-            .target
+            .target()
+            .unwrap()
             .reasoning_translation
             .as_ref()
             .unwrap()
@@ -298,7 +300,8 @@ async fn test_chat_override_preserves_endpoint_responses_default(pool: sqlx::PgP
     );
     assert_eq!(
         provider
-            .target
+            .target()
+            .unwrap()
             .reasoning_translation
             .as_ref()
             .unwrap()
@@ -353,7 +356,7 @@ async fn test_disabling_one_reasoning_surface_preserves_the_other(pool: sqlx::Pg
     let target = targets.targets.get("regular-private").unwrap();
     let pool = target.value();
     let provider = &pool.providers()[0];
-    let config = provider.target.reasoning_translation.as_ref().unwrap();
+    let config = provider.target().unwrap().reasoning_translation.as_ref().unwrap();
     assert!(config.chat_completions.is_none());
     assert!(config.responses.is_some());
 }
@@ -400,7 +403,7 @@ async fn test_disabling_both_reasoning_surfaces_removes_provider_config(pool: sq
     let target = targets.targets.get("regular-private").unwrap();
     let pool = target.value();
     let provider = &pool.providers()[0];
-    assert!(provider.target.reasoning_translation.is_none());
+    assert!(provider.target().unwrap().reasoning_translation.is_none());
 }
 
 #[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
@@ -427,7 +430,8 @@ async fn test_token_budget_multi_write_survives_provider_sync(pool: sqlx::PgPool
     let pool = target.value();
     let provider = &pool.providers()[0];
     let writes = &provider
-        .target
+        .target()
+        .unwrap()
         .reasoning_translation
         .as_ref()
         .unwrap()
@@ -501,7 +505,8 @@ async fn test_composite_components_keep_distinct_effective_reasoning_translation
         .iter()
         .map(|provider| {
             let path = provider
-                .target
+                .target()
+                .unwrap()
                 .reasoning_translation
                 .as_ref()
                 .unwrap()
@@ -511,7 +516,7 @@ async fn test_composite_components_keep_distinct_effective_reasoning_translation
                 .writes[0]
                 .target_path
                 .as_str();
-            (provider.target.onwards_model.as_deref().unwrap(), path)
+            (provider.target().unwrap().onwards_model.as_deref().unwrap(), path)
         })
         .collect::<std::collections::HashMap<_, _>>();
 
@@ -750,12 +755,12 @@ async fn test_cache_shape_composite_pool_strategy_and_fallback(pool: sqlx::PgPoo
     assert!(!pool_has_key(composite_pool, KEY_BATCH_SECRET));
 
     let providers = composite_pool.providers();
-    assert_eq!(providers[0].target.onwards_model.as_deref(), Some("component-b-model"));
-    assert_eq!(providers[1].target.onwards_model.as_deref(), Some("component-a-model"));
+    assert_eq!(providers[0].target().unwrap().onwards_model.as_deref(), Some("component-b-model"));
+    assert_eq!(providers[1].target().unwrap().onwards_model.as_deref(), Some("component-a-model"));
     assert_eq!(providers[0].weight, 30);
     assert_eq!(providers[1].weight, 70);
-    assert!(providers[0].target.sanitize_response);
-    assert!(providers[1].target.sanitize_response);
+    assert!(providers[0].target().unwrap().sanitize_response);
+    assert!(providers[1].target().unwrap().sanitize_response);
 
     // Default migration state: no backoff configured. The fallback config
     // surfaces to onwards with `backoff: None`, which preserves the legacy
@@ -915,7 +920,7 @@ async fn test_cache_shape_deleted_component_model_is_excluded_from_composite(poo
         1,
         "only one composite provider should remain after component model deletion"
     );
-    assert_eq!(providers[0].target.onwards_model.as_deref(), Some("component-b-model"));
+    assert_eq!(providers[0].target().unwrap().onwards_model.as_deref(), Some("component-b-model"));
 }
 
 #[sqlx::test(fixtures(path = "fixtures", scripts("cache_base", "cache_traffic_routing_rules")))]

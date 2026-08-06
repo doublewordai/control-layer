@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT COALESCE(MAX(sort_order) + 1, 0)\n            FROM (\n                SELECT sort_order FROM deployed_model_components\n                WHERE composite_model_id = $1 AND group_id IS NULL\n                UNION ALL\n                SELECT sort_order FROM deployed_model_component_groups\n                WHERE composite_model_id = $1\n            ) members\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "coalesce",
+        "type_info": "Int4"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "74859014045d1c73086922806310ace085bdf57aaa2c67f0fea3f0755d0c1df6"
+}

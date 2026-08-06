@@ -155,6 +155,8 @@ fn db_component_to_response(c: DeploymentComponentDBResponse) -> ModelComponentR
         enabled: c.enabled,
         sort_order: c.sort_order,
         created_at: c.created_at,
+        group_id: c.group_id,
+        group_name: c.group_name,
         model: ComponentModelSummary {
             id: c.deployed_model_id,
             alias: c.model_alias,
@@ -1238,20 +1240,32 @@ pub async fn add_model_component<P: PoolProvider>(
     }
 
     // Add the component. Its priority position is always assigned by the server
-    // as "one past the current last component" so sort_order stays unique and
-    // dense within the composite — the client-supplied `sort_order` is ignored
-    // (reordering is done via PATCH, which moves-and-reindexes). Lock the
-    // composite first so concurrent adds can't both read the same MAX and
-    // collide on a position.
+    // as "one past the current last member" of its sequence — the target group's
+    // when `group_id` is supplied, the composite root otherwise — so sort_order
+    // stays unique and dense within the sequence. The client-supplied
+    // `sort_order` is ignored (reordering is done via PATCH, which
+    // moves-and-reindexes). Lock the composite first so concurrent adds can't
+    // both read the same MAX and collide on a position.
     let mut repo = Deployments::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
     repo.lock_composite(id).await?;
-    let sort_order = repo.next_component_sort_order(id).await?;
+    if let Some(group_id) = body.group_id
+        && repo.get_component_group(id, group_id).await?.is_none()
+    {
+        return Err(Error::BadRequest {
+            message: "Group does not belong to this composite model".to_string(),
+        });
+    }
+    let sort_order = match body.group_id {
+        Some(group_id) => repo.next_group_component_sort_order(group_id).await?,
+        None => repo.next_component_sort_order(id).await?,
+    };
     let request = DeploymentComponentCreateDBRequest {
         composite_model_id: id,
         deployed_model_id: component_id,
         weight: body.weight,
         enabled: body.enabled,
         sort_order,
+        group_id: body.group_id,
     };
 
     let component = repo.add_component(&request).await?;
@@ -1308,7 +1322,14 @@ pub async fn update_model_component<P: PoolProvider>(
         // Serialize with other component mutations on this composite so the
         // move-and-reindex below isn't interleaved with a concurrent add/reorder.
         repo.lock_composite(id).await?;
-        repo.update_component(id, component_id, body.weight, body.enabled, body.sort_order)
+        if let Some(Some(group_id)) = body.group_id
+            && repo.get_component_group(id, group_id).await?.is_none()
+        {
+            return Err(Error::BadRequest {
+                message: "Group does not belong to this composite model".to_string(),
+            });
+        }
+        repo.update_component(id, component_id, body.weight, body.enabled, body.sort_order, body.group_id)
             .await?
             .ok_or_else(|| Error::NotFound {
                 resource: "component".to_string(),
@@ -1370,6 +1391,237 @@ pub async fn remove_model_component<P: PoolProvider>(
     tx.commit().await.map_err(|e| Error::Database(e.into()))?;
 
     Ok(Json("Component removed".to_string()))
+}
+
+// ===== Composite Model Component Group Handlers =====
+
+use crate::api::models::deployments::{ModelGroupCreate, ModelGroupDeleteQuery, ModelGroupResponse, ModelGroupUpdate};
+use crate::db::models::deployments::{
+    DeploymentComponentGroup, DeploymentComponentGroupCreateDBRequest, DeploymentComponentGroupUpdateDBRequest,
+};
+
+/// Convert a DB component group (plus its member components) to an API response
+fn db_group_to_response(g: DeploymentComponentGroup, components: Vec<ModelComponentResponse>) -> ModelGroupResponse {
+    ModelGroupResponse {
+        id: g.id,
+        name: g.name,
+        lb_strategy: g.lb_strategy,
+        weight: g.weight,
+        sort_order: g.sort_order,
+        enabled: g.enabled,
+        created_at: g.created_at,
+        components,
+    }
+}
+
+#[utoipa::path(
+    post,
+    path = "/models/{id}/groups",
+    tag = "composite-models",
+    summary = "Create component group on composite model",
+    description = "Create a named component group with its own load balancing strategy. The group is appended to the composite root sequence, which it shares with direct components.",
+    params(
+        ("id" = String, Path, description = "The composite model ID", format = "uuid"),
+    ),
+    request_body = ModelGroupCreate,
+    responses(
+        (status = 200, description = "Group created", body = ModelGroupResponse),
+        (status = 400, description = "Model is not a composite model or the group is invalid"),
+        (status = 401, description = "Unauthorized"),
+        (status = 404, description = "Composite model not found"),
+        (status = 409, description = "A group with this name already exists on the composite model"),
+        (status = 500, description = "Internal server error"),
+    ),
+    security(
+        ("BearerAuth" = []),
+        ("CookieAuth" = []),
+        ("X-Doubleword-User" = [])
+    )
+)]
+#[tracing::instrument(skip_all)]
+pub async fn create_model_group<P: PoolProvider>(
+    State(state): State<AppState<P>>,
+    Path(id): Path<DeploymentId>,
+    _: RequiresPermission<resource::CompositeModels, operation::UpdateAll>,
+    Json(body): Json<ModelGroupCreate>,
+) -> Result<Json<ModelGroupResponse>> {
+    if !(1..=100).contains(&body.weight) {
+        return Err(Error::BadRequest {
+            message: "Weight must be between 1 and 100".to_string(),
+        });
+    }
+    if body.name.trim().is_empty() {
+        return Err(Error::BadRequest {
+            message: "Group name must not be empty".to_string(),
+        });
+    }
+
+    let mut tx = state.db.write().begin().await.map_err(|e| Error::Database(e.into()))?;
+    let group = {
+        let mut repo = Deployments::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
+
+        let composite = repo.get_by_id(id).await?.ok_or_else(|| Error::NotFound {
+            resource: "composite model".to_string(),
+            id: id.to_string(),
+        })?;
+        if !composite.is_composite {
+            return Err(Error::BadRequest {
+                message: "Model is not a composite model".to_string(),
+            });
+        }
+
+        // The group occupies one slot in the root sequence; lock the composite
+        // so concurrent appends can't collide on a position.
+        repo.lock_composite(id).await?;
+        let sort_order = repo.next_component_sort_order(id).await?;
+        repo.add_component_group(&DeploymentComponentGroupCreateDBRequest {
+            composite_model_id: id,
+            name: body.name,
+            lb_strategy: body.lb_strategy,
+            weight: body.weight,
+            enabled: body.enabled,
+            sort_order,
+        })
+        .await?
+    };
+    tx.commit().await.map_err(|e| Error::Database(e.into()))?;
+
+    Ok(Json(db_group_to_response(group, vec![])))
+}
+
+#[utoipa::path(
+    patch,
+    path = "/models/{id}/groups/{group_id}",
+    tag = "composite-models",
+    summary = "Update component group",
+    description = "Update a component group's name, load balancing strategy, weight or enabled status, and/or move it to a new position in the composite root sequence.",
+    params(
+        ("id" = String, Path, description = "The composite model ID", format = "uuid"),
+        ("group_id" = String, Path, description = "The component group ID", format = "uuid"),
+    ),
+    request_body = ModelGroupUpdate,
+    responses(
+        (status = 200, description = "Group updated", body = ModelGroupResponse),
+        (status = 400, description = "Invalid weight or name"),
+        (status = 401, description = "Unauthorized"),
+        (status = 404, description = "Composite model or group not found"),
+        (status = 409, description = "A group with this name already exists on the composite model"),
+        (status = 500, description = "Internal server error"),
+    ),
+    security(
+        ("BearerAuth" = []),
+        ("CookieAuth" = []),
+        ("X-Doubleword-User" = [])
+    )
+)]
+#[tracing::instrument(skip_all)]
+pub async fn update_model_group<P: PoolProvider>(
+    State(state): State<AppState<P>>,
+    Path((id, group_id)): Path<(DeploymentId, uuid::Uuid)>,
+    _: RequiresPermission<resource::CompositeModels, operation::UpdateAll>,
+    Json(body): Json<ModelGroupUpdate>,
+) -> Result<Json<ModelGroupResponse>> {
+    if let Some(weight) = body.weight
+        && !(1..=100).contains(&weight)
+    {
+        return Err(Error::BadRequest {
+            message: "Weight must be between 1 and 100".to_string(),
+        });
+    }
+    if let Some(ref name) = body.name
+        && name.trim().is_empty()
+    {
+        return Err(Error::BadRequest {
+            message: "Group name must not be empty".to_string(),
+        });
+    }
+
+    // A sort_order change moves the group within the root sequence and renumbers
+    // it, so run on a transaction to keep that multi-row rewrite atomic.
+    let mut tx = state.db.write().begin().await.map_err(|e| Error::Database(e.into()))?;
+    let (group, members) = {
+        let mut repo = Deployments::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
+        repo.lock_composite(id).await?;
+        let group = repo
+            .update_component_group(
+                id,
+                group_id,
+                &DeploymentComponentGroupUpdateDBRequest {
+                    name: body.name,
+                    lb_strategy: body.lb_strategy,
+                    weight: body.weight,
+                    enabled: body.enabled,
+                },
+                body.sort_order,
+            )
+            .await?
+            .ok_or_else(|| Error::NotFound {
+                resource: "component group".to_string(),
+                id: format!("{}/{}", id, group_id),
+            })?;
+        let members = repo
+            .get_components(id)
+            .await?
+            .into_iter()
+            .filter(|c| c.group_id == Some(group.id))
+            .map(db_component_to_response)
+            .collect();
+        (group, members)
+    };
+    tx.commit().await.map_err(|e| Error::Database(e.into()))?;
+
+    Ok(Json(db_group_to_response(group, members)))
+}
+
+#[utoipa::path(
+    delete,
+    path = "/models/{id}/groups/{group_id}",
+    tag = "composite-models",
+    summary = "Delete component group",
+    description = "Delete a component group. By default its members are promoted to direct components at the end of the composite root sequence; with cascade=true the member components are removed as well.",
+    params(
+        ("id" = String, Path, description = "The composite model ID", format = "uuid"),
+        ("group_id" = String, Path, description = "The component group ID", format = "uuid"),
+        ("cascade" = Option<bool>, Query, description = "When true, delete the group's member components too (default: false, members are promoted to direct components)"),
+    ),
+    responses(
+        (status = 200, description = "Group deleted"),
+        (status = 401, description = "Unauthorized"),
+        (status = 404, description = "Composite model or group not found"),
+        (status = 500, description = "Internal server error"),
+    ),
+    security(
+        ("BearerAuth" = []),
+        ("CookieAuth" = []),
+        ("X-Doubleword-User" = [])
+    )
+)]
+#[tracing::instrument(skip_all)]
+pub async fn delete_model_group<P: PoolProvider>(
+    State(state): State<AppState<P>>,
+    Path((id, group_id)): Path<(DeploymentId, uuid::Uuid)>,
+    Query(query): Query<ModelGroupDeleteQuery>,
+    _: RequiresPermission<resource::CompositeModels, operation::UpdateAll>,
+) -> Result<Json<String>> {
+    // Promotion/cascade rewrites member rows and the root sequence; lock the
+    // composite and run it all in one transaction to serialize with concurrent
+    // add/reorder.
+    let mut tx = state.db.write().begin().await.map_err(|e| Error::Database(e.into()))?;
+    {
+        let mut repo = Deployments::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
+        repo.lock_composite(id).await?;
+
+        let deleted = repo.delete_component_group(id, group_id, query.cascade.unwrap_or(false)).await?;
+        if !deleted {
+            return Err(Error::NotFound {
+                resource: "component group".to_string(),
+                id: format!("{}/{}", id, group_id),
+            });
+        }
+    }
+    tx.commit().await.map_err(|e| Error::Database(e.into()))?;
+
+    Ok(Json("Group removed".to_string()))
 }
 
 #[cfg(test)]

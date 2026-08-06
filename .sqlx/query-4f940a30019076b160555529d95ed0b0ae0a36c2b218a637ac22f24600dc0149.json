@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT\n                dmc.id,\n                dmc.composite_model_id,\n                dmc.deployed_model_id,\n                dmc.weight,\n                dmc.enabled,\n                dmc.sort_order,\n                dmc.created_at,\n                dm.alias as model_alias,\n                dm.model_name,\n                dm.description as model_description,\n                dm.type as model_type,\n                dm.trusted as model_trusted,\n                dm.open_responses_adapter as \"model_open_responses_adapter?\",\n                dm.hosted_on as endpoint_id,\n                e.name as \"endpoint_name?\"\n            FROM deployed_model_components dmc\n            JOIN deployed_models dm ON dm.id = dmc.deployed_model_id\n            LEFT JOIN inference_endpoints e ON e.id = dm.hosted_on\n            WHERE dmc.composite_model_id = $1\n            ORDER BY dmc.sort_order ASC, dmc.weight DESC, dmc.created_at ASC\n            ",
+  "query": "\n            SELECT\n                dmc.id,\n                dmc.composite_model_id,\n                dmc.deployed_model_id,\n                dmc.weight,\n                dmc.enabled,\n                dmc.sort_order,\n                dmc.created_at,\n                dmc.group_id as \"group_id?\",\n                g.name as \"group_name?\",\n                dm.alias as model_alias,\n                dm.model_name,\n                dm.description as model_description,\n                dm.type as model_type,\n                dm.trusted as model_trusted,\n                dm.open_responses_adapter as \"model_open_responses_adapter?\",\n                dm.hosted_on as endpoint_id,\n                e.name as \"endpoint_name?\"\n            FROM deployed_model_components dmc\n            JOIN deployed_models dm ON dm.id = dmc.deployed_model_id\n            LEFT JOIN inference_endpoints e ON e.id = dm.hosted_on\n            LEFT JOIN deployed_model_component_groups g ON g.id = dmc.group_id\n            WHERE dmc.composite_model_id = $1\n            ORDER BY dmc.group_id NULLS FIRST, dmc.sort_order ASC, dmc.weight DESC, dmc.created_at ASC\n            ",
   "describe": {
     "columns": [
       {
@@ -40,41 +40,51 @@
       },
       {
         "ordinal": 7,
-        "name": "model_alias",
-        "type_info": "Varchar"
+        "name": "group_id?",
+        "type_info": "Uuid"
       },
       {
         "ordinal": 8,
-        "name": "model_name",
+        "name": "group_name?",
         "type_info": "Varchar"
       },
       {
         "ordinal": 9,
-        "name": "model_description",
-        "type_info": "Text"
+        "name": "model_alias",
+        "type_info": "Varchar"
       },
       {
         "ordinal": 10,
-        "name": "model_type",
+        "name": "model_name",
         "type_info": "Varchar"
       },
       {
         "ordinal": 11,
+        "name": "model_description",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 12,
+        "name": "model_type",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 13,
         "name": "model_trusted",
         "type_info": "Bool"
       },
       {
-        "ordinal": 12,
+        "ordinal": 14,
         "name": "model_open_responses_adapter?",
         "type_info": "Bool"
       },
       {
-        "ordinal": 13,
+        "ordinal": 15,
         "name": "endpoint_id",
         "type_info": "Uuid"
       },
       {
-        "ordinal": 14,
+        "ordinal": 16,
         "name": "endpoint_name?",
         "type_info": "Varchar"
       }
@@ -92,6 +102,8 @@
       false,
       false,
       false,
+      true,
+      false,
       false,
       false,
       true,
@@ -102,5 +114,5 @@
       false
     ]
   },
-  "hash": "0c1795527389966fadf15ad4294b6a9ca45187bd5daa0058d8c8e88b8edefff7"
+  "hash": "4f940a30019076b160555529d95ed0b0ae0a36c2b218a637ac22f24600dc0149"
 }

@@ -6,7 +6,8 @@ use crate::db::{
     errors::{DbError, Result},
     handlers::repository::Repository,
     models::deployments::{
-        DeploymentComponentCreateDBRequest, DeploymentComponentDBResponse, DeploymentCreateDBRequest, DeploymentDBResponse,
+        DeploymentComponentCreateDBRequest, DeploymentComponentDBResponse, DeploymentComponentGroup,
+        DeploymentComponentGroupCreateDBRequest, DeploymentComponentGroupUpdateDBRequest, DeploymentCreateDBRequest, DeploymentDBResponse,
         DeploymentUpdateDBRequest, LoadBalancingStrategy, ModelStatus, ModelType, ProviderPricing, ProviderPricingFields,
         TrafficRuleAction, TrafficRuleDBRow,
     },
@@ -757,6 +758,23 @@ impl<'c> Repository for Deployments<'c> {
     }
 }
 
+/// Map a sqlx row (anonymous record with the group columns) to a
+/// [`DeploymentComponentGroup`], parsing the stored strategy string.
+macro_rules! group_from_row {
+    ($r:expr) => {
+        DeploymentComponentGroup {
+            id: $r.id,
+            composite_model_id: $r.composite_model_id,
+            name: $r.name,
+            lb_strategy: LoadBalancingStrategy::try_parse(&$r.lb_strategy).unwrap_or_default(),
+            weight: $r.weight,
+            sort_order: $r.sort_order,
+            enabled: $r.enabled,
+            created_at: $r.created_at,
+        }
+    };
+}
+
 impl<'c> Deployments<'c> {
     pub fn new(db: &'c mut PgConnection) -> Self {
         Self { db }
@@ -964,9 +982,9 @@ impl<'c> Deployments<'c> {
         let result = sqlx::query!(
             r#"
             WITH inserted AS (
-                INSERT INTO deployed_model_components (composite_model_id, deployed_model_id, weight, enabled, sort_order)
-                VALUES ($1, $2, $3, $4, $5)
-                RETURNING id, composite_model_id, deployed_model_id, weight, enabled, sort_order, created_at
+                INSERT INTO deployed_model_components (composite_model_id, deployed_model_id, weight, enabled, sort_order, group_id)
+                VALUES ($1, $2, $3, $4, $5, $6)
+                RETURNING id, composite_model_id, deployed_model_id, weight, enabled, sort_order, created_at, group_id
             )
             SELECT
                 inserted.id,
@@ -976,6 +994,8 @@ impl<'c> Deployments<'c> {
                 inserted.enabled,
                 inserted.sort_order,
                 inserted.created_at,
+                inserted.group_id as "group_id?",
+                g.name as "group_name?",
                 dm.alias as model_alias,
                 dm.model_name,
                 dm.description as model_description,
@@ -987,12 +1007,14 @@ impl<'c> Deployments<'c> {
             FROM inserted
             JOIN deployed_models dm ON dm.id = inserted.deployed_model_id
             LEFT JOIN inference_endpoints e ON e.id = dm.hosted_on
+            LEFT JOIN deployed_model_component_groups g ON g.id = inserted.group_id
             "#,
             request.composite_model_id,
             request.deployed_model_id,
             request.weight,
             request.enabled,
-            request.sort_order
+            request.sort_order,
+            request.group_id
         )
         .fetch_one(&mut *self.db)
         .await?;
@@ -1005,6 +1027,8 @@ impl<'c> Deployments<'c> {
             enabled: result.enabled,
             sort_order: result.sort_order,
             created_at: result.created_at,
+            group_id: result.group_id,
+            group_name: result.group_name,
             model_alias: result.model_alias,
             model_name: result.model_name,
             model_description: result.model_description,
@@ -1043,6 +1067,8 @@ impl<'c> Deployments<'c> {
                 dmc.enabled,
                 dmc.sort_order,
                 dmc.created_at,
+                dmc.group_id as "group_id?",
+                g.name as "group_name?",
                 dm.alias as model_alias,
                 dm.model_name,
                 dm.description as model_description,
@@ -1054,8 +1080,9 @@ impl<'c> Deployments<'c> {
             FROM deployed_model_components dmc
             JOIN deployed_models dm ON dm.id = dmc.deployed_model_id
             LEFT JOIN inference_endpoints e ON e.id = dm.hosted_on
+            LEFT JOIN deployed_model_component_groups g ON g.id = dmc.group_id
             WHERE dmc.composite_model_id = $1
-            ORDER BY dmc.sort_order ASC, dmc.weight DESC, dmc.created_at ASC
+            ORDER BY dmc.group_id NULLS FIRST, dmc.sort_order ASC, dmc.weight DESC, dmc.created_at ASC
             "#,
             composite_model_id
         )
@@ -1072,6 +1099,8 @@ impl<'c> Deployments<'c> {
                 enabled: r.enabled,
                 sort_order: r.sort_order,
                 created_at: r.created_at,
+                group_id: r.group_id,
+                group_name: r.group_name,
                 model_alias: r.model_alias,
                 model_name: r.model_name,
                 model_description: r.model_description,
@@ -1104,6 +1133,8 @@ impl<'c> Deployments<'c> {
                 dmc.enabled,
                 dmc.sort_order,
                 dmc.created_at,
+                dmc.group_id as "group_id?",
+                g.name as "group_name?",
                 dm.alias as model_alias,
                 dm.model_name,
                 dm.description as model_description,
@@ -1115,8 +1146,9 @@ impl<'c> Deployments<'c> {
             FROM deployed_model_components dmc
             JOIN deployed_models dm ON dm.id = dmc.deployed_model_id
             LEFT JOIN inference_endpoints e ON e.id = dm.hosted_on
+            LEFT JOIN deployed_model_component_groups g ON g.id = dmc.group_id
             WHERE dmc.composite_model_id = ANY($1)
-            ORDER BY dmc.composite_model_id, dmc.sort_order ASC, dmc.weight DESC, dmc.created_at ASC
+            ORDER BY dmc.composite_model_id, dmc.group_id NULLS FIRST, dmc.sort_order ASC, dmc.weight DESC, dmc.created_at ASC
             "#,
             &composite_model_ids
         )
@@ -1134,6 +1166,8 @@ impl<'c> Deployments<'c> {
                 enabled: r.enabled,
                 sort_order: r.sort_order,
                 created_at: r.created_at,
+                group_id: r.group_id,
+                group_name: r.group_name,
                 model_alias: r.model_alias,
                 model_name: r.model_name,
                 model_description: r.model_description,
@@ -1173,6 +1207,7 @@ impl<'c> Deployments<'c> {
                 weight,
                 enabled,
                 sort_order,
+                group_id: None,
             };
             results.push(self.add_component(&request).await?);
         }
@@ -1198,17 +1233,77 @@ impl<'c> Deployments<'c> {
         Ok(locked.is_some())
     }
 
-    /// Renumber a composite's components to a dense 0..n-1 sequence in their
-    /// current priority order (sort_order, then weight DESC, then created_at).
+    /// The composite's root sequence — direct components (group_id IS NULL) and
+    /// groups share one sort-order space — in priority order. Members are keyed
+    /// by table row id (`(is_group, row_id)`).
+    async fn fetch_root_sequence(&mut self, composite_model_id: DeploymentId) -> Result<Vec<(bool, uuid::Uuid)>> {
+        let rows = sqlx::query!(
+            r#"
+            SELECT is_group as "is_group!", row_id as "row_id!"
+            FROM (
+                SELECT FALSE AS is_group, dmc.id AS row_id, dmc.sort_order, dmc.weight, dmc.created_at
+                FROM deployed_model_components dmc
+                WHERE dmc.composite_model_id = $1 AND dmc.group_id IS NULL
+                UNION ALL
+                SELECT TRUE, g.id, g.sort_order, g.weight, g.created_at
+                FROM deployed_model_component_groups g
+                WHERE g.composite_model_id = $1
+            ) members
+            ORDER BY sort_order ASC, weight DESC, created_at ASC
+            "#,
+            composite_model_id
+        )
+        .fetch_all(&mut *self.db)
+        .await?;
+
+        Ok(rows.into_iter().map(|r| (r.is_group, r.row_id)).collect())
+    }
+
+    /// Write `sort_order = index` back across a root sequence (both tables).
+    async fn write_root_sequence(&mut self, ordered: &[(bool, uuid::Uuid)]) -> Result<()> {
+        for (idx, (is_group, row_id)) in ordered.iter().enumerate() {
+            if *is_group {
+                sqlx::query!(
+                    "UPDATE deployed_model_component_groups SET sort_order = $2
+                     WHERE id = $1 AND sort_order IS DISTINCT FROM $2",
+                    row_id,
+                    idx as i32
+                )
+                .execute(&mut *self.db)
+                .await?;
+            } else {
+                sqlx::query!(
+                    "UPDATE deployed_model_components SET sort_order = $2
+                     WHERE id = $1 AND sort_order IS DISTINCT FROM $2",
+                    row_id,
+                    idx as i32
+                )
+                .execute(&mut *self.db)
+                .await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Renumber a composite's sequences to dense 0..n-1 runs in their current
+    /// priority order (sort_order, then weight DESC, then created_at): the root
+    /// sequence (direct components + groups) and each group's member sequence.
     /// Used after a removal so deletions don't leave gaps. Idempotent.
     #[instrument(skip(self), fields(composite_id = %abbrev_uuid(&composite_model_id)), err)]
     pub async fn compact_component_sort_order(&mut self, composite_model_id: DeploymentId) -> Result<()> {
+        let root = self.fetch_root_sequence(composite_model_id).await?;
+        self.write_root_sequence(&root).await?;
+
         sqlx::query!(
             r#"
             WITH ranked AS (
-                SELECT id, ROW_NUMBER() OVER (ORDER BY sort_order ASC, weight DESC, created_at ASC) - 1 AS new_order
+                SELECT id, ROW_NUMBER() OVER (
+                    PARTITION BY group_id
+                    ORDER BY sort_order ASC, weight DESC, created_at ASC
+                ) - 1 AS new_order
                 FROM deployed_model_components
-                WHERE composite_model_id = $1
+                WHERE composite_model_id = $1 AND group_id IS NOT NULL
             )
             UPDATE deployed_model_components dmc
             SET sort_order = ranked.new_order
@@ -1224,8 +1319,9 @@ impl<'c> Deployments<'c> {
         Ok(())
     }
 
-    /// The sort_order to use when appending a new component: one past the
-    /// current maximum within the composite, or 0 if it has no components yet.
+    /// The sort_order to use when appending a new direct component or group to
+    /// the composite's root sequence: one past the current maximum across the
+    /// union of direct components and groups, or 0 if the sequence is empty.
     /// Callers serialize via [`Self::lock_composite`] so concurrent appends can't
     /// observe the same maximum. With removals compacting the sequence
     /// ([`Self::compact_component_sort_order`]) there are no gaps, so this is also
@@ -1233,7 +1329,16 @@ impl<'c> Deployments<'c> {
     #[instrument(skip(self), fields(composite_id = %abbrev_uuid(&composite_model_id)), err)]
     pub async fn next_component_sort_order(&mut self, composite_model_id: DeploymentId) -> Result<i32> {
         let next = sqlx::query_scalar!(
-            "SELECT COALESCE(MAX(sort_order) + 1, 0) FROM deployed_model_components WHERE composite_model_id = $1",
+            r#"
+            SELECT COALESCE(MAX(sort_order) + 1, 0)
+            FROM (
+                SELECT sort_order FROM deployed_model_components
+                WHERE composite_model_id = $1 AND group_id IS NULL
+                UNION ALL
+                SELECT sort_order FROM deployed_model_component_groups
+                WHERE composite_model_id = $1
+            ) members
+            "#,
             composite_model_id
         )
         .fetch_one(&mut *self.db)
@@ -1242,19 +1347,57 @@ impl<'c> Deployments<'c> {
         Ok(next.unwrap_or(0))
     }
 
-    /// Reassign sort_order across a composite's components by descending weight
-    /// (ties broken by insertion order), producing a dense, unique 0..n-1
-    /// sequence. Used when a composite switches to the `priority` strategy so the
-    /// previous weighting determines the failover order instead of leaving every
-    /// component at the default sort_order = 0.
+    /// The sort_order to use when appending a component to a group's member
+    /// sequence. Callers serialize via [`Self::lock_composite`].
+    #[instrument(skip(self), fields(group_id = %abbrev_uuid(&group_id)), err)]
+    pub async fn next_group_component_sort_order(&mut self, group_id: uuid::Uuid) -> Result<i32> {
+        let next = sqlx::query_scalar!(
+            "SELECT COALESCE(MAX(sort_order) + 1, 0) FROM deployed_model_components WHERE group_id = $1",
+            group_id
+        )
+        .fetch_one(&mut *self.db)
+        .await?;
+
+        Ok(next.unwrap_or(0))
+    }
+
+    /// Reassign sort_order by descending weight (ties broken by insertion order)
+    /// in every sequence of the composite: the root union of direct components +
+    /// groups, and each group's member sequence. Used when a composite switches
+    /// to the `priority` strategy so the previous weighting determines the
+    /// failover order instead of leaving every member at the default sort_order.
     #[instrument(skip(self), fields(composite_id = %abbrev_uuid(&composite_model_id)), err)]
     pub async fn renumber_components_by_weight(&mut self, composite_model_id: DeploymentId) -> Result<()> {
+        let root = sqlx::query!(
+            r#"
+            SELECT is_group as "is_group!", row_id as "row_id!"
+            FROM (
+                SELECT FALSE AS is_group, dmc.id AS row_id, dmc.weight, dmc.created_at
+                FROM deployed_model_components dmc
+                WHERE dmc.composite_model_id = $1 AND dmc.group_id IS NULL
+                UNION ALL
+                SELECT TRUE, g.id, g.weight, g.created_at
+                FROM deployed_model_component_groups g
+                WHERE g.composite_model_id = $1
+            ) members
+            ORDER BY weight DESC, created_at ASC
+            "#,
+            composite_model_id
+        )
+        .fetch_all(&mut *self.db)
+        .await?;
+        let root: Vec<(bool, uuid::Uuid)> = root.into_iter().map(|r| (r.is_group, r.row_id)).collect();
+        self.write_root_sequence(&root).await?;
+
         sqlx::query!(
             r#"
             WITH ranked AS (
-                SELECT id, ROW_NUMBER() OVER (ORDER BY weight DESC, created_at ASC) - 1 AS new_order
+                SELECT id, ROW_NUMBER() OVER (
+                    PARTITION BY group_id
+                    ORDER BY weight DESC, created_at ASC
+                ) - 1 AS new_order
                 FROM deployed_model_components
-                WHERE composite_model_id = $1
+                WHERE composite_model_id = $1 AND group_id IS NOT NULL
             )
             UPDATE deployed_model_components dmc
             SET sort_order = ranked.new_order
@@ -1270,11 +1413,32 @@ impl<'c> Deployments<'c> {
         Ok(())
     }
 
-    /// Move a component to `target_position` within its composite and renumber the
-    /// rest so sort_order stays a dense, unique 0..n-1 sequence. `target_position`
-    /// is clamped into range. Run inside a transaction so the multi-row rewrite is
-    /// atomic. This is what keeps two components from ever sharing a sort_order via
-    /// the reorder path.
+    /// Move a member of the root sequence (a direct component or a group) to
+    /// `target_position` and renumber the rest so sort_order stays a dense,
+    /// unique 0..n-1 sequence. `target_position` is clamped into range.
+    async fn move_root_member_to_position(
+        &mut self,
+        composite_model_id: DeploymentId,
+        member: (bool, uuid::Uuid),
+        target_position: i32,
+    ) -> Result<()> {
+        let mut ordered = self.fetch_root_sequence(composite_model_id).await?;
+
+        if let Some(pos) = ordered.iter().position(|m| *m == member) {
+            ordered.remove(pos);
+        }
+        let target = target_position.clamp(0, ordered.len() as i32) as usize;
+        ordered.insert(target, member);
+
+        self.write_root_sequence(&ordered).await
+    }
+
+    /// Move a component to `target_position` within its sequence — the root
+    /// union of direct components + groups when it is a direct member, or its
+    /// group's member sequence otherwise — and renumber that sequence to stay a
+    /// dense, unique 0..n-1 run. `target_position` is clamped into range. Run
+    /// inside a transaction so the multi-row rewrite is atomic. This is what
+    /// keeps two members from ever sharing a sort_order via the reorder path.
     #[instrument(skip(self), fields(composite_id = %abbrev_uuid(&composite_model_id), deployed_id = %abbrev_uuid(&deployed_model_id)), err)]
     async fn move_component_to_position(
         &mut self,
@@ -1282,38 +1446,54 @@ impl<'c> Deployments<'c> {
         deployed_model_id: DeploymentId,
         target_position: i32,
     ) -> Result<()> {
-        // Current order (same key the read paths use), as component ids.
-        let mut ordered: Vec<DeploymentId> = sqlx::query_scalar!(
-            "SELECT deployed_model_id FROM deployed_model_components
-             WHERE composite_model_id = $1
-             ORDER BY sort_order ASC, weight DESC, created_at ASC",
-            composite_model_id
+        let Some(row) = sqlx::query!(
+            "SELECT id, group_id FROM deployed_model_components
+             WHERE composite_model_id = $1 AND deployed_model_id = $2",
+            composite_model_id,
+            deployed_model_id
         )
-        .fetch_all(&mut *self.db)
-        .await?;
+        .fetch_optional(&mut *self.db)
+        .await?
+        else {
+            return Ok(());
+        };
 
-        // Splice the moved component out and reinsert it at the requested slot.
-        if let Some(pos) = ordered.iter().position(|id| *id == deployed_model_id) {
-            ordered.remove(pos);
+        match row.group_id {
+            None => {
+                self.move_root_member_to_position(composite_model_id, (false, row.id), target_position)
+                    .await
+            }
+            Some(group_id) => {
+                // Current order within the group (same key the read paths use).
+                let mut ordered: Vec<uuid::Uuid> = sqlx::query_scalar!(
+                    "SELECT id FROM deployed_model_components
+                     WHERE group_id = $1
+                     ORDER BY sort_order ASC, weight DESC, created_at ASC",
+                    group_id
+                )
+                .fetch_all(&mut *self.db)
+                .await?;
+
+                if let Some(pos) = ordered.iter().position(|id| *id == row.id) {
+                    ordered.remove(pos);
+                }
+                let target = target_position.clamp(0, ordered.len() as i32) as usize;
+                ordered.insert(target, row.id);
+
+                for (idx, id) in ordered.iter().enumerate() {
+                    sqlx::query!(
+                        "UPDATE deployed_model_components SET sort_order = $2
+                         WHERE id = $1 AND sort_order IS DISTINCT FROM $2",
+                        id,
+                        idx as i32
+                    )
+                    .execute(&mut *self.db)
+                    .await?;
+                }
+
+                Ok(())
+            }
         }
-        let target = target_position.clamp(0, ordered.len() as i32) as usize;
-        ordered.insert(target, deployed_model_id);
-
-        // Write back sort_order = index for the whole composite.
-        for (idx, id) in ordered.iter().enumerate() {
-            sqlx::query!(
-                "UPDATE deployed_model_components SET sort_order = $3
-                 WHERE composite_model_id = $1 AND deployed_model_id = $2
-                   AND sort_order IS DISTINCT FROM $3",
-                composite_model_id,
-                id,
-                idx as i32
-            )
-            .execute(&mut *self.db)
-            .await?;
-        }
-
-        Ok(())
     }
 
     /// Fetch a single component (with joined model/endpoint info) by its ids.
@@ -1333,6 +1513,8 @@ impl<'c> Deployments<'c> {
                 dmc.enabled,
                 dmc.sort_order,
                 dmc.created_at,
+                dmc.group_id as "group_id?",
+                g.name as "group_name?",
                 dm.alias as model_alias,
                 dm.model_name,
                 dm.description as model_description,
@@ -1344,6 +1526,7 @@ impl<'c> Deployments<'c> {
             FROM deployed_model_components dmc
             JOIN deployed_models dm ON dm.id = dmc.deployed_model_id
             LEFT JOIN inference_endpoints e ON e.id = dm.hosted_on
+            LEFT JOIN deployed_model_component_groups g ON g.id = dmc.group_id
             WHERE dmc.composite_model_id = $1 AND dmc.deployed_model_id = $2
             "#,
             composite_model_id,
@@ -1360,6 +1543,8 @@ impl<'c> Deployments<'c> {
             enabled: r.enabled,
             sort_order: r.sort_order,
             created_at: r.created_at,
+            group_id: r.group_id,
+            group_name: r.group_name,
             model_alias: r.model_alias,
             model_name: r.model_name,
             model_description: r.model_description,
@@ -1371,12 +1556,19 @@ impl<'c> Deployments<'c> {
         }))
     }
 
-    /// Update a component's weight and/or enabled status, and optionally move it to
-    /// a new priority position. When `sort_order` is supplied it is treated as a
-    /// target position: the component is moved there and the whole composite is
-    /// renumbered to a dense, unique 0..n-1 sequence (so two components can never
-    /// share a sort_order). When `sort_order` is `None` the existing order is left
-    /// untouched. Returns `None` if the component does not exist.
+    /// Update a component's weight and/or enabled status, move it between groups
+    /// and/or to a new priority position. When `group_id` is `Some(Some(id))` the
+    /// component moves into that group; `Some(None)` moves it back to the root
+    /// (direct membership); `None` leaves membership unchanged. A moved component
+    /// is appended to its destination sequence and both the source and destination
+    /// sequences are renumbered dense. When `sort_order` is supplied it is treated
+    /// as a target position within the component's (possibly new) sequence: the
+    /// component is moved there and the sequence is renumbered to a dense, unique
+    /// 0..n-1 run (so two members can never share a sort_order). Returns `None` if
+    /// the component does not exist.
+    ///
+    /// The destination group must belong to the same composite — callers validate
+    /// for a friendly error; the DB trigger is the backstop.
     ///
     /// Must run on a transaction connection: a position change rewrites multiple
     /// rows and the caller commits them together.
@@ -1388,18 +1580,201 @@ impl<'c> Deployments<'c> {
         weight: Option<i32>,
         enabled: Option<bool>,
         sort_order: Option<i32>,
+        group_id: Option<Option<uuid::Uuid>>,
     ) -> Result<Option<DeploymentComponentDBResponse>> {
-        // Apply weight/enabled first; this also tells us whether the component exists.
-        let exists = sqlx::query_scalar!(
+        // Apply weight/enabled first; this also tells us whether the component
+        // exists and which sequence it currently belongs to.
+        let Some(current) = sqlx::query!(
             "UPDATE deployed_model_components
              SET weight = COALESCE($3, weight),
                  enabled = COALESCE($4, enabled)
              WHERE composite_model_id = $1 AND deployed_model_id = $2
-             RETURNING id",
+             RETURNING id, group_id",
             composite_model_id,
             deployed_model_id,
             weight,
             enabled
+        )
+        .fetch_optional(&mut *self.db)
+        .await?
+        else {
+            return Ok(None);
+        };
+
+        // A group change appends the component to the destination sequence and
+        // compacts the source (and every other) sequence.
+        if let Some(new_group) = group_id
+            && new_group != current.group_id
+        {
+            let next = match new_group {
+                Some(g) => self.next_group_component_sort_order(g).await?,
+                None => self.next_component_sort_order(composite_model_id).await?,
+            };
+            sqlx::query!(
+                "UPDATE deployed_model_components SET group_id = $2, sort_order = $3 WHERE id = $1",
+                current.id,
+                new_group,
+                next
+            )
+            .execute(&mut *self.db)
+            .await?;
+            self.compact_component_sort_order(composite_model_id).await?;
+        }
+
+        // A supplied sort_order is a move-to-position request within the
+        // component's (possibly new) sequence; reindex that sequence.
+        if let Some(target_position) = sort_order {
+            self.move_component_to_position(composite_model_id, deployed_model_id, target_position)
+                .await?;
+        }
+
+        self.get_component(composite_model_id, deployed_model_id).await
+    }
+
+    // ===== Composite Model Component Group Management =====
+
+    /// Create a component group on a composite model. The caller assigns the
+    /// root-sequence position (via [`Self::next_component_sort_order`]) under
+    /// [`Self::lock_composite`]. A duplicate name within the composite surfaces
+    /// as a unique violation.
+    #[instrument(skip(self), fields(composite_id = %abbrev_uuid(&request.composite_model_id)), err)]
+    pub async fn add_component_group(&mut self, request: &DeploymentComponentGroupCreateDBRequest) -> Result<DeploymentComponentGroup> {
+        let row = sqlx::query!(
+            r#"
+            INSERT INTO deployed_model_component_groups (composite_model_id, name, lb_strategy, weight, enabled, sort_order)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            RETURNING id, composite_model_id, name, lb_strategy, weight, sort_order, enabled, created_at
+            "#,
+            request.composite_model_id,
+            request.name,
+            request.lb_strategy.as_str(),
+            request.weight,
+            request.enabled,
+            request.sort_order
+        )
+        .fetch_one(&mut *self.db)
+        .await?;
+
+        Ok(group_from_row!(row))
+    }
+
+    /// Fetch a single component group by its composite and group ids.
+    #[instrument(skip(self), fields(composite_id = %abbrev_uuid(&composite_model_id), group_id = %abbrev_uuid(&group_id)), err)]
+    pub async fn get_component_group(
+        &mut self,
+        composite_model_id: DeploymentId,
+        group_id: uuid::Uuid,
+    ) -> Result<Option<DeploymentComponentGroup>> {
+        let row = sqlx::query!(
+            r#"
+            SELECT id, composite_model_id, name, lb_strategy, weight, sort_order, enabled, created_at
+            FROM deployed_model_component_groups
+            WHERE composite_model_id = $1 AND id = $2
+            "#,
+            composite_model_id,
+            group_id
+        )
+        .fetch_optional(&mut *self.db)
+        .await?;
+
+        Ok(row.map(|r| group_from_row!(r)))
+    }
+
+    /// Get all component groups of a composite model in root-sequence order.
+    #[instrument(skip(self), fields(composite_id = %abbrev_uuid(&composite_model_id)), err)]
+    pub async fn get_component_groups(&mut self, composite_model_id: DeploymentId) -> Result<Vec<DeploymentComponentGroup>> {
+        let rows = sqlx::query!(
+            r#"
+            SELECT id, composite_model_id, name, lb_strategy, weight, sort_order, enabled, created_at
+            FROM deployed_model_component_groups
+            WHERE composite_model_id = $1
+            ORDER BY sort_order ASC, weight DESC, created_at ASC
+            "#,
+            composite_model_id
+        )
+        .fetch_all(&mut *self.db)
+        .await?;
+
+        Ok(rows.into_iter().map(|r| group_from_row!(r)).collect())
+    }
+
+    /// Get component groups for multiple composite models in bulk.
+    #[instrument(skip(self, composite_model_ids), fields(count = composite_model_ids.len()), err)]
+    pub async fn get_component_groups_bulk(
+        &mut self,
+        composite_model_ids: Vec<DeploymentId>,
+    ) -> Result<HashMap<DeploymentId, Vec<DeploymentComponentGroup>>> {
+        if composite_model_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let rows = sqlx::query!(
+            r#"
+            SELECT id, composite_model_id, name, lb_strategy, weight, sort_order, enabled, created_at
+            FROM deployed_model_component_groups
+            WHERE composite_model_id = ANY($1)
+            ORDER BY composite_model_id, sort_order ASC, weight DESC, created_at ASC
+            "#,
+            &composite_model_ids
+        )
+        .fetch_all(&mut *self.db)
+        .await?;
+
+        let mut map: HashMap<DeploymentId, Vec<DeploymentComponentGroup>> = HashMap::new();
+        for r in rows {
+            map.entry(r.composite_model_id).or_default().push(group_from_row!(r));
+        }
+
+        Ok(map)
+    }
+
+    /// All component groups across every composite, in root-sequence order per
+    /// composite. Intended for bulk config assembly (onwards sync).
+    #[instrument(skip(self), err)]
+    pub async fn get_all_component_groups(&mut self) -> Result<Vec<DeploymentComponentGroup>> {
+        let rows = sqlx::query!(
+            r#"
+            SELECT id, composite_model_id, name, lb_strategy, weight, sort_order, enabled, created_at
+            FROM deployed_model_component_groups
+            ORDER BY composite_model_id, sort_order ASC, weight DESC, created_at ASC
+            "#,
+        )
+        .fetch_all(&mut *self.db)
+        .await?;
+
+        Ok(rows.into_iter().map(|r| group_from_row!(r)).collect())
+    }
+
+    /// Update a component group's name/strategy/weight/enabled, and optionally
+    /// move it to a new position in the composite's root sequence (dense
+    /// renumber, clamped — same semantics as component moves). Returns `None`
+    /// if the group does not exist.
+    ///
+    /// Must run on a transaction connection under [`Self::lock_composite`].
+    #[instrument(skip(self, update), fields(composite_id = %abbrev_uuid(&composite_model_id), group_id = %abbrev_uuid(&group_id)), err)]
+    pub async fn update_component_group(
+        &mut self,
+        composite_model_id: DeploymentId,
+        group_id: uuid::Uuid,
+        update: &DeploymentComponentGroupUpdateDBRequest,
+        sort_order: Option<i32>,
+    ) -> Result<Option<DeploymentComponentGroup>> {
+        let exists = sqlx::query_scalar!(
+            r#"
+            UPDATE deployed_model_component_groups
+            SET name = COALESCE($3, name),
+                lb_strategy = COALESCE($4, lb_strategy),
+                weight = COALESCE($5, weight),
+                enabled = COALESCE($6, enabled)
+            WHERE composite_model_id = $1 AND id = $2
+            RETURNING id
+            "#,
+            composite_model_id,
+            group_id,
+            update.name.as_deref(),
+            update.lb_strategy.map(|s| s.as_str()),
+            update.weight,
+            update.enabled
         )
         .fetch_optional(&mut *self.db)
         .await?;
@@ -1408,13 +1783,57 @@ impl<'c> Deployments<'c> {
             return Ok(None);
         }
 
-        // A supplied sort_order is a move-to-position request; reindex the composite.
         if let Some(target_position) = sort_order {
-            self.move_component_to_position(composite_model_id, deployed_model_id, target_position)
+            self.move_root_member_to_position(composite_model_id, (true, group_id), target_position)
                 .await?;
         }
 
-        self.get_component(composite_model_id, deployed_model_id).await
+        self.get_component_group(composite_model_id, group_id).await
+    }
+
+    /// Delete a component group. By default its members are promoted to direct
+    /// components, appended to the end of the root sequence in their in-group
+    /// order; with `cascade` the member components are deleted instead. All
+    /// sequences are compacted afterwards. Returns `false` if the group does
+    /// not exist.
+    ///
+    /// Must run on a transaction connection under [`Self::lock_composite`].
+    #[instrument(skip(self), fields(composite_id = %abbrev_uuid(&composite_model_id), group_id = %abbrev_uuid(&group_id)), err)]
+    pub async fn delete_component_group(&mut self, composite_model_id: DeploymentId, group_id: uuid::Uuid, cascade: bool) -> Result<bool> {
+        if cascade {
+            sqlx::query!("DELETE FROM deployed_model_components WHERE group_id = $1", group_id)
+                .execute(&mut *self.db)
+                .await?;
+        } else {
+            // Stage members past the root tail, preserving their in-group order:
+            // per-group sort_orders are dense 0..m-1, so offsetting by the next
+            // root position keeps them contiguous after every current root
+            // member. The FK's ON DELETE SET NULL then promotes them, and the
+            // final compaction makes the root dense again.
+            let offset = self.next_component_sort_order(composite_model_id).await?;
+            sqlx::query!(
+                "UPDATE deployed_model_components SET sort_order = sort_order + $2 WHERE group_id = $1",
+                group_id,
+                offset
+            )
+            .execute(&mut *self.db)
+            .await?;
+        }
+
+        let deleted = sqlx::query!(
+            "DELETE FROM deployed_model_component_groups WHERE composite_model_id = $1 AND id = $2",
+            composite_model_id,
+            group_id
+        )
+        .execute(&mut *self.db)
+        .await?;
+
+        if deleted.rows_affected() == 0 {
+            return Ok(false);
+        }
+
+        self.compact_component_sort_order(composite_model_id).await?;
+        Ok(true)
     }
 
     /// Get throughput values for the given model aliases
@@ -4708,6 +5127,7 @@ mod tests {
                     weight: 50,
                     enabled: true,
                     sort_order,
+                    group_id: None,
                 })
                 .await
                 .unwrap();
@@ -4739,6 +5159,7 @@ mod tests {
                     weight,
                     enabled: true,
                     sort_order: 0,
+                    group_id: None,
                 })
                 .await
                 .unwrap();
@@ -4774,6 +5195,7 @@ mod tests {
                     weight: 50,
                     enabled: true,
                     sort_order: i as i32,
+                    group_id: None,
                 })
                 .await
                 .unwrap();
@@ -4786,7 +5208,7 @@ mod tests {
         {
             let mut repo = Deployments::new(tx.acquire().await.unwrap());
             let moved = repo
-                .update_component(composite, components[2], None, None, Some(0))
+                .update_component(composite, components[2], None, None, Some(0), None)
                 .await
                 .unwrap()
                 .expect("component exists");
@@ -4805,7 +5227,7 @@ mod tests {
         let mut tx = pool.begin().await.unwrap();
         {
             let mut repo = Deployments::new(tx.acquire().await.unwrap());
-            repo.update_component(composite, components[2], None, None, Some(999))
+            repo.update_component(composite, components[2], None, None, Some(999), None)
                 .await
                 .unwrap()
                 .expect("component exists");
@@ -4821,7 +5243,7 @@ mod tests {
         let mut tx = pool.begin().await.unwrap();
         {
             let mut repo = Deployments::new(tx.acquire().await.unwrap());
-            repo.update_component(composite, components[0], Some(99), None, None)
+            repo.update_component(composite, components[0], Some(99), None, None, None)
                 .await
                 .unwrap()
                 .expect("component exists");
@@ -4847,6 +5269,7 @@ mod tests {
                     weight: 50,
                     enabled: true,
                     sort_order: i as i32,
+                    group_id: None,
                 })
                 .await
                 .unwrap();
@@ -4878,5 +5301,534 @@ mod tests {
         };
         tx.commit().await.unwrap();
         assert_eq!(next, 2);
+    }
+
+    // ===== Component groups =====
+
+    /// Create a group on a composite through the repo (lock → append to root
+    /// sequence → insert), mirroring the handler flow. Returns the group id.
+    async fn create_group(pool: &PgPool, composite: DeploymentId, name: &str, weight: i32) -> uuid::Uuid {
+        let mut tx = pool.begin().await.unwrap();
+        let group = {
+            let mut repo = Deployments::new(tx.acquire().await.unwrap());
+            repo.lock_composite(composite).await.unwrap();
+            let sort_order = repo.next_component_sort_order(composite).await.unwrap();
+            repo.add_component_group(&DeploymentComponentGroupCreateDBRequest {
+                composite_model_id: composite,
+                name: name.to_string(),
+                lb_strategy: LoadBalancingStrategy::WeightedRandom,
+                weight,
+                enabled: true,
+                sort_order,
+            })
+            .await
+            .unwrap()
+        };
+        tx.commit().await.unwrap();
+        group.id
+    }
+
+    /// Link a component into the composite, optionally inside a group,
+    /// appending it to the correct sequence like the handler does.
+    async fn link_component(pool: &PgPool, composite: DeploymentId, component: DeploymentId, weight: i32, group: Option<uuid::Uuid>) {
+        let mut tx = pool.begin().await.unwrap();
+        {
+            let mut repo = Deployments::new(tx.acquire().await.unwrap());
+            repo.lock_composite(composite).await.unwrap();
+            let sort_order = match group {
+                Some(g) => repo.next_group_component_sort_order(g).await.unwrap(),
+                None => repo.next_component_sort_order(composite).await.unwrap(),
+            };
+            repo.add_component(&DeploymentComponentCreateDBRequest {
+                composite_model_id: composite,
+                deployed_model_id: component,
+                weight,
+                enabled: true,
+                sort_order,
+                group_id: group,
+            })
+            .await
+            .unwrap();
+        }
+        tx.commit().await.unwrap();
+    }
+
+    /// The composite's root sequence as (kind, external id, sort_order) in
+    /// priority order. Components are keyed by deployed_model_id, groups by id.
+    async fn root_sequence(pool: &PgPool, composite: DeploymentId) -> Vec<(String, uuid::Uuid, i32)> {
+        sqlx::query_as::<_, (String, uuid::Uuid, i32)>(
+            r#"
+            SELECT kind, ext_id, sort_order FROM (
+                SELECT 'component'::text AS kind, dmc.deployed_model_id AS ext_id,
+                       dmc.sort_order, dmc.weight, dmc.created_at
+                FROM deployed_model_components dmc
+                WHERE dmc.composite_model_id = $1 AND dmc.group_id IS NULL
+                UNION ALL
+                SELECT 'group', g.id, g.sort_order, g.weight, g.created_at
+                FROM deployed_model_component_groups g
+                WHERE g.composite_model_id = $1
+            ) m
+            ORDER BY sort_order ASC, weight DESC, created_at ASC
+            "#,
+        )
+        .bind(composite)
+        .fetch_all(pool)
+        .await
+        .unwrap()
+    }
+
+    /// (deployed_model_id, sort_order) pairs of a group's members in order.
+    async fn group_members(pool: &PgPool, group: uuid::Uuid) -> Vec<(DeploymentId, i32)> {
+        sqlx::query_as::<_, (DeploymentId, i32)>(
+            "SELECT deployed_model_id, sort_order FROM deployed_model_components
+             WHERE group_id = $1
+             ORDER BY sort_order ASC, weight DESC, created_at ASC",
+        )
+        .bind(group)
+        .fetch_all(pool)
+        .await
+        .unwrap()
+    }
+
+    fn assert_dense(seq: &[(String, uuid::Uuid, i32)]) {
+        let orders: Vec<i32> = seq.iter().map(|(_, _, s)| *s).collect();
+        let expected: Vec<i32> = (0..orders.len() as i32).collect();
+        assert_eq!(orders, expected, "root sequence must be a dense, unique 0..n-1 run");
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_group_occupies_one_root_slot(pool: PgPool) {
+        let user = create_test_user(&pool).await;
+        let (composite, components) = create_composite_and_components(&pool, user.id, 3).await;
+
+        // Root: [c0, c1], then the group takes slot 2, then c2 appends at 3.
+        link_component(&pool, composite, components[0], 50, None).await;
+        link_component(&pool, composite, components[1], 50, None).await;
+        let group = create_group(&pool, composite, "third-party", 1).await;
+        link_component(&pool, composite, components[2], 50, None).await;
+
+        let seq = root_sequence(&pool, composite).await;
+        assert_dense(&seq);
+        assert_eq!(
+            seq.iter().map(|(k, id, _)| (k.as_str(), *id)).collect::<Vec<_>>(),
+            vec![
+                ("component", components[0]),
+                ("component", components[1]),
+                ("group", group),
+                ("component", components[2]),
+            ]
+        );
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_group_members_have_per_group_sequence(pool: PgPool) {
+        let user = create_test_user(&pool).await;
+        let (composite, components) = create_composite_and_components(&pool, user.id, 3).await;
+
+        let group = create_group(&pool, composite, "pool", 1).await;
+        link_component(&pool, composite, components[0], 50, Some(group)).await;
+        link_component(&pool, composite, components[1], 50, Some(group)).await;
+        link_component(&pool, composite, components[2], 50, Some(group)).await;
+
+        // Members get their own dense 0..m-1 run.
+        assert_eq!(
+            group_members(&pool, group).await,
+            vec![(components[0], 0), (components[1], 1), (components[2], 2)]
+        );
+        // The root sequence holds only the group.
+        let seq = root_sequence(&pool, composite).await;
+        assert_dense(&seq);
+        assert_eq!(seq.len(), 1);
+        assert_eq!(seq[0].1, group);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_move_component_between_group_and_root(pool: PgPool) {
+        let user = create_test_user(&pool).await;
+        let (composite, components) = create_composite_and_components(&pool, user.id, 4).await;
+
+        // Root: [c0, groupA(c1, c2), c3]
+        link_component(&pool, composite, components[0], 50, None).await;
+        let group_a = create_group(&pool, composite, "a", 1).await;
+        link_component(&pool, composite, components[1], 50, Some(group_a)).await;
+        link_component(&pool, composite, components[2], 50, Some(group_a)).await;
+        link_component(&pool, composite, components[3], 50, None).await;
+
+        // Move c1 out of the group to the root: appended at the tail, source compacted.
+        let mut tx = pool.begin().await.unwrap();
+        {
+            let mut repo = Deployments::new(tx.acquire().await.unwrap());
+            repo.lock_composite(composite).await.unwrap();
+            let moved = repo
+                .update_component(composite, components[1], None, None, None, Some(None))
+                .await
+                .unwrap()
+                .expect("component exists");
+            assert_eq!(moved.group_id, None);
+        }
+        tx.commit().await.unwrap();
+
+        let seq = root_sequence(&pool, composite).await;
+        assert_dense(&seq);
+        assert_eq!(seq.last().unwrap().1, components[1], "promoted member appends to root tail");
+        assert_eq!(group_members(&pool, group_a).await, vec![(components[2], 0)]);
+
+        // Move c3 into the group: appended after the remaining member.
+        let mut tx = pool.begin().await.unwrap();
+        {
+            let mut repo = Deployments::new(tx.acquire().await.unwrap());
+            repo.lock_composite(composite).await.unwrap();
+            let moved = repo
+                .update_component(composite, components[3], None, None, None, Some(Some(group_a)))
+                .await
+                .unwrap()
+                .expect("component exists");
+            assert_eq!(moved.group_id, Some(group_a));
+            assert_eq!(moved.group_name.as_deref(), Some("a"));
+        }
+        tx.commit().await.unwrap();
+
+        assert_eq!(group_members(&pool, group_a).await, vec![(components[2], 0), (components[3], 1)]);
+        let seq = root_sequence(&pool, composite).await;
+        assert_dense(&seq);
+        assert!(!seq.iter().any(|(_, id, _)| *id == components[3]));
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_move_component_position_within_group(pool: PgPool) {
+        let user = create_test_user(&pool).await;
+        let (composite, components) = create_composite_and_components(&pool, user.id, 3).await;
+
+        let group = create_group(&pool, composite, "pool", 1).await;
+        for c in &components {
+            link_component(&pool, composite, *c, 50, Some(group)).await;
+        }
+
+        // Move the last member to the front of its group.
+        let mut tx = pool.begin().await.unwrap();
+        {
+            let mut repo = Deployments::new(tx.acquire().await.unwrap());
+            repo.lock_composite(composite).await.unwrap();
+            let moved = repo
+                .update_component(composite, components[2], None, None, Some(0), None)
+                .await
+                .unwrap()
+                .expect("component exists");
+            assert_eq!(moved.sort_order, 0);
+        }
+        tx.commit().await.unwrap();
+
+        assert_eq!(
+            group_members(&pool, group).await,
+            vec![(components[2], 0), (components[0], 1), (components[1], 2)]
+        );
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_move_group_within_root_sequence(pool: PgPool) {
+        let user = create_test_user(&pool).await;
+        let (composite, components) = create_composite_and_components(&pool, user.id, 2).await;
+
+        // Root: [c0, c1, group]
+        link_component(&pool, composite, components[0], 50, None).await;
+        link_component(&pool, composite, components[1], 50, None).await;
+        let group = create_group(&pool, composite, "pool", 1).await;
+
+        // Move the group to the front of the root sequence.
+        let mut tx = pool.begin().await.unwrap();
+        {
+            let mut repo = Deployments::new(tx.acquire().await.unwrap());
+            repo.lock_composite(composite).await.unwrap();
+            let updated = repo
+                .update_component_group(composite, group, &DeploymentComponentGroupUpdateDBRequest::default(), Some(0))
+                .await
+                .unwrap()
+                .expect("group exists");
+            assert_eq!(updated.sort_order, 0);
+        }
+        tx.commit().await.unwrap();
+
+        let seq = root_sequence(&pool, composite).await;
+        assert_dense(&seq);
+        assert_eq!(
+            seq.iter().map(|(_, id, _)| *id).collect::<Vec<_>>(),
+            vec![group, components[0], components[1]]
+        );
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_delete_group_promotes_members_to_root_tail(pool: PgPool) {
+        let user = create_test_user(&pool).await;
+        let (composite, components) = create_composite_and_components(&pool, user.id, 3).await;
+
+        // Root: [c0, group(m1, m2)]
+        link_component(&pool, composite, components[0], 50, None).await;
+        let group = create_group(&pool, composite, "pool", 1).await;
+        link_component(&pool, composite, components[1], 50, Some(group)).await;
+        link_component(&pool, composite, components[2], 50, Some(group)).await;
+
+        let mut tx = pool.begin().await.unwrap();
+        {
+            let mut repo = Deployments::new(tx.acquire().await.unwrap());
+            repo.lock_composite(composite).await.unwrap();
+            assert!(repo.delete_component_group(composite, group, false).await.unwrap());
+        }
+        tx.commit().await.unwrap();
+
+        // Members promoted to the root tail in their in-group order; dense.
+        let seq = root_sequence(&pool, composite).await;
+        assert_dense(&seq);
+        assert_eq!(
+            seq.iter().map(|(k, id, _)| (k.as_str(), *id)).collect::<Vec<_>>(),
+            vec![
+                ("component", components[0]),
+                ("component", components[1]),
+                ("component", components[2]),
+            ]
+        );
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_delete_group_cascade_removes_members(pool: PgPool) {
+        let user = create_test_user(&pool).await;
+        let (composite, components) = create_composite_and_components(&pool, user.id, 3).await;
+
+        // Root: [group(m0, m1), c2]
+        let group = create_group(&pool, composite, "pool", 1).await;
+        link_component(&pool, composite, components[0], 50, Some(group)).await;
+        link_component(&pool, composite, components[1], 50, Some(group)).await;
+        link_component(&pool, composite, components[2], 50, None).await;
+
+        let mut tx = pool.begin().await.unwrap();
+        {
+            let mut repo = Deployments::new(tx.acquire().await.unwrap());
+            repo.lock_composite(composite).await.unwrap();
+            assert!(repo.delete_component_group(composite, group, true).await.unwrap());
+        }
+        tx.commit().await.unwrap();
+
+        // Members are gone; the remaining direct component compacts to slot 0.
+        let seq = root_sequence(&pool, composite).await;
+        assert_eq!(seq.iter().map(|(_, id, s)| (*id, *s)).collect::<Vec<_>>(), vec![(components[2], 0)]);
+        let remaining: Vec<(DeploymentId, i32)> =
+            sqlx::query_as("SELECT deployed_model_id, sort_order FROM deployed_model_components WHERE composite_model_id = $1")
+                .bind(composite)
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(remaining, vec![(components[2], 0)]);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_delete_missing_group_returns_false(pool: PgPool) {
+        let user = create_test_user(&pool).await;
+        let (composite, _) = create_composite_and_components(&pool, user.id, 0).await;
+
+        let mut tx = pool.begin().await.unwrap();
+        {
+            let mut repo = Deployments::new(tx.acquire().await.unwrap());
+            repo.lock_composite(composite).await.unwrap();
+            assert!(!repo.delete_component_group(composite, uuid::Uuid::new_v4(), false).await.unwrap());
+        }
+        tx.commit().await.unwrap();
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_duplicate_group_name_is_unique_violation(pool: PgPool) {
+        let user = create_test_user(&pool).await;
+        let (composite, _) = create_composite_and_components(&pool, user.id, 0).await;
+
+        create_group(&pool, composite, "pool", 1).await;
+
+        let mut conn = pool.acquire().await.unwrap();
+        let mut repo = Deployments::new(&mut conn);
+        let err = repo
+            .add_component_group(&DeploymentComponentGroupCreateDBRequest {
+                composite_model_id: composite,
+                name: "pool".to_string(),
+                lb_strategy: LoadBalancingStrategy::Priority,
+                weight: 1,
+                enabled: true,
+                sort_order: 1,
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DbError::UniqueViolation { .. }), "got {err:?}");
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_group_on_non_composite_rejected_by_trigger(pool: PgPool) {
+        let user = create_test_user(&pool).await;
+        let (_, components) = create_composite_and_components(&pool, user.id, 1).await;
+
+        let mut conn = pool.acquire().await.unwrap();
+        let mut repo = Deployments::new(&mut conn);
+        let result = repo
+            .add_component_group(&DeploymentComponentGroupCreateDBRequest {
+                composite_model_id: components[0],
+                name: "pool".to_string(),
+                lb_strategy: LoadBalancingStrategy::WeightedRandom,
+                weight: 1,
+                enabled: true,
+                sort_order: 0,
+            })
+            .await;
+        assert!(result.is_err(), "standard models must not accept groups");
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_component_group_must_match_composite(pool: PgPool) {
+        let user = create_test_user(&pool).await;
+        let (composite_a, _) = create_composite_and_components(&pool, user.id, 0).await;
+        let (composite_b, components_b) = create_composite_and_components(&pool, user.id, 1).await;
+
+        let foreign_group = create_group(&pool, composite_a, "pool", 1).await;
+
+        let mut conn = pool.acquire().await.unwrap();
+        let mut repo = Deployments::new(&mut conn);
+        let result = repo
+            .add_component(&DeploymentComponentCreateDBRequest {
+                composite_model_id: composite_b,
+                deployed_model_id: components_b[0],
+                weight: 1,
+                enabled: true,
+                sort_order: 0,
+                group_id: Some(foreign_group),
+            })
+            .await;
+        assert!(result.is_err(), "a component's group must belong to the same composite");
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_renumber_by_weight_covers_root_union_and_groups(pool: PgPool) {
+        let user = create_test_user(&pool).await;
+        let (composite, components) = create_composite_and_components(&pool, user.id, 4).await;
+
+        // Root: c0 (w10), group (w50, members m1 w20 / m2 w80), c3 (w30).
+        link_component(&pool, composite, components[0], 10, None).await;
+        let group = create_group(&pool, composite, "pool", 50).await;
+        link_component(&pool, composite, components[1], 20, Some(group)).await;
+        link_component(&pool, composite, components[2], 80, Some(group)).await;
+        link_component(&pool, composite, components[3], 30, None).await;
+
+        let mut tx = pool.begin().await.unwrap();
+        {
+            let mut repo = Deployments::new(tx.acquire().await.unwrap());
+            repo.lock_composite(composite).await.unwrap();
+            repo.renumber_components_by_weight(composite).await.unwrap();
+        }
+        tx.commit().await.unwrap();
+
+        // Root by weight DESC: group (50), c3 (30), c0 (10).
+        let seq = root_sequence(&pool, composite).await;
+        assert_dense(&seq);
+        assert_eq!(
+            seq.iter().map(|(_, id, _)| *id).collect::<Vec<_>>(),
+            vec![group, components[3], components[0]]
+        );
+        // Group members by weight DESC: m2 (80), m1 (20).
+        assert_eq!(group_members(&pool, group).await, vec![(components[2], 0), (components[1], 1)]);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_remove_grouped_component_compacts_group(pool: PgPool) {
+        let user = create_test_user(&pool).await;
+        let (composite, components) = create_composite_and_components(&pool, user.id, 3).await;
+
+        let group = create_group(&pool, composite, "pool", 1).await;
+        for c in &components {
+            link_component(&pool, composite, *c, 50, Some(group)).await;
+        }
+
+        // Mirror the DELETE handler: remove then compact.
+        let mut tx = pool.begin().await.unwrap();
+        {
+            let mut repo = Deployments::new(tx.acquire().await.unwrap());
+            repo.lock_composite(composite).await.unwrap();
+            assert!(repo.remove_component(composite, components[1]).await.unwrap());
+            repo.compact_component_sort_order(composite).await.unwrap();
+        }
+        tx.commit().await.unwrap();
+
+        assert_eq!(group_members(&pool, group).await, vec![(components[0], 0), (components[2], 1)]);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_get_all_component_groups_bulk(pool: PgPool) {
+        let user = create_test_user(&pool).await;
+        let (composite_a, _) = create_composite_and_components(&pool, user.id, 0).await;
+        let (composite_b, _) = create_composite_and_components(&pool, user.id, 0).await;
+
+        let group_a = create_group(&pool, composite_a, "a", 10).await;
+        let group_b1 = create_group(&pool, composite_b, "b1", 20).await;
+        let group_b2 = create_group(&pool, composite_b, "b2", 30).await;
+
+        let mut conn = pool.acquire().await.unwrap();
+        let mut repo = Deployments::new(&mut conn);
+
+        let all = repo.get_all_component_groups().await.unwrap();
+        let mine: Vec<_> = all
+            .iter()
+            .filter(|g| g.composite_model_id == composite_a || g.composite_model_id == composite_b)
+            .collect();
+        assert_eq!(mine.len(), 3);
+        let a = mine.iter().find(|g| g.id == group_a).unwrap();
+        assert_eq!((a.name.as_str(), a.weight, a.sort_order, a.enabled), ("a", 10, 0, true));
+        assert_eq!(a.lb_strategy, LoadBalancingStrategy::WeightedRandom);
+
+        let by_composite = repo.get_component_groups_bulk(vec![composite_a, composite_b]).await.unwrap();
+        assert_eq!(by_composite[&composite_a].len(), 1);
+        assert_eq!(
+            by_composite[&composite_b].iter().map(|g| g.id).collect::<Vec<_>>(),
+            vec![group_b1, group_b2]
+        );
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_update_group_fields(pool: PgPool) {
+        let user = create_test_user(&pool).await;
+        let (composite, _) = create_composite_and_components(&pool, user.id, 0).await;
+        let group = create_group(&pool, composite, "pool", 1).await;
+
+        let mut tx = pool.begin().await.unwrap();
+        let updated = {
+            let mut repo = Deployments::new(tx.acquire().await.unwrap());
+            repo.lock_composite(composite).await.unwrap();
+            repo.update_component_group(
+                composite,
+                group,
+                &DeploymentComponentGroupUpdateDBRequest {
+                    name: Some("renamed".to_string()),
+                    lb_strategy: Some(LoadBalancingStrategy::Priority),
+                    weight: Some(42),
+                    enabled: Some(false),
+                },
+                None,
+            )
+            .await
+            .unwrap()
+            .expect("group exists")
+        };
+        tx.commit().await.unwrap();
+
+        assert_eq!(updated.name, "renamed");
+        assert_eq!(updated.lb_strategy, LoadBalancingStrategy::Priority);
+        assert_eq!(updated.weight, 42);
+        assert!(!updated.enabled);
     }
 }

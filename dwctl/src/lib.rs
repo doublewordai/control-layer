@@ -1372,6 +1372,22 @@ pub async fn build_router(
             "/models/{id}/components/{component_id}",
             delete(api::handlers::deployments::remove_model_component),
         )
+        // Composite model component groups (named sub-pools with their own lb
+        // strategy). The path parameter is named `deployment_id` to match the
+        // existing GET /models/{deployment_id}/groups (model access groups) —
+        // axum requires consistent parameter names for a shared path.
+        .route(
+            "/models/{deployment_id}/groups",
+            post(api::handlers::deployments::create_model_group),
+        )
+        .route(
+            "/models/{deployment_id}/groups/{group_id}",
+            patch(api::handlers::deployments::update_model_group),
+        )
+        .route(
+            "/models/{deployment_id}/groups/{group_id}",
+            delete(api::handlers::deployments::delete_model_group),
+        )
         // Image content store — short-lived signed URL for normalised
         // image bytes the user has previously submitted. Authorisation
         // is per-user via the image_access table.

@@ -7,9 +7,10 @@ use crate::AppState;
 use crate::auth;
 use crate::client::HttpClient;
 use crate::errors::{ErrorResponseBody, OnwardsErrorResponse};
+use crate::load_balancer::SelectionGuard;
 use crate::models::ListModelResponse;
 use crate::sse::SseBufferedStream;
-use crate::target::{ConcurrencyGuard, RoutingAction, Target};
+use crate::target::{RoutingAction, Target};
 use axum::{
     Json,
     extract::Request,
@@ -185,14 +186,14 @@ impl Drop for InflightGuard {
     }
 }
 
-/// A stream wrapper that keeps a [`ConcurrencyGuard`] and [`InflightGuard`] alive
+/// A stream wrapper that keeps a [`SelectionGuard`] and [`InflightGuard`] alive
 /// until the stream is fully consumed or dropped. This ensures the active connection
-/// count and inflight gauge are decremented when the response body finishes, not
-/// when the handler returns — critical for streaming responses where the body
-/// outlives the handler.
+/// counts (leaf and, for grouped providers, the group node) and inflight gauge are
+/// decremented when the response body finishes, not when the handler returns —
+/// critical for streaming responses where the body outlives the handler.
 struct GuardedStream<S> {
     inner: S,
-    _guard: ConcurrencyGuard,
+    _guard: SelectionGuard,
     _inflight_guard: InflightGuard,
 }
 
@@ -572,8 +573,11 @@ pub async fn target_message_handler<T: HttpClient>(
     };
 
     if let Some(reasoning) = canonical_reasoning.as_ref() {
-        for provider in pool.providers() {
-            if let Some(config) = provider.target.reasoning_translation.as_ref() {
+        for provider in pool.leaves() {
+            if let Some(config) = provider
+                .target()
+                .and_then(|t| t.reasoning_translation.as_ref())
+            {
                 config
                     .validate_request(&canonical_request_path, reasoning)
                     .map_err(|error| OnwardsErrorResponse::reasoning(&error))?;
@@ -1387,12 +1391,10 @@ pub async fn target_message_handler<T: HttpClient>(
         if let Some(ref header_name) = state.response_id_header
             && crate::response_id::path_supports_id_override(&path_and_query)
             && (200..300).contains(&status)
-        {
-            if let Some(override_id) =
+            && let Some(override_id) =
                 crate::response_id::extract_override_id(&original_headers, header_name)
-            {
-                crate::response_id::patch_response_body_id(&mut response, override_id).await;
-            }
+        {
+            crate::response_id::patch_response_body_id(&mut response, override_id).await;
         }
 
         // Add custom response headers

@@ -437,6 +437,41 @@ pub struct DeploymentComponentCreateDBRequest {
     pub weight: i32,
     pub enabled: bool,
     pub sort_order: i32,
+    /// Group this component belongs to. None = direct member of the composite.
+    pub group_id: Option<Uuid>,
+}
+
+/// A component group of a composite model (database row)
+#[derive(Debug, Clone)]
+pub struct DeploymentComponentGroup {
+    pub id: Uuid,
+    pub composite_model_id: DeploymentId,
+    pub name: String,
+    pub lb_strategy: LoadBalancingStrategy,
+    pub weight: i32,
+    pub sort_order: i32,
+    pub enabled: bool,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Database request for creating a component group on a composite model
+#[derive(Debug, Clone)]
+pub struct DeploymentComponentGroupCreateDBRequest {
+    pub composite_model_id: DeploymentId,
+    pub name: String,
+    pub lb_strategy: LoadBalancingStrategy,
+    pub weight: i32,
+    pub enabled: bool,
+    pub sort_order: i32,
+}
+
+/// Database request for updating a component group (None = no change)
+#[derive(Debug, Clone, Default)]
+pub struct DeploymentComponentGroupUpdateDBRequest {
+    pub name: Option<String>,
+    pub lb_strategy: Option<LoadBalancingStrategy>,
+    pub weight: Option<i32>,
+    pub enabled: Option<bool>,
 }
 
 /// Database response for a deployment component (flat structure with joined model info)
@@ -450,6 +485,10 @@ pub struct DeploymentComponentDBResponse {
     pub enabled: bool,
     pub sort_order: i32,
     pub created_at: DateTime<Utc>,
+    /// Group membership (None = direct member of the composite)
+    pub group_id: Option<Uuid>,
+    /// Joined group name when the component belongs to a group
+    pub group_name: Option<String>,
     // Joined model fields
     pub model_alias: String,
     pub model_name: String,
