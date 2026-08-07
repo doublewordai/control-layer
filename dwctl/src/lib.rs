@@ -2319,14 +2319,20 @@ impl BackgroundServices {
         // straight from here to a proxied request can beat the apply and get a
         // 403 for an API key that is already committed to the database.
         //
-        // Both the alias set and each pool's authorised-key count are checked:
-        // a stale pool that already has the right alias but not yet the new key
-        // is exactly what produces the spurious 403.
-        let expected: Vec<(String, usize)> = new_targets
+        // The alias set and each pool's authorised keys are compared by
+        // identity, not by count: a pool can carry the right number of keys and
+        // still not the one under test, which produces exactly the same 403 as
+        // a pool with no keys at all.
+        let expected: Vec<(String, Option<onwards::auth::KeySet>)> = new_targets
             .targets
             .iter()
-            .map(|entry| (entry.key().clone(), entry.value().keys().map_or(0, |keys| keys.len())))
+            .map(|entry| (entry.key().clone(), entry.value().keys().cloned()))
             .collect();
+
+        // Kept so the update can be re-asserted below. `Targets` is a handle of
+        // `Arc` maps and `receive_updates` only reads from the value it is
+        // given, so re-sending this clone is safe.
+        let desired = new_targets.clone();
 
         // Send through the watch channel (same as automatic sync)
         sender
@@ -2343,30 +2349,48 @@ impl BackgroundServices {
         // (e.g. only an endpoint URL) - such an update matches immediately and
         // returns without waiting, exactly as before.
         //
-        // The budget is deliberately longer than the config listener's periodic
-        // fallback sync: the listener shares this watch channel, so a periodic
-        // reload that started loading just before the test's own write could
-        // land after this send and briefly apply the older config. The next
-        // fallback sync corrects that, and waiting past one interval means the
-        // helper rides it out instead of failing the test.
+        // Waiting for the state to appear once is not enough. The config
+        // listener shares this watch channel, and a reload it started before
+        // the test's own write can finish afterwards and apply that older
+        // snapshot over this one - dropping the key again in the window between
+        // this function returning and the test issuing its request. So the
+        // state has to hold for a settle window, and any regression re-asserts
+        // the desired config rather than waiting for the listener's periodic
+        // sync to come back around.
+        const SETTLE: std::time::Duration = std::time::Duration::from_millis(250);
+        const REASSERT_EVERY: std::time::Duration = std::time::Duration::from_millis(200);
+
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let mut stable_since: Option<std::time::Instant> = None;
+        let mut last_reassert = std::time::Instant::now();
+
         loop {
             let live = &self.onwards_targets.targets;
             let applied = live.len() == expected.len()
-                && expected.iter().all(|(alias, key_count)| {
-                    live.get(alias)
-                        .is_some_and(|pool| pool.keys().map_or(0, |keys| keys.len()) == *key_count)
-                });
+                && expected
+                    .iter()
+                    .all(|(alias, keys)| live.get(alias).is_some_and(|pool| pool.keys() == keys.as_ref()));
 
+            let now = std::time::Instant::now();
             if applied {
-                return Ok(());
+                if now.duration_since(*stable_since.get_or_insert(now)) >= SETTLE {
+                    return Ok(());
+                }
+            } else {
+                stable_since = None;
+                if now.duration_since(last_reassert) >= REASSERT_EVERY {
+                    sender
+                        .send(desired.clone())
+                        .map_err(|_| anyhow::anyhow!("Failed to re-send targets update"))?;
+                    last_reassert = now;
+                }
             }
 
-            if std::time::Instant::now() >= deadline {
-                anyhow::bail!("onwards did not apply the config update within 5s");
+            if now >= deadline {
+                anyhow::bail!("onwards did not apply the config update within 15s");
             }
 
-            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
         }
     }
 
