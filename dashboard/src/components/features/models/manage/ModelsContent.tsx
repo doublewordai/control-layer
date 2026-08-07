@@ -71,6 +71,7 @@ const COMPLETION_WINDOWS: Record<
 > = {
   "1h": { label: "Async", icon: Zap, sort: 0 },
   "24h": { label: "Batch", icon: Clock, sort: 1 },
+  background: { label: "Background", icon: Clock, sort: 2 },
 };
 
 const formatReleaseDate = (dateStr: string): string => {
@@ -714,9 +715,12 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
 
                                 // Determine which batch windows this model supports:
                                 // per-model override > global config defaults
-                                const availableWindows = [...(batchDenied
+                                const availableWindows = [...new Set(batchDenied
                                   ? []
-                                  : model.allowed_batch_completion_windows ?? globalBatchWindows
+                                  : [
+                                      ...(model.allowed_batch_completion_windows ?? globalBatchWindows),
+                                      "background",
+                                    ]
                                 )].sort((a: string, b: string) =>
                                   (COMPLETION_WINDOWS[a]?.sort ?? 99) - (COMPLETION_WINDOWS[b]?.sort ?? 99)
                                 );
@@ -750,14 +754,21 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
                                   },
                                   ...availableWindows.map((window: string) => {
                                     const cw = COMPLETION_WINDOWS[window];
-                                    const tariff = batchTariffsByWindow.get(window);
+                                    const tariff =
+                                      batchTariffsByWindow.get(window) ??
+                                      (window === "background"
+                                        ? batchTariffsByWindow.get("24h")
+                                        : undefined);
                                     return {
                                       key: `batch-${window}`,
                                       label: cw?.label ?? window,
                                       icon: cw?.icon ?? Clock,
                                       denied: false,
                                       deniedMessage: "",
-                                      description: `${window} completion window`,
+                                      description:
+                                        window === "background"
+                                          ? "Best-effort background processing"
+                                          : `${window} completion window`,
                                       inputPrice: tariff?.input_price_per_token ?? null,
                                       outputPrice: tariff?.output_price_per_token ?? null,
                                     };

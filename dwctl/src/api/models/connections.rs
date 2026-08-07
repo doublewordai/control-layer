@@ -60,7 +60,8 @@ pub struct TriggerSyncRequest {
     pub file_keys: Option<Vec<String>>,
     /// Override default endpoint for batch creation.
     pub endpoint: Option<String>,
-    /// Override default completion window.
+    /// Override the default completion window. Use `background` for
+    /// best-effort processing (requires the BackgroundInferenceUser role).
     pub completion_window: Option<String>,
     /// When true, skip dedup and re-ingest files even if already synced.
     #[serde(default)]

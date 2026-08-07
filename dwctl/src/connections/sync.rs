@@ -906,6 +906,7 @@ pub(crate) async fn run_activate_batch<P: PoolProvider + Clone + Send + Sync + '
         .and_then(|v| v.as_str())
         .unwrap_or("24h")
         .to_string();
+    let is_background = completion_window == "background";
 
     // 3. Load sync entry early — needed for retry detection (batch_id already set)
     //    and for provenance metadata / validation errors later.
@@ -933,7 +934,7 @@ pub(crate) async fn run_activate_batch<P: PoolProvider + Clone + Send + Sync + '
     //     file is re-ingested and retried automatically on the next sync once the
     //     creditor verifies or earlier volume drains. No batch row is created,
     //     and the actionable message rides on the entry's `error` column.
-    if sync_entry.batch_id.is_none() {
+    if sync_entry.batch_id.is_none() && !is_background {
         use crate::db::handlers::users::Users;
 
         let (owner_id, owner_verified) = {
@@ -982,7 +983,9 @@ pub(crate) async fn run_activate_batch<P: PoolProvider + Clone + Send + Sync + '
         }
     }
 
-    // 4. Capacity check — reserve capacity before creating the batch.
+    // 4. Validate referenced models, then reserve foreground SLA capacity before
+    //    creating the batch. Background work must still target existing models,
+    //    but deliberately bypasses the foreground reservation.
     //    On retries where a previous attempt already created AND populated a batch,
     //    skip reservation since those requests are already counted in pending.
     //    If the batch exists but isn't populated yet (failure between create and populate),
@@ -1000,7 +1003,6 @@ pub(crate) async fn run_activate_batch<P: PoolProvider + Clone + Send + Sync + '
     let reservation_ids = if batch_already_populated {
         Vec::new()
     } else {
-        use crate::api::handlers::sla_capacity::{CapacityError, CapacityReservationInput, reserve_capacity};
         use crate::db::handlers::deployments::Deployments;
 
         let file_stats = state
@@ -1022,17 +1024,12 @@ pub(crate) async fn run_activate_batch<P: PoolProvider + Clone + Send + Sync + '
         } else {
             let model_aliases: Vec<String> = file_model_counts.keys().cloned().collect();
 
-            let batch_model_info = {
-                let mut conn = dwctl.acquire().await?;
-                Deployments::new(&mut conn).get_batch_model_info(&model_aliases).await?
-            };
-
             let model_ids_by_alias = {
                 let mut conn = dwctl.acquire().await?;
                 Deployments::new(&mut conn).get_model_ids_by_aliases(&model_aliases).await?
             };
 
-            // Validate all models exist (deleted/missing models would bypass capacity checks)
+            // Validate all models exist before creating any kind of batch.
             let missing: Vec<&str> = model_aliases
                 .iter()
                 .filter(|a| !model_ids_by_alias.contains_key(*a))
@@ -1042,28 +1039,38 @@ pub(crate) async fn run_activate_batch<P: PoolProvider + Clone + Send + Sync + '
                 return Err(ActivateError::Fatal(format!("model(s) no longer available: {}", missing.join(", "))).into());
             }
 
-            let config = state.config.snapshot();
-            let cap_input = CapacityReservationInput {
-                completion_window: &completion_window,
-                file_model_counts: &file_model_counts,
-                model_throughputs: &batch_model_info.throughputs,
-                model_ids_by_alias: &model_ids_by_alias,
-                default_throughput: config.batches.default_throughput,
-                relaxation_factor: config.batches.relaxation_factor(&completion_window),
-                reservation_ttl_secs: config.batches.reservation_ttl_secs,
-                include_pending_counts: config.batches.pending_capacity_counts_enabled,
-            };
+            if is_background {
+                Vec::new()
+            } else {
+                use crate::api::handlers::sla_capacity::{CapacityError, CapacityReservationInput, reserve_capacity};
 
-            match reserve_capacity(dwctl, &*state.request_manager, &cap_input).await {
-                Ok(ids) => ids,
-                Err(CapacityError::InsufficientCapacity { completion_window, models }) => {
-                    return Err(ActivateError::Retryable(format!(
-                        "insufficient capacity for {completion_window} window (models: {models})"
-                    ))
-                    .into());
-                }
-                Err(CapacityError::Internal(msg)) => {
-                    return Err(anyhow::anyhow!("capacity reservation: {msg}"));
+                let batch_model_info = {
+                    let mut conn = dwctl.acquire().await?;
+                    Deployments::new(&mut conn).get_batch_model_info(&model_aliases).await?
+                };
+                let config = state.config.snapshot();
+                let cap_input = CapacityReservationInput {
+                    completion_window: &completion_window,
+                    file_model_counts: &file_model_counts,
+                    model_throughputs: &batch_model_info.throughputs,
+                    model_ids_by_alias: &model_ids_by_alias,
+                    default_throughput: config.batches.default_throughput,
+                    relaxation_factor: config.batches.relaxation_factor(&completion_window),
+                    reservation_ttl_secs: config.batches.reservation_ttl_secs,
+                    include_pending_counts: config.batches.pending_capacity_counts_enabled,
+                };
+
+                match reserve_capacity(dwctl, &*state.request_manager, &cap_input).await {
+                    Ok(ids) => ids,
+                    Err(CapacityError::InsufficientCapacity { completion_window, models }) => {
+                        return Err(ActivateError::Retryable(format!(
+                            "insufficient capacity for {completion_window} window (models: {models})"
+                        ))
+                        .into());
+                    }
+                    Err(CapacityError::Internal(msg)) => {
+                        return Err(anyhow::anyhow!("capacity reservation: {msg}"));
+                    }
                 }
             }
         }
@@ -1128,22 +1135,36 @@ pub(crate) async fn run_activate_batch<P: PoolProvider + Clone + Send + Sync + '
             "dw_external_key": external_key,
         });
 
-        let batch_input = fusillade::BatchInput {
-            file_id: fusillade::FileId(input.file_id),
-            endpoint,
-            completion_window,
-            metadata: Some(metadata),
-            created_by: Some(batch_owner.to_string()),
-            api_key_id: Some(api_key_id),
-            api_key: Some(batch_api_key),
-            total_requests: Some(input.template_count as i64),
+        let batch = if is_background {
+            state
+                .request_manager
+                .create_background_batch_record(fusillade::BackgroundBatchInput {
+                    file_id: fusillade::FileId(input.file_id),
+                    endpoint,
+                    metadata: Some(metadata),
+                    created_by: Some(batch_owner.to_string()),
+                    api_key_id: Some(api_key_id),
+                    api_key: Some(batch_api_key),
+                    total_requests: Some(input.template_count as i64),
+                })
+                .await
+                .map_err(|e| anyhow::anyhow!("create background batch record: {e}"))?
+        } else {
+            state
+                .request_manager
+                .create_batch_record(fusillade::BatchInput {
+                    file_id: fusillade::FileId(input.file_id),
+                    endpoint,
+                    completion_window,
+                    metadata: Some(metadata),
+                    created_by: Some(batch_owner.to_string()),
+                    api_key_id: Some(api_key_id),
+                    api_key: Some(batch_api_key),
+                    total_requests: Some(input.template_count as i64),
+                })
+                .await
+                .map_err(|e| anyhow::anyhow!("create batch record: {e}"))?
         };
-
-        let batch = state
-            .request_manager
-            .create_batch_record(batch_input)
-            .await
-            .map_err(|e| anyhow::anyhow!("create batch record: {e}"))?;
 
         let bid = *batch.id;
 
@@ -1764,5 +1785,136 @@ mod tests {
         let error = error.expect("an actionable error message should be stored");
         assert!(error.contains("unverified upload limit"), "message should explain the cap: {error}");
         assert!(error.contains("next sync"), "message should explain the auto-retry: {error}");
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn background_activation_bypasses_sla_admission_and_creates_background_batch(pool: PgPool) {
+        use crate::api::models::users::Role;
+        use crate::test::utils::{create_test_endpoint, create_test_model};
+
+        let mut config = create_test_config();
+        config.batches.default_throughput = 0.001;
+        config.batches.unverified_requests_per_completion_hour = 1;
+        let state = setup_task_state_with_config(pool.clone(), config).await;
+
+        let user = create_test_user(&pool, Role::BackgroundInferenceUser).await;
+        let endpoint_id = create_test_endpoint(&pool, "background-sync-endpoint", user.id).await;
+        let model_alias = "background-sync-model";
+        create_test_model(&pool, "background-sync-model-internal", model_alias, endpoint_id, user.id).await;
+
+        let connection_id = insert_test_connection(&pool, user.id).await;
+        let sync_id = insert_test_sync_op(&pool, connection_id, user.id).await;
+        sqlx::query!(
+            "UPDATE sync_operations SET sync_config = $2 WHERE id = $1",
+            sync_id,
+            serde_json::json!({
+                "endpoint": "/v1/chat/completions",
+                "completion_window": "background"
+            }),
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let entry_id = insert_test_sync_entry(&pool, sync_id, connection_id, "data/background.jsonl").await;
+
+        let templates: Vec<_> = (0..200).map(|_| valid_template(model_alias)).collect();
+        let file_id = create_test_file(&state, user.id, templates).await;
+        sqlx::query!(
+            "UPDATE sync_entries SET file_id = $2, template_count = 200 WHERE id = $1",
+            entry_id,
+            file_id,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        run_activate_batch(
+            &state,
+            &ActivateBatchInput {
+                sync_id,
+                sync_entry_id: entry_id,
+                connection_id,
+                file_id,
+                template_count: 200,
+            },
+        )
+        .await
+        .expect("background activation should not be rejected by SLA admission");
+
+        let batch_id: Uuid = sqlx::query_scalar("SELECT batch_id FROM sync_entries WHERE id = $1")
+            .bind(entry_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let (service_tier, completion_window, expires_at): (Option<String>, Option<String>, Option<chrono::DateTime<chrono::Utc>>) =
+            sqlx::query_as("SELECT service_tier, completion_window, expires_at FROM fusillade.batches WHERE id = $1")
+                .bind(batch_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(service_tier.as_deref(), Some("background"));
+        assert_eq!(completion_window, None);
+        assert_eq!(expires_at, None);
+
+        let reservations: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM batch_capacity_reservations WHERE completion_window = 'background'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(reservations, 0);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn background_activation_rejects_missing_models_before_batch_creation(pool: PgPool) {
+        use crate::api::models::users::Role;
+
+        let state = setup_task_state_with_config(pool.clone(), create_test_config()).await;
+        let user = create_test_user(&pool, Role::BackgroundInferenceUser).await;
+        let connection_id = insert_test_connection(&pool, user.id).await;
+        let sync_id = insert_test_sync_op(&pool, connection_id, user.id).await;
+        sqlx::query!(
+            "UPDATE sync_operations SET sync_config = $2 WHERE id = $1",
+            sync_id,
+            serde_json::json!({
+                "endpoint": "/v1/chat/completions",
+                "completion_window": "background"
+            }),
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let entry_id = insert_test_sync_entry(&pool, sync_id, connection_id, "data/missing-model.jsonl").await;
+        let file_id = create_test_file(&state, user.id, vec![valid_template("deleted-model")]).await;
+        sqlx::query!(
+            "UPDATE sync_entries SET file_id = $2, template_count = 1 WHERE id = $1",
+            entry_id,
+            file_id,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let error = run_activate_batch(
+            &state,
+            &ActivateBatchInput {
+                sync_id,
+                sync_entry_id: entry_id,
+                connection_id,
+                file_id,
+                template_count: 1,
+            },
+        )
+        .await
+        .expect_err("background activation must reject missing models");
+        assert!(error.to_string().contains("model(s) no longer available"));
+
+        let batch_id: Option<Uuid> = sqlx::query_scalar("SELECT batch_id FROM sync_entries WHERE id = $1")
+            .bind(entry_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(batch_id, None);
     }
 }
