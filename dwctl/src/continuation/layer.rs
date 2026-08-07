@@ -229,6 +229,13 @@ fn bearer(req: &Request) -> Option<String> {
 /// The middleware. Anything that fails a gate is forwarded untouched — this
 /// layer never changes the request it decides not to arm.
 pub async fn continuation_middleware(State(state): State<ContinuationState>, request: Request, next: Next) -> Response {
+    // Gate 0 — the global kill switch. `build_router` does not add this layer at
+    // all when continuation is disabled, so this is belt-and-braces (and the
+    // hook the off-switch test drives).
+    if !state.cfg.enabled {
+        return next.run(request).await;
+    }
+
     // Gate 1 — route shape. No metric: embeddings/responses traffic would swamp
     // the counter with a reason nobody will ever query.
     if !is_chat_completions(&request) {
@@ -390,9 +397,12 @@ fn tee(response: Response, state: ContinuationState, ctx: RequestContext) -> Res
         let mut saw_usage = false;
         // The terminating frames, held rather than forwarded: we may need to put
         // a synthesized usage frame in front of `[DONE]`, and a death frame must
-        // only reach the client if the resume chain fails.
+        // only reach the client if the resume chain fails. `first_death` is what
+        // the client would have received had this layer not existed, so it — not
+        // a later leg's error — is what an exhausted chain surfaces.
         let mut done_bytes: Option<Bytes> = None;
-        let mut held_death: Option<Bytes> = None;
+        let mut first_death: Option<Bytes> = None;
+        let mut refusal: Option<Bytes> = None;
         let mut attempts = 0u32;
         let mut last_render: Option<RenderedPrefix> = None;
         let mut death_at: Option<Instant> = None;
@@ -437,7 +447,10 @@ fn tee(response: Response, state: ContinuationState, ctx: RequestContext) -> Res
                 match detect::classify(&DeathEvent::Frame(&value)) {
                     Verdict::Alive => {}
                     other => {
-                        held_death = Some(item);
+                        if first_death.is_none() {
+                            first_death = Some(item.clone());
+                        }
+                        refusal = Some(item);
                         break other;
                     }
                 }
@@ -511,7 +524,10 @@ fn tee(response: Response, state: ContinuationState, ctx: RequestContext) -> Res
                     break 'chain;
                 }
                 Verdict::NoResume(reason) => {
-                    if let Some(frame) = held_death.take() {
+                    // Surface the frame we are refusing to resume — that is the
+                    // error the client needs to see, not an earlier one we did
+                    // try to recover from.
+                    if let Some(frame) = refusal.take().or_else(|| first_death.take()) {
                         yield Ok(frame);
                     }
                     outcome.record("failed", reason);
@@ -521,7 +537,7 @@ fn tee(response: Response, state: ContinuationState, ctx: RequestContext) -> Res
                     let Some(text) = acc.continuation_text() else {
                         // Disarmed, or nothing generated yet: resume-from-zero is
                         // a plain retry, which is not this feature's job.
-                        if let Some(frame) = held_death.take() {
+                        if let Some(frame) = first_death.take() {
                             yield Ok(frame);
                         }
                         outcome.record("failed", "not_reconstructable");
@@ -543,7 +559,7 @@ fn tee(response: Response, state: ContinuationState, ctx: RequestContext) -> Res
                             None => {
                                 // An incident is already saturating this model's
                                 // resume budget; surface the death as today.
-                                if let Some(frame) = held_death.take() {
+                                if let Some(frame) = first_death.take() {
                                     yield Ok(frame);
                                 }
                                 outcome.record("failed", "throttled");
@@ -594,12 +610,12 @@ fn tee(response: Response, state: ContinuationState, ctx: RequestContext) -> Res
                             last_render = Some(l.render);
                             current = l.stream;
                             resuming = true;
-                            held_death = None;
+                            refusal = None;
                         }
                         None => {
                             // Out of attempts: the client sees exactly what an
                             // unresumed death would have given them.
-                            if let Some(frame) = held_death.take() {
+                            if let Some(frame) = first_death.take() {
                                 yield Ok(frame);
                             }
                             outcome.record("failed", last_failure);

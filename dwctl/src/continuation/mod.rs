@@ -32,6 +32,9 @@ pub mod render;
 pub mod resume;
 pub mod rewrap;
 
+#[cfg(test)]
+mod resume_tests;
+
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, RwLock};
