@@ -1,13 +1,19 @@
-//! Open Responses API schemas
+//! Open Responses API schemas.
 //!
-//! These schemas match the Open Responses specification.
-//! See: https://www.openresponses.org/specification
+//! Copied from onwards' `strict::schemas::responses` as part of moving Responses
+//! ownership into dwctl (onwards' copy retires in COR-536). These schemas match
+//! the Open Responses specification. See: https://www.openresponses.org/specification
+
+// Copied wholesale; dwctl doesn't yet exercise every type/helper (e.g. the
+// response-field normaliser), so allow dead code rather than trimming the
+// faithful copy.
+#![allow(dead_code)]
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
-use super::utils::ensure_field;
+use super::util::ensure_field;
 
 pub(crate) fn generated_response_id() -> String {
     format!("resp_{}", Uuid::new_v4())
@@ -24,31 +30,21 @@ fn response_status_for_event_type(event_type: &str) -> &'static str {
     }
 }
 
-fn backfill_responses_response_fields(
-    object: &mut serde_json::Map<String, Value>,
-    fallback_model: &str,
-    fallback_response_id: &str,
-) {
-    ensure_field(object, "id", || {
-        Value::String(fallback_response_id.to_string())
-    });
+fn backfill_responses_response_fields(object: &mut serde_json::Map<String, Value>, fallback_model: &str, fallback_response_id: &str) {
+    ensure_field(object, "id", || Value::String(fallback_response_id.to_string()));
     ensure_field(object, "object", || Value::String("response".to_string()));
     ensure_field(object, "created_at", || Value::from(0));
     ensure_field(object, "completed_at", || Value::Null);
     ensure_field(object, "status", || Value::String("completed".to_string()));
     ensure_field(object, "incomplete_details", || Value::Null);
-    ensure_field(object, "model", || {
-        Value::String(fallback_model.to_string())
-    });
+    ensure_field(object, "model", || Value::String(fallback_model.to_string()));
     ensure_field(object, "previous_response_id", || Value::Null);
     ensure_field(object, "instructions", || Value::Null);
     ensure_field(object, "output", || Value::Array(Vec::new()));
     ensure_field(object, "error", || Value::Null);
     ensure_field(object, "tools", || Value::Array(Vec::new()));
     ensure_field(object, "tool_choice", || Value::String("auto".to_string()));
-    ensure_field(object, "truncation", || {
-        Value::String("disabled".to_string())
-    });
+    ensure_field(object, "truncation", || Value::String("disabled".to_string()));
     ensure_field(object, "parallel_tool_calls", || Value::Bool(true));
     ensure_field(object, "text", || {
         serde_json::json!({
@@ -68,9 +64,7 @@ fn backfill_responses_response_fields(
     ensure_field(object, "max_tool_calls", || Value::Null);
     ensure_field(object, "store", || Value::Bool(false));
     ensure_field(object, "background", || Value::Bool(false));
-    ensure_field(object, "service_tier", || {
-        Value::String("default".to_string())
-    });
+    ensure_field(object, "service_tier", || Value::String("default".to_string()));
     ensure_field(object, "metadata", || Value::Null);
     ensure_field(object, "safety_identifier", || Value::Null);
     ensure_field(object, "prompt_cache_key", || Value::Null);
@@ -103,20 +97,12 @@ pub(crate) fn normalize_responses_response_value(value: &mut Value, fallback_mod
 ///
 /// Streaming needs a dedicated normalizer because some defaults depend on the
 /// SSE event type itself, notably `status`.
-pub(crate) fn normalize_responses_streaming_event_value(
-    value: &mut Value,
-    fallback_model: &str,
-    fallback_response_id: &str,
-) {
+pub(crate) fn normalize_responses_streaming_event_value(value: &mut Value, fallback_model: &str, fallback_response_id: &str) {
     let Some(object) = value.as_object_mut() else {
         return;
     };
 
-    let event_type = object
-        .get("type")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
+    let event_type = object.get("type").and_then(Value::as_str).unwrap_or_default().to_string();
 
     if let Some(response) = object.get_mut("response") {
         let missing_status = response
@@ -133,11 +119,7 @@ pub(crate) fn normalize_responses_streaming_event_value(
             }
 
             // Streaming snapshots like response.created may legitimately omit output.
-            backfill_responses_response_fields(
-                response_object,
-                fallback_model,
-                fallback_response_id,
-            );
+            backfill_responses_response_fields(response_object, fallback_model, fallback_response_id);
         }
     }
 }
@@ -281,31 +263,27 @@ impl<'de> serde::Deserialize<'de> for Item {
         // silently misclassifying the item as a message.
         let item_type = match value.get("type") {
             None => "message",
-            Some(v) => v.as_str().ok_or_else(|| {
-                serde::de::Error::custom("Responses input item `type` must be a string")
-            })?,
+            Some(v) => v
+                .as_str()
+                .ok_or_else(|| serde::de::Error::custom("Responses input item `type` must be a string"))?,
         };
 
         // Match against known types
         match item_type {
             "message" => {
-                let item: MessageItem =
-                    serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+                let item: MessageItem = serde_json::from_value(value).map_err(serde::de::Error::custom)?;
                 Ok(Item::Message(item))
             }
             "function_call" => {
-                let item: FunctionCallItem =
-                    serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+                let item: FunctionCallItem = serde_json::from_value(value).map_err(serde::de::Error::custom)?;
                 Ok(Item::FunctionCall(item))
             }
             "function_call_output" => {
-                let item: FunctionCallOutputItem =
-                    serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+                let item: FunctionCallOutputItem = serde_json::from_value(value).map_err(serde::de::Error::custom)?;
                 Ok(Item::FunctionCallOutput(item))
             }
             "reasoning" => {
-                let item: ReasoningItem =
-                    serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+                let item: ReasoningItem = serde_json::from_value(value).map_err(serde::de::Error::custom)?;
                 Ok(Item::Reasoning(item))
             }
             // Unknown type - preserve the entire raw value
@@ -324,10 +302,7 @@ impl serde::Serialize for Item {
             Item::Message(msg) => {
                 // Serialize with type tag
                 let mut map = serde_json::Map::new();
-                map.insert(
-                    "type".to_string(),
-                    serde_json::Value::String("message".to_string()),
-                );
+                map.insert("type".to_string(), serde_json::Value::String("message".to_string()));
                 let value = serde_json::to_value(msg).map_err(serde::ser::Error::custom)?;
                 if let serde_json::Value::Object(obj) = value {
                     map.extend(obj);
@@ -336,10 +311,7 @@ impl serde::Serialize for Item {
             }
             Item::FunctionCall(fc) => {
                 let mut map = serde_json::Map::new();
-                map.insert(
-                    "type".to_string(),
-                    serde_json::Value::String("function_call".to_string()),
-                );
+                map.insert("type".to_string(), serde_json::Value::String("function_call".to_string()));
                 let value = serde_json::to_value(fc).map_err(serde::ser::Error::custom)?;
                 if let serde_json::Value::Object(obj) = value {
                     map.extend(obj);
@@ -348,10 +320,7 @@ impl serde::Serialize for Item {
             }
             Item::FunctionCallOutput(fco) => {
                 let mut map = serde_json::Map::new();
-                map.insert(
-                    "type".to_string(),
-                    serde_json::Value::String("function_call_output".to_string()),
-                );
+                map.insert("type".to_string(), serde_json::Value::String("function_call_output".to_string()));
                 let value = serde_json::to_value(fco).map_err(serde::ser::Error::custom)?;
                 if let serde_json::Value::Object(obj) = value {
                     map.extend(obj);
@@ -360,10 +329,7 @@ impl serde::Serialize for Item {
             }
             Item::Reasoning(r) => {
                 let mut map = serde_json::Map::new();
-                map.insert(
-                    "type".to_string(),
-                    serde_json::Value::String("reasoning".to_string()),
-                );
+                map.insert("type".to_string(), serde_json::Value::String("reasoning".to_string()));
                 let value = serde_json::to_value(r).map_err(serde::ser::Error::custom)?;
                 if let serde_json::Value::Object(obj) = value {
                     map.extend(obj);
@@ -867,18 +833,26 @@ pub struct ResponseUsage {
     pub input_tokens: u32,
     pub output_tokens: u32,
     pub total_tokens: u32,
+    // The detail objects are `serde(default)` so this type doubles as the billing
+    // usage parser (`OpenResponses::extract_usage`) - a provider that omits the
+    // cached/reasoning breakdown still deserializes, rather than failing and
+    // recording zero tokens. Serialization is unaffected (still always emitted).
+    #[serde(default)]
     pub input_tokens_details: InputTokensDetails,
+    #[serde(default)]
     pub output_tokens_details: OutputTokensDetails,
 }
 
 /// Details about input tokens
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct InputTokensDetails {
     pub cached_tokens: u32,
 }
 
 /// Details about output tokens
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct OutputTokensDetails {
     pub reasoning_tokens: u32,
 }
@@ -982,10 +956,7 @@ mod tests {
         }"#;
 
         let request: ResponsesRequest = serde_json::from_str(json).unwrap();
-        assert_eq!(
-            request.previous_response_id,
-            Some("resp_abc123".to_string())
-        );
+        assert_eq!(request.previous_response_id, Some("resp_abc123".to_string()));
     }
 
     #[test]
@@ -1037,9 +1008,7 @@ mod tests {
                 output_tokens: 5,
                 total_tokens: 15,
                 input_tokens_details: InputTokensDetails { cached_tokens: 0 },
-                output_tokens_details: OutputTokensDetails {
-                    reasoning_tokens: 0,
-                },
+                output_tokens_details: OutputTokensDetails { reasoning_tokens: 0 },
             }),
             max_output_tokens: None,
             max_tool_calls: None,
@@ -1061,14 +1030,8 @@ mod tests {
 
     #[test]
     fn test_item_status_serialization() {
-        assert_eq!(
-            serde_json::to_string(&ItemStatus::InProgress).unwrap(),
-            "\"in_progress\""
-        );
-        assert_eq!(
-            serde_json::to_string(&ItemStatus::Completed).unwrap(),
-            "\"completed\""
-        );
+        assert_eq!(serde_json::to_string(&ItemStatus::InProgress).unwrap(), "\"in_progress\"");
+        assert_eq!(serde_json::to_string(&ItemStatus::Completed).unwrap(), "\"completed\"");
     }
 
     #[test]
@@ -1177,10 +1140,7 @@ mod tests {
         }"#;
 
         let result: Result<ResponsesRequest, _> = serde_json::from_str(json);
-        assert!(
-            result.is_err(),
-            "Tool without description should be rejected"
-        );
+        assert!(result.is_err(), "Tool without description should be rejected");
 
         let err_msg = result.unwrap_err().to_string();
         assert!(
@@ -1203,10 +1163,7 @@ mod tests {
         }"#;
 
         let result: Result<ResponsesRequest, _> = serde_json::from_str(json);
-        assert!(
-            result.is_err(),
-            "Tool without parameters should be rejected"
-        );
+        assert!(result.is_err(), "Tool without parameters should be rejected");
 
         let err_msg = result.unwrap_err().to_string();
         assert!(
@@ -1298,10 +1255,7 @@ mod tests {
         let response = event.response.as_ref().unwrap();
         assert_eq!(response.model, "gpt-4o-mini-2024-07-18");
         // reasoning null fields must survive the roundtrip
-        assert_eq!(
-            response.reasoning,
-            serde_json::json!({"effort": null, "summary": null})
-        );
+        assert_eq!(response.reasoning, serde_json::json!({"effort": null, "summary": null}));
     }
 
     #[test]
@@ -1354,14 +1308,8 @@ mod tests {
         assert_eq!(reparsed["sequence_number"], 5);
         assert_eq!(reparsed["response"]["model"], "gpt-4o-mini");
         // reasoning null fields must survive roundtrip through the typed struct
-        assert_eq!(
-            reparsed["response"]["reasoning"]["effort"],
-            serde_json::Value::Null
-        );
-        assert_eq!(
-            reparsed["response"]["reasoning"]["summary"],
-            serde_json::Value::Null
-        );
+        assert_eq!(reparsed["response"]["reasoning"]["effort"], serde_json::Value::Null);
+        assert_eq!(reparsed["response"]["reasoning"]["summary"], serde_json::Value::Null);
     }
 
     #[test]
