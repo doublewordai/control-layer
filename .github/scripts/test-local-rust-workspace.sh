@@ -204,8 +204,8 @@ if set(release_manifest) != {
     raise SystemExit(
         "release manifest must track dwctl, Onwards, and Fusillade Arsenal independently"
     )
-if release_manifest["fusillade-arsenal"] != "3.1.0":
-    raise SystemExit("Fusillade Arsenal release baseline must remain 3.1.0")
+if release_manifest["fusillade-arsenal"] != "4.0.0":
+    raise SystemExit("Fusillade Arsenal release baseline must remain 4.0.0")
 if release_manifest["fusillade-core"] != "5.0.0":
     raise SystemExit("Fusillade Core release baseline must remain 5.0.0")
 PY
