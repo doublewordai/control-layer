@@ -1687,10 +1687,15 @@ pub async fn list_user_join_requests<P: PoolProvider>(
 /// "create a workspace" while their company already has one creates a second
 /// one, which is how a domain ends up with two workspaces nobody meant.
 ///
-/// **Disclosure.** The domain is taken from the caller's own authenticated
-/// address; there is no parameter to pass someone else's. Learning that
+/// **Disclosure.** The domain is taken from the *subject's* own authenticated
+/// address; there is no parameter to pass an arbitrary one. Learning that
 /// `acme.com` has a workspace therefore requires receiving mail at acme.com,
 /// and even then reveals only that — see [`DomainMatchResponse`].
+///
+/// Subject and caller are the same person except for a platform manager
+/// holding ReadAll on Users, who may name another user and gets *their*
+/// context — the same own-or-privileged split as `/users/{id}/organizations`.
+/// Anyone else naming a user who isn't them gets a 403.
 #[utoipa::path(
     get,
     path = "/users/{user_id}/onboarding-context",
@@ -1789,6 +1794,12 @@ pub async fn get_onboarding_context<P: PoolProvider>(
     };
 
     // 2. An outstanding request of their own.
+    //
+    // The organization lookups here and above resolve to `None` only if the
+    // row vanished between the two reads, which for these queries means it was
+    // deleted — and a request into a deleted organization is one nobody can
+    // ever approve, so reporting nothing is the intended answer rather than a
+    // dropped row. Same reasoning as `list_user_join_requests`'s own mapping.
     let mut org_repo = Organizations::new(&mut pool_conn);
     let requests = org_repo.list_user_join_requests(target_user_id).await?;
     let join_request = match requests.first() {
@@ -1849,10 +1860,15 @@ pub async fn get_onboarding_context<P: PoolProvider>(
 /// behalf any more — not signup, not the screen that tells them a workspace
 /// exists. This endpoint runs only because they pressed the button.
 ///
-/// The organization is resolved from the **caller's own email domain**, never
+/// The organization is resolved from the **subject's own email domain**, never
 /// from the request body. A caller cannot name the workspace they want into:
 /// that would turn this into a way to spam requests at arbitrary
 /// organizations, and to enumerate which ids are organizations at all.
+///
+/// Ordinarily the subject is the caller. A platform manager holding ReadAll on
+/// Users may file on another user's behalf — they can already `add_member`
+/// outright, so this grants nothing new — and the request is still constrained
+/// to that user's own domain.
 ///
 /// Which of the two things happens is the organization's choice, not the
 /// caller's — see [`DomainJoinOutcome`]. Idempotent in both directions:

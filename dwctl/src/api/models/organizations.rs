@@ -323,8 +323,11 @@ pub struct PendingJoinRequestResponse {
 pub struct PendingInvitationResponse {
     /// The invitation's id. Accept or decline it at
     /// `/organizations/{organization_id}/invites/{id}/accept|decline`.
+    ///
+    /// A `user_organizations` row id, so `Uuid` rather than `UserId` — same
+    /// reason as [`PendingJoinRequestResponse::id`].
     #[schema(value_type = String, format = "uuid")]
-    pub id: UserId,
+    pub id: uuid::Uuid,
     #[schema(value_type = String, format = "uuid")]
     pub organization_id: UserId,
     /// Display name where the organization has one, `username` otherwise —
