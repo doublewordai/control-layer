@@ -42,6 +42,10 @@ use crate::image_normalizer::ImageNormalizer;
 /// State for the inference middleware.
 #[derive(Clone)]
 pub struct InferenceMiddlewareState<P: PoolProvider + Clone = sqlx_pool_router::DbPools> {
+    /// Work accepted by an HTTP request but intentionally continued after its
+    /// 202 response. Shutdown closes and drains this tracker before stopping
+    /// persistence services.
+    pub accepted_tasks: crate::AcceptedTaskTracker,
     pub request_manager: Arc<PostgresRequestManager<P>>,
     pub daemon_id: OnwardsDaemonId,
     /// Base URL for loopback requests (e.g., "http://127.0.0.1:3001/ai").
@@ -213,6 +217,28 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
             .unwrap();
     }
     let is_daemon_processed = matches!(service_tier, ServiceTier::Flex | ServiceTier::Background);
+    let mut accepted_task = if background && !is_daemon_processed {
+        match state.accepted_tasks.try_admit() {
+            Some(admission) => Some(admission),
+            None => {
+                return Response::builder()
+                    .status(StatusCode::SERVICE_UNAVAILABLE)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "error": {
+                                "message": "The server is draining and cannot accept background work.",
+                                "type": "server_error"
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap();
+            }
+        }
+    } else {
+        None
+    };
 
     // The warm path / multi-step loop only earns its keep when the
     // request actually has tools to dispatch. Tool-free `/v1/responses`
@@ -270,7 +296,7 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
             }
         }
         WarmPathBranch::Background => {
-            if let Some(resp) = try_warm_path_background(&state, &request_value, api_key.as_deref(), model).await {
+            if let Some(resp) = try_warm_path_background(&state, &request_value, api_key.as_deref(), model, &mut accepted_task).await {
                 return resp;
             }
         }
@@ -452,7 +478,19 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                 api_key: api_key.clone().unwrap_or_default(),
                 created_by: created_by.unwrap_or_default(),
             };
-            handle_realtime(&state, realtime_input, &resp_id, model, background, zdr, parts, body_bytes, next).await
+            handle_realtime(
+                &state,
+                realtime_input,
+                &resp_id,
+                model,
+                background,
+                accepted_task,
+                zdr,
+                parts,
+                body_bytes,
+                next,
+            )
+            .await
         }
         ServiceTier::Flex | ServiceTier::Background => {
             let is_background_tier = matches!(service_tier, ServiceTier::Background);
@@ -847,6 +885,7 @@ async fn handle_realtime<P: PoolProvider + Clone + Send + Sync + 'static>(
     resp_id: &str,
     model: &str,
     background: bool,
+    accepted_task: Option<crate::AcceptedTaskAdmission>,
     zdr: bool,
     parts: axum::http::request::Parts,
     body_bytes: bytes::Bytes,
@@ -912,11 +951,11 @@ async fn handle_realtime<P: PoolProvider + Clone + Send + Sync + 'static>(
             "output": [],
         });
 
-        tokio::spawn(async move {
+        tokio::spawn(accepted_task.expect("background realtime request was admitted").run(async move {
             let response = next.run(req).await;
             let (_parts, body) = response.into_parts();
             let _ = axum::body::to_bytes(body, usize::MAX).await;
-        });
+        }));
 
         (StatusCode::ACCEPTED, Json(response_body)).into_response()
     } else {
@@ -1297,12 +1336,14 @@ async fn try_warm_path_background<P: PoolProvider + Clone + Send + Sync + 'stati
     request_value: &serde_json::Value,
     api_key: Option<&str>,
     model: &str,
+    accepted_task: &mut Option<crate::AcceptedTaskAdmission>,
 ) -> Option<Response> {
     let api_key = api_key?;
     let (request_id, resolved, upstream) = match warm_path_setup(state, request_value, api_key, model).await {
         Some(s) => s,
         None => return None,
     };
+    let accepted_task = accepted_task.take().expect("realtime background request was admitted");
 
     let resp_id = format!("resp_{request_id}");
     let response_body = serde_json::json!({
@@ -1320,7 +1361,7 @@ async fn try_warm_path_background<P: PoolProvider + Clone + Send + Sync + 'stati
     let loop_config = state.loop_config;
     let model_str = model.to_string();
     let request_id_str = request_id.to_string();
-    tokio::spawn(async move {
+    tokio::spawn(accepted_task.run(async move {
         let _ = super::streaming::run_inline_blocking(
             response_store,
             tool_executor,
@@ -1332,7 +1373,7 @@ async fn try_warm_path_background<P: PoolProvider + Clone + Send + Sync + 'stati
             model_str,
         )
         .await;
-    });
+    }));
 
     Some((StatusCode::ACCEPTED, Json(response_body)).into_response())
 }

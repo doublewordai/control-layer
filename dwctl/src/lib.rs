@@ -205,7 +205,7 @@ use bon::Builder;
 pub use config::Config;
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
 use opentelemetry::trace::TraceContextExt;
-use outlet::{MultiHandler, RequestLoggerConfig, RequestLoggerLayer};
+use outlet::{MultiHandler, RequestLoggerConfig, RequestLoggerLayer, RequestLoggerShutdown};
 use outlet_postgres::PostgresHandler;
 use request_logging::{AiResponse, ParsedAIRequest};
 use sqlx::{ConnectOptions, Executor, PgPool, postgres::PgConnectOptions};
@@ -219,6 +219,121 @@ use tower_http::{
     set_header::SetResponseHeaderLayer,
     trace::TraceLayer,
 };
+
+const FAIL_FAST_ACCEPTED_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const FAIL_FAST_HTTP_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const FAIL_FAST_HTTP_ABORT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+async fn cancel_request_on_forced_shutdown(
+    State(cancellation): State<tokio_util::sync::CancellationToken>,
+    request: Request,
+    next: middleware::Next,
+) -> Response {
+    tokio::select! {
+        response = next.run(request) => response,
+        () = cancellation.cancelled() => Response::builder()
+            .status(http::StatusCode::SERVICE_UNAVAILABLE)
+            .body(axum::body::Body::empty())
+            .expect("static forced-shutdown response is valid"),
+    }
+}
+
+/// Atomically admits detached request work and coordinates its shutdown.
+#[derive(Clone)]
+pub struct AcceptedTaskTracker {
+    state: Arc<std::sync::Mutex<AcceptedTaskState>>,
+    empty: Arc<tokio::sync::Notify>,
+    cancellation: tokio_util::sync::CancellationToken,
+}
+
+struct AcceptedTaskState {
+    accepting: bool,
+    active: usize,
+}
+
+pub struct AcceptedTaskAdmission {
+    tracker: AcceptedTaskTracker,
+    cancellation: tokio_util::sync::CancellationToken,
+}
+
+impl AcceptedTaskTracker {
+    fn new() -> Self {
+        Self {
+            state: Arc::new(std::sync::Mutex::new(AcceptedTaskState {
+                accepting: true,
+                active: 0,
+            })),
+            empty: Arc::new(tokio::sync::Notify::new()),
+            cancellation: tokio_util::sync::CancellationToken::new(),
+        }
+    }
+
+    pub fn try_admit(&self) -> Option<AcceptedTaskAdmission> {
+        let mut state = self.state.lock().expect("accepted task admission lock poisoned");
+        if !state.accepting {
+            return None;
+        }
+        state.active += 1;
+        Some(AcceptedTaskAdmission {
+            tracker: self.clone(),
+            cancellation: self.cancellation.clone(),
+        })
+    }
+
+    fn close(&self) {
+        let mut state = self.state.lock().expect("accepted task admission lock poisoned");
+        state.accepting = false;
+        if state.active == 0 {
+            // `notify_one` retains a permit if the waiter is between checking
+            // the state and polling `notified()`, avoiding a lost wake-up.
+            self.empty.notify_one();
+        }
+    }
+
+    async fn wait(&self) {
+        loop {
+            let notified = self.empty.notified();
+            {
+                let state = self.state.lock().expect("accepted task admission lock poisoned");
+                if !state.accepting && state.active == 0 {
+                    return;
+                }
+            }
+            notified.await;
+        }
+    }
+
+    fn cancel(&self) {
+        self.cancellation.cancel();
+    }
+
+    fn is_closed(&self) -> bool {
+        !self.state.lock().expect("accepted task admission lock poisoned").accepting
+    }
+
+    fn finish(&self) {
+        let mut state = self.state.lock().expect("accepted task admission lock poisoned");
+        state.active = state.active.checked_sub(1).expect("accepted task admission underflow");
+        if !state.accepting && state.active == 0 {
+            self.empty.notify_one();
+        }
+    }
+}
+
+impl AcceptedTaskAdmission {
+    pub async fn run<F: std::future::Future<Output = ()>>(self, future: F) {
+        tokio::select! {
+            () = self.cancellation.cancelled() => {}
+            () = future => {}
+        }
+    }
+}
+
+impl Drop for AcceptedTaskAdmission {
+    fn drop(&mut self) {
+        self.tracker.finish();
+    }
+}
 use tracing::{debug, info, instrument, warn};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 use uuid::Uuid;
@@ -1155,6 +1270,29 @@ pub async fn build_router(
     strict_mode: bool,
     inference_middleware_state: Option<crate::inference::middleware::InferenceMiddlewareState>,
 ) -> anyhow::Result<Router> {
+    let (router, _outlet_shutdown) = build_router_with_shutdown(
+        state,
+        onwards_router,
+        analytics_sender,
+        requests_writer_sender,
+        metrics_recorder,
+        strict_mode,
+        inference_middleware_state,
+    )
+    .await?;
+    Ok(router)
+}
+
+#[instrument(skip_all)]
+async fn build_router_with_shutdown(
+    state: &mut AppState,
+    onwards_router: Router,
+    analytics_sender: Option<request_logging::batcher::AnalyticsSender>,
+    requests_writer_sender: Option<crate::inference::engine::writer::RequestsWriterSender>,
+    metrics_recorder: Option<GenAiMetrics>,
+    strict_mode: bool,
+    inference_middleware_state: Option<crate::inference::middleware::InferenceMiddlewareState>,
+) -> anyhow::Result<(Router, Option<RequestLoggerShutdown>)> {
     let config = state.current_config();
 
     // Setup request logging and/or analytics based on config flags
@@ -1168,7 +1306,7 @@ pub async fn build_router(
     let request_logging_enabled = state.outlet_db.is_some() && config.enable_request_logging;
     let analytics_enabled = config.enable_analytics;
 
-    let outlet_layer = if request_logging_enabled || analytics_enabled {
+    let (outlet_layer, outlet_shutdown) = if request_logging_enabled || analytics_enabled {
         // Store the metrics recorder in state (created earlier in Application::new)
         state.metrics_recorder = metrics_recorder;
 
@@ -1210,7 +1348,7 @@ pub async fn build_router(
 
         // Only create layer if at least one handler is enabled (should always be true here)
         if multi_handler.is_empty() {
-            None
+            (None, None)
         } else {
             let outlet_config = RequestLoggerConfig {
                 capture_request_body: true,
@@ -1218,10 +1356,11 @@ pub async fn build_router(
                 path_filter: None, // No path filter needed - applied directly to ai_router
                 ..Default::default()
             };
-            Some(RequestLoggerLayer::new(outlet_config, multi_handler))
+            let (layer, shutdown) = RequestLoggerLayer::new_with_shutdown(outlet_config, multi_handler);
+            (Some(layer), Some(shutdown))
         }
     } else {
-        None
+        (None, None)
     };
     // Authentication routes (at root level, can be masked when deployed behind SSO proxy)
     let auth_routes = Router::new()
@@ -2049,7 +2188,7 @@ pub async fn build_router(
             ),
     );
 
-    Ok(router)
+    Ok((router, outlet_shutdown))
 }
 
 /// Middleware that records the OpenTelemetry trace ID on the current span,
@@ -2183,7 +2322,7 @@ impl BackgroundServices {
         }
     }
 
-    /// Get a clone of the shutdown token for coordinating early cancellation
+    /// Get a clone of the shutdown token for coordinating post-HTTP-drain cancellation.
     pub fn shutdown_token(&self) -> tokio_util::sync::CancellationToken {
         self.shutdown_token.clone()
     }
@@ -3000,6 +3139,8 @@ pub struct Application {
     _embedded_db: Option<db::embedded::EmbeddedDatabase>,
     _tracer_provider: Option<telemetry::SdkTracerProvider>,
     bg_services: BackgroundServices,
+    accepted_tasks: AcceptedTaskTracker,
+    outlet_shutdown: Option<RequestLoggerShutdown>,
 }
 
 impl Application {
@@ -3326,7 +3467,9 @@ impl Application {
         // Inference middleware state. Non-background realtime no longer
         // does any DB work up front; the completion path goes through
         // FusilladeOutletHandler -> RequestsWriter.
+        let accepted_tasks = AcceptedTaskTracker::new();
         let inference_middleware_state = crate::inference::middleware::InferenceMiddlewareState {
+            accepted_tasks: accepted_tasks.clone(),
             request_manager: bg_services.request_manager.clone(),
             daemon_id: crate::inference::store::OnwardsDaemonId(onwards_daemon_id),
             loopback_base_url: {
@@ -3404,7 +3547,7 @@ impl Application {
             );
         }
 
-        let router = build_router(
+        let (router, outlet_shutdown) = build_router_with_shutdown(
             &mut app_state,
             onwards_router,
             bg_services.analytics_sender.clone(),
@@ -3425,6 +3568,8 @@ impl Application {
             _embedded_db,
             _tracer_provider: tracer_provider,
             bg_services,
+            accepted_tasks,
+            outlet_shutdown,
         })
     }
 
@@ -3454,31 +3599,92 @@ impl Application {
 
         // Apply middleware before path matching
         let middleware = middleware::from_fn_with_state(self.app_state, admin_ai_proxy_middleware);
-        let service = middleware.layer(self.router);
+        let request_cancellation = tokio_util::sync::CancellationToken::new();
+        let force_cancellation = middleware::from_fn_with_state(request_cancellation.clone(), cancel_request_on_forced_shutdown);
+        let service = force_cancellation.layer(middleware.layer(self.router));
 
-        // Cancel shutdown token when SIGTERM arrives, BEFORE axum starts waiting
-        // for in-flight connections to close. This lets background services (e.g.,
-        // fusillade daemon) abort in-flight HTTP tasks immediately, allowing
-        // proxy connections to close and axum's graceful shutdown to complete.
-        let shutdown_token = self.bg_services.shutdown_token();
-        let shutdown = async move {
-            shutdown.await;
-            shutdown_token.cancel();
-        };
+        // Keep response writers, analytics, and the other background services
+        // alive while Axum drains requests that were accepted before SIGTERM.
+        // Those request futures still depend on the services' channels. Cancel
+        // them only after Axum confirms that every in-flight connection closed.
+        let background_shutdown = self.bg_services.shutdown_token();
+        let fail_fast_shutdown = tokio_util::sync::CancellationToken::new();
+        let server_shutdown = fail_fast_shutdown.clone();
+        let accepted_tasks = self.accepted_tasks.clone();
+        let accepted_tasks_after_server = self.accepted_tasks.clone();
+        let outlet_shutdown = self.outlet_shutdown.take();
+
+        // Keep the internal loopback listener available while accepted
+        // background work finishes. New background submissions are rejected as
+        // soon as the tracker closes; already accepted multi-step requests can
+        // still make their remaining loopback calls. Axum starts its connection
+        // drain only after those tasks complete.
+        let graceful_shutdown = wait_for_shutdown_and_accepted_work(shutdown, server_shutdown, accepted_tasks);
+
+        let mut server = Box::pin(std::future::IntoFuture::into_future(
+            axum::serve(listener, service.into_make_service()).with_graceful_shutdown(graceful_shutdown),
+        ));
 
         // Race the server against background task failures (fail-fast)
-        let server_error: Option<anyhow::Error> = tokio::select! {
-            result = axum::serve(listener, service.into_make_service()).with_graceful_shutdown(shutdown) => {
-                result.err().map(Into::into) // None if server shut down cleanly
+        let (server_error, server_stopped): (Option<anyhow::Error>, bool) = tokio::select! {
+            result = &mut server => {
+                if !accepted_tasks_after_server.is_closed() {
+                    drain_accepted_tasks_after_failure(&accepted_tasks_after_server).await;
+                }
+                (result.err().map(Into::into), true) // None if server shut down cleanly
             }
             result = self.bg_services.wait_for_failure() => {
-                // Background task failed - save error for fail-fast restart after cleanup
-                match result {
+                // Trigger the same accepted-work and HTTP drain used by SIGTERM,
+                // then wait for the server before persistence cleanup.
+                let failure = match result {
                     Ok(_infallible) => unreachable!("wait_for_failure never returns Ok"),
-                    Err(e) => Some(e),
-                }
+                    Err(e) => e,
+                };
+                fail_fast_shutdown.cancel();
+                let server_stopped = match tokio::time::timeout(FAIL_FAST_HTTP_DRAIN_TIMEOUT, &mut server).await {
+                    Ok(Ok(())) => true,
+                    Ok(Err(server_error)) => {
+                        tracing::error!(%server_error, "HTTP server also failed during fail-fast drain");
+                        true
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            timeout_seconds = FAIL_FAST_HTTP_DRAIN_TIMEOUT.as_secs(),
+                            "HTTP connections exceeded fail-fast drain timeout; cancelling in-flight requests"
+                        );
+                        request_cancellation.cancel();
+                        match tokio::time::timeout(FAIL_FAST_HTTP_ABORT_TIMEOUT, &mut server).await {
+                            Ok(Ok(())) => true,
+                            Ok(Err(server_error)) => {
+                                tracing::error!(%server_error, "HTTP server failed while aborting in-flight requests");
+                                true
+                            }
+                            Err(_) => {
+                                tracing::error!(
+                                    timeout_seconds = FAIL_FAST_HTTP_ABORT_TIMEOUT.as_secs(),
+                                    "HTTP request cancellation did not terminate every connection; skipping Outlet drain"
+                                );
+                                false
+                            }
+                        }
+                    }
+                };
+                (Some(failure), server_stopped)
             }
         };
+        // In particular, abort a fail-fast HTTP drain that exceeded its
+        // deadline before tearing down the persistence services it uses.
+        drop(server);
+
+        // Axum has released every Outlet service sender. Drain captured
+        // request/response records before cancelling their downstream writers.
+        if server_stopped
+            && let Some(outlet_shutdown) = outlet_shutdown
+            && let Err(error) = outlet_shutdown.shutdown().await
+        {
+            tracing::error!(%error, "Outlet request logger worker panicked during shutdown");
+        }
+        background_shutdown.cancel();
 
         // Graceful shutdown - even if we're failing fast, clean up properly
         info!("Shutting down background services...");
@@ -3515,6 +3721,155 @@ impl Application {
         }
 
         Ok(())
+    }
+}
+
+/// Wait for either normal shutdown or fail-fast, then stop accepting new
+/// background work and keep the HTTP listener alive until accepted work has
+/// finished its internal loopback calls.
+async fn wait_for_shutdown_and_accepted_work<F>(
+    shutdown: F,
+    fail_fast_shutdown: tokio_util::sync::CancellationToken,
+    accepted_tasks: AcceptedTaskTracker,
+) where
+    F: std::future::Future<Output = ()>,
+{
+    let fail_fast = tokio::select! {
+        () = shutdown => false,
+        () = fail_fast_shutdown.cancelled() => true,
+    };
+    accepted_tasks.close();
+    if fail_fast {
+        drain_accepted_tasks_after_failure(&accepted_tasks).await;
+    } else {
+        accepted_tasks.wait().await;
+    }
+}
+
+async fn drain_accepted_tasks_after_failure(accepted_tasks: &AcceptedTaskTracker) {
+    drain_accepted_tasks_after_failure_with_timeout(accepted_tasks, FAIL_FAST_ACCEPTED_DRAIN_TIMEOUT).await;
+}
+
+async fn drain_accepted_tasks_after_failure_with_timeout(accepted_tasks: &AcceptedTaskTracker, timeout: std::time::Duration) {
+    accepted_tasks.close();
+    if tokio::time::timeout(timeout, accepted_tasks.wait()).await.is_err() {
+        tracing::warn!(
+            timeout_seconds = timeout.as_secs_f64(),
+            "Accepted request work exceeded fail-fast drain timeout; cancelling it"
+        );
+        accepted_tasks.cancel();
+    }
+}
+
+#[cfg(test)]
+mod graceful_shutdown_order_tests {
+    use std::sync::Arc;
+
+    use axum::{
+        Router,
+        body::Body,
+        http::{Request, StatusCode},
+        middleware,
+        routing::get,
+    };
+    use tokio::sync::Notify;
+    use tower::{Layer, ServiceExt};
+
+    use super::{AcceptedTaskTracker, cancel_request_on_forced_shutdown};
+
+    #[test]
+    fn closing_admission_is_atomic_with_new_work() {
+        let accepted_tasks = AcceptedTaskTracker::new();
+        let admitted = accepted_tasks.try_admit().expect("tracker starts open");
+
+        accepted_tasks.close();
+
+        assert!(accepted_tasks.try_admit().is_none(), "no work may enter after close returns");
+        drop(admitted);
+    }
+
+    #[tokio::test]
+    async fn fail_fast_drain_is_bounded_before_admitted_work_enters_run() {
+        let accepted_tasks = AcceptedTaskTracker::new();
+        let _admission_stalled_in_setup = accepted_tasks.try_admit().unwrap();
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            super::drain_accepted_tasks_after_failure_with_timeout(&accepted_tasks, std::time::Duration::from_millis(10)),
+        )
+        .await
+        .expect("fail-fast drain must not wait indefinitely for pre-spawn setup");
+    }
+
+    #[tokio::test]
+    async fn force_cancellation_drops_a_request_that_ignores_graceful_shutdown() {
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let service = middleware::from_fn_with_state(cancellation.clone(), cancel_request_on_forced_shutdown)
+            .layer(Router::new().route("/", get(|| async { std::future::pending::<axum::response::Response>().await })));
+        let request = tokio::spawn(async move {
+            service
+                .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+                .await
+                .unwrap()
+        });
+
+        tokio::task::yield_now().await;
+        cancellation.cancel();
+
+        let response = tokio::time::timeout(std::time::Duration::from_secs(1), request)
+            .await
+            .expect("forced cancellation must terminate the request")
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn fail_fast_signal_waits_for_accepted_work_before_http_drain() {
+        let accepted_tasks = AcceptedTaskTracker::new();
+        let accepted_task_started = Arc::new(Notify::new());
+        let make_loopback_call = Arc::new(Notify::new());
+        let finish_accepted_task = Arc::new(Notify::new());
+        let fail_fast_shutdown = tokio_util::sync::CancellationToken::new();
+        let loopback_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let loopback_address = loopback_listener.local_addr().unwrap();
+
+        let admission = accepted_tasks.try_admit().unwrap();
+        tokio::spawn(admission.run({
+            let accepted_task_started = Arc::clone(&accepted_task_started);
+            let make_loopback_call = Arc::clone(&make_loopback_call);
+            let finish_accepted_task = Arc::clone(&finish_accepted_task);
+            async move {
+                accepted_task_started.notify_one();
+                make_loopback_call.notified().await;
+                tokio::net::TcpStream::connect(loopback_address).await.unwrap();
+                finish_accepted_task.notified().await;
+            }
+        }));
+
+        let graceful_signal = {
+            let accepted_tasks = accepted_tasks.clone();
+            let fail_fast_shutdown = fail_fast_shutdown.clone();
+            tokio::spawn(async move {
+                super::wait_for_shutdown_and_accepted_work(std::future::pending(), fail_fast_shutdown, accepted_tasks).await;
+            })
+        };
+
+        accepted_task_started.notified().await;
+        fail_fast_shutdown.cancel();
+        make_loopback_call.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(1), loopback_listener.accept())
+            .await
+            .expect("internal loopback listener stopped before accepted work drained")
+            .unwrap();
+        tokio::task::yield_now().await;
+        assert!(
+            !graceful_signal.is_finished(),
+            "Axum must keep serving internal loopback calls while accepted work drains"
+        );
+
+        finish_accepted_task.notify_one();
+        graceful_signal.await.unwrap();
+        assert!(accepted_tasks.is_closed());
     }
 }
 
