@@ -26,6 +26,8 @@
 
 pub mod accumulate;
 pub mod detect;
+pub mod metrics;
+pub mod render;
 pub mod rewrap;
 
 use sqlx::PgPool;
