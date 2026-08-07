@@ -401,7 +401,13 @@ mod continuation_knob_tests {
         let req: CompletionRequest =
             serde_json::from_value(serde_json::json!({"model": "m", "prompt": "x"})).unwrap();
         let out = serde_json::to_value(&req).unwrap();
-        for k in ["ignore_eos", "min_tokens", "stop_token_ids", "skip_special_tokens", "include_stop_str_in_output"] {
+        for k in [
+            "ignore_eos",
+            "min_tokens",
+            "stop_token_ids",
+            "skip_special_tokens",
+            "include_stop_str_in_output",
+        ] {
             assert!(out.get(k).is_none(), "{k} should be omitted when unset");
         }
     }
