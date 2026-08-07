@@ -142,6 +142,11 @@
         "ordinal": 27,
         "name": "auto_topup_retry_after",
         "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 28,
+        "name": "auto_join_enabled",
+        "type_info": "Bool"
       }
     ],
     "parameters": {
@@ -177,7 +182,8 @@
       false,
       false,
       false,
-      true
+      true,
+      false
     ]
   },
   "hash": "29dbbb71782841c85e29f1b9830629b5163848c8e2281e17926c22a89fce3428"

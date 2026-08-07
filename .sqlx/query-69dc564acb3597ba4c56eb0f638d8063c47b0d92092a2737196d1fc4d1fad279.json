@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE users SET auto_join_enabled = $2, updated_at = NOW()\n            WHERE id = $1 AND user_type = 'organization' AND is_deleted = false\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Bool"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "69dc564acb3597ba4c56eb0f638d8063c47b0d92092a2737196d1fc4d1fad279"
+}

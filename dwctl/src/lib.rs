@@ -1454,6 +1454,18 @@ pub async fn build_router(
             "/organizations/{id}/join-requests/{request_id}/decline",
             post(api::handlers::organizations::decline_join_request),
         )
+        // Accept/decline by id, for an invitee who reached the invitation
+        // through onboarding rather than the emailed link. Authorized on the
+        // caller's own address matching the one invited — not on membership,
+        // which the only eligible caller does not have yet.
+        .route(
+            "/organizations/{id}/invites/{invite_id}/accept",
+            post(api::handlers::organizations::accept_invite_by_id),
+        )
+        .route(
+            "/organizations/{id}/invites/{invite_id}/decline",
+            post(api::handlers::organizations::decline_invite_by_id),
+        )
         .route(
             "/organizations/invites/{token}",
             get(api::handlers::organizations::get_invite_details),
@@ -1484,6 +1496,18 @@ pub async fn build_router(
         .route(
             "/users/{user_id}/join-requests",
             get(api::handlers::organizations::list_user_join_requests),
+        )
+        // Filing one is a POST the user makes, never something signup does for
+        // them. Same path because it is the same resource from the same side.
+        .route(
+            "/users/{user_id}/join-requests",
+            post(api::handlers::organizations::create_user_join_request),
+        )
+        // The single read onboarding makes to decide which screen a new user
+        // sees: invited, domain-matched, or neither.
+        .route(
+            "/users/{user_id}/onboarding-context",
+            get(api::handlers::organizations::get_onboarding_context),
         )
         // Organization session context (validates membership, client stores org ID for X-Organization-Id header)
         .route("/session/organization", post(api::handlers::organizations::set_active_organization))
