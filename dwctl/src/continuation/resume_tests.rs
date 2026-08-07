@@ -764,3 +764,39 @@ async fn non_2xx_and_non_streaming_responses_are_left_alone(pool: PgPool) {
     );
     assert!(fake.resume_requests().is_empty());
 }
+
+/// Review-sweep item: the resume leg must re-enter at THIS layer's inner
+/// service, not at the top of the stack. If the capture point ever moved above
+/// outlet or the cache layer, every resumed request would produce a second
+/// analytics row, a second billing record and a second cache classify. The
+/// counting layer here stands in for those: it must see the customer's request
+/// exactly once, however many legs it took to serve it.
+#[sqlx::test]
+async fn a_resume_leg_never_re_enters_the_layers_above_this_one(pool: PgPool) {
+    let fake = Fake::new(
+        vec![content("chatcmpl-1", "one "), Chunk::Reset],
+        vec![vec![leg_text("two", Some("stop")), leg_usage(1004, 2), done()]],
+    );
+    let tokenizer = render_stub(vec![1, 2], 1004, 4).await;
+    let st = state(pool, &fake, tokenizer.uri(), test_config());
+
+    // Stands in for outlet / the cache layer: everything OUTER to continuation.
+    let outer_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = Arc::clone(&outer_calls);
+    let app = app(&fake, st).layer(middleware::from_fn(move |req: Request<Body>, next: axum::middleware::Next| {
+        let counter = Arc::clone(&counter);
+        async move {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            next.run(req).await
+        }
+    }));
+
+    let payloads = collect_payloads(app.oneshot(chat_request(streaming_body())).await.unwrap()).await;
+    assert_eq!(contents(&parsed(&payloads)), "one two", "the stream was resumed");
+    assert_eq!(fake.resume_requests().len(), 1, "a leg was dispatched");
+    assert_eq!(
+        outer_calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the layers above continuation see ONE logical request — no double billing, logging or caching"
+    );
+}

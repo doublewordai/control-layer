@@ -415,9 +415,13 @@ fn tee(response: Response, state: ContinuationState, ctx: RequestContext) -> Res
                     Err(_) => break detect::classify(&DeathEvent::Stall),
                     // `saw_done: false` is not an assumption: a `[DONE]` frame
                     // breaks this loop the moment it arrives, so reaching EOF
-                    // here means the trailer never came.
+                    // here means the trailer never came. A terminal usage frame
+                    // counts as "finished" alongside `finish_reason`: a
+                    // generation that has already reported its accounting is
+                    // over, and resuming past it would emit a second usage frame
+                    // — the one thing outlet and the cache layer must never see.
                     Ok(None) => break detect::classify(&DeathEvent::Eof {
-                        saw_finish_reason: acc.saw_finish_reason(),
+                        saw_finish_reason: acc.saw_finish_reason() || saw_usage,
                         saw_done: false,
                     }),
                     Ok(Some(Err(_))) => break detect::classify(&DeathEvent::TransportError),
@@ -428,7 +432,7 @@ fn tee(response: Response, state: ContinuationState, ctx: RequestContext) -> Res
                 if payload == Some("[DONE]") {
                     done_bytes = Some(item);
                     break detect::classify(&DeathEvent::Eof {
-                        saw_finish_reason: acc.saw_finish_reason(),
+                        saw_finish_reason: acc.saw_finish_reason() || saw_usage,
                         saw_done: true,
                     });
                 }
