@@ -663,7 +663,7 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
             -- but is used internally for onwards inference, so it is exempt.
             AND (
                 ak.user_id = '00000000-0000-0000-0000-000000000000'
-                OR ak.purpose IN ('realtime', 'batch', 'playground')
+                OR ak.purpose IN ('realtime', 'batch', 'playground', 'continuation')
             )
         ) ak
         WHERE cm.is_composite = TRUE
@@ -1409,7 +1409,7 @@ pub async fn load_targets_from_db(
             -- but is used internally for onwards inference, so it is exempt.
             AND (
                 ak.user_id = '00000000-0000-0000-0000-000000000000'
-                OR ak.purpose IN ('realtime', 'batch', 'playground')
+                OR ak.purpose IN ('realtime', 'batch', 'playground', 'continuation')
             )
         ) ak ON true
         WHERE dm.deleted = FALSE
