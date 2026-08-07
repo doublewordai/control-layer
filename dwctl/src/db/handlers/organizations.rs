@@ -182,6 +182,51 @@ impl<'c> Organizations<'c> {
         }
     }
 
+    /// Whether this organization admits signups from its claimed domain
+    /// automatically, rather than offering them the choice to ask.
+    ///
+    /// Read separately rather than carried on [`UserDBResponse`] deliberately:
+    /// the flag is consulted in exactly two places — the domain match at signup
+    /// and the organization's own settings — so threading it through every
+    /// query that materialises a user row would cost far more than the extra
+    /// statement. Both callers already hold the organization id.
+    ///
+    /// Returns `false` for a row that doesn't exist or isn't an organization,
+    /// which is the safe direction: unknown means "do not admit".
+    #[instrument(skip(self), fields(org_id = %abbrev_uuid(&org_id)), err)]
+    pub async fn auto_join_enabled(&mut self, org_id: UserId) -> Result<bool> {
+        let enabled = sqlx::query_scalar!(
+            r#"
+            SELECT auto_join_enabled
+            FROM users
+            WHERE id = $1 AND user_type = 'organization' AND is_deleted = false
+            "#,
+            org_id,
+        )
+        .fetch_optional(&mut *self.db)
+        .await?;
+
+        Ok(enabled.unwrap_or(false))
+    }
+
+    /// Turn domain auto-join on or off. Returns false if there is no such
+    /// organization to change.
+    #[instrument(skip(self), fields(org_id = %abbrev_uuid(&org_id), enabled), err)]
+    pub async fn set_auto_join_enabled(&mut self, org_id: UserId, enabled: bool) -> Result<bool> {
+        let result = sqlx::query!(
+            r#"
+            UPDATE users SET auto_join_enabled = $2, updated_at = NOW()
+            WHERE id = $1 AND user_type = 'organization' AND is_deleted = false
+            "#,
+            org_id,
+            enabled,
+        )
+        .execute(&mut *self.db)
+        .await?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
     /// Create a new organization. The creator is automatically added as owner.
     ///
     /// `default_roles` specifies which roles to assign to the org user entity.
@@ -533,27 +578,52 @@ impl<'c> Organizations<'c> {
     /// Record a request to join an organization, awaiting owner/admin approval.
     ///
     /// The mirror of an invite: same table, same lifecycle, opposite direction.
-    /// `UNIQUE (user_id, organization_id)` means a second request while one is
-    /// outstanding - or while the user is already a member - conflicts rather
-    /// than creating a duplicate, so callers should treat that as "already
-    /// requested" rather than an error.
+    ///
+    /// Idempotent. `UNIQUE (user_id, organization_id)` means a second request
+    /// while one is outstanding — or while the user is already a member —
+    /// collides rather than duplicating, and the whole point of this call is a
+    /// button a user can press twice. On collision the **existing** row comes
+    /// back rather than an error, so the caller reads `status` to tell the
+    /// cases apart: `requested` is "you already asked", `active` is "you are
+    /// already in", `pending` is "you were invited and haven't accepted".
+    /// Every one of those is a state the caller must describe, not a failure.
     #[instrument(skip(self), fields(org_id = %abbrev_uuid(&org_id), user_id = %abbrev_uuid(&user_id)), err)]
     pub async fn create_join_request(&mut self, org_id: UserId, user_id: UserId) -> Result<OrganizationMemberDBResponse> {
-        let row = sqlx::query_as!(
+        let inserted = sqlx::query_as!(
             MemberRow,
             r#"
             INSERT INTO user_organizations (user_id, organization_id, role, status)
             VALUES ($1, $2, 'member', 'requested')
+            ON CONFLICT (user_id, organization_id) DO NOTHING
             RETURNING id, user_id, organization_id, role, status, created_at,
                       invite_email, invited_by, expires_at
             "#,
             user_id,
             org_id,
         )
-        .fetch_one(&mut *self.db)
+        .fetch_optional(&mut *self.db)
         .await?;
 
-        Ok(row.into())
+        if let Some(row) = inserted {
+            return Ok(row.into());
+        }
+
+        let existing = sqlx::query_as!(
+            MemberRow,
+            r#"
+            SELECT id, user_id, organization_id, role, status, created_at,
+                   invite_email, invited_by, expires_at
+            FROM user_organizations
+            WHERE user_id = $1 AND organization_id = $2
+            "#,
+            user_id,
+            org_id,
+        )
+        .fetch_optional(&mut *self.db)
+        .await?
+        .ok_or(DbError::NotFound)?;
+
+        Ok(existing.into())
     }
 
     /// A user's own outstanding join requests, oldest first.
@@ -739,6 +809,72 @@ impl<'c> Organizations<'c> {
         .await?;
 
         Ok(row.into())
+    }
+
+    /// The pending invite addressed to `email`, if one is outstanding.
+    ///
+    /// The token-hash lookup above answers "who is this link for"; this one
+    /// answers "has anyone invited *me*", which is the question onboarding has
+    /// to ask. A user who signed up without ever opening the invitation mail —
+    /// or who lost it — has no token, and the stored hash is one-way, so the
+    /// link cannot be reconstructed to hand back to them.
+    ///
+    /// Matched on the address rather than `user_id` because an invite raised
+    /// before the invitee had an account carries no `user_id` at all; that
+    /// column is only filled in on acceptance. Compared case-insensitively for
+    /// the same reason the token path does: mailbox addresses are routinely
+    /// capitalised differently by the sender and the identity provider.
+    ///
+    /// Expired invites and invites into deleted organizations are excluded:
+    /// both would offer the user a door that cannot open.
+    #[instrument(skip(self), err)]
+    pub async fn find_pending_invite_for_email(&mut self, email: &str) -> Result<Option<OrganizationMemberDBResponse>> {
+        let row = sqlx::query_as!(
+            MemberRow,
+            r#"
+            SELECT uo.id, uo.user_id, uo.organization_id, uo.role, uo.status,
+                   uo.created_at, uo.invite_email, uo.invited_by, uo.expires_at
+            FROM user_organizations uo
+            INNER JOIN users o ON o.id = uo.organization_id
+            WHERE LOWER(uo.invite_email) = LOWER($1)
+              AND uo.status = 'pending'
+              AND o.is_deleted = false
+              AND (uo.expires_at IS NULL OR uo.expires_at > NOW())
+            ORDER BY uo.created_at ASC
+            LIMIT 1
+            "#,
+            email,
+        )
+        .fetch_optional(&mut *self.db)
+        .await?;
+
+        Ok(row.map(Into::into))
+    }
+
+    /// A pending invite by row id, scoped to its organization.
+    ///
+    /// The by-id counterpart to [`Self::find_invite_by_token_hash`], for the
+    /// invitee who reached the invite through onboarding rather than through
+    /// the emailed link. Possession of the token is what proves the mailbox on
+    /// the link path; here the caller's own authenticated address does, so
+    /// callers MUST compare `invite_email` against it before acting.
+    #[instrument(skip(self), fields(org_id = %abbrev_uuid(&org_id), invite_id = %abbrev_uuid(&invite_id)), err)]
+    pub async fn find_invite_by_id(&mut self, org_id: UserId, invite_id: Uuid) -> Result<Option<OrganizationMemberDBResponse>> {
+        let row = sqlx::query_as!(
+            MemberRow,
+            r#"
+            SELECT id, user_id, organization_id, role, status, created_at,
+                   invite_email, invited_by, expires_at
+            FROM user_organizations
+            WHERE id = $1 AND organization_id = $2 AND status = 'pending'
+            "#,
+            invite_id,
+            org_id,
+        )
+        .fetch_optional(&mut *self.db)
+        .await?;
+
+        Ok(row.map(Into::into))
     }
 
     /// Find a pending invite by token hash
