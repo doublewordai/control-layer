@@ -106,6 +106,22 @@ impl<'c> Organizations<'c> {
     /// Find an organization by its domain (stored as username).
     /// Returns `None` if no active (non-deleted) organization exists with that domain.
     #[instrument(skip(self), fields(domain = %domain), err)]
+    /// The organization a join request for `domain` should go to.
+    ///
+    /// Organization usernames are `{domain}~{suffix}`, so one company can hold
+    /// several workspaces - prod and dev being the obvious pair - while
+    /// `users.username` stays unique. The bare `username = $1` arm matches
+    /// organizations created before the suffix existed, whose username is the
+    /// domain alone.
+    ///
+    /// `~` is the separator precisely because it can't occur in a domain, so
+    /// the prefix match is exact: "acme.com" cannot match an organization for
+    /// "acme.com.au", which a plain `LIKE 'acme.com%'` would have done and
+    /// routed a join request to the wrong company.
+    ///
+    /// Several may match; the oldest surviving one wins. That's the workspace a
+    /// colleague signing up is most likely to mean, and it stays stable as
+    /// later ones come and go.
     pub async fn find_by_domain(&mut self, domain: &str) -> Result<Option<UserDBResponse>> {
         let row = sqlx::query!(
             r#"
@@ -113,9 +129,16 @@ impl<'c> Organizations<'c> {
                    is_admin, password_hash, external_user_id, payment_provider_id,
                    is_deleted, is_internal, batch_notifications_enabled, first_batch_email_sent,
                    low_balance_notification_sent, low_balance_threshold,
-                   auto_topup_amount, auto_topup_threshold, auto_topup_monthly_limit, user_type, zero_data_retention
+                   auto_topup_amount, auto_topup_threshold, auto_topup_monthly_limit, user_type, verified, zero_data_retention
             FROM users
-            WHERE username = $1 AND user_type = 'organization' AND is_deleted = false
+            WHERE (username = $1 OR username LIKE $1 || '~%')
+              AND user_type = 'organization'
+              -- A soft-deleted workspace must never receive join requests:
+              -- nobody is left to approve them, so the requester would sit on a
+              -- queue no one can see.
+              AND is_deleted = false
+            ORDER BY created_at ASC
+            LIMIT 1
             "#,
             domain
         )
@@ -151,11 +174,57 @@ impl<'c> Organizations<'c> {
                     auto_topup_threshold: r.auto_topup_threshold,
                     auto_topup_monthly_limit: r.auto_topup_monthly_limit,
                     user_type: r.user_type,
+                    verified: r.verified,
                     zero_data_retention: r.zero_data_retention,
                 }))
             }
             None => Ok(None),
         }
+    }
+
+    /// Whether this organization admits signups from its claimed domain
+    /// automatically, rather than offering them the choice to ask.
+    ///
+    /// Read separately rather than carried on [`UserDBResponse`] deliberately:
+    /// the flag is consulted in exactly two places — the domain match at signup
+    /// and the organization's own settings — so threading it through every
+    /// query that materialises a user row would cost far more than the extra
+    /// statement. Both callers already hold the organization id.
+    ///
+    /// Returns `false` for a row that doesn't exist or isn't an organization,
+    /// which is the safe direction: unknown means "do not admit".
+    #[instrument(skip(self), fields(org_id = %abbrev_uuid(&org_id)), err)]
+    pub async fn auto_join_enabled(&mut self, org_id: UserId) -> Result<bool> {
+        let enabled = sqlx::query_scalar!(
+            r#"
+            SELECT auto_join_enabled
+            FROM users
+            WHERE id = $1 AND user_type = 'organization' AND is_deleted = false
+            "#,
+            org_id,
+        )
+        .fetch_optional(&mut *self.db)
+        .await?;
+
+        Ok(enabled.unwrap_or(false))
+    }
+
+    /// Turn domain auto-join on or off. Returns false if there is no such
+    /// organization to change.
+    #[instrument(skip(self), fields(org_id = %abbrev_uuid(&org_id), enabled), err)]
+    pub async fn set_auto_join_enabled(&mut self, org_id: UserId, enabled: bool) -> Result<bool> {
+        let result = sqlx::query!(
+            r#"
+            UPDATE users SET auto_join_enabled = $2, updated_at = NOW()
+            WHERE id = $1 AND user_type = 'organization' AND is_deleted = false
+            "#,
+            org_id,
+            enabled,
+        )
+        .execute(&mut *self.db)
+        .await?;
+
+        Ok(result.rows_affected() > 0)
     }
 
     /// Create a new organization. The creator is automatically added as owner.
@@ -177,7 +246,7 @@ impl<'c> Organizations<'c> {
                       is_admin, password_hash, external_user_id, payment_provider_id,
                       is_deleted, is_internal, batch_notifications_enabled, first_batch_email_sent,
                       low_balance_notification_sent, low_balance_threshold,
-                      auto_topup_amount, auto_topup_threshold, auto_topup_monthly_limit, user_type, zero_data_retention
+                      auto_topup_amount, auto_topup_threshold, auto_topup_monthly_limit, user_type, verified, zero_data_retention
             "#,
             org_id,
             request.name,
@@ -235,6 +304,7 @@ impl<'c> Organizations<'c> {
             auto_topup_threshold: row.auto_topup_threshold,
             auto_topup_monthly_limit: row.auto_topup_monthly_limit,
             user_type: row.user_type,
+            verified: row.verified,
             zero_data_retention: row.zero_data_retention,
         })
     }
@@ -279,7 +349,7 @@ impl<'c> Organizations<'c> {
                       is_admin, password_hash, external_user_id, payment_provider_id,
                       batch_notifications_enabled, first_batch_email_sent,
                       low_balance_notification_sent, low_balance_threshold,
-                      auto_topup_amount, auto_topup_threshold, auto_topup_monthly_limit, user_type, zero_data_retention
+                      auto_topup_amount, auto_topup_threshold, auto_topup_monthly_limit, user_type, verified, zero_data_retention
             "#,
             id,
             request.display_name,
@@ -321,6 +391,7 @@ impl<'c> Organizations<'c> {
             auto_topup_threshold: row.auto_topup_threshold,
             auto_topup_monthly_limit: row.auto_topup_monthly_limit,
             user_type: row.user_type,
+            verified: row.verified,
             zero_data_retention: row.zero_data_retention,
         })
     }
@@ -374,6 +445,77 @@ impl<'c> Organizations<'c> {
         Ok(row.into())
     }
 
+    /// Grant or revoke the additive 'manage_keys' org role on a membership
+    /// row (organization_member_roles). Only meaningful for base role
+    /// 'member' — owners/admins hold the capability implicitly.
+    #[instrument(skip(self), fields(membership_id = %abbrev_uuid(&membership_id)), err)]
+    pub async fn set_membership_manage_keys(&mut self, membership_id: Uuid, granted: bool) -> Result<()> {
+        if granted {
+            sqlx::query!(
+                "INSERT INTO organization_member_roles (user_organization_id, role) VALUES ($1, 'manage_keys') ON CONFLICT DO NOTHING",
+                membership_id
+            )
+            .execute(&mut *self.db)
+            .await?;
+        } else {
+            sqlx::query!(
+                "DELETE FROM organization_member_roles WHERE user_organization_id = $1 AND role = 'manage_keys'",
+                membership_id
+            )
+            .execute(&mut *self.db)
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// Does this membership row carry the 'manage_keys' org role?
+    #[instrument(skip(self), fields(membership_id = %abbrev_uuid(&membership_id)), err)]
+    pub async fn membership_has_manage_keys(&mut self, membership_id: Uuid) -> Result<bool> {
+        let exists = sqlx::query_scalar!(
+            r#"SELECT EXISTS(SELECT 1 FROM organization_member_roles WHERE user_organization_id = $1 AND role = 'manage_keys') AS "exists!""#,
+            membership_id
+        )
+        .fetch_one(&mut *self.db)
+        .await?;
+        Ok(exists)
+    }
+
+    /// Membership row ids in this org that carry the 'manage_keys' role
+    /// (one query for member-list rendering).
+    #[instrument(skip(self), fields(org_id = %abbrev_uuid(&org_id)), err)]
+    pub async fn list_manage_keys_membership_ids(&mut self, org_id: UserId) -> Result<std::collections::HashSet<Uuid>> {
+        let ids = sqlx::query_scalar!(
+            r#"
+            SELECT omr.user_organization_id
+            FROM organization_member_roles omr
+            JOIN user_organizations uo ON uo.id = omr.user_organization_id
+            WHERE uo.organization_id = $1 AND omr.role = 'manage_keys'
+            "#,
+            org_id
+        )
+        .fetch_all(&mut *self.db)
+        .await?;
+        Ok(ids.into_iter().collect())
+    }
+
+    /// Org ids where this user's membership carries the 'manage_keys' role
+    /// (one query for the session's org-context capabilities).
+    #[instrument(skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
+    pub async fn user_manage_keys_org_ids(&mut self, user_id: UserId) -> Result<std::collections::HashSet<UserId>> {
+        let ids = sqlx::query_scalar!(
+            r#"
+            SELECT uo.organization_id
+            FROM user_organizations uo
+            JOIN organization_member_roles omr ON omr.user_organization_id = uo.id
+            WHERE uo.user_id = $1 AND omr.role = 'manage_keys'
+            "#,
+            user_id
+        )
+        .fetch_all(&mut *self.db)
+        .await?;
+        Ok(ids.into_iter().collect())
+    }
+
     /// Remove a member from an organization
     #[instrument(skip(self), fields(org_id = %abbrev_uuid(&org_id), user_id = %abbrev_uuid(&user_id)), err)]
     pub async fn remove_member(&mut self, org_id: UserId, user_id: UserId) -> Result<bool> {
@@ -421,6 +563,7 @@ impl<'c> Organizations<'c> {
             FROM user_organizations uo
             LEFT JOIN users u ON u.id = uo.user_id
             WHERE uo.organization_id = $1
+              AND uo.status <> 'requested'
               AND (uo.user_id IS NULL OR u.is_deleted = false)
             ORDER BY uo.status ASC, uo.created_at ASC
             "#,
@@ -430,6 +573,154 @@ impl<'c> Organizations<'c> {
         .await?;
 
         Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    /// Record a request to join an organization, awaiting owner/admin approval.
+    ///
+    /// The mirror of an invite: same table, same lifecycle, opposite direction.
+    ///
+    /// Idempotent. `UNIQUE (user_id, organization_id)` means a second request
+    /// while one is outstanding — or while the user is already a member —
+    /// collides rather than duplicating, and the whole point of this call is a
+    /// button a user can press twice. On collision the **existing** row comes
+    /// back rather than an error, so the caller reads `status` to tell the
+    /// cases apart: `requested` is "you already asked", `active` is "you are
+    /// already in", `pending` is "you were invited and haven't accepted".
+    /// Every one of those is a state the caller must describe, not a failure.
+    #[instrument(skip(self), fields(org_id = %abbrev_uuid(&org_id), user_id = %abbrev_uuid(&user_id)), err)]
+    pub async fn create_join_request(&mut self, org_id: UserId, user_id: UserId) -> Result<OrganizationMemberDBResponse> {
+        let inserted = sqlx::query_as!(
+            MemberRow,
+            r#"
+            INSERT INTO user_organizations (user_id, organization_id, role, status)
+            VALUES ($1, $2, 'member', 'requested')
+            ON CONFLICT (user_id, organization_id) DO NOTHING
+            RETURNING id, user_id, organization_id, role, status, created_at,
+                      invite_email, invited_by, expires_at
+            "#,
+            user_id,
+            org_id,
+        )
+        .fetch_optional(&mut *self.db)
+        .await?;
+
+        if let Some(row) = inserted {
+            return Ok(row.into());
+        }
+
+        let existing = sqlx::query_as!(
+            MemberRow,
+            r#"
+            SELECT id, user_id, organization_id, role, status, created_at,
+                   invite_email, invited_by, expires_at
+            FROM user_organizations
+            WHERE user_id = $1 AND organization_id = $2
+            "#,
+            user_id,
+            org_id,
+        )
+        .fetch_optional(&mut *self.db)
+        .await?
+        .ok_or(DbError::NotFound)?;
+
+        Ok(existing.into())
+    }
+
+    /// A user's own outstanding join requests, oldest first.
+    ///
+    /// The mirror of [`Self::list_join_requests`], which answers "who wants
+    /// into my organization" for an owner. This one answers "what have I asked
+    /// to join" for the requester, who is by definition not a member yet and so
+    /// cannot read the organization-scoped queue.
+    ///
+    /// Deleted organizations are excluded for the same reason they don't match
+    /// on signup: nobody is left to approve the request, so surfacing it would
+    /// promise an outcome that can never arrive.
+    #[instrument(skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
+    pub async fn list_user_join_requests(&mut self, user_id: UserId) -> Result<Vec<OrganizationMemberDBResponse>> {
+        let rows = sqlx::query_as!(
+            MemberRow,
+            r#"
+            SELECT uo.id, uo.user_id, uo.organization_id, uo.role, uo.status,
+                   uo.created_at, uo.invite_email, uo.invited_by, uo.expires_at
+            FROM user_organizations uo
+            INNER JOIN users o ON o.id = uo.organization_id
+            WHERE uo.user_id = $1
+              AND uo.status = 'requested'
+              AND o.is_deleted = false
+            ORDER BY uo.created_at ASC
+            "#,
+            user_id
+        )
+        .fetch_all(&mut *self.db)
+        .await?;
+
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    /// Outstanding join requests for an organization, oldest first.
+    #[instrument(skip(self), fields(org_id = %abbrev_uuid(&org_id)), err)]
+    pub async fn list_join_requests(&mut self, org_id: UserId) -> Result<Vec<OrganizationMemberDBResponse>> {
+        let rows = sqlx::query_as!(
+            MemberRow,
+            r#"
+            SELECT uo.id, uo.user_id, uo.organization_id, uo.role, uo.status,
+                   uo.created_at, uo.invite_email, uo.invited_by, uo.expires_at
+            FROM user_organizations uo
+            INNER JOIN users u ON u.id = uo.user_id
+            WHERE uo.organization_id = $1
+              AND uo.status = 'requested'
+              AND u.is_deleted = false
+            ORDER BY uo.created_at ASC
+            "#,
+            org_id
+        )
+        .fetch_all(&mut *self.db)
+        .await?;
+
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
+    /// Approve a join request: the requester becomes an active member.
+    ///
+    /// Scoped to `org_id` as well as the request id so a caller who can manage
+    /// one organization can't approve a request belonging to another. Returns
+    /// false if the request no longer exists or was already decided, which
+    /// makes concurrent approvals a no-op rather than a double-add.
+    #[instrument(skip(self), fields(org_id = %abbrev_uuid(&org_id), request_id = %abbrev_uuid(&request_id)), err)]
+    pub async fn approve_join_request(&mut self, org_id: UserId, request_id: Uuid, role: &str) -> Result<bool> {
+        let result = sqlx::query!(
+            r#"
+            UPDATE user_organizations
+            SET status = 'active', role = $3
+            WHERE id = $1 AND organization_id = $2 AND status = 'requested'
+            "#,
+            request_id,
+            org_id,
+            role,
+        )
+        .execute(&mut *self.db)
+        .await?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Decline a join request, removing the row.
+    ///
+    /// Deleted rather than kept in a `declined` state so the user can ask again
+    /// later - a permanent tombstone would silently block them forever via the
+    /// unique constraint.
+    #[instrument(skip(self), fields(org_id = %abbrev_uuid(&org_id), request_id = %abbrev_uuid(&request_id)), err)]
+    pub async fn decline_join_request(&mut self, org_id: UserId, request_id: Uuid) -> Result<bool> {
+        let result = sqlx::query!(
+            "DELETE FROM user_organizations WHERE id = $1 AND organization_id = $2 AND status = 'requested'",
+            request_id,
+            org_id,
+        )
+        .execute(&mut *self.db)
+        .await?;
+
+        Ok(result.rows_affected() > 0)
     }
 
     /// List organizations a user belongs to (active memberships only)
@@ -520,6 +811,72 @@ impl<'c> Organizations<'c> {
         Ok(row.into())
     }
 
+    /// The pending invite addressed to `email`, if one is outstanding.
+    ///
+    /// The token-hash lookup above answers "who is this link for"; this one
+    /// answers "has anyone invited *me*", which is the question onboarding has
+    /// to ask. A user who signed up without ever opening the invitation mail —
+    /// or who lost it — has no token, and the stored hash is one-way, so the
+    /// link cannot be reconstructed to hand back to them.
+    ///
+    /// Matched on the address rather than `user_id` because an invite raised
+    /// before the invitee had an account carries no `user_id` at all; that
+    /// column is only filled in on acceptance. Compared case-insensitively for
+    /// the same reason the token path does: mailbox addresses are routinely
+    /// capitalised differently by the sender and the identity provider.
+    ///
+    /// Expired invites and invites into deleted organizations are excluded:
+    /// both would offer the user a door that cannot open.
+    #[instrument(skip(self), err)]
+    pub async fn find_pending_invite_for_email(&mut self, email: &str) -> Result<Option<OrganizationMemberDBResponse>> {
+        let row = sqlx::query_as!(
+            MemberRow,
+            r#"
+            SELECT uo.id, uo.user_id, uo.organization_id, uo.role, uo.status,
+                   uo.created_at, uo.invite_email, uo.invited_by, uo.expires_at
+            FROM user_organizations uo
+            INNER JOIN users o ON o.id = uo.organization_id
+            WHERE LOWER(uo.invite_email) = LOWER($1)
+              AND uo.status = 'pending'
+              AND o.is_deleted = false
+              AND (uo.expires_at IS NULL OR uo.expires_at > NOW())
+            ORDER BY uo.created_at ASC
+            LIMIT 1
+            "#,
+            email,
+        )
+        .fetch_optional(&mut *self.db)
+        .await?;
+
+        Ok(row.map(Into::into))
+    }
+
+    /// A pending invite by row id, scoped to its organization.
+    ///
+    /// The by-id counterpart to [`Self::find_invite_by_token_hash`], for the
+    /// invitee who reached the invite through onboarding rather than through
+    /// the emailed link. Possession of the token is what proves the mailbox on
+    /// the link path; here the caller's own authenticated address does, so
+    /// callers MUST compare `invite_email` against it before acting.
+    #[instrument(skip(self), fields(org_id = %abbrev_uuid(&org_id), invite_id = %abbrev_uuid(&invite_id)), err)]
+    pub async fn find_invite_by_id(&mut self, org_id: UserId, invite_id: Uuid) -> Result<Option<OrganizationMemberDBResponse>> {
+        let row = sqlx::query_as!(
+            MemberRow,
+            r#"
+            SELECT id, user_id, organization_id, role, status, created_at,
+                   invite_email, invited_by, expires_at
+            FROM user_organizations
+            WHERE id = $1 AND organization_id = $2 AND status = 'pending'
+            "#,
+            invite_id,
+            org_id,
+        )
+        .fetch_optional(&mut *self.db)
+        .await?;
+
+        Ok(row.map(Into::into))
+    }
+
     /// Find a pending invite by token hash
     #[instrument(skip(self, token_hash), err)]
     pub async fn find_invite_by_token_hash(&mut self, token_hash: &str) -> Result<Option<OrganizationMemberDBResponse>> {
@@ -563,6 +920,41 @@ impl<'c> Organizations<'c> {
         .ok_or(DbError::NotFound)?;
 
         Ok(row.into())
+    }
+
+    /// Re-issue a pending invite: new token, fresh expiry.
+    ///
+    /// The original token is only stored as a hash, so it can't be recovered to
+    /// re-send - a resend necessarily mints a new one. That also invalidates
+    /// the old link, which is the behaviour you want if the first was sent to
+    /// the wrong place or has leaked.
+    ///
+    /// Returns the invite's email and role so the caller can send the mail,
+    /// or None if there's no pending invite by that id in this organization.
+    #[instrument(skip(self, token_hash), fields(org_id = %abbrev_uuid(&org_id), invite_id = %abbrev_uuid(&invite_id)), err)]
+    pub async fn refresh_invite_token(
+        &mut self,
+        org_id: UserId,
+        invite_id: Uuid,
+        token_hash: &str,
+        expires_at: DateTime<Utc>,
+    ) -> Result<Option<(String, String)>> {
+        let row = sqlx::query!(
+            r#"
+            UPDATE user_organizations
+            SET invite_token_hash = $3, expires_at = $4
+            WHERE id = $1 AND organization_id = $2 AND status = 'pending'
+            RETURNING invite_email, role
+            "#,
+            invite_id,
+            org_id,
+            token_hash,
+            expires_at,
+        )
+        .fetch_optional(&mut *self.db)
+        .await?;
+
+        Ok(row.and_then(|r| r.invite_email.map(|email| (email, r.role))))
     }
 
     /// Cancel (delete) a pending invite by row ID

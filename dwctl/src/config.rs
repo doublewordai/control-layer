@@ -604,6 +604,12 @@ pub struct StripeConfig {
     /// Custom text displayed for terms of service acceptance during auto top-up setup.
     /// If not set, no terms of service acceptance text is shown.
     pub auto_topup_terms_of_service_text: Option<String>,
+    /// Custom text displayed for terms of service acceptance during onboarding
+    /// card verification (`POST /payments/setup`). Falls back to
+    /// `auto_topup_terms_of_service_text` when unset, since both are setup-mode
+    /// checkouts saving a card for later off-session use.
+    #[serde(default)]
+    pub setup_terms_of_service_text: Option<String>,
     /// Stripe tax code for auto top-up tax calculations (e.g. "txcd_10000000").
     /// If not set, falls back to the account-level default tax code in Stripe Tax settings.
     pub tax_code: Option<String>,
@@ -1088,6 +1094,18 @@ pub struct CacheConfig {
     /// Set via environment: `DWCTL_CACHE__INDEX_CONN_RETRIES=3`
     pub index_conn_retries: u32,
 
+    /// Exact chat-templated token counting via tokenizer-svc `/v1/render` (svc ≥ 0.3.0).
+    /// When true, cache splits are counted against the model's real chat-template
+    /// rendering — the same bytes the engine tokenizes — instead of raw content-block
+    /// text, eliminating the classifier-vs-engine drift that forces the billing caps to
+    /// engage. Per-alias it additionally requires a `template_version` from `/v1/models`;
+    /// aliases without one (and render failures) keep raw-segment counting. Rollout:
+    /// staging first, watch `dwctl_cache_render_drift_tokens` ≈ 0, then prod.
+    ///
+    /// Set via environment: `DWCTL_CACHE__RENDER_COUNTING=true`
+    #[serde(default)]
+    pub render_counting: bool,
+
     /// Handling of provider-injected per-request *telemetry* blocks (e.g. the Claude Code SDK's
     /// `x-anthropic-billing-header` line, whose nonce changes every request). Such a block sits
     /// ahead of the caller's `cache_control` breakpoint, so leaving it in would change the prefix
@@ -1107,6 +1125,7 @@ impl Default for CacheConfig {
             default_ttl: "5m".to_string(),
             classify_deadline_secs: 5,
             index_conn_retries: 1,
+            render_counting: false,
             telemetry_blocks: TelemetryBlockConfig::default(),
         }
     }
@@ -1277,12 +1296,6 @@ pub struct BatchConfig {
         deserialize_with = "deserialize_positive_reservation_ttl"
     )]
     pub reservation_ttl_secs: i64,
-    /// Optional realtime priority decay window (seconds) for queue monitoring.
-    /// When set, completed FLEX requests within this lookback are included
-    /// in the 1h pending-request-counts bucket. When null or omitted, no decay
-    /// count is applied.
-    #[serde(default, deserialize_with = "deserialize_non_negative_optional_i64")]
-    pub priority_decay_window_secs: Option<i64>,
     /// Upload-volume cap for *unverified* creditors, expressed as requests per
     /// hour of completion window. The effective cap for a submission scales with
     /// its completion window: `unverified_requests_per_completion_hour *
@@ -1383,22 +1396,6 @@ where
     }
 }
 
-fn deserialize_non_negative_optional_i64<'de, D>(deserializer: D) -> Result<Option<i64>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    use serde::de::Error;
-
-    let opt: Option<i64> = Option::deserialize(deserializer)?;
-    match opt {
-        Some(value) if value < 0 => Err(D::Error::custom(format!(
-            "priority_decay_window_secs must be non-negative, got {}",
-            value
-        ))),
-        value => Ok(value),
-    }
-}
-
 /// Custom deserializer that validates throughput is positive, with null/missing defaulting to 100.0
 fn deserialize_positive_throughput<'de, D>(deserializer: D) -> Result<f32, D::Error>
 where
@@ -1436,7 +1433,6 @@ impl Default for BatchConfig {
             files: FilesConfig::default(),
             default_throughput: default_batch_throughput(),
             reservation_ttl_secs: default_reservation_ttl_secs(),
-            priority_decay_window_secs: None,
             unverified_requests_per_completion_hour: 1000,
             pending_capacity_counts_enabled: false,
         }
@@ -1878,6 +1874,14 @@ where
     }
 }
 
+/// Batch metadata keys fusillade forwards to dwctl as `x-fusillade-batch-<key>`
+/// headers on every dispatched request.
+///
+/// THIS LIST IS THE WHOLE MECHANISM. Storing a key in a batch's metadata does
+/// nothing on its own — `claimed_rows_to_requests` only copies the keys named
+/// here onto the claimed request, so an unlisted key is written, persisted, and
+/// silently never sent. Anything that has to reach `http_analytics` has to be
+/// added here as well as at the write site.
 fn default_batch_metadata_fields_dwctl() -> Vec<String> {
     vec![
         "id".to_string(),
@@ -1885,6 +1889,10 @@ fn default_batch_metadata_fields_dwctl() -> Vec<String> {
         "created_at".to_string(),
         "completion_window".to_string(),
         "request_source".to_string(),
+        // The submitter's User-Agent, stamped at creation by `create_batch`. Without
+        // it the analytics row for a dispatched batch request has no client at all:
+        // fusillade's own HTTP client sends no User-Agent.
+        "dw_user_agent".to_string(),
     ]
 }
 
@@ -2304,6 +2312,17 @@ pub struct CreditsConfig {
     /// `purchase`), so existing paying customers are never matched.
     #[serde(default)]
     pub first_payment_match_up_to: rust_decimal::Decimal,
+    /// Signup credits granted the first time a billing target verifies a payment
+    /// method through setup-mode checkout (`POST /payments/setup`), in dollars.
+    /// 0 disables the grant.
+    ///
+    /// Distinct from `initial_credits_for_standard_users`, which lands at account
+    /// creation for everyone. This one is the onboarding carrot that only pays out
+    /// once a real card has been verified, so it is not farmable by signing up
+    /// repeatedly. Idempotent per checkout session, and granted at most once per
+    /// billing target (see `Credits::grant_verification_credits`).
+    #[serde(default)]
+    pub verification_credits: rust_decimal::Decimal,
 }
 
 impl Default for CreditsConfig {
@@ -2313,6 +2332,8 @@ impl Default for CreditsConfig {
             initial_credits_for_standard_users: rust_decimal::Decimal::ZERO,
             // Default to 0 (first-payment match promotion disabled)
             first_payment_match_up_to: rust_decimal::Decimal::ZERO,
+            // Default to 0 (no signup credits on card verification)
+            verification_credits: rust_decimal::Decimal::ZERO,
         }
     }
 }
@@ -3000,6 +3021,30 @@ mod tests {
     #[test]
     fn default_auth_roles_include_background_inference() {
         assert!(AuthConfig::default().default_user_roles.contains(&Role::BackgroundInferenceUser));
+    }
+
+    /// Stamping a key into a batch's metadata does NOTHING unless the key is also on this
+    /// list: fusillade copies only the listed keys onto each claimed request, so an
+    /// unlisted one is written, persisted, and silently never sent as a header — and the
+    /// `http_analytics` column it feeds stays empty with no error anywhere. Every column
+    /// fed this way is asserted here, so removing one from the list fails the build rather
+    /// than the dashboard.
+    #[test]
+    fn forwarded_batch_metadata_covers_every_column_analytics_fills_from_it() {
+        let forwarded = DaemonConfig::default().batch_metadata_fields;
+        // (metadata key, the http_analytics column it lands in)
+        for (key, column) in [
+            ("id", "fusillade_batch_id"),
+            ("completion_window", "batch_sla"),
+            ("created_at", "batch_created_at (batch-creation pricing)"),
+            ("request_source", "batch_request_source"),
+            ("dw_user_agent", "user_agent"),
+        ] {
+            assert!(
+                forwarded.contains(&key.to_string()),
+                "batch metadata key '{key}' is not forwarded, so http_analytics.{column} will never be populated for batch requests"
+            );
+        }
     }
 
     #[test]
@@ -3719,62 +3764,9 @@ batches:
     }
 
     #[test]
-    fn test_priority_decay_window_default_disabled() {
-        let config = Config::default();
-        assert_eq!(config.batches.priority_decay_window_secs, None);
-    }
-
-    #[test]
     fn test_pending_capacity_counts_default_disabled() {
         let config = Config::default();
         assert!(!config.batches.pending_capacity_counts_enabled);
-    }
-
-    #[test]
-    fn test_priority_decay_window_explicit_value() {
-        Jail::expect_with(|jail| {
-            jail.create_file(
-                "test.yaml",
-                r#"
-secret_key: "test-secret-key"
-batches:
-  priority_decay_window_secs: 600
-"#,
-            )?;
-
-            let args = Args {
-                config: "test.yaml".into(),
-                validate: false,
-            };
-            let config = Config::load(&args)?;
-            assert_eq!(config.batches.priority_decay_window_secs, Some(600));
-
-            Ok(())
-        });
-    }
-
-    #[test]
-    fn test_priority_decay_window_negative_rejected() {
-        Jail::expect_with(|jail| {
-            jail.create_file(
-                "test.yaml",
-                r#"
-secret_key: "test-secret-key"
-batches:
-  priority_decay_window_secs: -1
-"#,
-            )?;
-
-            let args = Args {
-                config: "test.yaml".into(),
-                validate: false,
-            };
-            let result = Config::load(&args);
-            assert!(result.is_err());
-            assert!(result.unwrap_err().to_string().contains("priority_decay_window_secs"));
-
-            Ok(())
-        });
     }
 
     #[test]

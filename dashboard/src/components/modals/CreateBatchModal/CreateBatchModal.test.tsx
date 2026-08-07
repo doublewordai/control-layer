@@ -4,6 +4,7 @@ import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { CreateBatchModal } from "./CreateBatchModal";
 import * as hooks from "../../../api/control-layer/hooks";
+import * as contexts from "../../../contexts";
 
 // Mock the hooks
 vi.mock("../../../api/control-layer/hooks", () => ({
@@ -12,12 +13,19 @@ vi.mock("../../../api/control-layer/hooks", () => ({
   useUploadFileWithProgress: vi.fn(),
   useFiles: vi.fn(),
   useFileCostEstimate: vi.fn(),
+  useApiKeys: vi.fn(),
+  useUser: vi.fn(),
   useConfig: vi.fn(() => ({
     data: {
       docs_url: "https://docs.example.com",
       docs_jsonl_url: "https://docs.example.com/jsonl",
     },
   })),
+}));
+
+// Mock the organization context (the modal only reads useOrganizationContext)
+vi.mock("../../../contexts", () => ({
+  useOrganizationContext: vi.fn(),
 }));
 
 // Mock sonner toast
@@ -36,6 +44,81 @@ const mockFile = {
   expires_at: 1765065600,
   filename: "test-batch.jsonl",
   purpose: "batch" as const,
+};
+
+const CURRENT_USER_ID = "user-1";
+
+const mockApiKeys = [
+  {
+    id: "key-1",
+    name: "My realtime key",
+    purpose: "realtime",
+    created_at: "2026-01-01T00:00:00Z",
+    created_by: CURRENT_USER_ID,
+    spend_limit: null,
+    spend: null,
+  },
+  {
+    id: "key-2",
+    name: "Capped key",
+    purpose: "realtime",
+    created_at: "2026-01-01T00:00:00Z",
+    created_by: CURRENT_USER_ID,
+    spend_limit: "10",
+    spend: "3.2",
+  },
+  {
+    id: "key-3",
+    name: "Other member key",
+    purpose: "realtime",
+    created_at: "2026-01-01T00:00:00Z",
+    created_by: "user-2",
+    spend_limit: null,
+    spend: null,
+  },
+];
+
+const personalContext = {
+  activeOrganizationId: null,
+  activeOrganization: null,
+  isOrgContext: false,
+  setActiveOrganization: vi.fn(),
+};
+
+const orgContext = (role: string, canManageKeys = true) => ({
+  activeOrganizationId: "org-1",
+  activeOrganization: {
+    id: "org-1",
+    name: "Test Org",
+    role,
+    zero_data_retention: false,
+    can_manage_keys: canManageKeys,
+  },
+  isOrgContext: true,
+  setActiveOrganization: vi.fn(),
+});
+
+const mockCreateBatch = (isPending = false) => {
+  const mutateAsync = vi.fn().mockResolvedValue({});
+  vi.mocked(hooks.useCreateBatch).mockReturnValue({
+    mutateAsync,
+    isPending,
+    isError: false,
+    error: null,
+    isSuccess: false,
+    data: undefined,
+    mutate: vi.fn(),
+    reset: vi.fn(),
+    status: isPending ? "pending" : "idle",
+    context: undefined,
+    failureCount: 0,
+    failureReason: null,
+    isIdle: !isPending,
+    isPaused: false,
+    submittedAt: 0,
+    variables: undefined,
+  } as any);
+  return mutateAsync;
 };
 
 const createWrapper = () => {
@@ -117,6 +200,25 @@ describe("CreateBatchModal", () => {
     // Default mock for useFileCostEstimate
     vi.mocked(hooks.useFileCostEstimate).mockReturnValue({
       data: null,
+      isLoading: false,
+      error: null,
+      refetch: vi.fn(),
+    } as any);
+
+    // Default: personal context (no org)
+    vi.mocked(contexts.useOrganizationContext).mockReturnValue(personalContext);
+
+    // Default mock for useUser (current user)
+    vi.mocked(hooks.useUser).mockReturnValue({
+      data: { id: CURRENT_USER_ID },
+      isLoading: false,
+      error: null,
+      refetch: vi.fn(),
+    } as any);
+
+    // Default mock for useApiKeys
+    vi.mocked(hooks.useApiKeys).mockReturnValue({
+      data: { data: mockApiKeys, total_count: mockApiKeys.length },
       isLoading: false,
       error: null,
       refetch: vi.fn(),
@@ -467,6 +569,212 @@ describe("CreateBatchModal", () => {
 
       // Verify the mutation was NOT called again
       expect(mutateAsync).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("API key selector", () => {
+    it("should not render the selector in personal context", () => {
+      mockCreateBatch();
+
+      render(
+        <CreateBatchModal
+          isOpen={true}
+          onClose={vi.fn()}
+          preselectedFile={mockFile}
+        />,
+        { wrapper: createWrapper() },
+      );
+
+      expect(
+        screen.queryByRole("combobox", { name: /bill to api key/i }),
+      ).not.toBeInTheDocument();
+    });
+
+    it("should show the selector with the user's org keys in org context", async () => {
+      const user = userEvent.setup();
+      mockCreateBatch();
+      vi.mocked(contexts.useOrganizationContext).mockReturnValue(
+        orgContext("member"),
+      );
+
+      render(
+        <CreateBatchModal
+          isOpen={true}
+          onClose={vi.fn()}
+          preselectedFile={mockFile}
+        />,
+        { wrapper: createWrapper() },
+      );
+
+      // Keys are listed for the org, not the personal account
+      expect(vi.mocked(hooks.useApiKeys)).toHaveBeenCalledWith(
+        "org-1",
+        expect.any(Object),
+      );
+
+      const trigger = screen.getByRole("combobox", {
+        name: /bill to api key/i,
+      });
+      await user.click(trigger);
+
+      // Default option plus the member's own keys
+      expect(
+        screen.getByRole("option", { name: /account default/i }),
+      ).toBeInTheDocument();
+      expect(
+        screen.getByRole("option", { name: /my realtime key/i }),
+      ).toBeInTheDocument();
+
+      // Capped key shows its usage annotation
+      expect(
+        screen.getByRole("option", { name: /capped key.*\$3\.20 of \$10\.00 used/i }),
+      ).toBeInTheDocument();
+
+      // Plain members only see keys they hold
+      expect(
+        screen.queryByRole("option", { name: /other member key/i }),
+      ).not.toBeInTheDocument();
+    });
+
+    it("offers admins only their OWN keys — managing others' keys never means billing to them", async () => {
+      const user = userEvent.setup();
+      mockCreateBatch();
+      vi.mocked(contexts.useOrganizationContext).mockReturnValue(
+        orgContext("admin"),
+      );
+
+      render(
+        <CreateBatchModal
+          isOpen={true}
+          onClose={vi.fn()}
+          preselectedFile={mockFile}
+        />,
+        { wrapper: createWrapper() },
+      );
+
+      await user.click(
+        screen.getByRole("combobox", { name: /bill to api key/i }),
+      );
+
+      expect(
+        screen.queryByRole("option", { name: /other member key/i }),
+      ).not.toBeInTheDocument();
+    });
+
+    it("should require a key selection for members without key management", async () => {
+      const user = userEvent.setup();
+      const mutateAsync = mockCreateBatch();
+      vi.mocked(contexts.useOrganizationContext).mockReturnValue(
+        orgContext("member", false),
+      );
+
+      render(
+        <CreateBatchModal
+          isOpen={true}
+          onClose={vi.fn()}
+          preselectedFile={mockFile}
+        />,
+        { wrapper: createWrapper() },
+      );
+
+      // Required: helper text shown, submit disabled until a key is chosen
+      expect(
+        screen.getByText(
+          /your organization requires selecting one of your issued api keys/i,
+        ),
+      ).toBeInTheDocument();
+      const createButton = screen.getByRole("button", {
+        name: /create batch/i,
+      });
+      expect(createButton).toBeDisabled();
+
+      await user.click(
+        screen.getByRole("combobox", { name: /bill to api key/i }),
+      );
+
+      // No "Account default" escape hatch in managed mode for plain members
+      expect(
+        screen.queryByRole("option", { name: /account default/i }),
+      ).not.toBeInTheDocument();
+
+      await user.click(
+        screen.getByRole("option", { name: /my realtime key/i }),
+      );
+
+      expect(createButton).toBeEnabled();
+      await user.click(createButton);
+
+      await waitFor(() => {
+        expect(mutateAsync).toHaveBeenCalledWith({
+          input_file_id: "file-123",
+          endpoint: "/v1/chat/completions",
+          completion_window: "24h",
+          metadata: undefined,
+          api_key_id: "key-1",
+        });
+      });
+    });
+
+    it("should include the selected key id in the create payload", async () => {
+      const user = userEvent.setup();
+      const mutateAsync = mockCreateBatch();
+      vi.mocked(contexts.useOrganizationContext).mockReturnValue(
+        orgContext("member"),
+      );
+
+      render(
+        <CreateBatchModal
+          isOpen={true}
+          onClose={vi.fn()}
+          preselectedFile={mockFile}
+        />,
+        { wrapper: createWrapper() },
+      );
+
+      await user.click(
+        screen.getByRole("combobox", { name: /bill to api key/i }),
+      );
+      await user.click(screen.getByRole("option", { name: /capped key/i }));
+
+      await user.click(screen.getByRole("button", { name: /create batch/i }));
+
+      await waitFor(() => {
+        expect(mutateAsync).toHaveBeenCalledWith({
+          input_file_id: "file-123",
+          endpoint: "/v1/chat/completions",
+          completion_window: "24h",
+          metadata: undefined,
+          api_key_id: "key-2",
+        });
+      });
+    });
+
+    it("should omit api_key_id when the account default is kept in org context", async () => {
+      const user = userEvent.setup();
+      const mutateAsync = mockCreateBatch();
+      vi.mocked(contexts.useOrganizationContext).mockReturnValue(
+        orgContext("member"),
+      );
+
+      render(
+        <CreateBatchModal
+          isOpen={true}
+          onClose={vi.fn()}
+          preselectedFile={mockFile}
+        />,
+        { wrapper: createWrapper() },
+      );
+
+      await user.click(screen.getByRole("button", { name: /create batch/i }));
+
+      await waitFor(() => {
+        expect(mutateAsync).toHaveBeenCalledWith({
+          input_file_id: "file-123",
+          endpoint: "/v1/chat/completions",
+          completion_window: "24h",
+          metadata: undefined,
+        });
+      });
     });
 
     it("should submit with empty description when Enter is pressed", async () => {

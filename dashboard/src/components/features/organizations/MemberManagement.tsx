@@ -1,25 +1,28 @@
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   useOrganizationMembers,
   useInviteMember,
   useCancelInvite,
-  useUpdateMemberRole,
   useRemoveMember,
   useLeaveOrganization,
   useUser,
 } from "@/api/control-layer/hooks";
+import { dwctlApi } from "@/api/control-layer/client";
+import { queryKeys } from "@/api/control-layer/keys";
 import { useOrganizationContext } from "@/contexts";
-import type { OrgMemberRole, OrganizationMember } from "@/api/control-layer/types";
+import type {
+  InviteMemberRequest,
+  OrgMemberRole,
+  OrganizationMember,
+  UpdateMemberRoleRequest,
+} from "@/api/control-layer/types";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
+import { Label } from "@/components/ui/label";
+import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group";
+import { Switch } from "@/components/ui/switch";
 import {
   Dialog,
   DialogContent,
@@ -29,8 +32,111 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { UserAvatar } from "@/components/ui";
-import { UserPlus, Trash2, Mail, X, LogOut } from "lucide-react";
+import { UserPlus, Trash2, Mail, X, LogOut, KeyRound } from "lucide-react";
 import { toast } from "sonner";
+
+const ROLE_OPTIONS: {
+  value: OrgMemberRole;
+  label: string;
+  description: string;
+}[] = [
+  {
+    value: "member",
+    label: "Member",
+    description:
+      "Can create inference jobs and view their own usage. Cannot manage billing or other users.",
+  },
+  {
+    value: "admin",
+    label: "Admin",
+    description:
+      "Can invite members, manage API keys for all users, and view org-wide billing and workloads.",
+  },
+  {
+    value: "owner",
+    label: "Owner",
+    description:
+      "Full control over the organization, including members, billing, and settings.",
+  },
+];
+
+interface RoleRadioCardsProps {
+  idPrefix: string;
+  value: OrgMemberRole;
+  onValueChange: (role: OrgMemberRole) => void;
+  includeOwner?: boolean;
+  canManageKeys: boolean;
+  onCanManageKeysChange: (value: boolean) => void;
+}
+
+function RoleRadioCards({
+  idPrefix,
+  value,
+  onValueChange,
+  includeOwner = false,
+  canManageKeys,
+  onCanManageKeysChange,
+}: RoleRadioCardsProps) {
+  const options = includeOwner
+    ? ROLE_OPTIONS
+    : ROLE_OPTIONS.filter((option) => option.value !== "owner");
+
+  return (
+    <RadioGroup
+      value={value}
+      onValueChange={(v) => onValueChange(v as OrgMemberRole)}
+      aria-label="Role"
+    >
+      {options.map((option) => {
+        const selected = value === option.value;
+        return (
+          <div
+            key={option.value}
+            className={`rounded-lg border p-3 ${
+              selected
+                ? "border-doubleword-accent-blue bg-blue-50/50"
+                : "border-gray-200"
+            }`}
+          >
+            <div className="flex items-start gap-3">
+              <RadioGroupItem
+                value={option.value}
+                id={`${idPrefix}-role-${option.value}`}
+                className="mt-0.5"
+              />
+              <div className="flex-1">
+                <Label
+                  htmlFor={`${idPrefix}-role-${option.value}`}
+                  className="text-sm font-medium text-gray-900 cursor-pointer"
+                >
+                  {option.label}
+                </Label>
+                <p className="text-xs text-gray-500 mt-0.5">
+                  {option.description}
+                </p>
+                {option.value === "member" && selected && (
+                  <div className="flex items-center justify-between gap-2 mt-3 pt-3 border-t border-gray-200">
+                    <Label
+                      htmlFor={`${idPrefix}-can-manage-keys`}
+                      className="text-sm text-gray-900 cursor-pointer"
+                    >
+                      Can generate API keys
+                    </Label>
+                    <Switch
+                      id={`${idPrefix}-can-manage-keys`}
+                      checked={canManageKeys}
+                      onCheckedChange={onCanManageKeysChange}
+                    />
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        );
+      })}
+    </RadioGroup>
+  );
+}
 
 interface MemberManagementProps {
   organizationId: string;
@@ -39,19 +145,45 @@ interface MemberManagementProps {
 
 export function MemberManagement({ organizationId, readOnly = false }: MemberManagementProps) {
   const navigate = useNavigate();
+  const queryClient = useQueryClient();
   const { setActiveOrganization } = useOrganizationContext();
   const { data: members = [], isLoading } =
     useOrganizationMembers(organizationId);
   const { data: currentUser } = useUser("current");
   const inviteMember = useInviteMember();
   const cancelInvite = useCancelInvite();
-  const updateRole = useUpdateMemberRole();
   const removeMember = useRemoveMember();
   const leaveOrg = useLeaveOrganization();
 
-  const [showAddForm, setShowAddForm] = useState(false);
-  const [email, setEmail] = useState("");
-  const [selectedRole, setSelectedRole] = useState<OrgMemberRole>("member");
+  // Local mutation (rather than useUpdateMemberRole) so the request can carry
+  // the optional can_manage_keys flag alongside the role.
+  const updateMemberRole = useMutation({
+    mutationKey: ["organizations", "updateMemberRole"],
+    mutationFn: ({
+      userId,
+      data,
+    }: {
+      userId: string;
+      data: UpdateMemberRoleRequest;
+    }) => dwctlApi.organizations.updateMemberRole(organizationId, userId, data),
+    onSettled: () => {
+      queryClient.invalidateQueries({
+        queryKey: queryKeys.organizations.members(organizationId),
+      });
+    },
+  });
+
+  // Invite modal state
+  const [inviteOpen, setInviteOpen] = useState(false);
+  const [inviteEmail, setInviteEmail] = useState("");
+  const [inviteRole, setInviteRole] = useState<OrgMemberRole>("member");
+  const [inviteCanManageKeys, setInviteCanManageKeys] = useState(false);
+
+  // Role modal state
+  const [roleMember, setRoleMember] = useState<OrganizationMember | null>(null);
+  const [roleValue, setRoleValue] = useState<OrgMemberRole>("member");
+  const [roleCanManageKeys, setRoleCanManageKeys] = useState(false);
+
   const [memberToRemove, setMemberToRemove] =
     useState<OrganizationMember | null>(null);
   const [showLeaveConfirm, setShowLeaveConfirm] = useState(false);
@@ -59,18 +191,27 @@ export function MemberManagement({ organizationId, readOnly = false }: MemberMan
   const activeMembers = members.filter((m) => m.status === "active");
   const pendingInvites = members.filter((m) => m.status === "pending");
 
+  const resetInviteForm = () => {
+    setInviteEmail("");
+    setInviteRole("member");
+    setInviteCanManageKeys(false);
+  };
+
   const handleInviteMember = async () => {
-    if (!email) return;
+    if (!inviteEmail) return;
+
+    const data: InviteMemberRequest = { email: inviteEmail, role: inviteRole };
+    // can_manage_keys only applies to the member role (owners/admins are
+    // implicitly allowed to manage keys).
+    if (inviteRole === "member") {
+      data.can_manage_keys = inviteCanManageKeys;
+    }
 
     try {
-      await inviteMember.mutateAsync({
-        orgId: organizationId,
-        data: { email, role: selectedRole },
-      });
-      toast.success(`Invite sent to ${email}`);
-      setShowAddForm(false);
-      setEmail("");
-      setSelectedRole("member");
+      await inviteMember.mutateAsync({ orgId: organizationId, data });
+      toast.success(`Invite sent to ${inviteEmail}`);
+      setInviteOpen(false);
+      resetInviteForm();
     } catch (error) {
       toast.error(
         error instanceof Error ? error.message : "Failed to send invite",
@@ -92,17 +233,27 @@ export function MemberManagement({ organizationId, readOnly = false }: MemberMan
     }
   };
 
-  const handleRoleChange = async (
-    userId: string,
-    newRole: OrgMemberRole,
-  ) => {
+  const openRoleModal = (member: OrganizationMember) => {
+    setRoleValue(member.role as OrgMemberRole);
+    setRoleCanManageKeys(member.can_manage_keys);
+    setRoleMember(member);
+  };
+
+  const handleSaveRole = async () => {
+    if (!roleMember?.user) return;
+
+    const data: UpdateMemberRoleRequest = { role: roleValue };
+    if (roleValue === "member") {
+      data.can_manage_keys = roleCanManageKeys;
+    }
+
     try {
-      await updateRole.mutateAsync({
-        orgId: organizationId,
-        userId,
-        role: newRole,
+      await updateMemberRole.mutateAsync({
+        userId: roleMember.user.id,
+        data,
       });
       toast.success("Role updated");
+      setRoleMember(null);
     } catch (error) {
       toast.error(
         error instanceof Error ? error.message : "Failed to update role",
@@ -160,59 +311,13 @@ export function MemberManagement({ organizationId, readOnly = false }: MemberMan
             <Button
               variant="outline"
               size="sm"
-              onClick={() => setShowAddForm(!showAddForm)}
+              onClick={() => setInviteOpen(true)}
             >
               <UserPlus className="h-4 w-4 mr-2" />
               Invite Member
             </Button>
           )}
         </div>
-
-        {showAddForm && (
-          <div className="border rounded-lg p-4 space-y-3 bg-muted/30 mb-4">
-            <div className="grid gap-2">
-              <Input
-                type="email"
-                placeholder="Enter email address..."
-                value={email}
-                onChange={(e) => setEmail(e.target.value)}
-              />
-            </div>
-            <div className="flex items-center gap-2">
-              <Select
-                value={selectedRole}
-                onValueChange={(v) => setSelectedRole(v as OrgMemberRole)}
-              >
-                <SelectTrigger className="w-32">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="member">Member</SelectItem>
-                  <SelectItem value="admin">Admin</SelectItem>
-                  <SelectItem value="owner">Owner</SelectItem>
-                </SelectContent>
-              </Select>
-              <Button
-                size="sm"
-                onClick={handleInviteMember}
-                disabled={!email || inviteMember.isPending}
-              >
-                {inviteMember.isPending ? "Sending..." : "Send Invite"}
-              </Button>
-              <Button
-                size="sm"
-                variant="ghost"
-                onClick={() => {
-                  setShowAddForm(false);
-                  setEmail("");
-                  setSelectedRole("member");
-                }}
-              >
-                Cancel
-              </Button>
-            </div>
-          </div>
-        )}
 
         {/* Active Members */}
         <div className="divide-y divide-gray-200">
@@ -234,6 +339,13 @@ export function MemberManagement({ organizationId, readOnly = false }: MemberMan
                   </div>
                 </div>
                 <div className="flex items-center gap-2">
+                  {member.can_manage_keys && (
+                    <KeyRound
+                      className="h-4 w-4 text-gray-400"
+                      role="img"
+                      aria-label="Can create API keys"
+                    />
+                  )}
                   {member.user?.id === currentUser?.id ? (
                     <>
                       <span className="text-xs text-muted-foreground capitalize px-2 py-1 bg-muted rounded">
@@ -254,21 +366,17 @@ export function MemberManagement({ organizationId, readOnly = false }: MemberMan
                     </span>
                   ) : (
                     <>
-                      <Select
-                        value={member.role}
-                        onValueChange={(v) =>
-                          handleRoleChange(member.user!.id, v as OrgMemberRole)
-                        }
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        className="h-8 text-xs capitalize"
+                        onClick={() => openRoleModal(member)}
+                        aria-label={`Change role for ${
+                          member.user.display_name || member.user.username
+                        }`}
                       >
-                        <SelectTrigger className="w-28 h-8 text-xs">
-                          <SelectValue />
-                        </SelectTrigger>
-                        <SelectContent>
-                          <SelectItem value="member">Member</SelectItem>
-                          <SelectItem value="admin">Admin</SelectItem>
-                          <SelectItem value="owner">Owner</SelectItem>
-                        </SelectContent>
-                      </Select>
+                        {member.role}
+                      </Button>
                       <button
                         onClick={() => setMemberToRemove(member)}
                         className="h-8 w-8 p-0 rounded text-red-600 hover:text-red-700 hover:bg-red-50 transition-all flex items-center justify-center"
@@ -335,6 +443,96 @@ export function MemberManagement({ organizationId, readOnly = false }: MemberMan
           </>
         )}
       </div>
+
+      <Dialog
+        open={inviteOpen}
+        onOpenChange={(open) => {
+          setInviteOpen(open);
+          if (!open) resetInviteForm();
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Invite member</DialogTitle>
+            <DialogDescription>
+              Send an invitation to join this organization.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-4">
+            <div className="grid gap-2">
+              <Label htmlFor="invite-email">Email</Label>
+              <Input
+                id="invite-email"
+                type="email"
+                placeholder="Enter email address..."
+                value={inviteEmail}
+                onChange={(e) => setInviteEmail(e.target.value)}
+              />
+            </div>
+            <RoleRadioCards
+              idPrefix="invite"
+              value={inviteRole}
+              onValueChange={setInviteRole}
+              canManageKeys={inviteCanManageKeys}
+              onCanManageKeysChange={setInviteCanManageKeys}
+            />
+          </div>
+          <DialogFooter>
+            <Button
+              variant="outline"
+              onClick={() => {
+                setInviteOpen(false);
+                resetInviteForm();
+              }}
+            >
+              Cancel
+            </Button>
+            <Button
+              onClick={handleInviteMember}
+              disabled={!inviteEmail || inviteMember.isPending}
+            >
+              {inviteMember.isPending ? "Sending..." : "Send Invite"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog
+        open={!!roleMember}
+        onOpenChange={(open) => !open && setRoleMember(null)}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Select Role</DialogTitle>
+            <DialogDescription>
+              Choose a role for{" "}
+              <strong>
+                {roleMember?.user?.display_name || roleMember?.user?.username}
+              </strong>
+              .
+            </DialogDescription>
+          </DialogHeader>
+          <RoleRadioCards
+            idPrefix="member-role"
+            value={roleValue}
+            onValueChange={setRoleValue}
+            includeOwner
+            canManageKeys={roleCanManageKeys}
+            onCanManageKeysChange={setRoleCanManageKeys}
+          />
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setRoleMember(null)}>
+              Cancel
+            </Button>
+            <Button
+              onClick={handleSaveRole}
+              disabled={updateMemberRole.isPending}
+            >
+              {updateMemberRole.isPending ? "Saving..." : "Save"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       <Dialog
         open={!!memberToRemove}

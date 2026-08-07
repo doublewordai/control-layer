@@ -40,9 +40,16 @@ pub struct OrganizationUpdate {
     /// Omit entirely to leave unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]
     pub low_balance_threshold: Option<Option<f32>>,
-    /// Account-wide zero-data-retention flag. Admin-only: only callers with
-    /// UpdateAll on organizations may set this. Omit to leave unchanged.
+    /// Account-wide zero-data-retention flag. Settable by an **owner** of the
+    /// organization, or by a platform manager holding UpdateAll on
+    /// organizations — an org admin is refused. Omit to leave unchanged.
     pub zero_data_retention: Option<bool>,
+    /// Admit signups from this workspace's claimed email domain as members
+    /// automatically. Same gate as `zero_data_retention` above — an **owner**
+    /// or a platform manager with UpdateAll, never an org admin: it decides
+    /// who gets into the workspace without anyone reviewing them, which is not
+    /// a call an admin should make unilaterally. Omit to leave unchanged.
+    pub auto_join_enabled: Option<bool>,
 }
 
 /// Full organization details returned by the API.
@@ -61,6 +68,12 @@ pub struct OrganizationResponse {
     /// confirmed via the link sent to the new address.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pending_email_change: Option<PendingEmailChangeResponse>,
+    /// Whether a signup whose email domain matches this workspace's claimed
+    /// domain is admitted as a member on the spot, instead of being offered
+    /// the choice to request access. Off unless an owner turns it on — org
+    /// admins can read it here but cannot change it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_join_enabled: Option<bool>,
 }
 
 impl OrganizationResponse {
@@ -69,6 +82,7 @@ impl OrganizationResponse {
             user,
             member_count: None,
             pending_email_change: None,
+            auto_join_enabled: None,
         }
     }
 
@@ -79,6 +93,11 @@ impl OrganizationResponse {
 
     pub fn with_pending_email_change(mut self, info: PendingEmailChangeResponse) -> Self {
         self.pending_email_change = Some(info);
+        self
+    }
+
+    pub fn with_auto_join_enabled(mut self, enabled: bool) -> Self {
+        self.auto_join_enabled = Some(enabled);
         self
     }
 }
@@ -105,6 +124,14 @@ impl From<crate::db::models::organizations::PendingOrgEmailChangeDBResponse> for
     }
 }
 
+/// Optional body for approving a join request.
+#[derive(Debug, Clone, Deserialize, Serialize, ToSchema, Default)]
+pub struct ApproveJoinRequestRequest {
+    /// Role to grant on approval. Defaults to 'member'.
+    #[serde(default)]
+    pub role: Option<String>,
+}
+
 /// Organization member details
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct OrganizationMemberResponse {
@@ -116,10 +143,17 @@ pub struct OrganizationMemberResponse {
     pub user: Option<UserResponse>,
     /// Role in the organization: 'owner', 'admin', or 'member'
     pub role: String,
-    /// Membership status: 'active' or 'pending'
+    /// Membership status: 'active' for current members, 'pending' for an
+    /// invite the organization sent, or 'requested' for someone asking to
+    /// join and awaiting a decision.
     pub status: String,
     /// When the membership was created
     pub created_at: DateTime<Utc>,
+    /// Effective key-creation capability: owners/admins always true; members
+    /// true only when their membership carries the additive 'manage_keys'
+    /// org role. Governs whether the member can create/edit their own API
+    /// keys (without it they hold issued keys: view + rotate only).
+    pub can_manage_keys: bool,
     /// Email address for pending invites
     #[serde(skip_serializing_if = "Option::is_none")]
     pub invite_email: Option<String>,
@@ -133,6 +167,10 @@ pub struct InviteMemberRequest {
     pub email: String,
     /// Role to assign: 'owner', 'admin', or 'member' (defaults to 'member')
     pub role: Option<String>,
+    /// For base role 'member': may they create and manage their own API keys?
+    /// Defaults to FALSE — new members hold issued keys only until an org
+    /// admin opts them in. Ignored for owner/admin (implicitly true).
+    pub can_manage_keys: Option<bool>,
 }
 
 /// Response after creating an invite
@@ -174,6 +212,10 @@ pub struct AddMemberRequest {
     pub user_id: UserId,
     /// Role to assign: 'owner', 'admin', or 'member' (defaults to 'member')
     pub role: Option<String>,
+    /// For base role 'member': may they create and manage their own API keys?
+    /// Defaults to FALSE — new members hold issued keys only until an org
+    /// admin opts them in. Ignored for owner/admin (implicitly true).
+    pub can_manage_keys: Option<bool>,
 }
 
 /// Request body for updating a member's role
@@ -181,6 +223,10 @@ pub struct AddMemberRequest {
 pub struct UpdateMemberRoleRequest {
     /// New role: 'owner', 'admin', or 'member'
     pub role: String,
+    /// Grant/revoke the 'manage_keys' org role alongside the base role.
+    /// Absent = leave unchanged. Only meaningful for base role 'member'
+    /// (owners/admins hold the capability implicitly).
+    pub can_manage_keys: Option<bool>,
 }
 
 /// Query parameters for listing organizations
@@ -224,4 +270,160 @@ pub struct OrganizationSummary {
     /// Whether the organization is flagged for zero data retention. Account-wide
     /// flag on the org; surfaced here so a member can see their org's ZDR status.
     pub zero_data_retention: bool,
+    /// Effective key-creation capability in this org: owners/admins always
+    /// true; members true only with the additive 'manage_keys' org role.
+    /// Drives the dashboard's create/edit affordances and the batch key
+    /// selection requirement.
+    pub can_manage_keys: bool,
+    /// Whether the organization has proven a payment method - a completed
+    /// purchase or a setup-mode card verification. Surfaced alongside the
+    /// other org-wide flags so a member can see their organization's status
+    /// without a second request per organization.
+    ///
+    /// Distinct from the same field on the *user*: paying as an org admin
+    /// verifies the organization, not you, so a client showing "is this
+    /// workspace able to pay" must read it from here when acting as an org.
+    pub verified: bool,
+}
+
+/// An organization the caller has asked to join and is waiting on.
+///
+/// Signup files these automatically when the caller's email domain matches a
+/// claimed organization, so the requester is typically unaware one exists.
+/// Onboarding reads this to say so, rather than presenting the create-workspace
+/// screen as if their company had no workspace.
+///
+/// Deliberately thinner than [`OrganizationSummary`]: the caller is not a
+/// member, so this carries only what identifies the organization they are
+/// queued for. Nothing about its membership, billing or configuration is
+/// readable from here.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PendingJoinRequestResponse {
+    /// The join request itself, not the organization. A `user_organizations`
+    /// row id — deliberately `Uuid` rather than `UserId`, which it is not and
+    /// which would invite a caller to pass it where a user is expected. Same
+    /// convention as `OrganizationMemberResponse::id` above.
+    #[schema(value_type = String, format = "uuid")]
+    pub id: uuid::Uuid,
+    #[schema(value_type = String, format = "uuid")]
+    pub organization_id: UserId,
+    /// The organization's `username`. Carries the `{domain}~{suffix}` form for
+    /// organizations created since domains became claimable; clients that want
+    /// to show a company name should strip at the separator.
+    pub organization_name: String,
+    /// When the request was filed — the moment the user asked, not the moment
+    /// they signed up: nothing is filed on their behalf.
+    pub requested_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// An outstanding invitation addressed to the caller's own email.
+///
+/// The same invite the emailed link opens, reached from onboarding instead.
+/// Invite tokens are stored only as hashes, so the link cannot be handed back
+/// to a user who never opened the mail — this is how they find it anyway.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PendingInvitationResponse {
+    /// The invitation's id. Accept or decline it at
+    /// `/organizations/{organization_id}/invites/{id}/accept|decline`.
+    ///
+    /// A `user_organizations` row id, so `Uuid` rather than `UserId` — same
+    /// reason as [`PendingJoinRequestResponse::id`].
+    #[schema(value_type = String, format = "uuid")]
+    pub id: uuid::Uuid,
+    #[schema(value_type = String, format = "uuid")]
+    pub organization_id: UserId,
+    /// Display name where the organization has one, `username` otherwise —
+    /// the same resolution the token-based invite screen uses, so both
+    /// entry points name the organization identically.
+    pub organization_name: String,
+    /// The role being offered: 'owner', 'admin' or 'member'.
+    pub role: String,
+    /// Who sent it, where that is known and they still exist.
+    pub inviter_name: Option<String>,
+    /// When the invitation lapses. Expired invitations are never returned.
+    pub expires_at: Option<DateTime<Utc>>,
+}
+
+/// An existing workspace that has claimed the caller's own email domain.
+///
+/// Deliberately anonymous. It names the **domain** and nothing else: not the
+/// workspace's display name, not its size, not who owns it. The caller has
+/// proven only that they receive mail at that domain, which is enough to be
+/// told "your company already has a workspace here" and not enough to be told
+/// anything about it. Naming it would turn every signup into a lookup of what
+/// a given company runs.
+///
+/// For the same reason there is no endpoint that takes a domain as a
+/// parameter: this one derives it from the caller's authenticated address, so
+/// probing for a company's workspace means first controlling an address there.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct DomainMatchResponse {
+    #[schema(value_type = String, format = "uuid")]
+    pub organization_id: UserId,
+    /// The claimed domain, e.g. `acme.com` — extracted from the caller's own
+    /// email, not from the organization's `{domain}~{suffix}` username, so
+    /// clients never have to split on the separator to display it.
+    #[schema(example = "acme.com")]
+    pub domain: String,
+    /// Whether this workspace admits the caller without review.
+    ///
+    /// Normally false by the time anyone reads this: when it is on, signup has
+    /// already made them a member and there is nothing to report. It can still
+    /// be true if the owner turned auto-join on *after* they signed up, and
+    /// that case is the reason it is carried rather than assumed — a client
+    /// seeing `true` should complete the join rather than ask the user to
+    /// request access to a workspace that would have let them straight in.
+    pub auto_join_enabled: bool,
+}
+
+/// What `POST /users/{id}/join-requests` actually did.
+///
+/// The caller asks to act on their domain match; the *organization's* setting
+/// decides whether that is a membership or a queue position, so the outcome
+/// cannot be known before the call and is reported rather than assumed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DomainJoinOutcome {
+    /// Auto-join was on: the caller is now an active member.
+    Joined,
+    /// Auto-join was off: an owner or admin has to approve.
+    Requested,
+    /// Nothing was filed, because an invitation to this organization is
+    /// already outstanding for the caller. They should accept that instead of
+    /// queueing behind an approval they don't need.
+    Invited,
+    /// The caller was already an active member. Nothing changed.
+    AlreadyMember,
+}
+
+/// Result of acting on a domain match.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct DomainJoinResponse {
+    pub outcome: DomainJoinOutcome,
+    #[schema(value_type = String, format = "uuid")]
+    pub organization_id: UserId,
+    /// The queued request, when `outcome` is `requested`. Absent otherwise.
+    pub join_request: Option<PendingJoinRequestResponse>,
+}
+
+/// Everything onboarding needs to decide which screen to show, in one read.
+///
+/// One endpoint rather than three because the decision is a single branch and
+/// the client cannot render anything until it has all of it — three calls
+/// would mean either a flash of the wrong screen or three waterfalled
+/// spinners. The precedence is the caller's to apply and is documented on the
+/// handler.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct OnboardingContextResponse {
+    /// Someone invited this exact address. Takes precedence over everything
+    /// else: it is the only signal that a human deliberately chose to admit
+    /// this person.
+    pub invitation: Option<PendingInvitationResponse>,
+    /// A workspace has claimed the caller's email domain, and has not opted
+    /// into admitting its domain automatically. Absent when auto-join was on,
+    /// because signup will already have made them a member.
+    pub domain_match: Option<DomainMatchResponse>,
+    /// The caller has already asked to join, and is waiting. Present on a
+    /// return visit to onboarding after clicking "Request access".
+    pub join_request: Option<PendingJoinRequestResponse>,
 }

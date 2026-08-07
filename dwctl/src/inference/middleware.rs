@@ -5,13 +5,20 @@
 //!
 //! ## Routing
 //!
-//! - `priority` / `default` / `auto` (realtime): creates a batch of 1 with
-//!   `completion_window=0s` in `processing` state, proxies via onwards.
+//! Every tier here writes a BATCHLESS request — one `requests` row with
+//! `batch_id = NULL`, distinguished by `service_tier`. None of them creates a
+//! batch, and none of them has a completion window; the tier column carries what
+//! the legacy `completion_window` values ("0s", "1h") used to encode.
+//!
+//! - `priority` / `default` / `auto` (realtime): writes `service_tier='priority'`
+//!   straight into `processing` (the proxy is already handling it, and a nil
+//!   `daemon_id` keeps the daemon from claiming it), proxies via onwards.
 //!   With `background=true`, returns 202 and spawns the proxy as a background task.
-//! - `flex` (async): creates a batch of 1 with `completion_window=1h` in
-//!   `pending` state. The fusillade daemon picks it up. With `background=false`,
-//!   holds the connection and polls until complete. With `background=true`,
-//!   returns 202 immediately.
+//! - `flex`: writes `service_tier='flex'` in `pending` state for the fusillade
+//!   daemon to claim. With `background=false`, holds the connection and polls
+//!   until complete. With `background=true`, returns 202 immediately.
+//! - `background`: writes `service_tier='background'` in `pending` state, run on
+//!   spare capacity with no deadline.
 
 use std::sync::Arc;
 
@@ -50,7 +57,7 @@ pub struct InferenceMiddlewareState<P: PoolProvider + Clone = sqlx_pool_router::
     pub response_store: Arc<super::store::FusilladeResponseStore<P>>,
     pub multi_step_tool_executor: Arc<crate::inference::tools::HttpToolExecutor>,
     pub multi_step_http_client: Arc<fusillade::ReqwestHttpClient>,
-    pub loop_config: onwards::LoopConfig,
+    pub loop_config: onwards_fusillade::LoopConfig,
     /// Image-input normaliser (content-addressed store). On the **Flex**
     /// path the request is persisted and dispatched later by the daemon, so
     /// images are normalised to `dw-img://` tokens here (when enabled) — the
@@ -561,6 +568,19 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                 .map(|key| key.key_owner_id.to_string())
                 .or_else(|| created_by.clone())
                 .unwrap_or_default();
+            // Provenance for the dispatched request. This is the last moment the caller's
+            // client is knowable: the daemon picks this request up minutes to hours from
+            // now, over an HTTP client that sends no User-Agent, so without stashing it
+            // here the analytics row for the dispatch has no client at all. Same key and
+            // same 256-char truncation as the batch path (`batches::create_batch`), so both
+            // arrive as `x-fusillade-batch-dw-user-agent` and read identically downstream.
+            let queued_metadata = parts
+                .headers
+                .get(axum::http::header::USER_AGENT)
+                .and_then(|value| value.to_str().ok())
+                .map(|ua| ua.chars().take(256).collect::<String>())
+                .filter(|ua| !ua.is_empty())
+                .map(|ua| serde_json::json!({ "dw_user_agent": ua }));
             if is_background_tier {
                 let background_input = fusillade::CreateBackgroundInput {
                     request_id,
@@ -571,6 +591,7 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                     path: endpoint.clone(),
                     api_key: queued_api_key,
                     created_by: queued_created_by,
+                    metadata: queued_metadata,
                 };
                 return handle_background(&state, background_input, &resp_id, model).await;
             }
@@ -584,6 +605,7 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                 path: endpoint.clone(),
                 api_key: queued_api_key,
                 created_by: queued_created_by,
+                metadata: queued_metadata,
             };
 
             match (is_chat_completions_api, flex_stream) {
@@ -602,7 +624,7 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
 enum ServiceTier {
     /// Realtime: direct proxy via onwards.
     Realtime,
-    /// Flex: batch of 1 with 1h completion window, processed by fusillade daemon.
+    /// Flex: a batchless `service_tier='flex'` request, claimed by the fusillade daemon.
     Flex,
     /// Background: no-SLA spare-capacity processing by background workers.
     Background,
@@ -1339,7 +1361,11 @@ async fn warm_path_setup<P: PoolProvider + Clone + Send + Sync + 'static>(
     request_value: &serde_json::Value,
     api_key: &str,
     model: &str,
-) -> Option<(uuid::Uuid, Arc<crate::inference::tools::ResolvedToolSet>, onwards::UpstreamTarget)> {
+) -> Option<(
+    uuid::Uuid,
+    Arc<crate::inference::tools::ResolvedToolSet>,
+    onwards_fusillade::UpstreamTarget,
+)> {
     let created_by = response_store::lookup_created_by(&state.dwctl_pool, Some(api_key)).await;
 
     let resolved = match crate::inference::tools::resolve_tools_for_request(&state.dwctl_pool, api_key, Some(model)).await {
@@ -1414,7 +1440,7 @@ async fn warm_path_setup<P: PoolProvider + Clone + Send + Sync + 'static>(
     // Endpoint + path are split (not pre-concatenated) so fusillade
     // can match `/v1/chat/completions` against its streamable_endpoints
     // list and pick the streaming branch when the user requested SSE.
-    let upstream = onwards::UpstreamTarget {
+    let upstream = onwards_fusillade::UpstreamTarget {
         endpoint: state.loopback_base_url.clone(),
         path: "/v1/chat/completions".to_string(),
         api_key: Some(api_key.to_string()),

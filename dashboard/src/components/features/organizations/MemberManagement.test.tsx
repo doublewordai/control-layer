@@ -85,7 +85,7 @@ describe("MemberManagement", () => {
     });
   });
 
-  it("shows invite form when clicking Invite Member", async () => {
+  it("opens the invite modal when clicking Invite Member", async () => {
     const user = userEvent.setup();
     const { container } = render(
       <MemberManagement organizationId="org-550e8400-0001" />,
@@ -100,11 +100,17 @@ describe("MemberManagement", () => {
       within(container).getByRole("button", { name: /invite member/i }),
     );
 
+    const dialog = await screen.findByRole("dialog");
     expect(
-      within(container).getByPlaceholderText("Enter email address..."),
+      within(dialog).getByPlaceholderText("Enter email address..."),
     ).toBeInTheDocument();
+    // Member is selected by default, with the API keys toggle off.
+    expect(within(dialog).getByRole("radio", { name: "Member" })).toBeChecked();
     expect(
-      within(container).getByRole("button", { name: /send invite/i }),
+      within(dialog).getByRole("switch", { name: "Can generate API keys" }),
+    ).not.toBeChecked();
+    expect(
+      within(dialog).getByRole("button", { name: /send invite/i }),
     ).toBeInTheDocument();
   });
 
@@ -126,6 +132,11 @@ describe("MemberManagement", () => {
     // No remove buttons
     expect(
       within(container).queryByTitle("Remove member"),
+    ).not.toBeInTheDocument();
+
+    // No role-change buttons
+    expect(
+      within(container).queryByRole("button", { name: /change role for/i }),
     ).not.toBeInTheDocument();
   });
 

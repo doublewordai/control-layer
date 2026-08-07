@@ -15,6 +15,13 @@ use crate::{
     payment_providers::{CheckoutPayer, PaymentError, PaymentProvider, PaymentSession, Result, WebhookEvent},
 };
 
+#[cfg(test)]
+use crate::payment_providers::AutoTopupDeclineKind;
+
+/// Marks a dummy session as setup-mode (card verification, no charge), standing
+/// in for Stripe's `CheckoutSessionMode::Setup`.
+const DUMMY_SETUP_SESSION_PREFIX: &str = "dummy_setup_";
+
 /// Dummy payment provider that adds credits automatically
 pub struct DummyProvider {
     config: crate::config::DummyConfig,
@@ -104,6 +111,38 @@ impl PaymentProvider for DummyProvider {
             }
         }
 
+        // Setup-mode sessions carry their own prefix, mirroring the Stripe
+        // provider's dispatch on `CheckoutSessionMode`.
+        if let Some(rest) = session_id.strip_prefix(DUMMY_SETUP_SESSION_PREFIX) {
+            let target_id: crate::types::UserId = rest
+                .split('_')
+                .next()
+                .unwrap_or_default()
+                .parse()
+                .map_err(|e| PaymentError::InvalidData(format!("Invalid dummy setup target user ID: {}", e)))?;
+
+            {
+                let mut users = crate::db::handlers::users::Users::new(&mut conn);
+                if users.get_by_id(target_id).await?.is_none() {
+                    return Err(PaymentError::InvalidData("Setup session target user not found".to_string()));
+                }
+                users
+                    .set_payment_provider_id_if_empty(target_id, &format!("dummy_cus_{}", target_id))
+                    .await?;
+                users.set_verified(target_id).await?;
+            }
+
+            if let Err(e) = Credits::new(&mut conn)
+                .grant_verification_credits(credits_config.verification_credits, target_id, session_id)
+                .await
+            {
+                tracing::error!(session_id, target_id = %target_id, error = %e, "Verification credits grant failed");
+            }
+
+            tracing::info!("Successfully fulfilled dummy setup session {} for user {}", session_id, target_id);
+            return Ok(());
+        }
+
         // Get payment session details to extract user_id
         let payment_session = self.get_payment_session(session_id).await?;
 
@@ -184,6 +223,13 @@ impl PaymentProvider for DummyProvider {
         Ok(())
     }
 
+    async fn create_setup_checkout_session(&self, payer: &CheckoutPayer, _cancel_url: &str, success_url: &str) -> Result<String> {
+        // Distinct prefix from the payment/auto-topup sessions so
+        // `process_payment_session` can dispatch on it.
+        let session_id = format!("{}{}_{}", DUMMY_SETUP_SESSION_PREFIX, payer.id, uuid::Uuid::new_v4());
+        Ok(success_url.replace("{CHECKOUT_SESSION_ID}", &session_id))
+    }
+
     async fn create_auto_topup_checkout_session(&self, payer: &CheckoutPayer, _cancel_url: &str, success_url: &str) -> Result<String> {
         // Dummy provider: always redirect to success URL (no real payment flow)
         let session_id = format!("dummy_session_{}_{}", payer.id, uuid::Uuid::new_v4());
@@ -215,11 +261,34 @@ impl PaymentProvider for DummyProvider {
         _payment_method_id: &str,
         _idempotency_key: &str,
     ) -> Result<String> {
+        #[cfg(test)]
+        match _customer_id {
+            "cus_test_soft_decline" => {
+                return Err(PaymentError::AutoTopupDeclined(AutoTopupDeclineKind::Soft));
+            }
+            "cus_test_hard_decline" => {
+                return Err(PaymentError::AutoTopupDeclined(AutoTopupDeclineKind::Hard));
+            }
+            "cus_test_provider_error" => {
+                return Err(PaymentError::ProviderApi("simulated provider failure".to_string()));
+            }
+            _ => {}
+        }
+
         // Dummy provider always succeeds - return a fake payment intent ID
         Ok(format!("dummy_pi_{}", uuid::Uuid::new_v4()))
     }
 
     async fn get_default_payment_method(&self, customer_id: &str) -> Result<Option<String>> {
+        #[cfg(test)]
+        match customer_id {
+            "cus_test_no_payment_method" => return Ok(None),
+            "cus_test_payment_method_lookup_error" => {
+                return Err(PaymentError::ProviderApi("simulated payment method lookup failure".to_string()));
+            }
+            _ => {}
+        }
+
         Ok(Some(format!("dummy_pm_{}", customer_id)))
     }
 

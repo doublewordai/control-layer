@@ -256,6 +256,17 @@ credits:
   # is derived from whether they have any prior purchase).
   # Example: 50 matches a new user's first $50 of credits.
   first_payment_match_up_to: 0
+  # Signup credits granted the first time a billing target verifies a payment
+  # method through setup-mode checkout (POST /payments/setup) — the onboarding
+  # "Add Payment Method" step, which saves and verifies a card without charging
+  # it. Set to 0 to disable.
+  #
+  # Unlike initial_credits_for_standard_users (granted to everyone at account
+  # creation), this only pays out once a real card has been verified, so it
+  # can't be farmed by signing up repeatedly. Granted at most once per billing
+  # target, and idempotent across the webhook/front-channel race.
+  # Example: 25 gives a newly verified user 25 credits.
+  verification_credits: 0
 
 # Optional feature toggles
 enable_metrics: true # Enable Prometheus metrics endpoint
@@ -320,10 +331,6 @@ batches:
   # method / make a payment). Set to 0 to disable. Default: 1000.
   unverified_requests_per_completion_hour: 1000
 
-  # Optional realtime priority decay window for queue monitoring (seconds).
-  # When set, completed FLEX requests within this lookback are included in
-  # the 1h pending-request-counts bucket. Omit or set null to disable.
-  priority_decay_window_secs: 600
   pending_capacity_counts_enabled: false # Include committed pending requests in batch submission capacity checks (default: false)
 
   # Allowed completion windows for batch processing

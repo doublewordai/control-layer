@@ -1,4 +1,6 @@
 {
-  ".": "8.103.3",
-  "onwards": "0.36.0"
+  ".": "10.9.0",
+  "fusillade-arsenal": "4.0.0",
+  "fusillade-core": "5.0.0",
+  "onwards": "0.37.1"
 }

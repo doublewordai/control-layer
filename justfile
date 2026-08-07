@@ -564,6 +564,7 @@ lint target *args="":
                 --package fusillade \
                 --package fusillade-core \
                 --package fusillade-arsenal \
+                --package onwards-fusillade \
                 --all-features \
                 --no-deps \
                 {{args}}
@@ -579,6 +580,8 @@ lint target *args="":
             bash .github/scripts/test-local-rust-workspace.sh
             .github/scripts/test-fusillade-migration-checksums.py
             .github/scripts/test-publish-onwards.sh
+            .github/scripts/test-publish-fusillade-crates.sh
+            .github/scripts/test-sync-fusillade-release-dependencies.sh
             .github/scripts/test-rust-ci-matrix.sh
             .github/scripts/test-aggregate-rust-coverage.sh
             ;;
@@ -622,6 +625,7 @@ fmt target *args="":
                 --package fusillade \
                 --package fusillade-core \
                 --package fusillade-arsenal \
+                --package onwards-fusillade \
                 {{args}}
             ;;
         *)
@@ -848,6 +852,20 @@ db-start:
         fi
     else
         echo "Creating new test-postgres container with fsync disabled and trust auth..."
+        # max_connections=400 (postgres defaults to 100, which this suite exhausts).
+        #
+        # `#[sqlx::test]` runs one test per core and each test that builds a full app opens
+        # FOUR pools -- main 4 + fusillade 4 + outlet 4 + underway 10, see
+        # dwctl/src/test/utils.rs -- so ~22 connections per test at the ceiling. Eight cores
+        # is therefore ~176 worst case, sixteen is ~350, before anything else on the machine
+        # takes a share. Past the limit tests fail with "pool timed out while waiting for an
+        # open connection", which reads like a hang or a deadlock rather than a resource
+        # limit, and which tests fail changes between runs.
+        #
+        # Worth knowing: a `cargo run` dev server pointed at the same database holds ~38
+        # connections of its own. Under the old default that alone was ~40% of the budget,
+        # and stopping it was the difference between a module failing 10 tests and passing
+        # 57 in 7 seconds. Raising the ceiling means you no longer have to think about it.
         # Create volume if it doesn't exist
         docker volume create test-postgres-data >/dev/null 2>&1 || true
         docker run --name test-postgres \
@@ -856,7 +874,8 @@ db-start:
           -p 5432:5432 \
           -v test-postgres-data:/var/lib/postgresql/ \
           -d postgres:latest \
-          postgres -c fsync=off \
+          postgres -c max_connections=400 \
+          -c fsync=off \
           -c full_page_writes=off \
           -c synchronous_commit=off \
           -c wal_level=minimal \

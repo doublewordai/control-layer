@@ -34,6 +34,13 @@ pub fn create_provider(config: PaymentConfig) -> Box<dyn PaymentProvider> {
 /// Result type for payment provider operations
 pub type Result<T> = std::result::Result<T, PaymentError>;
 
+/// Whether an automatic top-up decline may be retried.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutoTopupDeclineKind {
+    Soft,
+    Hard,
+}
+
 /// Errors that can occur during payment processing
 #[derive(Debug, thiserror::Error)]
 pub enum PaymentError {
@@ -54,6 +61,9 @@ pub enum PaymentError {
 
     #[error("User does not have a payment provider customer ID")]
     NoCustomerId,
+
+    #[error("Automatic top-up payment was declined: {0:?}")]
+    AutoTopupDeclined(AutoTopupDeclineKind),
 }
 
 impl From<PaymentError> for StatusCode {
@@ -62,6 +72,7 @@ impl From<PaymentError> for StatusCode {
             PaymentError::PaymentNotCompleted => StatusCode::PAYMENT_REQUIRED,
             PaymentError::InvalidData(_) | PaymentError::NoCustomerId => StatusCode::BAD_REQUEST,
             PaymentError::AlreadyProcessed => StatusCode::OK,
+            PaymentError::AutoTopupDeclined(_) => StatusCode::PAYMENT_REQUIRED,
             PaymentError::ProviderApi(_) | PaymentError::Database(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -155,10 +166,33 @@ pub trait PaymentProvider: Send + Sync {
     /// Fetches the payment session from the provider and returns validated details.
     async fn get_payment_session(&self, session_id: &str) -> Result<PaymentSession>;
 
-    /// Process a completed payment session
+    /// Create a setup-mode checkout session that verifies and saves a payment
+    /// method without charging it.
+    ///
+    /// Used by onboarding's "Add Payment Method" step: the user proves a real
+    /// card (and clears the unverified rate-limit tier) without having to buy
+    /// credits first. Returns the hosted checkout URL.
+    ///
+    /// Distinct from `create_auto_topup_checkout_session`, which is also
+    /// setup-mode but carries auto-top-up-specific consent copy and is only
+    /// reachable from the auto-top-up flow.
+    ///
+    /// # Arguments
+    /// * `payer` - The billing target being verified (individual or org)
+    /// * `cancel_url` - URL to redirect to if the user cancels
+    /// * `success_url` - URL to redirect to on success
+    async fn create_setup_checkout_session(&self, payer: &CheckoutPayer, cancel_url: &str, success_url: &str) -> Result<String>;
+
+    /// Process a completed checkout session
     ///
     /// This is idempotent - calling multiple times with the same session_id
     /// should not create duplicate transactions.
+    ///
+    /// Handles both checkout modes, dispatching on the session the provider
+    /// fetches: `payment` sessions credit the account, `setup` sessions save the
+    /// verified payment method and grant signup credits. The caller (the
+    /// `PATCH /payments/{id}` front channel and the webhook path alike) does not
+    /// know which mode a session id belongs to, so the dispatch lives here.
     ///
     /// `credits_config` carries credit-system settings (e.g. the first-payment
     /// match promotion) applied as part of processing, so the provider can act on

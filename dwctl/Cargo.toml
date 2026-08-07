@@ -1,6 +1,6 @@
 [package]
 name = "dwctl"
-version = "8.103.3" # x-release-please-version
+version = "10.9.0" # x-release-please-version
 edition = "2024"
 publish = false
 description = "The Doubleword Control Layer - A self-hostable observability and analytics platform for LLM applications"
@@ -82,7 +82,8 @@ jsonwebtoken = { version = "10", features = ["rust_crypto"] }
 argon2 = "0.5"
 base64 = "0.22"
 bytes = "1.5"
-onwards = { path = "../onwards", features = ["multi-step"] }
+onwards = { path = "../onwards" }
+onwards-fusillade = { path = "../onwards-fusillade" }
 thiserror = "2.0.14"
 axum-prometheus = "0.10"
 # Metrics facade and exporter (same versions as axum-prometheus uses)
@@ -113,6 +114,9 @@ hickory-resolver = { version = "0.26", default-features = false, features = [
 aes-gcm = "0.10.3"
 # Redis-backed keystore for zero-data-retention flex request keys.
 deadpool-redis = "0.18"
+redis = { version = "0.27", default-features = false, features = [
+  "tokio-rustls-comp",
+] }
 paste = "1.0"
 serde_with = "3.14.1"
 rust_decimal = { version = "1.38.0", features = ["serde"] }

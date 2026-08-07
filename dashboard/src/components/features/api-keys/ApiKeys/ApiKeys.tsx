@@ -7,7 +7,9 @@ import {
   Loader2,
   Check,
   ChevronDown,
+  Eye,
   Info,
+  RefreshCw,
 } from "lucide-react";
 import { toast } from "sonner";
 import {
@@ -25,7 +27,12 @@ import {
   formatResetInstant,
   resetPreviewLine,
 } from "./spendCap";
-import { useUser } from "../../../../api/control-layer/hooks";
+import {
+  useUser,
+  useRevealApiKey,
+  useRotateApiKey,
+  useOrganizationMembers,
+} from "../../../../api/control-layer/hooks";
 import { DataTable } from "../../../ui/data-table";
 import { createColumns } from "./columns";
 import {
@@ -57,18 +64,28 @@ import {
   HoverCardContent,
   HoverCardTrigger,
 } from "../../../ui/hover-card";
+import { Tabs, TabsList, TabsTrigger } from "../../../ui/tabs";
 import { useServerPagination } from "@/hooks/useServerPagination";
 import { useOrganizationContext } from "@/contexts";
 
 export const ApiKeys: React.FC = () => {
   const { data: user } = useUser("current");
-  const { activeOrganizationId } = useOrganizationContext();
+  const { activeOrganizationId, activeOrganization } = useOrganizationContext();
   // In org context, use org ID for API key operations (orgs are virtual users)
   const targetUserId = activeOrganizationId || user?.id || "current";
+  const isOrgContext = !!activeOrganizationId;
+  // Org "managers" (owner/admin) see and manage all org keys; the role comes
+  // from the current user's membership summary on the org context.
+  const isOrgManager =
+    activeOrganization?.role === "owner" || activeOrganization?.role === "admin";
+  const { data: membersData } = useOrganizationMembers(
+    activeOrganizationId ?? "",
+  );
   const [showCreateForm, setShowCreateForm] = useState(false);
   const [newKeyName, setNewKeyName] = useState("");
   const [newKeyDescription, setNewKeyDescription] = useState("");
   const [newKeyPurpose, setNewKeyPurpose] = useState<ApiKeyPurpose>("realtime");
+  const [newKeyAssignee, setNewKeyAssignee] = useState<string>("self");
   const [newKeyRequestsPerSecond, setNewKeyRequestsPerSecond] = useState<
     number | ""
   >("");
@@ -91,34 +108,129 @@ export const ApiKeys: React.FC = () => {
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
   const [selectedKeys, setSelectedKeys] = useState<any[]>([]);
   const [showBulkDeleteModal, setShowBulkDeleteModal] = useState(false);
+  const [showBulkRotateModal, setShowBulkRotateModal] = useState(false);
+  const [bulkRotating, setBulkRotating] = useState(false);
+  // One-time display of the replacement secrets from a bulk rotation.
+  const [bulkRotatedKeys, setBulkRotatedKeys] = useState<
+    { id: string; name: string; key: string }[] | null
+  >(null);
   const [advancedOpen, setAdvancedOpen] = useState(false);
+  const [rotateModal, setRotateModal] = useState<ApiKey | null>(null);
+  const [revealModal, setRevealModal] = useState<ApiKey | null>(null);
+  // One-time secret display, shared by rotation and the one-off reveal —
+  // `mode` only varies the dialog copy.
+  const [rotatedKey, setRotatedKey] = useState<{
+    name: string;
+    key: string;
+    mode: "rotate" | "reveal";
+  } | null>(null);
+  // Manager-only view scoping (org context): tab + per-member filter,
+  // applied client-side since the API already returns all org keys to
+  // managers.
+  const [keyScope, setKeyScopeState] = useState<"all" | "mine">("all");
+  const [memberFilter, setMemberFilterState] = useState<string>("all");
 
   // Check if user is a platform manager
   const isPlatformManager = user?.roles?.includes("PlatformManager") || false;
+  // Per-member key governance: can the current user create/manage their own
+  // keys in this context? Personal context is always true; in org context the
+  // server-computed can_manage_keys flag decides (owners/admins are always
+  // true, plain members only when granted the additive role).
+  const canSelfManage = !isOrgContext || !!activeOrganization?.can_manage_keys;
+  // Anyone whose LIST is unscoped (org managers, and PlatformManagers whose
+  // ReadAll bypasses created_by scoping server-side) gets the scoping
+  // controls — otherwise a PM who is a plain member of the org sees
+  // everyone's keys with no way to narrow them.
+  const showScopingControls =
+    isOrgContext && (isOrgManager || isPlatformManager);
   const pagination = useServerPagination();
+  // Scoping is applied SERVER-side (?created_by): pagination and total_count
+  // then cover the filtered set, so "all of member X's keys" really is all
+  // of them — nothing hiding on other pages during an admin cleanup.
+  const createdByFilter = showScopingControls
+    ? keyScope === "mine"
+      ? user?.id
+      : memberFilter !== "all"
+        ? memberFilter
+        : undefined
+    : undefined;
   const {
     data: apiKeysData,
     isLoading,
     error,
   } = useApiKeys(targetUserId, {
     ...pagination.queryParams,
+    created_by: createdByFilter,
   });
 
   const apiKeys = apiKeysData?.data || [];
 
+  const orgMembers = (membersData ?? []).filter(
+    (m) => m.status === "active" && m.user,
+  );
+  const memberLabel = (memberUser: { display_name?: string; email: string }) =>
+    memberUser.display_name || memberUser.email;
+  const resolveAssignee = (createdBy: string) => {
+    const member = orgMembers.find((m) => m.user!.id === createdBy);
+    if (member) return memberLabel(member.user!);
+    // Holder is no longer an active member (or list still loading): fall
+    // back to a shortened UUID.
+    return `${createdBy.slice(0, 8)}…`;
+  };
+
+
   const createApiKeyMutation = useCreateApiKey();
   const deleteApiKeyMutation = useDeleteApiKey();
   const updateApiKeyMutation = useUpdateApiKey();
+  const rotateApiKeyMutation = useRotateApiKey();
+  const revealApiKeyMutation = useRevealApiKey();
+
+  // Changing scope re-slices the server-side list — snap back to page 1 so
+  // the new filter isn't viewed from a stale offset.
+  const setKeyScope = (scope: "all" | "mine") => {
+    setKeyScopeState(scope);
+    pagination.handleReset();
+  };
+  const setMemberFilter = (member: string) => {
+    setMemberFilterState(member);
+    pagination.handleReset();
+  };
+
+  const resetCreateForm = () => {
+    setShowCreateForm(false);
+    setNewKeyName("");
+    setNewKeyDescription("");
+    setNewKeyPurpose("realtime");
+    setNewKeyAssignee("self");
+    setNewKeyRequestsPerSecond("");
+    setNewKeyBurstSize("");
+    setNewKeyCapAmount("");
+    setNewKeyCapInterval("none");
+    setNewKeyResponse(null);
+    setAdvancedOpen(false);
+  };
 
   const handleCreateApiKey = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!newKeyName.trim()) return;
+
+    // Managers can issue an org key to another member; the key lands in
+    // that member's view (created_by = member). Only send member_id when a
+    // member other than self is selected.
+    const assignedMemberId =
+      isOrgContext &&
+      isOrgManager &&
+      newKeyAssignee !== "self" &&
+      newKeyAssignee !== user?.id
+        ? newKeyAssignee
+        : undefined;
 
     const newKey = await createApiKeyMutation.mutateAsync({
       data: {
         name: newKeyName.trim(),
         description: newKeyDescription.trim() || undefined,
         purpose: newKeyPurpose,
+        member_id: assignedMemberId,
         requests_per_second:
           newKeyRequestsPerSecond === ""
             ? null
@@ -218,6 +330,31 @@ export const ApiKeys: React.FC = () => {
     }
   };
 
+  const handleBulkRotate = async () => {
+    setBulkRotating(true);
+    const rotated: { id: string; name: string; key: string }[] = [];
+    const failed: string[] = [];
+    for (const key of selectedKeys) {
+      try {
+        const { key: secret } = await rotateApiKeyMutation.mutateAsync({
+          keyId: key.id,
+          userId: targetUserId,
+        });
+        rotated.push({ id: key.id, name: key.name, key: secret });
+      } catch (e) {
+        console.error("Failed to rotate API key:", e);
+        failed.push(key.name);
+      }
+    }
+    setBulkRotating(false);
+    setShowBulkRotateModal(false);
+    setSelectedKeys([]);
+    if (failed.length > 0) {
+      toast.error(`Rotated ${rotated.length}, failed for: ${failed.join(", ")}`);
+    }
+    if (rotated.length > 0) setBulkRotatedKeys(rotated);
+  };
+
   const copyToClipboard = async (text: string) => {
     try {
       await navigator.clipboard.writeText(text);
@@ -234,18 +371,74 @@ export const ApiKeys: React.FC = () => {
     }
   };
 
-  // Mirrors what the PATCH endpoint permits: the key's creator, or a
-  // PlatformManager. (Org-specific cap permissions — e.g. restricting cap
-  // edits on org keys to owners/admins — are deferred to the dedicated
-  // org-permissions follow-up; keep this gate in lockstep with the server.)
+  const handleRotateKey = async () => {
+    if (!rotateModal) return;
+    try {
+      const { key } = await rotateApiKeyMutation.mutateAsync({
+        keyId: rotateModal.id,
+        userId: targetUserId,
+      });
+      // One-time secret display, same pattern as creation.
+      setRotatedKey({ name: rotateModal.name, key, mode: "rotate" });
+      setRotateModal(null);
+    } catch (e) {
+      console.error("Failed to rotate API key:", e);
+      toast.error((e as Error)?.message ?? "Failed to rotate API key");
+    }
+  };
+
+  const handleRevealKey = async () => {
+    if (!revealModal) return;
+    try {
+      const { key } = await revealApiKeyMutation.mutateAsync({
+        keyId: revealModal.id,
+        userId: targetUserId,
+      });
+      setRotatedKey({ name: revealModal.name, key, mode: "reveal" });
+      setRevealModal(null);
+    } catch (e) {
+      console.error("Failed to reveal API key:", e);
+      toast.error((e as Error)?.message ?? "Failed to reveal API key");
+    }
+  };
+
+  // Mirrors what the server permits for edit/rename/delete: a
+  // PlatformManager, an org owner/admin acting on any key of the active org,
+  // or the key's creator when they hold self-manage rights. Keep this gate in
+  // lockstep with the server.
   const canManageKey = (apiKey: ApiKey) =>
-    isPlatformManager || (!!apiKey.created_by && apiKey.created_by === user?.id);
+    isPlatformManager ||
+    (isOrgContext && isOrgManager) ||
+    (!!apiKey.created_by && apiKey.created_by === user?.id && canSelfManage);
+
+  // Rotation is the secret-recovery path: members without creation rights can
+  // still rotate keys they hold to get a fresh secret (shown once).
+  const canRotateKey = (apiKey: ApiKey) =>
+    canManageKey(apiKey) ||
+    (!!apiKey.created_by && apiKey.created_by === user?.id);
+
+  // The one-off reveal is HOLDER-only (matching the server): an issued key
+  // the holder hasn't opened yet. Until they do, Reveal replaces Rotate for
+  // them; issuers/admins always see plain Rotate.
+  const canRevealKey = (apiKey: ApiKey) =>
+    !!apiKey.created_by &&
+    apiKey.created_by === user?.id &&
+    apiKey.secret_revealed_at == null;
 
   const columns = createColumns({
     onDelete: handleDeleteFromTable,
     onEdit: openEditModal,
+    onRotate: setRotateModal,
+    onReveal: setRevealModal,
     canManage: canManageKey,
+    canRotate: canRotateKey,
+    canReveal: canRevealKey,
     isPlatformManager,
+    // Assignee is a manager's concept: members' views are isolated to their
+    // own keys, so the column would only ever echo their own name.
+    showAssignee: isOrgContext && (isOrgManager || isPlatformManager),
+    resolveAssignee: isOrgContext ? resolveAssignee : undefined,
+    showSelect: canSelfManage,
   });
 
   if (isLoading) {
@@ -277,7 +470,7 @@ export const ApiKeys: React.FC = () => {
               Manage your API keys for programmatic access
             </p>
           </div>
-          {apiKeys.length > 0 && (
+          {apiKeys.length > 0 && canSelfManage && (
             <Button
               onClick={() => setShowCreateForm(true)}
               className="bg-doubleword-background-dark hover:bg-doubleword-neutral-900 w-full sm:w-auto"
@@ -289,6 +482,19 @@ export const ApiKeys: React.FC = () => {
           )}
         </div>
       </div>
+
+      {!canSelfManage && (
+        <div
+          className="mb-6 flex items-center gap-2 rounded-lg border border-doubleword-neutral-200 bg-doubleword-neutral-50 px-4 py-3 text-sm text-doubleword-neutral-600"
+          role="status"
+        >
+          <Info className="h-4 w-4 shrink-0" />
+          <span>
+            API keys in this organization are issued by its admins. You can
+            rotate a key you hold to get a fresh secret.
+          </span>
+        </div>
+      )}
 
       {error && (
         <div className="mb-6 bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded-lg">
@@ -314,7 +520,63 @@ export const ApiKeys: React.FC = () => {
         </div>
       )}
 
-      {apiKeys.length > 0 ? (
+      {/* Keep the scoping controls mounted whenever a filter is active —
+          a member with zero keys must leave the admin a way to back out,
+          not dump them on the unscoped empty state. */}
+      {showScopingControls && (apiKeys.length > 0 || createdByFilter != null) && (
+        <div className="mb-4 flex flex-wrap items-center gap-3">
+          <Tabs
+            value={keyScope}
+            onValueChange={(value) => setKeyScope(value as "all" | "mine")}
+          >
+            <TabsList aria-label="Key scope">
+              <TabsTrigger value="all">All keys</TabsTrigger>
+              <TabsTrigger value="mine">My keys</TabsTrigger>
+            </TabsList>
+          </Tabs>
+          {keyScope === "all" && (
+            <Select value={memberFilter} onValueChange={setMemberFilter}>
+              <SelectTrigger className="w-56" aria-label="Filter by member">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="all">All members</SelectItem>
+                {orgMembers.map((member) => (
+                  <SelectItem key={member.user!.id} value={member.user!.id}>
+                    {/* Emails, not display names/usernames — matching the
+                        assign dropdown; nobody remembers usernames. */}
+                    {member.user!.email}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          )}
+        </div>
+      )}
+
+      {apiKeys.length === 0 && createdByFilter != null ? (
+        <div
+          className="text-center py-12"
+          role="status"
+          aria-label="No keys for this filter"
+        >
+          <div className="p-4 bg-doubleword-neutral-100 rounded-full w-16 h-16 mx-auto mb-4 flex items-center justify-center">
+            <Key className="w-8 h-8 text-doubleword-neutral-600" />
+          </div>
+          <h3
+            className="text-lg font-medium text-doubleword-neutral-900 mb-2"
+            role="heading"
+            aria-level={3}
+          >
+            No keys match this filter
+          </h3>
+          <p className="text-doubleword-neutral-600">
+            {keyScope === "mine"
+              ? "You don't hold any keys in this organization yet."
+              : "The selected member holds no API keys in this organization. Try another member or switch back to all members."}
+          </p>
+        </div>
+      ) : apiKeys.length > 0 ? (
         <DataTable
           columns={columns}
           data={apiKeys}
@@ -330,6 +592,14 @@ export const ApiKeys: React.FC = () => {
                 </span>
               </div>
               <div className="flex items-center gap-2">
+                <button
+                  onClick={() => setShowBulkRotateModal(true)}
+                  className="flex items-center gap-1 px-3 py-1.5 bg-white border border-blue-300 text-blue-900 text-sm rounded-md hover:bg-blue-100 transition-colors"
+                  aria-label={`Rotate ${selectedKeys.length} selected API key${selectedKeys.length !== 1 ? "s" : ""}`}
+                >
+                  <RefreshCw className="w-4 h-4" />
+                  Rotate Selected
+                </button>
                 <button
                   onClick={() => setShowBulkDeleteModal(true)}
                   className="flex items-center gap-1 px-3 py-1.5 bg-red-600 text-white text-sm rounded-md hover:bg-red-700 transition-colors"
@@ -368,16 +638,20 @@ export const ApiKeys: React.FC = () => {
             No API keys configured
           </h3>
           <p className="text-doubleword-neutral-600 mb-6">
-            Create your first API key to start using the API
+            {canSelfManage
+              ? "Create your first API key to start using the API"
+              : "An org admin can issue an API key for you"}
           </p>
-          <Button
-            onClick={() => setShowCreateForm(true)}
-            className="bg-doubleword-background-dark hover:bg-doubleword-neutral-900"
-            aria-label="Create first API key"
-          >
-            <Plus className="w-4 h-4 mr-2" />
-            Create API Key
-          </Button>
+          {canSelfManage && (
+            <Button
+              onClick={() => setShowCreateForm(true)}
+              className="bg-doubleword-background-dark hover:bg-doubleword-neutral-900"
+              aria-label="Create first API key"
+            >
+              <Plus className="w-4 h-4 mr-2" />
+              Create API Key
+            </Button>
+          )}
         </div>
       )}
 
@@ -386,16 +660,7 @@ export const ApiKeys: React.FC = () => {
         open={showCreateForm}
         onOpenChange={(open) => {
           if (!open) {
-            setShowCreateForm(false);
-            setNewKeyName("");
-            setNewKeyDescription("");
-            setNewKeyPurpose("realtime");
-            setNewKeyRequestsPerSecond("");
-            setNewKeyBurstSize("");
-            setNewKeyCapAmount("");
-            setNewKeyCapInterval("none");
-            setNewKeyResponse(null);
-            setAdvancedOpen(false);
+            resetCreateForm();
           } else {
             setShowCreateForm(true);
           }
@@ -462,21 +727,7 @@ export const ApiKeys: React.FC = () => {
               </div>
 
               <DialogFooter>
-                <Button
-                  onClick={() => {
-                    setShowCreateForm(false);
-                    setNewKeyName("");
-                    setNewKeyDescription("");
-                    setNewKeyPurpose("realtime");
-                    setNewKeyRequestsPerSecond("");
-                    setNewKeyBurstSize("");
-                    setNewKeyCapAmount("");
-                    setNewKeyCapInterval("none");
-                    setNewKeyResponse(null);
-                    setAdvancedOpen(false);
-                  }}
-                  className="w-full sm:w-auto"
-                >
+                <Button onClick={resetCreateForm} className="w-full sm:w-auto">
                   Done
                 </Button>
               </DialogFooter>
@@ -516,6 +767,47 @@ export const ApiKeys: React.FC = () => {
                     className="resize-none"
                   />
                 </div>
+
+                {/* Issue-to-member — managers only, org context only */}
+                {isOrgContext && isOrgManager && (
+                  <div className="space-y-2">
+                    <Label>
+                      Assign to member{" "}
+                      <span className="font-normal text-doubleword-neutral-400">
+                        (optional)
+                      </span>
+                    </Label>
+                    <Select
+                      value={newKeyAssignee}
+                      onValueChange={setNewKeyAssignee}
+                    >
+                      <SelectTrigger
+                        className="w-full"
+                        aria-label="Assign to member"
+                      >
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="self">Myself</SelectItem>
+                        {orgMembers
+                          .filter((member) => member.user!.id !== user?.id)
+                          .map((member) => (
+                            <SelectItem
+                              key={member.user!.id}
+                              value={member.user!.id}
+                            >
+                              {member.user!.email}
+                            </SelectItem>
+                          ))}
+                      </SelectContent>
+                    </Select>
+                    <p className="text-xs text-doubleword-neutral-500">
+                      The key appears in the assigned member's view. You'll
+                      still see the secret once on creation, and the member
+                      can separately reveal it once from their API Keys page.
+                    </p>
+                  </div>
+                )}
 
                 {/* Key type — card-style choice, matching the design */}
                 <div className="space-y-2">
@@ -735,21 +1027,7 @@ export const ApiKeys: React.FC = () => {
               </form>
 
               <DialogFooter>
-                <Button
-                  type="button"
-                  variant="outline"
-                  onClick={() => {
-                    setShowCreateForm(false);
-                    setNewKeyName("");
-                    setNewKeyDescription("");
-                    setNewKeyPurpose("realtime");
-                    setNewKeyRequestsPerSecond("");
-                    setNewKeyBurstSize("");
-                    setNewKeyCapAmount("");
-                    setNewKeyCapInterval("none");
-                    setAdvancedOpen(false);
-                  }}
-                >
+                <Button type="button" variant="outline" onClick={resetCreateForm}>
                   Cancel
                 </Button>
                 <Button
@@ -938,6 +1216,211 @@ export const ApiKeys: React.FC = () => {
       </Dialog>
 
 
+      {/* Reveal Confirmation Modal — the reveal is one-off, so make the
+          user own the click before consuming it */}
+      <Dialog
+        open={!!revealModal}
+        onOpenChange={(open) => {
+          if (!open) setRevealModal(null);
+        }}
+      >
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <div className="flex items-center gap-3">
+              <div className="w-10 h-10 bg-doubleword-neutral-100 rounded-full flex items-center justify-center">
+                <Eye className="w-5 h-5 text-doubleword-neutral-700" />
+              </div>
+              <div>
+                <DialogTitle>Reveal API Key</DialogTitle>
+                <DialogDescription>
+                  View the secret for <strong>{revealModal?.name}</strong>
+                </DialogDescription>
+              </div>
+            </div>
+          </DialogHeader>
+
+          <div className="space-y-4 py-2">
+            <p className="text-sm text-gray-700">
+              This key was issued to you by an organization admin. You can
+              view its secret exactly once — after that, rotating the key is
+              the only way to get a fresh secret.
+            </p>
+            <div className="p-3 bg-yellow-50 border border-yellow-200 rounded-lg">
+              <p className="text-sm text-yellow-800">
+                <strong>Note:</strong> have somewhere safe ready to store the
+                secret before revealing it. It won't be shown again.
+              </p>
+            </div>
+          </div>
+
+          <DialogFooter>
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => setRevealModal(null)}
+              disabled={revealApiKeyMutation.isPending}
+            >
+              Cancel
+            </Button>
+            <Button
+              type="button"
+              onClick={handleRevealKey}
+              disabled={revealApiKeyMutation.isPending}
+            >
+              {revealApiKeyMutation.isPending && (
+                <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+              )}
+              Reveal Key
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Rotate Confirmation Modal */}
+      <Dialog
+        open={!!rotateModal}
+        onOpenChange={(open) => {
+          if (!open) setRotateModal(null);
+        }}
+      >
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <div className="flex items-center gap-3">
+              <div className="w-10 h-10 bg-doubleword-neutral-100 rounded-full flex items-center justify-center">
+                <RefreshCw className="w-5 h-5 text-doubleword-neutral-700" />
+              </div>
+              <div>
+                <DialogTitle>Rotate API Key</DialogTitle>
+                <DialogDescription>
+                  Generate a new secret for{" "}
+                  <strong>{rotateModal?.name}</strong>
+                </DialogDescription>
+              </div>
+            </div>
+          </DialogHeader>
+
+          <div className="space-y-4 py-2">
+            <p className="text-sm text-gray-700">
+              The current secret stops working immediately and a new one is
+              generated. The key's usage limit and usage history are
+              unaffected.
+            </p>
+            <div className="p-3 bg-yellow-50 border border-yellow-200 rounded-lg">
+              <p className="text-sm text-yellow-800">
+                <strong>Note:</strong> batches already submitted with this key
+                will keep running. If this key was compromised, cancel any
+                in-flight batches separately.
+              </p>
+            </div>
+          </div>
+
+          <DialogFooter>
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => setRotateModal(null)}
+              disabled={rotateApiKeyMutation.isPending}
+            >
+              Cancel
+            </Button>
+            <Button
+              type="button"
+              onClick={handleRotateKey}
+              disabled={rotateApiKeyMutation.isPending}
+            >
+              {rotateApiKeyMutation.isPending && (
+                <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+              )}
+              Rotate Key
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Rotated Secret Modal — one-time display, same pattern as creation */}
+      <Dialog
+        open={!!rotatedKey}
+        onOpenChange={(open) => {
+          if (!open) setRotatedKey(null);
+        }}
+      >
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>
+              {rotatedKey?.mode === "reveal"
+                ? "API Key Revealed"
+                : "API Key Rotated"}
+            </DialogTitle>
+            <DialogDescription>
+              {rotatedKey?.mode === "reveal" ? (
+                <>
+                  This is the secret for <strong>{rotatedKey?.name}</strong>.
+                  It won't be shown again.
+                </>
+              ) : (
+                <>
+                  <strong>{rotatedKey?.name}</strong> has a new secret. The
+                  old secret no longer works for new requests.
+                </>
+              )}
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="space-y-4">
+            <div
+              className="p-3 bg-green-50 border border-green-200 rounded-lg"
+              role="alert"
+            >
+              <div className="flex items-center gap-2">
+                <Key className="w-4 h-4 text-green-600" />
+                <p className="text-sm text-green-800 font-medium">
+                  Save this key now - it won't be shown again
+                </p>
+              </div>
+            </div>
+
+            <div className="space-y-2">
+              <Label>
+                {rotatedKey?.mode === "reveal" ? "API Key" : "New API Key"}
+              </Label>
+              <div className="flex items-center gap-2">
+                <div className="flex-1 overflow-hidden rounded border bg-gray-50">
+                  <code className="block text-xs font-mono px-3 py-2 overflow-x-auto whitespace-nowrap">
+                    {rotatedKey?.key}
+                  </code>
+                </div>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="icon"
+                  onClick={() => rotatedKey && copyToClipboard(rotatedKey.key)}
+                  aria-label={
+                    rotatedKey && copiedKey === rotatedKey.key
+                      ? "API key copied"
+                      : "Copy API key"
+                  }
+                >
+                  {rotatedKey && copiedKey === rotatedKey.key ? (
+                    <Check className="h-4 w-4 text-green-600" />
+                  ) : (
+                    <Copy className="h-4 w-4" />
+                  )}
+                </Button>
+              </div>
+            </div>
+          </div>
+
+          <DialogFooter>
+            <Button
+              onClick={() => setRotatedKey(null)}
+              className="w-full sm:w-auto"
+            >
+              Done
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
       {/* Bulk Delete Confirmation Modal */}
       <Dialog open={showBulkDeleteModal} onOpenChange={setShowBulkDeleteModal}>
         <DialogContent className="sm:max-w-md">
@@ -1016,6 +1499,161 @@ export const ApiKeys: React.FC = () => {
                   {selectedKeys.length !== 1 ? "s" : ""}
                 </>
               )}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Bulk Rotate Confirmation Modal */}
+      <Dialog open={showBulkRotateModal} onOpenChange={setShowBulkRotateModal}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <div className="flex items-center gap-3">
+              <div className="w-10 h-10 bg-doubleword-neutral-100 rounded-full flex items-center justify-center">
+                <RefreshCw className="w-5 h-5 text-doubleword-neutral-700" />
+              </div>
+              <div>
+                <DialogTitle>Rotate API Keys</DialogTitle>
+                <DialogDescription>
+                  Generate new secrets for {selectedKeys.length} key
+                  {selectedKeys.length !== 1 ? "s" : ""}
+                </DialogDescription>
+              </div>
+            </div>
+          </DialogHeader>
+
+          <div className="space-y-4">
+            <p className="text-sm text-gray-700">
+              Each key's current secret stops working immediately and a new
+              one is generated. Usage limits and usage history are
+              unaffected. The new secrets are shown once afterwards.
+            </p>
+            <div className="bg-gray-50 rounded-lg p-3 max-h-32 overflow-y-auto">
+              <p className="text-sm font-medium text-gray-600 mb-2">
+                Keys to be rotated:
+              </p>
+              <ul className="text-sm text-gray-700 space-y-1">
+                {selectedKeys.map((key) => (
+                  <li key={key.id}>{key.name}</li>
+                ))}
+              </ul>
+            </div>
+            <div className="p-3 bg-yellow-50 border border-yellow-200 rounded-lg">
+              <p className="text-sm text-yellow-800">
+                <strong>Note:</strong> batches already submitted with these
+                keys will keep running. If a key was compromised, cancel any
+                in-flight batches separately.
+              </p>
+            </div>
+          </div>
+
+          <DialogFooter>
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => setShowBulkRotateModal(false)}
+              disabled={bulkRotating}
+            >
+              Cancel
+            </Button>
+            <Button type="button" onClick={handleBulkRotate} disabled={bulkRotating}>
+              {bulkRotating ? (
+                <>
+                  <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                  Rotating...
+                </>
+              ) : (
+                <>
+                  <RefreshCw className="w-4 h-4 mr-2" />
+                  Rotate {selectedKeys.length} Key
+                  {selectedKeys.length !== 1 ? "s" : ""}
+                </>
+              )}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Bulk Rotated Secrets Modal — one-time display, same pattern as
+          single rotation but listing every replacement secret */}
+      <Dialog
+        open={!!bulkRotatedKeys}
+        onOpenChange={(open) => {
+          if (!open) setBulkRotatedKeys(null);
+        }}
+      >
+        <DialogContent className="sm:max-w-lg">
+          <DialogHeader>
+            <DialogTitle>API Keys Rotated</DialogTitle>
+            <DialogDescription>
+              {bulkRotatedKeys?.length} key
+              {bulkRotatedKeys?.length !== 1 ? "s" : ""} rotated. The old
+              secrets no longer work for new requests.
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="space-y-4">
+            <div
+              className="p-3 bg-green-50 border border-green-200 rounded-lg"
+              role="alert"
+            >
+              <div className="flex items-center gap-2">
+                <Key className="w-4 h-4 text-green-600" />
+                <p className="text-sm text-green-800 font-medium">
+                  Save these keys now - they won't be shown again
+                </p>
+              </div>
+            </div>
+
+            <div className="space-y-3 max-h-64 overflow-y-auto">
+              {(bulkRotatedKeys ?? []).map((entry) => (
+                <div key={entry.id} className="space-y-1">
+                  <Label>{entry.name}</Label>
+                  <div className="flex items-center gap-2">
+                    <div className="flex-1 overflow-hidden rounded border bg-gray-50">
+                      <code className="block text-xs font-mono px-3 py-2 overflow-x-auto whitespace-nowrap">
+                        {entry.key}
+                      </code>
+                    </div>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="icon"
+                      onClick={() => copyToClipboard(entry.key)}
+                      aria-label={
+                        copiedKey === entry.key
+                          ? `Copied secret for ${entry.name}`
+                          : `Copy secret for ${entry.name}`
+                      }
+                    >
+                      {copiedKey === entry.key ? (
+                        <Check className="w-4 h-4" />
+                      ) : (
+                        <Copy className="w-4 h-4" />
+                      )}
+                    </Button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          <DialogFooter>
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() =>
+                copyToClipboard(
+                  (bulkRotatedKeys ?? [])
+                    .map((entry) => `${entry.name}: ${entry.key}`)
+                    .join("\n"),
+                )
+              }
+            >
+              Copy all
+            </Button>
+            <Button type="button" onClick={() => setBulkRotatedKeys(null)}>
+              I've saved them
             </Button>
           </DialogFooter>
         </DialogContent>

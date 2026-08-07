@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO organization_member_roles (user_organization_id, role) VALUES ($1, 'manage_keys') ON CONFLICT DO NOTHING",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "147e342ffd6fa448243f4ff0ef31b64cf618bc5d64bba283775250b3be62ffd4"
+}

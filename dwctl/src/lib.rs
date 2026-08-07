@@ -352,6 +352,12 @@ fn get_or_install_prometheus_handle() -> PrometheusHandle {
             // classify, tokenizer-svc call, commit, and index lookup (cache read).
             const CACHE_LATENCY_BUCKETS: &[f64] = &[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0];
 
+            // Render-drift histogram buckets, in TOKENS (signed: render_total − engine
+            // prompt_tokens). Edges double as alert thresholds: the share of requests
+            // with |drift| beyond ±5/±20/±50/±100/±500 is exact at these edges, so
+            // Grafana alert rules can be tuned across them without a code release.
+            const RENDER_DRIFT_TOKEN_BUCKETS: &[f64] = &[-500.0, -100.0, -50.0, -20.0, -5.0, 0.0, 5.0, 20.0, 50.0, 100.0, 500.0];
+
             // Custom histogram buckets for fusillade retry attempts (0-10 retries)
             const RETRY_ATTEMPTS_BUCKETS: &[f64] = &[0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0];
 
@@ -386,6 +392,11 @@ fn get_or_install_prometheus_handle() -> PrometheusHandle {
                     CACHE_LATENCY_BUCKETS,
                 )
                 .expect("Failed to set custom buckets for dwctl_cache_lookup_duration_seconds")
+                .set_buckets_for_metric(
+                    Matcher::Full("dwctl_cache_render_drift_tokens".to_string()),
+                    RENDER_DRIFT_TOKEN_BUCKETS,
+                )
+                .expect("Failed to set custom buckets for dwctl_cache_render_drift_tokens")
                 .set_buckets_for_metric(
                     Matcher::Full("fusillade_retry_attempts_on_success".to_string()),
                     RETRY_ATTEMPTS_BUCKETS,
@@ -1252,6 +1263,14 @@ pub async fn build_router(
             patch(api::handlers::api_keys::update_user_api_key),
         )
         .route(
+            "/users/{user_id}/api-keys/{id}/rotate",
+            post(api::handlers::api_keys::rotate_user_api_key),
+        )
+        .route(
+            "/users/{user_id}/api-keys/{id}/reveal",
+            post(api::handlers::api_keys::reveal_user_api_key),
+        )
+        .route(
             "/users/{user_id}/api-keys/{id}",
             delete(api::handlers::api_keys::delete_user_api_key),
         )
@@ -1284,6 +1303,9 @@ pub async fn build_router(
         .route("/transactions", get(api::handlers::transactions::list_transactions))
         // Payment processing
         .route("/payments", post(api::handlers::payments::create_payment))
+        // Registered before `/payments/{id}` for clarity; axum matches the
+        // static segment first regardless, and the methods differ anyway.
+        .route("/payments/setup", post(api::handlers::payments::create_payment_setup))
         .route("/payments/{id}", patch(api::handlers::payments::process_payment))
         .route("/billing-portal", post(api::handlers::payments::create_billing_portal_session))
         .route("/auto-topup/enable", post(api::handlers::payments::enable_auto_topup))
@@ -1415,6 +1437,36 @@ pub async fn build_router(
             delete(api::handlers::organizations::cancel_invite),
         )
         .route(
+            "/organizations/{id}/invites/{invite_id}/resend",
+            post(api::handlers::organizations::resend_invite),
+        )
+        // Join requests: the mirror of invites, for users asking to join an
+        // organization that matches their email domain.
+        .route(
+            "/organizations/{id}/join-requests",
+            get(api::handlers::organizations::list_join_requests),
+        )
+        .route(
+            "/organizations/{id}/join-requests/{request_id}/approve",
+            post(api::handlers::organizations::approve_join_request),
+        )
+        .route(
+            "/organizations/{id}/join-requests/{request_id}/decline",
+            post(api::handlers::organizations::decline_join_request),
+        )
+        // Accept/decline by id, for an invitee who reached the invitation
+        // through onboarding rather than the emailed link. Authorized on the
+        // caller's own address matching the one invited — not on membership,
+        // which the only eligible caller does not have yet.
+        .route(
+            "/organizations/{id}/invites/{invite_id}/accept",
+            post(api::handlers::organizations::accept_invite_by_id),
+        )
+        .route(
+            "/organizations/{id}/invites/{invite_id}/decline",
+            post(api::handlers::organizations::decline_invite_by_id),
+        )
+        .route(
             "/organizations/invites/{token}",
             get(api::handlers::organizations::get_invite_details),
         )
@@ -1437,6 +1489,25 @@ pub async fn build_router(
         .route(
             "/users/{user_id}/organizations",
             get(api::handlers::organizations::list_user_organizations),
+        )
+        // A user's own outstanding join requests. Sits on the user rather than
+        // the organization because the requester isn't a member yet, so the
+        // organization-scoped queue below is closed to them.
+        .route(
+            "/users/{user_id}/join-requests",
+            get(api::handlers::organizations::list_user_join_requests),
+        )
+        // Filing one is a POST the user makes, never something signup does for
+        // them. Same path because it is the same resource from the same side.
+        .route(
+            "/users/{user_id}/join-requests",
+            post(api::handlers::organizations::create_user_join_request),
+        )
+        // The single read onboarding makes to decide which screen a new user
+        // sees: invited, domain-matched, or neither.
+        .route(
+            "/users/{user_id}/onboarding-context",
+            get(api::handlers::organizations::get_onboarding_context),
         )
         // Organization session context (validates membership, client stores org ID for X-Organization-Id header)
         .route("/session/organization", post(api::handlers::organizations::set_active_organization))
@@ -1468,10 +1539,7 @@ pub async fn build_router(
         .route("/probes/{id}/results", get(api::handlers::probes::get_probe_results))
         .route("/probes/{id}/statistics", get(api::handlers::probes::get_statistics))
         // Queue monitoring
-        .route(
-            "/monitoring/pending-request-counts",
-            get(api::handlers::queue::get_pending_request_counts),
-        )
+        .route("/monitoring/demand", get(api::handlers::queue::get_demand))
         // Tool sources CRUD
         .route("/tool-sources", get(api::handlers::tool_sources::list_tool_sources))
         .route("/tool-sources", post(api::handlers::tool_sources::create_tool_source))
@@ -1686,6 +1754,7 @@ pub async fn build_router(
                     cfg.cache.telemetry_blocks.strip_from_prompt,
                     &cfg.cache.telemetry_blocks.prefixes,
                 ),
+                cfg.cache.render_counting,
             );
             // Bound the cache layer's body buffer by the same limit onwards uses (0 =
             // unlimited), so it's never more restrictive than the entry point.
@@ -2272,12 +2341,92 @@ impl BackgroundServices {
             crate::sync::onwards_config::load_targets_from_db(pool, &[], self.strict_mode, &crate::config::RateLimitTiersConfig::default())
                 .await?;
 
+        // Snapshot the routing table this update should produce, before the
+        // config is handed to the channel.
+        //
+        // `send` only queues the config for `Targets::receive_updates`, which
+        // applies it on its own task, so returning as soon as it succeeds does
+        // not mean the proxy can serve the new config yet. A test that goes
+        // straight from here to a proxied request can beat the apply and get a
+        // 403 for an API key that is already committed to the database.
+        //
+        // The alias set and each pool's authorised keys are compared by
+        // identity, not by count: a pool can carry the right number of keys and
+        // still not the one under test, which produces exactly the same 403 as
+        // a pool with no keys at all.
+        let expected: Vec<(String, Option<onwards::auth::KeySet>)> = new_targets
+            .targets
+            .iter()
+            .map(|entry| (entry.key().clone(), entry.value().keys().cloned()))
+            .collect();
+
+        // Kept so the update can be re-asserted below. `Targets` is a handle of
+        // `Arc` maps and `receive_updates` only reads from the value it is
+        // given, so re-sending this clone is safe.
+        let desired = new_targets.clone();
+
         // Send through the watch channel (same as automatic sync)
         sender
             .send(new_targets)
             .map_err(|_| anyhow::anyhow!("Failed to send targets update"))?;
 
-        Ok(())
+        // `onwards_targets` shares its maps with the router's `AppState`, so
+        // polling it observes exactly what a proxied request would resolve
+        // against. Reaching this point means the sender exists, which in turn
+        // means `receive_updates` was wired for this app, so an update that
+        // never lands is a real failure rather than a disabled-sync no-op.
+        //
+        // Note this cannot detect an update that changes nothing structural
+        // (e.g. only an endpoint URL) - such an update matches immediately and
+        // returns without waiting, exactly as before.
+        //
+        // Waiting for the state to appear once is not enough. The config
+        // listener shares this watch channel, and a reload it started before
+        // the test's own write can finish afterwards and apply that older
+        // snapshot over this one - dropping the key again in the window between
+        // this function returning and the test issuing its request. So the
+        // state has to hold for a settle window, and any regression re-asserts
+        // the desired config rather than waiting for the listener's periodic
+        // sync to come back around.
+        const SETTLE: std::time::Duration = std::time::Duration::from_millis(250);
+        const REASSERT_EVERY: std::time::Duration = std::time::Duration::from_millis(200);
+        // Comfortably inside SETTLE, so the settle window is still sampled many
+        // times, without waking the scheduler thousands of times per call.
+        const POLL_EVERY: std::time::Duration = std::time::Duration::from_millis(10);
+        const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+        let deadline = std::time::Instant::now() + TIMEOUT;
+        let mut stable_since: Option<std::time::Instant> = None;
+        let mut last_reassert = std::time::Instant::now();
+
+        loop {
+            let live = &self.onwards_targets.targets;
+            let applied = live.len() == expected.len()
+                && expected
+                    .iter()
+                    .all(|(alias, keys)| live.get(alias).is_some_and(|pool| pool.keys() == keys.as_ref()));
+
+            let now = std::time::Instant::now();
+            if applied {
+                if now.duration_since(*stable_since.get_or_insert(now)) >= SETTLE {
+                    return Ok(());
+                }
+            } else {
+                stable_since = None;
+                if now.duration_since(last_reassert) >= REASSERT_EVERY {
+                    sender
+                        .send(desired.clone())
+                        .map_err(|_| anyhow::anyhow!("Failed to re-send targets update"))?;
+                    last_reassert = now;
+                }
+            }
+
+            if now >= deadline {
+                anyhow::bail!("onwards did not apply the config update within {:?}", TIMEOUT);
+            }
+
+            tokio::time::sleep(POLL_EVERY).await;
+        }
     }
 
     /// Manually refresh the per-key ZDR cache from the database (for testing).
@@ -3112,7 +3261,7 @@ impl Application {
             std::time::Duration::from_millis(fusillade_daemon_config.body_timeout_ms),
             fusillade_daemon_config.streamable_endpoints.clone(),
         ));
-        let multi_step_loop_config = onwards::LoopConfig {
+        let multi_step_loop_config = onwards_fusillade::LoopConfig {
             max_response_step_depth: config.responses.max_response_step_depth,
             max_response_iterations: config.responses.max_response_iterations,
         };

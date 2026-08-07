@@ -1880,6 +1880,9 @@ where
                         if let Ok(backlog) = storage.count_archivable_batches(grace).await {
                             gauge!("fusillade_archive_backlog").set(backlog as f64);
                         }
+                        if let Ok(unfrozen) = storage.count_unfrozen_terminal_batches().await {
+                            gauge!("fusillade_unfrozen_terminal_batches").set(unfrozen as f64);
+                        }
                     }
                 });
             }

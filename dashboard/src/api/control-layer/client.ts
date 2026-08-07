@@ -13,6 +13,7 @@ import type {
   UserCreateRequest,
   GroupCreateRequest,
   ApiKeyCreateRequest,
+  ApiKeySecretResponse,
   ApiKeyUpdateRequest,
   UserUpdateRequest,
   GroupUpdateRequest,
@@ -213,12 +214,14 @@ const userApi = {
   apiKeys: {
     async getAll(
       userId: string = "current",
-      options: { skip?: number; limit?: number } = {},
+      options: { skip?: number; limit?: number; created_by?: string } = {},
     ): Promise<PaginatedResponse<ApiKey>> {
       const params = new URLSearchParams();
       if (options.skip !== undefined) params.set("skip", String(options.skip));
       if (options.limit !== undefined)
         params.set("limit", String(options.limit));
+      if (options.created_by !== undefined)
+        params.set("created_by", options.created_by);
 
       const queryString = params.toString();
       const url = `/admin/api/v1/users/${userId}/api-keys${queryString ? `?${queryString}` : ""}`;
@@ -291,6 +294,50 @@ const userApi = {
       if (!response.ok) {
         throw new Error(`Failed to delete API key: ${response.status}`);
       }
+    },
+
+    // Replace the key's secret. The old secret stops working within ~1s for
+    // NEW requests; batches already submitted keep running on their hidden
+    // execution key — cancel them separately if the old secret leaked.
+    async rotate(
+      keyId: string,
+      userId: string = "current",
+    ): Promise<ApiKeySecretResponse> {
+      const response = await fetch(
+        `/admin/api/v1/users/${userId}/api-keys/${keyId}/rotate`,
+        { method: "POST" },
+      );
+      if (!response.ok) {
+        const text = await response.text().catch(() => "");
+        throw new Error(
+          text
+            ? `Failed to rotate API key: ${response.status} - ${text}`
+            : `Failed to rotate API key: ${response.status}`,
+        );
+      }
+      return response.json();
+    },
+
+    // One-off reveal of an issued key's secret — holder only, consumed
+    // forever on first success (409 afterwards; rotation is the only path
+    // to a secret from then on).
+    async reveal(
+      keyId: string,
+      userId: string = "current",
+    ): Promise<ApiKeySecretResponse> {
+      const response = await fetch(
+        `/admin/api/v1/users/${userId}/api-keys/${keyId}/reveal`,
+        { method: "POST" },
+      );
+      if (!response.ok) {
+        const text = await response.text().catch(() => "");
+        throw new Error(
+          text
+            ? `Failed to reveal API key: ${response.status} - ${text}`
+            : `Failed to reveal API key: ${response.status}`,
+        );
+      }
+      return response.json();
     },
   },
 
@@ -1804,11 +1851,14 @@ const monitoringApi = {
     options?: PendingRequestCountsQuery,
   ): Promise<PendingRequestCountsByModelAndWindow> {
     const params = new URLSearchParams();
+    // The demand endpoint takes explicit deadline windows and echoes them
+    // back as response keys; 1h,24h matches the completion windows the UI
+    // displays.
+    params.set("window", options?.window ?? "1h,24h");
     if (options?.service_tiers)
       params.set("service_tiers", options.service_tiers);
-    const qs = params.toString() ? `?${params.toString()}` : "";
     const response = await fetch(
-      `/admin/api/v1/monitoring/pending-request-counts${qs}`,
+      `/admin/api/v1/monitoring/demand?${params.toString()}`,
     );
     if (!response.ok) {
       throw new Error(

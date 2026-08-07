@@ -1,0 +1,22 @@
+[package]
+name = "onwards-fusillade"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88.0"
+publish = false
+description = "Private Fusillade integration for Onwards multi-step responses"
+license = "MIT"
+
+[dependencies]
+async-trait = "0.1"
+fusillade = { path = "../fusillade", default-features = false }
+futures-util = "0.3"
+onwards = { path = "../onwards" }
+serde_json = "1"
+tokio = { version = "1", features = ["sync"] }
+tracing = "0.1"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+wiremock = "0.6"

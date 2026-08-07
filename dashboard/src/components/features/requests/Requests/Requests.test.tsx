@@ -104,7 +104,7 @@ const modelsHandler = http.get("/admin/api/v1/models", () => {
 
 // Add handler for monitoring pending request counts endpoint
 const pendingRequestCountsHandler = http.get(
-  "/admin/api/v1/monitoring/pending-request-counts",
+  "/admin/api/v1/monitoring/demand",
   () => {
     return HttpResponse.json({
       "claude-sonnet-3.5": { "1h": 0, "24h": 0 },

@@ -1,19 +1,44 @@
 "use client";
 
 import { type ColumnDef } from "@tanstack/react-table";
-import { ArrowUpDown, Trash2, Pencil } from "lucide-react";
+import { ArrowUpDown, Trash2, Pencil, RefreshCw, Eye } from "lucide-react";
 import { Button } from "../../../ui/button";
 import { Checkbox } from "../../../ui/checkbox";
+import { Tooltip, TooltipContent, TooltipTrigger } from "../../../ui/tooltip";
 import type { ApiKey } from "../../../../api/control-layer/types";
-import { formatCredits, formatResetInstant, limitPeriodLabel } from "./spendCap";
+import {
+  formatCredits,
+  formatResetInstant,
+  limitPeriodLabel,
+} from "./spendCap";
 
 interface ColumnActions {
   onDelete: (apiKey: ApiKey) => void;
   onEdit: (apiKey: ApiKey) => void;
-  /** Whether the current user may edit this key's usage limit (creator or
-   *  PlatformManager — mirrors what the PATCH endpoint permits). */
+  /** Whether the current user may manage this key (rename, edit caps,
+   *  delete). Mirrors what the server permits: PlatformManager, org
+   *  owner/admin in org context, or the key's creator when they hold
+   *  self-manage rights in the active context. */
   canManage: (apiKey: ApiKey) => boolean;
+  /** Whether the current user may rotate this key. Broader than canManage:
+   *  rotation is the secret-recovery path, so members without creation
+   *  rights can still rotate keys they hold. */
+  canRotate: (apiKey: ApiKey) => boolean;
   isPlatformManager?: boolean;
+  /** Org context only: show the holder of each key, resolved from the org
+   *  members list via created_by. */
+  showAssignee?: boolean;
+  resolveAssignee?: (createdBy: string) => string;
+  onRotate: (apiKey: ApiKey) => void;
+  /** Whether the current user may use the ONE-OFF reveal on this key: they
+   *  are its holder and the reveal hasn't been consumed. While true, Reveal
+   *  replaces Rotate for them (rotating before ever seeing the secret makes
+   *  no sense); admins keep plain Rotate throughout. */
+  canReveal: (apiKey: ApiKey) => boolean;
+  onReveal: (apiKey: ApiKey) => void;
+  /** Hide the bulk-select column (e.g. members without key-creation rights
+   *  can't delete). */
+  showSelect?: boolean;
 }
 
 export const createColumns = (actions: ColumnActions): ColumnDef<ApiKey>[] => {
@@ -83,6 +108,43 @@ export const createColumns = (actions: ColumnActions): ColumnDef<ApiKey>[] => {
         );
       },
     },
+    {
+      id: "assignee",
+      header: "Assignee",
+      cell: ({ row }) => {
+        const apiKey = row.original;
+        return (
+          <div className="flex flex-col gap-0.5">
+            <span className="text-sm text-doubleword-neutral-700">
+              {actions.resolveAssignee
+                ? actions.resolveAssignee(apiKey.created_by)
+                : apiKey.created_by}
+            </span>
+            {/* Issued-key engagement signal for managers: once the holder
+                has opened (revealed) the key it's live on their side —
+                don't rotate it without cause. */}
+            {apiKey.secret_revealed_at == null ? (
+              <span className="text-xs text-amber-700">Not opened yet</span>
+            ) : (
+              <span className="text-xs text-doubleword-neutral-400">
+                Opened{" "}
+                {/* Fixed to UTC: local-tz rendering shifts dates around
+                    midnight per viewer and makes tests flaky. */}
+                {new Date(apiKey.secret_revealed_at).toLocaleDateString(
+                  "en-US",
+                  {
+                    year: "numeric",
+                    month: "short",
+                    day: "numeric",
+                    timeZone: "UTC",
+                  },
+                )}
+              </span>
+            )}
+          </div>
+        );
+      },
+    },
     // {
     //   id: "rateLimit",
     //   header: "Rate Limit",
@@ -132,7 +194,10 @@ export const createColumns = (actions: ColumnActions): ColumnDef<ApiKey>[] => {
         const pct =
           limit > 0 ? Math.min(100, Math.round((spent / limit) * 100)) : 0;
         return (
-          <div className="min-w-40 flex flex-col gap-0.5" aria-label="Usage limit">
+          <div
+            className="min-w-40 flex flex-col gap-0.5"
+            aria-label="Usage limit"
+          >
             <span className="flex items-center gap-2 text-sm font-medium text-doubleword-neutral-900">
               {formatCredits(apiKey.spend ?? "0")} /{" "}
               {formatCredits(apiKey.spend_limit)}
@@ -195,36 +260,99 @@ export const createColumns = (actions: ColumnActions): ColumnDef<ApiKey>[] => {
       header: "Actions",
       cell: ({ row }) => {
         const apiKey = row.original;
+        const canManage = actions.canManage(apiKey);
+        const canReveal = actions.canReveal(apiKey);
+        // While the holder's one-off reveal is pending, it REPLACES rotate
+        // for them — rotating a secret you've never seen makes no sense.
+        const canRotate = !canReveal && actions.canRotate(apiKey);
 
+        if (!canManage && !canRotate && !canReveal) {
+          // View-only rows: no mutating actions.
+          return null;
+        }
+
+        // Icon-only buttons need hover tooltips — Reveal vs Rotate are
+        // both circular-arrow-adjacent glyphs and easily confused. No
+        // TooltipProvider here: the ui/tooltip Tooltip wraps itself in one
+        // (delay 0), so an outer provider is inert.
         return (
           <div className="flex items-center">
-            {actions.canManage(apiKey) && (
-              <Button
-                variant="ghost"
-                size="sm"
-                onClick={() => actions.onEdit(apiKey)}
-                aria-label={`Edit usage limit for ${apiKey.name}`}
-                className="text-doubleword-neutral-600 hover:text-doubleword-neutral-900"
-              >
-                <Pencil className="h-4 w-4" />
-              </Button>
+            {canManage && (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => actions.onEdit(apiKey)}
+                    aria-label={`Edit usage limit for ${apiKey.name}`}
+                    className="text-doubleword-neutral-600 hover:text-doubleword-neutral-900"
+                  >
+                    <Pencil className="h-4 w-4" />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent>Edit usage limit</TooltipContent>
+              </Tooltip>
             )}
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={() => actions.onDelete(apiKey)}
-              aria-label={`Delete ${apiKey.name}`}
-              className="text-red-600 hover:text-red-700 hover:bg-red-50"
-            >
-              <Trash2 className="h-4 w-4" />
-            </Button>
+            {canReveal && (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => actions.onReveal(apiKey)}
+                    aria-label={`Reveal ${apiKey.name}`}
+                    className="text-doubleword-neutral-600 hover:text-doubleword-neutral-900"
+                  >
+                    <Eye className="h-4 w-4" />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent>Reveal secret (one-off)</TooltipContent>
+              </Tooltip>
+            )}
+            {canRotate && (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => actions.onRotate(apiKey)}
+                    aria-label={`Rotate ${apiKey.name}`}
+                    className="text-doubleword-neutral-600 hover:text-doubleword-neutral-900"
+                  >
+                    <RefreshCw className="h-4 w-4" />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent>Rotate secret</TooltipContent>
+              </Tooltip>
+            )}
+            {canManage && (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => actions.onDelete(apiKey)}
+                    aria-label={`Delete ${apiKey.name}`}
+                    className="text-red-600 hover:text-red-700 hover:bg-red-50"
+                  >
+                    <Trash2 className="h-4 w-4" />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent>Delete key</TooltipContent>
+              </Tooltip>
+            )}
           </div>
         );
       },
     },
   ];
 
-  // The key-type badge now rides inline on the Name column for everyone,
-  // matching the design; there is no separate purpose column to gate.
-  return allColumns;
+  // The key-type badge rides inline on the Name column for everyone; the
+  // Assignee column only appears in org context, and the bulk-select column
+  // is dropped for users who can't delete anything anyway.
+  return allColumns.filter((col) => {
+    if (col.id === "assignee" && !actions.showAssignee) return false;
+    if (col.id === "select" && actions.showSelect === false) return false;
+    return true;
+  });
 };

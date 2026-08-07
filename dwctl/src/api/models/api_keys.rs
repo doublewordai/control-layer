@@ -93,6 +93,11 @@ pub struct ApiKeyResponse {
     pub requests_per_second: Option<f32>,
     /// Per-API-key rate limit: maximum burst size (null = no limit)
     pub burst_size: Option<i32>,
+    /// When the key's holder first fetched the secret. Null = an issued key
+    /// whose holder has not yet used their one-off reveal (POST
+    /// .../api-keys/{id}/reveal); self-created keys are born revealed.
+    /// Surfaced to org admins as "opened at". Rotation never changes this.
+    pub secret_revealed_at: Option<DateTime<Utc>>,
     /// Spending cap in credits (null = no cap)
     #[schema(value_type = Option<String>)]
     pub spend_limit: Option<Decimal>,
@@ -128,6 +133,11 @@ pub struct ApiKeyInfoResponse {
     pub requests_per_second: Option<f32>,
     /// Per-API-key rate limit: maximum burst size (null = no limit)
     pub burst_size: Option<i32>,
+    /// When the key's holder first fetched the secret. Null = an issued key
+    /// whose holder has not yet used their one-off reveal (POST
+    /// .../api-keys/{id}/reveal); self-created keys are born revealed.
+    /// Surfaced to org admins as "opened at". Rotation never changes this.
+    pub secret_revealed_at: Option<DateTime<Utc>>,
     /// Spending cap in credits (null = no cap)
     #[schema(value_type = Option<String>)]
     pub spend_limit: Option<Decimal>,
@@ -143,12 +153,29 @@ pub struct ApiKeyInfoResponse {
     pub resets_at: Option<DateTime<Utc>>,
 }
 
+/// Response carrying an API key's secret — returned ONLY by the dedicated
+/// secret-fetch and rotate endpoints (never by list/get), so every exposure
+/// of a secret is an explicit, audited event.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ApiKeySecretResponse {
+    /// The API key secret.
+    pub key: String,
+}
+
 #[derive(Debug, Deserialize, IntoParams, ToSchema)]
 pub struct ListApiKeysQuery {
     /// Pagination parameters
     #[serde(flatten)]
     #[param(inline)]
     pub pagination: Pagination,
+    /// Only return keys held by this user (their `created_by`). Org
+    /// owners/admins and PlatformManagers may name any holder — pagination
+    /// and total_count then cover the filtered set, so "all of member X's
+    /// keys" is answerable without paging the whole org list. Everyone else
+    /// may only name themselves (their list is already scoped to that).
+    #[param(value_type = Option<String>, format = "uuid")]
+    #[schema(value_type = Option<String>, format = "uuid")]
+    pub created_by: Option<UserId>,
 }
 
 impl From<ApiKeyDBResponse> for ApiKeyResponse {
@@ -166,6 +193,7 @@ impl From<ApiKeyDBResponse> for ApiKeyResponse {
             model_access: db.model_access,
             requests_per_second: db.requests_per_second,
             burst_size: db.burst_size,
+            secret_revealed_at: db.secret_revealed_at,
             spend_limit: db.spend_limit,
             spend_limit_interval: db.spend_limit_interval,
             // Checkpoint-derived display fields; populated by the handler via
@@ -203,6 +231,7 @@ impl From<ApiKeyDBResponse> for ApiKeyInfoResponse {
             model_access: db.model_access,
             requests_per_second: db.requests_per_second,
             burst_size: db.burst_size,
+            secret_revealed_at: db.secret_revealed_at,
             spend_limit: db.spend_limit,
             spend_limit_interval: db.spend_limit_interval,
             // Checkpoint-derived display fields; populated by the handler via
