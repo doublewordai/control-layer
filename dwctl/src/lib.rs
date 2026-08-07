@@ -1463,6 +1463,18 @@ pub async fn build_router(
             "/organizations/{id}/join-requests/{request_id}/decline",
             post(api::handlers::organizations::decline_join_request),
         )
+        // Accept/decline by id, for an invitee who reached the invitation
+        // through onboarding rather than the emailed link. Authorized on the
+        // caller's own address matching the one invited — not on membership,
+        // which the only eligible caller does not have yet.
+        .route(
+            "/organizations/{id}/invites/{invite_id}/accept",
+            post(api::handlers::organizations::accept_invite_by_id),
+        )
+        .route(
+            "/organizations/{id}/invites/{invite_id}/decline",
+            post(api::handlers::organizations::decline_invite_by_id),
+        )
         .route(
             "/organizations/invites/{token}",
             get(api::handlers::organizations::get_invite_details),
@@ -1486,6 +1498,25 @@ pub async fn build_router(
         .route(
             "/users/{user_id}/organizations",
             get(api::handlers::organizations::list_user_organizations),
+        )
+        // A user's own outstanding join requests. Sits on the user rather than
+        // the organization because the requester isn't a member yet, so the
+        // organization-scoped queue below is closed to them.
+        .route(
+            "/users/{user_id}/join-requests",
+            get(api::handlers::organizations::list_user_join_requests),
+        )
+        // Filing one is a POST the user makes, never something signup does for
+        // them. Same path because it is the same resource from the same side.
+        .route(
+            "/users/{user_id}/join-requests",
+            post(api::handlers::organizations::create_user_join_request),
+        )
+        // The single read onboarding makes to decide which screen a new user
+        // sees: invited, domain-matched, or neither.
+        .route(
+            "/users/{user_id}/onboarding-context",
+            get(api::handlers::organizations::get_onboarding_context),
         )
         // Organization session context (validates membership, client stores org ID for X-Organization-Id header)
         .route("/session/organization", post(api::handlers::organizations::set_active_organization))
@@ -2319,12 +2350,92 @@ impl BackgroundServices {
             crate::sync::onwards_config::load_targets_from_db(pool, &[], self.strict_mode, &crate::config::RateLimitTiersConfig::default())
                 .await?;
 
+        // Snapshot the routing table this update should produce, before the
+        // config is handed to the channel.
+        //
+        // `send` only queues the config for `Targets::receive_updates`, which
+        // applies it on its own task, so returning as soon as it succeeds does
+        // not mean the proxy can serve the new config yet. A test that goes
+        // straight from here to a proxied request can beat the apply and get a
+        // 403 for an API key that is already committed to the database.
+        //
+        // The alias set and each pool's authorised keys are compared by
+        // identity, not by count: a pool can carry the right number of keys and
+        // still not the one under test, which produces exactly the same 403 as
+        // a pool with no keys at all.
+        let expected: Vec<(String, Option<onwards::auth::KeySet>)> = new_targets
+            .targets
+            .iter()
+            .map(|entry| (entry.key().clone(), entry.value().keys().cloned()))
+            .collect();
+
+        // Kept so the update can be re-asserted below. `Targets` is a handle of
+        // `Arc` maps and `receive_updates` only reads from the value it is
+        // given, so re-sending this clone is safe.
+        let desired = new_targets.clone();
+
         // Send through the watch channel (same as automatic sync)
         sender
             .send(new_targets)
             .map_err(|_| anyhow::anyhow!("Failed to send targets update"))?;
 
-        Ok(())
+        // `onwards_targets` shares its maps with the router's `AppState`, so
+        // polling it observes exactly what a proxied request would resolve
+        // against. Reaching this point means the sender exists, which in turn
+        // means `receive_updates` was wired for this app, so an update that
+        // never lands is a real failure rather than a disabled-sync no-op.
+        //
+        // Note this cannot detect an update that changes nothing structural
+        // (e.g. only an endpoint URL) - such an update matches immediately and
+        // returns without waiting, exactly as before.
+        //
+        // Waiting for the state to appear once is not enough. The config
+        // listener shares this watch channel, and a reload it started before
+        // the test's own write can finish afterwards and apply that older
+        // snapshot over this one - dropping the key again in the window between
+        // this function returning and the test issuing its request. So the
+        // state has to hold for a settle window, and any regression re-asserts
+        // the desired config rather than waiting for the listener's periodic
+        // sync to come back around.
+        const SETTLE: std::time::Duration = std::time::Duration::from_millis(250);
+        const REASSERT_EVERY: std::time::Duration = std::time::Duration::from_millis(200);
+        // Comfortably inside SETTLE, so the settle window is still sampled many
+        // times, without waking the scheduler thousands of times per call.
+        const POLL_EVERY: std::time::Duration = std::time::Duration::from_millis(10);
+        const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+        let deadline = std::time::Instant::now() + TIMEOUT;
+        let mut stable_since: Option<std::time::Instant> = None;
+        let mut last_reassert = std::time::Instant::now();
+
+        loop {
+            let live = &self.onwards_targets.targets;
+            let applied = live.len() == expected.len()
+                && expected
+                    .iter()
+                    .all(|(alias, keys)| live.get(alias).is_some_and(|pool| pool.keys() == keys.as_ref()));
+
+            let now = std::time::Instant::now();
+            if applied {
+                if now.duration_since(*stable_since.get_or_insert(now)) >= SETTLE {
+                    return Ok(());
+                }
+            } else {
+                stable_since = None;
+                if now.duration_since(last_reassert) >= REASSERT_EVERY {
+                    sender
+                        .send(desired.clone())
+                        .map_err(|_| anyhow::anyhow!("Failed to re-send targets update"))?;
+                    last_reassert = now;
+                }
+            }
+
+            if now >= deadline {
+                anyhow::bail!("onwards did not apply the config update within {:?}", TIMEOUT);
+            }
+
+            tokio::time::sleep(POLL_EVERY).await;
+        }
     }
 
     /// Manually refresh the per-key ZDR cache from the database (for testing).

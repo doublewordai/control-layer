@@ -198,16 +198,45 @@ async fn try_proxy_header_auth<P: sqlx_pool_router::PoolProvider + Clone + Send 
                         let mut org_repo = Organizations::new(&mut tx);
                         match org_repo.find_by_domain(&domain).await {
                             Ok(Some(org)) => {
-                                // Org exists — ask to join rather than joining.
+                                // Org exists. Whether that means anything happens here is
+                                // the organization's call, not ours.
                                 //
                                 // This used to call `add_member` directly, so anyone who
                                 // could receive mail at a company's domain landed inside
                                 // the organization that owns its billing account, with no
-                                // approval and no notice to either side. Now an owner or
-                                // admin decides. Sharing an email domain is evidence that
-                                // someone probably belongs, not that they do.
-                                if let Err(e) = org_repo.create_join_request(org.id, user.id).await {
-                                    tracing::warn!("Failed to record join request for org {domain}: {e}");
+                                // approval and no notice to either side. #1430 replaced
+                                // that with an automatic join request — which fixed the
+                                // silent membership but kept the silence: a request the
+                                // user never knowingly made, sitting on a queue they
+                                // couldn't read.
+                                //
+                                // Now signup does one of exactly two things:
+                                //
+                                //   auto-join ON  — the organization has said in advance
+                                //     that everyone at its domain belongs, so admit them
+                                //     as a member. Deliberate, and revocable by the org.
+                                //
+                                //   auto-join OFF — do nothing at all. The domain match
+                                //     is surfaced to the user in onboarding
+                                //     (`/users/{id}/onboarding-context`) and *they* decide
+                                //     whether to ask. Filing a request on their behalf,
+                                //     however well-meant, is still acting without them.
+                                match org_repo.auto_join_enabled(org.id).await {
+                                    Ok(true) => {
+                                        if let Err(e) = org_repo.add_member(org.id, user.id, "member").await {
+                                            tracing::warn!("Failed to auto-join user into org for domain {domain}: {e}");
+                                        }
+                                    }
+                                    Ok(false) => {
+                                        tracing::debug!(
+                                            "Organization claims domain {domain} but auto-join is off; leaving the choice to the user"
+                                        );
+                                    }
+                                    Err(e) => {
+                                        // Fail closed: an unreadable setting must not be
+                                        // treated as consent to admit a stranger.
+                                        tracing::warn!("Failed to read auto-join setting for org on domain {domain}: {e}");
+                                    }
                                 }
                             }
                             Ok(None) => {
@@ -1798,12 +1827,20 @@ mod tests {
     }
 
     #[sqlx::test]
-    /// Sharing an email domain gets you a request, not a membership.
+    /// Sharing an email domain gets you nothing at all, by default.
     ///
-    /// This used to add the second user straight in as a member. Anyone who
-    /// could receive mail at a company's domain landed inside the organization
-    /// that owns its billing account, with nobody asked and nobody told.
-    async fn test_proxy_header_signup_requests_to_join_existing_org(pool: PgPool) {
+    /// This has now been wrong in two different directions. It used to add the
+    /// second user straight in as a member: anyone who could receive mail at a
+    /// company's domain landed inside the organization that owns its billing
+    /// account, with nobody asked and nobody told. #1430 replaced that with an
+    /// automatic join request, which stopped the silent membership but still
+    /// acted for the user — a request they never made, on a queue they could
+    /// not read.
+    ///
+    /// The default is now to do nothing and let them decide. The absence of
+    /// the request is the assertion that matters here; offering the choice is
+    /// the onboarding-context endpoint's job.
+    async fn test_proxy_header_signup_leaves_domain_match_to_the_user(pool: PgPool) {
         let mut config = create_test_config();
         config.auth.proxy_header.enabled = true;
         config.auth.proxy_header.auto_create_users = true;
@@ -1827,30 +1864,78 @@ mod tests {
             Some("owner".to_string())
         );
 
-        // The second user is NOT a member - `get_user_org_role` only counts
-        // active memberships, so this is the check that would have failed
-        // before the change.
+        // Not a member - `get_user_org_role` only counts active memberships.
         assert_eq!(
             org_repo.get_user_org_role(second.id, org.id).await.unwrap(),
             None,
             "sharing a domain must not grant membership"
         );
 
-        // They're waiting in the queue instead.
-        let requests = org_repo.list_join_requests(org.id).await.unwrap();
-        assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].user_id, Some(second.id));
-        assert_eq!(requests[0].status, "requested");
+        // And not queued either: nothing was filed on their behalf.
+        assert!(
+            org_repo.list_join_requests(org.id).await.unwrap().is_empty(),
+            "signup must not ask to join for the user"
+        );
+        assert!(
+            org_repo.list_user_join_requests(second.id).await.unwrap().is_empty(),
+            "the user has asked for nothing"
+        );
 
-        // And the queue doesn't leak into the members list.
         let members = org_repo.list_members(org.id).await.unwrap();
         assert_eq!(members.len(), 1, "only the owner is a member");
         assert_eq!(members[0].user_id, Some(first.id));
     }
 
-    /// Logging in repeatedly must not pile up duplicate requests.
     #[sqlx::test]
-    async fn test_proxy_header_repeat_login_does_not_duplicate_join_request(pool: PgPool) {
+    /// With auto-join on, the same signup lands inside the organization.
+    ///
+    /// The old behaviour, back as a choice the organization makes for itself
+    /// rather than a rule imposed on everyone. The pairing with the test above
+    /// is the point: identical signup, opposite outcome, and the only
+    /// difference is the setting.
+    async fn test_proxy_header_signup_auto_joins_when_organization_opted_in(pool: PgPool) {
+        let mut config = create_test_config();
+        config.auth.proxy_header.enabled = true;
+        config.auth.proxy_header.auto_create_users = true;
+
+        let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
+
+        let mut parts1 = create_test_parts_with_auth("auth0|first", "first@widgets.io");
+        let first = CurrentUser::from_request_parts(&mut parts1, &state).await.unwrap();
+        let org_id = claim_domain(&pool, "widgets.io", first.id).await;
+
+        {
+            let mut conn = pool.acquire().await.unwrap();
+            let mut org_repo = Organizations::new(&mut conn);
+            assert!(
+                !org_repo.auto_join_enabled(org_id).await.unwrap(),
+                "a new workspace must not admit its domain until asked to"
+            );
+            assert!(org_repo.set_auto_join_enabled(org_id, true).await.unwrap());
+        }
+
+        let mut parts2 = create_test_parts_with_auth("auth0|second", "second@widgets.io");
+        let second = CurrentUser::from_request_parts(&mut parts2, &state).await.unwrap();
+
+        let mut conn = pool.acquire().await.unwrap();
+        let mut org_repo = Organizations::new(&mut conn);
+        assert_eq!(
+            org_repo.get_user_org_role(second.id, org_id).await.unwrap(),
+            Some("member".to_string()),
+            "auto-join admits as a plain member, never an admin"
+        );
+        assert!(
+            org_repo.list_join_requests(org_id).await.unwrap().is_empty(),
+            "there is nobody left to ask once the org has said yes in advance"
+        );
+    }
+
+    /// Logging in repeatedly must not pile up duplicate memberships.
+    ///
+    /// Only the first login runs the domain match at all, but the unique
+    /// constraint is what makes that safe to get wrong, so pin the outcome.
+    #[sqlx::test]
+    async fn test_proxy_header_repeat_login_does_not_duplicate_auto_join(pool: PgPool) {
         let mut config = create_test_config();
         config.auth.proxy_header.enabled = true;
         config.auth.proxy_header.auto_create_users = true;
@@ -1859,7 +1944,11 @@ mod tests {
 
         let mut owner_parts = create_test_parts_with_auth("auth0|owner", "owner@widgets.io");
         let owner = CurrentUser::from_request_parts(&mut owner_parts, &state).await.unwrap();
-        claim_domain(&pool, "widgets.io", owner.id).await;
+        let org_id = claim_domain(&pool, "widgets.io", owner.id).await;
+        {
+            let mut conn = pool.acquire().await.unwrap();
+            Organizations::new(&mut conn).set_auto_join_enabled(org_id, true).await.unwrap();
+        }
 
         for i in 0..3 {
             let mut parts = create_test_parts_with_auth("auth0|joiner", "joiner@widgets.io");
@@ -1870,8 +1959,8 @@ mod tests {
 
         let mut conn = pool.acquire().await.unwrap();
         let mut org_repo = Organizations::new(&mut conn);
-        let org = org_repo.find_by_domain("widgets.io").await.unwrap().unwrap();
-        assert_eq!(org_repo.list_join_requests(org.id).await.unwrap().len(), 1);
+        let members = org_repo.list_members(org_id).await.unwrap();
+        assert_eq!(members.len(), 2, "the owner and the joiner, once each");
     }
 
     #[sqlx::test]
