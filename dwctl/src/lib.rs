@@ -1372,6 +1372,10 @@ pub async fn build_router(
         // Composite model component management (for models where is_composite=true)
         .route("/models/{id}/components", get(api::handlers::deployments::get_model_components))
         .route(
+            "/models/{id}/components/routing",
+            put(api::handlers::deployments::update_model_component_layout),
+        )
+        .route(
             "/models/{id}/components/{component_id}",
             post(api::handlers::deployments::add_model_component),
         )

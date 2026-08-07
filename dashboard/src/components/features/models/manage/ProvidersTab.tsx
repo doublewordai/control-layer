@@ -27,7 +27,6 @@ import {
   type DragEndEvent,
 } from "@dnd-kit/core";
 import {
-  arrayMove,
   SortableContext,
   sortableKeyboardCoordinates,
   useSortable,
@@ -39,6 +38,7 @@ import {
   useModelComponents,
   useAddModelComponent,
   useUpdateModelComponent,
+  useUpdateModelComponentLayout,
   useRemoveModelComponent,
   useUpdateModel,
   useConfig,
@@ -48,6 +48,12 @@ import {
 } from "../../../../api/control-layer";
 import { ModelCombobox } from "../../../ui/model-combobox";
 import { queryKeys } from "../../../../api/control-layer/keys";
+import { ApiError } from "../../../../api/control-layer/errors";
+import {
+  groupPriorityTiers,
+  moveProviderToTier,
+  parseRoutingInteger,
+} from "./priorityTiers";
 import {
   Card,
   CardContent,
@@ -139,22 +145,31 @@ const ProviderRow: React.FC<{
 
   return (
     <div className={`flex flex-col group ${isDragging ? "opacity-90" : ""}`}>
-      <div
-        className={`flex items-center ${canManage && dragHandleProps ? "cursor-grab active:cursor-grabbing" : ""}`}
-        {...(canManage && dragHandleProps ? dragHandleProps.attributes : {})}
-        {...(canManage && dragHandleProps ? dragHandleProps.listeners : {})}
-      >
+      <div className="flex items-center">
         {/* Priority cascade indicator */}
         {isPriorityMode && (
           <div className="flex items-center justify-center mr-4 w-8">
             <div
               className={`w-8 h-8 rounded-full flex items-center justify-center text-sm font-medium transition-all
+                ${canManage && dragHandleProps ? "cursor-grab active:cursor-grabbing" : ""}
                 ${isDragging ? "shadow-lg scale-110 ring-2 ring-blue-400" : ""}
                 ${
                   priorityIndex === 1
                     ? "bg-blue-100 text-blue-700"
                     : "bg-gray-100 text-gray-600"
                 }`}
+              {...(canManage && dragHandleProps ? dragHandleProps.attributes : {})}
+              {...(canManage && dragHandleProps ? dragHandleProps.listeners : {})}
+              aria-label={
+                canManage && dragHandleProps
+                  ? `Move ${component.model.alias}, currently in tier ${priorityIndex}`
+                  : undefined
+              }
+              title={
+                canManage && dragHandleProps
+                  ? `Move ${component.model.alias}, currently in tier ${priorityIndex}`
+                  : undefined
+              }
             >
               {/* Show number by default, grip icon on hover when draggable */}
               {canManage && dragHandleProps ? (
@@ -211,9 +226,8 @@ const ProviderRow: React.FC<{
               )}
             </div>
 
-            {/* Weight display - only for weighted mode */}
-            {!isPriorityMode && (
-              <div className="flex items-center gap-3 shrink-0">
+            {/* Weight is global in weighted mode and relative within a priority tier. */}
+            <div className="flex items-center gap-3 shrink-0">
                 <div className="text-right">
                   <p className="font-medium text-gray-900">
                     {component.weight}
@@ -226,8 +240,7 @@ const ProviderRow: React.FC<{
                     style={{ width: `${percentage}%` }}
                   />
                 </div>
-              </div>
-            )}
+            </div>
           </div>
 
           {canManage && (
@@ -298,18 +311,25 @@ const ProviderRow: React.FC<{
                   </TooltipContent>
                 </Tooltip>
               )}
-              {!isPriorityMode && (
-                <Button
-                  variant="ghost"
-                  size="icon"
-                  onClick={onEdit}
-                  disabled={isUpdating}
-                  className="h-8 w-8"
-                  title="Edit weight"
-                >
-                  <Edit className="h-4 w-4" />
-                </Button>
-              )}
+              <Button
+                variant="ghost"
+                size="icon"
+                onClick={onEdit}
+                disabled={isUpdating}
+                className="h-8 w-8"
+                title={
+                  isPriorityMode
+                    ? `Edit tier and weight for ${component.model.alias}`
+                    : `Edit weight for ${component.model.alias}`
+                }
+                aria-label={
+                  isPriorityMode
+                    ? `Edit tier and weight for ${component.model.alias}`
+                    : `Edit weight for ${component.model.alias}`
+                }
+              >
+                <Edit className="h-4 w-4" />
+              </Button>
               <Button
                 variant="ghost"
                 size="icon"
@@ -394,6 +414,7 @@ const AddProviderModal: React.FC<{
   onClose: () => void;
   modelId: string;
   existingComponentIds: string[];
+  existingComponents: ModelComponent[];
   isPriorityMode: boolean;
   strictModeEnabled: boolean;
 }> = ({
@@ -401,15 +422,32 @@ const AddProviderModal: React.FC<{
   onClose,
   modelId,
   existingComponentIds,
+  existingComponents,
   isPriorityMode,
   strictModeEnabled,
 }) => {
   const [selectedModel, setSelectedModel] = useState<Model | null>(null);
   const [weight, setWeight] = useState<string>("50");
+  const [priorityTier, setPriorityTier] = useState<string>(() => {
+    const maxTier = Math.max(-1, ...existingComponents.map((item) => item.sort_order));
+    return String(maxTier + 2);
+  });
   const [trusted, setTrusted] = useState<string>("untrusted");
 
   const addMutation = useAddModelComponent();
   const updateModelMutation = useUpdateModel();
+  const parsedWeight = parseRoutingInteger(weight, 1, 100);
+  const parsedPriorityTier = parseRoutingInteger(priorityTier, 1, 10000);
+
+  React.useEffect(() => {
+    if (open && isPriorityMode) {
+      const maxTier = Math.max(
+        -1,
+        ...existingComponents.map((item) => item.sort_order),
+      );
+      setPriorityTier(String(maxTier + 2));
+    }
+  }, [existingComponents, isPriorityMode, open]);
 
   // Excludes composite models (a virtual model can't include another virtual
   // as a component) and any models already added to this composite. The
@@ -420,17 +458,23 @@ const AddProviderModal: React.FC<{
   );
 
   const handleSubmit = async () => {
-    if (!selectedModel) return;
+    if (
+      !selectedModel ||
+      parsedWeight === null ||
+      (isPriorityMode && parsedPriorityTier === null)
+    ) {
+      return;
+    }
 
     try {
       await addMutation.mutateAsync({
         modelId,
         data: {
           deployed_model_id: selectedModel.id,
-          // New components are added at the end of the priority order
-          sort_order: existingComponentIds.length,
-          // Only include weight for weighted_random mode
-          ...(isPriorityMode ? {} : { weight: parseInt(weight, 10) }),
+          sort_order: isPriorityMode
+            ? (parsedPriorityTier ?? 1) - 1
+            : existingComponentIds.length,
+          weight: parsedWeight,
         },
       });
       // Set trusted flag if strict mode is enabled
@@ -443,6 +487,7 @@ const AddProviderModal: React.FC<{
       onClose();
       setSelectedModel(null);
       setWeight("50");
+      setPriorityTier("1");
       setTrusted("untrusted");
     } catch {
       // Error handled by mutation
@@ -483,11 +528,36 @@ const AddProviderModal: React.FC<{
             />
           </div>
 
-          {/* Weight field - only for weighted distribution mode */}
-          {!isPriorityMode && (
+          {isPriorityMode && (
             <div className="space-y-2">
+              <label
+                htmlFor="new-provider-tier"
+                className="text-sm font-medium text-gray-700"
+              >
+                Priority tier
+              </label>
+              <Input
+                id="new-provider-tier"
+                type="number"
+                min="1"
+                max="10000"
+                value={priorityTier}
+                onChange={(event) => setPriorityTier(event.target.value)}
+              />
+              <p className="text-xs text-gray-500">
+                Providers in the same tier share traffic by weighted least
+                connections.
+              </p>
+            </div>
+          )}
+
+          {/* Weight applies globally or within a priority tier. */}
+          <div className="space-y-2">
               <div className="flex items-center gap-1">
-                <label className="text-sm font-medium text-gray-700">
+                <label
+                  htmlFor="new-provider-weight"
+                  className="text-sm font-medium text-gray-700"
+                >
                   Weight
                 </label>
                 <HoverCard openDelay={100} closeDelay={50}>
@@ -503,6 +573,7 @@ const AddProviderModal: React.FC<{
                 </HoverCard>
               </div>
               <Input
+                id="new-provider-weight"
                 type="number"
                 min="1"
                 max="100"
@@ -511,8 +582,7 @@ const AddProviderModal: React.FC<{
                 placeholder="1-100"
               />
               <p className="text-xs text-gray-500">Value from 1 to 100.</p>
-            </div>
-          )}
+          </div>
 
           {/* Trust level - only in strict mode */}
           {strictModeEnabled && (
@@ -566,8 +636,8 @@ const AddProviderModal: React.FC<{
             disabled={
               !selectedModel ||
               addMutation.isPending ||
-              (!isPriorityMode &&
-                (parseInt(weight, 10) < 1 || parseInt(weight, 10) > 100))
+              parsedWeight === null ||
+              (isPriorityMode && parsedPriorityTier === null)
             }
           >
             {addMutation.isPending ? (
@@ -591,34 +661,66 @@ const EditWeightModal: React.FC<{
   onClose: () => void;
   component: ModelComponent | null;
   modelId: string;
-}> = ({ open, onClose, component, modelId }) => {
+  components: ModelComponent[];
+  isPriorityMode: boolean;
+}> = ({ open, onClose, component, modelId, components, isPriorityMode }) => {
   const [weight, setWeight] = useState<string>(
     component?.weight?.toString() || "50",
   );
+  const [priorityTier, setPriorityTier] = useState<string>(
+    String((component?.sort_order ?? 0) + 1),
+  );
 
   const updateComponentMutation = useUpdateModelComponent();
+  const updateLayoutMutation = useUpdateModelComponentLayout();
+  const parsedWeight = parseRoutingInteger(weight, 1, 100);
+  const parsedPriorityTier = parseRoutingInteger(priorityTier, 1, 10000);
 
   // Update weight when component changes
   React.useEffect(() => {
     if (component) {
       setWeight(component.weight.toString());
+      setPriorityTier(String(component.sort_order + 1));
     }
   }, [component]);
 
   const handleSubmit = async () => {
-    if (!component) return;
+    if (
+      !component ||
+      parsedWeight === null ||
+      (isPriorityMode && parsedPriorityTier === null)
+    ) {
+      return;
+    }
 
     try {
-      await updateComponentMutation.mutateAsync({
-        modelId,
-        componentModelId: component.model.id,
-        data: {
-          weight: parseInt(weight, 10),
-        },
-      });
+      if (isPriorityMode) {
+        await updateLayoutMutation.mutateAsync({
+          modelId,
+          components: components.map((item) =>
+            item.model.id === component.model.id
+              ? {
+                  ...item,
+                  weight: parsedWeight,
+                  sort_order: (parsedPriorityTier ?? 1) - 1,
+                }
+              : item,
+          ),
+        });
+      } else {
+        await updateComponentMutation.mutateAsync({
+          modelId,
+          componentModelId: component.model.id,
+          data: { weight: parsedWeight },
+        });
+      }
       onClose();
-    } catch {
-      // Error handled by mutation
+    } catch (error) {
+      // A conflict means the component set changed while the dialog was open.
+      // Close the stale editor; the mutation refreshes the component query.
+      if (error instanceof ApiError && error.status === 409) {
+        onClose();
+      }
     }
   };
 
@@ -626,7 +728,7 @@ const EditWeightModal: React.FC<{
     <Dialog open={open} onOpenChange={onClose}>
       <DialogContent className="sm:max-w-sm">
         <DialogHeader>
-          <DialogTitle>Edit Weight</DialogTitle>
+          <DialogTitle>Edit Routing</DialogTitle>
           <DialogDescription>
             Adjust the weight for{" "}
             {component?.model.alias || component?.model.id}
@@ -634,9 +736,33 @@ const EditWeightModal: React.FC<{
         </DialogHeader>
 
         <div className="space-y-4 py-4">
+          {isPriorityMode && (
+            <div className="space-y-2">
+              <label
+                htmlFor="edit-provider-tier"
+                className="text-sm font-medium text-gray-700"
+              >
+                Priority tier
+              </label>
+              <Input
+                id="edit-provider-tier"
+                type="number"
+                min="1"
+                max="10000"
+                value={priorityTier}
+                onChange={(event) => setPriorityTier(event.target.value)}
+              />
+              <p className="text-xs text-gray-500">
+                Use the same number to pool providers in one tier.
+              </p>
+            </div>
+          )}
           <div className="space-y-2">
             <div className="flex items-center gap-1">
-              <label className="text-sm font-medium text-gray-700">
+              <label
+                htmlFor="edit-provider-weight"
+                className="text-sm font-medium text-gray-700"
+              >
                 Weight
               </label>
               <HoverCard openDelay={100} closeDelay={50}>
@@ -652,6 +778,7 @@ const EditWeightModal: React.FC<{
               </HoverCard>
             </div>
             <Input
+              id="edit-provider-weight"
               type="number"
               min="1"
               max="100"
@@ -671,11 +798,12 @@ const EditWeightModal: React.FC<{
             onClick={handleSubmit}
             disabled={
               updateComponentMutation.isPending ||
-              parseInt(weight, 10) < 1 ||
-              parseInt(weight, 10) > 100
+              updateLayoutMutation.isPending ||
+              parsedWeight === null ||
+              (isPriorityMode && parsedPriorityTier === null)
             }
           >
-            {updateComponentMutation.isPending ? (
+            {updateComponentMutation.isPending || updateLayoutMutation.isPending ? (
               <>
                 <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin mr-2" />
                 Saving...
@@ -852,7 +980,7 @@ const EditRoutingModal: React.FC<{
             </Select>
             <p className="text-xs text-gray-500">
               {strategy === "weighted_random"
-                ? "Requests are randomly distributed based on hosted model weights."
+                ? "Requests use weighted least connections across hosted models."
                 : "Requests go to the highest-priority hosted model; others are fallbacks."}
             </p>
           </div>
@@ -866,8 +994,8 @@ const EditRoutingModal: React.FC<{
                 </Label>
                 <p className="text-xs text-gray-500">
                   {strategy === "priority"
-                    ? "Try next hosted model in order on failure"
-                    : "Resample from remaining hosted models on failure"}
+                    ? "Exhaust the current tier, then try the next tier on failure"
+                    : "Select from remaining hosted models on failure"}
                 </p>
               </div>
               <Switch
@@ -1041,6 +1169,7 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
   });
 
   const updateComponentMutation = useUpdateModelComponent();
+  const updateLayoutMutation = useUpdateModelComponentLayout();
   const removeMutation = useRemoveModelComponent();
   const updateModelMutation = useUpdateModel();
 
@@ -1052,11 +1181,24 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
   const totalWeight =
     components?.reduce((sum, c) => (c.enabled ? sum + c.weight : sum), 0) || 0;
 
+  const priorityTierWeights = React.useMemo(() => {
+    const weights = new Map<number, number>();
+    for (const component of components ?? []) {
+      if (component.enabled) {
+        weights.set(
+          component.sort_order,
+          (weights.get(component.sort_order) ?? 0) + component.weight,
+        );
+      }
+    }
+    return weights;
+  }, [components]);
+
   // Sort components by sort_order asc for priority mode display
   const sortedComponents = React.useMemo(() => {
     if (!components) return [];
     if (isPriorityMode) {
-      return [...components].sort((a, b) => a.sort_order - b.sort_order);
+      return groupPriorityTiers(components).flatMap((tier) => tier.providers);
     }
     return components;
   }, [components, isPriorityMode]);
@@ -1093,57 +1235,34 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
 
     if (oldIndex === -1 || newIndex === -1) return;
 
-    // Reorder the array
-    const newOrder = arrayMove(sortedComponents, oldIndex, newIndex);
-
-    // Calculate new sort_order based on positions (lower sort_order = higher priority)
-    // We assign sort_order in ascending order: 0, 1, 2, etc.
-    const updates = newOrder.map((component, index) => ({
-      componentModelId: component.model.id,
-      newSortOrder: index,
-    }));
+    const targetTier = sortedComponents[newIndex].sort_order;
 
     // Optimistically update the cache immediately for smooth UX
     const queryKey = queryKeys.models.components(model.id);
     const previousComponents =
       queryClient.getQueryData<ModelComponent[]>(queryKey);
 
-    // Create optimistically updated components with new sort_order
-    const optimisticComponents = components.map((component) => {
-      const update = updates.find(
-        (u) => u.componentModelId === component.model.id,
-      );
-      if (update) {
-        return { ...component, sort_order: update.newSortOrder };
-      }
-      return component;
-    });
+    const optimisticComponents = moveProviderToTier(
+      components,
+      String(active.id),
+      targetTier,
+    );
 
     queryClient.setQueryData(queryKey, optimisticComponents);
 
-    // Now update the backend (don't await - let it happen in background)
-    // The mutation's onSuccess will invalidate queries, but since we've already
-    // set the correct data, it will just confirm what we've optimistically set
     try {
-      for (const update of updates) {
-        const currentComponent = previousComponents?.find(
-          (c) => c.model.id === update.componentModelId,
-        );
-        // Only update if sort_order actually changed
-        if (
-          currentComponent &&
-          currentComponent.sort_order !== update.newSortOrder
-        ) {
-          await updateComponentMutation.mutateAsync({
-            modelId: model.id,
-            componentModelId: update.componentModelId,
-            data: { sort_order: update.newSortOrder },
-          });
-        }
+      await updateLayoutMutation.mutateAsync({
+        modelId: model.id,
+        components: optimisticComponents,
+      });
+    } catch (error) {
+      if (error instanceof ApiError && error.status === 409) {
+        // Never restore the stale optimistic snapshot after an exact-set
+        // conflict. Refetch the server's current component set instead.
+        await queryClient.invalidateQueries({ queryKey });
+      } else {
+        queryClient.setQueryData(queryKey, previousComponents);
       }
-    } catch {
-      // On error, revert to previous state
-      queryClient.setQueryData(queryKey, previousComponents);
     }
   };
 
@@ -1280,8 +1399,8 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
                 </CardTitle>
                 <CardDescription className="line-clamp-2">
                   {isPriorityMode
-                    ? "Requests route to the highest-priority provider. On failure, the next provider is tried."
-                    : "Requests are distributed randomly across providers based on their weights."}
+                    ? "Requests use weighted least connections within the highest available tier, then fail over to lower tiers."
+                    : "Requests use weighted least connections across providers."}
                 </CardDescription>
               </div>
               {canManage && (
@@ -1316,8 +1435,8 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
                           When enabled, failed requests automatically failover
                           to another hosted model.
                           {isPriorityMode
-                            ? " In priority mode, this means trying the next hosted model in order."
-                            : " In weighted mode, this means resampling from the remaining hosted models."}
+                            ? " In priority mode, peers in the current tier are tried before traffic spills to the next tier."
+                            : " In weighted mode, this means selecting from the remaining hosted models."}
                         </p>
                         <p>
                           <strong>Gateway rate limit:</strong> The hosted
@@ -1360,8 +1479,8 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
                     )}
                     <p className="text-xs text-gray-500 mt-2">
                       {isPriorityMode
-                        ? "On failure, tries the next hosted model in priority order."
-                        : "On failure, resamples from remaining hosted models by weight."}
+                        ? "On failure, tries peers in the current tier before the next tier."
+                        : "On failure, selects from remaining hosted models by weighted least connections."}
                     </p>
                   </div>
                 ) : (
@@ -1394,7 +1513,7 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
                   {sortedComponents.length} hosted model
                   {sortedComponents.length !== 1 ? "s" : ""}{" "}
                   {isPriorityMode
-                    ? `in failover order${canManage ? " — drag to reorder" : ""}`
+                    ? `across numbered failover tiers${canManage ? " — drag a provider onto another tier to pool them" : ""}`
                     : "configured"}
                 </CardDescription>
               </div>
@@ -1444,27 +1563,45 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
                 >
                   <div className="space-y-0">
                     {sortedComponents.map((component, index) => (
-                      <SortableProviderRow
-                        key={component.model.id}
-                        id={component.model.id}
-                        component={component}
-                        totalWeight={totalWeight}
-                        priorityIndex={index + 1}
-                        isPriorityMode={true}
-                        isLast={index === sortedComponents.length - 1}
-                        onEdit={() => setEditingComponent(component)}
-                        onRemove={() => setRemovingComponent(component)}
-                        onToggle={() => handleToggle(component)}
-                        onToggleTrusted={() => handleToggleTrusted(component)}
-                        onToggleAdapter={() => handleToggleAdapter(component)}
-                        canManage={canManage}
-                        isUpdating={
-                          updateComponentMutation.isPending ||
-                          removeMutation.isPending
-                        }
-                        strictModeEnabled={strictModeEnabled}
-                        isAnyDragging={isAnyDragging}
-                      />
+                      <React.Fragment key={component.model.id}>
+                        {(index === 0 ||
+                          sortedComponents[index - 1].sort_order !==
+                            component.sort_order) && (
+                          <div className="mt-4 first:mt-0 rounded-t-md border border-b-0 bg-gray-50 px-3 py-2">
+                            <p className="text-sm font-medium text-gray-700">
+                              Tier {component.sort_order + 1}
+                            </p>
+                            <p className="text-xs text-gray-500">
+                              Providers in this tier share traffic by weighted
+                              least connections.
+                            </p>
+                          </div>
+                        )}
+                        <SortableProviderRow
+                          id={component.model.id}
+                          component={component}
+                          totalWeight={priorityTierWeights.get(component.sort_order) ?? 0}
+                          priorityIndex={component.sort_order + 1}
+                          isPriorityMode={true}
+                          isLast={
+                            index === sortedComponents.length - 1 ||
+                            sortedComponents[index + 1].sort_order === component.sort_order
+                          }
+                          onEdit={() => setEditingComponent(component)}
+                          onRemove={() => setRemovingComponent(component)}
+                          onToggle={() => handleToggle(component)}
+                          onToggleTrusted={() => handleToggleTrusted(component)}
+                          onToggleAdapter={() => handleToggleAdapter(component)}
+                          canManage={canManage}
+                          isUpdating={
+                            updateComponentMutation.isPending ||
+                            updateLayoutMutation.isPending ||
+                            removeMutation.isPending
+                          }
+                          strictModeEnabled={strictModeEnabled}
+                          isAnyDragging={isAnyDragging}
+                        />
+                      </React.Fragment>
                     ))}
                   </div>
                 </SortableContext>
@@ -1475,10 +1612,17 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
                   <ProviderRow
                     key={component.model.id}
                     component={component}
-                    totalWeight={totalWeight}
-                    priorityIndex={isPriorityMode ? index + 1 : undefined}
+                    totalWeight={
+                      isPriorityMode
+                        ? priorityTierWeights.get(component.sort_order) ?? 0
+                        : totalWeight
+                    }
+                    priorityIndex={isPriorityMode ? component.sort_order + 1 : undefined}
                     isPriorityMode={isPriorityMode}
-                    isLast={index === sortedComponents.length - 1}
+                    isLast={
+                      index === sortedComponents.length - 1 ||
+                      sortedComponents[index + 1].sort_order === component.sort_order
+                    }
                     onEdit={() => setEditingComponent(component)}
                     onRemove={() => setRemovingComponent(component)}
                     onToggle={() => handleToggle(component)}
@@ -1504,6 +1648,7 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
         onClose={() => setShowAddModal(false)}
         modelId={model.id}
         existingComponentIds={components?.map((c) => c.model.id) || []}
+        existingComponents={components ?? []}
         isPriorityMode={isPriorityMode}
         strictModeEnabled={strictModeEnabled}
       />
@@ -1513,6 +1658,8 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
         onClose={() => setEditingComponent(null)}
         component={editingComponent}
         modelId={model.id}
+        components={components ?? []}
+        isPriorityMode={isPriorityMode}
       />
 
       <ConfirmRemoveDialog

@@ -34,6 +34,17 @@ use axum::{
 };
 use sqlx::Acquire;
 
+const MAX_COMPONENT_PRIORITY_TIER: i32 = 9_999;
+
+fn validate_component_priority_tier(sort_order: i32) -> Result<()> {
+    if !(0..=MAX_COMPONENT_PRIORITY_TIER).contains(&sort_order) {
+        return Err(Error::BadRequest {
+            message: format!("Priority tier must be between 0 and {MAX_COMPONENT_PRIORITY_TIER}"),
+        });
+    }
+    Ok(())
+}
+
 fn validate_reasoning_translation_overrides(overrides: Option<&ReasoningTranslationOverrides>) -> Result<()> {
     if let Some(overrides) = overrides {
         overrides.validate().map_err(|error| Error::BadRequest {
@@ -1111,7 +1122,7 @@ pub async fn delete_deployed_model<P: PoolProvider>(
 
 // ===== Composite Model Component Handlers =====
 
-use crate::api::models::deployments::{ModelComponentCreate, ModelComponentUpdate};
+use crate::api::models::deployments::{ModelComponentCreate, ModelComponentLayoutUpdate, ModelComponentUpdate};
 use crate::db::models::deployments::DeploymentComponentCreateDBRequest;
 
 #[utoipa::path(
@@ -1142,30 +1153,95 @@ pub async fn get_model_components<P: PoolProvider>(
     Path(id): Path<DeploymentId>,
     _: RequiresPermission<resource::CompositeModels, operation::ReadAll>,
 ) -> Result<Json<Vec<ModelComponentResponse>>> {
-    // Verify the model exists and is composite
-    {
-        let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
-        let mut repo = Deployments::new(&mut conn);
-        let deployment = repo.get_by_id(id).await?.ok_or_else(|| Error::NotFound {
-            resource: "model".to_string(),
-            id: id.to_string(),
-        })?;
-
-        if !deployment.is_composite {
-            return Err(Error::BadRequest {
-                message: "Model is not a composite model".to_string(),
-            });
-        }
-    }
-
-    // Get components
-    let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
+    // Component layouts are commonly read immediately after a mutation, so use
+    // the primary to avoid returning stale tiers from a lagging replica.
+    let mut conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
     let mut repo = Deployments::new(&mut conn);
+    let deployment = repo.get_by_id(id).await?.ok_or_else(|| Error::NotFound {
+        resource: "model".to_string(),
+        id: id.to_string(),
+    })?;
+    if !deployment.is_composite {
+        return Err(Error::BadRequest {
+            message: "Model is not a composite model".to_string(),
+        });
+    }
     let components = repo.get_components(id).await?;
 
     let response: Vec<ModelComponentResponse> = components.into_iter().map(db_component_to_response).collect();
 
     Ok(Json(response))
+}
+
+#[utoipa::path(
+    put,
+    path = "/models/{id}/components/routing",
+    tag = "models",
+    summary = "Replace composite model routing layout",
+    description = "Atomically update weight, enabled state, and priority tier for the exact current set of components",
+    params(("id" = String, Path, description = "The composite model ID", format = "uuid")),
+    request_body = ModelComponentLayoutUpdate,
+    responses(
+        (status = 200, description = "Updated component layout", body = Vec<ModelComponentResponse>),
+        (status = 400, description = "Invalid weight or priority tier"),
+        (status = 404, description = "Composite model not found"),
+        (status = 409, description = "Component set changed; refresh and retry")
+    ),
+    security(("BearerAuth" = []), ("CookieAuth" = []), ("X-Doubleword-User" = []))
+)]
+#[tracing::instrument(skip_all)]
+pub async fn update_model_component_layout<P: PoolProvider>(
+    State(state): State<AppState<P>>,
+    Path(id): Path<DeploymentId>,
+    _: RequiresPermission<resource::CompositeModels, operation::UpdateAll>,
+    Json(body): Json<ModelComponentLayoutUpdate>,
+) -> Result<Json<Vec<ModelComponentResponse>>> {
+    let mut ids = std::collections::HashSet::with_capacity(body.components.len());
+    for component in &body.components {
+        if !ids.insert(component.deployed_model_id) {
+            return Err(Error::Conflict {
+                message: "Component layout contains duplicate model IDs".to_string(),
+                conflicts: None,
+            });
+        }
+        if !(1..=100).contains(&component.weight) {
+            return Err(Error::BadRequest {
+                message: "Weight must be between 1 and 100".to_string(),
+            });
+        }
+        validate_component_priority_tier(component.sort_order)?;
+    }
+
+    let layout: Vec<_> = body
+        .components
+        .into_iter()
+        .map(|component| {
+            (
+                component.deployed_model_id,
+                component.weight,
+                component.enabled,
+                component.sort_order,
+            )
+        })
+        .collect();
+
+    let mut tx = state.db.write().begin().await.map_err(|e| Error::Database(e.into()))?;
+    let updated = {
+        let mut repo = Deployments::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
+        if !repo.lock_composite(id).await? {
+            return Err(Error::NotFound {
+                resource: "composite model".to_string(),
+                id: id.to_string(),
+            });
+        }
+        repo.update_component_layout(id, &layout).await?.ok_or_else(|| Error::Conflict {
+            message: "Component set changed; refresh the model and retry".to_string(),
+            conflicts: None,
+        })?
+    };
+    tx.commit().await.map_err(|e| Error::Database(e.into()))?;
+
+    Ok(Json(updated.into_iter().map(db_component_to_response).collect()))
 }
 
 #[utoipa::path(
@@ -1205,6 +1281,9 @@ pub async fn add_model_component<P: PoolProvider>(
             message: "Weight must be between 1 and 100".to_string(),
         });
     }
+    if let Some(sort_order) = body.sort_order {
+        validate_component_priority_tier(sort_order)?;
+    }
 
     let mut tx = state.db.write().begin().await.map_err(|e| Error::Database(e.into()))?;
 
@@ -1237,15 +1316,19 @@ pub async fn add_model_component<P: PoolProvider>(
         }
     }
 
-    // Add the component. Its priority position is always assigned by the server
-    // as "one past the current last component" so sort_order stays unique and
-    // dense within the composite — the client-supplied `sort_order` is ignored
-    // (reordering is done via PATCH, which moves-and-reindexes). Lock the
-    // composite first so concurrent adds can't both read the same MAX and
-    // collide on a position.
+    // Lock the composite so an omitted tier can be appended consistently with
+    // concurrent component mutations. An explicit tier may intentionally match
+    // an existing component to join its load-balanced pool.
     let mut repo = Deployments::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
     repo.lock_composite(id).await?;
-    let sort_order = repo.next_component_sort_order(id).await?;
+    let sort_order = match body.sort_order {
+        Some(sort_order) => sort_order,
+        None => {
+            let sort_order = repo.next_component_sort_order(id).await?;
+            validate_component_priority_tier(sort_order)?;
+            sort_order
+        }
+    };
     let request = DeploymentComponentCreateDBRequest {
         composite_model_id: id,
         deployed_model_id: component_id,
@@ -1299,6 +1382,9 @@ pub async fn update_model_component<P: PoolProvider>(
             message: "Weight must be between 1 and 100".to_string(),
         });
     }
+    if let Some(sort_order) = body.sort_order {
+        validate_component_priority_tier(sort_order)?;
+    }
 
     // A sort_order change moves the component and renumbers the whole composite,
     // so run on a transaction to keep that multi-row rewrite atomic.
@@ -1348,10 +1434,8 @@ pub async fn remove_model_component<P: PoolProvider>(
     Path((id, component_id)): Path<(DeploymentId, DeploymentId)>,
     _: RequiresPermission<resource::CompositeModels, operation::UpdateAll>,
 ) -> Result<Json<String>> {
-    // Remove and then compact the remaining components back to a dense 0..n-1
-    // sequence, so a deletion doesn't leave a gap in the priority order. Lock the
-    // composite and run both in one transaction to serialize with concurrent
-    // add/reorder.
+    // Remove and then compact distinct tiers while preserving providers that
+    // share a tier. Run both operations in one serialized transaction.
     let mut tx = state.db.write().begin().await.map_err(|e| Error::Database(e.into()))?;
     {
         let mut repo = Deployments::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
@@ -1375,10 +1459,12 @@ pub async fn remove_model_component<P: PoolProvider>(
 #[cfg(test)]
 mod tests {
 
+    use std::collections::HashMap;
+
     use crate::{
         api::{
             handlers::deployments::DeployedModelResponse,
-            models::{pagination::PaginatedResponse, users::Role},
+            models::{deployments::ModelComponentResponse, pagination::PaginatedResponse, users::Role},
         },
         db::{
             handlers::{CacheTariffOverrides, CacheTariffs, Deployments, Groups, Repository},
@@ -1389,6 +1475,92 @@ mod tests {
     };
     use serde_json::json;
     use sqlx::PgPool;
+
+    #[test]
+    fn component_priority_tier_has_practical_bounds() {
+        assert!(super::validate_component_priority_tier(0).is_ok());
+        assert!(super::validate_component_priority_tier(9_999).is_ok());
+        assert!(super::validate_component_priority_tier(-1).is_err());
+        assert!(super::validate_component_priority_tier(10_000).is_err());
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn component_routing_api_supports_pools_and_rejects_stale_layouts(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let first = create_test_deployment(&pool, admin.id, "provider-one", "provider-one").await;
+        let second = create_test_deployment(&pool, admin.id, "provider-two", "provider-two").await;
+        let third = create_test_deployment(&pool, admin.id, "provider-three", "provider-three").await;
+        let auth = add_auth_headers(&admin);
+
+        let response = app
+            .post("/admin/api/v1/models")
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .json(&json!({
+                "type": "composite",
+                "model_name": "priority-pool",
+                "alias": "priority-pool",
+                "lb_strategy": "priority"
+            }))
+            .await;
+        response.assert_status_ok();
+        let composite: DeployedModelResponse = response.json();
+
+        for (component, body) in [
+            (first.id, json!({ "weight": 10 })),
+            (second.id, json!({ "weight": 20 })),
+            (third.id, json!({ "weight": 30, "sort_order": 0 })),
+        ] {
+            let response = app
+                .post(&format!("/admin/api/v1/models/{}/components/{component}", composite.id))
+                .add_header(&auth[0].0, &auth[0].1)
+                .add_header(&auth[1].0, &auth[1].1)
+                .json(&body)
+                .await;
+            response.assert_status_ok();
+        }
+
+        let response = app
+            .get(&format!("/admin/api/v1/models/{}/components", composite.id))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+        response.assert_status_ok();
+        let before: Vec<ModelComponentResponse> = response.json();
+        let tiers: HashMap<_, _> = before.iter().map(|component| (component.model.id, component.sort_order)).collect();
+        assert_eq!(tiers[&first.id], 0);
+        assert_eq!(tiers[&second.id], 1);
+        assert_eq!(tiers[&third.id], 0);
+
+        let stale = app
+            .put(&format!("/admin/api/v1/models/{}/components/routing", composite.id))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .json(&json!({
+                "components": [{
+                    "deployed_model_id": first.id,
+                    "weight": 99,
+                    "enabled": true,
+                    "sort_order": 0
+                }]
+            }))
+            .await;
+        stale.assert_status(axum::http::StatusCode::CONFLICT);
+
+        let response = app
+            .get(&format!("/admin/api/v1/models/{}/components", composite.id))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+        response.assert_status_ok();
+        let after: Vec<ModelComponentResponse> = response.json();
+        let weights: HashMap<_, _> = after.iter().map(|component| (component.model.id, component.weight)).collect();
+        assert_eq!(weights[&first.id], 10);
+        assert_eq!(weights[&second.id], 20);
+        assert_eq!(weights[&third.id], 30);
+    }
 
     /// Helper function to find a model by ID in a paginated response
     fn get_model_by_id(id: DeploymentId, response: &PaginatedResponse<DeployedModelResponse>) -> Option<&DeployedModelResponse> {

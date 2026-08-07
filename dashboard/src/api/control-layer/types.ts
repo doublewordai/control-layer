@@ -105,6 +105,17 @@ export interface UpdateComponentRequest {
   enabled?: boolean;
   sort_order?: number;
 }
+
+export interface ComponentLayoutEntry {
+  deployed_model_id: string;
+  weight: number;
+  enabled: boolean;
+  sort_order: number;
+}
+
+export interface ComponentLayoutUpdate {
+  components: ComponentLayoutEntry[];
+}
 export type AuthSource = "vouch" | "native" | "system" | "proxy-header";
 export type Role =
   | "PlatformManager"

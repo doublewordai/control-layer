@@ -1,0 +1,18 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE deployed_model_components\n                 SET weight = $3, enabled = $4, sort_order = $5\n                 WHERE composite_model_id = $1 AND deployed_model_id = $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Int4",
+        "Bool",
+        "Int4"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "c64c9f077be02aecb9145e2be4bd69852065749994d5a0e5b393aed571310c6e"
+}

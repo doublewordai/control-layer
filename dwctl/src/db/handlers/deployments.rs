@@ -17,7 +17,7 @@ use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, PgConnection, Row, query_builder::QueryBuilder};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tracing::instrument;
 
 /// Per-model batch info: throughputs and allowed completion windows.
@@ -1180,6 +1180,49 @@ impl<'c> Deployments<'c> {
         Ok(results)
     }
 
+    /// Atomically replace the mutable routing fields for every existing
+    /// component. Returns `None` when the supplied component IDs are not an exact
+    /// set match, allowing callers to surface a stale-layout conflict without
+    /// applying any partial updates.
+    #[instrument(skip(self, components), fields(composite_id = %abbrev_uuid(&composite_model_id), count = components.len()), err)]
+    pub async fn update_component_layout(
+        &mut self,
+        composite_model_id: DeploymentId,
+        components: &[(DeploymentId, i32, bool, i32)],
+    ) -> Result<Option<Vec<DeploymentComponentDBResponse>>> {
+        let current_ids: Vec<DeploymentId> = sqlx::query_scalar!(
+            "SELECT deployed_model_id FROM deployed_model_components
+             WHERE composite_model_id = $1
+             FOR UPDATE",
+            composite_model_id
+        )
+        .fetch_all(&mut *self.db)
+        .await?;
+
+        let current_set: HashSet<_> = current_ids.iter().copied().collect();
+        let requested_set: HashSet<_> = components.iter().map(|(id, _, _, _)| *id).collect();
+        if current_ids.len() != components.len() || current_set != requested_set {
+            return Ok(None);
+        }
+
+        for (deployed_model_id, weight, enabled, sort_order) in components {
+            sqlx::query!(
+                "UPDATE deployed_model_components
+                 SET weight = $3, enabled = $4, sort_order = $5
+                 WHERE composite_model_id = $1 AND deployed_model_id = $2",
+                composite_model_id,
+                deployed_model_id,
+                weight,
+                enabled,
+                sort_order
+            )
+            .execute(&mut *self.db)
+            .await?;
+        }
+
+        Ok(Some(self.get_components(composite_model_id).await?))
+    }
+
     /// Take a row lock on the composite model so component mutations (add /
     /// reorder / remove) for that composite are serialized. Without this, two
     /// concurrent adds could both read the same `MAX(sort_order)` and insert
@@ -1198,15 +1241,15 @@ impl<'c> Deployments<'c> {
         Ok(locked.is_some())
     }
 
-    /// Renumber a composite's components to a dense 0..n-1 sequence in their
-    /// current priority order (sort_order, then weight DESC, then created_at).
-    /// Used after a removal so deletions don't leave gaps. Idempotent.
+    /// Renumber a composite's distinct priority tiers to a dense 0..n-1 sequence
+    /// while preserving equal values as a shared tier. Used after removal so
+    /// deletions don't leave gaps. Idempotent.
     #[instrument(skip(self), fields(composite_id = %abbrev_uuid(&composite_model_id)), err)]
     pub async fn compact_component_sort_order(&mut self, composite_model_id: DeploymentId) -> Result<()> {
         sqlx::query!(
             r#"
             WITH ranked AS (
-                SELECT id, ROW_NUMBER() OVER (ORDER BY sort_order ASC, weight DESC, created_at ASC) - 1 AS new_order
+                SELECT id, DENSE_RANK() OVER (ORDER BY sort_order ASC) - 1 AS new_order
                 FROM deployed_model_components
                 WHERE composite_model_id = $1
             )
@@ -1233,13 +1276,15 @@ impl<'c> Deployments<'c> {
     #[instrument(skip(self), fields(composite_id = %abbrev_uuid(&composite_model_id)), err)]
     pub async fn next_component_sort_order(&mut self, composite_model_id: DeploymentId) -> Result<i32> {
         let next = sqlx::query_scalar!(
-            "SELECT COALESCE(MAX(sort_order) + 1, 0) FROM deployed_model_components WHERE composite_model_id = $1",
+            r#"SELECT COALESCE(MAX(sort_order::BIGINT) + 1, 0) AS "next!"
+               FROM deployed_model_components
+               WHERE composite_model_id = $1"#,
             composite_model_id
         )
         .fetch_one(&mut *self.db)
         .await?;
 
-        Ok(next.unwrap_or(0))
+        i32::try_from(next).map_err(|_| DbError::Other(anyhow::anyhow!("component priority tier exceeds the supported range")))
     }
 
     /// Reassign sort_order across a composite's components by descending weight
@@ -4688,6 +4733,96 @@ mod tests {
         let orders: Vec<i32> = ordered.iter().map(|(_, s)| *s).collect();
         let expected: Vec<i32> = (0..orders.len() as i32).collect();
         assert_eq!(orders, expected, "sort_order must be a dense, unique 0..n-1 sequence");
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_update_component_layout_allows_shared_priority_tiers(pool: PgPool) {
+        let user = create_test_user(&pool).await;
+        let (composite, components) = create_composite_and_components(&pool, user.id, 3).await;
+        let initial: Vec<_> = components
+            .iter()
+            .enumerate()
+            .map(|(index, id)| (*id, 1, true, index as i32))
+            .collect();
+
+        let mut tx = pool.begin().await.unwrap();
+        let updated = {
+            let mut repo = Deployments::new(tx.acquire().await.unwrap());
+            repo.set_components(composite, initial).await.unwrap();
+            repo.lock_composite(composite).await.unwrap();
+            repo.update_component_layout(
+                composite,
+                &[
+                    (components[0], 25, true, 0),
+                    (components[1], 75, true, 0),
+                    (components[2], 1, false, 1),
+                ],
+            )
+            .await
+            .unwrap()
+            .unwrap()
+        };
+        tx.commit().await.unwrap();
+
+        assert_eq!(updated.iter().map(|item| item.sort_order).collect::<Vec<_>>(), vec![0, 0, 1]);
+        assert_eq!(updated.iter().map(|item| item.weight).collect::<Vec<_>>(), vec![75, 25, 1]);
+        assert!(!updated[2].enabled);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_update_component_layout_rejects_stale_exact_set_without_changes(pool: PgPool) {
+        let user = create_test_user(&pool).await;
+        let (composite, components) = create_composite_and_components(&pool, user.id, 2).await;
+
+        let mut tx = pool.begin().await.unwrap();
+        let result = {
+            let mut repo = Deployments::new(tx.acquire().await.unwrap());
+            repo.set_components(composite, vec![(components[0], 10, true, 0), (components[1], 20, true, 1)])
+                .await
+                .unwrap();
+            repo.lock_composite(composite).await.unwrap();
+            repo.update_component_layout(composite, &[(components[0], 99, true, 0)])
+                .await
+                .unwrap()
+        };
+        assert!(result.is_none());
+        tx.commit().await.unwrap();
+
+        let mut conn = pool.acquire().await.unwrap();
+        let mut repo = Deployments::new(&mut conn);
+        let unchanged = repo.get_components(composite).await.unwrap();
+        assert_eq!(unchanged.iter().map(|item| item.weight).collect::<Vec<_>>(), vec![10, 20]);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_compact_component_sort_order_preserves_shared_tiers(pool: PgPool) {
+        let user = create_test_user(&pool).await;
+        let (composite, components) = create_composite_and_components(&pool, user.id, 4).await;
+
+        let mut tx = pool.begin().await.unwrap();
+        {
+            let mut repo = Deployments::new(tx.acquire().await.unwrap());
+            repo.set_components(
+                composite,
+                vec![
+                    (components[0], 1, true, 0),
+                    (components[1], 1, true, 0),
+                    (components[2], 1, true, 2),
+                    (components[3], 1, true, 2),
+                ],
+            )
+            .await
+            .unwrap();
+            repo.remove_component(composite, components[0]).await.unwrap();
+            repo.compact_component_sort_order(composite).await.unwrap();
+        }
+        tx.commit().await.unwrap();
+
+        let remaining = ordered_components(&pool, composite).await;
+        assert_eq!(remaining.iter().map(|(_, tier)| *tier).collect::<Vec<_>>(), vec![0, 1, 1]);
     }
 
     #[sqlx::test]

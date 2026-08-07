@@ -847,11 +847,10 @@ pub struct ModelComponentCreate {
     /// Whether this component is enabled
     #[serde(default = "default_enabled")]
     pub enabled: bool,
-    /// Deprecated/ignored: the priority position is assigned by the server when a
-    /// component is added (appended after the current last component). Use the
-    /// PATCH endpoint's `sort_order` to reorder. Retained for API compatibility.
+    /// Priority tier for the new component. Equal values share traffic. When
+    /// omitted, the component is appended as a new lowest-priority tier.
     #[serde(default)]
-    pub sort_order: i32,
+    pub sort_order: Option<i32>,
 }
 
 fn default_weight() -> i32 {
@@ -874,6 +873,26 @@ pub struct ModelComponentUpdate {
     /// dense, unique 0..n-1 sequence — two components can never share a position.
     /// Out-of-range values are clamped. Omit to leave the order unchanged.
     pub sort_order: Option<i32>,
+}
+
+/// One component in an atomic composite routing layout update.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ModelComponentLayoutEntry {
+    /// The deployed model represented by this component.
+    #[schema(value_type = String, format = "uuid")]
+    pub deployed_model_id: DeploymentId,
+    /// Weight used by weighted least-connections within a priority tier (1-100).
+    pub weight: i32,
+    /// Whether this component can receive traffic.
+    pub enabled: bool,
+    /// Priority tier number. Lower values are preferred; equal values share traffic.
+    pub sort_order: i32,
+}
+
+/// Exact-set request for atomically updating every component's routing fields.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ModelComponentLayoutUpdate {
+    pub components: Vec<ModelComponentLayoutEntry>,
 }
 
 /// Summary of a model used as a component in a composite model
