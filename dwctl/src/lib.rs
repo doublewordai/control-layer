@@ -1478,6 +1478,13 @@ pub async fn build_router(
             "/users/{user_id}/organizations",
             get(api::handlers::organizations::list_user_organizations),
         )
+        // A user's own outstanding join requests. Sits on the user rather than
+        // the organization because the requester isn't a member yet, so the
+        // organization-scoped queue below is closed to them.
+        .route(
+            "/users/{user_id}/join-requests",
+            get(api::handlers::organizations::list_user_join_requests),
+        )
         // Organization session context (validates membership, client stores org ID for X-Organization-Id header)
         .route("/session/organization", post(api::handlers::organizations::set_active_organization))
         // Support requests
