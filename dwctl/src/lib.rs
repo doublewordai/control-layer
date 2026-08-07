@@ -145,6 +145,7 @@ pub mod auth;
 pub mod config;
 mod config_watcher;
 pub mod connections;
+pub mod continuation;
 mod crypto;
 pub mod db;
 mod email;
@@ -957,9 +958,17 @@ async fn setup_database(
         iterations: config.auth.native.password.argon2_iterations,
         parallelism: config.auth.native.password.argon2_parallelism,
     };
-    create_initial_admin_user(&config.admin_email, config.admin_password.as_deref(), argon2_params, &db_pools)
+    let admin_user_id = create_initial_admin_user(&config.admin_email, config.admin_password.as_deref(), argon2_params, &db_pools)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to create initial admin user: {}", e))?;
+
+    // Provision the global continuation key (hidden, admin-owned) so it exists and
+    // has synced into the onwards key cache before the first resume attempt.
+    if config.continuation.enabled {
+        continuation::provision_global_key(&db_pools, admin_user_id)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to provision continuation key: {}", e))?;
+    }
 
     // Seed database with initial configuration (only runs once)
     seed_database(&config.model_sources, &db_pools).await?;
