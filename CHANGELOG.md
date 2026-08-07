@@ -1,5 +1,12 @@
 # Changelog
 
+## [10.8.0](https://github.com/doublewordai/control-layer/compare/v10.7.2...v10.8.0) (2026-08-06)
+
+
+### Features
+
+* cache template render counting ([#1441](https://github.com/doublewordai/control-layer/issues/1441)) ([61adf92](https://github.com/doublewordai/control-layer/commit/61adf92618efd8c24e432e375bfde58f9dc7fb07))
+
 ## [10.7.2](https://github.com/doublewordai/control-layer/compare/v10.7.1...v10.7.2) (2026-08-05)
 
 
