@@ -13,9 +13,9 @@
 //!
 //! The two questions these are designed to answer directly in PromQL:
 //! - "what fraction of eligible streams died, and of those, how many did we
-//!    save?" → `outcome_total{outcome="resumed"} / eligible_streams_total`;
+//!   save?" → `outcome_total{outcome="resumed"} / eligible_streams_total`;
 //! - "what did resuming cost us?" → `eaten_prompt_tokens_total` × tariff, done in
-//!    Grafana (never dollarized in code).
+//!   Grafana (never dollarized in code).
 
 use metrics::{counter, histogram};
 
