@@ -150,6 +150,20 @@ pub fn reframe_chunk(chunk: &Value, env: &Envelope) -> Option<Value> {
     }))
 }
 
+/// A bare `finish_reason: "length"` chunk. Emitted when the client's own
+/// `max_tokens` is already spent by the partial generation: the correct end of
+/// that stream is the one the model would itself have produced on the next
+/// token, not a resume that would overrun the cap.
+pub fn length_stop_frame(env: &Envelope) -> Value {
+    json!({
+        "id": env.id,
+        "object": "chat.completion.chunk",
+        "created": env.created,
+        "model": env.model,
+        "choices": [{"index": 0, "delta": {}, "finish_reason": "length"}],
+    })
+}
+
 /// The terminal usage frame in the shape the model would have emitted: a chat
 /// chunk with no choices carrying the merged accounting.
 pub fn usage_frame(env: &Envelope, usage: MergedUsage) -> Value {
