@@ -2359,8 +2359,12 @@ impl BackgroundServices {
         // sync to come back around.
         const SETTLE: std::time::Duration = std::time::Duration::from_millis(250);
         const REASSERT_EVERY: std::time::Duration = std::time::Duration::from_millis(200);
+        // Comfortably inside SETTLE, so the settle window is still sampled many
+        // times, without waking the scheduler thousands of times per call.
+        const POLL_EVERY: std::time::Duration = std::time::Duration::from_millis(10);
+        const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let deadline = std::time::Instant::now() + TIMEOUT;
         let mut stable_since: Option<std::time::Instant> = None;
         let mut last_reassert = std::time::Instant::now();
 
@@ -2387,10 +2391,10 @@ impl BackgroundServices {
             }
 
             if now >= deadline {
-                anyhow::bail!("onwards did not apply the config update within 15s");
+                anyhow::bail!("onwards did not apply the config update within {:?}", TIMEOUT);
             }
 
-            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            tokio::time::sleep(POLL_EVERY).await;
         }
     }
 
