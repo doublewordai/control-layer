@@ -280,9 +280,12 @@ pub struct OrganizationSummary {
 /// readable from here.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct PendingJoinRequestResponse {
-    /// The join request itself, not the organization.
+    /// The join request itself, not the organization. A `user_organizations`
+    /// row id — deliberately `Uuid` rather than `UserId`, which it is not and
+    /// which would invite a caller to pass it where a user is expected. Same
+    /// convention as `OrganizationMemberResponse::id` above.
     #[schema(value_type = String, format = "uuid")]
-    pub id: UserId,
+    pub id: uuid::Uuid,
     #[schema(value_type = String, format = "uuid")]
     pub organization_id: UserId,
     /// The organization's `username`. Carries the `{domain}~{suffix}` form for

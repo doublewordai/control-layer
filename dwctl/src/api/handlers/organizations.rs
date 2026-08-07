@@ -1552,15 +1552,21 @@ pub async fn list_user_organizations<P: PoolProvider>(
 /// automatically when the caller's email domain matches a claimed organization,
 /// which makes the invisible case the common one.
 ///
-/// Scoped to the caller's own requests. It deliberately does not answer "does
-/// an organization exist for this domain" in general: that would let anyone
-/// probe for the existence of a company's workspace by signing up.
+/// Answers only "what have *I* asked to join". It deliberately does not answer
+/// "does an organization exist for this domain" in general: that would let
+/// anyone probe for the existence of a company's workspace by signing up.
+///
+/// On authorization, note that "own" is about the *subject* of the query, not
+/// the caller: a platform manager holding ReadAll on Users may read another
+/// user's requests, exactly as they may read that user's organizations via
+/// `/users/{id}/organizations` beside it. An ordinary caller is confined to
+/// their own, and a non-`current` path they don't own is a 403.
 #[utoipa::path(
     get,
     path = "/users/{user_id}/join-requests",
     tag = "organizations",
     summary = "List user's pending join requests",
-    description = "List organizations the user has asked to join and is awaiting a decision on.",
+    description = "List organizations the user has asked to join and is awaiting a decision on. Readable by that user, or by a platform manager with read-all on users.",
     params(
         ("user_id" = String, Path, description = "User ID (UUID) or 'current' for current user"),
     ),
@@ -1610,6 +1616,14 @@ pub async fn list_user_join_requests<P: PoolProvider>(
     let mut users_repo = Users::new(&mut pool_conn);
     let org_map = users_repo.get_bulk(org_ids).await?;
 
+    // `filter_map` cannot silently swallow a live request here: both halves
+    // apply the same `is_deleted = false` filter — `list_user_join_requests`
+    // INNER JOINs it, `get_bulk` has it in its WHERE — so a request that
+    // survived the first query has its organization in `org_map`. The only way
+    // to miss is the organization being deleted between the two, and dropping
+    // it is then the correct answer rather than a lost row: a deleted
+    // organization has nobody left to approve, which is exactly why the query
+    // excludes them in the first place.
     let responses: Vec<crate::api::models::organizations::PendingJoinRequestResponse> = requests
         .iter()
         .filter_map(|r| {
