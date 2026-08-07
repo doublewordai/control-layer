@@ -40,14 +40,15 @@ pub struct OrganizationUpdate {
     /// Omit entirely to leave unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]
     pub low_balance_threshold: Option<Option<f32>>,
-    /// Account-wide zero-data-retention flag. Admin-only: only callers with
-    /// UpdateAll on organizations may set this. Omit to leave unchanged.
+    /// Account-wide zero-data-retention flag. Settable by an **owner** of the
+    /// organization, or by a platform manager holding UpdateAll on
+    /// organizations — an org admin is refused. Omit to leave unchanged.
     pub zero_data_retention: Option<bool>,
     /// Admit signups from this workspace's claimed email domain as members
-    /// automatically. Owner-only, like zero data retention: it decides who
-    /// gets into the workspace without anyone reviewing them, which is not a
-    /// call an admin should be able to make unilaterally. Omit to leave
-    /// unchanged.
+    /// automatically. Same gate as `zero_data_retention` above — an **owner**
+    /// or a platform manager with UpdateAll, never an org admin: it decides
+    /// who gets into the workspace without anyone reviewing them, which is not
+    /// a call an admin should make unilaterally. Omit to leave unchanged.
     pub auto_join_enabled: Option<bool>,
 }
 
@@ -69,7 +70,8 @@ pub struct OrganizationResponse {
     pub pending_email_change: Option<PendingEmailChangeResponse>,
     /// Whether a signup whose email domain matches this workspace's claimed
     /// domain is admitted as a member on the spot, instead of being offered
-    /// the choice to request access. Off unless an owner or admin turns it on.
+    /// the choice to request access. Off unless an owner turns it on — org
+    /// admins can read it here but cannot change it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auto_join_enabled: Option<bool>,
 }
@@ -386,6 +388,10 @@ pub enum DomainJoinOutcome {
     Joined,
     /// Auto-join was off: an owner or admin has to approve.
     Requested,
+    /// Nothing was filed, because an invitation to this organization is
+    /// already outstanding for the caller. They should accept that instead of
+    /// queueing behind an approval they don't need.
+    Invited,
     /// The caller was already an active member. Nothing changed.
     AlreadyMember,
 }

@@ -9,8 +9,9 @@
 -- colleague by hand.
 --
 -- So the behaviour comes back as a setting rather than a rule, and it is the
--- organization's own owners/admins who turn it on. FALSE for every existing
--- row: nobody who has not asked for it gets the old behaviour back.
+-- organization's own owners who turn it on — the API refuses an org admin,
+-- same gate as zero_data_retention. FALSE for every existing row: nobody who
+-- has not asked for it gets the old behaviour back.
 --
 -- Lives on `users` because organizations *are* rows in `users`
 -- (`user_type = 'organization'`), alongside the other org-wide flags

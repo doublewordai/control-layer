@@ -11,7 +11,9 @@ use crate::{
         pagination::PaginatedResponse,
         users::{CurrentUser, UserResponse},
     },
-    auth::permissions::{can_manage_org_resource, can_read_all_resources, can_read_own_resource},
+    auth::permissions::{
+        can_manage_org_resource, can_read_all_resources, can_read_own_resource, can_update_all_resources, can_update_own_resource,
+    },
     db::handlers::{Credits, Organizations, Repository, Users, api_keys::ApiKeys, organizations::OrganizationFilter},
     db::models::organizations::{OrganizationCreateDBRequest, OrganizationUpdateDBRequest},
     email::EmailService,
@@ -1909,8 +1911,12 @@ pub async fn create_user_join_request<P: PoolProvider>(
         UserIdOrCurrent::Id(uuid) => uuid,
     };
 
-    let can_all = can_read_all_resources(&current_user, Resource::Users);
-    let can_own = can_read_own_resource(&current_user, Resource::Users, target_user_id);
+    // Update, not read: this creates a membership row. Guarding a write with
+    // the read helpers would have let a read-only caller file a request while
+    // the error told them they needed UpdateOwn — the check and its own
+    // explanation disagreeing.
+    let can_all = can_update_all_resources(&current_user, Resource::Users);
+    let can_own = can_update_own_resource(&current_user, Resource::Users, target_user_id);
     if !can_all && !can_own {
         return Err(Error::InsufficientPermissions {
             required: Permission::Allow(Resource::Users, Operation::UpdateOwn),
@@ -1966,17 +1972,39 @@ pub async fn create_user_join_request<P: PoolProvider>(
         }));
     }
 
-    let request = org_repo.create_join_request(org.id, target_user_id).await?;
+    let row = org_repo.create_join_request(org.id, target_user_id).await?;
+
+    // The insert is idempotent by colliding on `UNIQUE (user_id, organization_id)`
+    // and handing back whatever row was already there — which is not always a
+    // request. An invitation to someone who already has an account carries
+    // their `user_id` (see `invite_member`), so it occupies the same slot, and
+    // reporting it as `requested` would tell a user to wait for approval they
+    // do not need: they have an invitation they could accept right now. The
+    // `active` case is normally caught by the membership check above, but an
+    // approval landing between that read and this write arrives here instead.
+    //
+    // So the row's own status decides the answer rather than the call site
+    // assuming it got what it asked for.
+    let outcome = match row.status.as_str() {
+        "requested" => DomainJoinOutcome::Requested,
+        "pending" => DomainJoinOutcome::Invited,
+        _ => DomainJoinOutcome::AlreadyMember,
+    };
 
     Ok(Json(DomainJoinResponse {
-        outcome: DomainJoinOutcome::Requested,
+        outcome,
         organization_id: org.id,
-        join_request: Some(PendingJoinRequestResponse {
-            id: request.id,
-            organization_id: org.id,
-            organization_name: org.username,
-            requested_at: request.created_at,
-        }),
+        // Only ever the caller's own request. Handing back an invitation's id
+        // under `join_request` would be the same conflation in a second place.
+        join_request: match outcome {
+            DomainJoinOutcome::Requested => Some(PendingJoinRequestResponse {
+                id: row.id,
+                organization_id: org.id,
+                organization_name: org.username,
+                requested_at: row.created_at,
+            }),
+            _ => None,
+        },
     }))
 }
 
@@ -2422,9 +2450,9 @@ pub async fn decline_invite<P: PoolProvider>(
     ),
     responses(
         (status = 200, description = "Invitation accepted"),
-        (status = 400, description = "Bad request - expired, email mismatch, or org limit reached"),
+        (status = 400, description = "Bad request - expired, or organization limit reached"),
         (status = 401, description = "Unauthorized"),
-        (status = 404, description = "Not found"),
+        (status = 404, description = "Not found, or not addressed to the caller"),
     ),
     security(
         ("BearerAuth" = []),
@@ -2484,9 +2512,8 @@ pub async fn accept_invite_by_id<P: PoolProvider>(
     ),
     responses(
         (status = 200, description = "Invitation declined"),
-        (status = 400, description = "Bad request - email mismatch"),
         (status = 401, description = "Unauthorized"),
-        (status = 404, description = "Not found"),
+        (status = 404, description = "Not found, or not addressed to the caller"),
     ),
     security(
         ("BearerAuth" = []),
@@ -3554,6 +3581,63 @@ mod tests {
         assert!(
             repo.list_join_requests(org_id).await.unwrap().is_empty(),
             "nobody was queued — they were admitted"
+        );
+    }
+
+    /// An outstanding invitation must not come back dressed as a join request.
+    ///
+    /// An invitation to someone who already has an account carries their
+    /// `user_id`, so it occupies the same `UNIQUE (user_id, organization_id)`
+    /// slot the request would. The idempotent insert hands that row back, and
+    /// reporting it as `requested` would tell the user to wait for an approval
+    /// they don't need — they hold an invitation they could accept now.
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_request_access_reports_an_outstanding_invitation(pool: PgPool) {
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let owner = create_test_user_on_domain(&pool, Role::StandardUser, "acme.test").await;
+        let org_id = org_claiming_domain(&pool, owner.id, "acme.test").await;
+        let invitee = create_test_user_on_domain(&pool, Role::StandardUser, "acme.test").await;
+
+        // Invited by address *and* matched by domain, with the row carrying
+        // their user id the way `invite_member` writes it for a known account.
+        {
+            let mut conn = pool.acquire().await.unwrap();
+            crate::db::handlers::Organizations::new(&mut conn)
+                .create_invite(
+                    org_id,
+                    Some(invitee.id),
+                    &invitee.email,
+                    "member",
+                    owner.id,
+                    "test-token-hash",
+                    chrono::Utc::now() + chrono::Duration::days(7),
+                )
+                .await
+                .unwrap();
+        }
+
+        let headers = add_auth_headers(&invitee);
+        let resp = server
+            .post("/admin/api/v1/users/current/join-requests")
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .await;
+        resp.assert_status_ok();
+        let body = resp.json::<serde_json::Value>();
+
+        assert_eq!(body["outcome"].as_str().unwrap(), "invited");
+        assert!(
+            body["join_request"].is_null(),
+            "an invitation's id must not be handed back as a join request"
+        );
+
+        let mut conn = pool.acquire().await.unwrap();
+        let mut repo = crate::db::handlers::Organizations::new(&mut conn);
+        assert!(repo.list_join_requests(org_id).await.unwrap().is_empty(), "nothing was queued");
+        assert!(
+            repo.find_pending_invite_for_email(&invitee.email).await.unwrap().is_some(),
+            "and the invitation survives, still acceptable"
         );
     }
 
