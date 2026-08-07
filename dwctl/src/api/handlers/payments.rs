@@ -88,6 +88,8 @@ struct BillingTarget {
     id: crate::types::UserId,
     payment_provider_id: Option<String>,
     email: String,
+    /// Billed by emailed invoice rather than an immediate card charge.
+    invoicing_enabled: bool,
     /// Name to put on the payment-provider customer. Set for organizations
     /// (a real, user-provided org name), but `None` for individuals: their
     /// display_name is only ever a randomly generated placeholder, never the
@@ -121,13 +123,27 @@ async fn resolve_billing_target(user: &CurrentUser, conn: &mut sqlx::PgConnectio
             id: org.id,
             payment_provider_id: org.payment_provider_id,
             email: org.email,
+            invoicing_enabled: org.invoicing_enabled,
             display_name: org.display_name,
         })
     } else {
+        // Read off the row rather than `CurrentUser`: the auth extractor doesn't
+        // carry this flag, and threading it through all nine of its construction
+        // sites isn't worth it for one boolean on the payment path.
+        let invoicing_enabled = sqlx::query_scalar!("SELECT invoicing_enabled FROM users WHERE id = $1", user.id)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(|e| {
+                tracing::error!("Failed to read invoicing flag: {:?}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?
+            .unwrap_or(false);
+
         Ok(BillingTarget {
             id: user.id,
             payment_provider_id: user.payment_provider_id.clone(),
             email: user.email.clone(),
+            invoicing_enabled,
             // Intentionally omitted: an individual's display_name is a
             // generated placeholder, not their real name (see BillingTarget).
             display_name: None,
@@ -213,6 +229,25 @@ pub async fn create_payment<P: PoolProvider>(
     })?;
     let target = resolve_billing_target(&user, &mut conn).await?;
     drop(conn);
+
+    // Invoice-billed accounts don't buy credits by card. Sending them to
+    // Checkout would either fail (they may have no card at all) or take a
+    // payment for credits Stripe is also going to invoice them for at the end
+    // of the period - billing them twice for the same top-up.
+    //
+    // Their balance is maintained by auto top-up, which accrues onto the next
+    // invoice (see `process_auto_topups`), so there is nothing for this
+    // endpoint to do.
+    if target.invoicing_enabled {
+        tracing::info!(target_id = %target.id, "Refused card checkout for an invoice-billed account");
+        return Ok((
+            StatusCode::CONFLICT,
+            Json(json!({
+                "message": "This account is billed by invoice. Credits are added automatically and charged to your monthly invoice."
+            })),
+        )
+            .into_response());
+    }
 
     let payer = payment_providers::CheckoutPayer {
         id: target.id,
@@ -1773,6 +1808,42 @@ mod tests {
         let url = url::Url::parse(checkout_url).unwrap();
         let query_pairs: std::collections::HashMap<_, _> = url.query_pairs().collect();
         query_pairs.get("session_id").expect("session_id in return URL").to_string()
+    }
+
+    /// An invoice-billed account must not be able to run a card checkout: they
+    /// may have no card at all, and taking the payment would bill them twice
+    /// for credits their monthly invoice already covers.
+    #[sqlx::test]
+    async fn test_create_payment_refuses_invoice_billed_accounts(pool: PgPool) {
+        let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), setup_flow_config(Decimal::ZERO)).await;
+        let user = crate::test::utils::create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
+        let auth_headers = crate::test::utils::add_auth_headers(&user);
+
+        let app = Router::new().route("/payments", post(create_payment)).with_state(state);
+        let server = TestServer::new(app).unwrap();
+
+        // Card-billed by default: checkout is offered as usual.
+        let mut request = server.post("/payments");
+        for (key, value) in &auth_headers {
+            request = request.add_header(key.as_str(), value.as_str());
+        }
+        request.await.assert_status(StatusCode::OK);
+
+        sqlx::query!("UPDATE users SET invoicing_enabled = true WHERE id = $1", user.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let mut request = server.post("/payments");
+        for (key, value) in &auth_headers {
+            request = request.add_header(key.as_str(), value.as_str());
+        }
+        let response = request.await;
+        response.assert_status(StatusCode::CONFLICT);
+        assert!(
+            response.text().contains("billed by invoice"),
+            "the refusal should explain why, not just fail"
+        );
     }
 
     #[sqlx::test]

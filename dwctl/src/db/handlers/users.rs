@@ -70,6 +70,8 @@ pub struct AutoTopupUser {
     pub auto_topup_limit_notification_sent: bool,
     /// Consecutive soft card declines since the last successful auto top-up.
     pub auto_topup_soft_failure_count: i32,
+    /// Bill this top-up onto the account's next invoice instead of charging a card.
+    pub invoicing_enabled: bool,
 }
 
 /// User with a low-balance threshold configured.
@@ -116,6 +118,7 @@ struct User {
     pub user_type: String,
     pub verified: bool,
     pub zero_data_retention: bool,
+    pub invoicing_enabled: bool,
 }
 
 pub struct Users<'c> {
@@ -149,6 +152,7 @@ impl From<(Vec<Role>, User)> for UserDBResponse {
             user_type: user.user_type,
             verified: user.verified,
             zero_data_retention: user.zero_data_retention,
+            invoicing_enabled: user.invoicing_enabled,
         }
     }
 }
@@ -247,12 +251,13 @@ impl<'c> Repository for Users<'c> {
                 u.auto_topup_limit_notification_sent,
                 u.user_type,
                 u.verified,
+                u.invoicing_enabled,
                 u.zero_data_retention,
                 ARRAY_AGG(ur.role) FILTER (WHERE ur.role IS NOT NULL) as "roles: Vec<Role>"
             FROM users u
             LEFT JOIN user_roles ur ON ur.user_id = u.id
             WHERE u.id = $1 AND u.id != '00000000-0000-0000-0000-000000000000' AND u.is_deleted = false
-            GROUP BY u.id, u.username, u.email, u.display_name, u.avatar_url, u.auth_source, u.created_at, u.updated_at, u.last_login, u.is_admin, u.password_hash, u.external_user_id, u.payment_provider_id, u.is_deleted, u.is_internal, u.batch_notifications_enabled, u.first_batch_email_sent, u.low_balance_notification_sent, u.low_balance_threshold, u.auto_topup_amount, u.auto_topup_threshold, u.auto_topup_monthly_limit, u.auto_topup_limit_notification_sent, u.user_type, u.verified, u.zero_data_retention
+            GROUP BY u.id, u.username, u.email, u.display_name, u.avatar_url, u.auth_source, u.created_at, u.updated_at, u.last_login, u.is_admin, u.password_hash, u.external_user_id, u.payment_provider_id, u.is_deleted, u.is_internal, u.batch_notifications_enabled, u.first_batch_email_sent, u.low_balance_notification_sent, u.low_balance_threshold, u.auto_topup_amount, u.auto_topup_threshold, u.auto_topup_monthly_limit, u.auto_topup_limit_notification_sent, u.user_type, u.verified, u.invoicing_enabled, u.zero_data_retention
             "#,
             id
         )
@@ -288,6 +293,7 @@ impl<'c> Repository for Users<'c> {
                 auto_topup_retry_after: None,
                 user_type: row.user_type,
                 verified: row.verified,
+                invoicing_enabled: row.invoicing_enabled,
                 zero_data_retention: row.zero_data_retention,
             };
 
@@ -334,12 +340,13 @@ impl<'c> Repository for Users<'c> {
                 u.auto_topup_limit_notification_sent,
                 u.user_type,
                 u.verified,
+                u.invoicing_enabled,
                 u.zero_data_retention,
                 ARRAY_AGG(ur.role) FILTER (WHERE ur.role IS NOT NULL) as "roles: Vec<Role>"
             FROM users u
             LEFT JOIN user_roles ur ON ur.user_id = u.id
             WHERE u.id = ANY($1) AND u.id != '00000000-0000-0000-0000-000000000000' AND u.is_deleted = false
-            GROUP BY u.id, u.username, u.email, u.display_name, u.avatar_url, u.auth_source, u.created_at, u.updated_at, u.last_login, u.is_admin, u.password_hash, u.external_user_id, u.payment_provider_id, u.is_deleted, u.is_internal, u.batch_notifications_enabled, u.first_batch_email_sent, u.low_balance_notification_sent, u.low_balance_threshold, u.auto_topup_amount, u.auto_topup_threshold, u.auto_topup_monthly_limit, u.auto_topup_limit_notification_sent, u.user_type, u.verified, u.zero_data_retention
+            GROUP BY u.id, u.username, u.email, u.display_name, u.avatar_url, u.auth_source, u.created_at, u.updated_at, u.last_login, u.is_admin, u.password_hash, u.external_user_id, u.payment_provider_id, u.is_deleted, u.is_internal, u.batch_notifications_enabled, u.first_batch_email_sent, u.low_balance_notification_sent, u.low_balance_threshold, u.auto_topup_amount, u.auto_topup_threshold, u.auto_topup_monthly_limit, u.auto_topup_limit_notification_sent, u.user_type, u.verified, u.invoicing_enabled, u.zero_data_retention
             "#,
             ids.as_slice()
         )
@@ -377,6 +384,7 @@ impl<'c> Repository for Users<'c> {
                 auto_topup_retry_after: None,
                 user_type: row.user_type,
                 verified: row.verified,
+                invoicing_enabled: row.invoicing_enabled,
                 zero_data_retention: row.zero_data_retention,
             };
 
@@ -944,7 +952,8 @@ impl<'c> Users<'c> {
                    c.balance as "checkpoint_balance?",
                    u.auto_topup_monthly_limit::decimal(20, 9) as "auto_topup_monthly_limit?",
                    u.auto_topup_limit_notification_sent,
-                   u.auto_topup_soft_failure_count
+                   u.auto_topup_soft_failure_count,
+                   u.invoicing_enabled
             FROM users u
             LEFT JOIN user_balance_checkpoints c ON c.user_id = u.id
             WHERE u.id != '00000000-0000-0000-0000-000000000000'

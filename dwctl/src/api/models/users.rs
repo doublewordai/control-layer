@@ -157,6 +157,10 @@ pub struct UserResponse {
     pub verified: bool,
     /// Account-wide zero-data-retention flag.
     pub zero_data_retention: bool,
+    /// Whether this account is billed by emailed invoice rather than an
+    /// immediate card charge. Enabled by Doubleword after approval, not
+    /// self-service - it extends credit on payment terms.
+    pub invoicing_enabled: bool,
     /// Organizations this user belongs to (only included if `include=organizations` is specified)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub organizations: Option<Vec<super::organizations::OrganizationSummary>>,
@@ -266,6 +270,7 @@ impl From<UserDBResponse> for UserResponse {
             user_type: db.user_type,
             verified: db.verified,
             zero_data_retention: db.zero_data_retention,
+            invoicing_enabled: db.invoicing_enabled,
             organizations: None,
             active_organization_id: None,
             onboarding_redirect_url: None,
