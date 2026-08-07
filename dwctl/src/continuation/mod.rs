@@ -24,6 +24,10 @@
 //! The key is owned by the initial admin user and provisioned at startup so it
 //! has synced into the onwards key cache before the first resume attempt.
 
+pub mod accumulate;
+pub mod detect;
+pub mod rewrap;
+
 use sqlx::PgPool;
 
 use crate::UserId;
