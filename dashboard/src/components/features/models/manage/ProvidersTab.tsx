@@ -471,10 +471,10 @@ const AddProviderModal: React.FC<{
         modelId,
         data: {
           deployed_model_id: selectedModel.id,
-          sort_order: isPriorityMode
-            ? (parsedPriorityTier ?? 1) - 1
-            : existingComponentIds.length,
           weight: parsedWeight,
+          ...(isPriorityMode
+            ? { sort_order: (parsedPriorityTier ?? 1) - 1 }
+            : {}),
         },
       });
       // Set trusted flag if strict mode is enabled
