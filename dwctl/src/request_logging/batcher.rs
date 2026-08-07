@@ -1866,6 +1866,7 @@ fn parse_api_key_purpose(s: &str) -> ApiKeyPurpose {
         "platform" => ApiKeyPurpose::Platform,
         "batch" => ApiKeyPurpose::Batch,
         "playground" => ApiKeyPurpose::Playground,
+        "continuation" => ApiKeyPurpose::Continuation,
         _ => ApiKeyPurpose::Realtime,
     }
 }

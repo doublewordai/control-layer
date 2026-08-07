@@ -74,6 +74,7 @@ impl From<(Vec<DeploymentId>, ApiKey)> for ApiKeyDBResponse {
                 "realtime" => Some(ApiKeyPurpose::Realtime),
                 "batch" => Some(ApiKeyPurpose::Batch),
                 "playground" => Some(ApiKeyPurpose::Playground),
+                "continuation" => Some(ApiKeyPurpose::Continuation),
                 // Legacy: map old "inference" to "realtime" for backwards compatibility
                 "inference" => Some(ApiKeyPurpose::Realtime),
                 _ => None,
@@ -1128,6 +1129,7 @@ impl<'c> ApiKeys<'c> {
                     "realtime" => Some(ApiKeyPurpose::Realtime),
                     "batch" => Some(ApiKeyPurpose::Batch),
                     "playground" => Some(ApiKeyPurpose::Playground),
+                    "continuation" => Some(ApiKeyPurpose::Continuation),
                     // Legacy: map old "inference" to "realtime" for backwards compatibility
                     "inference" => Some(ApiKeyPurpose::Realtime),
                     _ => None,
