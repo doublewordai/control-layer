@@ -148,6 +148,7 @@ pub mod connections;
 mod crypto;
 pub mod db;
 mod email;
+mod email_http;
 pub mod encryption;
 mod error_enrichment;
 pub mod errors;
