@@ -556,6 +556,38 @@ impl<'c> Organizations<'c> {
         Ok(row.into())
     }
 
+    /// A user's own outstanding join requests, oldest first.
+    ///
+    /// The mirror of [`Self::list_join_requests`], which answers "who wants
+    /// into my organization" for an owner. This one answers "what have I asked
+    /// to join" for the requester, who is by definition not a member yet and so
+    /// cannot read the organization-scoped queue.
+    ///
+    /// Deleted organizations are excluded for the same reason they don't match
+    /// on signup: nobody is left to approve the request, so surfacing it would
+    /// promise an outcome that can never arrive.
+    #[instrument(skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
+    pub async fn list_user_join_requests(&mut self, user_id: UserId) -> Result<Vec<OrganizationMemberDBResponse>> {
+        let rows = sqlx::query_as!(
+            MemberRow,
+            r#"
+            SELECT uo.id, uo.user_id, uo.organization_id, uo.role, uo.status,
+                   uo.created_at, uo.invite_email, uo.invited_by, uo.expires_at
+            FROM user_organizations uo
+            INNER JOIN users o ON o.id = uo.organization_id
+            WHERE uo.user_id = $1
+              AND uo.status = 'requested'
+              AND o.is_deleted = false
+            ORDER BY uo.created_at ASC
+            "#,
+            user_id
+        )
+        .fetch_all(&mut *self.db)
+        .await?;
+
+        Ok(rows.into_iter().map(Into::into).collect())
+    }
+
     /// Outstanding join requests for an organization, oldest first.
     #[instrument(skip(self), fields(org_id = %abbrev_uuid(&org_id)), err)]
     pub async fn list_join_requests(&mut self, org_id: UserId) -> Result<Vec<OrganizationMemberDBResponse>> {

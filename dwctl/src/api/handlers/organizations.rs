@@ -1543,6 +1543,104 @@ pub async fn list_user_organizations<P: PoolProvider>(
     Ok(Json(summaries))
 }
 
+/// List the caller's own outstanding join requests.
+///
+/// The requester-side counterpart to `/organizations/{id}/join-requests`. That
+/// endpoint is gated on managing the organization, which a requester by
+/// definition cannot do — they are not a member yet — so without this a user
+/// has no way to learn that a request exists on their behalf. Signup files one
+/// automatically when the caller's email domain matches a claimed organization,
+/// which makes the invisible case the common one.
+///
+/// Answers only "what have *I* asked to join". It deliberately does not answer
+/// "does an organization exist for this domain" in general: that would let
+/// anyone probe for the existence of a company's workspace by signing up.
+///
+/// On authorization, note that "own" is about the *subject* of the query, not
+/// the caller: a platform manager holding ReadAll on Users may read another
+/// user's requests, exactly as they may read that user's organizations via
+/// `/users/{id}/organizations` beside it. An ordinary caller is confined to
+/// their own, and a non-`current` path they don't own is a 403.
+#[utoipa::path(
+    get,
+    path = "/users/{user_id}/join-requests",
+    tag = "organizations",
+    summary = "List user's pending join requests",
+    description = "List organizations the user has asked to join and is awaiting a decision on. Readable by that user, or by a platform manager with read-all on users.",
+    params(
+        ("user_id" = String, Path, description = "User ID (UUID) or 'current' for current user"),
+    ),
+    responses(
+        (status = 200, description = "Pending join requests", body = Vec<crate::api::models::organizations::PendingJoinRequestResponse>),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden"),
+    ),
+    security(
+        ("BearerAuth" = []),
+        ("CookieAuth" = []),
+        ("X-Doubleword-User" = [])
+    )
+)]
+#[tracing::instrument(skip_all)]
+pub async fn list_user_join_requests<P: PoolProvider>(
+    State(state): State<AppState<P>>,
+    Path(user_id): Path<UserIdOrCurrent>,
+    current_user: CurrentUser,
+) -> Result<Json<Vec<crate::api::models::organizations::PendingJoinRequestResponse>>> {
+    let target_user_id = match user_id {
+        UserIdOrCurrent::Current(_) => current_user.id,
+        UserIdOrCurrent::Id(uuid) => uuid,
+    };
+
+    let can_all = can_read_all_resources(&current_user, Resource::Users);
+    let can_own = can_read_own_resource(&current_user, Resource::Users, target_user_id);
+    if !can_all && !can_own {
+        return Err(Error::InsufficientPermissions {
+            required: Permission::Allow(Resource::Users, Operation::ReadOwn),
+            action: Operation::ReadOwn,
+            resource: format!("Join requests for user {target_user_id}"),
+        });
+    }
+
+    // Primary, not the replica: signup records the request during the very
+    // first login, and onboarding reads this immediately afterwards to decide
+    // whether to offer "request to join" instead of "create a workspace". Off
+    // the replica that read can land before the row propagates, and the user
+    // gets the create-workspace screen this endpoint exists to replace. Same
+    // trap `list_user_organizations` above avoids for the same reason.
+    let mut pool_conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
+    let mut repo = Organizations::new(&mut pool_conn);
+    let requests = repo.list_user_join_requests(target_user_id).await?;
+
+    let org_ids: Vec<UserId> = requests.iter().map(|r| r.organization_id).collect();
+    let mut users_repo = Users::new(&mut pool_conn);
+    let org_map = users_repo.get_bulk(org_ids).await?;
+
+    // `filter_map` cannot silently swallow a live request here: both halves
+    // apply the same `is_deleted = false` filter — `list_user_join_requests`
+    // INNER JOINs it, `get_bulk` has it in its WHERE — so a request that
+    // survived the first query has its organization in `org_map`. The only way
+    // to miss is the organization being deleted between the two, and dropping
+    // it is then the correct answer rather than a lost row: a deleted
+    // organization has nobody left to approve, which is exactly why the query
+    // excludes them in the first place.
+    let responses: Vec<crate::api::models::organizations::PendingJoinRequestResponse> = requests
+        .iter()
+        .filter_map(|r| {
+            org_map
+                .get(&r.organization_id)
+                .map(|o| crate::api::models::organizations::PendingJoinRequestResponse {
+                    id: r.id,
+                    organization_id: o.id,
+                    organization_name: o.username.clone(),
+                    requested_at: r.created_at,
+                })
+        })
+        .collect();
+
+    Ok(Json(responses))
+}
+
 /// Validate and confirm an active organization context.
 ///
 /// Sets a `dw_active_org` cookie so the browser sends it automatically with all
@@ -2818,6 +2916,127 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(role, None, "the request must still be outstanding");
+    }
+
+    /// The requester can't read the organization-scoped queue - that's gated on
+    /// managing the org, which they can't do until they're approved. Without a
+    /// user-scoped view, a request filed on their behalf at signup would be
+    /// invisible to the only person waiting on it.
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_user_sees_their_own_pending_join_request(pool: PgPool) {
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let owner = create_test_user(&pool, Role::StandardUser).await;
+        let joiner = create_test_user(&pool, Role::StandardUser).await;
+        let (org_id, request_id) = org_with_join_request(&pool, owner.id, joiner.id).await;
+        let joiner_headers = add_auth_headers(&joiner);
+
+        // The org-scoped queue stays shut to them.
+        let resp = server
+            .get(&format!("/admin/api/v1/organizations/{org_id}/join-requests"))
+            .add_header(&joiner_headers[0].0, &joiner_headers[0].1)
+            .add_header(&joiner_headers[1].0, &joiner_headers[1].1)
+            .await;
+        resp.assert_status(axum::http::StatusCode::FORBIDDEN);
+
+        let resp = server
+            .get("/admin/api/v1/users/current/join-requests")
+            .add_header(&joiner_headers[0].0, &joiner_headers[0].1)
+            .add_header(&joiner_headers[1].0, &joiner_headers[1].1)
+            .await;
+        resp.assert_status_ok();
+        let body = resp.json::<serde_json::Value>();
+        let items = body.as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["id"].as_str().unwrap(), request_id.to_string());
+        assert_eq!(items[0]["organization_id"].as_str().unwrap(), org_id.to_string());
+        assert!(items[0]["organization_name"].as_str().is_some_and(|n| !n.is_empty()));
+
+        // It carries only the organization's identity - nothing about who else
+        // is in it, or is queued for it.
+        assert!(items[0].get("user").is_none());
+        assert!(items[0].get("member_count").is_none());
+    }
+
+    /// Approval is the end of the request, so the banner it drives must clear
+    /// on its own rather than lingering after the user is already inside.
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_own_join_requests_clear_once_decided(pool: PgPool) {
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let owner = create_test_user(&pool, Role::StandardUser).await;
+        let joiner = create_test_user(&pool, Role::StandardUser).await;
+        let (org_id, request_id) = org_with_join_request(&pool, owner.id, joiner.id).await;
+        let joiner_headers = add_auth_headers(&joiner);
+        let owner_headers = add_auth_headers(&owner);
+
+        let resp = server
+            .get("/admin/api/v1/users/current/join-requests")
+            .add_header(&joiner_headers[0].0, &joiner_headers[0].1)
+            .add_header(&joiner_headers[1].0, &joiner_headers[1].1)
+            .await;
+        resp.assert_status_ok();
+        assert_eq!(
+            resp.json::<serde_json::Value>().as_array().unwrap().len(),
+            1,
+            "outstanding before the decision"
+        );
+
+        let resp = server
+            .post(&format!("/admin/api/v1/organizations/{org_id}/join-requests/{request_id}/approve"))
+            .add_header(&owner_headers[0].0, &owner_headers[0].1)
+            .add_header(&owner_headers[1].0, &owner_headers[1].1)
+            .await;
+        resp.assert_status(axum::http::StatusCode::NO_CONTENT);
+
+        let resp = server
+            .get("/admin/api/v1/users/current/join-requests")
+            .add_header(&joiner_headers[0].0, &joiner_headers[0].1)
+            .add_header(&joiner_headers[1].0, &joiner_headers[1].1)
+            .await;
+        resp.assert_status_ok();
+        assert!(
+            resp.json::<serde_json::Value>().as_array().unwrap().is_empty(),
+            "an approved request is no longer pending"
+        );
+
+        // The membership it became is visible in the place that does list it.
+        let resp = server
+            .get("/admin/api/v1/users/current/organizations")
+            .add_header(&joiner_headers[0].0, &joiner_headers[0].1)
+            .add_header(&joiner_headers[1].0, &joiner_headers[1].1)
+            .await;
+        resp.assert_status_ok();
+        assert_eq!(resp.json::<serde_json::Value>().as_array().unwrap().len(), 1);
+    }
+
+    /// Requests are the caller's own business: one user must not be able to
+    /// enumerate which organizations another has asked to join.
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_own_join_requests_are_not_readable_by_other_users(pool: PgPool) {
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let owner = create_test_user(&pool, Role::StandardUser).await;
+        let joiner = create_test_user(&pool, Role::StandardUser).await;
+        let (_org_id, _) = org_with_join_request(&pool, owner.id, joiner.id).await;
+
+        let snooper = create_test_user(&pool, Role::StandardUser).await;
+        let snooper_headers = add_auth_headers(&snooper);
+        let resp = server
+            .get(&format!("/admin/api/v1/users/{}/join-requests", joiner.id))
+            .add_header(&snooper_headers[0].0, &snooper_headers[0].1)
+            .add_header(&snooper_headers[1].0, &snooper_headers[1].1)
+            .await;
+        resp.assert_status(axum::http::StatusCode::FORBIDDEN);
+
+        // Their own list is unaffected by the attempt, and empty.
+        let resp = server
+            .get("/admin/api/v1/users/current/join-requests")
+            .add_header(&snooper_headers[0].0, &snooper_headers[0].1)
+            .add_header(&snooper_headers[1].0, &snooper_headers[1].1)
+            .await;
+        resp.assert_status_ok();
+        assert!(resp.json::<serde_json::Value>().as_array().unwrap().is_empty());
     }
 
     #[sqlx::test]

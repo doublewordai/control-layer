@@ -266,3 +266,33 @@ pub struct OrganizationSummary {
     /// workspace able to pay" must read it from here when acting as an org.
     pub verified: bool,
 }
+
+/// An organization the caller has asked to join and is waiting on.
+///
+/// Signup files these automatically when the caller's email domain matches a
+/// claimed organization, so the requester is typically unaware one exists.
+/// Onboarding reads this to say so, rather than presenting the create-workspace
+/// screen as if their company had no workspace.
+///
+/// Deliberately thinner than [`OrganizationSummary`]: the caller is not a
+/// member, so this carries only what identifies the organization they are
+/// queued for. Nothing about its membership, billing or configuration is
+/// readable from here.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PendingJoinRequestResponse {
+    /// The join request itself, not the organization. A `user_organizations`
+    /// row id — deliberately `Uuid` rather than `UserId`, which it is not and
+    /// which would invite a caller to pass it where a user is expected. Same
+    /// convention as `OrganizationMemberResponse::id` above.
+    #[schema(value_type = String, format = "uuid")]
+    pub id: uuid::Uuid,
+    #[schema(value_type = String, format = "uuid")]
+    pub organization_id: UserId,
+    /// The organization's `username`. Carries the `{domain}~{suffix}` form for
+    /// organizations created since domains became claimable; clients that want
+    /// to show a company name should strip at the separator.
+    pub organization_name: String,
+    /// When the request was filed — on the requester's first login for one
+    /// raised by domain match.
+    pub requested_at: chrono::DateTime<chrono::Utc>,
+}
