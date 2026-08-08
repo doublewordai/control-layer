@@ -1498,6 +1498,10 @@ pub struct DaemonConfig {
     /// Default concurrency limit per model (default: 10)
     pub default_model_concurrency: usize,
 
+    /// Minimum time between per-model AIMD adjustments after downstream 529s
+    /// and successful responses (default: 1000ms).
+    pub adaptive_concurrency_recovery_interval_ms: u64,
+
     /// How long to sleep between claim iterations in milliseconds (default: 1000)
     pub claim_interval_ms: u64,
 
@@ -1903,6 +1907,7 @@ impl Default for DaemonConfig {
             mode: DaemonMode::Both,
             claim_batch_size: 100,
             default_model_concurrency: 10,
+            adaptive_concurrency_recovery_interval_ms: 1_000,
             claim_interval_ms: 1000,
             max_retries: Some(1000),
             stop_before_deadline_ms: Some(900_000),
@@ -1983,6 +1988,7 @@ impl DaemonConfig {
             mode: self.mode.into(),
             claim_batch_size: self.claim_batch_size,
             model_concurrency_limits: model_capacity_limits.unwrap_or_else(|| std::sync::Arc::new(dashmap::DashMap::new())),
+            adaptive_concurrency_recovery_interval_ms: self.adaptive_concurrency_recovery_interval_ms,
             model_escalations: Arc::new(DashMap::from_iter(self.model_escalations.clone())),
             claim_interval_ms: self.claim_interval_ms,
             max_retries: self.max_retries,
@@ -3962,6 +3968,52 @@ background_services:
                     .to_fusillade_config()
                     .additional_retryable_statuses
                     .is_empty()
+            );
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_adaptive_concurrency_recovery_interval_default_override_and_mapping() {
+        Jail::expect_with(|jail| {
+            jail.create_file("test.yaml", "secret_key: test-secret-key\n")?;
+            let args = Args {
+                config: "test.yaml".into(),
+                validate: false,
+            };
+
+            let config = Config::load(&args)?;
+            assert_eq!(
+                config.background_services.batch_daemon.adaptive_concurrency_recovery_interval_ms,
+                1_000
+            );
+            assert_eq!(
+                config
+                    .background_services
+                    .batch_daemon
+                    .to_fusillade_config()
+                    .adaptive_concurrency_recovery_interval_ms,
+                1_000
+            );
+
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: test-secret-key
+background_services:
+  batch_daemon:
+    adaptive_concurrency_recovery_interval_ms: 5000
+"#,
+            )?;
+            let config = Config::load(&args)?;
+            assert_eq!(
+                config
+                    .background_services
+                    .batch_daemon
+                    .to_fusillade_config()
+                    .adaptive_concurrency_recovery_interval_ms,
+                5_000
             );
 
             Ok(())

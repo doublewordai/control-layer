@@ -540,6 +540,7 @@ background_services:
     # Performance & Concurrency Settings
     claim_batch_size: 100 # Maximum number of requests to claim in each iteration
     default_model_concurrency: 10 # Default concurrent requests per model
+    adaptive_concurrency_recovery_interval_ms: 1000 # Per-model AIMD adjustment cadence after downstream 529s
     claim_interval_ms: 1000 # Milliseconds to sleep between claim iterations
 
     # Split claim daemons (fusillade >= 20): batched and batchless (flex) rows
