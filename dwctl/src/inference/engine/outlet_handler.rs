@@ -63,24 +63,55 @@ impl FusilladeOutletHandler {
             .and_then(|bytes| std::str::from_utf8(bytes).ok())
     }
 
+    fn is_daemon_batch(request: &RequestData) -> bool {
+        request.headers.contains_key("x-fusillade-batch-id")
+    }
+
+    fn is_realtime_inference_request(request: &RequestData) -> bool {
+        matches!(
+            request.uri.path(),
+            "/v1/chat/completions" | "/v1/responses" | "/v1/messages" | "/v1/completions" | "/v1/embeddings"
+        )
+    }
+
     /// Extract the identifiers + attribution context every `CompleteResponseJob`
-    /// needs. Returns `None` (after logging) when a required header is absent
-    /// or unparseable, so both [`Self::handle_response`] and
-    /// [`Self::handle_abandoned`] short-circuit consistently. Centralising
-    /// this here keeps the two handler paths from drifting on which headers
-    /// are gating vs. just warned-about.
+    /// needs. Daemon-owned batch traffic is identified explicitly and skipped.
+    /// Realtime traffic recovers a missing display response ID from the durable
+    /// fusillade request UUID, while a missing UUID remains an unrecoverable
+    /// drop. Centralising this here keeps [`Self::handle_response`] and
+    /// [`Self::handle_abandoned`] consistent.
     fn extract_complete_response_ctx(request: &RequestData) -> Option<CompleteResponseCtx> {
-        // Only the inference middleware sets `x-onwards-response-id`, so its
-        // absence means this is either a daemon-driven fusillade batch request
-        // (daemon handles its own completion) or unrelated traffic. Silent
-        // no-op — no warning, no work to do.
-        let response_id = Self::extract_response_id(request)?;
+        if Self::is_daemon_batch(request) {
+            metrics::counter!("dwctl_requests_writer_skipped_total", "reason" => "fusillade_batch").increment(1);
+            return None;
+        }
+
+        let supplied_response_id = Self::extract_response_id(request);
+        if supplied_response_id.is_none() && !Self::is_realtime_inference_request(request) {
+            return None;
+        }
 
         let request_id = match Self::extract_request_id(request) {
             Some(id) => id,
             None => {
-                tracing::warn!(response_id = %response_id, "Missing x-fusillade-request-id header — skipping enqueue");
+                metrics::counter!("dwctl_requests_writer_dropped_total", "reason" => "missing_request_id").increment(1);
+                tracing::error!(
+                    uri = %request.uri,
+                    "Realtime response cannot be recorded: missing or invalid x-fusillade-request-id"
+                );
                 return None;
+            }
+        };
+        let response_id = match supplied_response_id {
+            Some(id) => id,
+            None => {
+                metrics::counter!("dwctl_requests_writer_header_anomalies_total", "header" => "response_id").increment(1);
+                tracing::error!(
+                    request_id = %request_id,
+                    uri = %request.uri,
+                    "Missing x-onwards-response-id on realtime request; recovered from x-fusillade-request-id"
+                );
+                format!("resp_{request_id}")
             }
         };
 
@@ -386,17 +417,21 @@ mod tests {
     use std::collections::HashMap;
     use std::time::SystemTime;
 
-    fn make_request_data(headers: HashMap<String, Vec<Bytes>>) -> RequestData {
+    fn make_request_data_for_uri(uri: &str, headers: HashMap<String, Vec<Bytes>>) -> RequestData {
         RequestData {
             correlation_id: 1,
             timestamp: SystemTime::now(),
             method: axum::http::Method::POST,
-            uri: "/v1/responses".parse().unwrap(),
+            uri: uri.parse().unwrap(),
             headers,
             body: None,
             trace_id: None,
             span_id: None,
         }
+    }
+
+    fn make_request_data(headers: HashMap<String, Vec<Bytes>>) -> RequestData {
+        make_request_data_for_uri("/v1/responses", headers)
     }
 
     #[test]
@@ -508,13 +543,33 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_complete_response_ctx_missing_response_id_returns_none() {
-        // x-onwards-response-id absence is the silent-no-op gate: this is
-        // either daemon traffic or unrelated, and the handler must return
-        // without enqueueing anything.
+    fn test_extract_complete_response_ctx_missing_response_id_recovers_from_request_id() {
         let mut headers = full_headers();
         headers.remove(ONWARDS_RESPONSE_ID_HEADER);
         let request = make_request_data(headers);
+        let ctx = FusilladeOutletHandler::extract_complete_response_ctx(&request)
+            .expect("realtime response context should recover from the durable request id");
+        assert_eq!(ctx.response_id, "resp_12345678-1234-1234-1234-123456789abc");
+        assert_eq!(ctx.request_id, Uuid::parse_str("12345678-1234-1234-1234-123456789abc").unwrap());
+    }
+
+    #[test]
+    fn test_extract_complete_response_ctx_daemon_batch_is_intentionally_skipped() {
+        let mut headers = full_headers();
+        headers.remove(ONWARDS_RESPONSE_ID_HEADER);
+        headers.insert(
+            "x-fusillade-batch-id".to_string(),
+            vec![Bytes::from("87654321-4321-4321-4321-cba987654321")],
+        );
+        let request = make_request_data(headers);
+        assert!(FusilladeOutletHandler::extract_complete_response_ctx(&request).is_none());
+    }
+
+    #[test]
+    fn test_extract_complete_response_ctx_unrelated_traffic_is_ignored() {
+        let mut headers = full_headers();
+        headers.remove(ONWARDS_RESPONSE_ID_HEADER);
+        let request = make_request_data_for_uri("/healthz", headers);
         assert!(FusilladeOutletHandler::extract_complete_response_ctx(&request).is_none());
     }
 
