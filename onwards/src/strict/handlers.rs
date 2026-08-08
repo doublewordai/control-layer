@@ -2215,9 +2215,11 @@ async fn sanitize_streaming_responses_response(
 /// - `trusted = true` (our own endpoints): preserve message/type/code
 ///   verbatim — the embedded code is real signal we want downstream to
 ///   see (e.g. retry on 500).
-/// - `trusted = false` (third-party gateways): preserve the embedded status
-///   for correct client and retry semantics, but replace provider prose and
-///   metadata with a generic error keyed only by that status.
+/// - `trusted = false` (third-party gateways): rewrite message to a
+///   generic one keyed off the embedded code, and apply
+///   [`mask_account_class_status`] so account-class codes (401/402/403/451)
+///   surface as 502 — callers must not be able to probe whether the
+///   upstream's key was bad or out of credits.
 fn try_format_sse_error(value: &serde_json::Value, trusted: bool) -> Option<String> {
     // Require a real error: an object carrying at least a `message` or a
     // `code`. This rejects `error: null` and empty `error: {}` payloads
@@ -2235,8 +2237,9 @@ fn try_format_sse_error(value: &serde_json::Value, trusted: bool) -> Option<Stri
         let envelope = json!({ "error": error_obj });
         Some(format!("data: {envelope}"))
     } else {
-        // For untrusted providers, preserve the status but replace prose and
-        // metadata so upstream billing/auth details cannot leak.
+        // For untrusted providers, replace prose with a generic message
+        // and mask account-class status codes to 502 so we don't leak
+        // upstream billing/auth state.
         let provider_code = error_obj
             .get("code")
             .and_then(parse_provider_status_code)
@@ -2247,13 +2250,19 @@ fn try_format_sse_error(value: &serde_json::Value, trusted: bool) -> Option<Stri
                 );
                 500
             });
-        let (error_type, message) = sanitized_error_for_status(provider_code);
+        // Derive type/message from the *masked* code (not the original) so the
+        // envelope is self-consistent: a masked 402→502 must read as "Bad
+        // gateway" and never surface the 402-specific message, which would
+        // hint at the hidden billing/auth state we just masked.
+        // (401/402/403/451 → 502, 408 → 504; see `mask_account_class_status`.)
+        let masked_code = mask_account_class_status(provider_code);
+        let (error_type, message) = sanitized_error_for_status(masked_code);
         let envelope = json!({
             "error": {
                 "message": message,
                 "type": error_type,
                 "param": null,
-                "code": provider_code,
+                "code": masked_code,
             }
         });
         Some(format!("data: {envelope}"))
@@ -2322,9 +2331,18 @@ async fn sanitize_error_response(mut response: Response) -> Response {
 /// Used by both `standard_error_response` and `try_format_sse_error` to
 /// sanitize errors from untrusted providers without leaking internals.
 ///
-/// Status codes are intentionally preserved. Confidentiality comes from the
-/// generic message and type returned here, never from changing the code.
+/// Callers should apply [`mask_account_class_status`] to the upstream
+/// status *before* calling this function so that account-class codes
+/// (401/402/403/451) are mapped to 502 first — this function alone does
+/// not mask, it only maps a (possibly-already-masked) status to a
+/// type/message pair.
 fn sanitized_error_for_status(status: u16) -> (&'static str, &'static str) {
+    // The 401/402/403/408 arms are defensive. Both production callers
+    // (`try_format_sse_error`, `standard_error_response`) run
+    // `mask_account_class_status` first (401/402/403/451 -> 502, 408 -> 504),
+    // so those statuses are remapped before reaching here. These arms render
+    // only if a future caller maps an un-masked status — keeping them avoids
+    // falling through to the generic "An error occurred".
     match status {
         400 => ("invalid_request_error", "Invalid request"),
         401 => ("authentication_error", "Authentication failed"),
@@ -2343,10 +2361,43 @@ fn sanitized_error_for_status(status: u16) -> (&'static str, &'static str) {
     }
 }
 
-/// Generate a generic error response without changing the upstream status.
+/// Remap upstream HTTP status codes that would leak provider-side billing,
+/// authentication, or jurisdictional state to a single generic 502.
+///
+/// Onwards routes requests to third-party providers on the operator's
+/// behalf — the caller never sees the provider directly. Surfacing the
+/// provider's `401 Unauthorized` (our API key revoked), `402 Payment
+/// Required` (our credits exhausted), `403 Forbidden` (our org blocked),
+/// or `451 Unavailable For Legal Reasons` would let the caller probe
+/// the operator's account state, which is both an information leak and
+/// confusing (the *caller's* auth is fine — it's ours that isn't). All
+/// four collapse to `502 Bad Gateway`: a generic "upstream is sad".
+///
+/// `408 Request Timeout` is rewritten to `504 Gateway Timeout` for the
+/// same reason — the upstream timing out is *our* gateway timing out
+/// from the caller's perspective.
+///
+/// Everything else passes through unchanged: `400/404/413/422/429` are
+/// real user-facing signals about the caller's request and must surface,
+/// and `5xx` codes are already "upstream failed" semantics.
+fn mask_account_class_status(status: u16) -> u16 {
+    match status {
+        401 | 402 | 403 | 451 => 502,
+        408 => 504,
+        _ => status,
+    }
+}
+
+/// Generate standard error response based on HTTP status code, applying
+/// account-class masking so the caller can't distinguish account-state
+/// failures (auth/billing/permissions) from generic upstream errors.
 fn standard_error_response(status: StatusCode) -> Response {
-    let (error_type, message) = sanitized_error_for_status(status.as_u16());
-    error_response(status, error_type, message)
+    let masked_code = mask_account_class_status(status.as_u16());
+    // `mask_account_class_status` only yields valid codes (the input status or
+    // a fixed 502/504), so `from_u16` never fails; the fallback is defensive.
+    let masked_status = StatusCode::from_u16(masked_code).unwrap_or(status);
+    let (error_type, message) = sanitized_error_for_status(masked_code);
+    error_response(masked_status, error_type, message)
 }
 
 #[cfg(test)]
@@ -2555,8 +2606,8 @@ mod tests {
             );
         }
 
-        // Account-class codes retain their status, but their bodies are still
-        // generated locally and contain no provider account details.
+        // Account-class codes — masked to 502 so the caller can't probe
+        // upstream auth/billing state. See `mask_account_class_status`.
         for status in [
             StatusCode::UNAUTHORIZED,
             StatusCode::PAYMENT_REQUIRED,
@@ -2566,8 +2617,8 @@ mod tests {
             let response = standard_error_response(status);
             assert_eq!(
                 response.status(),
-                status,
-                "{status} must be preserved during sanitization"
+                StatusCode::BAD_GATEWAY,
+                "{status} must be masked to 502"
             );
         }
     }
@@ -4902,9 +4953,9 @@ mod tests {
     }
 
     /// A trusted endpoint's account-class error (e.g. 402 Payment Required)
-    /// must be forwarded with its original status and message. Untrusted
-    /// providers keep the same status but receive generic text; a trusted
-    /// provider's codes and prose are never rewritten.
+    /// must be forwarded with its original status and message. Account-class
+    /// masking (401/402/403/451 -> 502) applies only to untrusted providers;
+    /// a trusted provider's codes and prose are never rewritten.
     #[tokio::test]
     async fn test_trusted_target_account_class_error_not_masked() {
         use crate::load_balancer::{Provider, ProviderPool};
@@ -4960,11 +5011,11 @@ mod tests {
             .unwrap();
 
         let response = router.oneshot(request).await.unwrap();
-        // Status preserved.
+        // Status preserved, NOT masked to 502.
         assert_eq!(
             response.status(),
             StatusCode::PAYMENT_REQUIRED,
-            "trusted account-class error must keep its original status"
+            "trusted account-class error must keep its original status, not be masked to 502"
         );
 
         let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
@@ -7713,42 +7764,58 @@ mod tests {
         );
     }
 
-    /// Sanitization must preserve status codes. The body, rather than the
-    /// status, is where provider account details are removed.
+    /// Account-class status codes from untrusted providers must be
+    /// rewritten to 502 so callers can't tell whether the upstream's
+    /// API key was bad, out of credits, or revoked.
     #[test]
-    fn test_sanitized_status_preserves_upstream_code() {
-        for status in [
-            400, 401, 402, 403, 404, 408, 413, 422, 429, 451, 500, 502, 503, 504,
-        ] {
-            let status = StatusCode::from_u16(status).unwrap();
-            assert_eq!(standard_error_response(status).status(), status);
-        }
+    fn test_mask_account_class_status_remaps_account_codes() {
+        // Account-class → 502
+        assert_eq!(mask_account_class_status(401), 502);
+        assert_eq!(mask_account_class_status(402), 502);
+        assert_eq!(mask_account_class_status(403), 502);
+        assert_eq!(mask_account_class_status(451), 502);
+        // Retriable timeout
+        assert_eq!(mask_account_class_status(408), 504);
+        // User-facing codes pass through
+        assert_eq!(mask_account_class_status(400), 400);
+        assert_eq!(mask_account_class_status(404), 404);
+        assert_eq!(mask_account_class_status(413), 413);
+        assert_eq!(mask_account_class_status(422), 422);
+        assert_eq!(mask_account_class_status(429), 429);
+        // Server-class pass through
+        assert_eq!(mask_account_class_status(500), 500);
+        assert_eq!(mask_account_class_status(502), 502);
+        assert_eq!(mask_account_class_status(503), 503);
+        assert_eq!(mask_account_class_status(504), 504);
     }
 
-    /// In-stream errors preserve the status for retry and client semantics,
-    /// while replacing provider billing details with safe generic text.
+    /// In-stream errors from untrusted providers must apply the account-class
+    /// mask. A code 402 from OpenRouter (e.g. "insufficient credits") must
+    /// surface as code 502 to the caller — exposing the provider's billing
+    /// state is an information leak.
     #[test]
-    fn test_try_format_sse_error_preserves_untrusted_402() {
+    fn test_try_format_sse_error_masks_untrusted_402_to_502() {
         let data_part = r#"{"error": {"message": "Insufficient credits", "code": 402}}"#;
         let value: serde_json::Value = serde_json::from_str(data_part).unwrap();
         let line = try_format_sse_error(&value, false).expect("should emit");
+        // Body must carry the masked code so fusillade reclassifies to 502.
         assert!(
-            line.contains("\"code\":402"),
-            "expected code 402 to be preserved, got: {line}"
+            line.contains("\"code\":502"),
+            "expected code masked to 502, got: {line}"
         );
         // Provider's prose must not leak.
         assert!(!line.contains("Insufficient credits"));
-        assert!(line.contains("Service unavailable"));
     }
 
-    /// Timeout sanitization retains 408 while removing provider prose.
+    /// The 408→504 timeout-masking path: an untrusted upstream timeout must
+    /// surface as a 504 Gateway Timeout, not the original 408.
     #[test]
-    fn test_try_format_sse_error_preserves_untrusted_408() {
+    fn test_try_format_sse_error_masks_untrusted_408_to_504() {
         let value = serde_json::json!({"error": {"message": "upstream timed out", "code": 408}});
         let line = try_format_sse_error(&value, false).expect("should emit");
         assert!(
-            line.contains("\"code\":408"),
-            "expected code 408 to be preserved, got: {line}"
+            line.contains("\"code\":504"),
+            "expected 408 masked to 504, got: {line}"
         );
         assert!(line.contains("Gateway timeout"));
         // The provider's prose must not leak.
@@ -7782,21 +7849,22 @@ mod tests {
         );
     }
 
-    /// Standard (non-streaming) errors preserve status while sanitizing text.
+    /// Standard (non-streaming) error responses from untrusted providers
+    /// must also have account-class codes masked before reaching the
+    /// caller.
     #[tokio::test]
-    async fn test_standard_error_response_preserves_402() {
+    async fn test_standard_error_response_masks_402_to_502() {
         let response = standard_error_response(StatusCode::PAYMENT_REQUIRED);
         assert_eq!(
             response.status(),
-            StatusCode::PAYMENT_REQUIRED,
-            "sanitization must preserve the upstream status"
+            StatusCode::BAD_GATEWAY,
+            "402 from an untrusted provider must surface as 502"
         );
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["error"]["type"], "api_error");
-        assert_eq!(json["error"]["message"], "Service unavailable");
     }
 
     /// Explicit arms for 402 and 408 in `sanitized_error_for_status` —
