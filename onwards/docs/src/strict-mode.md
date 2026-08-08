@@ -81,34 +81,38 @@ When strict mode is enabled, all error responses follow OpenAI's error format ex
 |------------|------------|---------|
 | 400 | `invalid_request_error` | Invalid request |
 | 401 | `authentication_error` | Authentication failed |
+| 402 | `api_error` | Service unavailable |
 | 403 | `permission_error` | Permission denied |
 | 404 | `not_found_error` | Not found |
+| 408 | `api_error` | Gateway timeout |
 | 429 | `rate_limit_error` | Rate limit exceeded |
+| 451 | `api_error` | An error occurred |
 | 500 | `api_error` | Internal server error |
 | 502 | `api_error` | Bad gateway |
 | 503 | `api_error` | Service unavailable |
 
-For **untrusted** upstreams, account-class status codes are remapped *before* this table is applied — see [Account-class status code masking](#account-class-status-code-masking).
-
 Third-party error details are always logged server-side but never sent to clients.
 
-## Account-class status code masking
+## Status preservation and body sanitization
 
-Untrusted providers can return status codes that describe the *operator's* relationship with the provider — not the *caller's* relationship with onwards. Surfacing those would let callers probe the operator's account state. Onwards rewrites:
+Untrusted providers can return errors containing the operator's billing,
+authentication, permission, or jurisdictional details. Onwards preserves the
+HTTP status because clients and retry policies depend on it, but replaces the
+provider body with the generic type and message from the table above.
 
-| Upstream status | Surfaced as | Rationale |
+| Upstream status | Surfaced as | Sanitized message |
 |---|---|---|
-| `401 Unauthorized` | `502 Bad Gateway` | The caller's auth is fine; ours isn't — don't expose that |
-| `402 Payment Required` | `502 Bad Gateway` | Provider billing state is internal |
-| `403 Forbidden` | `502 Bad Gateway` | Permission failures are operator-scoped |
-| `451 Unavailable For Legal Reasons` | `502 Bad Gateway` | Jurisdictional restrictions are operator-scoped |
-| `408 Request Timeout` | `504 Gateway Timeout` | Upstream timeouts are gateway timeouts from the caller's view |
+| `401 Unauthorized` | `401 Unauthorized` | Authentication failed |
+| `402 Payment Required` | `402 Payment Required` | Service unavailable |
+| `403 Forbidden` | `403 Forbidden` | Permission denied |
+| `451 Unavailable For Legal Reasons` | `451 Unavailable For Legal Reasons` | An error occurred |
+| `408 Request Timeout` | `408 Request Timeout` | Gateway timeout |
 
-User-facing codes (`400`, `404`, `413`, `422`, `429`) pass through unchanged — they're real signal about the caller's request and downstream retry logic depends on seeing them.
+For untrusted providers, the embedded error's `code` is read whether the provider encodes it as a number (`429`), a numeric string (`"429"`), or a named string — the rate-limit family (`rate_limit`, `rate_limit_error`, `rate_limit_exceeded`) maps to `429` so retry semantics survive, and unrecognized names fall back to `500`. The resulting numeric code is emitted unchanged with generic text.
 
-For untrusted providers, the embedded error's `code` is read whether the provider encodes it as a number (`429`), a numeric string (`"429"`), or a named string — the rate-limit family (`rate_limit`, `rate_limit_error`, `rate_limit_exceeded`) maps to `429` so retry semantics survive, and unrecognized names fall back to `500`. The resulting code is then masked per the table above.
-
-Masking is applied to both non-streaming error responses (where the upstream status is the outer HTTP status) and to embedded `error.code` values in SSE streams (so a downstream reassembler that reclassifies on the embedded code surfaces the masked code as the HTTP status). Trusted targets bypass masking entirely.
+Sanitization is applied to both non-streaming error responses (where the
+upstream status is the outer HTTP status) and embedded `error.code` values in
+SSE streams. Trusted targets continue to pass provider error bodies through.
 
 ## Errors embedded in 2xx SSE streams
 
@@ -128,7 +132,7 @@ data: {"error":{"message":"Rate limit exceeded","type":"rate_limit_error","param
 
 The chunk wrapper is stripped so the emitted SSE data line begins with `{"error"` — that prefix is what the [`fusillade`](https://crates.io/crates/fusillade) reassembler matches on to reclassify the response from HTTP 200 to the embedded `code`. End-to-end, an upstream-of-upstream 429 becomes a real HTTP 429 to the client, with retry semantics intact.
 
-This applies to both bare error chunks and chunks that carry completion fields alongside the error. Untrusted upstreams additionally have the embedded `error.code` masked (per the table above) and the prose replaced with a generic message; trusted targets forward the envelope verbatim.
+This applies to both bare error chunks and chunks that carry completion fields alongside the error. Untrusted upstreams retain the embedded `error.code`, while provider prose and metadata are replaced with generic local values; trusted targets forward the envelope verbatim.
 
 ## Supported endpoints
 

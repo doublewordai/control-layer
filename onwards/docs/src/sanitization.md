@@ -125,7 +125,7 @@ data: {"error":{"code":429,"message":"..."}}
 
 The emitted data line begins with `{"error"`, the prefix downstream reassemblers match on to reclassify the response from HTTP 200 to the embedded `code`.
 
-**Non-strict mode forwards the error verbatim.** The provider's message and the original status `code` pass through unchanged — non-strict mode does **not** mask account-class codes (`401`/`402`/`403`/`451`) or replace the provider's prose. If you need that protection so callers can't probe the operator's auth/billing/jurisdictional state, use [Strict Mode](strict-mode.md), which masks account-class codes and replaces untrusted error messages with generic ones.
+**Non-strict mode forwards the error verbatim.** The provider's message and the original status `code` pass through unchanged. If you need to preserve the status while preventing provider auth, billing, permission, or jurisdictional details from reaching callers, use [Strict Mode](strict-mode.md), which replaces untrusted provider prose and metadata with generic local values.
 
 > ⚠️ **Security warning:** Verbatim forwarding passes the **entire** error object through to your clients — every field, including the provider's `message`, billing/auth state hints, and any nested `metadata`/`raw`/unknown fields. Do not enable `sanitize_response: true` on targets proxying untrusted third parties if you need to hide upstream internals. Use [Strict Mode](strict-mode.md) for production deployments requiring information-leakage prevention.
 

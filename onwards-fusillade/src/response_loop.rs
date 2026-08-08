@@ -100,6 +100,7 @@ pub struct UpstreamTarget {
 #[derive(Debug)]
 pub enum LoopError {
     Failed(Value),
+    Upstream { status: u16 },
     MaxIterationsExceeded,
     MaxDepthExceeded,
     EmptyAction,
@@ -111,6 +112,7 @@ impl fmt::Display for LoopError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             LoopError::Failed(payload) => write!(f, "response loop failed: {}", payload),
+            LoopError::Upstream { status } => write!(f, "model call returned HTTP {status}"),
             LoopError::MaxIterationsExceeded => {
                 write!(f, "response loop exceeded max_response_iterations cap")
             }
@@ -618,10 +620,9 @@ async fn fire_model_call<H: FusilladeHttpClient + 'static>(
     })?;
 
     if response.status < 200 || response.status >= 300 {
-        return Err(LoopError::Executor(ExecutorError::ExecutionError(format!(
-            "model call returned HTTP {}: {}",
-            response.status, response.body
-        ))));
+        return Err(LoopError::Upstream {
+            status: response.status,
+        });
     }
 
     serde_json::from_str::<Value>(&response.body).map_err(|e| {
@@ -738,6 +739,11 @@ fn translate_tool_error(e: ToolError) -> ExecutorError {
 fn error_to_payload(e: &LoopError) -> Value {
     match e {
         LoopError::Failed(payload) => payload.clone(),
+        LoopError::Upstream { status } => serde_json::json!({
+            "type": "upstream_error",
+            "message": "Upstream request failed",
+            "status": status,
+        }),
         LoopError::MaxIterationsExceeded => serde_json::json!({
             "type": "max_iterations_exceeded",
             "message": e.to_string(),
@@ -759,4 +765,18 @@ fn error_to_payload(e: &LoopError) -> Value {
             "message": err.to_string(),
         }),
     }
+}
+
+/// Return the sanitized upstream HTTP status carried by a terminal failure.
+///
+/// The response loop persists failures as JSON between iterations, so the
+/// status must survive that storage boundary as structured data. Values
+/// outside the HTTP status range are rejected rather than passed to clients.
+pub fn failure_http_status(payload: &Value) -> Option<u16> {
+    if payload.get("type")?.as_str()? != "upstream_error" {
+        return None;
+    }
+    let status = payload.get("status")?.as_u64()?;
+    let status = u16::try_from(status).ok()?;
+    (100..=599).contains(&status).then_some(status)
 }

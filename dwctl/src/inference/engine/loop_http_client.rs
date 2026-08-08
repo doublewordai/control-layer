@@ -22,7 +22,7 @@ use fusillade::http::{HttpClient as FusilladeHttpClient, HttpResponse};
 use fusillade::{FusilladeError, RequestData, ReqwestHttpClient, Result as FusilladeResult};
 use fusillade_arsenal::PoolProvider as FusilladePool;
 use onwards::traits::{RequestContext, ToolExecutor};
-use onwards_fusillade::{LoopConfig, LoopError, MultiStepStore, UpstreamTarget};
+use onwards_fusillade::{LoopConfig, LoopError, MultiStepStore, UpstreamTarget, failure_http_status};
 
 use crate::inference::engine::processor::DaemonToolResolver;
 use crate::inference::store::{FusilladeResponseStore, PendingResponseInput};
@@ -69,7 +69,7 @@ where
 
 fn loop_error_payload(error: &LoopError) -> (u16, serde_json::Value) {
     match error {
-        LoopError::Failed(payload) => (500, payload.clone()),
+        LoopError::Failed(payload) => (failure_http_status(payload).unwrap_or(500), payload.clone()),
         _ if is_unsupported_jsonb_payload_error(error) => (
             400,
             serde_json::json!({
@@ -261,5 +261,19 @@ mod tests {
 
         assert_eq!(status, 500);
         assert!(body.contains("loop_error"));
+    }
+
+    #[test]
+    fn loop_error_payload_preserves_upstream_status() {
+        let error = LoopError::Failed(serde_json::json!({
+            "type": "upstream_error",
+            "message": "Upstream request failed",
+            "status": 400,
+        }));
+
+        let (status, _payload, body) = loop_error_response(&error);
+
+        assert_eq!(status, 400);
+        assert!(!body.contains("provider account"));
     }
 }
