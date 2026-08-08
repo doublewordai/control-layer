@@ -638,12 +638,15 @@ async fn model_call_failure_preserves_status_without_provider_text() {
 
 #[test]
 fn failure_http_status_accepts_only_typed_valid_statuses() {
-    for status in [100, 400, 599] {
+    for status in [300, 400, 599] {
         let payload = json!({"type": "upstream_error", "status": status});
         assert_eq!(failure_http_status(&payload), Some(status));
     }
 
     for payload in [
+        json!({"type": "upstream_error", "status": 100}),
+        json!({"type": "upstream_error", "status": 200}),
+        json!({"type": "upstream_error", "status": 299}),
         json!({"type": "upstream_error", "status": 99}),
         json!({"type": "upstream_error", "status": 600}),
         json!({"type": "upstream_error", "status": "400"}),

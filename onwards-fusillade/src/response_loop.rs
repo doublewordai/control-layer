@@ -771,12 +771,13 @@ fn error_to_payload(e: &LoopError) -> Value {
 ///
 /// The response loop persists failures as JSON between iterations, so the
 /// status must survive that storage boundary as structured data. Values
-/// outside the HTTP status range are rejected rather than passed to clients.
+/// below the non-success range or outside the HTTP status range are rejected
+/// rather than passed to clients as terminal failures.
 pub fn failure_http_status(payload: &Value) -> Option<u16> {
     if payload.get("type")?.as_str()? != "upstream_error" {
         return None;
     }
     let status = payload.get("status")?.as_u64()?;
     let status = u16::try_from(status).ok()?;
-    (100..=599).contains(&status).then_some(status)
+    (300..=599).contains(&status).then_some(status)
 }
