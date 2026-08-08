@@ -6,6 +6,7 @@ import {
   keepPreviousData,
 } from "@tanstack/react-query";
 import { dwctlApi, setAiApiBaseUrl } from "./client";
+import { ApiError } from "./errors";
 import { queryKeys } from "./keys";
 import type {
   UserCreateRequest,
@@ -39,6 +40,7 @@ import type {
   Endpoint,
   AddComponentRequest,
   UpdateComponentRequest,
+  ModelComponent,
   ModelMetrics,
   ModelsInclude,
   WebhookCreateRequest,
@@ -436,6 +438,44 @@ export function useUpdateModelComponent() {
       queryClient.invalidateQueries({
         queryKey: queryKeys.models.byId(variables.modelId),
       });
+    },
+  });
+}
+
+export function useUpdateModelComponentLayout() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: ({
+      modelId,
+      components,
+    }: {
+      modelId: string;
+      components: ModelComponent[];
+    }) =>
+      dwctlApi.models.components.updateLayout(modelId, {
+        components: components.map((component) => ({
+          deployed_model_id: component.model.id,
+          weight: component.weight,
+          enabled: component.enabled,
+          sort_order: component.sort_order,
+        })),
+      }),
+    onSuccess: (components, variables) => {
+      queryClient.setQueryData(
+        queryKeys.models.components(variables.modelId),
+        components,
+      );
+      queryClient.invalidateQueries({
+        queryKey: queryKeys.models.byId(variables.modelId),
+      });
+    },
+    onError: (error, variables) => {
+      if (error instanceof ApiError && error.status === 409) {
+        queryClient.invalidateQueries({
+          queryKey: queryKeys.models.components(variables.modelId),
+        });
+      }
     },
   });
 }

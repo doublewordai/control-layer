@@ -1538,12 +1538,14 @@ export const handlers = [
       if (!componentModel) {
         return HttpResponse.json({ error: "Component model not found" }, { status: 404 });
       }
-      const body = (await request.json()) as { weight?: number; enabled?: boolean };
+      const body = (await request.json()) as { weight?: number; enabled?: boolean; sort_order?: number };
       const component: StoredComponent = {
         componentModelId: String(params.componentId),
         weight: body.weight ?? 1,
         enabled: body.enabled ?? true,
-        sort_order: getModelComponentsState(demoState, model.id, initialModelComponents).length,
+        sort_order:
+          body.sort_order ??
+          getModelComponentsState(demoState, model.id, initialModelComponents).length,
       };
       demoState = addModelComponentState(demoState, model.id, component, initialModelComponents);
 
@@ -1567,6 +1569,53 @@ export const handlers = [
         },
         { status: 201 },
       );
+    },
+  ),
+
+  http.put(
+    "/admin/api/v1/models/:id/components/routing",
+    async ({ params, request }) => {
+      const model = modelsData.find((m) => m.id === params.id);
+      if (!model) {
+        return HttpResponse.json({ error: "Model not found" }, { status: 404 });
+      }
+      const body = (await request.json()) as {
+        components: Array<{
+          deployed_model_id: string;
+          weight: number;
+          enabled: boolean;
+          sort_order: number;
+        }>;
+      };
+      const current = getModelComponentsState(
+        demoState,
+        model.id,
+        initialModelComponents,
+      );
+      const currentIds = new Set(current.map((item) => item.componentModelId));
+      const requestedIds = new Set(
+        body.components.map((item) => item.deployed_model_id),
+      );
+      if (
+        current.length !== body.components.length ||
+        requestedIds.size !== body.components.length ||
+        [...currentIds].some((id) => !requestedIds.has(id))
+      ) {
+        return HttpResponse.json(
+          { error: "Component set changed; refresh and retry" },
+          { status: 409 },
+        );
+      }
+      for (const component of body.components) {
+        demoState = updateModelComponentState(
+          demoState,
+          model.id,
+          component.deployed_model_id,
+          component,
+          initialModelComponents,
+        );
+      }
+      return HttpResponse.json(resolveComponents(model.id));
     },
   ),
 

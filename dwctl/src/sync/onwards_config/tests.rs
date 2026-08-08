@@ -754,6 +754,8 @@ async fn test_cache_shape_composite_pool_strategy_and_fallback(pool: sqlx::PgPoo
     assert_eq!(providers[1].target.onwards_model.as_deref(), Some("component-a-model"));
     assert_eq!(providers[0].weight, 30);
     assert_eq!(providers[1].weight, 70);
+    assert_eq!(providers[0].priority(), Some(0));
+    assert_eq!(providers[1].priority(), Some(1));
     assert!(providers[0].target.sanitize_response);
     assert!(providers[1].target.sanitize_response);
 
@@ -762,6 +764,30 @@ async fn test_cache_shape_composite_pool_strategy_and_fallback(pool: sqlx::PgPoo
     // zero-delay retry behavior for composites that haven't opted in.
     assert!(fallback.backoff.is_none(), "backoff should default to None");
     assert!(fallback.max_total_backoff_ms.is_none());
+}
+
+#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
+async fn test_cache_shape_preserves_shared_priority_tiers(pool: sqlx::PgPool) {
+    sqlx::query(
+        "UPDATE deployed_model_components
+         SET sort_order = 0
+         WHERE composite_model_id = (
+             SELECT id FROM deployed_models WHERE alias = 'composite-priority'
+         )",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let targets = super::load_targets_from_db(&pool, &[], false, &RateLimitTiersConfig::default())
+        .await
+        .unwrap();
+    let composite = targets.targets.get("composite-priority").unwrap();
+    let providers = composite.providers();
+
+    assert_eq!(providers.len(), 2);
+    assert_eq!(providers[0].priority(), Some(0));
+    assert_eq!(providers[1].priority(), Some(0));
 }
 
 #[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
