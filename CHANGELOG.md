@@ -1,5 +1,12 @@
 # Changelog
 
+## [10.9.1](https://github.com/doublewordai/control-layer/compare/v10.9.0...v10.9.1) (2026-08-08)
+
+
+### Bug Fixes
+
+* preserve sanitized upstream error statuses ([#1458](https://github.com/doublewordai/control-layer/issues/1458)) ([5b92a8d](https://github.com/doublewordai/control-layer/commit/5b92a8d9c89a2482441e67e75fc4129e9c1e8535))
+
 ## [10.9.0](https://github.com/doublewordai/control-layer/compare/v10.8.0...v10.9.0) (2026-08-07)
 
 
