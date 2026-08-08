@@ -3,10 +3,12 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+mod adaptive_concurrency;
 pub mod config;
 
+use adaptive_concurrency::{AdaptiveConcurrencyController, ConcurrencyAdjustment};
 use metrics::{counter, gauge, histogram};
 use tokio::task::JoinSet;
 
@@ -20,7 +22,7 @@ use crate::error::Result;
 use crate::http::HttpClient;
 use crate::manager::{ArchiveOutcome, DaemonStorage, Storage};
 use crate::processor::{DefaultRequestProcessor, RequestProcessor};
-use crate::request::{Claimed, DaemonId, Request, RequestCompletionResult};
+use crate::request::{Claimed, DaemonId, FailureReason, Request, RequestCompletionResult};
 
 pub use config::{
     DaemonConfig, DaemonMode, ModelEscalationConfig, ShouldRetryFn, default_should_retry,
@@ -34,6 +36,17 @@ pub use fusillade_core::daemon_record::{
 struct UserThroughputStats {
     completed: AtomicU64,
     failed: AtomicU64,
+}
+
+/// A claimed request after route-at-claim-time rewriting.
+///
+/// `request.data.model` is the downstream model that receives the request.
+/// `capacity_model` is the configured model whose claim slot this request
+/// consumes. They differ when escalation rewrites the route after the storage
+/// claim has already been made.
+struct PreparedRequest {
+    request: Request<Claimed>,
+    capacity_model: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,6 +99,52 @@ fn background_capacity(ordinary_limit: usize, background_limit: usize, in_flight
     ordinary_limit
         .min(background_limit)
         .saturating_sub(in_flight)
+}
+
+fn available_capacity_for_model(
+    controller: &AdaptiveConcurrencyController,
+    model: &str,
+    configured_limit: usize,
+    in_flight: usize,
+) -> usize {
+    controller
+        .effective_limit(model, configured_limit)
+        .saturating_sub(in_flight)
+}
+
+fn is_downstream_overload(reason: &FailureReason) -> bool {
+    matches!(
+        reason,
+        FailureReason::RetriableHttpStatus { status: 529, .. }
+            | FailureReason::NonRetriableHttpStatus { status: 529, .. }
+    )
+}
+
+fn emit_concurrency_decrease(model: &str, adjustment: ConcurrencyAdjustment) {
+    counter!("fusillade_adaptive_concurrency_decreases_total", "model" => model.to_owned())
+        .increment(1);
+    gauge!("fusillade_adaptive_concurrency_limit", "model" => model.to_owned())
+        .set(adjustment.new_limit as f64);
+    tracing::warn!(
+        model,
+        previous_limit = adjustment.previous_limit,
+        new_limit = adjustment.new_limit,
+        status = 529,
+        "Reduced model concurrency after downstream overload"
+    );
+}
+
+fn emit_concurrency_increase(model: &str, adjustment: ConcurrencyAdjustment) {
+    counter!("fusillade_adaptive_concurrency_increases_total", "model" => model.to_owned())
+        .increment(1);
+    gauge!("fusillade_adaptive_concurrency_limit", "model" => model.to_owned())
+        .set(adjustment.new_limit as f64);
+    tracing::debug!(
+        model,
+        previous_limit = adjustment.previous_limit,
+        new_limit = adjustment.new_limit,
+        "Increased model concurrency after successful response"
+    );
 }
 
 fn sla_dynamo_priority(deadline: chrono::DateTime<chrono::Utc>) -> i32 {
@@ -355,6 +414,10 @@ where
     /// daemon behavior.
     processor: Arc<dyn RequestProcessor<S, H>>,
     requests_in_flight: Arc<dashmap::DashMap<String, AtomicUsize>>,
+    /// Per-model AIMD state. The configured concurrency remains the hard
+    /// ceiling; HTTP 529 responses reduce this daemon's effective ceiling and
+    /// successful responses recover it gradually.
+    adaptive_concurrency: Arc<AdaptiveConcurrencyController>,
     /// Per-user in-flight request counts across all models, used to prioritise
     /// users with fewer active requests during claim (per-user fair scheduling).
     user_requests_in_flight: Arc<dashmap::DashMap<String, AtomicUsize>>,
@@ -397,6 +460,9 @@ where
         shutdown_token: tokio_util::sync::CancellationToken,
     ) -> Self {
         let should_retry = config.retry_predicate();
+        let adaptive_concurrency = Arc::new(AdaptiveConcurrencyController::new(
+            Duration::from_millis(config.adaptive_concurrency_recovery_interval_ms),
+        ));
         let config = DaemonConfig {
             should_retry,
             ..config
@@ -409,6 +475,7 @@ where
             config,
             processor: Arc::new(DefaultRequestProcessor),
             requests_in_flight: Arc::new(dashmap::DashMap::new()),
+            adaptive_concurrency,
             user_requests_in_flight: Arc::new(dashmap::DashMap::new()),
             leak_buckets: Arc::new(dashmap::DashMap::new()),
             user_throughput: Arc::new(dashmap::DashMap::new()),
@@ -466,7 +533,12 @@ where
                     .get(&model)
                     .map(|e| e.value().load(Ordering::Relaxed))
                     .unwrap_or(0);
-                let available = limit.saturating_sub(in_flight);
+                let available = available_capacity_for_model(
+                    &self.adaptive_concurrency,
+                    &model,
+                    limit,
+                    in_flight,
+                );
                 if available > 0 {
                     Some((model, available))
                 } else {
@@ -483,7 +555,10 @@ where
             .iter()
             .filter_map(|entry| {
                 let model = entry.key().clone();
-                let ordinary_limit = *entry.value();
+                let configured_limit = *entry.value();
+                let ordinary_limit = self
+                    .adaptive_concurrency
+                    .effective_limit(&model, configured_limit);
                 let in_flight = self
                     .requests_in_flight
                     .get(&model)
@@ -648,7 +723,7 @@ where
                 _ => unreachable!("foreground kind passed to background claim loop"),
             };
 
-            let mut claimed = match claim_result {
+            let claimed = match claim_result {
                 Ok(claimed) => {
                     consecutive_claim_failures = 0;
                     claimed
@@ -706,8 +781,8 @@ where
                 "Claimed requests from storage"
             );
 
-            self.prepare_claimed_requests(&mut claimed, kind);
-            self.dispatch_claimed_requests(&mut join_set, claimed, kind);
+            let prepared = self.prepare_claimed_requests(claimed, kind);
+            self.dispatch_claimed_requests(&mut join_set, prepared, kind);
         }
     }
 
@@ -813,7 +888,7 @@ where
                 _ => unreachable!("background kind passed to foreground claim loop"),
             };
 
-            let mut claimed = match claim_result {
+            let claimed = match claim_result {
                 Ok(claimed) => {
                     consecutive_claim_failures = 0;
                     claimed
@@ -875,13 +950,26 @@ where
                 self.stamp_leaks(&claimed);
             }
 
-            self.prepare_claimed_requests(&mut claimed, kind);
-            self.dispatch_claimed_requests(&mut join_set, claimed, kind);
+            let prepared = self.prepare_claimed_requests(claimed, kind);
+            self.dispatch_claimed_requests(&mut join_set, prepared, kind);
         }
     }
 
-    fn prepare_claimed_requests(&self, claimed: &mut [Request<Claimed>], kind: ClaimLoopKind) {
-        for request in claimed.iter_mut() {
+    fn prepare_claimed_requests(
+        &self,
+        claimed: Vec<Request<Claimed>>,
+        kind: ClaimLoopKind,
+    ) -> Vec<PreparedRequest> {
+        let mut prepared: Vec<_> = claimed
+            .into_iter()
+            .map(|request| PreparedRequest {
+                capacity_model: request.data.model.clone(),
+                request,
+            })
+            .collect();
+
+        for prepared_request in &mut prepared {
+            let request = &mut prepared_request.request;
             if kind.is_background() {
                 continue;
             }
@@ -920,7 +1008,8 @@ where
             }
         }
 
-        for request in claimed {
+        for prepared_request in &mut prepared {
+            let request = &mut prepared_request.request;
             let priority = if kind.is_background() {
                 BACKGROUND_DYNAMO_PRIORITY
             } else if self.config.inject_deadline_priority {
@@ -933,18 +1022,20 @@ where
             };
             inject_dynamo_priority(&mut request.data.body, priority);
         }
+
+        prepared
     }
 
     fn dispatch_claimed_requests(
         self: &Arc<Self>,
         join_set: &mut JoinSet<Result<()>>,
-        claimed: Vec<Request<Claimed>>,
+        claimed: Vec<PreparedRequest>,
         kind: ClaimLoopKind,
     ) {
         let mut by_model: HashMap<String, Vec<_>> = HashMap::new();
-        for request in claimed {
-            let model = request.data.model.clone();
-            by_model.entry(model).or_default().push(request);
+        for prepared_request in claimed {
+            let model = prepared_request.request.data.model.clone();
+            by_model.entry(model).or_default().push(prepared_request);
         }
 
         tracing::debug!(
@@ -956,7 +1047,11 @@ where
         for (model, requests) in by_model {
             tracing::debug!(model = %model, count = requests.len(), "Processing requests for model");
 
-            for request in requests {
+            for prepared_request in requests {
+                let PreparedRequest {
+                    request,
+                    capacity_model,
+                } = prepared_request;
                 let request_id = request.data.id;
                 let batch_id = request.data.batch_id;
 
@@ -968,6 +1063,7 @@ where
                 );
 
                 let model_clone = model.clone();
+                let capacity_model_clone = capacity_model.clone();
                 let user_id = request.data.created_by.clone();
                 let is_background = kind.is_background();
                 let uses_foreground_accounting = kind.uses_foreground_accounting();
@@ -1000,6 +1096,8 @@ where
                 let processor = self.processor.clone();
                 let retry_config: crate::request::transitions::RetryConfig = (&self.config).into();
                 let requests_in_flight = self.requests_in_flight.clone();
+                let adaptive_concurrency = self.adaptive_concurrency.clone();
+                let model_concurrency_limits = self.config.model_concurrency_limits.clone();
                 let user_throughput = self.user_throughput.clone();
                 let user_requests_in_flight = self.user_requests_in_flight.clone();
                 let requests_processed = self.requests_processed.clone();
@@ -1018,10 +1116,10 @@ where
                         .increment(1.0);
                 } else {
                     requests_in_flight
-                        .entry(model_clone.clone())
+                        .entry(capacity_model_clone.clone())
                         .or_default()
                         .fetch_add(1, Ordering::Relaxed);
-                    gauge!("fusillade_requests_in_flight", "model" => model_clone.clone())
+                    gauge!("fusillade_requests_in_flight", "model" => capacity_model_clone.clone())
                         .increment(1.0);
 
                     user_requests_in_flight
@@ -1040,6 +1138,7 @@ where
                     request_id = %request_id,
                     batch_id = ?batch_id,
                     model = %model,
+                    capacity_model = %capacity_model,
                     outcome = tracing::field::Empty,
                 );
 
@@ -1051,7 +1150,7 @@ where
                     }
 
                     let processing_start = std::time::Instant::now();
-                    let model_for_guard = model_clone.clone();
+                    let model_for_guard = capacity_model_clone.clone();
                     let user_for_guard = user_id.clone();
                     let cw_for_guard = completion_window.clone();
                     let in_flight_for_guard = requests_in_flight.clone();
@@ -1106,6 +1205,17 @@ where
                     match completion_result {
                         Ok(RequestCompletionResult::Completed(completed)) => {
                             tracing::Span::current().record("outcome", "completed");
+                            if let Some(configured_limit) = model_concurrency_limits
+                                .get(&capacity_model_clone)
+                                .map(|limit| *limit)
+                                && let Some(adjustment) = adaptive_concurrency.record_success(
+                                    &capacity_model_clone,
+                                    configured_limit,
+                                    Instant::now(),
+                                )
+                            {
+                                emit_concurrency_increase(&capacity_model_clone, adjustment);
+                            }
                             requests_processed.fetch_add(1, Ordering::Relaxed);
                             user_throughput.entry(user_id.clone()).or_insert_with(|| UserThroughputStats {
                                 completed: AtomicU64::new(0),
@@ -1136,6 +1246,18 @@ where
                         }
                         Ok(RequestCompletionResult::Failed(failed)) => {
                             tracing::Span::current().record("outcome", "failed");
+                            if is_downstream_overload(&failed.state.reason)
+                                && let Some(configured_limit) = model_concurrency_limits
+                                    .get(&capacity_model_clone)
+                                    .map(|limit| *limit)
+                                && let Some(adjustment) = adaptive_concurrency.record_overload(
+                                    &capacity_model_clone,
+                                    configured_limit,
+                                    Instant::now(),
+                                )
+                            {
+                                emit_concurrency_decrease(&capacity_model_clone, adjustment);
+                            }
                             let retry_attempt = failed.state.retry_attempt;
                             let reason_label = failed.state.reason.metric_label();
                             if failed.state.reason.is_retriable() {
@@ -1952,7 +2074,58 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
+
+    use super::adaptive_concurrency::AdaptiveConcurrencyController;
     use super::*;
+    use crate::request::FailureReason;
+
+    #[test]
+    fn available_capacity_uses_the_adaptive_limit_before_subtracting_in_flight() {
+        let controller = AdaptiveConcurrencyController::new(Duration::from_secs(1));
+        controller.record_overload("model", 100, Instant::now());
+
+        assert_eq!(
+            available_capacity_for_model(&controller, "model", 100, 20),
+            30
+        );
+        assert_eq!(
+            available_capacity_for_model(&controller, "other-model", 100, 20),
+            80
+        );
+        assert_eq!(
+            available_capacity_for_model(&controller, "model", 100, 60),
+            0
+        );
+    }
+
+    #[test]
+    fn only_http_529_is_a_downstream_overload_signal() {
+        for reason in [
+            FailureReason::RetriableHttpStatus {
+                status: 529,
+                body: String::new(),
+            },
+            FailureReason::NonRetriableHttpStatus {
+                status: 529,
+                body: String::new(),
+            },
+        ] {
+            assert!(is_downstream_overload(&reason));
+        }
+
+        for reason in [
+            FailureReason::RetriableHttpStatus {
+                status: 503,
+                body: String::new(),
+            },
+            FailureReason::NetworkError {
+                error: "connection reset".to_string(),
+            },
+        ] {
+            assert!(!is_downstream_overload(&reason));
+        }
+    }
 
     #[test]
     fn claim_failure_backoff_grows_exponentially_and_caps() {
