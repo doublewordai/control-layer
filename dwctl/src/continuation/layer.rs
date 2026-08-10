@@ -18,7 +18,7 @@
 //! **The tee loop.** Frames from leg 1 are forwarded to the client BYTE-FOR-BYTE
 //! (never re-serialized: a typed round-trip silently drops unknown fields — the
 //! lesson from `http_responses.body`) while a copy of the generation accumulates
-//! in a [`PlainContent`]. When the stream dies, [`detect::classify`] decides
+//! in the model's [`StreamAccumulator`]. When the stream dies, [`detect::classify`] decides
 //! whether it is resumable; if so the chain loop in [`super::resume`] renders the
 //! prefix, dispatches a `/v1/completions` leg on the global continuation key, and
 //! its chunks are reframed onto the client's original envelope. The client sees
@@ -50,7 +50,7 @@ use crate::db::models::api_keys::ApiKeyPurpose;
 use crate::inference::store::ONWARDS_RESPONSE_ID_HEADER;
 use crate::prompt_cache::sse::SseBufferedStream;
 
-use super::accumulate::{PlainContent, StreamAccumulator};
+use super::accumulate::{self, StreamAccumulator};
 use super::detect::{self, DeathEvent, Verdict};
 use super::metrics;
 use super::render::{RenderClient, RenderPrefix, RenderedPrefix};
@@ -390,7 +390,9 @@ fn tee(response: Response, state: ContinuationState, ctx: RequestContext) -> Res
 
     let stream = async_stream::stream! {
         let mut outcome = OutcomeGuard::new();
-        let mut acc = PlainContent::new(state.cfg.max_buffer_bytes);
+        // Which reconstructor this stream gets is a per-model capability lookup;
+        // see `accumulate::for_model`.
+        let mut acc: Box<dyn StreamAccumulator> = accumulate::for_model(&ctx.model, &state.cfg);
         let mut current: LegStream = Box::pin(SseBufferedStream::new(leg_one));
         // Is `current` a resume leg (text_completion chunks needing reframing)?
         let mut resuming = false;

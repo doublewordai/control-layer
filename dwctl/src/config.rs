@@ -1244,6 +1244,23 @@ pub struct ContinuationConfig {
     ///
     /// Set via environment: `DWCTL_CONTINUATION__MAX_INFLIGHT_PER_MODEL=8`
     pub max_inflight_per_model: u32,
+
+    /// Which reconstructor rebuilds the partial generation, per model alias.
+    ///
+    /// A stream is only resumable if we can rebuild the exact text the model had
+    /// already emitted. The default reconstructor handles plain `content` and
+    /// gives up on `reasoning_content` / `tool_calls`; a model whose family has a
+    /// byte-exactness verdict from the fidelity harness can name that family here
+    /// and stay resumable through reasoning and partial tool calls. Recognised
+    /// value: `dsv4` (DeepSeek-V4 / DSML). A model absent from the map — or
+    /// naming a family we do not know — keeps the default.
+    ///
+    /// This is deliberately a config map for the canary: it moves onto the
+    /// per-route DB row next to the `continuation` traffic rule once more than one
+    /// family is live.
+    ///
+    /// Set via environment: `DWCTL_CONTINUATION__MODEL_RECONSTRUCTORS='{"deepseek-ai/DeepSeek-V4-Flash":"dsv4"}'`
+    pub model_reconstructors: HashMap<String, String>,
 }
 
 impl Default for ContinuationConfig {
@@ -1257,6 +1274,7 @@ impl Default for ContinuationConfig {
             max_buffer_bytes: 2 * 1024 * 1024,
             priority: 100,
             max_inflight_per_model: 8,
+            model_reconstructors: HashMap::new(),
         }
     }
 }

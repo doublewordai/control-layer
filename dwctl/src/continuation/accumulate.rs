@@ -3,21 +3,28 @@
 //! A resume leg conditions the model on `messages`, the generation-prompt stub,
 //! and **the exact text the model had already emitted**. Getting that text wrong
 //! is the biggest correctness risk in this feature, so reconstruction lives behind a
-//! trait: [`StreamAccumulator`]. v1 ships one implementation, [`PlainContent`],
-//! which handles the case we can prove — plain `delta.content` — and DISARMS
-//! (never guesses) on everything else.
+//! trait: [`StreamAccumulator`], chosen per model by [`for_model`].
 //!
-//! Why disarm rather than approximate: onwards splits a model's single token
-//! sequence into separate delta fields (`content` vs `reasoning_content`), and
-//! tool calls arrive as structured fragments, not as the syntax the model
-//! actually sampled. Re-serializing those needs a per-model serializer whose
-//! output is byte-compared against real emissions — that's the fidelity-harness
-//! workstream. Until it issues a verdict for a model, a stream carrying those
-//! deltas is not reconstructable and the tee disarms with a labelled reason.
-//! Adding a reconstructor later is a new `impl StreamAccumulator`, nothing else.
+//! The default is [`PlainContent`], which handles the case we can prove — plain
+//! `delta.content` — and DISARMS (never guesses) on everything else. Why disarm
+//! rather than approximate: onwards splits a model's single token sequence into
+//! separate delta fields (`content` vs `reasoning_content`), and tool calls
+//! arrive as structured fragments, not as the syntax the model actually sampled.
+//! Re-serializing those needs a per-model serializer whose output is
+//! byte-compared against real emissions — that's the fidelity-harness workstream.
+//! Until it issues a verdict for a model, a stream carrying those deltas is not
+//! reconstructable and the tee disarms with a labelled reason.
+//!
+//! A model that HAS a verdict gets its family's reconstructor instead:
+//! [`super::dsv4::Dsv4Reconstructor`] for the DeepSeek-V4 (DSML) family, which
+//! makes mid-reasoning and mid-tool-call deaths resumable. Adding the next family
+//! is a new `impl StreamAccumulator` plus one arm in [`for_model`].
 
 use serde_json::Value;
 
+use crate::config::ContinuationConfig;
+
+use super::dsv4::Dsv4Reconstructor;
 use super::rewrap::Envelope;
 
 /// Why a stream stopped being reconstructable. Each maps to a bounded
@@ -59,6 +66,63 @@ pub trait StreamAccumulator: Send {
     fn continuation_text(&self) -> Option<String>;
     /// Retained generation length in bytes (cap accounting).
     fn len_bytes(&self) -> usize;
+    /// The original stream's identity, once a chunk has carried one, so resumed
+    /// frames can be reframed onto the client's stream.
+    fn envelope(&self) -> Option<&Envelope>;
+    /// Whether a `finish_reason` has been seen — the signal that separates "died
+    /// mid-generation" from "finished, trailer lost".
+    fn saw_finish_reason(&self) -> bool;
+    /// The disarm cause, if this stream is no longer reconstructable.
+    fn disarmed(&self) -> Option<AccumulateError>;
+}
+
+/// Pick the accumulator for `model`.
+///
+/// Selection is a capability lookup, not a guess: a model gets a family
+/// reconstructor only once the fidelity harness has issued a byte-exactness
+/// verdict for it, and until then it gets [`PlainContent`] — the same behaviour
+/// as before any reconstructor existed. An unrecognised value falls back the same
+/// way, so a typo degrades resumability instead of corrupting a prefix.
+///
+/// `continuation.model_reconstructors` is the v1 home for that lookup because it
+/// needs no schema change to canary one model. It moves onto the per-route DB row
+/// (alongside the `continuation` traffic rule that already gates which models are
+/// resumable at all) once more than one family is live, at which point the two
+/// halves of "is this model resumable" stop being configured in two places.
+pub fn for_model(model: &str, cfg: &ContinuationConfig) -> Box<dyn StreamAccumulator> {
+    match cfg.model_reconstructors.get(model).map(String::as_str) {
+        Some("dsv4") => Box::new(Dsv4Reconstructor::new(cfg.max_buffer_bytes)),
+        _ => Box::new(PlainContent::new(cfg.max_buffer_bytes)),
+    }
+}
+
+/// Capture id/model/created the first time a chunk carries them.
+pub(super) fn capture_envelope(slot: &mut Option<Envelope>, chunk: &Value) {
+    if slot.is_some() {
+        return;
+    }
+    let Some(id) = chunk.get("id").and_then(Value::as_str) else {
+        return;
+    };
+    *slot = Some(Envelope {
+        id: id.to_string(),
+        model: chunk.get("model").and_then(Value::as_str).unwrap_or_default().to_string(),
+        created: chunk.get("created").and_then(Value::as_u64).unwrap_or(0),
+    });
+}
+
+/// The chunk's single choice. `Ok(None)` means there is nothing to process —
+/// usage-only trailers and keep-alives carry no choices.
+pub(super) fn single_choice(chunk: &Value) -> Result<Option<&Value>, AccumulateError> {
+    let Some(choices) = chunk.get("choices").and_then(Value::as_array) else {
+        return Ok(None);
+    };
+    if choices.len() > 1 {
+        // `n > 1`: several independent generations share one stream, and a
+        // completions resume produces one.
+        return Err(AccumulateError::MultiChoice);
+    }
+    Ok(choices.first())
 }
 
 /// The v1 accumulator: plain `choices[0].delta.content` concatenation.
@@ -86,42 +150,12 @@ impl PlainContent {
         }
     }
 
-    /// The original stream's identity, once a chunk has carried one.
-    pub fn envelope(&self) -> Option<&Envelope> {
-        self.envelope.as_ref()
-    }
-
-    /// Whether a `finish_reason` has been seen — i.e. the model said it was done.
-    pub fn saw_finish_reason(&self) -> bool {
-        self.finish_reason
-    }
-
-    /// The disarm cause, if this stream is no longer reconstructable.
-    pub fn disarmed(&self) -> Option<AccumulateError> {
-        self.disarmed
-    }
-
     /// Disarm and drop the buffer. Sticky: the first cause is kept.
     fn disarm(&mut self, cause: AccumulateError) -> Result<(), AccumulateError> {
         self.text.clear();
         self.text.shrink_to_fit();
         let cause = *self.disarmed.get_or_insert(cause);
         Err(cause)
-    }
-
-    /// Capture id/model/created the first time a chunk carries them.
-    fn capture_envelope(&mut self, chunk: &Value) {
-        if self.envelope.is_some() {
-            return;
-        }
-        let Some(id) = chunk.get("id").and_then(Value::as_str) else {
-            return;
-        };
-        self.envelope = Some(Envelope {
-            id: id.to_string(),
-            model: chunk.get("model").and_then(Value::as_str).unwrap_or_default().to_string(),
-            created: chunk.get("created").and_then(Value::as_u64).unwrap_or(0),
-        });
     }
 }
 
@@ -130,17 +164,12 @@ impl StreamAccumulator for PlainContent {
         if let Some(cause) = self.disarmed {
             return Err(cause);
         }
-        self.capture_envelope(chunk);
+        capture_envelope(&mut self.envelope, chunk);
 
-        let Some(choices) = chunk.get("choices").and_then(Value::as_array) else {
-            // Usage-only trailers and keep-alives carry no choices — nothing to do.
-            return Ok(());
-        };
-        if choices.len() > 1 {
-            return self.disarm(AccumulateError::MultiChoice);
-        }
-        let Some(choice) = choices.first() else {
-            return Ok(());
+        let choice = match single_choice(chunk) {
+            Ok(Some(choice)) => choice,
+            Ok(None) => return Ok(()),
+            Err(cause) => return self.disarm(cause),
         };
 
         if choice.get("finish_reason").is_some_and(|f| !f.is_null()) {
@@ -180,6 +209,18 @@ impl StreamAccumulator for PlainContent {
 
     fn len_bytes(&self) -> usize {
         self.text.len()
+    }
+
+    fn envelope(&self) -> Option<&Envelope> {
+        self.envelope.as_ref()
+    }
+
+    fn saw_finish_reason(&self) -> bool {
+        self.finish_reason
+    }
+
+    fn disarmed(&self) -> Option<AccumulateError> {
+        self.disarmed
     }
 }
 
@@ -312,6 +353,68 @@ mod tests {
         assert_eq!(err.reason(), "cap_exceeded");
         assert_eq!(acc.len_bytes(), 0);
         assert_eq!(acc.continuation_text(), None);
+    }
+
+    // ── per-model selection ──────────────────────────────────────────────────
+
+    fn cfg_with(entries: &[(&str, &str)]) -> ContinuationConfig {
+        ContinuationConfig {
+            max_buffer_bytes: CAP,
+            model_reconstructors: entries.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+            ..Default::default()
+        }
+    }
+
+    /// A reasoning delta is the cheapest way to tell the two apart from behind
+    /// the trait: `PlainContent` disarms on it, the DSV4 reconstructor keeps it.
+    fn survives_reasoning(acc: &mut dyn StreamAccumulator) -> bool {
+        acc.ingest(&json!({"id": "chatcmpl-1", "choices": [{"delta": {"reasoning_content": "hmm"}}]}))
+            .is_ok()
+    }
+
+    #[test]
+    fn a_mapped_model_gets_its_family_reconstructor() {
+        let cfg = cfg_with(&[("deepseek-ai/DeepSeek-V4-Flash", "dsv4")]);
+        let mut acc = for_model("deepseek-ai/DeepSeek-V4-Flash", &cfg);
+        assert!(survives_reasoning(acc.as_mut()));
+        assert_eq!(acc.continuation_text().as_deref(), Some("hmm"));
+    }
+
+    #[test]
+    fn every_other_model_keeps_the_plain_content_behaviour() {
+        let cfg = cfg_with(&[("deepseek-ai/DeepSeek-V4-Flash", "dsv4")]);
+        for model in ["gpt-4o", "deepseek-ai/DeepSeek-V4-Flash-0731", ""] {
+            let mut acc = for_model(model, &cfg);
+            assert!(!survives_reasoning(acc.as_mut()), "{model} must not be reconstructed as dsv4");
+        }
+        // Including when nothing is configured at all.
+        let mut acc = for_model("deepseek-ai/DeepSeek-V4-Flash", &ContinuationConfig::default());
+        assert!(!survives_reasoning(acc.as_mut()));
+    }
+
+    #[test]
+    fn an_unrecognised_family_falls_back_instead_of_guessing() {
+        let cfg = cfg_with(&[("m", "glm5"), ("n", "DSV4")]);
+        for model in ["m", "n"] {
+            let mut acc = for_model(model, &cfg);
+            assert!(
+                !survives_reasoning(acc.as_mut()),
+                "{model}: a typo degrades resumability, never fidelity"
+            );
+        }
+    }
+
+    #[test]
+    fn the_configured_cap_reaches_both_accumulators() {
+        let cfg = ContinuationConfig {
+            max_buffer_bytes: 4,
+            ..cfg_with(&[("dsv4-model", "dsv4")])
+        };
+        for model in ["dsv4-model", "plain-model"] {
+            let mut acc = for_model(model, &cfg);
+            let err = acc.ingest(&content_chunk("12345")).unwrap_err();
+            assert_eq!(err, AccumulateError::CapExceeded, "{model}");
+        }
     }
 
     #[test]
