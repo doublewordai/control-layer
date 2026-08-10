@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT auto_join_enabled\n            FROM users\n            WHERE id = $1 AND user_type = 'organization' AND is_deleted = false\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "auto_join_enabled",
+        "type_info": "Bool"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "ae1256b665c88c8a27df46f297e5486946ba2ad1ceacc04b835457392727323f"
+}

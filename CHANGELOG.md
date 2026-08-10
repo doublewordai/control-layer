@@ -1,5 +1,25 @@
 # Changelog
 
+## [10.9.1](https://github.com/doublewordai/control-layer/compare/v10.9.0...v10.9.1) (2026-08-08)
+
+
+### Bug Fixes
+
+* preserve sanitized upstream error statuses ([#1458](https://github.com/doublewordai/control-layer/issues/1458)) ([5b92a8d](https://github.com/doublewordai/control-layer/commit/5b92a8d9c89a2482441e67e75fc4129e9c1e8535))
+
+## [10.9.0](https://github.com/doublewordai/control-layer/compare/v10.8.0...v10.9.0) (2026-08-07)
+
+
+### Features
+
+* **organizations:** let a user see their own pending join requests ([#1449](https://github.com/doublewordai/control-layer/issues/1449)) ([fda6491](https://github.com/doublewordai/control-layer/commit/fda64919e50e846cf4e291b44ae1bcbba9a573d6))
+* **organizations:** route onboarding on invitation, domain and auto-join ([#1455](https://github.com/doublewordai/control-layer/issues/1455)) ([d1db87a](https://github.com/doublewordai/control-layer/commit/d1db87a3b542a1d1a528a4b2bb3163dc6ab2088b))
+
+
+### Bug Fixes
+
+* **ci:** track the fusillade-arsenal 4.0.0 release baseline ([#1452](https://github.com/doublewordai/control-layer/issues/1452)) ([a090ad6](https://github.com/doublewordai/control-layer/commit/a090ad68ea86ab693a0c8486b5eb8fba69f557ee))
+
 ## [10.8.0](https://github.com/doublewordai/control-layer/compare/v10.7.2...v10.8.0) (2026-08-06)
 
 

@@ -22,7 +22,9 @@ use uuid::Uuid;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use crate::response_loop::{LoopConfig, LoopError, UpstreamTarget, run_response_loop};
+use crate::response_loop::{
+    LoopConfig, LoopError, UpstreamTarget, failure_http_status, run_response_loop,
+};
 use crate::traits::{
     ChainStep, MultiStepStore, NextAction, RecordedStep, RequestContext, StepDescriptor, StepKind,
     StepState, StoreError, ToolError, ToolExecutor, ToolKind, ToolSchema,
@@ -577,6 +579,82 @@ async fn step_failure_does_not_abort_loop() {
     assert_eq!(snap.fail_order[0].0, "step_001");
     assert_eq!(snap.complete_order.len(), 1, "second call completes");
     assert_eq!(snap.complete_order[0].0, "step_002");
+}
+
+#[tokio::test]
+async fn model_call_failure_preserves_status_without_provider_text() {
+    const PROVIDER_SECRET: &str = "provider account 7 has insufficient credits";
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat"))
+        .respond_with(ResponseTemplate::new(400).set_body_string(PROVIDER_SECRET))
+        .mount(&server)
+        .await;
+
+    let store = MockStore::new();
+    let tool_exec = ScriptedToolExecutor::new();
+    let ctx = RequestContext::new();
+    let target = UpstreamTarget {
+        endpoint: server.uri(),
+        path: "/chat".into(),
+        api_key: None,
+    };
+    store.script(
+        None,
+        vec![
+            NextAction::AppendSteps(vec![model_call(json!({}))]),
+            NextAction::Complete(json!({"handled": true})),
+        ],
+    );
+
+    run_response_loop(
+        &store,
+        &tool_exec,
+        &ctx,
+        &target,
+        http_client_for_tests(),
+        None,
+        "req_1",
+        None,
+        LoopConfig::default(),
+        0,
+    )
+    .await
+    .unwrap();
+
+    let snap = store.snapshot();
+    assert_eq!(snap.fail_order.len(), 1);
+    assert_eq!(
+        snap.fail_order[0].1,
+        json!({
+            "type": "upstream_error",
+            "message": "Upstream request failed",
+            "status": 400,
+        })
+    );
+    assert!(!snap.fail_order[0].1.to_string().contains(PROVIDER_SECRET));
+}
+
+#[test]
+fn failure_http_status_accepts_only_typed_valid_statuses() {
+    for status in [300, 400, 599] {
+        let payload = json!({"type": "upstream_error", "status": status});
+        assert_eq!(failure_http_status(&payload), Some(status));
+    }
+
+    for payload in [
+        json!({"type": "upstream_error", "status": 100}),
+        json!({"type": "upstream_error", "status": 200}),
+        json!({"type": "upstream_error", "status": 299}),
+        json!({"type": "upstream_error", "status": 99}),
+        json!({"type": "upstream_error", "status": 600}),
+        json!({"type": "upstream_error", "status": "400"}),
+        json!({"type": "tool_error", "status": 400}),
+        json!({"type": "upstream_error"}),
+    ] {
+        assert_eq!(failure_http_status(&payload), None);
+    }
 }
 
 #[tokio::test]

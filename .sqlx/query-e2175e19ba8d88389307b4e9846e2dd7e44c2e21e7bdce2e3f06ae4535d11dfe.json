@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            INSERT INTO user_organizations (user_id, organization_id, role, status)\n            VALUES ($1, $2, 'member', 'requested')\n            RETURNING id, user_id, organization_id, role, status, created_at,\n                      invite_email, invited_by, expires_at\n            ",
+  "query": "\n            SELECT uo.id, uo.user_id, uo.organization_id, uo.role, uo.status,\n                   uo.created_at, uo.invite_email, uo.invited_by, uo.expires_at\n            FROM user_organizations uo\n            INNER JOIN users o ON o.id = uo.organization_id\n            WHERE LOWER(uo.invite_email) = LOWER($1)\n              AND uo.status = 'pending'\n              AND o.is_deleted = false\n              AND (uo.expires_at IS NULL OR uo.expires_at > NOW())\n            ORDER BY uo.created_at ASC\n            LIMIT 1\n            ",
   "describe": {
     "columns": [
       {
@@ -51,8 +51,7 @@
     ],
     "parameters": {
       "Left": [
-        "Uuid",
-        "Uuid"
+        "Text"
       ]
     },
     "nullable": [
@@ -67,5 +66,5 @@
       true
     ]
   },
-  "hash": "16161654b04e7faa5eacd3f40e6a4fad922fc28f8d87cbdb8b124414446ed6d5"
+  "hash": "e2175e19ba8d88389307b4e9846e2dd7e44c2e21e7bdce2e3f06ae4535d11dfe"
 }
