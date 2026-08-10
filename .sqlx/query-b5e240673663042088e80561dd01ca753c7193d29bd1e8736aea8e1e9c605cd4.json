@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT deployed_model_id FROM deployed_model_components\n             WHERE composite_model_id = $1 AND role = 'completions'",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "deployed_model_id",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "b5e240673663042088e80561dd01ca753c7193d29bd1e8736aea8e1e9c605cd4"
+}

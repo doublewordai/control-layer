@@ -838,6 +838,53 @@ impl DeployedModelResponse {
 
 // ===== Composite Model Component Types =====
 
+/// Which request classes a composite member serves.
+///
+/// Emitted to onwards as the provider's `serves` tag. The filter engages only
+/// when a composite has a `Completions` member, so tagging is inert until
+/// somebody attaches a validated continuation target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ComponentRole {
+    /// Eligible for every request. On-prem/dynamo members are these: dynamo
+    /// should serve resume legs first (free for us, fails fast when the model
+    /// is not live).
+    Both,
+    /// Everything EXCEPT completions-class requests. Third-party chat failovers
+    /// are these — none of them is validated to continue a token-id prefix.
+    Chat,
+    /// ONLY completions-class requests: the validated continuation target. At
+    /// most one per composite.
+    Completions,
+}
+
+impl ComponentRole {
+    /// The stored/wire value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ComponentRole::Both => "both",
+            ComponentRole::Chat => "chat",
+            ComponentRole::Completions => "completions",
+        }
+    }
+
+    /// Parse a stored value, falling back to the column default for anything
+    /// unrecognised (a row can only hold the three the CHECK constraint allows).
+    pub fn from_db(value: &str) -> Self {
+        match value {
+            "both" => ComponentRole::Both,
+            "completions" => ComponentRole::Completions,
+            _ => ComponentRole::Chat,
+        }
+    }
+}
+
+/// The column default: an unqualified member serves chat traffic. Adding a
+/// component therefore never silently creates a continuation target.
+fn default_component_role() -> ComponentRole {
+    ComponentRole::Chat
+}
+
 /// Request to add a component to a composite model
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ModelComponentCreate {
@@ -852,6 +899,9 @@ pub struct ModelComponentCreate {
     /// PATCH endpoint's `sort_order` to reorder. Retained for API compatibility.
     #[serde(default)]
     pub sort_order: i32,
+    /// Which request classes this member serves. Defaults to `chat`.
+    #[serde(default = "default_component_role")]
+    pub role: ComponentRole,
 }
 
 fn default_weight() -> i32 {
@@ -874,6 +924,8 @@ pub struct ModelComponentUpdate {
     /// dense, unique 0..n-1 sequence — two components can never share a position.
     /// Out-of-range values are clamped. Omit to leave the order unchanged.
     pub sort_order: Option<i32>,
+    /// Which request classes this member serves. Omit to leave it unchanged.
+    pub role: Option<ComponentRole>,
 }
 
 /// Summary of a model used as a component in a composite model
@@ -915,6 +967,8 @@ pub struct ModelComponentResponse {
     pub weight: i32,
     /// Whether this component is enabled
     pub enabled: bool,
+    /// Which request classes this member serves
+    pub role: ComponentRole,
     /// Sort order for priority-based routing (lower = higher priority)
     pub sort_order: i32,
     /// When this component was added

@@ -7,7 +7,7 @@ use metrics::histogram;
 use onwards::target::{
     Auth, BackoffConfig as OnwardsBackoffConfig, ConcurrencyLimitParameters, ConfigFile, FallbackConfig as OnwardsFallbackConfig,
     JitterStrategy as OnwardsJitterStrategy, KeyDefinition, LoadBalanceStrategy as OnwardsLoadBalanceStrategy, OpenResponsesConfig,
-    PoolSpec, ProviderSpec, RateLimitParameters, RoutingAction, RoutingRule, TargetSpecOrList, Targets, WatchTargetsStream,
+    PoolSpec, ProviderSpec, RateLimitParameters, RoutingAction, RoutingRule, ServesScope, TargetSpecOrList, Targets, WatchTargetsStream,
 };
 use sqlx::{PgPool, postgres::PgListener};
 use tokio::sync::{mpsc, watch};
@@ -441,10 +441,26 @@ impl OnwardsConfigSync {
 // Composite models are stored in the deployed_models table with is_composite = TRUE.
 // They have NULL hosted_on and instead have components in deployed_model_components.
 
+/// Map `deployed_model_components.role` onto onwards' member scope.
+///
+/// Unrecognised values fall back to `Chat` — the column's own default and the
+/// conservative direction: a member we cannot classify never receives
+/// continuation resume traffic.
+fn serves_scope(role: &str) -> ServesScope {
+    match role {
+        "both" => ServesScope::Both,
+        "completions" => ServesScope::Completions,
+        _ => ServesScope::Chat,
+    }
+}
+
 /// Data structure for composite model components (prepared for onwards integration)
 #[derive(Debug, Clone)]
 struct CompositeModelComponent {
     weight: i32,
+    /// Which request classes this member serves, straight from
+    /// `deployed_model_components.role`.
+    role: String,
     // Component target info (from the underlying deployed_model)
     target: OnwardsTarget,
 }
@@ -524,6 +540,7 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
             -- Component info
             dmc.deployed_model_id,
             dmc.weight,
+            dmc.role as component_role,
             -- Underlying deployment info
             dm.model_name,
             dm.alias as deployment_alias,
@@ -765,6 +782,7 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
         if let Some(composite) = composite_map.get_mut(&row.composite_model_id) {
             composite.components.push(CompositeModelComponent {
                 weight: row.weight,
+                role: row.component_role.clone(),
                 target: OnwardsTarget {
                     model_name: row.model_name.clone(),
                     alias: row.deployment_alias.clone(),
@@ -1008,6 +1026,12 @@ fn convert_composite_to_target_spec(
                     // leaked to them.
                     propagate_trace_context: None,
                     reasoning_translation: target.reasoning_translation.clone().map(Into::into),
+                    // The pool member's request-class scope. Emitted explicitly
+                    // for every member (never left to onwards' `both` default)
+                    // so the completions filter sees the operator's intent, not
+                    // a fallback: today's third-party failovers are `chat` and
+                    // must not receive resume legs.
+                    serves: serves_scope(&component.role),
                 }
             }
         })
@@ -1170,6 +1194,9 @@ fn convert_to_config_file(
                 }),
                 request_timeout_secs: None,
                 trusted: Some(target.trusted),
+                // A non-composite model is its own single provider: it serves
+                // whatever it is asked, exactly as before.
+                serves: ServesScope::Both,
                 // None → inherit from resolved `trusted` (see composite-model
                 // site above): self-hosted providers propagate W3C trace
                 // context, third-party providers do not.

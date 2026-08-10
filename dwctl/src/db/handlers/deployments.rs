@@ -964,9 +964,9 @@ impl<'c> Deployments<'c> {
         let result = sqlx::query!(
             r#"
             WITH inserted AS (
-                INSERT INTO deployed_model_components (composite_model_id, deployed_model_id, weight, enabled, sort_order)
-                VALUES ($1, $2, $3, $4, $5)
-                RETURNING id, composite_model_id, deployed_model_id, weight, enabled, sort_order, created_at
+                INSERT INTO deployed_model_components (composite_model_id, deployed_model_id, weight, enabled, sort_order, role)
+                VALUES ($1, $2, $3, $4, $5, $6)
+                RETURNING id, composite_model_id, deployed_model_id, weight, enabled, sort_order, role, created_at
             )
             SELECT
                 inserted.id,
@@ -975,6 +975,7 @@ impl<'c> Deployments<'c> {
                 inserted.weight,
                 inserted.enabled,
                 inserted.sort_order,
+                inserted.role,
                 inserted.created_at,
                 dm.alias as model_alias,
                 dm.model_name,
@@ -992,7 +993,8 @@ impl<'c> Deployments<'c> {
             request.deployed_model_id,
             request.weight,
             request.enabled,
-            request.sort_order
+            request.sort_order,
+            request.role
         )
         .fetch_one(&mut *self.db)
         .await?;
@@ -1004,6 +1006,7 @@ impl<'c> Deployments<'c> {
             weight: result.weight,
             enabled: result.enabled,
             sort_order: result.sort_order,
+            role: result.role,
             created_at: result.created_at,
             model_alias: result.model_alias,
             model_name: result.model_name,
@@ -1042,6 +1045,7 @@ impl<'c> Deployments<'c> {
                 dmc.weight,
                 dmc.enabled,
                 dmc.sort_order,
+                dmc.role,
                 dmc.created_at,
                 dm.alias as model_alias,
                 dm.model_name,
@@ -1071,6 +1075,7 @@ impl<'c> Deployments<'c> {
                 weight: r.weight,
                 enabled: r.enabled,
                 sort_order: r.sort_order,
+                role: r.role,
                 created_at: r.created_at,
                 model_alias: r.model_alias,
                 model_name: r.model_name,
@@ -1103,6 +1108,7 @@ impl<'c> Deployments<'c> {
                 dmc.weight,
                 dmc.enabled,
                 dmc.sort_order,
+                dmc.role,
                 dmc.created_at,
                 dm.alias as model_alias,
                 dm.model_name,
@@ -1133,6 +1139,7 @@ impl<'c> Deployments<'c> {
                 weight: r.weight,
                 enabled: r.enabled,
                 sort_order: r.sort_order,
+                role: r.role,
                 created_at: r.created_at,
                 model_alias: r.model_alias,
                 model_name: r.model_name,
@@ -1173,6 +1180,11 @@ impl<'c> Deployments<'c> {
                 weight,
                 enabled,
                 sort_order,
+                // Bulk replacement predates roles and has no way to express one;
+                // it writes the column default, so a composite rebuilt this way
+                // keeps today's behaviour. Roles are set per component via the
+                // components API (or SQL for the canary).
+                role: "chat".to_string(),
             };
             results.push(self.add_component(&request).await?);
         }
@@ -1332,6 +1344,7 @@ impl<'c> Deployments<'c> {
                 dmc.weight,
                 dmc.enabled,
                 dmc.sort_order,
+                dmc.role,
                 dmc.created_at,
                 dm.alias as model_alias,
                 dm.model_name,
@@ -1359,6 +1372,7 @@ impl<'c> Deployments<'c> {
             weight: r.weight,
             enabled: r.enabled,
             sort_order: r.sort_order,
+            role: r.role,
             created_at: r.created_at,
             model_alias: r.model_alias,
             model_name: r.model_name,
@@ -1369,6 +1383,21 @@ impl<'c> Deployments<'c> {
             model_trusted: r.model_trusted,
             model_open_responses_adapter: r.model_open_responses_adapter.unwrap_or(true),
         }))
+    }
+
+    /// The deployed-model id of this composite's `completions` member, if it has
+    /// one. Used to turn "at most one completions member" into a clear 400
+    /// instead of a unique-index violation surfacing as a 500.
+    #[instrument(skip(self), fields(composite_id = %abbrev_uuid(&composite_model_id)), err)]
+    pub async fn completions_component(&mut self, composite_model_id: DeploymentId) -> Result<Option<DeploymentId>> {
+        let existing = sqlx::query_scalar!(
+            "SELECT deployed_model_id FROM deployed_model_components
+             WHERE composite_model_id = $1 AND role = 'completions'",
+            composite_model_id
+        )
+        .fetch_optional(&mut *self.db)
+        .await?;
+        Ok(existing)
     }
 
     /// Update a component's weight and/or enabled status, and optionally move it to
@@ -1388,18 +1417,21 @@ impl<'c> Deployments<'c> {
         weight: Option<i32>,
         enabled: Option<bool>,
         sort_order: Option<i32>,
+        role: Option<String>,
     ) -> Result<Option<DeploymentComponentDBResponse>> {
-        // Apply weight/enabled first; this also tells us whether the component exists.
+        // Apply weight/enabled/role first; this also tells us whether the component exists.
         let exists = sqlx::query_scalar!(
             "UPDATE deployed_model_components
              SET weight = COALESCE($3, weight),
-                 enabled = COALESCE($4, enabled)
+                 enabled = COALESCE($4, enabled),
+                 role = COALESCE($5, role)
              WHERE composite_model_id = $1 AND deployed_model_id = $2
              RETURNING id",
             composite_model_id,
             deployed_model_id,
             weight,
-            enabled
+            enabled,
+            role
         )
         .fetch_optional(&mut *self.db)
         .await?;
@@ -4708,6 +4740,7 @@ mod tests {
                     weight: 50,
                     enabled: true,
                     sort_order,
+                    role: "chat".to_string(),
                 })
                 .await
                 .unwrap();
@@ -4739,6 +4772,7 @@ mod tests {
                     weight,
                     enabled: true,
                     sort_order: 0,
+                    role: "chat".to_string(),
                 })
                 .await
                 .unwrap();
@@ -4774,6 +4808,7 @@ mod tests {
                     weight: 50,
                     enabled: true,
                     sort_order: i as i32,
+                    role: "chat".to_string(),
                 })
                 .await
                 .unwrap();
@@ -4786,7 +4821,7 @@ mod tests {
         {
             let mut repo = Deployments::new(tx.acquire().await.unwrap());
             let moved = repo
-                .update_component(composite, components[2], None, None, Some(0))
+                .update_component(composite, components[2], None, None, Some(0), None)
                 .await
                 .unwrap()
                 .expect("component exists");
@@ -4805,7 +4840,7 @@ mod tests {
         let mut tx = pool.begin().await.unwrap();
         {
             let mut repo = Deployments::new(tx.acquire().await.unwrap());
-            repo.update_component(composite, components[2], None, None, Some(999))
+            repo.update_component(composite, components[2], None, None, Some(999), None)
                 .await
                 .unwrap()
                 .expect("component exists");
@@ -4821,7 +4856,7 @@ mod tests {
         let mut tx = pool.begin().await.unwrap();
         {
             let mut repo = Deployments::new(tx.acquire().await.unwrap());
-            repo.update_component(composite, components[0], Some(99), None, None)
+            repo.update_component(composite, components[0], Some(99), None, None, None)
                 .await
                 .unwrap()
                 .expect("component exists");
@@ -4847,6 +4882,7 @@ mod tests {
                     weight: 50,
                     enabled: true,
                     sort_order: i as i32,
+                    role: "chat".to_string(),
                 })
                 .await
                 .unwrap();

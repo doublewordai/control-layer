@@ -437,6 +437,8 @@ pub struct DeploymentComponentCreateDBRequest {
     pub weight: i32,
     pub enabled: bool,
     pub sort_order: i32,
+    /// Which request classes this member serves (`both` | `chat` | `completions`).
+    pub role: String,
 }
 
 /// Database response for a deployment component (flat structure with joined model info)
@@ -449,6 +451,8 @@ pub struct DeploymentComponentDBResponse {
     pub weight: i32,
     pub enabled: bool,
     pub sort_order: i32,
+    /// Which request classes this member serves (`both` | `chat` | `completions`).
+    pub role: String,
     pub created_at: DateTime<Utc>,
     // Joined model fields
     pub model_alias: String,

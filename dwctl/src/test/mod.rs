@@ -2525,3 +2525,98 @@ async fn test_read_pool_enforces_readonly(pool: PgPool) {
 
     assert!(result.is_ok(), "Write operation on write pool should succeed");
 }
+
+/// The components API round-trips the member's request-class role, and holds
+/// the one-completions-member-per-composite invariant.
+#[sqlx::test]
+#[test_log::test]
+async fn test_component_role_round_trips_and_is_unique_for_completions(pool: PgPool) {
+    let (server, _bg) = utils::create_test_app(pool.clone(), false).await;
+    let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
+    let headers = add_auth_headers(&admin);
+
+    let endpoint: serde_json::Value = server
+        .post("/admin/api/v1/endpoints")
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .json(&serde_json::json!({"name": "Test Endpoint", "url": "https://api.example.com/v1"}))
+        .await
+        .json();
+
+    let mut members = Vec::new();
+    for name in ["dynamo-flash", "fireworks-flash", "novita-flash"] {
+        let model: serde_json::Value = server
+            .post("/admin/api/v1/models")
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .json(&serde_json::json!({"type": "standard", "model_name": name, "hosted_on": endpoint["id"]}))
+            .await
+            .json();
+        members.push(model["id"].as_str().unwrap().to_string());
+    }
+
+    let composite: serde_json::Value = server
+        .post("/admin/api/v1/models")
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .json(&serde_json::json!({"type": "composite", "model_name": "dsv4-flash"}))
+        .await
+        .json();
+    let composite_id = composite["id"].as_str().unwrap().to_string();
+
+    // An untagged add keeps today's behaviour: a chat member.
+    let plain = server
+        .post(&format!("/admin/api/v1/models/{composite_id}/components/{}", members[2]))
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .json(&serde_json::json!({"weight": 50}))
+        .await;
+    assert_eq!(plain.status_code(), 200);
+    assert_eq!(plain.json::<serde_json::Value>()["role"], "chat");
+
+    let on_prem = server
+        .post(&format!("/admin/api/v1/models/{composite_id}/components/{}", members[0]))
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .json(&serde_json::json!({"weight": 50, "role": "both"}))
+        .await;
+    assert_eq!(on_prem.status_code(), 200);
+    assert_eq!(on_prem.json::<serde_json::Value>()["role"], "both");
+
+    let validated = server
+        .post(&format!("/admin/api/v1/models/{composite_id}/components/{}", members[1]))
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .json(&serde_json::json!({"weight": 50, "role": "completions"}))
+        .await;
+    assert_eq!(validated.status_code(), 200);
+    assert_eq!(validated.json::<serde_json::Value>()["role"], "completions");
+
+    // A second completions member is refused with a clear 400, not a unique-index 500.
+    let second = server
+        .patch(&format!("/admin/api/v1/models/{composite_id}/components/{}", members[2]))
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .json(&serde_json::json!({"role": "completions"}))
+        .await;
+    assert_eq!(second.status_code(), 400, "at most one completions member per composite");
+
+    // Promoting a chat member to `both` is fine, and the listing reflects it.
+    let promoted = server
+        .patch(&format!("/admin/api/v1/models/{composite_id}/components/{}", members[2]))
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .json(&serde_json::json!({"role": "both"}))
+        .await;
+    assert_eq!(promoted.status_code(), 200);
+
+    let listed: serde_json::Value = server
+        .get(&format!("/admin/api/v1/models/{composite_id}/components"))
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .await
+        .json();
+    let roles: Vec<&str> = listed.as_array().unwrap().iter().map(|c| c["role"].as_str().unwrap()).collect();
+    assert_eq!(roles.iter().filter(|r| **r == "completions").count(), 1);
+    assert_eq!(roles.iter().filter(|r| **r == "both").count(), 2);
+}

@@ -11,8 +11,8 @@ use crate::{
     AppState,
     api::models::{
         deployments::{
-            ComponentEndpointSummary, ComponentModelSummary, DeployedModelCreate, DeployedModelResponse, DeployedModelUpdate,
-            GetModelQuery, ListModelsQuery, ModelComponentResponse, enrichment::DeployedModelEnricher,
+            ComponentEndpointSummary, ComponentModelSummary, ComponentRole, DeployedModelCreate, DeployedModelResponse,
+            DeployedModelUpdate, GetModelQuery, ListModelsQuery, ModelComponentResponse, enrichment::DeployedModelEnricher,
         },
         users::CurrentUser,
     },
@@ -26,7 +26,7 @@ use crate::{
     },
     errors::{Error, Result},
     reasoning::ReasoningTranslationOverrides,
-    types::{DeploymentId, Resource},
+    types::{DeploymentId, InferenceEndpointId, Resource},
 };
 use axum::{
     extract::{Path, Query, State},
@@ -148,11 +148,47 @@ async fn resolve_traffic_rules(
     Ok(resolved)
 }
 
+/// Guard the two invariants a `completions` member carries (v1):
+///
+/// 1. **At most one per composite.** The resume path has no reason to fail over
+///    between validated targets yet, and a second one would make "which target
+///    served this seam?" ambiguous. A partial unique index enforces it in the
+///    database; this turns the violation into a clear 400.
+/// 2. **It must be reachable over HTTP** — a continuation leg is an ordinary
+///    `/v1/completions` call to a provider, so the component's model needs an
+///    inference endpoint. (Composite components always do today; the check keeps
+///    that from becoming an assumption.)
+async fn validate_completions_role(
+    repo: &mut Deployments<'_>,
+    composite_id: DeploymentId,
+    component_id: DeploymentId,
+    role: ComponentRole,
+    component_hosted_on: Option<InferenceEndpointId>,
+) -> Result<()> {
+    if role != ComponentRole::Completions {
+        return Ok(());
+    }
+    if component_hosted_on.is_none() {
+        return Err(Error::BadRequest {
+            message: "A completions component must be hosted on an inference endpoint".to_string(),
+        });
+    }
+    if let Some(existing) = repo.completions_component(composite_id).await?
+        && existing != component_id
+    {
+        return Err(Error::BadRequest {
+            message: format!("Composite model already has a completions component ({existing})"),
+        });
+    }
+    Ok(())
+}
+
 /// Convert a DB component response to an API component response
 fn db_component_to_response(c: DeploymentComponentDBResponse) -> ModelComponentResponse {
     ModelComponentResponse {
         weight: c.weight,
         enabled: c.enabled,
+        role: ComponentRole::from_db(&c.role),
         sort_order: c.sort_order,
         created_at: c.created_at,
         model: ComponentModelSummary {
@@ -1235,6 +1271,8 @@ pub async fn add_model_component<P: PoolProvider>(
                 message: "Cannot add a composite model as a component".to_string(),
             });
         }
+
+        validate_completions_role(&mut repo, id, component_id, body.role, component.hosted_on).await?;
     }
 
     // Add the component. Its priority position is always assigned by the server
@@ -1252,6 +1290,7 @@ pub async fn add_model_component<P: PoolProvider>(
         weight: body.weight,
         enabled: body.enabled,
         sort_order,
+        role: body.role.as_str().to_string(),
     };
 
     let component = repo.add_component(&request).await?;
@@ -1308,12 +1347,26 @@ pub async fn update_model_component<P: PoolProvider>(
         // Serialize with other component mutations on this composite so the
         // move-and-reindex below isn't interleaved with a concurrent add/reorder.
         repo.lock_composite(id).await?;
-        repo.update_component(id, component_id, body.weight, body.enabled, body.sort_order)
-            .await?
-            .ok_or_else(|| Error::NotFound {
-                resource: "component".to_string(),
-                id: format!("{}/{}", id, component_id),
-            })?
+        if let Some(role) = body.role {
+            let component = repo.get_by_id(component_id).await?.ok_or_else(|| Error::NotFound {
+                resource: "component model".to_string(),
+                id: component_id.to_string(),
+            })?;
+            validate_completions_role(&mut repo, id, component_id, role, component.hosted_on).await?;
+        }
+        repo.update_component(
+            id,
+            component_id,
+            body.weight,
+            body.enabled,
+            body.sort_order,
+            body.role.map(|r| r.as_str().to_string()),
+        )
+        .await?
+        .ok_or_else(|| Error::NotFound {
+            resource: "component".to_string(),
+            id: format!("{}/{}", id, component_id),
+        })?
     };
     tx.commit().await.map_err(|e| Error::Database(e.into()))?;
 

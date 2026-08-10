@@ -1707,3 +1707,53 @@ mod resolve_key_rate_limit_tests {
         assert_eq!(rl.requests_per_second, NonZeroU32::new(5).unwrap());
     }
 }
+
+/// The sync emits an explicit `serves` tag per composite member, never leaving
+/// it to onwards' `both` default: today's third-party failovers must not receive
+/// completions-class traffic once a validated continuation target is attached.
+#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
+async fn test_cache_shape_component_role_becomes_the_serves_tag(pool: sqlx::PgPool) {
+    // The fixture predates roles, so its components carry the column default.
+    let targets = super::load_targets_from_db(&pool, &[], false, &RateLimitTiersConfig::default())
+        .await
+        .unwrap();
+    let composite = targets.targets.get("composite-priority").expect("composite-priority should exist");
+    for provider in composite.value().providers() {
+        assert_eq!(
+            provider.target.serves,
+            onwards::target::ServesScope::Chat,
+            "an untagged component defaults to chat, so it never serves a resume leg"
+        );
+    }
+    assert!(
+        !composite.value().has_completions_member(),
+        "the completions filter must not engage for a composite nobody has tagged"
+    );
+    // A plain (non-composite) model is its own provider and serves everything.
+    let regular = targets.targets.get("regular-public").expect("regular-public should exist");
+    assert_eq!(regular.value().providers()[0].target.serves, onwards::target::ServesScope::Both);
+
+    // Tag the members the way the canary is wired: on-prem first, third-party
+    // chat failover, validated completions target.
+    sqlx::query!("UPDATE deployed_model_components SET role = 'both' WHERE deployed_model_id = '40000000-0000-0000-0000-000000000006'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query!(
+        "UPDATE deployed_model_components SET role = 'completions' WHERE deployed_model_id = '40000000-0000-0000-0000-000000000005'"
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let targets = super::load_targets_from_db(&pool, &[], false, &RateLimitTiersConfig::default())
+        .await
+        .unwrap();
+    let composite = targets.targets.get("composite-priority").expect("composite-priority should exist");
+    let scopes: Vec<_> = composite.value().providers().iter().map(|p| p.target.serves).collect();
+    assert_eq!(
+        scopes,
+        vec![onwards::target::ServesScope::Both, onwards::target::ServesScope::Completions]
+    );
+    assert!(composite.value().has_completions_member());
+}
