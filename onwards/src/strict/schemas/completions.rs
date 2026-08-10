@@ -11,8 +11,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
-use super::chat_completions::{StopSequence, Usage};
-use super::utils::ensure_field;
+use super::chat_completions::{StopSequence, StreamOptions, Usage};
+use super::utils::{ensure_field, strip_privileged_fields_from_extra};
 
 pub(crate) fn generated_completion_id() -> String {
     format!("cmpl-{}", Uuid::new_v4())
@@ -227,9 +227,45 @@ pub struct CompletionRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking_token_budget: Option<serde_json::Value>,
 
+    /// Ask the engine for a terminal usage frame on a streamed response. Passes
+    /// through for every caller — a stream that does not report its own usage
+    /// cannot be billed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream_options: Option<StreamOptions>,
+
+    /// Scheduling priority. **Privileged**: the dynamo scheduler orders its
+    /// queue by this field, so a caller who could set it would be able to jump
+    /// ahead of everyone else's realtime work. Stripped from every request
+    /// except one authenticated with a `continuation`-purpose key — a resume
+    /// leg finishing a stream we already accepted, on a strict seam budget.
+    /// See [`CompletionRequest::strip_privileged_fields`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub priority: Option<i64>,
+
     /// Captured only to return a useful compatibility error.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chat_template_kwargs: Option<serde_json::Value>,
+
+    /// Additional fields not explicitly modeled, mirroring the chat schema so
+    /// engine-specific knobs survive the strict router's re-serialization.
+    /// Anything privileged that lands here is removed by
+    /// [`CompletionRequest::strip_privileged_fields`].
+    #[serde(flatten)]
+    pub extra: Option<Value>,
+}
+
+impl CompletionRequest {
+    /// Remove caller-supplied privileged fields before proxying.
+    ///
+    /// `priority` is stripped from BOTH the typed field and the flattened
+    /// extras: the typed field is what an honest caller would set, the extras
+    /// are what a caller would use to smuggle it past a schema that did not
+    /// model it (which is how it reaches the chat schema — see
+    /// [`super::chat_completions::ChatCompletionRequest::strip_privileged_fields`]).
+    pub(crate) fn strip_privileged_fields(&mut self) {
+        self.priority = None;
+        strip_privileged_fields_from_extra(&mut self.extra);
+    }
 }
 
 /// Response from POST /v1/completions (non-streaming)

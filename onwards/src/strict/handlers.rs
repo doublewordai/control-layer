@@ -52,6 +52,36 @@ struct ForwardResult {
     internal_error: bool,
 }
 
+/// The `purpose` label of the key that authenticated this request.
+///
+/// dwctl's onwards sync stamps every synced key with a `purpose` label — the
+/// same label `model_traffic_rules` redirects match on, and the same value
+/// analytics derives `request_origin` from. It is already in memory (the
+/// routing-rule path in `handlers.rs` reads the identical map), so this is a
+/// lookup, not a round trip.
+fn key_purpose<T: HttpClient>(state: &AppState<T>, headers: &HeaderMap) -> Option<String> {
+    let token = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))?;
+    state
+        .targets
+        .key_labels
+        .get(token)
+        .and_then(|labels| labels.get("purpose").cloned())
+}
+
+/// Whether this request may set privileged scheduling fields.
+///
+/// Only the hidden `continuation` key may: its requests are resume legs
+/// finishing a stream the platform already accepted and partially delivered, on
+/// a seam budget the user is sitting through. Everything else — including the
+/// dashboard's own playground and batch keys — gets its `priority` stripped, so
+/// no caller can put itself ahead of everyone else's realtime work.
+fn may_set_privileged_fields<T: HttpClient>(state: &AppState<T>, headers: &HeaderMap) -> bool {
+    key_purpose(state, headers).as_deref() == Some("continuation")
+}
+
 fn is_sse_content_type(content_type: &str) -> bool {
     content_type
         .split(';')
@@ -90,6 +120,11 @@ pub async fn chat_completions_handler<T: HttpClient + Clone + Send + Sync + 'sta
     Json(mut request): Json<ChatCompletionRequest>,
 ) -> Response {
     request.scrub_request_id_fields();
+    // This schema models no `priority`, but its `extra` bag forwards unknown
+    // fields verbatim — so chat is exactly as exposed as completions.
+    if !may_set_privileged_fields(&state, &headers) {
+        request.strip_privileged_fields();
+    }
 
     let original_model = request.model.clone();
     let is_streaming = request.stream.unwrap_or(false);
@@ -432,8 +467,12 @@ pub async fn embeddings_handler<T: HttpClient + Clone + Send + Sync + 'static>(
 pub async fn completions_handler<T: HttpClient + Clone + Send + Sync + 'static>(
     State(state): State<AppState<T>>,
     headers: HeaderMap,
-    Json(request): Json<CompletionRequest>,
+    Json(mut request): Json<CompletionRequest>,
 ) -> Response {
+    if !may_set_privileged_fields(&state, &headers) {
+        request.strip_privileged_fields();
+    }
+
     let unsupported_reasoning_param = [
         (request.reasoning_effort.is_some(), "reasoning_effort"),
         (request.reasoning.is_some(), "reasoning"),

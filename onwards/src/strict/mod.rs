@@ -1358,4 +1358,151 @@ mod tests {
         );
         assert_eq!(merge_usage_details(Some(v.clone()), None).unwrap(), v);
     }
+
+    // ── privileged field scrub ───────────────────────────────────────────────
+    //
+    // `priority` steers the dynamo scheduler's queue. Only the hidden
+    // `continuation` key may set it (resume legs finish a stream we already
+    // accepted); for everyone else it is stripped from BOTH the typed field and
+    // the flattened extras — the chat schema models no `priority` at all, but
+    // its extras bag would otherwise forward one verbatim.
+
+    /// Build a strict app whose single key carries `purpose`, exactly as dwctl's
+    /// onwards sync stamps it.
+    fn app_with_key_purpose(purpose: Option<&str>) -> (AppState<MockHttpClient>, MockHttpClient) {
+        let targets = Arc::new(DashMap::new());
+        targets.insert(
+            "dsv4-flash".to_string(),
+            Target::builder()
+                .url("https://api.example.com/v1/".parse().unwrap())
+                .build()
+                .into_pool(),
+        );
+        let key_labels = Arc::new(DashMap::new());
+        if let Some(purpose) = purpose {
+            key_labels.insert(
+                "sk-test".to_string(),
+                std::collections::HashMap::from([("purpose".to_string(), purpose.to_string())]),
+            );
+        }
+
+        let targets = Targets {
+            targets,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels,
+            strict_mode: true,
+            http_pool_config: None,
+        };
+        let mock_client = MockHttpClient::new(
+            StatusCode::OK,
+            r#"{"id":"cmpl-1","object":"text_completion","created":0,"model":"dsv4-flash","choices":[]}"#,
+        );
+        (
+            AppState::with_client(targets, mock_client.clone()),
+            mock_client,
+        )
+    }
+
+    async fn forwarded_body(
+        state: AppState<MockHttpClient>,
+        mock_client: &MockHttpClient,
+        uri: &str,
+        body: &str,
+    ) -> serde_json::Value {
+        let request = Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer sk-test")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let response = build_strict_router(state).oneshot(request).await.unwrap();
+        assert!(
+            response.status().is_success(),
+            "{uri}: {}",
+            response.status()
+        );
+        let requests = mock_client.get_requests();
+        assert_eq!(requests.len(), 1, "{uri}");
+        serde_json::from_slice(&requests[0].body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn priority_is_stripped_from_completions_for_ordinary_keys() {
+        for purpose in [Some("realtime"), Some("batch"), Some("playground"), None] {
+            let (state, mock_client) = app_with_key_purpose(purpose);
+            let body = forwarded_body(
+                state,
+                &mock_client,
+                "/completions",
+                r#"{"model":"dsv4-flash","prompt":[1,2,3],"priority":9999,"stream_options":{"include_usage":true}}"#,
+            )
+            .await;
+            assert!(
+                body.get("priority").is_none(),
+                "purpose={purpose:?} must not reach the scheduler with a priority"
+            );
+            // stream_options passes for everyone — a stream that reports no
+            // usage cannot be billed.
+            assert_eq!(body["stream_options"]["include_usage"], true);
+        }
+    }
+
+    #[tokio::test]
+    async fn priority_passes_for_the_continuation_key() {
+        let (state, mock_client) = app_with_key_purpose(Some("continuation"));
+        let body = forwarded_body(
+            state,
+            &mock_client,
+            "/completions",
+            r#"{"model":"dsv4-flash","prompt":[1,2,3],"priority":100}"#,
+        )
+        .await;
+        assert_eq!(body["priority"], 100);
+    }
+
+    /// The chat schema has no typed `priority`, so this is purely the extras
+    /// path — the hole the flatten bag would otherwise leave open.
+    #[tokio::test]
+    async fn priority_is_stripped_from_chat_extras_for_ordinary_keys() {
+        let (state, mock_client) = app_with_key_purpose(Some("realtime"));
+        let body = forwarded_body(
+            state,
+            &mock_client,
+            "/chat/completions",
+            r#"{"model":"dsv4-flash","messages":[{"role":"user","content":"hi"}],"priority":9999,"custom_knob":true}"#,
+        )
+        .await;
+        assert!(body.get("priority").is_none());
+        // Only the privileged field goes; other unmodelled fields still ride
+        // the extras bag through.
+        assert_eq!(body["custom_knob"], true);
+
+        let (state, mock_client) = app_with_key_purpose(Some("continuation"));
+        let body = forwarded_body(
+            state,
+            &mock_client,
+            "/chat/completions",
+            r#"{"model":"dsv4-flash","messages":[{"role":"user","content":"hi"}],"priority":100}"#,
+        )
+        .await;
+        assert_eq!(body["priority"], 100);
+    }
+
+    /// The continuation knobs and the extras bag coexist: typed fields stay
+    /// typed, unknown ones survive re-serialization instead of being dropped.
+    #[tokio::test]
+    async fn completions_extras_survive_re_serialization() {
+        let (state, mock_client) = app_with_key_purpose(Some("realtime"));
+        let body = forwarded_body(
+            state,
+            &mock_client,
+            "/completions",
+            r#"{"model":"dsv4-flash","prompt":[1,2],"ignore_eos":true,"repetition_penalty":1.1}"#,
+        )
+        .await;
+        assert_eq!(body["ignore_eos"], true);
+        assert_eq!(body["repetition_penalty"], 1.1);
+    }
 }
