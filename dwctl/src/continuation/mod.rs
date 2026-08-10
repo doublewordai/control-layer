@@ -26,6 +26,7 @@
 
 pub mod accumulate;
 pub mod detect;
+pub mod dsv4;
 pub mod layer;
 pub mod metrics;
 pub mod render;
