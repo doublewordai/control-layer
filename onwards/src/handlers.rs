@@ -9,7 +9,7 @@ use crate::client::HttpClient;
 use crate::errors::{ErrorResponseBody, OnwardsErrorResponse};
 use crate::models::ListModelResponse;
 use crate::sse::SseBufferedStream;
-use crate::target::{ConcurrencyGuard, RoutingAction, Target};
+use crate::target::{ConcurrencyGuard, RequestClass, RoutingAction, Target};
 use axum::{
     Json,
     extract::Request,
@@ -588,6 +588,24 @@ pub async fn target_message_handler<T: HttpClient>(
         return Err(OnwardsErrorResponse::service_unavailable());
     }
 
+    // Classify the request once, from the path, and scope the pool view to the
+    // members allowed to serve that class. Derived here (before any provider is
+    // selected) because filtering must sit BELOW nothing and ABOVE everything
+    // else: the LB strategy, the failover loop and every limiter see only the
+    // filtered view.
+    let request_class = RequestClass::from_path(&canonical_request_path);
+    let scope_engaged = request_class == RequestClass::Completions && pool.has_completions_member();
+    if pool.scoped_len(request_class) == 0 {
+        // A completions-only pool asked to serve chat (or vice versa): the pool
+        // exists but has nobody who may answer this class of request.
+        debug!(
+            "Pool for model '{}' has no providers serving {} requests",
+            model_name,
+            request_class.as_str()
+        );
+        return Err(OnwardsErrorResponse::service_unavailable());
+    }
+
     // Check pool-level rate limit before selecting a provider
     {
         let _rate_limit_span = tracing::info_span!("onwards.rate_limit_check", otel.name = "onwards.rate_limit_check", model = %model_name).entered();
@@ -669,8 +687,8 @@ pub async fn target_message_handler<T: HttpClient>(
     let mut any_attempted = false;
     let mut attempt_number: u32 = 0;
     let mut total_backoff_ms: u64 = 0;
-    let pool_max_attempts = pool.fallback_max_attempts();
-    for (_idx, target, connection_guard) in pool.select_iter() {
+    let pool_max_attempts = pool.fallback_max_attempts_scoped(request_class);
+    for (_idx, target, connection_guard) in pool.select_iter_scoped(request_class) {
         any_attempted = true;
         attempt_number += 1;
 
@@ -683,7 +701,13 @@ pub async fn target_message_handler<T: HttpClient>(
             provider.timeout_secs = target.request_timeout_secs,
             http.response.status_code = tracing::field::Empty,
             onwards.fallback = tracing::field::Empty,
+            onwards.scope = tracing::field::Empty,
         );
+        // Recorded only when the completions filter actually narrowed the pool,
+        // so the field's presence answers "did scoped routing engage here?".
+        if scope_engaged {
+            attempt_span.record("onwards.scope", request_class.as_str());
+        }
 
         // The loop body is wrapped in an instrumented async block so that
         // attempt_span is the "current" span for all logging / field recording,
@@ -2480,6 +2504,7 @@ mod tests {
             trusted,
             propagate_trace_context,
             reasoning_translation: None,
+            serves: crate::target::ServesScope::default(),
         }
     }
 

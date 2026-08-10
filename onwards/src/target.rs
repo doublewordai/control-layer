@@ -42,6 +42,85 @@ pub struct ConcurrencyLimitParameters {
     pub max_concurrent_requests: usize,
 }
 
+/// Which request classes a pool member may serve.
+///
+/// A pool can mix members that are interchangeable for ordinary chat traffic
+/// with a member that exists only to serve `/v1/completions` (a token-id
+/// continuation target validated per model). The tag says which is which; the
+/// pool filters on it before load balancing (see
+/// [`crate::load_balancer::ProviderPool::select_iter_scoped`]).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ServesScope {
+    /// Eligible for every request. The serde default, so an untagged member
+    /// parses exactly as it behaves today: usable for everything.
+    ///
+    /// Untagged raw-config pools are unaffected in practice because the
+    /// completions filter only engages when a pool has a `completions` member —
+    /// which nobody gets by default. dwctl's sync is explicit: it emits `chat`
+    /// for third-party failover members and `both` for on-prem ones.
+    #[default]
+    Both,
+    /// Eligible for everything EXCEPT completions-class requests, once the
+    /// filter engages. Third-party chat failovers (OpenRouter et al) are these:
+    /// they have never been validated to continue a token-id prefix.
+    Chat,
+    /// Eligible ONLY for completions-class requests. Never serves
+    /// chat/responses/embeddings traffic.
+    Completions,
+}
+
+impl ServesScope {
+    /// Whether a member with this scope may serve `class`.
+    pub fn serves(self, class: RequestClass) -> bool {
+        match (self, class) {
+            (ServesScope::Both, _) => true,
+            (ServesScope::Chat, RequestClass::Normal) => true,
+            (ServesScope::Chat, RequestClass::Completions) => false,
+            (ServesScope::Completions, RequestClass::Normal) => false,
+            (ServesScope::Completions, RequestClass::Completions) => true,
+        }
+    }
+}
+
+/// The class of an inbound request, derived from its path alone.
+///
+/// Purpose labels play no part: a completions request is a completions request
+/// whoever sent it, which is what keeps this mechanism usable by ordinary user
+/// completions traffic as well as by continuation resume legs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RequestClass {
+    /// Chat completions, responses, embeddings, everything else.
+    #[default]
+    Normal,
+    /// The legacy completions endpoint, under either router.
+    Completions,
+}
+
+impl RequestClass {
+    /// Classify a request path. The strict router forwards `/completions` and
+    /// the passthrough router `/v1/completions`, so the suffix — not the whole
+    /// path — is the discriminator. `/chat/completions` is deliberately NOT
+    /// completions-class.
+    pub fn from_path(path: &str) -> Self {
+        let path = path.split('?').next().unwrap_or(path);
+        let path = path.trim_end_matches('/');
+        if path.ends_with("/completions") && !path.ends_with("/chat/completions") {
+            RequestClass::Completions
+        } else {
+            RequestClass::Normal
+        }
+    }
+
+    /// Bounded span/metric label.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RequestClass::Normal => "normal",
+            RequestClass::Completions => "completions",
+        }
+    }
+}
+
 /// Provider-specific configuration for a single upstream provider.
 /// This is used within a pool to configure individual providers.
 #[derive(Debug, Clone, Serialize, Deserialize, Builder)]
@@ -102,6 +181,12 @@ pub struct ProviderSpec {
     /// Translate canonical OpenAI reasoning controls into this provider's request shape.
     #[serde(default)]
     pub reasoning_translation: Option<ReasoningTranslationConfig>,
+
+    /// Which request classes this member may serve. Defaults to `both`, so an
+    /// untagged config parses and behaves exactly as before.
+    #[serde(default)]
+    #[builder(default)]
+    pub serves: ServesScope,
 }
 
 /// Configuration for Open Responses API behavior
@@ -392,6 +477,11 @@ pub struct TargetSpec {
     /// Translate canonical OpenAI reasoning controls into this provider's request shape.
     #[serde(default)]
     pub reasoning_translation: Option<ReasoningTranslationConfig>,
+
+    /// Which request classes this member may serve. Defaults to `both`.
+    #[serde(default)]
+    #[builder(default)]
+    pub serves: ServesScope,
 }
 
 fn default_weight() -> u32 {
@@ -479,6 +569,7 @@ impl TargetSpecOrList {
                         // an unset value still inherits the resolved trusted value.
                         propagate_trace_context: t.propagate_trace_context,
                         reasoning_translation: t.reasoning_translation,
+                        serves: t.serves,
                     })
                     .collect();
                 Ok(PoolConfig {
@@ -520,6 +611,7 @@ impl TargetSpecOrList {
                     // YAML form would be silently dropped.
                     propagate_trace_context: spec.propagate_trace_context,
                     reasoning_translation: spec.reasoning_translation,
+                    serves: spec.serves,
                 };
                 Ok(PoolConfig {
                     keys,
@@ -575,6 +667,7 @@ impl From<TargetSpec> for Target {
             trusted: None,
             propagate_trace_context: value.propagate_trace_context,
             reasoning_translation: value.reasoning_translation,
+            serves: value.serves,
         }
     }
 }
@@ -601,6 +694,7 @@ impl From<ProviderSpec> for Target {
             trusted: value.trusted,
             propagate_trace_context: value.propagate_trace_context,
             reasoning_translation: value.reasoning_translation,
+            serves: value.serves,
         }
     }
 }
@@ -751,6 +845,10 @@ pub struct Target {
     pub propagate_trace_context: Option<bool>,
     /// Provider-specific translation for canonical OpenAI reasoning controls.
     pub reasoning_translation: Option<ReasoningTranslationConfig>,
+    /// Which request classes this member may serve. Defaults to `both` so every
+    /// existing construction site (and every untagged config) is unchanged.
+    #[builder(default)]
+    pub serves: ServesScope,
 }
 
 impl Target {
@@ -2306,6 +2404,7 @@ mod tests {
                 trusted: None,
                 propagate_trace_context: None,
                 reasoning_translation: None,
+                serves: ServesScope::default(),
             }],
         };
 
@@ -2901,5 +3000,137 @@ mod tests {
 
         assert!(error.to_string().contains("thinking_token_budget"));
         assert!(error.to_string().contains("reasoning_effort"));
+    }
+
+    // ── serves / request class ───────────────────────────────────────────────
+
+    /// An existing config — nobody has written `serves` anywhere — parses with
+    /// every member eligible for everything, which is exactly today's behaviour.
+    /// This is the first of the two readings the spec asks to be tested; the
+    /// second (dwctl's sync tagging members explicitly) is asserted in
+    /// `load_balancer`'s rule-2 test.
+    #[test]
+    fn untagged_members_default_to_serving_everything() {
+        let json = r#"{
+            "targets": {
+                "gpt-4": {
+                    "providers": [
+                        {"url": "https://dynamo.example.com"},
+                        {"url": "https://openrouter.example.com"}
+                    ]
+                }
+            }
+        }"#;
+        let config: ConfigFile = serde_json::from_str(json).unwrap();
+        let pool_config = config
+            .targets
+            .into_values()
+            .next()
+            .unwrap()
+            .into_pool_config()
+            .unwrap();
+        assert_eq!(pool_config.providers.len(), 2);
+        for provider in &pool_config.providers {
+            assert_eq!(provider.serves, ServesScope::Both);
+        }
+        // And no untagged pool ever engages the completions filter.
+        for provider in pool_config.providers {
+            let target: Target = provider.into();
+            assert!(target.serves.serves(RequestClass::Normal));
+            assert!(target.serves.serves(RequestClass::Completions));
+        }
+    }
+
+    /// The tags are spelled in config exactly as the sync emits them.
+    #[test]
+    fn serves_parses_the_three_documented_values() {
+        let json = r#"{
+            "targets": {
+                "dsv4-flash": {
+                    "providers": [
+                        {"url": "https://dynamo.example.com", "serves": "both"},
+                        {"url": "https://openrouter.example.com", "serves": "chat"},
+                        {"url": "https://fireworks.example.com", "serves": "completions"}
+                    ]
+                }
+            }
+        }"#;
+        let config: ConfigFile = serde_json::from_str(json).unwrap();
+        let pool_config = config
+            .targets
+            .into_values()
+            .next()
+            .unwrap()
+            .into_pool_config()
+            .unwrap();
+        let scopes: Vec<_> = pool_config.providers.iter().map(|p| p.serves).collect();
+        assert_eq!(
+            scopes,
+            vec![
+                ServesScope::Both,
+                ServesScope::Chat,
+                ServesScope::Completions
+            ]
+        );
+    }
+
+    /// The legacy single-provider and list config forms carry the tag through
+    /// rather than silently dropping it.
+    #[test]
+    fn legacy_config_forms_carry_serves_through() {
+        let json = r#"{
+            "targets": {
+                "single": {"url": "https://fireworks.example.com", "serves": "completions"},
+                "list": [
+                    {"url": "https://dynamo.example.com", "serves": "both"},
+                    {"url": "https://openrouter.example.com", "serves": "chat"}
+                ]
+            }
+        }"#;
+        let config: ConfigFile = serde_json::from_str(json).unwrap();
+        let single = config.targets["single"].clone().into_pool_config().unwrap();
+        assert_eq!(single.providers[0].serves, ServesScope::Completions);
+        let list = config.targets["list"].clone().into_pool_config().unwrap();
+        assert_eq!(list.providers[0].serves, ServesScope::Both);
+        assert_eq!(list.providers[1].serves, ServesScope::Chat);
+    }
+
+    /// Classification is by path suffix only — no purpose, no header, no body.
+    #[test]
+    fn request_class_is_derived_from_the_path_alone() {
+        // The strict router forwards `/completions`; the passthrough router
+        // sees the full `/v1/completions`; dwctl nests both under `/ai`.
+        for path in [
+            "/completions",
+            "/v1/completions",
+            "/ai/v1/completions",
+            "/v1/completions?stream=true",
+            "/v1/completions/",
+        ] {
+            assert_eq!(
+                RequestClass::from_path(path),
+                RequestClass::Completions,
+                "{path}"
+            );
+        }
+        for path in [
+            "/chat/completions",
+            "/v1/chat/completions",
+            "/ai/v1/chat/completions",
+            "/v1/chat/completions?stream=true",
+            "/v1/responses",
+            "/v1/embeddings",
+            "/v1/models",
+            "/",
+            "",
+        ] {
+            assert_eq!(
+                RequestClass::from_path(path),
+                RequestClass::Normal,
+                "{path}"
+            );
+        }
+        assert_eq!(RequestClass::Completions.as_str(), "completions");
+        assert_eq!(RequestClass::Normal.as_str(), "normal");
     }
 }

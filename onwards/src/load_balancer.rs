@@ -10,7 +10,7 @@
 use crate::auth::KeySet;
 use crate::target::{
     ConcurrencyGuard, ConcurrencyLimiter, FallbackConfig, LoadBalanceStrategy, RateLimiter,
-    RoutingAction, RoutingRule, Target,
+    RequestClass, RoutingAction, RoutingRule, ServesScope, Target,
 };
 use rand::Rng;
 use std::collections::{HashMap, HashSet};
@@ -150,20 +150,67 @@ impl ProviderPool {
     /// spent. So every strategy — including a single-provider `Priority` pool —
     /// honors the configured retry count, rather than stopping after one cascade.
     pub fn select_iter(&self) -> SelectIter<'_> {
+        self.select_iter_scoped(RequestClass::Normal)
+    }
+
+    /// Select providers lazily for `class`, seeing only the members eligible to
+    /// serve it.
+    ///
+    /// Scoping happens BEFORE the load-balance strategy and the failover loop, so
+    /// rate limits, connection guards, `fallback_on_status`, backoff and the
+    /// weighted strategies all operate on the filtered view with no changes of
+    /// their own. See [`ProviderPool::has_completions_member`] for when the completions
+    /// filter engages at all.
+    pub fn select_iter_scoped(&self, class: RequestClass) -> SelectIter<'_> {
         let with_replacement = self.fallback.as_ref().is_some_and(|f| f.with_replacement);
+        let base_excluded = self.ineligible(class);
         let max_attempts = self
             .fallback
             .as_ref()
             .and_then(|f| f.max_attempts)
-            .unwrap_or(self.providers.len());
+            .unwrap_or_else(|| self.providers.len() - base_excluded.len());
 
         SelectIter {
             pool: self,
-            excluded: HashSet::new(),
+            excluded: base_excluded.clone(),
+            base_excluded,
             max_attempts,
             attempts: 0,
             with_replacement,
         }
+    }
+
+    /// Whether the completions filter engages for this pool.
+    ///
+    /// It engages only when somebody attached a validated completions member:
+    /// a pool without one keeps today's behaviour for completions traffic
+    /// (whatever its luck), which is what makes this change inert for every
+    /// existing pool.
+    pub fn has_completions_member(&self) -> bool {
+        self.providers
+            .iter()
+            .any(|p| p.target.serves == ServesScope::Completions)
+    }
+
+    /// Indices of members that must NOT serve `class`.
+    fn ineligible(&self, class: RequestClass) -> HashSet<usize> {
+        // Rule 3: no completions member ⇒ the view is the rule-1 view. Since a
+        // pool without completions members holds only `both`/`chat` members,
+        // that is every member — no filtering at all.
+        if class == RequestClass::Completions && !self.has_completions_member() {
+            return HashSet::new();
+        }
+        self.providers
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| !p.target.serves.serves(class))
+            .map(|(idx, _)| idx)
+            .collect()
+    }
+
+    /// Number of members eligible to serve `class`.
+    pub fn scoped_len(&self, class: RequestClass) -> usize {
+        self.providers.len() - self.ineligible(class).len()
     }
 
     /// Internal: select excluding specific provider indices
@@ -336,10 +383,18 @@ impl ProviderPool {
     /// cascade when a pass is exhausted, so e.g. a single-provider `Priority`
     /// pool with `max_attempts = 3` retries that provider three times.
     pub fn fallback_max_attempts(&self) -> usize {
+        self.fallback_max_attempts_scoped(RequestClass::Normal)
+    }
+
+    /// As [`ProviderPool::fallback_max_attempts`], for the view a request of
+    /// `class` sees: the implicit "one pass through the pool" budget counts the
+    /// eligible members only. An explicit `fallback.max_attempts` is a caller's
+    /// number and is honoured verbatim, as before.
+    pub fn fallback_max_attempts_scoped(&self, class: RequestClass) -> usize {
         self.fallback
             .as_ref()
             .and_then(|f| f.max_attempts)
-            .unwrap_or(self.providers.len())
+            .unwrap_or_else(|| self.scoped_len(class))
     }
 
     /// Get the load balancing strategy
@@ -414,6 +469,10 @@ impl ProviderPool {
 pub struct SelectIter<'a> {
     pool: &'a ProviderPool,
     excluded: HashSet<usize>,
+    /// Members outside this request's class view. Unlike `excluded` these are
+    /// never re-included when a pass restarts — they are not "already tried",
+    /// they are not part of the pool this request can see at all.
+    base_excluded: HashSet<usize>,
     max_attempts: usize,
     attempts: usize,
     with_replacement: bool,
@@ -445,9 +504,9 @@ impl<'a> Iterator for SelectIter<'a> {
         // iterator rather than re-running the same scan.
         let result = match self.pool.select_excluding(&self.excluded) {
             Some(result) => result,
-            None if self.excluded.is_empty() => return None,
+            None if self.excluded == self.base_excluded => return None,
             None => {
-                self.excluded.clear();
+                self.excluded.clone_from(&self.base_excluded);
                 self.pool.select_excluding(&self.excluded)?
             }
         };
@@ -1508,5 +1567,343 @@ mod tests {
             new_pool.pool_concurrency_limiter().unwrap().limit(),
             Some(200)
         );
+    }
+
+    // ── completions-scoped selection ─────────────────────────────────────────
+    //
+    // Semantics under test (spec: "completions-scoped composite members"):
+    //   1. normal-class  → members serving {both, chat}
+    //   2. completions-class WITH a completions member → {both, completions}
+    //   3. completions-class WITHOUT one → identical to rule 1
+    // Filtering runs before the strategy, so limits and failover are untouched.
+
+    fn scoped_target(url: &str, serves: ServesScope) -> Target {
+        Target::builder()
+            .url(url.parse().unwrap())
+            .serves(serves)
+            .build()
+    }
+
+    fn priority_pool(providers: Vec<Provider>, fallback: Option<FallbackConfig>) -> ProviderPool {
+        ProviderPool::with_config(
+            providers,
+            None,
+            None,
+            None,
+            fallback,
+            LoadBalanceStrategy::Priority,
+            false,
+            Vec::new(),
+        )
+    }
+
+    /// The URLs a request of `class` actually attempts, in order.
+    fn attempt_urls(pool: &ProviderPool, class: RequestClass) -> Vec<String> {
+        pool.select_iter_scoped(class)
+            .map(|(_, target, _guard)| target.url.to_string())
+            .collect()
+    }
+
+    /// (a) An existing pool — every member untagged, i.e. parsed with the serde
+    /// default — attempts exactly the same providers in exactly the same order
+    /// as before scoping existed, for BOTH request classes. This is the
+    /// backwards-compatibility snapshot: the literal expectation below is the
+    /// pre-change behaviour of a three-member priority pool.
+    #[test]
+    fn rule_1_untagged_pool_selection_is_byte_identical() {
+        let pool = priority_pool(
+            vec![
+                Provider::new(create_test_target("https://dynamo.example.com"), 1),
+                Provider::new(create_test_target("https://openrouter.example.com"), 1),
+                Provider::new(create_test_target("https://backup.example.com"), 1),
+            ],
+            None,
+        );
+
+        let expected = vec![
+            "https://dynamo.example.com/".to_string(),
+            "https://openrouter.example.com/".to_string(),
+            "https://backup.example.com/".to_string(),
+        ];
+        // The unscoped entry point (every existing caller).
+        assert_eq!(
+            pool.select_iter()
+                .map(|(_, t, _g)| t.url.to_string())
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(attempt_urls(&pool, RequestClass::Normal), expected);
+        // (c) Rule 3: no completions member ⇒ completions traffic sees the same
+        // view it always has, whatever its luck.
+        assert_eq!(attempt_urls(&pool, RequestClass::Completions), expected);
+        assert_eq!(pool.fallback_max_attempts(), 3);
+        assert_eq!(
+            pool.fallback_max_attempts_scoped(RequestClass::Completions),
+            3
+        );
+    }
+
+    /// The subtlety the spec flags: what an UNTAGGED member means under rule 2.
+    /// Both readings are asserted here. Reading 1 (raw config, nothing tagged):
+    /// covered above — the filter never engages, so `both`-by-default is inert.
+    /// Reading 2 (dwctl sync, which tags explicitly): third-party members are
+    /// emitted as `chat` and are therefore excluded once a completions member
+    /// exists. A member left `both` deliberately stays eligible for both.
+    #[test]
+    fn rule_2_completions_class_sees_both_and_completions_members() {
+        let pool = priority_pool(
+            vec![
+                Provider::new(
+                    scoped_target("https://dynamo.example.com", ServesScope::Both),
+                    1,
+                ),
+                Provider::new(
+                    scoped_target("https://openrouter.example.com", ServesScope::Chat),
+                    1,
+                ),
+                Provider::new(
+                    scoped_target("https://fireworks.example.com", ServesScope::Completions),
+                    1,
+                ),
+            ],
+            None,
+        );
+
+        // Rule 2: dynamo first (free, fails fast), then the validated target.
+        assert_eq!(
+            attempt_urls(&pool, RequestClass::Completions),
+            vec![
+                "https://dynamo.example.com/".to_string(),
+                "https://fireworks.example.com/".to_string(),
+            ]
+        );
+        // Rule 1 is unchanged by the presence of a completions member.
+        assert_eq!(
+            attempt_urls(&pool, RequestClass::Normal),
+            vec![
+                "https://dynamo.example.com/".to_string(),
+                "https://openrouter.example.com/".to_string(),
+            ]
+        );
+        // The implicit one-pass attempt budget counts the eligible members only.
+        assert_eq!(
+            pool.fallback_max_attempts_scoped(RequestClass::Completions),
+            2
+        );
+        assert_eq!(pool.fallback_max_attempts_scoped(RequestClass::Normal), 2);
+        assert!(pool.has_completions_member());
+    }
+
+    /// (d) A completions member is never selected for anything else, whatever
+    /// the strategy, the pass count or the attempt budget. Property-style: every
+    /// path onwards routes, against a pool where the completions member is also
+    /// the least loaded (so weighted-least-connections would otherwise pick it).
+    #[test]
+    fn completions_member_never_serves_normal_class() {
+        for strategy in [
+            LoadBalanceStrategy::Priority,
+            LoadBalanceStrategy::WeightedRandom,
+        ] {
+            let pool = ProviderPool::with_config(
+                vec![
+                    Provider::new(
+                        scoped_target("https://fireworks.example.com", ServesScope::Completions),
+                        10,
+                    ),
+                    Provider::new(
+                        scoped_target("https://dynamo.example.com", ServesScope::Both),
+                        1,
+                    ),
+                ],
+                None,
+                None,
+                None,
+                // A generous budget forces several restarted passes.
+                Some(FallbackConfig {
+                    enabled: true,
+                    max_attempts: Some(12),
+                    ..Default::default()
+                }),
+                strategy,
+                false,
+                Vec::new(),
+            );
+
+            for path in [
+                "/v1/chat/completions",
+                "/chat/completions",
+                "/v1/responses",
+                "/v1/embeddings",
+                "/v1/models",
+                "/completions/extra",
+            ] {
+                let class = RequestClass::from_path(path);
+                assert_eq!(class, RequestClass::Normal, "{path}");
+                let urls = attempt_urls(&pool, class);
+                assert!(!urls.is_empty(), "{path}: the pool still serves this class");
+                assert!(
+                    urls.iter().all(|u| u.contains("dynamo")),
+                    "{path} ({strategy:?}): a completions member must never serve normal traffic, got {urls:?}"
+                );
+            }
+        }
+    }
+
+    /// (e) Limits and guards operate on the filtered view, unchanged: a member
+    /// outside the view holds no slot, and a member inside it that is at
+    /// capacity is skipped exactly as before.
+    #[test]
+    fn concurrency_guards_apply_to_the_filtered_view_only() {
+        let pool = priority_pool(
+            vec![
+                Provider::with_concurrency_limit(
+                    scoped_target("https://dynamo.example.com", ServesScope::Both),
+                    1,
+                    1,
+                ),
+                Provider::new(
+                    scoped_target("https://openrouter.example.com", ServesScope::Chat),
+                    1,
+                ),
+                Provider::new(
+                    scoped_target("https://fireworks.example.com", ServesScope::Completions),
+                    1,
+                ),
+            ],
+            None,
+        );
+
+        // Saturate dynamo's single slot and hold the guard.
+        let mut iter = pool.select_iter_scoped(RequestClass::Completions);
+        let (idx, target, _held) = iter.next().expect("dynamo first");
+        assert_eq!(idx, 0);
+        assert!(target.url.as_str().contains("dynamo"));
+        drop(iter);
+
+        // A completions request now falls through to the validated target. The
+        // attempt budget is still 2 (the eligible-member count) and the pass
+        // restarts when the saturated member is the only untried one — the
+        // pre-existing retry-above-the-strategy behaviour, unchanged here.
+        assert_eq!(
+            attempt_urls(&pool, RequestClass::Completions),
+            vec![
+                "https://fireworks.example.com/".to_string(),
+                "https://fireworks.example.com/".to_string(),
+            ]
+        );
+        // ...and a chat request falls through to the chat failover, never to it.
+        assert_eq!(
+            attempt_urls(&pool, RequestClass::Normal),
+            vec![
+                "https://openrouter.example.com/".to_string(),
+                "https://openrouter.example.com/".to_string(),
+            ]
+        );
+        // The excluded members' connection counters are untouched by the filter.
+        assert_eq!(pool.providers()[1].active_connections(), 0);
+        assert_eq!(pool.providers()[2].active_connections(), 0);
+    }
+
+    /// (g) Weighted random: filter first, then strategy. Over many draws the
+    /// completions member appears for completions traffic and the chat member
+    /// never does — and vice versa — with weights still respected inside the
+    /// view.
+    #[test]
+    fn weighted_random_filters_before_the_strategy() {
+        let pool = ProviderPool::with_config(
+            vec![
+                Provider::new(
+                    scoped_target("https://dynamo.example.com", ServesScope::Both),
+                    1,
+                ),
+                Provider::new(
+                    scoped_target("https://openrouter.example.com", ServesScope::Chat),
+                    50,
+                ),
+                Provider::new(
+                    scoped_target("https://fireworks.example.com", ServesScope::Completions),
+                    50,
+                ),
+            ],
+            None,
+            None,
+            None,
+            None,
+            LoadBalanceStrategy::WeightedRandom,
+            false,
+            Vec::new(),
+        );
+
+        for _ in 0..200 {
+            let completions = attempt_urls(&pool, RequestClass::Completions);
+            assert_eq!(completions.len(), 2, "one pass over the filtered view");
+            assert!(completions.iter().all(|u| !u.contains("openrouter")));
+            let normal = attempt_urls(&pool, RequestClass::Normal);
+            assert_eq!(normal.len(), 2);
+            assert!(normal.iter().all(|u| !u.contains("fireworks")));
+        }
+    }
+
+    /// A restarted pass (the attempt budget above the strategy) re-includes
+    /// already-tried members but never the ones outside the view.
+    #[test]
+    fn restarted_passes_keep_the_scope_filter() {
+        let pool = priority_pool(
+            vec![
+                Provider::new(
+                    scoped_target("https://dynamo.example.com", ServesScope::Both),
+                    1,
+                ),
+                Provider::new(
+                    scoped_target("https://openrouter.example.com", ServesScope::Chat),
+                    1,
+                ),
+                Provider::new(
+                    scoped_target("https://fireworks.example.com", ServesScope::Completions),
+                    1,
+                ),
+            ],
+            Some(FallbackConfig {
+                enabled: true,
+                max_attempts: Some(5),
+                ..Default::default()
+            }),
+        );
+
+        let urls = attempt_urls(&pool, RequestClass::Completions);
+        assert_eq!(
+            urls,
+            vec![
+                "https://dynamo.example.com/",
+                "https://fireworks.example.com/",
+                "https://dynamo.example.com/",
+                "https://fireworks.example.com/",
+                "https://dynamo.example.com/",
+            ],
+            "the budget is honoured verbatim, cycling only the eligible members"
+        );
+    }
+
+    /// A pool whose only member is completions-scoped cannot serve chat: the
+    /// iterator yields nothing rather than falling back to an ineligible member.
+    /// (handlers.rs turns this into a 503 before the loop is even entered.)
+    #[test]
+    fn a_scope_with_no_eligible_members_yields_nothing() {
+        let pool = priority_pool(
+            vec![Provider::new(
+                scoped_target("https://fireworks.example.com", ServesScope::Completions),
+                1,
+            )],
+            Some(FallbackConfig {
+                enabled: true,
+                max_attempts: Some(3),
+                ..Default::default()
+            }),
+        );
+
+        assert_eq!(pool.scoped_len(RequestClass::Normal), 0);
+        assert!(attempt_urls(&pool, RequestClass::Normal).is_empty());
+        assert_eq!(pool.scoped_len(RequestClass::Completions), 1);
+        assert!(!pool.is_empty(), "the pool itself is not empty");
     }
 }

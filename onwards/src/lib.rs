@@ -4407,4 +4407,153 @@ mod tests {
             assert_eq!(body["error"]["message"], "provider-specific detail");
         }
     }
+
+    /// Completions-scoped routing, end to end through the router.
+    ///
+    /// A composite carrying a validated completions member must send
+    /// `/v1/completions` there (after the on-prem member) and must never send
+    /// chat traffic there. Asserted on the URL the upstream client actually
+    /// received, under both routers.
+    mod completions_scope {
+        use super::*;
+        use crate::target::{LoadBalanceStrategy, ServesScope};
+
+        fn scoped_pool() -> ProviderPool {
+            let member = |url: &str, serves: ServesScope| {
+                Provider::new(
+                    Target::builder()
+                        .url(url.parse().unwrap())
+                        .serves(serves)
+                        .build(),
+                    1,
+                )
+            };
+            ProviderPool::with_config(
+                vec![
+                    member("https://dynamo.example.com", ServesScope::Both),
+                    member("https://openrouter.example.com", ServesScope::Chat),
+                    member("https://fireworks.example.com", ServesScope::Completions),
+                ],
+                None,
+                None,
+                None,
+                None,
+                LoadBalanceStrategy::Priority,
+                false,
+                Vec::new(),
+            )
+        }
+
+        fn server_with(strict_mode: bool) -> (TestServer, MockHttpClient) {
+            let targets_map = Arc::new(DashMap::new());
+            targets_map.insert("dsv4-flash".to_string(), scoped_pool());
+            let targets = Targets {
+                targets: targets_map,
+                key_rate_limiters: Arc::new(DashMap::new()),
+                key_concurrency_limiters: Arc::new(DashMap::new()),
+                key_labels: Arc::new(DashMap::new()),
+                strict_mode,
+                http_pool_config: None,
+            };
+            let mock_client = MockHttpClient::new(
+                StatusCode::OK,
+                r#"{"id":"cmpl-1","object":"text_completion","created":0,"model":"dsv4-flash","choices":[]}"#,
+            );
+            let app_state = AppState::with_client(targets, mock_client.clone());
+            let server = TestServer::new(build_router(app_state)).unwrap();
+            (server, mock_client)
+        }
+
+        /// The first attempt goes to the on-prem member (`both`), which is free
+        /// for us; the validated completions target is the fallback.
+        #[tokio::test]
+        async fn completions_requests_reach_the_on_prem_member_first() {
+            for strict_mode in [false, true] {
+                let (server, client) = server_with(strict_mode);
+                let response = server
+                    .post("/v1/completions")
+                    .json(&json!({"model": "dsv4-flash", "prompt": [1, 2, 3]}))
+                    .await;
+                assert_eq!(
+                    response.status_code(),
+                    StatusCode::OK,
+                    "strict={strict_mode}"
+                );
+
+                let requests = client.requests.lock().unwrap();
+                assert_eq!(requests.len(), 1, "strict={strict_mode}");
+                assert!(
+                    requests[0].uri.starts_with("https://dynamo.example.com/"),
+                    "strict={strict_mode}: got {}",
+                    requests[0].uri
+                );
+            }
+        }
+
+        /// Chat traffic never touches the completions member — it goes to the
+        /// same on-prem member as before, and the chat failover behind it.
+        #[tokio::test]
+        async fn chat_requests_never_reach_the_completions_member() {
+            for strict_mode in [false, true] {
+                let (server, client) = server_with(strict_mode);
+                let response = server
+                    .post("/v1/chat/completions")
+                    .json(&json!({
+                        "model": "dsv4-flash",
+                        "messages": [{"role": "user", "content": "hi"}]
+                    }))
+                    .await;
+                assert!(
+                    response.status_code().is_success(),
+                    "strict={strict_mode}: {}",
+                    response.status_code()
+                );
+
+                let requests = client.requests.lock().unwrap();
+                assert!(
+                    requests.iter().all(|r| !r.uri.contains("fireworks")),
+                    "strict={strict_mode}: {:?}",
+                    requests.iter().map(|r| r.uri.clone()).collect::<Vec<_>>()
+                );
+            }
+        }
+
+        /// A pool with nobody eligible for the class answers 503 rather than
+        /// leaking the request to an ineligible member.
+        #[tokio::test]
+        async fn a_completions_only_pool_refuses_chat_traffic() {
+            let targets_map = Arc::new(DashMap::new());
+            targets_map.insert(
+                "continuation-only".to_string(),
+                ProviderPool::new(vec![Provider::new(
+                    Target::builder()
+                        .url("https://fireworks.example.com".parse().unwrap())
+                        .serves(ServesScope::Completions)
+                        .build(),
+                    1,
+                )]),
+            );
+            let targets = Targets {
+                targets: targets_map,
+                key_rate_limiters: Arc::new(DashMap::new()),
+                key_concurrency_limiters: Arc::new(DashMap::new()),
+                key_labels: Arc::new(DashMap::new()),
+                strict_mode: false,
+                http_pool_config: None,
+            };
+            let mock = MockHttpClient::new(StatusCode::OK, "{}");
+            let app_state = AppState::with_client(targets, mock.clone());
+            let server = TestServer::new(build_router(app_state)).unwrap();
+
+            let response = server
+                .post("/v1/chat/completions")
+                .json(&json!({
+                    "model": "continuation-only",
+                    "messages": [{"role": "user", "content": "hi"}]
+                }))
+                .await;
+            assert_eq!(response.status_code(), StatusCode::SERVICE_UNAVAILABLE);
+            assert!(mock.requests.lock().unwrap().is_empty());
+        }
+    }
 }
