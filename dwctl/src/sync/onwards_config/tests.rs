@@ -167,7 +167,11 @@ async fn test_cache_shape_regular_public_and_private_access(pool: sqlx::PgPool) 
 
     let public = targets.targets.get("regular-public").expect("regular-public should exist");
     let public_pool = public.value();
-    assert_eq!(public_pool.default_pool().len(), 1, "regular-public should map to a single provider pool");
+    assert_eq!(
+        public_pool.default_pool().len(),
+        1,
+        "regular-public should map to a single provider pool"
+    );
     assert_eq!(pool_keys_len(public_pool), 4, "public model should expose system + all user keys");
     assert!(pool_has_key(public_pool, SYSTEM_KEY_SECRET));
     assert!(pool_has_key(public_pool, KEY_A_SECRET));
@@ -176,7 +180,11 @@ async fn test_cache_shape_regular_public_and_private_access(pool: sqlx::PgPool) 
 
     let private = targets.targets.get("regular-private").expect("regular-private should exist");
     let private_pool = private.value();
-    assert_eq!(private_pool.default_pool().len(), 1, "regular-private should map to a single provider pool");
+    assert_eq!(
+        private_pool.default_pool().len(),
+        1,
+        "regular-private should map to a single provider pool"
+    );
     assert_eq!(
         pool_keys_len(private_pool),
         2,
@@ -1720,11 +1728,18 @@ async fn test_cache_shape_component_pool_becomes_a_named_pool(pool: sqlx::PgPool
         .await
         .unwrap();
     let composite = targets.targets.get("composite-priority").expect("composite-priority should exist");
-    assert_eq!(composite.value().pool_count(), 1, "an untouched composite has only its default pool");
+    assert_eq!(
+        composite.value().pool_count(),
+        1,
+        "an untouched composite has only its default pool"
+    );
     let default_members = composite.value().default_pool().len();
     assert!(default_members >= 2, "fixture has multiple members");
     assert!(
-        composite.value().resolved_name(onwards::target::RequestClass::Completions).is_none(),
+        composite
+            .value()
+            .resolved_name(onwards::target::RequestClass::Completions)
+            .is_none(),
         "completions must resolve to the default pool until somebody adds a completions pool"
     );
 
@@ -1778,10 +1793,5 @@ async fn test_cache_shape_component_pool_becomes_a_named_pool(pool: sqlx::PgPool
     // A plain (non-composite) model is its own single pool, unchanged.
     let regular = targets.targets.get("regular-public").expect("regular-public should exist");
     assert_eq!(regular.value().pool_count(), 1);
-    assert!(
-        regular
-            .value()
-            .resolved_name(onwards::target::RequestClass::Completions)
-            .is_none()
-    );
+    assert!(regular.value().resolved_name(onwards::target::RequestClass::Completions).is_none());
 }

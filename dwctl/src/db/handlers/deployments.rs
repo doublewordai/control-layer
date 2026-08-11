@@ -7,9 +7,8 @@ use crate::db::{
     handlers::repository::Repository,
     models::deployments::{
         DEFAULT_COMPONENT_POOL, DeploymentComponentCreateDBRequest, DeploymentComponentDBResponse, DeploymentCreateDBRequest,
-        DeploymentDBResponse,
-        DeploymentUpdateDBRequest, LoadBalancingStrategy, ModelStatus, ModelType, ProviderPricing, ProviderPricingFields,
-        TrafficRuleAction, TrafficRuleDBRow,
+        DeploymentDBResponse, DeploymentUpdateDBRequest, LoadBalancingStrategy, ModelStatus, ModelType, ProviderPricing,
+        ProviderPricingFields, TrafficRuleAction, TrafficRuleDBRow,
     },
 };
 use crate::reasoning::{ModelReasoningPolicy, resolve_reasoning_translation};
@@ -4899,7 +4898,11 @@ mod tests {
         let mut tx = pool.begin().await.unwrap();
         {
             let mut repo = Deployments::new(tx.acquire().await.unwrap());
-            assert!(repo.remove_component(composite, components[1], DEFAULT_COMPONENT_POOL).await.unwrap());
+            assert!(
+                repo.remove_component(composite, components[1], DEFAULT_COMPONENT_POOL)
+                    .await
+                    .unwrap()
+            );
             repo.compact_component_sort_order(composite, DEFAULT_COMPONENT_POOL).await.unwrap();
         }
         tx.commit().await.unwrap();

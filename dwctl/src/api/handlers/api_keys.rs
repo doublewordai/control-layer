@@ -1335,10 +1335,12 @@ mod tests {
             .unwrap();
         let has_key = |targets: &onwards::target::Targets, secret: &str| {
             let expected = ConstantTimeString::from(secret.to_string());
-            targets
-                .targets
-                .get("cap-e2e-model")
-                .is_some_and(|p| p.value().default_pool().keys().is_some_and(|keys| keys.iter().any(|c| c == &expected)))
+            targets.targets.get("cap-e2e-model").is_some_and(|p| {
+                p.value()
+                    .default_pool()
+                    .keys()
+                    .is_some_and(|keys| keys.iter().any(|c| c == &expected))
+            })
         };
         assert!(has_key(&targets, &created.key));
         assert!(has_key(&targets, &child_secret));

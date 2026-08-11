@@ -11,9 +11,8 @@ use crate::{
     AppState,
     api::models::{
         deployments::{
-            ComponentEndpointSummary, ComponentModelSummary, ComponentPool, ComponentPoolQuery, DeployedModelCreate,
-            DeployedModelResponse, DeployedModelUpdate, GetModelQuery, ListModelsQuery, ModelComponentResponse,
-            enrichment::DeployedModelEnricher,
+            ComponentEndpointSummary, ComponentModelSummary, ComponentPool, ComponentPoolQuery, DeployedModelCreate, DeployedModelResponse,
+            DeployedModelUpdate, GetModelQuery, ListModelsQuery, ModelComponentResponse, enrichment::DeployedModelEnricher,
         },
         users::CurrentUser,
     },

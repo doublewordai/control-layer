@@ -2586,11 +2586,7 @@ async fn test_component_pool_round_trips_and_allows_dual_membership(pool: PgPool
     // The same hosted model joins the completions pool too — position 0 there,
     // independent of its position in the default pool.
     let on_prem_completions = add(&members[0], serde_json::json!({"weight": 50, "pool": "completions"})).await;
-    assert_eq!(
-        on_prem_completions.status_code(),
-        200,
-        "a member may belong to more than one pool"
-    );
+    assert_eq!(on_prem_completions.status_code(), 200, "a member may belong to more than one pool");
     let on_prem_completions: serde_json::Value = on_prem_completions.json();
     assert_eq!(on_prem_completions["pool"], "completions");
     assert_eq!(on_prem_completions["sort_order"], 0, "ordering is per pool");
