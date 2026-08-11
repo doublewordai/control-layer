@@ -1427,38 +1427,26 @@ mod tests {
         serde_json::from_slice(&requests[0].body).unwrap()
     }
 
+    /// Onwards VALIDATES and then forwards the ORIGINAL bytes (COR-522) — it is
+    /// not the enforcement point for privileged fields. `priority` is stripped
+    /// from external traffic by dwctl's inference middleware (which fusillade
+    /// daemon requests bypass, and continuation resume legs enter below); this
+    /// test pins that onwards itself never eats the field, for any key, so
+    /// enforcement lives in exactly one place.
     #[tokio::test]
-    async fn priority_is_stripped_from_completions_for_ordinary_keys() {
-        for purpose in [Some("realtime"), Some("playground"), None] {
+    async fn scheduling_fields_forward_verbatim_for_every_key() {
+        for purpose in [Some("realtime"), Some("continuation"), None] {
             let (state, mock_client) = app_with_key_purpose(purpose);
             let body = forwarded_body(
                 state,
                 &mock_client,
                 "/completions",
-                r#"{"model":"dsv4-flash","prompt":[1,2,3],"priority":9999,"stream_options":{"include_usage":true}}"#,
+                r#"{"model":"dsv4-flash","prompt":[1,2,3],"priority":100,"stream_options":{"include_usage":true}}"#,
             )
             .await;
-            assert!(
-                body.get("priority").is_none(),
-                "purpose={purpose:?} must not reach the scheduler with a priority"
-            );
-            // stream_options passes for everyone — a stream that reports no
-            // usage cannot be billed.
+            assert_eq!(body["priority"], 100, "purpose={purpose:?}: onwards must not eat the field");
             assert_eq!(body["stream_options"]["include_usage"], true);
         }
-    }
-
-    #[tokio::test]
-    async fn priority_passes_for_the_continuation_key() {
-        let (state, mock_client) = app_with_key_purpose(Some("continuation"));
-        let body = forwarded_body(
-            state,
-            &mock_client,
-            "/completions",
-            r#"{"model":"dsv4-flash","prompt":[1,2,3],"priority":100}"#,
-        )
-        .await;
-        assert_eq!(body["priority"], 100);
     }
 
     /// REGRESSION: fusillade derives a NEGATIVE priority from each batch
@@ -1489,54 +1477,26 @@ mod tests {
         }
     }
 
-    /// The chat schema has no typed `priority`, so this is purely the extras
-    /// path — the hole the flatten bag would otherwise leave open.
+    /// Verbatim forwarding applies to unmodelled fields too, on BOTH endpoints:
+    /// the schema is a validation surface, not a filter (COR-522 moved body
+    /// manipulation to the dwctl edge). This pins the contract so nobody
+    /// reintroduces per-field dropping here and silently breaks engine knobs
+    /// that ride through today.
     #[tokio::test]
-    async fn priority_is_stripped_from_chat_extras_for_ordinary_keys() {
-        let (state, mock_client) = app_with_key_purpose(Some("realtime"));
-        let body = forwarded_body(
-            state,
-            &mock_client,
-            "/chat/completions",
-            r#"{"model":"dsv4-flash","messages":[{"role":"user","content":"hi"}],"priority":9999,"custom_knob":true}"#,
-        )
-        .await;
-        assert!(body.get("priority").is_none());
-        // Only the privileged field goes; other unmodelled fields still ride
-        // the extras bag through.
-        assert_eq!(body["custom_knob"], true);
-
-        let (state, mock_client) = app_with_key_purpose(Some("continuation"));
-        let body = forwarded_body(
-            state,
-            &mock_client,
-            "/chat/completions",
-            r#"{"model":"dsv4-flash","messages":[{"role":"user","content":"hi"}],"priority":100}"#,
-        )
-        .await;
-        assert_eq!(body["priority"], 100);
-    }
-
-    /// Completions stays STRICT: it models the fields it forwards, and an
-    /// unmodelled one is dropped rather than passed through. `priority` is
-    /// modelled precisely because it sometimes has to survive.
-    #[tokio::test]
-    async fn completions_drops_unmodelled_fields() {
-        let (state, mock_client) = app_with_key_purpose(Some("continuation"));
-        let body = forwarded_body(
-            state,
-            &mock_client,
-            "/completions",
-            r#"{"model":"dsv4-flash","prompt":[1,2],"priority":7,"ignore_eos":true,"repetition_penalty":1.1,"custom_knob":true}"#,
-        )
-        .await;
-        assert!(
-            body.get("repetition_penalty").is_none(),
-            "an unmodelled engine knob is dropped, as it was before this branch"
-        );
-        assert!(body.get("custom_knob").is_none(), "strict means strict");
-        // Fields the schema DOES model still ride through.
-        assert_eq!(body["ignore_eos"], true);
-        assert_eq!(body["priority"], 7, "a modelled field still survives");
+    async fn unmodelled_fields_forward_verbatim_after_validation() {
+        for (uri, body) in [
+            (
+                "/completions",
+                r#"{"model":"dsv4-flash","prompt":[1,2],"ignore_eos":true,"repetition_penalty":1.1,"custom_knob":true}"#,
+            ),
+            (
+                "/chat/completions",
+                r#"{"model":"dsv4-flash","messages":[{"role":"user","content":"hi"}],"custom_knob":true}"#,
+            ),
+        ] {
+            let (state, mock_client) = app_with_key_purpose(Some("realtime"));
+            let forwarded = forwarded_body(state, &mock_client, uri, body).await;
+            assert_eq!(forwarded["custom_knob"], true, "{uri}: original bytes forward untouched");
+        }
     }
 }

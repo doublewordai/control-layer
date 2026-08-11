@@ -234,33 +234,19 @@ pub struct CompletionRequest {
     pub stream_options: Option<StreamOptions>,
 
     /// Scheduling priority. **Privileged**: the dynamo scheduler orders its
-    /// queue by this field, so a caller who could set it would be able to jump
-    /// ahead of everyone else's realtime work. Stripped unless the key's
-    /// purpose is `batch` or `continuation` — see
-    /// [`CompletionRequest::strip_priority`] and `strict::handlers`.
-    ///
-    /// Modelled rather than left to an extras bag deliberately: this schema is
-    /// strict, so an unmodelled field is DROPPED, and a field we must sometimes
-    /// forward has to be typed to survive re-serialization.
+    /// queue by this field. Modelled here so validation ACCEPTS it (this
+    /// schema is strict; an unmodelled field would fail requests that
+    /// legitimately carry it). Enforcement is not this layer's job: onwards
+    /// forwards the original bytes, and dwctl's inference middleware strips
+    /// `priority` from every external request — fusillade daemon requests
+    /// bypass that middleware (keeping batch's deadline priority) and
+    /// continuation resume legs enter the stack below it (keeping theirs).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub priority: Option<i64>,
 
     /// Captured only to return a useful compatibility error.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chat_template_kwargs: Option<serde_json::Value>,
-}
-
-impl CompletionRequest {
-    /// Drop a caller-supplied scheduling priority before proxying.
-    ///
-    /// The typed field is the whole surface here: completions is a strict
-    /// schema with no extras bag, so an unmodelled field never reaches the
-    /// upstream to begin with. (Chat is different — it forwards unknown fields
-    /// verbatim, so it needs its extras scrubbed too; see
-    /// [`super::chat_completions::ChatCompletionRequest::strip_priority`].)
-    pub(crate) fn strip_priority(&mut self) {
-        self.priority = None;
-    }
 }
 
 /// Response from POST /v1/completions (non-streaming)

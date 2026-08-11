@@ -987,6 +987,23 @@ impl TargetPools {
         &self.default
     }
 
+    /// The default pool's first provider — the composite's representative for
+    /// composite-level config checks (e.g. Open Responses adapter detection),
+    /// which predate named pools and are not per-request-class.
+    pub fn first_target(&self) -> Option<&Target> {
+        self.default.first_target()
+    }
+
+    /// Evaluate the composite's routing rules. Rules live on the default pool
+    /// (named pools inherit them when unset — see the sync layer), so the
+    /// default pool's rules ARE the composite's rules for label-based checks.
+    pub fn evaluate_routing_rules(
+        &self,
+        labels: &HashMap<String, String>,
+    ) -> Option<&RoutingAction> {
+        self.default.evaluate_routing_rules(labels)
+    }
+
     /// Look a pool up by name.
     pub fn get(&self, name: &str) -> Option<&ProviderPool> {
         if name == DEFAULT_POOL {
@@ -3409,7 +3426,14 @@ mod tests {
         }"#;
         let targets = Targets::from_config(serde_json::from_str(json).unwrap()).unwrap();
         let entry = targets.targets.get("dsv4-flash").unwrap();
-        assert_eq!(entry.resolve(RequestClass::Completions).keys().unwrap().len(), 2);
+        assert_eq!(
+            entry
+                .resolve(RequestClass::Completions)
+                .keys()
+                .unwrap()
+                .len(),
+            2
+        );
         assert_eq!(entry.resolve(RequestClass::Normal).keys().unwrap().len(), 1);
     }
 

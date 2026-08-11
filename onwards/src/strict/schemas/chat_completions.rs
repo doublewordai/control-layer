@@ -7,10 +7,35 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
-use super::utils::{ensure_field, scrub_request_id_fields_from_extra, strip_priority_from_extra};
+use super::utils::ensure_field;
 
 pub(crate) fn generated_chat_completion_id() -> String {
     format!("chatcmpl-{}", Uuid::new_v4())
+}
+
+fn normalize_null_like_tool_call_arguments(message: &mut Value) {
+    let Some(tool_calls) = message.get_mut("tool_calls").and_then(Value::as_array_mut) else {
+        return;
+    };
+
+    for tool_call in tool_calls {
+        let Some(function) = tool_call.get_mut("function").and_then(Value::as_object_mut) else {
+            continue;
+        };
+
+        let null_like = match function.get("arguments") {
+            None | Some(Value::Null) => true,
+            Some(Value::String(arguments)) => {
+                let arguments = arguments.trim();
+                arguments.is_empty() || arguments == "null"
+            }
+            Some(_) => false,
+        };
+
+        if null_like {
+            function.insert("arguments".to_string(), Value::String("{}".to_string()));
+        }
+    }
 }
 
 fn normalize_chat_message_value(value: &mut Value) {
@@ -20,6 +45,8 @@ fn normalize_chat_message_value(value: &mut Value) {
 
     ensure_field(object, "role", || Value::String("assistant".to_string()));
     ensure_field(object, "content", || Value::Null);
+
+    normalize_null_like_tool_call_arguments(value);
 }
 
 fn normalize_chat_choice_value(value: &mut Value, fallback_index: usize) {
@@ -215,23 +242,6 @@ pub struct ChatCompletionRequest {
     /// Additional fields not explicitly modeled
     #[serde(flatten)]
     pub extra: Option<serde_json::Value>,
-}
-
-impl ChatCompletionRequest {
-    /// Remove caller-controlled request identifier fields before proxying.
-    pub(crate) fn scrub_request_id_fields(&mut self) {
-        scrub_request_id_fields_from_extra(&mut self.extra);
-    }
-
-    /// Drop a caller-supplied scheduling priority before proxying.
-    ///
-    /// This schema models no `priority` field, but `extra` forwards unknown
-    /// fields verbatim — so a chat request is just as capable of smuggling one
-    /// through as a completions request, and needs the same scrub. Only `batch`
-    /// and `continuation` keys may set it (see `strict::handlers`).
-    pub(crate) fn strip_priority(&mut self) {
-        strip_priority_from_extra(&mut self.extra);
-    }
 }
 
 /// A message in the conversation

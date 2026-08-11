@@ -314,27 +314,38 @@ async fn test_strict_mode_allows_chat_completions(pool: PgPool) {
     }
     assert!(model_available, "Model gpt-4 should be available in onwards within 3 seconds");
 
-    // Make the chat completion request. The models poll above is answered
-    // by dwctl from the DB, so it does NOT prove onwards' key cache has
-    // processed the NOTIFY yet — in strict mode a not-yet-admitted key gets
-    // 403 from onwards. Poll through that startup race and assert the
-    // terminal state.
-    let start = std::time::Instant::now();
-    let (status, body_text) = loop {
-        let chat_response = server
+    // Make the chat completion request.
+    //
+    // The `/ai/v1/models` poll above is NOT a sufficient guard on its own:
+    // dwctl answers model discovery from the control-layer DB, so it flips to
+    // 200 as soon as the row is committed, whereas `/chat/completions` routes
+    // through onwards' asynchronously-synced caches. Two distinct startup races
+    // can still bite right after discovery reports the model:
+    //   - 404 `model_not_found` until onwards' config cache catches up, and
+    //   - 403 until onwards' key cache has processed the admission NOTIFY
+    //     (strict mode rejects a not-yet-admitted key).
+    // Poll through both and assert the terminal state.
+    let chat_request = serde_json::json!({
+        "model": "gpt-4",
+        "messages": [{
+            "role": "user",
+            "content": "Hello, test strict mode"
+        }]
+    });
+    let send_chat = async |body: &serde_json::Value| {
+        server
             .post("/ai/v1/chat/completions")
             .add_header("Authorization", &format!("Bearer {}", api_key))
             .add_header("Content-Type", "application/json")
-            .json(&serde_json::json!({
-                "model": "gpt-4",
-                "messages": [{
-                    "role": "user",
-                    "content": "Hello, test strict mode"
-                }]
-            }))
-            .await;
+            .json(body)
+            .await
+    };
+
+    let start = std::time::Instant::now();
+    let (status, body_text) = loop {
+        let chat_response = send_chat(&chat_request).await;
         let status = chat_response.status_code();
-        if status != 403 || start.elapsed() > std::time::Duration::from_secs(3) {
+        if (status != 403 && status != 404) || start.elapsed() > std::time::Duration::from_secs(5) {
             break (status, chat_response.text());
         }
         tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;

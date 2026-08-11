@@ -4425,7 +4425,9 @@ mod tests {
         fn priority_pool(urls: &[&str]) -> ProviderPool {
             ProviderPool::with_config(
                 urls.iter()
-                    .map(|url| Provider::new(Target::builder().url(url.parse().unwrap()).build(), 1))
+                    .map(|url| {
+                        Provider::new(Target::builder().url(url.parse().unwrap()).build(), 1)
+                    })
                     .collect(),
                 None,
                 None,
@@ -4573,7 +4575,9 @@ mod tests {
                 HashMap::from([(COMPLETIONS_POOL.to_string(), ProviderPool::new(vec![]))]),
             );
             assert!(
-                pools.resolved_name(crate::target::RequestClass::Completions).is_none(),
+                pools
+                    .resolved_name(crate::target::RequestClass::Completions)
+                    .is_none(),
                 "an empty pool is not a picked pool"
             );
             let (server, client) = server_with(false, pools);
@@ -4586,7 +4590,9 @@ mod tests {
             let requests = client.requests.lock().unwrap();
             assert_eq!(requests.len(), 1);
             assert!(
-                requests[0].uri.starts_with("https://openrouter.example.com/"),
+                requests[0]
+                    .uri
+                    .starts_with("https://openrouter.example.com/"),
                 "got {}",
                 requests[0].uri
             );

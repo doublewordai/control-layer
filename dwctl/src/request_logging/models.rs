@@ -5,10 +5,12 @@ use std::collections::HashMap;
 use async_openai::types::chat::{CreateChatCompletionRequest, CreateChatCompletionResponse, CreateChatCompletionStreamResponse};
 use async_openai::types::completions::{CreateCompletionRequest, CreateCompletionResponse};
 use async_openai::types::embeddings::{CreateBase64EmbeddingResponse, CreateEmbeddingRequest, CreateEmbeddingResponse};
-use async_openai::types::responses::{Response, ResponseStreamEvent};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
+
+use crate::inference::translation::anthropic::model::MessagesResponse;
+use crate::inference::translation::responses::types::{ResponsesResponse, ResponsesStreamingEvent};
 
 /// Errors that can occur during SSE parsing
 #[derive(Debug, Clone, PartialEq, Error)]
@@ -76,7 +78,20 @@ pub enum CompletionChunk {
     Done,
 }
 
-/// AI response types with special handling for streaming
+/// AI response types with special handling for streaming.
+///
+/// One dwctl-owned enum whose variants wrap each endpoint's canonical response
+/// type from wherever that endpoint's types live:
+/// - chat completions / completions / embeddings are the native OpenAI-shape
+///   passthrough endpoints, so they use async-openai's tolerant response types
+///   (outlet captures the raw upstream provider body, which async-openai parses),
+/// - responses and anthropic bodies are produced by dwctl's own edge translators
+///   (translation sits inside outlet), so they parse back with dwctl's own types:
+///   [`ResponsesResponse`] / [`ResponsesStreamingEvent`] and [`MessagesResponse`].
+///
+/// This single type feeds both request logging (stored as JSONB) and billing
+/// ([`TokenMetrics`](crate::request_logging::serializers) via `From<&AiResponse>`),
+/// so the response is parsed once, into one shape, for both.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 #[allow(clippy::large_enum_variant)]
@@ -87,10 +102,19 @@ pub enum AiResponse {
     CompletionsStream(Vec<CompletionChunk>),
     Embeddings(CreateEmbeddingResponse),
     Base64Embeddings(CreateBase64EmbeddingResponse),
-    /// Non-streaming /v1/responses response object.
-    Responses(Response),
+    /// Non-streaming /v1/responses response object (dwctl-owned schema).
+    Responses(ResponsesResponse),
     /// Streaming /v1/responses – SSE events collected until stream end.
-    ResponsesStream(Vec<ResponseStreamEvent>),
+    ResponsesStream(Vec<ResponsesStreamingEvent>),
+    /// Non-streaming /v1/messages (Anthropic) response object.
+    Anthropic(MessagesResponse),
+    /// Streaming /v1/messages – SSE event frames collected as raw JSON. Anthropic's
+    /// stream events are emitted ad-hoc (never typed structs anywhere in dwctl), so
+    /// keeping them as `Value` avoids inventing a parallel typed event hierarchy
+    /// just for billing; usage is read by scanning the frames in `TokenMetrics`.
+    /// Listed last (before `Other`) so its `Vec<Value>` catch-all cannot shadow the
+    /// other, typed stream variants during untagged deserialization.
+    AnthropicStream(Vec<Value>),
     Other(Value),
 }
 

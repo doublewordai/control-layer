@@ -1,7 +1,11 @@
 //! Typed request handlers for strict mode
 //!
-//! These handlers validate requests using Axum's Json extractor (which uses serde)
-//! before forwarding to the upstream provider.
+//! The chat-completions, completions and embeddings handlers validate the request
+//! by deserialising it against the strict schema, then forward the ORIGINAL request
+//! bytes unchanged - request-body manipulation (id-scrub, streaming usage flags,
+//! image normalisation, tool injection) now lives upstream in dwctl, so onwards only
+//! checks the shape and never re-serialises (or drops unknown fields from) the
+//! customer's request.
 //!
 //! For responses, strict mode provides security by:
 //! - Deserializing third-party responses through our strict schemas (drops extra fields)
@@ -52,48 +56,6 @@ struct ForwardResult {
     internal_error: bool,
 }
 
-/// The `purpose` label of the key that authenticated this request.
-///
-/// dwctl's onwards sync stamps every synced key with a `purpose` label — the
-/// same label `model_traffic_rules` redirects match on, and the same value
-/// analytics derives `request_origin` from. It is already in memory (the
-/// routing-rule path in `handlers.rs` reads the identical map), so this is a
-/// lookup, not a round trip.
-fn key_purpose<T: HttpClient>(state: &AppState<T>, headers: &HeaderMap) -> Option<String> {
-    let token = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))?;
-    state
-        .targets
-        .key_labels
-        .get(token)
-        .and_then(|labels| labels.get("purpose").cloned())
-}
-
-/// Whether this request's `priority` survives to the upstream.
-///
-/// Tri-level, on the authenticating key's purpose:
-///
-/// - **`batch`** — passthrough. fusillade derives a NEGATIVE priority from each
-///   request's deadline so batch work sorts BEHIND realtime traffic and, within
-///   itself, by urgency. Stripping it would flatten batch scheduling to a
-///   single tier and let a far-future batch compete with one about to miss its
-///   window. Batch priorities are negative by construction, so passthrough
-///   cannot jump the realtime queue.
-/// - **`continuation`** — passthrough. Resume legs finish a stream the platform
-///   already accepted and partially delivered, on a seam budget the user is
-///   sitting through.
-/// - **everything else** — stripped, including the dashboard's playground key,
-///   so no caller can put itself ahead of everyone else's realtime work. A
-///   stripped request is priority 0 at dynamo, the realtime default.
-fn may_set_priority<T: HttpClient>(state: &AppState<T>, headers: &HeaderMap) -> bool {
-    matches!(
-        key_purpose(state, headers).as_deref(),
-        Some("batch") | Some("continuation")
-    )
-}
-
 fn is_sse_content_type(content_type: &str) -> bool {
     content_type
         .split(';')
@@ -122,21 +84,49 @@ pub async fn models_handler<T: HttpClient + Clone + Send + Sync + 'static>(
     crate::handlers::models(State(state), req).await
 }
 
+/// Deserialize a strict-mode request body, mapping serde errors to the same HTTP
+/// statuses Axum's `Json` extractor produced before these handlers switched to
+/// validate-and-forward-original: `422 Unprocessable Entity` for a well-formed JSON
+/// body that doesn't match the schema (missing/mistyped field), `400 Bad Request`
+/// for malformed JSON.
+fn parse_strict_request<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T, Response> {
+    serde_json::from_slice::<T>(body).map_err(|e| {
+        let status = if e.is_data() {
+            StatusCode::UNPROCESSABLE_ENTITY
+        } else {
+            StatusCode::BAD_REQUEST
+        };
+        error_response(
+            status,
+            "invalid_request_error",
+            &format!("Invalid request: {e}"),
+        )
+    })
+}
+
 /// Handler for POST /v1/chat/completions
 ///
 /// Validates the request against the Chat Completions schema, then forwards
-/// to the upstream provider via the standard passthrough handler.
+/// the original request bytes to the upstream provider.
 pub async fn chat_completions_handler<T: HttpClient + Clone + Send + Sync + 'static>(
     State(state): State<AppState<T>>,
-    headers: HeaderMap,
-    Json(mut request): Json<ChatCompletionRequest>,
+    req: Request<Body>,
 ) -> Response {
-    request.scrub_request_id_fields();
-    // This schema models no `priority`, but its `extra` bag forwards unknown
-    // fields verbatim — so chat is exactly as exposed as completions.
-    if !may_set_priority(&state, &headers) {
-        request.strip_priority();
-    }
+    let headers = req.headers().clone();
+    let body_bytes = match axum::body::to_bytes(req.into_body(), state.body_limit).await {
+        Ok(bytes) => bytes,
+        Err(_) => return OnwardsErrorResponse::payload_too_large(state.body_limit).into_response(),
+    };
+
+    // Validate the request against the strict schema, but forward the ORIGINAL bytes
+    // untouched. dwctl owns request-body manipulation now (id-scrub, streaming usage
+    // flags, image normalisation, tool injection); onwards only checks the shape and
+    // passes the body through, so it never re-serialises (or silently drops unknown
+    // nested fields) the customer's request.
+    let request: ChatCompletionRequest = match parse_strict_request(&body_bytes) {
+        Ok(request) => request,
+        Err(response) => return response,
+    };
 
     let original_model = request.model.clone();
     let is_streaming = request.stream.unwrap_or(false);
@@ -148,26 +138,13 @@ pub async fn chat_completions_handler<T: HttpClient + Clone + Send + Sync + 'sta
         "Chat completions request validated"
     );
 
-    // Re-serialize the validated request and forward it
-    let body_bytes = match serde_json::to_vec(&request) {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            error!(error = %e, "Failed to serialize chat completions request");
-            return error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "server_error",
-                "Failed to process request",
-            );
-        }
-    };
-
     let resolved_model =
         extract_model_from_request(&headers, &body_bytes).unwrap_or(original_model.clone());
     let ForwardResult {
         response,
         trusted,
         internal_error,
-    } = forward_request(state, headers, "/chat/completions", body_bytes).await;
+    } = forward_request(state, headers, "/chat/completions", body_bytes.to_vec()).await;
 
     // Success responses are always sanitized (model rewriting, extra field removal)
     // Error responses are only sanitized for untrusted providers
@@ -216,10 +193,8 @@ pub async fn responses_handler<T: HttpClient + Clone + Send + Sync + 'static>(
     // A native Responses request keeps its `/responses` path and falls through to
     // the normal adapter/passthrough logic below.
     if req.uri().path().ends_with("/chat/completions") {
-        return match Json::<ChatCompletionRequest>::from_request(req, &state).await {
-            Ok(chat_request) => chat_completions_handler(State(state), headers, chat_request).await,
-            Err(rejection) => rejection.into_response(),
-        };
+        // The chat handler validates the shape and forwards the original bytes.
+        return chat_completions_handler(State(state), req).await;
     }
 
     // Split the request so we can grab extensions (inserted by middleware)
@@ -228,7 +203,7 @@ pub async fn responses_handler<T: HttpClient + Clone + Send + Sync + 'static>(
     let extensions = std::mem::take(&mut parts.extensions);
     let req = Request::from_parts(parts, body);
 
-    let mut request: ResponsesRequest = match axum::extract::Json::from_request(req, &state).await {
+    let request: ResponsesRequest = match axum::extract::Json::from_request(req, &state).await {
         Ok(Json(r)) => r,
         Err(e) => {
             error!(error = %e, "Failed to parse responses request");
@@ -239,7 +214,6 @@ pub async fn responses_handler<T: HttpClient + Clone + Send + Sync + 'static>(
             );
         }
     };
-    request.scrub_request_id_fields();
 
     debug!(
         model = %request.model,
@@ -428,9 +402,20 @@ pub async fn responses_handler<T: HttpClient + Clone + Send + Sync + 'static>(
 /// to the upstream provider via the standard passthrough handler.
 pub async fn embeddings_handler<T: HttpClient + Clone + Send + Sync + 'static>(
     State(state): State<AppState<T>>,
-    headers: HeaderMap,
-    Json(request): Json<EmbeddingsRequest>,
+    req: Request<Body>,
 ) -> Response {
+    let headers = req.headers().clone();
+    let body_bytes = match axum::body::to_bytes(req.into_body(), state.body_limit).await {
+        Ok(bytes) => bytes,
+        Err(_) => return OnwardsErrorResponse::payload_too_large(state.body_limit).into_response(),
+    };
+
+    // Validate the shape, forward the original bytes untouched (see chat handler).
+    let request: EmbeddingsRequest = match parse_strict_request(&body_bytes) {
+        Ok(request) => request,
+        Err(response) => return response,
+    };
+
     let original_model = request.model.clone();
 
     debug!(
@@ -438,26 +423,13 @@ pub async fn embeddings_handler<T: HttpClient + Clone + Send + Sync + 'static>(
         "Embeddings request validated"
     );
 
-    // Re-serialize the validated request and forward it
-    let body_bytes = match serde_json::to_vec(&request) {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            error!(error = %e, "Failed to serialize embeddings request");
-            return error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "server_error",
-                "Failed to process request",
-            );
-        }
-    };
-
     let resolved_model =
         extract_model_from_request(&headers, &body_bytes).unwrap_or(original_model.clone());
     let ForwardResult {
         response,
         trusted,
         internal_error,
-    } = forward_request(state, headers, "/embeddings", body_bytes).await;
+    } = forward_request(state, headers, "/embeddings", body_bytes.to_vec()).await;
 
     // Success responses are always sanitized (model rewriting, extra field removal)
     // Error responses are only sanitized for untrusted providers
@@ -478,12 +450,19 @@ pub async fn embeddings_handler<T: HttpClient + Clone + Send + Sync + 'static>(
 /// to the upstream provider's `/v1/completions` endpoint.
 pub async fn completions_handler<T: HttpClient + Clone + Send + Sync + 'static>(
     State(state): State<AppState<T>>,
-    headers: HeaderMap,
-    Json(mut request): Json<CompletionRequest>,
+    req: Request<Body>,
 ) -> Response {
-    if !may_set_priority(&state, &headers) {
-        request.strip_priority();
-    }
+    let headers = req.headers().clone();
+    let body_bytes = match axum::body::to_bytes(req.into_body(), state.body_limit).await {
+        Ok(bytes) => bytes,
+        Err(_) => return OnwardsErrorResponse::payload_too_large(state.body_limit).into_response(),
+    };
+
+    // Validate the shape, forward the original bytes untouched (see chat handler).
+    let request: CompletionRequest = match parse_strict_request(&body_bytes) {
+        Ok(request) => request,
+        Err(response) => return response,
+    };
 
     let unsupported_reasoning_param = [
         (request.reasoning_effort.is_some(), "reasoning_effort"),
@@ -521,25 +500,13 @@ pub async fn completions_handler<T: HttpClient + Clone + Send + Sync + 'static>(
         "Completions request validated"
     );
 
-    let body_bytes = match serde_json::to_vec(&request) {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            error!(error = %e, "Failed to serialize completions request");
-            return error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "server_error",
-                "Failed to process request",
-            );
-        }
-    };
-
     let resolved_model =
         extract_model_from_request(&headers, &body_bytes).unwrap_or(original_model);
     let ForwardResult {
         response,
         trusted,
         internal_error,
-    } = forward_request(state, headers, "/completions", body_bytes).await;
+    } = forward_request(state, headers, "/completions", body_bytes.to_vec()).await;
 
     if response.status().is_success() {
         let response_is_sse = response_is_sse(&response);
@@ -576,10 +543,6 @@ fn should_use_adapter<T: HttpClient + Clone + Send + Sync + 'static>(
         }
     };
 
-    // The adapter is a Responses-API concern, which is default-pool traffic —
-    // a per-request-class pool never serves it.
-    let pool = pool.default_pool();
-
     // If the pool has providers, check the first one's adapter config directly
     if let Some(target) = pool.first_target() {
         return target
@@ -613,7 +576,7 @@ fn should_use_adapter<T: HttpClient + Clone + Send + Sync + 'static>(
                 .targets
                 .targets
                 .get(target.as_str())
-                .and_then(|p| p.default_pool().first_target().cloned())
+                .and_then(|p| p.first_target().cloned())
                 .and_then(|t| t.open_responses)
                 .map(|config| config.adapter)
                 .unwrap_or(false)
@@ -2758,7 +2721,85 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_strict_chat_request_scrubs_request_id_fields_before_forwarding() {
+    async fn test_strict_chat_response_normalizes_null_like_tool_arguments() {
+        let targets = Arc::new(DashMap::new());
+        targets.insert(
+            "gpt-4".to_string(),
+            Target::builder()
+                .url("https://api.openai.com/v1/".parse().unwrap())
+                .onwards_key("sk-test".to_string())
+                .build()
+                .into_pool(),
+        );
+
+        let targets = Targets {
+            targets,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels: Arc::new(DashMap::new()),
+            strict_mode: true,
+            http_pool_config: None,
+        };
+
+        let mock_response = r#"{
+            "id":"chatcmpl-tools",
+            "object":"chat.completion",
+            "created":1,
+            "model":"provider-model",
+            "choices":[{
+                "index":0,
+                "message":{
+                    "role":"assistant",
+                    "content":null,
+                    "tool_calls":[
+                        {"id":"missing","type":"function","function":{"name":"missing"}},
+                        {"id":"null","type":"function","function":{"name":"null","arguments":null}},
+                        {"id":"empty","type":"function","function":{"name":"empty","arguments":""}},
+                        {"id":"string-null","type":"function","function":{"name":"string_null","arguments":"null"}},
+                        {"id":"valid","type":"function","function":{"name":"valid","arguments":"{\"query\":\"x\"}"}}
+                    ]
+                },
+                "finish_reason":"tool_calls"
+            }]
+        }"#;
+
+        let mock_client = MockHttpClient::new(StatusCode::OK, mock_response);
+        let state = AppState::with_client(targets, mock_client);
+        let router = crate::strict::build_strict_router(state);
+        let request = Request::builder()
+            .method("POST")
+            .uri("/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}"#,
+            ))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let calls = body["choices"][0]["message"]["tool_calls"]
+            .as_array()
+            .unwrap();
+
+        assert_eq!(calls[0]["function"]["arguments"], "{}");
+        assert_eq!(calls[1]["function"]["arguments"], "{}");
+        assert_eq!(calls[2]["function"]["arguments"], "{}");
+        assert_eq!(calls[3]["function"]["arguments"], "{}");
+        assert_eq!(calls[4]["function"]["arguments"], r#"{"query":"x"}"#);
+    }
+
+    #[tokio::test]
+    // Onwards no longer manipulates the request body: it validates the shape and
+    // forwards the ORIGINAL bytes verbatim. The id-scrub that used to live here moved
+    // to dwctl's outbound_request middleware, so onwards must pass caller fields
+    // through untouched - including unknown top-level and nested fields the old typed
+    // re-serialise would have dropped.
+    async fn test_strict_chat_request_forwards_body_unchanged() {
         let targets = Arc::new(DashMap::new());
         targets.insert(
             "gpt-4".to_string(),
@@ -2798,14 +2839,10 @@ mod tests {
         let router = crate::strict::build_strict_router(state);
 
         let request_body = r#"{
-            "id": "chatcmpl-client-leak",
-            "completion_id": "cmpl-client-leak",
-            "completionId": "cmplClientLeak",
-            "response_id": "resp_client_leak",
-            "responseId": "respClientLeak",
+            "id": "chatcmpl-client-supplied",
             "provider_extension": "preserve-me",
             "model": "gpt-4",
-            "messages": [{"role": "user", "content": "Hello"}]
+            "messages": [{"role": "user", "content": "Hello", "nested_unknown": "keep-me"}]
         }"#;
 
         let request = Request::builder()
@@ -2821,15 +2858,19 @@ mod tests {
         let requests = mock_client.get_requests();
         assert_eq!(requests.len(), 1);
 
-        let forwarded_json: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
-        let forwarded_object = forwarded_json.as_object().unwrap();
+        // Byte-for-byte identical: onwards did not re-serialise (which would reorder
+        // keys / drop whitespace) - it forwarded exactly what it received.
+        assert_eq!(
+            &requests[0].body[..],
+            request_body.as_bytes(),
+            "onwards must forward the request body verbatim"
+        );
 
-        assert!(!forwarded_object.contains_key("id"));
-        assert!(!forwarded_object.contains_key("completion_id"));
-        assert!(!forwarded_object.contains_key("completionId"));
-        assert!(!forwarded_object.contains_key("response_id"));
-        assert!(!forwarded_object.contains_key("responseId"));
+        // And nothing was scrubbed or dropped, including the nested unknown field.
+        let forwarded_json: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(forwarded_json["id"], "chatcmpl-client-supplied");
         assert_eq!(forwarded_json["provider_extension"], "preserve-me");
+        assert_eq!(forwarded_json["messages"][0]["nested_unknown"], "keep-me");
     }
 
     /// Test that strict mode rewrites the model field to match the requested model
@@ -5929,102 +5970,6 @@ mod tests {
             "Optional 'status' field should not be present when omitted in request, found: {:?}",
             message_item
         );
-    }
-
-    #[tokio::test]
-    async fn test_responses_api_request_scrubs_request_id_fields_before_forwarding() {
-        let targets = Arc::new(DashMap::new());
-        targets.insert(
-            "gpt-4o".to_string(),
-            Target::builder()
-                .url("https://api.openai.com/v1/".parse().unwrap())
-                .onwards_key("sk-test".to_string())
-                .build()
-                .into_pool(),
-        );
-
-        let targets = Targets {
-            targets,
-            key_rate_limiters: Arc::new(DashMap::new()),
-            key_concurrency_limiters: Arc::new(DashMap::new()),
-            key_labels: Arc::new(DashMap::new()),
-            strict_mode: true,
-            http_pool_config: None,
-        };
-
-        let mock_response = r#"{
-            "id": "resp_123",
-            "object": "response",
-            "created_at": 1234567890,
-            "completed_at": 1234567900,
-            "status": "completed",
-            "incomplete_details": null,
-            "model": "gpt-4o",
-            "previous_response_id": "resp_previous",
-            "instructions": null,
-            "output": [],
-            "error": null,
-            "tools": [],
-            "tool_choice": "auto",
-            "truncation": "disabled",
-            "parallel_tool_calls": true,
-            "text": { "format": { "type": "text" } },
-            "top_p": 1.0,
-            "presence_penalty": 0.0,
-            "frequency_penalty": 0.0,
-            "top_logprobs": 0,
-            "temperature": 1.0,
-            "reasoning": null,
-            "usage": null,
-            "max_output_tokens": null,
-            "max_tool_calls": null,
-            "store": false,
-            "background": false,
-            "service_tier": "default",
-            "metadata": null,
-            "safety_identifier": null,
-            "prompt_cache_key": null
-        }"#;
-
-        let mock_client = MockHttpClient::new(StatusCode::OK, mock_response);
-        let state = AppState::with_client(targets, mock_client.clone());
-        let router = crate::strict::build_strict_router(state);
-
-        let request_body = r#"{
-            "id": "resp_client_leak",
-            "completion_id": "cmpl-client-leak",
-            "completionId": "cmplClientLeak",
-            "response_id": "resp_client_leak_2",
-            "responseId": "respClientLeak2",
-            "provider_extension": "preserve-me",
-            "model": "gpt-4o",
-            "previous_response_id": "resp_previous",
-            "input": "Hello"
-        }"#;
-
-        let request = Request::builder()
-            .method("POST")
-            .uri("/responses")
-            .header("content-type", "application/json")
-            .body(Body::from(request_body))
-            .unwrap();
-
-        let response = router.oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-
-        let requests = mock_client.get_requests();
-        assert_eq!(requests.len(), 1);
-
-        let forwarded_json: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
-        let forwarded_object = forwarded_json.as_object().unwrap();
-
-        assert!(!forwarded_object.contains_key("id"));
-        assert!(!forwarded_object.contains_key("completion_id"));
-        assert!(!forwarded_object.contains_key("completionId"));
-        assert!(!forwarded_object.contains_key("response_id"));
-        assert!(!forwarded_object.contains_key("responseId"));
-        assert_eq!(forwarded_json["previous_response_id"], "resp_previous");
-        assert_eq!(forwarded_json["provider_extension"], "preserve-me");
     }
 
     /// Test that unknown item types preserve their original payload
