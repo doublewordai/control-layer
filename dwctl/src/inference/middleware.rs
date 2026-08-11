@@ -98,7 +98,7 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
 
     // Read and parse the request body
     let (parts, body) = req.into_parts();
-    let body_bytes = match axum::body::to_bytes(body, usize::MAX).await {
+    let mut body_bytes = match axum::body::to_bytes(body, usize::MAX).await {
         Ok(bytes) => bytes,
         Err(e) => {
             tracing::error!(error = %e, "Failed to read request body in inference middleware");
@@ -120,6 +120,20 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
     // from onwards PR #240 that these ids never reach upstream. Exact-key removal:
     // extension fields and a legitimate `previous_response_id` are left intact.
     scrub_request_id_fields(&mut request_value);
+
+    // Strip the operator-only `nvext` extension from client requests. Everything
+    // reaching this point is external: the fusillade daemon's loopback re-entry
+    // carries `x-fusillade-request-id` and returned early above, and the edge
+    // nginx strips that header from inbound traffic, so a client cannot forge the
+    // internal path. `nvext.agent_hints` carries the scheduling priority and
+    // routing hints the platform injects for itself (fusillade's
+    // `inject_deadline_priority`); a client must not be able to set them and jump
+    // the queue. Re-derive the forwarded bytes only when the key was actually
+    // present, so the common realtime path (which forwards `body_bytes` verbatim)
+    // stays byte-identical and pays no re-serialisation cost.
+    if strip_client_nvext(&mut request_value) {
+        body_bytes = bytes::Bytes::from(request_value.to_string());
+    }
 
     let model = request_value["model"].as_str().unwrap_or("unknown").to_string();
     let model = model.as_str();
@@ -1183,6 +1197,19 @@ fn scrub_request_id_fields(value: &mut serde_json::Value) {
     }
 }
 
+/// Remove the top-level `nvext` object from a request body, returning whether a
+/// key was actually present.
+///
+/// `nvext` is the operator/NVIDIA-extension namespace (scheduling priority,
+/// routing hints) the platform injects on its own dispatch path; external
+/// callers must not be able to set it. Only requests that already failed the
+/// internal `x-fusillade-request-id` gate reach this, so it runs on external
+/// traffic only. The boolean lets the caller re-serialise the forwarded body
+/// solely when something changed, keeping the untouched common path verbatim.
+fn strip_client_nvext(value: &mut serde_json::Value) -> bool {
+    value.as_object_mut().is_some_and(|obj| obj.remove("nvext").is_some())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1246,6 +1273,38 @@ mod tests {
         assert_eq!(obj["previous_response_id"], "resp_keep");
         assert_eq!(obj["x_custom_extension"], "keep");
         assert_eq!(obj["model"], "gpt-4o");
+    }
+
+    #[test]
+    fn test_strip_client_nvext_removes_and_reports() {
+        let mut v = serde_json::json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "hi"}],
+            "nvext": {"agent_hints": {"priority": -1786444059}},
+        });
+        assert!(strip_client_nvext(&mut v), "nvext present should report removal");
+        let obj = v.as_object().unwrap();
+        assert!(!obj.contains_key("nvext"), "nvext should be gone");
+        // Everything else is preserved.
+        assert_eq!(obj["model"], "gpt-4o");
+        assert!(obj.contains_key("messages"));
+    }
+
+    #[test]
+    fn test_strip_client_nvext_absent_is_noop() {
+        let mut v = serde_json::json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "hi"}],
+        });
+        let before = v.clone();
+        assert!(!strip_client_nvext(&mut v), "no nvext should report no change");
+        assert_eq!(v, before, "body must be untouched when nvext is absent");
+    }
+
+    #[test]
+    fn test_strip_client_nvext_non_object_is_noop() {
+        let mut v = serde_json::json!(["not", "an", "object"]);
+        assert!(!strip_client_nvext(&mut v));
     }
 
     #[test]
