@@ -1,5 +1,12 @@
 # Changelog
 
+## [10.10.0](https://github.com/doublewordai/control-layer/compare/v10.9.1...v10.10.0) (2026-08-11)
+
+
+### Features
+
+* move the OpenAI Responses API into the dwctl edge (COR-519 + COR-536 + COR-522) ([#1317](https://github.com/doublewordai/control-layer/issues/1317)) ([2061ce0](https://github.com/doublewordai/control-layer/commit/2061ce05c5a0490e74931348da14d5b2d9d0354c))
+
 ## [10.9.1](https://github.com/doublewordai/control-layer/compare/v10.9.0...v10.9.1) (2026-08-08)
 
 
