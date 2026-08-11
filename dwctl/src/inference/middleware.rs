@@ -1281,11 +1281,20 @@ async fn try_warm_path_blocking<P: PoolProvider + Clone + Send + Sync + 'static>
     )
     .await;
 
+    Some(blocking_result_to_response(result))
+}
+
+fn blocking_result_to_response(result: Result<serde_json::Value, serde_json::Value>) -> Response {
     let (status, body) = match result {
         Ok(json) => (StatusCode::OK, json),
-        Err(err_payload) => (StatusCode::BAD_GATEWAY, serde_json::json!({"error": err_payload})),
+        Err(err_payload) => {
+            let status = onwards_fusillade::failure_http_status(&err_payload)
+                .and_then(|status| StatusCode::from_u16(status).ok())
+                .unwrap_or(StatusCode::BAD_GATEWAY);
+            (status, serde_json::json!({"error": err_payload}))
+        }
     };
-    Some((status, Json(body)).into_response())
+    (status, Json(body)).into_response()
 }
 
 /// Warm-path background handler for `/v1/responses` with
@@ -1452,6 +1461,42 @@ async fn warm_path_setup<P: PoolProvider + Clone + Send + Sync + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn blocking_result_preserves_upstream_status() {
+        let response = blocking_result_to_response(Err(serde_json::json!({
+            "type": "upstream_error",
+            "message": "Upstream request failed",
+            "status": 400,
+        })));
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["error"]["message"], "Upstream request failed");
+    }
+
+    #[test]
+    fn blocking_result_rejects_invalid_upstream_status() {
+        let response = blocking_result_to_response(Err(serde_json::json!({
+            "type": "upstream_error",
+            "message": "Upstream request failed",
+            "status": 700,
+        })));
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[test]
+    fn blocking_result_ignores_status_on_non_upstream_error() {
+        let response = blocking_result_to_response(Err(serde_json::json!({
+            "type": "tool_error",
+            "message": "Tool failed",
+            "status": 400,
+        })));
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    }
 
     #[test]
     fn test_should_intercept_responses() {

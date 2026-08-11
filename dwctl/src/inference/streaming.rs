@@ -395,7 +395,38 @@ where
     P: fusillade_arsenal::PoolProvider + Clone + Send + Sync + 'static,
 {
     response_store
-        .finalize_head_request(request_id, 500, error.clone())
+        .finalize_head_request(request_id, terminal_failure_status(error), error.clone())
         .await
         .map_err(|e| format!("finalize head: {e}"))
+}
+
+fn terminal_failure_status(error: &Value) -> u16 {
+    onwards_fusillade::failure_http_status(error).unwrap_or(500)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn terminal_failure_status_preserves_sanitized_upstream_status() {
+        let payload = serde_json::json!({
+            "type": "upstream_error",
+            "message": "Upstream request failed",
+            "status": 400,
+        });
+
+        assert_eq!(terminal_failure_status(&payload), 400);
+    }
+
+    #[test]
+    fn terminal_failure_status_defaults_non_upstream_errors_to_500() {
+        let payload = serde_json::json!({
+            "type": "tool_error",
+            "message": "Tool failed",
+            "status": 400,
+        });
+
+        assert_eq!(terminal_failure_status(&payload), 500);
+    }
 }
