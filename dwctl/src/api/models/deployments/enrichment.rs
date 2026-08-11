@@ -8,7 +8,7 @@ use crate::{
     api::models::{
         cache_pricing::CachePricingResponse,
         deployments::{
-            ComponentEndpointSummary, ComponentModelSummary, ComponentRole, DeployedModelResponse, ModelComponentResponse, ModelMetrics,
+            ComponentEndpointSummary, ComponentModelSummary, ComponentPool, DeployedModelResponse, ModelComponentResponse, ModelMetrics,
             ModelProbeStatus, ModelType,
         },
         inference_endpoints::InferenceEndpointResponse,
@@ -425,7 +425,7 @@ impl<'a> DeployedModelEnricher<'a> {
         ModelComponentResponse {
             weight: c.weight,
             enabled: c.enabled,
-            role: ComponentRole::from_db(&c.role),
+            pool: ComponentPool::from_db(&c.pool),
             sort_order: c.sort_order,
             created_at: c.created_at,
             model: ComponentModelSummary {

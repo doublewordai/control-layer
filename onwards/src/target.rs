@@ -42,52 +42,27 @@ pub struct ConcurrencyLimitParameters {
     pub max_concurrent_requests: usize,
 }
 
-/// Which request classes a pool member may serve.
-///
-/// A pool can mix members that are interchangeable for ordinary chat traffic
-/// with a member that exists only to serve `/v1/completions` (a token-id
-/// continuation target validated per model). The tag says which is which; the
-/// pool filters on it before load balancing (see
-/// [`crate::load_balancer::ProviderPool::select_iter_scoped`]).
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ServesScope {
-    /// Eligible for every request. The serde default, so an untagged member
-    /// parses exactly as it behaves today: usable for everything.
-    ///
-    /// Untagged raw-config pools are unaffected in practice because the
-    /// completions filter only engages when a pool has a `completions` member —
-    /// which nobody gets by default. dwctl's sync is explicit: it emits `chat`
-    /// for third-party failover members and `both` for on-prem ones.
-    #[default]
-    Both,
-    /// Eligible for everything EXCEPT completions-class requests, once the
-    /// filter engages. Third-party chat failovers (OpenRouter et al) are these:
-    /// they have never been validated to continue a token-id prefix.
-    Chat,
-    /// Eligible ONLY for completions-class requests. Never serves
-    /// chat/responses/embeddings traffic.
-    Completions,
-}
+/// The pool every request class falls back to. Exactly today's single pool.
+pub const DEFAULT_POOL: &str = "default";
 
-impl ServesScope {
-    /// Whether a member with this scope may serve `class`.
-    pub fn serves(self, class: RequestClass) -> bool {
-        match (self, class) {
-            (ServesScope::Both, _) => true,
-            (ServesScope::Chat, RequestClass::Normal) => true,
-            (ServesScope::Chat, RequestClass::Completions) => false,
-            (ServesScope::Completions, RequestClass::Normal) => false,
-            (ServesScope::Completions, RequestClass::Completions) => true,
-        }
-    }
-}
+/// The pool serving completions-class requests, when a composite defines one.
+pub const COMPLETIONS_POOL: &str = "completions";
+
+/// Pool names a composite may define. A name outside this set is a config error
+/// rather than a silently-never-selected pool — the resolver only ever asks for
+/// the names below, so a typo would otherwise be invisible.
+pub const KNOWN_POOLS: [&str; 2] = [DEFAULT_POOL, COMPLETIONS_POOL];
 
 /// The class of an inbound request, derived from its path alone.
 ///
-/// Purpose labels play no part: a completions request is a completions request
-/// whoever sent it, which is what keeps this mechanism usable by ordinary user
+/// This is the input to pool resolution and nothing else: a class names a pool,
+/// and [`TargetPools::resolve`] hands back that pool or the default. Purpose
+/// labels play no part — a completions request is a completions request whoever
+/// sent it, which is what keeps the mechanism usable by ordinary user
 /// completions traffic as well as by continuation resume legs.
+///
+/// New request classes are new arms here plus a pool name; selection, failover
+/// and the limiters never learn that classes exist.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum RequestClass {
     /// Chat completions, responses, embeddings, everything else.
@@ -112,11 +87,11 @@ impl RequestClass {
         }
     }
 
-    /// Bounded span/metric label.
-    pub fn as_str(self) -> &'static str {
+    /// The pool this class asks for. Absent that pool, the default serves it.
+    pub fn pool_name(self) -> &'static str {
         match self {
-            RequestClass::Normal => "normal",
-            RequestClass::Completions => "completions",
+            RequestClass::Normal => DEFAULT_POOL,
+            RequestClass::Completions => COMPLETIONS_POOL,
         }
     }
 }
@@ -181,12 +156,6 @@ pub struct ProviderSpec {
     /// Translate canonical OpenAI reasoning controls into this provider's request shape.
     #[serde(default)]
     pub reasoning_translation: Option<ReasoningTranslationConfig>,
-
-    /// Which request classes this member may serve. Defaults to `both`, so an
-    /// untagged config parses and behaves exactly as before.
-    #[serde(default)]
-    #[builder(default)]
-    pub serves: ServesScope,
 }
 
 /// Configuration for Open Responses API behavior
@@ -477,15 +446,24 @@ pub struct TargetSpec {
     /// Translate canonical OpenAI reasoning controls into this provider's request shape.
     #[serde(default)]
     pub reasoning_translation: Option<ReasoningTranslationConfig>,
-
-    /// Which request classes this member may serve. Defaults to `both`.
-    #[serde(default)]
-    #[builder(default)]
-    pub serves: ServesScope,
 }
 
 fn default_weight() -> u32 {
     1
+}
+
+/// A composite carrying more than one named pool.
+///
+/// The map must contain `default` — that is the pool every request class falls
+/// back to, and a composite without one could serve nothing. Names are bounded
+/// by [`KNOWN_POOLS`]: the resolver asks for a fixed set of names, so an
+/// unrecognised one is a typo that would never be selected, and failing the
+/// config load is the only way that gets noticed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PoolsSpec {
+    /// Pools by name. `default` is required; `completions` is the only other
+    /// name understood today.
+    pub pools: HashMap<String, PoolSpec>,
 }
 
 /// A target specification that supports multiple configuration formats.
@@ -493,6 +471,12 @@ fn default_weight() -> u32 {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum TargetSpecOrList {
+    /// Several named pools, one per request class (see [`PoolsSpec`]).
+    ///
+    /// First in the untagged order because it is the only variant with a
+    /// `pools` key: `PoolSpec` requires `providers` and `TargetSpec` requires
+    /// `url`, so no existing config shape can be captured by this arm.
+    Pools(PoolsSpec),
     /// Pool with explicit providers array (recommended for load balancing)
     Pool(PoolSpec),
     /// Array of providers (legacy format, still supported)
@@ -502,6 +486,7 @@ pub enum TargetSpecOrList {
 }
 
 /// Extracted pool configuration from any target format
+#[derive(Debug)]
 pub struct PoolConfig {
     pub keys: Option<KeySet>,
     pub rate_limit: Option<RateLimitParameters>,
@@ -516,23 +501,87 @@ pub struct PoolConfig {
     pub providers: Vec<ProviderSpec>,
 }
 
+impl From<PoolSpec> for PoolConfig {
+    fn from(pool: PoolSpec) -> Self {
+        PoolConfig {
+            keys: pool.keys,
+            rate_limit: pool.rate_limit,
+            concurrency_limit: pool.concurrency_limit,
+            response_headers: pool.response_headers,
+            fallback: pool.fallback,
+            strategy: pool.strategy,
+            sanitize_response: pool.sanitize_response,
+            open_responses: pool.open_responses,
+            trusted: pool.trusted,
+            routing_rules: pool.routing_rules,
+            providers: pool.providers,
+        }
+    }
+}
+
 impl TargetSpecOrList {
-    /// Convert to pool-level config and list of provider specs
+    /// Convert to the composite's named pools, `default` first.
+    ///
+    /// Every legacy config shape yields exactly one pool, named `default` —
+    /// which is what makes named pools inert for existing configs: one pool
+    /// called `default` is the same thing as today's single pool.
+    ///
+    /// Non-default pools inherit the default pool's **access control** (`keys`,
+    /// `routing_rules`) when they do not state their own. Access control is a
+    /// property of the alias, not of which upstream answers, so a pool added
+    /// for one request class must not become a way around the alias's keys or
+    /// deny rules.
+    pub fn into_pool_configs(self) -> Result<Vec<(String, PoolConfig)>, anyhow::Error> {
+        let TargetSpecOrList::Pools(spec) = self else {
+            return Ok(vec![(DEFAULT_POOL.to_string(), self.into_pool_config()?)]);
+        };
+
+        let mut pools = spec.pools;
+        for name in pools.keys() {
+            if !KNOWN_POOLS.contains(&name.as_str()) {
+                return Err(anyhow!(
+                    "Unknown pool name '{}'. Known pools: {}.",
+                    name,
+                    KNOWN_POOLS.join(", ")
+                ));
+            }
+        }
+        let default: PoolConfig = pools
+            .remove(DEFAULT_POOL)
+            .ok_or_else(|| anyhow!("A `pools` target must define a '{DEFAULT_POOL}' pool."))?
+            .into();
+
+        let mut configs = Vec::with_capacity(pools.len() + 1);
+        // `default` first so the caller can log/report it as the composite's
+        // primary, and so pool construction order is deterministic.
+        for (name, pool) in pools {
+            let mut config: PoolConfig = pool.into();
+            if config.keys.is_none() {
+                config.keys = default.keys.clone();
+            }
+            if config.routing_rules.is_empty() {
+                config.routing_rules = default.routing_rules.clone();
+            }
+            configs.push((name, config));
+        }
+        configs.sort_by(|(a, _), (b, _)| a.cmp(b));
+        configs.insert(0, (DEFAULT_POOL.to_string(), default));
+        Ok(configs)
+    }
+
+    /// Convert to pool-level config and list of provider specs.
+    ///
+    /// For a multi-pool target this is the `default` pool — the one that serves
+    /// every request class without a pool of its own.
     pub fn into_pool_config(self) -> Result<PoolConfig, anyhow::Error> {
         match self {
-            TargetSpecOrList::Pool(pool) => Ok(PoolConfig {
-                keys: pool.keys,
-                rate_limit: pool.rate_limit,
-                concurrency_limit: pool.concurrency_limit,
-                response_headers: pool.response_headers,
-                fallback: pool.fallback,
-                strategy: pool.strategy,
-                sanitize_response: pool.sanitize_response,
-                open_responses: pool.open_responses,
-                trusted: pool.trusted,
-                routing_rules: pool.routing_rules,
-                providers: pool.providers,
-            }),
+            TargetSpecOrList::Pools(spec) => spec
+                .pools
+                .into_iter()
+                .find(|(name, _)| name == DEFAULT_POOL)
+                .map(|(_, pool)| pool.into())
+                .ok_or_else(|| anyhow!("A `pools` target must define a '{DEFAULT_POOL}' pool.")),
+            TargetSpecOrList::Pool(pool) => Ok(pool.into()),
             TargetSpecOrList::List(list) => {
                 // Legacy list format: no pool-level config, convert TargetSpecs to ProviderSpecs
                 // Take keys and trusted from first provider for backwards compatibility
@@ -569,7 +618,6 @@ impl TargetSpecOrList {
                         // an unset value still inherits the resolved trusted value.
                         propagate_trace_context: t.propagate_trace_context,
                         reasoning_translation: t.reasoning_translation,
-                        serves: t.serves,
                     })
                     .collect();
                 Ok(PoolConfig {
@@ -611,7 +659,6 @@ impl TargetSpecOrList {
                     // YAML form would be silently dropped.
                     propagate_trace_context: spec.propagate_trace_context,
                     reasoning_translation: spec.reasoning_translation,
-                    serves: spec.serves,
                 };
                 Ok(PoolConfig {
                     keys,
@@ -667,7 +714,6 @@ impl From<TargetSpec> for Target {
             trusted: None,
             propagate_trace_context: value.propagate_trace_context,
             reasoning_translation: value.reasoning_translation,
-            serves: value.serves,
         }
     }
 }
@@ -694,7 +740,6 @@ impl From<ProviderSpec> for Target {
             trusted: value.trusted,
             propagate_trace_context: value.propagate_trace_context,
             reasoning_translation: value.reasoning_translation,
-            serves: value.serves,
         }
     }
 }
@@ -845,17 +890,13 @@ pub struct Target {
     pub propagate_trace_context: Option<bool>,
     /// Provider-specific translation for canonical OpenAI reasoning controls.
     pub reasoning_translation: Option<ReasoningTranslationConfig>,
-    /// Which request classes this member may serve. Defaults to `both` so every
-    /// existing construction site (and every untagged config) is unchanged.
-    #[builder(default)]
-    pub serves: ServesScope,
 }
 
 impl Target {
     /// Convert this target into a single-provider pool with weight 1
     /// This is a convenience method for backwards compatibility and testing
     /// Note: Keys from the target are transferred to the pool level
-    pub fn into_pool(self) -> ProviderPool {
+    pub fn into_pool(self) -> TargetPools {
         let keys = self.keys.clone();
         ProviderPool::with_config(
             vec![Provider::new(self, 1)],
@@ -867,6 +908,103 @@ impl Target {
             false,
             Vec::new(),
         )
+        .into()
+    }
+}
+
+/// The named pools of one composite (one entry in [`Targets::targets`]).
+///
+/// A composite is `{default: Pool, completions?: Pool}`. `default` is exactly
+/// today's pool, always present; the others are optional and serve one request
+/// class each. Which pool answers a request is decided ONCE, before selection,
+/// by [`TargetPools::resolve`] — everything below it (the load-balance
+/// strategy, `select_iter`, the failover loop, rate and concurrency limits)
+/// runs on the chosen pool and never learns that other pools exist.
+///
+/// `default` is a field rather than a map entry so its presence is a type
+/// guarantee: resolution can fall back without an unwrap.
+#[derive(Debug, Clone)]
+pub struct TargetPools {
+    /// Serves every request class that has no pool of its own.
+    default: ProviderPool,
+    /// Additional pools by name. Empty for every composite that has not been
+    /// given one, which is what makes this inert for existing configs.
+    extra: HashMap<String, ProviderPool>,
+}
+
+impl From<ProviderPool> for TargetPools {
+    /// A single pool is a composite whose only pool is `default`.
+    fn from(default: ProviderPool) -> Self {
+        Self {
+            default,
+            extra: HashMap::new(),
+        }
+    }
+}
+
+impl TargetPools {
+    /// Build from a default pool plus any additional named pools.
+    pub fn with_pools(default: ProviderPool, extra: HashMap<String, ProviderPool>) -> Self {
+        Self { default, extra }
+    }
+
+    /// The pool resolver: request class → pool name → that pool, or the
+    /// default when the composite defines no such pool.
+    ///
+    /// This is the whole of the request-class mechanism. A future class (say,
+    /// pools chosen on `max_tokens`) adds an arm to [`RequestClass`] and a pool
+    /// name; nothing here or below changes.
+    pub fn resolve(&self, class: RequestClass) -> &ProviderPool {
+        self.extra.get(class.pool_name()).unwrap_or(&self.default)
+    }
+
+    /// The name of the pool [`TargetPools::resolve`] would pick, but only when
+    /// it is not the default — so "was a non-default pool used?" is exactly
+    /// "is this `Some`?", which is what the span field reports.
+    pub fn resolved_name(&self, class: RequestClass) -> Option<&'static str> {
+        let name = class.pool_name();
+        self.extra.contains_key(name).then_some(name)
+    }
+
+    /// The pool serving everything without a pool of its own. Callers that are
+    /// not serving a request (model listing, config diagnostics) want this.
+    pub fn default_pool(&self) -> &ProviderPool {
+        &self.default
+    }
+
+    /// Look a pool up by name.
+    pub fn get(&self, name: &str) -> Option<&ProviderPool> {
+        if name == DEFAULT_POOL {
+            Some(&self.default)
+        } else {
+            self.extra.get(name)
+        }
+    }
+
+    /// Every pool, `default` first.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &ProviderPool)> {
+        std::iter::once((DEFAULT_POOL, &self.default))
+            .chain(self.extra.iter().map(|(name, pool)| (name.as_str(), pool)))
+    }
+
+    /// Number of pools, always at least 1.
+    ///
+    /// Deliberately NOT called `len`/`is_empty`: a composite used to BE a pool,
+    /// and those names would silently answer a different question than they did
+    /// (providers, not pools) at every call site that still compiled.
+    pub fn pool_count(&self) -> usize {
+        self.extra.len() + 1
+    }
+
+    /// Carry live connection counters across a config reload, pool by pool.
+    /// A pool that did not exist before starts at zero, as a new pool should.
+    pub fn adopt_provider_state(&mut self, old: &TargetPools) {
+        self.default.adopt_provider_state(&old.default);
+        for (name, pool) in self.extra.iter_mut() {
+            if let Some(old_pool) = old.extra.get(name) {
+                pool.adopt_provider_state(old_pool);
+            }
+        }
     }
 }
 
@@ -951,8 +1089,9 @@ pub struct ConfigFile {
 /// The live-updating collection of targets.
 #[derive(Debug, Clone)]
 pub struct Targets {
-    /// Map of alias names to provider pools (supports load balancing)
-    pub targets: Arc<DashMap<String, ProviderPool>>,
+    /// Map of alias names to their named pools (supports load balancing, and
+    /// per-request-class pools — see [`TargetPools`])
+    pub targets: Arc<DashMap<String, TargetPools>>,
     /// Direct rate limiters per actual API key (actual key -> rate limiter)
     pub key_rate_limiters: Arc<DashMap<String, Arc<DefaultDirectRateLimiter>>>,
     /// Concurrency limiters per actual API key (actual key -> concurrency limiter)
@@ -1066,6 +1205,93 @@ impl TargetsStream for WatchTargetsStream {
     }
 }
 
+/// Build one pool of the composite `alias` from its config.
+///
+/// Identical for every pool name — a pool is a pool, and `default` gets no
+/// special treatment beyond being the one that always exists.
+fn build_pool(
+    alias: &str,
+    pool_name: &str,
+    pool_config: PoolConfig,
+    global_keys: &KeySet,
+) -> Result<ProviderPool, anyhow::Error> {
+    for (index, provider) in pool_config.providers.iter().enumerate() {
+        if let Some(config) = provider.reasoning_translation.as_ref() {
+            config.validate().map_err(|error| {
+                anyhow!(
+                    "Invalid reasoning translation for target '{}' pool '{}' provider {}: {}",
+                    alias,
+                    pool_name,
+                    index,
+                    error.message()
+                )
+            })?;
+        }
+    }
+
+    // Merge global keys with pool-level keys
+    let merged_keys = if let Some(mut keys) = pool_config.keys {
+        debug!(
+            "Pool '{}' ({}) has {} keys configured",
+            alias,
+            pool_name,
+            keys.len()
+        );
+        keys.extend(global_keys.clone());
+        Some(keys)
+    } else if !global_keys.is_empty() {
+        Some(global_keys.clone())
+    } else {
+        None
+    };
+
+    // Create pool-level rate limiter
+    let pool_limiter: Option<Arc<dyn RateLimiter>> = pool_config.rate_limit.map(|rl| {
+        Arc::new(governor::RateLimiter::direct(
+            Quota::per_second(rl.requests_per_second)
+                .allow_burst(rl.burst_size.unwrap_or(rl.requests_per_second)),
+        )) as Arc<dyn RateLimiter>
+    });
+
+    // Create pool-level concurrency limiter
+    let pool_concurrency_limiter = pool_config
+        .concurrency_limit
+        .map(|cl| ConcurrencyLimiter::with_limit(cl.max_concurrent_requests));
+
+    // Convert provider specs to providers
+    // Pool-level sanitize_response enables sanitization for all providers
+    let pool_sanitize = pool_config.sanitize_response;
+    let providers: Vec<Provider> = pool_config
+        .providers
+        .into_iter()
+        .map(|mut spec| {
+            let weight = spec.weight;
+            let concurrency_limit = spec
+                .concurrency_limit
+                .as_ref()
+                .map(|cl| cl.max_concurrent_requests);
+            // Enable sanitization if either pool or provider level is true
+            spec.sanitize_response = pool_sanitize || spec.sanitize_response;
+            let target: Target = spec.into();
+            match concurrency_limit {
+                Some(limit) => Provider::with_concurrency_limit(target, weight, limit),
+                None => Provider::new(target, weight),
+            }
+        })
+        .collect();
+
+    Ok(ProviderPool::with_config(
+        providers,
+        merged_keys,
+        pool_limiter,
+        pool_concurrency_limiter,
+        pool_config.fallback,
+        pool_config.strategy,
+        pool_config.trusted,
+        pool_config.routing_rules,
+    ))
+}
+
 impl Targets {
     pub async fn from_config_file(config_path: &PathBuf) -> Result<Self, anyhow::Error> {
         let contents = tokio::fs::read_to_string(config_path).await.map_err(|e| {
@@ -1132,86 +1358,32 @@ impl Targets {
 
         let targets = Arc::new(DashMap::new());
         for (name, target_spec_or_list) in config_file.targets {
-            // Extract pool-level config and provider specs
-            let pool_config = target_spec_or_list.into_pool_config()?;
-
-            for (index, provider) in pool_config.providers.iter().enumerate() {
-                if let Some(config) = provider.reasoning_translation.as_ref() {
-                    config.validate().map_err(|error| {
-                        anyhow!(
-                            "Invalid reasoning translation for target '{}' provider {}: {}",
-                            name,
-                            index,
-                            error.message()
-                        )
-                    })?;
-                }
-            }
-
-            // Merge global keys with pool-level keys
-            let merged_keys = if let Some(mut keys) = pool_config.keys {
-                debug!("Pool '{}' has {} keys configured", name, keys.len());
-                keys.extend(global_keys.clone());
-                Some(keys)
-            } else if !global_keys.is_empty() {
-                Some(global_keys.clone())
-            } else {
-                None
-            };
-
-            // Create pool-level rate limiter
-            let pool_limiter: Option<Arc<dyn RateLimiter>> = pool_config.rate_limit.map(|rl| {
-                Arc::new(governor::RateLimiter::direct(
-                    Quota::per_second(rl.requests_per_second)
-                        .allow_burst(rl.burst_size.unwrap_or(rl.requests_per_second)),
-                )) as Arc<dyn RateLimiter>
-            });
-
-            // Create pool-level concurrency limiter
-            let pool_concurrency_limiter = pool_config
-                .concurrency_limit
-                .map(|cl| ConcurrencyLimiter::with_limit(cl.max_concurrent_requests));
-
-            // Convert provider specs to providers
-            // Pool-level sanitize_response enables sanitization for all providers
-            let pool_sanitize = pool_config.sanitize_response;
-            let providers: Vec<Provider> = pool_config
-                .providers
-                .into_iter()
-                .map(|mut spec| {
-                    let weight = spec.weight;
-                    let concurrency_limit = spec
-                        .concurrency_limit
-                        .as_ref()
-                        .map(|cl| cl.max_concurrent_requests);
-                    // Enable sanitization if either pool or provider level is true
-                    spec.sanitize_response = pool_sanitize || spec.sanitize_response;
-                    let target: Target = spec.into();
-                    match concurrency_limit {
-                        Some(limit) => Provider::with_concurrency_limit(target, weight, limit),
-                        None => Provider::new(target, weight),
-                    }
+            // Every target is one or more named pools; the legacy shapes are a
+            // single pool called `default`.
+            let mut pool_configs = target_spec_or_list.into_pool_configs()?.into_iter();
+            let (_, default_config) = pool_configs
+                .next()
+                .expect("into_pool_configs always yields the default pool first");
+            let default_pool = build_pool(&name, DEFAULT_POOL, default_config, &global_keys)?;
+            let extra = pool_configs
+                .map(|(pool_name, config)| {
+                    let pool = build_pool(&name, &pool_name, config, &global_keys)?;
+                    Ok::<_, anyhow::Error>((pool_name, pool))
                 })
-                .collect();
+                .collect::<Result<HashMap<_, _>, _>>()?;
 
-            let pool = ProviderPool::with_config(
-                providers,
-                merged_keys,
-                pool_limiter,
-                pool_concurrency_limiter,
-                pool_config.fallback,
-                pool_config.strategy,
-                pool_config.trusted,
-                pool_config.routing_rules,
-            );
-            debug!(
-                "Created provider pool '{}' with {} provider(s), fallback enabled: {}, strategy: {:?}",
-                name,
-                pool.len(),
-                pool.fallback_enabled(),
-                pool.strategy()
-            );
-            targets.insert(name, pool);
+            let pools = TargetPools::with_pools(default_pool, extra);
+            for (pool_name, pool) in pools.iter() {
+                debug!(
+                    "Created provider pool '{}' ({}) with {} provider(s), fallback enabled: {}, strategy: {:?}",
+                    name,
+                    pool_name,
+                    pool.len(),
+                    pool.fallback_enabled(),
+                    pool.strategy()
+                );
+            }
+            targets.insert(name, pools);
         }
 
         Ok(Targets {
@@ -1351,6 +1523,13 @@ mod tests {
     use crate::auth::ConstantTimeString;
     use dashmap::DashMap;
     use std::collections::HashSet;
+
+    /// The default pool of `alias`, cloned so tests keep the `let pool = …`
+    /// shape without holding a DashMap ref. Pool clones share their live
+    /// concurrency counters, exactly as the request path's clone does.
+    fn default_pool(targets: &Targets, alias: &str) -> ProviderPool {
+        targets.targets.get(alias).unwrap().default_pool().clone()
+    }
     use std::sync::Arc;
     pub struct MockConfigWatcher {
         configs: Vec<Result<Targets, String>>,
@@ -1556,7 +1735,7 @@ mod tests {
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
         // Verify target properties were updated
-        let pool = initial_targets.targets.get("gpt-4").unwrap();
+        let pool = default_pool(&initial_targets, "gpt-4");
         let target = pool.first_target().unwrap();
         // Note: URL normalization only happens during from_config, not direct Target creation
         assert_eq!(target.url.as_str(), "https://api.openai.com/v2");
@@ -1599,7 +1778,7 @@ mod tests {
         };
 
         let targets = Targets::from_config(config_file).unwrap();
-        let pool = targets.targets.get("test-model").unwrap();
+        let pool = default_pool(&targets, "test-model");
 
         // Pool should have both its own keys and global keys (5 unique keys)
         let pool_keys = pool.keys().unwrap();
@@ -1639,7 +1818,7 @@ mod tests {
         };
 
         let targets = Targets::from_config(config_file).unwrap();
-        let pool = targets.targets.get("test-model").unwrap();
+        let pool = default_pool(&targets, "test-model");
 
         // Pool without explicit keys should get global keys
         let pool_keys = pool.keys().unwrap();
@@ -1672,7 +1851,7 @@ mod tests {
         };
 
         let targets = Targets::from_config(config_file).unwrap();
-        let pool = targets.targets.get("test-model").unwrap();
+        let pool = default_pool(&targets, "test-model");
         let target = pool.first_target().unwrap();
 
         // Target should have rate limiter configured
@@ -1699,7 +1878,7 @@ mod tests {
         };
 
         let targets = Targets::from_config(config_file).unwrap();
-        let pool = targets.targets.get("test-model").unwrap();
+        let pool = default_pool(&targets, "test-model");
         let target = pool.first_target().unwrap();
 
         // Target should not have rate limiter
@@ -1883,14 +2062,14 @@ mod tests {
         let targets = Targets::from_config(config_file).unwrap();
 
         // Pool with keys should keep them unchanged
-        let pool_with_keys = targets.targets.get("model-with-keys").unwrap();
+        let pool_with_keys = default_pool(&targets, "model-with-keys");
         let pool_keys = pool_with_keys.keys().unwrap();
         assert_eq!(pool_keys.len(), 2);
         assert!(pool_keys.contains(&ConstantTimeString::from("target-key-1".to_string())));
         assert!(pool_keys.contains(&ConstantTimeString::from("target-key-2".to_string())));
 
         // Pool without keys should remain None
-        let pool_without_keys = targets.targets.get("model-without-keys").unwrap();
+        let pool_without_keys = default_pool(&targets, "model-without-keys");
         assert!(pool_without_keys.keys().is_none());
     }
 
@@ -1969,7 +2148,7 @@ mod tests {
         };
 
         let targets = Targets::from_config(config_file).unwrap();
-        let pool = targets.targets.get("test-model").unwrap();
+        let pool = default_pool(&targets, "test-model");
 
         // Provider should have concurrency limiter configured (limit of 5)
         // Verify by selecting 5 times (all succeed) then a 6th (fails)
@@ -1999,7 +2178,7 @@ mod tests {
         };
 
         let targets = Targets::from_config(config_file).unwrap();
-        let pool = targets.targets.get("test-model").unwrap();
+        let pool = default_pool(&targets, "test-model");
 
         // Provider should not have concurrency limiter (unlimited selects)
         let guards: Vec<_> = (0..100).filter_map(|_| pool.select()).collect();
@@ -2197,7 +2376,7 @@ mod tests {
         let config: ConfigFile = serde_json::from_str(json).unwrap();
         let targets = Targets::from_config(config).unwrap();
 
-        let pool = targets.targets.get("gpt-4").unwrap();
+        let pool = default_pool(&targets, "gpt-4");
         assert_eq!(pool.len(), 1);
         assert_eq!(pool.strategy(), LoadBalanceStrategy::WeightedRandom); // default
         assert!(!pool.fallback_enabled());
@@ -2218,7 +2397,7 @@ mod tests {
         let config: ConfigFile = serde_json::from_str(json).unwrap();
         let targets = Targets::from_config(config).unwrap();
 
-        let pool = targets.targets.get("gpt-4").unwrap();
+        let pool = default_pool(&targets, "gpt-4");
         assert_eq!(pool.len(), 2);
         assert_eq!(pool.strategy(), LoadBalanceStrategy::WeightedRandom); // default
     }
@@ -2246,7 +2425,7 @@ mod tests {
         let config: ConfigFile = serde_json::from_str(json).unwrap();
         let targets = Targets::from_config(config).unwrap();
 
-        let pool = targets.targets.get("gpt-4").unwrap();
+        let pool = default_pool(&targets, "gpt-4");
         assert_eq!(pool.len(), 2);
         assert_eq!(pool.strategy(), LoadBalanceStrategy::Priority);
         assert!(pool.fallback_enabled());
@@ -2272,7 +2451,7 @@ mod tests {
         let config: ConfigFile = serde_json::from_str(json).unwrap();
         let targets = Targets::from_config(config).unwrap();
 
-        let pool = targets.targets.get("gpt-4").unwrap();
+        let pool = default_pool(&targets, "gpt-4");
         assert_eq!(pool.strategy(), LoadBalanceStrategy::WeightedRandom);
     }
 
@@ -2288,7 +2467,7 @@ mod tests {
         let pool = target.into_pool();
 
         // Verify the target's sanitize_response is accessible through the pool
-        let (_, first_target, _guard) = pool.select_iter().next().unwrap();
+        let (_, first_target, _guard) = pool.default_pool().select_iter().next().unwrap();
         assert!(
             first_target.sanitize_response,
             "into_pool should preserve sanitize_response setting"
@@ -2306,7 +2485,7 @@ mod tests {
         let pool = target.into_pool();
 
         // Verify the target's sanitize_response is accessible through the pool
-        let (_, first_target, _guard) = pool.select_iter().next().unwrap();
+        let (_, first_target, _guard) = pool.default_pool().select_iter().next().unwrap();
         assert!(
             !first_target.sanitize_response,
             "into_pool should preserve default sanitize_response setting"
@@ -2329,7 +2508,7 @@ mod tests {
         let config: ConfigFile = serde_json::from_str(json).unwrap();
         let targets = Targets::from_config(config).unwrap();
 
-        let pool = targets.targets.get("gpt-4").unwrap();
+        let pool = default_pool(&targets, "gpt-4");
         let target = pool.first_target().unwrap();
         assert_eq!(target.request_timeout_secs, Some(30));
     }
@@ -2348,7 +2527,7 @@ mod tests {
         let config: ConfigFile = serde_json::from_str(json).unwrap();
         let targets = Targets::from_config(config).unwrap();
 
-        let pool = targets.targets.get("test-model").unwrap();
+        let pool = default_pool(&targets, "test-model");
         assert!(!pool.is_trusted(), "trusted should default to false");
     }
 
@@ -2367,7 +2546,7 @@ mod tests {
         let config: ConfigFile = serde_json::from_str(json).unwrap();
         let targets = Targets::from_config(config).unwrap();
 
-        let pool = targets.targets.get("test-model").unwrap();
+        let pool = default_pool(&targets, "test-model");
         assert!(
             pool.is_trusted(),
             "trusted should be true when explicitly set"
@@ -2404,7 +2583,6 @@ mod tests {
                 trusted: None,
                 propagate_trace_context: None,
                 reasoning_translation: None,
-                serves: ServesScope::default(),
             }],
         };
 
@@ -2429,7 +2607,7 @@ mod tests {
         let config: ConfigFile = serde_json::from_str(json).unwrap();
         let targets = Targets::from_config(config).unwrap();
 
-        let pool = targets.targets.get("test-model").unwrap();
+        let pool = default_pool(&targets, "test-model");
         assert!(
             pool.is_trusted(),
             "Single TargetSpec with trusted: true should create trusted pool"
@@ -2519,7 +2697,7 @@ mod tests {
         let config: ConfigFile = serde_json::from_str(json).unwrap();
         let targets = Targets::from_config(config).unwrap();
 
-        let pool = targets.targets.get("gpt-4").unwrap();
+        let pool = default_pool(&targets, "gpt-4");
         let target = pool.first_target().unwrap();
         assert_eq!(target.request_timeout_secs, None);
     }
@@ -2555,7 +2733,7 @@ mod tests {
         let config: ConfigFile = serde_json::from_str(json).unwrap();
         let targets = Targets::from_config(config).unwrap();
 
-        let pool = targets.targets.get("gpt-4").unwrap();
+        let pool = default_pool(&targets, "gpt-4");
         assert_eq!(pool.len(), 2);
 
         // Check both providers have their respective timeouts
@@ -2602,7 +2780,7 @@ mod tests {
         let config: ConfigFile = serde_json::from_str(json).unwrap();
         let targets = Targets::from_config(config).unwrap();
 
-        let pool = targets.targets.get("gpt-4").unwrap();
+        let pool = default_pool(&targets, "gpt-4");
         let providers = pool.providers();
 
         // One provider with timeout
@@ -2641,7 +2819,7 @@ mod tests {
         let config: ConfigFile = serde_json::from_str(json_trusted).unwrap();
         let targets = Targets::from_config(config).unwrap();
 
-        let pool = targets.targets.get("trusted-pool").unwrap();
+        let pool = default_pool(&targets, "trusted-pool");
         assert!(
             pool.is_trusted(),
             "Pool with trusted: true should be trusted"
@@ -2667,7 +2845,7 @@ mod tests {
         let config: ConfigFile = serde_json::from_str(json_untrusted).unwrap();
         let targets = Targets::from_config(config).unwrap();
 
-        let pool = targets.targets.get("untrusted-pool").unwrap();
+        let pool = default_pool(&targets, "untrusted-pool");
         assert!(
             !pool.is_trusted(),
             "Pool without trusted flag should default to false"
@@ -2726,7 +2904,7 @@ mod tests {
 
         let config: ConfigFile = serde_json::from_str(json).unwrap();
         let targets = Targets::from_config(config).unwrap();
-        let pool = targets.targets.get("gpt-4").unwrap();
+        let pool = default_pool(&targets, "gpt-4");
 
         assert!(!pool.is_trusted(), "Pool-level trusted should be false");
 
@@ -2767,7 +2945,7 @@ mod tests {
         let config: ConfigFile = serde_json::from_str(json).unwrap();
         let targets = Targets::from_config(config).unwrap();
 
-        let pool = targets.targets.get("gpt-4").unwrap();
+        let pool = default_pool(&targets, "gpt-4");
         let rules = pool.routing_rules();
         assert_eq!(rules.len(), 2);
 
@@ -2852,7 +3030,7 @@ mod tests {
         let config: ConfigFile = serde_json::from_str(json).unwrap();
         let targets = Targets::from_config(config).unwrap();
 
-        let pool = targets.targets.get("gpt-4").unwrap();
+        let pool = default_pool(&targets, "gpt-4");
         assert!(pool.routing_rules().is_empty());
     }
 
@@ -3002,97 +3180,263 @@ mod tests {
         assert!(error.to_string().contains("reasoning_effort"));
     }
 
-    // ── serves / request class ───────────────────────────────────────────────
+    // ── named pools / request class ──────────────────────────────────────────
 
-    /// An existing config — nobody has written `serves` anywhere — parses with
-    /// every member eligible for everything, which is exactly today's behaviour.
-    /// This is the first of the two readings the spec asks to be tested; the
-    /// second (dwctl's sync tagging members explicitly) is asserted in
-    /// `load_balancer`'s rule-2 test.
+    /// Rule 3, at the config layer: a config nobody has touched — no `pools`
+    /// key anywhere — becomes a composite whose only pool is `default`. That is
+    /// what makes named pools inert for every existing composite.
     #[test]
-    fn untagged_members_default_to_serving_everything() {
+    fn an_existing_config_becomes_a_single_default_pool() {
         let json = r#"{
             "targets": {
                 "gpt-4": {
                     "providers": [
-                        {"url": "https://dynamo.example.com"},
-                        {"url": "https://openrouter.example.com"}
+                        {"url": "https://dynamo.example.com/"},
+                        {"url": "https://openrouter.example.com/"}
                     ]
                 }
             }
         }"#;
         let config: ConfigFile = serde_json::from_str(json).unwrap();
-        let pool_config = config
-            .targets
-            .into_values()
-            .next()
-            .unwrap()
-            .into_pool_config()
-            .unwrap();
-        assert_eq!(pool_config.providers.len(), 2);
-        for provider in &pool_config.providers {
-            assert_eq!(provider.serves, ServesScope::Both);
-        }
-        // And no untagged pool ever engages the completions filter.
-        for provider in pool_config.providers {
-            let target: Target = provider.into();
-            assert!(target.serves.serves(RequestClass::Normal));
-            assert!(target.serves.serves(RequestClass::Completions));
+        let pools = config.targets["gpt-4"].clone().into_pool_configs().unwrap();
+        assert_eq!(pools.len(), 1);
+        assert_eq!(pools[0].0, DEFAULT_POOL);
+        assert_eq!(pools[0].1.providers.len(), 2);
+
+        // And the built composite resolves EVERY class to that one pool.
+        let targets = Targets::from_config(serde_json::from_str(json).unwrap()).unwrap();
+        let entry = targets.targets.get("gpt-4").unwrap();
+        assert_eq!(entry.pool_count(), 1);
+        for class in [RequestClass::Normal, RequestClass::Completions] {
+            assert_eq!(entry.resolve(class).len(), 2);
+            assert!(entry.resolved_name(class).is_none());
         }
     }
 
-    /// The tags are spelled in config exactly as the sync emits them.
+    /// Snapshot: an existing single-pool config still serializes as a bare
+    /// pool, NOT as a named-pool map. The named-pool variant is additive — it
+    /// must not rewrite anybody's config into a new shape, and a config written
+    /// out by this build must still be readable by one without pools.
     #[test]
-    fn serves_parses_the_three_documented_values() {
+    fn an_existing_config_re_serializes_without_a_pools_wrapper() {
+        let json = r#"{
+            "targets": {
+                "pool-form": {
+                    "keys": ["sk-a"],
+                    "strategy": "priority",
+                    "providers": [
+                        {"url": "https://dynamo.example.com/"},
+                        {"url": "https://openrouter.example.com/"}
+                    ]
+                },
+                "list-form": [{"url": "https://a.example.com/"}],
+                "single-form": {"url": "https://b.example.com/"}
+            },
+            "strict_mode": false
+        }"#;
+        let config: ConfigFile = serde_json::from_str(json).unwrap();
+        let serialized = serde_json::to_value(&config).unwrap();
+
+        // The shape discriminators are unchanged: a pool is still `providers`,
+        // a list is still an array, a single is still a bare `url` — and none
+        // of them grew a `pools` key.
+        let targets = &serialized["targets"];
+        assert!(targets["pool-form"]["providers"].is_array());
+        assert!(targets["pool-form"].get("pools").is_none());
+        assert!(targets["list-form"].is_array());
+        assert!(targets["single-form"]["url"].is_string());
+        assert!(
+            !serialized.to_string().contains("\"pools\""),
+            "no existing target may serialize as a named-pool map: {serialized}"
+        );
+
+        // And the written-out config parses back to the same thing: one pool,
+        // named `default`, with the same members in the same order.
+        let reparsed: ConfigFile = serde_json::from_value(serialized).unwrap();
+        for name in ["pool-form", "list-form", "single-form"] {
+            let pools = reparsed.targets[name].clone().into_pool_configs().unwrap();
+            assert_eq!(pools.len(), 1, "{name}");
+            assert_eq!(pools[0].0, DEFAULT_POOL, "{name}");
+        }
+        let pool_form = reparsed.targets["pool-form"]
+            .clone()
+            .into_pool_configs()
+            .unwrap();
+        let urls: Vec<_> = pool_form[0]
+            .1
+            .providers
+            .iter()
+            .map(|p| p.url.to_string())
+            .collect();
+        assert_eq!(
+            urls,
+            vec![
+                "https://dynamo.example.com/",
+                "https://openrouter.example.com/"
+            ]
+        );
+        assert_eq!(pool_form[0].1.strategy, LoadBalanceStrategy::Priority);
+        assert_eq!(pool_form[0].1.keys.as_ref().unwrap().len(), 1);
+    }
+
+    /// The multi-pool shape: the same hosted model may sit in both pools with
+    /// independent per-pool ordering, and the validated target only in
+    /// `completions`.
+    #[test]
+    fn a_pools_target_parses_into_named_pools() {
         let json = r#"{
             "targets": {
                 "dsv4-flash": {
-                    "providers": [
-                        {"url": "https://dynamo.example.com", "serves": "both"},
-                        {"url": "https://openrouter.example.com", "serves": "chat"},
-                        {"url": "https://fireworks.example.com", "serves": "completions"}
-                    ]
+                    "pools": {
+                        "default": {
+                            "strategy": "priority",
+                            "providers": [
+                                {"url": "https://dynamo.example.com/"},
+                                {"url": "https://openrouter.example.com/"}
+                            ]
+                        },
+                        "completions": {
+                            "strategy": "priority",
+                            "providers": [
+                                {"url": "https://dynamo.example.com/"},
+                                {"url": "https://fireworks.example.com/"}
+                            ]
+                        }
+                    }
+                }
+            }
+        }"#;
+        let targets = Targets::from_config(serde_json::from_str(json).unwrap()).unwrap();
+        let entry = targets.targets.get("dsv4-flash").unwrap();
+        assert_eq!(entry.pool_count(), 2);
+
+        let urls = |class| {
+            entry
+                .resolve(class)
+                .providers()
+                .iter()
+                .map(|p| p.target.url.to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            urls(RequestClass::Normal),
+            vec![
+                "https://dynamo.example.com/",
+                "https://openrouter.example.com/"
+            ]
+        );
+        assert_eq!(
+            urls(RequestClass::Completions),
+            vec![
+                "https://dynamo.example.com/",
+                "https://fireworks.example.com/"
+            ]
+        );
+        assert_eq!(
+            entry.resolved_name(RequestClass::Completions),
+            Some(COMPLETIONS_POOL)
+        );
+        assert!(entry.resolved_name(RequestClass::Normal).is_none());
+    }
+
+    /// Access control belongs to the alias: a pool added for one request class
+    /// is not a way around the alias's keys or deny rules.
+    #[test]
+    fn a_named_pool_inherits_the_default_pools_access_control() {
+        let json = r#"{
+            "targets": {
+                "dsv4-flash": {
+                    "pools": {
+                        "default": {
+                            "keys": ["sk-alias"],
+                            "routing_rules": [
+                                {"match_labels": {"purpose": "batch"}, "action": {"type": "deny"}}
+                            ],
+                            "providers": [{"url": "https://dynamo.example.com/"}]
+                        },
+                        "completions": {
+                            "providers": [{"url": "https://fireworks.example.com/"}]
+                        }
+                    }
+                }
+            }
+        }"#;
+        let targets = Targets::from_config(serde_json::from_str(json).unwrap()).unwrap();
+        let entry = targets.targets.get("dsv4-flash").unwrap();
+        let completions = entry.resolve(RequestClass::Completions);
+        assert_eq!(
+            completions.keys().unwrap().len(),
+            1,
+            "completions pool must be behind the same keys"
+        );
+        assert_eq!(completions.routing_rules().len(), 1);
+    }
+
+    /// A pool that states its own keys keeps them — inheritance fills a gap, it
+    /// does not overwrite a decision.
+    #[test]
+    fn a_named_pool_keeps_its_own_access_control() {
+        let json = r#"{
+            "targets": {
+                "dsv4-flash": {
+                    "pools": {
+                        "default": {
+                            "keys": ["sk-alias"],
+                            "providers": [{"url": "https://dynamo.example.com/"}]
+                        },
+                        "completions": {
+                            "keys": ["sk-continuation", "sk-other"],
+                            "providers": [{"url": "https://fireworks.example.com/"}]
+                        }
+                    }
+                }
+            }
+        }"#;
+        let targets = Targets::from_config(serde_json::from_str(json).unwrap()).unwrap();
+        let entry = targets.targets.get("dsv4-flash").unwrap();
+        assert_eq!(entry.resolve(RequestClass::Completions).keys().unwrap().len(), 2);
+        assert_eq!(entry.resolve(RequestClass::Normal).keys().unwrap().len(), 1);
+    }
+
+    /// A composite must be able to serve the classes it has no pool for.
+    #[test]
+    fn a_pools_target_without_a_default_is_rejected() {
+        let json = r#"{
+            "targets": {
+                "dsv4-flash": {
+                    "pools": {
+                        "completions": {"providers": [{"url": "https://fireworks.example.com/"}]}
+                    }
                 }
             }
         }"#;
         let config: ConfigFile = serde_json::from_str(json).unwrap();
-        let pool_config = config
-            .targets
-            .into_values()
-            .next()
-            .unwrap()
-            .into_pool_config()
-            .unwrap();
-        let scopes: Vec<_> = pool_config.providers.iter().map(|p| p.serves).collect();
-        assert_eq!(
-            scopes,
-            vec![
-                ServesScope::Both,
-                ServesScope::Chat,
-                ServesScope::Completions
-            ]
-        );
+        let error = config.targets["dsv4-flash"]
+            .clone()
+            .into_pool_configs()
+            .unwrap_err();
+        assert!(error.to_string().contains("default"), "{error}");
     }
 
-    /// The legacy single-provider and list config forms carry the tag through
-    /// rather than silently dropping it.
+    /// A pool name the resolver never asks for would be silently dead config.
     #[test]
-    fn legacy_config_forms_carry_serves_through() {
+    fn an_unknown_pool_name_is_rejected() {
         let json = r#"{
             "targets": {
-                "single": {"url": "https://fireworks.example.com", "serves": "completions"},
-                "list": [
-                    {"url": "https://dynamo.example.com", "serves": "both"},
-                    {"url": "https://openrouter.example.com", "serves": "chat"}
-                ]
+                "dsv4-flash": {
+                    "pools": {
+                        "default": {"providers": [{"url": "https://dynamo.example.com/"}]},
+                        "completion": {"providers": [{"url": "https://fireworks.example.com/"}]}
+                    }
+                }
             }
         }"#;
         let config: ConfigFile = serde_json::from_str(json).unwrap();
-        let single = config.targets["single"].clone().into_pool_config().unwrap();
-        assert_eq!(single.providers[0].serves, ServesScope::Completions);
-        let list = config.targets["list"].clone().into_pool_config().unwrap();
-        assert_eq!(list.providers[0].serves, ServesScope::Both);
-        assert_eq!(list.providers[1].serves, ServesScope::Chat);
+        let error = config.targets["dsv4-flash"]
+            .clone()
+            .into_pool_configs()
+            .unwrap_err();
+        assert!(error.to_string().contains("completion"), "{error}");
     }
 
     /// Classification is by path suffix only — no purpose, no header, no body.
@@ -3130,7 +3474,7 @@ mod tests {
                 "{path}"
             );
         }
-        assert_eq!(RequestClass::Completions.as_str(), "completions");
-        assert_eq!(RequestClass::Normal.as_str(), "normal");
+        assert_eq!(RequestClass::Completions.pool_name(), COMPLETIONS_POOL);
+        assert_eq!(RequestClass::Normal.pool_name(), DEFAULT_POOL);
     }
 }

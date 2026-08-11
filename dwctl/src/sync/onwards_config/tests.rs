@@ -2,7 +2,6 @@ use std::{str::FromStr, time::Duration};
 
 use onwards::{
     auth::ConstantTimeString,
-    load_balancer::ProviderPool,
     target::{LoadBalanceStrategy as OnwardsLoadBalanceStrategy, RoutingAction, TargetSpecOrList},
 };
 use tokio::{sync::mpsc, time::timeout};
@@ -63,13 +62,16 @@ const KEY_A_SECRET: &str = "sk-cache-a";
 const KEY_B_SECRET: &str = "sk-cache-b";
 const KEY_BATCH_SECRET: &str = "sk-cache-batch";
 
-fn pool_has_key(pool: &ProviderPool, key: &str) -> bool {
+fn pool_has_key(pools: &onwards::target::TargetPools, key: &str) -> bool {
     let expected = ConstantTimeString::from(key.to_string());
-    pool.keys().is_some_and(|keys| keys.iter().any(|candidate| candidate == &expected))
+    pools
+        .default_pool()
+        .keys()
+        .is_some_and(|keys| keys.iter().any(|candidate| candidate == &expected))
 }
 
-fn pool_keys_len(pool: &ProviderPool) -> usize {
-    pool.keys().map_or(0, |keys| keys.len())
+fn pool_keys_len(pools: &onwards::target::TargetPools) -> usize {
+    pools.default_pool().keys().map_or(0, |keys| keys.len())
 }
 
 #[test]
@@ -165,7 +167,7 @@ async fn test_cache_shape_regular_public_and_private_access(pool: sqlx::PgPool) 
 
     let public = targets.targets.get("regular-public").expect("regular-public should exist");
     let public_pool = public.value();
-    assert_eq!(public_pool.len(), 1, "regular-public should map to a single provider pool");
+    assert_eq!(public_pool.default_pool().len(), 1, "regular-public should map to a single provider pool");
     assert_eq!(pool_keys_len(public_pool), 4, "public model should expose system + all user keys");
     assert!(pool_has_key(public_pool, SYSTEM_KEY_SECRET));
     assert!(pool_has_key(public_pool, KEY_A_SECRET));
@@ -174,7 +176,7 @@ async fn test_cache_shape_regular_public_and_private_access(pool: sqlx::PgPool) 
 
     let private = targets.targets.get("regular-private").expect("regular-private should exist");
     let private_pool = private.value();
-    assert_eq!(private_pool.len(), 1, "regular-private should map to a single provider pool");
+    assert_eq!(private_pool.default_pool().len(), 1, "regular-private should map to a single provider pool");
     assert_eq!(
         pool_keys_len(private_pool),
         2,
@@ -185,7 +187,7 @@ async fn test_cache_shape_regular_public_and_private_access(pool: sqlx::PgPool) 
     assert!(!pool_has_key(private_pool, KEY_B_SECRET));
     assert!(!pool_has_key(private_pool, KEY_BATCH_SECRET));
 
-    let provider = &private_pool.providers()[0];
+    let provider = &private_pool.default_pool().providers()[0];
     assert_eq!(provider.target.onwards_model.as_deref(), Some("regular-private-model"));
     assert_eq!(provider.target.upstream_auth_header_name.as_deref(), Some("X-API-Key"));
     assert_eq!(provider.target.upstream_auth_header_prefix.as_deref(), Some("Token "));
@@ -216,7 +218,7 @@ async fn test_endpoint_reasoning_default_reaches_standard_provider(pool: sqlx::P
         .await
         .unwrap();
     let target = targets.targets.get("regular-private").unwrap();
-    let provider = &target.value().providers()[0];
+    let provider = &target.value().default_pool().providers()[0];
     assert_eq!(
         provider
             .target
@@ -282,7 +284,7 @@ async fn test_chat_override_preserves_endpoint_responses_default(pool: sqlx::PgP
         .await
         .unwrap();
     let target = targets.targets.get("regular-private").unwrap();
-    let provider = &target.value().providers()[0];
+    let provider = &target.value().default_pool().providers()[0];
     assert_eq!(
         provider
             .target
@@ -352,7 +354,7 @@ async fn test_disabling_one_reasoning_surface_preserves_the_other(pool: sqlx::Pg
         .unwrap();
     let target = targets.targets.get("regular-private").unwrap();
     let pool = target.value();
-    let provider = &pool.providers()[0];
+    let provider = &pool.default_pool().providers()[0];
     let config = provider.target.reasoning_translation.as_ref().unwrap();
     assert!(config.chat_completions.is_none());
     assert!(config.responses.is_some());
@@ -399,7 +401,7 @@ async fn test_disabling_both_reasoning_surfaces_removes_provider_config(pool: sq
         .unwrap();
     let target = targets.targets.get("regular-private").unwrap();
     let pool = target.value();
-    let provider = &pool.providers()[0];
+    let provider = &pool.default_pool().providers()[0];
     assert!(provider.target.reasoning_translation.is_none());
 }
 
@@ -425,7 +427,7 @@ async fn test_token_budget_multi_write_survives_provider_sync(pool: sqlx::PgPool
         .unwrap();
     let target = targets.targets.get("regular-private").unwrap();
     let pool = target.value();
-    let provider = &pool.providers()[0];
+    let provider = &pool.default_pool().providers()[0];
     let writes = &provider
         .target
         .reasoning_translation
@@ -496,7 +498,7 @@ async fn test_composite_components_keep_distinct_effective_reasoning_translation
         .unwrap();
     let target = targets.targets.get("composite-priority").unwrap();
     let pool = target.value();
-    let providers = pool.providers();
+    let providers = pool.default_pool().providers();
     let paths = providers
         .iter()
         .map(|provider| {
@@ -720,16 +722,16 @@ async fn test_cache_shape_composite_pool_strategy_and_fallback(pool: sqlx::PgPoo
     let composite = targets.targets.get("composite-priority").expect("composite-priority should exist");
     let composite_pool = composite.value();
 
-    assert_eq!(composite_pool.len(), 2, "composite pool should have two providers");
-    assert_eq!(composite_pool.strategy(), OnwardsLoadBalanceStrategy::Priority);
-    assert!(composite_pool.fallback_enabled());
-    assert!(!composite_pool.should_fallback_on_rate_limit());
-    assert!(composite_pool.should_fallback_on_status(429));
-    assert!(!composite_pool.should_fallback_on_status(499));
-    assert!(composite_pool.should_fallback_on_status(503));
-    assert!(!composite_pool.should_fallback_on_status(500));
+    assert_eq!(composite_pool.default_pool().len(), 2, "composite pool should have two providers");
+    assert_eq!(composite_pool.default_pool().strategy(), OnwardsLoadBalanceStrategy::Priority);
+    assert!(composite_pool.default_pool().fallback_enabled());
+    assert!(!composite_pool.default_pool().should_fallback_on_rate_limit());
+    assert!(composite_pool.default_pool().should_fallback_on_status(429));
+    assert!(!composite_pool.default_pool().should_fallback_on_status(499));
+    assert!(composite_pool.default_pool().should_fallback_on_status(503));
+    assert!(!composite_pool.default_pool().should_fallback_on_status(500));
 
-    let fallback = composite_pool.fallback().expect("fallback should be set");
+    let fallback = composite_pool.default_pool().fallback().expect("fallback should be set");
     assert_eq!(
         fallback.on_status,
         vec![429, 503],
@@ -749,7 +751,7 @@ async fn test_cache_shape_composite_pool_strategy_and_fallback(pool: sqlx::PgPoo
     assert!(!pool_has_key(composite_pool, KEY_B_SECRET));
     assert!(!pool_has_key(composite_pool, KEY_BATCH_SECRET));
 
-    let providers = composite_pool.providers();
+    let providers = composite_pool.default_pool().providers();
     assert_eq!(providers[0].target.onwards_model.as_deref(), Some("component-b-model"));
     assert_eq!(providers[1].target.onwards_model.as_deref(), Some("component-a-model"));
     assert_eq!(providers[0].weight, 30);
@@ -775,7 +777,7 @@ async fn test_cache_shape_null_composite_uses_application_fallback_status_defaul
         .await
         .unwrap();
     let composite = targets.targets.get("composite-priority").expect("composite-priority should exist");
-    let fallback = composite.value().fallback().expect("fallback should be set");
+    let fallback = composite.value().default_pool().fallback().expect("fallback should be set");
 
     assert_eq!(fallback.on_status, vec![429, 499, 500, 502, 503, 504]);
 }
@@ -806,7 +808,7 @@ async fn test_cache_shape_composite_backoff_round_trips(pool: sqlx::PgPool) {
         .await
         .unwrap();
     let composite = targets.targets.get("composite-priority").expect("composite-priority should exist");
-    let fallback = composite.value().fallback().expect("fallback should be present");
+    let fallback = composite.value().default_pool().fallback().expect("fallback should be present");
 
     let backoff = fallback.backoff.as_ref().expect("backoff should be Some");
     assert_eq!(backoff.initial_ms, 250);
@@ -843,7 +845,7 @@ async fn test_cache_shape_composite_with_all_components_disabled(pool: sqlx::PgP
         .get("composite-priority")
         .expect("composite should still exist in cache even with all components disabled");
     assert!(
-        pool_entry.is_empty(),
+        pool_entry.default_pool().is_empty(),
         "composite pool should have zero providers when all components are disabled"
     );
 }
@@ -909,7 +911,7 @@ async fn test_cache_shape_deleted_component_model_is_excluded_from_composite(poo
         .await
         .unwrap();
     let composite = targets.targets.get("composite-priority").expect("composite-priority should exist");
-    let providers = composite.value().providers();
+    let providers = composite.value().default_pool().providers();
     assert_eq!(
         providers.len(),
         1,
@@ -924,7 +926,7 @@ async fn test_cache_shape_regular_model_routing_rules(pool: sqlx::PgPool) {
         .await
         .unwrap();
     let regular_private = targets.targets.get("regular-private").expect("regular-private should exist");
-    let rules = regular_private.value().routing_rules();
+    let rules = regular_private.value().default_pool().routing_rules();
 
     assert_eq!(rules.len(), 2, "regular-private should expose two routing rules");
 
@@ -944,7 +946,7 @@ async fn test_cache_shape_composite_model_routing_rules(pool: sqlx::PgPool) {
         .await
         .unwrap();
     let composite = targets.targets.get("composite-priority").expect("composite-priority should exist");
-    let rules = composite.value().routing_rules();
+    let rules = composite.value().default_pool().routing_rules();
 
     assert_eq!(rules.len(), 2, "composite-priority should expose two routing rules");
 
@@ -1496,7 +1498,7 @@ async fn test_batch_api_key_access_to_composite_escalation_target(pool: sqlx::Pg
     // Verify batch API key has access
     // Keys are stored as ConstantTimeString in onwards
     let batch_key_ct = ConstantTimeString::from(batch_api_key.secret.clone());
-    let keys = pool_spec.keys().expect("Composite model should have keys");
+    let keys = pool_spec.default_pool().keys().expect("Composite model should have keys");
     let has_batch_key = keys.iter().any(|k| k == &batch_key_ct);
 
     assert!(has_batch_key, "Batch API key should have access to composite escalation target");
@@ -1708,39 +1710,38 @@ mod resolve_key_rate_limit_tests {
     }
 }
 
-/// The sync emits an explicit `serves` tag per composite member, never leaving
-/// it to onwards' `both` default: today's third-party failovers must not receive
-/// completions-class traffic once a validated continuation target is attached.
+/// The sync emits one named pool per composite pool: a composite nobody has
+/// given a second pool keeps the single-pool shape it always had, and attaching
+/// a completions member produces a second pool that chat traffic cannot reach.
 #[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
-async fn test_cache_shape_component_role_becomes_the_serves_tag(pool: sqlx::PgPool) {
-    // The fixture predates roles, so its components carry the column default.
+async fn test_cache_shape_component_pool_becomes_a_named_pool(pool: sqlx::PgPool) {
+    // The fixture predates pools, so its components carry the column default.
     let targets = super::load_targets_from_db(&pool, &[], false, &RateLimitTiersConfig::default())
         .await
         .unwrap();
     let composite = targets.targets.get("composite-priority").expect("composite-priority should exist");
-    for provider in composite.value().providers() {
-        assert_eq!(
-            provider.target.serves,
-            onwards::target::ServesScope::Chat,
-            "an untagged component defaults to chat, so it never serves a resume leg"
-        );
-    }
+    assert_eq!(composite.value().pool_count(), 1, "an untouched composite has only its default pool");
+    let default_members = composite.value().default_pool().len();
+    assert!(default_members >= 2, "fixture has multiple members");
     assert!(
-        !composite.value().has_completions_member(),
-        "the completions filter must not engage for a composite nobody has tagged"
+        composite.value().resolved_name(onwards::target::RequestClass::Completions).is_none(),
+        "completions must resolve to the default pool until somebody adds a completions pool"
     );
-    // A plain (non-composite) model is its own provider and serves everything.
-    let regular = targets.targets.get("regular-public").expect("regular-public should exist");
-    assert_eq!(regular.value().providers()[0].target.serves, onwards::target::ServesScope::Both);
 
-    // Tag the members the way the canary is wired: on-prem first, third-party
-    // chat failover, validated completions target.
-    sqlx::query!("UPDATE deployed_model_components SET role = 'both' WHERE deployed_model_id = '40000000-0000-0000-0000-000000000006'")
-        .execute(&pool)
-        .await
-        .unwrap();
+    // Wire the canary: dynamo stays in the default pool AND joins the
+    // completions pool at position 0; the validated target is completions-only.
     sqlx::query!(
-        "UPDATE deployed_model_components SET role = 'completions' WHERE deployed_model_id = '40000000-0000-0000-0000-000000000005'"
+        "INSERT INTO deployed_model_components (composite_model_id, deployed_model_id, weight, enabled, sort_order, pool)
+         SELECT composite_model_id, deployed_model_id, weight, enabled, 0, 'completions'
+         FROM deployed_model_components
+         WHERE deployed_model_id = '40000000-0000-0000-0000-000000000006'"
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query!(
+        "UPDATE deployed_model_components SET pool = 'completions', sort_order = 1
+         WHERE deployed_model_id = '40000000-0000-0000-0000-000000000005'"
     )
     .execute(&pool)
     .await
@@ -1750,10 +1751,37 @@ async fn test_cache_shape_component_role_becomes_the_serves_tag(pool: sqlx::PgPo
         .await
         .unwrap();
     let composite = targets.targets.get("composite-priority").expect("composite-priority should exist");
-    let scopes: Vec<_> = composite.value().providers().iter().map(|p| p.target.serves).collect();
+    assert_eq!(composite.value().pool_count(), 2, "the composite now has two pools");
     assert_eq!(
-        scopes,
-        vec![onwards::target::ServesScope::Both, onwards::target::ServesScope::Completions]
+        composite.value().resolved_name(onwards::target::RequestClass::Completions),
+        Some("completions")
     );
-    assert!(composite.value().has_completions_member());
+
+    let member_urls = |class| {
+        composite
+            .value()
+            .resolve(class)
+            .providers()
+            .iter()
+            .map(|p| p.target.url.to_string())
+            .collect::<Vec<_>>()
+    };
+    let chat = member_urls(onwards::target::RequestClass::Normal);
+    let completions = member_urls(onwards::target::RequestClass::Completions);
+    assert_eq!(completions.len(), 2, "dynamo plus the validated target, in failover order");
+    assert_eq!(
+        chat.len(),
+        default_members - 1,
+        "the validated target left the default pool, so chat can never reach it"
+    );
+
+    // A plain (non-composite) model is its own single pool, unchanged.
+    let regular = targets.targets.get("regular-public").expect("regular-public should exist");
+    assert_eq!(regular.value().pool_count(), 1);
+    assert!(
+        regular
+            .value()
+            .resolved_name(onwards::target::RequestClass::Completions)
+            .is_none()
+    );
 }

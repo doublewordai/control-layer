@@ -924,7 +924,7 @@ mod tests {
     use test_utils::MockHttpClient;
 
     /// Helper to create a single-provider pool from a target
-    fn pool(target: Target) -> ProviderPool {
+    fn pool(target: Target) -> target::TargetPools {
         target.into_pool()
     }
 
@@ -1172,7 +1172,7 @@ mod tests {
             Vec::new(),
         );
         let targets_map = Arc::new(DashMap::new());
-        targets_map.insert(alias.to_string(), pool);
+        targets_map.insert(alias.to_string(), pool.into());
         target::Targets {
             targets: targets_map,
             key_rate_limiters: Arc::new(DashMap::new()),
@@ -2078,7 +2078,7 @@ mod tests {
             .build();
         targets_map.insert(
             "limited-model".to_string(),
-            ProviderPool::new(vec![Provider::with_concurrency_limit(target, 1, 5)]),
+            ProviderPool::new(vec![Provider::with_concurrency_limit(target, 1, 5)]).into(),
         );
 
         let targets = Targets {
@@ -2131,7 +2131,8 @@ mod tests {
                 target::LoadBalanceStrategy::default(),
                 false,
                 Vec::new(),
-            ),
+            )
+            .into(),
         );
 
         let targets = Targets {
@@ -2283,7 +2284,7 @@ mod tests {
         #[fixture]
         #[once]
         fn get_shared_metrics_servers(
-            #[default(Arc::new(DashMap::new()))] targets: Arc<DashMap<String, ProviderPool>>,
+            #[default(Arc::new(DashMap::new()))] targets: Arc<DashMap<String, target::TargetPools>>,
         ) -> (TestServer, TestServer) {
             let targets = Targets {
                 targets,
@@ -3194,7 +3195,7 @@ mod tests {
             let pool = ProviderPool::new(providers);
 
             let targets_map = Arc::new(DashMap::new());
-            targets_map.insert("test-model".to_string(), pool);
+            targets_map.insert("test-model".to_string(), pool.into());
 
             let targets = Targets {
                 targets: targets_map,
@@ -3250,7 +3251,7 @@ mod tests {
             let pool = ProviderPool::new(providers);
 
             let targets_map = Arc::new(DashMap::new());
-            targets_map.insert("weighted-model".to_string(), pool);
+            targets_map.insert("weighted-model".to_string(), pool.into());
 
             let targets = Targets {
                 targets: targets_map,
@@ -3316,7 +3317,7 @@ mod tests {
             );
 
             let targets_map = Arc::new(DashMap::new());
-            targets_map.insert("single-model".to_string(), pool);
+            targets_map.insert("single-model".to_string(), pool.into());
 
             let targets = Targets {
                 targets: targets_map,
@@ -3508,7 +3509,8 @@ mod tests {
                 target::LoadBalanceStrategy::Priority,
                 false,
                 Vec::new(),
-            ),
+            )
+            .into(),
         );
         let targets = Targets {
             targets: targets_map,
@@ -3675,7 +3677,8 @@ mod tests {
                 target::LoadBalanceStrategy::Priority,
                 false,
                 Vec::new(),
-            ),
+            )
+            .into(),
         );
         let targets = Targets {
             targets: targets_map,
@@ -3759,7 +3762,8 @@ mod tests {
                 target::LoadBalanceStrategy::Priority,
                 false,
                 Vec::new(),
-            ),
+            )
+            .into(),
         );
         let targets = Targets {
             targets: targets_map,
@@ -4197,7 +4201,7 @@ mod tests {
             ]);
 
             let targets_map = Arc::new(DashMap::new());
-            targets_map.insert("test-model".to_string(), pool);
+            targets_map.insert("test-model".to_string(), pool.into());
 
             let targets = Targets {
                 targets: targets_map,
@@ -4408,32 +4412,21 @@ mod tests {
         }
     }
 
-    /// Completions-scoped routing, end to end through the router.
+    /// Per-request-class pools, end to end through the router.
     ///
-    /// A composite carrying a validated completions member must send
-    /// `/v1/completions` there (after the on-prem member) and must never send
-    /// chat traffic there. Asserted on the URL the upstream client actually
-    /// received, under both routers.
-    mod completions_scope {
+    /// A composite with a `completions` pool must send `/v1/completions` into
+    /// that pool and everything else into `default`. Asserted on the URL the
+    /// upstream client actually received, under both routers.
+    mod completions_pool {
         use super::*;
-        use crate::target::{LoadBalanceStrategy, ServesScope};
+        use crate::target::{COMPLETIONS_POOL, LoadBalanceStrategy, TargetPools};
+        use std::collections::HashMap;
 
-        fn scoped_pool() -> ProviderPool {
-            let member = |url: &str, serves: ServesScope| {
-                Provider::new(
-                    Target::builder()
-                        .url(url.parse().unwrap())
-                        .serves(serves)
-                        .build(),
-                    1,
-                )
-            };
+        fn priority_pool(urls: &[&str]) -> ProviderPool {
             ProviderPool::with_config(
-                vec![
-                    member("https://dynamo.example.com", ServesScope::Both),
-                    member("https://openrouter.example.com", ServesScope::Chat),
-                    member("https://fireworks.example.com", ServesScope::Completions),
-                ],
+                urls.iter()
+                    .map(|url| Provider::new(Target::builder().url(url.parse().unwrap()).build(), 1))
+                    .collect(),
                 None,
                 None,
                 None,
@@ -4444,9 +4437,27 @@ mod tests {
             )
         }
 
-        fn server_with(strict_mode: bool) -> (TestServer, MockHttpClient) {
+        /// dynamo sits at position 0 of BOTH pools — the same hosted model is a
+        /// member of each, with independent ordering behind it.
+        fn flash_pools() -> TargetPools {
+            TargetPools::with_pools(
+                priority_pool(&[
+                    "https://dynamo.example.com",
+                    "https://openrouter.example.com",
+                ]),
+                HashMap::from([(
+                    COMPLETIONS_POOL.to_string(),
+                    priority_pool(&[
+                        "https://dynamo.example.com",
+                        "https://fireworks.example.com",
+                    ]),
+                )]),
+            )
+        }
+
+        fn server_with(strict_mode: bool, pools: TargetPools) -> (TestServer, MockHttpClient) {
             let targets_map = Arc::new(DashMap::new());
-            targets_map.insert("dsv4-flash".to_string(), scoped_pool());
+            targets_map.insert("dsv4-flash".to_string(), pools);
             let targets = Targets {
                 targets: targets_map,
                 key_rate_limiters: Arc::new(DashMap::new()),
@@ -4464,12 +4475,12 @@ mod tests {
             (server, mock_client)
         }
 
-        /// The first attempt goes to the on-prem member (`both`), which is free
-        /// for us; the validated completions target is the fallback.
+        /// The completions pool's first member answers — the on-prem one, which
+        /// is free for us; the validated third-party target is its failover.
         #[tokio::test]
-        async fn completions_requests_reach_the_on_prem_member_first() {
+        async fn completions_requests_are_served_by_the_completions_pool() {
             for strict_mode in [false, true] {
-                let (server, client) = server_with(strict_mode);
+                let (server, client) = server_with(strict_mode, flash_pools());
                 let response = server
                     .post("/v1/completions")
                     .json(&json!({"model": "dsv4-flash", "prompt": [1, 2, 3]}))
@@ -4490,12 +4501,13 @@ mod tests {
             }
         }
 
-        /// Chat traffic never touches the completions member — it goes to the
-        /// same on-prem member as before, and the chat failover behind it.
+        /// "Never serves chat" is structural: the validated completions target
+        /// is not a member of the default pool, so chat traffic cannot reach it
+        /// even when the default pool fails over.
         #[tokio::test]
-        async fn chat_requests_never_reach_the_completions_member() {
+        async fn chat_requests_never_reach_the_completions_pool() {
             for strict_mode in [false, true] {
-                let (server, client) = server_with(strict_mode);
+                let (server, client) = server_with(strict_mode, flash_pools());
                 let response = server
                     .post("/v1/chat/completions")
                     .json(&json!({
@@ -4518,42 +4530,52 @@ mod tests {
             }
         }
 
-        /// A pool with nobody eligible for the class answers 503 rather than
-        /// leaking the request to an ineligible member.
+        /// Rule 3: a composite with no completions pool serves completions from
+        /// its default pool, exactly as before named pools existed.
         #[tokio::test]
-        async fn a_completions_only_pool_refuses_chat_traffic() {
-            let targets_map = Arc::new(DashMap::new());
-            targets_map.insert(
-                "continuation-only".to_string(),
-                ProviderPool::new(vec![Provider::new(
-                    Target::builder()
-                        .url("https://fireworks.example.com".parse().unwrap())
-                        .serves(ServesScope::Completions)
-                        .build(),
-                    1,
-                )]),
+        async fn a_composite_without_a_completions_pool_serves_completions_from_default() {
+            for strict_mode in [false, true] {
+                let (server, client) = server_with(
+                    strict_mode,
+                    priority_pool(&["https://dynamo.example.com"]).into(),
+                );
+                let response = server
+                    .post("/v1/completions")
+                    .json(&json!({"model": "dsv4-flash", "prompt": "hi"}))
+                    .await;
+                assert_eq!(
+                    response.status_code(),
+                    StatusCode::OK,
+                    "strict={strict_mode}"
+                );
+
+                let requests = client.requests.lock().unwrap();
+                assert_eq!(requests.len(), 1, "strict={strict_mode}");
+                assert!(
+                    requests[0].uri.starts_with("https://dynamo.example.com/"),
+                    "strict={strict_mode}: got {}",
+                    requests[0].uri
+                );
+            }
+        }
+
+        /// An empty completions pool is not a licence to fall back to chat
+        /// members: the resolver picked it, and a pool with no providers is a
+        /// 503 whichever pool it is.
+        #[tokio::test]
+        async fn an_empty_completions_pool_refuses_rather_than_falling_back() {
+            let pools = TargetPools::with_pools(
+                priority_pool(&["https://openrouter.example.com"]),
+                HashMap::from([(COMPLETIONS_POOL.to_string(), ProviderPool::new(vec![]))]),
             );
-            let targets = Targets {
-                targets: targets_map,
-                key_rate_limiters: Arc::new(DashMap::new()),
-                key_concurrency_limiters: Arc::new(DashMap::new()),
-                key_labels: Arc::new(DashMap::new()),
-                strict_mode: false,
-                http_pool_config: None,
-            };
-            let mock = MockHttpClient::new(StatusCode::OK, "{}");
-            let app_state = AppState::with_client(targets, mock.clone());
-            let server = TestServer::new(build_router(app_state)).unwrap();
+            let (server, client) = server_with(false, pools);
 
             let response = server
-                .post("/v1/chat/completions")
-                .json(&json!({
-                    "model": "continuation-only",
-                    "messages": [{"role": "user", "content": "hi"}]
-                }))
+                .post("/v1/completions")
+                .json(&json!({"model": "dsv4-flash", "prompt": "hi"}))
                 .await;
             assert_eq!(response.status_code(), StatusCode::SERVICE_UNAVAILABLE);
-            assert!(mock.requests.lock().unwrap().is_empty());
+            assert!(client.requests.lock().unwrap().is_empty());
         }
     }
 }

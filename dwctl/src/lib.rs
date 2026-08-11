@@ -2415,7 +2415,7 @@ impl BackgroundServices {
         let expected: Vec<(String, Option<onwards::auth::KeySet>)> = new_targets
             .targets
             .iter()
-            .map(|entry| (entry.key().clone(), entry.value().keys().cloned()))
+            .map(|entry| (entry.key().clone(), entry.value().default_pool().keys().cloned()))
             .collect();
 
         // Kept so the update can be re-asserted below. `Targets` is a handle of
@@ -2462,7 +2462,7 @@ impl BackgroundServices {
             let applied = live.len() == expected.len()
                 && expected
                     .iter()
-                    .all(|(alias, keys)| live.get(alias).is_some_and(|pool| pool.keys() == keys.as_ref()));
+                    .all(|(alias, keys)| live.get(alias).is_some_and(|pool| pool.default_pool().keys() == keys.as_ref()));
 
             let now = std::time::Instant::now();
             if applied {

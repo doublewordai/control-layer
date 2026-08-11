@@ -857,11 +857,17 @@ async fn the_route_config_reaches_the_render_call_and_the_leg_body(pool: PgPool)
     );
     assert_eq!(render_requests[0]["continuation_text"], "Hello");
 
-    // 2. The leg's prompt drops our leading BOS, because this provider prepends
-    //    its own — otherwise the exact prefix shifts by one token.
+    // 2. The leg's prompt is the rendered prefix VERBATIM — leading token and
+    //    all — even though this route says the provider prepends its own BOS.
+    //    `strip_leading_bos` is carried, not applied: BOS-prepending is a
+    //    property of the MEMBER that ends up serving the leg, and this body is
+    //    built once, before onwards picks one out of the completions pool. Its
+    //    first member is on-prem and does NOT prepend, so a pre-stripped prompt
+    //    would reach dynamo a token short. The strip belongs in onwards'
+    //    per-member forwarding; see `RouteInfo::strip_leading_bos`.
     let leg = fake.resume_requests();
     assert_eq!(leg.len(), 1);
-    assert_eq!(leg[0].body["prompt"], json!([1, 2, 3]));
+    assert_eq!(leg[0].body["prompt"], json!([7, 1, 2, 3]));
 }
 
 /// The client's own `chat_template_kwargs` describe how leg 1 was actually

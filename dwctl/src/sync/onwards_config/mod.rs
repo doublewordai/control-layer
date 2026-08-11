@@ -1,13 +1,18 @@
 //! Configuration synchronization to onwards routing layer.
 
+use crate::db::models::deployments::DEFAULT_COMPONENT_POOL;
 use crate::metrics::errors::component::ONWARDS_SYNC;
-use std::{collections::HashMap, num::NonZeroU32, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashMap},
+    num::NonZeroU32,
+    sync::Arc,
+};
 
 use metrics::histogram;
 use onwards::target::{
     Auth, BackoffConfig as OnwardsBackoffConfig, ConcurrencyLimitParameters, ConfigFile, FallbackConfig as OnwardsFallbackConfig,
     JitterStrategy as OnwardsJitterStrategy, KeyDefinition, LoadBalanceStrategy as OnwardsLoadBalanceStrategy, OpenResponsesConfig,
-    PoolSpec, ProviderSpec, RateLimitParameters, RoutingAction, RoutingRule, ServesScope, TargetSpecOrList, Targets, WatchTargetsStream,
+    PoolSpec, PoolsSpec, ProviderSpec, RateLimitParameters, RoutingAction, RoutingRule, TargetSpecOrList, Targets, WatchTargetsStream,
 };
 use sqlx::{PgPool, postgres::PgListener};
 use tokio::sync::{mpsc, watch};
@@ -441,26 +446,13 @@ impl OnwardsConfigSync {
 // Composite models are stored in the deployed_models table with is_composite = TRUE.
 // They have NULL hosted_on and instead have components in deployed_model_components.
 
-/// Map `deployed_model_components.role` onto onwards' member scope.
-///
-/// Unrecognised values fall back to `Chat` — the column's own default and the
-/// conservative direction: a member we cannot classify never receives
-/// continuation resume traffic.
-fn serves_scope(role: &str) -> ServesScope {
-    match role {
-        "both" => ServesScope::Both,
-        "completions" => ServesScope::Completions,
-        _ => ServesScope::Chat,
-    }
-}
-
 /// Data structure for composite model components (prepared for onwards integration)
 #[derive(Debug, Clone)]
 struct CompositeModelComponent {
     weight: i32,
-    /// Which request classes this member serves, straight from
-    /// `deployed_model_components.role`.
-    role: String,
+    /// Which of the composite's named pools this membership belongs to,
+    /// straight from `deployed_model_components.pool`.
+    pool: String,
     // Component target info (from the underlying deployed_model)
     target: OnwardsTarget,
 }
@@ -540,7 +532,7 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
             -- Component info
             dmc.deployed_model_id,
             dmc.weight,
-            dmc.role as component_role,
+            dmc.pool as component_pool,
             -- Underlying deployment info
             dm.model_name,
             dm.alias as deployment_alias,
@@ -570,7 +562,7 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
         -- weight/created_at keys break any residual sort_order tie the same way
         -- the admin API does, so the provider shown as "Primary" is the one
         -- onwards actually tries first.
-        ORDER BY cm.id, dmc.sort_order ASC, dmc.weight DESC, dmc.created_at ASC
+        ORDER BY cm.id, dmc.pool, dmc.sort_order ASC, dmc.weight DESC, dmc.created_at ASC
         "#
     )
     .fetch_all(db)
@@ -782,7 +774,7 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
         if let Some(composite) = composite_map.get_mut(&row.composite_model_id) {
             composite.components.push(CompositeModelComponent {
                 weight: row.weight,
-                role: row.component_role.clone(),
+                pool: row.component_pool.clone(),
                 target: OnwardsTarget {
                     model_name: row.model_name.clone(),
                     alias: row.deployment_alias.clone(),
@@ -961,11 +953,12 @@ fn convert_composite_to_target_spec(
         None
     };
 
-    // Build provider specs from components
-    let providers: Vec<ProviderSpec> = composite
-        .components
-        .iter()
-        .map(|component| {
+    // Build provider specs from components, grouped by the pool each membership
+    // belongs to. The query orders by (pool, sort_order), so each pool's members
+    // come out in its own failover order.
+    let mut pool_providers: BTreeMap<String, Vec<ProviderSpec>> = BTreeMap::new();
+    for component in composite.components.iter() {
+        let provider = {
             let target = &component.target;
 
             // Build provider-level rate limiting (from underlying deployment)
@@ -1026,34 +1019,34 @@ fn convert_composite_to_target_spec(
                     // leaked to them.
                     propagate_trace_context: None,
                     reasoning_translation: target.reasoning_translation.clone().map(Into::into),
-                    // The pool member's request-class scope. Emitted explicitly
-                    // for every member (never left to onwards' `both` default)
-                    // so the completions filter sees the operator's intent, not
-                    // a fallback: today's third-party failovers are `chat` and
-                    // must not receive resume legs.
-                    serves: serves_scope(&component.role),
                 }
             }
-        })
-        .collect();
+        };
+        pool_providers.entry(component.pool.clone()).or_default().push(provider);
+    }
+
+    // A composite always has a default pool, even with no members: an empty pool
+    // answers 503, which is what a composite with nothing enabled did before.
+    pool_providers.entry(DEFAULT_COMPONENT_POOL.to_string()).or_default();
 
     debug!(
-        "Composite model '{}' configured with {} providers, strategy: {:?}, fallback: {}, sanitize_responses: {}",
+        "Composite model '{}' configured with {} pool(s) ({} providers), strategy: {:?}, fallback: {}, sanitize_responses: {}",
         composite.alias,
-        providers.len(),
+        pool_providers.len(),
+        pool_providers.values().map(Vec::len).sum::<usize>(),
         strategy,
         composite.fallback_enabled,
         composite.sanitize_responses
     );
 
-    // Create PoolSpec with weighted providers
+    // Create a PoolSpec per pool, with the composite's settings applied to each.
     // Note: trusted is not set at the pool level for composite models
     // Each provider uses its own trusted setting via ProviderSpec.trusted
-    let pool_spec = PoolSpec {
-        keys,
-        rate_limit,
-        concurrency_limit,
-        fallback,
+    let make_pool = |providers: Vec<ProviderSpec>| PoolSpec {
+        keys: keys.clone(),
+        rate_limit: rate_limit.clone(),
+        concurrency_limit: concurrency_limit.clone(),
+        fallback: fallback.clone(),
         strategy,
         providers,
         response_headers: None,
@@ -1065,7 +1058,17 @@ fn convert_composite_to_target_spec(
         routing_rules: composite.routing_rules.clone(),
     };
 
-    (composite.alias.clone(), TargetSpecOrList::Pool(pool_spec))
+    let mut pools: HashMap<String, PoolSpec> = pool_providers.into_iter().map(|(name, p)| (name, make_pool(p))).collect();
+
+    // A composite with only a default pool emits the single-pool shape it always
+    // emitted — no config churn for the models nobody has given a second pool.
+    let spec = if pools.len() == 1 {
+        TargetSpecOrList::Pool(pools.remove(DEFAULT_COMPONENT_POOL).expect("default pool is always present"))
+    } else {
+        TargetSpecOrList::Pools(PoolsSpec { pools })
+    };
+
+    (composite.alias.clone(), spec)
 }
 
 /// Resolves the rate limit for an API key. A non-NULL per-key
@@ -1194,9 +1197,6 @@ fn convert_to_config_file(
                 }),
                 request_timeout_secs: None,
                 trusted: Some(target.trusted),
-                // A non-composite model is its own single provider: it serves
-                // whatever it is asked, exactly as before.
-                serves: ServesScope::Both,
                 // None → inherit from resolved `trusted` (see composite-model
                 // site above): self-hosted providers propagate W3C trace
                 // context, third-party providers do not.

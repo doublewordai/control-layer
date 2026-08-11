@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            WITH inserted AS (\n                INSERT INTO deployed_model_components (composite_model_id, deployed_model_id, weight, enabled, sort_order, role)\n                VALUES ($1, $2, $3, $4, $5, $6)\n                RETURNING id, composite_model_id, deployed_model_id, weight, enabled, sort_order, role, created_at\n            )\n            SELECT\n                inserted.id,\n                inserted.composite_model_id,\n                inserted.deployed_model_id,\n                inserted.weight,\n                inserted.enabled,\n                inserted.sort_order,\n                inserted.role,\n                inserted.created_at,\n                dm.alias as model_alias,\n                dm.model_name,\n                dm.description as model_description,\n                dm.type as model_type,\n                dm.trusted as model_trusted,\n                dm.open_responses_adapter as \"model_open_responses_adapter?\",\n                dm.hosted_on as endpoint_id,\n                e.name as \"endpoint_name?\"\n            FROM inserted\n            JOIN deployed_models dm ON dm.id = inserted.deployed_model_id\n            LEFT JOIN inference_endpoints e ON e.id = dm.hosted_on\n            ",
+  "query": "\n            WITH inserted AS (\n                INSERT INTO deployed_model_components (composite_model_id, deployed_model_id, weight, enabled, sort_order, pool)\n                VALUES ($1, $2, $3, $4, $5, $6)\n                RETURNING id, composite_model_id, deployed_model_id, weight, enabled, sort_order, pool, created_at\n            )\n            SELECT\n                inserted.id,\n                inserted.composite_model_id,\n                inserted.deployed_model_id,\n                inserted.weight,\n                inserted.enabled,\n                inserted.sort_order,\n                inserted.pool,\n                inserted.created_at,\n                dm.alias as model_alias,\n                dm.model_name,\n                dm.description as model_description,\n                dm.type as model_type,\n                dm.trusted as model_trusted,\n                dm.open_responses_adapter as \"model_open_responses_adapter?\",\n                dm.hosted_on as endpoint_id,\n                e.name as \"endpoint_name?\"\n            FROM inserted\n            JOIN deployed_models dm ON dm.id = inserted.deployed_model_id\n            LEFT JOIN inference_endpoints e ON e.id = dm.hosted_on\n            ",
   "describe": {
     "columns": [
       {
@@ -35,7 +35,7 @@
       },
       {
         "ordinal": 6,
-        "name": "role",
+        "name": "pool",
         "type_info": "Varchar"
       },
       {
@@ -113,5 +113,5 @@
       true
     ]
   },
-  "hash": "73d91e76c3ff5704693c5862c60754fe51b15f5fd0eb09f7f90c5d4cc438d9a3"
+  "hash": "f8dccabd50a71180cc7c5eb729dd1c787d13c4f76f3fc96d1f5955f730bca442"
 }

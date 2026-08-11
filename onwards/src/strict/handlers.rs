@@ -564,6 +564,10 @@ fn should_use_adapter<T: HttpClient + Clone + Send + Sync + 'static>(
         }
     };
 
+    // The adapter is a Responses-API concern, which is default-pool traffic —
+    // a per-request-class pool never serves it.
+    let pool = pool.default_pool();
+
     // If the pool has providers, check the first one's adapter config directly
     if let Some(target) = pool.first_target() {
         return target
@@ -597,7 +601,7 @@ fn should_use_adapter<T: HttpClient + Clone + Send + Sync + 'static>(
                 .targets
                 .targets
                 .get(target.as_str())
-                .and_then(|p| p.first_target().cloned())
+                .and_then(|p| p.default_pool().first_target().cloned())
                 .and_then(|t| t.open_responses)
                 .map(|config| config.adapter)
                 .unwrap_or(false)
@@ -4809,7 +4813,7 @@ mod tests {
             true, // Mark pool as trusted
             Vec::new(),
         );
-        targets_map.insert("gpt-4".to_string(), pool);
+        targets_map.insert("gpt-4".to_string(), pool.into());
 
         let targets = Targets {
             targets: targets_map,
@@ -4921,7 +4925,7 @@ mod tests {
             true, // Mark pool as trusted
             Vec::new(),
         );
-        targets_map.insert("gpt-4".to_string(), pool);
+        targets_map.insert("gpt-4".to_string(), pool.into());
 
         let targets = Targets {
             targets: targets_map,
@@ -5023,7 +5027,7 @@ mod tests {
             true, // Mark pool as trusted
             Vec::new(),
         );
-        targets_map.insert("gpt-4".to_string(), pool);
+        targets_map.insert("gpt-4".to_string(), pool.into());
 
         let targets = Targets {
             targets: targets_map,
@@ -5094,7 +5098,7 @@ mod tests {
             true, // Mark pool as trusted
             Vec::new(),
         );
-        targets_map.insert("gpt-4".to_string(), pool);
+        targets_map.insert("gpt-4".to_string(), pool.into());
 
         let targets = Targets {
             targets: targets_map,
@@ -5200,7 +5204,7 @@ mod tests {
             true, // Mark pool as trusted
             Vec::new(),
         );
-        targets_map.insert("gpt-4o-mini".to_string(), pool);
+        targets_map.insert("gpt-4o-mini".to_string(), pool.into());
 
         let targets = Targets {
             targets: targets_map,
@@ -5289,7 +5293,7 @@ mod tests {
             true, // Mark pool as trusted
             Vec::new(),
         );
-        targets_map.insert("text-embedding-ada-002".to_string(), pool);
+        targets_map.insert("text-embedding-ada-002".to_string(), pool.into());
 
         let targets = Targets {
             targets: targets_map,
@@ -5384,7 +5388,7 @@ mod tests {
             true, // Mark pool as trusted
             Vec::new(),
         );
-        targets_map.insert("gpt-4o-mini".to_string(), pool);
+        targets_map.insert("gpt-4o-mini".to_string(), pool.into());
 
         let targets = Targets {
             targets: targets_map,
@@ -5504,7 +5508,7 @@ mod tests {
             true, // Mark pool as trusted
             Vec::new(),
         );
-        targets_map.insert("text-embedding-ada-002".to_string(), pool);
+        targets_map.insert("text-embedding-ada-002".to_string(), pool.into());
 
         let targets = Targets {
             targets: targets_map,
@@ -6349,7 +6353,7 @@ mod tests {
             true, // Mark pool as trusted
             Vec::new(),
         );
-        targets_map.insert("trusted-pool".to_string(), trusted_pool);
+        targets_map.insert("trusted-pool".to_string(), trusted_pool.into());
 
         // Untrusted pool
         let untrusted_pool = ProviderPool::with_config(
@@ -6368,7 +6372,7 @@ mod tests {
             false, // NOT trusted
             Vec::new(),
         );
-        targets_map.insert("untrusted-pool".to_string(), untrusted_pool);
+        targets_map.insert("untrusted-pool".to_string(), untrusted_pool.into());
 
         let targets = Targets {
             targets: targets_map,
@@ -6490,7 +6494,7 @@ mod tests {
             true, // Mark pool as trusted
             Vec::new(),
         );
-        targets_map.insert("gpt-4".to_string(), pool);
+        targets_map.insert("gpt-4".to_string(), pool.into());
 
         let targets = Targets {
             targets: targets_map,
@@ -6578,7 +6582,7 @@ mod tests {
             false, // pool is NOT trusted
             Vec::new(),
         );
-        targets_map.insert("gpt-4".to_string(), pool);
+        targets_map.insert("gpt-4".to_string(), pool.into());
 
         let targets = Targets {
             targets: targets_map,
@@ -6649,7 +6653,7 @@ mod tests {
             true, // pool IS trusted
             Vec::new(),
         );
-        targets_map.insert("gpt-4".to_string(), pool);
+        targets_map.insert("gpt-4".to_string(), pool.into());
 
         let targets = Targets {
             targets: targets_map,
@@ -7505,7 +7509,7 @@ mod tests {
             true, // trusted
             Vec::new(),
         );
-        targets_map.insert("gpt-3.5-turbo-instruct".to_string(), pool);
+        targets_map.insert("gpt-3.5-turbo-instruct".to_string(), pool.into());
 
         let targets = Targets {
             targets: targets_map,
@@ -7566,7 +7570,7 @@ mod tests {
             true, // trusted
             Vec::new(),
         );
-        targets_map.insert("gpt-3.5-turbo-instruct".to_string(), pool);
+        targets_map.insert("gpt-3.5-turbo-instruct".to_string(), pool.into());
 
         let targets = Targets {
             targets: targets_map,

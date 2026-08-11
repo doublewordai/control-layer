@@ -5,10 +5,12 @@
 //! the exact prompt + partial output as a token-id vector via tokenizer-svc
 //! `/v1/render` and re-enters the onwards stack as a `/v1/completions` request
 //! on the SAME model alias. Routing is onwards' business: the model's composite
-//! carries a `completions`-scoped member (the validated continuation target),
-//! and a completions-class request sees only the on-prem members plus that one
-//! — dynamo first, provider fallback. The client keeps one uninterrupted
-//! stream; outlet/billing see one logical request with a merged usage frame.
+//! carries a `completions` POOL (dynamo first, the validated continuation
+//! target behind it), and onwards resolves a completions-class request to that
+//! pool before it selects a provider — so a resume leg can never land on a chat
+//! failover that was never validated to continue a token-id prefix. The client
+//! keeps one uninterrupted stream; outlet/billing see one logical request with
+//! a merged usage frame.
 //!
 //! This module currently owns the **global continuation key**: a single hidden
 //! `continuation`-purpose API key that authenticates resume legs into onwards.
@@ -96,12 +98,12 @@ pub async fn provision_global_key_for_admin(pool: &PgPool, admin_email: &str) ->
 }
 
 /// Per-model continuation route configuration, read from the composite's
-/// `completions` component row.
+/// `completions` pool.
 ///
-/// The same row is what makes the model resumable at all (onwards routes
-/// `/v1/completions` to it) and how we must render for it, so "is this model
-/// resumable" and "how do we build its prefix" stop being configured in two
-/// places.
+/// The same rows are what make the model resumable at all (onwards resolves
+/// `/v1/completions` to that pool) and how we must render for it, so "is this
+/// model resumable" and "how do we build its prefix" stop being configured in
+/// two places.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct RouteInfo {
     /// `chat_template_kwargs` for tokenizer-svc `/v1/render`. Also the source of
@@ -170,9 +172,9 @@ impl RouteInfo {
 /// The models that have a continuation route attached, with that route's
 /// per-model config, refreshed by a background poll.
 ///
-/// "Attached" = the model's composite has an enabled component with
-/// `role = 'completions'` — the validated completions target onwards sends
-/// `/v1/completions` traffic to. Reads are lock-cheap and happen on every
+/// "Attached" = the model's composite has a `completions` pool with at least one
+/// enabled member — the pool onwards resolves `/v1/completions` traffic to.
+/// Reads are lock-cheap and happen on every
 /// streaming chat request, so the map is swapped wholesale rather than mutated.
 /// An empty map — including the moment before the first refresh lands — means no
 /// model is resumable, which is the safe direction.
@@ -234,19 +236,36 @@ impl ContinuationRoutes {
         // A disabled component receives no traffic from onwards either, so it is
         // not a route. The composite's alias is the key because that is the model
         // name the client asked for and the resume leg re-sends.
+        //
+        // One row per composite: a completions pool is a failover list, and the
+        // middleware builds ONE body before onwards picks a member of it. The
+        // representative is the pool's first member that is NOT also in the
+        // default pool — the validated continuation target. (A member shared
+        // with the default pool is the free first hop, typically dynamo, and
+        // carries no continuation config of its own.) Falling back to plain
+        // pool order keeps a single-member completions pool working.
         let rows = sqlx::query!(
             r#"
-            SELECT
+            SELECT DISTINCT ON (cm.alias)
                 cm.alias,
                 dmc.render_kwargs,
                 dmc.strip_leading_bos
             FROM deployed_model_components dmc
             JOIN deployed_models cm ON cm.id = dmc.composite_model_id
             JOIN deployed_models dm ON dm.id = dmc.deployed_model_id
-            WHERE dmc.role = 'completions'
+            WHERE dmc.pool = 'completions'
               AND dmc.enabled = true
               AND cm.deleted = false
               AND dm.deleted = false
+            ORDER BY
+                cm.alias,
+                EXISTS (
+                    SELECT 1 FROM deployed_model_components shared
+                    WHERE shared.composite_model_id = dmc.composite_model_id
+                      AND shared.deployed_model_id = dmc.deployed_model_id
+                      AND shared.pool = 'default'
+                ),
+                dmc.sort_order ASC
             "#
         )
         .fetch_all(pool)
@@ -423,14 +442,20 @@ mod tests {
         assert_eq!(from_startup, from_router);
     }
 
-    /// Link `component` into `composite` with the given role.
-    async fn add_component(pool: &PgPool, composite: uuid::Uuid, component: uuid::Uuid, role: &str) {
+    /// Link `component` into one of `composite`'s pools.
+    async fn add_component(pool: &PgPool, composite: uuid::Uuid, component: uuid::Uuid, component_pool: &str) {
+        add_component_at(pool, composite, component, component_pool, 0).await
+    }
+
+    /// Link `component` into a pool at an explicit position within that pool.
+    async fn add_component_at(pool: &PgPool, composite: uuid::Uuid, component: uuid::Uuid, component_pool: &str, sort_order: i32) {
         sqlx::query!(
-            "INSERT INTO deployed_model_components (composite_model_id, deployed_model_id, weight, enabled, sort_order, role)
-             VALUES ($1, $2, 1, true, 0, $3)",
+            "INSERT INTO deployed_model_components (composite_model_id, deployed_model_id, weight, enabled, sort_order, pool)
+             VALUES ($1, $2, 1, true, $4, $3)",
             composite,
             component,
-            role
+            component_pool,
+            sort_order
         )
         .execute(pool)
         .await
@@ -454,7 +479,7 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn routes_only_include_composites_with_a_completions_component(pool: PgPool) {
+    async fn routes_only_include_composites_with_a_completions_pool(pool: PgPool) {
         let user = create_test_user(&pool, Role::PlatformManager).await;
         let endpoint = create_test_endpoint(&pool, "ep", user.id).await;
 
@@ -464,23 +489,24 @@ mod tests {
         let openrouter = create_test_model(&pool, "m-or", "openrouter", endpoint, user.id).await;
         let fireworks = create_test_model(&pool, "m-fw", "fireworks", endpoint, user.id).await;
 
-        // Both composites start with ordinary members only.
-        add_component(&pool, resumable, dynamo, "both").await;
-        add_component(&pool, plain, openrouter, "chat").await;
+        // Both composites start with a default pool only.
+        add_component(&pool, resumable, dynamo, "default").await;
+        add_component(&pool, plain, openrouter, "default").await;
 
         let routes = ContinuationRoutes::new();
         routes.refresh(&pool).await.unwrap();
-        assert!(routes.is_empty(), "a chat-only composite is not resumable");
+        assert!(routes.is_empty(), "a composite with only a default pool is not resumable");
         assert!(!routes.is_enabled("alias-resumable"));
 
-        // Attach the validated completions target.
-        add_component(&pool, resumable, fireworks, "completions").await;
+        // Give it a completions pool: dynamo first, the validated target behind.
+        add_component_at(&pool, resumable, dynamo, "completions", 0).await;
+        add_component_at(&pool, resumable, fireworks, "completions", 1).await;
         routes.refresh(&pool).await.unwrap();
 
         assert!(routes.is_enabled("alias-resumable"));
         assert!(
             !routes.is_enabled("alias-plain"),
-            "a composite with no completions member is never resumable"
+            "a composite with no completions pool is never resumable"
         );
         assert_eq!(routes.len(), 1);
         // Default per-route config until someone sets it.
@@ -488,12 +514,12 @@ mod tests {
         assert_eq!(route.render_kwargs, None);
         assert!(!route.strip_leading_bos);
 
-        // A disabled completions component receives no traffic from onwards, so
-        // it is not a route either.
+        // A disabled member receives no traffic from onwards, so it is not part
+        // of the pool; disabling every member of the completions pool removes
+        // the route.
         sqlx::query!(
-            "UPDATE deployed_model_components SET enabled = false WHERE composite_model_id = $1 AND deployed_model_id = $2",
-            resumable,
-            fireworks
+            "UPDATE deployed_model_components SET enabled = false WHERE composite_model_id = $1 AND pool = 'completions'",
+            resumable
         )
         .execute(&pool)
         .await
@@ -527,6 +553,45 @@ mod tests {
         assert_eq!(route.render_kwargs, Some(serde_json::json!({"thinking_mode": "chat"})));
         assert!(route.strip_leading_bos);
         assert!(!route.thinking(), "a chat-mode route must not close a think tag");
+    }
+
+    /// A completions pool is a failover list, and the middleware builds ONE body
+    /// before onwards picks a member of it. The route's config therefore comes
+    /// from the member that exists only to serve completions — the validated
+    /// target — not from the free first hop it shares with the default pool.
+    #[sqlx::test]
+    async fn the_route_config_comes_from_the_completions_only_member(pool: PgPool) {
+        let user = create_test_user(&pool, Role::PlatformManager).await;
+        let endpoint = create_test_endpoint(&pool, "ep", user.id).await;
+        let composite = create_composite(&pool, "dsv4-flash", user.id).await;
+        let dynamo = create_test_model(&pool, "m-dynamo", "dynamo", endpoint, user.id).await;
+        let fireworks = create_test_model(&pool, "m-fw", "fireworks", endpoint, user.id).await;
+
+        // dynamo is in both pools (position 0 of each); fireworks only in
+        // completions, behind it.
+        add_component(&pool, composite, dynamo, "default").await;
+        add_component_at(&pool, composite, dynamo, "completions", 0).await;
+        add_component_at(&pool, composite, fireworks, "completions", 1).await;
+        sqlx::query!(
+            r#"UPDATE deployed_model_components
+               SET render_kwargs = '{"thinking_mode": "chat"}'::jsonb, strip_leading_bos = true
+               WHERE composite_model_id = $1 AND deployed_model_id = $2 AND pool = 'completions'"#,
+            composite,
+            fireworks
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let routes = ContinuationRoutes::new();
+        routes.refresh(&pool).await.unwrap();
+        let route = routes.get("dsv4-flash").expect("the canary route");
+        assert_eq!(
+            route.render_kwargs,
+            Some(serde_json::json!({"thinking_mode": "chat"})),
+            "the validated target's config wins over the shared first hop's defaults"
+        );
+        assert!(route.strip_leading_bos);
     }
 
     #[test]

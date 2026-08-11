@@ -448,8 +448,8 @@ pub async fn target_message_handler<T: HttpClient>(
             .collect::<Vec<_>>()
     );
 
-    let mut pool = match state.targets.targets.get(&model_name) {
-        Some(pool) => {
+    let pools = match state.targets.targets.get(&model_name) {
+        Some(pools) => {
             // Now that the model is known to be a configured target, tag the
             // in-flight guard so `onwards_model_inflight{model=…}` tracks this
             // request for its whole lifetime (the guard moves into GuardedStream on
@@ -459,7 +459,7 @@ pub async fn target_message_handler<T: HttpClient>(
             if let Some(guard) = inflight_guard.as_mut() {
                 guard.set_model(&model_name);
             }
-            pool.clone()
+            pools.clone()
         }
         None => {
             debug!("No target found for model: {}", model_name);
@@ -469,6 +469,15 @@ pub async fn target_message_handler<T: HttpClient>(
     };
 
     let canonical_request_path = req.uri().path().to_string();
+
+    // Resolve which of the composite's pools serves this request, once, from
+    // the path alone — before auth, limits or provider selection, all of which
+    // then run on the chosen pool exactly as they ran on the single pool
+    // before. A composite with no pool for this class resolves to its default,
+    // which is byte-identically today's behaviour.
+    let request_class = RequestClass::from_path(&canonical_request_path);
+    let resolved_pool_name = pools.resolved_name(request_class);
+    let mut pool = pools.resolve(request_class).clone();
 
     // Extract bearer token for authentication and rate limiting
     let bearer_token = req
@@ -537,7 +546,10 @@ pub async fn target_message_handler<T: HttpClient>(
                             model_name, redirect_alias, labels
                         );
                         pool = match state.targets.targets.get(redirect_alias) {
-                            Some(p) => p.clone(),
+                            // The redirect names an alias, so its pools are
+                            // resolved for this request's class just as the
+                            // original alias's were.
+                            Some(p) => p.resolve(request_class).clone(),
                             None => {
                                 debug!("Redirect target '{}' not found", redirect_alias);
                                 return Err(OnwardsErrorResponse::bad_gateway());
@@ -585,24 +597,6 @@ pub async fn target_message_handler<T: HttpClient>(
     // This runs after routing rules so that redirects get a chance to replace the pool.
     if pool.is_empty() {
         debug!("Pool for model '{}' has no providers", model_name);
-        return Err(OnwardsErrorResponse::service_unavailable());
-    }
-
-    // Classify the request once, from the path, and scope the pool view to the
-    // members allowed to serve that class. Derived here (before any provider is
-    // selected) because filtering must sit BELOW nothing and ABOVE everything
-    // else: the LB strategy, the failover loop and every limiter see only the
-    // filtered view.
-    let request_class = RequestClass::from_path(&canonical_request_path);
-    let scope_engaged = request_class == RequestClass::Completions && pool.has_completions_member();
-    if pool.scoped_len(request_class) == 0 {
-        // A completions-only pool asked to serve chat (or vice versa): the pool
-        // exists but has nobody who may answer this class of request.
-        debug!(
-            "Pool for model '{}' has no providers serving {} requests",
-            model_name,
-            request_class.as_str()
-        );
         return Err(OnwardsErrorResponse::service_unavailable());
     }
 
@@ -687,8 +681,8 @@ pub async fn target_message_handler<T: HttpClient>(
     let mut any_attempted = false;
     let mut attempt_number: u32 = 0;
     let mut total_backoff_ms: u64 = 0;
-    let pool_max_attempts = pool.fallback_max_attempts_scoped(request_class);
-    for (_idx, target, connection_guard) in pool.select_iter_scoped(request_class) {
+    let pool_max_attempts = pool.fallback_max_attempts();
+    for (_idx, target, connection_guard) in pool.select_iter() {
         any_attempted = true;
         attempt_number += 1;
 
@@ -701,12 +695,12 @@ pub async fn target_message_handler<T: HttpClient>(
             provider.timeout_secs = target.request_timeout_secs,
             http.response.status_code = tracing::field::Empty,
             onwards.fallback = tracing::field::Empty,
-            onwards.scope = tracing::field::Empty,
+            onwards.pool = tracing::field::Empty,
         );
-        // Recorded only when the completions filter actually narrowed the pool,
-        // so the field's presence answers "did scoped routing engage here?".
-        if scope_engaged {
-            attempt_span.record("onwards.scope", request_class.as_str());
+        // Recorded only when a non-default pool served the request, so the
+        // field's presence answers "did per-class routing engage here?".
+        if let Some(pool_name) = resolved_pool_name {
+            attempt_span.record("onwards.pool", pool_name);
         }
 
         // The loop body is wrapped in an instrumented async block so that
@@ -1552,7 +1546,10 @@ pub async fn models<T: HttpClient>(
         .targets
         .iter()
         .filter(|entry| {
-            let pool = entry.value();
+            // Model listing is about the alias, not about a request class, and
+            // a non-default pool inherits the default's keys unless it states
+            // its own — so the default pool's keys are the alias's visibility.
+            let pool = entry.value().default_pool();
 
             // If pool has no keys configured, it's publicly accessible
             let Some(keys) = pool.keys() else {
@@ -2432,7 +2429,7 @@ mod tests {
             .unwrap();
 
         // Test the timeout logic directly (not the full handler)
-        let target = pool.first_target().unwrap();
+        let target = pool.default_pool().first_target().unwrap();
         let timeout_secs = target.request_timeout_secs.unwrap();
         let timeout_duration = std::time::Duration::from_secs(timeout_secs);
 
@@ -2504,7 +2501,6 @@ mod tests {
             trusted,
             propagate_trace_context,
             reasoning_translation: None,
-            serves: crate::target::ServesScope::default(),
         }
     }
 

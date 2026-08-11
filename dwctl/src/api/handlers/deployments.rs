@@ -11,8 +11,9 @@ use crate::{
     AppState,
     api::models::{
         deployments::{
-            ComponentEndpointSummary, ComponentModelSummary, ComponentRole, DeployedModelCreate, DeployedModelResponse,
-            DeployedModelUpdate, GetModelQuery, ListModelsQuery, ModelComponentResponse, enrichment::DeployedModelEnricher,
+            ComponentEndpointSummary, ComponentModelSummary, ComponentPool, ComponentPoolQuery, DeployedModelCreate,
+            DeployedModelResponse, DeployedModelUpdate, GetModelQuery, ListModelsQuery, ModelComponentResponse,
+            enrichment::DeployedModelEnricher,
         },
         users::CurrentUser,
     },
@@ -148,36 +149,18 @@ async fn resolve_traffic_rules(
     Ok(resolved)
 }
 
-/// Guard the two invariants a `completions` member carries (v1):
+/// A completions-pool member must be reachable over HTTP: a continuation leg is
+/// an ordinary `/v1/completions` call to a provider, so the component's model
+/// needs an inference endpoint. (Composite components always do today; the
+/// check keeps that from becoming an assumption.)
 ///
-/// 1. **At most one per composite.** The resume path has no reason to fail over
-///    between validated targets yet, and a second one would make "which target
-///    served this seam?" ambiguous. A partial unique index enforces it in the
-///    database; this turns the violation into a clear 400.
-/// 2. **It must be reachable over HTTP** — a continuation leg is an ordinary
-///    `/v1/completions` call to a provider, so the component's model needs an
-///    inference endpoint. (Composite components always do today; the check keeps
-///    that from becoming an assumption.)
-async fn validate_completions_role(
-    repo: &mut Deployments<'_>,
-    composite_id: DeploymentId,
-    component_id: DeploymentId,
-    role: ComponentRole,
-    component_hosted_on: Option<InferenceEndpointId>,
-) -> Result<()> {
-    if role != ComponentRole::Completions {
-        return Ok(());
-    }
-    if component_hosted_on.is_none() {
+/// Deliberately NOT limited to one member: a completions pool is a failover
+/// list like any other — dynamo first, the validated third-party target behind
+/// it. Pool membership itself is bounded by the column's CHECK constraint.
+fn validate_pool_member(pool: ComponentPool, component_hosted_on: Option<InferenceEndpointId>) -> Result<()> {
+    if pool == ComponentPool::Completions && component_hosted_on.is_none() {
         return Err(Error::BadRequest {
-            message: "A completions component must be hosted on an inference endpoint".to_string(),
-        });
-    }
-    if let Some(existing) = repo.completions_component(composite_id).await?
-        && existing != component_id
-    {
-        return Err(Error::BadRequest {
-            message: format!("Composite model already has a completions component ({existing})"),
+            message: "A completions-pool component must be hosted on an inference endpoint".to_string(),
         });
     }
     Ok(())
@@ -188,7 +171,7 @@ fn db_component_to_response(c: DeploymentComponentDBResponse) -> ModelComponentR
     ModelComponentResponse {
         weight: c.weight,
         enabled: c.enabled,
-        role: ComponentRole::from_db(&c.role),
+        pool: ComponentPool::from_db(&c.pool),
         sort_order: c.sort_order,
         created_at: c.created_at,
         model: ComponentModelSummary {
@@ -1272,25 +1255,25 @@ pub async fn add_model_component<P: PoolProvider>(
             });
         }
 
-        validate_completions_role(&mut repo, id, component_id, body.role, component.hosted_on).await?;
+        validate_pool_member(body.pool, component.hosted_on)?;
     }
 
     // Add the component. Its priority position is always assigned by the server
-    // as "one past the current last component" so sort_order stays unique and
-    // dense within the composite — the client-supplied `sort_order` is ignored
+    // as "one past the current last component of that pool" so sort_order stays
+    // unique and dense within the pool — the client-supplied `sort_order` is ignored
     // (reordering is done via PATCH, which moves-and-reindexes). Lock the
     // composite first so concurrent adds can't both read the same MAX and
     // collide on a position.
     let mut repo = Deployments::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
     repo.lock_composite(id).await?;
-    let sort_order = repo.next_component_sort_order(id).await?;
+    let sort_order = repo.next_component_sort_order(id, body.pool.as_str()).await?;
     let request = DeploymentComponentCreateDBRequest {
         composite_model_id: id,
         deployed_model_id: component_id,
         weight: body.weight,
         enabled: body.enabled,
         sort_order,
-        role: body.role.as_str().to_string(),
+        pool: body.pool.as_str().to_string(),
     };
 
     let component = repo.add_component(&request).await?;
@@ -1308,6 +1291,7 @@ pub async fn add_model_component<P: PoolProvider>(
     params(
         ("id" = String, Path, description = "The composite model ID", format = "uuid"),
         ("component_id" = String, Path, description = "The deployed model ID of the component", format = "uuid"),
+        ComponentPoolQuery,
     ),
     request_body = ModelComponentUpdate,
     responses(
@@ -1327,6 +1311,7 @@ pub async fn add_model_component<P: PoolProvider>(
 pub async fn update_model_component<P: PoolProvider>(
     State(state): State<AppState<P>>,
     Path((id, component_id)): Path<(DeploymentId, DeploymentId)>,
+    Query(query): Query<ComponentPoolQuery>,
     _: RequiresPermission<resource::CompositeModels, operation::UpdateAll>,
     Json(body): Json<ModelComponentUpdate>,
 ) -> Result<Json<ModelComponentResponse>> {
@@ -1339,34 +1324,20 @@ pub async fn update_model_component<P: PoolProvider>(
         });
     }
 
-    // A sort_order change moves the component and renumbers the whole composite,
-    // so run on a transaction to keep that multi-row rewrite atomic.
+    // A sort_order change moves the component and renumbers its pool, so run on
+    // a transaction to keep that multi-row rewrite atomic.
     let mut tx = state.db.write().begin().await.map_err(|e| Error::Database(e.into()))?;
     let component = {
         let mut repo = Deployments::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
         // Serialize with other component mutations on this composite so the
         // move-and-reindex below isn't interleaved with a concurrent add/reorder.
         repo.lock_composite(id).await?;
-        if let Some(role) = body.role {
-            let component = repo.get_by_id(component_id).await?.ok_or_else(|| Error::NotFound {
-                resource: "component model".to_string(),
-                id: component_id.to_string(),
-            })?;
-            validate_completions_role(&mut repo, id, component_id, role, component.hosted_on).await?;
-        }
-        repo.update_component(
-            id,
-            component_id,
-            body.weight,
-            body.enabled,
-            body.sort_order,
-            body.role.map(|r| r.as_str().to_string()),
-        )
-        .await?
-        .ok_or_else(|| Error::NotFound {
-            resource: "component".to_string(),
-            id: format!("{}/{}", id, component_id),
-        })?
+        repo.update_component(id, component_id, query.pool.as_str(), body.weight, body.enabled, body.sort_order)
+            .await?
+            .ok_or_else(|| Error::NotFound {
+                resource: "component".to_string(),
+                id: format!("{}/{}/{}", id, component_id, query.pool.as_str()),
+            })?
     };
     tx.commit().await.map_err(|e| Error::Database(e.into()))?;
 
@@ -1382,6 +1353,7 @@ pub async fn update_model_component<P: PoolProvider>(
     params(
         ("id" = String, Path, description = "The composite model ID", format = "uuid"),
         ("component_id" = String, Path, description = "The deployed model ID of the component to remove", format = "uuid"),
+        ComponentPoolQuery,
     ),
     responses(
         (status = 200, description = "Component removed"),
@@ -1399,6 +1371,7 @@ pub async fn update_model_component<P: PoolProvider>(
 pub async fn remove_model_component<P: PoolProvider>(
     State(state): State<AppState<P>>,
     Path((id, component_id)): Path<(DeploymentId, DeploymentId)>,
+    Query(query): Query<ComponentPoolQuery>,
     _: RequiresPermission<resource::CompositeModels, operation::UpdateAll>,
 ) -> Result<Json<String>> {
     // Remove and then compact the remaining components back to a dense 0..n-1
@@ -1410,15 +1383,15 @@ pub async fn remove_model_component<P: PoolProvider>(
         let mut repo = Deployments::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
         repo.lock_composite(id).await?;
 
-        let removed = repo.remove_component(id, component_id).await?;
+        let removed = repo.remove_component(id, component_id, query.pool.as_str()).await?;
         if !removed {
             return Err(Error::NotFound {
                 resource: "component".to_string(),
-                id: format!("{}/{}", id, component_id),
+                id: format!("{}/{}/{}", id, component_id, query.pool.as_str()),
             });
         }
 
-        repo.compact_component_sort_order(id).await?;
+        repo.compact_component_sort_order(id, query.pool.as_str()).await?;
     }
     tx.commit().await.map_err(|e| Error::Database(e.into()))?;
 

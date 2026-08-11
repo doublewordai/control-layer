@@ -354,7 +354,9 @@ pub async fn update_cache_info_metrics(pool: &PgPool, targets: &Targets, state: 
     // API key counts — from the Targets DashMap (no SQL needed)
     for entry in targets.targets.iter() {
         let model = entry.key().clone();
-        let count = entry.value().keys().map(|k| k.len()).unwrap_or(0);
+        // Access control is a property of the alias; a non-default pool
+        // inherits the default's keys unless it states its own.
+        let count = entry.value().default_pool().keys().map(|k| k.len()).unwrap_or(0);
         gauge!("dwctl_model_api_key_count", "model" => model).set(count as f64);
     }
 
