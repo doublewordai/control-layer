@@ -14,11 +14,12 @@ use crate::api::models::connections::{
     ExternalFileResponse, ListConnectionsQuery, ListExternalFilesQuery, SyncEntryListResponse, SyncEntryResponse,
     SyncOperationListResponse, SyncOperationResponse, SyncedKeyResponse, TriggerSyncRequest,
 };
-use crate::auth::permissions::{RequiresPermission, operation, resource};
+use crate::auth::permissions::{RequiresPermission, can_run_background_inference, operation, resource};
 use crate::connections::provider::{self, ProviderError};
 use crate::db::handlers::connections::{Connections, SyncEntries, SyncOperations};
 use crate::encryption;
 use crate::errors::{Error, Result};
+use crate::types::{Operation, Permission, Resource};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -343,6 +344,19 @@ pub async fn trigger_sync<P: PoolProvider>(
         });
     }
 
+    let config = state.config.snapshot();
+    let completion_window = req
+        .completion_window
+        .as_deref()
+        .unwrap_or(&config.connections.sync.default_completion_window);
+    if completion_window == "background" && !can_run_background_inference(&current_user) {
+        return Err(Error::InsufficientPermissions {
+            required: Permission::Allow(Resource::Connections, Operation::CreateOwn),
+            action: Operation::CreateOwn,
+            resource: "background inference; assign the BackgroundInferenceUser role to submit this completion_window".to_string(),
+        });
+    }
+
     // Verify connection exists and user owns it
     let mut conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
     let connection = Connections::new(&mut conn)
@@ -362,12 +376,11 @@ pub async fn trigger_sync<P: PoolProvider>(
     }
 
     // Build sync config from request + defaults
-    let config = state.config.snapshot();
     let host = if config.host == "0.0.0.0" { "127.0.0.1" } else { &config.host };
     let ai_base_url = format!("http://{}:{}/ai", host, config.port);
     let sync_config = serde_json::json!({
         "endpoint": req.endpoint.as_deref().unwrap_or(&config.connections.sync.default_endpoint),
-        "completion_window": req.completion_window.as_deref().unwrap_or(&config.connections.sync.default_completion_window),
+        "completion_window": completion_window,
         "ai_base_url": ai_base_url,
     });
 
@@ -698,6 +711,7 @@ pub async fn list_connection_files<P: PoolProvider>(
 mod tests {
     use axum::http::StatusCode;
     use sqlx::PgPool;
+    use uuid::Uuid;
 
     use crate::api::models::users::Role;
     use crate::test::utils::{add_auth_headers, create_test_app, create_test_user_with_roles};
@@ -937,6 +951,81 @@ mod tests {
         let body: serde_json::Value = resp.json();
         assert_eq!(body["status"], "pending");
         assert_eq!(body["strategy"], "snapshot");
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn background_sync_requires_background_inference_role(pool: PgPool) {
+        let (app, _bg) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::PlatformManager]).await;
+        let auth = add_auth_headers(&user);
+
+        let conn: serde_json::Value = app
+            .post("/admin/api/v1/connections")
+            .json(&create_connection_body("background-role-test"))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await
+            .json();
+        let conn_id = conn["id"].as_str().unwrap();
+
+        let response = app
+            .post(&format!("/admin/api/v1/connections/{conn_id}/sync"))
+            .json(&serde_json::json!({
+                "strategy": "snapshot",
+                "completion_window": "background"
+            }))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+
+        response.assert_status(StatusCode::FORBIDDEN);
+        assert!(
+            response.text().contains("BackgroundInferenceUser"),
+            "error should explain how to enable background syncs"
+        );
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn background_sync_with_role_preserves_background_class(pool: PgPool) {
+        let (app, _bg) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(
+            &pool,
+            vec![Role::StandardUser, Role::PlatformManager, Role::BackgroundInferenceUser],
+        )
+        .await;
+        let auth = add_auth_headers(&user);
+
+        let conn: serde_json::Value = app
+            .post("/admin/api/v1/connections")
+            .json(&create_connection_body("background-sync-test"))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await
+            .json();
+        let conn_id = conn["id"].as_str().unwrap();
+
+        let response = app
+            .post(&format!("/admin/api/v1/connections/{conn_id}/sync"))
+            .json(&serde_json::json!({
+                "strategy": "snapshot",
+                "completion_window": "background"
+            }))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+        response.assert_status(StatusCode::ACCEPTED);
+        let body: serde_json::Value = response.json();
+        let sync_id = Uuid::parse_str(body["id"].as_str().unwrap()).unwrap();
+
+        let completion_window: Option<String> =
+            sqlx::query_scalar("SELECT sync_config->>'completion_window' FROM sync_operations WHERE id = $1")
+                .bind(sync_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(completion_window.as_deref(), Some("background"));
     }
 
     #[sqlx::test]

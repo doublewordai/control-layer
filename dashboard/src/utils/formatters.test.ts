@@ -322,6 +322,10 @@ describe("formatters", () => {
       expect(getTariffDisplayName("batch", "24h")).toBe("Batch");
     });
 
+    it("should return Background for the background batch window", () => {
+      expect(getTariffDisplayName("batch", "background")).toBe("Background");
+    });
+
     it("should return Batch for batch with other windows", () => {
       expect(getTariffDisplayName("batch", "12h")).toBe("Batch");
     });
@@ -354,8 +358,9 @@ describe("formatters", () => {
       expect(result[0].api_key_purpose).toBe("realtime");
     });
 
-    it("should sort: Realtime → Async → Batch", () => {
+    it("should sort: Realtime → Async → Batch → Background", () => {
       const tariffs = [
+        { api_key_purpose: "batch", completion_window: "background", is_active: true },
         { api_key_purpose: "batch", completion_window: "24h", is_active: true },
         { api_key_purpose: "batch", completion_window: "1h", is_active: true },
         { api_key_purpose: "realtime", completion_window: null, is_active: true },
@@ -365,9 +370,11 @@ describe("formatters", () => {
         "realtime",
         "batch",
         "batch",
+        "batch",
       ]);
       expect(result[1].completion_window).toBe("1h");
       expect(result[2].completion_window).toBe("24h");
+      expect(result[3].completion_window).toBe("background");
     });
 
     it("should handle empty array", () => {

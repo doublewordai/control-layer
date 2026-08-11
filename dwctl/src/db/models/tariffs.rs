@@ -21,7 +21,7 @@ pub struct ModelTariff {
     /// If None, tariff is not automatically applied (legacy/manual pricing)
     /// If Some(purpose), tariff applies when model is accessed via that purpose
     pub api_key_purpose: Option<ApiKeyPurpose>,
-    /// Optional completion window (priority) for batch tariffs (e.g., "24h", "1h")
+    /// Optional completion window (priority) for batch tariffs (e.g., "24h", "1h", "background")
     /// Required for batch tariffs to allow multiple pricing tiers per priority
     /// Not applicable for realtime/playground tariffs
     pub completion_window: Option<String>,
@@ -36,7 +36,7 @@ pub struct TariffCreateDBRequest {
     pub output_price_per_token: Decimal,
     /// Optional API key purpose this tariff applies to
     pub api_key_purpose: Option<ApiKeyPurpose>,
-    /// Optional completion window (priority) for batch tariffs (e.g., "24h", "1h")
+    /// Optional completion window (priority) for batch tariffs (e.g., "24h", "1h", "background")
     /// Required when api_key_purpose is Batch to support multiple pricing tiers per priority
     pub completion_window: Option<String>,
     /// Optional valid_from timestamp (defaults to NOW())

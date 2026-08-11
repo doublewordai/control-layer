@@ -68,7 +68,7 @@ pub struct CreditTransactionResponse {
     pub description: Option<String>,
     /// When the transaction was created
     pub created_at: DateTime<Utc>,
-    /// Service tier: "realtime", "flex", "async", or "batch".
+    /// Service tier: "realtime", "flex", "async", "batch", or "background".
     /// Only present for usage transactions
     #[serde(skip_serializing_if = "Option::is_none")]
     pub service_tier: Option<String>,

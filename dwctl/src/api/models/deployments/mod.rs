@@ -743,16 +743,26 @@ impl DeployedModelResponse {
         self
     }
 
-    /// Filter out batch tariffs for completion windows that aren't in allowed_batch_completion_windows.
+    /// Filter out foreground batch tariffs for completion windows that aren't in
+    /// allowed_batch_completion_windows. Background is scheduled independently of
+    /// the foreground SLA configuration and always remains visible.
     /// - `None` → all tariffs pass through (global defaults apply).
-    /// - `Some([])` → no batch windows allowed, all batch tariffs removed.
-    /// - `Some(["24h", ...])` → keep batch tariffs whose window is in the list, plus generic
-    ///   batch tariffs (no window) since they serve as billing fallbacks for allowed windows.
+    /// - `Some([])` → no foreground batch windows are allowed.
+    /// - `Some(["24h", ...])` → keep foreground batch tariffs whose window is in the list.
+    ///
+    /// Background and its 24h pricing fallback remain available independently
+    /// of foreground windows. Generic batch tariffs remain when any foreground
+    /// batch window is enabled.
     pub fn filter_disabled_batch_tariffs(mut self) -> Self {
         if let Some(ref allowed) = self.allowed_batch_completion_windows
             && let Some(ref mut tariffs) = self.tariffs
         {
+            let has_background_tariff = tariffs.iter().any(|tariff| {
+                tariff.api_key_purpose.as_ref() == Some(&ApiKeyPurpose::Batch) && tariff.completion_window.as_deref() == Some("background")
+            });
             tariffs.retain(|t| match (&t.api_key_purpose, &t.completion_window) {
+                (Some(ApiKeyPurpose::Batch), Some(window)) if window == "background" => true,
+                (Some(ApiKeyPurpose::Batch), Some(window)) if window == "24h" => allowed.contains(window) || !has_background_tariff,
                 (Some(ApiKeyPurpose::Batch), Some(window)) => allowed.contains(window),
                 (Some(ApiKeyPurpose::Batch), None) => !allowed.is_empty(), // Generic fallback kept when batch is allowed
                 _ => true,                                                 // Non-batch tariffs always pass through

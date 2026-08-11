@@ -120,8 +120,9 @@ impl<'c> Tariffs<'c> {
 
     /// Get pricing with fallback support
     ///
-    /// Tries to get pricing for the preferred API key purpose, falling back to the
-    /// fallback purpose if the preferred one is not found.
+    /// Tries to get pricing for the preferred API key purpose. Background work
+    /// falls back only to the 24h batch tariff; other purposes use the supplied
+    /// fallback purpose when their preferred tariff is absent.
     ///
     /// # Arguments
     /// * `deployed_model_id` - The model to get pricing for
@@ -148,6 +149,19 @@ impl<'c> Tariffs<'c> {
                 .await?
         {
             return Ok(Some(pricing));
+        }
+
+        // Background is a distinct accounting tier, but inherits 24h batch
+        // pricing until an explicit background tariff is configured.
+        if preferred_purpose == Some(&crate::db::models::api_keys::ApiKeyPurpose::Batch) && completion_window == Some("background") {
+            return self
+                .get_pricing_at_timestamp(
+                    deployed_model_id,
+                    &crate::db::models::api_keys::ApiKeyPurpose::Batch,
+                    timestamp,
+                    Some("24h"),
+                )
+                .await;
         }
 
         // Fall back to fallback purpose (completion_window not relevant for fallback)
@@ -346,6 +360,149 @@ mod tests {
             .find(|t| t.completion_window == Some("1h".to_string()))
             .unwrap();
         assert_eq!(tariff_1h_found.name, "Batch 1h");
+    }
+
+    #[sqlx::test]
+    async fn background_pricing_prefers_explicit_tariff_then_falls_back_to_24h(pool: PgPool) {
+        let base_url = url::Url::parse("http://localhost:8080").unwrap();
+        let sources = vec![crate::config::ModelSource {
+            name: "test".to_string(),
+            url: base_url.clone(),
+            api_key: None,
+            sync_interval: std::time::Duration::from_secs(3600),
+            default_models: None,
+        }];
+        crate::seed_database(&sources, &pool).await.unwrap();
+
+        let user = crate::test::utils::create_test_user(&pool, crate::api::models::users::Role::PlatformManager).await;
+        let endpoint_id = crate::test::utils::get_test_endpoint_id(&pool).await;
+        let model_id = DeploymentId::new_v4();
+        sqlx::query!(
+            "INSERT INTO deployed_models (id, model_name, alias, hosted_on, created_by) \
+             VALUES ($1, 'background-tariff-model', 'background-tariff-model', $2, $3)",
+            model_id,
+            endpoint_id,
+            user.id
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mut conn = pool.acquire().await.unwrap();
+        let mut tariffs = Tariffs::new(&mut conn);
+        tariffs
+            .create(&TariffCreateDBRequest {
+                deployed_model_id: model_id,
+                name: "24h".to_string(),
+                input_price_per_token: Decimal::from_str("0.00005").unwrap(),
+                output_price_per_token: Decimal::from_str("0.00010").unwrap(),
+                api_key_purpose: Some(ApiKeyPurpose::Batch),
+                completion_window: Some("24h".to_string()),
+                valid_from: None,
+            })
+            .await
+            .unwrap();
+
+        let fallback = tariffs
+            .get_pricing_at_timestamp_with_fallback(
+                model_id,
+                Some(&ApiKeyPurpose::Batch),
+                &ApiKeyPurpose::Realtime,
+                Utc::now(),
+                Some("background"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            fallback,
+            Some((Decimal::from_str("0.00005").unwrap(), Decimal::from_str("0.00010").unwrap()))
+        );
+
+        tariffs
+            .create(&TariffCreateDBRequest {
+                deployed_model_id: model_id,
+                name: "Background".to_string(),
+                input_price_per_token: Decimal::from_str("0.00002").unwrap(),
+                output_price_per_token: Decimal::from_str("0.00004").unwrap(),
+                api_key_purpose: Some(ApiKeyPurpose::Batch),
+                completion_window: Some("background".to_string()),
+                valid_from: None,
+            })
+            .await
+            .unwrap();
+
+        let explicit = tariffs
+            .get_pricing_at_timestamp_with_fallback(
+                model_id,
+                Some(&ApiKeyPurpose::Batch),
+                &ApiKeyPurpose::Realtime,
+                Utc::now(),
+                Some("background"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            explicit,
+            Some((Decimal::from_str("0.00002").unwrap(), Decimal::from_str("0.00004").unwrap()))
+        );
+    }
+
+    #[sqlx::test]
+    async fn background_pricing_does_not_fall_back_to_realtime(pool: PgPool) {
+        let base_url = url::Url::parse("http://localhost:8080").unwrap();
+        crate::seed_database(
+            &[crate::config::ModelSource {
+                name: "test".to_string(),
+                url: base_url,
+                api_key: None,
+                sync_interval: std::time::Duration::from_secs(3600),
+                default_models: None,
+            }],
+            &pool,
+        )
+        .await
+        .unwrap();
+
+        let user = crate::test::utils::create_test_user(&pool, crate::api::models::users::Role::PlatformManager).await;
+        let endpoint_id = crate::test::utils::get_test_endpoint_id(&pool).await;
+        let model_id = DeploymentId::new_v4();
+        sqlx::query!(
+            "INSERT INTO deployed_models (id, model_name, alias, hosted_on, created_by) \
+             VALUES ($1, 'background-no-price-model', 'background-no-price-model', $2, $3)",
+            model_id,
+            endpoint_id,
+            user.id
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mut conn = pool.acquire().await.unwrap();
+        let mut tariffs = Tariffs::new(&mut conn);
+        tariffs
+            .create(&TariffCreateDBRequest {
+                deployed_model_id: model_id,
+                name: "Realtime".to_string(),
+                input_price_per_token: Decimal::from_str("0.001").unwrap(),
+                output_price_per_token: Decimal::from_str("0.002").unwrap(),
+                api_key_purpose: Some(ApiKeyPurpose::Realtime),
+                completion_window: None,
+                valid_from: None,
+            })
+            .await
+            .unwrap();
+
+        let pricing = tariffs
+            .get_pricing_at_timestamp_with_fallback(
+                model_id,
+                Some(&ApiKeyPurpose::Batch),
+                &ApiKeyPurpose::Realtime,
+                Utc::now(),
+                Some("background"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(pricing, None);
     }
 
     #[sqlx::test]
