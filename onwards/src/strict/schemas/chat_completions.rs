@@ -13,6 +13,31 @@ pub(crate) fn generated_chat_completion_id() -> String {
     format!("chatcmpl-{}", Uuid::new_v4())
 }
 
+fn normalize_null_like_tool_call_arguments(message: &mut Value) {
+    let Some(tool_calls) = message.get_mut("tool_calls").and_then(Value::as_array_mut) else {
+        return;
+    };
+
+    for tool_call in tool_calls {
+        let Some(function) = tool_call.get_mut("function").and_then(Value::as_object_mut) else {
+            continue;
+        };
+
+        let null_like = match function.get("arguments") {
+            None | Some(Value::Null) => true,
+            Some(Value::String(arguments)) => {
+                let arguments = arguments.trim();
+                arguments.is_empty() || arguments == "null"
+            }
+            Some(_) => false,
+        };
+
+        if null_like {
+            function.insert("arguments".to_string(), Value::String("{}".to_string()));
+        }
+    }
+}
+
 fn normalize_chat_message_value(value: &mut Value) {
     let Some(object) = value.as_object_mut() else {
         return;
@@ -20,6 +45,8 @@ fn normalize_chat_message_value(value: &mut Value) {
 
     ensure_field(object, "role", || Value::String("assistant".to_string()));
     ensure_field(object, "content", || Value::Null);
+
+    normalize_null_like_tool_call_arguments(value);
 }
 
 fn normalize_chat_choice_value(value: &mut Value, fallback_index: usize) {
