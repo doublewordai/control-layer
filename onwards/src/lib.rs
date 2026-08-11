@@ -4559,14 +4559,22 @@ mod tests {
             }
         }
 
-        /// An empty completions pool is not a licence to fall back to chat
-        /// members: the resolver picked it, and a pool with no providers is a
-        /// 503 whichever pool it is.
+        /// An EMPTY completions pool is treated as an absent one: the default
+        /// pool serves the class, exactly as it did before the pool existed.
+        ///
+        /// A pool whose members were all removed or disabled must not start
+        /// 503-ing traffic the default pool handled the day before. Resume legs
+        /// are kept off unvalidated members upstream of here — dwctl only calls
+        /// a model resumable while its completions pool has a member.
         #[tokio::test]
-        async fn an_empty_completions_pool_refuses_rather_than_falling_back() {
+        async fn an_empty_completions_pool_falls_back_to_the_default() {
             let pools = TargetPools::with_pools(
                 priority_pool(&["https://openrouter.example.com"]),
                 HashMap::from([(COMPLETIONS_POOL.to_string(), ProviderPool::new(vec![]))]),
+            );
+            assert!(
+                pools.resolved_name(crate::target::RequestClass::Completions).is_none(),
+                "an empty pool is not a picked pool"
             );
             let (server, client) = server_with(false, pools);
 
@@ -4574,8 +4582,14 @@ mod tests {
                 .post("/v1/completions")
                 .json(&json!({"model": "dsv4-flash", "prompt": "hi"}))
                 .await;
-            assert_eq!(response.status_code(), StatusCode::SERVICE_UNAVAILABLE);
-            assert!(client.requests.lock().unwrap().is_empty());
+            assert_eq!(response.status_code(), StatusCode::OK);
+            let requests = client.requests.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            assert!(
+                requests[0].uri.starts_with("https://openrouter.example.com/"),
+                "got {}",
+                requests[0].uri
+            );
         }
     }
 }

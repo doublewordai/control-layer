@@ -955,15 +955,30 @@ impl TargetPools {
     /// pools chosen on `max_tokens`) adds an arm to [`RequestClass`] and a pool
     /// name; nothing here or below changes.
     pub fn resolve(&self, class: RequestClass) -> &ProviderPool {
-        self.extra.get(class.pool_name()).unwrap_or(&self.default)
+        self.named_pool(class).unwrap_or(&self.default)
     }
 
     /// The name of the pool [`TargetPools::resolve`] would pick, but only when
     /// it is not the default — so "was a non-default pool used?" is exactly
     /// "is this `Some`?", which is what the span field reports.
     pub fn resolved_name(&self, class: RequestClass) -> Option<&'static str> {
-        let name = class.pool_name();
-        self.extra.contains_key(name).then_some(name)
+        self.named_pool(class).map(|_| class.pool_name())
+    }
+
+    /// This class's own pool, if the composite has one WITH members.
+    ///
+    /// An empty pool is treated as absent, not as a pool that refuses
+    /// everything: a pool whose members were all removed or disabled would
+    /// otherwise start 503-ing traffic the default pool served perfectly well
+    /// the day before. What keeps resume legs off unvalidated members is not
+    /// this fallback — it is dwctl's route cache, which only calls a model
+    /// resumable while its completions pool has at least one enabled member, so
+    /// an empty pool means no resume legs are generated at all. Ordinary
+    /// `/v1/completions` traffic keeps working throughout.
+    fn named_pool(&self, class: RequestClass) -> Option<&ProviderPool> {
+        self.extra
+            .get(class.pool_name())
+            .filter(|pool| !pool.is_empty())
     }
 
     /// The pool serving everything without a pool of its own. Callers that are
