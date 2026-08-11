@@ -106,8 +106,19 @@ pub fn build_leg_body(ctx: &RequestContext, token_ids: &[u32], max_tokens: Optio
         body["max_tokens"] = json!(max_tokens);
     }
     // Sampling passthrough: the continuation must be drawn from the same
-    // distribution the client asked for.
-    for key in ["temperature", "top_p", "seed", "stop", "logit_bias"] {
+    // distribution the client asked for. The repetition penalties belong here
+    // as much as temperature does — they are what stops a long generation
+    // looping, and a leg that drops them can degenerate into repetition
+    // precisely on the requests long enough to have needed resuming.
+    for key in [
+        "temperature",
+        "top_p",
+        "seed",
+        "stop",
+        "logit_bias",
+        "frequency_penalty",
+        "presence_penalty",
+    ] {
         if let Some(value) = ctx.body.get(key).filter(|v| !v.is_null()) {
             body[key] = value.clone();
         }
@@ -194,6 +205,11 @@ pub async fn attempt(state: &ContinuationState, ctx: &RequestContext, continuati
     }
 
     metrics::record_resume_leg(&ctx.model, attempt_no);
+    // Every leg re-prefills the WHOLE prompt; that is what resuming costs us.
+    // Counted here, at dispatch, from the prefix we actually sent — not from
+    // the leg's own usage frame, which a leg that dies mid-stream never emits.
+    // Those are exactly the legs whose cost we most need to see.
+    metrics::record_eaten_prompt_tokens(&ctx.model, render.token_ids.len() as u64);
     let body = BodyExt::into_data_stream(response.into_body()).map(|r| r.map_err(std::io::Error::other));
     Ok(Leg {
         render,
@@ -241,7 +257,7 @@ mod tests {
             "model": "dsv4-flash", "stream": true,
             "temperature": 0.7, "top_p": 0.95, "seed": 42,
             "stop": ["\n\n"], "logit_bias": {"50256": -100},
-            "frequency_penalty": null
+            "frequency_penalty": 0.5, "presence_penalty": 0.25
         });
         let body = build_leg_body(&ctx(original), &[9], None, 100);
         assert_eq!(body["temperature"], 0.7);
@@ -249,10 +265,29 @@ mod tests {
         assert_eq!(body["seed"], 42);
         assert_eq!(body["stop"], json!(["\n\n"]));
         assert_eq!(body["logit_bias"]["50256"], -100);
+        // The repetition penalties are sampling too: a leg that dropped them
+        // could degenerate into looping on exactly the long generations that
+        // needed resuming in the first place.
+        assert_eq!(body["frequency_penalty"], 0.5);
+        assert_eq!(body["presence_penalty"], 0.25);
         assert!(body.get("max_tokens").is_none(), "an unbounded request stays unbounded");
-        assert!(body.get("frequency_penalty").is_none(), "null fields are not forwarded");
         // The chat-shaped fields must never appear on a completions leg.
         assert!(body.get("messages").is_none());
+    }
+
+    /// A field the client sent as `null` means "unset"; forwarding it as an
+    /// explicit null is not the same request.
+    #[test]
+    fn leg_body_omits_null_sampling_fields() {
+        let body = build_leg_body(
+            &ctx(json!({"model": "dsv4-flash", "temperature": null, "frequency_penalty": null, "presence_penalty": null})),
+            &[9],
+            None,
+            100,
+        );
+        for key in ["temperature", "frequency_penalty", "presence_penalty"] {
+            assert!(body.get(key).is_none(), "{key} was sent as null and must not be forwarded");
+        }
     }
 
     #[test]

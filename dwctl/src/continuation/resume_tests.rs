@@ -443,6 +443,49 @@ async fn a_stalled_stream_is_resumed_at_the_last_frame_boundary(pool: PgPool) {
     assert_eq!(contents(&parsed(&payloads)), "Hello");
 }
 
+/// An unparseable `data:` frame on leg 1 is forwarded to the client — we never
+/// re-serialize their stream — but it DISARMS resume.
+///
+/// The accumulator could not ingest it, so our record of "what has been said so
+/// far" is missing whatever that frame carried. Resuming from an incomplete
+/// prefix would silently drop content the client already saw and stitch the
+/// continuation onto the wrong place. Before this fix the frame was skipped in
+/// silence and the resume went ahead anyway.
+#[sqlx::test]
+async fn an_unparseable_frame_reaches_the_client_and_disarms_resume(pool: PgPool) {
+    let fake = Fake::new(
+        vec![
+            content("chatcmpl-1", "Hello"),
+            // Well-formed SSE framing, malformed JSON payload.
+            Chunk::Data("data: {\"choices\": [ NOPE\n\n".to_string()),
+            Chunk::Reset,
+        ],
+        // A leg is scripted, so "no leg was dispatched" is a real assertion
+        // rather than an artefact of having nothing to dispatch.
+        vec![vec![leg_text(", world!", Some("stop")), leg_usage(1010, 3), done()]],
+    );
+    let tokenizer = render_stub(vec![1, 2, 3], 1010, 5).await;
+    let st = state(pool, &fake, tokenizer.uri(), test_config());
+
+    let payloads = collect_payloads(app(&fake, st).oneshot(chat_request(streaming_body())).await.unwrap()).await;
+
+    // 1. The malformed frame still reached the client, byte for byte.
+    assert!(
+        payloads.iter().any(|p| p.contains("NOPE")),
+        "the client's bytes are forwarded whatever we can make of them: {payloads:?}"
+    );
+    // 2. ...and the content before it did too. (Parsed selectively: `parsed`
+    //    would unwrap the malformed payload this test exists to send.)
+    let well_formed: Vec<Value> = payloads.iter().filter_map(|p| serde_json::from_str(p).ok()).collect();
+    assert_eq!(contents(&well_formed), "Hello");
+    // 3. But the stream is no longer resumable: no leg was dispatched, so the
+    //    client sees the truncation rather than a silently wrong continuation.
+    assert!(
+        fake.resume_requests().is_empty(),
+        "a stream we cannot fully reconstruct must not be resumed"
+    );
+}
+
 // ── chain and exhaustion ─────────────────────────────────────────────────────
 
 /// A resume leg that itself dies re-enters the same flow: its output is appended

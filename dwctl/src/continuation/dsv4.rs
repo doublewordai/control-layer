@@ -682,6 +682,10 @@ impl StreamAccumulator for Dsv4Reconstructor {
     fn disarmed(&self) -> Option<AccumulateError> {
         self.disarmed
     }
+
+    fn disarm_externally(&mut self, cause: AccumulateError) {
+        let _ = self.disarm(cause);
+    }
 }
 
 #[cfg(test)]

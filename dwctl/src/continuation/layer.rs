@@ -457,6 +457,18 @@ fn tee(response: Response, state: ContinuationState, ctx: RequestContext) -> Res
                     // it is part of the client's stream and is forwarded verbatim; on
                     // a resume leg it belongs to that leg's own framing, so drop it.
                     if !resuming {
+                        // A `data:` frame we could not parse is DIFFERENT from a
+                        // comment or keep-alive: the client received content the
+                        // accumulator did not, so our reconstruction of "what has
+                        // been said so far" is now incomplete. Resuming from it
+                        // would silently drop whatever that frame carried, so
+                        // disarm — the stream is still forwarded byte for byte,
+                        // it simply can no longer be saved.
+                        if payload.is_some() && acc.disarmed().is_none() {
+                            let cause = crate::continuation::accumulate::AccumulateError::UnparseableFrame;
+                            acc.disarm_externally(cause);
+                            outcome.record("disarmed", cause.reason());
+                        }
                         // The one annotated yield: it fixes the stream's item type.
                         yield Ok::<Bytes, std::io::Error>(item);
                     }
@@ -503,8 +515,6 @@ fn tee(response: Response, state: ContinuationState, ctx: RequestContext) -> Res
                     if let Some(a) = anomaly {
                         metrics::record_usage_anomaly(a.kind());
                     }
-                    // Every leg re-paid the whole prompt; that is what resuming costs us.
-                    metrics::record_eaten_prompt_tokens(&ctx.model, leg_prompt);
                     saw_usage = true;
                     yield Ok(rewrap::sse_frame(&rewrap::usage_frame(&env, merged)));
                     continue;

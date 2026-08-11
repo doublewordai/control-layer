@@ -45,6 +45,11 @@ pub enum AccumulateError {
     /// buffer is dropped immediately — memory safety wins over resumability.
     #[error("accumulated generation exceeded the configured cap")]
     CapExceeded,
+    /// A `data:` frame the client received but we could not parse, so it never
+    /// reached the accumulator. Our record of the generation is missing
+    /// whatever it carried; resuming would stitch onto the wrong place.
+    #[error("stream carried a frame we could not parse")]
+    UnparseableFrame,
 }
 
 impl AccumulateError {
@@ -54,6 +59,7 @@ impl AccumulateError {
             AccumulateError::UnsupportedDelta => "unsupported_delta",
             AccumulateError::MultiChoice => "multi_choice",
             AccumulateError::CapExceeded => "cap_exceeded",
+            AccumulateError::UnparseableFrame => "unparseable_frame",
         }
     }
 }
@@ -76,6 +82,11 @@ pub trait StreamAccumulator: Send {
     fn saw_finish_reason(&self) -> bool;
     /// The disarm cause, if this stream is no longer reconstructable.
     fn disarmed(&self) -> Option<AccumulateError>;
+    /// Disarm from OUTSIDE the accumulator, for a stream that became
+    /// unreconstructable without any chunk reaching `ingest` — a `data:` frame
+    /// the tee could not parse is the case that exists. First cause wins, as it
+    /// does for an ingest-time disarm.
+    fn disarm_externally(&mut self, cause: AccumulateError);
 }
 
 /// Pick the accumulator for `model`, configured for how `route` serves it.
@@ -225,6 +236,10 @@ impl StreamAccumulator for PlainContent {
 
     fn disarmed(&self) -> Option<AccumulateError> {
         self.disarmed
+    }
+
+    fn disarm_externally(&mut self, cause: AccumulateError) {
+        let _ = self.disarm(cause);
     }
 }
 
