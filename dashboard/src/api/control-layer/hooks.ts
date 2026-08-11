@@ -773,6 +773,29 @@ export function useDeleteApiKey() {
  * running on their execution key — cancel them separately if the old secret
  * was compromised.
  */
+/**
+ * One-off reveal of an issued key's secret (holder only). Invalidate on
+ * success so the row's pending-reveal state flips to rotate.
+ */
+export function useRevealApiKey() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: ({
+      keyId,
+      userId = "current",
+    }: {
+      keyId: string;
+      userId?: string;
+    }) => dwctlApi.users.apiKeys.reveal(keyId, userId),
+    onSuccess: () => {
+      queryClient.invalidateQueries({
+        queryKey: queryKeys.apiKeys.all,
+      });
+    },
+  });
+}
+
 export function useRotateApiKey() {
   const queryClient = useQueryClient();
 

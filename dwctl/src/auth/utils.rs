@@ -53,8 +53,15 @@ pub fn generate_random_display_name() -> String {
 
 /// Extract the domain part from an email address.
 /// Returns `None` if the email doesn't contain an `@`.
-pub fn email_domain(email: &str) -> Option<&str> {
-    email.rsplit_once('@').map(|(_, domain)| domain)
+/// The domain part of an email address, lowercased.
+///
+/// Normalised because domains are case-insensitive but the things we compare
+/// them against are not. Without it `Alice@Acme.com` claims `Acme.com`, a
+/// later `bob@acme.com` fails to match it and gets no join request, and -
+/// worse - `x@GMAIL.com` slips past `is_personal_email_domain` and claims
+/// gmail.com as a company domain.
+pub fn email_domain(email: &str) -> Option<String> {
+    email.rsplit_once('@').map(|(_, domain)| domain.to_ascii_lowercase())
 }
 
 /// Returns `true` if the domain belongs to a personal/free email provider

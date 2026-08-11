@@ -1,5 +1,24 @@
 # Changelog
 
+## [4.0.0](https://github.com/doublewordai/control-layer/compare/fusillade-arsenal-v3.1.0...fusillade-arsenal-v4.0.0) (2026-08-06)
+
+
+### ⚠ BREAKING CHANGES
+
+* tier-grouped pending demand in one query; remove the priority-decay top-up ([#1408](https://github.com/doublewordai/control-layer/issues/1408))
+
+### Features
+
+* attribute batch traffic to the client that submitted it ([#1410](https://github.com/doublewordai/control-layer/issues/1410)) ([2dde662](https://github.com/doublewordai/control-layer/commit/2dde6620ced2d283d1efffa376aa3a86dc7b66c0))
+* signed demand windows with trailing outcome counts on /monitoring/demand ([#1399](https://github.com/doublewordai/control-layer/issues/1399)) ([24105ac](https://github.com/doublewordai/control-layer/commit/24105ac236c855dd9e4d928ad703a6a7868abf43))
+* tier-grouped pending demand in one query; remove the priority-decay top-up ([#1408](https://github.com/doublewordai/control-layer/issues/1408)) ([52fa075](https://github.com/doublewordai/control-layer/commit/52fa075cf7e0faa502e8b72af3a5cae73034c771))
+
+
+### Bug Fixes
+
+* bind trailing demand window bounds as scalar timestamps ([#1403](https://github.com/doublewordai/control-layer/issues/1403)) ([ff156a6](https://github.com/doublewordai/control-layer/commit/ff156a6a01d3398c55e8d0b932303d3f292c0b85))
+* **fusillade:** add populate-duration histogram and unfrozen-termina… ([#1413](https://github.com/doublewordai/control-layer/issues/1413)) ([081f4d5](https://github.com/doublewordai/control-layer/commit/081f4d52644c8d2ad0c53b78b2e21927db306456))
+
 ## [3.1.0](https://github.com/doublewordai/control-layer/compare/fusillade-arsenal-v3.0.0...fusillade-arsenal-v3.1.0) (2026-07-29)
 
 

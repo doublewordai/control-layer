@@ -65,6 +65,8 @@ impl Modify for AdminSecurityAddon {
         api::handlers::api_keys::get_user_api_key,
         api::handlers::api_keys::update_user_api_key,
         api::handlers::api_keys::delete_user_api_key,
+        api::handlers::api_keys::rotate_user_api_key,
+        api::handlers::api_keys::reveal_user_api_key,
         api::handlers::inference_endpoints::list_inference_endpoints,
         api::handlers::inference_endpoints::get_inference_endpoint,
         api::handlers::inference_endpoints::create_inference_endpoint,
