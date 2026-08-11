@@ -71,15 +71,27 @@ fn key_purpose<T: HttpClient>(state: &AppState<T>, headers: &HeaderMap) -> Optio
         .and_then(|labels| labels.get("purpose").cloned())
 }
 
-/// Whether this request may set privileged scheduling fields.
+/// Whether this request's `priority` survives to the upstream.
 ///
-/// Only the hidden `continuation` key may: its requests are resume legs
-/// finishing a stream the platform already accepted and partially delivered, on
-/// a seam budget the user is sitting through. Everything else — including the
-/// dashboard's own playground and batch keys — gets its `priority` stripped, so
-/// no caller can put itself ahead of everyone else's realtime work.
-fn may_set_privileged_fields<T: HttpClient>(state: &AppState<T>, headers: &HeaderMap) -> bool {
-    key_purpose(state, headers).as_deref() == Some("continuation")
+/// Tri-level, on the authenticating key's purpose:
+///
+/// - **`batch`** — passthrough. fusillade derives a NEGATIVE priority from each
+///   request's deadline so batch work sorts BEHIND realtime traffic and, within
+///   itself, by urgency. Stripping it would flatten batch scheduling to a
+///   single tier and let a far-future batch compete with one about to miss its
+///   window. Batch priorities are negative by construction, so passthrough
+///   cannot jump the realtime queue.
+/// - **`continuation`** — passthrough. Resume legs finish a stream the platform
+///   already accepted and partially delivered, on a seam budget the user is
+///   sitting through.
+/// - **everything else** — stripped, including the dashboard's playground key,
+///   so no caller can put itself ahead of everyone else's realtime work. A
+///   stripped request is priority 0 at dynamo, the realtime default.
+fn may_set_priority<T: HttpClient>(state: &AppState<T>, headers: &HeaderMap) -> bool {
+    matches!(
+        key_purpose(state, headers).as_deref(),
+        Some("batch") | Some("continuation")
+    )
 }
 
 fn is_sse_content_type(content_type: &str) -> bool {
@@ -122,8 +134,8 @@ pub async fn chat_completions_handler<T: HttpClient + Clone + Send + Sync + 'sta
     request.scrub_request_id_fields();
     // This schema models no `priority`, but its `extra` bag forwards unknown
     // fields verbatim — so chat is exactly as exposed as completions.
-    if !may_set_privileged_fields(&state, &headers) {
-        request.strip_privileged_fields();
+    if !may_set_priority(&state, &headers) {
+        request.strip_priority();
     }
 
     let original_model = request.model.clone();
@@ -469,8 +481,8 @@ pub async fn completions_handler<T: HttpClient + Clone + Send + Sync + 'static>(
     headers: HeaderMap,
     Json(mut request): Json<CompletionRequest>,
 ) -> Response {
-    if !may_set_privileged_fields(&state, &headers) {
-        request.strip_privileged_fields();
+    if !may_set_priority(&state, &headers) {
+        request.strip_priority();
     }
 
     let unsupported_reasoning_param = [

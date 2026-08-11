@@ -31,19 +31,17 @@ pub(crate) fn scrub_request_id_fields_from_extra(extra: &mut Option<Value>) {
     )
 }
 
-/// Fields that steer OUR scheduling rather than the model's output, and so must
-/// never arrive from a caller. Currently just `priority`, which the dynamo
-/// scheduler orders its queue by: left in place, any caller could put themselves
-/// ahead of every realtime request on the platform.
+/// Remove a caller-supplied scheduling `priority` captured by a
+/// `#[serde(flatten)]` extras bag.
 ///
-/// Both request schemas carry a `#[serde(flatten)]` extras bag, so an unmodelled
-/// field is forwarded rather than dropped — that is why this runs on the extras
-/// as well as on typed fields.
-const PRIVILEGED_REQUEST_FIELDS: [&str; 1] = ["priority"];
-
-/// Remove privileged fields captured by `#[serde(flatten)]` request extras.
-pub(crate) fn strip_privileged_fields_from_extra(extra: &mut Option<Value>) {
-    remove_keys_from_extra(extra, &PRIVILEGED_REQUEST_FIELDS)
+/// `priority` steers OUR scheduling rather than the model's output: the dynamo
+/// scheduler orders its queue by it, so left in place any caller could put
+/// themselves ahead of every realtime request on the platform. The chat schema
+/// forwards unmodelled fields verbatim, so its bag is a way past a schema that
+/// never modelled the field — hence this scrub. (The completions schema is
+/// strict and has no bag; it models `priority` and clears the typed field.)
+pub(crate) fn strip_priority_from_extra(extra: &mut Option<Value>) {
+    remove_keys_from_extra(extra, &["priority"])
 }
 
 fn remove_keys_from_extra(extra: &mut Option<Value>, keys: &[&str]) {

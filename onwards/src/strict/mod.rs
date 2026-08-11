@@ -1359,13 +1359,12 @@ mod tests {
         assert_eq!(merge_usage_details(Some(v.clone()), None).unwrap(), v);
     }
 
-    // ── privileged field scrub ───────────────────────────────────────────────
+    // ── scheduling priority policy ───────────────────────────────────────────
     //
-    // `priority` steers the dynamo scheduler's queue. Only the hidden
-    // `continuation` key may set it (resume legs finish a stream we already
-    // accepted); for everyone else it is stripped from BOTH the typed field and
-    // the flattened extras — the chat schema models no `priority` at all, but
-    // its extras bag would otherwise forward one verbatim.
+    // `priority` steers the dynamo scheduler's queue, so it is tri-level on the
+    // authenticating key's purpose: `batch` and `continuation` pass through,
+    // everyone else is stripped from BOTH the typed field and (for chat) the
+    // flattened extras.
 
     /// Build a strict app whose single key carries `purpose`, exactly as dwctl's
     /// onwards sync stamps it.
@@ -1430,7 +1429,7 @@ mod tests {
 
     #[tokio::test]
     async fn priority_is_stripped_from_completions_for_ordinary_keys() {
-        for purpose in [Some("realtime"), Some("batch"), Some("playground"), None] {
+        for purpose in [Some("realtime"), Some("playground"), None] {
             let (state, mock_client) = app_with_key_purpose(purpose);
             let body = forwarded_body(
                 state,
@@ -1462,6 +1461,34 @@ mod tests {
         assert_eq!(body["priority"], 100);
     }
 
+    /// REGRESSION: fusillade derives a NEGATIVE priority from each batch
+    /// request's deadline, so batch work sorts behind realtime traffic and,
+    /// within itself, by urgency. Stripping it would silently flatten batch
+    /// scheduling to one tier — a live behaviour change on the busiest path
+    /// through the platform, invisible from the response.
+    ///
+    /// Asserted on chat, which is what fusillade actually sends.
+    #[tokio::test]
+    async fn a_batch_keys_deadline_priority_survives_re_serialization() {
+        for (uri, body) in [
+            (
+                "/chat/completions",
+                r#"{"model":"dsv4-flash","messages":[{"role":"user","content":"hi"}],"priority":-1754812800}"#,
+            ),
+            (
+                "/completions",
+                r#"{"model":"dsv4-flash","prompt":[1,2,3],"priority":-1754812800}"#,
+            ),
+        ] {
+            let (state, mock_client) = app_with_key_purpose(Some("batch"));
+            let forwarded = forwarded_body(state, &mock_client, uri, body).await;
+            assert_eq!(
+                forwarded["priority"], -1754812800,
+                "{uri}: a batch key's deadline-derived priority must reach the scheduler"
+            );
+        }
+    }
+
     /// The chat schema has no typed `priority`, so this is purely the extras
     /// path — the hole the flatten bag would otherwise leave open.
     #[tokio::test]
@@ -1490,19 +1517,26 @@ mod tests {
         assert_eq!(body["priority"], 100);
     }
 
-    /// The continuation knobs and the extras bag coexist: typed fields stay
-    /// typed, unknown ones survive re-serialization instead of being dropped.
+    /// Completions stays STRICT: it models the fields it forwards, and an
+    /// unmodelled one is dropped rather than passed through. `priority` is
+    /// modelled precisely because it sometimes has to survive.
     #[tokio::test]
-    async fn completions_extras_survive_re_serialization() {
-        let (state, mock_client) = app_with_key_purpose(Some("realtime"));
+    async fn completions_drops_unmodelled_fields() {
+        let (state, mock_client) = app_with_key_purpose(Some("continuation"));
         let body = forwarded_body(
             state,
             &mock_client,
             "/completions",
-            r#"{"model":"dsv4-flash","prompt":[1,2],"ignore_eos":true,"repetition_penalty":1.1}"#,
+            r#"{"model":"dsv4-flash","prompt":[1,2],"priority":7,"ignore_eos":true,"repetition_penalty":1.1,"custom_knob":true}"#,
         )
         .await;
+        assert!(
+            body.get("repetition_penalty").is_none(),
+            "an unmodelled engine knob is dropped, as it was before this branch"
+        );
+        assert!(body.get("custom_knob").is_none(), "strict means strict");
+        // Fields the schema DOES model still ride through.
         assert_eq!(body["ignore_eos"], true);
-        assert_eq!(body["repetition_penalty"], 1.1);
+        assert_eq!(body["priority"], 7, "a modelled field still survives");
     }
 }

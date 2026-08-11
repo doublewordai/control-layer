@@ -7,9 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
-use super::utils::{
-    ensure_field, scrub_request_id_fields_from_extra, strip_privileged_fields_from_extra,
-};
+use super::utils::{ensure_field, scrub_request_id_fields_from_extra, strip_priority_from_extra};
 
 pub(crate) fn generated_chat_completion_id() -> String {
     format!("chatcmpl-{}", Uuid::new_v4())
@@ -225,15 +223,14 @@ impl ChatCompletionRequest {
         scrub_request_id_fields_from_extra(&mut self.extra);
     }
 
-    /// Remove caller-supplied privileged fields before proxying.
+    /// Drop a caller-supplied scheduling priority before proxying.
     ///
     /// This schema models no `priority` field, but `extra` forwards unknown
     /// fields verbatim — so a chat request is just as capable of smuggling one
-    /// through as a completions request, and needs the same scrub. Only a
-    /// `continuation`-purpose key is allowed to set it (see
-    /// `strict::handlers`).
-    pub(crate) fn strip_privileged_fields(&mut self) {
-        strip_privileged_fields_from_extra(&mut self.extra);
+    /// through as a completions request, and needs the same scrub. Only `batch`
+    /// and `continuation` keys may set it (see `strict::handlers`).
+    pub(crate) fn strip_priority(&mut self) {
+        strip_priority_from_extra(&mut self.extra);
     }
 }
 
