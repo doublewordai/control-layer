@@ -7028,13 +7028,18 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
                 UPDATE batches b
                 SET notification_sent_at = NOW()
                 WHERE b.id IN (
+                    -- SKIP LOCKED so concurrent pollers on other replicas
+                    -- claim disjoint sets instead of queueing on row locks;
+                    -- oldest-frozen-first so nothing starves under a backlog.
                     SELECT id FROM batches
                     WHERE counts_frozen_at IS NOT NULL
                       AND notification_sent_at IS NULL
                       AND cancelling_at IS NULL
                       AND deleted_at IS NULL
                       AND total_requests > 0
+                    ORDER BY counts_frozen_at
                     LIMIT 100
+                    FOR UPDATE SKIP LOCKED
                 )
                   AND b.notification_sent_at IS NULL  -- Re-check to handle concurrent pollers
                 RETURNING b.id, b.file_id, b.endpoint, b.service_tier, b.completion_window, b.metadata,

@@ -1880,9 +1880,6 @@ where
                         if let Ok(backlog) = storage.count_archivable_batches(grace).await {
                             gauge!("fusillade_archive_backlog").set(backlog as f64);
                         }
-                        if let Ok(unfrozen) = storage.count_unfrozen_terminal_batches().await {
-                            gauge!("fusillade_unfrozen_terminal_batches").set(unfrozen as f64);
-                        }
                     }
                 });
             }
@@ -1944,6 +1941,14 @@ where
                         Err(e) => {
                             crate::background_error!("finalize_cancelled_failed", Error, error = %e, "Failed to finalize cancelled batches");
                         }
+                    }
+
+                    // The finalizer's scoreboard lives with the finalizer (the
+                    // archive loops are config-gated OFF by default and may
+                    // not be running): sustained nonzero = batches stuck on
+                    // the recount path, unable to archive.
+                    if let Ok(unfrozen) = storage.count_unfrozen_terminal_batches().await {
+                        gauge!("fusillade_unfrozen_terminal_batches").set(unfrozen as f64);
                     }
                 }
             });
