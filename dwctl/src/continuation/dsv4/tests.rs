@@ -87,7 +87,7 @@ fn delta_frames(fixture: &Fixture) -> Vec<&Value> {
 
 /// The reconstruction after the first `upto` delta frames.
 fn replay(fixture: &Fixture, upto: usize) -> Option<String> {
-    let mut acc = Dsv4Reconstructor::new(CAP);
+    let mut acc = Dsv4Reconstructor::new(CAP, true);
     for frame in delta_frames(fixture).into_iter().take(upto) {
         acc.ingest(frame).expect("fixture streams never disarm");
     }
@@ -186,7 +186,7 @@ fn tool_frame(index: i64, name: Option<&str>, arguments: &str, finish: bool) -> 
 /// AND lands the prefix on a token that makes the model emit EOS at once.
 #[test]
 fn a_completed_invoke_never_closes_the_tool_block() {
-    let mut acc = Dsv4Reconstructor::new(CAP);
+    let mut acc = Dsv4Reconstructor::new(CAP, true);
     acc.ingest(&tool_frame(0, Some("get_weather"), r#"{"city": "Paris"}"#, false))
         .unwrap();
 
@@ -221,7 +221,7 @@ fn a_completed_invoke_never_closes_the_tool_block() {
 /// restores normal continuation.
 #[test]
 fn a_prefix_ending_on_a_closing_tag_gains_its_implied_newline() {
-    let mut acc = Dsv4Reconstructor::new(CAP);
+    let mut acc = Dsv4Reconstructor::new(CAP, true);
     acc.ingest(&tool_frame(0, Some("get_weather"), r#"{"city": "Paris"}"#, false))
         .unwrap();
     let text = acc.continuation_text().unwrap();
@@ -256,11 +256,11 @@ fn no_cut_of_any_fixture_stream_ends_on_a_closing_tag() {
 fn the_tool_block_separator_is_injected_only_when_the_content_lacks_it() {
     let content = |text: &str| json!({"id": "chatcmpl-1", "choices": [{"index": 0, "delta": {"content": text}}]});
 
-    let mut swallowed = Dsv4Reconstructor::new(CAP);
+    let mut swallowed = Dsv4Reconstructor::new(CAP, true);
     swallowed.ingest(&content("Checking.")).unwrap();
     swallowed.ingest(&tool_frame(0, Some("f"), "{", false)).unwrap();
 
-    let mut surfaced = Dsv4Reconstructor::new(CAP);
+    let mut surfaced = Dsv4Reconstructor::new(CAP, true);
     surfaced.ingest(&content("Checking.")).unwrap();
     surfaced.ingest(&content("\n\n")).unwrap();
     surfaced.ingest(&tool_frame(0, Some("f"), "{", false)).unwrap();
@@ -285,7 +285,7 @@ fn reasoning_is_closed_with_a_think_tag_only_once_the_body_starts() {
         }}]})
     };
 
-    let mut acc = Dsv4Reconstructor::new(CAP);
+    let mut acc = Dsv4Reconstructor::new(CAP, true);
     acc.ingest(&reasoning("Let me")).unwrap();
     acc.ingest(&reasoning(" think.")).unwrap();
     assert_eq!(
@@ -307,7 +307,7 @@ fn reasoning_is_closed_with_a_think_tag_only_once_the_body_starts() {
 fn chat_mode_omits_the_think_tag_that_thinking_mode_emits() {
     let body = json!({"id": "chatcmpl-1", "choices": [{"index": 0, "delta": {"content": "Answer"}}]});
 
-    let mut thinking = Dsv4Reconstructor::new(CAP);
+    let mut thinking = Dsv4Reconstructor::new(CAP, true);
     thinking.ingest(&body).unwrap();
     assert_eq!(thinking.continuation_text().as_deref(), Some("</think>Answer"));
 
@@ -340,7 +340,7 @@ fn every_partial_argument_state_reconstructs_to_a_resumable_prefix() {
         ),
     ];
     for (arguments, tail) in cases {
-        let mut acc = Dsv4Reconstructor::new(CAP);
+        let mut acc = Dsv4Reconstructor::new(CAP, true);
         acc.ingest(&tool_frame(0, Some("get_weather"), arguments, false)).unwrap();
         let text = acc.continuation_text().unwrap();
         assert!(text.ends_with(&tail), "arguments {arguments:?} → {text:?}");
@@ -353,7 +353,7 @@ fn every_partial_argument_state_reconstructs_to_a_resumable_prefix() {
 #[test]
 fn a_growing_number_literal_stays_in_flight() {
     let text = |arguments: &str| {
-        let mut acc = Dsv4Reconstructor::new(CAP);
+        let mut acc = Dsv4Reconstructor::new(CAP, true);
         acc.ingest(&tool_frame(0, Some("f"), arguments, false)).unwrap();
         acc.continuation_text().unwrap()
     };
@@ -366,7 +366,7 @@ fn a_growing_number_literal_stays_in_flight() {
 /// with Python's separators, which is what we re-dump with.
 #[test]
 fn escaping_and_non_scalar_values_round_trip() {
-    let mut acc = Dsv4Reconstructor::new(CAP);
+    let mut acc = Dsv4Reconstructor::new(CAP, true);
     acc.ingest(&tool_frame(
         0,
         Some("save"),
@@ -392,7 +392,7 @@ fn escaping_and_non_scalar_values_round_trip() {
 /// alignment against the dead leg's token ids, not client-visible correctness.
 #[test]
 fn non_canonical_json_spacing_round_trips_to_canonical_form() {
-    let mut acc = Dsv4Reconstructor::new(CAP);
+    let mut acc = Dsv4Reconstructor::new(CAP, true);
     acc.ingest(&tool_frame(0, Some("plot"), r#"{"xs":[1,2,3]}"#, true)).unwrap();
     let text = acc.continuation_text().unwrap();
     assert!(text.contains(">[1, 2, 3]<"), "spacing is the parser's, not the model's: {text}");
@@ -405,7 +405,7 @@ fn non_canonical_json_spacing_round_trips_to_canonical_form() {
 /// wants a ground-truth capture before it is changed.
 #[test]
 fn a_zero_parameter_call_keeps_the_encoders_blank_body_line() {
-    let mut acc = Dsv4Reconstructor::new(CAP);
+    let mut acc = Dsv4Reconstructor::new(CAP, true);
     acc.ingest(&tool_frame(0, Some("now"), "{}", true)).unwrap();
     assert_eq!(
         acc.continuation_text().unwrap(),
@@ -417,7 +417,7 @@ fn a_zero_parameter_call_keeps_the_encoders_blank_body_line() {
 
 #[test]
 fn nothing_generated_is_not_resumable() {
-    let acc = Dsv4Reconstructor::new(CAP);
+    let acc = Dsv4Reconstructor::new(CAP, true);
     assert_eq!(acc.continuation_text(), None);
     assert_eq!(acc.len_bytes(), 0);
     assert!(!acc.saw_finish_reason());
@@ -425,7 +425,7 @@ fn nothing_generated_is_not_resumable() {
 
 #[test]
 fn the_envelope_and_finish_reason_are_tracked_as_for_plain_content() {
-    let mut acc = Dsv4Reconstructor::new(CAP);
+    let mut acc = Dsv4Reconstructor::new(CAP, true);
     acc.ingest(&json!({
         "id": "chatcmpl-1", "created": 1_700_000_000, "model": "dsv4-flash",
         "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}}]
@@ -444,7 +444,7 @@ fn the_envelope_and_finish_reason_are_tracked_as_for_plain_content() {
 
 #[test]
 fn usage_only_and_choiceless_frames_are_ignored() {
-    let mut acc = Dsv4Reconstructor::new(CAP);
+    let mut acc = Dsv4Reconstructor::new(CAP, true);
     acc.ingest(&json!({"id": "chatcmpl-1", "choices": [{"delta": {"content": "hi"}}]}))
         .unwrap();
     acc.ingest(&json!({"choices": [], "usage": {"prompt_tokens": 5}})).unwrap();
@@ -454,7 +454,7 @@ fn usage_only_and_choiceless_frames_are_ignored() {
 
 #[test]
 fn multi_choice_disarms() {
-    let mut acc = Dsv4Reconstructor::new(CAP);
+    let mut acc = Dsv4Reconstructor::new(CAP, true);
     let err = acc
         .ingest(&json!({"choices": [
             {"index": 0, "delta": {"content": "a"}},
@@ -467,7 +467,7 @@ fn multi_choice_disarms() {
 
 #[test]
 fn exceeding_the_cap_disarms_and_drops_every_channel() {
-    let mut acc = Dsv4Reconstructor::new(16);
+    let mut acc = Dsv4Reconstructor::new(16, true);
     acc.ingest(&json!({"choices": [{"delta": {"reasoning_content": "12345"}}]}))
         .unwrap();
     acc.ingest(&tool_frame(0, Some("f"), "{", false)).unwrap();
@@ -483,7 +483,7 @@ fn exceeding_the_cap_disarms_and_drops_every_channel() {
 /// exactly as they do for `PlainContent`.
 #[test]
 fn unmeasured_delta_shapes_still_disarm() {
-    let mut legacy = Dsv4Reconstructor::new(CAP);
+    let mut legacy = Dsv4Reconstructor::new(CAP, true);
     assert_eq!(
         legacy
             .ingest(&json!({"choices": [{"delta": {"function_call": {"name": "f"}}}]}))
@@ -493,14 +493,14 @@ fn unmeasured_delta_shapes_still_disarm() {
 
     // `reasoning` without `reasoning_content` is reasoning text we have no
     // measured position for in the sequence.
-    let mut bare = Dsv4Reconstructor::new(CAP);
+    let mut bare = Dsv4Reconstructor::new(CAP, true);
     assert_eq!(
         bare.ingest(&json!({"choices": [{"delta": {"reasoning": "hmm"}}]})).unwrap_err(),
         AccumulateError::UnsupportedDelta
     );
 
     // Null-valued keys are sent on ordinary frames by most providers.
-    let mut ok = Dsv4Reconstructor::new(CAP);
+    let mut ok = Dsv4Reconstructor::new(CAP, true);
     ok.ingest(&json!({"choices": [{"delta": {
         "content": "fine", "reasoning": null, "function_call": null, "tool_calls": null
     }}]}))
@@ -510,7 +510,7 @@ fn unmeasured_delta_shapes_still_disarm() {
 
 #[test]
 fn disarm_is_sticky_and_keeps_the_first_cause() {
-    let mut acc = Dsv4Reconstructor::new(CAP);
+    let mut acc = Dsv4Reconstructor::new(CAP, true);
     assert_eq!(
         acc.ingest(&json!({"choices": [{"delta": {"function_call": {}}}]})).unwrap_err(),
         AccumulateError::UnsupportedDelta

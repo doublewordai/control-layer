@@ -453,7 +453,8 @@ struct ToolSlot {
 /// tool-call deltas are re-serialized into the raw sequence the model sampled,
 /// so a death mid-reasoning or mid-tool-call stays resumable.
 ///
-/// Selected per model by `continuation.model_reconstructors` (value `dsv4`).
+/// Selected per model by `continuation.model_reconstructors` (value `dsv4`);
+/// its thinking/chat mode comes from the route's `render_kwargs`.
 pub struct Dsv4Reconstructor {
     reasoning: String,
     content: String,
@@ -469,21 +470,22 @@ pub struct Dsv4Reconstructor {
 }
 
 impl Dsv4Reconstructor {
-    pub fn new(cap: usize) -> Self {
+    /// `thinking` says whether the resume prompt will end inside an open
+    /// `<think>` — i.e. whether the reconstruction must close it. It is derived
+    /// from the route's `render_kwargs` (see [`super::RouteInfo::thinking`]),
+    /// because that is what the prefix is rendered with: tokenizer-svc renders
+    /// this family in thinking mode by default, but a route serving it in chat
+    /// mode ends `</think>` already and must not get a second one. The mode
+    /// cannot be inferred from the deltas — a thinking-mode turn that does no
+    /// thinking emits `</think>` first with no `reasoning_content` at all, which
+    /// is exactly the `plat-reasoning` fixture.
+    pub fn new(cap: usize, thinking: bool) -> Self {
         Self {
             reasoning: String::new(),
             content: String::new(),
             tools: Vec::new(),
             saw_any_tool_frame: false,
-            // tokenizer-svc renders this family in thinking mode by default, so
-            // the resume prompt ends `<think>` and the reconstruction must close
-            // it. A chat-mode leg would need this flipped — the mode cannot be
-            // inferred from the deltas (a thinking-mode turn that does no
-            // thinking emits `</think>` first with no `reasoning_content` at
-            // all, which is exactly the `plat-reasoning` fixture), so plumbing
-            // the request's `chat_template_kwargs` through to here is the follow-up
-            // that finding 1 of the fidelity report asks for.
-            thinking: true,
+            thinking,
             cap,
             envelope: None,
             finish_reason: false,
@@ -491,14 +493,11 @@ impl Dsv4Reconstructor {
         }
     }
 
-    /// Test/rollout constructor for a leg that ran in chat mode (prompt already
-    /// ended `</think>`), where no think tag must be closed.
+    /// A leg that ran in chat mode (prompt already ended `</think>`), where no
+    /// think tag must be closed.
     #[cfg(test)]
     fn chat_mode(cap: usize) -> Self {
-        Self {
-            thinking: false,
-            ..Self::new(cap)
-        }
+        Self::new(cap, false)
     }
 
     fn disarm(&mut self, cause: AccumulateError) -> Result<(), AccumulateError> {

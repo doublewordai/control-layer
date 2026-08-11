@@ -56,7 +56,7 @@ use super::metrics;
 use super::render::{RenderClient, RenderPrefix, RenderedPrefix};
 use super::resume::{self, LegError, LegStream};
 use super::rewrap::{self, DONE_FRAME};
-use super::{ContinuationRoutes, InflightGuard, InflightLimiter, PurposeResolver};
+use super::{ContinuationRoutes, InflightGuard, InflightLimiter, PurposeResolver, RouteInfo};
 
 /// Everything the middleware needs at request time. Cloned per request (all
 /// fields are cheap handles), built once in `build_router` behind
@@ -65,8 +65,9 @@ use super::{ContinuationRoutes, InflightGuard, InflightLimiter, PurposeResolver}
 pub struct ContinuationState {
     pub cfg: Arc<ContinuationConfig>,
     /// Secret of the global hidden `continuation` key. Resume legs authenticate
-    /// with it, and its purpose is what the `model_traffic_rules` redirect
-    /// matches on to steer them at the continuation composite.
+    /// with it; its purpose is what lets them carry a scheduling `priority`
+    /// (onwards strips that field from every other caller). Routing is by
+    /// request path, not by purpose.
     pub key_secret: Arc<str>,
     pub tokenizer: RenderClient,
     /// The router clone taken at this layer's own insertion point — the resume
@@ -135,6 +136,10 @@ pub struct RequestContext {
     pub path: String,
     /// The inference layer's response id, when present — correlation only.
     pub response_id: Option<String>,
+    /// This model's continuation route config, captured when the stream was
+    /// armed. Held on the context rather than re-read per leg so a mid-stream
+    /// config change cannot make leg 2 render differently from leg 1.
+    pub route: RouteInfo,
 }
 
 impl RequestContext {
@@ -148,6 +153,13 @@ impl RequestContext {
 
     pub fn chat_template_kwargs(&self) -> Option<&Value> {
         self.body.get("chat_template_kwargs").filter(|v| !v.is_null())
+    }
+
+    /// The `chat_template_kwargs` a render for this stream must use: the route's
+    /// serving mode, overlaid with whatever the client asked for (see
+    /// [`RouteInfo::merged_render_kwargs`]).
+    pub fn render_kwargs(&self) -> Option<Value> {
+        self.route.merged_render_kwargs(self.chat_template_kwargs())
     }
 
     pub fn max_tokens(&self) -> Option<u32> {
@@ -287,10 +299,10 @@ pub async fn continuation_middleware(State(state): State<ContinuationState>, req
     // (memoised) key lookup. The in-memory gates therefore run first, per the
     // spec's own stated cheapest-first principle. Only the recorded `reason`
     // label differs when several gates would fail.
-    if !state.routes.is_enabled(&model) {
+    let Some(route) = state.routes.get(&model) else {
         metrics::record_outcome("ineligible", "no_route");
         return next.run(forward(parts, body_bytes)).await;
-    }
+    };
     if is_structured_output(&body, &model) {
         metrics::record_outcome("ineligible", "structured_output");
         return next.run(forward(parts, body_bytes)).await;
@@ -314,6 +326,7 @@ pub async fn continuation_middleware(State(state): State<ContinuationState>, req
         body,
         path,
         response_id,
+        route,
     };
     metrics::record_eligible_stream(&ctx.model);
 
@@ -392,7 +405,7 @@ fn tee(response: Response, state: ContinuationState, ctx: RequestContext) -> Res
         let mut outcome = OutcomeGuard::new();
         // Which reconstructor this stream gets is a per-model capability lookup;
         // see `accumulate::for_model`.
-        let mut acc: Box<dyn StreamAccumulator> = accumulate::for_model(&ctx.model, &state.cfg);
+        let mut acc: Box<dyn StreamAccumulator> = accumulate::for_model(&ctx.model, &state.cfg, &ctx.route);
         let mut current: LegStream = Box::pin(SseBufferedStream::new(leg_one));
         // Is `current` a resume leg (text_completion chunks needing reframing)?
         let mut resuming = false;
@@ -644,11 +657,12 @@ fn tee(response: Response, state: ContinuationState, ctx: RequestContext) -> Res
 /// produced. Returns `None` if the render fails — better no usage frame than a
 /// fabricated one.
 async fn render_only_usage(state: &ContinuationState, ctx: &RequestContext, text: &str) -> Option<rewrap::MergedUsage> {
+    let render_kwargs = ctx.render_kwargs();
     let prefix = RenderPrefix {
         virtual_model: &ctx.model,
         messages: ctx.messages(),
         tools: ctx.tools(),
-        chat_template_kwargs: ctx.chat_template_kwargs(),
+        chat_template_kwargs: render_kwargs.as_ref(),
         continuation_text: text,
     };
     let render = state.tokenizer.render(&prefix).await.ok()?;
@@ -724,6 +738,7 @@ mod tests {
             }),
             path: "/chat/completions".to_string(),
             response_id: None,
+            route: RouteInfo::default(),
         };
         assert_eq!(ctx.messages()[0]["role"], "user");
         assert!(ctx.tools().is_some());
@@ -736,6 +751,7 @@ mod tests {
             body: json!({"max_completion_tokens": 42}),
             path: "/chat/completions".to_string(),
             response_id: None,
+            route: RouteInfo::default(),
         };
         assert_eq!(ctx.max_tokens(), Some(42));
         assert!(ctx.tools().is_none());

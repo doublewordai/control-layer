@@ -24,6 +24,8 @@ use serde_json::Value;
 
 use crate::config::ContinuationConfig;
 
+use super::RouteInfo;
+
 use super::dsv4::Dsv4Reconstructor;
 use super::rewrap::Envelope;
 
@@ -76,22 +78,24 @@ pub trait StreamAccumulator: Send {
     fn disarmed(&self) -> Option<AccumulateError>;
 }
 
-/// Pick the accumulator for `model`.
+/// Pick the accumulator for `model`, configured for how `route` serves it.
 ///
-/// Selection is a capability lookup, not a guess: a model gets a family
-/// reconstructor only once the fidelity harness has issued a byte-exactness
-/// verdict for it, and until then it gets [`PlainContent`] — the same behaviour
-/// as before any reconstructor existed. An unrecognised value falls back the same
-/// way, so a typo degrades resumability instead of corrupting a prefix.
+/// Two inputs, deliberately from two places:
 ///
-/// `continuation.model_reconstructors` is the v1 home for that lookup because it
-/// needs no schema change to canary one model. It moves onto the per-route DB row
-/// (alongside the `continuation` traffic rule that already gates which models are
-/// resumable at all) once more than one family is live, at which point the two
-/// halves of "is this model resumable" stop being configured in two places.
-pub fn for_model(model: &str, cfg: &ContinuationConfig) -> Box<dyn StreamAccumulator> {
+/// - WHICH reconstructor is a capability lookup in
+///   `continuation.model_reconstructors`: a model gets a family reconstructor
+///   only once the fidelity harness has issued a byte-exactness verdict for it,
+///   and until then it gets [`PlainContent`] — the same behaviour as before any
+///   reconstructor existed. An unrecognised value falls back the same way, so a
+///   typo degrades resumability instead of corrupting a prefix.
+/// - HOW it reconstructs comes from the route's `render_kwargs`, because that is
+///   literally what the resume prefix will be rendered with. A DeepSeek route
+///   serving chat mode must not have a `</think>` spliced in, and the mode
+///   cannot be inferred from the deltas (a thinking turn that does no thinking
+///   emits `</think>` first with no `reasoning_content` at all).
+pub fn for_model(model: &str, cfg: &ContinuationConfig, route: &RouteInfo) -> Box<dyn StreamAccumulator> {
     match cfg.model_reconstructors.get(model).map(String::as_str) {
-        Some("dsv4") => Box::new(Dsv4Reconstructor::new(cfg.max_buffer_bytes)),
+        Some("dsv4") => Box::new(Dsv4Reconstructor::new(cfg.max_buffer_bytes, route.thinking())),
         _ => Box::new(PlainContent::new(cfg.max_buffer_bytes)),
     }
 }
@@ -375,7 +379,7 @@ mod tests {
     #[test]
     fn a_mapped_model_gets_its_family_reconstructor() {
         let cfg = cfg_with(&[("deepseek-ai/DeepSeek-V4-Flash", "dsv4")]);
-        let mut acc = for_model("deepseek-ai/DeepSeek-V4-Flash", &cfg);
+        let mut acc = for_model("deepseek-ai/DeepSeek-V4-Flash", &cfg, &RouteInfo::default());
         assert!(survives_reasoning(acc.as_mut()));
         assert_eq!(acc.continuation_text().as_deref(), Some("hmm"));
     }
@@ -384,11 +388,15 @@ mod tests {
     fn every_other_model_keeps_the_plain_content_behaviour() {
         let cfg = cfg_with(&[("deepseek-ai/DeepSeek-V4-Flash", "dsv4")]);
         for model in ["gpt-4o", "deepseek-ai/DeepSeek-V4-Flash-0731", ""] {
-            let mut acc = for_model(model, &cfg);
+            let mut acc = for_model(model, &cfg, &RouteInfo::default());
             assert!(!survives_reasoning(acc.as_mut()), "{model} must not be reconstructed as dsv4");
         }
         // Including when nothing is configured at all.
-        let mut acc = for_model("deepseek-ai/DeepSeek-V4-Flash", &ContinuationConfig::default());
+        let mut acc = for_model(
+            "deepseek-ai/DeepSeek-V4-Flash",
+            &ContinuationConfig::default(),
+            &RouteInfo::default(),
+        );
         assert!(!survives_reasoning(acc.as_mut()));
     }
 
@@ -396,7 +404,7 @@ mod tests {
     fn an_unrecognised_family_falls_back_instead_of_guessing() {
         let cfg = cfg_with(&[("m", "glm5"), ("n", "DSV4")]);
         for model in ["m", "n"] {
-            let mut acc = for_model(model, &cfg);
+            let mut acc = for_model(model, &cfg, &RouteInfo::default());
             assert!(
                 !survives_reasoning(acc.as_mut()),
                 "{model}: a typo degrades resumability, never fidelity"
@@ -411,10 +419,40 @@ mod tests {
             ..cfg_with(&[("dsv4-model", "dsv4")])
         };
         for model in ["dsv4-model", "plain-model"] {
-            let mut acc = for_model(model, &cfg);
+            let mut acc = for_model(model, &cfg, &RouteInfo::default());
             let err = acc.ingest(&content_chunk("12345")).unwrap_err();
             assert_eq!(err, AccumulateError::CapExceeded, "{model}");
         }
+    }
+
+    /// The route's serving mode configures the reconstructor it selects. The
+    /// canary (DeepSeek-V4-Flash) is served in CHAT mode while tokenizer-svc
+    /// renders that family in thinking mode by default, so without this the
+    /// resume prefix would gain a `</think>` the model never emitted.
+    #[test]
+    fn the_route_render_kwargs_choose_the_reconstructor_mode() {
+        let cfg = cfg_with(&[("dsv4-flash", "dsv4")]);
+        let chat_route = RouteInfo {
+            render_kwargs: Some(json!({"thinking_mode": "chat"})),
+            strip_leading_bos: false,
+        };
+
+        let mut chat = for_model("dsv4-flash", &cfg, &chat_route);
+        chat.ingest(&json!({"id": "c", "choices": [{"delta": {"content": "Hello"}}]}))
+            .unwrap();
+        assert_eq!(
+            chat.continuation_text().as_deref(),
+            Some("Hello"),
+            "a chat-mode route must not close a think tag the prompt never opened"
+        );
+
+        // The same model on a thinking route (or an unconfigured one) still
+        // closes it.
+        let mut thinking = for_model("dsv4-flash", &cfg, &RouteInfo::default());
+        thinking
+            .ingest(&json!({"id": "c", "choices": [{"delta": {"content": "Hello"}}]}))
+            .unwrap();
+        assert_eq!(thinking.continuation_text().as_deref(), Some("</think>Hello"));
     }
 
     #[test]

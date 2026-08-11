@@ -1,0 +1,32 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT\n                cm.alias,\n                dmc.render_kwargs,\n                dmc.strip_leading_bos\n            FROM deployed_model_components dmc\n            JOIN deployed_models cm ON cm.id = dmc.composite_model_id\n            JOIN deployed_models dm ON dm.id = dmc.deployed_model_id\n            WHERE dmc.role = 'completions'\n              AND dmc.enabled = true\n              AND cm.deleted = false\n              AND dm.deleted = false\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "alias",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 1,
+        "name": "render_kwargs",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 2,
+        "name": "strip_leading_bos",
+        "type_info": "Bool"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      true,
+      false
+    ]
+  },
+  "hash": "6b27a04451cd895bf960de58c9dcdb9a757bbed9c235a1d6a4e13b9c9ccd3873"
+}

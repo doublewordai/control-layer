@@ -4,14 +4,18 @@
 //! middleware (wired inner to outlet/cache, outer to error enrichment) rebuilds
 //! the exact prompt + partial output as a token-id vector via tokenizer-svc
 //! `/v1/render` and re-enters the onwards stack as a `/v1/completions` request
-//! on the model's continuation composite (dynamo first, provider fallback).
-//! The client keeps one uninterrupted stream; outlet/billing see one logical
-//! request with a merged usage frame.
+//! on the SAME model alias. Routing is onwards' business: the model's composite
+//! carries a `completions`-scoped member (the validated continuation target),
+//! and a completions-class request sees only the on-prem members plus that one
+//! — dynamo first, provider fallback. The client keeps one uninterrupted
+//! stream; outlet/billing see one logical request with a merged usage frame.
 //!
 //! This module currently owns the **global continuation key**: a single hidden
-//! `continuation`-purpose API key that authenticates resume legs into onwards
-//! and carries the purpose label the `model_traffic_rules` redirect fires on.
-//! It is deliberately global (not per-user):
+//! `continuation`-purpose API key that authenticates resume legs into onwards.
+//! Its purpose label is no longer a routing input (the request path is), but it
+//! is what permits the leg to carry a scheduling `priority` — onwards strips
+//! that field from every other caller. It is deliberately global (not
+//! per-user):
 //! - resume legs must keep working even when the requesting user's own keys
 //!   have been pulled mid-stream (e.g. credit exhaustion) — once we have
 //!   accepted and partially streamed a response, we finish it; the user is
@@ -36,7 +40,7 @@ pub mod rewrap;
 #[cfg(test)]
 mod resume_tests;
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -53,7 +57,8 @@ use crate::metrics::errors::component;
 
 pub use layer::{ContinuationState, continuation_middleware};
 
-/// How often the per-model route cache is refreshed from `model_traffic_rules`.
+/// How often the per-model route cache is refreshed from the composite's
+/// components.
 /// v1 is a poll: attaching a continuation route is an admin action measured in
 /// days, so a 30s window to take effect is irrelevant, and LISTEN/NOTIFY (which
 /// the onwards config sync already runs) can replace it later without changing
@@ -90,16 +95,89 @@ pub async fn provision_global_key_for_admin(pool: &PgPool, admin_email: &str) ->
     provision_global_key(pool, admin_id).await
 }
 
-/// The set of model aliases that have a continuation route attached, refreshed
-/// by a background poll.
+/// Per-model continuation route configuration, read from the composite's
+/// `completions` component row.
 ///
-/// "Attached" = a `model_traffic_rules` row with `api_key_purpose = 'continuation'`
-/// (M3 wires one by SQL for the canary model). Reads are lock-cheap and happen on
-/// every streaming chat request, so the set is swapped wholesale rather than
-/// mutated. An empty set — including the moment before the first refresh lands —
-/// means no model is resumable, which is the safe direction.
+/// The same row is what makes the model resumable at all (onwards routes
+/// `/v1/completions` to it) and how we must render for it, so "is this model
+/// resumable" and "how do we build its prefix" stop being configured in two
+/// places.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RouteInfo {
+    /// `chat_template_kwargs` for tokenizer-svc `/v1/render`. Also the source of
+    /// truth for the serving mode the reconstructor must match: a route serving
+    /// DeepSeek in chat mode (`{"thinking_mode": "chat"}`) must not have a
+    /// `</think>` spliced into its resume prefix, while tokenizer-svc renders
+    /// that family in thinking mode by default. `None` = the model's template
+    /// default.
+    pub render_kwargs: Option<serde_json::Value>,
+    /// This provider prepends its own BOS (Fireworks does on most models), so
+    /// our leading BOS has to come off or the exact prefix shifts by one token.
+    ///
+    /// **Carried, not yet applied — deliberately.** BOS-prepending is a property
+    /// of the MEMBER that ends up serving the leg, and the middleware builds one
+    /// body before onwards picks one: a composite tries its on-prem member first,
+    /// which does not prepend, so a pre-stripped prompt would reach dynamo a
+    /// token short. The strip belongs in onwards' per-member request forwarding,
+    /// next to `onwards_model` rewriting, and should be wired there when a
+    /// provider that needs it is onboarded. Today's only validated route
+    /// (Fireworks / DeepSeek-V4-Flash) is `strip_leading_bos = false`, so
+    /// nothing is lost by carrying the value and acting on it later.
+    pub strip_leading_bos: bool,
+}
+
+impl RouteInfo {
+    /// Whether the leg this route serves generates in thinking mode.
+    ///
+    /// Read from `render_kwargs`, because that is literally what the prompt was
+    /// rendered with: `thinking_mode` (DeepSeek's spelling, `"thinking"` /
+    /// `"chat"`) or a boolean `thinking`. Absent ⇒ true, matching
+    /// tokenizer-svc's own default for the families that have one.
+    pub fn thinking(&self) -> bool {
+        let Some(kwargs) = self.render_kwargs.as_ref() else {
+            return true;
+        };
+        if let Some(mode) = kwargs.get("thinking_mode").and_then(|v| v.as_str()) {
+            return !mode.eq_ignore_ascii_case("chat");
+        }
+        kwargs.get("thinking").and_then(|v| v.as_bool()).unwrap_or(true)
+    }
+
+    /// Merge this route's render kwargs with the ones the client sent.
+    ///
+    /// The route describes how the model is served (its default mode); the
+    /// request's own `chat_template_kwargs` are what leg 1 was actually
+    /// templated with downstream, so they win key-by-key. Reproducing leg 1's
+    /// prompt is the whole objective.
+    pub fn merged_render_kwargs(&self, request_kwargs: Option<&serde_json::Value>) -> Option<serde_json::Value> {
+        match (self.render_kwargs.as_ref(), request_kwargs) {
+            (None, other) => other.cloned(),
+            (Some(route), None) => Some(route.clone()),
+            (Some(serde_json::Value::Object(route)), Some(serde_json::Value::Object(request))) => {
+                let mut merged = route.clone();
+                for (k, v) in request {
+                    merged.insert(k.clone(), v.clone());
+                }
+                Some(serde_json::Value::Object(merged))
+            }
+            // A non-object on either side is not mergeable; the request's own
+            // value is the more specific one.
+            (Some(route), Some(request)) => Some(if request.is_null() { route.clone() } else { request.clone() }),
+        }
+    }
+}
+
+/// The models that have a continuation route attached, with that route's
+/// per-model config, refreshed by a background poll.
+///
+/// "Attached" = the model's composite has an enabled component with
+/// `role = 'completions'` — the validated completions target onwards sends
+/// `/v1/completions` traffic to. Reads are lock-cheap and happen on every
+/// streaming chat request, so the map is swapped wholesale rather than mutated.
+/// An empty map — including the moment before the first refresh lands — means no
+/// model is resumable, which is the safe direction.
 pub struct ContinuationRoutes {
-    enabled: RwLock<Arc<HashSet<String>>>,
+    routes: RwLock<Arc<HashMap<String, RouteInfo>>>,
 }
 
 impl Default for ContinuationRoutes {
@@ -111,53 +189,81 @@ impl Default for ContinuationRoutes {
 impl ContinuationRoutes {
     pub fn new() -> Self {
         Self {
-            enabled: RwLock::new(Arc::new(HashSet::new())),
+            routes: RwLock::new(Arc::new(HashMap::new())),
         }
     }
 
-    /// Test/seed constructor.
+    /// Test/seed constructor: models with default route config.
     pub fn with_models<I: IntoIterator<Item = String>>(models: I) -> Self {
+        Self::with_routes(models.into_iter().map(|m| (m, RouteInfo::default())))
+    }
+
+    /// Test/seed constructor carrying per-model config.
+    pub fn with_routes<I: IntoIterator<Item = (String, RouteInfo)>>(routes: I) -> Self {
         Self {
-            enabled: RwLock::new(Arc::new(models.into_iter().collect())),
+            routes: RwLock::new(Arc::new(routes.into_iter().collect())),
         }
     }
 
     pub fn is_enabled(&self, model: &str) -> bool {
-        self.enabled.read().map(|s| s.contains(model)).unwrap_or(false)
+        self.get(model).is_some()
+    }
+
+    /// This model's route config, or `None` when it has no continuation route.
+    pub fn get(&self, model: &str) -> Option<RouteInfo> {
+        self.routes.read().ok()?.get(model).cloned()
     }
 
     pub fn len(&self) -> usize {
-        self.enabled.read().map(|s| s.len()).unwrap_or(0)
+        self.routes.read().map(|s| s.len()).unwrap_or(0)
     }
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
-    fn store(&self, models: HashSet<String>) {
-        if let Ok(mut guard) = self.enabled.write() {
-            *guard = Arc::new(models);
+    fn store(&self, routes: HashMap<String, RouteInfo>) {
+        if let Ok(mut guard) = self.routes.write() {
+            *guard = Arc::new(routes);
         }
     }
 
     /// One refresh pass. Public so tests can drive it deterministically instead
     /// of waiting on the poller's interval.
     pub async fn refresh(&self, pool: &PgPool) -> anyhow::Result<()> {
-        // Any rule row for the purpose counts, per spec: attachment is a
-        // redirect rule, and a hypothetical `deny` row would simply make the
-        // resume leg fail at onwards (wasted work, never wrong output).
-        let aliases = sqlx::query_scalar!(
+        // A disabled component receives no traffic from onwards either, so it is
+        // not a route. The composite's alias is the key because that is the model
+        // name the client asked for and the resume leg re-sends.
+        let rows = sqlx::query!(
             r#"
-            SELECT DISTINCT dm.alias
-            FROM model_traffic_rules mtr
-            JOIN deployed_models dm ON dm.id = mtr.deployed_model_id
-            WHERE mtr.api_key_purpose = 'continuation'
+            SELECT
+                cm.alias,
+                dmc.render_kwargs,
+                dmc.strip_leading_bos
+            FROM deployed_model_components dmc
+            JOIN deployed_models cm ON cm.id = dmc.composite_model_id
+            JOIN deployed_models dm ON dm.id = dmc.deployed_model_id
+            WHERE dmc.role = 'completions'
+              AND dmc.enabled = true
+              AND cm.deleted = false
               AND dm.deleted = false
             "#
         )
         .fetch_all(pool)
         .await?;
-        self.store(aliases.into_iter().collect());
+        self.store(
+            rows.into_iter()
+                .map(|row| {
+                    (
+                        row.alias,
+                        RouteInfo {
+                            render_kwargs: row.render_kwargs,
+                            strip_leading_bos: row.strip_leading_bos,
+                        },
+                    )
+                })
+                .collect(),
+        );
         Ok(())
     }
 
@@ -317,44 +423,151 @@ mod tests {
         assert_eq!(from_startup, from_router);
     }
 
+    /// Link `component` into `composite` with the given role.
+    async fn add_component(pool: &PgPool, composite: uuid::Uuid, component: uuid::Uuid, role: &str) {
+        sqlx::query!(
+            "INSERT INTO deployed_model_components (composite_model_id, deployed_model_id, weight, enabled, sort_order, role)
+             VALUES ($1, $2, 1, true, 0, $3)",
+            composite,
+            component,
+            role
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn create_composite(pool: &PgPool, alias: &str, created_by: UserId) -> uuid::Uuid {
+        let id = uuid::Uuid::new_v4();
+        sqlx::query!(
+            "INSERT INTO deployed_models (id, model_name, alias, created_by, deleted, is_composite)
+             VALUES ($1, $2, $3, $4, false, true)",
+            id,
+            alias,
+            alias,
+            created_by
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        id
+    }
+
     #[sqlx::test]
-    async fn routes_only_include_models_with_a_continuation_rule(pool: PgPool) {
+    async fn routes_only_include_composites_with_a_completions_component(pool: PgPool) {
         let user = create_test_user(&pool, Role::PlatformManager).await;
         let endpoint = create_test_endpoint(&pool, "ep", user.id).await;
-        let resumable = create_test_model(&pool, "m1", "alias-resumable", endpoint, user.id).await;
-        let _plain = create_test_model(&pool, "m2", "alias-plain", endpoint, user.id).await;
-        let batch_ruled = create_test_model(&pool, "m3", "alias-batch-denied", endpoint, user.id).await;
+
+        let resumable = create_composite(&pool, "alias-resumable", user.id).await;
+        let plain = create_composite(&pool, "alias-plain", user.id).await;
+        let dynamo = create_test_model(&pool, "m-dynamo", "dynamo", endpoint, user.id).await;
+        let openrouter = create_test_model(&pool, "m-or", "openrouter", endpoint, user.id).await;
+        let fireworks = create_test_model(&pool, "m-fw", "fireworks", endpoint, user.id).await;
+
+        // Both composites start with ordinary members only.
+        add_component(&pool, resumable, dynamo, "both").await;
+        add_component(&pool, plain, openrouter, "chat").await;
+
+        let routes = ContinuationRoutes::new();
+        routes.refresh(&pool).await.unwrap();
+        assert!(routes.is_empty(), "a chat-only composite is not resumable");
+        assert!(!routes.is_enabled("alias-resumable"));
+
+        // Attach the validated completions target.
+        add_component(&pool, resumable, fireworks, "completions").await;
+        routes.refresh(&pool).await.unwrap();
+
+        assert!(routes.is_enabled("alias-resumable"));
+        assert!(
+            !routes.is_enabled("alias-plain"),
+            "a composite with no completions member is never resumable"
+        );
+        assert_eq!(routes.len(), 1);
+        // Default per-route config until someone sets it.
+        let route = routes.get("alias-resumable").unwrap();
+        assert_eq!(route.render_kwargs, None);
+        assert!(!route.strip_leading_bos);
+
+        // A disabled completions component receives no traffic from onwards, so
+        // it is not a route either.
         sqlx::query!(
-            "INSERT INTO model_traffic_rules (deployed_model_id, api_key_purpose, action) VALUES ($1, 'batch', 'deny')",
-            batch_ruled
+            "UPDATE deployed_model_components SET enabled = false WHERE composite_model_id = $1 AND deployed_model_id = $2",
+            resumable,
+            fireworks
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        routes.refresh(&pool).await.unwrap();
+        assert!(routes.is_empty());
+    }
+
+    #[sqlx::test]
+    async fn per_route_config_reaches_the_cache(pool: PgPool) {
+        let user = create_test_user(&pool, Role::PlatformManager).await;
+        let endpoint = create_test_endpoint(&pool, "ep", user.id).await;
+        let composite = create_composite(&pool, "dsv4-flash", user.id).await;
+        let fireworks = create_test_model(&pool, "m-fw", "fireworks", endpoint, user.id).await;
+        add_component(&pool, composite, fireworks, "completions").await;
+        sqlx::query!(
+            r#"UPDATE deployed_model_components
+               SET render_kwargs = '{"thinking_mode": "chat"}'::jsonb,
+                   strip_leading_bos = true,
+                   continuation_validated_at = NOW()
+               WHERE composite_model_id = $1"#,
+            composite
         )
         .execute(&pool)
         .await
         .unwrap();
 
         let routes = ContinuationRoutes::new();
-        // Before any rule exists the set is empty — the safe direction.
         routes.refresh(&pool).await.unwrap();
-        assert!(routes.is_empty());
-        assert!(!routes.is_enabled("alias-resumable"));
+        let route = routes.get("dsv4-flash").expect("the canary route");
+        assert_eq!(route.render_kwargs, Some(serde_json::json!({"thinking_mode": "chat"})));
+        assert!(route.strip_leading_bos);
+        assert!(!route.thinking(), "a chat-mode route must not close a think tag");
+    }
 
-        sqlx::query!(
-            r#"INSERT INTO model_traffic_rules (deployed_model_id, api_key_purpose, action, redirect_target_id)
-               VALUES ($1, 'continuation', 'redirect', $1)"#,
-            resumable
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-        routes.refresh(&pool).await.unwrap();
+    #[test]
+    fn thinking_is_read_from_the_route_kwargs() {
+        let route = |kwargs: Option<serde_json::Value>| RouteInfo {
+            render_kwargs: kwargs,
+            strip_leading_bos: false,
+        };
+        // tokenizer-svc renders the reasoning families in thinking mode by
+        // default, so an unconfigured route is a thinking route.
+        assert!(route(None).thinking());
+        assert!(route(Some(serde_json::json!({}))).thinking());
+        assert!(route(Some(serde_json::json!({"thinking_mode": "thinking"}))).thinking());
+        assert!(!route(Some(serde_json::json!({"thinking_mode": "chat"}))).thinking());
+        assert!(!route(Some(serde_json::json!({"thinking_mode": "CHAT"}))).thinking());
+        // The boolean spelling some templates use.
+        assert!(!route(Some(serde_json::json!({"thinking": false}))).thinking());
+        assert!(route(Some(serde_json::json!({"thinking": true}))).thinking());
+    }
 
-        assert!(routes.is_enabled("alias-resumable"));
-        assert!(!routes.is_enabled("alias-plain"), "a model with no rule is never resumable");
-        assert!(
-            !routes.is_enabled("alias-batch-denied"),
-            "a rule for a different purpose must not enable resume"
+    #[test]
+    fn request_kwargs_override_the_route_key_by_key() {
+        let route = RouteInfo {
+            render_kwargs: Some(serde_json::json!({"thinking_mode": "chat", "tool_style": "dsml"})),
+            strip_leading_bos: false,
+        };
+        // Nothing from the client: the route's own kwargs.
+        assert_eq!(route.merged_render_kwargs(None), route.render_kwargs);
+        // The client templated leg 1 with something else; that is what we must
+        // reproduce, key by key.
+        assert_eq!(
+            route.merged_render_kwargs(Some(&serde_json::json!({"thinking_mode": "thinking"}))),
+            Some(serde_json::json!({"thinking_mode": "thinking", "tool_style": "dsml"}))
         );
-        assert_eq!(routes.len(), 1);
+        // No route config: the client's kwargs pass through untouched.
+        let bare = RouteInfo::default();
+        assert_eq!(
+            bare.merged_render_kwargs(Some(&serde_json::json!({"thinking": true}))),
+            Some(serde_json::json!({"thinking": true}))
+        );
+        assert_eq!(bare.merged_render_kwargs(None), None);
     }
 
     #[sqlx::test]

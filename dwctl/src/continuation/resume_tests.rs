@@ -800,3 +800,112 @@ async fn a_resume_leg_never_re_enters_the_layers_above_this_one(pool: PgPool) {
         "the layers above continuation see ONE logical request — no double billing, logging or caching"
     );
 }
+
+/// The per-route config on the completions component reaches BOTH of its
+/// consumers on a live resume: the render call (which templates the prefix) and
+/// the leg body (whose token ids must match what the provider will actually
+/// see).
+///
+/// This is what makes the canary correct: DeepSeek-V4-Flash is served in CHAT
+/// mode, while tokenizer-svc renders that family in thinking mode by default.
+/// Without the route's kwargs the render would open a `<think>` the leg never
+/// had — and the reconstructor would close one the model never opened.
+#[sqlx::test]
+async fn the_route_config_reaches_the_render_call_and_the_leg_body(pool: PgPool) {
+    let fake = Fake::new(
+        vec![content("chatcmpl-1", "Hello"), Chunk::Reset],
+        vec![vec![leg_text(", world!", Some("stop")), leg_usage(1010, 3), done()]],
+    );
+
+    // A render stub that records what it was asked for.
+    let rendered = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let sink = Arc::clone(&rendered);
+    let tokenizer = MockServer::start().await;
+    Mock::given(wm_method("POST"))
+        .and(wm_path("/v1/render"))
+        .respond_with(move |req: &wiremock::Request| {
+            sink.lock().unwrap().push(serde_json::from_slice(&req.body).unwrap());
+            ResponseTemplate::new(200).set_body_json(json!({
+                "virtual_model": MODEL,
+                "token_ids": [7, 1, 2, 3],
+                "total": 1010,
+                "continuation_tokens": 5
+            }))
+        })
+        .mount(&tokenizer)
+        .await;
+
+    let mut st = state(pool, &fake, tokenizer.uri(), test_config());
+    st.routes = Arc::new(ContinuationRoutes::with_routes([(
+        MODEL.to_string(),
+        crate::continuation::RouteInfo {
+            render_kwargs: Some(json!({"thinking_mode": "chat"})),
+            strip_leading_bos: true,
+        },
+    )]));
+
+    let payloads = collect_payloads(app(&fake, st).oneshot(chat_request(streaming_body())).await.unwrap()).await;
+    assert_eq!(contents(&parsed(&payloads)), "Hello, world!", "the stream was resumed");
+
+    // 1. The render call carries the route's kwargs.
+    let render_requests = rendered.lock().unwrap().clone();
+    assert_eq!(render_requests.len(), 1);
+    assert_eq!(
+        render_requests[0]["chat_template_kwargs"],
+        json!({"thinking_mode": "chat"}),
+        "the prefix must be rendered the way the route serves the model"
+    );
+    assert_eq!(render_requests[0]["continuation_text"], "Hello");
+
+    // 2. The leg's prompt drops our leading BOS, because this provider prepends
+    //    its own — otherwise the exact prefix shifts by one token.
+    let leg = fake.resume_requests();
+    assert_eq!(leg.len(), 1);
+    assert_eq!(leg[0].body["prompt"], json!([1, 2, 3]));
+}
+
+/// The client's own `chat_template_kwargs` describe how leg 1 was actually
+/// templated downstream, so they win over the route's defaults key by key —
+/// reproducing leg 1's prompt is the whole objective.
+#[sqlx::test]
+async fn request_template_kwargs_override_the_route_defaults_on_a_live_resume(pool: PgPool) {
+    let fake = Fake::new(
+        vec![content("chatcmpl-1", "Hi"), Chunk::Reset],
+        vec![vec![leg_text("!", Some("stop")), leg_usage(1002, 1), done()]],
+    );
+    let rendered = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let sink = Arc::clone(&rendered);
+    let tokenizer = MockServer::start().await;
+    Mock::given(wm_method("POST"))
+        .and(wm_path("/v1/render"))
+        .respond_with(move |req: &wiremock::Request| {
+            sink.lock().unwrap().push(serde_json::from_slice(&req.body).unwrap());
+            ResponseTemplate::new(200).set_body_json(json!({
+                "token_ids": [4, 5], "total": 1002, "continuation_tokens": 2
+            }))
+        })
+        .mount(&tokenizer)
+        .await;
+
+    let mut st = state(pool, &fake, tokenizer.uri(), test_config());
+    st.routes = Arc::new(ContinuationRoutes::with_routes([(
+        MODEL.to_string(),
+        crate::continuation::RouteInfo {
+            render_kwargs: Some(json!({"thinking_mode": "chat", "tool_style": "dsml"})),
+            strip_leading_bos: false,
+        },
+    )]));
+
+    let mut body = streaming_body();
+    body["chat_template_kwargs"] = json!({"thinking_mode": "thinking"});
+    collect_payloads(app(&fake, st).oneshot(chat_request(body)).await.unwrap()).await;
+
+    let render_requests = rendered.lock().unwrap().clone();
+    assert_eq!(
+        render_requests[0]["chat_template_kwargs"],
+        json!({"thinking_mode": "thinking", "tool_style": "dsml"}),
+        "the client's value wins; the route's other keys survive"
+    );
+    // Nothing stripped: the full rendered prefix goes to the provider.
+    assert_eq!(fake.resume_requests()[0].body["prompt"], json!([4, 5]));
+}

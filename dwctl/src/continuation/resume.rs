@@ -143,11 +143,15 @@ fn is_sse(response: &axum::response::Response) -> bool {
 pub async fn attempt(state: &ContinuationState, ctx: &RequestContext, continuation_text: &str, attempt_no: u32) -> Result<Leg, LegError> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(state.cfg.resume_deadline_secs);
 
+    // The route's render kwargs (its serving mode) overlaid with the client's:
+    // the resume prefix must reproduce how leg 1 was templated, and a route
+    // serving a chat-mode model must not be rendered in thinking mode.
+    let render_kwargs = ctx.render_kwargs();
     let prefix = RenderPrefix {
         virtual_model: &ctx.model,
         messages: ctx.messages(),
         tools: ctx.tools(),
-        chat_template_kwargs: ctx.chat_template_kwargs(),
+        chat_template_kwargs: render_kwargs.as_ref(),
         continuation_text,
     };
     let render = match tokio::time::timeout_at(deadline, state.tokenizer.render(&prefix)).await {
@@ -169,6 +173,9 @@ pub async fn attempt(state: &ContinuationState, ctx: &RequestContext, continuati
         None => None,
     };
 
+    // NOTE: `route.strip_leading_bos` is deliberately NOT applied here. See
+    // [`super::RouteInfo::strip_leading_bos`]: BOS-prepending is a per-MEMBER
+    // property, and this body is built once, before onwards picks a member.
     let body = build_leg_body(ctx, &render.token_ids, max_tokens, state.cfg.priority);
     let request = build_leg_request(&ctx.path, &state.key_secret, &body);
 
@@ -204,6 +211,7 @@ mod tests {
             body,
             path: "/chat/completions".to_string(),
             response_id: None,
+            route: crate::continuation::RouteInfo::default(),
         }
     }
 
