@@ -2277,7 +2277,7 @@ mod tests {
         // completions reports prompt_tokens=20000 with the cached share as a detail.
         let anthropic_request = messages_request_data(false);
         let anthropic_response = ok_response(
-            r#"{"id":"msg_1","type":"message","role":"assistant","model":"claude-3-5-sonnet","content":[],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":5000,"output_tokens":8,"cache_read_input_tokens":12000,"cache_creation_input_tokens":3000}}"#,
+            r#"{"id":"msg_1","type":"message","role":"assistant","model":"claude-3-5-sonnet","content":[],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":5000,"output_tokens":8,"cache_read_input_tokens":12000,"cache_creation_input_tokens":3000,"cache_creation":{"ephemeral_1h_input_tokens":3000}}}"#,
         );
         let anthropic_parsed = parse_ai_response(&anthropic_request, &anthropic_response).unwrap();
         let anthropic = UsageMetrics::extract(
@@ -2301,7 +2301,7 @@ mod tests {
             span_id: None,
         };
         let chat_response = ok_response(
-            r#"{"id":"chatcmpl-1","object":"chat.completion","created":1,"model":"claude-3-5-sonnet","choices":[{"index":0,"message":{"role":"assistant","content":""},"finish_reason":"stop"}],"usage":{"prompt_tokens":20000,"completion_tokens":8,"total_tokens":20008,"prompt_tokens_details":{"cached_tokens":12000},"cache_creation_input_tokens":3000}}"#,
+            r#"{"id":"chatcmpl-1","object":"chat.completion","created":1,"model":"claude-3-5-sonnet","choices":[{"index":0,"message":{"role":"assistant","content":""},"finish_reason":"stop"}],"usage":{"prompt_tokens":20000,"completion_tokens":8,"total_tokens":20008,"prompt_tokens_details":{"cached_tokens":12000},"cache_read_input_tokens":12000,"cache_creation_input_tokens":3000,"cache_creation":{"ephemeral_1h_input_tokens":3000}}}"#,
         );
         let chat_parsed = parse_ai_response(&chat_request, &chat_response).unwrap();
         let chat = UsageMetrics::extract(
@@ -2322,6 +2322,13 @@ mod tests {
         );
         assert_eq!(anthropic.completion_tokens, chat.completion_tokens);
         assert_eq!(anthropic.total_tokens, 20008);
+        // The CACHE SPLIT must also survive both ingresses identically — the
+        // batcher prices reads at the read multiplier and each creation tier at
+        // its own write premium, so a bucket lost in translation bills wrong.
+        assert_eq!(anthropic.cache_read_input_tokens, 12000);
+        assert_eq!(anthropic.cache_read_input_tokens, chat.cache_read_input_tokens);
+        assert_eq!(anthropic.cache_creation_1h_input_tokens, 3000);
+        assert_eq!(anthropic.cache_creation_1h_input_tokens, chat.cache_creation_1h_input_tokens);
     }
 
     /// Same split, streaming. Anthropic splits usage across `message_start` and

@@ -222,6 +222,24 @@ pub struct Usage {
     pub cache_read_input_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_creation_input_tokens: Option<u64>,
+    /// Per-TTL creation breakdown (Anthropic's `cache_creation` object; the 24h
+    /// field is a dwctl extension). Billing prices each tier at its own write
+    /// premium, so dropping this on translation billed creations at list.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_creation: Option<CacheCreation>,
+}
+
+/// The `cache_creation` per-TTL breakdown. Field names match what the cache
+/// layer splices into the OpenAI frame, so the analytics extractor reads either
+/// shape with one code path.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CacheCreation {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ephemeral_5m_input_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ephemeral_1h_input_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ephemeral_24h_input_tokens: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------

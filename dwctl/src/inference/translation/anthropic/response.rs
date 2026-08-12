@@ -64,8 +64,8 @@ pub fn from_chat_completions(body: Bytes) -> Result<Bytes, TranslationError> {
         }
     }
 
-    let (input_tokens, output_tokens, cache_read_input_tokens, cache_creation_input_tokens) =
-        resp.get("usage").map(anthropic_usage).unwrap_or((0, 0, None, None));
+    let (input_tokens, output_tokens, cache_read_input_tokens, cache_creation_input_tokens, cache_creation) =
+        resp.get("usage").map(anthropic_usage).unwrap_or((0, 0, None, None, None));
 
     // vLLM/sglang expose the matched stop sequence (a string) at
     // `choices[].stop_reason`. When present, Anthropic reports
@@ -93,6 +93,7 @@ pub fn from_chat_completions(body: Bytes) -> Result<Bytes, TranslationError> {
             output_tokens,
             cache_read_input_tokens,
             cache_creation_input_tokens,
+            cache_creation,
         },
     };
 
@@ -138,7 +139,7 @@ pub fn anthropic_error(status: StatusCode, message: String) -> (StatusCode, Byte
 /// `(input, output, cache_read, cache_creation)`; the cache values are `None`
 /// when zero/absent so they serialise out. Shared by the blocking and streaming
 /// paths.
-pub(super) fn anthropic_usage(usage: &Value) -> (u64, u64, Option<u64>, Option<u64>) {
+pub(super) fn anthropic_usage(usage: &Value) -> (u64, u64, Option<u64>, Option<u64>, Option<super::model::CacheCreation>) {
     let prompt = usage.get("prompt_tokens").and_then(Value::as_u64).unwrap_or(0);
     let output = usage.get("completion_tokens").and_then(Value::as_u64).unwrap_or(0);
     let cached = usage
@@ -147,11 +148,18 @@ pub(super) fn anthropic_usage(usage: &Value) -> (u64, u64, Option<u64>, Option<u
         .and_then(Value::as_u64)
         .unwrap_or(0);
     let creation = usage.get("cache_creation_input_tokens").and_then(Value::as_u64).unwrap_or(0);
+    // The per-TTL breakdown rides the same object the cache layer spliced in;
+    // pass it through so write premiums stay billable after translation.
+    let breakdown = usage
+        .get("cache_creation")
+        .and_then(|c| serde_json::from_value::<super::model::CacheCreation>(c.clone()).ok())
+        .filter(|_| creation > 0);
     (
         prompt.saturating_sub(cached).saturating_sub(creation),
         output,
         (cached > 0).then_some(cached),
         (creation > 0).then_some(creation),
+        breakdown,
     )
 }
 
