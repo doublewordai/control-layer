@@ -15,4 +15,3 @@ pub(crate) fn ensure_field(
         object.insert(key.to_string(), default());
     }
 }
-

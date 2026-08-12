@@ -61,6 +61,7 @@ pub struct AnthropicStreamReframer {
     output_tokens: u64,
     cache_read: Option<u64>,
     cache_creation: Option<u64>,
+    cache_creation_breakdown: Option<super::model::CacheCreation>,
 }
 
 impl AnthropicStreamReframer {
@@ -122,11 +123,12 @@ impl StreamReframer for AnthropicStreamReframer {
 
         // Usage usually arrives as a final, choices-empty chunk.
         if let Some(usage) = chunk.get("usage").filter(|u| !u.is_null()) {
-            let (input, output, cache_read, cache_creation) = anthropic_usage(usage);
+            let (input, output, cache_read, cache_creation, breakdown) = anthropic_usage(usage);
             self.input_tokens = input;
             self.output_tokens = output;
             self.cache_read = cache_read;
             self.cache_creation = cache_creation;
+            self.cache_creation_breakdown = breakdown;
         }
 
         if let Some(choice) = chunk.get("choices").and_then(Value::as_array).and_then(|a| a.first()) {
@@ -268,6 +270,11 @@ impl StreamReframer for AnthropicStreamReframer {
         }
         if let Some(cache_creation) = self.cache_creation {
             usage["cache_creation_input_tokens"] = json!(cache_creation);
+        }
+        if let Some(breakdown) = &self.cache_creation_breakdown {
+            // Per-TTL breakdown: billing prices each tier at its own write
+            // premium, and the analytics extractor reads this exact object.
+            usage["cache_creation"] = serde_json::to_value(breakdown).unwrap_or(Value::Null);
         }
         push_event(
             &mut out,
@@ -487,5 +494,27 @@ mod tests {
         ]);
         assert!(sse.contains(r#""input_tokens":30"#)); // 50 - 20 cached
         assert!(sse.contains(r#""cache_read_input_tokens":20"#));
+    }
+
+    /// Anthropic's `input_tokens` excludes BOTH cache buckets: reads AND creations.
+    /// Subtracting only reads left creation tokens inside `input_tokens`, so a
+    /// spec-following client (or our own analytics, which sums the three fields to
+    /// recover the total) counted them twice.
+    #[test]
+    fn streaming_usage_excludes_cache_creation_tokens_too() {
+        let sse = run(&[
+            json!({ "id": "c1", "model": "m", "choices": [ { "delta": { "content": "hi" } } ] }),
+            json!({ "choices": [ { "delta": {}, "finish_reason": "stop" } ],
+                "usage": { "prompt_tokens": 50, "completion_tokens": 4,
+                    "prompt_tokens_details": { "cached_tokens": 20 },
+                    "cache_creation_input_tokens": 10,
+                    "cache_creation": { "ephemeral_1h_input_tokens": 10 } } }),
+        ]);
+        assert!(sse.contains(r#""input_tokens":20"#), "50 - 20 read - 10 created: {sse}");
+        assert!(sse.contains(r#""cache_read_input_tokens":20"#));
+        assert!(sse.contains(r#""cache_creation_input_tokens":10"#));
+        // The per-TTL breakdown must survive the reframe: billing prices each
+        // tier at its own write premium, and analytics reads exactly this object.
+        assert!(sse.contains(r#""cache_creation":{"ephemeral_1h_input_tokens":10}"#), "{sse}");
     }
 }
