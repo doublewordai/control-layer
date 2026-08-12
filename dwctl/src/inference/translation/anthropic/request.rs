@@ -2,7 +2,7 @@
 
 use serde_json::{Value, json};
 
-use super::model::{Content, ContentBlock, ImageSource, InputMessage, MessagesRequest, System, Tool, ToolResultContent};
+use super::model::{Content, ContentBlock, ImageSource, InputMessage, MessagesRequest, Tool, ToolResultContent};
 use crate::inference::translation::TranslationError;
 
 /// Translate an Anthropic Messages request into a Chat Completions request body. `cache_enabled`
@@ -150,13 +150,14 @@ fn thinking_to_reasoning_effort(thinking: Option<&Value>) -> Option<&'static str
     })
 }
 
-/// Anthropic top-level `system` -> a leading OpenAI system message. Text blocks
-/// keep `cache_control` by emitting array-form content parts.
-fn system_to_message(system: &System) -> Option<Value> {
+/// System content (the top-level `system` field, or a `role: "system"` entry in
+/// `messages`) -> an OpenAI system message. Text blocks keep `cache_control` by
+/// emitting array-form content parts.
+fn system_to_message(system: &Content) -> Option<Value> {
     match system {
-        System::Text(t) if !t.is_empty() => Some(json!({ "role": "system", "content": t })),
-        System::Text(_) => None,
-        System::Blocks(blocks) => {
+        Content::Text(t) if !t.is_empty() => Some(json!({ "role": "system", "content": t })),
+        Content::Text(_) => None,
+        Content::Blocks(blocks) => {
             let parts: Vec<Value> = blocks.iter().filter_map(text_block_to_part).collect();
             if parts.is_empty() {
                 None
@@ -171,6 +172,10 @@ fn convert_message(m: &InputMessage, out: &mut Vec<Value>) -> Result<(), Transla
     match m.role.as_str() {
         "assistant" => out.push(convert_assistant(&m.content)),
         "user" => convert_user(&m.content, out),
+        // Anthropic accepts mid-conversation `role: "system"` entries in `messages`
+        // (Claude Code injects harness reminders this way); keep them in place as
+        // OpenAI system messages.
+        "system" => out.extend(system_to_message(&m.content)),
         other => return Err(TranslationError::BadRequest(format!("unsupported message role: {other}"))),
     }
     Ok(())
@@ -592,5 +597,43 @@ mod tests {
             out["messages"][0]["tool_calls"][0].get("cache_control").is_none(),
             "no marker → clean tool_call"
         );
+    }
+
+    #[test]
+    fn system_role_in_messages_kept_in_place() {
+        // Anthropic accepts mid-conversation `role: "system"` entries (Claude Code injects harness
+        // reminders this way). They must translate in place, not 400.
+        let out = translate(json!({
+            "model": "m", "max_tokens": 16,
+            "system": "top-level system",
+            "messages": [
+                { "role": "user", "content": "hi" },
+                { "role": "system", "content": [
+                    { "type": "text", "text": "reminder", "cache_control": { "type": "ephemeral" } }
+                ]},
+                { "role": "user", "content": "go" }
+            ]
+        }));
+        let msgs = out["messages"].as_array().unwrap();
+        assert_eq!(msgs[0], json!({ "role": "system", "content": "top-level system" }));
+        assert_eq!(msgs[1]["role"], "user");
+        assert_eq!(msgs[2]["role"], "system");
+        assert_eq!(
+            msgs[2]["content"],
+            json!([{ "type": "text", "text": "reminder", "cache_control": { "type": "ephemeral" } }]),
+            "block-form system entry keeps its cache_control part"
+        );
+        assert_eq!(msgs[3]["role"], "user");
+    }
+
+    #[test]
+    fn unknown_role_in_messages_still_rejected() {
+        let req = serde_json::from_value::<MessagesRequest>(json!({
+            "model": "m", "max_tokens": 16,
+            "messages": [{ "role": "developer", "content": "hi" }]
+        }))
+        .unwrap();
+        let err = to_chat_completions(req, true).unwrap_err();
+        assert!(matches!(err, TranslationError::BadRequest(m) if m.contains("developer")));
     }
 }
