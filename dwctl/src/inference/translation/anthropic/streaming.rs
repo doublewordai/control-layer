@@ -488,4 +488,22 @@ mod tests {
         assert!(sse.contains(r#""input_tokens":30"#)); // 50 - 20 cached
         assert!(sse.contains(r#""cache_read_input_tokens":20"#));
     }
+
+    /// Anthropic's `input_tokens` excludes BOTH cache buckets: reads AND creations.
+    /// Subtracting only reads left creation tokens inside `input_tokens`, so a
+    /// spec-following client (or our own analytics, which sums the three fields to
+    /// recover the total) counted them twice.
+    #[test]
+    fn streaming_usage_excludes_cache_creation_tokens_too() {
+        let sse = run(&[
+            json!({ "id": "c1", "model": "m", "choices": [ { "delta": { "content": "hi" } } ] }),
+            json!({ "choices": [ { "delta": {}, "finish_reason": "stop" } ],
+                "usage": { "prompt_tokens": 50, "completion_tokens": 4,
+                    "prompt_tokens_details": { "cached_tokens": 20 },
+                    "cache_creation_input_tokens": 10 } }),
+        ]);
+        assert!(sse.contains(r#""input_tokens":20"#), "50 - 20 read - 10 created: {sse}");
+        assert!(sse.contains(r#""cache_read_input_tokens":20"#));
+        assert!(sse.contains(r#""cache_creation_input_tokens":10"#));
+    }
 }

@@ -211,8 +211,9 @@ pub enum StopReason {
 }
 
 /// Token usage on a response. Per Anthropic's usage shape, `input_tokens`
-/// excludes cached prompt tokens, which are reported separately. The cache
-/// fields are omitted entirely when zero/absent.
+/// excludes BOTH cache buckets (reads and creations), which are reported
+/// separately — `input + cache_read + cache_creation` is the full prompt.
+/// The cache fields are omitted entirely when zero/absent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Usage {
     pub input_tokens: u64,
