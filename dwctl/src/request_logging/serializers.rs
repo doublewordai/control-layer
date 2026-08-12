@@ -886,8 +886,7 @@ impl From<&AiResponse> for TokenMetrics {
                 let cache_total = |usage: &Value| -> Option<i64> {
                     let read = usage.get("cache_read_input_tokens").and_then(Value::as_i64);
                     let creation = usage.get("cache_creation_input_tokens").and_then(Value::as_i64);
-                    (read.is_some() || creation.is_some())
-                        .then(|| read.unwrap_or(0).max(0) + creation.unwrap_or(0).max(0))
+                    (read.is_some() || creation.is_some()).then(|| read.unwrap_or(0).max(0) + creation.unwrap_or(0).max(0))
                 };
                 for event in events {
                     match event.get("type").and_then(|v| v.as_str()).unwrap_or_default() {
@@ -2268,14 +2267,18 @@ mod tests {
     /// while meaning "total input" everywhere else. Billing derives uncached input as
     /// `prompt - read - creations`, so the cached tokens were subtracted twice and billed
     /// at nothing (observed: 3.28M prompt tokens recorded against 19.34M processed).
-    /// The assertion that matters is PARITY: the same conversation through either ingress
-    /// must report the same prompt_tokens.
+    /// The assertion that matters is PARITY: the SAME conversation, billed through either
+    /// ingress, must report the same `prompt_tokens` — that is the invariant billing
+    /// relies on, and the one nothing checked before.
     #[test]
     fn anthropic_prompt_tokens_include_cached_and_match_chat_completions() {
-        // 20k total input: 12k read from cache, 3k written, 5k uncached.
-        let anthropic_body = r#"{"id":"msg_1","type":"message","role":"assistant","model":"claude-3-5-sonnet","content":[],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":5000,"output_tokens":8,"cache_read_input_tokens":12000,"cache_creation_input_tokens":3000}}"#;
+        // One conversation, 20k total input: 12k read from cache, 3k written, 5k uncached.
+        // Anthropic splits it as input_tokens=5000 + the two cache buckets; chat
+        // completions reports prompt_tokens=20000 with the cached share as a detail.
         let anthropic_request = messages_request_data(false);
-        let anthropic_response = ok_response(anthropic_body);
+        let anthropic_response = ok_response(
+            r#"{"id":"msg_1","type":"message","role":"assistant","model":"claude-3-5-sonnet","content":[],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":5000,"output_tokens":8,"cache_read_input_tokens":12000,"cache_creation_input_tokens":3000}}"#,
+        );
         let anthropic_parsed = parse_ai_response(&anthropic_request, &anthropic_response).unwrap();
         let anthropic = UsageMetrics::extract(
             Uuid::new_v4(),
@@ -2285,12 +2288,40 @@ mod tests {
             &crate::test::utils::create_test_config(),
         );
 
+        let chat_request = RequestData {
+            correlation_id: 2,
+            timestamp: SystemTime::now(),
+            method: Method::POST,
+            uri: "/v1/chat/completions".parse::<Uri>().unwrap(),
+            headers: HashMap::new(),
+            body: Some(Bytes::from(
+                r#"{"model":"claude-3-5-sonnet","messages":[{"role":"user","content":"hi"}]}"#,
+            )),
+            trace_id: None,
+            span_id: None,
+        };
+        let chat_response = ok_response(
+            r#"{"id":"chatcmpl-1","object":"chat.completion","created":1,"model":"claude-3-5-sonnet","choices":[{"index":0,"message":{"role":"assistant","content":""},"finish_reason":"stop"}],"usage":{"prompt_tokens":20000,"completion_tokens":8,"total_tokens":20008,"prompt_tokens_details":{"cached_tokens":12000},"cache_creation_input_tokens":3000}}"#,
+        );
+        let chat_parsed = parse_ai_response(&chat_request, &chat_response).unwrap();
+        let chat = UsageMetrics::extract(
+            Uuid::new_v4(),
+            &chat_request,
+            &chat_response,
+            &chat_parsed,
+            &crate::test::utils::create_test_config(),
+        );
+
+        assert_eq!(
+            anthropic.prompt_tokens, chat.prompt_tokens,
+            "the same conversation must report the same prompt_tokens on both ingresses"
+        );
         assert_eq!(
             anthropic.prompt_tokens, 20000,
             "prompt_tokens must be TOTAL input (5000 uncached + 12000 read + 3000 written)"
         );
+        assert_eq!(anthropic.completion_tokens, chat.completion_tokens);
         assert_eq!(anthropic.total_tokens, 20008);
-        assert_eq!(anthropic.completion_tokens, 8);
     }
 
     /// Same split, streaming. Anthropic splits usage across `message_start` and

@@ -96,7 +96,11 @@ fn parse_strict_request<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T
         } else {
             StatusCode::BAD_REQUEST
         };
-        error_response(status, "invalid_request_error", &format!("Invalid request: {e}"))
+        error_response(
+            status,
+            "invalid_request_error",
+            &format!("Invalid request: {e}"),
+        )
     })
 }
 
