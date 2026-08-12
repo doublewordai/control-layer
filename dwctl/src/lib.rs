@@ -164,6 +164,7 @@ pub mod pricing;
 mod probes;
 pub mod prompt_cache;
 pub mod reasoning;
+mod recompute;
 mod request_logging;
 pub mod sample_files;
 mod static_assets;

@@ -461,12 +461,16 @@ fn ai_response_stream_errored(response: &AiResponse) -> bool {
 }
 
 /// The cache token split read from a response `usage` object.
+///
+/// Visible to the crate because [`crate::recompute`] replays a stored response through this
+/// same extractor rather than re-implementing it — a recompute that read the split
+/// differently from the live path would "correct" healthy requests.
 #[derive(Debug, Clone, Copy, Default)]
-struct CacheTokens {
-    read: i64,
-    creation_5m: i64,
-    creation_1h: i64,
-    creation_24h: i64,
+pub(crate) struct CacheTokens {
+    pub read: i64,
+    pub creation_5m: i64,
+    pub creation_1h: i64,
+    pub creation_24h: i64,
 }
 
 /// Pull the cache split out of a single `usage` JSON object. Reads come **only** from
@@ -510,7 +514,7 @@ fn cache_tokens_from_usage(usage: &Value) -> CacheTokens {
 /// terminal `data:` frame (take the last one seen). Returns all-zero when there is no
 /// usage object (non-cache request, error body, or a stream that died before its usage
 /// frame) — which is exactly the no-cache-billing case.
-fn extract_cache_tokens(response_data: &ResponseData) -> CacheTokens {
+pub(crate) fn extract_cache_tokens(response_data: &ResponseData) -> CacheTokens {
     let Some(body) = &response_data.body else {
         return CacheTokens::default();
     };
@@ -630,15 +634,21 @@ fn extract_finish_reason(response: &AiResponse) -> Option<String> {
     }
 }
 
-/// Helper struct for extracting token metrics from responses
+/// Helper struct for extracting token metrics from responses.
+///
+/// Visible to the crate because [`crate::recompute`] replays a stored response through
+/// `From<&AiResponse>` rather than re-deriving counts of its own. That is what makes a
+/// recompute of healthy traffic a guaranteed no-op: it is the same code that produced the
+/// original row, so any delta it reports is a real change in what this code believes — not
+/// a second opinion.
 #[derive(Debug, Clone)]
-struct TokenMetrics {
-    prompt_tokens: i64,
-    completion_tokens: i64,
-    reasoning_tokens: i64,
-    total_tokens: i64,
-    response_type: String,
-    response_model: Option<String>,
+pub(crate) struct TokenMetrics {
+    pub prompt_tokens: i64,
+    pub completion_tokens: i64,
+    pub reasoning_tokens: i64,
+    pub total_tokens: i64,
+    pub response_type: String,
+    pub response_model: Option<String>,
 }
 
 fn extract_completion_reasoning_tokens(usage: &async_openai::types::chat::CompletionUsage) -> i64 {
