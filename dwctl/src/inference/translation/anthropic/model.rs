@@ -21,8 +21,10 @@ pub struct MessagesRequest {
     pub max_tokens: u32,
     #[serde(default)]
     pub messages: Vec<InputMessage>,
+    /// Top-level `system`: either a string or an array of content blocks —
+    /// the same shape as message content, so it reuses [`Content`].
     #[serde(default)]
-    pub system: Option<System>,
+    pub system: Option<Content>,
     #[serde(default)]
     pub stream: bool,
     #[serde(default)]
@@ -54,14 +56,6 @@ pub struct MessagesRequest {
     /// to synthesize a breakpoint on the last block (and strips it before the upstream call).
     #[serde(default)]
     pub cache_control: Option<Value>,
-}
-
-/// Top-level `system`: either a string or an array of content blocks.
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-pub enum System {
-    Text(String),
-    Blocks(Vec<ContentBlock>),
 }
 
 /// A single conversation message.
