@@ -2,10 +2,10 @@
 
 /// Derive a default display name from an email address.
 ///
-/// Uses the local part (the text before `@`), falling back to `"user"` when
-/// the email has no `@` or the local part is empty. This replaces the previous
-/// randomly-generated "{adjective} {noun} {number}" placeholder so a new
-/// user's name is recognisable — derived from their email, not invented.
+/// Uses the local part (the text before `@`). If there's no `@`, returns the
+/// input string unchanged. Falls back to `"user"` when the local part is empty.
+/// This replaces the previous randomly-generated "{adjective} {noun} {number}"
+/// placeholder so a new user's name is recognisable — derived from their email, not invented.
 ///
 /// Examples:
 ///   `seb@doubleword.ai`      → `seb`
