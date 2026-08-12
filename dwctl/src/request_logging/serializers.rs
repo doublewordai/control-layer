@@ -852,8 +852,17 @@ impl From<&AiResponse> for TokenMetrics {
             AiResponse::Anthropic(response) => {
                 // Anthropic reports no `total_tokens` (sum the two) and folds any thinking
                 // tokens into `output_tokens`, so there is no separate reasoning count.
-                let prompt_tokens = response.usage.input_tokens as i64;
-                let completion_tokens = response.usage.output_tokens as i64;
+                //
+                // `input_tokens` EXCLUDES cached tokens in Anthropic's shape, but
+                // `prompt_tokens` means TOTAL input everywhere else in dwctl — billing
+                // derives uncached input as `prompt - read - creations`, so recording the
+                // reduced value subtracts the cached tokens twice and bills them at
+                // nothing. Add the cache buckets back to recover the full prompt.
+                let usage = &response.usage;
+                let prompt_tokens = (usage.input_tokens
+                    + usage.cache_read_input_tokens.unwrap_or(0)
+                    + usage.cache_creation_input_tokens.unwrap_or(0)) as i64;
+                let completion_tokens = usage.output_tokens as i64;
                 Self {
                     prompt_tokens,
                     completion_tokens,
@@ -867,9 +876,19 @@ impl From<&AiResponse> for TokenMetrics {
                 // Anthropic splits usage across the stream: `message_start` carries the
                 // model and input tokens; the reframer also puts both input and output on
                 // `message_delta` (non-standard, see the streaming module), so prefer it.
+                // As in the blocking branch, `input_tokens` excludes the cache buckets;
+                // they are added back so `prompt_tokens` is the TOTAL input dwctl means
+                // everywhere else. Cache counts ride the same frames as the input count.
                 let mut input = 0i64;
+                let mut cached = 0i64;
                 let mut output = 0i64;
                 let mut model = None;
+                let cache_total = |usage: &Value| -> Option<i64> {
+                    let read = usage.get("cache_read_input_tokens").and_then(Value::as_i64);
+                    let creation = usage.get("cache_creation_input_tokens").and_then(Value::as_i64);
+                    (read.is_some() || creation.is_some())
+                        .then(|| read.unwrap_or(0).max(0) + creation.unwrap_or(0).max(0))
+                };
                 for event in events {
                     match event.get("type").and_then(|v| v.as_str()).unwrap_or_default() {
                         "message_start" => {
@@ -883,11 +902,17 @@ impl From<&AiResponse> for TokenMetrics {
                             {
                                 input = i;
                             }
+                            if let Some(c) = event.pointer("/message/usage").and_then(cache_total) {
+                                cached = c;
+                            }
                         }
                         "message_delta" => {
                             if let Some(usage) = event.get("usage").filter(|u| !u.is_null()) {
                                 if let Some(i) = usage.get("input_tokens").and_then(Value::as_i64).filter(|i| *i > 0) {
                                     input = i;
+                                }
+                                if let Some(c) = cache_total(usage) {
+                                    cached = c;
                                 }
                                 output = usage.get("output_tokens").and_then(Value::as_i64).unwrap_or(output);
                             }
@@ -895,6 +920,7 @@ impl From<&AiResponse> for TokenMetrics {
                         _ => {}
                     }
                 }
+                let input = input + cached;
                 Self {
                     prompt_tokens: input,
                     completion_tokens: output,
@@ -2235,6 +2261,83 @@ mod tests {
         assert_eq!(metrics.reasoning_tokens, 0);
         assert_eq!(metrics.response_type, "anthropic_message");
         assert_eq!(metrics.status_code, 200);
+    }
+
+    /// The bug this guards: Anthropic's `input_tokens` EXCLUDES cached tokens, so
+    /// recording it verbatim made `prompt_tokens` mean "uncached input" on this ingress
+    /// while meaning "total input" everywhere else. Billing derives uncached input as
+    /// `prompt - read - creations`, so the cached tokens were subtracted twice and billed
+    /// at nothing (observed: 3.28M prompt tokens recorded against 19.34M processed).
+    /// The assertion that matters is PARITY: the same conversation through either ingress
+    /// must report the same prompt_tokens.
+    #[test]
+    fn anthropic_prompt_tokens_include_cached_and_match_chat_completions() {
+        // 20k total input: 12k read from cache, 3k written, 5k uncached.
+        let anthropic_body = r#"{"id":"msg_1","type":"message","role":"assistant","model":"claude-3-5-sonnet","content":[],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":5000,"output_tokens":8,"cache_read_input_tokens":12000,"cache_creation_input_tokens":3000}}"#;
+        let anthropic_request = messages_request_data(false);
+        let anthropic_response = ok_response(anthropic_body);
+        let anthropic_parsed = parse_ai_response(&anthropic_request, &anthropic_response).unwrap();
+        let anthropic = UsageMetrics::extract(
+            Uuid::new_v4(),
+            &anthropic_request,
+            &anthropic_response,
+            &anthropic_parsed,
+            &crate::test::utils::create_test_config(),
+        );
+
+        assert_eq!(
+            anthropic.prompt_tokens, 20000,
+            "prompt_tokens must be TOTAL input (5000 uncached + 12000 read + 3000 written)"
+        );
+        assert_eq!(anthropic.total_tokens, 20008);
+        assert_eq!(anthropic.completion_tokens, 8);
+    }
+
+    /// Same split, streaming. Anthropic splits usage across `message_start` and
+    /// `message_delta`; the cache buckets must be folded in from whichever frame
+    /// carries them.
+    #[test]
+    fn anthropic_stream_prompt_tokens_include_cached() {
+        let request_data = messages_request_data(true);
+        let sse = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-3-5-sonnet\",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":5000,\"output_tokens\":0,\"cache_read_input_tokens\":12000,\"cache_creation_input_tokens\":3000}}}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"input_tokens\":5000,\"output_tokens\":8,\"cache_read_input_tokens\":12000,\"cache_creation_input_tokens\":3000}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        let response_data = ok_response(sse);
+        let parsed = parse_ai_response(&request_data, &response_data).unwrap();
+        let metrics = UsageMetrics::extract(
+            Uuid::new_v4(),
+            &request_data,
+            &response_data,
+            &parsed,
+            &crate::test::utils::create_test_config(),
+        );
+
+        assert_eq!(metrics.prompt_tokens, 20000, "streaming must fold the cache buckets in too");
+        assert_eq!(metrics.completion_tokens, 8);
+        assert_eq!(metrics.total_tokens, 20008);
+    }
+
+    /// A response with no cache activity must be unchanged by the fix.
+    #[test]
+    fn anthropic_prompt_tokens_unchanged_without_caching() {
+        let request_data = messages_request_data(false);
+        let body = r#"{"id":"msg_1","type":"message","role":"assistant","model":"claude-3-5-sonnet","content":[],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":12,"output_tokens":8}}"#;
+        let response_data = ok_response(body);
+        let parsed = parse_ai_response(&request_data, &response_data).unwrap();
+        let metrics = UsageMetrics::extract(
+            Uuid::new_v4(),
+            &request_data,
+            &response_data,
+            &parsed,
+            &crate::test::utils::create_test_config(),
+        );
+        assert_eq!(metrics.prompt_tokens, 12);
+        assert_eq!(metrics.total_tokens, 20);
     }
 
     #[test]
