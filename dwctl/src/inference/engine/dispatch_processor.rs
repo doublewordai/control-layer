@@ -101,6 +101,14 @@ impl DispatchProcessor {
             error: "Zero-data-retention request could not be processed".to_string(),
         }
     }
+
+    /// Generic terminal reason for non-ZDR pre-dispatch preparation failures
+    /// (JIT signing). Deliberately says nothing about tokens or signing.
+    fn dispatch_unprocessable() -> FailureReason {
+        FailureReason::RequestBuilderError {
+            error: "Request could not be prepared for dispatch".to_string(),
+        }
+    }
 }
 
 #[async_trait]
@@ -173,12 +181,16 @@ where
                     // request can never be processed. Terminalize (persist + Ok(Failed))
                     // so the daemon records it as terminally failed instead of leaving
                     // the row in `processing` until the batch window expires.
-                    let failed = Self::failed(
-                        request,
-                        FailureReason::RequestBuilderError {
-                            error: "ZDR request key expired before dispatch; cannot decrypt".to_string(),
-                        },
+                    // Client reason is the same generic one as the other ZDR branches;
+                    // the specific cause is logged for operators only.
+                    crate::background_error!(
+                        crate::metrics::errors::component::ZDR_DISPATCH,
+                        "key_expired",
+                        Error,
+                        request_id = %request.data.id.0,
+                        "ZDR request key expired or was deleted before dispatch; cannot decrypt"
                     );
+                    let failed = Self::failed(request, Self::zdr_unprocessable());
                     storage.persist(&failed).await?;
                     return Ok(RequestCompletionResult::Failed(failed));
                 }
@@ -219,12 +231,25 @@ where
             // unparseable body here means corruption, and dispatching the literal
             // token upstream (which cannot fetch a `dw-img://` URL) would surface
             // as a confusing upstream error far from the root cause.
-            // ValidationError, not Other: malformed input never succeeds on retry.
-            let mut body_value: serde_json::Value = serde_json::from_str(&request.data.body).map_err(|e| {
-                fusillade::FusilladeError::ValidationError(format!(
-                    "JIT image signing: request body is not valid JSON ({e}); refusing to dispatch with unresolved tokens"
-                ))
-            })?;
+            // Terminalize rather than returning `Err`: malformed input never
+            // succeeds on retry, and a bare `Err` only logs a task failure and
+            // strands the row in `processing` (same reasoning as the ZDR branches).
+            let mut body_value: serde_json::Value = match serde_json::from_str(&request.data.body) {
+                Ok(value) => value,
+                Err(e) => {
+                    crate::background_error!(
+                        crate::metrics::errors::component::ZDR_DISPATCH,
+                        "jit_signing_body_not_json",
+                        Error,
+                        request_id = %request.data.id.0,
+                        error = %e,
+                        "Request body is not valid JSON; refusing to dispatch with unresolved dw-img tokens"
+                    );
+                    let failed = Self::failed(request, Self::dispatch_unprocessable());
+                    storage.persist(&failed).await?;
+                    return Ok(RequestCompletionResult::Failed(failed));
+                }
+            };
             let result = crate::image_normalizer::walker::substitute_with(
                 &mut body_value,
                 crate::image_normalizer::Mode::TokensOnly,
@@ -244,16 +269,45 @@ where
                 Ok(count) if count > 0 => match serde_json::to_string(&body_value) {
                     Ok(new_body) => request.data.body = new_body,
                     Err(e) => {
-                        return Err(fusillade::FusilladeError::Other(anyhow::anyhow!(
-                            "re-serialise body after JIT signing: {e}"
-                        )));
+                        // Re-serialising a `Value` that was just parsed does not fail
+                        // for input reasons; treat it as terminal rather than
+                        // stranding the row on a bare `Err`.
+                        crate::background_error!(
+                            crate::metrics::errors::component::ZDR_DISPATCH,
+                            "jit_signing_reserialise_failed",
+                            Error,
+                            request_id = %request.data.id.0,
+                            error = %e,
+                            "Failed to re-serialise request body after JIT signing"
+                        );
+                        let failed = Self::failed(request, Self::dispatch_unprocessable());
+                        storage.persist(&failed).await?;
+                        return Ok(RequestCompletionResult::Failed(failed));
                     }
                 },
                 Ok(_) => {} // no tokens found, leave body alone
                 Err(e) => {
-                    return Err(fusillade::FusilladeError::Other(anyhow::anyhow!(
-                        "JIT image-URL signing failed: {e}"
-                    )));
+                    // Signing is a call to an external signer, so a failure here is
+                    // usually TRANSIENT (signer/network blip). Return a retriable
+                    // failure without persisting, so the daemon re-pends the row -
+                    // same shape as the keystore-unreachable branch above.
+                    // Terminalising here would permanently kill batch rows during a
+                    // signer outage.
+                    crate::background_error!(
+                        crate::metrics::errors::component::ZDR_DISPATCH,
+                        "jit_signing_failed",
+                        Warning,
+                        request_id = %request.data.id.0,
+                        error = %e,
+                        "JIT image-URL signing failed; scheduling retry"
+                    );
+                    let failed = Self::failed(
+                        request,
+                        FailureReason::NetworkError {
+                            error: "Request could not be prepared for dispatch".to_string(),
+                        },
+                    );
+                    return Ok(RequestCompletionResult::Failed(failed));
                 }
             }
         }
