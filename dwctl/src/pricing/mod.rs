@@ -367,10 +367,10 @@ mod tests {
 
     #[test]
     fn drifted_split_is_capped_by_reducing_read_not_discarded() {
-        // The tokenizer-drift shape (detail.dev, 2026-07): markers cover the whole prompt
-        // and the classifier's count lands ~1% above the engine's prompt_tokens
-        // (10_000 read + 200 write vs 10_100 prompt = 100-token overrun). The overrun
-        // comes off the READ count; the discount survives.
+        // The tokenizer-drift shape seen in production agent traffic (2026-07): markers
+        // cover the whole prompt and the classifier's count lands ~1% above the engine's
+        // prompt_tokens (10_000 read + 200 write vs 10_100 prompt = 100-token overrun).
+        // The overrun comes off the READ count; the discount survives.
         let m = CacheMultipliers::default(); // read 0.1, write_5m 1.25
         let c = counts(10_100, 5, 10_000, 200, 0, 0);
         let got = cost(&c, &m).unwrap();
