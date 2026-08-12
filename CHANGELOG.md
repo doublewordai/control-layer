@@ -1,5 +1,12 @@
 # Changelog
 
+## [10.10.2](https://github.com/doublewordai/control-layer/compare/v10.10.1...v10.10.2) (2026-08-12)
+
+
+### Bug Fixes
+
+* antrhopic billing ([#1470](https://github.com/doublewordai/control-layer/issues/1470)) ([c44b73a](https://github.com/doublewordai/control-layer/commit/c44b73ae4a1223ff0174d0fa117f151699bc6e45))
+
 ## [10.10.1](https://github.com/doublewordai/control-layer/compare/v10.10.0...v10.10.1) (2026-08-12)
 
 
