@@ -160,6 +160,7 @@ mod metrics;
 mod notifications;
 mod openapi;
 mod payment_providers;
+pub mod pricing;
 mod probes;
 pub mod prompt_cache;
 pub mod reasoning;
