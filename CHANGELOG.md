@@ -1,5 +1,12 @@
 # Changelog
 
+## [10.11.0](https://github.com/doublewordai/control-layer/compare/v10.10.2...v10.11.0) (2026-08-13)
+
+
+### Features
+
+* **fusillade:** own batch finalization in a daemon loop, decouple no… ([#1462](https://github.com/doublewordai/control-layer/issues/1462)) ([83066bb](https://github.com/doublewordai/control-layer/commit/83066bb951405f67569d2776ad96ca61a5c372e6))
+
 ## [10.10.2](https://github.com/doublewordai/control-layer/compare/v10.10.1...v10.10.2) (2026-08-12)
 
 
