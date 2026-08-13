@@ -38,7 +38,7 @@ use crate::daemon::{
     Running,
 };
 use crate::error::{FusilladeError, Result};
-use crate::manager::TrailingDemandCount;
+use crate::manager::{RetentionSweepCutoffs, RetentionSweepOutcome, TrailingDemandCount};
 use crate::request::{
     Canceled, CascadeTargetState, Claimed, Completed, CreateBackgroundInput, CreateFlexInput,
     CreateRealtimeInput, DaemonId, Failed, FailureReason, LeakStamp, Pending,
@@ -439,6 +439,29 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
             .begin_write()
             .await
             .map_err(|e| FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e)))?;
+
+        // Serialize against file deletion/expiry and reject inaccessible
+        // sources before creating the batch or its virtual files. An FK alone
+        // only proves the soft-deleted file row still exists.
+        let source_available = sqlx::query_scalar::<_, bool>(
+            r#"SELECT EXISTS(
+                SELECT 1 FROM files
+                WHERE id = $1
+                  AND deleted_at IS NULL
+                  AND status = 'processed'
+                  AND (expires_at IS NULL OR expires_at > NOW())
+                FOR UPDATE
+            )"#,
+        )
+        .bind(*input.file_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to lock source file: {e}")))?;
+        if !source_available {
+            return Err(FusilladeError::ValidationError(
+                "source file is deleted or expired".to_string(),
+            ));
+        }
 
         let row = sqlx::query!(
             r#"
@@ -4210,6 +4233,26 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
             .await
             .map_err(|e| FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e)))?;
 
+        // Establish a single lock order for explicit deletion and automated
+        // expiry: file first, then dependent batches. Besides avoiding an
+        // inverse-lock deadlock, the row lock conflicts with FK checks from a
+        // concurrent batch creation, so no new dependent batch can appear in
+        // the unlink window below.
+        let exists = sqlx::query_scalar::<_, bool>(
+            r#"SELECT EXISTS(
+                SELECT 1 FROM files
+                WHERE id = $1 AND deleted_at IS NULL
+                FOR UPDATE
+            )"#,
+        )
+        .bind(*file_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to lock file: {}", e)))?;
+        if !exists {
+            return Err(FusilladeError::Other(anyhow!("File not found")));
+        }
+
         // Step 1: Cancel non-terminal batches associated with this file
         // This will:
         // - Prevent pending requests from being claimed (claim_requests filters by cancelling_at)
@@ -5319,6 +5362,25 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
             .await
             .map_err(|e| FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e)))?;
 
+        // Lock creator-owned files before touching batches. This matches the
+        // file-then-batch order used by explicit deletion and batch creation,
+        // while SKIP LOCKED lets another deletion finish without a cycle.
+        let file_ids: Vec<Uuid> = sqlx::query_scalar(
+            r#"
+            SELECT id FROM files
+            WHERE uploaded_by = $1
+              AND deleted_at IS NULL
+            ORDER BY id
+            LIMIT $2
+            FOR UPDATE SKIP LOCKED
+            "#,
+        )
+        .bind(creator_id)
+        .bind(batch_size)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to lock user files: {}", e)))?;
+
         // Stage 0: Hard-delete batchless (realtime/flex) requests and their
         // dedicated templates. These have batch_id IS NULL, so they have no
         // soft-deleted parent batch for the orphan-purge daemon to key off —
@@ -5402,25 +5464,17 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
 
         // Stage 2: Soft-delete files uploaded by this creator. Their templates
         // are reaped by the orphan-purge daemon once files.deleted_at is set.
-        let files_affected = sqlx::query_scalar!(
+        let files_affected = sqlx::query_scalar::<_, Uuid>(
             r#"
-            WITH to_delete AS (
-                SELECT id FROM files
-                WHERE uploaded_by = $1
-                  AND deleted_at IS NULL
-                LIMIT $2
-                FOR UPDATE SKIP LOCKED
-            )
             UPDATE files f
             SET deleted_at = NOW(),
                 status = 'deleted'
-            FROM to_delete td
-            WHERE f.id = td.id
+            WHERE f.id = ANY($1)
+              AND f.deleted_at IS NULL
             RETURNING f.id
             "#,
-            creator_id,
-            batch_size,
         )
+        .bind(&file_ids)
         .fetch_all(&mut *tx)
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to soft-delete user files: {}", e)))?
@@ -5488,10 +5542,93 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         let repended: std::collections::HashSet<Uuid> = if retryable.is_empty() {
             Default::default()
         } else {
-            let retry_ids: Vec<Uuid> = retryable.iter().map(|(id, _)| *id).collect();
             let mut tx = self.begin_write().await.map_err(|e| {
                 FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e))
             })?;
+
+            // Batchless retries serialize on their request row. Batched
+            // retries additionally lock every source file before the parent
+            // batch, matching expiration/deletion lock order. Requests whose
+            // batch or source became unavailable simply fall out and are
+            // reported as a concurrent state change below.
+            let requested_batch_ids: Vec<Uuid> = retryable
+                .iter()
+                .filter_map(|(_, batch_id)| *batch_id)
+                .collect::<std::collections::HashSet<_>>()
+                .into_iter()
+                .collect();
+            let batch_sources: Vec<(Uuid, Uuid)> = if requested_batch_ids.is_empty() {
+                Vec::new()
+            } else {
+                sqlx::query_as(
+                    "SELECT id, file_id FROM batches WHERE id = ANY($1) AND deleted_at IS NULL AND file_id IS NOT NULL",
+                )
+                .bind(&requested_batch_ids)
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(|e| {
+                    FusilladeError::Other(anyhow!("Failed to read retry batch sources: {}", e))
+                })?
+            };
+            let source_by_batch: std::collections::HashMap<Uuid, Uuid> =
+                batch_sources.into_iter().collect();
+            let source_file_ids: Vec<Uuid> = source_by_batch
+                .values()
+                .copied()
+                .collect::<std::collections::HashSet<_>>()
+                .into_iter()
+                .collect();
+            let available_file_ids: Vec<Uuid> = if source_file_ids.is_empty() {
+                Vec::new()
+            } else {
+                sqlx::query_scalar(
+                    r#"
+                    SELECT id FROM files
+                    WHERE id = ANY($1)
+                      AND deleted_at IS NULL
+                      AND status = 'processed'
+                      AND (expires_at IS NULL OR expires_at > NOW())
+                    ORDER BY id
+                    FOR UPDATE
+                    "#,
+                )
+                .bind(&source_file_ids)
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(|e| {
+                    FusilladeError::Other(anyhow!("Failed to lock retry source files: {}", e))
+                })?
+            };
+            let safe_batch_ids: std::collections::HashSet<Uuid> = if available_file_ids.is_empty() {
+                Default::default()
+            } else {
+                sqlx::query_as::<_, (Uuid, Uuid)>(
+                    r#"
+                    SELECT b.id, b.file_id FROM batches b
+                    WHERE b.id = ANY($1)
+                      AND b.deleted_at IS NULL
+                      AND b.file_id = ANY($2)
+                    ORDER BY b.id
+                    FOR UPDATE OF b
+                    "#,
+                )
+                .bind(&requested_batch_ids)
+                .bind(&available_file_ids)
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(|e| FusilladeError::Other(anyhow!("Failed to lock retry batches: {}", e)))?
+                .into_iter()
+                .filter(|(batch_id, file_id)| source_by_batch.get(batch_id) == Some(file_id))
+                .map(|(batch_id, _)| batch_id)
+                .collect()
+            };
+            let retry_ids: Vec<Uuid> = retryable
+                .iter()
+                .filter(|(_, batch_id)| {
+                    batch_id.is_none_or(|batch_id| safe_batch_ids.contains(&batch_id))
+                })
+                .map(|(id, _)| *id)
+                .collect();
 
             // Phase 3: failed rows of ARCHIVED batches live in the archive —
             // move them back as pending first (same one-step re-pend shape as
@@ -5661,27 +5798,76 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
             .await
             .map_err(|e| FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e)))?;
 
-        // Lock the batch row first: archive_batch locks the same row for its
-        // whole move transaction, so retry and the sweeper serialize — rows
-        // can never be mid-move while we re-pend them. Also fetches the
-        // routing state for the archive move-back below.
-        let routing = sqlx::query!(
+        // Read the source reference, then lock and validate that file before
+        // locking the batch. File expiration/deletion takes the same
+        // file-before-batch order, so a terminal batch cannot be reactivated
+        // after its templates have become inaccessible.
+        let source_file_id: Option<Option<Uuid>> =
+            sqlx::query_scalar("SELECT file_id FROM batches WHERE id = $1 AND deleted_at IS NULL")
+                .bind(*batch_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| {
+                    FusilladeError::Other(anyhow!("Failed to read batch source: {}", e))
+                })?;
+
+        let Some(source_file_id) = source_file_id else {
+            // Missing/deleted batch: preserve the pre-existing no-op contract.
+            return Ok(0);
+        };
+        let Some(source_file_id) = source_file_id else {
+            return Err(FusilladeError::ValidationError(
+                "batch source file is unavailable".to_string(),
+            ));
+        };
+
+        let source_available = sqlx::query_scalar::<_, bool>(
+            r#"SELECT EXISTS(
+                SELECT 1 FROM files
+                WHERE id = $1
+                  AND deleted_at IS NULL
+                  AND status = 'processed'
+                  AND (expires_at IS NULL OR expires_at > NOW())
+                FOR UPDATE
+            )"#,
+        )
+        .bind(source_file_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| {
+            FusilladeError::Other(anyhow!("Failed to lock batch source for retry: {}", e))
+        })?;
+        if !source_available {
+            return Err(FusilladeError::ValidationError(
+                "batch source file is deleted or expired".to_string(),
+            ));
+        }
+
+        // archive_batch locks the same batch row for its whole move
+        // transaction, so retry and the archive sweeper serialize. Recheck
+        // the source reference after locking in case an earlier deletion
+        // changed it before the file lock was acquired.
+        let routing = sqlx::query_as::<_, (String, Option<chrono::NaiveDate>, Option<Uuid>)>(
             r#"
-            SELECT location, archive_bucket
+            SELECT location, archive_bucket, file_id
             FROM batches WHERE id = $1 AND deleted_at IS NULL
             FOR UPDATE
             "#,
-            *batch_id as Uuid,
         )
+        .bind(*batch_id)
         .fetch_optional(&mut *tx)
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to lock batch for retry: {}", e)))?;
 
         let Some(routing) = routing else {
-            // Missing/deleted batch: preserve the pre-existing no-op contract
-            // (both UPDATEs below would have affected zero rows).
+            // A concurrent deletion won after the initial unlocked read.
             return Ok(0);
         };
+        if routing.2 != Some(source_file_id) {
+            return Err(FusilladeError::ValidationError(
+                "batch source file changed while retrying".to_string(),
+            ));
+        }
 
         // Retry move-back (phase 3): for an archived or split batch, the
         // failed/canceled rows live in the archive. Re-home them as PENDING
@@ -5691,12 +5877,12 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         // again. ON CONFLICT keeps a crash-replay idempotent. Completed rows
         // stay archived: the batch becomes 'split' and the split-aware
         // read/freeze paths count them from the archive.
-        let unarchived = if routing.location != "live" {
-            let Some(bucket) = routing.archive_bucket else {
+        let unarchived = if routing.0 != "live" {
+            let Some(bucket) = routing.1 else {
                 return Err(FusilladeError::Other(anyhow!(
                     "batch {batch_id} has location '{}' but no archive_bucket \
                      (batches_archived_have_bucket should make this impossible)",
-                    routing.location
+                    routing.0
                 )));
             };
             let moved = sqlx::query!(
@@ -7861,6 +8047,10 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
 // Implement DaemonStorage trait
 #[async_trait]
 impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
+    fn supports_retention_sweeps(&self) -> bool {
+        true
+    }
+
     async fn persist_daemon<T: DaemonState + Clone>(&self, record: &DaemonRecord<T>) -> Result<()>
     where
         AnyDaemonRecord: From<DaemonRecord<T>>,
@@ -8227,6 +8417,507 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
         }
 
         Ok(total)
+    }
+
+    async fn sweep_expired_content(
+        &self,
+        cutoffs: &RetentionSweepCutoffs,
+        batch_size: i64,
+    ) -> Result<RetentionSweepOutcome> {
+        if batch_size < 1 {
+            return Ok(RetentionSweepOutcome::default());
+        }
+
+        let mut outcome = RetentionSweepOutcome::default();
+
+        if let Some(expire_files_before) = cutoffs.expire_files_before() {
+            // Automated expiry never cancels active work. Candidate rows are
+            // locked before being made inaccessible; batch creation takes the
+            // same file-row lock and will reject the new status after waiting.
+            // Terminal batches can keep their source-file reference because
+            // their request/result rows are self-contained.
+            let mut tx = self.begin_write().await.map_err(|e| {
+                FusilladeError::Other(anyhow!("Failed to begin file retention transaction: {e}"))
+            })?;
+            let lease_acquired: bool = sqlx::query_scalar(
+                "SELECT pg_try_advisory_xact_lock(hashtextextended('fusillade.retention.sweep', 0))",
+            )
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| {
+                FusilladeError::Other(anyhow!("Failed to acquire retention sweep lease: {e}"))
+            })?;
+            if !lease_acquired {
+                outcome.lease_skipped = true;
+                return Ok(outcome);
+            }
+            let candidate_ids: Vec<Uuid> = sqlx::query_scalar(
+                r#"
+                SELECT id
+                FROM files
+                WHERE expires_at <= $2
+                  AND deleted_at IS NULL
+                  AND status IN ('processed', 'expired')
+                  AND NOT EXISTS (
+                      SELECT 1 FROM batches b
+                      WHERE b.file_id = files.id
+                        AND b.deleted_at IS NULL
+                        AND b.counts_frozen_at IS NULL
+                  )
+                ORDER BY expires_at, id
+                LIMIT $1
+                FOR UPDATE SKIP LOCKED
+                "#,
+            )
+            .bind(batch_size)
+            .bind(expire_files_before)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(|e| FusilladeError::Other(anyhow!("Failed to select expired files: {e}")))?;
+
+            if !candidate_ids.is_empty() {
+                outcome.files_expired = sqlx::query(
+                    r#"
+                    UPDATE files
+                    SET deleted_at = NOW(),
+                        status = 'expired',
+                        name = 'expired-' || id::text,
+                        description = NULL,
+                        uploaded_by = NULL,
+                        api_key_id = NULL,
+                        source_connection_id = NULL,
+                        source_external_key = NULL
+                    WHERE id = ANY($1)
+                      AND expires_at <= $2
+                      AND deleted_at IS NULL
+                      AND status IN ('processed', 'expired')
+                      AND NOT EXISTS (
+                          SELECT 1 FROM batches b
+                          WHERE b.file_id = files.id
+                            AND b.deleted_at IS NULL
+                            AND b.counts_frozen_at IS NULL
+                      )
+                    "#,
+                )
+                .bind(&candidate_ids)
+                .bind(expire_files_before)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| FusilladeError::Other(anyhow!("Failed to mark files expired: {e}")))?
+                .rows_affected();
+            }
+            tx.commit().await.map_err(|e| {
+                FusilladeError::Other(anyhow!("Failed to commit file retention transaction: {e}"))
+            })?;
+        }
+
+        if let Some(terminal_batch_before) = cutoffs.terminal_batch_before() {
+            // counts_frozen_at is the stable terminal anchor. In particular,
+            // cancelled_at is an intent timestamp and can precede late
+            // in-flight completions, so it is not sufficient for deletion.
+            let mut tx = self.begin_write().await.map_err(|e| {
+                FusilladeError::Other(anyhow!("Failed to begin batch retention transaction: {e}"))
+            })?;
+            let lease_acquired: bool = sqlx::query_scalar(
+                "SELECT pg_try_advisory_xact_lock(hashtextextended('fusillade.retention.sweep', 0))",
+            )
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| {
+                FusilladeError::Other(anyhow!("Failed to acquire retention sweep lease: {e}"))
+            })?;
+            if !lease_acquired {
+                outcome.lease_skipped = true;
+                return Ok(outcome);
+            }
+            // Read a bounded candidate set first so output/error file rows can
+            // be locked before their owning batch rows. Explicit file deletion
+            // uses the same file-then-batch order.
+            let candidates = sqlx::query_as::<_, (Uuid, Option<Uuid>, Option<Uuid>)>(
+                r#"
+                SELECT id, output_file_id, error_file_id
+                    FROM batches
+                    WHERE deleted_at IS NULL
+                      AND counts_frozen_at IS NOT NULL
+                      AND counts_frozen_at <= $2
+                      AND NOT EXISTS (
+                          SELECT 1 FROM requests r
+                          WHERE r.batch_id = batches.id
+                            AND r.state = 'canceled'
+                            AND r.claimed_at IS NOT NULL
+                            AND r.canceled_at > NOW() - make_interval(secs => $3)
+                      )
+                    ORDER BY counts_frozen_at, id
+                    LIMIT $1
+                "#,
+            )
+            .bind(batch_size)
+            .bind(terminal_batch_before)
+            .bind(cutoffs.terminal_batch_cancel_grace_secs())
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(|e| {
+                FusilladeError::Other(anyhow!("Failed to select terminal batches: {e}"))
+            })?;
+            let candidate_batch_ids: Vec<Uuid> = candidates.iter().map(|row| row.0).collect();
+            let candidate_file_ids: Vec<Uuid> = candidates
+                .iter()
+                .flat_map(|row| [row.1, row.2])
+                .flatten()
+                .collect();
+
+            if !candidate_file_ids.is_empty() {
+                sqlx::query_scalar::<_, Uuid>(
+                    "SELECT id FROM files WHERE id = ANY($1) ORDER BY id FOR UPDATE",
+                )
+                .bind(&candidate_file_ids)
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(|e| {
+                    FusilladeError::Other(anyhow!("Failed to lock terminal batch files: {e}"))
+                })?;
+            }
+
+            let rows = if candidate_batch_ids.is_empty() {
+                Vec::new()
+            } else {
+                sqlx::query_as::<_, (Uuid, Option<Uuid>, Option<Uuid>)>(
+                    r#"
+                    SELECT id, output_file_id, error_file_id
+                    FROM batches
+                    WHERE id = ANY($1)
+                      AND deleted_at IS NULL
+                      AND counts_frozen_at IS NOT NULL
+                      AND counts_frozen_at <= $2
+                      AND NOT EXISTS (
+                          SELECT 1 FROM requests r
+                          WHERE r.batch_id = batches.id
+                            AND r.state = 'canceled'
+                            AND r.claimed_at IS NOT NULL
+                            AND r.canceled_at > NOW() - make_interval(secs => $3)
+                      )
+                    ORDER BY id
+                    FOR UPDATE SKIP LOCKED
+                    "#,
+                )
+                .bind(&candidate_batch_ids)
+                .bind(terminal_batch_before)
+                .bind(cutoffs.terminal_batch_cancel_grace_secs())
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(|e| {
+                    FusilladeError::Other(anyhow!("Failed to lock terminal batches: {e}"))
+                })?
+            };
+            let batch_ids: Vec<Uuid> = rows.iter().map(|row| row.0).collect();
+            let virtual_file_ids: Vec<Uuid> = rows
+                .iter()
+                .flat_map(|row| [row.1, row.2])
+                .flatten()
+                .collect();
+
+            if !batch_ids.is_empty() {
+                outcome.batches_expired = sqlx::query(
+                    r#"
+                UPDATE batches b
+                SET deleted_at = NOW(),
+                    metadata = NULL,
+                    errors = NULL,
+                    api_key = NULL,
+                    api_key_id = NULL,
+                    created_by = '',
+                    output_file_id = NULL,
+                    error_file_id = NULL
+                WHERE b.id = ANY($1)
+                "#,
+                )
+                .bind(&batch_ids)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| {
+                    FusilladeError::Other(anyhow!("Failed to expire terminal batches: {e}"))
+                })?
+                .rows_affected();
+
+                if !virtual_file_ids.is_empty() {
+                    sqlx::query(
+                        r#"
+                        UPDATE files
+                        SET deleted_at = NOW(),
+                            status = 'expired',
+                            name = 'expired-' || id::text,
+                            description = NULL,
+                            uploaded_by = NULL,
+                            api_key_id = NULL,
+                            source_connection_id = NULL,
+                            source_external_key = NULL
+                        WHERE id = ANY($1) AND deleted_at IS NULL
+                        "#,
+                    )
+                    .bind(&virtual_file_ids)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| {
+                        FusilladeError::Other(anyhow!("Failed to expire virtual batch files: {e}"))
+                    })?;
+                }
+            }
+            tx.commit().await.map_err(|e| {
+                FusilladeError::Other(anyhow!("Failed to commit batch retention transaction: {e}"))
+            })?;
+        }
+
+        let mut batchless_candidates_processed = 0u64;
+        if !cutoffs.batchless_before_by_service_tier().is_empty() {
+            let tiers: Vec<&str> = cutoffs
+                .batchless_before_by_service_tier()
+                .keys()
+                .map(String::as_str)
+                .collect();
+            let before: Vec<DateTime<Utc>> = cutoffs
+                .batchless_before_by_service_tier()
+                .values()
+                .copied()
+                .collect();
+
+            let mut tx = self.begin_write().await.map_err(|e| {
+                FusilladeError::Other(anyhow!(
+                    "Failed to begin batchless retention transaction: {e}"
+                ))
+            })?;
+            let lease_acquired: bool = sqlx::query_scalar(
+                "SELECT pg_try_advisory_xact_lock(hashtextextended('fusillade.retention.sweep', 0))",
+            )
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| {
+                FusilladeError::Other(anyhow!("Failed to acquire retention sweep lease: {e}"))
+            })?;
+            if !lease_acquired {
+                outcome.lease_skipped = true;
+                return Ok(outcome);
+            }
+            let candidates = sqlx::query_as::<_, (Uuid, Option<Uuid>, bool)>(
+                r#"
+                WITH policy(service_tier, expire_before) AS (
+                    SELECT * FROM UNNEST($2::text[], $3::timestamptz[])
+                )
+                SELECT
+                    r.id,
+                    r.template_id,
+                    r.state = 'canceled' AND r.claimed_at IS NOT NULL AS redact_only
+                FROM requests r
+                JOIN policy p ON p.service_tier = r.service_tier
+                LEFT JOIN request_templates t ON t.id = r.template_id
+                WHERE r.batch_id IS NULL
+                  AND (
+                      (r.state = 'completed' AND r.completed_at <= p.expire_before)
+                      OR (r.state = 'failed' AND r.failed_at <= p.expire_before)
+                      OR (r.state = 'canceled' AND r.canceled_at <= p.expire_before)
+                  )
+                  AND (
+                      r.state <> 'canceled'
+                      OR r.claimed_at IS NULL
+                      OR r.model <> ''
+                      OR r.custom_id IS NOT NULL
+                      OR r.created_by <> ''
+                      OR r.response_body IS NOT NULL
+                      OR r.error IS NOT NULL
+                      OR r.routed_model IS NOT NULL
+                      OR COALESCE(t.endpoint, '') <> ''
+                      OR COALESCE(t.method, '') <> ''
+                      OR COALESCE(t.path, '') <> ''
+                      OR COALESCE(t.body, '') <> ''
+                      OR COALESCE(t.model, '') <> ''
+                      OR COALESCE(t.api_key, '') <> ''
+                      OR t.custom_id IS NOT NULL
+                      OR t.metadata IS NOT NULL
+                      -- A model-call step carries the request FK. Its
+                      -- tool-call descendants deliberately do not; every
+                      -- chain row instead shares the canonical head through
+                      -- parent_step_id (the head itself has NULL).
+                      OR EXISTS (
+                          SELECT 1
+                          FROM response_steps direct
+                          JOIN response_steps s
+                            ON s.id = COALESCE(direct.parent_step_id, direct.id)
+                            OR s.parent_step_id = COALESCE(direct.parent_step_id, direct.id)
+                          WHERE direct.request_id = r.id
+                            AND (
+                                s.request_payload <> '{}'::jsonb
+                                OR COALESCE(s.response_payload, '{}'::jsonb) <> '{}'::jsonb
+                                OR COALESCE(s.error, '{}'::jsonb) <> '{}'::jsonb
+                            )
+                      )
+                  )
+                ORDER BY CASE r.state
+                             WHEN 'completed' THEN r.completed_at
+                             WHEN 'failed' THEN r.failed_at
+                             WHEN 'canceled' THEN r.canceled_at
+                         END,
+                         r.id
+                LIMIT $1
+                FOR UPDATE OF r SKIP LOCKED
+                "#,
+            )
+            .bind(batch_size)
+            .bind(&tiers)
+            .bind(&before)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(|e| {
+                FusilladeError::Other(anyhow!("Failed to select expired batchless requests: {e}"))
+            })?;
+            batchless_candidates_processed = candidates.len() as u64;
+
+            let delete_ids: Vec<Uuid> = candidates
+                .iter()
+                .filter_map(|(id, _, redact_only)| (!redact_only).then_some(*id))
+                .collect();
+            let redact_ids: Vec<Uuid> = candidates
+                .iter()
+                .filter_map(|(id, _, redact_only)| redact_only.then_some(*id))
+                .collect();
+            let delete_template_ids: Vec<Uuid> = candidates
+                .iter()
+                .filter_map(|(_, template_id, redact_only)| {
+                    (!redact_only).then_some(*template_id).flatten()
+                })
+                .collect();
+            let redact_template_ids: Vec<Uuid> = candidates
+                .iter()
+                .filter_map(|(_, template_id, redact_only)| {
+                    redact_only.then_some(*template_id).flatten()
+                })
+                .collect();
+
+            if !delete_ids.is_empty() {
+                outcome.batchless_requests_deleted =
+                    sqlx::query("DELETE FROM requests WHERE id = ANY($1)")
+                        .bind(&delete_ids)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(|e| {
+                            FusilladeError::Other(anyhow!(
+                                "Failed to expire batchless requests: {e}"
+                            ))
+                        })?
+                        .rows_affected();
+            }
+
+            // Cancellation is a soft terminal: a dispatched request may still
+            // persist a billed completion after cancellation. Keep its small
+            // lifecycle row so that late transition remains safe, but erase
+            // all request/response content immediately once retention is due.
+            if !redact_ids.is_empty() {
+                outcome.batchless_requests_redacted = sqlx::query(
+                    r#"
+                    UPDATE requests
+                    SET model = '',
+                        custom_id = NULL,
+                        created_by = '',
+                        response_status = NULL,
+                        response_body = NULL,
+                        error = NULL,
+                        routed_model = NULL
+                    WHERE id = ANY($1)
+                      AND state = 'canceled'
+                      AND claimed_at IS NOT NULL
+                    "#,
+                )
+                .bind(&redact_ids)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| {
+                    FusilladeError::Other(anyhow!(
+                        "Failed to redact canceled batchless requests: {e}"
+                    ))
+                })?
+                .rows_affected();
+
+                sqlx::query(
+                    r#"
+                    -- Resolve each retained request's direct model-call step
+                    -- to its canonical chain head, then scrub the head and
+                    -- every descendant. Tool-call rows have request_id NULL.
+                    UPDATE response_steps
+                    SET request_payload = '{}'::jsonb,
+                        response_payload = CASE WHEN state = 'completed' THEN '{}'::jsonb ELSE NULL END,
+                        error = CASE WHEN state = 'failed' THEN '{}'::jsonb ELSE NULL END
+                    WHERE EXISTS (
+                        SELECT 1
+                        FROM response_steps direct
+                        WHERE direct.request_id = ANY($1)
+                          AND (
+                              response_steps.id = COALESCE(direct.parent_step_id, direct.id)
+                              OR response_steps.parent_step_id =
+                                 COALESCE(direct.parent_step_id, direct.id)
+                          )
+                    )
+                    "#,
+                )
+                .bind(&redact_ids)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| {
+                    FusilladeError::Other(anyhow!(
+                        "Failed to redact canceled batchless response steps: {e}"
+                    ))
+                })?;
+            }
+
+            if !redact_template_ids.is_empty() {
+                sqlx::query(
+                    r#"
+                    UPDATE request_templates
+                    SET endpoint = '',
+                        method = '',
+                        path = '',
+                        body = '',
+                        model = '',
+                        api_key = '',
+                        custom_id = NULL,
+                        metadata = NULL,
+                        body_byte_size = 0
+                    WHERE id = ANY($1)
+                      AND file_id IS NULL
+                    "#,
+                )
+                .bind(&redact_template_ids)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| {
+                    FusilladeError::Other(anyhow!(
+                        "Failed to redact canceled batchless templates: {e}"
+                    ))
+                })?;
+            }
+
+            if !delete_template_ids.is_empty() {
+                sqlx::query(
+                    "DELETE FROM request_templates t WHERE id = ANY($1) AND file_id IS NULL AND NOT EXISTS (SELECT 1 FROM requests r WHERE r.template_id = t.id)",
+                )
+                    .bind(&delete_template_ids)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| {
+                        FusilladeError::Other(anyhow!(
+                            "Failed to delete expired batchless templates: {e}"
+                        ))
+                    })?;
+            }
+            tx.commit().await.map_err(|e| {
+                FusilladeError::Other(anyhow!(
+                    "Failed to commit batchless retention transaction: {e}"
+                ))
+            })?;
+        }
+
+        let limit = batch_size as u64;
+        outcome.may_have_more = outcome.files_expired == limit
+            || outcome.batches_expired == limit
+            || batchless_candidates_processed == limit;
+        Ok(outcome)
     }
 
     async fn archive_batch(&self, batch_id: BatchId) -> Result<ArchiveOutcome> {
@@ -19737,11 +20428,1016 @@ mod tests {
         assert_eq!(retried_again, 0, "No failed requests to retry");
     }
 
+    #[sqlx::test]
+    async fn batch_retry_rejects_an_expired_source_without_unfreezing(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+        let batch = create_background_batch_for_test(&manager, "expired-retry", "owner").await;
+        sqlx::query(
+            "UPDATE requests SET state = 'failed', error = 'failed', failed_at = NOW() WHERE batch_id = $1",
+        )
+        .bind(*batch.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let request_id: Uuid =
+            sqlx::query_scalar("SELECT id FROM requests WHERE batch_id = $1 LIMIT 1")
+                .bind(*batch.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        sqlx::query(
+            "UPDATE batches SET failed_at = NOW(), counts_frozen_at = NOW(), failed_requests = total_requests WHERE id = $1",
+        )
+        .bind(*batch.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE files SET expires_at = NOW() - INTERVAL '1 second' WHERE id = $1")
+            .bind(*batch.file_id.unwrap())
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let error = manager
+            .retry_failed_requests_for_batch(batch.id)
+            .await
+            .expect_err("retry must not reactivate content after its source deadline");
+        assert!(matches!(error, FusilladeError::ValidationError(_)));
+        let state = sqlx::query_as::<_, (Option<DateTime<Utc>>, i64)>(
+            "SELECT counts_frozen_at, (SELECT count(*) FROM requests WHERE batch_id = $1 AND state = 'failed') FROM batches WHERE id = $1",
+        )
+        .bind(*batch.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(state.0.is_some(), "rejected retry must remain frozen");
+        assert_eq!(state.1, 1, "failed work must not be re-pended");
+
+        let individual = manager
+            .retry_failed_requests(vec![RequestId(request_id)])
+            .await
+            .unwrap();
+        assert!(individual[0].is_err());
+        let state: String = sqlx::query_scalar("SELECT state FROM requests WHERE id = $1")
+            .bind(request_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(state, "failed", "individual retry must also be rejected");
+    }
+
+    #[sqlx::test]
+    async fn batch_retry_serializes_with_source_expiration(pool: sqlx::PgPool) {
+        let manager = Arc::new(PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        ));
+        let batch = create_background_batch_for_test(&manager, "retry-race", "owner").await;
+        sqlx::query(
+            "UPDATE requests SET state = 'failed', error = 'failed', failed_at = NOW() WHERE batch_id = $1",
+        )
+        .bind(*batch.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE batches SET failed_at = NOW(), counts_frozen_at = NOW(), failed_requests = total_requests WHERE id = $1",
+        )
+        .bind(*batch.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let file_id = *batch.file_id.unwrap();
+        let mut expiration = pool.begin().await.unwrap();
+        sqlx::query_scalar::<_, Uuid>("SELECT id FROM files WHERE id = $1 FOR UPDATE")
+            .bind(file_id)
+            .fetch_one(&mut *expiration)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE files SET deleted_at = NOW(), status = 'expired' WHERE id = $1")
+            .bind(file_id)
+            .execute(&mut *expiration)
+            .await
+            .unwrap();
+
+        let retry_manager = manager.clone();
+        let batch_id = batch.id;
+        let mut retry = tokio::spawn(async move {
+            retry_manager
+                .retry_failed_requests_for_batch(batch_id)
+                .await
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut retry)
+                .await
+                .is_err(),
+            "retry should wait for the source-file deletion lock"
+        );
+
+        expiration.commit().await.unwrap();
+        let error = retry
+            .await
+            .unwrap()
+            .expect_err("the committed expiration must win the retry race");
+        assert!(matches!(error, FusilladeError::ValidationError(_)));
+        let state = sqlx::query_as::<_, (Option<DateTime<Utc>>, i64)>(
+            "SELECT counts_frozen_at, (SELECT count(*) FROM requests WHERE batch_id = $1 AND state = 'failed') FROM batches WHERE id = $1",
+        )
+        .bind(*batch.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(state.0.is_some());
+        assert_eq!(state.1, 1);
+    }
+
     // =========================================================================
     // ORPHANED ROW PURGE
     // =========================================================================
     // Tests for purge_orphaned_rows: right-to-erasure compliance by hard-deleting
     // orphaned request_templates and requests after soft-deletion of files/batches.
+
+    #[sqlx::test]
+    async fn retention_sweep_expires_only_files_past_their_deadline(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+        let expired = manager
+            .create_file("expired".to_string(), None, vec![])
+            .await
+            .unwrap();
+        let current = manager
+            .create_file("current".to_string(), None, vec![])
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE files SET expires_at = NOW() - INTERVAL '1 second', status = 'expired', description = 'private', uploaded_by = 'private', api_key_id = gen_random_uuid(), source_external_key = 'private' WHERE id = $1",
+        )
+            .bind(*expired)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE files SET expires_at = NOW() + INTERVAL '1 hour' WHERE id = $1")
+            .bind(*current)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let outcome = manager
+            .sweep_expired_content(
+                &crate::manager::RetentionSweepPolicy {
+                    expire_files: true,
+                    ..Default::default()
+                }
+                .cutoffs_at(Utc::now(), 0.0)
+                .unwrap(),
+                10,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.files_expired, 1);
+        assert_eq!(outcome.affected_rows(), 1);
+        let rows = sqlx::query_as::<
+            _,
+            (
+                Uuid,
+                String,
+                Option<DateTime<Utc>>,
+                String,
+                Option<String>,
+                Option<String>,
+                Option<Uuid>,
+                Option<String>,
+            ),
+        >(
+            "SELECT id, status, deleted_at, name, description, uploaded_by, api_key_id, source_external_key FROM files WHERE id = ANY($1) ORDER BY id",
+        )
+        .bind([*expired, *current])
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        let expired_row = rows.iter().find(|row| row.0 == *expired).unwrap();
+        let current_row = rows.iter().find(|row| row.0 == *current).unwrap();
+        assert_eq!(expired_row.1, "expired");
+        assert!(expired_row.2.is_some());
+        assert_eq!(expired_row.3, format!("expired-{}", expired_row.0));
+        assert_eq!(
+            (
+                &expired_row.4,
+                &expired_row.5,
+                &expired_row.6,
+                &expired_row.7
+            ),
+            (&None, &None, &None, &None)
+        );
+        assert_eq!(current_row.1, "processed");
+        assert!(current_row.2.is_none());
+    }
+
+    #[sqlx::test]
+    async fn retention_sweep_skips_when_another_replica_holds_the_lease(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+        let file_id = manager
+            .create_file("lease-candidate".to_string(), None, vec![])
+            .await
+            .unwrap();
+        sqlx::query("UPDATE files SET expires_at = NOW() - INTERVAL '1 second' WHERE id = $1")
+            .bind(*file_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let mut competing_sweep = pool.begin().await.unwrap();
+        sqlx::query(
+            "SELECT pg_advisory_xact_lock(hashtextextended('fusillade.retention.sweep', 0))",
+        )
+        .execute(&mut *competing_sweep)
+        .await
+        .unwrap();
+
+        let outcome = manager
+            .sweep_expired_content(
+                &crate::manager::RetentionSweepPolicy {
+                    expire_files: true,
+                    ..Default::default()
+                }
+                .cutoffs_at(Utc::now(), 0.0)
+                .unwrap(),
+                10,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.affected_rows(), 0);
+        assert!(outcome.lease_skipped);
+        let deleted_at: Option<DateTime<Utc>> =
+            sqlx::query_scalar("SELECT deleted_at FROM files WHERE id = $1")
+                .bind(*file_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(deleted_at.is_none());
+    }
+
+    #[sqlx::test]
+    async fn retention_sweep_does_not_expire_files_used_by_active_batches(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+        let file_id = manager
+            .create_file(
+                "active-source".to_string(),
+                None,
+                vec![RequestTemplateInput {
+                    custom_id: None,
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/test".to_string(),
+                    body: "{}".to_string(),
+                    model: "test".to_string(),
+                    api_key: "key".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+        let batch = manager
+            .create_background_batch(BackgroundBatchInput {
+                file_id,
+                endpoint: "/test".to_string(),
+                metadata: None,
+                created_by: Some("owner".to_string()),
+                api_key_id: None,
+                api_key: None,
+                total_requests: None,
+            })
+            .await
+            .unwrap();
+        sqlx::query("UPDATE files SET expires_at = NOW() - INTERVAL '1 second' WHERE id = $1")
+            .bind(*file_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let outcome = manager
+            .sweep_expired_content(
+                &crate::manager::RetentionSweepPolicy {
+                    expire_files: true,
+                    ..Default::default()
+                }
+                .cutoffs_at(Utc::now(), 0.0)
+                .unwrap(),
+                10,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.files_expired, 0);
+        let file_deleted: Option<DateTime<Utc>> =
+            sqlx::query_scalar("SELECT deleted_at FROM files WHERE id = $1")
+                .bind(*file_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let batch_cancelled: Option<DateTime<Utc>> =
+            sqlx::query_scalar("SELECT cancelled_at FROM batches WHERE id = $1")
+                .bind(*batch.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(file_deleted.is_none());
+        assert!(
+            batch_cancelled.is_none(),
+            "expiry must not cancel active work"
+        );
+    }
+
+    #[sqlx::test]
+    async fn retention_sweep_skips_creator_lock_and_rechecks_active_batch(pool: sqlx::PgPool) {
+        let manager = Arc::new(PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        ));
+        let file_id = manager
+            .create_file(
+                "create-wins".to_string(),
+                Some("private".to_string()),
+                vec![],
+            )
+            .await
+            .unwrap();
+        sqlx::query("UPDATE files SET expires_at = NOW() - INTERVAL '1 second' WHERE id = $1")
+            .bind(*file_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // Model a creator that validated immediately before the deadline: it
+        // owns the file lock while the deadline crosses, then commits the
+        // active batch after the sweeper has skipped the locked row.
+        let mut creator = pool.begin().await.unwrap();
+        sqlx::query_scalar::<_, Uuid>("SELECT id FROM files WHERE id = $1 FOR UPDATE")
+            .bind(*file_id)
+            .fetch_one(&mut *creator)
+            .await
+            .unwrap();
+        let sweep_manager = manager.clone();
+        let sweep = tokio::spawn(async move {
+            sweep_manager
+                .sweep_expired_content(
+                    &crate::manager::RetentionSweepPolicy {
+                        expire_files: true,
+                        ..Default::default()
+                    }
+                    .cutoffs_at(Utc::now(), 0.0)
+                    .unwrap(),
+                    10,
+                )
+                .await
+        });
+        let skipped = tokio::time::timeout(std::time::Duration::from_secs(1), sweep)
+            .await
+            .expect("SKIP LOCKED must not wait for the creator")
+            .unwrap()
+            .unwrap();
+        assert_eq!(skipped.files_expired, 0);
+
+        sqlx::query(
+            "INSERT INTO batches (file_id, endpoint, service_tier, completion_window, created_by, total_requests) VALUES ($1, '/test', 'background', NULL, 'owner', 0)",
+        )
+        .bind(*file_id)
+        .execute(&mut *creator)
+        .await
+        .unwrap();
+        creator.commit().await.unwrap();
+
+        let outcome = manager
+            .sweep_expired_content(
+                &crate::manager::RetentionSweepPolicy {
+                    expire_files: true,
+                    ..Default::default()
+                }
+                .cutoffs_at(Utc::now(), 0.0)
+                .unwrap(),
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome.files_expired, 0);
+        assert_eq!(outcome.affected_rows(), 0);
+        let file = sqlx::query_as::<_, (Option<DateTime<Utc>>, String, Option<String>)>(
+            "SELECT deleted_at, name, description FROM files WHERE id = $1",
+        )
+        .bind(*file_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(file.0.is_none());
+        assert_eq!(file.1, "create-wins");
+        assert_eq!(file.2.as_deref(), Some("private"));
+    }
+
+    #[sqlx::test]
+    async fn batch_creation_rejects_a_due_source_file(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+        let file_id = manager
+            .create_file("due-source".to_string(), None, vec![])
+            .await
+            .unwrap();
+        sqlx::query("UPDATE files SET expires_at = NOW() - INTERVAL '1 second' WHERE id = $1")
+            .bind(*file_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let error = manager
+            .create_background_batch_record(BackgroundBatchInput {
+                file_id,
+                endpoint: "/test".to_string(),
+                metadata: None,
+                created_by: Some("owner".to_string()),
+                api_key_id: None,
+                api_key: None,
+                total_requests: Some(0),
+            })
+            .await
+            .expect_err("an expired source cannot start new work");
+        assert!(matches!(error, FusilladeError::ValidationError(_)));
+        let batch_count: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM batches WHERE file_id = $1")
+                .bind(*file_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(batch_count, 0);
+    }
+
+    #[sqlx::test]
+    async fn retention_sweep_only_ages_terminal_batches_after_the_cutoff(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+
+        let old = create_background_batch_for_test(&manager, "old-terminal", "owner").await;
+        let recent = create_background_batch_for_test(&manager, "recent-terminal", "owner").await;
+        let active = create_background_batch_for_test(&manager, "active", "owner").await;
+        sqlx::query(
+            "UPDATE batches SET completed_at = NOW() - INTERVAL '2 hours', counts_frozen_at = NOW() - INTERVAL '2 hours' WHERE id = $1",
+        )
+        .bind(*old.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE batches SET metadata = '{\"sensitive\":true}', errors = '{\"message\":\"private\"}', api_key = 'secret', api_key_id = gen_random_uuid() WHERE id = $1",
+        )
+        .bind(*old.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE batches SET completed_at = NOW() - INTERVAL '1 second', counts_frozen_at = NOW() - INTERVAL '1 second' WHERE id = $1",
+        )
+        .bind(*recent.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let outcome = manager
+            .sweep_expired_content(
+                &crate::manager::RetentionSweepPolicy {
+                    terminal_batch_seconds: Some(60),
+                    ..Default::default()
+                }
+                .cutoffs_at(Utc::now(), 0.0)
+                .unwrap(),
+                10,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.batches_expired, 1);
+        let deleted = sqlx::query_as::<
+            _,
+            (
+                Uuid,
+                Option<DateTime<Utc>>,
+                Option<serde_json::Value>,
+                Option<serde_json::Value>,
+                Option<String>,
+                String,
+                Option<Uuid>,
+                Option<Uuid>,
+            ),
+        >(
+            "SELECT id, deleted_at, metadata, errors, api_key, created_by, output_file_id, error_file_id FROM batches WHERE id = ANY($1)",
+        )
+            .bind([*old.id, *recent.id, *active.id])
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        let old_row = deleted.iter().find(|row| row.0 == *old.id).unwrap();
+        assert!(old_row.1.is_some());
+        assert!(old_row.2.is_none(), "expired metadata must be erased");
+        assert!(old_row.3.is_none(), "expired errors must be erased");
+        assert!(old_row.4.is_none(), "execution credentials must be erased");
+        assert!(old_row.5.is_empty(), "creator attribution must be erased");
+        assert!(old_row.6.is_none() && old_row.7.is_none());
+        for file_id in [old.output_file_id.unwrap(), old.error_file_id.unwrap()] {
+            let file = sqlx::query_as::<_, (String, Option<DateTime<Utc>>, Option<String>)>(
+                "SELECT status, deleted_at, uploaded_by FROM files WHERE id = $1",
+            )
+            .bind(*file_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(file.0, "expired");
+            assert!(file.1.is_some());
+            assert!(file.2.is_none());
+        }
+        assert!(
+            deleted
+                .iter()
+                .find(|row| row.0 == *recent.id)
+                .unwrap()
+                .1
+                .is_none()
+        );
+        assert!(
+            deleted
+                .iter()
+                .find(|row| row.0 == *active.id)
+                .unwrap()
+                .1
+                .is_none()
+        );
+    }
+
+    #[sqlx::test]
+    async fn retention_sweep_preserves_canceled_batch_for_late_result_grace(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+        let batch = create_background_batch_for_test(&manager, "cancel-grace", "owner").await;
+        let (request_id, template_id): (Uuid, Uuid) =
+            sqlx::query_as("SELECT id, template_id FROM requests WHERE batch_id = $1 LIMIT 1")
+                .bind(*batch.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        sqlx::query(
+            "UPDATE requests SET state = 'canceled', claimed_at = NOW(), canceled_at = NOW() WHERE id = $1",
+        )
+        .bind(request_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE batches SET cancelled_at = NOW(), counts_frozen_at = NOW() - INTERVAL '2 hours' WHERE id = $1",
+        )
+        .bind(*batch.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let cutoffs = crate::manager::RetentionSweepPolicy {
+            terminal_batch_seconds: Some(60),
+            ..Default::default()
+        }
+        .cutoffs_at(Utc::now(), 600.0)
+        .unwrap();
+        let protected = manager.sweep_expired_content(&cutoffs, 10).await.unwrap();
+        assert_eq!(protected.batches_expired, 0);
+
+        manager
+            .persist(&Request {
+                data: RequestData {
+                    id: RequestId(request_id),
+                    batch_id: Some(batch.id),
+                    template_id: TemplateId(template_id),
+                    custom_id: None,
+                    endpoint: String::new(),
+                    method: String::new(),
+                    path: String::new(),
+                    body: String::new(),
+                    model: String::new(),
+                    api_key: String::new(),
+                    created_by: String::new(),
+                    batch_metadata: HashMap::new(),
+                },
+                state: Completed {
+                    response_status: 200,
+                    response_body: "late-result".to_string(),
+                    claimed_at: Utc::now(),
+                    started_at: Utc::now(),
+                    completed_at: Utc::now(),
+                    routed_model: "late-route".to_string(),
+                },
+            })
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE batches SET counts_frozen_at = NOW() - INTERVAL '2 hours' WHERE id = $1",
+        )
+        .bind(*batch.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let expired = manager.sweep_expired_content(&cutoffs, 10).await.unwrap();
+        assert_eq!(expired.batches_expired, 1);
+    }
+
+    #[sqlx::test]
+    async fn retention_sweep_hard_deletes_only_configured_terminal_batchless_tiers(
+        pool: sqlx::PgPool,
+    ) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+        let eligible = create_background_request_for_test(&manager, "test", "owner").await;
+        let retained = manager
+            .create_realtime(CreateRealtimeInput {
+                request_id: Uuid::new_v4(),
+                body: "{}".to_string(),
+                model: "test".to_string(),
+                endpoint: "https://api.example.com".to_string(),
+                method: "POST".to_string(),
+                path: "/test".to_string(),
+                api_key: "key".to_string(),
+                created_by: "owner".to_string(),
+            })
+            .await
+            .unwrap();
+        for id in [eligible, retained] {
+            sqlx::query(
+                "UPDATE requests SET state = 'completed', response_status = 200, response_body = '{}', completed_at = NOW() - INTERVAL '2 hours' WHERE id = $1",
+            )
+            .bind(*id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let template_id: Uuid =
+            sqlx::query_scalar("SELECT template_id FROM requests WHERE id = $1")
+                .bind(*eligible)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let step_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO response_steps (id, request_id, step_kind, step_sequence, request_payload, state) VALUES ($1, $2, 'model_call', 0, '{}'::jsonb, 'pending')",
+        )
+        .bind(step_id)
+        .bind(*eligible)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let outcome = manager
+            .sweep_expired_content(
+                &crate::manager::RetentionSweepPolicy {
+                    batchless_seconds_by_service_tier: std::collections::HashMap::from([(
+                        "background".to_string(),
+                        60,
+                    )]),
+                    ..Default::default()
+                }
+                .cutoffs_at(Utc::now(), 0.0)
+                .unwrap(),
+                1,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.batchless_requests_deleted, 1);
+        assert!(outcome.may_have_more);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM requests WHERE id = $1")
+                .bind(*eligible)
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM request_templates WHERE id = $1")
+                .bind(template_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM response_steps WHERE id = $1")
+                .bind(step_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            0,
+            "request-linked state must cascade in the same transaction"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM requests WHERE id = $1")
+                .bind(*retained)
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            1,
+            "an unconfigured tier remains subject to explicit deletion"
+        );
+    }
+
+    #[sqlx::test]
+    async fn retention_sweep_redacts_canceled_in_flight_batchless_content(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+        let request_id = manager
+            .create_realtime(CreateRealtimeInput {
+                request_id: Uuid::new_v4(),
+                body: r#"{"prompt":"private"}"#.to_string(),
+                model: "private-model".to_string(),
+                endpoint: "https://api.example.com".to_string(),
+                method: "POST".to_string(),
+                path: "/private".to_string(),
+                api_key: "private-key".to_string(),
+                created_by: "private-owner".to_string(),
+            })
+            .await
+            .unwrap();
+        sqlx::query(
+            r#"
+            UPDATE requests
+            SET state = 'canceled',
+                daemon_id = gen_random_uuid(),
+                claimed_at = NOW() - INTERVAL '2 hours',
+                started_at = NOW() - INTERVAL '2 hours',
+                canceled_at = NOW() - INTERVAL '2 hours',
+                response_body = 'private-response',
+                error = 'private-error',
+                routed_model = 'private-route'
+            WHERE id = $1
+            "#,
+        )
+        .bind(*request_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE request_templates SET custom_id = 'private-id', metadata = '{\"private\":true}' WHERE id = (SELECT template_id FROM requests WHERE id = $1)",
+        )
+        .bind(*request_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let template_id: Uuid =
+            sqlx::query_scalar("SELECT template_id FROM requests WHERE id = $1")
+                .bind(*request_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let step_id = Uuid::new_v4();
+        sqlx::query(
+            r#"
+            INSERT INTO response_steps (
+                id, request_id, step_kind, step_sequence, request_payload,
+                response_payload, state, started_at, completed_at
+            ) VALUES (
+                $1, $2, 'model_call', 0, '{"prompt":"private"}',
+                '{"response":"private"}', 'completed', NOW(), NOW()
+            )
+            "#,
+        )
+        .bind(step_id)
+        .bind(*request_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let tool_step_id = Uuid::new_v4();
+        sqlx::query(
+            r#"
+            INSERT INTO response_steps (
+                id, request_id, parent_step_id, prev_step_id, step_kind,
+                step_sequence, request_payload, response_payload, state,
+                started_at, completed_at
+            ) VALUES (
+                $1, NULL, $2, $2, 'tool_call', 1,
+                '{"arguments":"private"}', '{"result":"private"}',
+                'completed', NOW(), NOW()
+            )
+            "#,
+        )
+        .bind(tool_step_id)
+        .bind(step_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let outcome = manager
+            .sweep_expired_content(
+                &crate::manager::RetentionSweepPolicy {
+                    batchless_seconds_by_service_tier: std::collections::HashMap::from([(
+                        "priority".to_string(),
+                        60,
+                    )]),
+                    ..Default::default()
+                }
+                .cutoffs_at(Utc::now(), 0.0)
+                .unwrap(),
+                10,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.batchless_requests_deleted, 0);
+        assert_eq!(outcome.batchless_requests_redacted, 1);
+        let request = sqlx::query_as::<
+            _,
+            (
+                String,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+            ),
+        >(
+            "SELECT model, created_by, response_body, error, routed_model FROM requests WHERE id = $1",
+        )
+        .bind(*request_id)
+        .fetch_one(&pool)
+        .await
+        .expect("a possible late completion still needs its lifecycle row");
+        assert_eq!(
+            request,
+            (String::new(), Some(String::new()), None, None, None)
+        );
+
+        let template = sqlx::query_as::<
+            _,
+            (
+                String,
+                String,
+                String,
+                String,
+                String,
+                String,
+                Option<String>,
+                Option<serde_json::Value>,
+                i64,
+            ),
+        >(
+            "SELECT endpoint, method, path, body, model, api_key, custom_id, metadata, body_byte_size FROM request_templates WHERE id = (SELECT template_id FROM requests WHERE id = $1)",
+        )
+        .bind(*request_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            template,
+            (
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                None,
+                None,
+                0,
+            )
+        );
+        let step_payloads = sqlx::query_as::<_, (serde_json::Value, Option<serde_json::Value>)>(
+            "SELECT request_payload, response_payload FROM response_steps WHERE id = $1",
+        )
+        .bind(step_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            step_payloads,
+            (serde_json::json!({}), Some(serde_json::json!({})))
+        );
+        let tool_payloads = sqlx::query_as::<_, (serde_json::Value, Option<serde_json::Value>)>(
+            "SELECT request_payload, response_payload FROM response_steps WHERE id = $1",
+        )
+        .bind(tool_step_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            tool_payloads,
+            (serde_json::json!({}), Some(serde_json::json!({})))
+        );
+
+        // A writer that already claimed the request can append step content
+        // after the first redaction without completing the parent request.
+        sqlx::query(
+            "UPDATE response_steps SET request_payload = '{\"prompt\":\"late-private\"}', response_payload = '{\"response\":\"late-private\"}' WHERE id = $1",
+        )
+        .bind(tool_step_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let repeated = manager
+            .sweep_expired_content(
+                &crate::manager::RetentionSweepPolicy {
+                    batchless_seconds_by_service_tier: std::collections::HashMap::from([(
+                        "priority".to_string(),
+                        60,
+                    )]),
+                    ..Default::default()
+                }
+                .cutoffs_at(Utc::now(), 0.0)
+                .unwrap(),
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(repeated.batchless_requests_redacted, 1);
+        let step_payloads = sqlx::query_as::<_, (serde_json::Value, Option<serde_json::Value>)>(
+            "SELECT request_payload, response_payload FROM response_steps WHERE id = $1",
+        )
+        .bind(tool_step_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            step_payloads,
+            (serde_json::json!({}), Some(serde_json::json!({})))
+        );
+
+        // A result already in flight is still allowed to supersede the soft
+        // cancellation. The retained lifecycle row accepts it, and the next
+        // sweep then hard-deletes the newly written response content.
+        manager
+            .persist(&Request {
+                data: RequestData {
+                    id: request_id,
+                    batch_id: None,
+                    template_id: TemplateId(template_id),
+                    custom_id: None,
+                    endpoint: String::new(),
+                    method: String::new(),
+                    path: String::new(),
+                    body: String::new(),
+                    model: String::new(),
+                    api_key: String::new(),
+                    created_by: String::new(),
+                    batch_metadata: HashMap::new(),
+                },
+                state: Completed {
+                    response_status: 200,
+                    response_body: "late-private-response".to_string(),
+                    claimed_at: Utc::now() - chrono::Duration::hours(2),
+                    started_at: Utc::now() - chrono::Duration::hours(2),
+                    completed_at: Utc::now() - chrono::Duration::hours(2),
+                    routed_model: "late-private-route".to_string(),
+                },
+            })
+            .await
+            .unwrap();
+
+        let outcome = manager
+            .sweep_expired_content(
+                &crate::manager::RetentionSweepPolicy {
+                    batchless_seconds_by_service_tier: std::collections::HashMap::from([(
+                        "priority".to_string(),
+                        60,
+                    )]),
+                    ..Default::default()
+                }
+                .cutoffs_at(Utc::now(), 0.0)
+                .unwrap(),
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome.batchless_requests_deleted, 1);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM requests WHERE id = $1")
+                .bind(*request_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            0
+        );
+    }
 
     #[sqlx::test]
     async fn test_purge_orphaned_templates_after_file_delete(pool: sqlx::PgPool) {

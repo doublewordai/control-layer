@@ -335,6 +335,14 @@ pub struct DaemonConfig {
     pub purge_interval_ms: u64,
     pub purge_batch_size: i64,
     pub purge_throttle_ms: u64,
+    /// Optional automated content-expiration rules. Empty by default: the
+    /// library never chooses retention periods for an operator.
+    #[serde(default)]
+    pub retention: crate::RetentionSweepPolicy,
+    /// Retention sweep cadence in milliseconds. Zero disables the worker.
+    /// A nonzero value requires at least one retention rule.
+    #[serde(default)]
+    pub retention_sweep_interval_ms: u64,
     /// Batch-archive sweeper (phase 3): moves frozen terminal batches' rows
     /// from `requests` into `batch_requests_archive`. OFF by default — the
     /// blue/green invariant is that deploys never move data; only flipping
@@ -607,6 +615,8 @@ impl Default for DaemonConfig {
             batch_finalizer_cancelled_per_tick: default_batch_finalizer_cancelled_per_tick(),
             purge_batch_size: 1000,
             purge_throttle_ms: 100,
+            retention: crate::RetentionSweepPolicy::default(),
+            retention_sweep_interval_ms: 0,
             throughput_log_interval_ms: Some(60_000),
             urgency_weight: 0.0,
             service_tier_completion_windows_ms: default_service_tier_completion_windows_ms(),
@@ -754,6 +764,36 @@ mod tests {
         let decoded: DaemonConfig = serde_json::from_value(serialized).unwrap();
         assert!(!decoded.batch_archive_sweep_enabled);
         assert_eq!(decoded.batch_archive_partitions_weeks_ahead, 4);
+    }
+
+    #[test]
+    fn retention_defaults_off_and_explicit_rules_round_trip() {
+        let mut serialized = serde_json::to_value(DaemonConfig::default()).unwrap();
+        serialized.as_object_mut().unwrap().remove("retention");
+        serialized
+            .as_object_mut()
+            .unwrap()
+            .remove("retention_sweep_interval_ms");
+        let defaulted: DaemonConfig = serde_json::from_value(serialized).unwrap();
+        assert!(!defaulted.retention.is_enabled());
+        assert_eq!(defaulted.retention_sweep_interval_ms, 0);
+
+        let config = DaemonConfig {
+            retention: crate::RetentionSweepPolicy {
+                expire_files: true,
+                terminal_batch_seconds: Some(60),
+                batchless_seconds_by_service_tier: std::collections::HashMap::from([(
+                    "flex".to_string(),
+                    120,
+                )]),
+            },
+            retention_sweep_interval_ms: 250,
+            ..DaemonConfig::default()
+        };
+        let decoded: DaemonConfig =
+            serde_json::from_value(serde_json::to_value(&config).unwrap()).unwrap();
+        assert_eq!(decoded.retention, config.retention);
+        assert_eq!(decoded.retention_sweep_interval_ms, 250);
     }
 
     #[test]

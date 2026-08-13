@@ -281,6 +281,50 @@ or fail retries based on a completion deadline. A zero
 `background_concurrency_limit` disables processing but not submission,
 inspection, or cancellation.
 
+## Automated content retention
+
+The daemon can apply operator-defined retention rules without embedding a
+retention schedule in the library. `DaemonConfig::retention` accepts rules for
+existing file deadlines, terminal file-backed batches, and terminal
+batchless tiers. `retention_sweep_interval_ms` controls the worker
+cadence; both are disabled by default and must be enabled together.
+
+Each sweep resolves relative periods to one set of absolute cutoffs, then:
+
+- retires due files only when they are not referenced by active batches;
+- soft-deletes batches only after their terminal counters are frozen and the
+  existing `batch_archive_cancel_grace_secs` window no longer protects a
+  canceled, previously claimed request;
+- hard-deletes eligible terminal batchless requests and their unreferenced
+  templates in one transaction; and
+- for a canceled request that was already dispatched, erases request,
+  response, template, and response-step content while retaining the minimal
+  lifecycle row needed to accept a late billed result. A later sweep
+  hard-deletes that row if the result supersedes the cancellation.
+
+Batchless rules accept the persisted `priority`, `flex`, and `background`
+service tiers. Any unconfigured tier remains subject to explicit deletion.
+
+Root selection is ordered, limited, and uses `FOR UPDATE SKIP LOCKED`. A
+nonblocking database lease prevents multiple daemon replicas from running the
+same phase concurrently. Each tick processes at most four bounded chunks so a
+backlog cannot monopolize the worker. A daemon also rejects enabled retention at startup
+unless its storage backend explicitly advertises sweep support. The
+ordinary orphan purge subsequently removes request/template content belonging
+to soft-deleted files and batches, including archived batch rows. Aggregate
+metrics report sweep duration, affected rows by category, errors, and whether
+the current work budget was exhausted; no request identifiers or content are
+emitted.
+
+Deployments should supply their own periods and worker cadence through runtime
+configuration. Pre-create all three candidate indexes with `CONCURRENTLY` in
+each applicable environment before deploying the migration/release, following
+the statements in the retention-sweep migration. Use the application's
+component-schema `search_path` (or schema-qualify both indexes and tables), and
+verify `pg_index.indisready` and `pg_index.indisvalid` are both true for all
+three indexes. Enable the rules and worker cadence only after the new
+application generation is healthy.
+
 Ordinary pending-count queries exclude background demand. To expose it, use an
 explicit `ServiceTierFilter::Include(vec![Some("background".to_string())])`; results use a
 separate `"background"` bucket per model and combine batched and batchless
