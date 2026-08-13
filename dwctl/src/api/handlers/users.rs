@@ -1,5 +1,7 @@
 //! HTTP handlers for user management endpoints.
 
+use sha2::{Digest, Sha256};
+use sqlx::Connection;
 use sqlx_pool_router::PoolProvider;
 
 use crate::{
@@ -492,6 +494,18 @@ pub async fn delete_user<P: PoolProvider>(
         });
     }
 
+    let user_exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM users WHERE id = $1 AND is_deleted = false)")
+        .bind(user_id)
+        .fetch_one(state.db.write())
+        .await
+        .map_err(|e| Error::Database(e.into()))?;
+    if !user_exists {
+        return Err(Error::NotFound {
+            resource: "User".to_string(),
+            id: user_id.to_string(),
+        });
+    }
+
     // Cancel all active batches for this user before deletion
     let user_id_str = user_id.to_string();
     let batches = state
@@ -505,7 +519,7 @@ pub async fn delete_user<P: PoolProvider>(
         .map_err(|e| {
             // A listing failure is an internal fault (DB unreachable, etc.), not
             // a missing resource — don't mislabel it as 404 "Batch not found".
-            tracing::error!(user_id = %user_id, error = %e, "Failed to list batches for user deletion");
+            tracing::error!(error = %e, "Failed to list batches for user deletion");
             Error::Internal {
                 operation: "list user batches for deletion".to_string(),
             }
@@ -517,44 +531,68 @@ pub async fn delete_user<P: PoolProvider>(
         {
             tracing::warn!(
                 batch_id = %batch.id,
-                user_id = %user_id,
                 error = %e,
                 "Failed to cancel batch during user deletion"
             );
         }
     }
 
-    // Soft-delete + scrub the user row and hard-delete their API keys
-    // (atomic, in repo.delete). Scoped so the connection borrow is released
-    // before we enqueue the background purge below.
+    // Account scrub, access-key removal, durable receipt, and queue insertion
+    // share one transaction. Either all become visible or none do.
+    let erasure_id = uuid::Uuid::new_v4();
+    let subject_id = user_id.to_string();
+    let fingerprint = Sha256::digest(subject_id.as_bytes()).to_vec();
+    let mut conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
+    let mut tx = conn.begin().await.map_err(|e| Error::Database(e.into()))?;
     let deleted = {
-        let mut conn = state.db.write().acquire().await.expect("Failed to acquire database connection");
-        let mut repo = Users::new(&mut conn);
+        let mut repo = Users::new(&mut tx);
         repo.delete(user_id).await?
     };
 
     if !deleted {
+        tx.rollback().await.map_err(|e| Error::Database(e.into()))?;
         return Err(Error::NotFound {
             resource: "User".to_string(),
             id: user_id.to_string(),
         });
     }
 
-    // Erase the user's fusillade data (files, batches, requests) in the
-    // background. API keys were already hard-deleted synchronously above so
-    // they stop authenticating immediately; fusillade data can be unbounded,
-    // so it is offloaded to an at-least-once underway job.
-    enqueue_purge_user_data(&state, user_id_str).await;
+    sqlx::query(
+        "INSERT INTO data_erasure_requests \
+         (id, subject_id, subject_fingerprint, capture_store_applicable) \
+         VALUES ($1, $2, $3, $4)",
+    )
+    .bind(erasure_id)
+    .bind(&subject_id)
+    .bind(fingerprint)
+    // Applicability is the startup-initialized store capability, not the
+    // live-reloadable config snapshot. This cannot change underneath a receipt.
+    .bind(state.outlet_db.is_some())
+    .execute(&mut *tx)
+    .await
+    .map_err(|e| Error::Database(e.into()))?;
+
+    state
+        .task_runner
+        .purge_user_data_job
+        .enqueue_using(&mut *tx, &PurgeUserDataInput { erasure_id })
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "Failed to enqueue durable data erasure");
+            Error::Internal {
+                operation: "enqueue durable data erasure".to_string(),
+            }
+        })?;
+    tx.commit().await.map_err(|e| Error::Database(e.into()))?;
 
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Input for the user-data purge background job. Carries the user id as a
-/// string because fusillade keys ownership (`created_by` / `uploaded_by`) as
-/// text.
+/// Queue input carries only the non-sensitive receipt identifier. The raw
+/// subject is fetched from the durable receipt and cleared on completion.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PurgeUserDataInput {
-    pub user_id: String,
+    pub erasure_id: uuid::Uuid,
 }
 
 /// Build the underway job that erases a deleted user's fusillade data
@@ -565,36 +603,98 @@ pub async fn build_purge_user_data_job<P: sqlx_pool_router::PoolProvider + Clone
     pool: sqlx::PgPool,
     state: crate::tasks::TaskState<P>,
 ) -> anyhow::Result<underway::Job<PurgeUserDataInput, crate::tasks::TaskState<P>>> {
-    use fusillade::Storage;
     use underway::Job;
     use underway::job::To;
     use underway::task::Error as TaskError;
 
-    // Chunk size per bulk_delete_data call. bulk_delete_data only touches the
-    // user's batch/file rows and batchless requests (child rows are reaped by
-    // the orphan-purge daemon), so even large accounts drain in a few passes.
     const BATCH_SIZE: i64 = 1000;
+    const MAX_PAGES_PER_ATTEMPT: usize = 100;
+    let retry_policy = underway::task::RetryPolicy::builder()
+        // Erasure is durable work, not a best-effort cleanup. Operational
+        // monitoring should surface stalled receipts, while the queue keeps
+        // retrying instead of silently exhausting a practical attempt limit.
+        .max_attempts(i32::MAX)
+        .initial_interval_ms(1_000)
+        .max_interval_ms(300_000)
+        .backoff_coefficient(2.0)
+        .build();
 
     Job::<PurgeUserDataInput, _>::builder()
         .state(state)
         .step(|cx, input: PurgeUserDataInput| async move {
-            let mut total: u64 = 0;
-            loop {
-                match cx.state.request_manager.bulk_delete_data(&input.user_id, BATCH_SIZE).await {
-                    Ok(0) => {
-                        if total > 0 {
-                            tracing::info!(user_id = %input.user_id, rows = total, "Purged user fusillade data");
-                        }
-                        return To::done();
-                    }
-                    Ok(n) => total += n,
-                    Err(e) => {
-                        tracing::error!(user_id = %input.user_id, error = %e, "Failed to purge user fusillade data");
-                        return Err(TaskError::Retryable(e.to_string()));
-                    }
-                }
+            let receipt: Option<(Option<String>, String, bool)> = sqlx::query_as(
+                "SELECT subject_id, status, capture_store_applicable \
+                 FROM data_erasure_requests WHERE id = $1",
+            )
+            .bind(input.erasure_id)
+            .fetch_optional(&cx.state.dwctl_pool)
+            .await
+            .map_err(|e| TaskError::Retryable(e.to_string()))?;
+            let Some((subject_id, status, capture_store_applicable)) = receipt else {
+                return Err(TaskError::Fatal("data erasure receipt is missing".to_string()));
+            };
+            if status == "completed" {
+                return To::done();
             }
+
+            let Some(subject_id) = subject_id else {
+                return Err(TaskError::Fatal("active data erasure receipt has no subject".to_string()));
+            };
+            sqlx::query(
+                "UPDATE data_erasure_requests SET status = 'running', \
+                 started_at = COALESCE(started_at, NOW()), last_attempt_at = NOW(), \
+                 attempt_count = attempt_count + 1, failure_target = NULL WHERE id = $1",
+            )
+            .bind(input.erasure_id)
+            .execute(&cx.state.dwctl_pool)
+            .await
+            .map_err(|e| TaskError::Retryable(e.to_string()))?;
+
+            if let Err(e) = erase_request_store(cx.state.request_manager.as_ref(), &subject_id, BATCH_SIZE, MAX_PAGES_PER_ATTEMPT).await {
+                record_erasure_failure(&cx.state.dwctl_pool, input.erasure_id, "request_store").await;
+                return Err(TaskError::Retryable(e.to_string()));
+            }
+            sqlx::query(
+                "UPDATE data_erasure_requests SET request_store_completed_at = \
+                 COALESCE(request_store_completed_at, NOW()) WHERE id = $1",
+            )
+            .bind(input.erasure_id)
+            .execute(&cx.state.dwctl_pool)
+            .await
+            .map_err(|e| TaskError::Retryable(e.to_string()))?;
+
+            if capture_store_applicable {
+                let Some(outlet_pool) = cx.state.outlet_pool.as_ref() else {
+                    record_erasure_failure(&cx.state.dwctl_pool, input.erasure_id, "capture_store").await;
+                    return Err(TaskError::Retryable("capture store is required but unavailable".to_string()));
+                };
+                if let Err(e) = erase_capture_store(outlet_pool, &subject_id, MAX_PAGES_PER_ATTEMPT).await {
+                    record_erasure_failure(&cx.state.dwctl_pool, input.erasure_id, "capture_store").await;
+                    return Err(TaskError::Retryable(e.to_string()));
+                }
+                sqlx::query(
+                    "UPDATE data_erasure_requests SET capture_store_completed_at = \
+                     COALESCE(capture_store_completed_at, NOW()) WHERE id = $1",
+                )
+                .bind(input.erasure_id)
+                .execute(&cx.state.dwctl_pool)
+                .await
+                .map_err(|e| TaskError::Retryable(e.to_string()))?;
+            }
+
+            sqlx::query(
+                "UPDATE data_erasure_requests SET status = 'completed', subject_id = NULL, \
+                 completed_at = NOW(), failure_target = NULL WHERE id = $1",
+            )
+            .bind(input.erasure_id)
+            .execute(&cx.state.dwctl_pool)
+            .await
+            .map_err(|e| TaskError::Retryable(e.to_string()))?;
+            metrics::counter!("data_erasure_completed_total").increment(1);
+            tracing::info!(erasure_id = %input.erasure_id, "Data erasure completed");
+            To::done()
         })
+        .retry_policy(retry_policy)
         .name("purge-user-data")
         .pool(pool)
         .build()
@@ -602,28 +702,54 @@ pub async fn build_purge_user_data_job<P: sqlx_pool_router::PoolProvider + Clone
         .map_err(Into::into)
 }
 
-/// Enqueue the purge-user-data job. Best-effort: the delete handler still
-/// returns success on failure (the row + keys are already gone). But a failed
-/// enqueue means the user's fusillade data is *not* scheduled for erasure and
-/// nothing retries it automatically — a right-to-erasure gap that must be
-/// visible, so it emits the background-error metric (severity `error`:
-/// triageable, ~1-month legal window, not a page) rather than a silent warn.
-async fn enqueue_purge_user_data<P: PoolProvider>(state: &AppState<P>, user_id: String) {
-    if let Err(e) = state
-        .task_runner
-        .purge_user_data_job
-        .enqueue(&PurgeUserDataInput { user_id: user_id.clone() })
-        .await
-    {
-        crate::background_error!(
-            crate::metrics::errors::component::TASK_WORKER,
-            "purge_user_data_enqueue",
-            Error,
-            user_id = %user_id,
-            error = %e,
-            "Failed to enqueue purge-user-data job; fusillade data will NOT be erased until retried (right-to-erasure gap)"
-        );
+async fn erase_request_store<P: PoolProvider>(
+    manager: &fusillade_arsenal::PostgresRequestManager<P>,
+    subject_id: &str,
+    batch_size: i64,
+    max_pages: usize,
+) -> anyhow::Result<()> {
+    use fusillade::Storage;
+    manager.block_creator_data(subject_id).await?;
+    for _ in 0..max_pages {
+        if manager.bulk_delete_data(subject_id, batch_size).await? == 0 {
+            break;
+        }
     }
+    for _ in 0..max_pages {
+        if manager.purge_creator_orphaned_rows(subject_id, batch_size).await? == 0 {
+            break;
+        }
+    }
+    if !manager.finalize_creator_data_erasure(subject_id).await? {
+        anyhow::bail!("request store erasure has more work")
+    }
+    Ok(())
+}
+
+async fn erase_capture_store(pool: &sqlx::PgPool, subject_id: &str, max_pages: usize) -> anyhow::Result<()> {
+    let repository = outlet_postgres::RetentionRepository::new(pool.clone());
+    let batch_size = outlet_postgres::BatchSize::new(1000)?;
+    for _ in 0..max_pages {
+        if repository.delete_subject_batch(subject_id, batch_size).await?.complete() {
+            if repository.subject_presence(subject_id).await?.is_absent() {
+                return Ok(());
+            }
+            break;
+        }
+    }
+    anyhow::bail!("capture store erasure has more work")
+}
+
+async fn record_erasure_failure(pool: &sqlx::PgPool, erasure_id: uuid::Uuid, target: &'static str) {
+    let _ = sqlx::query(
+        "UPDATE data_erasure_requests SET status = 'pending', failure_target = $2 \
+         WHERE id = $1 AND status <> 'completed'",
+    )
+    .bind(erasure_id)
+    .bind(target)
+    .execute(pool)
+    .await;
+    metrics::counter!("data_erasure_retry_total", "target" => target).increment(1);
 }
 
 #[cfg(test)]
@@ -1292,6 +1418,36 @@ mod tests {
             .await;
 
         response.assert_status(axum::http::StatusCode::NO_CONTENT);
+
+        let fingerprint = sha2::Sha256::digest(regular_user.id.to_string().as_bytes()).to_vec();
+        let mut receipt = None;
+        for _ in 0..100 {
+            let current: (String, Option<String>, bool) = sqlx::query_as(
+                "SELECT status, subject_id, capture_store_applicable \
+                 FROM data_erasure_requests WHERE subject_fingerprint = $1",
+            )
+            .bind(&fingerprint)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            if current.0 == "completed" {
+                receipt = Some(current);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(receipt, Some(("completed".to_string(), None, false)));
+
+        let queued_inputs: Vec<serde_json::Value> =
+            sqlx::query_scalar("SELECT input FROM underway.task WHERE task_queue_name = 'purge-user-data'")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(queued_inputs.len(), 1);
+        assert!(
+            !queued_inputs[0].to_string().contains(&regular_user.id.to_string()),
+            "the queue payload must carry only the receipt id"
+        );
 
         // Verify user is deleted by trying to get it
         let get_response = app

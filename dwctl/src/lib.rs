@@ -870,9 +870,10 @@ async fn setup_database(
     // Run underway migrations (background task queue)
     underway::run_migrations(&*db_pools).await?;
 
-    // Setup outlet schema and pool if request logging is enabled
-    let outlet_pools = if config.enable_request_logging {
-        info!("Setting up outlet request logging pool (logging enabled)");
+    // Keep the capture store reachable while it remains an erasure target,
+    // even when new capture has been disabled.
+    let outlet_pools = if config.enable_request_logging || config.erase_request_captures() {
+        info!("Setting up outlet request logging pool");
         let pools = match config.database.outlet() {
             config::ComponentDb::Schema {
                 name, pool: pool_settings, ..
@@ -944,10 +945,21 @@ async fn setup_database(
             }
         };
         outlet_postgres::migrator().run(&*pools).await?;
+        if config.erase_request_captures() {
+            let timeouts = outlet_postgres::MaintenanceTimeouts::new(
+                std::time::Duration::from_millis(config.data_erasure.capture_index_lock_timeout_ms),
+                std::time::Duration::from_millis(config.data_erasure.capture_index_statement_timeout_ms),
+            )?;
+            let outcomes = outlet_postgres::RetentionRepository::new(pools.clone())
+                .ensure_subject_indexes_concurrently(timeouts)
+                .await
+                .context("failed to prepare request-capture subject erasure indexes")?;
+            tracing::info!(partitions = outcomes.len(), "Request-capture subject erasure indexes verified");
+        }
 
         Some(pools)
     } else {
-        info!("Skipping outlet pool setup (logging disabled)");
+        info!("Skipping outlet pool setup (capture and erasure disabled)");
         None
     };
 
@@ -2984,10 +2996,10 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
                 pool: underway_pool.clone(),
             },
         ];
-        if let Some(outlet) = outlet_pool {
+        if let Some(ref outlet) = outlet_pool {
             pools.push(db::LabeledPool {
                 name: "outlet",
-                pool: outlet,
+                pool: outlet.clone(),
             });
         }
         let metrics_shutdown = shutdown_token.clone();
@@ -3062,6 +3074,7 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
     let task_state = tasks::TaskState {
         request_manager: request_manager.clone(),
         dwctl_pool: pool.clone(),
+        outlet_pool: outlet_pool.clone(),
         config: shared_config.clone(),
         encryption_key: encryption_key.clone(),
         ingest_file_job: Arc::new(std::sync::OnceLock::new()),

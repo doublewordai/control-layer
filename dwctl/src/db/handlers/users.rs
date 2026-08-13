@@ -450,14 +450,25 @@ impl<'c> Repository for Users<'c> {
 
     #[instrument(skip(self), fields(user_id = %abbrev_uuid(&id)), err)]
     async fn delete(&mut self, id: Self::Id) -> Result<bool> {
-        // Soft delete with GDPR-compliant data scrubbing
-        // We scrub all personal information but keep the record for referential integrity
-        let scrubbed_email = format!("deleted-{}@deleted.local", id);
-        let scrubbed_username = format!("deleted-{}", id);
+        // Scrub personal fields while retaining an opaque ledger subject for
+        // referential integrity. A fresh token avoids copying the account id
+        // into replacement identifiers.
+        let scrub_token = uuid::Uuid::new_v4();
+        let scrubbed_email = format!("deleted-{scrub_token}@deleted.local");
+        let scrubbed_username = format!("deleted-{scrub_token}");
 
-        // Scrub the user row and hard-delete their API keys atomically so a
-        // "deleted" account can never keep authenticating.
+        // Account artifacts, credentials, identifiers and access grants are
+        // removed atomically with the user scrub and API-key revocation.
         let mut tx = self.db.begin().await?;
+
+        let original_email: Option<String> = sqlx::query_scalar("SELECT email FROM users WHERE id = $1 AND is_deleted = false FOR UPDATE")
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
+        let Some(original_email) = original_email else {
+            tx.rollback().await?;
+            return Ok(false);
+        };
 
         let result = sqlx::query!(
             r#"
@@ -481,12 +492,93 @@ impl<'c> Repository for Users<'c> {
         .execute(&mut *tx)
         .await?;
 
-        // Only when we actually transitioned the user to deleted (idempotent on
-        // repeat calls). Hard-delete keys owned by the user (user_id) — these
-        // authenticate as them. Keys they merely created for others (created_by)
-        // belong to those users and are left alone. The api_keys DELETE trigger
-        // emits NOTIFY, so the onwards proxy drops them from its cache at once.
+        // Remove joins back to request-level identifiers while retaining
+        // aggregate usage and pricing fields needed for ledger integrity.
         if result.rows_affected() > 0 {
+            sqlx::query(
+                "UPDATE http_analytics SET \
+                     user_id = NULL, api_key_id = NULL, fusillade_request_id = NULL, \
+                     fusillade_batch_id = NULL, custom_id = NULL, trace_id = NULL, \
+                     response_step_id = NULL, user_agent = NULL \
+                 WHERE user_id = $1 \
+                    OR api_key_id IN (SELECT id FROM api_keys WHERE user_id = $1)",
+            )
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+
+            sqlx::query(
+                "UPDATE credits_transactions SET \
+                     api_key_id = NULL, fusillade_batch_id = NULL, fusillade_request_id = NULL, \
+                     source_id = 'erased-' || id::text, description = NULL \
+                 WHERE user_id = $1",
+            )
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+
+            // Connection rows carry encrypted third-party credentials; their
+            // child operation/entry rows can carry external object names.
+            sqlx::query(
+                "DELETE FROM sync_entries WHERE connection_id IN \
+                 (SELECT id FROM connections WHERE user_id = $1)",
+            )
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "DELETE FROM sync_operations WHERE connection_id IN \
+                 (SELECT id FROM connections WHERE user_id = $1)",
+            )
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query("DELETE FROM connections WHERE user_id = $1")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+
+            sqlx::query("DELETE FROM user_webhooks WHERE user_id = $1")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("DELETE FROM password_reset_tokens WHERE user_id = $1")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("DELETE FROM image_access WHERE user_id = $1 OR organization_id = $1")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("DELETE FROM user_groups WHERE user_id = $1")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("DELETE FROM user_roles WHERE user_id = $1")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("UPDATE user_organizations SET invited_by = NULL WHERE invited_by = $1")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query(
+                "DELETE FROM user_organizations \
+                 WHERE user_id = $1 OR organization_id = $1 \
+                    OR (user_id IS NULL AND lower(invite_email) = lower($2))",
+            )
+            .bind(id)
+            .bind(original_email)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query("DELETE FROM pending_org_email_changes WHERE organization_id = $1")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+
+            // Keys owned by this user authenticate as them. Keys they merely
+            // created for other subjects belong to those subjects and remain.
+            // The DELETE trigger notifies the proxy cache immediately.
             sqlx::query!(r#"DELETE FROM api_keys WHERE user_id = $1"#, id)
                 .execute(&mut *tx)
                 .await?;
@@ -1216,6 +1308,56 @@ mod tests {
             .await
             .unwrap();
         assert!(before >= 1, "user should own at least the realtime key");
+        let api_key_id: uuid::Uuid = sqlx::query_scalar("SELECT id FROM api_keys WHERE user_id = $1 LIMIT 1")
+            .bind(user.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        sqlx::query(
+            "INSERT INTO http_analytics \
+             (instance_id, correlation_id, timestamp, method, uri, user_id, api_key_id, custom_id, trace_id, user_agent) \
+             VALUES ($1, 987654321, NOW(), 'POST', '/ai/v1/test', $2, $3, 'customer-reference', 'trace-reference', 'identifying-agent')",
+        )
+        .bind(uuid::Uuid::new_v4())
+        .bind(user.id)
+        .bind(api_key_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO connections (user_id, api_key_id, provider, name, config_encrypted) \
+             VALUES ($1, $2, 'test', 'sensitive connection', decode('00', 'hex'))",
+        )
+        .bind(user.id)
+        .bind(api_key_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO user_webhooks (user_id, url, secret, description) \
+             VALUES ($1, 'https://example.invalid/hook', 'whsec_sensitive', 'private endpoint')",
+        )
+        .bind(user.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO password_reset_tokens (user_id, token_hash, expires_at) \
+             VALUES ($1, 'sensitive-reset-token', NOW() + INTERVAL '1 hour')",
+        )
+        .bind(user.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO image_access (user_id, sha256, mime, bytes_len) \
+             VALUES ($1, decode(repeat('ab', 32), 'hex'), 'image/png', 1)",
+        )
+        .bind(user.id)
+        .execute(&pool)
+        .await
+        .unwrap();
 
         let deleted = {
             let mut repo = Users::new(&mut conn);
@@ -1235,6 +1377,36 @@ mod tests {
             .unwrap();
         assert!(row.is_deleted);
         assert!(row.email.starts_with("deleted-"));
+
+        let analytics: (
+            Option<uuid::Uuid>,
+            Option<uuid::Uuid>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = sqlx::query_as(
+            "SELECT user_id, api_key_id, custom_id, trace_id, user_agent \
+                 FROM http_analytics WHERE correlation_id = 987654321",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(analytics, (None, None, None, None, None));
+        for table in [
+            "connections",
+            "user_webhooks",
+            "password_reset_tokens",
+            "image_access",
+            "user_groups",
+            "user_roles",
+        ] {
+            let count: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {table} WHERE user_id = $1"))
+                .bind(user.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(count, 0, "{table} should not retain deleted-account data");
+        }
 
         // Idempotent: a second delete is a no-op, not an error.
         let again = {

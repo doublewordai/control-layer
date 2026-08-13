@@ -90,7 +90,7 @@ axum-prometheus = "0.10"
 metrics = "0.24"
 metrics-exporter-prometheus = "0.18"
 outlet = "0.9.1"
-outlet-postgres = { git = "https://github.com/doublewordai/outlet-postgres.git", rev = "d0817a4c7de0b742aeba6b04b4e0ad5461960ce5" }
+outlet-postgres = { git = "https://github.com/doublewordai/outlet-postgres.git", rev = "428fd46" }
 async-openai = { version = "0.34.0", default-features = false, features = [
   "chat-completion-types",
   "completion-types",

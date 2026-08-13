@@ -4509,7 +4509,7 @@ dependencies = [
 [[package]]
 name = "outlet-postgres"
 version = "0.6.0"
-source = "git+https://github.com/doublewordai/outlet-postgres.git?rev=d0817a4c7de0b742aeba6b04b4e0ad5461960ce5#d0817a4c7de0b742aeba6b04b4e0ad5461960ce5"
+source = "git+https://github.com/doublewordai/outlet-postgres.git?rev=428fd46#428fd465234bb50f8d3fa8f20020b7890adafb19"
 dependencies = [
  "base64",
  "bytes",
@@ -4519,6 +4519,7 @@ dependencies = [
  "outlet",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "sqlx",
  "sqlx-pool-router",
  "thiserror 2.0.18",

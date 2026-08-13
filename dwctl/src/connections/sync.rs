@@ -1349,6 +1349,7 @@ mod tests {
         crate::tasks::TaskState {
             request_manager,
             dwctl_pool: pool,
+            outlet_pool: None,
             config: crate::SharedConfig::new(config),
             encryption_key: None,
             ingest_file_job: std::sync::Arc::new(std::sync::OnceLock::new()),

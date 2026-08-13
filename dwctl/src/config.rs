@@ -156,6 +156,9 @@ pub struct Config {
     /// Header minimisation and opaque attribution for request/response logging.
     #[serde(default)]
     pub request_logging: RequestLoggingConfig,
+    /// Durable subject-erasure integration for optional content stores.
+    #[serde(default)]
+    pub data_erasure: DataErasureConfig,
     /// Enable analytics and billing (http_analytics table, credit deduction, Prometheus metrics)
     ///
     /// Can be enabled independently of `enable_request_logging`. When enabled without
@@ -2403,6 +2406,42 @@ pub struct RequestLoggingConfig {
     pub subject_header: Option<String>,
 }
 
+/// Controls which optional content stores participate in durable subject
+/// erasure.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DataErasureConfig {
+    /// Whether historical request-log captures must be erased for a deleted
+    /// subject. When omitted, this follows `enable_request_logging` for
+    /// backwards compatibility. Set it explicitly to `true` before disabling
+    /// capture if historical rows still exist.
+    pub erase_request_captures: Option<bool>,
+    /// Lock-wait budget for online capture-subject index preparation.
+    #[serde(default = "default_capture_index_lock_timeout_ms")]
+    pub capture_index_lock_timeout_ms: u64,
+    /// Whole-statement budget for online capture-subject index preparation.
+    #[serde(default = "default_capture_index_statement_timeout_ms")]
+    pub capture_index_statement_timeout_ms: u64,
+}
+
+fn default_capture_index_lock_timeout_ms() -> u64 {
+    1_000
+}
+
+fn default_capture_index_statement_timeout_ms() -> u64 {
+    86_400_000
+}
+
+impl Default for DataErasureConfig {
+    fn default() -> Self {
+        Self {
+            erase_request_captures: None,
+            capture_index_lock_timeout_ms: default_capture_index_lock_timeout_ms(),
+            capture_index_statement_timeout_ms: default_capture_index_statement_timeout_ms(),
+        }
+    }
+}
+
 impl Default for AnalyticsConfig {
     fn default() -> Self {
         Self {
@@ -2536,6 +2575,7 @@ impl Default for Config {
             enable_metrics: true,
             enable_request_logging: true,
             request_logging: RequestLoggingConfig::default(),
+            data_erasure: DataErasureConfig::default(),
             enable_analytics: true,
             analytics: AnalyticsConfig::default(),
             enable_otel_export: false,
@@ -2754,11 +2794,25 @@ impl Config {
         self.database.external_url()
     }
 
+    /// Whether the request-capture store is an erasure target. An explicit
+    /// value is sticky across later logging changes; the fallback preserves
+    /// existing configuration behavior.
+    pub fn erase_request_captures(&self) -> bool {
+        self.data_erasure.erase_request_captures.unwrap_or(self.enable_request_logging)
+    }
+
     /// Validate the configuration for consistency and required fields
     pub fn validate(&self) -> Result<(), Error> {
         if let Err(error) = crate::request_logging::build_capture_policy(&self.request_logging) {
             return Err(Error::Internal {
                 operation: format!("Config validation: request_logging is invalid: {error}"),
+            });
+        }
+        if self.erase_request_captures()
+            && (self.data_erasure.capture_index_lock_timeout_ms == 0 || self.data_erasure.capture_index_statement_timeout_ms == 0)
+        {
+            return Err(Error::Internal {
+                operation: "Config validation: capture erasure index timeouts must be positive".to_string(),
             });
         }
         if let Err(error) = self.background_services.batch_daemon.retention.validate() {
@@ -3092,6 +3146,42 @@ mod tests {
         assert_eq!(config.retained_request_headers, None);
         assert_eq!(config.retained_response_headers, None);
         assert_eq!(config.subject_header, None);
+    }
+
+    #[test]
+    fn request_capture_erasure_follows_logging_unless_explicitly_configured() {
+        let mut config = Config::default();
+        config.enable_request_logging = true;
+        assert!(config.erase_request_captures());
+
+        config.enable_request_logging = false;
+        assert!(!config.erase_request_captures());
+
+        config.data_erasure.erase_request_captures = Some(true);
+        assert!(config.erase_request_captures());
+    }
+
+    #[test]
+    fn request_capture_erasure_rejects_zero_index_timeouts() {
+        let mut config = Config::default();
+        config.data_erasure.capture_index_lock_timeout_ms = 0;
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("capture erasure index timeouts must be positive")
+        );
+
+        config.data_erasure.capture_index_lock_timeout_ms = 1;
+        config.data_erasure.capture_index_statement_timeout_ms = 0;
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("capture erasure index timeouts must be positive")
+        );
     }
 
     #[test]

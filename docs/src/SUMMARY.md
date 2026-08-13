@@ -20,3 +20,4 @@
 # Conceptual Guides
 
 - [How Billing Works](conceptual-guides/how-billing-works.md)
+- [Durable Data Erasure](conceptual-guides/durable-data-erasure.md)

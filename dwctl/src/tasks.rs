@@ -38,6 +38,8 @@ pub struct TaskState<P: PoolProvider + Clone = sqlx_pool_router::DbPools> {
     pub request_manager: Arc<PostgresRequestManager<P>>,
     /// dwctl database pool — for querying connections, sync_operations, sync_entries.
     pub dwctl_pool: PgPool,
+    /// Optional persistent capture store used by creator erasure jobs.
+    pub outlet_pool: Option<PgPool>,
     /// Shared config for capacity checks and other runtime configuration.
     pub config: crate::SharedConfig,
     /// Encryption key for decrypting connection credentials inside jobs.

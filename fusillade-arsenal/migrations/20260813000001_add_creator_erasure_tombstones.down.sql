@@ -1,0 +1,17 @@
+DROP TRIGGER IF EXISTS requests_creator_erasure_update_guard ON requests;
+DROP TRIGGER IF EXISTS batches_erased_content_update_guard ON batches;
+DROP TRIGGER IF EXISTS files_erased_content_update_guard ON files;
+DROP TRIGGER IF EXISTS batches_creator_erasure_update_guard ON batches;
+DROP TRIGGER IF EXISTS files_creator_erasure_update_guard ON files;
+DROP TRIGGER IF EXISTS requests_creator_erasure_insert_guard ON requests;
+DROP TRIGGER IF EXISTS batches_creator_erasure_insert_guard ON batches;
+DROP TRIGGER IF EXISTS files_creator_erasure_insert_guard ON files;
+DROP FUNCTION IF EXISTS enforce_creator_erasure_update();
+DROP FUNCTION IF EXISTS enforce_request_creator_erasure_insert();
+DROP FUNCTION IF EXISTS enforce_batch_creator_erasure_insert();
+DROP FUNCTION IF EXISTS enforce_file_creator_erasure_insert();
+DROP FUNCTION IF EXISTS lock_creator_erasure_shared(TEXT);
+DROP FUNCTION IF EXISTS prevent_erased_parent_content_update();
+ALTER TABLE batches DROP COLUMN IF EXISTS content_erased_at;
+ALTER TABLE files DROP COLUMN IF EXISTS content_erased_at;
+DROP TABLE IF EXISTS creator_erasure_tombstones;

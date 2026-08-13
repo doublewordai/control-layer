@@ -44,6 +44,7 @@ pub async fn create_test_app_state_with_config(pool: PgPool, config: crate::conf
     let task_state = crate::tasks::TaskState {
         request_manager: request_manager.clone(),
         dwctl_pool: pool.clone(),
+        outlet_pool: None,
         config: shared_config.clone(),
         encryption_key: None,
         ingest_file_job: std::sync::Arc::new(std::sync::OnceLock::new()),
@@ -140,6 +141,7 @@ pub async fn create_test_app_state_with_database_pools(
     let task_state = crate::tasks::TaskState {
         request_manager: request_manager.clone(),
         dwctl_pool: pool.clone(),
+        outlet_pool: None,
         config: shared_config.clone(),
         encryption_key: None,
         ingest_file_job: std::sync::Arc::new(std::sync::OnceLock::new()),
@@ -290,6 +292,7 @@ pub fn create_test_config() -> crate::config::Config {
         enable_metrics: false,
         enable_request_logging: false,
         request_logging: crate::config::RequestLoggingConfig::default(),
+        data_erasure: crate::config::DataErasureConfig::default(),
         enable_analytics: true,
         analytics: crate::config::AnalyticsConfig::default(),
         enable_otel_export: false,

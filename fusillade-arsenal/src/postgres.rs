@@ -414,6 +414,282 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
         &self.db_retry_config
     }
 
+    /// Permanently prevent new content from being attributed to an opaque
+    /// creator identifier.
+    ///
+    /// The database triggers and this write take the same row lock. Content
+    /// writes that started first commit before this method returns; writes that
+    /// start afterwards are rejected. Call this before draining creator data
+    /// so a late in-flight request cannot recreate it.
+    pub async fn block_creator_data(&self, creator_id: &str) -> Result<()> {
+        let creator_id = creator_id.trim();
+        if creator_id.is_empty() {
+            return Err(FusilladeError::ValidationError(
+                "creator id must not be empty".to_string(),
+            ));
+        }
+        sqlx::query(
+            "WITH creator_lock AS ( \
+                 SELECT pg_advisory_xact_lock( \
+                     hashtextextended('creator-erasure:' || $1, 0) \
+                 ) \
+             ) \
+             INSERT INTO creator_erasure_tombstones (creator_id, erased_at) \
+             SELECT $1, NOW() FROM creator_lock \
+             ON CONFLICT (creator_id) DO NOTHING",
+        )
+        .bind(creator_id)
+        .execute(self.write_executor())
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to block creator data: {e}")))?;
+        Ok(())
+    }
+
+    /// Delete one bounded page of child rows beneath this creator's
+    /// soft-deleted batches and files.
+    ///
+    /// Unlike the daemon-wide orphan sweep, this method cannot be starved by
+    /// unrelated tombstones. It is intended for deadline-bound subject
+    /// erasure after [`Self::block_creator_data`] and [`Storage::bulk_delete_data`].
+    pub async fn purge_creator_orphaned_rows(
+        &self,
+        creator_id: &str,
+        batch_size: i64,
+    ) -> Result<u64> {
+        let creator_id = creator_id.trim();
+        if creator_id.is_empty() {
+            return Err(FusilladeError::ValidationError(
+                "creator id must not be empty".to_string(),
+            ));
+        }
+        if batch_size < 1 {
+            return Ok(0);
+        }
+
+        let mut tx = self.begin_write().await.map_err(|e| {
+            FusilladeError::Other(anyhow!("Failed to begin creator orphan purge: {e}"))
+        })?;
+        let requests_deleted = sqlx::query(
+            r#"DELETE FROM requests
+               WHERE id IN (
+                   SELECT r.id
+                   FROM (
+                       SELECT id FROM batches
+                       WHERE created_by = $1 AND deleted_at IS NOT NULL
+                   ) b,
+                   LATERAL (
+                       SELECT id FROM requests
+                       WHERE batch_id = b.id
+                       LIMIT $2
+                       FOR UPDATE SKIP LOCKED
+                   ) r
+                   LIMIT $2
+               )"#,
+        )
+        .bind(creator_id)
+        .bind(batch_size)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to purge creator requests: {e}")))?
+        .rows_affected();
+        let archived_deleted = sqlx::query(
+            r#"DELETE FROM batch_requests_archive
+               WHERE (id, archive_bucket) IN (
+                   SELECT a.id, a.archive_bucket
+                   FROM (
+                       SELECT id, archive_bucket FROM batches
+                       WHERE created_by = $1
+                         AND deleted_at IS NOT NULL
+                         AND archive_bucket IS NOT NULL
+                   ) b,
+                   LATERAL (
+                       SELECT id, archive_bucket FROM batch_requests_archive
+                       WHERE archive_bucket = b.archive_bucket AND batch_id = b.id
+                       LIMIT $2
+                       FOR UPDATE SKIP LOCKED
+                   ) a
+                   LIMIT $2
+               )"#,
+        )
+        .bind(creator_id)
+        .bind(batch_size)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| {
+            FusilladeError::Other(anyhow!("Failed to purge archived creator requests: {e}"))
+        })?
+        .rows_affected();
+        let templates_deleted = sqlx::query(
+            r#"DELETE FROM request_templates
+               WHERE id IN (
+                   SELECT template.id
+                   FROM (
+                       SELECT id FROM files
+                       WHERE uploaded_by = $1 AND deleted_at IS NOT NULL
+                   ) file,
+                   LATERAL (
+                       SELECT id FROM request_templates
+                       WHERE file_id = file.id
+                       LIMIT $2
+                       FOR UPDATE SKIP LOCKED
+                   ) template
+                   LIMIT $2
+               )"#,
+        )
+        .bind(creator_id)
+        .bind(batch_size)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to purge creator templates: {e}")))?
+        .rows_affected();
+        tx.commit().await.map_err(|e| {
+            FusilladeError::Other(anyhow!("Failed to commit creator orphan purge: {e}"))
+        })?;
+
+        let total = requests_deleted + archived_deleted + templates_deleted;
+        if total > 0 {
+            tracing::info!(
+                requests_deleted,
+                archived_deleted,
+                templates_deleted,
+                "Purged creator child rows"
+            );
+        }
+        Ok(total)
+    }
+
+    /// Scrub creator identifiers and residual metadata after every associated
+    /// content row has been removed.
+    ///
+    /// Returns `false` without changing tombstones when live/archive requests
+    /// or file templates are still present. Callers can continue bounded
+    /// deletion and retry. The replay guard remains permanently active.
+    pub async fn finalize_creator_data_erasure(&self, creator_id: &str) -> Result<bool> {
+        let creator_id = creator_id.trim();
+        if creator_id.is_empty() {
+            return Err(FusilladeError::ValidationError(
+                "creator id must not be empty".to_string(),
+            ));
+        }
+        let mut tx = self.begin_write().await.map_err(|e| {
+            FusilladeError::Other(anyhow!("Failed to begin erasure finalization: {e}"))
+        })?;
+
+        // Blocking has already serialized with all attributed writes. The
+        // guard is permanent, so finalization only needs to verify it; holding
+        // its row lock while updating files would invert the ordinary
+        // file-before-batch lock order.
+        let blocked: bool = sqlx::query_scalar(
+            "SELECT erased_at IS NOT NULL FROM creator_erasure_tombstones \
+             WHERE creator_id = $1",
+        )
+        .bind(creator_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to lock creator erasure: {e}")))?
+        .unwrap_or(false);
+        if !blocked {
+            return Err(FusilladeError::ValidationError(
+                "creator must be blocked before erasure finalization".to_string(),
+            ));
+        }
+
+        let content_remains: bool = sqlx::query_scalar(
+            r#"SELECT
+                EXISTS(
+                    SELECT 1 FROM requests
+                    WHERE created_by = $1
+                    LIMIT 1
+                )
+                OR EXISTS(
+                    SELECT 1
+                    FROM batches b,
+                    LATERAL (
+                        SELECT 1 FROM requests r
+                        WHERE r.batch_id = b.id
+                        LIMIT 1
+                    ) request
+                    WHERE b.created_by = $1
+                    LIMIT 1
+                )
+                OR EXISTS(
+                    SELECT 1
+                    FROM batches b
+                    WHERE b.created_by = $1
+                      AND b.archive_bucket IS NOT NULL
+                      AND EXISTS (
+                          SELECT 1 FROM batch_requests_archive a
+                          WHERE a.archive_bucket = b.archive_bucket
+                            AND a.batch_id = b.id
+                          LIMIT 1
+                      )
+                    LIMIT 1
+                )
+                OR EXISTS(
+                    SELECT 1 FROM request_templates t
+                    JOIN files f ON f.id = t.file_id
+                    WHERE f.uploaded_by = $1
+                    LIMIT 1
+                )"#,
+        )
+        .bind(creator_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to verify creator erasure: {e}")))?;
+        let active_parents_remain: bool = sqlx::query_scalar(
+            r#"SELECT
+                EXISTS(
+                    SELECT 1 FROM files
+                    WHERE uploaded_by = $1 AND deleted_at IS NULL
+                    LIMIT 1
+                )
+                OR EXISTS(
+                    SELECT 1 FROM batches
+                    WHERE created_by = $1 AND deleted_at IS NULL
+                    LIMIT 1
+                )"#,
+        )
+        .bind(creator_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to verify creator tombstones: {e}")))?;
+        if content_remains || active_parents_remain {
+            tx.rollback().await.map_err(|e| {
+                FusilladeError::Other(anyhow!("Failed to end erasure verification: {e}"))
+            })?;
+            return Ok(false);
+        }
+
+        sqlx::query(
+            r#"UPDATE files
+               SET name = 'deleted', description = NULL, error_message = NULL,
+                   purpose = NULL, uploaded_by = NULL, api_key_id = NULL,
+                   source_connection_id = NULL, source_external_key = NULL,
+                   content_erased_at = COALESCE(content_erased_at, NOW())
+               WHERE uploaded_by = $1"#,
+        )
+        .bind(creator_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to scrub creator files: {e}")))?;
+        sqlx::query(
+            r#"UPDATE batches
+               SET created_by = '', metadata = NULL, errors = NULL,
+                   api_key = NULL, api_key_id = NULL,
+                   content_erased_at = COALESCE(content_erased_at, NOW())
+               WHERE created_by = $1"#,
+        )
+        .bind(creator_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to scrub creator batches: {e}")))?;
+
+        tx.commit().await.map_err(|e| {
+            FusilladeError::Other(anyhow!("Failed to commit erasure finalization: {e}"))
+        })?;
+        Ok(true)
+    }
+
     fn read_executor(&self) -> crate::db::RetryingPgPool {
         crate::db::RetryingPgPool::new(self.pools.read(), &self.db_retry_config)
     }
@@ -4732,7 +5008,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         }
     }
 
-    #[tracing::instrument(skip(self), fields(created_by = ?filter.created_by, limit = filter.limit))]
+    #[tracing::instrument(skip(self, filter), fields(limit = filter.limit))]
     async fn list_batches(&self, filter: ListBatchesFilter) -> Result<Vec<Batch>> {
         let ListBatchesFilter {
             created_by,
@@ -5355,6 +5631,11 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
             return Ok(0);
         }
 
+        // This commits before deletion begins. The trigger uses the same
+        // tombstone row, so all earlier writes are visible now and every later
+        // attributed insert is rejected.
+        self.block_creator_data(creator_id).await?;
+
         // One transaction per chunk: the rows locked via FOR UPDATE SKIP LOCKED
         // stay locked until commit, and Stage 0's two statements are dependent.
         let mut tx = self
@@ -5487,7 +5768,6 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         let total = batchless_requests + batches_affected + files_affected;
         if total > 0 {
             tracing::info!(
-                creator_id = %creator_id,
                 batchless_requests,
                 batches = batches_affected,
                 files = files_affected,
@@ -6285,7 +6565,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         Box::pin(ReceiverStream::new(rx))
     }
 
-    #[tracing::instrument(skip(self), fields(created_by = ?filter.created_by, limit = filter.limit))]
+    #[tracing::instrument(skip(self, filter), fields(limit = filter.limit))]
     async fn list_requests(
         &self,
         filter: crate::request::ListRequestsFilter,
@@ -8402,12 +8682,39 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
         })?
         .rows_affected() as i64;
 
-        let total = (requests_deleted + archived_deleted + templates_deleted) as u64;
+        // Batchless templates are normally removed atomically with their
+        // request. This also reaps historical orphans left by an idempotent
+        // request INSERT that lost a conflict after its template was written.
+        let batchless_templates_deleted = sqlx::query(
+            r#"
+            DELETE FROM request_templates
+            WHERE id IN (
+                SELECT t.id FROM request_templates t
+                WHERE t.file_id IS NULL
+                  AND NOT EXISTS (SELECT 1 FROM requests r WHERE r.template_id = t.id)
+                ORDER BY t.id
+                LIMIT $1
+                FOR UPDATE SKIP LOCKED
+            )
+            "#,
+        )
+        .bind(batch_size)
+        .execute(self.write_executor())
+        .await
+        .map_err(|e| {
+            FusilladeError::Other(anyhow!("Failed to purge orphaned batchless templates: {e}"))
+        })?
+        .rows_affected() as i64;
+
+        let total =
+            (requests_deleted + archived_deleted + templates_deleted + batchless_templates_deleted)
+                as u64;
         if total > 0 {
             tracing::info!(
                 requests_deleted,
                 archived_deleted,
                 templates_deleted,
+                batchless_templates_deleted,
                 "Purged orphaned rows"
             );
         }
@@ -24771,6 +25078,284 @@ mod tests {
             .await,
             0
         );
+    }
+
+    #[sqlx::test]
+    async fn creator_erasure_tombstone_rejects_late_realtime_capture(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+        manager.block_creator_data("user-A").await.unwrap();
+
+        let result = manager
+            .create_realtime(crate::request::CreateRealtimeInput {
+                request_id: uuid::Uuid::new_v4(),
+                body: r#"{"input":"must not persist"}"#.to_string(),
+                model: "gpt-4".to_string(),
+                endpoint: "http://localhost/ai".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/responses".to_string(),
+                api_key: String::new(),
+                created_by: "user-A".to_string(),
+            })
+            .await;
+
+        assert!(result.is_err());
+        let request_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM requests")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let template_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_templates")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(request_count, 0);
+        assert_eq!(
+            template_count, 0,
+            "the rejected transaction must not leave a body"
+        );
+    }
+
+    #[sqlx::test]
+    async fn realtime_capture_waiting_on_erasure_observes_tombstone(pool: sqlx::PgPool) {
+        let manager = Arc::new(PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        ));
+        let mut erasure = pool.begin().await.unwrap();
+        sqlx::query(
+            "SELECT pg_advisory_xact_lock( \
+                 hashtextextended('creator-erasure:' || $1, 0) \
+             )",
+        )
+        .bind("user-A")
+        .execute(&mut *erasure)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO creator_erasure_tombstones (creator_id, erased_at) \
+             VALUES ($1, NOW())",
+        )
+        .bind("user-A")
+        .execute(&mut *erasure)
+        .await
+        .unwrap();
+
+        let writer = manager.clone();
+        let mut capture = tokio::spawn(async move {
+            writer
+                .create_realtime(crate::request::CreateRealtimeInput {
+                    request_id: uuid::Uuid::new_v4(),
+                    body: r#"{"input":"must not persist"}"#.to_string(),
+                    model: "gpt-4".to_string(),
+                    endpoint: "http://localhost/ai".to_string(),
+                    method: "POST".to_string(),
+                    path: "/v1/responses".to_string(),
+                    api_key: String::new(),
+                    created_by: "user-A".to_string(),
+                })
+                .await
+        });
+        let mut observed_waiter = false;
+        for _ in 0..200 {
+            observed_waiter = sqlx::query_scalar(
+                "SELECT EXISTS( \
+                     SELECT 1 FROM pg_locks \
+                     WHERE locktype = 'advisory' AND NOT granted \
+                 )",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            if observed_waiter {
+                break;
+            }
+            if capture.is_finished() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(
+            observed_waiter,
+            "capture must wait behind erasure (finished={})",
+            capture.is_finished()
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(20), &mut capture)
+                .await
+                .is_err()
+        );
+
+        erasure.commit().await.unwrap();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), capture)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(result.is_err());
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM requests")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 0, "post-wait capture must observe the tombstone");
+    }
+
+    #[sqlx::test]
+    async fn creator_erasure_tombstone_rejects_late_batch_population(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+        let file_id = manager
+            .create_file(
+                "input.jsonl".to_string(),
+                None,
+                vec![RequestTemplateInput {
+                    custom_id: None,
+                    endpoint: "/v1/c".to_string(),
+                    method: "POST".to_string(),
+                    path: "/v1/c".to_string(),
+                    body: r#"{"input":"must not persist"}"#.to_string(),
+                    model: "m".to_string(),
+                    api_key: "key".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+        sqlx::query("UPDATE files SET uploaded_by = $1 WHERE id = $2")
+            .bind("user-A")
+            .bind(*file_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let batch = manager
+            .create_batch_record(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/c".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: Some("user-A".to_string()),
+                api_key_id: None,
+                api_key: Some("key".to_string()),
+                total_requests: None,
+            })
+            .await
+            .unwrap();
+
+        manager.block_creator_data("user-A").await.unwrap();
+        let result = manager.populate_batch(batch.id, file_id).await;
+
+        assert!(result.is_err());
+        let request_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM requests WHERE batch_id = $1")
+                .bind(*batch.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(request_count, 0);
+    }
+
+    #[sqlx::test]
+    async fn finalized_creator_erasure_scrubs_tombstones_after_children_are_gone(
+        pool: sqlx::PgPool,
+    ) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+        let file_id = manager
+            .create_file(
+                "personal-name.jsonl".to_string(),
+                Some("personal description".to_string()),
+                vec![RequestTemplateInput {
+                    custom_id: None,
+                    endpoint: "/v1/c".to_string(),
+                    method: "POST".to_string(),
+                    path: "/v1/c".to_string(),
+                    body: r#"{"input":"secret"}"#.to_string(),
+                    model: "m".to_string(),
+                    api_key: "secret-key".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+        sqlx::query("UPDATE files SET uploaded_by = $1 WHERE id = $2")
+            .bind("user-A")
+            .bind(*file_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let batch = manager
+            .create_batch(crate::batch::BatchInput {
+                file_id,
+                endpoint: "/v1/c".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: Some(serde_json::json!({"personal":"value"})),
+                created_by: Some("user-A".to_string()),
+                api_key_id: None,
+                api_key: Some("secret-key".to_string()),
+                total_requests: None,
+            })
+            .await
+            .unwrap();
+
+        manager.populate_batch(batch.id, file_id).await.unwrap();
+        // Legacy populated rows have no direct creator attribution. Erasure
+        // must still find them through the parent batch.
+        sqlx::query("UPDATE requests SET created_by = NULL WHERE batch_id = $1")
+            .bind(*batch.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        while manager.bulk_delete_data("user-A", 100).await.unwrap() > 0 {}
+        assert!(
+            !manager
+                .finalize_creator_data_erasure("user-A")
+                .await
+                .unwrap(),
+            "child request bodies must prevent premature finalization"
+        );
+        while manager
+            .purge_creator_orphaned_rows("user-A", 100)
+            .await
+            .unwrap()
+            > 0
+        {}
+        assert!(
+            manager
+                .finalize_creator_data_erasure("user-A")
+                .await
+                .unwrap()
+        );
+
+        let file: (String, Option<String>, Option<String>) =
+            sqlx::query_as("SELECT name, description, uploaded_by FROM files WHERE id = $1")
+                .bind(*file_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(file, ("deleted".to_string(), None, None));
+        let batch_row: (String, Option<serde_json::Value>, Option<String>) =
+            sqlx::query_as("SELECT created_by, metadata, api_key FROM batches WHERE id = $1")
+                .bind(*batch.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(batch_row, (String::new(), None, None));
+
+        let late_file_write =
+            sqlx::query("UPDATE files SET description = 'late content' WHERE id = $1")
+                .bind(*file_id)
+                .execute(&pool)
+                .await;
+        assert!(late_file_write.is_err());
+        let late_batch_write =
+            sqlx::query("UPDATE batches SET metadata = '{\"late\":true}' WHERE id = $1")
+                .bind(*batch.id)
+                .execute(&pool)
+                .await;
+        assert!(late_batch_write.is_err());
     }
 
     #[sqlx::test]

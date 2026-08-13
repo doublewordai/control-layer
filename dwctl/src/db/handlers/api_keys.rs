@@ -2591,6 +2591,7 @@ mod tests {
             enable_metrics: false,
             enable_request_logging: false,
             request_logging: crate::config::RequestLoggingConfig::default(),
+            data_erasure: crate::config::DataErasureConfig::default(),
             enable_analytics: true,
             analytics: Default::default(),
             enable_otel_export: false,
