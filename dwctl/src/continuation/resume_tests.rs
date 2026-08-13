@@ -320,6 +320,44 @@ async fn a_cut_stream_is_resumed_into_one_seamless_response(pool: PgPool) {
     );
 }
 
+/// Batch loopback: fusillade marks stream-intent with `x-fusillade-stream`
+/// while the BODY still says nothing about streaming (the outbound middleware
+/// forces `stream: true` below this layer). The header alone must arm the tee,
+/// or batch-origin streams — the largest death population — can never resume.
+#[sqlx::test]
+async fn a_fusillade_stream_header_arms_the_tee_without_body_stream(pool: PgPool) {
+    let fake = Fake::new(
+        vec![content("chatcmpl-1", "Hello"), content("chatcmpl-1", ", wor")],
+        vec![vec![leg_text("ld!", Some("stop")), leg_usage(1012, 8), done()]],
+    );
+    let tokenizer = render_stub(vec![1, 2, 3], 1012, 12).await;
+    let mut cfg = test_config();
+    cfg.origins.batch = true;
+    let st = state(pool, &fake, tokenizer.uri(), cfg);
+
+    let mut body = streaming_body();
+    body.as_object_mut().unwrap().remove("stream");
+    let request = Request::builder()
+        .method("POST")
+        .uri("/chat/completions")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("x-fusillade-stream", "true")
+        .body(Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+
+    let response = app(&fake, st).oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let payloads = collect_payloads(response).await;
+    let frames = parsed(&payloads);
+    assert_eq!(
+        contents(&frames),
+        "Hello, world!",
+        "a batch-origin death is rescued even though the body carried no stream flag"
+    );
+    assert_eq!(payloads.last().unwrap(), "[DONE]");
+    assert_eq!(usage_frames(&frames).len(), 1);
+}
+
 /// What the resume leg actually asked for. Everything here is load-bearing: the
 /// token-id prompt (no re-templating downstream), the global key (immune to the
 /// customer's credit state), the priority hint (jump the dynamo queue), usage

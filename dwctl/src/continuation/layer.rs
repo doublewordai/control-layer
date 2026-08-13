@@ -285,7 +285,19 @@ pub async fn continuation_middleware(State(state): State<ContinuationState>, req
 
     // Gate 2 — streaming only. Non-streaming resume is out of scope: there is no
     // partial output to continue from. No metric (ordinary traffic shape).
-    let Some(body) = parsed.filter(|b| b.get("stream").and_then(Value::as_bool) == Some(true)) else {
+    //
+    // Batch loopback bodies are NOT streaming yet at this layer: fusillade
+    // marks stream-intent with the `x-fusillade-stream` header and the
+    // outbound middleware (below us) forces `stream: true` into the body
+    // afterwards. Honor the header here or batch-origin streams — the largest
+    // death population (gemma-4-31B: ~2.8k mid-stream batch deaths/week vs
+    // 0-2 realtime) — could never arm.
+    let fusillade_stream = parts
+        .headers
+        .get("x-fusillade-stream")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.eq_ignore_ascii_case("true"));
+    let Some(body) = parsed.filter(|b| fusillade_stream || b.get("stream").and_then(Value::as_bool) == Some(true)) else {
         return next.run(forward(parts, body_bytes)).await;
     };
     let Some(model) = body.get("model").and_then(Value::as_str).map(str::to_string) else {
