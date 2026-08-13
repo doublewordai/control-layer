@@ -128,6 +128,14 @@ mod tests {
             Ok(0)
         }
 
+        async fn sweep_expired_content(
+            &self,
+            _cutoffs: &crate::manager::RetentionSweepCutoffs,
+            _batch_size: i64,
+        ) -> Result<crate::manager::RetentionSweepOutcome> {
+            Ok(crate::manager::RetentionSweepOutcome::default())
+        }
+
         async fn archive_batch(
             &self,
             _batch_id: crate::batch::BatchId,

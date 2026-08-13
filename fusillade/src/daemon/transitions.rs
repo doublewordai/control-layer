@@ -128,6 +128,14 @@ mod tests {
             Ok(0)
         }
 
+        async fn sweep_expired_content(
+            &self,
+            _cutoffs: &crate::RetentionSweepCutoffs,
+            _batch_size: i64,
+        ) -> Result<crate::RetentionSweepOutcome> {
+            Ok(crate::RetentionSweepOutcome::default())
+        }
+
         async fn purge_model_filter_events(
             &self,
             _batch_size: i64,

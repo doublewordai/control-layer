@@ -1614,6 +1614,15 @@ pub struct DaemonConfig {
     /// exist. Default: 100.
     pub purge_throttle_ms: u64,
 
+    /// Optional automated content-expiration rules. The application ships
+    /// with no time-based content deletion until an operator configures it.
+    #[serde(default)]
+    pub retention: fusillade::RetentionSweepPolicy,
+
+    /// Automated retention sweep cadence in milliseconds. Zero disables it.
+    #[serde(default)]
+    pub retention_sweep_interval_ms: u64,
+
     /// Request paths that should use SSE streaming for usage tracking.
     /// When a request's path matches, an `X-Fusillade-Stream` header is sent
     /// and the response is read as SSE, then reassembled into non-streaming JSON.
@@ -1926,6 +1935,8 @@ impl Default for DaemonConfig {
             purge_interval_ms: 600_000,
             purge_batch_size: 1000,
             purge_throttle_ms: 100,
+            retention: fusillade::RetentionSweepPolicy::default(),
+            retention_sweep_interval_ms: 0,
             streamable_endpoints: Vec::new(),
             urgency_weight: default_urgency_weight(),
             inject_deadline_priority: false,
@@ -2005,6 +2016,8 @@ impl DaemonConfig {
             purge_interval_ms: self.purge_interval_ms,
             purge_batch_size: self.purge_batch_size,
             purge_throttle_ms: self.purge_throttle_ms,
+            retention: self.retention.clone(),
+            retention_sweep_interval_ms: self.retention_sweep_interval_ms,
             streamable_endpoints: self.streamable_endpoints.clone(),
             urgency_weight: self.urgency_weight,
             inject_deadline_priority: self.inject_deadline_priority,
@@ -2720,6 +2733,32 @@ impl Config {
 
     /// Validate the configuration for consistency and required fields
     pub fn validate(&self) -> Result<(), Error> {
+        if let Err(error) = self.background_services.batch_daemon.retention.validate() {
+            return Err(Error::Internal {
+                operation: format!("Config validation: batch retention is invalid: {error}"),
+            });
+        }
+        let retention_enabled = self.background_services.batch_daemon.retention.is_enabled();
+        let retention_scheduled = self.background_services.batch_daemon.retention_sweep_interval_ms > 0;
+        if retention_enabled != retention_scheduled {
+            return Err(Error::Internal {
+                operation: "Config validation: retention rules and retention_sweep_interval_ms must be enabled or disabled together"
+                    .to_string(),
+            });
+        }
+        if retention_enabled && self.background_services.batch_daemon.enabled == DaemonEnabled::Never {
+            return Err(Error::Internal {
+                operation: "Config validation: automated retention requires the batch daemon to run".to_string(),
+            });
+        }
+        if retention_enabled
+            && (self.background_services.batch_daemon.purge_interval_ms == 0 || self.background_services.batch_daemon.purge_batch_size < 1)
+        {
+            return Err(Error::Internal {
+                operation: "Config validation: automated retention requires an enabled orphan purge and a positive purge batch size"
+                    .to_string(),
+            });
+        }
         // Validate native authentication requirements
         if self.auth.native.enabled {
             if self.secret_key.is_none() {
@@ -3023,6 +3062,50 @@ mod tests {
         assert!(AuthConfig::default().default_user_roles.contains(&Role::BackgroundInferenceUser));
     }
 
+    #[test]
+    fn retention_rules_and_schedule_must_be_enabled_together() {
+        let mut config = Config::default();
+        config.background_services.batch_daemon.retention.expire_files = true;
+
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("must be enabled or disabled together"));
+
+        config.background_services.batch_daemon.retention_sweep_interval_ms = 250;
+        assert_eq!(
+            config
+                .background_services
+                .batch_daemon
+                .to_fusillade_config()
+                .retention_sweep_interval_ms,
+            250
+        );
+    }
+
+    #[test]
+    fn retention_rejects_unknown_batchless_tiers() {
+        let mut config = Config::default();
+        config
+            .background_services
+            .batch_daemon
+            .retention
+            .batchless_seconds_by_service_tier
+            .insert("unknown".to_string(), 60);
+        config.background_services.batch_daemon.retention_sweep_interval_ms = 250;
+
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("unsupported service tier"));
+    }
+
+    #[test]
+    fn retention_requires_a_runnable_batch_daemon() {
+        let mut config = Config::default();
+        config.background_services.batch_daemon.enabled = DaemonEnabled::Never;
+        config.background_services.batch_daemon.retention.expire_files = true;
+        config.background_services.batch_daemon.retention_sweep_interval_ms = 250;
+
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("requires the batch daemon to run"));
+    }
     /// Stamping a key into a batch's metadata does NOTHING unless the key is also on this
     /// list: fusillade copies only the listed keys onto each claimed request, so an
     /// unlisted one is written, persisted, and silently never sent as a header — and the
