@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.38.0](https://github.com/doublewordai/control-layer/compare/onwards-v0.37.1...onwards-v0.38.0) (2026-08-11)
+
+
+### Features
+
+* move the OpenAI Responses API into the dwctl edge (COR-519 + COR-536 + COR-522) ([#1317](https://github.com/doublewordai/control-layer/issues/1317)) ([2061ce0](https://github.com/doublewordai/control-layer/commit/2061ce05c5a0490e74931348da14d5b2d9d0354c))
+
+
+### Bug Fixes
+
+* **inference:** normalize null-like tool call arguments ([#1461](https://github.com/doublewordai/control-layer/issues/1461)) ([5915516](https://github.com/doublewordai/control-layer/commit/591551646f54203c94d5541813499c615eaa8d6d))
+
 ## [0.37.1](https://github.com/doublewordai/control-layer/compare/onwards-v0.37.0...onwards-v0.37.1) (2026-07-30)
 
 

@@ -3233,6 +3233,28 @@ impl Application {
         let image_normalizer =
             crate::image_normalizer::from_config(&config.image_normalizer).map_err(|e| anyhow::anyhow!("image normaliser config: {e}"))?;
 
+        // Pre-dispatch preparation for daemon-claimed requests. MUST be installed
+        // before `setup_background_services` spawns the daemon, or claims can be
+        // dispatched without it. Two steps that cannot happen on the loopback:
+        //   - ZDR decrypt: the stored body is `dwzdr1:` ciphertext, so it is not
+        //     parseable JSON and every edge layer chokes before it could act.
+        //   - JIT image signing: the edge normaliser runs `Mode::All`, which does
+        //     not match the `dw-img://` tokens that file ingest stores.
+        // Derive the signing TTL from the daemon's processing timeout so a signed
+        // URL always outlives one full dispatch attempt.
+        {
+            let processing_timeout = std::time::Duration::from_millis(config.background_services.batch_daemon.processing_timeout_ms);
+            let dispatch_ttl = config.image_normalizer.signing.dispatch_ttl(processing_timeout);
+            let mut dispatch_processor =
+                crate::inference::engine::dispatch_processor::DispatchProcessor::new().with_keystore(keystore.clone());
+            if config.image_normalizer.enabled {
+                dispatch_processor = dispatch_processor.with_image_normalizer(image_normalizer.clone(), dispatch_ttl);
+            }
+            if let Err(e) = postgres_daemon.set_processor(Arc::new(dispatch_processor)) {
+                tracing::warn!(error = e, "Dispatch processor was already set; skipping");
+            }
+        }
+
         let mut bg_services = setup_background_services(BackgroundServicesInput {
             request_manager: request_manager.clone(),
             postgres_daemon: postgres_daemon.clone(),

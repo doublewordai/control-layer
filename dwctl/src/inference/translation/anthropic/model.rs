@@ -21,8 +21,10 @@ pub struct MessagesRequest {
     pub max_tokens: u32,
     #[serde(default)]
     pub messages: Vec<InputMessage>,
+    /// Top-level `system`: either a string or an array of content blocks —
+    /// the same shape as message content, so it reuses [`Content`].
     #[serde(default)]
-    pub system: Option<System>,
+    pub system: Option<Content>,
     #[serde(default)]
     pub stream: bool,
     #[serde(default)]
@@ -54,14 +56,6 @@ pub struct MessagesRequest {
     /// to synthesize a breakpoint on the last block (and strips it before the upstream call).
     #[serde(default)]
     pub cache_control: Option<Value>,
-}
-
-/// Top-level `system`: either a string or an array of content blocks.
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-pub enum System {
-    Text(String),
-    Blocks(Vec<ContentBlock>),
 }
 
 /// A single conversation message.
@@ -217,8 +211,9 @@ pub enum StopReason {
 }
 
 /// Token usage on a response. Per Anthropic's usage shape, `input_tokens`
-/// excludes cached prompt tokens, which are reported separately. The cache
-/// fields are omitted entirely when zero/absent.
+/// excludes BOTH cache buckets (reads and creations), which are reported
+/// separately — `input + cache_read + cache_creation` is the full prompt.
+/// The cache fields are omitted entirely when zero/absent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Usage {
     pub input_tokens: u64,
@@ -227,6 +222,24 @@ pub struct Usage {
     pub cache_read_input_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_creation_input_tokens: Option<u64>,
+    /// Per-TTL creation breakdown (Anthropic's `cache_creation` object; the 24h
+    /// field is a dwctl extension). Billing prices each tier at its own write
+    /// premium, so dropping this on translation billed creations at list.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_creation: Option<CacheCreation>,
+}
+
+/// The `cache_creation` per-TTL breakdown. Field names match what the cache
+/// layer splices into the OpenAI frame, so the analytics extractor reads either
+/// shape with one code path.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CacheCreation {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ephemeral_5m_input_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ephemeral_1h_input_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ephemeral_24h_input_tokens: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------

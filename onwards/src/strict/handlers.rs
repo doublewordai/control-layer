@@ -96,7 +96,11 @@ fn parse_strict_request<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T
         } else {
             StatusCode::BAD_REQUEST
         };
-        error_response(status, "invalid_request_error", &format!("Invalid request: {e}"))
+        error_response(
+            status,
+            "invalid_request_error",
+            &format!("Invalid request: {e}"),
+        )
     })
 }
 
@@ -2714,6 +2718,79 @@ mod tests {
         assert!(!body_str.contains("cost"));
         assert!(!body_str.contains("internal_id"));
         assert!(!body_str.contains("custom_field"));
+    }
+
+    #[tokio::test]
+    async fn test_strict_chat_response_normalizes_null_like_tool_arguments() {
+        let targets = Arc::new(DashMap::new());
+        targets.insert(
+            "gpt-4".to_string(),
+            Target::builder()
+                .url("https://api.openai.com/v1/".parse().unwrap())
+                .onwards_key("sk-test".to_string())
+                .build()
+                .into_pool(),
+        );
+
+        let targets = Targets {
+            targets,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels: Arc::new(DashMap::new()),
+            strict_mode: true,
+            http_pool_config: None,
+        };
+
+        let mock_response = r#"{
+            "id":"chatcmpl-tools",
+            "object":"chat.completion",
+            "created":1,
+            "model":"provider-model",
+            "choices":[{
+                "index":0,
+                "message":{
+                    "role":"assistant",
+                    "content":null,
+                    "tool_calls":[
+                        {"id":"missing","type":"function","function":{"name":"missing"}},
+                        {"id":"null","type":"function","function":{"name":"null","arguments":null}},
+                        {"id":"empty","type":"function","function":{"name":"empty","arguments":""}},
+                        {"id":"string-null","type":"function","function":{"name":"string_null","arguments":"null"}},
+                        {"id":"valid","type":"function","function":{"name":"valid","arguments":"{\"query\":\"x\"}"}}
+                    ]
+                },
+                "finish_reason":"tool_calls"
+            }]
+        }"#;
+
+        let mock_client = MockHttpClient::new(StatusCode::OK, mock_response);
+        let state = AppState::with_client(targets, mock_client);
+        let router = crate::strict::build_strict_router(state);
+        let request = Request::builder()
+            .method("POST")
+            .uri("/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}"#,
+            ))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let calls = body["choices"][0]["message"]["tool_calls"]
+            .as_array()
+            .unwrap();
+
+        assert_eq!(calls[0]["function"]["arguments"], "{}");
+        assert_eq!(calls[1]["function"]["arguments"], "{}");
+        assert_eq!(calls[2]["function"]["arguments"], "{}");
+        assert_eq!(calls[3]["function"]["arguments"], "{}");
+        assert_eq!(calls[4]["function"]["arguments"], r#"{"query":"x"}"#);
     }
 
     #[tokio::test]
