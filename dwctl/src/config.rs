@@ -1475,6 +1475,14 @@ impl From<DaemonMode> for fusillade::DaemonMode {
     }
 }
 
+fn default_adaptive_growth_factor() -> f64 {
+    1.5
+}
+
+fn default_adaptive_cut_factor() -> f64 {
+    0.8
+}
+
 /// The daemon processes batch requests asynchronously in the background.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
@@ -1498,9 +1506,31 @@ pub struct DaemonConfig {
     /// Default concurrency limit per model (default: 10)
     pub default_model_concurrency: usize,
 
-    /// Minimum time between per-model AIMD adjustments after downstream 529s
-    /// and successful responses (default: 1000ms).
-    pub adaptive_concurrency_recovery_interval_ms: u64,
+    /// Discover each model's concurrency limit from downstream 529s instead of
+    /// using its configured value as a hard ceiling (default: false).
+    ///
+    /// When on, `default_model_concurrency` and per-model `batch_capacity`
+    /// become starting points rather than ceilings, and `max_total_in_flight`
+    /// becomes the ceiling.
+    #[serde(default)]
+    pub adaptive_concurrency: bool,
+
+    /// Multiplier applied to a model's limit each time it goes up
+    /// (default: 1.5).
+    #[serde(default = "default_adaptive_growth_factor")]
+    pub adaptive_growth_factor: f64,
+
+    /// Multiplier applied to a model's limit on downstream 529 (default: 0.8).
+    #[serde(default = "default_adaptive_cut_factor")]
+    pub adaptive_cut_factor: f64,
+
+    /// Hard ceiling on this instance's total in-flight requests across all
+    /// models; 0 disables it (default: 0).
+    ///
+    /// Per-model ceilings still apply, but they bound each model separately and
+    /// can sum well above what one instance can hold.
+    #[serde(default)]
+    pub max_total_in_flight: usize,
 
     /// How long to sleep between claim iterations in milliseconds (default: 1000)
     pub claim_interval_ms: u64,
@@ -1907,7 +1937,10 @@ impl Default for DaemonConfig {
             mode: DaemonMode::Both,
             claim_batch_size: 100,
             default_model_concurrency: 10,
-            adaptive_concurrency_recovery_interval_ms: 1_000,
+            adaptive_concurrency: false,
+            adaptive_growth_factor: default_adaptive_growth_factor(),
+            adaptive_cut_factor: default_adaptive_cut_factor(),
+            max_total_in_flight: 0,
             claim_interval_ms: 1000,
             max_retries: Some(1000),
             stop_before_deadline_ms: Some(900_000),
@@ -1988,7 +2021,10 @@ impl DaemonConfig {
             mode: self.mode.into(),
             claim_batch_size: self.claim_batch_size,
             model_concurrency_limits: model_capacity_limits.unwrap_or_else(|| std::sync::Arc::new(dashmap::DashMap::new())),
-            adaptive_concurrency_recovery_interval_ms: self.adaptive_concurrency_recovery_interval_ms,
+            adaptive_concurrency: self.adaptive_concurrency,
+            adaptive_growth_factor: self.adaptive_growth_factor,
+            adaptive_cut_factor: self.adaptive_cut_factor,
+            max_total_in_flight: self.max_total_in_flight,
             model_escalations: Arc::new(DashMap::from_iter(self.model_escalations.clone())),
             claim_interval_ms: self.claim_interval_ms,
             max_retries: self.max_retries,
@@ -3975,7 +4011,7 @@ background_services:
     }
 
     #[test]
-    fn test_adaptive_concurrency_recovery_interval_default_override_and_mapping() {
+    fn test_adaptive_concurrency_default_override_and_mapping() {
         Jail::expect_with(|jail| {
             jail.create_file("test.yaml", "secret_key: test-secret-key\n")?;
             let args = Args {
@@ -3983,19 +4019,15 @@ background_services:
                 validate: false,
             };
 
+            // Off by default: turning it on lets a model's limit exceed its
+            // configured value, so it has to be a deliberate opt-in.
             let config = Config::load(&args)?;
-            assert_eq!(
-                config.background_services.batch_daemon.adaptive_concurrency_recovery_interval_ms,
-                1_000
-            );
-            assert_eq!(
-                config
-                    .background_services
-                    .batch_daemon
-                    .to_fusillade_config()
-                    .adaptive_concurrency_recovery_interval_ms,
-                1_000
-            );
+            assert!(!config.background_services.batch_daemon.adaptive_concurrency);
+            let fusillade_config = config.background_services.batch_daemon.to_fusillade_config();
+            assert!(!fusillade_config.adaptive_concurrency);
+            assert_eq!(fusillade_config.adaptive_growth_factor, 1.5);
+            assert_eq!(fusillade_config.adaptive_cut_factor, 0.8);
+            assert_eq!(fusillade_config.max_total_in_flight, 0);
 
             jail.create_file(
                 "test.yaml",
@@ -4003,18 +4035,18 @@ background_services:
 secret_key: test-secret-key
 background_services:
   batch_daemon:
-    adaptive_concurrency_recovery_interval_ms: 5000
+    adaptive_concurrency: true
+    adaptive_growth_factor: 2.0
+    adaptive_cut_factor: 0.5
+    max_total_in_flight: 40000
 "#,
             )?;
             let config = Config::load(&args)?;
-            assert_eq!(
-                config
-                    .background_services
-                    .batch_daemon
-                    .to_fusillade_config()
-                    .adaptive_concurrency_recovery_interval_ms,
-                5_000
-            );
+            let fusillade_config = config.background_services.batch_daemon.to_fusillade_config();
+            assert!(fusillade_config.adaptive_concurrency);
+            assert_eq!(fusillade_config.adaptive_growth_factor, 2.0);
+            assert_eq!(fusillade_config.adaptive_cut_factor, 0.5);
+            assert_eq!(fusillade_config.max_total_in_flight, 40_000);
 
             Ok(())
         });

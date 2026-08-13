@@ -684,7 +684,7 @@ async fn test_daemon_respects_per_model_concurrency_limits(pool: sqlx::PgPool) {
 }
 
 #[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
-async fn test_daemon_halves_claim_capacity_after_escalated_model_529(pool: sqlx::PgPool) {
+async fn test_daemon_cuts_claim_capacity_after_escalated_model_529(pool: sqlx::PgPool) {
     let http_client = Arc::new(MockHttpClient::new());
     let first_wave = [
         http_client.add_response_with_trigger(
@@ -744,7 +744,9 @@ async fn test_daemon_halves_claim_capacity_after_escalated_model_529(pool: sqlx:
         claim_interval_ms: 10,
         model_concurrency_limits,
         model_escalations,
-        adaptive_concurrency_recovery_interval_ms: 60_000,
+        adaptive_concurrency: true,
+        // Larger than anything this test dispatches, so the limit only moves
+        // downward and the assertion is about the cut alone.
         max_retries: Some(3),
         stop_before_deadline_ms: None,
         backoff_ms: 10,
@@ -785,13 +787,6 @@ async fn test_daemon_halves_claim_capacity_after_escalated_model_529(pool: sqlx:
         .await
         .unwrap();
     mark_models_live_for_test(manager.as_ref(), &["source-model"]).await;
-    let request_ids: Vec<_> = manager
-        .get_batch_requests(batch.id)
-        .await
-        .unwrap()
-        .into_iter()
-        .map(|request| request.id())
-        .collect();
 
     let shutdown_token = CancellationToken::new();
     let daemon_handle = postgres_daemon(manager.clone(), http_client.clone(), config)
@@ -825,28 +820,17 @@ async fn test_daemon_halves_claim_capacity_after_escalated_model_529(pool: sqlx:
         trigger.send(()).unwrap();
     }
 
+    // The 529 came back from the escalation target, but the slot it consumed was
+    // claimed against `source-model` - so that is the model whose limit must be
+    // cut. If the escalation target were charged instead, `source-model` would
+    // keep claiming four at a time and this would never be observed.
     tokio::time::timeout(Duration::from_secs(2), async {
-        while http_client.call_count() < 6 {
+        while http_client.in_flight_count() != 3 {
             tokio::task::yield_now().await;
         }
     })
     .await
-    .expect("a second claim should start after the first wave completes");
-
-    let requests = manager.get_requests(request_ids).await.unwrap();
-    let active_requests = requests
-        .iter()
-        .filter(|request| {
-            request
-                .as_ref()
-                .is_ok_and(|request| matches!(request.variant(), "Claimed" | "Processing"))
-        })
-        .count();
-    assert_eq!(
-        active_requests, 2,
-        "a 529 should halve the next claim from four requests to two"
-    );
-    assert_eq!(http_client.in_flight_count(), 2);
+    .expect("the 529 should cut source-model's limit from four to three");
 
     for trigger in remaining_triggers {
         trigger.send(()).unwrap();
@@ -870,8 +854,104 @@ async fn test_daemon_halves_claim_capacity_after_escalated_model_529(pool: sqlx:
         .expect("daemon should stop cleanly");
 }
 
+/// A clean, capacity-bound model is allowed past its configured limit.
+///
+/// That is the half of the problem a controller which only ratchets down cannot
+/// fix: a static limit sized for one model replica is far too low once the fleet
+/// scales up, and nothing downstream tells fusillade that more capacity exists.
+/// So a model that keeps filling every slot it is offered, without ever being
+/// rejected, has to be allowed past its configured value.
 #[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
-async fn background_529_throttles_foreground_claims_on_the_same_daemon(pool: sqlx::PgPool) {
+async fn adaptive_concurrency_grows_past_the_configured_limit(pool: sqlx::PgPool) {
+    let http_client = Arc::new(MockHttpClient::new());
+    let triggers: Vec<_> = (0..12)
+        .map(|_| {
+            http_client.add_response_with_trigger(
+                "POST /v1/grow",
+                Ok(HttpResponse {
+                    status: 200,
+                    body: r#"{"result":"success"}"#.to_string(),
+                }),
+            )
+        })
+        .collect();
+
+    let model_concurrency_limits = Arc::new(dashmap::DashMap::new());
+    model_concurrency_limits.insert("growing-model".to_string(), 2);
+    let config = DaemonConfig {
+        claim_batch_size: 20,
+        claim_interval_ms: 10,
+        model_concurrency_limits,
+        adaptive_concurrency: true,
+        max_retries: Some(3),
+        stop_before_deadline_ms: None,
+        status_log_interval_ms: None,
+        throughput_log_interval_ms: None,
+        heartbeat_interval_ms: 10_000,
+        cancellation_poll_interval_ms: 100,
+        purge_interval_ms: 0,
+        ..Default::default()
+    };
+    let manager = postgres_store(pool, &config).await;
+    for index in 0..12 {
+        manager
+            .create_flex(CreateFlexInput {
+                request_id: uuid::Uuid::new_v4(),
+                body: format!(r#"{{"kind":"grow-{index}"}}"#),
+                model: "growing-model".to_string(),
+                endpoint: "https://api.example.com".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/grow".to_string(),
+                api_key: "key".to_string(),
+                created_by: format!("owner-{index}"),
+                metadata: None,
+            })
+            .await
+            .unwrap();
+    }
+    mark_models_live_for_test(manager.as_ref(), &["growing-model"]).await;
+
+    let shutdown_token = CancellationToken::new();
+    let daemon_handle = postgres_daemon(manager.clone(), http_client.clone(), config)
+        .run(shutdown_token.clone())
+        .unwrap();
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while http_client.in_flight_count() != 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the configured limit should bound the first wave");
+
+    // Those two filled every slot offered and came back clean, which is the
+    // condition that raises the limit. Later waves should exceed the configured
+    // 2.
+    let mut triggers = triggers.into_iter();
+    triggers.next().unwrap().send(()).unwrap();
+    triggers.next().unwrap().send(()).unwrap();
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while http_client.in_flight_count() <= 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("a clean, capacity-bound model should be allowed past its configured limit");
+
+    shutdown_token.cancel();
+    for trigger in triggers {
+        let _ = trigger.send(());
+    }
+    tokio::time::timeout(Duration::from_secs(5), daemon_handle)
+        .await
+        .expect("daemon should stop")
+        .expect("daemon task should not panic")
+        .expect("daemon should stop cleanly");
+}
+
+#[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
+async fn background_529_does_not_throttle_foreground_claims(pool: sqlx::PgPool) {
     let http_client = Arc::new(MockHttpClient::new());
     let overload_trigger = http_client.add_response_with_trigger(
         "POST /v1/adaptive-shared",
@@ -904,7 +984,7 @@ async fn background_529_throttles_foreground_claims_on_the_same_daemon(pool: sql
         model_concurrency_limits,
         background_concurrency_limit: 4,
         inject_deadline_priority: true,
-        adaptive_concurrency_recovery_interval_ms: 60_000,
+        adaptive_concurrency: true,
         max_retries: Some(3),
         stop_before_deadline_ms: None,
         backoff_ms: 60_000,
@@ -976,14 +1056,20 @@ async fn background_529_throttles_foreground_claims_on_the_same_daemon(pool: sql
             .unwrap();
     }
 
-    wait_for_mock_calls(&http_client, 3).await;
-    assert_eq!(http_client.in_flight_count(), 2);
+    // Background work is opportunistic: it runs on top of the foreground limit
+    // rather than inside it, and it is admitted only while foreground is quiet.
+    // Its rejections therefore say that background overflowed, not that the
+    // foreground ceiling is too high - cutting foreground here would shrink the
+    // SLA-bearing traffic because spare-capacity traffic bounced. So the
+    // foreground limit must be untouched: all four claim at once.
+    wait_for_mock_calls(&http_client, 5).await;
+    assert_eq!(http_client.in_flight_count(), 4);
     let stability_deadline = tokio::time::Instant::now() + Duration::from_millis(150);
     while tokio::time::Instant::now() < stability_deadline {
         assert_eq!(
             http_client.call_count(),
-            3,
-            "background overload should halve foreground capacity from four to two"
+            5,
+            "a background 529 must not reduce foreground capacity"
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
@@ -991,8 +1077,6 @@ async fn background_529_throttles_foreground_claims_on_the_same_daemon(pool: sql
     let mut success_triggers = success_triggers.into_iter();
     success_triggers.next().unwrap().send(()).unwrap();
     success_triggers.next().unwrap().send(()).unwrap();
-    wait_for_mock_calls(&http_client, 5).await;
-    assert_eq!(http_client.in_flight_count(), 2);
     success_triggers.next().unwrap().send(()).unwrap();
     success_triggers.next().unwrap().send(()).unwrap();
 

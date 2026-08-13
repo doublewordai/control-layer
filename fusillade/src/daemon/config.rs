@@ -107,19 +107,50 @@ pub struct DaemonConfig {
     #[serde(default)]
     pub mode: DaemonMode,
     pub claim_batch_size: usize,
+    /// Per-model concurrency.
+    ///
+    /// With `adaptive_concurrency` off these are the limits, unchanged. With it
+    /// on they are where each model starts, and the controller owns the number
+    /// from there - bounded by `max_total_in_flight`, not per model.
     #[serde(
         default = "default_model_concurrency_limits",
         serialize_with = "serialize_model_concurrency_limits",
         deserialize_with = "deserialize_model_concurrency_limits"
     )]
     pub model_concurrency_limits: Arc<dashmap::DashMap<String, usize>>,
-    /// Minimum time between adaptive concurrency adjustments for one model.
+    /// Discover each model's concurrency from downstream backpressure instead of
+    /// running flat out at its configured value.
     ///
-    /// HTTP 529 responses halve that model's effective concurrency at most
-    /// once during this interval. Successful responses restore one permit at
-    /// most once per interval until the configured limit is reached.
-    #[serde(default = "default_adaptive_concurrency_recovery_interval_ms")]
-    pub adaptive_concurrency_recovery_interval_ms: u64,
+    /// Off by default, and turning it off returns every model to its configured
+    /// value exactly as before, so the flag is safe to flip either way. While it
+    /// is on a model's limit can go above its configured value, so
+    /// `max_total_in_flight` needs setting first.
+    #[serde(default)]
+    pub adaptive_concurrency: bool,
+    /// What to multiply a model's limit by each time it goes up.
+    ///
+    /// Clamped to `1.01..=10.0`. Higher recovers faster from a cut but overshoots
+    /// the model's real capacity further before a 529 says so, and every request
+    /// past that point is a retry and a database write.
+    #[serde(default = "default_adaptive_growth_factor")]
+    pub adaptive_growth_factor: f64,
+    /// What to multiply a model's limit by when it returns a 529.
+    ///
+    /// Clamped to `0.05..=0.99`. Closer to 1 gives up less throughput per
+    /// rejection but takes more steps to get down when capacity really has
+    /// dropped.
+    #[serde(default = "default_adaptive_cut_factor")]
+    pub adaptive_cut_factor: f64,
+    /// Hard ceiling on this process's total in-flight requests across all
+    /// models. Zero disables it.
+    ///
+    /// This is the bound that matters when `adaptive_concurrency` is on: memory
+    /// is total in-flight times request size, across all models, so a per-model
+    /// cap would not correspond to the risk. When it binds, per-model capacities
+    /// are scaled down proportionally - which is a signal to scale fusillade out
+    /// rather than a state to sit in.
+    #[serde(default)]
+    pub max_total_in_flight: usize,
     #[serde(skip, default = "default_model_escalations")]
     pub model_escalations: Arc<dashmap::DashMap<String, ModelEscalationConfig>>,
     #[serde(default)]
@@ -363,8 +394,12 @@ fn default_upload_stall_poll_ms() -> u64 {
     crate::http::DEFAULT_UPLOAD_STALL_POLL.as_millis() as u64
 }
 
-fn default_adaptive_concurrency_recovery_interval_ms() -> u64 {
-    1_000
+fn default_adaptive_growth_factor() -> f64 {
+    1.5
+}
+
+fn default_adaptive_cut_factor() -> f64 {
+    0.8
 }
 
 fn default_archive_sweep_interval_ms() -> u64 {
@@ -429,8 +464,10 @@ impl Default for DaemonConfig {
             mode: DaemonMode::default(),
             claim_batch_size: 100,
             model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
-            adaptive_concurrency_recovery_interval_ms:
-                default_adaptive_concurrency_recovery_interval_ms(),
+            adaptive_concurrency: false,
+            adaptive_growth_factor: default_adaptive_growth_factor(),
+            adaptive_cut_factor: default_adaptive_cut_factor(),
+            max_total_in_flight: 0,
             model_escalations: default_model_escalations(),
             inject_deadline_priority: false,
             background_concurrency_limit: 0,
@@ -549,28 +586,49 @@ mod tests {
     }
 
     #[test]
-    fn adaptive_concurrency_recovery_interval_defaults_and_round_trips() {
-        let default_config = DaemonConfig::default();
-        assert_eq!(
-            default_config.adaptive_concurrency_recovery_interval_ms,
-            1_000
-        );
+    fn adaptive_concurrency_ships_dark() {
+        // Turning it on lets a model's limit grow past its configured value, so
+        // the failure mode for defaulting it on is an OOM rather than a slow
+        // queue. It has to be a deliberate flip.
+        let config = DaemonConfig::default();
+        assert!(!config.adaptive_concurrency);
+        assert_eq!(config.max_total_in_flight, 0);
+    }
 
+    #[test]
+    fn adaptive_concurrency_knobs_default_and_round_trip() {
+        let default_config = DaemonConfig::default();
+        assert_eq!(default_config.adaptive_growth_factor, 1.5);
+        assert_eq!(default_config.adaptive_cut_factor, 0.8);
+
+        // Configs serialized before these keys existed must keep deserializing.
         let mut serialized = serde_json::to_value(&default_config).unwrap();
-        serialized
-            .as_object_mut()
-            .unwrap()
-            .remove("adaptive_concurrency_recovery_interval_ms");
+        {
+            let serialized = serialized.as_object_mut().unwrap();
+            serialized.remove("adaptive_concurrency");
+            serialized.remove("adaptive_growth_factor");
+            serialized.remove("adaptive_cut_factor");
+            serialized.remove("max_total_in_flight");
+        }
         let decoded: DaemonConfig = serde_json::from_value(serialized).unwrap();
-        assert_eq!(decoded.adaptive_concurrency_recovery_interval_ms, 1_000);
+        assert!(!decoded.adaptive_concurrency);
+        assert_eq!(decoded.adaptive_growth_factor, 1.5);
+        assert_eq!(decoded.adaptive_cut_factor, 0.8);
+        assert_eq!(decoded.max_total_in_flight, 0);
 
         let configured = DaemonConfig {
-            adaptive_concurrency_recovery_interval_ms: 5_000,
+            adaptive_concurrency: true,
+            adaptive_growth_factor: 2.0,
+            adaptive_cut_factor: 0.5,
+            max_total_in_flight: 40_000,
             ..DaemonConfig::default()
         };
         let decoded: DaemonConfig =
             serde_json::from_value(serde_json::to_value(configured).unwrap()).unwrap();
-        assert_eq!(decoded.adaptive_concurrency_recovery_interval_ms, 5_000);
+        assert!(decoded.adaptive_concurrency);
+        assert_eq!(decoded.adaptive_growth_factor, 2.0);
+        assert_eq!(decoded.adaptive_cut_factor, 0.5);
+        assert_eq!(decoded.max_total_in_flight, 40_000);
     }
 
     #[test]

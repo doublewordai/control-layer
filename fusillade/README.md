@@ -97,17 +97,68 @@ let pools = TestDbPools::new(pool).await?;
 let store = Arc::new(PostgresRequestManager::new(pools, (&config).into()));
 ```
 
-Each daemon adapts those limits when a downstream model returns HTTP 529. The
-first 529 in a recovery interval halves that model's effective concurrency for
-new claims, down to a minimum of one. Concurrent 529 responses in the same
-interval are treated as one overload event. Successful responses then restore
-one permit per interval until the configured limit is reached. Work already in
-flight is allowed to finish; if it exceeds the reduced limit, the daemon simply
-stops claiming for that model until enough requests complete.
+### Adaptive concurrency
 
-The feedback state is local to each daemon and shared by all of its claim
-loops. `adaptive_concurrency_recovery_interval_ms` controls both burst
-coalescing and additive recovery cadence and defaults to `1000`ms.
+With `adaptive_concurrency` on, each daemon discovers a model's sustainable
+in-flight count from downstream backpressure instead of trusting the configured
+number, which is too high at one model replica and far too low at a hundred.
+
+`model_concurrency_limits` are where each model **starts**; from there the
+controller owns the number, and `max_total_in_flight` bounds the process. There is
+no per-model ceiling: memory is total in-flight times request size across all
+models, so a per-model cap would not correspond to the risk, and capping the
+controller would leave the "far too low at a hundred replicas" half unfixed.
+
+Turning it off returns every model to its configured value exactly as before, so
+the flag is safe to flip in either direction.
+
+The limit moves multiplicatively in both directions:
+
+- **Down** on an HTTP 529, by `adaptive_cut_factor`.
+- **Up** by `adaptive_growth_factor`, once per claim cycle, for any model that
+  used every slot it was offered on the last claim. A model that used fewer had
+  run out of work, so a bigger limit would sit unused until a burst dispatched
+  the lot at once.
+
+Nothing here is sized to the fleet: a model at 500 and one at 50,000 take the
+same number of steps to move by the same proportion. That matters because Dynamo
+rejects by priority, so batch work is pushed down to almost no concurrency
+whenever realtime traffic is busy and has to climb straight back afterwards -
+and the controller cannot tell "the model is full" from "I am being outranked".
+
+Each request is stamped with a counter that is bumped on every adjustment, and a
+529 carrying an old stamp is discarded. In-flight work is never cancelled, so
+after a cut the requests sent under the old limit keep failing for up to a
+request lifetime; reacting to those would cut repeatedly for a single overload
+event, and a scale-down evicting thousands at once would drive the limit to 1.
+Genuinely sustained overload keeps producing fresh reports and keeps cutting.
+
+The cost is that finding the wall means overshooting it, so in steady state a
+fraction of requests are rejected. They are retried rather than lost, but each
+is wasted work and a database write, and `adaptive_growth_factor` sets how much
+of it there is.
+
+If a cut puts the limit below what is already running, the daemon stops claiming
+for that model until enough requests drain.
+
+Only exact HTTP 529 counts as overload. Timeouts, network errors and 5xx
+generally are failures of a request that was admitted, so they say nothing about
+capacity. Note that onwards' own concurrency limiter returns 429, not 529.
+
+Only foreground work drives the controller. Background work is opportunistic,
+runs on top of the foreground limit rather than inside it, and is admitted only
+while foreground is quiet - so its rejections mean background overflowed, not
+that the foreground ceiling is too high.
+
+State is local to each daemon process and shared by all of its claim loops.
+Nothing is coordinated between replicas or between the separately-deployed batch
+and non-batch daemons; how a model's capacity divides between them is settled
+downstream by Dynamo's priority-based rejection, not here.
+
+Off by default. Set `max_total_in_flight` before turning it on. Watch
+`fusillade_adaptive_concurrency_limit` against `dwctl_model_batch_capacity`: a
+limit that climbs without ever being cut means something that does not speak 529
+is in the way, most likely onwards' own concurrency limit, which returns 429.
 
 ### Database Retry Cadence
 
@@ -282,7 +333,10 @@ Configuration (all optional):
 | `batch_claim_require_live` | `false` | require an explicit `live` event to batch-claim |
 | `background_concurrency_limit` | `0` | per-model foreground threshold below which background workers may send; zero disables them |
 | `claim_ramp_exponent` | `0.56` | deadline-ramp curve (~59 min for 24h windows, ~10 min for 1h) |
-| `adaptive_concurrency_recovery_interval_ms` | `1000` | minimum per-model interval between 529 decreases and successful additive increases |
+| `adaptive_concurrency` | `false` | discover each model concurrency from downstream 529s, starting from its configured value |
+| `adaptive_growth_factor` | `1.5` | multiplier applied each time a limit goes up |
+| `adaptive_cut_factor` | `0.8` | multiplier applied to the limit on downstream 529 |
+| `max_total_in_flight` | `0` | hard cap on the process total in-flight across all models; zero disables |
 
 **Breaking changes relative to v19:**
 
