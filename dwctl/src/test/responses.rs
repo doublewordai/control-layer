@@ -534,12 +534,11 @@ async fn test_zdr_previous_response_id_returns_contract_400(pool: PgPool) {
     assert_eq!(stored, 0, "rejected ZDR continuation must not create a lifecycle row");
 }
 
-/// Encrypted reasoning items are not implemented. Accepting the OpenAI include
-/// flag while returning `encrypted_content: null` would falsely signal that a
-/// ZDR-compatible replay payload was produced.
+/// Standard Responses include projections must be accepted instead of being
+/// silently ignored or rejected before the request reaches the translator.
 #[sqlx::test]
 #[test_log::test]
-async fn test_encrypted_reasoning_include_returns_contract_400(pool: PgPool) {
+async fn test_standard_include_is_accepted(pool: PgPool) {
     let mock_server = wiremock::MockServer::start().await;
     mount_chat_completions_mock(&mock_server).await;
 
@@ -556,17 +555,37 @@ async fn test_encrypted_reasoning_include_returns_contract_400(pool: PgPool) {
         }))
         .await;
 
+    assert_eq!(response.status_code(), 200);
+}
+
+#[sqlx::test]
+#[test_log::test]
+async fn test_unknown_include_returns_contract_400_before_lifecycle_creation(pool: PgPool) {
+    let mock_server = wiremock::MockServer::start().await;
+    mount_chat_completions_mock(&mock_server).await;
+
+    let (server, api_key, _bg) = setup_ai_test(pool.clone(), &mock_server, true).await;
+    let response = server
+        .post("/ai/v1/responses")
+        .add_header("Authorization", &format!("Bearer {}", api_key))
+        .add_header("Content-Type", "application/json")
+        .json(&serde_json::json!({
+            "model": "gpt-4o",
+            "input": "reason about this",
+            "include": ["not.a.real.projection"]
+        }))
+        .await;
+
     assert_eq!(response.status_code(), 400);
     let body: serde_json::Value = response.json();
-    assert_eq!(body["error"]["type"], "invalid_request_error");
-    assert_eq!(body["error"]["code"], "unsupported_parameter");
+    assert_eq!(body["error"]["code"], "invalid_parameter");
     assert_eq!(body["error"]["param"], "include");
 
     let stored: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM fusillade.requests")
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(stored, 0, "unsupported include must be rejected before lifecycle creation");
+    assert_eq!(stored, 0);
 }
 
 /// Poll for the newest completed gpt-4o realtime row whose id is not `exclude`

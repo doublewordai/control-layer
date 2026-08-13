@@ -145,13 +145,13 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
     // object into a hydration 5xx.
     let zdr = crate::inference::zdr::is_zdr_request(&state.zdr_key_cache, api_key.as_deref());
     if is_responses_api
-        && request_value
-            .get("include")
-            .is_some_and(|include| !include.is_null() && include.as_array().is_none_or(|values| !values.is_empty()))
+        && let Some(include) = request_value.get("include")
+        && !include.is_null()
+        && serde_json::from_value::<Vec<crate::inference::translation::responses::types::Include>>(include.clone()).is_err()
     {
         return invalid_request_response(
-            "include is not supported by this Responses API implementation",
-            "unsupported_parameter",
+            "include must contain only supported Responses API projection values",
+            "invalid_parameter",
             "include",
         );
     }

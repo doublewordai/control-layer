@@ -10,6 +10,7 @@
 //! middleware) onto the response so `GET /v1/responses/{id}` resolves.
 
 pub mod hydrate;
+pub mod reasoning_token;
 pub mod request;
 pub mod response;
 pub mod streaming;
@@ -23,15 +24,25 @@ use serde_json::Value;
 use onwards::strict::schemas::chat_completions::{ChatCompletionChunk, ChatCompletionResponse};
 
 use self::types::ResponsesRequest;
+use self::{reasoning_token::ReasoningTokenCodec, types::Include};
 
 use super::{ProtocolTranslator, StreamReframer, TranslatedRequest, TranslationError};
 
-/// Translator for the OpenAI Responses API. Pure and stateless; see module docs.
-pub struct OpenResponses;
+/// Translator for the OpenAI Responses API. The optional codec is immutable
+/// process configuration used only for stateless encrypted reasoning tokens.
+pub struct OpenResponses {
+    reasoning_codec: Option<ReasoningTokenCodec>,
+}
 
 impl OpenResponses {
     pub fn new() -> Self {
-        Self
+        Self { reasoning_codec: None }
+    }
+
+    pub fn with_reasoning_secret(secret: &str) -> Self {
+        Self {
+            reasoning_codec: Some(ReasoningTokenCodec::from_secret(secret)),
+        }
     }
 }
 
@@ -55,7 +66,13 @@ impl ProtocolTranslator for OpenResponses {
         let req: ResponsesRequest =
             serde_json::from_slice(&body).map_err(|e| TranslationError::BadRequest(format!("invalid OpenAI Responses request: {e}")))?;
 
-        let chat = request::to_chat_request(&req);
+        if req.includes(Include::ReasoningEncryptedContent) && self.reasoning_codec.is_none() {
+            return Err(TranslationError::Internal(
+                "reasoning.encrypted_content requires a configured server encryption secret".to_string(),
+            ));
+        }
+
+        let chat = request::to_chat_request(&req, self.reasoning_codec.as_ref())?;
         let new_body = serde_json::to_vec(&chat).map_err(|e| TranslationError::Internal(e.to_string()))?;
 
         // Normalise the path so downstream code (the non-strict upstream
@@ -84,7 +101,8 @@ impl ProtocolTranslator for OpenResponses {
 
         // Stamp the platform tracking id so `GET /v1/responses/{id}` resolves; fall
         // back to the upstream completion id when there's no tracking row.
-        let out = response::to_responses_response(&chat, &req, response_id);
+        let out = response::to_responses_response(&chat, &req, response_id, self.reasoning_codec.as_ref())
+            .map_err(|e| TranslationError::Internal(e.to_string()))?;
         serde_json::to_vec(&out)
             .map(Bytes::from)
             .map_err(|e| TranslationError::Internal(e.to_string()))
@@ -101,7 +119,7 @@ impl ProtocolTranslator for OpenResponses {
     }
 
     fn stream_reframer(&self, request: &Bytes, response_id: Option<&str>) -> Box<dyn StreamReframer> {
-        Box::new(ResponsesStreamReframer::new(request, response_id))
+        Box::new(ResponsesStreamReframer::new(request, response_id, self.reasoning_codec.clone()))
     }
 }
 
@@ -152,10 +170,10 @@ struct ResponsesStreamReframer {
 }
 
 impl ResponsesStreamReframer {
-    fn new(request: &Bytes, response_id: Option<&str>) -> Self {
+    fn new(request: &Bytes, response_id: Option<&str>, reasoning_codec: Option<ReasoningTokenCodec>) -> Self {
         let state = serde_json::from_slice::<ResponsesRequest>(request)
             .ok()
-            .map(|req| streaming::StreamingState::new(&req, response_id));
+            .map(|req| streaming::StreamingState::new(&req, response_id, reasoning_codec));
         Self { state, errored: false }
     }
 
