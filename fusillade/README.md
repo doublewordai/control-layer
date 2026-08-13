@@ -218,6 +218,34 @@ or fail retries based on a completion deadline. A zero
 `background_concurrency_limit` disables processing but not submission,
 inspection, or cancellation.
 
+## Automated content retention
+
+The daemon can apply operator-defined retention rules without embedding a
+retention schedule in the library. `DaemonConfig::retention` accepts rules for
+existing file deadlines, terminal file-backed batches, and terminal
+asynchronous batchless tiers. `retention_sweep_interval_ms` controls the worker
+cadence; both are disabled by default and must be enabled together.
+
+Each sweep resolves relative periods to one set of absolute cutoffs, then:
+
+- retires due files only when they are not referenced by active batches;
+- soft-deletes batches only after their terminal counters are frozen;
+- hard-deletes eligible `flex` or `background` batchless requests and their
+  unreferenced templates in one transaction; and
+- leaves realtime and any unconfigured service tier subject to explicit
+  deletion.
+
+Root selection is ordered, limited, and uses `FOR UPDATE SKIP LOCKED`. The
+ordinary orphan purge subsequently removes request/template content belonging
+to soft-deleted files and batches, including archived batch rows. Aggregate
+metrics report sweep duration, affected rows by category, errors, and whether
+the current work budget was exhausted; no request identifiers or content are
+emitted.
+
+Deployments should supply their own periods and worker cadence through runtime
+configuration. On large existing databases, follow the concurrent index
+pre-creation instructions in the retention-sweep migration before deploying.
+
 Ordinary pending-count queries exclude background demand. To expose it, use an
 explicit `ServiceTierFilter::Include(vec![Some("background".to_string())])`; results use a
 separate `"background"` bucket per model and combine batched and batchless

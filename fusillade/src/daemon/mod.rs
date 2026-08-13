@@ -234,6 +234,19 @@ async fn with_query_timeout<T>(
     }
 }
 
+/// Run maintenance work only while the daemon remains live. Dropping the
+/// future cancels an in-flight SQLx operation and its transaction.
+async fn until_shutdown<T>(
+    shutdown: &tokio_util::sync::CancellationToken,
+    fut: impl Future<Output = T>,
+) -> Option<T> {
+    tokio::select! {
+        biased;
+        _ = shutdown.cancelled() => None,
+        result = fut => Some(result),
+    }
+}
+
 /// Daemon responsible for batchless pending requests.
 ///
 /// This loop owns the leaky-bucket/deadline-ramp policy for async/flex rows.
@@ -1285,6 +1298,29 @@ where
     pub async fn run_with_mode(self: Arc<Self>, mode: DaemonMode) -> Result<()> {
         tracing::info!("Daemon starting main processing loop");
 
+        self.config
+            .retention
+            .cutoffs_at(chrono::Utc::now())
+            .map_err(|error| {
+                FusilladeError::ValidationError(format!("invalid retention configuration: {error}"))
+            })?;
+        let retention_enabled = self.config.retention.is_enabled();
+        let retention_scheduled = self.config.retention_sweep_interval_ms > 0;
+        if retention_enabled != retention_scheduled {
+            return Err(FusilladeError::ValidationError(
+                "retention rules and retention_sweep_interval_ms must be enabled or disabled together"
+                    .to_string(),
+            ));
+        }
+        if retention_enabled
+            && (self.config.purge_interval_ms == 0 || self.config.purge_batch_size < 1)
+        {
+            return Err(FusilladeError::ValidationError(
+                "automated retention requires an enabled orphan purge and a positive purge batch size"
+                    .to_string(),
+            ));
+        }
+
         // Validate the configured claim topology before registering the daemon
         // or spawning any maintenance tasks. Background workers read this
         // process's foreground counters but run independently of its claim
@@ -1592,6 +1628,109 @@ where
                 }
             }
         });
+
+        // Spawn the policy-driven retention worker independently from orphan
+        // purging. Each call is bounded; a backlog is drained in paced chunks.
+        let retention_handle = if self.config.retention_sweep_interval_ms > 0 {
+            let storage = self.storage.clone();
+            let shutdown_token = self.shutdown_token.clone();
+            let interval_ms = self.config.retention_sweep_interval_ms;
+            let batch_size = self.config.purge_batch_size;
+            let throttle_ms = self.config.purge_throttle_ms;
+            let query_timeout = Duration::from_millis(self.config.claim_query_timeout_ms);
+            let policy = self.config.retention.clone();
+
+            Some(tokio::spawn(async move {
+                tracing::info!(
+                    interval_ms,
+                    batch_size,
+                    throttle_ms,
+                    "Retention sweep task started"
+                );
+                loop {
+                    tokio::select! {
+                        _ = tokio::time::sleep(Duration::from_millis(interval_ms)) => {},
+                        _ = shutdown_token.cancelled() => {
+                            tracing::info!("Shutting down retention sweep task");
+                            break;
+                        }
+                    }
+
+                    let cutoffs = match policy.cutoffs_at(chrono::Utc::now()) {
+                        Ok(cutoffs) => cutoffs,
+                        Err(error) => {
+                            crate::background_error!(
+                                "retention_configuration_invalid",
+                                Error,
+                                error,
+                                "Retention configuration became invalid"
+                            );
+                            return;
+                        }
+                    };
+                    loop {
+                        let started = std::time::Instant::now();
+                        let Some(sweep_result) = until_shutdown(
+                            &shutdown_token,
+                            with_query_timeout(
+                                "retention sweep query",
+                                query_timeout,
+                                storage.sweep_expired_content(&cutoffs, batch_size),
+                            ),
+                        )
+                        .await
+                        else {
+                            tracing::info!("Shutting down retention sweep task during query");
+                            return;
+                        };
+                        match sweep_result {
+                            Ok(outcome) => {
+                                histogram!("fusillade_retention_sweep_duration_seconds")
+                                    .record(started.elapsed().as_secs_f64());
+                                counter!("fusillade_retention_files_expired_total")
+                                    .increment(outcome.files_expired);
+                                counter!("fusillade_retention_batches_expired_total")
+                                    .increment(outcome.batches_expired);
+                                counter!("fusillade_retention_batchless_requests_deleted_total")
+                                    .increment(outcome.batchless_requests_deleted);
+                                gauge!("fusillade_retention_sweep_may_have_more")
+                                    .set(if outcome.may_have_more { 1.0 } else { 0.0 });
+                                tracing::info!(
+                                    files_expired = outcome.files_expired,
+                                    batches_expired = outcome.batches_expired,
+                                    batchless_requests_deleted = outcome.batchless_requests_deleted,
+                                    may_have_more = outcome.may_have_more,
+                                    "Retention sweep completed"
+                                );
+                                if !outcome.may_have_more {
+                                    break;
+                                }
+                            }
+                            Err(error) => {
+                                counter!("fusillade_retention_sweep_errors_total").increment(1);
+                                crate::background_error!(
+                                    "retention_sweep_failed",
+                                    Error,
+                                    error = %error,
+                                    "Retention sweep failed"
+                                );
+                                break;
+                            }
+                        }
+
+                        tokio::select! {
+                            _ = tokio::time::sleep(Duration::from_millis(throttle_ms)) => {},
+                            _ = shutdown_token.cancelled() => {
+                                tracing::info!("Shutting down retention sweep task during drain");
+                                return;
+                            }
+                        }
+                    }
+                }
+            }))
+        } else {
+            None
+        };
 
         // Spawn periodic purge task for orphaned rows (right-to-erasure compliance)
         if self.config.purge_interval_ms > 0 {
@@ -2005,6 +2144,20 @@ where
             }
         };
         claim_daemons.abort_all();
+        self.shutdown_token.cancel();
+
+        // Destructive maintenance must be fully stopped before this daemon is
+        // marked dead or its run future returns.
+        if let Some(retention_handle) = retention_handle
+            && let Err(error) = retention_handle.await
+        {
+            crate::background_error!(
+                "retention_task_panicked",
+                Critical,
+                error = %error,
+                "Retention sweep task panicked"
+            );
+        }
 
         // Wait for heartbeat task to complete (it will mark daemon as dead)
         tracing::info!("Waiting for heartbeat task to complete");
@@ -2046,6 +2199,20 @@ mod tests {
             DaemonConfig::default().claim_loop_max_consecutive_failures,
             10
         );
+    }
+
+    #[tokio::test]
+    async fn destructive_maintenance_future_is_cancelled_on_shutdown() {
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        shutdown.cancel();
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(100),
+            until_shutdown(&shutdown, std::future::pending::<()>()),
+        )
+        .await
+        .expect("shutdown-aware maintenance should return promptly");
+        assert!(result.is_none());
     }
 
     #[test]

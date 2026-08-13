@@ -18,7 +18,7 @@ use crate::request::{
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use futures::stream::Stream;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::pin::Pin;
 
 /// Outcome of [`DaemonStorage::archive_batch`]. Skips are NORMAL sweeper
@@ -43,6 +43,192 @@ pub struct TrailingDemandCount {
     /// `"pending"`, `"completed"`, or `"failed"`.
     pub outcome: String,
     pub count: i64,
+}
+
+/// Operator-supplied rules for automated content expiration.
+///
+/// The storage layer deliberately does not provide retention periods of its
+/// own. A deployment can enable only the content classes it intends to age
+/// out, while omitted classes remain subject to explicit deletion.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RetentionSweepPolicy {
+    /// Mark files whose existing `expires_at` deadline has passed as expired.
+    pub expire_files: bool,
+    /// Age terminal file-backed batches out this many seconds after their
+    /// terminal timestamp. `None` leaves them subject to explicit deletion.
+    pub terminal_batch_seconds: Option<u64>,
+    /// Age terminal batchless requests out by their exact service-tier label.
+    /// Missing tiers remain subject to explicit deletion.
+    pub batchless_seconds_by_service_tier: HashMap<String, u64>,
+}
+
+impl RetentionSweepPolicy {
+    /// Whether this policy contains at least one automated expiration rule.
+    pub fn is_enabled(&self) -> bool {
+        self.expire_files
+            || self.terminal_batch_seconds.is_some()
+            || !self.batchless_seconds_by_service_tier.is_empty()
+    }
+
+    /// Reject labels that cannot match a persisted service tier safely.
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        if self.terminal_batch_seconds == Some(0)
+            || self
+                .batchless_seconds_by_service_tier
+                .values()
+                .any(|seconds| *seconds == 0)
+        {
+            return Err("automated retention periods must be greater than zero".to_string());
+        }
+        let periods = self
+            .terminal_batch_seconds
+            .into_iter()
+            .chain(self.batchless_seconds_by_service_tier.values().copied());
+        if periods.into_iter().any(|seconds| {
+            i64::try_from(seconds)
+                .ok()
+                .and_then(chrono::Duration::try_seconds)
+                .is_none()
+        }) {
+            return Err("automated retention period is too large".to_string());
+        }
+        if self
+            .batchless_seconds_by_service_tier
+            .keys()
+            .any(|tier| !matches!(tier.as_str(), "flex" | "background"))
+        {
+            return Err("batchless retention supports only asynchronous service tiers".to_string());
+        }
+        Ok(())
+    }
+
+    /// Resolve relative configuration into immutable cutoffs for one sweep.
+    pub fn cutoffs_at(
+        &self,
+        now: DateTime<Utc>,
+    ) -> std::result::Result<RetentionSweepCutoffs, String> {
+        self.validate()?;
+        let cutoff = |seconds: u64| {
+            let seconds = i64::try_from(seconds)
+                .map_err(|_| "automated retention period is too large".to_string())?;
+            let duration = chrono::Duration::try_seconds(seconds)
+                .ok_or_else(|| "automated retention period is too large".to_string())?;
+            now.checked_sub_signed(duration)
+                .ok_or_else(|| "automated retention cutoff is out of range".to_string())
+        };
+        let terminal_batch_before = self.terminal_batch_seconds.map(cutoff).transpose()?;
+        let batchless_before_by_service_tier = self
+            .batchless_seconds_by_service_tier
+            .iter()
+            .map(|(tier, seconds)| Ok((tier.clone(), cutoff(*seconds)?)))
+            .collect::<std::result::Result<BTreeMap<_, _>, String>>()?;
+        Ok(RetentionSweepCutoffs {
+            expire_files_before: self.expire_files.then_some(now),
+            terminal_batch_before,
+            batchless_before_by_service_tier,
+        })
+    }
+}
+
+/// Absolute, deterministic boundaries for one retention sweep.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RetentionSweepCutoffs {
+    pub(crate) expire_files_before: Option<DateTime<Utc>>,
+    pub(crate) terminal_batch_before: Option<DateTime<Utc>>,
+    pub(crate) batchless_before_by_service_tier: BTreeMap<String, DateTime<Utc>>,
+}
+
+impl RetentionSweepCutoffs {
+    pub fn expire_files_before(&self) -> Option<DateTime<Utc>> {
+        self.expire_files_before
+    }
+
+    pub fn terminal_batch_before(&self) -> Option<DateTime<Utc>> {
+        self.terminal_batch_before
+    }
+
+    pub fn batchless_before_by_service_tier(&self) -> &BTreeMap<String, DateTime<Utc>> {
+        &self.batchless_before_by_service_tier
+    }
+}
+
+#[cfg(test)]
+mod retention_policy_tests {
+    use super::*;
+
+    #[test]
+    fn retention_is_disabled_by_default() {
+        let policy = RetentionSweepPolicy::default();
+        assert!(!policy.is_enabled());
+        assert!(policy.validate().is_ok());
+    }
+
+    #[test]
+    fn retention_rejects_ambiguous_or_immediate_rules() {
+        for tier in ["", "priority", "unknown"] {
+            let policy = RetentionSweepPolicy {
+                batchless_seconds_by_service_tier: HashMap::from([(tier.to_string(), 1)]),
+                ..Default::default()
+            };
+            assert!(policy.validate().is_err());
+        }
+
+        let batch = RetentionSweepPolicy {
+            terminal_batch_seconds: Some(0),
+            ..Default::default()
+        };
+        assert!(batch.validate().is_err());
+
+        let batchless = RetentionSweepPolicy {
+            batchless_seconds_by_service_tier: HashMap::from([("flex".to_string(), 0)]),
+            ..Default::default()
+        };
+        assert!(batchless.validate().is_err());
+
+        let oversized = RetentionSweepPolicy {
+            terminal_batch_seconds: Some(i64::MAX as u64),
+            ..Default::default()
+        };
+        assert!(oversized.validate().is_err());
+        assert!(oversized.cutoffs_at(Utc::now()).is_err());
+    }
+
+    #[test]
+    fn policy_resolves_absolute_cutoffs_once() {
+        let now = Utc::now();
+        let policy = RetentionSweepPolicy {
+            expire_files: true,
+            terminal_batch_seconds: Some(60),
+            batchless_seconds_by_service_tier: HashMap::from([("flex".to_string(), 120)]),
+        };
+        let cutoffs = policy.cutoffs_at(now).unwrap();
+        assert_eq!(cutoffs.expire_files_before, Some(now));
+        assert_eq!(
+            cutoffs.terminal_batch_before,
+            now.checked_sub_signed(chrono::Duration::seconds(60))
+        );
+    }
+}
+
+/// Aggregate, content-free result of one bounded retention sweep.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RetentionSweepOutcome {
+    /// Files newly marked expired.
+    pub files_expired: u64,
+    /// Terminal batches newly soft-deleted.
+    pub batches_expired: u64,
+    /// Terminal batchless requests and their dedicated templates hard-deleted.
+    pub batchless_requests_deleted: u64,
+    /// At least one category filled its per-category work budget and may have
+    /// more immediately eligible rows.
+    pub may_have_more: bool,
+}
+
+impl RetentionSweepOutcome {
+    pub fn affected_rows(self) -> u64 {
+        self.files_expired + self.batches_expired + self.batchless_requests_deleted
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1076,6 +1262,23 @@ pub trait DaemonStorage: Send + Sync {
     /// Returns total rows deleted across both tables. Called periodically by
     /// the daemon purge task for right-to-erasure compliance.
     async fn purge_orphaned_rows(&self, batch_size: i64) -> Result<u64>;
+
+    /// Apply operator-supplied absolute cutoffs in bounded chunks.
+    ///
+    /// Implementations must not delete active work. File-backed batches are
+    /// soft-deleted so the ordinary orphan purge can remove their content;
+    /// eligible batchless content should be removed atomically with its
+    /// dedicated request template.
+    async fn sweep_expired_content(
+        &self,
+        _cutoffs: &RetentionSweepCutoffs,
+        batch_size: i64,
+    ) -> Result<RetentionSweepOutcome> {
+        let _ = batch_size;
+        Err(crate::error::FusilladeError::ValidationError(
+            "automated content retention is not supported by this storage backend".to_string(),
+        ))
+    }
 
     /// Move one terminal batch's request rows from `requests` (live) into
     /// `batch_requests_archive` in a single bounded transaction (batches are
