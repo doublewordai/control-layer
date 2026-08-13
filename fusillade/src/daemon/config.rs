@@ -113,6 +113,13 @@ pub struct DaemonConfig {
         deserialize_with = "deserialize_model_concurrency_limits"
     )]
     pub model_concurrency_limits: Arc<dashmap::DashMap<String, usize>>,
+    /// Minimum time between adaptive concurrency adjustments for one model.
+    ///
+    /// HTTP 529 responses halve that model's effective concurrency at most
+    /// once during this interval. Successful responses restore one permit at
+    /// most once per interval until the configured limit is reached.
+    #[serde(default = "default_adaptive_concurrency_recovery_interval_ms")]
+    pub adaptive_concurrency_recovery_interval_ms: u64,
     #[serde(skip, default = "default_model_escalations")]
     pub model_escalations: Arc<dashmap::DashMap<String, ModelEscalationConfig>>,
     #[serde(default)]
@@ -356,6 +363,10 @@ fn default_upload_stall_poll_ms() -> u64 {
     crate::http::DEFAULT_UPLOAD_STALL_POLL.as_millis() as u64
 }
 
+fn default_adaptive_concurrency_recovery_interval_ms() -> u64 {
+    1_000
+}
+
 fn default_archive_sweep_interval_ms() -> u64 {
     5_000
 }
@@ -418,6 +429,8 @@ impl Default for DaemonConfig {
             mode: DaemonMode::default(),
             claim_batch_size: 100,
             model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
+            adaptive_concurrency_recovery_interval_ms:
+                default_adaptive_concurrency_recovery_interval_ms(),
             model_escalations: default_model_escalations(),
             inject_deadline_priority: false,
             background_concurrency_limit: 0,
@@ -533,6 +546,31 @@ mod tests {
             let serde_encoding = serde_json::to_value(mode).unwrap();
             assert_eq!(serde_encoding.as_str().unwrap(), mode.metric_label());
         }
+    }
+
+    #[test]
+    fn adaptive_concurrency_recovery_interval_defaults_and_round_trips() {
+        let default_config = DaemonConfig::default();
+        assert_eq!(
+            default_config.adaptive_concurrency_recovery_interval_ms,
+            1_000
+        );
+
+        let mut serialized = serde_json::to_value(&default_config).unwrap();
+        serialized
+            .as_object_mut()
+            .unwrap()
+            .remove("adaptive_concurrency_recovery_interval_ms");
+        let decoded: DaemonConfig = serde_json::from_value(serialized).unwrap();
+        assert_eq!(decoded.adaptive_concurrency_recovery_interval_ms, 1_000);
+
+        let configured = DaemonConfig {
+            adaptive_concurrency_recovery_interval_ms: 5_000,
+            ..DaemonConfig::default()
+        };
+        let decoded: DaemonConfig =
+            serde_json::from_value(serde_json::to_value(configured).unwrap()).unwrap();
+        assert_eq!(decoded.adaptive_concurrency_recovery_interval_ms, 5_000);
     }
 
     #[test]

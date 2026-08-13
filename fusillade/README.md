@@ -97,6 +97,18 @@ let pools = TestDbPools::new(pool).await?;
 let store = Arc::new(PostgresRequestManager::new(pools, (&config).into()));
 ```
 
+Each daemon adapts those limits when a downstream model returns HTTP 529. The
+first 529 in a recovery interval halves that model's effective concurrency for
+new claims, down to a minimum of one. Concurrent 529 responses in the same
+interval are treated as one overload event. Successful responses then restore
+one permit per interval until the configured limit is reached. Work already in
+flight is allowed to finish; if it exceeds the reduced limit, the daemon simply
+stops claiming for that model until enough requests complete.
+
+The feedback state is local to each daemon and shared by all of its claim
+loops. `adaptive_concurrency_recovery_interval_ms` controls both burst
+coalescing and additive recovery cadence and defaults to `1000`ms.
+
 ### Database Retry Cadence
 
 `fusillade-arsenal` can retry transient SQLx pool-acquire failures such as
@@ -270,6 +282,7 @@ Configuration (all optional):
 | `batch_claim_require_live` | `false` | require an explicit `live` event to batch-claim |
 | `background_concurrency_limit` | `0` | per-model foreground threshold below which background workers may send; zero disables them |
 | `claim_ramp_exponent` | `0.56` | deadline-ramp curve (~59 min for 24h windows, ~10 min for 1h) |
+| `adaptive_concurrency_recovery_interval_ms` | `1000` | minimum per-model interval between 529 decreases and successful additive increases |
 
 **Breaking changes relative to v19:**
 
