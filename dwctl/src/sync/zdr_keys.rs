@@ -1,7 +1,7 @@
 //! Lightweight per-key zero-data-retention (ZDR) sync.
 //!
 //! Maintains a memory-local map from api key secret to the owning account's
-//! `users.zero_data_retention` flag, so the request hot path
+//! `users.zero_data_retention` flag and opaque account identifier, so request hot paths
 //! ([`crate::inference::zdr::is_zdr_request`]) answers per-key ZDR policy with a
 //! lock-free map read and no DB round-trip.
 //!
@@ -22,13 +22,19 @@ use tracing::{debug, info};
 use crate::config::ONWARDS_CONFIG_CHANGED_CHANNEL;
 use crate::metrics::errors::component;
 
-/// Lock-free, cheap-to-clone handle to the shared secret-to-ZDR-flag map.
+#[derive(Clone, Debug)]
+struct KeyPolicy {
+    zero_data_retention: bool,
+    subject_id: Option<String>,
+}
+
+/// Lock-free, cheap-to-clone handle to the shared per-key policy map.
 ///
 /// A secret absent from the map is a deleted or invalid key (auth rejects it
 /// before any body is stored), so absence safely reads as "not ZDR".
 #[derive(Clone)]
 pub struct ZdrKeyCache {
-    inner: Arc<ArcSwap<HashMap<String, bool>>>,
+    inner: Arc<ArcSwap<HashMap<String, KeyPolicy>>>,
 }
 
 impl ZdrKeyCache {
@@ -42,10 +48,20 @@ impl ZdrKeyCache {
 
     /// Whether the api key `secret` belongs to a ZDR account. Hot-path safe.
     pub fn is_zdr(&self, secret: &str) -> bool {
-        self.inner.load().get(secret).copied().unwrap_or(false)
+        self.inner
+            .load()
+            .get(secret)
+            .map(|policy| policy.zero_data_retention)
+            .unwrap_or(false)
     }
 
-    fn replace(&self, map: HashMap<String, bool>) {
+    /// Opaque account subject for an authenticated key, if the key exists in
+    /// the server-loaded policy map.
+    pub fn subject_id(&self, secret: &str) -> Option<String> {
+        self.inner.load().get(secret).and_then(|policy| policy.subject_id.clone())
+    }
+
+    fn replace(&self, map: HashMap<String, KeyPolicy>) {
         self.inner.store(Arc::new(map));
     }
 
@@ -53,17 +69,68 @@ impl ZdrKeyCache {
     #[cfg(test)]
     pub fn from_pairs<I: IntoIterator<Item = (String, bool)>>(pairs: I) -> Self {
         let cache = Self::empty();
-        cache.replace(pairs.into_iter().collect());
+        cache.replace(
+            pairs
+                .into_iter()
+                .map(|(secret, zero_data_retention)| {
+                    (
+                        secret,
+                        KeyPolicy {
+                            zero_data_retention,
+                            subject_id: None,
+                        },
+                    )
+                })
+                .collect(),
+        );
         cache
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_policies<I: IntoIterator<Item = (String, bool, Option<String>)>>(policies: I) -> Self {
+        let cache = Self::empty();
+        cache.replace(
+            policies
+                .into_iter()
+                .map(|(secret, zero_data_retention, subject_id)| {
+                    (
+                        secret,
+                        KeyPolicy {
+                            zero_data_retention,
+                            subject_id,
+                        },
+                    )
+                })
+                .collect(),
+        );
+        cache
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replace_for_test<I: IntoIterator<Item = (String, bool, Option<String>)>>(&self, policies: I) {
+        self.replace(
+            policies
+                .into_iter()
+                .map(|(secret, zero_data_retention, subject_id)| {
+                    (
+                        secret,
+                        KeyPolicy {
+                            zero_data_retention,
+                            subject_id,
+                        },
+                    )
+                })
+                .collect(),
+        );
     }
 }
 
 /// Run the join and collect the flat secret-to-zdr map. ZDR lives on `users`
 /// (account-wide); a key inherits its owner's flag via `api_keys.user_id`.
-async fn load(pool: &PgPool) -> Result<HashMap<String, bool>, sqlx::Error> {
+async fn load(pool: &PgPool) -> Result<HashMap<String, KeyPolicy>, sqlx::Error> {
     let rows = sqlx::query!(
         r#"
-        SELECT ak.secret, u.zero_data_retention
+        SELECT ak.secret, ak.user_id, u.zero_data_retention
         FROM api_keys ak
         JOIN users u ON u.id = ak.user_id
         WHERE NOT ak.is_deleted
@@ -72,7 +139,18 @@ async fn load(pool: &PgPool) -> Result<HashMap<String, bool>, sqlx::Error> {
     .fetch_all(pool)
     .await?;
 
-    Ok(rows.into_iter().map(|r| (r.secret, r.zero_data_retention)).collect())
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            (
+                row.secret,
+                KeyPolicy {
+                    zero_data_retention: row.zero_data_retention,
+                    subject_id: Some(row.user_id.to_string()),
+                },
+            )
+        })
+        .collect())
 }
 
 /// Reload `cache` in place from the DB, returning the number of keys loaded.
@@ -108,6 +186,7 @@ pub async fn run(pool: PgPool, cache: ZdrKeyCache, fallback_interval_ms: u64, sh
         info!("Started ZDR key sync listener");
 
         let mut last_reload = std::time::Instant::now();
+        let mut pending_reload: Option<tokio::time::Instant> = None;
         let mut fallback_timer = fallback.map(|iv| {
             let mut t = tokio::time::interval(iv);
             t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -125,8 +204,14 @@ pub async fn run(pool: PgPool, cache: ZdrKeyCache, fallback_interval_ms: u64, sh
                 _ = shutdown.cancelled() => break 'outer,
                 notif = listener.try_recv() => match notif {
                     Ok(Some(_)) => {
-                        if last_reload.elapsed() < MIN_RELOAD_INTERVAL { continue; }
+                        if last_reload.elapsed() < MIN_RELOAD_INTERVAL {
+                            pending_reload.get_or_insert_with(|| {
+                                tokio::time::Instant::now() + MIN_RELOAD_INTERVAL.saturating_sub(last_reload.elapsed())
+                            });
+                            continue;
+                        }
                         last_reload = std::time::Instant::now();
+                        pending_reload = None;
                         reload(&pool, &cache).await;
                     }
                     Ok(None) => {
@@ -138,9 +223,20 @@ pub async fn run(pool: PgPool, cache: ZdrKeyCache, fallback_interval_ms: u64, sh
                         break;
                     }
                 },
+                _ = async {
+                    match pending_reload {
+                        Some(deadline) => tokio::time::sleep_until(deadline).await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    pending_reload = None;
+                    last_reload = std::time::Instant::now();
+                    reload(&pool, &cache).await;
+                }
                 _ = tick => {
                     if last_reload.elapsed() < MIN_RELOAD_INTERVAL { continue; }
                     last_reload = std::time::Instant::now();
+                    pending_reload = None;
                     reload(&pool, &cache).await;
                 }
             }
@@ -185,7 +281,110 @@ mod tests {
         let cache = ZdrKeyCache::empty();
         let handle = cache.clone();
         assert!(!handle.is_zdr("sk-on"));
-        cache.replace([("sk-on".to_string(), true)].into_iter().collect());
+        cache.replace(
+            [(
+                "sk-on".to_string(),
+                KeyPolicy {
+                    zero_data_retention: true,
+                    subject_id: None,
+                },
+            )]
+            .into_iter()
+            .collect(),
+        );
         assert!(handle.is_zdr("sk-on"));
+    }
+
+    #[test]
+    fn cache_returns_only_server_loaded_opaque_subjects() {
+        let subject_id = uuid::Uuid::new_v4().to_string();
+        let cache = ZdrKeyCache::from_policies([("sk-known".to_owned(), true, Some(subject_id.clone()))]);
+
+        assert_eq!(cache.subject_id("sk-known").as_deref(), Some(subject_id.as_str()));
+        assert_eq!(cache.subject_id("sk-missing"), None);
+
+        let legacy_test_cache = ZdrKeyCache::from_pairs([("sk-zdr".to_owned(), true)]);
+        assert!(legacy_test_cache.is_zdr("sk-zdr"));
+        assert_eq!(legacy_test_cache.subject_id("sk-zdr"), None);
+    }
+
+    #[sqlx::test]
+    async fn refresh_excludes_soft_deleted_credentials(pool: PgPool) {
+        let user = crate::test::utils::create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
+        for (secret, is_deleted) in [("sk-active", false), ("sk-deleted", true)] {
+            sqlx::query(
+                "INSERT INTO api_keys (id, name, secret, purpose, user_id, created_by, is_deleted) \
+                 VALUES ($1, $2, $3, 'realtime', $4, $4, $5)",
+            )
+            .bind(uuid::Uuid::new_v4())
+            .bind(format!("{secret} test key"))
+            .bind(secret)
+            .bind(user.id)
+            .bind(is_deleted)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let cache = ZdrKeyCache::empty();
+        refresh(&pool, &cache).await.unwrap();
+
+        let expected_subject = user.id.to_string();
+        assert_eq!(cache.subject_id("sk-active").as_deref(), Some(expected_subject.as_str()));
+        assert_eq!(cache.subject_id("sk-deleted"), None);
+    }
+
+    #[sqlx::test]
+    async fn listener_coalesces_a_second_mutation_inside_the_debounce_window(pool: PgPool) {
+        let user = crate::test::utils::create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
+        let cache = ZdrKeyCache::empty();
+        let shutdown = CancellationToken::new();
+        let task = tokio::spawn(run(pool.clone(), cache.clone(), 0, shutdown.clone()));
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        sqlx::query(
+            "INSERT INTO api_keys (id, name, secret, purpose, user_id, created_by) \
+             VALUES ($1, 'first debounce key', 'sk-debounce-first', 'realtime', $2, $2)",
+        )
+        .bind(uuid::Uuid::new_v4())
+        .bind(user.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while cache.subject_id("sk-debounce-first").is_none() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("first notification should refresh the cache");
+
+        // This mutation follows the completed first reload closely enough to
+        // exercise the trailing edge of the debounce window.
+        sqlx::query(
+            "INSERT INTO api_keys (id, name, secret, purpose, user_id, created_by) \
+             VALUES ($1, 'second debounce key', 'sk-debounce-second', 'realtime', $2, $2)",
+        )
+        .bind(uuid::Uuid::new_v4())
+        .bind(user.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while cache.subject_id("sk-debounce-second").is_none() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("debounced notification should trigger a trailing refresh");
+
+        shutdown.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .expect("listener should stop promptly")
+            .expect("listener task should not panic")
+            .expect("listener should exit cleanly");
     }
 }

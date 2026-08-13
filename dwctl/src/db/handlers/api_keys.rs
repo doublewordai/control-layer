@@ -2590,6 +2590,7 @@ mod tests {
             auth: Default::default(),
             enable_metrics: false,
             enable_request_logging: false,
+            request_logging: crate::config::RequestLoggingConfig::default(),
             enable_analytics: true,
             analytics: Default::default(),
             enable_otel_export: false,

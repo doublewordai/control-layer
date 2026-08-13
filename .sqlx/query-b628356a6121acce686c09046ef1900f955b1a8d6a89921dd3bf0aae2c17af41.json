@@ -1,0 +1,32 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT ak.secret, ak.user_id, u.zero_data_retention\n        FROM api_keys ak\n        JOIN users u ON u.id = ak.user_id\n        WHERE NOT ak.is_deleted\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "secret",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 1,
+        "name": "user_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "zero_data_retention",
+        "type_info": "Bool"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "b628356a6121acce686c09046ef1900f955b1a8d6a89921dd3bf0aae2c17af41"
+}

@@ -153,6 +153,9 @@ pub struct Config {
     /// When enabled, raw request and response bodies are stored in the
     /// `http_requests` and `http_responses` tables for debugging and auditing.
     pub enable_request_logging: bool,
+    /// Header minimisation and opaque attribution for request/response logging.
+    #[serde(default)]
+    pub request_logging: RequestLoggingConfig,
     /// Enable analytics and billing (http_analytics table, credit deduction, Prometheus metrics)
     ///
     /// Can be enabled independently of `enable_request_logging`. When enabled without
@@ -2368,6 +2371,25 @@ pub struct AnalyticsConfig {
     pub balance_notification_interval_milliseconds: u64,
 }
 
+/// Controls which HTTP metadata reaches persistent request logging.
+///
+/// `None` preserves the existing capture behaviour. `Some(vec![])` retains no
+/// headers for that direction. Deployments choose their own allowlists and may
+/// optionally name an internal carrier for a server-resolved opaque subject.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RequestLoggingConfig {
+    /// Request headers retained by persistent logging. `None` retains all
+    /// headers for backwards compatibility; an empty list retains none.
+    pub retained_request_headers: Option<Vec<String>>,
+    /// Response headers retained by persistent logging. `None` retains all
+    /// headers for backwards compatibility; an empty list retains none.
+    pub retained_response_headers: Option<Vec<String>>,
+    /// Internal header used to carry a server-resolved opaque subject into
+    /// persistence. Client-provided values are discarded before attribution.
+    pub subject_header: Option<String>,
+}
+
 impl Default for AnalyticsConfig {
     fn default() -> Self {
         Self {
@@ -2500,6 +2522,7 @@ impl Default for Config {
             background_services: BackgroundServicesConfig::default(),
             enable_metrics: true,
             enable_request_logging: true,
+            request_logging: RequestLoggingConfig::default(),
             enable_analytics: true,
             analytics: AnalyticsConfig::default(),
             enable_otel_export: false,
@@ -2720,6 +2743,11 @@ impl Config {
 
     /// Validate the configuration for consistency and required fields
     pub fn validate(&self) -> Result<(), Error> {
+        if let Err(error) = crate::request_logging::build_capture_policy(&self.request_logging) {
+            return Err(Error::Internal {
+                operation: format!("Config validation: request_logging is invalid: {error}"),
+            });
+        }
         // Validate native authentication requirements
         if self.auth.native.enabled {
             if self.secret_key.is_none() {
@@ -3021,6 +3049,90 @@ mod tests {
     #[test]
     fn default_auth_roles_include_background_inference() {
         assert!(AuthConfig::default().default_user_roles.contains(&Role::BackgroundInferenceUser));
+    }
+
+    #[test]
+    fn request_logging_config_defaults_to_preserving_existing_capture() {
+        let config = RequestLoggingConfig::default();
+
+        assert_eq!(config.retained_request_headers, None);
+        assert_eq!(config.retained_response_headers, None);
+        assert_eq!(config.subject_header, None);
+    }
+
+    #[test]
+    fn request_logging_config_loads_independent_allowlists_and_subject() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: hello
+request_logging:
+  retained_request_headers: [content-type]
+  retained_response_headers: []
+  subject_header: x-application-subject
+"#,
+            )?;
+
+            let config = Config::load(&Args {
+                config: "test.yaml".into(),
+                validate: false,
+            })?;
+
+            assert_eq!(
+                config.request_logging.retained_request_headers,
+                Some(vec!["content-type".to_owned()])
+            );
+            assert_eq!(config.request_logging.retained_response_headers, Some(vec![]));
+            assert_eq!(config.request_logging.subject_header.as_deref(), Some("x-application-subject"));
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn request_logging_config_rejects_invalid_header_names() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: hello
+request_logging:
+  retained_request_headers: ["invalid header"]
+"#,
+            )?;
+
+            let error = Config::load(&Args {
+                config: "test.yaml".into(),
+                validate: false,
+            })
+            .unwrap_err();
+
+            assert!(error.to_string().contains("request_logging is invalid"));
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn request_logging_config_rejects_credential_header_as_subject_carrier() {
+        let mut config = Config::default();
+        config.request_logging.subject_header = Some("Authorization".to_owned());
+
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("must not use a credential header name")
+        );
+    }
+
+    #[test]
+    fn request_logging_config_keeps_subject_out_of_retained_headers() {
+        let mut config = Config::default();
+        config.request_logging.subject_header = Some("x-example-subject".to_owned());
+        config.request_logging.retained_request_headers = Some(vec!["X-Example-Subject".to_owned()]);
+
+        assert!(config.validate().unwrap_err().to_string().contains("must not also be retained"));
     }
 
     /// Stamping a key into a batch's metadata does NOTHING unless the key is also on this

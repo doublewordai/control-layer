@@ -4509,8 +4509,7 @@ dependencies = [
 [[package]]
 name = "outlet-postgres"
 version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c0744e251cac20a4be6e9e762b740785397827de54f6fae0e057f4e67e1ea9fb"
+source = "git+https://github.com/doublewordai/outlet-postgres.git?rev=d0817a4c7de0b742aeba6b04b4e0ad5461960ce5#d0817a4c7de0b742aeba6b04b4e0ad5461960ce5"
 dependencies = [
  "base64",
  "bytes",

@@ -377,6 +377,56 @@ impl<H: RequestHandler> RequestHandler for ZdrBodyScrubber<H> {
         }
         self.inner.handle_response(request_data, response_data)
     }
+
+    fn handle_abandoned(&self, mut data: RequestData) -> impl std::future::Future<Output = ()> + Send {
+        if request_is_zdr(&data) {
+            data.body = None;
+        }
+        self.inner.handle_abandoned(data)
+    }
+
+    async fn handle_request_batch(&self, batch: &[RequestData]) {
+        let scrubbed: Vec<_> = batch
+            .iter()
+            .cloned()
+            .map(|mut data| {
+                if request_is_zdr(&data) {
+                    data.body = None;
+                }
+                data
+            })
+            .collect();
+        self.inner.handle_request_batch(&scrubbed).await;
+    }
+
+    async fn handle_response_batch(&self, batch: &[(RequestData, ResponseData)]) {
+        let scrubbed: Vec<_> = batch
+            .iter()
+            .cloned()
+            .map(|(mut request_data, mut response_data)| {
+                if request_is_zdr(&request_data) {
+                    request_data.body = None;
+                    response_data.body = None;
+                }
+                (request_data, response_data)
+            })
+            .collect();
+        self.inner.handle_response_batch(&scrubbed).await;
+    }
+
+    async fn handle_abandoned_batch(&self, batch: &[RequestData]) {
+        let scrubbed: Vec<_> = batch
+            .iter()
+            .cloned()
+            .map(|mut data| {
+                if request_is_zdr(&data) {
+                    data.body = None;
+                }
+                data
+            })
+            .collect();
+        self.inner.handle_abandoned_batch(&scrubbed).await;
+    }
 }
 
 #[cfg(test)]
@@ -572,6 +622,9 @@ mod tests {
     struct BodyRecorder {
         req: std::sync::Arc<std::sync::Mutex<Option<Option<Bytes>>>>,
         resp: std::sync::Arc<std::sync::Mutex<Option<Option<Bytes>>>>,
+        request_batches: std::sync::Arc<std::sync::Mutex<usize>>,
+        response_batches: std::sync::Arc<std::sync::Mutex<usize>>,
+        abandoned_batches: std::sync::Arc<std::sync::Mutex<usize>>,
     }
 
     impl RequestHandler for BodyRecorder {
@@ -584,6 +637,18 @@ mod tests {
             *self.req.lock().unwrap() = Some(request_data.body.clone());
             *self.resp.lock().unwrap() = Some(response_data.body.clone());
             async {}
+        }
+
+        async fn handle_request_batch(&self, _batch: &[RequestData]) {
+            *self.request_batches.lock().unwrap() += 1;
+        }
+
+        async fn handle_response_batch(&self, _batch: &[(RequestData, ResponseData)]) {
+            *self.response_batches.lock().unwrap() += 1;
+        }
+
+        async fn handle_abandoned_batch(&self, _batch: &[RequestData]) {
+            *self.abandoned_batches.lock().unwrap() += 1;
         }
     }
 
@@ -645,5 +710,21 @@ mod tests {
             rec.resp.lock().unwrap().clone().unwrap().is_some(),
             "non-ZDR response body must pass through"
         );
+    }
+
+    #[tokio::test]
+    async fn zdr_scrubber_preserves_inner_batch_callbacks() {
+        let rec = BodyRecorder::default();
+        let scrubber = ZdrBodyScrubber::new(rec.clone());
+        let requests = vec![body_request(true), body_request(false)];
+        let responses = vec![(body_request(true), body_response()), (body_request(false), body_response())];
+
+        scrubber.handle_request_batch(&requests).await;
+        scrubber.handle_response_batch(&responses).await;
+        scrubber.handle_abandoned_batch(&requests).await;
+
+        assert_eq!(*rec.request_batches.lock().unwrap(), 1);
+        assert_eq!(*rec.response_batches.lock().unwrap(), 1);
+        assert_eq!(*rec.abandoned_batches.lock().unwrap(), 1);
     }
 }

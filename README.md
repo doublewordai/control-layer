@@ -258,6 +258,15 @@ database:
 # request/responses, for example), toggle this flag.
 enable_request_logging: true # Enable request/response logging to database
 
+# Optional persistent-log minimisation. Omitted lists preserve all headers for
+# backwards compatibility; [] retains none. subject_header is an internal,
+# deployment-specific carrier populated from authenticated server state.
+# The carrier is captured internally and removed before upstream dispatch.
+# request_logging:
+#   retained_request_headers: [content-type]
+#   retained_response_headers: []
+#   subject_header: x-example-subject
+
 # Batches API configuration
 # The batches API provides OpenAI-compatible batch processing endpoints
 # Batches can be sent containing requests to any model configured in the

@@ -40,6 +40,10 @@ pub struct ResponsesRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ParsedAIRequest {
+    /// Kept for source compatibility. HTTP headers are persisted through the
+    /// dedicated capture fields and are never duplicated into parsed content.
+    #[allow(dead_code, reason = "source-compatible field intentionally remains empty")]
+    #[serde(skip)]
     pub headers: HashMap<String, String>,
     pub request: AiRequest,
     /// Populated when the request was routed to /v1/responses.

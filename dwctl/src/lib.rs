@@ -1153,7 +1153,7 @@ pub async fn build_router(
     requests_writer_sender: Option<crate::inference::engine::writer::RequestsWriterSender>,
     metrics_recorder: Option<GenAiMetrics>,
     strict_mode: bool,
-    inference_middleware_state: Option<crate::inference::middleware::InferenceMiddlewareState>,
+    mut inference_middleware_state: Option<crate::inference::middleware::InferenceMiddlewareState>,
 ) -> anyhow::Result<Router> {
     let config = state.current_config();
 
@@ -1178,17 +1178,25 @@ pub async fn build_router(
         // Add PostgresHandler for request logging if enabled
         if request_logging_enabled {
             let outlet_pool = state.outlet_db.as_ref().expect("outlet_db checked above");
+            let (capture_policy, subject_header) =
+                request_logging::build_capture_policy(&config.request_logging).context("invalid request logging capture configuration")?;
+            if let Some(subject_header) = subject_header {
+                inference_middleware_state
+                    .as_mut()
+                    .context("request logging subject attribution requires inference middleware")?
+                    .request_logging_subject_header = Some(subject_header);
+            }
             let postgres_handler = PostgresHandler::<DbPools, ParsedAIRequest, AiResponse>::from_pool_provider(outlet_pool.clone())
                 .await
-                .expect("Failed to create PostgresHandler for request logging")
+                .context("failed to create PostgresHandler for request logging")?
                 .with_request_serializer(parse_ai_request)
-                .with_response_serializer(parse_ai_response);
+                .with_response_serializer(parse_ai_response)
+                .with_capture_policy(capture_policy);
             // TRANSITIONAL (dwctl ZDR): guard the analytics logger so plaintext
             // ZDR bodies (decrypted for the upstream call, captured on the
             // loopback) never land in http_requests / http_responses. The marker
             // header rides on the dispatch; see ZdrBodyScrubber.
-            let postgres_handler = crate::inference::engine::outlet_handler::ZdrBodyScrubber::new(postgres_handler);
-            multi_handler = multi_handler.with(postgres_handler);
+            multi_handler = multi_handler.with(crate::inference::engine::outlet_handler::ZdrBodyScrubber::new(postgres_handler));
         }
 
         // Add AnalyticsHandler for analytics/billing if enabled
@@ -1842,6 +1850,22 @@ pub async fn build_router(
             translation_registry,
             crate::inference::translation::middleware::translation_middleware,
         ))
+    };
+
+    // Outlet must see the trusted attribution carrier, but protocol
+    // translation and upstream services must not. This layer is immediately
+    // inside Outlet, so capture happens first on ingress and stripping happens
+    // before the request is dispatched any further.
+    let onwards_router = if let Some(subject_header) = inference_middleware_state
+        .as_ref()
+        .and_then(|state| state.request_logging_subject_header.clone())
+    {
+        onwards_router.layer(middleware::from_fn_with_state(
+            subject_header,
+            request_logging::strip_subject_carrier,
+        ))
+    } else {
+        onwards_router
     };
 
     // Apply request logging (outlet). OUTER to translation, so on the response path
@@ -3143,6 +3167,7 @@ impl Application {
         pool: Option<PgPool>,
         tracer_provider: Option<telemetry::SdkTracerProvider>,
     ) -> anyhow::Result<Self> {
+        request_logging::build_capture_policy(&config.request_logging).context("invalid request logging configuration")?;
         debug!("Starting control layer with configuration: {:#?}", config);
 
         // Setup database connections, run migrations, and initialize data
@@ -3371,6 +3396,7 @@ impl Application {
             flex_completion_window: config.batches.async_requests.completion_window.clone(),
             keystore: bg_services.keystore.clone(),
             zdr_key_cache: bg_services.zdr_key_cache.clone(),
+            request_logging_subject_header: None,
         };
 
         // Build onwards router from targets with body transform + response sanitization.

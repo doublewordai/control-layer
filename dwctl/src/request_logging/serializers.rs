@@ -39,15 +39,18 @@
 //!
 //! [outlet]: https://github.com/doublewordai/outlet
 
-use crate::config::Config;
-use crate::request_logging::models::{AiRequest, AiResponse, ChatCompletionChunk, CompletionChunk, ParsedAIRequest, ResponsesRequest};
+use std::collections::HashMap;
+use std::fmt;
+use std::str;
+
 use outlet::{RequestData, ResponseData};
 use outlet_postgres::SerializationError;
 use serde_json::Value;
-use std::fmt;
-use std::str;
 use tracing::{error, instrument};
 use uuid::Uuid;
+
+use crate::config::Config;
+use crate::request_logging::models::{AiRequest, AiResponse, ChatCompletionChunk, CompletionChunk, ParsedAIRequest, ResponsesRequest};
 
 use super::utils;
 
@@ -177,17 +180,11 @@ pub struct UsageMetrics {
 ///   issues with the embeddings variant (both use an `input` field).
 #[instrument(skip_all, name = "dwctl.parse_ai_request")]
 pub fn parse_ai_request(request_data: &RequestData) -> Result<ParsedAIRequest, SerializationError> {
-    let headers = request_data
-        .headers
-        .iter()
-        .map(|(k, v)| (k.clone(), v.iter().map(|b| String::from_utf8_lossy(b).to_string()).collect()))
-        .collect();
-
     let bytes = match &request_data.body {
         Some(body) => body.as_ref(),
         None => {
             return Ok(ParsedAIRequest {
-                headers,
+                headers: HashMap::new(),
                 request: AiRequest::Other(Value::Null),
                 responses_request: None,
             });
@@ -198,7 +195,7 @@ pub fn parse_ai_request(request_data: &RequestData) -> Result<ParsedAIRequest, S
 
     if body_str.trim().is_empty() {
         return Ok(ParsedAIRequest {
-            headers,
+            headers: HashMap::new(),
             request: AiRequest::Other(Value::Null),
             responses_request: None,
         });
@@ -213,7 +210,7 @@ pub fn parse_ai_request(request_data: &RequestData) -> Result<ParsedAIRequest, S
                 let model = value.get("model").and_then(|v| v.as_str()).map(|s| s.to_string());
                 let stream = value.get("stream").and_then(|v| v.as_bool());
                 Ok(ParsedAIRequest {
-                    headers,
+                    headers: HashMap::new(),
                     request: AiRequest::Other(value),
                     responses_request: Some(ResponsesRequest { model, stream }),
                 })
@@ -230,7 +227,7 @@ pub fn parse_ai_request(request_data: &RequestData) -> Result<ParsedAIRequest, S
 
     match serde_json::from_str(&body_str) {
         Ok(request) => Ok(ParsedAIRequest {
-            headers,
+            headers: HashMap::new(),
             request,
             responses_request: None,
         }),
@@ -1042,6 +1039,28 @@ mod tests {
             }
             _ => panic!("Expected AiRequest::ChatCompletions"),
         }
+    }
+
+    #[test]
+    fn parsed_request_content_never_duplicates_http_headers() {
+        let json_body = r#"{"model": "example", "messages": [{"role": "user", "content": "hello"}]}"#;
+        let request_data = RequestData {
+            correlation_id: 123,
+            timestamp: SystemTime::now(),
+            method: Method::POST,
+            uri: "/test".parse::<Uri>().unwrap(),
+            headers: HashMap::from([("authorization".to_owned(), vec![Bytes::from_static(b"Bearer must-not-persist")])]),
+            body: Some(Bytes::from(json_body)),
+            trace_id: None,
+            span_id: None,
+        };
+
+        let parsed = parse_ai_request(&request_data).unwrap();
+        assert!(parsed.headers.is_empty());
+        let serialized = serde_json::to_value(parsed).unwrap();
+
+        assert!(serialized.get("headers").is_none());
+        assert!(!serialized.to_string().contains("must-not-persist"));
     }
 
     #[test]

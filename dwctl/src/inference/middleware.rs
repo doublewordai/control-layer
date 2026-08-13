@@ -26,7 +26,7 @@ use axum::{
     Json,
     body::Body,
     extract::State,
-    http::{Request, StatusCode},
+    http::{HeaderMap, HeaderName, HeaderValue, Request, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
 };
@@ -77,15 +77,62 @@ pub struct InferenceMiddlewareState<P: PoolProvider + Clone = sqlx_pool_router::
     /// Read by [`super::zdr::is_zdr_request`] on the submit path. Defaults to
     /// empty (every key reads as non-ZDR) when the sync is not wired.
     pub zdr_key_cache: crate::sync::zdr_keys::ZdrKeyCache,
+    /// Optional internal carrier for a server-resolved request-log subject.
+    /// The middleware replaces client input before the Outlet layer captures
+    /// the request, binding one trusted value to its full callback lifecycle;
+    /// an inner layer removes the carrier before proxy dispatch.
+    pub request_logging_subject_header: Option<HeaderName>,
+}
+
+fn request_api_key(headers: &HeaderMap) -> Option<&str> {
+    if let Some(value) = headers.get("authorization") {
+        return value
+            .to_str()
+            .ok()
+            .and_then(|value| value.strip_prefix("Bearer "))
+            .filter(|secret| !secret.is_empty());
+    }
+
+    headers
+        .get("x-api-key")
+        .and_then(|value| value.to_str().ok())
+        .filter(|secret| !secret.is_empty())
+}
+
+fn attribute_request_subject(headers: &mut HeaderMap, subject_header: &HeaderName, key_cache: &crate::sync::zdr_keys::ZdrKeyCache) -> bool {
+    let api_key = request_api_key(headers).map(str::to_owned);
+    headers.remove(subject_header);
+
+    let Some(api_key) = api_key else {
+        return true;
+    };
+    let Some(subject) = key_cache.subject_id(&api_key) else {
+        return false;
+    };
+
+    if let Ok(value) = HeaderValue::from_str(&subject) {
+        headers.insert(subject_header.clone(), value);
+    }
+    true
 }
 
 /// Middleware that routes inference requests based on service_tier and background.
 #[tracing::instrument(skip_all)]
 pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'static>(
     State(state): State<InferenceMiddlewareState<P>>,
-    req: Request<Body>,
+    mut req: Request<Body>,
     next: Next,
 ) -> Response {
+    if let Some(subject_header) = &state.request_logging_subject_header
+        && !attribute_request_subject(req.headers_mut(), subject_header, &state.zdr_key_cache)
+    {
+        tracing::warn!("Request log subject was absent from the authenticated-key policy cache");
+        return crate::errors::Error::ServiceUnavailable {
+            message: "request authentication state is still synchronizing; retry shortly".to_string(),
+        }
+        .into_response();
+    }
+
     // Only intercept POST requests to inference endpoints.
     if !should_intercept(req.method(), req.uri().path()) {
         return next.run(req).await;
@@ -1186,6 +1233,48 @@ fn scrub_request_id_fields(value: &mut serde_json::Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn request_subject_is_server_resolved_once_and_replaces_client_input() {
+        let cache =
+            crate::sync::zdr_keys::ZdrKeyCache::from_policies([("server-key".to_owned(), false, Some("opaque-subject".to_owned()))]);
+        let subject_header = axum::http::HeaderName::from_static("x-example-subject");
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("authorization", "Bearer server-key".parse().unwrap());
+        headers.insert(subject_header.clone(), "client-value".parse().unwrap());
+
+        assert!(attribute_request_subject(&mut headers, &subject_header, &cache));
+
+        assert_eq!(headers.get(&subject_header).unwrap(), "opaque-subject");
+        let captured = headers.clone();
+        cache.replace_for_test([]);
+        assert_eq!(captured.get(&subject_header).unwrap(), "opaque-subject");
+    }
+
+    #[test]
+    fn cache_miss_fails_closed_without_accepting_client_attribution() {
+        let cache = crate::sync::zdr_keys::ZdrKeyCache::empty();
+        let subject_header = axum::http::HeaderName::from_static("x-example-subject");
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("authorization", "Bearer newly-issued-or-invalid-key".parse().unwrap());
+        headers.insert(subject_header.clone(), "client-value".parse().unwrap());
+
+        assert!(!attribute_request_subject(&mut headers, &subject_header, &cache));
+
+        assert!(!headers.contains_key(subject_header));
+    }
+
+    #[test]
+    fn absent_credentials_are_allowed_but_client_attribution_is_removed() {
+        let cache = crate::sync::zdr_keys::ZdrKeyCache::empty();
+        let subject_header = axum::http::HeaderName::from_static("x-example-subject");
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(subject_header.clone(), "client-value".parse().unwrap());
+
+        assert!(attribute_request_subject(&mut headers, &subject_header, &cache));
+
+        assert!(!headers.contains_key(subject_header));
+    }
 
     #[test]
     fn test_should_intercept_responses() {
