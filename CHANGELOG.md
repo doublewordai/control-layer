@@ -1,5 +1,12 @@
 # Changelog
 
+## [10.11.1](https://github.com/doublewordai/control-layer/compare/v10.11.0...v10.11.1) (2026-08-13)
+
+
+### Bug Fixes
+
+* **onwards:** accept JSON-escaped model values in model extraction ([#1484](https://github.com/doublewordai/control-layer/issues/1484)) ([4b20813](https://github.com/doublewordai/control-layer/commit/4b208135a5093c54f8ebc9fc06c0409fe9907cd9))
+
 ## [10.11.0](https://github.com/doublewordai/control-layer/compare/v10.10.2...v10.11.0) (2026-08-13)
 
 
