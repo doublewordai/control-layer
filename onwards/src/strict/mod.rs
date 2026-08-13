@@ -1444,7 +1444,10 @@ mod tests {
                 r#"{"model":"dsv4-flash","prompt":[1,2,3],"priority":100,"stream_options":{"include_usage":true}}"#,
             )
             .await;
-            assert_eq!(body["priority"], 100, "purpose={purpose:?}: onwards must not eat the field");
+            assert_eq!(
+                body["priority"], 100,
+                "purpose={purpose:?}: onwards must not eat the field"
+            );
             assert_eq!(body["stream_options"]["include_usage"], true);
         }
     }
@@ -1496,7 +1499,10 @@ mod tests {
         ] {
             let (state, mock_client) = app_with_key_purpose(Some("realtime"));
             let forwarded = forwarded_body(state, &mock_client, uri, body).await;
-            assert_eq!(forwarded["custom_knob"], true, "{uri}: original bytes forward untouched");
+            assert_eq!(
+                forwarded["custom_knob"], true,
+                "{uri}: original bytes forward untouched"
+            );
         }
     }
 }

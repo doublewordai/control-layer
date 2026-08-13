@@ -682,7 +682,7 @@ pub async fn target_message_handler<T: HttpClient>(
     let mut attempt_number: u32 = 0;
     let mut total_backoff_ms: u64 = 0;
     let pool_max_attempts = pool.fallback_max_attempts();
-    for (_idx, target, connection_guard) in pool.select_iter() {
+    for (member_idx, target, connection_guard) in pool.select_iter() {
         any_attempted = true;
         attempt_number += 1;
 
@@ -745,6 +745,26 @@ pub async fn target_message_handler<T: HttpClient>(
 
         // Prepare body for this attempt (may need model rewrite)
         let mut attempt_body = body_bytes.clone();
+
+        // Within a non-default pool, `priority` (the dynamo scheduler's queue
+        // field) is only meaningful to the pool's PRIMARY member; third-party
+        // fallback members reject unknown fields outright (Fireworks:
+        // "Extra inputs are not permitted"). Strip it from every non-primary
+        // attempt — `member_idx` is the member's stable position in pool
+        // order, so 0 is the primary under the Priority strategy these pools
+        // use. Default-pool traffic is untouched: batch/flex deadline
+        // priorities must keep reaching dynamo exactly as today.
+        if resolved_pool_name.is_some()
+            && member_idx > 0
+            && attempt_body.windows(10).any(|w| w == b"\"priority\"")
+            && let Ok(mut parsed) = serde_json::from_slice::<serde_json::Value>(&attempt_body)
+            && let Some(obj) = parsed.as_object_mut()
+            && obj.remove("priority").is_some()
+            && let Ok(stripped) = serde_json::to_vec(&parsed)
+        {
+            debug!("Stripped scheduler priority for non-primary pool member");
+            attempt_body = stripped.into();
+        }
 
         // Rewrite model field if configured
         if let Some(ref rewrite) = target.onwards_model

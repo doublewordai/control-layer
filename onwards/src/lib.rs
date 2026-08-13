@@ -1188,6 +1188,144 @@ mod tests {
         fallback_targets(alias, n, vec![429])
     }
 
+    /// A composite whose COMPLETIONS pool has `n` members (Priority order,
+    /// embedded-429 retry) alongside a single-member default pool. Mirrors the
+    /// continuation-pool shape: dynamo primary, third-party fallback.
+    fn completions_pool_targets(alias: &str, n: usize) -> target::Targets {
+        use crate::load_balancer::{Provider, ProviderPool};
+        use crate::target::{FallbackConfig, LoadBalanceStrategy, Target, TargetPools};
+
+        let make_pool = |urls: Vec<String>| {
+            let providers = urls
+                .into_iter()
+                .map(|u| {
+                    let t = Target::builder()
+                        .url(u.parse().unwrap())
+                        .request_timeout_secs(5)
+                        .build();
+                    Provider::new(t, 1)
+                })
+                .collect();
+            ProviderPool::with_config(
+                providers,
+                None,
+                None,
+                None,
+                Some(FallbackConfig {
+                    enabled: true,
+                    on_status: vec![429],
+                    ..Default::default()
+                }),
+                LoadBalanceStrategy::Priority,
+                false,
+                Vec::new(),
+            )
+        };
+        let default_pool = make_pool(vec!["https://chat.example.com/".to_string()]);
+        let completions_pool = make_pool(
+            (0..n)
+                .map(|i| format!("https://c{i}.example.com/"))
+                .collect(),
+        );
+        let mut extra = std::collections::HashMap::new();
+        extra.insert("completions".to_string(), completions_pool);
+        let targets_map = Arc::new(DashMap::new());
+        targets_map.insert(
+            alias.to_string(),
+            TargetPools::with_pools(default_pool, extra),
+        );
+        target::Targets {
+            targets: targets_map,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels: Arc::new(DashMap::new()),
+            strict_mode: true,
+            http_pool_config: None,
+        }
+    }
+
+    /// The dynamo scheduler's `priority` field must reach a non-default pool's
+    /// PRIMARY member and be stripped for every fallback member: third-party
+    /// completions targets reject unknown fields outright (Fireworks:
+    /// "Extra inputs are not permitted, field: 'priority'"), which turned every
+    /// continuation resume-leg fallback into a 400 in the cl-1453 canary.
+    #[tokio::test]
+    async fn non_primary_completions_member_never_sees_priority() {
+        let error_frame =
+            "data: {\"error\":{\"code\":429,\"message\":\"Provider returned error\"}}\n\n"
+                .to_string();
+        let mock = MockHttpClient::new_streaming_sequence(
+            StatusCode::OK,
+            vec![
+                vec![error_frame],                  // primary: embedded 429 → fallback
+                vec![OK_CONTENT_FRAME.to_string()], // fallback member serves
+            ],
+        );
+        let app_state = AppState::with_client(completions_pool_targets("gpt-4", 2), mock.clone());
+        let server = TestServer::new(build_router(app_state)).unwrap();
+
+        let response = server
+            .post("/v1/completions")
+            .json(&json!({
+                "model": "gpt-4", "prompt": [1, 2, 3], "stream": true, "priority": 100
+            }))
+            .await;
+
+        assert_eq!(response.status_code(), 200);
+        let requests = mock.get_requests();
+        assert_eq!(requests.len(), 2, "primary fails, fallback serves");
+        let first: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        let second: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
+        assert_eq!(
+            first["priority"], 100,
+            "the primary (dynamo) member must receive the scheduler priority"
+        );
+        assert!(
+            second.get("priority").is_none(),
+            "a non-primary member must never see the dynamo-only field"
+        );
+        assert_eq!(
+            second["prompt"],
+            json!([1, 2, 3]),
+            "the rest of the body is untouched"
+        );
+    }
+
+    /// Control: default-pool fallbacks keep `priority` on every attempt —
+    /// batch/flex deadline priorities must keep reaching dynamo exactly as
+    /// today, whichever member serves.
+    #[tokio::test]
+    async fn default_pool_fallback_keeps_priority_on_every_attempt() {
+        let error_frame =
+            "data: {\"error\":{\"code\":429,\"message\":\"Provider returned error\"}}\n\n"
+                .to_string();
+        let mock = MockHttpClient::new_streaming_sequence(
+            StatusCode::OK,
+            vec![vec![error_frame], vec![OK_CONTENT_FRAME.to_string()]],
+        );
+        let app_state = AppState::with_client(embedded_error_targets("gpt-4", 2), mock.clone());
+        let server = TestServer::new(build_router(app_state)).unwrap();
+
+        let response = server
+            .post("/v1/chat/completions")
+            .json(&json!({
+                "model": "gpt-4", "stream": true, "priority": -1754812800,
+                "messages": [{"role": "user", "content": "Hello"}]
+            }))
+            .await;
+
+        assert_eq!(response.status_code(), 200);
+        let requests = mock.get_requests();
+        assert_eq!(requests.len(), 2);
+        for (i, req) in requests.iter().enumerate() {
+            let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+            assert_eq!(
+                body["priority"], -1754812800i64,
+                "attempt {i}: default-pool members all receive the deadline priority"
+            );
+        }
+    }
+
     // Some upstreams return HTTP 200 and put the real error in the body. These
     // tests exercise the embedded-error detection + retry in target_message_handler.
 
