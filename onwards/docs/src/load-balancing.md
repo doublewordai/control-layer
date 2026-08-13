@@ -25,8 +25,23 @@ Onwards supports load balancing across multiple providers for a single alias, wi
 
 ## Strategy
 
-- **`weighted_random`** (default): Distributes traffic randomly based on weights. A provider with `weight: 3` receives ~3x the traffic of `weight: 1`.
-- **`priority`**: Always routes to the first provider. Falls through to subsequent providers only when fallback is triggered.
+- **`weighted_random`** (default): Uses weighted least-connections across the pool. Providers with a lower `active_connections / weight` score are preferred; weighted random breaks ties.
+- **`priority`**: Uses the highest available numbered priority tier, then weighted least-connections within that tier. Lower numbers are preferred.
+
+Priority providers may all omit `priority` to retain legacy definition-order failover, or all set it to form explicit tiers. Mixing explicit and omitted priorities in one priority pool is rejected.
+
+```json
+{
+  "strategy": "priority",
+  "providers": [
+    { "url": "https://primary-a.example.com", "priority": 1, "weight": 2 },
+    { "url": "https://primary-b.example.com", "priority": 1, "weight": 1 },
+    { "url": "https://backup.example.com", "priority": 2, "weight": 1 }
+  ]
+}
+```
+
+The two tier-1 providers share traffic. Tier 2 is selected only when no tier-1 provider is eligible, including when every tier-1 concurrency limit is saturated.
 
 ## Fallback
 
@@ -37,6 +52,8 @@ Controls automatic retry on other providers when requests fail:
 | `enabled` | bool | `false` | Master switch for fallback |
 | `on_status` | int[] | -- | Status codes that trigger fallback (supports wildcards) |
 | `on_rate_limit` | bool | `false` | Fallback when hitting local rate limits |
+| `max_attempts` | int | provider count | Total attempt budget across repeated passes through the pool |
+| `with_replacement` | bool | `false` | Allow repeated sampling within a weighted-random pass; ignored by priority routing |
 
 Status code wildcards:
 
@@ -44,7 +61,7 @@ Status code wildcards:
 - `50` matches 500-509
 - `502` matches exact 502
 
-When fallback triggers, the next provider is selected based on strategy (weighted random resamples from remaining pool; priority uses definition order).
+When fallback triggers, priority routing tries untried peers in the current tier before lower tiers. Without an explicit `max_attempts`, each provider is considered at most once; unavailable untried providers do not cause an already-tried provider to repeat. An explicit budget that extends beyond one pass restarts from the highest tier. Provider-local rate limits follow the same order when `on_rate_limit` is enabled.
 
 ## Pool-level options
 
@@ -70,6 +87,7 @@ Settings specific to each provider:
 | `onwards_key` | API key for this provider |
 | `onwards_model` | Model name override |
 | `weight` | Traffic weight (default: 1) |
+| `priority` | Priority tier for the `priority` strategy; lower values are preferred and equal values form a pool |
 | `rate_limit` | Provider-specific rate limit |
 | `concurrency_limit` | Provider-specific concurrency limit |
 | `response_headers` | Provider-specific headers |

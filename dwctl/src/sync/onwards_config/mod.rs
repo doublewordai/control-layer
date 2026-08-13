@@ -445,6 +445,7 @@ impl OnwardsConfigSync {
 #[derive(Debug, Clone)]
 struct CompositeModelComponent {
     weight: i32,
+    sort_order: i32,
     // Component target info (from the underlying deployed_model)
     target: OnwardsTarget,
 }
@@ -524,6 +525,7 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
             -- Component info
             dmc.deployed_model_id,
             dmc.weight,
+            dmc.sort_order,
             -- Underlying deployment info
             dm.model_name,
             dm.alias as deployment_alias,
@@ -548,11 +550,8 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
           AND cm.deleted = FALSE
           AND dmc.enabled = TRUE
           AND dm.deleted = FALSE
-        -- Deterministic priority order: sort_order is the failover order onwards
-        -- uses (Priority strategy iterates providers in definition order). The
-        -- weight/created_at keys break any residual sort_order tie the same way
-        -- the admin API does, so the provider shown as "Primary" is the one
-        -- onwards actually tries first.
+        -- Stable provider order within each priority tier. Onwards receives
+        -- sort_order explicitly, so equal values form a load-balanced tier.
         ORDER BY cm.id, dmc.sort_order ASC, dmc.weight DESC, dmc.created_at ASC
         "#
     )
@@ -765,6 +764,7 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
         if let Some(composite) = composite_map.get_mut(&row.composite_model_id) {
             composite.components.push(CompositeModelComponent {
                 weight: row.weight,
+                sort_order: row.sort_order,
                 target: OnwardsTarget {
                     model_name: row.model_name.clone(),
                     alias: row.deployment_alias.clone(),
@@ -978,6 +978,10 @@ fn convert_composite_to_target_spec(
                     onwards_key: target.endpoint_api_key.clone(),
                     onwards_model: Some(target.model_name.clone()),
                     weight: component.weight.max(1) as u32,
+                    priority: match composite.lb_strategy {
+                        LoadBalancingStrategy::Priority => Some(component.sort_order),
+                        LoadBalancingStrategy::WeightedRandom => None,
+                    },
                     rate_limit: provider_rate_limit,
                     concurrency_limit: provider_concurrency_limit,
                     upstream_auth_header_name: if target.auth_header_name != "Authorization" {
@@ -1164,6 +1168,7 @@ fn convert_to_config_file(
                 upstream_auth_header_prefix,
                 response_headers: None,
                 weight: 1,
+                priority: None,
                 sanitize_response: target.sanitize_responses,
                 open_responses: Some(OpenResponsesConfig {
                     adapter: target.open_responses_adapter,

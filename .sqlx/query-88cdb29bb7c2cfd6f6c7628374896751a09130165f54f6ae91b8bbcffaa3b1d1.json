@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT COALESCE(MAX(sort_order::BIGINT) + 1, 0) AS \"next!\"\n               FROM deployed_model_components\n               WHERE composite_model_id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "next!",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "88cdb29bb7c2cfd6f6c7628374896751a09130165f54f6ae91b8bbcffaa3b1d1"
+}
