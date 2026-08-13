@@ -115,7 +115,14 @@ impl StoredExchange {
             extensions: Default::default(),
             correlation_id: 0,
             timestamp: SystemTime::UNIX_EPOCH,
-            status: StatusCode::from_u16(self.status_code).unwrap_or(StatusCode::OK),
+            // Fail CLOSED on an unparseable stored status. `from_u16` only rejects values
+            // outside 100-999, so this is a corrupt or never-populated row — and defaulting
+            // it to 200 would present an unknown request as a success. Everything downstream
+            // of a recompute gates on 2xx (only successful requests are billed, and the
+            // canonical `http_analytics` row an apply amends is chosen among 2xx rows), so
+            // guessing OK biases towards billing a request we know nothing about. A 5xx
+            // makes it unbillable, which is the conservative direction.
+            status: StatusCode::from_u16(self.status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
             headers: HashMap::new(),
             body: Some(Bytes::from(response_body.clone())),
             // Durations are not re-derived: a recompute corrects token counts and cost, and
@@ -254,6 +261,45 @@ mod tests {
             streamed: false,
         };
         assert!(matches!(e.to_outlet_pair(), Err(RecomputeError::BadEndpoint(_))));
+    }
+
+    /// A stored status we cannot parse means a corrupt or never-populated row. Replaying it
+    /// as 200 would present an unknown request as a success, and since everything downstream
+    /// gates on 2xx that biases towards billing it. Fail closed instead.
+    #[test]
+    fn an_unparseable_status_replays_as_a_server_error_not_ok() {
+        let body = r#"{"id":"chatcmpl-1","object":"chat.completion","created":1,"model":"m","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12}}"#;
+        for bogus in [0u16, 42, 1_000] {
+            let e = StoredExchange {
+                endpoint: "/v1/chat/completions".to_string(),
+                request_body: None,
+                response_body: Some(body.as_bytes().to_vec()),
+                status_code: bogus,
+                streamed: false,
+            };
+            let (_, resp) = e.to_outlet_pair().unwrap();
+            assert_eq!(
+                resp.status,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "status {bogus} must not be replayed as a success"
+            );
+        }
+    }
+
+    #[test]
+    fn a_valid_status_is_preserved_exactly() {
+        let body = r#"{"error":{"message":"nope"}}"#;
+        for real in [200u16, 400, 429, 502] {
+            let e = StoredExchange {
+                endpoint: "/v1/chat/completions".to_string(),
+                request_body: None,
+                response_body: Some(body.as_bytes().to_vec()),
+                status_code: real,
+                streamed: false,
+            };
+            let (_, resp) = e.to_outlet_pair().unwrap();
+            assert_eq!(resp.status.as_u16(), real);
+        }
     }
 
     #[test]
