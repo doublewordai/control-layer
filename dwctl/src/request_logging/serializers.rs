@@ -323,12 +323,31 @@ pub fn parse_ai_response(request_data: &RequestData, response_data: &ResponseDat
                         utils::parse_responses_non_streaming_response(&body_str).or_else(|_| utils::parse_non_streaming_response(&body_str))
                     }
                 } else {
+                    // The stream flag must survive a request the strict variants could
+                    // not model. A single unrecognised field or enum value - e.g.
+                    // `reasoning_effort: "max"`, which `crate::reasoning::ReasoningEffort`
+                    // defines and the platform routes on - drops the request into
+                    // `AiRequest::Other`. Reading the flag off the typed variant alone
+                    // used to lose it there, send a streamed body to the non-streaming
+                    // parser, and bill the request ZERO tokens. `Other` carries the raw
+                    // `Value`, so take the flag from that instead of re-parsing the body.
+                    let is_streaming = fusillade_stream
+                        || match &parsed_request.request {
+                            AiRequest::ChatCompletions(req) => req.stream.unwrap_or(false),
+                            AiRequest::Completions(req) => req.stream.unwrap_or(false),
+                            AiRequest::Other(value) => value.get("stream").and_then(Value::as_bool).unwrap_or(false),
+                            AiRequest::Embeddings(_) => false,
+                        };
+                    // Endpoint choice still comes from the typed request (it tells chat
+                    // from completions from embeddings). An unmodelled request (`Other`)
+                    // on a streaming body falls back to the chat streaming parser - chat
+                    // is the only streaming endpoint reachable here besides
+                    // `/completions`, and the legacy parser rejects a chat SSE body.
                     match parsed_request.request {
-                        AiRequest::ChatCompletions(chat_req) if chat_req.stream.unwrap_or(false) || fusillade_stream => {
-                            utils::parse_streaming_response(&body_str)
-                        }
-                        AiRequest::Completions(completion_req) if completion_req.stream.unwrap_or(false) || fusillade_stream => {
-                            utils::parse_completions_streaming_response(&body_str)
+                        AiRequest::ChatCompletions(_) if is_streaming => utils::parse_streaming_response(&body_str),
+                        AiRequest::Completions(_) if is_streaming => utils::parse_completions_streaming_response(&body_str),
+                        AiRequest::Other(_) if is_streaming => {
+                            utils::parse_streaming_response(&body_str).or_else(|_| utils::parse_completions_streaming_response(&body_str))
                         }
                         _ => utils::parse_non_streaming_response(&body_str),
                     }
@@ -2023,6 +2042,61 @@ mod tests {
             duration: Duration::from_millis(100),
             duration_to_first_byte: Duration::from_millis(50),
         }
+    }
+
+    /// `reasoning_effort: "max"` is a canonical value (`crate::reasoning::ReasoningEffort`)
+    /// that async-openai 0.34 does not know. Chat requests are typed against onwards'
+    /// strict schema, which models the field as a permissive `Value`, so the request
+    /// must still classify as `ChatCompletions` rather than collapsing to `Other`.
+    #[test]
+    fn chat_request_with_reasoning_effort_max_is_not_downgraded_to_other() {
+        let body = r#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}],"reasoning_effort":"max"}"#;
+        let mut data = responses_request_data(None);
+        data.uri = "/v1/chat/completions".parse::<Uri>().unwrap();
+        data.body = Some(Bytes::from(body));
+
+        match parse_ai_request(&data).unwrap().request {
+            AiRequest::ChatCompletions(req) => {
+                assert_eq!(req.model, "gpt-4o");
+                assert_eq!(req.reasoning_effort, Some(serde_json::json!("max")));
+            }
+            other => panic!("expected ChatCompletions, got {other:?}"),
+        }
+    }
+
+    /// Billing regression guard: a STREAMED chat request whose body the typed parser
+    /// cannot fully model must still be parsed with the streaming response parser.
+    /// Reading `stream` from the typed request used to lose the flag, feed an SSE body
+    /// to the non-streaming parser, and bill the request zero tokens.
+    #[test]
+    fn streaming_response_is_parsed_even_when_request_type_is_unrecognised() {
+        // `messages` is deliberately malformed for every typed variant, so the request
+        // lands as `AiRequest::Other` - standing in for any future schema drift.
+        let body = r#"{"model":"gpt-4o","messages":42,"stream":true}"#;
+        let mut req = responses_request_data(None);
+        req.uri = "/v1/chat/completions".parse::<Uri>().unwrap();
+        req.body = Some(Bytes::from(body));
+        assert!(
+            matches!(parse_ai_request(&req).unwrap().request, AiRequest::Other(_)),
+            "fixture must produce an unrecognised request for this guard to mean anything"
+        );
+
+        let sse = concat!(
+            "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-4o\",",
+            "\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-4o\",",
+            "\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":7,\"total_tokens\":12}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let parsed = parse_ai_response(&req, &responses_response_data(sse.to_string())).expect("streamed body should parse");
+
+        match &parsed {
+            AiResponse::ChatCompletionsStream(chunks) => assert!(!chunks.is_empty()),
+            other => panic!("expected ChatCompletionsStream, got {other:?}"),
+        }
+        let metrics = crate::request_logging::serializers::TokenMetrics::from(&parsed);
+        assert_eq!(metrics.completion_tokens, 7, "streamed request must not bill zero tokens");
+        assert_eq!(metrics.prompt_tokens, 5);
     }
 
     #[test]
