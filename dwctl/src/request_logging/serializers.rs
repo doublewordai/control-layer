@@ -309,22 +309,6 @@ pub fn parse_ai_response(request_data: &RequestData, response_data: &ResponseDat
             utils::parse_anthropic_non_streaming_response(&body_str).or_else(|_| utils::parse_non_streaming_response(&body_str))
         }
     } else {
-        // Whether the CLIENT asked for a stream, read straight off the raw request
-        // body rather than via the typed `AiRequest`. The typed parse is strict (it
-        // goes through async-openai), so a single unrecognised field or enum value -
-        // e.g. `reasoning_effort: "max"`, which our canonical `reasoning::ReasoningEffort`
-        // supports but async-openai 0.34 does not - collapses the whole request to
-        // `AiRequest::Other`. That used to lose the stream flag, send a streamed body
-        // to the non-streaming parser, and bill the request ZERO tokens. Reading the
-        // flag from raw JSON makes the dispatch immune to request-schema drift, and
-        // matches what the `/messages` and `/responses` branches already do.
-        let body_stream_flag = request_data
-            .body
-            .as_ref()
-            .and_then(|b| serde_json::from_slice::<Value>(b).ok())
-            .and_then(|v| v.get("stream").and_then(Value::as_bool))
-            .unwrap_or(false);
-        let is_streaming = body_stream_flag || fusillade_stream;
         // Parse response based on request type
         match parse_ai_request(request_data) {
             Ok(parsed_request) => {
@@ -339,12 +323,26 @@ pub fn parse_ai_response(request_data: &RequestData, response_data: &ResponseDat
                         utils::parse_responses_non_streaming_response(&body_str).or_else(|_| utils::parse_non_streaming_response(&body_str))
                     }
                 } else {
+                    // The stream flag must survive a request the strict variants could
+                    // not model. A single unrecognised field or enum value - e.g.
+                    // `reasoning_effort: "max"`, which `crate::reasoning::ReasoningEffort`
+                    // defines and the platform routes on - drops the request into
+                    // `AiRequest::Other`. Reading the flag off the typed variant alone
+                    // used to lose it there, send a streamed body to the non-streaming
+                    // parser, and bill the request ZERO tokens. `Other` carries the raw
+                    // `Value`, so take the flag from that instead of re-parsing the body.
+                    let is_streaming = fusillade_stream
+                        || match &parsed_request.request {
+                            AiRequest::ChatCompletions(req) => req.stream.unwrap_or(false),
+                            AiRequest::Completions(req) => req.stream.unwrap_or(false),
+                            AiRequest::Other(value) => value.get("stream").and_then(Value::as_bool).unwrap_or(false),
+                            AiRequest::Embeddings(_) => false,
+                        };
                     // Endpoint choice still comes from the typed request (it tells chat
-                    // from completions from embeddings); only the stream flag is read
-                    // raw. An unparseable request (`Other`) on a streaming body falls
-                    // back to the chat streaming parser - chat is the only streaming
-                    // endpoint reachable here besides `/completions`, and the legacy
-                    // parser would reject a chat SSE body anyway.
+                    // from completions from embeddings). An unmodelled request (`Other`)
+                    // on a streaming body falls back to the chat streaming parser - chat
+                    // is the only streaming endpoint reachable here besides
+                    // `/completions`, and the legacy parser rejects a chat SSE body.
                     match parsed_request.request {
                         AiRequest::ChatCompletions(_) if is_streaming => utils::parse_streaming_response(&body_str),
                         AiRequest::Completions(_) if is_streaming => utils::parse_completions_streaming_response(&body_str),

@@ -3,15 +3,15 @@
 use std::collections::HashMap;
 
 use async_openai::types::chat::{CreateChatCompletionResponse, CreateChatCompletionStreamResponse};
-// Chat REQUESTS use onwards' strict schema, not async-openai's. onwards is the
-// owner of the chat request shape (dwctl already reuses it in translation) and it
-// models `reasoning_effort` as a permissive `serde_json::Value`, so canonical
-// values async-openai has not caught up with - notably `max`, which
+use async_openai::types::completions::{CreateCompletionRequest, CreateCompletionResponse};
+use async_openai::types::embeddings::{CreateBase64EmbeddingResponse, CreateEmbeddingRequest, CreateEmbeddingResponse};
+// Chat REQUESTS use onwards' strict schema, not async-openai's. onwards owns the
+// chat request shape (dwctl already reuses it in translation) and models
+// `reasoning_effort` as a permissive `serde_json::Value`, so canonical values
+// async-openai has not caught up with - notably `max`, which
 // `crate::reasoning::ReasoningEffort` defines and the platform routes on - still
 // deserialize instead of collapsing the request to `AiRequest::Other`.
 use onwards::strict::schemas::chat_completions::ChatCompletionRequest;
-use async_openai::types::completions::{CreateCompletionRequest, CreateCompletionResponse};
-use async_openai::types::embeddings::{CreateBase64EmbeddingResponse, CreateEmbeddingRequest, CreateEmbeddingResponse};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
