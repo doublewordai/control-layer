@@ -43,6 +43,23 @@
 //! (`credits_transactions.source_id` is the analytics row id), and the balance derives from
 //! the ledger. One document in, a chain of pure derivations after it.
 //!
+//! # Everything is recomputed; nothing is assumed still correct
+//!
+//! The engine re-derives **every** usage figure the row stores — prompt, completion,
+//! reasoning, total, and the cache split — not just the ones a given incident is known to
+//! have broken. A field that comes back identical is then a *measurement* that it was fine,
+//! reported as a zero delta, rather than an assumption nobody checked.
+//!
+//! That distinction matters more than it sounds. In the August incident the completion
+//! counts happened to be correct on all 1,044 rows, and it would have been tempting to
+//! hard-code "completion is fine, skip it". The next incident will break a different field —
+//! the July one broke *everything*, because the response carried no usage at all — and a
+//! recompute that only looks where the last bug was is a recompute that misses the next one.
+//!
+//! So the only thing this module treats as un-recomputable is the cache split (below), and
+//! that is a property of the data being gone, not a judgement about which fields are
+//! trustworthy.
+//!
 //! Two findings from that work belong here, because whatever eventually reports or applies
 //! these corrections has to honour them:
 //!
@@ -166,6 +183,16 @@ impl Disagreement {
 pub struct RecomputedUsage {
     /// The counts to bill on, in the shape [`crate::pricing`] prices.
     pub counts: TokenCounts,
+    /// Reasoning tokens, re-read from the response. A *subset* of `counts.completion` rather
+    /// than an addition to it, so it does not affect price — but `http_analytics` stores it
+    /// as its own column, and a repair that leaves it stale makes the row internally
+    /// inconsistent. Zero for shapes with no such concept (Anthropic folds thinking into
+    /// `output_tokens` and reports no separate count).
+    pub reasoning: i64,
+    /// Total tokens as the response reports them, or `prompt + completion` where the shape
+    /// carries no total (Anthropic). Stored on its own column in `http_analytics`, so it is
+    /// recomputed rather than assumed to still follow from the other two.
+    pub total: i64,
     /// How `counts.prompt` was arrived at.
     pub prompt_source: TokenSource,
     /// How `counts.completion` was arrived at.
@@ -223,6 +250,8 @@ pub fn recompute_from_stored_response(
             cache_creation_1h: cache.creation_1h,
             cache_creation_24h: cache.creation_24h,
         },
+        reasoning: metrics.reasoning_tokens,
+        total: metrics.total_tokens,
         prompt_source: TokenSource::Reported,
         completion_source: TokenSource::Reported,
         disagreement: None,
@@ -283,6 +312,8 @@ mod tests {
                 cache_creation_1h: c1h,
                 cache_creation_24h: 0,
             },
+            reasoning: 0,
+            total: prompt + 50,
             prompt_source: TokenSource::Reported,
             completion_source: TokenSource::Reported,
             disagreement: None,
