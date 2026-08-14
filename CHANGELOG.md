@@ -1,5 +1,19 @@
 # Changelog
 
+## [10.11.2](https://github.com/doublewordai/control-layer/compare/v10.11.1...v10.11.2) (2026-08-13)
+
+
+### Bug Fixes
+
+* stop a strict request parse from zero-billing streamed requests ([#1483](https://github.com/doublewordai/control-layer/issues/1483)) ([6570648](https://github.com/doublewordai/control-layer/commit/657064892388d29454faa1191336d283baad31fa))
+
+## [10.11.1](https://github.com/doublewordai/control-layer/compare/v10.11.0...v10.11.1) (2026-08-13)
+
+
+### Bug Fixes
+
+* **onwards:** accept JSON-escaped model values in model extraction ([#1484](https://github.com/doublewordai/control-layer/issues/1484)) ([4b20813](https://github.com/doublewordai/control-layer/commit/4b208135a5093c54f8ebc9fc06c0409fe9907cd9))
+
 ## [10.11.0](https://github.com/doublewordai/control-layer/compare/v10.10.2...v10.11.0) (2026-08-13)
 
 

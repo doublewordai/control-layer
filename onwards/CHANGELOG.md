@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.38.1](https://github.com/doublewordai/control-layer/compare/onwards-v0.38.0...onwards-v0.38.1) (2026-08-13)
+
+
+### Bug Fixes
+
+* antrhopic billing ([#1470](https://github.com/doublewordai/control-layer/issues/1470)) ([c44b73a](https://github.com/doublewordai/control-layer/commit/c44b73ae4a1223ff0174d0fa117f151699bc6e45))
+* **onwards:** accept JSON-escaped model values in model extraction ([#1484](https://github.com/doublewordai/control-layer/issues/1484)) ([4b20813](https://github.com/doublewordai/control-layer/commit/4b208135a5093c54f8ebc9fc06c0409fe9907cd9))
+
 ## [0.38.0](https://github.com/doublewordai/control-layer/compare/onwards-v0.37.1...onwards-v0.38.0) (2026-08-11)
 
 
