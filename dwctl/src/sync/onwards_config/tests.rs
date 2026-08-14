@@ -2,7 +2,7 @@ use std::{str::FromStr, time::Duration};
 
 use onwards::{
     auth::ConstantTimeString,
-    target::{LoadBalanceStrategy as OnwardsLoadBalanceStrategy, RoutingAction, TargetSpecOrList},
+    target::{LoadBalanceStrategy as OnwardsLoadBalanceStrategy, RequestClass, RoutingAction, TargetSpecOrList},
 };
 use tokio::{sync::mpsc, time::timeout};
 use tokio_util::sync::CancellationToken;
@@ -720,6 +720,74 @@ async fn test_cache_shape_batch_escalation_access_for_private_alias(pool: sqlx::
     assert_eq!(pool_keys_len(pool_with.value()), 2, "with escalation batch key should be added");
     assert!(pool_has_key(pool_with.value(), SYSTEM_KEY_SECRET));
     assert!(pool_has_key(pool_with.value(), KEY_BATCH_SECRET));
+}
+
+/// The global continuation key must enter every composite's keyset regardless
+/// of group gating or pricing — it is SYSTEM-owned precisely so the access and
+/// balance gates exempt it. Owned by anyone else it would be silently absent
+/// from prod-shaped (group-restricted, priced) models, and every resume leg on
+/// them would 403 at onwards key auth.
+#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base", "cache_tariff_composite")))]
+async fn test_continuation_key_reaches_gated_and_priced_composites(pool: sqlx::PgPool) {
+    let secret = crate::continuation::provision_global_key(&pool).await.unwrap();
+
+    let targets = super::load_targets_from_db(&pool, &[], false, &RateLimitTiersConfig::default())
+        .await
+        .unwrap();
+
+    // composite-priority: group-restricted (group A only) AND priced (tariff
+    // fixture) with no user balances — the shape where every ordinarily-owned
+    // key fails the gates.
+    let composite = targets.targets.get("composite-priority").expect("composite-priority should exist");
+    assert!(
+        pool_has_key(composite.value(), &secret),
+        "the continuation key must be in a gated, priced composite's keyset"
+    );
+
+    // regular-private: the group-restricted REGULAR model — pins the same
+    // exemption through the second (non-composite) keyset query.
+    let private = targets.targets.get("regular-private").expect("regular-private should exist");
+    assert!(
+        pool_has_key(private.value(), &secret),
+        "the continuation key must be in a group-restricted regular model's keyset"
+    );
+}
+
+/// A named pool's ordering is a validated failover list (dynamo first, the
+/// harness-validated target behind it), never a load-balancing surface: under
+/// the composite's own strategy (DB default weighted_random) resume legs would
+/// split randomly between the free first hop and the paid provider.
+#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
+async fn test_completions_pool_forces_priority_strategy(pool: sqlx::PgPool) {
+    sqlx::query("UPDATE deployed_models SET lb_strategy = 'weighted_random' WHERE alias = 'composite-priority'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO deployed_model_components (composite_model_id, deployed_model_id, weight, enabled, sort_order, pool)
+         SELECT composite_model_id, deployed_model_id, 1, true, 0, 'completions'
+         FROM deployed_model_components
+         WHERE composite_model_id = '50000000-0000-0000-0000-000000000001' AND pool = 'default'
+         LIMIT 1",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let targets = super::load_targets_from_db(&pool, &[], false, &RateLimitTiersConfig::default())
+        .await
+        .unwrap();
+    let composite = targets.targets.get("composite-priority").expect("composite-priority should exist");
+    assert_eq!(
+        composite.value().default_pool().strategy(),
+        OnwardsLoadBalanceStrategy::WeightedRandom,
+        "the composite's own strategy still governs the default pool"
+    );
+    assert_eq!(
+        composite.value().resolve(RequestClass::Completions).strategy(),
+        OnwardsLoadBalanceStrategy::Priority,
+        "the completions pool is a failover list regardless of the composite's strategy"
+    );
 }
 
 #[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]

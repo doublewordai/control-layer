@@ -1056,7 +1056,16 @@ fn convert_composite_to_target_spec(
         rate_limit: rate_limit.clone(),
         concurrency_limit: concurrency_limit.clone(),
         fallback: fallback.clone(),
-        strategy,
+        // A named pool's ordering is a validated failover list (dynamo first,
+        // the harness-validated continuation target behind it), never a
+        // load-balancing surface: under the composite's own strategy (DB
+        // default weighted_random) resume legs would split randomly between
+        // the free first hop and the paid provider.
+        strategy: if pool_name == DEFAULT_COMPONENT_POOL {
+            strategy
+        } else {
+            OnwardsLoadBalanceStrategy::Priority
+        },
         providers,
         response_headers: None,
         sanitize_response: composite.sanitize_responses,
