@@ -218,6 +218,33 @@ impl RetentionCutoffs {
 /// Backwards-compatible name for legacy storage consumers.
 pub type RetentionSweepCutoffs = RetentionCutoffs;
 
+/// Content-free, matchable retained-response maintenance failures carried in
+/// [`crate::error::FusilladeError::Other`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum RetainedResponseMaintenanceError {
+    /// The storage backend has not opted into retained-response maintenance.
+    #[error("Retained response maintenance is not supported by this storage backend")]
+    Disabled,
+    /// A batchless logical response graph is missing a required member.
+    #[error("Retained response graph is incomplete")]
+    IncompleteGraph,
+}
+
+impl RetainedResponseMaintenanceError {
+    /// Recover this contract from the stable outer Fusillade error type.
+    pub fn from_fusillade_error(error: &crate::error::FusilladeError) -> Option<Self> {
+        match error {
+            crate::error::FusilladeError::Other(error) => error.downcast_ref::<Self>().copied(),
+            _ => None,
+        }
+    }
+
+    /// Wrap this maintenance failure in the stable outer Fusillade error type.
+    pub fn into_fusillade_error(self) -> crate::error::FusilladeError {
+        crate::error::FusilladeError::Other(anyhow::Error::new(self))
+    }
+}
+
 /// Aggregate, content-free result of atomically archiving bounded sets of
 /// complete retained batchless response graphs.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -417,10 +444,14 @@ mod retention_policy_tests {
     fn assert_maintenance_is_disabled<T>(result: Result<T>) {
         // Mutation caught: returning a successful no-op, a generic validation
         // error, or enabling maintenance without explicit backend opt-in.
-        assert!(matches!(
-            result,
-            Err(crate::error::FusilladeError::RetentionMaintenanceUnsupported)
-        ));
+        let error = match result {
+            Ok(_) => panic!("retained response maintenance unexpectedly succeeded"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            RetainedResponseMaintenanceError::from_fusillade_error(&error),
+            Some(RetainedResponseMaintenanceError::Disabled)
+        );
     }
 
     #[tokio::test]
@@ -449,6 +480,17 @@ mod retention_policy_tests {
                 .await,
         );
         assert_maintenance_is_disabled(storage.cleanup_retained_response_routes(1).await);
+    }
+
+    #[test]
+    fn retained_response_error_classifies_an_incomplete_graph_without_payload() {
+        // Mutation caught: using an untyped string error leaves callers unable
+        // to enforce the invariant that incomplete graphs remain wholly live.
+        let error = RetainedResponseMaintenanceError::IncompleteGraph.into_fusillade_error();
+        assert_eq!(
+            RetainedResponseMaintenanceError::from_fusillade_error(&error),
+            Some(RetainedResponseMaintenanceError::IncompleteGraph)
+        );
     }
 
     #[test]
@@ -1614,7 +1656,7 @@ pub trait DaemonStorage: Send + Sync {
     /// every count in [`RetainedResponseArchiveOutcome`] must describe only
     /// fully committed graphs. If a graph is partial (a required request,
     /// response step, or template is absent), implementations must return
-    /// [`crate::error::FusilladeError::IncompleteRetainedResponseGraph`] and
+    /// [`RetainedResponseMaintenanceError::IncompleteGraph`] and
     /// leave that entire graph live. Completed earlier groups may remain
     /// committed, so callers retry idempotently. Storage backends opt in
     /// explicitly; the default is disabled.
@@ -1625,7 +1667,7 @@ pub trait DaemonStorage: Send + Sync {
         _max_groups: i64,
         _max_bytes: i64,
     ) -> Result<RetainedResponseArchiveOutcome> {
-        Err(crate::error::FusilladeError::RetentionMaintenanceUnsupported)
+        Err(RetainedResponseMaintenanceError::Disabled.into_fusillade_error())
     }
 
     /// Ensure the daily partitions required for retained response graphs.
@@ -1635,19 +1677,19 @@ pub trait DaemonStorage: Send + Sync {
         _policy: &RetentionSweepPolicy,
         _days_ahead: i32,
     ) -> Result<(i64, i64)> {
-        Err(crate::error::FusilladeError::RetentionMaintenanceUnsupported)
+        Err(RetainedResponseMaintenanceError::Disabled.into_fusillade_error())
     }
 
     /// Retire one daily retained-response partition only after it is eligible.
     /// Storage backends opt in explicitly; the default is disabled.
     async fn retire_expired_response_partition(&self, _today: chrono::NaiveDate) -> Result<u64> {
-        Err(crate::error::FusilladeError::RetentionMaintenanceUnsupported)
+        Err(RetainedResponseMaintenanceError::Disabled.into_fusillade_error())
     }
 
     /// Remove bounded stale routing metadata for retained responses. Storage
     /// backends opt in explicitly; the default is disabled.
     async fn cleanup_retained_response_routes(&self, _limit: i64) -> Result<u64> {
-        Err(crate::error::FusilladeError::RetentionMaintenanceUnsupported)
+        Err(RetainedResponseMaintenanceError::Disabled.into_fusillade_error())
     }
 
     /// Move one terminal batch's request rows from `requests` (live) into
