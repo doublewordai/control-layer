@@ -52,6 +52,7 @@ use crate::prompt_cache::sse::SseBufferedStream;
 
 use super::accumulate::{self, StreamAccumulator};
 use super::detect::{self, DeathEvent, Verdict};
+use super::forward::ForwardParser;
 use super::metrics;
 use super::render::{RenderClient, RenderPrefix, RenderedPrefix};
 use super::resume::{self, LegError, LegStream};
@@ -471,6 +472,11 @@ fn tee(response: Response, state: ContinuationState, ctx: RequestContext) -> Res
         // Some(_) until the leg's first frame arrives, then None — reads fall
         // through to the inter-frame stall timer.
         let mut leg_deadline: Option<tokio::time::Instant> = None;
+        // The current leg's forward parser: raw generated text back into the
+        // chat deltas the client expects. Built from the accumulator when a leg
+        // starts, so it is seeded with the structure that was open at the death
+        // point, and rebuilt per leg because each leg picks up somewhere new.
+        let mut parser: Option<Box<dyn ForwardParser>> = None;
         let mut saw_usage = false;
         // The terminating frames, held rather than forwarded: we may need to put
         // a synthesized usage frame in front of `[DONE]`, and a death frame must
@@ -636,7 +642,45 @@ fn tee(response: Response, state: ContinuationState, ctx: RequestContext) -> Res
                     yield Ok(rewrap::sse_frame(&rewrap::usage_frame(&env, merged)));
                     continue;
                 }
-                if let Some(chat) = rewrap::reframe_chunk(&value, &env) {
+                // The leg's text is the model's RAW sequence, so it goes through
+                // the parser rather than straight into `delta.content`: one
+                // completions chunk yields 0..n chat chunks (reasoning, content
+                // and tool-call deltas), each on the client's own envelope. A
+                // `finish_reason` flushes the parser's held-back bytes first, so
+                // nothing a split tag was hiding is lost at the end of the leg.
+                let Some((text, finish_reason)) = rewrap::completion_parts(&value) else {
+                    continue;
+                };
+                let deltas = match parser.as_mut() {
+                    Some(p) => {
+                        let mut deltas = p.feed(text);
+                        if !finish_reason.is_null() {
+                            deltas.extend(p.finish());
+                        }
+                        deltas
+                    }
+                    // Unreachable: `resuming` is only ever set alongside a parser.
+                    None => continue,
+                };
+
+                let last = deltas.len().saturating_sub(1);
+                let mut frames: Vec<Value> = deltas
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, delta)| {
+                        // Only the final frame of a chunk carries its
+                        // finish_reason, which is where the client expects it.
+                        let finish = if i == last { finish_reason.clone() } else { Value::Null };
+                        rewrap::delta_chunk(&env, delta.into_delta(), finish)
+                    })
+                    .collect();
+                if frames.is_empty() && !finish_reason.is_null() {
+                    // A terminal chunk whose text produced nothing still has to
+                    // deliver the finish_reason.
+                    frames.push(rewrap::delta_chunk(&env, serde_json::json!({}), finish_reason));
+                }
+
+                for chat in frames {
                     if let Some(died) = death_at.take() {
                         metrics::record_seam(&ctx.model, leg_provider.unwrap_or("external"), died.elapsed().as_secs_f64());
                     }
@@ -650,6 +694,20 @@ fn tee(response: Response, state: ContinuationState, ctx: RequestContext) -> Res
             match verdict {
                 Verdict::Alive => unreachable!("Alive never breaks the frame loop"),
                 Verdict::Complete | Verdict::LostTrailer => {
+                    // A leg can end without ever sending a finish_reason chunk
+                    // (a lost trailer, or a usage frame that stood in for one),
+                    // and the parser may still be holding bytes that turned out
+                    // not to be the start of a tag. Flush before closing rather
+                    // than dropping them. `PlainForward` holds nothing back, so
+                    // this is inert for every unmapped model.
+                    let flushed = parser.as_mut().map(|p| p.finish()).unwrap_or_default();
+                    if !flushed.is_empty() && let Some(env) = acc.envelope().cloned() {
+                        for delta in flushed {
+                            let chat = rewrap::delta_chunk(&env, delta.into_delta(), Value::Null);
+                            let _ = acc.ingest(&chat);
+                            yield Ok(rewrap::sse_frame(&chat));
+                        }
+                    }
                     // The generation finished. If its usage frame never arrived
                     // (death families no_usage / no_done), synthesize one from a
                     // render so the request still bills and still reports.
@@ -779,6 +837,11 @@ fn tee(response: Response, state: ContinuationState, ctx: RequestContext) -> Res
                         Some(l) => {
                             last_render = Some(l.render);
                             current = l.stream;
+                            // Seeded HERE, before any of the leg's own output is
+                            // fed back in: the accumulator is at the death point
+                            // exactly now, and that is the structure the leg's
+                            // first token continues.
+                            parser = Some(acc.forward_parser());
                             resuming = true;
                             leg_provider = None;
                             leg_deadline = Some(l.deadline);
