@@ -1161,11 +1161,13 @@ async fn handle_responses_flex_streaming<P: PoolProvider + Clone + Send + Sync +
 /// it would otherwise be translated into; translation happens on the layer just
 /// inside this one.
 pub(crate) fn should_intercept(method: &axum::http::Method, path: &str) -> bool {
+    // `/completions` (which `/chat/completions` also ends with) is included so
+    // native completions traffic passes through `strip_scheduling_priority`:
+    // it is the one POST inference path where a typed `priority` field exists
+    // in onwards' strict schema, so leaving it un-intercepted would let any
+    // external key steer the dynamo scheduler queue.
     method == axum::http::Method::POST
-        && (path.ends_with("/responses")
-            || path.ends_with("/chat/completions")
-            || path.ends_with("/messages")
-            || path.ends_with("/embeddings"))
+        && (path.ends_with("/responses") || path.ends_with("/completions") || path.ends_with("/messages") || path.ends_with("/embeddings"))
 }
 
 /// Client-supplied completion/response id keys to strip from a request body
@@ -1193,6 +1195,12 @@ fn scrub_request_id_fields(value: &mut serde_json::Value) {
 /// (deadline-derived batch priority) take the `x-fusillade-request-id` early
 /// return, and continuation resume legs enter the stack below it. Everything
 /// parsed here is external traffic, for which absent ≡ priority 0 downstream.
+///
+/// NOTE: the `x-fusillade-request-id` early return is only safe because the
+/// sso-stack ingress strips all `x-fusillade-*` headers from external requests
+/// (shared-locations.conf.gotmpl, "dont allow fusillade header spoofing") — a
+/// dwctl reachable without traversing that proxy would let a client set the
+/// header and skip this strip. Defense-in-depth here depends on that perimeter.
 fn strip_scheduling_priority(value: &mut serde_json::Value) {
     if let Some(obj) = value.as_object_mut() {
         obj.remove("priority");
@@ -1238,6 +1246,16 @@ mod tests {
     #[test]
     fn test_should_intercept_embeddings() {
         assert!(should_intercept(&axum::http::Method::POST, "/v1/embeddings"));
+    }
+
+    /// Native completions must be intercepted: it is the one POST inference
+    /// path with a typed `priority` in onwards' strict schema (which forwards
+    /// the field verbatim), so skipping it would let any external key
+    /// queue-jump the dynamo scheduler via `/v1/completions`.
+    #[test]
+    fn test_should_intercept_completions() {
+        assert!(should_intercept(&axum::http::Method::POST, "/v1/completions"));
+        assert!(should_intercept(&axum::http::Method::POST, "/completions"));
     }
 
     #[test]
