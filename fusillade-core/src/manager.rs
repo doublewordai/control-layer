@@ -240,6 +240,10 @@ pub struct RetentionSweepOutcome {
     pub files_expired: u64,
     /// Terminal batches newly soft-deleted.
     pub batches_expired: u64,
+    /// Weekly terminal-request archive partitions retired as one DDL unit.
+    pub archive_partitions_retired: u64,
+    /// Weekly request-template payload partitions retired as one DDL unit.
+    pub template_partitions_retired: u64,
     /// Terminal batchless requests and their dedicated templates hard-deleted.
     pub batchless_requests_deleted: u64,
     /// Canceled, previously dispatched batchless requests whose content was
