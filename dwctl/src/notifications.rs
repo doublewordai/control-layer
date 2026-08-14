@@ -275,11 +275,13 @@ pub async fn run_notification_poller(
                 .inspect_err(|e| crate::background_error!(NOTIFICATIONS, "platform_event_process", Warning, error = %e, "Failed to process platform webhook events"));
         }
 
-        // === Step 2: Poll fusillade for completed batches ===
-        match request_manager.poll_completed_batches().await {
+        // === Step 2: Claim finalized batches for notification ===
+        // Finalization itself (stamp + freeze) is the fusillade daemon's
+        // batch-finalizer loop; this poller only consumes frozen batches.
+        match request_manager.claim_batch_notifications().await {
             Ok(batches) => {
                 if !batches.is_empty() {
-                    tracing::info!(count = batches.len(), "Found terminal batches to finalize");
+                    tracing::info!(count = batches.len(), "Claimed finalized batches for notification");
 
                     let infos: Vec<_> = batches.iter().filter_map(BatchNotificationInfo::try_from_batch).collect();
 
@@ -297,7 +299,7 @@ pub async fn run_notification_poller(
                 }
             }
             Err(e) => {
-                crate::background_error!(NOTIFICATIONS, "poll_completed_batches", Warning, error = %e, "Failed to poll for completed batches");
+                crate::background_error!(NOTIFICATIONS, "claim_batch_notifications", Warning, error = %e, "Failed to claim finalized batches for notification");
             }
         }
 

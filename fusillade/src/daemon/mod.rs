@@ -1880,12 +1880,78 @@ where
                         if let Ok(backlog) = storage.count_archivable_batches(grace).await {
                             gauge!("fusillade_archive_backlog").set(backlog as f64);
                         }
-                        if let Ok(unfrozen) = storage.count_unfrozen_terminal_batches().await {
-                            gauge!("fusillade_unfrozen_terminal_batches").set(unfrozen as f64);
-                        }
                     }
                 });
             }
+        }
+
+        // Batch finalizer: owns terminal transitions (stamp + freeze, and for
+        // cancelled batches settle-then-freeze) so that finalization never
+        // depends on anyone reading the batch or on notification delivery.
+        // Notification is a downstream consumer of counts_frozen_at.
+        if self.config.batch_finalizer_enabled {
+            let storage = self.storage.clone();
+            let shutdown_token = self.shutdown_token.clone();
+            let interval_ms = self.config.batch_finalizer_interval_ms;
+            let cancelled_grace = self.config.batch_finalizer_cancelled_grace_secs;
+            let cancelled_per_tick = self.config.batch_finalizer_cancelled_per_tick;
+            tokio::spawn(async move {
+                // Misconfiguration guard, same rationale as the archive mover:
+                // interval 0 busy-loops, per_tick <= 0 unbounds the LIMIT.
+                if interval_ms == 0 || cancelled_per_tick <= 0 {
+                    crate::background_error!(
+                        "batch_finalizer_invalid_config",
+                        Error,
+                        interval_ms,
+                        cancelled_per_tick,
+                        "Batch finalizer disabled due to invalid config"
+                    );
+                    return;
+                }
+                tracing::info!(interval_ms, "Batch finalizer started");
+                loop {
+                    tokio::select! {
+                        _ = tokio::time::sleep(Duration::from_millis(interval_ms)) => {},
+                        _ = shutdown_token.cancelled() => {
+                            tracing::info!("Shutting down batch finalizer");
+                            break;
+                        }
+                    }
+
+                    match storage.finalize_terminal_batches().await {
+                        Ok(n) if n > 0 => {
+                            counter!("fusillade_finalized_batches_total", "kind" => "terminal")
+                                .increment(n as u64);
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            crate::background_error!("finalize_terminal_failed", Error, error = %e, "Failed to finalize terminal batches");
+                        }
+                    }
+
+                    match storage
+                        .finalize_cancelled_batches(cancelled_grace, cancelled_per_tick)
+                        .await
+                    {
+                        Ok(n) if n > 0 => {
+                            counter!("fusillade_finalized_batches_total", "kind" => "cancelled")
+                                .increment(n as u64);
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            crate::background_error!("finalize_cancelled_failed", Error, error = %e, "Failed to finalize cancelled batches");
+                        }
+                    }
+
+                    // The finalizer's scoreboard lives with the finalizer (the
+                    // archive loops are config-gated OFF by default and may
+                    // not be running): sustained nonzero = batches stuck on
+                    // the recount path, unable to archive.
+                    if let Ok(unfrozen) = storage.count_unfrozen_terminal_batches().await {
+                        gauge!("fusillade_unfrozen_terminal_batches").set(unfrozen as f64);
+                    }
+                }
+            });
         }
 
         for claim_loop_kind in claim_loop_kinds {
