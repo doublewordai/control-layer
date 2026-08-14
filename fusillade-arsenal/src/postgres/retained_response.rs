@@ -1,17 +1,23 @@
 //! Versioned retained-response object snapshots.
 //!
-//! This module only defines the representation and decoding boundary for
-//! retained response graphs. It does not select, move, route, or retire data.
+//! This module defines the representation/decoding boundary and the bounded,
+//! atomic mover for retained response graphs. Read routing and retirement stay
+//! outside this rollout step.
 
 use std::fmt;
 
 use chrono::{DateTime, NaiveDate, Utc};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use sqlx::Row;
+use sqlx::postgres::PgRow;
+use sqlx::{Postgres, Row, Transaction};
 use uuid::Uuid;
 
+use super::{PoolProvider, PostgresRequestManager};
 use crate::error::{FusilladeError, Result};
+use crate::manager::{
+    RetainedResponseArchiveOutcome, RetainedResponseMaintenanceError, RetentionSweepPolicy,
+};
 use crate::request::{RequestDetail, RequestId};
 use crate::response_step::{ResponseStep, StepId, StepKind, StepState};
 
@@ -1187,6 +1193,987 @@ fn to_payload<T: Serialize>(
     value: &T,
 ) -> std::result::Result<serde_json::Value, RetainedResponseSerializationError> {
     serde_json::to_value(value).map_err(|_| RetainedResponseSerializationError::EncodeFailure)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetainedResponseMovementError {
+    CandidateIndexUnavailable,
+    PartitionUnavailable,
+    IntegrityMismatch,
+    DatabaseFailure,
+}
+
+impl fmt::Display for RetainedResponseMovementError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::CandidateIndexUnavailable => "Retained response candidate index is unavailable",
+            Self::PartitionUnavailable => "Retained response partition is unavailable",
+            Self::IntegrityMismatch => "Retained response integrity verification failed",
+            Self::DatabaseFailure => "Retained response movement failed",
+        })
+    }
+}
+
+impl std::error::Error for RetainedResponseMovementError {}
+
+impl RetainedResponseMovementError {
+    fn into_fusillade_error(self) -> FusilladeError {
+        FusilladeError::Other(anyhow::Error::new(self))
+    }
+}
+
+type MovementResult<T> = std::result::Result<T, FusilladeError>;
+
+fn database_failure<T>(_: T) -> FusilladeError {
+    RetainedResponseMovementError::DatabaseFailure.into_fusillade_error()
+}
+
+fn incomplete_graph() -> FusilladeError {
+    RetainedResponseMaintenanceError::IncompleteGraph.into_fusillade_error()
+}
+
+#[derive(Clone, Copy)]
+struct Candidate {
+    request_id: Uuid,
+    group_id: Uuid,
+}
+
+enum MoveGraphOutcome {
+    Archived {
+        requests: u64,
+        steps: u64,
+        templates: u64,
+        bytes: u64,
+    },
+    SkippedLocked,
+    Deferred,
+}
+
+fn request_snapshot(row: &PgRow) -> MovementResult<RetainedRequestSnapshot> {
+    let decode = || -> std::result::Result<RetainedRequestSnapshot, sqlx::Error> {
+        Ok(RetainedRequestSnapshot {
+            id: row.try_get("id")?,
+            batch_id: row.try_get("batch_id")?,
+            template_id: row.try_get("template_id")?,
+            custom_id: row.try_get("custom_id")?,
+            model: row.try_get("model")?,
+            state: row.try_get("state")?,
+            retry_attempt: row.try_get("retry_attempt")?,
+            not_before: row.try_get("not_before")?,
+            daemon_id: row.try_get("daemon_id")?,
+            claimed_at: row.try_get("claimed_at")?,
+            started_at: row.try_get("started_at")?,
+            response_status: row.try_get("response_status")?,
+            response_body: row.try_get("response_body")?,
+            completed_at: row.try_get("completed_at")?,
+            error: row.try_get("error")?,
+            failed_at: row.try_get("failed_at")?,
+            canceled_at: row.try_get("canceled_at")?,
+            response_size: row.try_get("response_size")?,
+            routed_model: row.try_get("routed_model")?,
+            service_tier: row.try_get("service_tier")?,
+            created_by: row.try_get("created_by")?,
+            created_at: row.try_get("created_at")?,
+            updated_at: row.try_get("updated_at")?,
+        })
+    };
+    decode().map_err(database_failure)
+}
+
+fn template_snapshot(row: &PgRow) -> MovementResult<RetainedTemplateSnapshot> {
+    let decode = || -> std::result::Result<RetainedTemplateSnapshot, sqlx::Error> {
+        Ok(RetainedTemplateSnapshot {
+            id: row.try_get("id")?,
+            file_id: row.try_get("file_id")?,
+            custom_id: row.try_get("custom_id")?,
+            endpoint: row.try_get("endpoint")?,
+            method: row.try_get("method")?,
+            path: row.try_get("path")?,
+            body: row.try_get("body")?,
+            model: row.try_get("model")?,
+            api_key: row.try_get("api_key")?,
+            line_number: row.try_get("line_number")?,
+            body_byte_size: row.try_get("body_byte_size")?,
+            metadata: row.try_get("metadata")?,
+            created_at: row.try_get("created_at")?,
+            updated_at: row.try_get("updated_at")?,
+        })
+    };
+    decode().map_err(database_failure)
+}
+
+fn step_payload(row: &PgRow) -> MovementResult<RetainedStepPayloadV1> {
+    let step_kind: String = row.try_get("step_kind").map_err(database_failure)?;
+    let state: String = row.try_get("state").map_err(database_failure)?;
+    let step_kind = StepKind::parse(&step_kind).ok_or_else(incomplete_graph)?;
+    let state = StepState::parse(&state).ok_or_else(incomplete_graph)?;
+    let decode = || -> std::result::Result<RetainedStepPayloadV1, sqlx::Error> {
+        Ok(RetainedStepPayloadV1 {
+            step: RetainedStepSnapshot {
+                id: row.try_get("id")?,
+                request_id: row.try_get("request_id")?,
+                prev_step_id: row.try_get("prev_step_id")?,
+                parent_step_id: row.try_get("parent_step_id")?,
+                step_kind,
+                step_sequence: row.try_get("step_sequence")?,
+                request_payload: row.try_get("request_payload")?,
+                response_payload: row.try_get("response_payload")?,
+                state,
+                started_at: row.try_get("started_at")?,
+                completed_at: row.try_get("completed_at")?,
+                failed_at: row.try_get("failed_at")?,
+                canceled_at: row.try_get("canceled_at")?,
+                retry_attempt: row.try_get("retry_attempt")?,
+                error: row.try_get("error")?,
+                created_at: row.try_get("created_at")?,
+                updated_at: row.try_get("updated_at")?,
+            },
+        })
+    };
+    decode().map_err(database_failure)
+}
+
+async fn step_ids_for_group(
+    tx: &mut Transaction<'_, Postgres>,
+    group_id: Uuid,
+) -> MovementResult<Vec<Uuid>> {
+    sqlx::query_scalar(
+        r#"
+        SELECT id
+        FROM response_steps
+        WHERE id = $1 OR parent_step_id = $1
+        ORDER BY id
+        "#,
+    )
+    .bind(group_id)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(database_failure)
+}
+
+async fn request_ids_for_steps(
+    tx: &mut Transaction<'_, Postgres>,
+    step_ids: &[Uuid],
+) -> MovementResult<Vec<Uuid>> {
+    sqlx::query_scalar(
+        r#"
+        SELECT DISTINCT request_id
+        FROM response_steps
+        WHERE id = ANY($1) AND request_id IS NOT NULL
+        ORDER BY request_id
+        "#,
+    )
+    .bind(step_ids)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(database_failure)
+}
+
+async fn lock_requests(
+    tx: &mut Transaction<'_, Postgres>,
+    request_ids: &[Uuid],
+) -> MovementResult<bool> {
+    let locked: Vec<Uuid> = sqlx::query_scalar(
+        r#"
+        SELECT id
+        FROM requests
+        WHERE id = ANY($1)
+        ORDER BY id
+        FOR UPDATE SKIP LOCKED
+        "#,
+    )
+    .bind(request_ids)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(database_failure)?;
+    if locked == request_ids {
+        return Ok(true);
+    }
+    let existing: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM requests WHERE id = ANY($1)")
+        .bind(request_ids)
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(database_failure)?;
+    if existing != request_ids.len() as i64 {
+        return Err(incomplete_graph());
+    }
+    Ok(false)
+}
+
+async fn lock_steps(tx: &mut Transaction<'_, Postgres>, step_ids: &[Uuid]) -> MovementResult<bool> {
+    let locked: Vec<Uuid> = sqlx::query_scalar(
+        r#"
+        SELECT id
+        FROM response_steps
+        WHERE id = ANY($1)
+        ORDER BY id
+        FOR UPDATE SKIP LOCKED
+        "#,
+    )
+    .bind(step_ids)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(database_failure)?;
+    if locked == step_ids {
+        return Ok(true);
+    }
+    let existing: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM response_steps WHERE id = ANY($1)")
+            .bind(step_ids)
+            .fetch_one(&mut **tx)
+            .await
+            .map_err(database_failure)?;
+    if existing != step_ids.len() as i64 {
+        return Err(incomplete_graph());
+    }
+    Ok(false)
+}
+
+fn exact_expiry(terminal_at: DateTime<Utc>, seconds: u64) -> MovementResult<DateTime<Utc>> {
+    let seconds = i64::try_from(seconds).map_err(|_| incomplete_graph())?;
+    let duration = chrono::Duration::try_seconds(seconds).ok_or_else(incomplete_graph)?;
+    terminal_at
+        .checked_add_signed(duration)
+        .ok_or_else(incomplete_graph)
+}
+
+fn canonical_payload_bytes(rows: &[RetainedResponseObjectRow]) -> MovementResult<Vec<u8>> {
+    let mut bytes = Vec::new();
+    for row in rows {
+        let payload = serde_json::to_vec(&row.payload)
+            .map_err(|_| RetainedResponseMovementError::IntegrityMismatch.into_fusillade_error())?;
+        bytes.extend_from_slice(&(payload.len() as u64).to_be_bytes());
+        bytes.extend_from_slice(&payload);
+    }
+    Ok(bytes)
+}
+
+fn row_metadata_matches(
+    left: &RetainedResponseObjectRow,
+    right: &RetainedResponseObjectRow,
+) -> bool {
+    left.delete_on == right.delete_on
+        && left.group_id == right.group_id
+        && left.object_kind == right.object_kind
+        && left.object_id == right.object_id
+        && left.request_id == right.request_id
+        && left.head_step_id == right.head_step_id
+        && left.created_by == right.created_by
+        && left.service_tier == right.service_tier
+        && left.state == right.state
+        && left.model == right.model
+        && left.created_at == right.created_at
+        && left.terminal_at == right.terminal_at
+        && left.step_sequence == right.step_sequence
+        && left.schema_version == right.schema_version
+}
+
+async fn sha256(tx: &mut Transaction<'_, Postgres>, bytes: &[u8]) -> MovementResult<Vec<u8>> {
+    sqlx::query_scalar("SELECT sha256($1::bytea)")
+        .bind(bytes)
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(database_failure)
+}
+
+async fn active_partition_exists(
+    tx: &mut Transaction<'_, Postgres>,
+    delete_on: NaiveDate,
+) -> MovementResult<bool> {
+    sqlx::query_scalar(
+        r#"
+        SELECT EXISTS (
+            SELECT 1
+            FROM retained_response_buckets bucket
+            JOIN pg_namespace namespace
+              ON namespace.nspname = bucket.partition_schema
+            JOIN pg_class child
+              ON child.relnamespace = namespace.oid
+             AND child.relname = bucket.partition_table
+             AND child.oid = bucket.partition_oid
+            JOIN pg_inherits inheritance
+              ON inheritance.inhrelid = child.oid
+             AND NOT inheritance.inhdetachpending
+            WHERE bucket.delete_on = $1
+              AND bucket.state = 'active'
+              AND bucket.partition_schema = current_schema()
+              AND bucket.partition_table =
+                  'retained_response_objects_d' || to_char($1::date, 'YYYYMMDD')
+              AND inheritance.inhparent =
+                  to_regclass(format('%I.retained_response_objects', current_schema()))
+              AND pg_get_expr(child.relpartbound, child.oid) = format(
+                  'FOR VALUES FROM (%L) TO (%L)', $1::date, $1::date + 1
+              )
+        )
+        "#,
+    )
+    .bind(delete_on)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(database_failure)
+}
+
+async fn insert_and_verify_objects(
+    tx: &mut Transaction<'_, Postgres>,
+    delete_on: NaiveDate,
+    group_id: Uuid,
+    expected: &[RetainedResponseObjectRow],
+) -> MovementResult<()> {
+    let request_ids = expected
+        .iter()
+        .filter(|row| row.object_kind == RetainedObjectKind::Request)
+        .map(|row| row.object_id)
+        .collect::<Vec<_>>();
+    let step_ids = expected
+        .iter()
+        .filter(|row| row.object_kind == RetainedObjectKind::Step)
+        .map(|row| row.object_id)
+        .collect::<Vec<_>>();
+    let conflicting_bucket: bool = sqlx::query_scalar(
+        r#"
+        SELECT EXISTS (
+            SELECT 1
+            FROM retained_response_objects
+            WHERE delete_on <> $1
+              AND (
+                    (object_kind = 'group' AND object_id = $2)
+                 OR (object_kind = 'request' AND object_id = ANY($3))
+                 OR (object_kind = 'step' AND object_id = ANY($4))
+              )
+        )
+        "#,
+    )
+    .bind(delete_on)
+    .bind(group_id)
+    .bind(&request_ids)
+    .bind(&step_ids)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(database_failure)?;
+    if conflicting_bucket {
+        return Err(RetainedResponseMovementError::IntegrityMismatch.into_fusillade_error());
+    }
+
+    for row in expected {
+        sqlx::query(
+            r#"
+            INSERT INTO retained_response_objects (
+                delete_on, group_id, object_kind, object_id, request_id,
+                head_step_id, created_by, service_tier, state, model,
+                created_at, terminal_at, step_sequence, schema_version, payload
+            ) VALUES (
+                $1, $2, $3, $4, $5,
+                $6, $7, $8, $9, $10,
+                $11, $12, $13, $14, $15
+            )
+            ON CONFLICT (delete_on, object_kind, object_id) DO NOTHING
+            "#,
+        )
+        .bind(row.delete_on)
+        .bind(row.group_id)
+        .bind(row.object_kind.as_str())
+        .bind(row.object_id)
+        .bind(row.request_id)
+        .bind(row.head_step_id)
+        .bind(&row.created_by)
+        .bind(&row.service_tier)
+        .bind(&row.state)
+        .bind(&row.model)
+        .bind(row.created_at)
+        .bind(row.terminal_at)
+        .bind(row.step_sequence)
+        .bind(row.schema_version)
+        .bind(&row.payload)
+        .execute(&mut **tx)
+        .await
+        .map_err(database_failure)?;
+    }
+
+    let stored = sqlx::query(
+        r#"
+        SELECT delete_on, group_id, object_kind, object_id, request_id,
+               head_step_id, created_by, service_tier, state, model,
+               created_at, terminal_at, step_sequence, schema_version, payload
+        FROM retained_response_objects
+        WHERE delete_on = $1 AND group_id = $2
+        ORDER BY CASE object_kind
+                     WHEN 'group' THEN 0
+                     WHEN 'request' THEN 1
+                     WHEN 'step' THEN 2
+                     ELSE 3
+                 END,
+                 object_id
+        "#,
+    )
+    .bind(delete_on)
+    .bind(group_id)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(database_failure)?;
+    let mut actual = Vec::with_capacity(stored.len());
+    for row in &stored {
+        actual.push(RetainedResponseObjectRow::from_pg_row(row).map_err(|_| {
+            RetainedResponseMovementError::IntegrityMismatch.into_fusillade_error()
+        })?);
+    }
+    if actual.len() != expected.len()
+        || actual
+            .iter()
+            .zip(expected)
+            .any(|(actual, expected)| !row_metadata_matches(actual, expected))
+    {
+        return Err(RetainedResponseMovementError::IntegrityMismatch.into_fusillade_error());
+    }
+
+    let expected_bytes = canonical_payload_bytes(expected)?;
+    let actual_bytes = canonical_payload_bytes(&actual)?;
+    if expected_bytes.len() != actual_bytes.len()
+        || sha256(tx, &expected_bytes).await? != sha256(tx, &actual_bytes).await?
+    {
+        return Err(RetainedResponseMovementError::IntegrityMismatch.into_fusillade_error());
+    }
+    Ok(())
+}
+
+async fn insert_and_verify_routes(
+    tx: &mut Transaction<'_, Postgres>,
+    delete_on: NaiveDate,
+    group_id: Uuid,
+    request_ids: &[Uuid],
+    step_ids: &[Uuid],
+) -> MovementResult<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO retained_response_group_routes (group_id, delete_on)
+        VALUES ($1, $2)
+        ON CONFLICT (group_id) DO NOTHING
+        "#,
+    )
+    .bind(group_id)
+    .bind(delete_on)
+    .execute(&mut **tx)
+    .await
+    .map_err(database_failure)?;
+    for request_id in request_ids {
+        sqlx::query(
+            r#"
+            INSERT INTO retained_response_request_routes (request_id, group_id, delete_on)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (request_id) DO NOTHING
+            "#,
+        )
+        .bind(request_id)
+        .bind(group_id)
+        .bind(delete_on)
+        .execute(&mut **tx)
+        .await
+        .map_err(database_failure)?;
+    }
+    for step_id in step_ids {
+        sqlx::query(
+            r#"
+            INSERT INTO retained_response_step_routes (step_id, group_id, delete_on)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (step_id) DO NOTHING
+            "#,
+        )
+        .bind(step_id)
+        .bind(group_id)
+        .bind(delete_on)
+        .execute(&mut **tx)
+        .await
+        .map_err(database_failure)?;
+    }
+
+    let group_route: Option<NaiveDate> = sqlx::query_scalar(
+        "SELECT delete_on FROM retained_response_group_routes WHERE group_id = $1",
+    )
+    .bind(group_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(database_failure)?;
+    if group_route != Some(delete_on) {
+        return Err(RetainedResponseMovementError::IntegrityMismatch.into_fusillade_error());
+    }
+    let request_routes: Vec<(Uuid, Uuid, NaiveDate)> = sqlx::query_as(
+        r#"
+        SELECT request_id, group_id, delete_on
+        FROM retained_response_request_routes
+        WHERE request_id = ANY($1)
+        ORDER BY request_id
+        "#,
+    )
+    .bind(request_ids)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(database_failure)?;
+    if request_routes.len() != request_ids.len()
+        || request_routes.iter().zip(request_ids).any(
+            |((route_request_id, route_group_id, route_delete_on), request_id)| {
+                route_request_id != request_id
+                    || *route_group_id != group_id
+                    || *route_delete_on != delete_on
+            },
+        )
+    {
+        return Err(RetainedResponseMovementError::IntegrityMismatch.into_fusillade_error());
+    }
+    let step_routes: Vec<(Uuid, Uuid, NaiveDate)> = sqlx::query_as(
+        r#"
+        SELECT step_id, group_id, delete_on
+        FROM retained_response_step_routes
+        WHERE step_id = ANY($1)
+        ORDER BY step_id
+        "#,
+    )
+    .bind(step_ids)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(database_failure)?;
+    if step_routes.len() != step_ids.len()
+        || step_routes.iter().zip(step_ids).any(
+            |((route_step_id, route_group_id, route_delete_on), step_id)| {
+                route_step_id != step_id
+                    || *route_group_id != group_id
+                    || *route_delete_on != delete_on
+            },
+        )
+    {
+        return Err(RetainedResponseMovementError::IntegrityMismatch.into_fusillade_error());
+    }
+    Ok(())
+}
+
+async fn move_graph<P: PoolProvider>(
+    manager: &PostgresRequestManager<P>,
+    candidate: Candidate,
+    policy: &RetentionSweepPolicy,
+    archive_now: DateTime<Utc>,
+    cancel_grace_before: DateTime<Utc>,
+    remaining_bytes: u64,
+    allow_oversized: bool,
+) -> MovementResult<MoveGraphOutcome> {
+    let mut tx = manager.begin_write().await.map_err(database_failure)?;
+    let initial_step_ids = step_ids_for_group(&mut tx, candidate.group_id).await?;
+    let request_ids = if initial_step_ids.is_empty() {
+        vec![candidate.request_id]
+    } else {
+        let request_ids = request_ids_for_steps(&mut tx, &initial_step_ids).await?;
+        if !request_ids.contains(&candidate.request_id) || request_ids.is_empty() {
+            return Err(incomplete_graph());
+        }
+        request_ids
+    };
+
+    if !lock_requests(&mut tx, &request_ids).await? {
+        return Ok(MoveGraphOutcome::SkippedLocked);
+    }
+    if !initial_step_ids.is_empty() && !lock_steps(&mut tx, &initial_step_ids).await? {
+        return Ok(MoveGraphOutcome::SkippedLocked);
+    }
+
+    let revalidated_step_ids = step_ids_for_group(&mut tx, candidate.group_id).await?;
+    if revalidated_step_ids != initial_step_ids {
+        return Err(incomplete_graph());
+    }
+    if !revalidated_step_ids.is_empty()
+        && request_ids_for_steps(&mut tx, &revalidated_step_ids).await? != request_ids
+    {
+        return Err(incomplete_graph());
+    }
+
+    let request_rows = sqlx::query(
+        r#"
+        SELECT id, batch_id, template_id, custom_id, model, state,
+               retry_attempt, not_before, daemon_id, claimed_at, started_at,
+               response_status, response_body, completed_at, error, failed_at,
+               canceled_at, response_size, routed_model, service_tier,
+               created_by, created_at, updated_at
+        FROM requests
+        WHERE id = ANY($1)
+        ORDER BY id
+        "#,
+    )
+    .bind(&request_ids)
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(database_failure)?;
+    if request_rows.len() != request_ids.len() {
+        return Err(incomplete_graph());
+    }
+    let requests = request_rows
+        .iter()
+        .map(request_snapshot)
+        .collect::<MovementResult<Vec<_>>>()?;
+
+    let step_rows = sqlx::query(
+        r#"
+        SELECT id, request_id, prev_step_id, parent_step_id, step_kind,
+               step_sequence, request_payload, response_payload, state,
+               started_at, completed_at, failed_at, canceled_at, retry_attempt,
+               error, created_at, updated_at
+        FROM response_steps
+        WHERE id = ANY($1)
+        ORDER BY id
+        "#,
+    )
+    .bind(&revalidated_step_ids)
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(database_failure)?;
+    if step_rows.len() != revalidated_step_ids.len() {
+        return Err(incomplete_graph());
+    }
+    let steps = step_rows
+        .iter()
+        .map(step_payload)
+        .collect::<MovementResult<Vec<_>>>()?;
+
+    let mut template_ids = requests
+        .iter()
+        .map(|request| request.template_id.ok_or_else(incomplete_graph))
+        .collect::<MovementResult<Vec<_>>>()?;
+    template_ids.sort_unstable();
+    if template_ids.windows(2).any(|ids| ids[0] == ids[1]) {
+        return Err(incomplete_graph());
+    }
+    let template_rows = sqlx::query(
+        r#"
+        SELECT id, file_id, custom_id, endpoint, method, path, body, model,
+               api_key, line_number, body_byte_size, metadata, created_at, updated_at
+        FROM request_templates
+        WHERE id = ANY($1)
+        ORDER BY id
+        FOR UPDATE SKIP LOCKED
+        "#,
+    )
+    .bind(&template_ids)
+    .fetch_all(&mut *tx)
+    .await
+    .map_err(database_failure)?;
+    if template_rows.len() != template_ids.len() {
+        let existing: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM request_templates WHERE id = ANY($1)")
+                .bind(&template_ids)
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(database_failure)?;
+        if existing == template_ids.len() as i64 {
+            return Ok(MoveGraphOutcome::SkippedLocked);
+        }
+        return Err(incomplete_graph());
+    }
+    let templates = template_rows
+        .iter()
+        .map(template_snapshot)
+        .collect::<MovementResult<Vec<_>>>()?;
+    if templates.iter().any(|template| template.file_id.is_some()) {
+        return Err(incomplete_graph());
+    }
+    let outside_template_references: i64 = sqlx::query_scalar(
+        r#"
+        SELECT COUNT(*)
+        FROM requests
+        WHERE template_id = ANY($1) AND NOT (id = ANY($2))
+        "#,
+    )
+    .bind(&template_ids)
+    .bind(&request_ids)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(database_failure)?;
+    if outside_template_references != 0 {
+        return Err(incomplete_graph());
+    }
+
+    let mut max_retention_seconds = 0_u64;
+    let mut delete_on = None;
+    for request in &requests {
+        if request.batch_id.is_some() {
+            return Err(incomplete_graph());
+        }
+        let Some(tier) = request.service_tier.as_deref() else {
+            return Ok(MoveGraphOutcome::Deferred);
+        };
+        let Some(seconds) = policy.batchless_seconds_by_service_tier.get(tier).copied() else {
+            return Ok(MoveGraphOutcome::Deferred);
+        };
+        let Some(terminal_at) = request.terminal_at().map_err(|_| incomplete_graph())? else {
+            return Err(incomplete_graph());
+        };
+        if request.state == "canceled"
+            && request.claimed_at.is_some()
+            && terminal_at > cancel_grace_before
+        {
+            return Ok(MoveGraphOutcome::Deferred);
+        }
+        if exact_expiry(terminal_at, seconds)? > archive_now {
+            return Ok(MoveGraphOutcome::Deferred);
+        }
+        max_retention_seconds = max_retention_seconds.max(seconds);
+        let request_delete_on = RetentionSweepPolicy::delete_on(terminal_at, seconds)
+            .map_err(|_| incomplete_graph())?;
+        delete_on = Some(delete_on.map_or(request_delete_on, |current: NaiveDate| {
+            current.max(request_delete_on)
+        }));
+    }
+    for step in &steps {
+        let Some(terminal_at) = step.step.terminal_at() else {
+            return Err(incomplete_graph());
+        };
+        if exact_expiry(terminal_at, max_retention_seconds)? > archive_now {
+            return Ok(MoveGraphOutcome::Deferred);
+        }
+        let step_delete_on = RetentionSweepPolicy::delete_on(terminal_at, max_retention_seconds)
+            .map_err(|_| incomplete_graph())?;
+        delete_on = Some(delete_on.map_or(step_delete_on, |current: NaiveDate| {
+            current.max(step_delete_on)
+        }));
+    }
+    let delete_on = delete_on.ok_or_else(incomplete_graph)?;
+
+    let template_by_id = templates
+        .into_iter()
+        .map(|template| (template.id, template))
+        .collect::<std::collections::HashMap<_, _>>();
+    let request_payloads = requests
+        .into_iter()
+        .map(|request| {
+            let template_id = request.template_id.ok_or_else(incomplete_graph)?;
+            let template = template_by_id
+                .get(&template_id)
+                .cloned()
+                .ok_or_else(incomplete_graph)?;
+            Ok(RetainedRequestPayloadV1 { request, template })
+        })
+        .collect::<MovementResult<Vec<_>>>()?;
+    let group = RetainedGroup {
+        group_id: candidate.group_id,
+        head_step_id: (!revalidated_step_ids.is_empty()).then_some(candidate.group_id),
+        request_ids: request_ids.clone(),
+        step_ids: revalidated_step_ids.clone(),
+    };
+    let objects = RetainedGroup::compose_rows(delete_on, group, request_payloads, steps)
+        .map_err(|_| incomplete_graph())?;
+    let payload_bytes = objects.iter().try_fold(0_u64, |total, row| {
+        let bytes = serde_json::to_vec(&row.payload)
+            .map_err(|_| RetainedResponseMovementError::IntegrityMismatch.into_fusillade_error())?;
+        total
+            .checked_add(bytes.len() as u64)
+            .ok_or_else(|| RetainedResponseMovementError::IntegrityMismatch.into_fusillade_error())
+    })?;
+    if payload_bytes > remaining_bytes && !allow_oversized {
+        return Ok(MoveGraphOutcome::Deferred);
+    }
+    if !active_partition_exists(&mut tx, delete_on).await? {
+        return Err(RetainedResponseMovementError::PartitionUnavailable.into_fusillade_error());
+    }
+
+    insert_and_verify_objects(&mut tx, delete_on, candidate.group_id, &objects).await?;
+    insert_and_verify_routes(
+        &mut tx,
+        delete_on,
+        candidate.group_id,
+        &request_ids,
+        &revalidated_step_ids,
+    )
+    .await?;
+
+    let deleted_steps = sqlx::query("DELETE FROM response_steps WHERE id = ANY($1)")
+        .bind(&revalidated_step_ids)
+        .execute(&mut *tx)
+        .await
+        .map_err(database_failure)?
+        .rows_affected();
+    if deleted_steps != revalidated_step_ids.len() as u64 {
+        return Err(RetainedResponseMovementError::IntegrityMismatch.into_fusillade_error());
+    }
+    let deleted_requests = sqlx::query("DELETE FROM requests WHERE id = ANY($1)")
+        .bind(&request_ids)
+        .execute(&mut *tx)
+        .await
+        .map_err(database_failure)?
+        .rows_affected();
+    if deleted_requests != request_ids.len() as u64 {
+        return Err(RetainedResponseMovementError::IntegrityMismatch.into_fusillade_error());
+    }
+    let deleted_templates =
+        sqlx::query("DELETE FROM request_templates WHERE id = ANY($1) AND file_id IS NULL")
+            .bind(&template_ids)
+            .execute(&mut *tx)
+            .await
+            .map_err(database_failure)?
+            .rows_affected();
+    if deleted_templates != template_ids.len() as u64 {
+        return Err(RetainedResponseMovementError::IntegrityMismatch.into_fusillade_error());
+    }
+
+    let live_members: i64 = sqlx::query_scalar(
+        r#"
+        SELECT
+            (SELECT COUNT(*) FROM requests WHERE id = ANY($1))
+          + (SELECT COUNT(*) FROM response_steps WHERE id = ANY($2))
+          + (SELECT COUNT(*) FROM request_templates WHERE id = ANY($3))
+        "#,
+    )
+    .bind(&request_ids)
+    .bind(&revalidated_step_ids)
+    .bind(&template_ids)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(database_failure)?;
+    if live_members != 0 {
+        return Err(RetainedResponseMovementError::IntegrityMismatch.into_fusillade_error());
+    }
+    tx.commit().await.map_err(database_failure)?;
+    Ok(MoveGraphOutcome::Archived {
+        requests: request_ids.len() as u64,
+        steps: revalidated_step_ids.len() as u64,
+        templates: template_ids.len() as u64,
+        bytes: payload_bytes,
+    })
+}
+
+pub(crate) async fn archive_terminal_batchless_responses<P: PoolProvider>(
+    manager: &PostgresRequestManager<P>,
+    policy: &RetentionSweepPolicy,
+    cancel_grace_before: DateTime<Utc>,
+    max_groups: i64,
+    max_bytes: i64,
+) -> Result<RetainedResponseArchiveOutcome> {
+    if max_groups <= 0 || max_bytes <= 0 {
+        return Ok(RetainedResponseArchiveOutcome::default());
+    }
+    policy.validate().map_err(FusilladeError::ValidationError)?;
+    if policy.batchless_seconds_by_service_tier.is_empty() {
+        return Ok(RetainedResponseArchiveOutcome::default());
+    }
+    let index_ready: bool =
+        sqlx::query_scalar("SELECT retained_response_archive_index_ready(current_schema())")
+            .fetch_one(manager.read_executor())
+            .await
+            .map_err(database_failure)?;
+    if !index_ready {
+        return Err(RetainedResponseMovementError::CandidateIndexUnavailable.into_fusillade_error());
+    }
+    let archive_now: DateTime<Utc> = sqlx::query_scalar("SELECT statement_timestamp()")
+        .fetch_one(manager.read_executor())
+        .await
+        .map_err(database_failure)?;
+    let mut tiers = Vec::with_capacity(policy.batchless_seconds_by_service_tier.len());
+    let mut cutoffs = Vec::with_capacity(policy.batchless_seconds_by_service_tier.len());
+    for (tier, seconds) in &policy.batchless_seconds_by_service_tier {
+        tiers.push(tier.clone());
+        let seconds = i64::try_from(*seconds).map_err(|_| {
+            FusilladeError::ValidationError("automated retention period is too large".to_owned())
+        })?;
+        let duration = chrono::Duration::try_seconds(seconds).ok_or_else(|| {
+            FusilladeError::ValidationError("automated retention period is too large".to_owned())
+        })?;
+        cutoffs.push(archive_now.checked_sub_signed(duration).ok_or_else(|| {
+            FusilladeError::ValidationError("automated retention cutoff is out of range".to_owned())
+        })?);
+    }
+    let candidate_limit = max_groups.saturating_add(1);
+    let rows: Vec<(Uuid, Uuid)> = sqlx::query_as(
+        r#"
+        WITH policy(service_tier, expire_before) AS (
+            SELECT * FROM UNNEST($1::text[], $2::timestamptz[])
+        )
+        SELECT candidate.id,
+               COALESCE(direct.parent_step_id, direct.id, candidate.id) AS group_id
+        FROM policy
+        CROSS JOIN LATERAL (
+            SELECT request.id,
+                   CASE request.state
+                       WHEN 'completed' THEN request.completed_at
+                       WHEN 'failed' THEN request.failed_at
+                       WHEN 'canceled' THEN request.canceled_at
+                   END AS terminal_at
+            FROM requests request
+            WHERE request.service_tier = policy.service_tier
+              AND request.batch_id IS NULL
+              AND request.state IN ('completed', 'failed', 'canceled')
+              AND CASE request.state
+                      WHEN 'completed' THEN request.completed_at
+                      WHEN 'failed' THEN request.failed_at
+                      WHEN 'canceled' THEN request.canceled_at
+                  END <= policy.expire_before
+            ORDER BY CASE request.state
+                         WHEN 'completed' THEN request.completed_at
+                         WHEN 'failed' THEN request.failed_at
+                         WHEN 'canceled' THEN request.canceled_at
+                     END,
+                     request.id
+            LIMIT $3
+        ) candidate
+        LEFT JOIN response_steps direct ON direct.request_id = candidate.id
+        ORDER BY candidate.terminal_at, candidate.id
+        LIMIT $3
+        "#,
+    )
+    .bind(&tiers)
+    .bind(&cutoffs)
+    .bind(candidate_limit)
+    .fetch_all(manager.read_executor())
+    .await
+    .map_err(database_failure)?;
+
+    let mut candidates = Vec::new();
+    let mut seen_groups = std::collections::HashSet::new();
+    for (request_id, group_id) in &rows {
+        if seen_groups.insert(*group_id) {
+            candidates.push(Candidate {
+                request_id: *request_id,
+                group_id: *group_id,
+            });
+            if candidates.len() == max_groups as usize {
+                break;
+            }
+        }
+    }
+    let mut outcome = RetainedResponseArchiveOutcome {
+        may_have_more: rows.len() as i64 > max_groups,
+        ..Default::default()
+    };
+    for candidate in candidates {
+        let remaining_bytes = (max_bytes as u64).saturating_sub(outcome.bytes_archived);
+        match move_graph(
+            manager,
+            candidate,
+            policy,
+            archive_now,
+            cancel_grace_before,
+            remaining_bytes,
+            outcome.groups_archived == 0,
+        )
+        .await?
+        {
+            MoveGraphOutcome::Archived {
+                requests,
+                steps,
+                templates,
+                bytes,
+            } => {
+                outcome.groups_archived += 1;
+                outcome.requests_archived += requests;
+                outcome.steps_archived += steps;
+                outcome.templates_archived += templates;
+                outcome.bytes_archived += bytes;
+            }
+            MoveGraphOutcome::SkippedLocked => {
+                outcome.skipped_locked = true;
+                outcome.may_have_more = true;
+            }
+            MoveGraphOutcome::Deferred => {
+                outcome.may_have_more = true;
+                if outcome.groups_archived > 0 {
+                    break;
+                }
+            }
+        }
+    }
+    Ok(outcome)
 }
 
 #[cfg(test)]
