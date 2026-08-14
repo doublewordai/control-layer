@@ -1,8 +1,8 @@
 //! Versioned retained-response object snapshots.
 //!
-//! This module defines the representation/decoding boundary and the bounded,
-//! atomic mover for retained response graphs. Read routing and retirement stay
-//! outside this rollout step.
+//! This module defines the representation/decoding boundary, the bounded
+//! atomic mover, and active-bucket read routing for retained response graphs.
+//! Partition retirement remains a separate lifecycle phase.
 
 use std::fmt;
 
@@ -18,7 +18,9 @@ use crate::error::{FusilladeError, Result};
 use crate::manager::{
     RetainedResponseArchiveOutcome, RetainedResponseMaintenanceError, RetentionSweepPolicy,
 };
-use crate::request::{RequestDetail, RequestId};
+use crate::request::{
+    ListRequestsFilter, RequestDetail, RequestId, RequestListResult, RequestSummary,
+};
 use crate::response_step::{ResponseStep, StepId, StepKind, StepState};
 
 /// The only retained response payload version this binary knows how to read.
@@ -399,7 +401,13 @@ impl RetainedRequestPayloadV1 {
         if self.request.created_by.as_deref().is_none_or(str::is_empty) {
             return Err(RetainedResponseSerializationError::InvalidRequestSnapshot);
         }
-        self.request.terminal_at()?;
+        let terminal_at = self
+            .request
+            .terminal_at()?
+            .ok_or(RetainedResponseSerializationError::InvalidRequestSnapshot)?;
+        if terminal_at < self.request.created_at {
+            return Err(RetainedResponseSerializationError::InvalidRequestSnapshot);
+        }
         Ok(())
     }
 
@@ -408,12 +416,7 @@ impl RetainedRequestPayloadV1 {
         &self,
     ) -> std::result::Result<RequestDetail, RetainedResponseSerializationError> {
         self.validate()?;
-        let duration_ms = match (self.request.started_at, self.request.completed_at) {
-            (Some(started_at), Some(completed_at)) => Some(
-                (completed_at.timestamp_micros() - started_at.timestamp_micros()) as f64 / 1_000.0,
-            ),
-            _ => None,
-        };
+        let duration_ms = self.duration_ms();
         Ok(RequestDetail {
             id: self.request.id,
             batch_id: self.request.batch_id,
@@ -430,6 +433,34 @@ impl RetainedRequestPayloadV1 {
             service_tier: self.request.service_tier.clone(),
             created_by: self.request.created_by.clone().unwrap_or_default(),
         })
+    }
+
+    pub(crate) fn to_request_summary(
+        &self,
+    ) -> std::result::Result<RequestSummary, RetainedResponseSerializationError> {
+        self.validate()?;
+        Ok(RequestSummary {
+            id: self.request.id,
+            batch_id: self.request.batch_id,
+            model: self.request.model.clone(),
+            status: self.request.state.clone(),
+            created_at: self.request.created_at,
+            completed_at: self.request.completed_at,
+            failed_at: self.request.failed_at,
+            duration_ms: self.duration_ms(),
+            response_status: self.request.response_status,
+            service_tier: self.request.service_tier.clone(),
+            created_by: self.request.created_by.clone().unwrap_or_default(),
+        })
+    }
+
+    fn duration_ms(&self) -> Option<f64> {
+        match (self.request.started_at, self.request.completed_at) {
+            (Some(started_at), Some(completed_at)) => Some(
+                (completed_at.timestamp_micros() - started_at.timestamp_micros()) as f64 / 1_000.0,
+            ),
+            _ => None,
+        }
     }
 }
 
@@ -1193,6 +1224,652 @@ fn to_payload<T: Serialize>(
     value: &T,
 ) -> std::result::Result<serde_json::Value, RetainedResponseSerializationError> {
     serde_json::to_value(value).map_err(|_| RetainedResponseSerializationError::EncodeFailure)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetainedResponseReadError {
+    DatabaseFailure,
+}
+
+impl fmt::Display for RetainedResponseReadError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("Retained response read failed")
+    }
+}
+
+impl std::error::Error for RetainedResponseReadError {}
+
+fn read_database_failure<T>(_: T) -> FusilladeError {
+    FusilladeError::Other(anyhow::Error::new(
+        RetainedResponseReadError::DatabaseFailure,
+    ))
+}
+
+async fn begin_primary_read<P: PoolProvider>(
+    manager: &PostgresRequestManager<P>,
+) -> Result<Transaction<'static, Postgres>> {
+    let mut tx = manager.begin_write().await.map_err(read_database_failure)?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+        .execute(&mut *tx)
+        .await
+        .map_err(read_database_failure)?;
+    Ok(tx)
+}
+
+const RETAINED_OBJECT_COLUMNS: &str = "object.delete_on, object.group_id, object.object_kind, \
+    object.object_id, object.request_id, object.head_step_id, object.created_by, \
+    object.service_tier, object.state, object.model, object.created_at, object.terminal_at, \
+    object.step_sequence, object.schema_version, object.payload";
+
+pub(crate) async fn get_request_detail<P: PoolProvider>(
+    manager: &PostgresRequestManager<P>,
+    request_id: RequestId,
+) -> Result<RequestDetail> {
+    let mut tx = begin_primary_read(manager).await?;
+    let live = sqlx::query_as::<_, RequestDetail>(
+        r#"
+        SELECT
+            request.id, request.batch_id, request.model, request.state,
+            request.created_at, request.completed_at, request.failed_at,
+            (CASE WHEN request.completed_at IS NOT NULL AND request.started_at IS NOT NULL
+                THEN EXTRACT(EPOCH FROM (request.completed_at - request.started_at)) * 1000
+                ELSE NULL END)::float8 AS duration_ms,
+            request.response_status,
+            CASE WHEN file.deleted_at IS NULL OR template.file_id IS NULL
+                THEN template.body ELSE NULL END AS body,
+            request.response_body, request.error, request.service_tier,
+            request.created_by
+        FROM requests request
+        LEFT JOIN request_templates template ON request.template_id = template.id
+        LEFT JOIN files file ON template.file_id = file.id
+        WHERE request.id = $1 AND request.created_by IS NOT NULL
+        "#,
+    )
+    .bind(request_id.0)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(read_database_failure)?;
+
+    let detail = if let Some(live) = live {
+        Some(live)
+    } else {
+        let query = format!(
+            r#"
+            SELECT {RETAINED_OBJECT_COLUMNS}
+            FROM retained_response_request_routes route
+            JOIN retained_response_group_routes group_route
+              ON group_route.group_id = route.group_id
+             AND group_route.delete_on = route.delete_on
+            JOIN retained_response_buckets bucket
+              ON bucket.delete_on = route.delete_on
+            JOIN pg_namespace namespace
+              ON namespace.nspname = bucket.partition_schema
+            JOIN pg_class child
+              ON child.relnamespace = namespace.oid
+             AND child.relname = bucket.partition_table
+             AND child.oid = bucket.partition_oid
+            JOIN pg_inherits inheritance
+              ON inheritance.inhrelid = child.oid
+             AND NOT inheritance.inhdetachpending
+            JOIN retained_response_objects object
+              ON object.delete_on = route.delete_on
+             AND object.group_id = route.group_id
+             AND object.object_kind = 'request'
+             AND object.object_id = route.request_id
+             AND object.request_id = route.request_id
+            WHERE route.request_id = $1
+              AND bucket.state = 'active'
+              AND bucket.partition_schema = current_schema()
+              AND bucket.partition_table =
+                  'retained_response_objects_d' || to_char(route.delete_on, 'YYYYMMDD')
+              AND inheritance.inhparent =
+                  to_regclass(format('%I.retained_response_objects', current_schema()))
+              AND pg_get_expr(child.relpartbound, child.oid) = format(
+                  'FOR VALUES FROM (%L) TO (%L)', route.delete_on, route.delete_on + 1
+              )
+            "#,
+        );
+        sqlx::query(&query)
+            .bind(request_id.0)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(read_database_failure)?
+            .map(|row| {
+                RetainedResponseObjectRow::from_pg_row(&row)?
+                    .decode_request()
+                    .and_then(|payload| payload.to_request_detail())
+                    .map_err(RetainedResponseSerializationError::into_fusillade_error)
+            })
+            .transpose()?
+    };
+
+    tx.commit().await.map_err(read_database_failure)?;
+    detail.ok_or(FusilladeError::RequestNotFound(request_id))
+}
+
+const LIST_REQUESTS_COUNT_SQL: &str = r#"
+    WITH candidates AS (
+        SELECT request.id
+        FROM requests request
+        WHERE request.created_by IS NOT NULL
+          AND ($1::text IS NULL OR request.created_by = $1)
+          AND ($2::text IS NULL OR request.state = $2)
+          AND ($3::text[] IS NULL OR request.model = ANY($3))
+          AND ($4::timestamptz IS NULL OR request.created_at >= $4)
+          AND ($5::timestamptz IS NULL OR request.created_at <= $5)
+          AND ($6::text[] IS NULL OR request.service_tier = ANY($6))
+
+        UNION ALL
+
+        SELECT object.object_id
+        FROM retained_response_buckets bucket
+        JOIN pg_namespace namespace
+          ON namespace.nspname = bucket.partition_schema
+        JOIN pg_class child
+          ON child.relnamespace = namespace.oid
+         AND child.relname = bucket.partition_table
+         AND child.oid = bucket.partition_oid
+        JOIN pg_inherits inheritance
+          ON inheritance.inhrelid = child.oid
+         AND NOT inheritance.inhdetachpending
+        JOIN retained_response_objects object
+          ON object.delete_on = bucket.delete_on
+         AND object.object_kind = 'request'
+        JOIN retained_response_request_routes route
+          ON route.request_id = object.object_id
+         AND route.group_id = object.group_id
+         AND route.delete_on = object.delete_on
+        JOIN retained_response_group_routes group_route
+          ON group_route.group_id = object.group_id
+         AND group_route.delete_on = object.delete_on
+        WHERE bucket.state = 'active'
+          AND bucket.partition_schema = current_schema()
+          AND bucket.partition_table =
+              'retained_response_objects_d' || to_char(bucket.delete_on, 'YYYYMMDD')
+          AND inheritance.inhparent =
+              to_regclass(format('%I.retained_response_objects', current_schema()))
+          AND pg_get_expr(child.relpartbound, child.oid) = format(
+              'FOR VALUES FROM (%L) TO (%L)', bucket.delete_on, bucket.delete_on + 1
+          )
+          AND object.created_by IS NOT NULL
+          AND ($1::text IS NULL OR object.created_by = $1)
+          AND ($2::text IS NULL OR object.state = $2)
+          AND ($3::text[] IS NULL OR object.model = ANY($3))
+          AND ($4::timestamptz IS NULL OR object.created_at >= $4)
+          -- V1 proves created_at <= terminal_at < delete_on, so this
+          -- necessary lower bound enables daily partition pruning.
+          AND ($4::timestamptz IS NULL OR object.delete_on > ($4 AT TIME ZONE 'UTC')::date)
+          AND ($5::timestamptz IS NULL OR object.created_at <= $5)
+          AND ($6::text[] IS NULL OR object.service_tier = ANY($6))
+          AND NOT EXISTS (
+              SELECT 1 FROM requests live
+              WHERE live.id = object.object_id AND live.created_by IS NOT NULL
+          )
+    )
+    SELECT COUNT(*)::bigint FROM candidates
+"#;
+
+fn list_requests_page_sql(active_first: bool) -> String {
+    let order_clause = if active_first {
+        "CASE sort_state WHEN 'processing' THEN 0 WHEN 'claimed' THEN 1 WHEN 'pending' THEN 2 ELSE 3 END ASC, sort_created_at DESC, sort_id DESC"
+    } else {
+        "sort_created_at DESC, sort_id DESC"
+    };
+    format!(
+        r#"
+        WITH candidates AS (
+            SELECT
+                request.id AS sort_id,
+                request.state AS sort_state,
+                request.created_at AS sort_created_at,
+                FALSE AS retained,
+                jsonb_build_object(
+                    'id', request.id,
+                    'batch_id', request.batch_id,
+                    'model', request.model,
+                    'status', request.state,
+                    'created_at', request.created_at,
+                    'completed_at', request.completed_at,
+                    'failed_at', request.failed_at,
+                    'duration_ms', (CASE
+                        WHEN request.completed_at IS NOT NULL AND request.started_at IS NOT NULL
+                        THEN EXTRACT(EPOCH FROM (request.completed_at - request.started_at)) * 1000
+                        ELSE NULL END)::float8,
+                    'response_status', request.response_status,
+                    'service_tier', request.service_tier,
+                    'created_by', request.created_by
+                ) AS live_summary,
+                NULL::date AS delete_on,
+                NULL::uuid AS group_id,
+                NULL::text AS object_kind,
+                NULL::uuid AS object_id,
+                NULL::uuid AS request_id,
+                NULL::uuid AS head_step_id,
+                NULL::text AS created_by,
+                NULL::text AS service_tier,
+                NULL::text AS state,
+                NULL::text AS model,
+                NULL::timestamptz AS created_at,
+                NULL::timestamptz AS terminal_at,
+                NULL::bigint AS step_sequence,
+                NULL::smallint AS schema_version,
+                NULL::jsonb AS payload
+            FROM requests request
+            WHERE request.created_by IS NOT NULL
+              AND ($1::text IS NULL OR request.created_by = $1)
+              AND ($2::text IS NULL OR request.state = $2)
+              AND ($3::text[] IS NULL OR request.model = ANY($3))
+              AND ($4::timestamptz IS NULL OR request.created_at >= $4)
+              AND ($5::timestamptz IS NULL OR request.created_at <= $5)
+              AND ($6::text[] IS NULL OR request.service_tier = ANY($6))
+
+            UNION ALL
+
+            SELECT
+                object.object_id AS sort_id,
+                object.state AS sort_state,
+                object.created_at AS sort_created_at,
+                TRUE AS retained,
+                NULL::jsonb AS live_summary,
+                object.delete_on,
+                object.group_id,
+                object.object_kind,
+                object.object_id,
+                object.request_id,
+                object.head_step_id,
+                object.created_by,
+                object.service_tier,
+                object.state,
+                object.model,
+                object.created_at,
+                object.terminal_at,
+                object.step_sequence,
+                object.schema_version,
+                object.payload
+            FROM retained_response_buckets bucket
+            JOIN pg_namespace namespace
+              ON namespace.nspname = bucket.partition_schema
+            JOIN pg_class child
+              ON child.relnamespace = namespace.oid
+             AND child.relname = bucket.partition_table
+             AND child.oid = bucket.partition_oid
+            JOIN pg_inherits inheritance
+              ON inheritance.inhrelid = child.oid
+             AND NOT inheritance.inhdetachpending
+            JOIN retained_response_objects object
+              ON object.delete_on = bucket.delete_on
+             AND object.object_kind = 'request'
+            JOIN retained_response_request_routes route
+              ON route.request_id = object.object_id
+             AND route.group_id = object.group_id
+             AND route.delete_on = object.delete_on
+            JOIN retained_response_group_routes group_route
+              ON group_route.group_id = object.group_id
+             AND group_route.delete_on = object.delete_on
+            WHERE bucket.state = 'active'
+              AND bucket.partition_schema = current_schema()
+              AND bucket.partition_table =
+                  'retained_response_objects_d' || to_char(bucket.delete_on, 'YYYYMMDD')
+              AND inheritance.inhparent =
+                  to_regclass(format('%I.retained_response_objects', current_schema()))
+              AND pg_get_expr(child.relpartbound, child.oid) = format(
+                  'FOR VALUES FROM (%L) TO (%L)', bucket.delete_on, bucket.delete_on + 1
+              )
+              AND object.created_by IS NOT NULL
+              AND ($1::text IS NULL OR object.created_by = $1)
+              AND ($2::text IS NULL OR object.state = $2)
+              AND ($3::text[] IS NULL OR object.model = ANY($3))
+              AND ($4::timestamptz IS NULL OR object.created_at >= $4)
+              -- V1 proves created_at <= terminal_at < delete_on, so this
+              -- necessary lower bound enables daily partition pruning.
+              AND ($4::timestamptz IS NULL OR object.delete_on > ($4 AT TIME ZONE 'UTC')::date)
+              AND ($5::timestamptz IS NULL OR object.created_at <= $5)
+              AND ($6::text[] IS NULL OR object.service_tier = ANY($6))
+              AND NOT EXISTS (
+                  SELECT 1 FROM requests live
+                  WHERE live.id = object.object_id AND live.created_by IS NOT NULL
+              )
+        )
+        SELECT retained, live_summary, delete_on, group_id, object_kind,
+               object_id, request_id, head_step_id, created_by, service_tier,
+               state, model, created_at, terminal_at, step_sequence,
+               schema_version, payload
+        FROM candidates
+        ORDER BY {order_clause}
+        LIMIT $7 OFFSET $8
+        "#,
+    )
+}
+
+pub(crate) async fn list_requests<P: PoolProvider>(
+    manager: &PostgresRequestManager<P>,
+    filter: ListRequestsFilter,
+) -> Result<RequestListResult> {
+    if filter.skip < 0 {
+        return Err(FusilladeError::ValidationError(
+            "skip must be >= 0".to_string(),
+        ));
+    }
+    if filter.limit <= 0 {
+        return Err(FusilladeError::ValidationError(
+            "limit must be > 0".to_string(),
+        ));
+    }
+
+    let mut tx = begin_primary_read(manager).await?;
+    let count: i64 = sqlx::query_scalar(LIST_REQUESTS_COUNT_SQL)
+        .bind(filter.created_by.as_deref())
+        .bind(filter.status.as_deref())
+        .bind(filter.models.as_deref())
+        .bind(filter.created_after)
+        .bind(filter.created_before)
+        .bind(filter.service_tiers.as_deref())
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(read_database_failure)?;
+
+    let query = list_requests_page_sql(filter.active_first);
+    let rows = sqlx::query(&query)
+        .bind(filter.created_by.as_deref())
+        .bind(filter.status.as_deref())
+        .bind(filter.models.as_deref())
+        .bind(filter.created_after)
+        .bind(filter.created_before)
+        .bind(filter.service_tiers.as_deref())
+        .bind(filter.limit)
+        .bind(filter.skip)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(read_database_failure)?;
+
+    let mut data = Vec::with_capacity(rows.len());
+    for row in rows {
+        if row
+            .try_get::<bool, _>("retained")
+            .map_err(read_database_failure)?
+        {
+            data.push(
+                RetainedResponseObjectRow::from_pg_row(&row)?
+                    .decode_request()
+                    .and_then(|payload| payload.to_request_summary())
+                    .map_err(RetainedResponseSerializationError::into_fusillade_error)?,
+            );
+        } else {
+            let value: serde_json::Value =
+                row.try_get("live_summary").map_err(read_database_failure)?;
+            data.push(serde_json::from_value(value).map_err(|_| {
+                RetainedResponseSerializationError::MalformedRow.into_fusillade_error()
+            })?);
+        }
+    }
+    tx.commit().await.map_err(read_database_failure)?;
+    Ok(RequestListResult {
+        data,
+        total_count: count,
+    })
+}
+
+const COUNT_OWNER_FLEX_REQUESTS_SQL: &str = r#"
+    SELECT COUNT(*)::bigint
+    FROM (
+        SELECT request.id
+        FROM requests request
+        WHERE request.created_by = $1
+          AND request.created_at >= $2
+          AND request.service_tier = 'flex'
+
+        UNION ALL
+
+        SELECT object.object_id
+        FROM retained_response_buckets bucket
+        JOIN pg_namespace namespace
+          ON namespace.nspname = bucket.partition_schema
+        JOIN pg_class child
+          ON child.relnamespace = namespace.oid
+         AND child.relname = bucket.partition_table
+         AND child.oid = bucket.partition_oid
+        JOIN pg_inherits inheritance
+          ON inheritance.inhrelid = child.oid
+         AND NOT inheritance.inhdetachpending
+        JOIN retained_response_objects object
+          ON object.delete_on = bucket.delete_on
+         AND object.object_kind = 'request'
+        JOIN retained_response_request_routes route
+          ON route.request_id = object.object_id
+         AND route.group_id = object.group_id
+         AND route.delete_on = object.delete_on
+        JOIN retained_response_group_routes group_route
+          ON group_route.group_id = object.group_id
+         AND group_route.delete_on = object.delete_on
+        WHERE bucket.state = 'active'
+          AND bucket.partition_schema = current_schema()
+          AND bucket.partition_table =
+              'retained_response_objects_d' || to_char(bucket.delete_on, 'YYYYMMDD')
+          AND inheritance.inhparent =
+              to_regclass(format('%I.retained_response_objects', current_schema()))
+          AND pg_get_expr(child.relpartbound, child.oid) = format(
+              'FOR VALUES FROM (%L) TO (%L)', bucket.delete_on, bucket.delete_on + 1
+          )
+          AND object.created_by = $1
+          AND object.created_at >= $2
+          -- V1 proves created_at <= terminal_at < delete_on.
+          AND object.delete_on > ($2 AT TIME ZONE 'UTC')::date
+          AND object.service_tier = 'flex'
+          AND NOT EXISTS (
+              SELECT 1 FROM requests live
+              WHERE live.id = object.object_id AND live.created_by IS NOT NULL
+          )
+    ) candidate
+"#;
+
+pub(crate) async fn count_owner_flex_requests_since<P: PoolProvider>(
+    manager: &PostgresRequestManager<P>,
+    owner: &str,
+    cutoff: DateTime<Utc>,
+) -> Result<i64> {
+    sqlx::query_scalar(COUNT_OWNER_FLEX_REQUESTS_SQL)
+        .bind(owner)
+        .bind(cutoff)
+        .fetch_one(manager.write_executor())
+        .await
+        .map_err(read_database_failure)
+}
+
+pub(crate) async fn get_step(
+    tx: &mut Transaction<'_, Postgres>,
+    step_id: StepId,
+) -> Result<Option<ResponseStep>> {
+    let query = format!(
+        r#"
+        SELECT {RETAINED_OBJECT_COLUMNS}
+        FROM retained_response_step_routes route
+        JOIN retained_response_group_routes group_route
+          ON group_route.group_id = route.group_id
+         AND group_route.delete_on = route.delete_on
+        JOIN retained_response_buckets bucket
+          ON bucket.delete_on = route.delete_on
+        JOIN pg_namespace namespace
+          ON namespace.nspname = bucket.partition_schema
+        JOIN pg_class child
+          ON child.relnamespace = namespace.oid
+         AND child.relname = bucket.partition_table
+         AND child.oid = bucket.partition_oid
+        JOIN pg_inherits inheritance
+          ON inheritance.inhrelid = child.oid
+         AND NOT inheritance.inhdetachpending
+        JOIN retained_response_objects object
+          ON object.delete_on = route.delete_on
+         AND object.group_id = route.group_id
+         AND object.object_kind = 'step'
+         AND object.object_id = route.step_id
+        WHERE route.step_id = $1
+          AND bucket.state = 'active'
+          AND bucket.partition_schema = current_schema()
+          AND bucket.partition_table =
+              'retained_response_objects_d' || to_char(route.delete_on, 'YYYYMMDD')
+          AND inheritance.inhparent =
+              to_regclass(format('%I.retained_response_objects', current_schema()))
+          AND pg_get_expr(child.relpartbound, child.oid) = format(
+              'FOR VALUES FROM (%L) TO (%L)', route.delete_on, route.delete_on + 1
+          )
+        "#,
+    );
+    sqlx::query(&query)
+        .bind(step_id.0)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(read_database_failure)?
+        .map(|row| {
+            RetainedResponseObjectRow::from_pg_row(&row)?
+                .decode_step()
+                .map(|payload| payload.to_response_step())
+                .map_err(RetainedResponseSerializationError::into_fusillade_error)
+        })
+        .transpose()
+}
+
+pub(crate) async fn get_step_by_request(
+    tx: &mut Transaction<'_, Postgres>,
+    request_id: RequestId,
+) -> Result<Option<ResponseStep>> {
+    let query = format!(
+        r#"
+        SELECT {RETAINED_OBJECT_COLUMNS}
+        FROM retained_response_request_routes request_route
+        JOIN retained_response_group_routes group_route
+          ON group_route.group_id = request_route.group_id
+         AND group_route.delete_on = request_route.delete_on
+        JOIN retained_response_buckets bucket
+          ON bucket.delete_on = request_route.delete_on
+        JOIN pg_namespace namespace
+          ON namespace.nspname = bucket.partition_schema
+        JOIN pg_class child
+          ON child.relnamespace = namespace.oid
+         AND child.relname = bucket.partition_table
+         AND child.oid = bucket.partition_oid
+        JOIN pg_inherits inheritance
+          ON inheritance.inhrelid = child.oid
+         AND NOT inheritance.inhdetachpending
+        JOIN retained_response_objects object
+          ON object.delete_on = request_route.delete_on
+         AND object.group_id = request_route.group_id
+         AND object.object_kind = 'step'
+         AND object.request_id = request_route.request_id
+        JOIN retained_response_step_routes step_route
+          ON step_route.step_id = object.object_id
+         AND step_route.group_id = object.group_id
+         AND step_route.delete_on = object.delete_on
+        WHERE request_route.request_id = $1
+          AND bucket.state = 'active'
+          AND bucket.partition_schema = current_schema()
+          AND bucket.partition_table =
+              'retained_response_objects_d' || to_char(request_route.delete_on, 'YYYYMMDD')
+          AND inheritance.inhparent =
+              to_regclass(format('%I.retained_response_objects', current_schema()))
+          AND pg_get_expr(child.relpartbound, child.oid) = format(
+              'FOR VALUES FROM (%L) TO (%L)',
+              request_route.delete_on,
+              request_route.delete_on + 1
+          )
+        "#,
+    );
+    sqlx::query(&query)
+        .bind(request_id.0)
+        .fetch_optional(&mut **tx)
+        .await
+        .map_err(read_database_failure)?
+        .map(|row| {
+            RetainedResponseObjectRow::from_pg_row(&row)?
+                .decode_step()
+                .map(|payload| payload.to_response_step())
+                .map_err(RetainedResponseSerializationError::into_fusillade_error)
+        })
+        .transpose()
+}
+
+pub(crate) async fn list_chain(
+    tx: &mut Transaction<'_, Postgres>,
+    head_step_id: StepId,
+) -> Result<Vec<ResponseStep>> {
+    let query = format!(
+        r#"
+        SELECT {RETAINED_OBJECT_COLUMNS}
+        FROM retained_response_group_routes route
+        JOIN retained_response_buckets bucket
+          ON bucket.delete_on = route.delete_on
+        JOIN pg_namespace namespace
+          ON namespace.nspname = bucket.partition_schema
+        JOIN pg_class child
+          ON child.relnamespace = namespace.oid
+         AND child.relname = bucket.partition_table
+         AND child.oid = bucket.partition_oid
+        JOIN pg_inherits inheritance
+          ON inheritance.inhrelid = child.oid
+         AND NOT inheritance.inhdetachpending
+        JOIN retained_response_objects object
+          ON object.delete_on = route.delete_on
+         AND object.group_id = route.group_id
+         AND object.object_kind IN ('group', 'step')
+        LEFT JOIN retained_response_step_routes step_route
+          ON object.object_kind = 'step'
+         AND step_route.step_id = object.object_id
+         AND step_route.group_id = object.group_id
+         AND step_route.delete_on = object.delete_on
+        WHERE route.group_id = $1
+          AND bucket.state = 'active'
+          AND bucket.partition_schema = current_schema()
+          AND bucket.partition_table =
+              'retained_response_objects_d' || to_char(route.delete_on, 'YYYYMMDD')
+          AND inheritance.inhparent =
+              to_regclass(format('%I.retained_response_objects', current_schema()))
+          AND pg_get_expr(child.relpartbound, child.oid) = format(
+              'FOR VALUES FROM (%L) TO (%L)', route.delete_on, route.delete_on + 1
+          )
+          AND (object.object_kind = 'group' OR step_route.step_id IS NOT NULL)
+        ORDER BY CASE object.object_kind WHEN 'group' THEN 0 ELSE 1 END,
+                 object.step_sequence ASC,
+                 object.object_id ASC
+        "#,
+    );
+    let rows = sqlx::query(&query)
+        .bind(head_step_id.0)
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(read_database_failure)?;
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut rows = rows.into_iter();
+    let group_row = RetainedResponseObjectRow::from_pg_row(&rows.next().ok_or_else(|| {
+        RetainedResponseSerializationError::IncompleteGroup.into_fusillade_error()
+    })?)?;
+    let group = group_row
+        .decode_group()
+        .map_err(RetainedResponseSerializationError::into_fusillade_error)?;
+    if group.group_id != head_step_id.0 || group.head_step_id != Some(head_step_id.0) {
+        return Err(RetainedResponseSerializationError::IncompleteGroup.into_fusillade_error());
+    }
+
+    let mut steps = Vec::new();
+    for row in rows {
+        steps.push(
+            RetainedResponseObjectRow::from_pg_row(&row)?
+                .decode_step()
+                .map_err(RetainedResponseSerializationError::into_fusillade_error)?,
+        );
+    }
+    let actual_ids = steps
+        .iter()
+        .map(|payload| payload.step.id)
+        .collect::<Vec<_>>();
+    if !same_id_set(&actual_ids, &group.step_ids) {
+        return Err(RetainedResponseSerializationError::IncompleteGroup.into_fusillade_error());
+    }
+    Ok(steps
+        .into_iter()
+        .map(|payload| payload.to_response_step())
+        .collect())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2419,6 +3096,108 @@ mod tests {
             }
             _ => false,
         }
+    }
+
+    fn plan_mentions_relation(plan: &serde_json::Value, relation_name: &str) -> bool {
+        match plan {
+            serde_json::Value::Array(values) => values
+                .iter()
+                .any(|value| plan_mentions_relation(value, relation_name)),
+            serde_json::Value::Object(fields) => {
+                fields.get("Relation Name").and_then(|value| value.as_str()) == Some(relation_name)
+                    || fields
+                        .values()
+                        .any(|value| plan_mentions_relation(value, relation_name))
+            }
+            _ => false,
+        }
+    }
+
+    fn plan_scans_relation(plan: &serde_json::Value, relation_name: &str) -> bool {
+        match plan {
+            serde_json::Value::Array(values) => values
+                .iter()
+                .any(|value| plan_scans_relation(value, relation_name)),
+            serde_json::Value::Object(fields) => {
+                let scans_this_relation =
+                    fields.get("Relation Name").and_then(|value| value.as_str())
+                        == Some(relation_name)
+                        && fields
+                            .get("Actual Loops")
+                            .and_then(|value| value.as_u64())
+                            .is_none_or(|loops| loops > 0);
+                scans_this_relation
+                    || fields
+                        .values()
+                        .any(|value| plan_scans_relation(value, relation_name))
+            }
+            _ => false,
+        }
+    }
+
+    async fn explain_bounded_list_query(pool: &PgPool, sql: &str, page: bool) -> serde_json::Value {
+        let explain = format!("EXPLAIN (ANALYZE, FORMAT JSON) {sql}");
+        let query = sqlx::query_scalar(&explain)
+            .bind(Option::<&str>::None)
+            .bind(Option::<&str>::None)
+            .bind(Option::<Vec<String>>::None)
+            .bind(Some(timestamp("2026-08-10T00:00:00Z")))
+            .bind(Option::<DateTime<Utc>>::None)
+            .bind(Option::<Vec<String>>::None);
+        if page {
+            query.bind(20_i64).bind(0_i64)
+        } else {
+            query
+        }
+        .fetch_one(pool)
+        .await
+        .expect("bounded retained-list SQL must be explainable")
+    }
+
+    #[sqlx::test]
+    async fn retained_list_and_count_plans_prune_children_before_created_after(pool: PgPool) {
+        for delete_on in [
+            NaiveDate::from_ymd_opt(2026, 8, 3).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 8, 20).unwrap(),
+        ] {
+            sqlx::query("SELECT ensure_retained_response_partition($1, NULL)")
+                .bind(delete_on)
+                .execute(&pool)
+                .await
+                .expect("planner fixture partition must be available");
+        }
+
+        for (label, sql, page) in [
+            ("count", LIST_REQUESTS_COUNT_SQL.to_owned(), false),
+            ("page", list_requests_page_sql(false), true),
+        ] {
+            let plan = explain_bounded_list_query(&pool, &sql, page).await;
+            assert!(
+                plan_mentions_relation(&plan, "retained_response_objects_d20260820"),
+                "{label} plan must retain the relevant daily child: {plan}"
+            );
+            assert!(
+                !plan_scans_relation(&plan, "retained_response_objects_d20260803"),
+                "{label} plan must remove or avoid scanning the irrelevant daily child: {plan}"
+            );
+        }
+
+        let flex_explain =
+            format!("EXPLAIN (ANALYZE, FORMAT JSON) {COUNT_OWNER_FLEX_REQUESTS_SQL}");
+        let flex_plan: serde_json::Value = sqlx::query_scalar(&flex_explain)
+            .bind("planner-owner")
+            .bind(timestamp("2026-08-10T00:00:00Z"))
+            .fetch_one(&pool)
+            .await
+            .expect("bounded retained flex-count SQL must be explainable");
+        assert!(
+            plan_mentions_relation(&flex_plan, "retained_response_objects_d20260820"),
+            "flex-count plan must retain the relevant daily child: {flex_plan}"
+        );
+        assert!(
+            !plan_scans_relation(&flex_plan, "retained_response_objects_d20260803"),
+            "flex-count plan must remove or avoid scanning the irrelevant daily child: {flex_plan}"
+        );
     }
 
     #[sqlx::test]

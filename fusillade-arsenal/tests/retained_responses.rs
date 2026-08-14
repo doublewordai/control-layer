@@ -6,8 +6,12 @@ use chrono::{DateTime, NaiveDate, TimeDelta, Utc};
 use fusillade_arsenal::manager::{
     RetainedResponseArchiveOutcome, RetainedResponseMaintenanceError, RetentionSweepPolicy,
 };
+use fusillade_arsenal::postgres_response_step::RetainedResponseStepConflict;
+use fusillade_arsenal::request::{ListRequestsFilter, RequestId, ServiceTierFilter};
+use fusillade_arsenal::response_step::{CreateStepInput, ResponseStepStore, StepId, StepKind};
 use fusillade_arsenal::{
-    DaemonStorage, PoolProvider, PostgresRequestManager, PostgresStorageConfig, TestDbPools,
+    DaemonStorage, PoolProvider, PostgresRequestManager, PostgresResponseStepManager,
+    PostgresStorageConfig, Storage, TestDbPools,
 };
 use serde_json::json;
 use sqlx::pool::PoolConnection;
@@ -118,6 +122,21 @@ async fn manager(pool: &PgPool) -> PostgresRequestManager<TestDbPools> {
     )
 }
 
+async fn managers(
+    pool: &PgPool,
+) -> (
+    PostgresRequestManager<TestDbPools>,
+    PostgresResponseStepManager<TestDbPools>,
+) {
+    let pools = TestDbPools::new(pool.clone())
+        .await
+        .expect("test pools must initialize");
+    (
+        PostgresRequestManager::new(pools.clone(), PostgresStorageConfig::default()),
+        PostgresResponseStepManager::new(pools),
+    )
+}
+
 async fn write_gated_manager(
     pool: &PgPool,
 ) -> (
@@ -189,6 +208,56 @@ async fn wait_for_advisory_waiter(pool: &PgPool) {
         .fetch_one(pool)
         .await
         .expect("advisory lock wait must be observable");
+        if waiting {
+            return;
+        }
+        tokio::task::yield_now().await;
+    }
+}
+
+async fn wait_for_advisory_waiter_key(pool: &PgPool, key: i64) {
+    loop {
+        let waiting: bool = sqlx::query_scalar(
+            r#"
+            SELECT EXISTS (
+                SELECT 1
+                FROM pg_locks
+                WHERE locktype = 'advisory'
+                  AND classid = 0
+                  AND objid = $1::oid
+                  AND NOT granted
+            )
+            "#,
+        )
+        .bind(key as i32)
+        .fetch_one(pool)
+        .await
+        .expect("the keyed advisory-lock wait must be observable");
+        if waiting {
+            return;
+        }
+        tokio::task::yield_now().await;
+    }
+}
+
+async fn wait_for_relation_waiter(pool: &PgPool, relation: &str) {
+    loop {
+        let waiting: bool = sqlx::query_scalar(
+            r#"
+            SELECT EXISTS (
+                SELECT 1
+                FROM pg_locks
+                WHERE locktype = 'relation'
+                  AND relation = to_regclass($1)
+                  AND mode = 'AccessShareLock'
+                  AND NOT granted
+            )
+            "#,
+        )
+        .bind(relation)
+        .fetch_one(pool)
+        .await
+        .expect("the retained-route relation wait must be observable");
         if waiting {
             return;
         }
@@ -2094,4 +2163,825 @@ async fn extra_step_route_for_group_and_bucket_causes_integrity_rollback(pool: P
         "Retained response integrity verification failed"
     );
     assert_wholly_live(&pool, &graph).await;
+}
+
+#[derive(Debug, PartialEq)]
+struct PublicReadSnapshot {
+    details: Vec<serde_json::Value>,
+    step: serde_json::Value,
+    step_by_request: serde_json::Value,
+    chain: serde_json::Value,
+    lists: Vec<(serde_json::Value, i64)>,
+    flex_count: i64,
+    trailing: Vec<fusillade_arsenal::manager::TrailingDemandCount>,
+}
+
+async fn capture_public_reads(
+    request_manager: &PostgresRequestManager<TestDbPools>,
+    step_manager: &PostgresResponseStepManager<TestDbPools>,
+    graph: &LiveGraph,
+) -> PublicReadSnapshot {
+    let mut details = Vec::new();
+    for request_id in &graph.request_ids {
+        details.push(
+            serde_json::to_value(
+                request_manager
+                    .get_request_detail(RequestId(*request_id))
+                    .await
+                    .expect("request detail must be readable"),
+            )
+            .unwrap(),
+        );
+    }
+
+    let step = serde_json::to_value(
+        step_manager
+            .get_step(StepId(graph.group_id))
+            .await
+            .expect("step read must succeed")
+            .expect("head step must exist"),
+    )
+    .unwrap();
+    let step_by_request = serde_json::to_value(
+        step_manager
+            .get_step_by_request(RequestId(graph.request_ids[0]))
+            .await
+            .expect("request step read must succeed")
+            .expect("model step must exist"),
+    )
+    .unwrap();
+    let chain = serde_json::to_value(
+        step_manager
+            .list_chain(StepId(graph.group_id))
+            .await
+            .expect("chain read must succeed"),
+    )
+    .unwrap();
+
+    let filters = vec![
+        ListRequestsFilter::default(),
+        ListRequestsFilter {
+            active_first: true,
+            ..Default::default()
+        },
+        ListRequestsFilter {
+            created_by: Some(OWNER.to_owned()),
+            status: Some("completed".to_owned()),
+            models: Some(vec![MODEL.to_owned()]),
+            created_after: Some(timestamp("2026-07-31T00:00:00Z")),
+            created_before: Some(timestamp("2026-08-04T00:00:00Z")),
+            service_tiers: Some(vec!["flex".to_owned()]),
+            active_first: false,
+            skip: 0,
+            limit: 10,
+        },
+        ListRequestsFilter {
+            skip: 0,
+            limit: 1,
+            ..Default::default()
+        },
+        ListRequestsFilter {
+            skip: 1,
+            limit: 1,
+            ..Default::default()
+        },
+        ListRequestsFilter {
+            skip: 2,
+            limit: 1,
+            ..Default::default()
+        },
+        ListRequestsFilter {
+            status: Some("failed".to_owned()),
+            models: Some(Vec::new()),
+            service_tiers: Some(Vec::new()),
+            ..Default::default()
+        },
+    ];
+    let mut lists = Vec::new();
+    for filter in filters {
+        let result = request_manager
+            .list_requests(filter)
+            .await
+            .expect("request list must succeed");
+        lists.push((
+            serde_json::to_value(result.data).unwrap(),
+            result.total_count,
+        ));
+    }
+
+    let flex_count = request_manager
+        .count_owner_flex_requests_since(OWNER, timestamp("2026-07-01T00:00:00Z"), false)
+        .await
+        .expect("flex count must succeed");
+    let mut trailing = request_manager
+        .get_completed_request_counts_by_model_and_window(
+            &[("retained-window".to_owned(), -31_536_000, 0)],
+            &[MODEL.to_owned()],
+            &ServiceTierFilter::Any,
+        )
+        .await
+        .expect("trailing demand must succeed");
+    trailing.sort_by(|left, right| {
+        (&left.model, &left.service_tier, &left.outcome).cmp(&(
+            &right.model,
+            &right.service_tier,
+            &right.outcome,
+        ))
+    });
+
+    PublicReadSnapshot {
+        details,
+        step,
+        step_by_request,
+        chain,
+        lists,
+        flex_count,
+        trailing,
+    }
+}
+
+#[sqlx::test]
+async fn read_apis_preserve_exact_values_filters_pages_and_counts_after_move(pool: PgPool) {
+    install_candidate_index(&pool).await;
+    ensure_partition(&pool, date("2026-08-07")).await;
+    let graph = branching_graph(&pool, TerminalState::Completed).await;
+    let _pending = singleton(
+        &pool,
+        "priority",
+        TerminalState::Pending,
+        timestamp("2026-08-04T10:00:00Z"),
+        "still-live-pending",
+    )
+    .await;
+    let (request_manager, step_manager) = managers(&pool).await;
+    let before = capture_public_reads(&request_manager, &step_manager, &graph).await;
+
+    assert_eq!(before.details.len(), 2);
+    assert_eq!(before.chain.as_array().unwrap().len(), 5);
+    assert_eq!(before.lists[0].1, 3);
+    assert_eq!(before.lists[2].1, 1);
+    assert_eq!(before.flex_count, 1);
+    assert_eq!(before.trailing.iter().map(|row| row.count).sum::<i64>(), 2);
+
+    let outcome = archive(
+        &request_manager,
+        &policy(&[("flex", 86_400), ("priority", 3 * 86_400)]),
+        1,
+        i64::MAX,
+    )
+    .await
+    .expect("graph movement must succeed");
+    assert_eq!(outcome.groups_archived, 1);
+    assert_wholly_retained(&pool, &graph).await;
+
+    let after = capture_public_reads(&request_manager, &step_manager, &graph).await;
+    assert_eq!(after, before);
+}
+
+#[sqlx::test]
+async fn read_point_apis_never_observe_partial_data_during_atomic_movement(pool: PgPool) {
+    const MOVEMENT_GATE_KEY: i64 = 730_006;
+
+    install_candidate_index(&pool).await;
+    ensure_partition(&pool, date("2026-08-07")).await;
+    let graph = branching_graph(&pool, TerminalState::Completed).await;
+    let (request_manager, step_manager) = managers(&pool).await;
+    let before = capture_public_reads(&request_manager, &step_manager, &graph).await;
+
+    sqlx::query(
+        r#"
+        CREATE FUNCTION test_gate_retained_response_movement()
+        RETURNS trigger
+        LANGUAGE plpgsql
+        AS $$
+        BEGIN
+            PERFORM pg_advisory_xact_lock(730006);
+            RETURN NULL;
+        END
+        $$
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .expect("movement gate function must install");
+    sqlx::query(
+        r#"
+        CREATE TRIGGER test_gate_retained_response_movement
+        BEFORE DELETE ON response_steps
+        FOR EACH STATEMENT
+        EXECUTE FUNCTION test_gate_retained_response_movement()
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .expect("movement gate trigger must install");
+
+    let mut gate = pool
+        .acquire()
+        .await
+        .expect("movement gate connection must be available");
+    sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(MOVEMENT_GATE_KEY)
+        .execute(&mut *gate)
+        .await
+        .expect("movement gate must lock");
+    let mover_manager = manager(&pool).await;
+    let mut mover = tokio::spawn(async move {
+        archive(
+            &mover_manager,
+            &policy(&[("flex", 86_400), ("priority", 3 * 86_400)]),
+            1,
+            i64::MAX,
+        )
+        .await
+    });
+    tokio::select! {
+        result = &mut mover => panic!("movement completed before its deterministic gate: {result:?}"),
+        () = wait_for_advisory_waiter_key(&pool, MOVEMENT_GATE_KEY) => {}
+    }
+
+    // The mover has copied every retained object and route in its transaction
+    // and is paused immediately before deleting live steps. Other snapshots
+    // must still see the complete live graph, never the uncommitted archive.
+    let during = capture_public_reads(&request_manager, &step_manager, &graph).await;
+    assert_eq!(during, before);
+
+    let unlocked: bool = sqlx::query_scalar("SELECT pg_advisory_unlock($1)")
+        .bind(MOVEMENT_GATE_KEY)
+        .fetch_one(&mut *gate)
+        .await
+        .expect("movement gate must unlock");
+    assert!(unlocked);
+    let outcome = mover
+        .await
+        .expect("movement task must finish")
+        .expect("movement must commit after the gate opens");
+    assert_eq!(outcome.groups_archived, 1);
+
+    let after = capture_public_reads(&request_manager, &step_manager, &graph).await;
+    assert_eq!(after, before);
+}
+
+async fn set_bucket_state(pool: &PgPool, delete_on: NaiveDate, state: &str) {
+    sqlx::query("UPDATE retained_response_buckets SET state = $2 WHERE delete_on = $1")
+        .bind(delete_on)
+        .bind(state)
+        .execute(pool)
+        .await
+        .expect("bucket state transition must succeed");
+}
+
+#[sqlx::test]
+async fn read_point_helpers_keep_one_primary_snapshot_across_route_lookup(pool: PgPool) {
+    install_candidate_index(&pool).await;
+    let delete_on = date("2026-08-07");
+    ensure_partition(&pool, delete_on).await;
+    let graph = branching_graph(&pool, TerminalState::Completed).await;
+    let (request_manager, step_manager) = managers(&pool).await;
+    archive(
+        &request_manager,
+        &policy(&[("flex", 86_400), ("priority", 3 * 86_400)]),
+        1,
+        i64::MAX,
+    )
+    .await
+    .unwrap();
+
+    let expected_detail = serde_json::to_value(
+        request_manager
+            .get_request_detail(RequestId(graph.request_ids[0]))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let mut route_lock = pool.begin().await.unwrap();
+    sqlx::query("LOCK TABLE retained_response_request_routes IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *route_lock)
+        .await
+        .unwrap();
+    let detail_manager = manager(&pool).await;
+    let request_id = RequestId(graph.request_ids[0]);
+    let mut detail_read =
+        tokio::spawn(async move { detail_manager.get_request_detail(request_id).await });
+    tokio::select! {
+        result = &mut detail_read => panic!("detail read crossed its route gate: {result:?}"),
+        () = wait_for_relation_waiter(&pool, "retained_response_request_routes") => {}
+    }
+    set_bucket_state(&pool, delete_on, "retiring").await;
+    route_lock.commit().await.unwrap();
+    assert_eq!(
+        serde_json::to_value(detail_read.await.unwrap().unwrap()).unwrap(),
+        expected_detail,
+        "the retained detail must come from the snapshot established by the live lookup"
+    );
+    set_bucket_state(&pool, delete_on, "active").await;
+
+    let expected_step =
+        serde_json::to_value(step_manager.get_step(StepId(graph.group_id)).await.unwrap()).unwrap();
+    let mut route_lock = pool.begin().await.unwrap();
+    sqlx::query("LOCK TABLE retained_response_step_routes IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *route_lock)
+        .await
+        .unwrap();
+    let (_, gated_step_manager) = managers(&pool).await;
+    let step_id = StepId(graph.group_id);
+    let mut step_read = tokio::spawn(async move { gated_step_manager.get_step(step_id).await });
+    tokio::select! {
+        result = &mut step_read => panic!("step read crossed its route gate: {result:?}"),
+        () = wait_for_relation_waiter(&pool, "retained_response_step_routes") => {}
+    }
+    set_bucket_state(&pool, delete_on, "retiring").await;
+    route_lock.commit().await.unwrap();
+    assert_eq!(
+        serde_json::to_value(step_read.await.unwrap().unwrap()).unwrap(),
+        expected_step
+    );
+    set_bucket_state(&pool, delete_on, "active").await;
+
+    let expected_request_step = serde_json::to_value(
+        step_manager
+            .get_step_by_request(RequestId(graph.request_ids[0]))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let mut route_lock = pool.begin().await.unwrap();
+    sqlx::query("LOCK TABLE retained_response_request_routes IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *route_lock)
+        .await
+        .unwrap();
+    let (_, gated_step_manager) = managers(&pool).await;
+    let request_id = RequestId(graph.request_ids[0]);
+    let mut request_step_read =
+        tokio::spawn(async move { gated_step_manager.get_step_by_request(request_id).await });
+    tokio::select! {
+        result = &mut request_step_read => panic!("step-by-request read crossed its route gate: {result:?}"),
+        () = wait_for_relation_waiter(&pool, "retained_response_request_routes") => {}
+    }
+    set_bucket_state(&pool, delete_on, "retiring").await;
+    route_lock.commit().await.unwrap();
+    assert_eq!(
+        serde_json::to_value(request_step_read.await.unwrap().unwrap()).unwrap(),
+        expected_request_step
+    );
+    set_bucket_state(&pool, delete_on, "active").await;
+
+    let expected_chain = serde_json::to_value(
+        step_manager
+            .list_chain(StepId(graph.group_id))
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    let mut route_lock = pool.begin().await.unwrap();
+    sqlx::query("LOCK TABLE retained_response_group_routes IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *route_lock)
+        .await
+        .unwrap();
+    let (_, gated_step_manager) = managers(&pool).await;
+    let head_step_id = StepId(graph.group_id);
+    let mut chain_read =
+        tokio::spawn(async move { gated_step_manager.list_chain(head_step_id).await });
+    tokio::select! {
+        result = &mut chain_read => panic!("chain read crossed its route gate: {result:?}"),
+        () = wait_for_relation_waiter(&pool, "retained_response_group_routes") => {}
+    }
+    set_bucket_state(&pool, delete_on, "retiring").await;
+    route_lock.commit().await.unwrap();
+    assert_eq!(
+        serde_json::to_value(chain_read.await.unwrap().unwrap()).unwrap(),
+        expected_chain
+    );
+}
+
+#[sqlx::test]
+async fn read_mixed_live_and_retained_rows_do_not_double_count_or_split_demand(pool: PgPool) {
+    install_candidate_index(&pool).await;
+    ensure_partition(&pool, date("2026-08-03")).await;
+    let first = singleton(
+        &pool,
+        "flex",
+        TerminalState::Completed,
+        timestamp("2026-08-01T10:00:00Z"),
+        "mixed-first",
+    )
+    .await;
+    let second = singleton(
+        &pool,
+        "flex",
+        TerminalState::Completed,
+        timestamp("2026-08-02T10:00:00Z"),
+        "mixed-second",
+    )
+    .await;
+    let request_manager = manager(&pool).await;
+
+    let before_list = request_manager
+        .list_requests(ListRequestsFilter::default())
+        .await
+        .unwrap();
+    let before_flex = request_manager
+        .count_owner_flex_requests_since(OWNER, timestamp("2026-07-01T00:00:00Z"), false)
+        .await
+        .unwrap();
+    let before_trailing = request_manager
+        .get_completed_request_counts_by_model_and_window(
+            &[("retained-window".to_owned(), -31_536_000, 0)],
+            &[MODEL.to_owned()],
+            &ServiceTierFilter::Any,
+        )
+        .await
+        .unwrap();
+    assert_eq!(before_list.total_count, 2);
+    assert_eq!(before_flex, 2);
+    assert_eq!(before_trailing.len(), 1);
+    assert_eq!(before_trailing[0].count, 2);
+
+    let outcome = archive(&request_manager, &policy(&[("flex", 86_400)]), 1, i64::MAX)
+        .await
+        .unwrap();
+    assert_eq!(outcome.groups_archived, 1);
+    assert_wholly_retained(&pool, &first).await;
+    assert_wholly_live(&pool, &second).await;
+
+    // Recreate the retained request's live identity to model a stale route or
+    // repair overlap. Public unions must prefer this live row and suppress the
+    // retained copy rather than double-counting one logical request.
+    sqlx::query(
+        r#"
+        INSERT INTO request_templates (
+            id, file_id, endpoint, method, path, body, model, api_key,
+            line_number, body_byte_size, created_at, updated_at
+        ) VALUES (
+            $1, NULL, 'http://retention.invalid', 'POST', '/v1/responses',
+            '{"prompt":"duplicate"}', $2, 'secret-test-key', 0, 22,
+            '2026-08-01 08:00:00Z', '2026-08-01 10:00:00Z'
+        )
+        "#,
+    )
+    .bind(first.template_ids[0])
+    .bind(MODEL)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        r#"
+        INSERT INTO requests (
+            id, batch_id, template_id, model, state, retry_attempt,
+            claimed_at, started_at, response_status, response_body,
+            completed_at, response_size, routed_model, service_tier,
+            created_by, created_at, updated_at
+        ) VALUES (
+            $1, NULL, $2, $3, 'completed', 2,
+            '2026-08-01 09:58:00Z', '2026-08-01 09:59:00Z', 200,
+            '{"answer":"duplicate"}', '2026-08-01 10:00:00Z', 22,
+            $3, 'flex', $4, '2026-08-01 08:00:00Z', '2026-08-01 10:00:00Z'
+        )
+        "#,
+    )
+    .bind(first.request_ids[0])
+    .bind(first.template_ids[0])
+    .bind(MODEL)
+    .bind(OWNER)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let after_list = request_manager
+        .list_requests(ListRequestsFilter::default())
+        .await
+        .unwrap();
+    let after_flex = request_manager
+        .count_owner_flex_requests_since(OWNER, timestamp("2026-07-01T00:00:00Z"), false)
+        .await
+        .unwrap();
+    let after_trailing = request_manager
+        .get_completed_request_counts_by_model_and_window(
+            &[("retained-window".to_owned(), -31_536_000, 0)],
+            &[MODEL.to_owned()],
+            &ServiceTierFilter::Any,
+        )
+        .await
+        .unwrap();
+    assert_eq!(after_list.total_count, 2);
+    assert_eq!(after_list.data.len(), 2);
+    assert_eq!(after_flex, 2);
+    assert_eq!(after_trailing, before_trailing);
+}
+
+async fn assert_graph_reads_not_found(
+    request_manager: &PostgresRequestManager<TestDbPools>,
+    step_manager: &PostgresResponseStepManager<TestDbPools>,
+    graph: &LiveGraph,
+) {
+    for request_id in &graph.request_ids {
+        let error = request_manager
+            .get_request_detail(RequestId(*request_id))
+            .await
+            .expect_err("request content must be fenced");
+        assert!(
+            matches!(error, fusillade_arsenal::error::FusilladeError::RequestNotFound(id) if id == RequestId(*request_id))
+        );
+        assert!(
+            step_manager
+                .get_step_by_request(RequestId(*request_id))
+                .await
+                .expect("step-by-request fence must not error")
+                .is_none()
+        );
+    }
+    for step_id in &graph.step_ids {
+        assert!(
+            step_manager
+                .get_step(StepId(*step_id))
+                .await
+                .expect("step fence must not error")
+                .is_none()
+        );
+    }
+    assert!(
+        step_manager
+            .list_chain(StepId(graph.group_id))
+            .await
+            .expect("chain fence must not error")
+            .is_empty()
+    );
+}
+
+#[sqlx::test]
+async fn read_apis_fail_closed_for_retiring_and_dropped_buckets(pool: PgPool) {
+    install_candidate_index(&pool).await;
+    let delete_on = date("2026-08-07");
+    ensure_partition(&pool, delete_on).await;
+    let graph = branching_graph(&pool, TerminalState::Completed).await;
+    let (request_manager, step_manager) = managers(&pool).await;
+    archive(
+        &request_manager,
+        &policy(&[("flex", 86_400), ("priority", 3 * 86_400)]),
+        1,
+        i64::MAX,
+    )
+    .await
+    .expect("graph movement must succeed");
+
+    sqlx::query("UPDATE retained_response_buckets SET state = 'retiring' WHERE delete_on = $1")
+        .bind(delete_on)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_graph_reads_not_found(&request_manager, &step_manager, &graph).await;
+    assert_eq!(
+        request_manager
+            .list_requests(ListRequestsFilter::default())
+            .await
+            .unwrap()
+            .total_count,
+        0
+    );
+    assert_eq!(
+        request_manager
+            .count_owner_flex_requests_since(OWNER, timestamp("2026-07-01T00:00:00Z"), false,)
+            .await
+            .unwrap(),
+        0
+    );
+    assert!(
+        request_manager
+            .get_completed_request_counts_by_model_and_window(
+                &[("retained-window".to_owned(), -31_536_000, 0)],
+                &[MODEL.to_owned()],
+                &ServiceTierFilter::Any,
+            )
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    sqlx::query(
+        "ALTER TABLE retained_response_objects DETACH PARTITION retained_response_objects_d20260807",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("DROP TABLE retained_response_objects_d20260807")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_graph_reads_not_found(&request_manager, &step_manager, &graph).await;
+    assert_eq!(count_ids(&pool, "requests", &graph.request_ids).await, 0);
+    assert_eq!(count_ids(&pool, "response_steps", &graph.step_ids).await, 0);
+    assert_eq!(
+        count_ids(&pool, "request_templates", &graph.template_ids).await,
+        0
+    );
+    assert_eq!(retained_counts(&pool, graph.group_id).await, (0, 0, 0));
+}
+
+#[sqlx::test]
+async fn read_point_routes_fail_closed_for_wrong_bucket_group_and_partition_oid(pool: PgPool) {
+    install_candidate_index(&pool).await;
+    let delete_on = date("2026-08-07");
+    let wrong_delete_on = date("2026-08-08");
+    ensure_partition(&pool, delete_on).await;
+    ensure_partition(&pool, wrong_delete_on).await;
+    let graph = branching_graph(&pool, TerminalState::Completed).await;
+    let (request_manager, step_manager) = managers(&pool).await;
+    archive(
+        &request_manager,
+        &policy(&[("flex", 86_400), ("priority", 3 * 86_400)]),
+        1,
+        i64::MAX,
+    )
+    .await
+    .unwrap();
+    let request_id = RequestId(graph.request_ids[0]);
+    request_manager
+        .get_request_detail(request_id)
+        .await
+        .expect("valid retained route must resolve");
+
+    sqlx::query("UPDATE retained_response_request_routes SET delete_on = $2 WHERE request_id = $1")
+        .bind(request_id.0)
+        .bind(wrong_delete_on)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(matches!(
+        request_manager.get_request_detail(request_id).await,
+        Err(fusillade_arsenal::error::FusilladeError::RequestNotFound(id)) if id == request_id
+    ));
+
+    sqlx::query(
+        "UPDATE retained_response_request_routes SET delete_on = $2, group_id = $3 WHERE request_id = $1",
+    )
+    .bind(request_id.0)
+    .bind(delete_on)
+    .bind(Uuid::new_v4())
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert!(matches!(
+        request_manager.get_request_detail(request_id).await,
+        Err(fusillade_arsenal::error::FusilladeError::RequestNotFound(id)) if id == request_id
+    ));
+
+    sqlx::query("UPDATE retained_response_request_routes SET group_id = $2 WHERE request_id = $1")
+        .bind(request_id.0)
+        .bind(graph.group_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let step_id = StepId(graph.group_id);
+    step_manager
+        .get_step(step_id)
+        .await
+        .unwrap()
+        .expect("valid retained step route must resolve");
+    sqlx::query("UPDATE retained_response_step_routes SET delete_on = $2 WHERE step_id = $1")
+        .bind(step_id.0)
+        .bind(wrong_delete_on)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(step_manager.get_step(step_id).await.unwrap().is_none());
+    sqlx::query(
+        "UPDATE retained_response_step_routes SET delete_on = $2, group_id = $3 WHERE step_id = $1",
+    )
+    .bind(step_id.0)
+    .bind(delete_on)
+    .bind(Uuid::new_v4())
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert!(step_manager.get_step(step_id).await.unwrap().is_none());
+    sqlx::query("UPDATE retained_response_step_routes SET group_id = $2 WHERE step_id = $1")
+        .bind(step_id.0)
+        .bind(graph.group_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    sqlx::query("UPDATE retained_response_group_routes SET delete_on = $2 WHERE group_id = $1")
+        .bind(graph.group_id)
+        .bind(wrong_delete_on)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(matches!(
+        request_manager.get_request_detail(request_id).await,
+        Err(fusillade_arsenal::error::FusilladeError::RequestNotFound(id)) if id == request_id
+    ));
+    assert!(step_manager.get_step(step_id).await.unwrap().is_none());
+    assert!(step_manager.list_chain(step_id).await.unwrap().is_empty());
+    sqlx::query("UPDATE retained_response_group_routes SET delete_on = $2 WHERE group_id = $1")
+        .bind(graph.group_id)
+        .bind(delete_on)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    sqlx::query(
+        "UPDATE retained_response_buckets SET partition_oid = 'retained_response_objects'::regclass::oid WHERE delete_on = $1",
+    )
+    .bind(delete_on)
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert!(matches!(
+        request_manager.get_request_detail(request_id).await,
+        Err(fusillade_arsenal::error::FusilladeError::RequestNotFound(id)) if id == request_id
+    ));
+    assert!(step_manager.get_step(step_id).await.unwrap().is_none());
+}
+
+#[sqlx::test]
+async fn read_response_step_mutations_reject_retained_routes_without_content(pool: PgPool) {
+    install_candidate_index(&pool).await;
+    ensure_partition(&pool, date("2026-08-07")).await;
+    let graph = branching_graph(&pool, TerminalState::Completed).await;
+    let (request_manager, step_manager) = managers(&pool).await;
+    archive(
+        &request_manager,
+        &policy(&[("flex", 86_400), ("priority", 3 * 86_400)]),
+        1,
+        i64::MAX,
+    )
+    .await
+    .unwrap();
+    let step_id = StepId(graph.group_id);
+
+    let create_error = step_manager
+        .create_step(CreateStepInput {
+            id: Some(step_id.0),
+            request_id: None,
+            prev_step_id: None,
+            parent_step_id: None,
+            step_kind: StepKind::ToolCall,
+            step_sequence: 99,
+            request_payload: json!({"must_not": "leak-or-insert"}),
+        })
+        .await
+        .expect_err("retained step id must not be recreated");
+    let mut errors = vec![create_error];
+    errors.push(
+        step_manager
+            .create_step(CreateStepInput {
+                id: Some(Uuid::new_v4()),
+                request_id: None,
+                prev_step_id: Some(step_id),
+                parent_step_id: Some(step_id),
+                step_kind: StepKind::ToolCall,
+                step_sequence: 100,
+                request_payload: json!({"must_not": "leak-or-link"}),
+            })
+            .await
+            .expect_err("a new child must not attach to a retained graph"),
+    );
+    errors.push(
+        step_manager
+            .mark_step_processing(step_id)
+            .await
+            .expect_err("retained step must not be processed"),
+    );
+    errors.push(
+        step_manager
+            .complete_step(step_id, json!({"must_not": "leak"}))
+            .await
+            .expect_err("retained step must not be completed"),
+    );
+    errors.push(
+        step_manager
+            .fail_step(step_id, json!({"must_not": "leak"}))
+            .await
+            .expect_err("retained step must not be failed"),
+    );
+    errors.push(
+        step_manager
+            .cancel_step(step_id)
+            .await
+            .expect_err("retained step must not be canceled"),
+    );
+    errors.push(
+        step_manager
+            .requeue_step_for_retry(step_id)
+            .await
+            .expect_err("retained step must not be requeued"),
+    );
+    for error in errors {
+        assert_eq!(error.to_string(), "Response step is already retained");
+        match &error {
+            fusillade_arsenal::error::FusilladeError::Other(source) => assert!(
+                source
+                    .downcast_ref::<RetainedResponseStepConflict>()
+                    .is_some(),
+                "retained mutations must return the typed conflict"
+            ),
+            other => panic!("unexpected retained mutation error: {other:?}"),
+        }
+        let debug = format!("{error:?}");
+        assert!(!debug.contains(&step_id.0.to_string()));
+        assert!(!debug.contains("must_not"));
+    }
+    assert_eq!(count_ids(&pool, "response_steps", &graph.step_ids).await, 0);
 }

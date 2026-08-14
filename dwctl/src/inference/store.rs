@@ -1,8 +1,9 @@
 //! Fusillade-backed implementation of onwards' `ResponseStore` trait
 //! and standalone functions for creating/completing response records.
 //!
-//! All fusillade operations go through the `Storage` trait via `request_manager`.
-//! The only raw SQL is the `api_keys` lookup which queries a dwctl-owned table.
+//! All response reads go through fusillade's request/step stores, which resolve
+//! either the live tables or an active retained-response route. The only raw
+//! SQL is the `api_keys` lookup which queries a dwctl-owned table.
 
 use std::sync::Arc;
 
@@ -60,11 +61,11 @@ impl<P: PoolProvider + Clone> FusilladeResponseStore<P> {
     /// Two retrieval paths:
     ///
     /// * **Multi-step** — the id is a head step's uuid. We look up the
-    ///   head step, walk to its sub-request fusillade row, build the
-    ///   response envelope from that row (created_at, status, model,
+    ///   live or retained head step, walk to its sub-request snapshot, build
+    ///   the response envelope from that request (created_at, status, model,
     ///   response_body) and stamp `resp_<head_step_uuid>` as the id.
     ///
-    /// * **Single-step** — the id is itself a `fusillade.requests` id
+    /// * **Single-step** — the id is itself a fusillade request id
     ///   (a `/v1/chat/completions` or `/v1/embeddings` row created by
     ///   the realtime path). When no head step matches, we fall back
     ///   to the legacy lookup so `/v1/chat/completions` results stay
