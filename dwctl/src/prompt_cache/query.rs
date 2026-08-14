@@ -8,8 +8,10 @@
 //! stripping all see exactly what they'd see had the client sent the field itself — one code path.
 //!
 //! Rules:
-//! - The param name and values are matched byte-exact (they're unreserved ASCII, so
-//!   percent-encoding never produces a different byte sequence for them).
+//! - The param name and values are matched byte-exact — no percent-decoding is performed, so
+//!   encoded forms (e.g. `last%55serMessage`) are treated as distinct and therefore unsupported.
+//!   No real client percent-encodes unreserved ASCII unprompted; an encoded value gets the
+//!   strict 400 below, an encoded param NAME is simply an unknown (ignored) param.
 //! - An unrecognized value is a 400 ([`layer`](super::layer) builds the response): a typo must
 //!   not silently disable caching while the caller believes it's on.
 //! - A non-null top-level `cache_control` already in the body wins and the param is ignored —
