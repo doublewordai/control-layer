@@ -44,14 +44,6 @@ pub enum FusilladeError {
     #[error("Validation error: {0}")]
     ValidationError(String),
 
-    /// Retained-response maintenance is disabled for this storage backend.
-    #[error("Retained response maintenance is not supported by this storage backend")]
-    RetentionMaintenanceUnsupported,
-
-    /// A retained batchless response graph is missing a required member.
-    #[error("Retained response graph is incomplete")]
-    IncompleteRetainedResponseGraph,
-
     /// HTTP client error.
     #[error("HTTP request failed: {0}")]
     HttpClient(String),

@@ -15,9 +15,9 @@ pub use postgres::PostgresDaemon;
 
 pub use fusillade_core::manager::{
     ArchiveOutcome, BackgroundClaimKind, DaemonStorage, ModelFilter, ModelFilterState,
-    RetainedResponseArchiveOutcome, RetentionCutoffs, RetentionMaintenanceOutcome,
-    RetentionSweepCutoffs, RetentionSweepOutcome, RetentionSweepPolicy, Storage,
-    TrailingDemandCount,
+    RetainedResponseArchiveOutcome, RetainedResponseMaintenanceError, RetentionCutoffs,
+    RetentionMaintenanceOutcome, RetentionSweepCutoffs, RetentionSweepOutcome,
+    RetentionSweepPolicy, Storage, TrailingDemandCount,
 };
 
 /// Daemon executor trait for runtime orchestration.
