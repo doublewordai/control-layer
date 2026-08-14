@@ -33,6 +33,14 @@ pub struct ClassifyRequest<'a> {
     pub body: &'a [u8],
     /// The validated bearer token, or `None` (un-scopable → no caching).
     pub api_key: Option<&'a str>,
+    /// Pre-resolved billing principal, bypassing the `api_key` lookup.
+    ///
+    /// The serving path always has the bearer token. A *historical* replay
+    /// ([`crate::recompute::cache_replay`]) does not — `http_analytics` stores an
+    /// `api_key_id`, and the key it refers to may since have been rotated or revoked, which
+    /// would resolve to nothing and silently classify the request as uncacheable. Supplying
+    /// the principal directly keeps the scope the request actually used.
+    pub principal: Option<crate::types::UserId>,
 }
 
 /// Version pair from tokenizer-svc `/v1/models`: the tokenizer hash the index has always
@@ -172,11 +180,17 @@ impl Classifier {
 
     async fn classify_inner(&self, req: ClassifyRequest<'_>) -> CacheResult<ClassifyOutcome> {
         // Gates that fire *before* we know the model is cache-enabled → inactive.
-        let Some(api_key) = req.api_key else {
-            return Ok(ClassifyOutcome::inactive());
-        };
-        let Some(principal_id) = self.principal.resolve(api_key).await? else {
-            return Ok(ClassifyOutcome::inactive());
+        let principal_id = match req.principal {
+            Some(p) => p,
+            None => {
+                let Some(api_key) = req.api_key else {
+                    return Ok(ClassifyOutcome::inactive());
+                };
+                let Some(resolved) = self.principal.resolve(api_key).await? else {
+                    return Ok(ClassifyOutcome::inactive());
+                };
+                resolved
+            }
         };
         let cfg = self.model_config.resolve(req.virtual_model).await?;
         if !cfg.enabled {
@@ -996,6 +1010,7 @@ mod tests {
             virtual_model: ALIAS,
             body,
             api_key: Some(secret),
+            principal: None,
         }
     }
 

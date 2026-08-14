@@ -56,10 +56,6 @@
 //! the July one broke *everything*, because the response carried no usage at all — and a
 //! recompute that only looks where the last bug was is a recompute that misses the next one.
 //!
-//! So the only thing this module treats as un-recomputable is the cache split (below), and
-//! that is a property of the data being gone, not a judgement about which fields are
-//! trustworthy.
-//!
 //! Two findings from that work belong here, because whatever eventually reports or applies
 //! these corrections has to honour them:
 //!
@@ -112,6 +108,7 @@ use crate::request_logging::serializers::{TokenMetrics, extract_from_last_usage,
 use outlet::{RequestData, ResponseData};
 
 pub mod cache_fields;
+pub mod cache_replay;
 pub mod replay;
 pub mod report;
 pub mod source;

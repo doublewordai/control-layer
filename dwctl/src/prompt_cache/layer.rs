@@ -185,6 +185,8 @@ pub async fn cache_middleware(State(state): State<CacheLayerState>, request: Req
                     virtual_model: &model,
                     body: &body,
                     api_key: api_key.as_deref(),
+                    // Serving always has the bearer token; only historical replay pre-resolves.
+                    principal: None,
                 })
                 .await
         })
