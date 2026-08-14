@@ -448,7 +448,17 @@ pub async fn target_message_handler<T: HttpClient>(
             .collect::<Vec<_>>()
     );
 
-    let pools = match state.targets.targets.get(&model_name) {
+    let canonical_request_path = req.uri().path().to_string();
+
+    // Resolve which of the composite's pools serves this request, once, from
+    // the path alone — before auth, limits or provider selection, all of which
+    // then run on the chosen pool exactly as they ran on the single pool
+    // before. A composite with no pool for this class resolves to its default,
+    // which is byte-identically today's behaviour. Resolution happens INSIDE
+    // the map guard so only the chosen pool is cloned: KeySets are owned, so a
+    // whole-TargetPools clone would deep-copy every pool's keys per request.
+    let request_class = RequestClass::from_path(&canonical_request_path);
+    let (resolved_pool_name, mut pool) = match state.targets.targets.get(&model_name) {
         Some(pools) => {
             // Now that the model is known to be a configured target, tag the
             // in-flight guard so `onwards_model_inflight{model=…}` tracks this
@@ -459,7 +469,7 @@ pub async fn target_message_handler<T: HttpClient>(
             if let Some(guard) = inflight_guard.as_mut() {
                 guard.set_model(&model_name);
             }
-            pools.clone()
+            (pools.resolved_name(request_class), pools.resolve(request_class).clone())
         }
         None => {
             debug!("No target found for model: {}", model_name);
@@ -467,17 +477,6 @@ pub async fn target_message_handler<T: HttpClient>(
             return Err(OnwardsErrorResponse::model_not_found(model_name.as_str()));
         }
     };
-
-    let canonical_request_path = req.uri().path().to_string();
-
-    // Resolve which of the composite's pools serves this request, once, from
-    // the path alone — before auth, limits or provider selection, all of which
-    // then run on the chosen pool exactly as they ran on the single pool
-    // before. A composite with no pool for this class resolves to its default,
-    // which is byte-identically today's behaviour.
-    let request_class = RequestClass::from_path(&canonical_request_path);
-    let resolved_pool_name = pools.resolved_name(request_class);
-    let mut pool = pools.resolve(request_class).clone();
 
     // Extract bearer token for authentication and rate limiting
     let bearer_token = req
