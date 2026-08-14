@@ -117,8 +117,29 @@ pub async fn recompute_usage<P: PoolProvider>(
         limit,
     };
 
+    // A classifier for the cache-split reconstruction, built on the READ pool — the index it
+    // is given per row is historical and refuses writes, so this cannot mutate the cache.
+    // Absent when caching is disabled, in which case rows simply carry no reconstruction.
+    let cfg = state.current_config();
+    let classifier = cfg.cache.enabled.then(|| {
+        let pool = state.db.read().clone();
+        crate::prompt_cache::Classifier::new(
+            crate::prompt_cache::PrincipalResolver::new(pool.clone()),
+            crate::prompt_cache::ModelConfigResolver::new(pool.clone()),
+            crate::prompt_cache::TokenizerClient::new(cfg.cache.tokenizer_url.clone()),
+            // Placeholder: `recompute_corpus` swaps in a per-row historical index.
+            std::sync::Arc::new(crate::recompute::cache_replay::HistoricalIndex::new(pool, Utc::now())),
+            crate::prompt_cache::TierPolicy::from_config(&cfg.cache.enabled_ttls, &cfg.cache.default_ttl),
+            crate::prompt_cache::TelemetryPolicy::from_config(
+                cfg.cache.telemetry_blocks.strip_from_prompt,
+                &cfg.cache.telemetry_blocks.prefixes,
+            ),
+            cfg.cache.render_counting,
+        )
+    });
+
     // The read pool, deliberately: this path has no write handle at all.
-    let report = crate::recompute::recompute_corpus(state.db.read(), &filter, flat_tier)
+    let report = crate::recompute::recompute_corpus(state.db.read(), &filter, flat_tier, classifier.as_ref())
         .await
         .map_err(|e| Error::Internal {
             operation: format!("recompute usage: {e}"),

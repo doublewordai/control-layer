@@ -74,6 +74,39 @@ pub struct ReportRow {
     pub changed: bool,
     /// Why a row could not be replayed, when it could not.
     pub note: Option<String>,
+
+    /// The cache split re-derived from the prefix index as it stood at this request's
+    /// timestamp — an answer independent of anything the response reported.
+    ///
+    /// Absent when cache replay was not attempted (caching disabled, no request body) or the
+    /// model was not cache-enabled for this principal, which is different from a split of
+    /// zero.
+    pub reconstructed_cache: Option<ReconstructedCache>,
+}
+
+/// A cache split re-derived from the prefix index, and whether it agrees with the row.
+///
+/// This is the strong form of verification the recompute exists to support: the counts come
+/// from replaying the request through the serving classifier against a time-travelling
+/// index, so agreement with the stored row means the billing pipeline was right — not merely
+/// self-consistent.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct ReconstructedCache {
+    pub cache_read: i64,
+    pub cache_creation_5m: i64,
+    pub cache_creation_1h: i64,
+    pub cache_creation_24h: i64,
+    /// Exact chat-templated prompt total from `/v1/render`, when the classifier counted that
+    /// way. The tokenizer's independent answer for the whole prompt.
+    pub render_total: Option<i64>,
+    /// `exact`, or `approximate` where an entry predates the episode-per-row cutover and its
+    /// window over-approximates liveness (which under-counts creations).
+    pub fidelity: String,
+    /// Whether the re-derived split matches the split stored on the row.
+    pub agrees_with_stored: bool,
+    /// Whether `render_total` matches the stored prompt tokens. `None` when the classifier
+    /// did not render.
+    pub render_matches_prompt: Option<bool>,
 }
 
 /// Corpus-level totals. Read these before the rows.
@@ -85,6 +118,11 @@ pub struct ReportSummary {
     pub rows_not_replayable: i64,
     pub rows_columns_only: i64,
     pub rows_tier_inferred: i64,
+    /// Rows whose cache split was independently re-derived from the prefix index.
+    pub rows_cache_reconstructed: i64,
+    /// Of those, how many disagreed with the split stored on the row. Non-zero is a finding:
+    /// either the classifier was wrong at serving time, or the index no longer reflects it.
+    pub rows_cache_disagreed: i64,
     pub stored_prompt_tokens: i64,
     pub recomputed_prompt_tokens: i64,
     pub stored_completion_tokens: i64,
@@ -189,6 +227,35 @@ impl UsageFigures {
     }
 }
 
+impl ReconstructedCache {
+    /// Compare a reconstructed split against what the row stores.
+    pub fn compare(split: &super::cache_replay::ReconstructedSplit, row: &CorpusRow) -> Self {
+        let (read, c5, c1, c24) = (
+            split.read as i64,
+            split.creation_5m as i64,
+            split.creation_1h as i64,
+            split.creation_24h as i64,
+        );
+        Self {
+            cache_read: read,
+            cache_creation_5m: c5,
+            cache_creation_1h: c1,
+            cache_creation_24h: c24,
+            render_total: split.render_total.map(|t| t as i64),
+            fidelity: match split.fidelity {
+                super::cache_replay::Fidelity::Exact => "exact",
+                super::cache_replay::Fidelity::Approximate => "approximate",
+            }
+            .to_string(),
+            agrees_with_stored: read == row.stored_cache_read
+                && c5 == row.stored_cache_creation_5m
+                && c1 == row.stored_cache_creation_1h
+                && c24 == row.stored_cache_creation_24h,
+            render_matches_prompt: split.render_total.map(|t| t as i64 == row.stored_prompt_tokens),
+        }
+    }
+}
+
 impl ReportRow {
     /// A row that was replayed successfully.
     pub fn replayed(row: &CorpusRow, usage: &RecomputedUsage, cost: Option<Decimal>) -> Self {
@@ -208,6 +275,7 @@ impl ReportRow {
             cache_tier_inferred: usage.cache_tier_inferred,
             changed,
             note: None,
+            reconstructed_cache: None,
         }
     }
 
@@ -227,6 +295,7 @@ impl ReportRow {
             cache_tier_inferred: false,
             changed: false,
             note: Some(note),
+            reconstructed_cache: None,
         }
     }
 }
@@ -268,6 +337,12 @@ impl ReportSummary {
             }
             if r.cache_tier_inferred {
                 s.rows_tier_inferred += 1;
+            }
+            if let Some(rc) = &r.reconstructed_cache {
+                s.rows_cache_reconstructed += 1;
+                if !rc.agrees_with_stored {
+                    s.rows_cache_disagreed += 1;
+                }
             }
             s.stored_prompt_tokens += r.stored.prompt_tokens;
             s.stored_completion_tokens += r.stored.completion_tokens;

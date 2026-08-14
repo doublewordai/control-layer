@@ -20,11 +20,6 @@
 //!   can span invisible dead gaps. Liveness is therefore *over*-approximated: some creations
 //!   read back as reads, which under-bills. Answers are marked [`Fidelity::Approximate`].
 
-// Reachable only from this module's tests until the report wiring lands (comparing the
-// reconstructed split against the stored one, per row). Remove this attribute with that
-// change — it is the whole point of building this.
-#![allow(dead_code)]
-
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;

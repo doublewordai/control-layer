@@ -298,7 +298,7 @@ mod tests {
         )
         .await;
 
-        let report = recompute_corpus(&pool, &filter_for(user_id), CreationTier::FiveMinute)
+        let report = recompute_corpus(&pool, &filter_for(user_id), CreationTier::FiveMinute, None)
             .await
             .unwrap();
 
@@ -326,7 +326,7 @@ mod tests {
         )
         .await;
 
-        let report = recompute_corpus(&pool, &filter_for(user_id), CreationTier::FiveMinute)
+        let report = recompute_corpus(&pool, &filter_for(user_id), CreationTier::FiveMinute, None)
             .await
             .unwrap();
 
@@ -368,7 +368,7 @@ mod tests {
         .await
         .unwrap();
 
-        let report = recompute_corpus(&pool, &filter_for(user_id), CreationTier::FiveMinute)
+        let report = recompute_corpus(&pool, &filter_for(user_id), CreationTier::FiveMinute, None)
             .await
             .unwrap();
 

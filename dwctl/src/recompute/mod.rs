@@ -121,15 +121,16 @@ use replay::RecomputeError;
 /// Read-only by construction: it takes a `&PgPool` it only ever `SELECT`s through, and the
 /// report it returns is a document. Nothing here writes, and nothing it returns is applied
 /// automatically — see the module docs.
-#[tracing::instrument(skip(pool, filter), fields(limit = filter.limit))]
+#[tracing::instrument(skip(pool, filter, classifier), fields(limit = filter.limit))]
 pub async fn recompute_corpus(
     pool: &sqlx::PgPool,
     filter: &source::CorpusFilter,
     flat_tier: CreationTier,
+    classifier: Option<&crate::prompt_cache::Classifier>,
 ) -> Result<report::RecomputeReport, sqlx::Error> {
     let corpus = source::load_corpus(pool, filter).await?;
 
-    let rows = corpus
+    let mut rows: Vec<report::ReportRow> = corpus
         .iter()
         .map(|row| {
             let Some(exchange) = &row.exchange else {
@@ -165,7 +166,33 @@ pub async fn recompute_corpus(
                 Err(e) => report::ReportRow::unreplayable(row, report::Evidence::NotReplayable, e.to_string()),
             }
         })
-        .collect::<Vec<_>>();
+        .collect();
+
+    // Independently re-derive each row's cache split from the prefix index as it stood at
+    // the request's timestamp. This is what turns the report from "the response and the row
+    // agree" into "the billing pipeline was right": the counts come from replaying the
+    // request through the serving classifier, not from anything the response said.
+    if let Some(base) = classifier {
+        for (report_row, row) in rows.iter_mut().zip(corpus.iter()) {
+            let (Some(principal), Some(model), Some(exchange)) = (row.user_id, row.model.as_deref(), row.exchange.as_ref()) else {
+                continue;
+            };
+            let Some(body) = exchange.request_body.as_deref() else { continue };
+
+            let historical = base.with_index(std::sync::Arc::new(cache_replay::HistoricalIndex::new(pool.clone(), row.timestamp)));
+            match cache_replay::reconstruct_split(&historical, model, body, principal, row.timestamp).await {
+                Ok(Some(split)) => {
+                    report_row.reconstructed_cache = Some(report::ReconstructedCache::compare(&split, row));
+                }
+                // Not cache-enabled for this principal: no split to reconstruct, which is not
+                // the same as a split of zero, so the field stays absent.
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::debug!(analytics_id = row.analytics_id, error = %e, "cache split reconstruction failed");
+                }
+            }
+        }
+    }
 
     let oldest = corpus.iter().map(|r| r.timestamp).min();
 

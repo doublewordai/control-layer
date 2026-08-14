@@ -155,6 +155,17 @@ impl Classifier {
         }
     }
 
+    /// The same classifier answering against a different index.
+    ///
+    /// Everything else here is `Arc`/pool/cache-backed, so this is cheap. It exists so a
+    /// historical replay ([`crate::recompute::cache_replay`]) can reuse the *serving* parse,
+    /// hash and render logic while asking a time-travelling index whether each prefix was
+    /// live at the instant in question. Reimplementing that pipeline would defeat the
+    /// purpose: a reconstruction that hashes differently cannot verify the serving path.
+    pub fn with_index(&self, index: Arc<dyn CacheIndex>) -> Self {
+        Self { index, ..self.clone() }
+    }
+
     /// The configured TTL-tier policy (enabled tiers + default ttl), exposed for the cache
     /// layer's synchronous request-path marker validation.
     pub fn tier_policy(&self) -> &TierPolicy {
