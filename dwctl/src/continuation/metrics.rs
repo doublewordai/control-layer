@@ -17,7 +17,16 @@
 //! - "what did resuming cost us?" → `eaten_prompt_tokens_total` × tariff, done in
 //!   Grafana (never dollarized in code).
 
-use metrics::{counter, histogram};
+use metrics::{counter, gauge, histogram};
+
+/// Whether the resume layer is actually wired into the stack. Set once at
+/// router build: 1 when continuation is enabled and the state built, 0 when it
+/// was enabled but the build failed (the gateway keeps serving without resume).
+/// `enabled=false` deployments never set it. Alert on `== 0`: a deployment that
+/// asked for continuation and silently lost it looks healthy everywhere else.
+pub fn record_layer_wired(wired: bool) {
+    gauge!("dwctl_continuation_layer_wired").set(if wired { 1.0 } else { 0.0 });
+}
 
 /// Terminal outcome for one armed (or rejected) stream.
 ///
@@ -27,10 +36,11 @@ use metrics::{counter, histogram};
 ///
 /// `reason` is the sub-cause: `structured_output` | `unsupported_delta` |
 /// `cap_exceeded` | `multi_choice` | `no_route` | `origin_disabled` | `throttled`
-/// | `deadline` | `attempts_exhausted` | `client_disconnect` | `client_error` |
+/// | `deadline` | `attempts_exhausted` | `client_disconnect` |
 /// `not_streaming` | `unparseable` | `no_model` | `render_failed` | `no_envelope`
 /// | death families from [`super::detect`] (`transport_error`, `truncated`,
-/// `error_envelope`, `cancelled_499`, `stall`) | `ok` for a clean completion.
+/// `error_envelope`, `error_envelope_4xx`, `cancelled_499`, `stall`) | `ok` for
+/// a clean completion.
 pub fn record_outcome(outcome: &'static str, reason: &'static str) {
     counter!("dwctl_continuation_outcome_total", "outcome" => outcome, "reason" => reason).increment(1);
 }

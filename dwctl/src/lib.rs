@@ -958,14 +958,16 @@ async fn setup_database(
         iterations: config.auth.native.password.argon2_iterations,
         parallelism: config.auth.native.password.argon2_parallelism,
     };
-    let admin_user_id = create_initial_admin_user(&config.admin_email, config.admin_password.as_deref(), argon2_params, &db_pools)
+    create_initial_admin_user(&config.admin_email, config.admin_password.as_deref(), argon2_params, &db_pools)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to create initial admin user: {}", e))?;
 
-    // Provision the global continuation key (hidden, admin-owned) so it exists and
-    // has synced into the onwards key cache before the first resume attempt.
+    // Provision the global continuation key (hidden, SYSTEM-owned — system
+    // ownership is what admits it to every model's onwards keyset regardless of
+    // group gating or pricing) so it exists and has synced into the onwards key
+    // cache before the first resume attempt.
     if config.continuation.enabled {
-        continuation::provision_global_key(&db_pools, admin_user_id)
+        continuation::provision_global_key(&db_pools)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to provision continuation key: {}", e))?;
     }
@@ -1785,7 +1787,6 @@ pub async fn build_router(
                 &cfg.continuation,
                 &cfg.cache.tokenizer_url,
                 state.db.write().clone(),
-                &cfg.admin_email,
                 resume_target,
                 body_limit,
             )
@@ -1793,6 +1794,7 @@ pub async fn build_router(
             {
                 Ok(continuation_state) => {
                     tracing::info!("Mid-stream continuation enabled - wiring resume layer into onwards stack");
+                    crate::continuation::metrics::record_layer_wired(true);
                     onwards_router.layer(middleware::from_fn_with_state(
                         continuation_state,
                         crate::continuation::continuation_middleware,
@@ -1801,7 +1803,17 @@ pub async fn build_router(
                 Err(e) => {
                     // A missing continuation key must not take the gateway down:
                     // without the layer, streams die exactly as they do today.
-                    tracing::error!(error = %e, "Failed to build continuation state - resume layer NOT wired");
+                    // The gauge + background error are the ONLY signals that a
+                    // deployment which asked for continuation is serving without
+                    // it — no request ever fails because of this.
+                    crate::background_error!(
+                        crate::metrics::errors::component::CONTINUATION,
+                        "state_build",
+                        Error,
+                        error = %e,
+                        "Failed to build continuation state - resume layer NOT wired"
+                    );
+                    crate::continuation::metrics::record_layer_wired(false);
                     onwards_router
                 }
             }

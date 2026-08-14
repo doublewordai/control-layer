@@ -137,7 +137,16 @@ pub(super) fn single_choice(chunk: &Value) -> Result<Option<&Value>, AccumulateE
         // completions resume produces one.
         return Err(AccumulateError::MultiChoice);
     }
-    Ok(choices.first())
+    let choice = choices.first();
+    // Providers stream `n > 1` as alternating single-choice chunks (index 0,
+    // index 1, ...), so per-chunk width alone misses it — concatenating those
+    // would interleave two generations into one prefix. The eligibility gate
+    // rejects requests that ASK for n>1; this catches a provider emitting
+    // extra choices regardless.
+    if choice.and_then(|c| c.get("index")).and_then(Value::as_u64).is_some_and(|i| i != 0) {
+        return Err(AccumulateError::MultiChoice);
+    }
+    Ok(choice)
 }
 
 /// The v1 accumulator: plain `choices[0].delta.content` concatenation.

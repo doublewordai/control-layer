@@ -15,9 +15,13 @@
 //!   perfectly healthy → resume. `type: "client_disconnected"` is our own
 //!   fabrication for a client that hung up → nobody is listening, never resume.
 //!   Never classify by status code alone.
-//! - **A 4xx error envelope inside a 200 stream is not resumable.** The input
-//!   was rejected; re-sending a longer version of the same prompt cannot help,
-//!   and the client should see the error exactly as it does today.
+//! - **A mid-stream 4xx envelope resumes.** A genuine input rejection arrives
+//!   as the FIRST frame (onwards' first-frame retry territory; with nothing
+//!   generated, the resume loop finds no prefix and surfaces it unchanged). A
+//!   4xx that arrives after accepted, partially-streamed output is almost
+//!   always a proxy or downstream fault wearing a client status — and the case
+//!   where the input really was bad self-corrects: the resume leg is rejected
+//!   too, attempts exhaust, and the original error surfaces.
 
 use serde_json::Value;
 
@@ -102,8 +106,11 @@ fn classify_frame(frame: &Value) -> Verdict {
     }
 
     match error_code(error) {
-        // A rejected input stays rejected; a longer prompt cannot fix it.
-        Some(code) if (400..500).contains(&code) => Verdict::NoResume("client_error"),
+        // A 4xx after partial output is a proxy/downstream fault more often
+        // than a real rejection (a real one lands as the first frame, where
+        // there is no prefix to resume). Distinct label so the two envelope
+        // populations stay separable in the outcome metric.
+        Some(code) if (400..500).contains(&code) => Verdict::Resume("error_envelope_4xx"),
         // 5xx envelopes and shapeless errors (no numeric code) are upstream
         // faults inside a 200 stream — the OpenRouter family. Resume.
         _ => Verdict::Resume("error_envelope"),
@@ -172,9 +179,9 @@ mod tests {
                 Verdict::Resume("cancelled_499"),
             ),
             (
-                "4xx-shaped envelope",
+                "4xx-shaped envelope after partial output",
                 DeathEvent::Frame(&bad_request),
-                Verdict::NoResume("client_error"),
+                Verdict::Resume("error_envelope_4xx"),
             ),
             (
                 "499 client_disconnected",
@@ -218,15 +225,17 @@ mod tests {
         let client = json!({"error": {"code": 499, "type": "client_disconnected"}});
         assert_eq!(classify(&DeathEvent::Frame(&worker)), Verdict::Resume("cancelled_499"));
         assert_eq!(classify(&DeathEvent::Frame(&client)), Verdict::NoResume("client_disconnect"));
-        // A 499 with neither marker falls into the 4xx band: not resumable.
+        // A 499 with neither marker falls into the 4xx envelope band. If the
+        // client really is gone, the resume is cancelled structurally anyway
+        // (the whole chain runs inside the response body stream).
         let bare = json!({"error": {"code": 499}});
-        assert_eq!(classify(&DeathEvent::Frame(&bare)), Verdict::NoResume("client_error"));
+        assert_eq!(classify(&DeathEvent::Frame(&bare)), Verdict::Resume("error_envelope_4xx"));
     }
 
     #[test]
     fn numeric_string_codes_are_read_as_numbers() {
         let as_string = json!({"error": {"code": "400", "message": "bad"}});
-        assert_eq!(classify(&DeathEvent::Frame(&as_string)), Verdict::NoResume("client_error"));
+        assert_eq!(classify(&DeathEvent::Frame(&as_string)), Verdict::Resume("error_envelope_4xx"));
     }
 
     #[test]

@@ -641,6 +641,16 @@ impl StreamAccumulator for Dsv4Reconstructor {
                 if !self.fits(name.as_ref().map_or(0, String::len) + args.len()) {
                     return self.disarm(AccumulateError::CapExceeded);
                 }
+                // Reconstruction assumes tool calls arrive serially — a sibling
+                // only appears once its predecessor ended, so only the LAST
+                // slot can be partial. A fragment returning to an earlier slot
+                // (interleaved parallel calls — never produced by a faithful
+                // DSML parser) would encode that slot as complete with
+                // truncated arguments, so disarm instead of corrupting the
+                // prefix.
+                if self.tools.last().is_some_and(|last| last.index != index) && self.tools.iter().any(|t| t.index == index) {
+                    return self.disarm(AccumulateError::UnsupportedDelta);
+                }
                 let slot = self.slot(index);
                 if name.is_some() {
                     slot.name = name;

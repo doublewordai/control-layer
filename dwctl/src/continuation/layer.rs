@@ -90,17 +90,22 @@ impl ContinuationState {
         cfg: &ContinuationConfig,
         cache_tokenizer_url: &str,
         pool: PgPool,
-        admin_email: &str,
         resume_target: Router,
         body_limit: usize,
     ) -> anyhow::Result<Self> {
-        let key_secret = super::provision_global_key_for_admin(&pool, admin_email).await?;
+        let key_secret = super::provision_global_key(&pool).await?;
         let tokenizer_url = cfg.tokenizer_url.clone().unwrap_or_else(|| cache_tokenizer_url.to_string());
         let routes = Arc::new(ContinuationRoutes::new());
         // Seed synchronously so the first request after boot sees the real set
         // rather than waiting up to one poll interval.
         if let Err(e) = routes.refresh(&pool).await {
-            warn!(error = %e, "Initial continuation route load failed; the poller will retry");
+            crate::background_error!(
+                crate::metrics::errors::component::CONTINUATION,
+                "route_seed",
+                Warning,
+                error = %e,
+                "Initial continuation route load failed; the poller will retry"
+            );
         }
         Arc::clone(&routes).spawn_poller(pool.clone());
 
@@ -319,6 +324,14 @@ pub async fn continuation_middleware(State(state): State<ContinuationState>, req
         metrics::record_outcome("ineligible", "structured_output");
         return next.run(forward(parts, body_bytes)).await;
     }
+    // `n > 1` never arms: providers stream multiple choices as alternating
+    // single-choice chunks, which the accumulator would concatenate into one
+    // interleaved prefix. The accumulator's own `choice.index != 0` disarm is
+    // the backstop for providers that emit extra choices unasked.
+    if body.get("n").and_then(Value::as_u64).is_some_and(|n| n > 1) {
+        metrics::record_outcome("ineligible", "multi_choice");
+        return next.run(forward(parts, body_bytes)).await;
+    }
     let origin = Origin::from_purpose(match token.as_deref() {
         Some(t) => state.purposes.resolve(t).await,
         None => None,
@@ -421,6 +434,9 @@ fn tee(response: Response, state: ContinuationState, ctx: RequestContext) -> Res
         let mut current: LegStream = Box::pin(SseBufferedStream::new(leg_one));
         // Is `current` a resume leg (text_completion chunks needing reframing)?
         let mut resuming = false;
+        // Has leg 1 produced its first complete SSE event? The stall timer
+        // arms only after it has (see the read below).
+        let mut leg_one_started = false;
         let mut saw_usage = false;
         // The terminating frames, held rather than forwarded: we may need to put
         // a synthesized usage frame in front of `[DONE]`, and a death frame must
@@ -438,8 +454,23 @@ fn tee(response: Response, state: ContinuationState, ctx: RequestContext) -> Res
 
         'chain: loop {
             let verdict = loop {
-                let item = match tokio::time::timeout(stall, current.next()).await {
-                    Err(_) => break detect::classify(&DeathEvent::Stall),
+                // The stall timer arms only once leg 1 has produced its first
+                // event: pre-first-token silence is admission-queue/prefill
+                // time, which this layer must never bound — the platform has no
+                // first-token deadline, and severing here would fabricate an
+                // empty success out of a healthy slow stream (nothing has been
+                // generated, so there is nothing to resume either). Resume legs
+                // are timed from their first read: their time-to-first-token IS
+                // the seam the deadline exists to bound.
+                let next_item = if resuming || leg_one_started {
+                    match tokio::time::timeout(stall, current.next()).await {
+                        Err(_) => break detect::classify(&DeathEvent::Stall),
+                        Ok(item) => item,
+                    }
+                } else {
+                    current.next().await
+                };
+                let item = match next_item {
                     // `saw_done: false` is not an assumption: a `[DONE]` frame
                     // breaks this loop the moment it arrives, so reaching EOF
                     // here means the trailer never came. A terminal usage frame
@@ -447,13 +478,14 @@ fn tee(response: Response, state: ContinuationState, ctx: RequestContext) -> Res
                     // generation that has already reported its accounting is
                     // over, and resuming past it would emit a second usage frame
                     // — the one thing outlet and the cache layer must never see.
-                    Ok(None) => break detect::classify(&DeathEvent::Eof {
+                    None => break detect::classify(&DeathEvent::Eof {
                         saw_finish_reason: acc.saw_finish_reason() || saw_usage,
                         saw_done: false,
                     }),
-                    Ok(Some(Err(_))) => break detect::classify(&DeathEvent::TransportError),
-                    Ok(Some(Ok(bytes))) => bytes,
+                    Some(Err(_)) => break detect::classify(&DeathEvent::TransportError),
+                    Some(Ok(bytes)) => bytes,
                 };
+                leg_one_started = true;
 
                 let payload = frame_payload(&item);
                 if payload == Some("[DONE]") {
@@ -572,6 +604,16 @@ fn tee(response: Response, state: ContinuationState, ctx: RequestContext) -> Res
                         yield Ok(frame);
                     }
                     outcome.record("failed", reason);
+                    // Restore passthrough close semantics: drain whatever leg 1
+                    // still sends (typically the trailing `[DONE]`) so the
+                    // client's stream ends exactly as it would have without this
+                    // layer. Resume legs are never drained — their raw
+                    // completions frames belong to the leg, not the client.
+                    if !resuming {
+                        while let Some(Ok(bytes)) = current.next().await {
+                            yield Ok(bytes);
+                        }
+                    }
                     break 'chain;
                 }
                 Verdict::Resume(reason) => {

@@ -27,8 +27,14 @@
 //! - resumes are model/provider faults, so throttling belongs per-model in the
 //!   middleware, not per-user on the key.
 //!
-//! The key is owned by the initial admin user and provisioned at startup so it
-//! has synced into the onwards key cache before the first resume attempt.
+//! The key is owned by the nil-UUID SYSTEM user and provisioned at startup so
+//! it has synced into the onwards key cache before the first resume attempt.
+//! System ownership is load-bearing, not cosmetic: onwards' per-model keysets
+//! admit a key only when its owner is in one of the model's groups (or the
+//! model is public) AND the owner carries positive balance (or the model is
+//! free) — gates a prod-shaped (group-restricted, priced) composite would fail
+//! for any ordinary owner, silently 403ing every resume leg. The system user is
+//! exempt from all of those gates in the keyset queries.
 
 pub mod accumulate;
 pub mod detect;
@@ -53,7 +59,6 @@ use sqlx::PgPool;
 
 use crate::UserId;
 use crate::db::handlers::api_keys::ApiKeys;
-use crate::db::handlers::users::Users;
 use crate::db::models::api_keys::ApiKeyPurpose;
 use crate::metrics::errors::component;
 
@@ -67,34 +72,28 @@ pub use layer::{ContinuationState, continuation_middleware};
 /// the read side.
 const ROUTE_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 
+/// The global continuation key's owner: the nil-UUID system user, which the
+/// onwards keyset queries exempt from the group-access, balance and purpose
+/// gates. Owned by anyone else, the key would be silently absent from the
+/// keysets of group-restricted or priced composites and every resume leg on
+/// them would 403.
+pub fn global_key_owner() -> UserId {
+    uuid::Uuid::nil()
+}
+
 /// Get or create the global hidden continuation key, returning its secret.
 ///
 /// Idempotent (`ON CONFLICT` upsert keyed on owner + purpose): the startup call
 /// guarantees existence/sync, and the resume middleware calls it again to
 /// obtain the secret without caring which call created the row.
-pub async fn provision_global_key(pool: &PgPool, admin_user_id: UserId) -> anyhow::Result<String> {
+pub async fn provision_global_key(pool: &PgPool) -> anyhow::Result<String> {
+    let owner = global_key_owner();
     let mut tx = pool.begin().await?;
     let secret = ApiKeys::new(&mut tx)
-        .get_or_create_hidden_key(admin_user_id, ApiKeyPurpose::Continuation, admin_user_id)
+        .get_or_create_hidden_key(owner, ApiKeyPurpose::Continuation, owner)
         .await?;
     tx.commit().await?;
     Ok(secret)
-}
-
-/// Provision (or fetch) the global continuation key by the configured admin
-/// email. `build_router` has the config but not the admin's id — startup created
-/// that user from the same email, and the provisioning call is idempotent, so
-/// resolving by email here re-uses the very row the startup call made.
-pub async fn provision_global_key_for_admin(pool: &PgPool, admin_email: &str) -> anyhow::Result<String> {
-    let admin_id = {
-        let mut conn = pool.acquire().await?;
-        Users::new(&mut conn)
-            .get_user_by_email(admin_email)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("admin user {admin_email} not found"))?
-            .id
-    };
-    provision_global_key(pool, admin_id).await
 }
 
 /// Per-model continuation route configuration, read from the composite's
@@ -442,30 +441,23 @@ mod tests {
     use crate::test::utils::{create_test_endpoint, create_test_model, create_test_user};
 
     /// Provisioning twice returns the same secret (idempotent upsert), and the
-    /// row is a hidden continuation-purpose key owned by the given user.
+    /// row is a hidden continuation-purpose key owned by the SYSTEM user — the
+    /// ownership the onwards keyset queries exempt from the group-access and
+    /// balance gates, without which resume legs 403 on any group-restricted or
+    /// priced composite.
     #[sqlx::test]
-    async fn provision_global_key_is_idempotent_and_hidden(pool: PgPool) {
-        let admin = create_test_user(&pool, Role::PlatformManager).await;
-
-        let first = provision_global_key(&pool, admin.id).await.unwrap();
-        let second = provision_global_key(&pool, admin.id).await.unwrap();
+    async fn provision_global_key_is_idempotent_hidden_and_system_owned(pool: PgPool) {
+        let first = provision_global_key(&pool).await.unwrap();
+        let second = provision_global_key(&pool).await.unwrap();
         assert_eq!(first, second);
 
         let row = sqlx::query!(r#"SELECT user_id, purpose, hidden FROM api_keys WHERE secret = $1"#, first)
             .fetch_one(&pool)
             .await
             .unwrap();
-        assert_eq!(row.user_id, admin.id);
+        assert_eq!(row.user_id, global_key_owner());
         assert_eq!(row.purpose, "continuation");
         assert!(row.hidden);
-    }
-
-    #[sqlx::test]
-    async fn provisioning_by_admin_email_reuses_the_startup_key(pool: PgPool) {
-        let admin = create_test_user(&pool, Role::PlatformManager).await;
-        let from_startup = provision_global_key(&pool, admin.id).await.unwrap();
-        let from_router = provision_global_key_for_admin(&pool, &admin.email).await.unwrap();
-        assert_eq!(from_startup, from_router);
     }
 
     /// Link `component` into one of `composite`'s pools.

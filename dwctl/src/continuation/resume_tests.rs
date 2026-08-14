@@ -50,6 +50,10 @@ enum Chunk {
     Reset,
     /// Send nothing, ever, without closing — the stall mode.
     Hang,
+    /// A real pause (ms) before the next item — how slow time-to-first-token
+    /// is scripted. This is scripted upstream latency (the thing under test),
+    /// not a poll-for-condition sleep.
+    Delay(u64),
 }
 
 fn frame(value: Value) -> Chunk {
@@ -122,16 +126,25 @@ impl Fake {
     }
 }
 
+fn sse_stream(chunks: Vec<Chunk>) -> impl futures::Stream<Item = Result<Bytes, std::io::Error>> {
+    futures::stream::iter(chunks).then(|c| async move {
+        match c {
+            Chunk::Data(s) => Ok(Bytes::from(s)),
+            Chunk::Reset => Err(std::io::Error::other("upstream connection reset")),
+            Chunk::Delay(ms) => {
+                tokio::time::sleep(Duration::from_millis(ms)).await;
+                Ok(Bytes::new())
+            }
+            Chunk::Hang => unreachable!("Hang is expanded before streaming"),
+        }
+    })
+}
+
 fn sse_response(chunks: Vec<Chunk>) -> Response {
-    let stream = futures::stream::iter(chunks.into_iter().map(|c| match c {
-        Chunk::Data(s) => Ok(Bytes::from(s)),
-        Chunk::Reset => Err(std::io::Error::other("upstream connection reset")),
-        Chunk::Hang => unreachable!("Hang is expanded before streaming"),
-    }));
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/event-stream")
-        .body(Body::from_stream(stream))
+        .body(Body::from_stream(sse_stream(chunks)))
         .unwrap()
 }
 
@@ -142,11 +155,7 @@ fn stream_script(chunks: Vec<Chunk>) -> Response {
         None => sse_response(chunks),
         Some(at) => {
             let head: Vec<Chunk> = chunks[..at].to_vec();
-            let stream = futures::stream::iter(head.into_iter().map(|c| match c {
-                Chunk::Data(s) => Ok::<Bytes, std::io::Error>(Bytes::from(s)),
-                _ => unreachable!("only Data precedes a Hang"),
-            }))
-            .chain(futures::stream::pending());
+            let stream = sse_stream(head).chain(futures::stream::pending());
             Response::builder()
                 .status(StatusCode::OK)
                 .header(header::CONTENT_TYPE, "text/event-stream")
@@ -481,6 +490,40 @@ async fn a_stalled_stream_is_resumed_at_the_last_frame_boundary(pool: PgPool) {
     assert_eq!(contents(&parsed(&payloads)), "Hello");
 }
 
+/// A healthy stream whose first token takes longer than the resume deadline
+/// must NOT be severed: pre-first-token silence is admission-queue/prefill
+/// time, which the platform never bounds (there is no first-token deadline
+/// anywhere, and nothing has been generated to resume). Before this fix the
+/// stall timer wrapped the FIRST read too and turned every slow-TTFT stream
+/// into a fabricated empty 200 at exactly the deadline.
+#[sqlx::test]
+async fn a_slow_first_token_is_never_severed(pool: PgPool) {
+    let finished = frame(json!({
+        "id": "chatcmpl-1", "object": "chat.completion.chunk", "created": 1_700_000_000, "model": MODEL,
+        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+    }));
+    let usage = frame(json!({
+        "id": "chatcmpl-1", "object": "chat.completion.chunk", "created": 1_700_000_000, "model": MODEL,
+        "choices": [], "usage": {"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4}
+    }));
+    let fake = Fake::new(
+        // First token arrives well past the 1s deadline, then a normal close.
+        vec![Chunk::Delay(1_400), content("chatcmpl-1", "Hello"), finished, usage, done()],
+        vec![],
+    );
+    let tokenizer = render_stub(vec![1], 4, 1).await;
+    let cfg = ContinuationConfig {
+        resume_deadline_secs: 1,
+        ..test_config()
+    };
+    let st = state(pool, &fake, tokenizer.uri(), cfg);
+
+    let payloads = collect_payloads(app(&fake, st).oneshot(chat_request(streaming_body())).await.unwrap()).await;
+    assert_eq!(contents(&parsed(&payloads)), "Hello", "the late stream arrives intact");
+    assert!(fake.resume_requests().is_empty(), "a healthy slow stream is not a death");
+    assert_eq!(payloads.last().unwrap(), "[DONE]");
+}
+
 /// An unparseable `data:` frame on leg 1 is forwarded to the client — we never
 /// re-serialize their stream — but it DISARMS resume.
 ///
@@ -626,25 +669,70 @@ async fn a_render_failure_never_dispatches_a_leg(pool: PgPool) {
 
 // ── non-resumable deaths ─────────────────────────────────────────────────────
 
-/// Mode 6: a 4xx-shaped error inside the stream is a rejected input. Re-sending
-/// a longer version of the same prompt cannot help, so it is surfaced.
+/// Mode 6 (ruling 2026-08-13): a 4xx envelope AFTER partial output resumes. A
+/// genuine input rejection lands as the FIRST frame; one that arrives after
+/// accepted, partially-streamed output is a proxy/downstream fault wearing a
+/// client status. Genuine bad input self-corrects — the leg is rejected too,
+/// attempts exhaust, and the original error surfaces (the exhausted-chain
+/// test pins that path).
 #[sqlx::test]
-async fn a_4xx_envelope_inside_the_stream_is_surfaced_not_resumed(pool: PgPool) {
+async fn a_4xx_envelope_after_partial_output_is_resumed(pool: PgPool) {
     let death = json!({"error": {"code": 400, "message": "input too long", "type": "invalid_request_error"}});
     let fake = Fake::new(
-        vec![content("chatcmpl-1", "partial"), frame(death.clone())],
-        vec![vec![leg_text("!", Some("stop")), leg_usage(1, 1), done()]],
+        vec![content("chatcmpl-1", "partial"), frame(death)],
+        vec![vec![leg_text("!", Some("stop")), leg_usage(1007, 1), done()]],
     );
     let tokenizer = render_stub(vec![1], 1007, 7).await;
     let st = state(pool, &fake, tokenizer.uri(), test_config());
 
     let payloads = collect_payloads(app(&fake, st).oneshot(chat_request(streaming_body())).await.unwrap()).await;
-    assert!(fake.resume_requests().is_empty(), "no resume for a rejected input");
+    let frames = parsed(&payloads);
+    assert_eq!(fake.resume_requests().len(), 1, "a post-partial-output 4xx dispatches a resume leg");
+    assert_eq!(contents(&frames), "partial!");
+    assert!(
+        frames.iter().all(|f| f.get("error").is_none_or(Value::is_null)),
+        "the rescued client never sees the envelope"
+    );
+}
+
+/// A 4xx envelope as the FIRST frame is the genuine-rejection shape: nothing
+/// was generated, so there is no prefix — the error surfaces unchanged and no
+/// leg is ever dispatched (resume-from-zero is a plain retry, not this
+/// feature's job).
+#[sqlx::test]
+async fn a_first_frame_4xx_surfaces_with_no_resume(pool: PgPool) {
+    let death = json!({"error": {"code": 400, "message": "input too long", "type": "invalid_request_error"}});
+    let fake = Fake::new(vec![frame(death)], vec![]);
+    let tokenizer = render_stub(vec![1], 1, 1).await;
+    let st = state(pool, &fake, tokenizer.uri(), test_config());
+
+    let payloads = collect_payloads(app(&fake, st).oneshot(chat_request(streaming_body())).await.unwrap()).await;
+    assert!(fake.resume_requests().is_empty(), "nothing to resume from");
     assert_eq!(
         parsed(&payloads).last().unwrap()["error"]["code"],
         400,
-        "the client sees the error exactly as it does today"
+        "the client sees the rejection exactly as it does today"
     );
+}
+
+/// A death we refuse to resume surfaces WITH leg 1's trailing frames: the
+/// close is byte-identical to a stream this layer never touched. Before this
+/// fix the loop broke without draining, eating the trailing `[DONE]`.
+#[sqlx::test]
+async fn a_refused_death_drains_leg_ones_trailer(pool: PgPool) {
+    let death = json!({"error": {"code": 499, "message": "client disconnected", "type": "client_disconnected"}});
+    let fake = Fake::new(vec![content("chatcmpl-1", "partial"), frame(death), done()], vec![]);
+    let tokenizer = render_stub(vec![1], 1, 1).await;
+    let st = state(pool, &fake, tokenizer.uri(), test_config());
+
+    let payloads = collect_payloads(app(&fake, st).oneshot(chat_request(streaming_body())).await.unwrap()).await;
+    assert!(fake.resume_requests().is_empty(), "client_disconnected is never resumed");
+    assert_eq!(
+        parsed(&payloads).last().unwrap()["error"]["type"],
+        "client_disconnected",
+        "the refused frame surfaces"
+    );
+    assert_eq!(payloads.last().unwrap(), "[DONE]", "the trailing [DONE] still reaches the client");
 }
 
 /// Modes 7/8: the generation finished but its trailer was lost. Nothing needs
