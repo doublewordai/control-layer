@@ -23,16 +23,37 @@
 //!
 //! It computes what a request's usage *should* have been and reports it. It does not amend
 //! `http_analytics`, does not touch `credits_transactions`, and has no database access at
-//! all. Applying a correction is four steps of reviewed SQL run by a human, documented in
-//! the `internal` repo as `runbooks/usage-recompute-repair.md`: amend the canonical row,
+//! all. Applying a correction is a sequence of reviewed SQL steps run by a human, covered
+//! by the internal runbook `usage-recompute-repair`: amend the canonical analytics row,
 //! append compensating ledger rows, heal the balance checkpoints, patch the daily usage
-//! rollup (which has a forward-only cursor and so never re-reads an amended row).
+//! rollup (which has a forward-only cursor and so never re-reads an amended row), and —
+//! for a batch corpus only — delta-fold the batch aggregate's analytics columns.
 //!
 //! That split is deliberate. The arithmetic is fiddly, testable and worth automating; the
 //! money is neither. It also means the questions a write path would have to answer
 //! prematurely — whether a debit correction should trip auto-topup, how the warehouse
 //! handles an analytics UPDATE — get answered by a person at the time, with the specific
 //! corpus in front of them.
+//!
+//! The report is a **downloadable JSON document, not a database table**. There is no run
+//! history to persist, migrate or garbage-collect: the operator saves the file, attaches it
+//! to the incident, and feeds it to the repair scripts. It is also the only thing that has
+//! to carry state, because every later step derives from the database — step 1 amends
+//! `http_analytics` from the JSON, and billing then derives from the amended analytics
+//! (`credits_transactions.source_id` is the analytics row id), and the balance derives from
+//! the ledger. One document in, a chain of pure derivations after it.
+//!
+//! Two findings from that work belong here, because whatever eventually reports or applies
+//! these corrections has to honour them:
+//!
+//! - **A report must carry `fusillade_batch_id` per row.** A batch corpus needs its
+//!   `batch_aggregates` analytics columns delta-folded to stay consistent with the amended
+//!   analytics rows, and an operator cannot know that from the recomputed numbers alone.
+//! - **A correction for a batched request must NOT carry that batch id into the ledger.**
+//!   The transactions list shows batched spend only via `batch_aggregates`, and its
+//!   individual-transaction arm filters `fusillade_batch_id IS NULL` — so a batch-tagged
+//!   correction is charged to the customer and visible nowhere. Pinned by
+//!   `db::handlers::credits::tests::batched_transaction_is_invisible_without_an_aggregate_row`.
 //!
 //! # How a recompute stays honest
 //!
