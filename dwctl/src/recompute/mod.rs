@@ -449,7 +449,10 @@ pub fn recompute_from_stored_response(
 ///   billed us on, so an operator reviews the conflict rather than the tool silently
 ///   re-pricing a request on a contested count.
 ///
-/// The cache split is untouched in every branch.
+/// The cache split is untouched in every branch. Whenever the prompt is replaced, `total`
+/// is re-derived as `prompt + completion` — the response's own total described the reported
+/// prompt, and carrying it alongside a rendered one would leave the row internally
+/// inconsistent by exactly the amount the render corrected.
 ///
 // Not yet reachable: the corpus recompute reads usage from the stored response, which is
 // exact and covers both incidents seen so far. This is the entry point for the tokenizer
@@ -462,6 +465,7 @@ pub fn fold_render(mut usage: RecomputedUsage, rendered_prompt: i64, tolerance_b
     if reported_prompt <= 0 {
         usage.counts.prompt = rendered_prompt;
         usage.prompt_source = TokenSource::Rendered;
+        usage.total = usage.counts.prompt + usage.counts.completion;
         return usage;
     }
 
@@ -472,6 +476,7 @@ pub fn fold_render(mut usage: RecomputedUsage, rendered_prompt: i64, tolerance_b
     if disagreement.divergence_bps() <= tolerance_bps {
         usage.counts.prompt = rendered_prompt;
         usage.prompt_source = TokenSource::Rendered;
+        usage.total = usage.counts.prompt + usage.counts.completion;
     } else {
         usage.disagreement = Some(disagreement);
     }
@@ -510,6 +515,7 @@ mod tests {
         assert_eq!(got.counts.prompt, 20_100, "the exact templated count wins");
         assert_eq!(got.prompt_source, TokenSource::Rendered);
         assert!(got.disagreement.is_none());
+        assert_eq!(got.total, 20_150, "total follows the replaced prompt, not the stale response total");
     }
 
     #[test]
@@ -518,6 +524,7 @@ mod tests {
         let got = fold_render(usage(20_000, 12_000, 3_000), 10_000, 100);
         assert_eq!(got.counts.prompt, 20_000, "a contested count is not silently re-priced");
         assert_eq!(got.prompt_source, TokenSource::Reported);
+        assert_eq!(got.total, 20_050, "prompt kept → total kept");
         let d = got.disagreement.expect("the conflict must be surfaced");
         assert_eq!(d.reported_prompt, 20_000);
         assert_eq!(d.rendered_prompt, 10_000);
@@ -532,6 +539,7 @@ mod tests {
         assert_eq!(got.counts.prompt, 4_096);
         assert_eq!(got.prompt_source, TokenSource::Rendered);
         assert!(got.disagreement.is_none(), "there was nothing to disagree with");
+        assert_eq!(got.total, 4_146, "total re-derived from the rendered prompt + completion");
     }
 
     /// The invariant the whole design turns on: whatever the tokenizer says, the cache
