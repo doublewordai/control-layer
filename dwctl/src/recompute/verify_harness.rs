@@ -94,10 +94,11 @@ mod tests {
         // Show the first few disagreements, which are the whole point of running this.
         for row in report.rows.iter().filter(|r| r.changed).take(5) {
             println!(
-                "\nCHANGED analytics_id={} stored_prompt={} recomputed_prompt={:?}",
+                "\nCHANGED analytics_id={} source={:?}\n  stored     {:?}\n  recomputed {:?}",
                 row.analytics_id,
-                row.stored.prompt_tokens,
-                row.recomputed.as_ref().map(|r| r.prompt_tokens)
+                row.token_source,
+                row.stored,
+                row.recomputed.as_ref()
             );
         }
         for row in report

@@ -257,6 +257,16 @@ pub async fn reconstruct_split(
         // which is different from a split of zero.
         return Ok(None);
     }
+    if outcome.degraded {
+        // The classifier's counting infrastructure failed *now* (tokenizer-svc unreachable,
+        // render/tokenize transport error) and it degraded to zeros — correct for serving,
+        // but as a reconstruction it would read as "the serving path billed cache tokens the
+        // request never had". Measured: a dead tokenizer port-forward turned a healthy
+        // 25-row corpus into 25 confident false disagreements. Refuse instead.
+        return Err(CacheError::Invalid(
+            "classifier degraded (tokenizer unavailable): a zero split from a degraded classify is not evidence".into(),
+        ));
+    }
 
     let s = outcome.stats;
     Ok(Some(ReconstructedSplit {

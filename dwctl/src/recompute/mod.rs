@@ -132,6 +132,20 @@ pub async fn recompute_corpus(
 ) -> Result<report::RecomputeReport, sqlx::Error> {
     let corpus = source::load_corpus(pool, filter).await?;
 
+    // Tariff history for every model in the corpus, resolved per row below at the row's own
+    // pricing timestamp. The ledger is temporal (versions are closed, never rewritten), so
+    // this reproduces the exact multipliers the live path billed with — including across a
+    // tariff change mid-corpus.
+    let mut aliases: Vec<String> = corpus.iter().filter_map(|r| r.model.clone()).collect();
+    aliases.sort();
+    aliases.dedup();
+    let cache_tariffs = crate::pricing::lookup_cache_tariffs(pool, &aliases).await?;
+    // Rows that recorded cache tokens but whose tariff history no longer resolves (e.g. the
+    // deployed model was deleted, cascading its tariffs away). Those re-price at list rate,
+    // which is NOT what the live path charged — the report must say so rather than present
+    // the difference as a correction.
+    let mut rows_tariff_unresolvable = 0i64;
+
     let mut rows: Vec<report::ReportRow> = corpus
         .iter()
         .map(|row| {
@@ -152,15 +166,25 @@ pub async fn recompute_corpus(
 
             match replayed {
                 Ok(usage) => {
-                    // Price with the rates resolved at inference time, carried on the row.
-                    // Re-resolving the tariff here would silently re-base a correction onto
-                    // pricing that changed after the request was served.
+                    // Price with the per-token rates resolved at inference time, carried on
+                    // the row, and the cache multipliers from the tariff version valid at the
+                    // row's pricing timestamp — exactly the live batcher's resolution. `None`
+                    // means the model was not dwctl-cache-enabled then: any cache tokens on
+                    // the row are the provider's own and bill at list price, as they did live.
+                    let cache_mults = row
+                        .model
+                        .as_deref()
+                        .and_then(|alias| cache_tariffs.get(alias))
+                        .and_then(|versions| crate::pricing::resolve_cache_multipliers(versions, row.pricing_timestamp()));
+                    if cache_mults.is_none() && row.stored_cache_total() > 0 {
+                        rows_tariff_unresolvable += 1;
+                    }
                     let cost = crate::pricing::charged_cost(
                         &usage.counts,
                         row.model.as_deref(),
                         row.input_price_per_token,
                         row.output_price_per_token,
-                        cache_multipliers_for(row),
+                        cache_mults,
                         crate::metrics::errors::component::ANALYTICS,
                     );
                     report::ReportRow::replayed(row, &usage, cost)
@@ -213,9 +237,18 @@ pub async fn recompute_corpus(
 
     let oldest = corpus.iter().map(|r| r.timestamp).min();
 
+    let mut warnings = report::corpus_warnings(oldest);
+    if rows_tariff_unresolvable > 0 {
+        warnings.push(format!(
+            "{rows_tariff_unresolvable} row(s) recorded cache tokens but no cache tariff resolves at their \
+             pricing time (tariff history deleted with its model?): they re-price at list rate, which is not \
+             what was charged — do not apply their cost deltas without resolving the tariff first"
+        ));
+    }
+
     Ok(report::RecomputeReport {
         generated_at: chrono::Utc::now(),
-        warnings: report::corpus_warnings(oldest),
+        warnings,
         corpus: serde_json::json!({
             "start": filter.start,
             "end": filter.end,
@@ -227,17 +260,6 @@ pub async fn recompute_corpus(
         summary: report::ReportSummary::of(&rows),
         rows,
     })
-}
-
-/// Whether dwctl's cache discount applied to this request, inferred from the row itself.
-///
-/// The live path gates the discount on a `model_cache_tariffs` row valid at inference time.
-/// A recompute cannot re-resolve that without risking a tariff that changed since, so it
-/// uses the evidence already on the row: a request that recorded cache tokens was, by
-/// definition, priced by a cache-enabled model at the time. One that recorded none gets no
-/// multipliers, which is exactly the "provider's own caching, not ours" case.
-fn cache_multipliers_for(row: &source::CorpusRow) -> Option<crate::pricing::CacheMultipliers> {
-    (row.stored_cache_total() > 0).then(crate::pricing::CacheMultipliers::default)
 }
 
 /// Where a recomputed figure came from, and therefore how much it can be trusted.
@@ -358,7 +380,25 @@ pub fn recompute_from_stored_response(
     flat_tier: CreationTier,
 ) -> Result<RecomputedUsage, RecomputeError> {
     let parsed = parse_ai_response(request_data, response_data).map_err(RecomputeError::Parse)?;
-    let metrics = TokenMetrics::from(&parsed);
+    let mut metrics = TokenMetrics::from(&parsed);
+    // A stored fusillade body is the *upstream's* bytes, not the bytes the live serializer
+    // parsed — and some upstreams omit fields the typed parse requires (Dynamo leaves `role`
+    // off the message), so the untagged parse falls through to `Other` and reads zero for a
+    // request the live path recorded correctly. When that happens but the body plainly
+    // carries a usage object, read the counts from the raw JSON. Strictly a fallback: it can
+    // never override a reading the serializer actually produced, so the healthy-no-op
+    // property is preserved — and a response with no usage at all (the July shape) still
+    // recomputes to zero, because there is nothing raw to read either.
+    if metrics.prompt_tokens == 0
+        && metrics.completion_tokens == 0
+        && metrics.total_tokens == 0
+        && let Some(raw) = extract_from_last_usage(response_data, raw_usage_tokens)
+    {
+        metrics.prompt_tokens = raw.prompt;
+        metrics.completion_tokens = raw.completion;
+        metrics.reasoning_tokens = raw.reasoning;
+        metrics.total_tokens = raw.total;
+    }
     let CacheReading {
         tokens: cache,
         tier_inferred,
@@ -381,6 +421,48 @@ pub fn recompute_from_stored_response(
         cache_tier_inferred: tier_inferred,
         response_type: metrics.response_type,
         response_model: metrics.response_model,
+    })
+}
+
+/// Token counts read straight from a raw `usage` JSON object, for bodies the typed parse
+/// cannot represent. Field semantics mirror [`TokenMetrics`]'s arms exactly: an OpenAI
+/// `prompt_tokens` is already the total input; an Anthropic `input_tokens` excludes the
+/// cache buckets, which are added back — reading it verbatim is the August incident.
+struct RawUsageTokens {
+    prompt: i64,
+    completion: i64,
+    reasoning: i64,
+    total: i64,
+}
+
+/// Read [`RawUsageTokens`] out of one `usage` object, or `None` when it carries neither an
+/// OpenAI-shaped nor an Anthropic-shaped input count (nothing recognisable to bill on).
+fn raw_usage_tokens(usage: &serde_json::Value) -> Option<RawUsageTokens> {
+    use serde_json::Value;
+    let get = |k: &str| usage.get(k).and_then(Value::as_i64);
+    let prompt = match get("prompt_tokens") {
+        Some(p) => p,
+        None => {
+            get("input_tokens")?
+                + get("cache_read_input_tokens").unwrap_or(0).max(0)
+                + get("cache_creation_input_tokens").unwrap_or(0).max(0)
+        }
+    };
+    let completion = get("completion_tokens").or_else(|| get("output_tokens")).unwrap_or(0);
+    let reasoning = usage
+        .pointer("/completion_tokens_details/reasoning_tokens")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    // Floor everything at 0 (malformed bodies must not reach the cost maths), and derive the
+    // total where the shape reports none, as the Anthropic arm does.
+    let prompt = prompt.max(0);
+    let completion = completion.max(0);
+    let total = get("total_tokens").unwrap_or(prompt + completion).max(0);
+    Some(RawUsageTokens {
+        prompt,
+        completion,
+        reasoning: reasoning.max(0),
+        total,
     })
 }
 

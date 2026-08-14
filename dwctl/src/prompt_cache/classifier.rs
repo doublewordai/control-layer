@@ -51,6 +51,15 @@ pub struct TokenizerVersions {
     pub template: Option<String>,
 }
 
+/// The three answers a per-alias version lookup can give. `Unmapped` (not in the service's
+/// model list) is a stable fact and safe to act on; `Unreachable` is an outage of this
+/// moment, and the zeros it degrades to must never be mistaken for a request property.
+enum VersionsLookup {
+    Mapped(TokenizerVersions),
+    Unmapped,
+    Unreachable,
+}
+
 /// Outcome of the exact-counting attempt (see [`Classifier::render_counts`]).
 enum RenderCountsOutcome {
     /// Cumulative counts aligned with `parsed.breakpoints` (`None` = unpriceable), plus
@@ -74,6 +83,13 @@ pub struct ClassifyOutcome {
     pub stats: CacheStats,
     pub pending: PendingWrite,
     pub active: bool,
+    /// True when a zero split was the product of counting infrastructure failing *right
+    /// now* (tokenizer-svc unreachable, render/tokenize transport failure) rather than a
+    /// property of the request. The serving path deliberately ignores this — best-effort
+    /// zeros are the correct degradation there — but a *replay* must not: a degraded zero
+    /// compared against a row holding real cache tokens reads as "the serving path was
+    /// wrong" when the truth is the verifier's tokenizer was down.
+    pub degraded: bool,
 }
 
 impl ClassifyOutcome {
@@ -83,16 +99,28 @@ impl ClassifyOutcome {
             stats: CacheStats::default(),
             pending: PendingWrite::default(),
             active: false,
+            degraded: false,
         }
     }
 
-    /// Enabled, but this prompt cached nothing (no markers, below floor, tokenizer
-    /// degraded, …) — inject uniform zeros, commit nothing.
+    /// Enabled, but this prompt cached nothing (no markers, below floor, unparseable
+    /// body, …) — inject uniform zeros, commit nothing. A deterministic property of the
+    /// request: a replay reaches the same answer the serving path did.
     fn zero_active() -> Self {
         Self {
             stats: CacheStats::default(),
             pending: PendingWrite::default(),
             active: true,
+            degraded: false,
+        }
+    }
+
+    /// Enabled, but counting infrastructure failed now — same uniform zeros on the wire,
+    /// flagged so a replay can refuse to present them as evidence.
+    fn zero_active_degraded() -> Self {
+        Self {
+            degraded: true,
+            ..Self::zero_active()
         }
     }
 
@@ -102,6 +130,7 @@ impl ClassifyOutcome {
             stats,
             pending,
             active: true,
+            degraded: false,
         }
     }
 }
@@ -235,9 +264,19 @@ impl Classifier {
             cache_metrics::record_skip("no_markers");
             return Ok(ClassifyOutcome::zero_active()); // markers are required to cache
         }
-        let Some(versions) = self.tokenizer_versions(req.virtual_model).await? else {
-            cache_metrics::record_skip("tokenizer_unmapped");
-            return Ok(ClassifyOutcome::zero_active()); // model not mapped in tokenizer-svc
+        let versions = match self.tokenizer_versions(req.virtual_model).await? {
+            VersionsLookup::Mapped(v) => v,
+            // Not in the service's model list: a stable fact — the serving path degrades to
+            // zeros for every such request, so a replay reaching the same zeros is faithful.
+            VersionsLookup::Unmapped => {
+                cache_metrics::record_skip("tokenizer_unmapped");
+                return Ok(ClassifyOutcome::zero_active());
+            }
+            // Service unreachable: an outage of *this* moment, not a property of the request.
+            VersionsLookup::Unreachable => {
+                cache_metrics::record_skip("tokenizer_unreachable");
+                return Ok(ClassifyOutcome::zero_active_degraded());
+            }
         };
         let render_mode = self.render_counting && versions.template.is_some();
         // Under exact counting the stored entry counts mean something different (templated
@@ -293,7 +332,8 @@ impl Classifier {
                     Some(per_breakpoint)
                 }
                 RenderCountsOutcome::Fallback => None, // raw counting below
-                RenderCountsOutcome::Skip => return Ok(ClassifyOutcome::zero_active()),
+                // Render transport failure / shed — an infrastructure outage, not the body.
+                RenderCountsOutcome::Skip => return Ok(ClassifyOutcome::zero_active_degraded()),
             }
         } else {
             None
@@ -302,7 +342,8 @@ impl Classifier {
             Some(c) => c,
             None => match self.segment_counts(&req, &parsed, read_block, read_tokens, deepest).await? {
                 Some(c) => c,
-                None => return Ok(ClassifyOutcome::zero_active()),
+                // Tokenize failed / returned garbage — likewise an outage of this moment.
+                None => return Ok(ClassifyOutcome::zero_active_degraded()),
             },
         };
 
@@ -575,10 +616,13 @@ impl Classifier {
 
     /// alias → versions (cached from `/v1/models`); `None` if unmapped or the
     /// service is unreachable (→ no caching).
-    async fn tokenizer_versions(&self, alias: &str) -> CacheResult<Option<TokenizerVersions>> {
+    async fn tokenizer_versions(&self, alias: &str) -> CacheResult<VersionsLookup> {
         if let Some(v) = self.versions.get(alias).await {
             cache_metrics::record_tokenizer_version_cache("hit");
-            return Ok(v);
+            return Ok(match v {
+                Some(v) => VersionsLookup::Mapped(v),
+                None => VersionsLookup::Unmapped,
+            });
         }
         cache_metrics::record_tokenizer_version_cache("miss");
         let Ok(models) = self.tokenizer.models().await else {
@@ -588,8 +632,10 @@ impl Classifier {
             // staying dark for the cache TTL. The cost is one cheap failed `/v1/models` GET per
             // cacheable request during the outage — best-effort, off the user path. (Caching
             // None at the 300s TTL here would instead blind the cache for up to 5 min after
-            // recovery, which is worse than the redundant probes.)
-            return Ok(None);
+            // recovery, which is worse than the redundant probes.) Reported as its own case
+            // rather than folded into Unmapped, because a replay must refuse the zeros this
+            // produces while trusting the zeros an unmapped model produces.
+            return Ok(VersionsLookup::Unreachable);
         };
         let mut found = None;
         for m in models {
@@ -605,7 +651,10 @@ impl Classifier {
         if found.is_none() {
             self.versions.insert(alias.to_string(), None).await;
         }
-        Ok(found)
+        Ok(match found {
+            Some(v) => VersionsLookup::Mapped(v),
+            None => VersionsLookup::Unmapped,
+        })
     }
 
     /// Find the longest cached prefix: union the walk-back candidates across all
@@ -873,7 +922,9 @@ mod tests {
         )
         .await;
         let b = body();
-        let ClassifyOutcome { stats, pending, active } = h.classifier.classify(req(&h.secret, &b)).await.unwrap();
+        let ClassifyOutcome {
+            stats, pending, active, ..
+        } = h.classifier.classify(req(&h.secret, &b)).await.unwrap();
         assert!(active);
         assert_eq!(stats.creation_1h, 1600, "the marker's prefix count is the write");
         assert_eq!(stats.render_total, Some(1900), "full-render total feeds the drift alarm");
@@ -910,7 +961,9 @@ mod tests {
         })
         .to_string()
         .into_bytes();
-        let ClassifyOutcome { stats, pending, active } = h.classifier.classify(req(&h.secret, &b)).await.unwrap();
+        let ClassifyOutcome {
+            stats, pending, active, ..
+        } = h.classifier.classify(req(&h.secret, &b)).await.unwrap();
         assert!(active);
         assert_eq!(stats.creation_1h, 1400, "tools-only prefix priced via render");
         assert_eq!(pending.writes.len(), 1);
@@ -929,7 +982,9 @@ mod tests {
         )
         .await;
         let b = body();
-        let ClassifyOutcome { stats, pending, active } = h.classifier.classify(req(&h.secret, &b)).await.unwrap();
+        let ClassifyOutcome {
+            stats, pending, active, ..
+        } = h.classifier.classify(req(&h.secret, &b)).await.unwrap();
         assert!(active);
         assert_eq!(stats.creation_1h, 1500, "raw-segment fallback count");
         assert_eq!(stats.render_total, None, "no drift sample without a render");
@@ -985,7 +1040,9 @@ mod tests {
         )
         .await;
         let b = body();
-        let ClassifyOutcome { stats, pending, active } = h.classifier.classify(req(&h.secret, &b)).await.unwrap();
+        let ClassifyOutcome {
+            stats, pending, active, ..
+        } = h.classifier.classify(req(&h.secret, &b)).await.unwrap();
         assert!(active);
         assert_eq!(stats.creation_1h, 1500, "null prefix backfilled from raw cumulative");
         assert_eq!(stats.render_total, Some(1900), "drift sample survives a null prefix");
@@ -1009,7 +1066,9 @@ mod tests {
         )
         .await;
         let b = body();
-        let ClassifyOutcome { stats, pending, active } = h.classifier.classify(req(&h.secret, &b)).await.unwrap();
+        let ClassifyOutcome {
+            stats, pending, active, ..
+        } = h.classifier.classify(req(&h.secret, &b)).await.unwrap();
         assert!(active);
         assert_eq!(stats.creation_1h, 1500, "raw-segment fallback count");
         assert_eq!(stats.render_total, None, "a rejected render contributes no drift sample");
@@ -1025,11 +1084,49 @@ mod tests {
         }
     }
 
+    /// An unreachable tokenizer degrades to the same uniform zeros the wire always shows,
+    /// but the outcome must SAY it degraded: a replay comparing those zeros against a row
+    /// holding real cache tokens would otherwise report the serving path as wrong (a dead
+    /// port-forward turned a healthy 25-row corpus into 25 false disagreements). A genuine
+    /// zero — a marked request on an enabled model is not one, so use a markerless body —
+    /// stays un-degraded, because a replay CAN trust it.
+    #[sqlx::test]
+    async fn unreachable_tokenizer_is_degraded_but_no_markers_is_not(pool: PgPool) {
+        let h = harness(&pool, true, 4096, 1024).await;
+
+        // Same principal/model/index, but the tokenizer endpoint refuses connections.
+        let dead = Classifier::new(
+            PrincipalResolver::new(pool.clone()),
+            ModelConfigResolver::new(pool.clone()),
+            TokenizerClient::new("http://127.0.0.1:1".to_string()),
+            Arc::new(PostgresIndex::new(pool.clone(), 0)),
+            all_tiers(),
+            TelemetryPolicy::default(),
+            false,
+        );
+        let b = body();
+        let out = dead.classify(req(&h.secret, &b)).await.unwrap();
+        assert!(out.active, "the model is enabled; an outage does not change that");
+        assert_eq!(out.stats.read, 0);
+        assert_eq!(out.stats.creation_5m + out.stats.creation_1h + out.stats.creation_24h, 0);
+        assert!(out.degraded, "zeros produced by an outage must say so");
+
+        // No markers, healthy tokenizer: the zero split is a property of the request.
+        let plain = serde_json::json!({"model": ALIAS, "messages":[{"role":"user","content":"hi"}]})
+            .to_string()
+            .into_bytes();
+        let out = h.classifier.classify(req(&h.secret, &plain)).await.unwrap();
+        assert!(out.active);
+        assert!(!out.degraded, "a genuine no-marker zero is evidence, not degradation");
+    }
+
     #[sqlx::test]
     async fn no_prior_entry_is_all_creation(pool: PgPool) {
         let h = harness(&pool, true, 1500, 1024).await;
         let b = body();
-        let ClassifyOutcome { stats, pending, active } = h.classifier.classify(req(&h.secret, &b)).await.unwrap();
+        let ClassifyOutcome {
+            stats, pending, active, ..
+        } = h.classifier.classify(req(&h.secret, &b)).await.unwrap();
 
         assert!(active, "enabled model is active");
         assert_eq!(stats.read, 0);
@@ -1063,7 +1160,9 @@ mod tests {
             .unwrap();
 
         let b = body();
-        let ClassifyOutcome { stats, pending, active } = h.classifier.classify(req(&h.secret, &b)).await.unwrap();
+        let ClassifyOutcome {
+            stats, pending, active, ..
+        } = h.classifier.classify(req(&h.secret, &b)).await.unwrap();
         assert!(active);
         assert_eq!(stats.read, 1500);
         assert_eq!(stats.creation_total(), 0, "a full read writes nothing");
@@ -1107,7 +1206,9 @@ mod tests {
         .to_string()
         .into_bytes();
 
-        let ClassifyOutcome { stats, pending, active } = h.classifier.classify(req(&h.secret, &b)).await.unwrap();
+        let ClassifyOutcome {
+            stats, pending, active, ..
+        } = h.classifier.classify(req(&h.secret, &b)).await.unwrap();
         assert!(active);
         assert_eq!(stats.read, 0);
         assert_eq!(stats.creation_1h, 1500, "automatic marker writes the prefix at its tier");

@@ -741,50 +741,7 @@ where
     #[tracing::instrument(skip_all)]
     async fn batch_lookup_cache_tariffs(&self, aliases: &[&str]) -> Result<HashMap<String, Vec<CacheTariffRow>>, sqlx::Error> {
         let aliases_vec: Vec<String> = aliases.iter().map(|s| s.to_string()).collect();
-
-        struct Row {
-            alias: String,
-            write_multiplier_5m: Decimal,
-            write_multiplier_1h: Decimal,
-            write_multiplier_24h: Decimal,
-            read_multiplier: Decimal,
-            valid_from: DateTime<Utc>,
-            valid_until: Option<DateTime<Utc>>,
-        }
-
-        let rows: Vec<Row> = sqlx::query_as!(
-            Row,
-            r#"
-            SELECT
-                dm.alias,
-                mct.write_multiplier_5m,
-                mct.write_multiplier_1h,
-                mct.write_multiplier_24h,
-                mct.read_multiplier,
-                mct.valid_from,
-                mct.valid_until
-            FROM deployed_models dm
-            JOIN model_cache_tariffs mct ON mct.deployed_model_id = dm.id
-            WHERE dm.alias = ANY($1)
-            ORDER BY dm.alias, mct.valid_from DESC
-            "#,
-            &aliases_vec
-        )
-        .fetch_all(&self.pool)
-        .await?;
-
-        let mut map: HashMap<String, Vec<CacheTariffRow>> = HashMap::new();
-        for row in rows {
-            map.entry(row.alias).or_default().push(CacheTariffRow {
-                write_multiplier_5m: row.write_multiplier_5m,
-                write_multiplier_1h: row.write_multiplier_1h,
-                write_multiplier_24h: row.write_multiplier_24h,
-                read_multiplier: row.read_multiplier,
-                valid_from: row.valid_from,
-                valid_until: row.valid_until,
-            });
-        }
-
+        let map = crate::pricing::lookup_cache_tariffs(&self.pool, &aliases_vec).await?;
         trace!(count = map.len(), "Batch lookup cache tariffs completed");
         Ok(map)
     }

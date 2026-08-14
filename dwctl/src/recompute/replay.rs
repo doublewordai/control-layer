@@ -234,11 +234,13 @@ mod tests {
         }
     }
 
-    /// Streaming is where the endpoint genuinely decides the outcome: Anthropic's SSE
+    /// Streaming is where the endpoint decides how a body is *parsed*: Anthropic's SSE
     /// lifecycle (`message_start` / `message_delta`) is nothing like a chat-completion
-    /// chunk stream, and the wrong parser finds no usage at all. A recompute run on a
-    /// mis-recorded endpoint would then propose billing a real request at zero — which is
-    /// why [`StoredExchange::endpoint`] is a required field rather than an inferred one.
+    /// chunk stream, and the wrong typed parser finds no usage in it. The raw-usage
+    /// fallback then reads the terminal frame's usage object directly, so a mis-recorded
+    /// endpoint degrades to the same counts rather than proposing to bill a real request
+    /// at zero. [`StoredExchange::endpoint`] stays a required field: the typed parse it
+    /// dispatches is still the primary, serializer-faithful reading.
     #[test]
     fn streaming_dispatch_depends_on_the_endpoint() {
         let sse = concat!(
@@ -263,9 +265,11 @@ mod tests {
         let (req, resp) = wrong.to_outlet_pair().unwrap();
         let wrong = recompute_from_stored_response(&req, &resp, CreationTier::FiveMinute).unwrap();
         assert_eq!(
-            wrong.counts.prompt, 0,
-            "the chat-completion SSE parser finds no usage in an Anthropic event stream"
+            wrong.counts.prompt, 20_000,
+            "the chat-completion SSE parser finds no usage in an Anthropic event stream, \
+             but the raw-usage fallback recovers the terminal frame's counts"
         );
+        assert_eq!(wrong.counts.completion, 8);
     }
 
     #[test]
@@ -321,6 +325,48 @@ mod tests {
             565,
             "uncached input is the provider's input_tokens"
         );
+    }
+
+    /// A Dynamo upstream leaves `role` off the message object, so the typed parse cannot
+    /// represent the body and the untagged enum falls through to `Other` — which read every
+    /// count as zero for requests the live path recorded correctly (measured on healthy
+    /// GLM-5.2 traffic: analytics_id 186138686 recomputed to all-zero against a body whose
+    /// usage was perfect). The raw-usage fallback must recover the counts.
+    #[test]
+    fn dynamo_body_without_role_recovers_counts_from_raw_usage() {
+        let e = exchange(
+            "/chat/completions",
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#,
+            r#"{"choices":[{"finish_reason":"stop","index":0,"message":{"content":"done","reasoning_content":"thinking"}}],"created":1786737102,"id":"dyn-1","model":"m","object":"chat.completion","usage":{"cache_creation":{"ephemeral_1h_input_tokens":0,"ephemeral_24h_input_tokens":0,"ephemeral_5m_input_tokens":340},"cache_creation_input_tokens":340,"cache_read_input_tokens":30974,"completion_tokens":74,"completion_tokens_details":{"reasoning_tokens":21},"prompt_tokens":32558,"prompt_tokens_details":{"cached_tokens":30974},"total_tokens":32632}}"#,
+        );
+        let (req, resp) = e.to_outlet_pair().unwrap();
+        let got = recompute_from_stored_response(&req, &resp, CreationTier::FiveMinute).unwrap();
+
+        assert_eq!(got.counts.prompt, 32_558, "recovered from the raw usage object");
+        assert_eq!(got.counts.completion, 74);
+        assert_eq!(got.reasoning, 21);
+        assert_eq!(got.total, 32_632);
+        assert_eq!(got.counts.cache_read, 30_974);
+        assert_eq!(got.counts.cache_creation_5m, 340, "nested split read as before");
+        assert!(!got.cache_tier_inferred, "the body stated the tier");
+        assert_eq!(got.prompt_source, TokenSource::Reported, "still the provider's own numbers");
+    }
+
+    /// The July shape: `usage` is null, so there is genuinely nothing to read — the raw
+    /// fallback must not invent counts, and the row recomputes to zero as before (that class
+    /// is the tokenizer path's job, not this one's).
+    #[test]
+    fn null_usage_still_recomputes_to_zero() {
+        let e = exchange(
+            "/chat/completions",
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#,
+            r#"{"choices":[{"finish_reason":"tool_calls","index":0,"message":{"role":"assistant","content":null}}],"created":1,"id":"c","model":"m","object":"chat.completion","usage":null}"#,
+        );
+        let (req, resp) = e.to_outlet_pair().unwrap();
+        let got = recompute_from_stored_response(&req, &resp, CreationTier::FiveMinute).unwrap();
+        assert_eq!(got.counts.prompt, 0);
+        assert_eq!(got.counts.completion, 0);
+        assert_eq!(got.total, 0);
     }
 
     /// Reasoning tokens are their own column in `http_analytics`, so a repair that leaves

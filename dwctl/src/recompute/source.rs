@@ -51,6 +51,9 @@ pub struct CorpusRow {
     /// Present on batch traffic. Carried because a batch corpus needs its `batch_aggregates`
     /// analytics columns delta-folded, and that is not inferable from the numbers alone.
     pub fusillade_batch_id: Option<Uuid>,
+    /// When the batch was created, for batch traffic. Carried because the live path prices
+    /// a batch request as of its batch's creation — tariffs included — not as of processing.
+    pub batch_created_at: Option<DateTime<Utc>>,
 
     // What is stored today — the "before" side of every delta.
     pub stored_prompt_tokens: i64,
@@ -78,6 +81,13 @@ impl CorpusRow {
     /// Whether the cache split is all zero, i.e. this request recorded no caching at all.
     pub fn stored_cache_total(&self) -> i64 {
         self.stored_cache_read + self.stored_cache_creation_5m + self.stored_cache_creation_1h + self.stored_cache_creation_24h
+    }
+
+    /// The instant tariffs are resolved at — batch creation for batch traffic, else the
+    /// request's own time. Must match the live batcher's `pricing_timestamp` exactly, or a
+    /// recompute across a tariff change would "correct" rows the live path priced right.
+    pub fn pricing_timestamp(&self) -> DateTime<Utc> {
+        self.batch_created_at.unwrap_or(self.timestamp)
     }
 }
 
@@ -115,10 +125,12 @@ pub async fn load_corpus(pool: &PgPool, filter: &CorpusFilter) -> Result<Vec<Cor
             -- link. Without the override sqlx types it as String and the None case vanishes.
             rt.body                            AS "request_body?",
             r.response_body                    AS "response_body?",
-            r.response_status                  AS "response_status?"
+            r.response_status                  AS "response_status?",
+            b.created_at                       AS "batch_created_at?"
         FROM http_analytics ha
         LEFT JOIN fusillade.requests r          ON r.id  = ha.fusillade_request_id
         LEFT JOIN fusillade.request_templates rt ON rt.id = r.template_id
+        LEFT JOIN fusillade.batches b            ON b.id  = ha.fusillade_batch_id
         -- Ordered so the planner drives off a timestamp index. There is NO index on
         -- http_analytics.user_id, and ordering by `id` instead makes Postgres walk the
         -- primary key filtering as it goes — on a 186M-row table that scans most of it
@@ -171,6 +183,7 @@ pub async fn load_corpus(pool: &PgPool, filter: &CorpusFilter) -> Result<Vec<Cor
                 timestamp: r.timestamp,
                 fusillade_request_id: r.fusillade_request_id,
                 fusillade_batch_id: r.fusillade_batch_id,
+                batch_created_at: r.batch_created_at,
                 stored_prompt_tokens: r.prompt_tokens,
                 stored_completion_tokens: r.completion_tokens,
                 stored_reasoning_tokens: r.reasoning_tokens,
@@ -346,6 +359,57 @@ mod tests {
         assert_eq!(rec.cache_creation_5m, 538, "recovered from the FLAT field");
         assert!(row.cache_tier_inferred, "the body never stated a tier");
         assert!(report.summary.net_correction > Decimal::ZERO, "an undercharge");
+    }
+
+    /// A dwctl-cached request re-prices with the tariff version valid at its time — not the
+    /// config defaults, and not a version that superseded it. Measured failure this pins:
+    /// healthy GLM-5.2 traffic (tariff read ×0.8, writes ×1.0) re-priced with the defaults
+    /// (read ×0.1, write ×1.25) and reported a −$0.06 "overcharge" on 25 healthy rows.
+    #[sqlx::test]
+    async fn cached_row_reprices_with_the_tariff_valid_at_its_time(pool: PgPool) {
+        setup_fusillade_pool(&pool).await;
+
+        // The model behind alias 'm', with a superseded tariff version and the live one.
+        // Neither matches the config defaults, so resolving wrongly cannot pass by luck.
+        let creator = crate::test::utils::create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
+        let endpoint = crate::test::utils::create_test_endpoint(&pool, "ep-tariff", creator.id).await;
+        let model_id = crate::test::utils::create_test_model(&pool, "m", "m", endpoint, creator.id).await;
+        sqlx::query!(
+            r#"INSERT INTO model_cache_tariffs
+                 (deployed_model_id, write_multiplier_5m, write_multiplier_1h, write_multiplier_24h, read_multiplier, min_prefix_tokens, valid_from, valid_until)
+               VALUES ($1, 2.0, 2.0, 2.5, 0.5, 1024, now() - interval '2 hours', now() - interval '1 hour'),
+                      ($1, 1.0, 1.0, 1.0, 0.8, 1024, now() - interval '1 hour', NULL)"#,
+            model_id,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // The live path's arithmetic for prompt 31840 (read 30723 @ ×0.8, creation 251 @ ×1.0,
+        // uncached 866) at 1e-6/2e-6: (866 + 30723·0.8 + 251·1.0)·1e-6 + 709·2e-6.
+        let (user_id, _) = seed(
+            &pool,
+            "/chat/completions",
+            r#"{"id":"c","object":"chat.completion","created":1,"model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"x"},"finish_reason":"stop"}],"usage":{"prompt_tokens":31840,"completion_tokens":709,"total_tokens":32549,"cache_read_input_tokens":30723,"cache_creation_input_tokens":251,"cache_creation":{"ephemeral_5m_input_tokens":251,"ephemeral_1h_input_tokens":0,"ephemeral_24h_input_tokens":0},"prompt_tokens_details":{"cached_tokens":30723}}}"#,
+            31840,
+            709,
+            30723,
+            251,
+            Decimal::from_str_exact("0.0271134").unwrap(),
+        )
+        .await;
+
+        let report = recompute_corpus(&pool, &filter_for(user_id), CreationTier::FiveMinute, None)
+            .await
+            .unwrap();
+
+        assert_eq!(report.summary.rows_total, 1);
+        assert_eq!(
+            report.summary.rows_changed, 0,
+            "a healthy cached row must re-price to exactly what the live tariff charged"
+        );
+        assert_eq!(report.summary.net_correction, Decimal::ZERO);
+        assert!(report.warnings.is_empty(), "the tariff resolved; nothing to warn about");
     }
 
     /// A request with no stored body cannot be checked at all. It must be reported as such
