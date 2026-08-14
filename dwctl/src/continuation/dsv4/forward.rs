@@ -248,6 +248,10 @@ impl Dsv4Forward {
         const TAGS: [&str; 2] = [INVOKE_OPEN, TOOL_CALLS_CLOSE];
         if let Some((i, tag)) = find_first(rest, &TAGS) {
             self.structural(out, &rest[..i]);
+            // The previous call's closing `}` can still be queued here — one
+            // chunk may carry an invoke's end and the next one's start — and it
+            // belongs to THAT call's index, not the one about to open.
+            self.flush_args(out);
             if tag == INVOKE_OPEN {
                 self.open_call();
             } else {

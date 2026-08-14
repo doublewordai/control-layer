@@ -197,4 +197,62 @@ mod tests {
             json!({"tool_calls": [{"index": 1, "function": {"arguments": "\"city\""}}]})
         );
     }
+
+    /// The passthrough guarantee, stated as bytes. This reproduces exactly what
+    /// the middleware does with a leg chunk and compares it against
+    /// [`reframe_chunk`] — the pre-parser implementation, kept as the reference
+    /// — for every shape a completions chunk comes in. An unmapped model's
+    /// client must not be able to tell the parser was introduced.
+    ///
+    /// [`reframe_chunk`]: crate::continuation::rewrap::reframe_chunk
+    #[test]
+    fn plain_forward_frames_are_byte_identical_to_the_pre_parser_path() {
+        use crate::continuation::rewrap::{self, Envelope};
+
+        let env = Envelope {
+            id: "chatcmpl-abc".to_string(),
+            model: "dsv4-flash".to_string(),
+            created: 1_700_000_000,
+        };
+        let cases = [
+            json!({"choices": [{"text": " world", "index": 0, "logprobs": null, "finish_reason": null}]}),
+            json!({"choices": [{"text": "!", "index": 0, "finish_reason": "stop"}]}),
+            json!({"choices": [{"text": "", "index": 0, "finish_reason": "length"}]}),
+            json!({"choices": [{"text": "", "index": 0, "finish_reason": null}]}),
+        ];
+
+        for chunk in cases {
+            // ── the middleware's emitter, verbatim ──
+            let (text, finish_reason) = rewrap::completion_parts(&chunk).expect("a chunk with a choice");
+            let mut parser = PlainForward;
+            let mut deltas = parser.feed(text);
+            if !finish_reason.is_null() {
+                deltas.extend(parser.finish());
+            }
+            let last = deltas.len().saturating_sub(1);
+            let mut frames: Vec<Value> = deltas
+                .into_iter()
+                .enumerate()
+                .map(|(i, delta)| {
+                    let finish = if i == last { finish_reason.clone() } else { Value::Null };
+                    rewrap::delta_chunk(&env, delta.into_delta(), finish)
+                })
+                .collect();
+            if frames.is_empty() && !finish_reason.is_null() {
+                frames.push(rewrap::delta_chunk(&env, json!({}), finish_reason.clone()));
+            }
+
+            match rewrap::reframe_chunk(&chunk, &env) {
+                Some(want) => {
+                    assert_eq!(frames.len(), 1, "one chunk in, one frame out: {chunk}");
+                    assert_eq!(
+                        rewrap::sse_frame(&frames[0]),
+                        rewrap::sse_frame(&want),
+                        "the client's bytes changed for {chunk}"
+                    );
+                }
+                None => assert!(frames.is_empty(), "nothing was owed for {chunk}, got {frames:?}"),
+            }
+        }
+    }
 }

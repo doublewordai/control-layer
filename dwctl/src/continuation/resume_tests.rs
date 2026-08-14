@@ -1175,3 +1175,139 @@ async fn request_template_kwargs_override_the_route_defaults_on_a_live_resume(po
     // Nothing stripped: the full rendered prefix goes to the provider.
     assert_eq!(fake.resume_requests()[0].body["prompt"], json!([4, 5]));
 }
+
+// ── the forward parser, end to end ───────────────────────────────────────────
+
+/// A model whose reconstructor is configured, so its resume legs are parsed
+/// rather than passed through.
+fn dsv4_config() -> ContinuationConfig {
+    ContinuationConfig {
+        model_reconstructors: [(MODEL.to_string(), "dsv4".to_string())].into_iter().collect(),
+        ..test_config()
+    }
+}
+
+fn reasoning(id: &str, text: &str) -> Chunk {
+    frame(json!({
+        "id": id, "object": "chat.completion.chunk", "created": 1_700_000_000, "model": MODEL,
+        "choices": [{"index": 0, "delta": {"reasoning_content": text}, "finish_reason": null}]
+    }))
+}
+
+fn channel(frames: &[Value], key: &str) -> String {
+    frames.iter().filter_map(|f| f["choices"][0]["delta"][key].as_str()).collect()
+}
+
+/// **The point of the parser.** A leg that dies mid-reasoning resumes into raw
+/// model text — `</think>`, then DSML — and the client must receive that as
+/// `reasoning_content`, `content` and structured `tool_calls`, never as raw
+/// text in `delta.content`. The raw arrives split across chunks, including one
+/// that ends in the middle of `</think>`, because that is what an SSE boundary
+/// does to a tag.
+#[sqlx::test]
+async fn a_resumed_dsml_leg_reaches_the_client_as_parsed_channels(pool: PgPool) {
+    let fake = Fake::new(
+        vec![reasoning("chatcmpl-1", "Let me"), reasoning("chatcmpl-1", " check")],
+        vec![vec![
+            leg_text(" the weather.</thi", None),
+            leg_text("nk>Checking now.\n\n<\u{ff5c}DSML\u{ff5c}tool_calls>\n", None),
+            leg_text("<\u{ff5c}DSML\u{ff5c}invoke name=\"get_weather\">\n", None),
+            leg_text(
+                "<\u{ff5c}DSML\u{ff5c}parameter name=\"city\" string=\"true\">Par",
+                None,
+            ),
+            leg_text(
+                "is</\u{ff5c}DSML\u{ff5c}parameter>\n</\u{ff5c}DSML\u{ff5c}invoke>\n</\u{ff5c}DSML\u{ff5c}tool_calls>",
+                Some("tool_calls"),
+            ),
+            leg_usage(1030, 40),
+            done(),
+        ]],
+    );
+    let tokenizer = render_stub(vec![1, 2, 3], 1012, 12).await;
+    let st = state(pool, &fake, tokenizer.uri(), dsv4_config());
+
+    let response = app(&fake, st).oneshot(chat_request(streaming_body())).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let payloads = collect_payloads(response).await;
+    let frames = parsed(&payloads);
+
+    // No structure reaches any client-visible channel — a real `</think>` in a
+    // content stream is the production bug this replaces.
+    for tag in ["</think>", "<\u{ff5c}DSML\u{ff5c}", "\u{ff5c}DSML\u{ff5c}parameter"] {
+        assert!(
+            !contents(&frames).contains(tag),
+            "{tag} leaked into delta.content: {:?}",
+            contents(&frames)
+        );
+        assert!(!channel(&frames, "reasoning_content").contains(tag), "{tag} leaked into reasoning");
+    }
+
+    assert_eq!(
+        channel(&frames, "reasoning_content"),
+        "Let me check the weather.",
+        "leg 1's reasoning and the resumed reasoning are one continuous channel"
+    );
+    assert_eq!(contents(&frames), "Checking now.\n\n", "the body, separator included");
+
+    // The tool call is structured, opened once, and its arguments are JSON.
+    let calls: Vec<&Value> = frames
+        .iter()
+        .filter_map(|f| f["choices"][0]["delta"]["tool_calls"].as_array())
+        .flatten()
+        .collect();
+    assert!(!calls.is_empty(), "the DSML block became tool-call deltas");
+    assert!(calls.iter().all(|c| c["index"] == 0), "one call, one index");
+    let opened: Vec<&Value> = calls.iter().filter(|c| c.get("id").is_some()).copied().collect();
+    assert_eq!(opened.len(), 1, "a call is announced exactly once");
+    assert_eq!(opened[0]["function"]["name"], "get_weather");
+    assert!(
+        opened[0]["id"].as_str().is_some_and(|id| id.starts_with("call_")),
+        "ids follow the serving parser's scheme"
+    );
+    let arguments: String = calls
+        .iter()
+        .filter_map(|c| c["function"]["arguments"].as_str())
+        .collect();
+    assert_eq!(arguments, r#"{"city": "Paris"}"#);
+
+    // And the stream is still one logical response.
+    assert_eq!(
+        frames.iter().filter(|f| f["choices"][0]["finish_reason"] == "tool_calls").count(),
+        1,
+        "exactly one finish_reason, on the last delta of the terminal chunk"
+    );
+    assert_eq!(usage_frames(&frames).len(), 1, "still exactly one usage frame");
+    assert_eq!(payloads.last().unwrap(), "[DONE]");
+    for f in &frames {
+        assert_eq!(f["id"], "chatcmpl-1", "every delta is on the client's own envelope");
+        assert_eq!(f["model"], MODEL);
+    }
+}
+
+/// The same script on an UNMAPPED model: no reconstructor, so the leg is passed
+/// through byte for byte and the raw text lands in `delta.content` exactly as it
+/// did before the parser existed. This is the regression guard for every model
+/// that is not deliberately enabled.
+#[sqlx::test]
+async fn an_unmapped_model_still_passes_the_leg_through_verbatim(pool: PgPool) {
+    let raw = "ld!</think> and <\u{ff5c}DSML\u{ff5c}tool_calls> stay text";
+    let fake = Fake::new(
+        vec![content("chatcmpl-1", "Hello"), content("chatcmpl-1", ", wor")],
+        vec![vec![leg_text(raw, Some("stop")), leg_usage(1012, 8), done()]],
+    );
+    let tokenizer = render_stub(vec![1, 2, 3], 1012, 12).await;
+    let st = state(pool, &fake, tokenizer.uri(), test_config());
+
+    let frames = parsed(&collect_payloads(app(&fake, st).oneshot(chat_request(streaming_body())).await.unwrap()).await);
+    assert_eq!(
+        contents(&frames),
+        format!("Hello, wor{raw}"),
+        "an unmapped model's raw text is content, unparsed"
+    );
+    assert!(
+        frames.iter().all(|f| f["choices"][0]["delta"].get("tool_calls").is_none()),
+        "nothing is interpreted"
+    );
+    assert_eq!(usage_frames(&frames).len(), 1);
+}
