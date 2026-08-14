@@ -1247,6 +1247,20 @@ enum MoveGraphOutcome {
     },
     SkippedLocked,
     Deferred,
+    AlreadyGone,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct GraphTopology {
+    request_ids: Vec<Uuid>,
+    step_ids: Vec<Uuid>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LockSetOutcome {
+    Locked,
+    Skipped,
+    Missing,
 }
 
 fn request_snapshot(row: &PgRow) -> MovementResult<RetainedRequestSnapshot> {
@@ -1333,29 +1347,64 @@ fn step_payload(row: &PgRow) -> MovementResult<RetainedStepPayloadV1> {
     decode().map_err(database_failure)
 }
 
-async fn step_ids_for_group(
+async fn current_group_id(
+    tx: &mut Transaction<'_, Postgres>,
+    request_id: Uuid,
+) -> MovementResult<Uuid> {
+    sqlx::query_scalar::<_, Uuid>(
+        r#"
+        SELECT COALESCE(parent_step_id, id)
+        FROM response_steps
+        WHERE request_id = $1
+        "#,
+    )
+    .bind(request_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(database_failure)
+    .map(|group_id| group_id.unwrap_or(request_id))
+}
+
+async fn graph_topology(
     tx: &mut Transaction<'_, Postgres>,
     group_id: Uuid,
-) -> MovementResult<Vec<Uuid>> {
-    sqlx::query_scalar(
+    candidate_request_id: Uuid,
+) -> MovementResult<GraphTopology> {
+    let step_ids: Vec<Uuid> = sqlx::query_scalar(
         r#"
+        WITH RECURSIVE graph_steps(id, request_id) AS (
+            SELECT step.id, step.request_id
+            FROM response_steps step
+            WHERE step.id = $1
+
+            UNION
+
+            SELECT child.id, child.request_id
+            FROM response_steps child
+            JOIN graph_steps member
+              ON child.parent_step_id = member.id
+              OR child.prev_step_id = member.id
+              OR (
+                  member.request_id IS NOT NULL
+                  AND child.request_id = member.request_id
+              )
+        )
         SELECT id
-        FROM response_steps
-        WHERE id = $1 OR parent_step_id = $1
+        FROM graph_steps
         ORDER BY id
         "#,
     )
     .bind(group_id)
     .fetch_all(&mut **tx)
     .await
-    .map_err(database_failure)
-}
-
-async fn request_ids_for_steps(
-    tx: &mut Transaction<'_, Postgres>,
-    step_ids: &[Uuid],
-) -> MovementResult<Vec<Uuid>> {
-    sqlx::query_scalar(
+    .map_err(database_failure)?;
+    if step_ids.is_empty() {
+        return Ok(GraphTopology {
+            request_ids: vec![candidate_request_id],
+            step_ids,
+        });
+    }
+    let request_ids: Vec<Uuid> = sqlx::query_scalar(
         r#"
         SELECT DISTINCT request_id
         FROM response_steps
@@ -1363,8 +1412,68 @@ async fn request_ids_for_steps(
         ORDER BY request_id
         "#,
     )
-    .bind(step_ids)
+    .bind(&step_ids)
     .fetch_all(&mut **tx)
+    .await
+    .map_err(database_failure)?;
+    if request_ids.is_empty() || !request_ids.contains(&candidate_request_id) {
+        return Err(incomplete_graph());
+    }
+    Ok(GraphTopology {
+        request_ids,
+        step_ids,
+    })
+}
+
+async fn graph_closure_is_exact(
+    tx: &mut Transaction<'_, Postgres>,
+    topology: &GraphTopology,
+) -> MovementResult<bool> {
+    sqlx::query_scalar(
+        r#"
+        SELECT NOT EXISTS (
+            SELECT 1
+            FROM response_steps step
+            WHERE (
+                    step.request_id = ANY($1)
+                 OR step.parent_step_id = ANY($2)
+                 OR step.prev_step_id = ANY($2)
+            )
+              AND NOT (step.id = ANY($2))
+        )
+        "#,
+    )
+    .bind(&topology.request_ids)
+    .bind(&topology.step_ids)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(database_failure)
+}
+
+async fn selected_graph_is_absent(
+    tx: &mut Transaction<'_, Postgres>,
+    candidate: Candidate,
+    topology: &GraphTopology,
+) -> MovementResult<bool> {
+    sqlx::query_scalar(
+        r#"
+        SELECT
+            NOT EXISTS (SELECT 1 FROM requests WHERE id = ANY($1))
+        AND NOT EXISTS (
+            SELECT 1
+            FROM response_steps
+            WHERE id = ANY($2)
+               OR request_id = ANY($1)
+               OR id = $3
+               OR parent_step_id = $3
+               OR prev_step_id = $3
+        )
+        "#,
+    )
+    .bind(&topology.request_ids)
+    .bind(&topology.step_ids)
+    .bind(candidate.group_id)
+    .fetch_one(&mut **tx)
     .await
     .map_err(database_failure)
 }
@@ -1372,7 +1481,7 @@ async fn request_ids_for_steps(
 async fn lock_requests(
     tx: &mut Transaction<'_, Postgres>,
     request_ids: &[Uuid],
-) -> MovementResult<bool> {
+) -> MovementResult<LockSetOutcome> {
     let locked: Vec<Uuid> = sqlx::query_scalar(
         r#"
         SELECT id
@@ -1387,7 +1496,7 @@ async fn lock_requests(
     .await
     .map_err(database_failure)?;
     if locked == request_ids {
-        return Ok(true);
+        return Ok(LockSetOutcome::Locked);
     }
     let existing: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM requests WHERE id = ANY($1)")
         .bind(request_ids)
@@ -1395,12 +1504,15 @@ async fn lock_requests(
         .await
         .map_err(database_failure)?;
     if existing != request_ids.len() as i64 {
-        return Err(incomplete_graph());
+        return Ok(LockSetOutcome::Missing);
     }
-    Ok(false)
+    Ok(LockSetOutcome::Skipped)
 }
 
-async fn lock_steps(tx: &mut Transaction<'_, Postgres>, step_ids: &[Uuid]) -> MovementResult<bool> {
+async fn lock_steps(
+    tx: &mut Transaction<'_, Postgres>,
+    step_ids: &[Uuid],
+) -> MovementResult<LockSetOutcome> {
     let locked: Vec<Uuid> = sqlx::query_scalar(
         r#"
         SELECT id
@@ -1415,7 +1527,7 @@ async fn lock_steps(tx: &mut Transaction<'_, Postgres>, step_ids: &[Uuid]) -> Mo
     .await
     .map_err(database_failure)?;
     if locked == step_ids {
-        return Ok(true);
+        return Ok(LockSetOutcome::Locked);
     }
     let existing: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM response_steps WHERE id = ANY($1)")
@@ -1424,9 +1536,9 @@ async fn lock_steps(tx: &mut Transaction<'_, Postgres>, step_ids: &[Uuid]) -> Mo
             .await
             .map_err(database_failure)?;
     if existing != step_ids.len() as i64 {
-        return Err(incomplete_graph());
+        return Ok(LockSetOutcome::Missing);
     }
-    Ok(false)
+    Ok(LockSetOutcome::Skipped)
 }
 
 fn exact_expiry(terminal_at: DateTime<Utc>, seconds: u64) -> MovementResult<DateTime<Utc>> {
@@ -1476,41 +1588,56 @@ async fn sha256(tx: &mut Transaction<'_, Postgres>, bytes: &[u8]) -> MovementRes
         .map_err(database_failure)
 }
 
-async fn active_partition_exists(
+async fn lock_active_partition(
     tx: &mut Transaction<'_, Postgres>,
     delete_on: NaiveDate,
 ) -> MovementResult<bool> {
-    sqlx::query_scalar(
+    sqlx::query(
         r#"
-        SELECT EXISTS (
-            SELECT 1
-            FROM retained_response_buckets bucket
-            JOIN pg_namespace namespace
-              ON namespace.nspname = bucket.partition_schema
-            JOIN pg_class child
-              ON child.relnamespace = namespace.oid
-             AND child.relname = bucket.partition_table
-             AND child.oid = bucket.partition_oid
-            JOIN pg_inherits inheritance
-              ON inheritance.inhrelid = child.oid
-             AND NOT inheritance.inhdetachpending
-            WHERE bucket.delete_on = $1
-              AND bucket.state = 'active'
-              AND bucket.partition_schema = current_schema()
-              AND bucket.partition_table =
-                  'retained_response_objects_d' || to_char($1::date, 'YYYYMMDD')
-              AND inheritance.inhparent =
-                  to_regclass(format('%I.retained_response_objects', current_schema()))
-              AND pg_get_expr(child.relpartbound, child.oid) = format(
-                  'FOR VALUES FROM (%L) TO (%L)', $1::date, $1::date + 1
-              )
+        SELECT pg_advisory_xact_lock(
+            hashtextextended(
+                'retained_response_objects.partition:' || current_schema() || ':' || $1::text,
+                0
+            )
         )
         "#,
     )
     .bind(delete_on)
-    .fetch_one(&mut **tx)
+    .execute(&mut **tx)
+    .await
+    .map_err(database_failure)?;
+
+    sqlx::query_scalar::<_, NaiveDate>(
+        r#"
+        SELECT bucket.delete_on
+        FROM retained_response_buckets bucket
+        JOIN pg_namespace namespace
+          ON namespace.nspname = bucket.partition_schema
+        JOIN pg_class child
+          ON child.relnamespace = namespace.oid
+         AND child.relname = bucket.partition_table
+         AND child.oid = bucket.partition_oid
+        JOIN pg_inherits inheritance
+          ON inheritance.inhrelid = child.oid
+         AND NOT inheritance.inhdetachpending
+        WHERE bucket.delete_on = $1
+          AND bucket.state = 'active'
+          AND bucket.partition_schema = current_schema()
+          AND bucket.partition_table =
+              'retained_response_objects_d' || to_char($1::date, 'YYYYMMDD')
+          AND inheritance.inhparent =
+              to_regclass(format('%I.retained_response_objects', current_schema()))
+          AND pg_get_expr(child.relpartbound, child.oid) = format(
+              'FOR VALUES FROM (%L) TO (%L)', $1::date, $1::date + 1
+        )
+        FOR UPDATE OF bucket
+        "#,
+    )
+    .bind(delete_on)
+    .fetch_optional(&mut **tx)
     .await
     .map_err(database_failure)
+    .map(|bucket| bucket.is_some())
 }
 
 async fn insert_and_verify_objects(
@@ -1699,11 +1826,12 @@ async fn insert_and_verify_routes(
         r#"
         SELECT request_id, group_id, delete_on
         FROM retained_response_request_routes
-        WHERE request_id = ANY($1)
+        WHERE request_id = ANY($1) OR group_id = $2
         ORDER BY request_id
         "#,
     )
     .bind(request_ids)
+    .bind(group_id)
     .fetch_all(&mut **tx)
     .await
     .map_err(database_failure)?;
@@ -1722,11 +1850,12 @@ async fn insert_and_verify_routes(
         r#"
         SELECT step_id, group_id, delete_on
         FROM retained_response_step_routes
-        WHERE step_id = ANY($1)
+        WHERE step_id = ANY($1) OR group_id = $2
         ORDER BY step_id
         "#,
     )
     .bind(step_ids)
+    .bind(group_id)
     .fetch_all(&mut **tx)
     .await
     .map_err(database_failure)?;
@@ -1746,7 +1875,7 @@ async fn insert_and_verify_routes(
 
 async fn move_graph<P: PoolProvider>(
     manager: &PostgresRequestManager<P>,
-    candidate: Candidate,
+    mut candidate: Candidate,
     policy: &RetentionSweepPolicy,
     archive_now: DateTime<Utc>,
     cancel_grace_before: DateTime<Utc>,
@@ -1754,33 +1883,41 @@ async fn move_graph<P: PoolProvider>(
     allow_oversized: bool,
 ) -> MovementResult<MoveGraphOutcome> {
     let mut tx = manager.begin_write().await.map_err(database_failure)?;
-    let initial_step_ids = step_ids_for_group(&mut tx, candidate.group_id).await?;
-    let request_ids = if initial_step_ids.is_empty() {
-        vec![candidate.request_id]
-    } else {
-        let request_ids = request_ids_for_steps(&mut tx, &initial_step_ids).await?;
-        if !request_ids.contains(&candidate.request_id) || request_ids.is_empty() {
+    candidate.group_id = current_group_id(&mut tx, candidate.request_id).await?;
+    let initial_topology =
+        graph_topology(&mut tx, candidate.group_id, candidate.request_id).await?;
+
+    match lock_requests(&mut tx, &initial_topology.request_ids).await? {
+        LockSetOutcome::Locked => {}
+        LockSetOutcome::Skipped => return Ok(MoveGraphOutcome::SkippedLocked),
+        LockSetOutcome::Missing => {
+            if selected_graph_is_absent(&mut tx, candidate, &initial_topology).await? {
+                return Ok(MoveGraphOutcome::AlreadyGone);
+            }
             return Err(incomplete_graph());
         }
-        request_ids
-    };
-
-    if !lock_requests(&mut tx, &request_ids).await? {
-        return Ok(MoveGraphOutcome::SkippedLocked);
     }
-    if !initial_step_ids.is_empty() && !lock_steps(&mut tx, &initial_step_ids).await? {
-        return Ok(MoveGraphOutcome::SkippedLocked);
-    }
-
-    let revalidated_step_ids = step_ids_for_group(&mut tx, candidate.group_id).await?;
-    if revalidated_step_ids != initial_step_ids {
+    let locked_group_id = current_group_id(&mut tx, candidate.request_id).await?;
+    if locked_group_id != candidate.group_id {
         return Err(incomplete_graph());
     }
-    if !revalidated_step_ids.is_empty()
-        && request_ids_for_steps(&mut tx, &revalidated_step_ids).await? != request_ids
+    if !initial_topology.step_ids.is_empty() {
+        match lock_steps(&mut tx, &initial_topology.step_ids).await? {
+            LockSetOutcome::Locked => {}
+            LockSetOutcome::Skipped => return Ok(MoveGraphOutcome::SkippedLocked),
+            LockSetOutcome::Missing => return Err(incomplete_graph()),
+        }
+    }
+
+    let revalidated_topology =
+        graph_topology(&mut tx, candidate.group_id, candidate.request_id).await?;
+    if revalidated_topology != initial_topology
+        || !graph_closure_is_exact(&mut tx, &revalidated_topology).await?
     {
         return Err(incomplete_graph());
     }
+    let request_ids = revalidated_topology.request_ids;
+    let revalidated_step_ids = revalidated_topology.step_ids;
 
     let request_rows = sqlx::query(
         r#"
@@ -1965,7 +2102,7 @@ async fn move_graph<P: PoolProvider>(
     if payload_bytes > remaining_bytes && !allow_oversized {
         return Ok(MoveGraphOutcome::Deferred);
     }
-    if !active_partition_exists(&mut tx, delete_on).await? {
+    if !lock_active_partition(&mut tx, delete_on).await? {
         return Err(RetainedResponseMovementError::PartitionUnavailable.into_fusillade_error());
     }
 
@@ -2034,6 +2171,102 @@ async fn move_graph<P: PoolProvider>(
     })
 }
 
+async fn next_candidate<P: PoolProvider>(
+    manager: &PostgresRequestManager<P>,
+    tiers: &[String],
+    cutoffs: &[DateTime<Utc>],
+    excluded_request_ids: &[Uuid],
+) -> MovementResult<Option<Candidate>> {
+    let row: Option<(Uuid, Uuid)> = sqlx::query_as(
+        r#"
+        WITH policy(service_tier, expire_before) AS (
+            SELECT * FROM UNNEST($1::text[], $2::timestamptz[])
+        )
+        SELECT candidate.id,
+               COALESCE(direct.parent_step_id, direct.id, candidate.id) AS group_id
+        FROM policy
+        CROSS JOIN LATERAL (
+            SELECT request.id,
+                   CASE request.state
+                       WHEN 'completed' THEN request.completed_at
+                       WHEN 'failed' THEN request.failed_at
+                       WHEN 'canceled' THEN request.canceled_at
+                   END AS terminal_at
+            FROM requests request
+            WHERE request.service_tier = policy.service_tier
+              AND request.batch_id IS NULL
+              AND request.state IN ('completed', 'failed', 'canceled')
+              AND NOT (request.id = ANY($3))
+              AND CASE request.state
+                      WHEN 'completed' THEN request.completed_at
+                      WHEN 'failed' THEN request.failed_at
+                      WHEN 'canceled' THEN request.canceled_at
+                  END <= policy.expire_before
+            ORDER BY CASE request.state
+                         WHEN 'completed' THEN request.completed_at
+                         WHEN 'failed' THEN request.failed_at
+                         WHEN 'canceled' THEN request.canceled_at
+                     END,
+                     request.id
+            LIMIT 1
+        ) candidate
+        LEFT JOIN response_steps direct ON direct.request_id = candidate.id
+        ORDER BY candidate.terminal_at, candidate.id
+        LIMIT 1
+        "#,
+    )
+    .bind(tiers)
+    .bind(cutoffs)
+    .bind(excluded_request_ids)
+    .fetch_optional(manager.read_executor())
+    .await
+    .map_err(database_failure)?;
+    Ok(row.map(|(request_id, group_id)| Candidate {
+        request_id,
+        group_id,
+    }))
+}
+
+async fn candidate_group_request_ids<P: PoolProvider>(
+    manager: &PostgresRequestManager<P>,
+    candidate: Candidate,
+) -> MovementResult<Vec<Uuid>> {
+    let mut request_ids: Vec<Uuid> = sqlx::query_scalar(
+        r#"
+        WITH RECURSIVE graph_steps(id, request_id) AS (
+            SELECT step.id, step.request_id
+            FROM response_steps step
+            WHERE step.id = $1
+
+            UNION
+
+            SELECT child.id, child.request_id
+            FROM response_steps child
+            JOIN graph_steps member
+              ON child.parent_step_id = member.id
+              OR child.prev_step_id = member.id
+              OR (
+                  member.request_id IS NOT NULL
+                  AND child.request_id = member.request_id
+              )
+        )
+        SELECT DISTINCT request_id
+        FROM graph_steps
+        WHERE request_id IS NOT NULL
+        ORDER BY request_id
+        "#,
+    )
+    .bind(candidate.group_id)
+    .fetch_all(manager.read_executor())
+    .await
+    .map_err(database_failure)?;
+    if !request_ids.contains(&candidate.request_id) {
+        request_ids.push(candidate.request_id);
+        request_ids.sort_unstable();
+    }
+    Ok(request_ids)
+}
+
 pub(crate) async fn archive_terminal_batchless_responses<P: PoolProvider>(
     manager: &PostgresRequestManager<P>,
     policy: &RetentionSweepPolicy,
@@ -2075,65 +2308,31 @@ pub(crate) async fn archive_terminal_batchless_responses<P: PoolProvider>(
         })?);
     }
     let candidate_limit = max_groups.saturating_add(1);
-    let rows: Vec<(Uuid, Uuid)> = sqlx::query_as(
-        r#"
-        WITH policy(service_tier, expire_before) AS (
-            SELECT * FROM UNNEST($1::text[], $2::timestamptz[])
-        )
-        SELECT candidate.id,
-               COALESCE(direct.parent_step_id, direct.id, candidate.id) AS group_id
-        FROM policy
-        CROSS JOIN LATERAL (
-            SELECT request.id,
-                   CASE request.state
-                       WHEN 'completed' THEN request.completed_at
-                       WHEN 'failed' THEN request.failed_at
-                       WHEN 'canceled' THEN request.canceled_at
-                   END AS terminal_at
-            FROM requests request
-            WHERE request.service_tier = policy.service_tier
-              AND request.batch_id IS NULL
-              AND request.state IN ('completed', 'failed', 'canceled')
-              AND CASE request.state
-                      WHEN 'completed' THEN request.completed_at
-                      WHEN 'failed' THEN request.failed_at
-                      WHEN 'canceled' THEN request.canceled_at
-                  END <= policy.expire_before
-            ORDER BY CASE request.state
-                         WHEN 'completed' THEN request.completed_at
-                         WHEN 'failed' THEN request.failed_at
-                         WHEN 'canceled' THEN request.canceled_at
-                     END,
-                     request.id
-            LIMIT $3
-        ) candidate
-        LEFT JOIN response_steps direct ON direct.request_id = candidate.id
-        ORDER BY candidate.terminal_at, candidate.id
-        LIMIT $3
-        "#,
-    )
-    .bind(&tiers)
-    .bind(&cutoffs)
-    .bind(candidate_limit)
-    .fetch_all(manager.read_executor())
-    .await
-    .map_err(database_failure)?;
-
+    let max_probes = candidate_limit.saturating_mul(2);
     let mut candidates = Vec::new();
     let mut seen_groups = std::collections::HashSet::new();
-    for (request_id, group_id) in &rows {
-        if seen_groups.insert(*group_id) {
-            candidates.push(Candidate {
-                request_id: *request_id,
-                group_id: *group_id,
-            });
-            if candidates.len() == max_groups as usize {
-                break;
-            }
+    let mut excluded_request_ids = Vec::new();
+    let mut discovery_exhausted = false;
+    for _ in 0..max_probes {
+        if candidates.len() as i64 == candidate_limit {
+            break;
+        }
+        let Some(candidate) =
+            next_candidate(manager, &tiers, &cutoffs, &excluded_request_ids).await?
+        else {
+            discovery_exhausted = true;
+            break;
+        };
+        let request_ids = candidate_group_request_ids(manager, candidate).await?;
+        excluded_request_ids.extend(request_ids);
+        excluded_request_ids.sort_unstable();
+        excluded_request_ids.dedup();
+        if seen_groups.insert(candidate.group_id) {
+            candidates.push(candidate);
         }
     }
     let mut outcome = RetainedResponseArchiveOutcome {
-        may_have_more: rows.len() as i64 > max_groups,
+        may_have_more: candidates.len() as i64 > max_groups || !discovery_exhausted,
         ..Default::default()
     };
     for candidate in candidates {
@@ -2160,6 +2359,9 @@ pub(crate) async fn archive_terminal_batchless_responses<P: PoolProvider>(
                 outcome.steps_archived += steps;
                 outcome.templates_archived += templates;
                 outcome.bytes_archived += bytes;
+                if outcome.groups_archived == max_groups as u64 {
+                    break;
+                }
             }
             MoveGraphOutcome::SkippedLocked => {
                 outcome.skipped_locked = true;
@@ -2167,10 +2369,8 @@ pub(crate) async fn archive_terminal_batchless_responses<P: PoolProvider>(
             }
             MoveGraphOutcome::Deferred => {
                 outcome.may_have_more = true;
-                if outcome.groups_archived > 0 {
-                    break;
-                }
             }
+            MoveGraphOutcome::AlreadyGone => {}
         }
     }
     Ok(outcome)

@@ -1,15 +1,18 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use chrono::{DateTime, NaiveDate, TimeDelta, Utc};
 use fusillade_arsenal::manager::{
     RetainedResponseArchiveOutcome, RetainedResponseMaintenanceError, RetentionSweepPolicy,
 };
 use fusillade_arsenal::{
-    DaemonStorage, PostgresRequestManager, PostgresStorageConfig, TestDbPools,
+    DaemonStorage, PoolProvider, PostgresRequestManager, PostgresStorageConfig, TestDbPools,
 };
 use serde_json::json;
-use sqlx::{PgPool, Row};
+use sqlx::pool::PoolConnection;
+use sqlx::postgres::PgPoolOptions;
+use sqlx::{PgPool, Postgres, Row};
 use tokio::sync::Barrier;
 use uuid::Uuid;
 
@@ -41,6 +44,24 @@ struct StepFixture {
     terminal_at: DateTime<Utc>,
 }
 
+#[derive(Clone)]
+struct WriteSignalingPools {
+    read: PgPool,
+    write: PgPool,
+    write_requested: Arc<AtomicBool>,
+}
+
+impl PoolProvider for WriteSignalingPools {
+    fn read(&self) -> &PgPool {
+        &self.read
+    }
+
+    fn write(&self) -> &PgPool {
+        self.write_requested.store(true, Ordering::Release);
+        &self.write
+    }
+}
+
 fn timestamp(value: &str) -> DateTime<Utc> {
     DateTime::parse_from_rfc3339(value)
         .expect("fixture timestamp must be valid")
@@ -68,6 +89,55 @@ async fn manager(pool: &PgPool) -> PostgresRequestManager<TestDbPools> {
             .expect("test pools must initialize"),
         PostgresStorageConfig::default(),
     )
+}
+
+async fn write_gated_manager(
+    pool: &PgPool,
+) -> (
+    PostgresRequestManager<WriteSignalingPools>,
+    PoolConnection<Postgres>,
+    Arc<AtomicBool>,
+) {
+    let write = PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with(pool.connect_options().as_ref().clone())
+        .await
+        .expect("gated write pool must connect");
+    let held_connection = write
+        .acquire()
+        .await
+        .expect("the sole write connection must be held");
+    let write_requested = Arc::new(AtomicBool::new(false));
+    let manager = PostgresRequestManager::new(
+        WriteSignalingPools {
+            read: pool.clone(),
+            write,
+            write_requested: Arc::clone(&write_requested),
+        },
+        PostgresStorageConfig::default(),
+    );
+    (manager, held_connection, write_requested)
+}
+
+async fn wait_for_write_request(write_requested: &AtomicBool) {
+    while !write_requested.load(Ordering::Acquire) {
+        tokio::task::yield_now().await;
+    }
+}
+
+async fn wait_for_advisory_waiter(pool: &PgPool) {
+    loop {
+        let waiting: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 'advisory' AND NOT granted)",
+        )
+        .fetch_one(pool)
+        .await
+        .expect("advisory lock wait must be observable");
+        if waiting {
+            return;
+        }
+        tokio::task::yield_now().await;
+    }
 }
 
 async fn install_candidate_index(pool: &PgPool) {
@@ -359,6 +429,14 @@ async fn singleton(
 }
 
 async fn branching_graph(pool: &PgPool, second_request_state: TerminalState) -> LiveGraph {
+    branching_graph_with_tail_states(pool, second_request_state, second_request_state).await
+}
+
+async fn branching_graph_with_tail_states(
+    pool: &PgPool,
+    second_request_state: TerminalState,
+    tail_step_state: TerminalState,
+) -> LiveGraph {
     let first_terminal = timestamp("2026-08-01T10:00:00Z");
     let second_terminal = timestamp("2026-08-02T11:00:00Z");
     let (first_request, first_template) = insert_request(
@@ -443,7 +521,7 @@ async fn branching_graph(pool: &PgPool, second_request_state: TerminalState) -> 
             prev_step_id: Some(nested_tool),
             parent_step_id: Some(head),
             sequence: 5,
-            state: second_request_state,
+            state: tail_step_state,
             terminal_at: second_terminal,
         },
     )
@@ -537,8 +615,8 @@ async fn assert_wholly_retained(pool: &PgPool, graph: &LiveGraph) {
     assert_eq!(distinct_delete_on_count(pool, graph.group_id).await, 1);
 }
 
-async fn archive(
-    manager: &PostgresRequestManager<TestDbPools>,
+async fn archive<P: PoolProvider>(
+    manager: &PostgresRequestManager<P>,
     policy: &RetentionSweepPolicy,
     max_groups: i64,
     max_bytes: i64,
@@ -551,6 +629,462 @@ async fn archive(
             max_bytes,
         )
         .await
+}
+
+#[sqlx::test]
+async fn stale_singleton_candidate_never_cascade_deletes_a_new_response_graph(pool: PgPool) {
+    install_candidate_index(&pool).await;
+    ensure_partition(&pool, date("2026-08-03")).await;
+    let mut graph = singleton(
+        &pool,
+        "flex",
+        TerminalState::Completed,
+        timestamp("2026-08-01T10:00:00Z"),
+        "stale-singleton",
+    )
+    .await;
+    let (gated_manager, held_connection, write_requested) = write_gated_manager(&pool).await;
+    let retention_policy = policy(&[("flex", 86_400)]);
+    let mut mover =
+        tokio::spawn(async move { archive(&gated_manager, &retention_policy, 1, i64::MAX).await });
+
+    tokio::select! {
+        result = &mut mover => panic!("mover completed before the write gate: {result:?}"),
+        () = wait_for_write_request(&write_requested) => {}
+    }
+
+    let head = Uuid::new_v4();
+    let child = Uuid::new_v4();
+    insert_step(
+        &pool,
+        StepFixture {
+            id: head,
+            request_id: Some(graph.request_ids[0]),
+            prev_step_id: None,
+            parent_step_id: None,
+            sequence: 1,
+            state: TerminalState::Completed,
+            terminal_at: timestamp("2026-08-01T10:00:00Z"),
+        },
+    )
+    .await;
+    insert_step(
+        &pool,
+        StepFixture {
+            id: child,
+            request_id: None,
+            prev_step_id: Some(head),
+            parent_step_id: Some(head),
+            sequence: 2,
+            state: TerminalState::Completed,
+            terminal_at: timestamp("2026-08-01T11:00:00Z"),
+        },
+    )
+    .await;
+    graph.group_id = head;
+    graph.step_ids = vec![head, child];
+    graph.step_ids.sort_unstable();
+
+    drop(held_connection);
+    match mover.await.expect("mover task must finish") {
+        Ok(outcome) if outcome.groups_archived == 1 => {
+            assert_eq!(outcome.requests_archived, 1);
+            assert_eq!(outcome.steps_archived, 2);
+            assert_wholly_retained(&pool, &graph).await;
+        }
+        _ => assert_wholly_live(&pool, &graph).await,
+    }
+}
+
+#[sqlx::test]
+async fn nonhead_parent_cascade_edge_fails_closed_without_deleting_any_member(pool: PgPool) {
+    install_candidate_index(&pool).await;
+    ensure_partition(&pool, date("2026-08-07")).await;
+    let mut graph = branching_graph(&pool, TerminalState::Completed).await;
+    let nonhead = *graph
+        .step_ids
+        .iter()
+        .find(|step_id| **step_id != graph.group_id)
+        .unwrap();
+    let malformed = Uuid::new_v4();
+    insert_step(
+        &pool,
+        StepFixture {
+            id: malformed,
+            request_id: None,
+            prev_step_id: Some(nonhead),
+            parent_step_id: Some(nonhead),
+            sequence: 99,
+            state: TerminalState::Completed,
+            terminal_at: timestamp("2026-08-03T15:00:00Z"),
+        },
+    )
+    .await;
+    graph.step_ids.push(malformed);
+    graph.step_ids.sort_unstable();
+    let manager = manager(&pool).await;
+
+    let error = archive(
+        &manager,
+        &policy(&[("flex", 86_400), ("priority", 3 * 86_400)]),
+        1,
+        i64::MAX,
+    )
+    .await
+    .expect_err("a transitive non-head parent edge must fail closed");
+
+    assert_eq!(
+        RetainedResponseMaintenanceError::from_fusillade_error(&error),
+        Some(RetainedResponseMaintenanceError::IncompleteGraph)
+    );
+    assert_wholly_live(&pool, &graph).await;
+}
+
+#[sqlx::test]
+async fn cross_head_predecessor_cascade_edge_fails_closed_without_deleting_any_member(
+    pool: PgPool,
+) {
+    install_candidate_index(&pool).await;
+    ensure_partition(&pool, date("2026-08-07")).await;
+    let mut graph = branching_graph(&pool, TerminalState::Completed).await;
+    let nonhead = *graph
+        .step_ids
+        .iter()
+        .find(|step_id| **step_id != graph.group_id)
+        .unwrap();
+    let other = singleton(
+        &pool,
+        "background",
+        TerminalState::Completed,
+        timestamp("2026-08-04T10:00:00Z"),
+        "cross-head-owner",
+    )
+    .await;
+    let other_head = Uuid::new_v4();
+    insert_step(
+        &pool,
+        StepFixture {
+            id: other_head,
+            request_id: Some(other.request_ids[0]),
+            prev_step_id: None,
+            parent_step_id: None,
+            sequence: 1,
+            state: TerminalState::Completed,
+            terminal_at: timestamp("2026-08-04T10:00:00Z"),
+        },
+    )
+    .await;
+    let malformed = Uuid::new_v4();
+    insert_step(
+        &pool,
+        StepFixture {
+            id: malformed,
+            request_id: None,
+            prev_step_id: Some(nonhead),
+            parent_step_id: Some(other_head),
+            sequence: 100,
+            state: TerminalState::Completed,
+            terminal_at: timestamp("2026-08-04T11:00:00Z"),
+        },
+    )
+    .await;
+    graph.request_ids.extend(other.request_ids.iter().copied());
+    graph.request_ids.sort_unstable();
+    graph
+        .template_ids
+        .extend(other.template_ids.iter().copied());
+    graph.template_ids.sort_unstable();
+    graph.step_ids.extend([other_head, malformed]);
+    graph.step_ids.sort_unstable();
+    let manager = manager(&pool).await;
+
+    let error = archive(
+        &manager,
+        &policy(&[("flex", 86_400), ("priority", 3 * 86_400)]),
+        1,
+        i64::MAX,
+    )
+    .await
+    .expect_err("a predecessor edge crossing response heads must fail closed");
+
+    assert_eq!(
+        RetainedResponseMaintenanceError::from_fusillade_error(&error),
+        Some(RetainedResponseMaintenanceError::IncompleteGraph)
+    );
+    assert_wholly_live(&pool, &graph).await;
+}
+
+#[sqlx::test]
+async fn duplicate_loser_starting_after_winner_commit_returns_a_clean_noop(pool: PgPool) {
+    install_candidate_index(&pool).await;
+    ensure_partition(&pool, date("2026-08-03")).await;
+    let graph = singleton(
+        &pool,
+        "flex",
+        TerminalState::Completed,
+        timestamp("2026-08-01T10:00:00Z"),
+        "ordered-duplicate",
+    )
+    .await;
+    let retention_policy = policy(&[("flex", 86_400)]);
+    let (loser_manager, held_connection, write_requested) = write_gated_manager(&pool).await;
+    let loser_policy = retention_policy.clone();
+    let mut loser =
+        tokio::spawn(async move { archive(&loser_manager, &loser_policy, 1, i64::MAX).await });
+
+    tokio::select! {
+        result = &mut loser => panic!("loser completed before the write gate: {result:?}"),
+        () = wait_for_write_request(&write_requested) => {}
+    }
+
+    let winner_manager = manager(&pool).await;
+    let winner = archive(&winner_manager, &retention_policy, 1, i64::MAX)
+        .await
+        .expect("winner must archive the live graph");
+    assert_eq!(winner.groups_archived, 1);
+    drop(held_connection);
+
+    let loser = loser
+        .await
+        .expect("loser task must finish")
+        .expect("a loser observing the committed winner must return a clean outcome");
+    assert_eq!(loser.groups_archived, 0);
+    assert_wholly_retained(&pool, &graph).await;
+}
+
+#[sqlx::test]
+async fn retirement_transition_fences_movement_until_retiring_is_visible(pool: PgPool) {
+    install_candidate_index(&pool).await;
+    let delete_on = date("2026-08-03");
+    ensure_partition(&pool, delete_on).await;
+    let graph = singleton(
+        &pool,
+        "flex",
+        TerminalState::Completed,
+        timestamp("2026-08-01T10:00:00Z"),
+        "retirement-race",
+    )
+    .await;
+    let mut retirement = pool.begin().await.unwrap();
+    sqlx::query(
+        r#"
+        SELECT pg_advisory_xact_lock(
+            hashtextextended(
+                'retained_response_objects.partition:' || current_schema() || ':' || $1::text,
+                0
+            )
+        )
+        "#,
+    )
+    .bind(delete_on)
+    .execute(&mut *retirement)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE retained_response_buckets SET state = 'retiring' WHERE delete_on = $1")
+        .bind(delete_on)
+        .execute(&mut *retirement)
+        .await
+        .unwrap();
+
+    let manager = manager(&pool).await;
+    let retention_policy = policy(&[("flex", 86_400)]);
+    let mut mover =
+        tokio::spawn(async move { archive(&manager, &retention_policy, 1, i64::MAX).await });
+    tokio::select! {
+        result = &mut mover => panic!("mover crossed the uncommitted retirement fence: {result:?}"),
+        () = wait_for_advisory_waiter(&pool) => {}
+    }
+    assert_wholly_live(&pool, &graph).await;
+
+    retirement.commit().await.unwrap();
+    let error = mover
+        .await
+        .expect("mover task must finish")
+        .expect_err("the retiring state must be observed after the fence opens");
+    assert_eq!(
+        error.to_string(),
+        "Retained response partition is unavailable"
+    );
+    assert_wholly_live(&pool, &graph).await;
+}
+
+#[sqlx::test]
+async fn locked_oldest_group_does_not_consume_the_movement_budget(pool: PgPool) {
+    install_candidate_index(&pool).await;
+    ensure_partition(&pool, date("2026-08-03")).await;
+    let oldest = singleton(
+        &pool,
+        "flex",
+        TerminalState::Completed,
+        timestamp("2026-08-01T08:00:00Z"),
+        "locked-lookahead",
+    )
+    .await;
+    let next = singleton(
+        &pool,
+        "flex",
+        TerminalState::Completed,
+        timestamp("2026-08-01T09:00:00Z"),
+        "movable-lookahead",
+    )
+    .await;
+    let mut blocker = pool.begin().await.unwrap();
+    sqlx::query("SELECT id FROM requests WHERE id = $1 FOR UPDATE")
+        .bind(oldest.request_ids[0])
+        .fetch_one(&mut *blocker)
+        .await
+        .unwrap();
+    let manager = manager(&pool).await;
+
+    let outcome = archive(&manager, &policy(&[("flex", 86_400)]), 1, i64::MAX)
+        .await
+        .expect("a locked oldest group must not hide the next group");
+
+    assert_eq!(outcome.groups_archived, 1);
+    assert!(outcome.skipped_locked);
+    assert!(outcome.may_have_more);
+    blocker.rollback().await.unwrap();
+    assert_wholly_live(&pool, &oldest).await;
+    assert_wholly_retained(&pool, &next).await;
+}
+
+#[sqlx::test]
+async fn deferred_oldest_group_does_not_consume_the_movement_budget(pool: PgPool) {
+    install_candidate_index(&pool).await;
+    ensure_partition(&pool, date("2026-08-03")).await;
+    let mut deferred = singleton(
+        &pool,
+        "flex",
+        TerminalState::Completed,
+        timestamp("2026-08-01T08:00:00Z"),
+        "deferred-lookahead",
+    )
+    .await;
+    let future_terminal: DateTime<Utc> = sqlx::query_scalar("SELECT statement_timestamp()")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let head = Uuid::new_v4();
+    insert_step(
+        &pool,
+        StepFixture {
+            id: head,
+            request_id: Some(deferred.request_ids[0]),
+            prev_step_id: None,
+            parent_step_id: None,
+            sequence: 1,
+            state: TerminalState::Completed,
+            terminal_at: future_terminal,
+        },
+    )
+    .await;
+    deferred.group_id = head;
+    deferred.step_ids = vec![head];
+    let next = singleton(
+        &pool,
+        "flex",
+        TerminalState::Completed,
+        timestamp("2026-08-01T09:00:00Z"),
+        "after-deferred-lookahead",
+    )
+    .await;
+    let manager = manager(&pool).await;
+
+    let outcome = archive(&manager, &policy(&[("flex", 86_400)]), 1, i64::MAX)
+        .await
+        .expect("a deferred oldest group must not hide the next group");
+
+    assert_eq!(outcome.groups_archived, 1);
+    assert!(outcome.may_have_more);
+    assert_wholly_live(&pool, &deferred).await;
+    assert_wholly_retained(&pool, &next).await;
+}
+
+#[sqlx::test]
+async fn many_requests_in_one_graph_count_once_toward_the_group_budget(pool: PgPool) {
+    install_candidate_index(&pool).await;
+    ensure_partition(&pool, date("2026-08-06")).await;
+    ensure_partition(&pool, date("2026-08-07")).await;
+    let mut first = branching_graph(&pool, TerminalState::Completed).await;
+    let (third_request, third_template) = insert_request(
+        &pool,
+        "flex",
+        TerminalState::Completed,
+        timestamp("2026-08-02T12:00:00Z"),
+        "third-request-in-graph",
+    )
+    .await;
+    let third_step = Uuid::new_v4();
+    insert_step(
+        &pool,
+        StepFixture {
+            id: third_step,
+            request_id: Some(third_request),
+            prev_step_id: Some(first.group_id),
+            parent_step_id: Some(first.group_id),
+            sequence: 6,
+            state: TerminalState::Completed,
+            terminal_at: timestamp("2026-08-02T12:00:00Z"),
+        },
+    )
+    .await;
+    first.request_ids.push(third_request);
+    first.template_ids.push(third_template);
+    first.step_ids.push(third_step);
+    for offset in 0_i64..6 {
+        let terminal_at = timestamp("2026-08-02T12:10:00Z") + TimeDelta::minutes(offset);
+        let suffix = format!("fanout-request-{offset}");
+        let (request_id, template_id) = insert_request(
+            &pool,
+            "flex",
+            TerminalState::Completed,
+            terminal_at,
+            &suffix,
+        )
+        .await;
+        let step_id = Uuid::new_v4();
+        insert_step(
+            &pool,
+            StepFixture {
+                id: step_id,
+                request_id: Some(request_id),
+                prev_step_id: Some(first.group_id),
+                parent_step_id: Some(first.group_id),
+                sequence: 7 + offset,
+                state: TerminalState::Completed,
+                terminal_at,
+            },
+        )
+        .await;
+        first.request_ids.push(request_id);
+        first.template_ids.push(template_id);
+        first.step_ids.push(step_id);
+    }
+    first.request_ids.sort_unstable();
+    first.template_ids.sort_unstable();
+    first.step_ids.sort_unstable();
+    let second = singleton(
+        &pool,
+        "flex",
+        TerminalState::Completed,
+        timestamp("2026-08-04T10:00:00Z"),
+        "second-distinct-group",
+    )
+    .await;
+    let manager = manager(&pool).await;
+
+    let outcome = archive(
+        &manager,
+        &policy(&[("flex", 86_400), ("priority", 3 * 86_400)]),
+        2,
+        i64::MAX,
+    )
+    .await
+    .expect("request fan-out must not consume distinct-group capacity");
+
+    assert_eq!(outcome.groups_archived, 2);
+    assert_wholly_retained(&pool, &first).await;
+    assert_wholly_retained(&pool, &second).await;
 }
 
 #[sqlx::test]
@@ -665,6 +1199,128 @@ async fn nonterminal_member_fails_the_complete_graph_and_rolls_back(pool: PgPool
         Some(RetainedResponseMaintenanceError::IncompleteGraph)
     );
     assert_wholly_live(&pool, &graph).await;
+}
+
+#[sqlx::test]
+async fn pending_request_with_terminal_step_fails_closed(pool: PgPool) {
+    install_candidate_index(&pool).await;
+    ensure_partition(&pool, date("2026-08-07")).await;
+    let graph =
+        branching_graph_with_tail_states(&pool, TerminalState::Pending, TerminalState::Completed)
+            .await;
+    let manager = manager(&pool).await;
+
+    let error = archive(
+        &manager,
+        &policy(&[("flex", 86_400), ("priority", 3 * 86_400)]),
+        1,
+        i64::MAX,
+    )
+    .await
+    .expect_err("a pending request must fail even when its step is terminal");
+
+    assert_eq!(
+        RetainedResponseMaintenanceError::from_fusillade_error(&error),
+        Some(RetainedResponseMaintenanceError::IncompleteGraph)
+    );
+    assert_wholly_live(&pool, &graph).await;
+}
+
+#[sqlx::test]
+async fn terminal_request_with_pending_step_fails_closed(pool: PgPool) {
+    install_candidate_index(&pool).await;
+    ensure_partition(&pool, date("2026-08-07")).await;
+    let graph =
+        branching_graph_with_tail_states(&pool, TerminalState::Completed, TerminalState::Pending)
+            .await;
+    let manager = manager(&pool).await;
+
+    let error = archive(
+        &manager,
+        &policy(&[("flex", 86_400), ("priority", 3 * 86_400)]),
+        1,
+        i64::MAX,
+    )
+    .await
+    .expect_err("a pending step must fail even when its request is terminal");
+
+    assert_eq!(
+        RetainedResponseMaintenanceError::from_fusillade_error(&error),
+        Some(RetainedResponseMaintenanceError::IncompleteGraph)
+    );
+    assert_wholly_live(&pool, &graph).await;
+}
+
+#[sqlx::test]
+async fn shared_template_fails_closed_with_every_reference_live(pool: PgPool) {
+    install_candidate_index(&pool).await;
+    ensure_partition(&pool, date("2026-08-07")).await;
+    let graph = branching_graph(&pool, TerminalState::Completed).await;
+    let updated = sqlx::query(
+        "UPDATE requests SET template_id = $1 WHERE id = ANY($2) AND template_id <> $1",
+    )
+    .bind(graph.template_ids[0])
+    .bind(&graph.request_ids)
+    .execute(&pool)
+    .await
+    .unwrap()
+    .rows_affected();
+    assert_eq!(updated, 1, "fixture must create one shared template");
+    let manager = manager(&pool).await;
+
+    let error = archive(
+        &manager,
+        &policy(&[("flex", 86_400), ("priority", 3 * 86_400)]),
+        1,
+        i64::MAX,
+    )
+    .await
+    .expect_err("a template shared inside the graph must not be moved or deleted");
+
+    assert_eq!(
+        RetainedResponseMaintenanceError::from_fusillade_error(&error),
+        Some(RetainedResponseMaintenanceError::IncompleteGraph)
+    );
+    assert_wholly_live(&pool, &graph).await;
+}
+
+#[sqlx::test]
+async fn file_backed_template_fails_closed_with_the_file_reference_live(pool: PgPool) {
+    install_candidate_index(&pool).await;
+    ensure_partition(&pool, date("2026-08-03")).await;
+    let graph = singleton(
+        &pool,
+        "flex",
+        TerminalState::Completed,
+        timestamp("2026-08-01T10:00:00Z"),
+        "file-backed-template",
+    )
+    .await;
+    let file_id = Uuid::new_v4();
+    sqlx::query("INSERT INTO files (id, name) VALUES ($1, $2)")
+        .bind(file_id)
+        .bind("retention-file-backed-template.jsonl")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE request_templates SET file_id = $1 WHERE id = $2")
+        .bind(file_id)
+        .bind(graph.template_ids[0])
+        .execute(&pool)
+        .await
+        .unwrap();
+    let manager = manager(&pool).await;
+
+    let error = archive(&manager, &policy(&[("flex", 86_400)]), 1, i64::MAX)
+        .await
+        .expect_err("a file-backed template must not be moved or deleted");
+
+    assert_eq!(
+        RetainedResponseMaintenanceError::from_fusillade_error(&error),
+        Some(RetainedResponseMaintenanceError::IncompleteGraph)
+    );
+    assert_wholly_live(&pool, &graph).await;
+    assert_eq!(count_ids(&pool, "files", &[file_id]).await, 1);
 }
 
 #[sqlx::test]
@@ -1184,6 +1840,76 @@ async fn conflicting_route_rolls_back_objects_and_keeps_the_graph_live(pool: PgP
     let error = archive(&manager, &policy(&[("flex", 86_400)]), 1, i64::MAX)
         .await
         .expect_err("a differing retained route must fail closed");
+
+    assert_eq!(
+        error.to_string(),
+        "Retained response integrity verification failed"
+    );
+    assert_wholly_live(&pool, &graph).await;
+}
+
+#[sqlx::test]
+async fn extra_request_route_for_group_and_bucket_causes_integrity_rollback(pool: PgPool) {
+    install_candidate_index(&pool).await;
+    let delete_on = date("2026-08-03");
+    ensure_partition(&pool, delete_on).await;
+    let graph = singleton(
+        &pool,
+        "flex",
+        TerminalState::Completed,
+        timestamp("2026-08-01T10:00:00Z"),
+        "extra-request-route",
+    )
+    .await;
+    sqlx::query(
+        "INSERT INTO retained_response_request_routes (request_id, group_id, delete_on) VALUES ($1, $2, $3)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(graph.group_id)
+    .bind(delete_on)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let manager = manager(&pool).await;
+
+    let error = archive(&manager, &policy(&[("flex", 86_400)]), 1, i64::MAX)
+        .await
+        .expect_err("an extra request route must reject the retained graph");
+
+    assert_eq!(
+        error.to_string(),
+        "Retained response integrity verification failed"
+    );
+    assert_wholly_live(&pool, &graph).await;
+}
+
+#[sqlx::test]
+async fn extra_step_route_for_group_and_bucket_causes_integrity_rollback(pool: PgPool) {
+    install_candidate_index(&pool).await;
+    let delete_on = date("2026-08-03");
+    ensure_partition(&pool, delete_on).await;
+    let graph = singleton(
+        &pool,
+        "flex",
+        TerminalState::Completed,
+        timestamp("2026-08-01T10:00:00Z"),
+        "extra-step-route",
+    )
+    .await;
+    sqlx::query(
+        "INSERT INTO retained_response_step_routes (step_id, group_id, delete_on) VALUES ($1, $2, $3)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(graph.group_id)
+    .bind(delete_on)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let manager = manager(&pool).await;
+
+    let error = archive(&manager, &policy(&[("flex", 86_400)]), 1, i64::MAX)
+        .await
+        .expect_err("an extra step route must reject the retained graph");
 
     assert_eq!(
         error.to_string(),
