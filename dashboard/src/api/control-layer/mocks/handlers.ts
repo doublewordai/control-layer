@@ -257,6 +257,7 @@ function resolveComponents(modelId: string): import("../types").ModelComponent[]
       enabled: sc.enabled,
       sort_order: sc.sort_order,
       created_at: "2025-09-15T00:00:00Z",
+      pool: "default" as const,
       model: {
         id: componentModel?.id ?? sc.componentModelId,
         alias: componentModel?.alias ?? "unknown",
