@@ -1148,7 +1148,10 @@ pub trait Storage: Send + Sync {
     ///
     /// - `owner`: the request `created_by` — the creditor id.
     /// - `cutoff`: only requests with `created_at >= cutoff` are counted.
-    /// - `strict`: set `true` to read from the write pool and avoid read lag.
+    /// - `strict`: retained for signature compatibility. Archive-aware storage
+    ///   backends use the write/primary pool for both values so the live and
+    ///   retained arms share one current statement snapshot; `true` continues
+    ///   to guarantee the documented no-read-lag behavior.
     async fn count_owner_flex_requests_since(
         &self,
         owner: &str,
