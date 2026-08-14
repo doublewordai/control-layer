@@ -482,12 +482,12 @@ impl<'c> Repository for Users<'c> {
         .await?;
 
         // Only when we actually transitioned the user to deleted (idempotent on
-        // repeat calls). Hard-delete keys owned by the user (user_id) — these
-        // authenticate as them. Keys they merely created for others (created_by)
-        // belong to those users and are left alone. The api_keys DELETE trigger
-        // emits NOTIFY, so the onwards proxy drops them from its cache at once.
+        // repeat calls). Hard-delete keys owned by or attributed to the user so
+        // keys issued in another account context cannot outlive their holder.
+        // The api_keys DELETE trigger emits NOTIFY, so the onwards proxy drops
+        // them from its cache at once.
         if result.rows_affected() > 0 {
-            sqlx::query!(r#"DELETE FROM api_keys WHERE user_id = $1"#, id)
+            sqlx::query!(r#"DELETE FROM api_keys WHERE user_id = $1 OR created_by = $1"#, id)
                 .execute(&mut *tx)
                 .await?;
         }
@@ -1149,6 +1149,19 @@ mod tests {
     use sqlx::PgPool;
     use std::str::FromStr;
 
+    async fn create_standard_user(conn: &mut PgConnection, username: &str) -> UserDBResponse {
+        Users::new(conn)
+            .create(&UserCreateDBRequest::from(UserCreate {
+                username: username.to_string(),
+                email: format!("{username}@example.com"),
+                display_name: None,
+                avatar_url: None,
+                roles: vec![Role::StandardUser],
+            }))
+            .await
+            .unwrap()
+    }
+
     #[sqlx::test]
     #[test_log::test]
     async fn test_create_user(pool: PgPool) {
@@ -1242,6 +1255,70 @@ mod tests {
             repo.delete(user.id).await.unwrap()
         };
         assert!(!again);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_delete_user_revokes_keys_attributed_to_them(pool: PgPool) {
+        use crate::db::models::api_keys::ApiKeyCreateDBRequest;
+
+        let mut conn = pool.acquire().await.unwrap();
+        let deleted_user = create_standard_user(&mut conn, "deleted-key-holder").await;
+        let retained_user = create_standard_user(&mut conn, "retained-key-holder").await;
+        let key_owner = create_standard_user(&mut conn, "shared-key-owner").await;
+
+        let (deleted_user_key, retained_user_key) = {
+            let mut keys = ApiKeys::new(&mut conn);
+            let deleted_user_key = keys
+                .create(&ApiKeyCreateDBRequest {
+                    user_id: key_owner.id,
+                    name: "deleted-user-key".to_string(),
+                    description: None,
+                    purpose: ApiKeyPurpose::Realtime,
+                    requests_per_second: None,
+                    burst_size: None,
+                    created_by: deleted_user.id,
+                    spend_limit: None,
+                    spend_limit_interval: None,
+                })
+                .await
+                .unwrap();
+            let retained_user_key = keys
+                .create(&ApiKeyCreateDBRequest {
+                    user_id: key_owner.id,
+                    name: "retained-user-key".to_string(),
+                    description: None,
+                    purpose: ApiKeyPurpose::Realtime,
+                    requests_per_second: None,
+                    burst_size: None,
+                    created_by: retained_user.id,
+                    spend_limit: None,
+                    spend_limit_interval: None,
+                })
+                .await
+                .unwrap();
+            (deleted_user_key, retained_user_key)
+        };
+
+        assert!(Users::new(&mut conn).delete(deleted_user.id).await.unwrap());
+
+        let deleted_key_exists: bool = sqlx::query_scalar!(
+            "SELECT EXISTS(SELECT 1 FROM api_keys WHERE id = $1) as \"exists!\"",
+            deleted_user_key.id
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let retained_key_is_active: bool = sqlx::query_scalar!(
+            "SELECT EXISTS(SELECT 1 FROM api_keys WHERE id = $1 AND is_deleted = false) as \"exists!\"",
+            retained_user_key.id
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert!(!deleted_key_exists, "keys attributed to the deleted user must be revoked");
+        assert!(retained_key_is_active, "keys attributed to other users must remain active");
     }
 
     #[sqlx::test]
