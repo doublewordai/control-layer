@@ -114,11 +114,36 @@ impl fmt::Debug for RetainedObjectKind {
     }
 }
 
+/// Deserialize a JSON object only after proving all listed nullable V1 fields
+/// are present. An explicit JSON `null` remains valid; a missing key does not.
+fn deserialize_object_with_required_fields<'de, D, T>(
+    deserializer: D,
+    required_fields: &[&str],
+) -> std::result::Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| <D::Error as serde::de::Error>::custom("expected V1 object"))?;
+    if required_fields
+        .iter()
+        .any(|field| !object.contains_key(*field))
+    {
+        return Err(<D::Error as serde::de::Error>::custom(
+            "missing nullable V1 field",
+        ));
+    }
+    serde_json::from_value(value).map_err(<D::Error as serde::de::Error>::custom)
+}
+
 /// A complete immutable copy of a `requests` row.
 ///
 /// The request-to-template relationship remains explicit even though the
 /// graph mover only accepts the dedicated batchless-template form.
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize)]
 pub(crate) struct RetainedRequestSnapshot {
     pub(crate) id: Uuid,
     pub(crate) batch_id: Option<Uuid>,
@@ -143,6 +168,87 @@ pub(crate) struct RetainedRequestSnapshot {
     pub(crate) created_by: Option<String>,
     pub(crate) created_at: DateTime<Utc>,
     pub(crate) updated_at: DateTime<Utc>,
+}
+
+#[derive(Deserialize)]
+struct RetainedRequestSnapshotWire {
+    id: Uuid,
+    batch_id: Option<Uuid>,
+    template_id: Option<Uuid>,
+    custom_id: Option<String>,
+    model: String,
+    state: String,
+    retry_attempt: i32,
+    not_before: Option<DateTime<Utc>>,
+    daemon_id: Option<Uuid>,
+    claimed_at: Option<DateTime<Utc>>,
+    started_at: Option<DateTime<Utc>>,
+    response_status: Option<i16>,
+    response_body: Option<String>,
+    completed_at: Option<DateTime<Utc>>,
+    error: Option<String>,
+    failed_at: Option<DateTime<Utc>>,
+    canceled_at: Option<DateTime<Utc>>,
+    response_size: i64,
+    routed_model: Option<String>,
+    service_tier: Option<String>,
+    created_by: Option<String>,
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+}
+
+impl<'de> Deserialize<'de> for RetainedRequestSnapshot {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire: RetainedRequestSnapshotWire = deserialize_object_with_required_fields(
+            deserializer,
+            &[
+                "batch_id",
+                "template_id",
+                "custom_id",
+                "not_before",
+                "daemon_id",
+                "claimed_at",
+                "started_at",
+                "response_status",
+                "response_body",
+                "completed_at",
+                "error",
+                "failed_at",
+                "canceled_at",
+                "routed_model",
+                "service_tier",
+                "created_by",
+            ],
+        )?;
+        Ok(Self {
+            id: wire.id,
+            batch_id: wire.batch_id,
+            template_id: wire.template_id,
+            custom_id: wire.custom_id,
+            model: wire.model,
+            state: wire.state,
+            retry_attempt: wire.retry_attempt,
+            not_before: wire.not_before,
+            daemon_id: wire.daemon_id,
+            claimed_at: wire.claimed_at,
+            started_at: wire.started_at,
+            response_status: wire.response_status,
+            response_body: wire.response_body,
+            completed_at: wire.completed_at,
+            error: wire.error,
+            failed_at: wire.failed_at,
+            canceled_at: wire.canceled_at,
+            response_size: wire.response_size,
+            routed_model: wire.routed_model,
+            service_tier: wire.service_tier,
+            created_by: wire.created_by,
+            created_at: wire.created_at,
+            updated_at: wire.updated_at,
+        })
+    }
 }
 
 impl RetainedRequestSnapshot {
@@ -187,7 +293,7 @@ impl fmt::Debug for RetainedRequestSnapshot {
 }
 
 /// A complete immutable copy of a dedicated `request_templates` row.
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize)]
 pub(crate) struct RetainedTemplateSnapshot {
     pub(crate) id: Uuid,
     pub(crate) file_id: Option<Uuid>,
@@ -203,6 +309,52 @@ pub(crate) struct RetainedTemplateSnapshot {
     pub(crate) metadata: Option<serde_json::Value>,
     pub(crate) created_at: DateTime<Utc>,
     pub(crate) updated_at: DateTime<Utc>,
+}
+
+#[derive(Deserialize)]
+struct RetainedTemplateSnapshotWire {
+    id: Uuid,
+    file_id: Option<Uuid>,
+    custom_id: Option<String>,
+    endpoint: String,
+    method: String,
+    path: String,
+    body: String,
+    model: String,
+    api_key: String,
+    line_number: i32,
+    body_byte_size: i64,
+    metadata: Option<serde_json::Value>,
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+}
+
+impl<'de> Deserialize<'de> for RetainedTemplateSnapshot {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire: RetainedTemplateSnapshotWire = deserialize_object_with_required_fields(
+            deserializer,
+            &["file_id", "custom_id", "metadata"],
+        )?;
+        Ok(Self {
+            id: wire.id,
+            file_id: wire.file_id,
+            custom_id: wire.custom_id,
+            endpoint: wire.endpoint,
+            method: wire.method,
+            path: wire.path,
+            body: wire.body,
+            model: wire.model,
+            api_key: wire.api_key,
+            line_number: wire.line_number,
+            body_byte_size: wire.body_byte_size,
+            metadata: wire.metadata,
+            created_at: wire.created_at,
+            updated_at: wire.updated_at,
+        })
+    }
 }
 
 impl fmt::Debug for RetainedTemplateSnapshot {
@@ -285,8 +437,42 @@ impl fmt::Debug for RetainedRequestPayloadV1 {
     }
 }
 
+/// Row-bound V1 request payload. The flat layout preserves the reviewed V1
+/// request/template fields while binding them to the route columns that select
+/// a retained graph.
+#[derive(Serialize)]
+struct RetainedRequestPayloadEnvelopeV1 {
+    group_id: Uuid,
+    head_step_id: Option<Uuid>,
+    #[serde(flatten)]
+    payload: RetainedRequestPayloadV1,
+}
+
+#[derive(Deserialize)]
+struct RetainedRequestPayloadEnvelopeV1Wire {
+    group_id: Uuid,
+    head_step_id: Option<Uuid>,
+    #[serde(flatten)]
+    payload: RetainedRequestPayloadV1,
+}
+
+impl<'de> Deserialize<'de> for RetainedRequestPayloadEnvelopeV1 {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire: RetainedRequestPayloadEnvelopeV1Wire =
+            deserialize_object_with_required_fields(deserializer, &["head_step_id"])?;
+        Ok(Self {
+            group_id: wire.group_id,
+            head_step_id: wire.head_step_id,
+            payload: wire.payload,
+        })
+    }
+}
+
 /// A complete immutable copy of a `response_steps` row.
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize)]
 pub(crate) struct RetainedStepSnapshot {
     pub(crate) id: Uuid,
     pub(crate) request_id: Option<Uuid>,
@@ -305,6 +491,68 @@ pub(crate) struct RetainedStepSnapshot {
     pub(crate) error: Option<serde_json::Value>,
     pub(crate) created_at: DateTime<Utc>,
     pub(crate) updated_at: DateTime<Utc>,
+}
+
+#[derive(Deserialize)]
+struct RetainedStepSnapshotWire {
+    id: Uuid,
+    request_id: Option<Uuid>,
+    prev_step_id: Option<Uuid>,
+    parent_step_id: Option<Uuid>,
+    step_kind: StepKind,
+    step_sequence: i64,
+    request_payload: serde_json::Value,
+    response_payload: Option<serde_json::Value>,
+    state: StepState,
+    started_at: Option<DateTime<Utc>>,
+    completed_at: Option<DateTime<Utc>>,
+    failed_at: Option<DateTime<Utc>>,
+    canceled_at: Option<DateTime<Utc>>,
+    retry_attempt: i32,
+    error: Option<serde_json::Value>,
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+}
+
+impl<'de> Deserialize<'de> for RetainedStepSnapshot {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire: RetainedStepSnapshotWire = deserialize_object_with_required_fields(
+            deserializer,
+            &[
+                "request_id",
+                "prev_step_id",
+                "parent_step_id",
+                "response_payload",
+                "started_at",
+                "completed_at",
+                "failed_at",
+                "canceled_at",
+                "error",
+            ],
+        )?;
+        Ok(Self {
+            id: wire.id,
+            request_id: wire.request_id,
+            prev_step_id: wire.prev_step_id,
+            parent_step_id: wire.parent_step_id,
+            step_kind: wire.step_kind,
+            step_sequence: wire.step_sequence,
+            request_payload: wire.request_payload,
+            response_payload: wire.response_payload,
+            state: wire.state,
+            started_at: wire.started_at,
+            completed_at: wire.completed_at,
+            failed_at: wire.failed_at,
+            canceled_at: wire.canceled_at,
+            retry_attempt: wire.retry_attempt,
+            error: wire.error,
+            created_at: wire.created_at,
+            updated_at: wire.updated_at,
+        })
+    }
 }
 
 impl RetainedStepSnapshot {
@@ -401,8 +649,41 @@ impl fmt::Debug for RetainedStepPayloadV1 {
     }
 }
 
+/// Row-bound V1 step payload. See [`RetainedRequestPayloadEnvelopeV1`] for
+/// why the routing identity is stored inside, as well as alongside, the row.
+#[derive(Serialize)]
+struct RetainedStepPayloadEnvelopeV1 {
+    group_id: Uuid,
+    head_step_id: Option<Uuid>,
+    #[serde(flatten)]
+    payload: RetainedStepPayloadV1,
+}
+
+#[derive(Deserialize)]
+struct RetainedStepPayloadEnvelopeV1Wire {
+    group_id: Uuid,
+    head_step_id: Option<Uuid>,
+    #[serde(flatten)]
+    payload: RetainedStepPayloadV1,
+}
+
+impl<'de> Deserialize<'de> for RetainedStepPayloadEnvelopeV1 {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire: RetainedStepPayloadEnvelopeV1Wire =
+            deserialize_object_with_required_fields(deserializer, &["head_step_id"])?;
+        Ok(Self {
+            group_id: wire.group_id,
+            head_step_id: wire.head_step_id,
+            payload: wire.payload,
+        })
+    }
+}
+
 /// Content-free group header that proves the exact retained graph membership.
-#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize)]
 pub(crate) struct RetainedGroup {
     pub(crate) group_id: Uuid,
     pub(crate) head_step_id: Option<Uuid>,
@@ -410,7 +691,120 @@ pub(crate) struct RetainedGroup {
     pub(crate) step_ids: Vec<Uuid>,
 }
 
+#[derive(Deserialize)]
+struct RetainedGroupWire {
+    group_id: Uuid,
+    head_step_id: Option<Uuid>,
+    request_ids: Vec<Uuid>,
+    step_ids: Vec<Uuid>,
+}
+
+impl<'de> Deserialize<'de> for RetainedGroup {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire: RetainedGroupWire =
+            deserialize_object_with_required_fields(deserializer, &["head_step_id"])?;
+        Ok(Self {
+            group_id: wire.group_id,
+            head_step_id: wire.head_step_id,
+            request_ids: wire.request_ids,
+            step_ids: wire.step_ids,
+        })
+    }
+}
+
 impl RetainedGroup {
+    fn validate_header(&self) -> std::result::Result<(), RetainedResponseSerializationError> {
+        if has_duplicate_ids(&self.request_ids) || has_duplicate_ids(&self.step_ids) {
+            return Err(RetainedResponseSerializationError::IncompleteGroup);
+        }
+        match self.head_step_id {
+            Some(head_step_id) => {
+                if self.group_id != head_step_id || !self.step_ids.contains(&head_step_id) {
+                    return Err(RetainedResponseSerializationError::IncompleteGroup);
+                }
+            }
+            None => {
+                if !self.step_ids.is_empty()
+                    || self.request_ids.len() != 1
+                    || self.request_ids[0] != self.group_id
+                {
+                    return Err(RetainedResponseSerializationError::IncompleteGroup);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_members(
+        &self,
+        requests: &[RetainedRequestPayloadV1],
+        steps: &[RetainedStepPayloadV1],
+    ) -> std::result::Result<(), RetainedResponseSerializationError> {
+        self.validate_header()?;
+
+        let request_ids = requests
+            .iter()
+            .map(|payload| payload.request.id)
+            .collect::<Vec<_>>();
+        let step_ids = steps
+            .iter()
+            .map(|payload| payload.step.id)
+            .collect::<Vec<_>>();
+        if self.request_ids != request_ids
+            || self.step_ids != step_ids
+            || has_duplicate_ids(&request_ids)
+            || has_duplicate_ids(&step_ids)
+        {
+            return Err(RetainedResponseSerializationError::IncompleteGroup);
+        }
+
+        match self.head_step_id {
+            None => Ok(()),
+            Some(head_step_id) => {
+                let head_count = steps
+                    .iter()
+                    .filter(|payload| payload.step.parent_step_id.is_none())
+                    .count();
+                let has_declared_head = steps.iter().any(|payload| {
+                    payload.step.id == head_step_id && payload.step.parent_step_id.is_none()
+                });
+                if head_count != 1 || !has_declared_head {
+                    return Err(RetainedResponseSerializationError::IncompleteGroup);
+                }
+
+                let mut model_request_ids = Vec::new();
+                for payload in steps {
+                    let step = &payload.step;
+                    if step.id != head_step_id && step.parent_step_id != Some(head_step_id) {
+                        return Err(RetainedResponseSerializationError::IncompleteGroup);
+                    }
+                    if step
+                        .prev_step_id
+                        .is_some_and(|predecessor_id| !self.step_ids.contains(&predecessor_id))
+                    {
+                        return Err(RetainedResponseSerializationError::IncompleteGroup);
+                    }
+                    match (step.step_kind, step.request_id) {
+                        (StepKind::ModelCall, Some(request_id)) => {
+                            model_request_ids.push(request_id)
+                        }
+                        (StepKind::ToolCall, None) => {}
+                        _ => return Err(RetainedResponseSerializationError::IncompleteGroup),
+                    }
+                }
+                if has_duplicate_ids(&model_request_ids)
+                    || !same_id_set(&model_request_ids, &self.request_ids)
+                {
+                    return Err(RetainedResponseSerializationError::IncompleteGroup);
+                }
+                Ok(())
+            }
+        }
+    }
+
     /// Compose a tagged group header and every member payload after proving the
     /// supplied member lists are exact. This is representation-only: callers
     /// still own database locking and the all-or-nothing move transaction.
@@ -421,31 +815,7 @@ impl RetainedGroup {
         steps: Vec<RetainedStepPayloadV1>,
     ) -> std::result::Result<Vec<RetainedResponseObjectRow>, RetainedResponseSerializationError>
     {
-        let request_ids = requests
-            .iter()
-            .map(|payload| payload.request.id)
-            .collect::<Vec<_>>();
-        let step_ids = steps
-            .iter()
-            .map(|payload| payload.step.id)
-            .collect::<Vec<_>>();
-        let complete = group.request_ids == request_ids
-            && group.step_ids == step_ids
-            && !has_duplicate_ids(&group.request_ids)
-            && !has_duplicate_ids(&group.step_ids)
-            && match group.head_step_id {
-                Some(head_step_id) => {
-                    group.group_id == head_step_id && group.step_ids.contains(&head_step_id)
-                }
-                None => {
-                    group.step_ids.is_empty()
-                        && group.request_ids.len() == 1
-                        && group.request_ids[0] == group.group_id
-                }
-            };
-        if !complete {
-            return Err(RetainedResponseSerializationError::IncompleteGroup);
-        }
+        group.validate_members(&requests, &steps)?;
 
         let mut rows = Vec::with_capacity(1 + requests.len() + steps.len());
         rows.push(RetainedResponseObjectRow::group(delete_on, &group)?);
@@ -485,6 +855,14 @@ fn has_duplicate_ids(ids: &[Uuid]) -> bool {
     let mut ids = ids.to_vec();
     ids.sort_unstable();
     ids.windows(2).any(|pair| pair[0] == pair[1])
+}
+
+fn same_id_set(left: &[Uuid], right: &[Uuid]) -> bool {
+    let mut left = left.to_vec();
+    let mut right = right.to_vec();
+    left.sort_unstable();
+    right.sort_unstable();
+    left == right
 }
 
 /// A typed row in `retained_response_objects` before it is bound to SQLx.
@@ -553,7 +931,11 @@ impl RetainedResponseObjectRow {
             terminal_at: payload.request.terminal_at()?,
             step_sequence: None,
             schema_version: RETAINED_RESPONSE_SCHEMA_V1,
-            payload: to_payload(payload)?,
+            payload: to_payload(&RetainedRequestPayloadEnvelopeV1 {
+                group_id,
+                head_step_id,
+                payload: payload.clone(),
+            })?,
         })
     }
 
@@ -578,7 +960,11 @@ impl RetainedResponseObjectRow {
             terminal_at: payload.step.terminal_at(),
             step_sequence: Some(payload.step.step_sequence),
             schema_version: RETAINED_RESPONSE_SCHEMA_V1,
-            payload: to_payload(payload)?,
+            payload: to_payload(&RetainedStepPayloadEnvelopeV1 {
+                group_id,
+                head_step_id,
+                payload: payload.clone(),
+            })?,
         })
     }
 
@@ -657,6 +1043,7 @@ impl RetainedResponseObjectRow {
         {
             return Err(RetainedResponseSerializationError::RowMetadataMismatch);
         }
+        group.validate_header()?;
         Ok(group)
     }
 
@@ -664,9 +1051,12 @@ impl RetainedResponseObjectRow {
         &self,
     ) -> std::result::Result<RetainedRequestPayloadV1, RetainedResponseSerializationError> {
         self.require_kind(RetainedObjectKind::Request)?;
-        let payload: RetainedRequestPayloadV1 = self.decode_payload()?;
+        let envelope: RetainedRequestPayloadEnvelopeV1 = self.decode_payload()?;
+        let payload = envelope.payload;
         payload.validate()?;
-        if self.object_id != payload.request.id
+        if self.group_id != envelope.group_id
+            || self.head_step_id != envelope.head_step_id
+            || self.object_id != payload.request.id
             || self.request_id != Some(payload.request.id)
             || self.created_by != payload.request.created_by
             || self.service_tier != payload.request.service_tier
@@ -685,8 +1075,11 @@ impl RetainedResponseObjectRow {
         &self,
     ) -> std::result::Result<RetainedStepPayloadV1, RetainedResponseSerializationError> {
         self.require_kind(RetainedObjectKind::Step)?;
-        let payload: RetainedStepPayloadV1 = self.decode_payload()?;
-        if self.object_id != payload.step.id
+        let envelope: RetainedStepPayloadEnvelopeV1 = self.decode_payload()?;
+        let payload = envelope.payload;
+        if self.group_id != envelope.group_id
+            || self.head_step_id != envelope.head_step_id
+            || self.object_id != payload.step.id
             || self.request_id != payload.step.request_id
             || self.created_by.is_some()
             || self.service_tier.is_some()
@@ -877,6 +1270,49 @@ mod tests {
             created_at: timestamp("2030-01-02T03:04:12.000000Z"),
             updated_at: timestamp("2030-01-02T03:04:14.000002Z"),
         }
+    }
+
+    fn other_request_id() -> Uuid {
+        Uuid::from_u128(0x66666666666666666666666666666666)
+    }
+
+    fn other_template_id() -> Uuid {
+        Uuid::from_u128(0x77777777777777777777777777777777)
+    }
+
+    fn other_step_id() -> Uuid {
+        Uuid::from_u128(0x88888888888888888888888888888888)
+    }
+
+    fn other_group_id() -> Uuid {
+        Uuid::from_u128(0x99999999999999999999999999999999)
+    }
+
+    fn other_request_payload() -> RetainedRequestPayloadV1 {
+        let mut payload = request_payload();
+        payload.request.id = other_request_id();
+        payload.request.template_id = Some(other_template_id());
+        payload.template.id = other_template_id();
+        payload
+    }
+
+    fn complete_multi_step_group() -> (
+        RetainedGroup,
+        RetainedRequestPayloadV1,
+        RetainedStepPayloadV1,
+        RetainedStepPayloadV1,
+    ) {
+        (
+            RetainedGroup {
+                group_id: group_id(),
+                head_step_id: Some(model_step_id()),
+                request_ids: vec![request_id()],
+                step_ids: vec![model_step_id(), tool_step_id()],
+            },
+            request_payload(),
+            RetainedStepPayloadV1::from_response_step(&model_step()),
+            RetainedStepPayloadV1::from_response_step(&tool_step()),
+        )
     }
 
     #[test]
@@ -1097,6 +1533,337 @@ mod tests {
         )
         .expect_err("missing a step from the header must fail closed");
         assert_eq!(error, RetainedResponseSerializationError::IncompleteGroup);
+    }
+
+    #[test]
+    fn group_decoder_rejects_duplicate_request_and_step_ids() {
+        // Mutation caught: accepting duplicate IDs in an archived group header
+        // can make one graph member appear as two independently routed rows.
+        let (group, _, _, _) = complete_multi_step_group();
+        let row = RetainedResponseObjectRow::group(delete_on(), &group)
+            .expect("group fixture must encode");
+
+        let mut duplicate_request = row.clone();
+        duplicate_request.payload["request_ids"] = json!([request_id(), request_id()]);
+        let request_error = duplicate_request
+            .decode_group()
+            .expect_err("duplicate request IDs must fail closed");
+        assert_eq!(
+            request_error,
+            RetainedResponseSerializationError::IncompleteGroup
+        );
+
+        let mut duplicate_step = row;
+        duplicate_step.payload["step_ids"] = json!([model_step_id(), model_step_id()]);
+        let step_error = duplicate_step
+            .decode_group()
+            .expect_err("duplicate step IDs must fail closed");
+        assert_eq!(
+            step_error,
+            RetainedResponseSerializationError::IncompleteGroup
+        );
+    }
+
+    #[test]
+    fn compose_rows_rejects_zero_or_multiple_logical_heads() {
+        // Mutation caught: a group with no unique root cannot be reconstructed
+        // as the public response chain identified by its head step.
+        let (group, request, mut model, tool) = complete_multi_step_group();
+        model.step.parent_step_id = Some(model_step_id());
+        let no_head = RetainedGroup::compose_rows(
+            delete_on(),
+            group.clone(),
+            vec![request.clone()],
+            vec![model, tool.clone()],
+        )
+        .expect_err("a multi-step group must contain its declared root");
+        assert_eq!(no_head, RetainedResponseSerializationError::IncompleteGroup);
+
+        let mut second_head = tool;
+        second_head.step.parent_step_id = None;
+        let multiple_heads = RetainedGroup::compose_rows(
+            delete_on(),
+            group,
+            vec![request],
+            vec![
+                RetainedStepPayloadV1::from_response_step(&model_step()),
+                second_head,
+            ],
+        )
+        .expect_err("a multi-step group must have exactly one root");
+        assert_eq!(
+            multiple_heads,
+            RetainedResponseSerializationError::IncompleteGroup
+        );
+    }
+
+    #[test]
+    fn compose_rows_rejects_foreign_parent_and_predecessor_links() {
+        // Mutation caught: accepting an edge that leaves the group permits a
+        // partial archived graph while the linked member remains live.
+        let (group, request, model, mut tool) = complete_multi_step_group();
+        tool.step.parent_step_id = Some(other_step_id());
+        let foreign_parent = RetainedGroup::compose_rows(
+            delete_on(),
+            group.clone(),
+            vec![request.clone()],
+            vec![model.clone(), tool],
+        )
+        .expect_err("every descendant must name the declared head as parent");
+        assert_eq!(
+            foreign_parent,
+            RetainedResponseSerializationError::IncompleteGroup
+        );
+
+        let mut mismatched_parent = RetainedStepPayloadV1::from_response_step(&tool_step());
+        mismatched_parent.step.parent_step_id = Some(tool_step_id());
+        let nonhead_parent = RetainedGroup::compose_rows(
+            delete_on(),
+            group.clone(),
+            vec![request.clone()],
+            vec![model.clone(), mismatched_parent],
+        )
+        .expect_err("every nonhead must name the declared head as parent");
+        assert_eq!(
+            nonhead_parent,
+            RetainedResponseSerializationError::IncompleteGroup
+        );
+
+        let mut tool = RetainedStepPayloadV1::from_response_step(&tool_step());
+        tool.step.prev_step_id = Some(other_step_id());
+        let foreign_predecessor =
+            RetainedGroup::compose_rows(delete_on(), group, vec![request], vec![model, tool])
+                .expect_err("a predecessor outside the group must fail closed");
+        assert_eq!(
+            foreign_predecessor,
+            RetainedResponseSerializationError::IncompleteGroup
+        );
+    }
+
+    #[test]
+    fn compose_rows_requires_a_one_to_one_model_request_membership() {
+        // Mutation caught: model steps can only represent their own backing
+        // request, while tool steps intentionally carry no request ID.
+        let (group, request, model, mut tool) = complete_multi_step_group();
+        tool.step.step_kind = StepKind::ModelCall;
+        tool.step.request_id = Some(request_id());
+        let duplicate_model_request = RetainedGroup::compose_rows(
+            delete_on(),
+            group.clone(),
+            vec![request.clone()],
+            vec![model.clone(), tool],
+        )
+        .expect_err("one request must not back multiple model steps");
+        assert_eq!(
+            duplicate_model_request,
+            RetainedResponseSerializationError::IncompleteGroup
+        );
+
+        let mut foreign_model = RetainedStepPayloadV1::from_response_step(&tool_step());
+        foreign_model.step.step_kind = StepKind::ModelCall;
+        foreign_model.step.request_id = Some(other_request_id());
+        let missing_request = RetainedGroup::compose_rows(
+            delete_on(),
+            group.clone(),
+            vec![request.clone()],
+            vec![model.clone(), foreign_model],
+        )
+        .expect_err("every model request ID must be a retained request member");
+        assert_eq!(
+            missing_request,
+            RetainedResponseSerializationError::IncompleteGroup
+        );
+
+        let mut extra_group = group;
+        extra_group.request_ids.push(other_request_id());
+        let unrepresented_request = RetainedGroup::compose_rows(
+            delete_on(),
+            extra_group,
+            vec![request, other_request_payload()],
+            vec![
+                model,
+                RetainedStepPayloadV1::from_response_step(&tool_step()),
+            ],
+        )
+        .expect_err("every retained request must belong to a model step");
+        assert_eq!(
+            unrepresented_request,
+            RetainedResponseSerializationError::IncompleteGroup
+        );
+    }
+
+    #[test]
+    fn request_and_step_decoders_reject_group_or_head_routing_tampering() {
+        // Mutation caught: changing only indexed route columns must not attach
+        // an otherwise valid content payload to another response graph.
+        let (group, request, model, tool) = complete_multi_step_group();
+        let rows =
+            RetainedGroup::compose_rows(delete_on(), group, vec![request], vec![model, tool])
+                .expect("complete group must compose");
+
+        let request_group_tamper = RetainedResponseObjectRow {
+            group_id: other_group_id(),
+            ..rows[1].clone()
+        }
+        .decode_request()
+        .expect_err("request rows must bind their group in payload");
+        assert_eq!(
+            request_group_tamper,
+            RetainedResponseSerializationError::RowMetadataMismatch
+        );
+
+        let mut request_payload_tamper = rows[1].clone();
+        request_payload_tamper.payload["group_id"] = json!(other_group_id());
+        let request_payload_error = request_payload_tamper
+            .decode_request()
+            .expect_err("request payload routing must match its row");
+        assert_eq!(
+            request_payload_error,
+            RetainedResponseSerializationError::RowMetadataMismatch
+        );
+
+        let step_head_tamper = RetainedResponseObjectRow {
+            head_step_id: Some(other_step_id()),
+            ..rows[2].clone()
+        }
+        .decode_step()
+        .expect_err("step rows must bind their head in payload");
+        assert_eq!(
+            step_head_tamper,
+            RetainedResponseSerializationError::RowMetadataMismatch
+        );
+
+        let mut step_payload_tamper = rows[2].clone();
+        step_payload_tamper.payload["head_step_id"] = json!(other_step_id());
+        let step_payload_error = step_payload_tamper
+            .decode_step()
+            .expect_err("step payload routing must match its row");
+        assert_eq!(
+            step_payload_error,
+            RetainedResponseSerializationError::RowMetadataMismatch
+        );
+    }
+
+    #[test]
+    fn decoders_distinguish_missing_nullable_fields_from_explicit_null() {
+        // Mutation caught: derive-based Option deserialization turns a
+        // truncated V1 field into None, making a malformed archive look valid.
+        let request = request_payload();
+        let request_row =
+            RetainedResponseObjectRow::request(delete_on(), group_id(), None, &request)
+                .expect("request fixture must encode");
+
+        let mut explicit_request_null = request_row.clone();
+        explicit_request_null.payload["request"]["response_body"] = serde_json::Value::Null;
+        explicit_request_null
+            .decode_request()
+            .expect("an explicit nullable request null must decode");
+        let mut missing_request_nullable = request_row.clone();
+        missing_request_nullable.payload["request"]
+            .as_object_mut()
+            .expect("request fixture is an object")
+            .remove("response_body");
+        let missing_request = missing_request_nullable
+            .decode_request()
+            .expect_err("an omitted nullable request field must fail closed");
+        assert_eq!(
+            missing_request,
+            RetainedResponseSerializationError::MalformedPayload
+        );
+
+        let mut explicit_template_null = request_row.clone();
+        explicit_template_null.payload["template"]["metadata"] = serde_json::Value::Null;
+        explicit_template_null
+            .decode_request()
+            .expect("an explicit nullable template null must decode");
+        let mut missing_template_nullable = request_row;
+        missing_template_nullable.payload["template"]
+            .as_object_mut()
+            .expect("template fixture is an object")
+            .remove("metadata");
+        let missing_template = missing_template_nullable
+            .decode_request()
+            .expect_err("an omitted nullable template field must fail closed");
+        assert_eq!(
+            missing_template,
+            RetainedResponseSerializationError::MalformedPayload
+        );
+
+        let step = RetainedStepPayloadV1::from_response_step(&tool_step());
+        let step_row =
+            RetainedResponseObjectRow::step(delete_on(), group_id(), Some(model_step_id()), &step)
+                .expect("step fixture must encode");
+        let mut explicit_step_null = step_row.clone();
+        explicit_step_null.payload["step"]["prev_step_id"] = serde_json::Value::Null;
+        explicit_step_null
+            .decode_step()
+            .expect("an explicit nullable step null must decode");
+        let mut missing_step_predecessor = step_row.clone();
+        missing_step_predecessor.payload["step"]
+            .as_object_mut()
+            .expect("step fixture is an object")
+            .remove("prev_step_id");
+        let missing_predecessor = missing_step_predecessor
+            .decode_step()
+            .expect_err("an omitted nullable predecessor must fail closed");
+        assert_eq!(
+            missing_predecessor,
+            RetainedResponseSerializationError::MalformedPayload
+        );
+
+        let mut missing_step_response = step_row;
+        missing_step_response.payload["step"]
+            .as_object_mut()
+            .expect("step fixture is an object")
+            .remove("response_payload");
+        let missing_response = missing_step_response
+            .decode_step()
+            .expect_err("an omitted nullable response payload must fail closed");
+        assert_eq!(
+            missing_response,
+            RetainedResponseSerializationError::MalformedPayload
+        );
+
+        let mut missing_request_route =
+            RetainedResponseObjectRow::request(delete_on(), group_id(), None, &request_payload())
+                .expect("request fixture must encode");
+        missing_request_route
+            .payload
+            .as_object_mut()
+            .expect("request fixture is an object")
+            .remove("head_step_id");
+        let missing_route = missing_request_route
+            .decode_request()
+            .expect_err("an omitted nullable route field must fail closed");
+        assert_eq!(
+            missing_route,
+            RetainedResponseSerializationError::MalformedPayload
+        );
+
+        let group = RetainedGroup {
+            group_id: request_id(),
+            head_step_id: None,
+            request_ids: vec![request_id()],
+            step_ids: Vec::new(),
+        };
+        let group_row = RetainedResponseObjectRow::group(delete_on(), &group)
+            .expect("request-only group fixture must encode");
+        group_row
+            .decode_group()
+            .expect("an explicit nullable group head must decode");
+        let mut missing_group_head = group_row;
+        missing_group_head
+            .payload
+            .as_object_mut()
+            .expect("group fixture is an object")
+            .remove("head_step_id");
+        let missing_head = missing_group_head
+            .decode_group()
+            .expect_err("an omitted nullable group head must fail closed");
+        assert_eq!(
+            missing_head,
+            RetainedResponseSerializationError::MalformedPayload
+        );
     }
 
     #[test]
