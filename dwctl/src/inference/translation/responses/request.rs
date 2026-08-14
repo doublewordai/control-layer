@@ -11,7 +11,6 @@ use super::types::{
     ContentPart, Include, Input, Item, MessageContent as ResponseMessageContent, ReasoningContent, ResponsesRequest,
     StopSequence as ResponsesStopSequence, TextConfig, Tool as ResponseTool, ToolChoice as ResponseToolChoice,
 };
-use super::{TranslationError, reasoning_token::ReasoningTokenCodec};
 use onwards::strict::schemas::chat_completions::{
     ChatCompletionRequest, ChatMessage, ContentPart as ChatContentPart, FunctionCall, FunctionDefinition, ImageUrl, MessageContent,
     ResponseFormat, StopSequence as ChatStopSequence, StreamOptions, Tool as ChatTool, ToolCall, ToolChoice as ChatToolChoice,
@@ -22,12 +21,8 @@ use tracing::{debug, warn};
 /// Convert a (fully hydrated) Responses request into a Chat Completions request.
 ///
 /// Any `previous_response_id` context has already been inlined into
-/// `request.input` by the hydration stage. Encrypted reasoning items are opened
-/// here because the canonical Chat Completions request needs their plaintext.
-pub fn to_chat_request(
-    request: &ResponsesRequest,
-    reasoning_codec: Option<&ReasoningTokenCodec>,
-) -> Result<ChatCompletionRequest, TranslationError> {
+/// `request.input` by the hydration stage.
+pub fn to_chat_request(request: &ResponsesRequest) -> ChatCompletionRequest {
     let mut messages: Vec<ChatMessage> = Vec::new();
 
     // System message from instructions leads the conversation.
@@ -45,14 +40,14 @@ pub fn to_chat_request(
         });
     }
 
-    messages.extend(input_to_messages(&request.input, &request.model, reasoning_codec)?);
+    messages.extend(input_to_messages(&request.input));
 
     let tools = request.tools.as_ref().map(|t| convert_tools(t));
     let tool_choice = request.tool_choice.as_ref().map(convert_tool_choice);
 
     let include_logprobs = request.includes(Include::MessageOutputTextLogprobs);
 
-    Ok(ChatCompletionRequest {
+    ChatCompletionRequest {
         model: request.model.clone(),
         messages,
         temperature: request.temperature,
@@ -84,17 +79,13 @@ pub fn to_chat_request(
         response_format: convert_text_format_to_response_format(request.text.as_ref()),
         service_tier: None,
         extra: None,
-    })
+    }
 }
 
 /// Convert Responses API input to Chat Completions messages.
-fn input_to_messages(
-    input: &Input,
-    model: &str,
-    reasoning_codec: Option<&ReasoningTokenCodec>,
-) -> Result<Vec<ChatMessage>, TranslationError> {
+fn input_to_messages(input: &Input) -> Vec<ChatMessage> {
     match input {
-        Input::Text(text) => Ok(vec![ChatMessage {
+        Input::Text(text) => vec![ChatMessage {
             role: "user".to_string(),
             content: Some(MessageContent::Text(text.clone())),
             name: None,
@@ -104,8 +95,8 @@ fn input_to_messages(
             reasoning_content: None,
             reasoning_details: None,
             extra: None,
-        }]),
-        Input::Items(items) => items_to_messages(items, model, reasoning_codec),
+        }],
+        Input::Items(items) => items_to_messages(items),
     }
 }
 
@@ -113,11 +104,7 @@ fn input_to_messages(
 ///
 /// Also used by the hydration stage to fold a prior response's `output` items
 /// into the current request, which is why it lives on the request side.
-pub fn items_to_messages(
-    items: &[Item],
-    model: &str,
-    reasoning_codec: Option<&ReasoningTokenCodec>,
-) -> Result<Vec<ChatMessage>, TranslationError> {
+pub fn items_to_messages(items: &[Item]) -> Vec<ChatMessage> {
     let mut messages = Vec::new();
     let mut pending_reasoning: Option<String> = None;
 
@@ -205,25 +192,13 @@ pub fn items_to_messages(
                             .join("\n")
                     })
                     .unwrap_or_default();
-                let plaintext = if !plaintext_content.is_empty() {
-                    plaintext_content
-                } else if let Some(token) = reasoning.encrypted_content.as_deref() {
-                    let codec = reasoning_codec
-                        .ok_or_else(|| TranslationError::Internal("encrypted reasoning replay is not configured".to_string()))?;
-                    codec
-                        .open(token, model)
-                        .map_err(|_| TranslationError::BadRequest("invalid reasoning.encrypted_content replay token".to_string()))?
-                } else {
-                    String::new()
-                };
-
-                if !plaintext.is_empty() {
+                if !plaintext_content.is_empty() {
                     match pending_reasoning.as_mut() {
                         Some(pending) => {
                             pending.push('\n');
-                            pending.push_str(&plaintext);
+                            pending.push_str(&plaintext_content);
                         }
-                        None => pending_reasoning = Some(plaintext),
+                        None => pending_reasoning = Some(plaintext_content),
                     }
                 }
             }
@@ -234,7 +209,7 @@ pub fn items_to_messages(
     }
 
     flush_pending_reasoning(&mut messages, &mut pending_reasoning);
-    Ok(messages)
+    messages
 }
 
 fn flush_pending_reasoning(messages: &mut Vec<ChatMessage>, pending_reasoning: &mut Option<String>) {
@@ -377,7 +352,7 @@ mod tests {
     #[test]
     fn input_text_becomes_single_user_message() {
         let input = Input::Text("Hello".to_string());
-        let messages = input_to_messages(&input, "gpt-4o", None).unwrap();
+        let messages = input_to_messages(&input);
 
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].role, "user");
@@ -409,7 +384,7 @@ mod tests {
             }),
         ];
 
-        let messages = items_to_messages(&items, "gpt-4o", None).unwrap();
+        let messages = items_to_messages(&items);
 
         assert_eq!(messages.len(), 3);
         assert_eq!(messages[0].role, "user");
@@ -430,7 +405,7 @@ mod tests {
         }))
         .unwrap();
 
-        let chat = to_chat_request(&request, None).unwrap();
+        let chat = to_chat_request(&request);
 
         assert_eq!(chat.model, "gpt-4o");
         assert_eq!(chat.messages.len(), 2); // system + user
@@ -449,7 +424,7 @@ mod tests {
         }))
         .unwrap();
 
-        let chat = to_chat_request(&request, None).unwrap();
+        let chat = to_chat_request(&request);
         assert_eq!(chat.reasoning_effort.as_ref(), Some(&serde_json::json!("none")));
     }
 
@@ -463,7 +438,7 @@ mod tests {
         }))
         .unwrap();
 
-        let chat = to_chat_request(&request, None).unwrap();
+        let chat = to_chat_request(&request);
         assert_eq!(chat.logprobs, Some(true));
         assert_eq!(chat.top_logprobs, Some(3));
     }
@@ -491,7 +466,7 @@ mod tests {
         }))
         .unwrap();
 
-        let chat = to_chat_request(&request, None).unwrap();
+        let chat = to_chat_request(&request);
         assert_eq!(chat.messages[0].role, "assistant");
         assert_eq!(chat.messages[0].reasoning_content.as_deref(), Some("private chain"));
         assert_eq!(chat.messages[1].role, "user");
@@ -516,7 +491,7 @@ mod tests {
         }))
         .unwrap();
 
-        let chat = to_chat_request(&request, None).unwrap();
+        let chat = to_chat_request(&request);
         let rf = chat.response_format.expect("json_schema text format should be forwarded");
 
         assert_eq!(rf.format_type, "json_schema");
@@ -544,7 +519,7 @@ mod tests {
         }))
         .unwrap();
 
-        let chat = to_chat_request(&request, None).unwrap();
+        let chat = to_chat_request(&request);
         let rf = chat.response_format.expect("json_object text format should be forwarded");
 
         assert_eq!(rf.format_type, "json_object");
@@ -558,8 +533,7 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(
-            to_chat_request(&streaming, None)
-                .unwrap()
+            to_chat_request(&streaming)
                 .stream_options
                 .expect("set when streaming")
                 .include_usage,
@@ -570,6 +544,6 @@ mod tests {
             "model": "gpt-4o", "input": "Hello"
         }))
         .unwrap();
-        assert!(to_chat_request(&blocking, None).unwrap().stream_options.is_none());
+        assert!(to_chat_request(&blocking).stream_options.is_none());
     }
 }

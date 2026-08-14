@@ -1834,16 +1834,7 @@ pub async fn build_router(
             // the normalised path through onwards' catch-all (the same mechanism the
             // `/messages` translation already relies on). dwctl owns Responses in
             // both modes so id stamping, GET retrieval and hydration work uniformly.
-            std::sync::Arc::new(
-                config
-                    .connections
-                    .encryption_key
-                    .as_deref()
-                    .or(config.secret_key.as_deref())
-                    .filter(|secret| !secret.trim().is_empty())
-                    .map(crate::inference::translation::responses::OpenResponses::with_reasoning_secret)
-                    .unwrap_or_default(),
-            ),
+            std::sync::Arc::new(crate::inference::translation::responses::OpenResponses::new()),
         ];
         let translation_registry =
             crate::inference::translation::TranslationRegistry::new(translators).with_max_body_size(translation_body_limit);

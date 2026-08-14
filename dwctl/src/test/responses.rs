@@ -534,11 +534,11 @@ async fn test_zdr_previous_response_id_returns_contract_400(pool: PgPool) {
     assert_eq!(stored, 0, "rejected ZDR continuation must not create a lifecycle row");
 }
 
-/// Standard Responses include projections must be accepted instead of being
-/// silently ignored or rejected before the request reaches the translator.
+/// The supported logprobs projection must reach the translator instead of being
+/// silently ignored or rejected by the control plane.
 #[sqlx::test]
 #[test_log::test]
-async fn test_standard_include_is_accepted(pool: PgPool) {
+async fn test_output_logprobs_include_is_accepted(pool: PgPool) {
     let mock_server = wiremock::MockServer::start().await;
     mount_chat_completions_mock(&mock_server).await;
 
@@ -551,11 +551,89 @@ async fn test_standard_include_is_accepted(pool: PgPool) {
         .json(&serde_json::json!({
             "model": "gpt-4o",
             "input": "reason about this",
-            "include": ["reasoning.encrypted_content"]
+            "include": ["message.output_text.logprobs"]
         }))
         .await;
 
     assert_eq!(response.status_code(), 200);
+}
+
+/// Encrypted reasoning replay needs a durable sealing-key lifecycle that is
+/// distinct from the response key shredded on ZDR retrieval. Until that
+/// contract exists, reject the projection before any request state is created.
+#[sqlx::test]
+#[test_log::test]
+async fn test_encrypted_reasoning_include_returns_contract_400_before_lifecycle_creation(pool: PgPool) {
+    let mock_server = wiremock::MockServer::start().await;
+    mount_chat_completions_mock(&mock_server).await;
+
+    let (server, api_key, bg) = setup_ai_test(pool.clone(), &mock_server, true).await;
+    enable_zdr_for_key(&pool, &bg, &api_key).await;
+
+    let response = server
+        .post("/ai/v1/responses")
+        .add_header("Authorization", &format!("Bearer {}", api_key))
+        .add_header("Content-Type", "application/json")
+        .json(&serde_json::json!({
+            "model": "gpt-4o",
+            "input": "reason about this",
+            "include": ["reasoning.encrypted_content"]
+        }))
+        .await;
+
+    assert_eq!(response.status_code(), 400);
+    let body: serde_json::Value = response.json();
+    assert_eq!(body["error"]["code"], "unsupported_parameter");
+    assert_eq!(body["error"]["param"], "include");
+
+    let stored: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM fusillade.requests")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(stored, 0);
+}
+
+/// Client-carried encrypted reasoning items are the continuation half of the
+/// same unsupported feature and must also fail before lifecycle creation.
+#[sqlx::test]
+#[test_log::test]
+async fn test_encrypted_reasoning_replay_returns_contract_400_before_lifecycle_creation(pool: PgPool) {
+    let mock_server = wiremock::MockServer::start().await;
+    mount_chat_completions_mock(&mock_server).await;
+
+    let (server, api_key, bg) = setup_ai_test(pool.clone(), &mock_server, true).await;
+    enable_zdr_for_key(&pool, &bg, &api_key).await;
+
+    let response = server
+        .post("/ai/v1/responses")
+        .add_header("Authorization", &format!("Bearer {}", api_key))
+        .add_header("Content-Type", "application/json")
+        .json(&serde_json::json!({
+            "model": "gpt-4o",
+            "input": [
+                {
+                    "type": "reasoning",
+                    "encrypted_content": "opaque-client-carried-state"
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": "continue"
+                }
+            ]
+        }))
+        .await;
+
+    assert_eq!(response.status_code(), 400);
+    let body: serde_json::Value = response.json();
+    assert_eq!(body["error"]["code"], "unsupported_parameter");
+    assert_eq!(body["error"]["param"], "input");
+
+    let stored: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM fusillade.requests")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(stored, 0);
 }
 
 #[sqlx::test]

@@ -21,7 +21,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use super::reasoning_token::ReasoningTokenCodec;
 use super::types::{
     ContentPart, FunctionCallItem, Include, Item, ItemStatus, MessageContent, MessageItem, ReasoningContent, ReasoningItem, ResponseStatus,
     ResponseUsage, ResponsesRequest, ResponsesResponse, SummaryContent, TextConfig, TextFormat, TruncationStrategy,
@@ -51,8 +50,6 @@ pub struct StreamingState {
     usage: Option<ResponseUsage>,
     /// Original request parameters (for echoing back in response.completed)
     request: ResponsesRequest,
-    /// Stateless codec for optional encrypted reasoning replay tokens.
-    reasoning_codec: Option<ReasoningTokenCodec>,
     /// Maps choice_index → items-vec index for message items
     msg_item_for_choice: HashMap<usize, usize>,
     /// Maps (choice_index, tc_index) → items-vec index for function call items
@@ -110,7 +107,7 @@ impl StreamingState {
     /// tracking id (from the inference middleware); when present the stream's
     /// `response.created` id is `resp_<response_id>` so it matches the stored row
     /// and a later `GET /v1/responses/{id}` resolves. `None` self-generates.
-    pub fn new(request: &ResponsesRequest, response_id: Option<&str>, reasoning_codec: Option<ReasoningTokenCodec>) -> Self {
+    pub fn new(request: &ResponsesRequest, response_id: Option<&str>) -> Self {
         let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
 
         Self {
@@ -127,7 +124,6 @@ impl StreamingState {
             started: false,
             usage: None,
             request: request.clone(),
-            reasoning_codec,
             msg_item_for_choice: HashMap::new(),
             fn_call_item_for: HashMap::new(),
             reasoning_item_for_choice: HashMap::new(),
@@ -611,7 +607,7 @@ impl StreamingState {
                 content: Some(vec![ReasoningContent::Text {
                     text: summary_text.clone(),
                 }]),
-                encrypted_content: self.encrypted_reasoning(summary_text),
+                encrypted_content: None,
                 summary: Some(vec![SummaryContent::Text {
                     text: summary_text.clone(),
                 }]),
@@ -813,7 +809,7 @@ impl StreamingState {
                     content: Some(vec![ReasoningContent::Text {
                         text: summary_text.clone(),
                     }]),
-                    encrypted_content: self.encrypted_reasoning(summary_text),
+                    encrypted_content: None,
                     summary: Some(vec![SummaryContent::Text {
                         text: summary_text.clone(),
                     }]),
@@ -823,20 +819,6 @@ impl StreamingState {
             .collect();
 
         self.build_response_snapshot(ResponseStatus::Completed, output, self.usage.clone())
-    }
-
-    fn encrypted_reasoning(&self, reasoning: &str) -> Option<String> {
-        if !self.request.includes(Include::ReasoningEncryptedContent) {
-            return None;
-        }
-        let codec = self.reasoning_codec.as_ref()?;
-        match codec.seal(&self.model, reasoning) {
-            Ok(token) => Some(token),
-            Err(error) => {
-                tracing::error!(%error, "failed to create encrypted reasoning replay token");
-                None
-            }
-        }
     }
 }
 
@@ -1003,7 +985,7 @@ mod tests {
 
     #[test]
     fn test_streaming_state_initial_events() {
-        let mut state = StreamingState::new(&test_request("gpt-4"), None, None);
+        let mut state = StreamingState::new(&test_request("gpt-4"), None);
 
         // Role-only delta should only emit response.created (message item
         // is deferred until content arrives to avoid empty items)
@@ -1020,7 +1002,7 @@ mod tests {
 
     #[test]
     fn test_streaming_state_content_events() {
-        let mut state = StreamingState::new(&test_request("gpt-4"), None, None);
+        let mut state = StreamingState::new(&test_request("gpt-4"), None);
 
         // First chunk with role only — deferred, no message item yet
         let chunk1 = create_test_chunk("chunk_1", None, Some("assistant"), None);
@@ -1038,7 +1020,7 @@ mod tests {
 
     #[test]
     fn test_streaming_state_completion_events() {
-        let mut state = StreamingState::new(&test_request("gpt-4"), None, None);
+        let mut state = StreamingState::new(&test_request("gpt-4"), None);
 
         // First chunk
         let chunk1 = create_test_chunk("chunk_1", Some("Hi"), Some("assistant"), None);
@@ -1057,7 +1039,7 @@ mod tests {
     fn test_streaming_state_preserves_usage_token_details() {
         use onwards::strict::schemas::chat_completions::Usage;
 
-        let mut state = StreamingState::new(&test_request("gpt-4"), None, None);
+        let mut state = StreamingState::new(&test_request("gpt-4"), None);
 
         // Content delta (no usage yet).
         let chunk1 = create_test_chunk("chunk_1", Some("Hi"), Some("assistant"), None);
@@ -1091,7 +1073,7 @@ mod tests {
 
     #[test]
     fn test_streaming_state_finalize() {
-        let mut state = StreamingState::new(&test_request("gpt-4"), None, None);
+        let mut state = StreamingState::new(&test_request("gpt-4"), None);
 
         let chunk = create_test_chunk("chunk_1", Some("Hello"), Some("assistant"), Some("stop"));
         state.process_chunk(&chunk);
@@ -1140,7 +1122,7 @@ mod tests {
 
     #[test]
     fn test_sequence_numbers_increase() {
-        let mut state = StreamingState::new(&test_request("gpt-4"), None, None);
+        let mut state = StreamingState::new(&test_request("gpt-4"), None);
 
         let chunk1 = create_test_chunk("chunk_1", Some("Hello"), Some("assistant"), None);
         let events1 = state.process_chunk(&chunk1);
@@ -1208,7 +1190,7 @@ mod tests {
 
     #[test]
     fn test_extract_tool_calls() {
-        let mut state = StreamingState::new(&test_request("gpt-4"), None, None);
+        let mut state = StreamingState::new(&test_request("gpt-4"), None);
 
         // Stream a tool call: role, then tool call start, then arguments, then finish
         state.process_chunk(&create_tool_call_chunk("c1", Some("assistant"), None, None, None, None));
@@ -1232,7 +1214,7 @@ mod tests {
 
     #[test]
     fn test_extract_tool_calls_empty_when_no_tools() {
-        let mut state = StreamingState::new(&test_request("gpt-4"), None, None);
+        let mut state = StreamingState::new(&test_request("gpt-4"), None);
 
         // Plain text stream with no tool calls
         state.process_chunk(&create_test_chunk("c1", Some("Hi"), Some("assistant"), None));
@@ -1244,7 +1226,7 @@ mod tests {
 
     #[test]
     fn test_prepare_next_iteration() {
-        let mut state = StreamingState::new(&test_request("gpt-4"), None, None);
+        let mut state = StreamingState::new(&test_request("gpt-4"), None);
 
         // First iteration: one item
         state.process_chunk(&create_test_chunk("c1", Some("Hi"), Some("assistant"), Some("stop")));
@@ -1262,7 +1244,7 @@ mod tests {
 
     #[test]
     fn test_multi_iteration_item_ids_are_unique() {
-        let mut state = StreamingState::new(&test_request("gpt-4"), None, None);
+        let mut state = StreamingState::new(&test_request("gpt-4"), None);
 
         // First iteration
         state.process_chunk(&create_test_chunk("c1", Some("call result"), Some("assistant"), Some("tool_calls")));
@@ -1289,7 +1271,7 @@ mod tests {
 
     #[test]
     fn test_multi_iteration_output_indices() {
-        let mut state = StreamingState::new(&test_request("gpt-4"), None, None);
+        let mut state = StreamingState::new(&test_request("gpt-4"), None);
 
         // First iteration
         let events1 = state.process_chunk(&create_test_chunk("c1", Some("Hi"), Some("assistant"), None));
@@ -1318,7 +1300,7 @@ mod tests {
 
     #[test]
     fn test_multi_iteration_final_response_includes_all_items() {
-        let mut state = StreamingState::new(&test_request("gpt-4"), None, None);
+        let mut state = StreamingState::new(&test_request("gpt-4"), None);
 
         // First iteration
         state.process_chunk(&create_test_chunk("c1", Some("thinking..."), Some("assistant"), Some("tool_calls")));
@@ -1376,7 +1358,7 @@ mod tests {
 
     #[test]
     fn test_reasoning_only_stream_produces_reasoning_item() {
-        let mut state = StreamingState::new(&test_request("deepseek-r1"), None, None);
+        let mut state = StreamingState::new(&test_request("deepseek-r1"), None);
 
         // Stream reasoning deltas
         let events1 = state.process_chunk(&create_reasoning_chunk(
@@ -1420,7 +1402,7 @@ mod tests {
 
     #[test]
     fn test_reasoning_plus_content_stream() {
-        let mut state = StreamingState::new(&test_request("deepseek-r1"), None, None);
+        let mut state = StreamingState::new(&test_request("deepseek-r1"), None);
 
         // Reasoning phase (using reasoning_content field for vLLM)
         state.process_chunk(&create_reasoning_chunk(
@@ -1452,7 +1434,7 @@ mod tests {
 
     #[test]
     fn test_reasoning_stream_event_sequence() {
-        let mut state = StreamingState::new(&test_request("deepseek-r1"), None, None);
+        let mut state = StreamingState::new(&test_request("deepseek-r1"), None);
 
         // First reasoning chunk
         let events = state.process_chunk(&create_reasoning_chunk("c1", Some("step 1"), None, None, Some("assistant"), None));
@@ -1487,7 +1469,7 @@ mod tests {
         let mut request = test_request("gpt-4");
         request.include = Some(vec![Include::MessageOutputTextLogprobs]);
         request.top_logprobs = Some(2);
-        let mut state = StreamingState::new(&request, None, None);
+        let mut state = StreamingState::new(&request, None);
         let token_logprob = serde_json::json!({
             "token": "Hi",
             "logprob": -0.2,
@@ -1526,35 +1508,5 @@ mod tests {
             panic!("expected output text");
         };
         assert_eq!(logprobs, &vec![token_logprob]);
-    }
-
-    #[test]
-    fn streaming_encrypted_reasoning_include_returns_replay_token() {
-        let mut request = test_request("deepseek-r1");
-        request.include = Some(vec![Include::ReasoningEncryptedContent]);
-        let codec = ReasoningTokenCodec::from_secret("test secret");
-        let mut state = StreamingState::new(&request, None, Some(codec.clone()));
-        state.process_chunk(&create_reasoning_chunk(
-            "c1",
-            Some("private chain"),
-            None,
-            None,
-            Some("assistant"),
-            Some("stop"),
-        ));
-
-        let completed = state
-            .finalize()
-            .into_iter()
-            .find(|event| event.event_type == "response.completed")
-            .expect("response completed");
-        let StreamingEventData::ResponseCompleted { response } = completed.data else {
-            panic!("expected completed response");
-        };
-        let Item::Reasoning(reasoning) = &response.output[0] else {
-            panic!("expected reasoning output");
-        };
-        let token = reasoning.encrypted_content.as_deref().expect("encrypted token included");
-        assert_eq!(codec.open(token, "deepseek-r1").unwrap(), "private chain");
     }
 }

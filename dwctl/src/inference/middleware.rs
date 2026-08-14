@@ -144,16 +144,43 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
     // clearer for callers, this avoids turning an unavailable/minimal stored
     // object into a hydration 5xx.
     let zdr = crate::inference::zdr::is_zdr_request(&state.zdr_key_cache, api_key.as_deref());
-    if is_responses_api
-        && let Some(include) = request_value.get("include")
-        && !include.is_null()
-        && serde_json::from_value::<Vec<crate::inference::translation::responses::types::Include>>(include.clone()).is_err()
-    {
-        return invalid_request_response(
-            "include must contain only supported Responses API projection values",
-            "invalid_parameter",
-            "include",
-        );
+    if is_responses_api {
+        if let Some(include) = request_value.get("include")
+            && !include.is_null()
+        {
+            let Ok(include) = serde_json::from_value::<Vec<crate::inference::translation::responses::types::Include>>(include.clone())
+            else {
+                return invalid_request_response(
+                    "include must contain only supported Responses API projection values",
+                    "invalid_parameter",
+                    "include",
+                );
+            };
+            if include.contains(&crate::inference::translation::responses::types::Include::ReasoningEncryptedContent) {
+                return invalid_request_response(
+                    "reasoning.encrypted_content is not supported by this Responses API implementation",
+                    "unsupported_parameter",
+                    "include",
+                );
+            }
+        }
+
+        let has_encrypted_reasoning_replay = request_value
+            .get("input")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|items| {
+                items.iter().any(|item| {
+                    item.get("type").and_then(serde_json::Value::as_str) == Some("reasoning")
+                        && item.get("encrypted_content").is_some_and(|value| !value.is_null())
+                })
+            });
+        if has_encrypted_reasoning_replay {
+            return invalid_request_response(
+                "encrypted reasoning item replay is not supported by this Responses API implementation",
+                "unsupported_parameter",
+                "input",
+            );
+        }
     }
     if is_responses_api && zdr && request_value.get("previous_response_id").is_some_and(|id| !id.is_null()) {
         return invalid_request_response(
