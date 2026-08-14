@@ -1,8 +1,9 @@
 //! PostgreSQL implementation of [`ResponseStepStore`].
 //!
 //! Mirrors the structural patterns of [`PostgresRequestManager`]: a thin
-//! wrapper over a [`PoolProvider`] using runtime-checked `sqlx::query()`
-//! against the `response_steps` table.
+//! wrapper over a [`PoolProvider`] using runtime-checked `sqlx::query()`.
+//! Point reads resolve the live table first and then exact active retained
+//! routes; lifecycle mutations remain live-only.
 
 use anyhow::anyhow;
 use async_trait::async_trait;
@@ -17,6 +18,19 @@ use crate::response_step::{
 };
 
 pub use sqlx_pool_router::PoolProvider;
+
+/// Content-free conflict returned when a response-step mutation targets a
+/// graph that has already moved out of the live tables.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetainedResponseStepConflict;
+
+impl std::fmt::Display for RetainedResponseStepConflict {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Response step is already retained")
+    }
+}
+
+impl std::error::Error for RetainedResponseStepConflict {}
 
 /// PostgreSQL implementation of [`ResponseStepStore`].
 ///
@@ -57,6 +71,51 @@ impl<P: PoolProvider> PostgresResponseStepManager<P> {
 
     fn write_executor(&self) -> crate::db::RetryingPgPool {
         crate::db::RetryingPgPool::new(self.pools.write(), &self.db_retry_config)
+    }
+
+    async fn begin_primary_read(&self) -> Result<sqlx::Transaction<'static, sqlx::Postgres>> {
+        let mut tx = crate::db::begin_transaction(self.pools.write(), &self.db_retry_config)
+            .await
+            .map_err(|_| FusilladeError::Other(anyhow!("Failed to begin response-step read")))?;
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+            .execute(&mut *tx)
+            .await
+            .map_err(|_| {
+                FusilladeError::Other(anyhow!("Failed to configure response-step read"))
+            })?;
+        Ok(tx)
+    }
+
+    async fn retained_route_exists(
+        &self,
+        step_ids: &[Uuid],
+        request_id: Option<RequestId>,
+    ) -> Result<bool> {
+        sqlx::query_scalar(
+            r#"
+            SELECT EXISTS (
+                SELECT 1 FROM retained_response_step_routes WHERE step_id = ANY($1)
+                UNION ALL
+                SELECT 1 FROM retained_response_request_routes
+                WHERE $2::uuid IS NOT NULL AND request_id = $2
+            )
+            "#,
+        )
+        .bind(step_ids)
+        .bind(request_id.map(|id| id.0))
+        .fetch_one(self.write_executor())
+        .await
+        .map_err(|_| FusilladeError::Other(anyhow!("Failed to check retained response route")))
+    }
+
+    async fn retained_conflict(&self, step_id: StepId) -> Result<Option<FusilladeError>> {
+        self.retained_route_exists(&[step_id.0], None)
+            .await
+            .map(|exists| {
+                exists.then(|| {
+                    FusilladeError::Other(anyhow::Error::new(RetainedResponseStepConflict))
+                })
+            })
     }
 }
 
@@ -112,8 +171,20 @@ async fn fetch_state(executor: crate::db::RetryingPgPool, id: StepId) -> Result<
 impl<P: PoolProvider> ResponseStepStore for PostgresResponseStepManager<P> {
     async fn create_step(&self, input: CreateStepInput) -> Result<StepId> {
         let id = input.id.unwrap_or_else(Uuid::new_v4);
+        let mut linked_step_ids = vec![id];
+        linked_step_ids.extend(input.prev_step_id.map(|step| step.0));
+        linked_step_ids.extend(input.parent_step_id.map(|step| step.0));
 
-        sqlx::query(
+        if self
+            .retained_route_exists(&linked_step_ids, input.request_id)
+            .await?
+        {
+            return Err(FusilladeError::Other(anyhow::Error::new(
+                RetainedResponseStepConflict,
+            )));
+        }
+
+        let insert = sqlx::query(
             "INSERT INTO response_steps \
              (id, request_id, prev_step_id, parent_step_id, step_kind, step_sequence, request_payload) \
              VALUES ($1, $2, $3, $4, $5, $6, $7)",
@@ -126,25 +197,49 @@ impl<P: PoolProvider> ResponseStepStore for PostgresResponseStepManager<P> {
         .bind(input.step_sequence)
         .bind(&input.request_payload)
         .execute(self.write_executor())
-        .await
-        .map_err(|e| FusilladeError::Other(anyhow!("Failed to insert response_step: {}", e)))?;
+        .await;
+        if let Err(error) = insert {
+            // Movement may commit after the precheck while this INSERT waits
+            // on a request/parent FK. Recheck the exact content-free routes so
+            // that ordering still surfaces the stable retained conflict.
+            if self
+                .retained_route_exists(&linked_step_ids, input.request_id)
+                .await?
+            {
+                return Err(FusilladeError::Other(anyhow::Error::new(
+                    RetainedResponseStepConflict,
+                )));
+            }
+            return Err(FusilladeError::Other(anyhow!(
+                "Failed to insert response_step: {}",
+                error
+            )));
+        }
 
         Ok(StepId(id))
     }
 
     async fn get_step(&self, id: StepId) -> Result<Option<ResponseStep>> {
-        // Reads go through the primary pool; see the type-level doc for why.
+        let mut tx = self.begin_primary_read().await?;
         let query = format!("SELECT {} FROM response_steps WHERE id = $1", STEP_COLUMNS);
         let row = sqlx::query(&query)
             .bind(id.0)
-            .fetch_optional(self.write_executor())
+            .fetch_optional(&mut *tx)
             .await
-            .map_err(|e| FusilladeError::Other(anyhow!("Failed to fetch response_step: {}", e)))?;
+            .map_err(|_| FusilladeError::Other(anyhow!("Failed to fetch response step")))?;
 
-        row.as_ref().map(step_from_row).transpose()
+        let step = match row.as_ref().map(step_from_row).transpose()? {
+            Some(step) => Some(step),
+            None => crate::postgres::retained_response::get_step(&mut tx, id).await?,
+        };
+        tx.commit()
+            .await
+            .map_err(|_| FusilladeError::Other(anyhow!("Failed to finish response-step read")))?;
+        Ok(step)
     }
 
     async fn get_step_by_request(&self, request_id: RequestId) -> Result<Option<ResponseStep>> {
+        let mut tx = self.begin_primary_read().await?;
         // Uses response_steps_request_id_unique partial index for O(log n) lookup.
         let query = format!(
             "SELECT {} FROM response_steps WHERE request_id = $1",
@@ -152,16 +247,22 @@ impl<P: PoolProvider> ResponseStepStore for PostgresResponseStepManager<P> {
         );
         let row = sqlx::query(&query)
             .bind(request_id.0)
-            .fetch_optional(self.write_executor())
+            .fetch_optional(&mut *tx)
             .await
-            .map_err(|e| {
-                FusilladeError::Other(anyhow!(
-                    "Failed to fetch response_step by request_id: {}",
-                    e
-                ))
+            .map_err(|_| {
+                FusilladeError::Other(anyhow!("Failed to fetch response step by request"))
             })?;
 
-        row.as_ref().map(step_from_row).transpose()
+        let step = match row.as_ref().map(step_from_row).transpose()? {
+            Some(step) => Some(step),
+            None => {
+                crate::postgres::retained_response::get_step_by_request(&mut tx, request_id).await?
+            }
+        };
+        tx.commit()
+            .await
+            .map_err(|_| FusilladeError::Other(anyhow!("Failed to finish response-step read")))?;
+        Ok(step)
     }
 
     async fn list_chain(&self, head_step_id: StepId) -> Result<Vec<ResponseStep>> {
@@ -176,6 +277,7 @@ impl<P: PoolProvider> ResponseStepStore for PostgresResponseStepManager<P> {
         // The two sets are disjoint (the head's parent_step_id is NULL
         // by invariant, and descendants have a distinct id), so UNION
         // ALL — cheaper than UNION's dedup — is correct.
+        let mut tx = self.begin_primary_read().await?;
         let query = format!(
             "SELECT {cols} FROM response_steps WHERE id = $1 \
              UNION ALL \
@@ -185,11 +287,19 @@ impl<P: PoolProvider> ResponseStepStore for PostgresResponseStepManager<P> {
         );
         let rows = sqlx::query(&query)
             .bind(head_step_id.0)
-            .fetch_all(self.write_executor())
+            .fetch_all(&mut *tx)
             .await
-            .map_err(|e| FusilladeError::Other(anyhow!("Failed to list response_steps: {}", e)))?;
+            .map_err(|_| FusilladeError::Other(anyhow!("Failed to list response steps")))?;
 
-        rows.iter().map(step_from_row).collect()
+        let steps = if rows.is_empty() {
+            crate::postgres::retained_response::list_chain(&mut tx, head_step_id).await?
+        } else {
+            rows.iter().map(step_from_row).collect::<Result<Vec<_>>>()?
+        };
+        tx.commit()
+            .await
+            .map_err(|_| FusilladeError::Other(anyhow!("Failed to finish response-step read")))?;
+        Ok(steps)
     }
 
     async fn mark_step_processing(&self, id: StepId) -> Result<()> {
@@ -207,6 +317,9 @@ impl<P: PoolProvider> ResponseStepStore for PostgresResponseStepManager<P> {
             // Idempotent: the row may already be processing or terminal under
             // crash recovery; surface only if the row is genuinely missing.
             if fetch_state(self.write_executor(), id).await?.is_none() {
+                if let Some(conflict) = self.retained_conflict(id).await? {
+                    return Err(conflict);
+                }
                 return Err(FusilladeError::Other(anyhow!(
                     "response_step not found: {}",
                     id
@@ -239,7 +352,9 @@ impl<P: PoolProvider> ResponseStepStore for PostgresResponseStepManager<P> {
                     id,
                     state
                 )),
-                None => FusilladeError::Other(anyhow!("response_step not found: {}", id)),
+                None => self.retained_conflict(id).await?.unwrap_or_else(|| {
+                    FusilladeError::Other(anyhow!("response_step not found: {}", id))
+                }),
             });
         }
 
@@ -268,7 +383,9 @@ impl<P: PoolProvider> ResponseStepStore for PostgresResponseStepManager<P> {
                     id,
                     state
                 )),
-                None => FusilladeError::Other(anyhow!("response_step not found: {}", id)),
+                None => self.retained_conflict(id).await?.unwrap_or_else(|| {
+                    FusilladeError::Other(anyhow!("response_step not found: {}", id))
+                }),
             });
         }
 
@@ -295,7 +412,9 @@ impl<P: PoolProvider> ResponseStepStore for PostgresResponseStepManager<P> {
                     id,
                     state
                 )),
-                None => FusilladeError::Other(anyhow!("response_step not found: {}", id)),
+                None => self.retained_conflict(id).await?.unwrap_or_else(|| {
+                    FusilladeError::Other(anyhow!("response_step not found: {}", id))
+                }),
             });
         }
 
@@ -323,7 +442,9 @@ impl<P: PoolProvider> ResponseStepStore for PostgresResponseStepManager<P> {
                     id,
                     state
                 )),
-                None => FusilladeError::Other(anyhow!("response_step not found: {}", id)),
+                None => self.retained_conflict(id).await?.unwrap_or_else(|| {
+                    FusilladeError::Other(anyhow!("response_step not found: {}", id))
+                }),
             });
         }
 

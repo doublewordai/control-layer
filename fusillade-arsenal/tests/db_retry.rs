@@ -198,6 +198,18 @@ async fn response_step_manager_retries_pool_acquisition_for_sqlx_queries() {
         .connect(&database_url())
         .await
         .unwrap();
+    // This retry-only test uses the shared developer database rather than the
+    // sqlx test harness, so provide the additive route tables introduced after
+    // that database's baseline. Temporary tables live on the pool's sole
+    // connection and keep the fixture isolated from the shared schema.
+    sqlx::query("CREATE TEMP TABLE retained_response_step_routes (step_id uuid PRIMARY KEY)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("CREATE TEMP TABLE retained_response_request_routes (request_id uuid PRIMARY KEY)")
+        .execute(&pool)
+        .await
+        .unwrap();
     let manager = PostgresResponseStepManager::new(LazyPools(pool.clone())).with_db_retry_config(
         DbRetryConfig::new(vec![
             Duration::from_millis(25),

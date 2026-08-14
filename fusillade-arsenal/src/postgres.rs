@@ -1396,42 +1396,9 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         &self,
         owner: &str,
         cutoff: DateTime<Utc>,
-        strict: bool,
+        _strict: bool,
     ) -> Result<i64> {
-        let executor = if strict {
-            self.write_executor()
-        } else {
-            self.read_executor()
-        };
-
-        // created_by IS NOT NULL ⟺ batch_id IS NULL (requests_attribution_xor),
-        // so filtering created_by already restricts to batchless rows. Served by
-        // idx_requests_user_created_sort: seek created_by, range created_at.
-        // service_tier = 'flex' is a residual filter, not a scan bound (it sits
-        // after the created_at range column in the index), but it stays in the
-        // index so the count can be served index-only without a heap fetch.
-        let count = sqlx::query_scalar!(
-            r#"
-            SELECT COUNT(*) AS "count!"
-            FROM requests
-            WHERE created_by = $1
-              AND created_at >= $2
-              AND service_tier = 'flex'
-            "#,
-            owner,
-            cutoff,
-        )
-        .fetch_one(executor)
-        .await
-        .map_err(|e| {
-            FusilladeError::Other(anyhow!(
-                "Failed to count flex requests for creditor {}: {}",
-                owner,
-                e
-            ))
-        })?;
-
-        Ok(count)
+        retained_response::count_owner_flex_requests_since(self, owner, cutoff).await
     }
 
     async fn get_pending_request_counts_by_model_and_window(
@@ -1832,7 +1799,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         // the trailing partial indexes (idx_requests_completed_trailing /
         // idx_requests_failed_trailing), and bound the damage with the same
         // statement timeout.
-        let mut tx = self.begin_read().await.map_err(|e| {
+        let mut tx = self.begin_write().await.map_err(|e| {
             FusilladeError::Other(anyhow!(
                 "Failed to begin transaction for trailing request counts: {}",
                 e
@@ -1888,6 +1855,8 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
             let end_ts = now + chrono::Duration::seconds(*end);
             let rows = sqlx::query(
                 r#"
+                SELECT model, service_tier, outcome, SUM(count)::BIGINT AS count
+                FROM (
                 SELECT
                     r.model,
                     r.service_tier,
@@ -1943,6 +1912,120 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                     ))
                 )
                 GROUP BY r.model, r.service_tier
+                UNION ALL
+                SELECT
+                    retained.model,
+                    retained.service_tier,
+                    'completed'::text AS outcome,
+                    COUNT(*)::BIGINT AS count
+                FROM retained_response_buckets bucket
+                JOIN pg_namespace namespace
+                  ON namespace.nspname = bucket.partition_schema
+                JOIN pg_class child
+                  ON child.relnamespace = namespace.oid
+                 AND child.relname = bucket.partition_table
+                 AND child.oid = bucket.partition_oid
+                JOIN pg_inherits inheritance
+                  ON inheritance.inhrelid = child.oid
+                 AND NOT inheritance.inhdetachpending
+                JOIN retained_response_objects retained
+                  ON retained.delete_on = bucket.delete_on
+                 AND retained.object_kind = 'request'
+                JOIN retained_response_request_routes route
+                  ON route.request_id = retained.object_id
+                 AND route.group_id = retained.group_id
+                 AND route.delete_on = retained.delete_on
+                JOIN retained_response_group_routes group_route
+                  ON group_route.group_id = retained.group_id
+                 AND group_route.delete_on = retained.delete_on
+                WHERE bucket.state = 'active'
+                  AND bucket.partition_schema = current_schema()
+                  AND bucket.partition_table =
+                      'retained_response_objects_d' || to_char(bucket.delete_on, 'YYYYMMDD')
+                  AND inheritance.inhparent =
+                      to_regclass(format('%I.retained_response_objects', current_schema()))
+                  AND pg_get_expr(child.relpartbound, child.oid) = format(
+                      'FOR VALUES FROM (%L) TO (%L)', bucket.delete_on, bucket.delete_on + 1
+                  )
+                  AND retained.state = 'completed'
+                  AND retained.terminal_at >= $1
+                  AND retained.terminal_at < $2
+                  AND (cardinality($3::text[]) = 0 OR retained.model = ANY($3))
+                  AND retained.service_tier IS DISTINCT FROM 'background'
+                  AND (
+                      $6 = 'any'
+                      OR ($6 = 'include' AND (
+                          (retained.service_tier IS NOT NULL AND retained.service_tier = ANY($4))
+                          OR ($5 AND retained.service_tier IS NULL)
+                      ))
+                      OR ($6 = 'exclude' AND (
+                          (retained.service_tier IS NULL AND NOT $5)
+                          OR (retained.service_tier IS NOT NULL AND retained.service_tier <> ALL($4))
+                      ))
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM requests live
+                      WHERE live.id = retained.object_id AND live.created_by IS NOT NULL
+                  )
+                GROUP BY retained.model, retained.service_tier
+                UNION ALL
+                SELECT
+                    retained.model,
+                    retained.service_tier,
+                    'failed'::text AS outcome,
+                    COUNT(*)::BIGINT AS count
+                FROM retained_response_buckets bucket
+                JOIN pg_namespace namespace
+                  ON namespace.nspname = bucket.partition_schema
+                JOIN pg_class child
+                  ON child.relnamespace = namespace.oid
+                 AND child.relname = bucket.partition_table
+                 AND child.oid = bucket.partition_oid
+                JOIN pg_inherits inheritance
+                  ON inheritance.inhrelid = child.oid
+                 AND NOT inheritance.inhdetachpending
+                JOIN retained_response_objects retained
+                  ON retained.delete_on = bucket.delete_on
+                 AND retained.object_kind = 'request'
+                JOIN retained_response_request_routes route
+                  ON route.request_id = retained.object_id
+                 AND route.group_id = retained.group_id
+                 AND route.delete_on = retained.delete_on
+                JOIN retained_response_group_routes group_route
+                  ON group_route.group_id = retained.group_id
+                 AND group_route.delete_on = retained.delete_on
+                WHERE bucket.state = 'active'
+                  AND bucket.partition_schema = current_schema()
+                  AND bucket.partition_table =
+                      'retained_response_objects_d' || to_char(bucket.delete_on, 'YYYYMMDD')
+                  AND inheritance.inhparent =
+                      to_regclass(format('%I.retained_response_objects', current_schema()))
+                  AND pg_get_expr(child.relpartbound, child.oid) = format(
+                      'FOR VALUES FROM (%L) TO (%L)', bucket.delete_on, bucket.delete_on + 1
+                  )
+                  AND retained.state = 'failed'
+                  AND retained.terminal_at >= $1
+                  AND retained.terminal_at < $2
+                  AND (cardinality($3::text[]) = 0 OR retained.model = ANY($3))
+                  AND retained.service_tier IS DISTINCT FROM 'background'
+                  AND (
+                      $6 = 'any'
+                      OR ($6 = 'include' AND (
+                          (retained.service_tier IS NOT NULL AND retained.service_tier = ANY($4))
+                          OR ($5 AND retained.service_tier IS NULL)
+                      ))
+                      OR ($6 = 'exclude' AND (
+                          (retained.service_tier IS NULL AND NOT $5)
+                          OR (retained.service_tier IS NOT NULL AND retained.service_tier <> ALL($4))
+                      ))
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM requests live
+                      WHERE live.id = retained.object_id AND live.created_by IS NOT NULL
+                  )
+                GROUP BY retained.model, retained.service_tier
+                ) terminal_counts
+                GROUP BY model, service_tier, outcome
                 "#,
             )
             .bind(start_ts)
@@ -6298,186 +6381,20 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         Box::pin(ReceiverStream::new(rx))
     }
 
-    #[tracing::instrument(skip(self), fields(created_by = ?filter.created_by, limit = filter.limit))]
+    #[tracing::instrument(skip(self, filter))]
     async fn list_requests(
         &self,
         filter: crate::request::ListRequestsFilter,
     ) -> Result<crate::request::RequestListResult> {
-        if filter.skip < 0 {
-            return Err(FusilladeError::ValidationError(
-                "skip must be >= 0".to_string(),
-            ));
-        }
-        if filter.limit <= 0 {
-            return Err(FusilladeError::ValidationError(
-                "limit must be > 0".to_string(),
-            ));
-        }
-
-        // Listing is scoped to batchless rows (responses) — those carry
-        // `created_by` directly. Real-batch rows have created_by IS NULL and
-        // are filtered out so the planner can use the partial index
-        // `idx_requests_user_*_sort`.
-        let where_clause = r#"
-            WHERE r.created_by IS NOT NULL
-              AND ($1::text IS NULL OR r.created_by = $1)
-              AND ($2::text IS NULL OR r.state = $2)
-              AND ($3::text[] IS NULL OR r.model = ANY($3))
-              AND ($4::timestamptz IS NULL OR r.created_at >= $4)
-              AND ($5::timestamptz IS NULL OR r.created_at <= $5)
-              AND ($6::text[] IS NULL OR r.service_tier = ANY($6))
-        "#
-        .to_string();
-
-        // Total count: try exact COUNT(*) with a short statement_timeout so
-        // narrow / small result sets return an accurate number; fall back to
-        // the planner's row estimate (EXPLAIN Plan Rows) when the exact count
-        // would be too slow (e.g., counting tens of millions of rows). The
-        // estimate is accurate within a few percent when table statistics are
-        // up-to-date. See `RequestListResult.total_count` doc for semantics.
-        let count_sql = format!(
-            r#"
-            SELECT COUNT(*)::bigint
-            FROM requests r
-            {where_clause}
-            "#
-        );
-        let exact_count: Option<i64> = {
-            let mut tx = self
-                .begin_read()
-                .await
-                .map_err(|e| FusilladeError::Other(anyhow!("Failed to begin count tx: {}", e)))?;
-            sqlx::query("SET LOCAL statement_timeout = '100ms'")
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| {
-                    FusilladeError::Other(anyhow!("Failed to set statement_timeout: {}", e))
-                })?;
-            let count_result: std::result::Result<i64, sqlx::Error> =
-                sqlx::query_scalar(&count_sql)
-                    .bind(filter.created_by.as_deref())
-                    .bind(filter.status.as_deref())
-                    .bind(filter.models.as_deref())
-                    .bind(filter.created_after)
-                    .bind(filter.created_before)
-                    .bind(filter.service_tiers.as_deref())
-                    .fetch_one(&mut *tx)
-                    .await;
-            match count_result {
-                Ok(n) => Some(n),
-                // SQLSTATE 57014 = query_canceled (statement_timeout fired) —
-                // fall through to the planner estimate fallback.
-                Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("57014") => None,
-                Err(e) => {
-                    return Err(FusilladeError::Other(anyhow!(
-                        "Failed to count requests: {}",
-                        e
-                    )));
-                }
-            }
-        };
-
-        let total_count = if let Some(n) = exact_count {
-            n
-        } else {
-            let plan_json: serde_json::Value = sqlx::query_scalar(&format!(
-                r#"
-                EXPLAIN (FORMAT JSON)
-                SELECT 1
-                FROM requests r
-                {where_clause}
-                "#
-            ))
-            .bind(filter.created_by.as_deref())
-            .bind(filter.status.as_deref())
-            .bind(filter.models.as_deref())
-            .bind(filter.created_after)
-            .bind(filter.created_before)
-            .bind(filter.service_tiers.as_deref())
-            .fetch_one(self.read_executor())
-            .await
-            .map_err(|e| FusilladeError::Other(anyhow!("Failed to estimate count: {}", e)))?;
-
-            plan_json
-                .get(0)
-                .and_then(|p| p.get("Plan"))
-                .and_then(|p| p.get("Plan Rows"))
-                .and_then(|r| r.as_i64())
-                .unwrap_or(0)
-        };
-
-        let order_clause = if filter.active_first {
-            "CASE r.state WHEN 'processing' THEN 0 WHEN 'claimed' THEN 1 WHEN 'pending' THEN 2 ELSE 3 END ASC, r.created_at DESC, r.id DESC"
-        } else {
-            "r.created_at DESC, r.id DESC"
-        };
-
-        let data: Vec<crate::request::RequestSummary> = sqlx::query_as(&format!(
-            r#"
-            SELECT
-                r.id, r.batch_id, r.model, r.state, r.created_at,
-                r.completed_at, r.failed_at,
-                (CASE WHEN r.completed_at IS NOT NULL AND r.started_at IS NOT NULL
-                    THEN EXTRACT(EPOCH FROM (r.completed_at - r.started_at)) * 1000
-                    ELSE NULL END)::float8 as duration_ms,
-                r.response_status,
-                r.service_tier,
-                r.created_by
-            FROM requests r
-            {where_clause}
-            ORDER BY {order_clause}
-            LIMIT $7 OFFSET $8
-            "#
-        ))
-        .bind(filter.created_by.as_deref())
-        .bind(filter.status.as_deref())
-        .bind(filter.models.as_deref())
-        .bind(filter.created_after)
-        .bind(filter.created_before)
-        .bind(filter.service_tiers.as_deref())
-        .bind(filter.limit)
-        .bind(filter.skip)
-        .fetch_all(self.read_executor())
-        .await
-        .map_err(|e| FusilladeError::Other(anyhow!("Failed to list requests: {}", e)))?;
-
-        Ok(crate::request::RequestListResult { data, total_count })
+        retained_response::list_requests(self, filter).await
     }
 
-    #[tracing::instrument(skip(self), fields(request_id = %request_id.0))]
+    #[tracing::instrument(skip(self, request_id))]
     async fn get_request_detail(
         &self,
         request_id: crate::request::RequestId,
     ) -> Result<crate::request::RequestDetail> {
-        let detail: crate::request::RequestDetail = sqlx::query_as(
-            r#"
-            SELECT
-                r.id, r.batch_id, r.model, r.state, r.created_at,
-                r.completed_at, r.failed_at,
-                (CASE WHEN r.completed_at IS NOT NULL AND r.started_at IS NOT NULL
-                    THEN EXTRACT(EPOCH FROM (r.completed_at - r.started_at)) * 1000
-                    ELSE NULL END)::float8 as duration_ms,
-                r.response_status,
-                -- Null out template body when the parent file is soft-deleted.
-                -- Batchless responses use templates with file_id IS NULL, which
-                -- always return their body.
-                CASE WHEN f.deleted_at IS NULL OR t.file_id IS NULL
-                    THEN t.body ELSE NULL END as body,
-                r.response_body, r.error,
-                r.service_tier, r.created_by
-            FROM requests r
-            LEFT JOIN request_templates t ON r.template_id = t.id
-            LEFT JOIN files f ON t.file_id = f.id
-            WHERE r.id = $1 AND r.created_by IS NOT NULL
-            "#,
-        )
-        .bind(request_id.0)
-        .fetch_optional(self.read_executor())
-        .await
-        .map_err(|e| FusilladeError::Other(anyhow!("Failed to get request detail: {}", e)))?
-        .ok_or(FusilladeError::RequestNotFound(request_id))?;
-
-        Ok(detail)
+        retained_response::get_request_detail(self, request_id).await
     }
 
     #[tracing::instrument(level = "debug", skip(self, input), fields(request_id = %input.request_id))]
