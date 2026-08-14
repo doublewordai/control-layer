@@ -1398,6 +1398,8 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         cutoff: DateTime<Utc>,
         _strict: bool,
     ) -> Result<i64> {
+        // The archive-aware live/retained union always uses one primary
+        // statement snapshot; `_strict` remains for Storage compatibility.
         retained_response::count_owner_flex_requests_since(self, owner, cutoff).await
     }
 
@@ -1853,196 +1855,22 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         for (label, start, end) in windows {
             let start_ts = now + chrono::Duration::seconds(*start);
             let end_ts = now + chrono::Duration::seconds(*end);
-            let rows = sqlx::query(
-                r#"
-                SELECT model, service_tier, outcome, SUM(count)::BIGINT AS count
-                FROM (
-                SELECT
-                    r.model,
-                    r.service_tier,
-                    'completed'::text AS outcome,
-                    COUNT(*)::BIGINT AS count
-                FROM requests r
-                WHERE r.state = 'completed'
-                AND r.completed_at >= $1
-                AND r.completed_at < $2
-                AND (cardinality($3::text[]) = 0 OR r.model = ANY($3))
-                AND r.service_tier IS DISTINCT FROM 'background'
-                AND (
-                    r.template_id IS NOT NULL
-                    OR (r.service_tier = 'priority' AND r.batch_id IS NULL)
-                )
-                AND (
-                    $6 = 'any'
-                    OR ($6 = 'include' AND (
-                        (r.service_tier IS NOT NULL AND r.service_tier = ANY($4))
-                        OR ($5 AND r.service_tier IS NULL)
+            let rows = sqlx::query(retained_response::TRAILING_DEMAND_SQL)
+                .bind(start_ts)
+                .bind(end_ts)
+                .bind(model_filter)
+                .bind(&tier_names)
+                .bind(tier_include_null)
+                .bind(tier_mode)
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(|e| {
+                    FusilladeError::Other(anyhow!(
+                        "Failed to get trailing request counts for window {:?}: {}",
+                        label,
+                        e
                     ))
-                    OR ($6 = 'exclude' AND (
-                        (r.service_tier IS NULL AND NOT $5)
-                        OR (r.service_tier IS NOT NULL AND r.service_tier <> ALL($4))
-                    ))
-                )
-                GROUP BY r.model, r.service_tier
-                UNION ALL
-                SELECT
-                    r.model,
-                    r.service_tier,
-                    'failed'::text AS outcome,
-                    COUNT(*)::BIGINT AS count
-                FROM requests r
-                WHERE r.state = 'failed'
-                AND r.failed_at >= $1
-                AND r.failed_at < $2
-                AND (cardinality($3::text[]) = 0 OR r.model = ANY($3))
-                AND r.service_tier IS DISTINCT FROM 'background'
-                AND (
-                    r.template_id IS NOT NULL
-                    OR (r.service_tier = 'priority' AND r.batch_id IS NULL)
-                )
-                AND (
-                    $6 = 'any'
-                    OR ($6 = 'include' AND (
-                        (r.service_tier IS NOT NULL AND r.service_tier = ANY($4))
-                        OR ($5 AND r.service_tier IS NULL)
-                    ))
-                    OR ($6 = 'exclude' AND (
-                        (r.service_tier IS NULL AND NOT $5)
-                        OR (r.service_tier IS NOT NULL AND r.service_tier <> ALL($4))
-                    ))
-                )
-                GROUP BY r.model, r.service_tier
-                UNION ALL
-                SELECT
-                    retained.model,
-                    retained.service_tier,
-                    'completed'::text AS outcome,
-                    COUNT(*)::BIGINT AS count
-                FROM retained_response_buckets bucket
-                JOIN pg_namespace namespace
-                  ON namespace.nspname = bucket.partition_schema
-                JOIN pg_class child
-                  ON child.relnamespace = namespace.oid
-                 AND child.relname = bucket.partition_table
-                 AND child.oid = bucket.partition_oid
-                JOIN pg_inherits inheritance
-                  ON inheritance.inhrelid = child.oid
-                 AND NOT inheritance.inhdetachpending
-                JOIN retained_response_objects retained
-                  ON retained.delete_on = bucket.delete_on
-                 AND retained.object_kind = 'request'
-                JOIN retained_response_request_routes route
-                  ON route.request_id = retained.object_id
-                 AND route.group_id = retained.group_id
-                 AND route.delete_on = retained.delete_on
-                JOIN retained_response_group_routes group_route
-                  ON group_route.group_id = retained.group_id
-                 AND group_route.delete_on = retained.delete_on
-                WHERE bucket.state = 'active'
-                  AND bucket.partition_schema = current_schema()
-                  AND bucket.partition_table =
-                      'retained_response_objects_d' || to_char(bucket.delete_on, 'YYYYMMDD')
-                  AND inheritance.inhparent =
-                      to_regclass(format('%I.retained_response_objects', current_schema()))
-                  AND pg_get_expr(child.relpartbound, child.oid) = format(
-                      'FOR VALUES FROM (%L) TO (%L)', bucket.delete_on, bucket.delete_on + 1
-                  )
-                  AND retained.state = 'completed'
-                  AND retained.terminal_at >= $1
-                  AND retained.terminal_at < $2
-                  AND (cardinality($3::text[]) = 0 OR retained.model = ANY($3))
-                  AND retained.service_tier IS DISTINCT FROM 'background'
-                  AND (
-                      $6 = 'any'
-                      OR ($6 = 'include' AND (
-                          (retained.service_tier IS NOT NULL AND retained.service_tier = ANY($4))
-                          OR ($5 AND retained.service_tier IS NULL)
-                      ))
-                      OR ($6 = 'exclude' AND (
-                          (retained.service_tier IS NULL AND NOT $5)
-                          OR (retained.service_tier IS NOT NULL AND retained.service_tier <> ALL($4))
-                      ))
-                  )
-                  AND NOT EXISTS (
-                      SELECT 1 FROM requests live
-                      WHERE live.id = retained.object_id AND live.created_by IS NOT NULL
-                  )
-                GROUP BY retained.model, retained.service_tier
-                UNION ALL
-                SELECT
-                    retained.model,
-                    retained.service_tier,
-                    'failed'::text AS outcome,
-                    COUNT(*)::BIGINT AS count
-                FROM retained_response_buckets bucket
-                JOIN pg_namespace namespace
-                  ON namespace.nspname = bucket.partition_schema
-                JOIN pg_class child
-                  ON child.relnamespace = namespace.oid
-                 AND child.relname = bucket.partition_table
-                 AND child.oid = bucket.partition_oid
-                JOIN pg_inherits inheritance
-                  ON inheritance.inhrelid = child.oid
-                 AND NOT inheritance.inhdetachpending
-                JOIN retained_response_objects retained
-                  ON retained.delete_on = bucket.delete_on
-                 AND retained.object_kind = 'request'
-                JOIN retained_response_request_routes route
-                  ON route.request_id = retained.object_id
-                 AND route.group_id = retained.group_id
-                 AND route.delete_on = retained.delete_on
-                JOIN retained_response_group_routes group_route
-                  ON group_route.group_id = retained.group_id
-                 AND group_route.delete_on = retained.delete_on
-                WHERE bucket.state = 'active'
-                  AND bucket.partition_schema = current_schema()
-                  AND bucket.partition_table =
-                      'retained_response_objects_d' || to_char(bucket.delete_on, 'YYYYMMDD')
-                  AND inheritance.inhparent =
-                      to_regclass(format('%I.retained_response_objects', current_schema()))
-                  AND pg_get_expr(child.relpartbound, child.oid) = format(
-                      'FOR VALUES FROM (%L) TO (%L)', bucket.delete_on, bucket.delete_on + 1
-                  )
-                  AND retained.state = 'failed'
-                  AND retained.terminal_at >= $1
-                  AND retained.terminal_at < $2
-                  AND (cardinality($3::text[]) = 0 OR retained.model = ANY($3))
-                  AND retained.service_tier IS DISTINCT FROM 'background'
-                  AND (
-                      $6 = 'any'
-                      OR ($6 = 'include' AND (
-                          (retained.service_tier IS NOT NULL AND retained.service_tier = ANY($4))
-                          OR ($5 AND retained.service_tier IS NULL)
-                      ))
-                      OR ($6 = 'exclude' AND (
-                          (retained.service_tier IS NULL AND NOT $5)
-                          OR (retained.service_tier IS NOT NULL AND retained.service_tier <> ALL($4))
-                      ))
-                  )
-                  AND NOT EXISTS (
-                      SELECT 1 FROM requests live
-                      WHERE live.id = retained.object_id AND live.created_by IS NOT NULL
-                  )
-                GROUP BY retained.model, retained.service_tier
-                ) terminal_counts
-                GROUP BY model, service_tier, outcome
-                "#,
-            )
-            .bind(start_ts)
-            .bind(end_ts)
-            .bind(model_filter)
-            .bind(&tier_names)
-            .bind(tier_include_null)
-            .bind(tier_mode)
-            .fetch_all(&mut *tx)
-            .await
-            .map_err(|e| {
-                FusilladeError::Other(anyhow!(
-                    "Failed to get trailing request counts for window {:?}: {}",
-                    label,
-                    e
-                ))
-            })?;
+                })?;
 
             for row in rows {
                 result.push(TrailingDemandCount {

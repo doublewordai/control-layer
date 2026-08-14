@@ -265,6 +265,29 @@ async fn wait_for_relation_waiter(pool: &PgPool, relation: &str) {
     }
 }
 
+async fn wait_for_backend_lock_waiter(pool: &PgPool, backend_pid: i32) {
+    loop {
+        let waiting: bool = sqlx::query_scalar(
+            r#"
+            SELECT EXISTS (
+                SELECT 1
+                FROM pg_locks
+                WHERE pid = $1
+                  AND NOT granted
+            )
+            "#,
+        )
+        .bind(backend_pid)
+        .fetch_one(pool)
+        .await
+        .expect("backend lock wait must be observable");
+        if waiting {
+            return;
+        }
+        tokio::task::yield_now().await;
+    }
+}
+
 async fn install_candidate_index(pool: &PgPool) {
     sqlx::query(
         r#"
@@ -2251,8 +2274,10 @@ async fn capture_public_reads(
             ..Default::default()
         },
         ListRequestsFilter {
-            status: Some("failed".to_owned()),
             models: Some(Vec::new()),
+            ..Default::default()
+        },
+        ListRequestsFilter {
             service_tiers: Some(Vec::new()),
             ..Default::default()
         },
@@ -2336,6 +2361,327 @@ async fn read_apis_preserve_exact_values_filters_pages_and_counts_after_move(poo
 
     let after = capture_public_reads(&request_manager, &step_manager, &graph).await;
     assert_eq!(after, before);
+}
+
+#[sqlx::test]
+async fn anomalous_request_chronology_uses_later_created_at_for_safe_deadline(pool: PgPool) {
+    install_candidate_index(&pool).await;
+    let expected_delete_on = date("2026-08-07");
+    ensure_partition(&pool, expected_delete_on).await;
+    let graph = singleton(
+        &pool,
+        "flex",
+        TerminalState::Completed,
+        timestamp("2026-08-01T10:00:00Z"),
+        "anomalous-created-after-terminal",
+    )
+    .await;
+    let anomalous_created_at = timestamp("2026-08-05T10:00:00Z");
+    sqlx::query("UPDATE requests SET created_at = $2 WHERE id = $1")
+        .bind(graph.request_ids[0])
+        .bind(anomalous_created_at)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let request_manager = manager(&pool).await;
+
+    let outcome = archive(&request_manager, &policy(&[("flex", 86_400)]), 1, i64::MAX)
+        .await
+        .expect("schema-valid anomalous chronology must archive conservatively");
+    assert_eq!(outcome.groups_archived, 1);
+    let routed_delete_on: NaiveDate = sqlx::query_scalar(
+        "SELECT delete_on FROM retained_response_request_routes WHERE request_id = $1",
+    )
+    .bind(graph.request_ids[0])
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(routed_delete_on, expected_delete_on);
+    let detail = request_manager
+        .get_request_detail(RequestId(graph.request_ids[0]))
+        .await
+        .expect("the safely retained anomalous row must decode");
+    assert_eq!(detail.created_at, anomalous_created_at);
+    assert_eq!(detail.completed_at, Some(timestamp("2026-08-01T10:00:00Z")));
+}
+
+async fn assert_list_ids(
+    manager: &PostgresRequestManager<TestDbPools>,
+    filter: ListRequestsFilter,
+    expected_ids: &[Uuid],
+) {
+    let result = manager.list_requests(filter).await.unwrap();
+    let actual_ids = result.data.iter().map(|row| row.id).collect::<Vec<_>>();
+    assert_eq!(actual_ids, expected_ids);
+    assert_eq!(result.total_count, expected_ids.len() as i64);
+}
+
+#[sqlx::test]
+async fn retained_list_filters_each_discriminate_one_matching_request(pool: PgPool) {
+    install_candidate_index(&pool).await;
+    ensure_partition(&pool, date("2026-08-12")).await;
+    let terminal_at = timestamp("2026-08-10T10:00:00Z");
+    let target = singleton(
+        &pool,
+        "flex",
+        TerminalState::Completed,
+        terminal_at,
+        "filter-target",
+    )
+    .await;
+    let owner_distractor = singleton(
+        &pool,
+        "flex",
+        TerminalState::Completed,
+        terminal_at,
+        "filter-owner",
+    )
+    .await;
+    sqlx::query("UPDATE requests SET created_by = 'other-owner' WHERE id = $1")
+        .bind(owner_distractor.request_ids[0])
+        .execute(&pool)
+        .await
+        .unwrap();
+    let status_distractor = singleton(
+        &pool,
+        "flex",
+        TerminalState::Failed,
+        terminal_at,
+        "filter-status",
+    )
+    .await;
+    let model_distractor = singleton(
+        &pool,
+        "flex",
+        TerminalState::Completed,
+        terminal_at,
+        "filter-model",
+    )
+    .await;
+    sqlx::query("UPDATE requests SET model = 'other-model' WHERE id = $1")
+        .bind(model_distractor.request_ids[0])
+        .execute(&pool)
+        .await
+        .unwrap();
+    let tier_distractor = singleton(
+        &pool,
+        "priority",
+        TerminalState::Completed,
+        terminal_at,
+        "filter-tier",
+    )
+    .await;
+    let early_distractor = singleton(
+        &pool,
+        "flex",
+        TerminalState::Completed,
+        terminal_at,
+        "filter-created-after",
+    )
+    .await;
+    sqlx::query("UPDATE requests SET created_at = '2026-08-10T06:00:00Z' WHERE id = $1")
+        .bind(early_distractor.request_ids[0])
+        .execute(&pool)
+        .await
+        .unwrap();
+    let late_distractor = singleton(
+        &pool,
+        "flex",
+        TerminalState::Completed,
+        terminal_at,
+        "filter-created-before",
+    )
+    .await;
+    sqlx::query("UPDATE requests SET created_at = '2026-08-10T09:30:00Z' WHERE id = $1")
+        .bind(late_distractor.request_ids[0])
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let request_manager = manager(&pool).await;
+    let outcome = archive(
+        &request_manager,
+        &policy(&[("flex", 86_400), ("priority", 86_400)]),
+        7,
+        i64::MAX,
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcome.groups_archived, 7);
+
+    let target_filter = ListRequestsFilter {
+        created_by: Some(OWNER.to_owned()),
+        status: Some("completed".to_owned()),
+        models: Some(vec![MODEL.to_owned()]),
+        created_after: Some(timestamp("2026-08-10T07:30:00Z")),
+        created_before: Some(timestamp("2026-08-10T08:30:00Z")),
+        service_tiers: Some(vec!["flex".to_owned()]),
+        active_first: false,
+        skip: 0,
+        limit: 20,
+    };
+    assert_list_ids(
+        &request_manager,
+        target_filter.clone(),
+        &[target.request_ids[0]],
+    )
+    .await;
+
+    let mut owner_filter = target_filter.clone();
+    owner_filter.created_by = Some("other-owner".to_owned());
+    assert_list_ids(
+        &request_manager,
+        owner_filter,
+        &[owner_distractor.request_ids[0]],
+    )
+    .await;
+    let mut status_filter = target_filter.clone();
+    status_filter.status = Some("failed".to_owned());
+    assert_list_ids(
+        &request_manager,
+        status_filter,
+        &[status_distractor.request_ids[0]],
+    )
+    .await;
+    let mut model_filter = target_filter.clone();
+    model_filter.models = Some(vec!["other-model".to_owned()]);
+    assert_list_ids(
+        &request_manager,
+        model_filter,
+        &[model_distractor.request_ids[0]],
+    )
+    .await;
+    let mut tier_filter = target_filter.clone();
+    tier_filter.service_tiers = Some(vec!["priority".to_owned()]);
+    assert_list_ids(
+        &request_manager,
+        tier_filter,
+        &[tier_distractor.request_ids[0]],
+    )
+    .await;
+    let mut after_filter = target_filter.clone();
+    after_filter.created_after = Some(timestamp("2026-08-10T09:00:00Z"));
+    after_filter.created_before = Some(timestamp("2026-08-10T10:00:00Z"));
+    assert_list_ids(
+        &request_manager,
+        after_filter,
+        &[late_distractor.request_ids[0]],
+    )
+    .await;
+    let mut before_filter = target_filter;
+    before_filter.created_after = Some(timestamp("2026-08-10T05:00:00Z"));
+    before_filter.created_before = Some(timestamp("2026-08-10T07:00:00Z"));
+    assert_list_ids(
+        &request_manager,
+        before_filter,
+        &[early_distractor.request_ids[0]],
+    )
+    .await;
+}
+
+#[sqlx::test]
+async fn retained_trailing_filters_discriminate_windows_models_and_tiers(pool: PgPool) {
+    install_candidate_index(&pool).await;
+    let fixture_now = Utc::now();
+    let target_terminal = fixture_now - TimeDelta::hours(2);
+    let older_terminal = fixture_now - TimeDelta::hours(8);
+    let target = singleton(
+        &pool,
+        "flex",
+        TerminalState::Completed,
+        target_terminal,
+        "trailing-target",
+    )
+    .await;
+    let older = singleton(
+        &pool,
+        "flex",
+        TerminalState::Completed,
+        older_terminal,
+        "trailing-older",
+    )
+    .await;
+    let priority = singleton(
+        &pool,
+        "priority",
+        TerminalState::Completed,
+        target_terminal,
+        "trailing-priority",
+    )
+    .await;
+    let other_model = singleton(
+        &pool,
+        "flex",
+        TerminalState::Completed,
+        target_terminal,
+        "trailing-model",
+    )
+    .await;
+    sqlx::query("UPDATE requests SET model = 'other-model' WHERE id = $1")
+        .bind(other_model.request_ids[0])
+        .execute(&pool)
+        .await
+        .unwrap();
+    for terminal_at in [target_terminal, older_terminal] {
+        let delete_on = RetentionSweepPolicy::delete_on(terminal_at, 1).unwrap();
+        ensure_partition(&pool, delete_on).await;
+    }
+    let request_manager = manager(&pool).await;
+    let outcome = archive(
+        &request_manager,
+        &policy(&[("flex", 1), ("priority", 1)]),
+        4,
+        i64::MAX,
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcome.groups_archived, 4);
+
+    let mut flex_rows = request_manager
+        .get_completed_request_counts_by_model_and_window(
+            &[
+                ("recent".to_owned(), -4 * 3_600, 0),
+                ("older".to_owned(), -10 * 3_600, -6 * 3_600),
+            ],
+            &[MODEL.to_owned()],
+            &ServiceTierFilter::Include(vec![Some("flex".to_owned())]),
+        )
+        .await
+        .unwrap();
+    flex_rows.sort_by(|left, right| left.window_label.cmp(&right.window_label));
+    assert_eq!(flex_rows.len(), 2);
+    assert_eq!(flex_rows[0].window_label, "older");
+    assert_eq!(flex_rows[0].service_tier.as_deref(), Some("flex"));
+    assert_eq!(flex_rows[0].count, 1);
+    assert_eq!(flex_rows[1].window_label, "recent");
+    assert_eq!(flex_rows[1].service_tier.as_deref(), Some("flex"));
+    assert_eq!(flex_rows[1].count, 1);
+
+    let priority_rows = request_manager
+        .get_completed_request_counts_by_model_and_window(
+            &[("recent".to_owned(), -4 * 3_600, 0)],
+            &[MODEL.to_owned()],
+            &ServiceTierFilter::Include(vec![Some("priority".to_owned())]),
+        )
+        .await
+        .unwrap();
+    assert_eq!(priority_rows.len(), 1);
+    assert_eq!(priority_rows[0].service_tier.as_deref(), Some("priority"));
+    assert_eq!(priority_rows[0].count, 1);
+
+    let excluded_flex = request_manager
+        .get_completed_request_counts_by_model_and_window(
+            &[("recent".to_owned(), -4 * 3_600, 0)],
+            &[MODEL.to_owned()],
+            &ServiceTierFilter::Exclude(vec![Some("flex".to_owned())]),
+        )
+        .await
+        .unwrap();
+    assert_eq!(excluded_flex, priority_rows);
+    assert_wholly_retained(&pool, &target).await;
+    assert_wholly_retained(&pool, &older).await;
+    assert_wholly_retained(&pool, &priority).await;
+    assert_wholly_retained(&pool, &other_model).await;
 }
 
 #[sqlx::test]
@@ -2984,4 +3330,252 @@ async fn read_response_step_mutations_reject_retained_routes_without_content(poo
         assert!(!debug.contains("must_not"));
     }
     assert_eq!(count_ids(&pool, "response_steps", &graph.step_ids).await, 0);
+}
+
+#[sqlx::test]
+async fn create_step_rolls_back_when_movement_commits_route_during_blocked_insert(pool: PgPool) {
+    const MOVEMENT_AFTER_DELETE_GATE: i64 = 730_016;
+
+    install_candidate_index(&pool).await;
+    ensure_partition(&pool, date("2026-08-07")).await;
+    let graph = branching_graph(&pool, TerminalState::Completed).await;
+    let retained_step_id = StepId(graph.group_id);
+
+    sqlx::query(
+        r#"
+        CREATE FUNCTION test_gate_after_retained_step_delete()
+        RETURNS trigger
+        LANGUAGE plpgsql
+        AS $$
+        BEGIN
+            PERFORM pg_advisory_xact_lock(730016);
+            RETURN NULL;
+        END
+        $$
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        r#"
+        CREATE TRIGGER test_gate_after_retained_step_delete
+        AFTER DELETE ON response_steps
+        FOR EACH STATEMENT
+        EXECUTE FUNCTION test_gate_after_retained_step_delete()
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let mut movement_gate = pool.acquire().await.unwrap();
+    sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(MOVEMENT_AFTER_DELETE_GATE)
+        .execute(&mut *movement_gate)
+        .await
+        .unwrap();
+    let mover_manager = manager(&pool).await;
+    let mut mover = tokio::spawn(async move {
+        archive(
+            &mover_manager,
+            &policy(&[("flex", 86_400), ("priority", 3 * 86_400)]),
+            1,
+            i64::MAX,
+        )
+        .await
+    });
+    tokio::select! {
+        result = &mut mover => panic!("movement completed before the after-delete gate: {result:?}"),
+        () = wait_for_advisory_waiter_key(&pool, MOVEMENT_AFTER_DELETE_GATE) => {}
+    }
+
+    // The mover has inserted the active routes and deleted the old step in its
+    // uncommitted transaction. The creator cannot see that route in its first
+    // statement and then waits on the deleted primary-key tuple.
+    let creator_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with(pool.connect_options().as_ref().clone())
+        .await
+        .unwrap();
+    let creator_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&creator_pool)
+        .await
+        .unwrap();
+    let creator_manager = PostgresResponseStepManager::new(WriteSignalingPools {
+        read: creator_pool.clone(),
+        write: creator_pool,
+        write_requested: Arc::new(AtomicBool::new(false)),
+    });
+    let mut creator = tokio::spawn(async move {
+        creator_manager
+            .create_step(CreateStepInput {
+                id: Some(retained_step_id.0),
+                request_id: None,
+                prev_step_id: None,
+                parent_step_id: None,
+                step_kind: StepKind::ToolCall,
+                step_sequence: 101,
+                request_payload: json!({"must_not": "survive-the-route-race"}),
+            })
+            .await
+    });
+    tokio::select! {
+        result = &mut creator => panic!("same-ID creator did not block on movement: {result:?}"),
+        () = wait_for_backend_lock_waiter(&pool, creator_pid) => {}
+    }
+
+    let unlocked: bool = sqlx::query_scalar("SELECT pg_advisory_unlock($1)")
+        .bind(MOVEMENT_AFTER_DELETE_GATE)
+        .fetch_one(&mut *movement_gate)
+        .await
+        .unwrap();
+    assert!(unlocked);
+    let outcome = mover.await.unwrap().unwrap();
+    assert_eq!(outcome.groups_archived, 1);
+
+    let error = creator
+        .await
+        .unwrap()
+        .expect_err("the successful same-ID INSERT must be rolled back after route recheck");
+    assert_eq!(error.to_string(), "Response step is already retained");
+    match &error {
+        fusillade_arsenal::error::FusilladeError::Other(source) => assert!(
+            source
+                .downcast_ref::<RetainedResponseStepConflict>()
+                .is_some()
+        ),
+        other => panic!("unexpected retained mutation error: {other:?}"),
+    }
+    assert_eq!(
+        count_ids(&pool, "response_steps", &[retained_step_id.0]).await,
+        0
+    );
+}
+
+#[sqlx::test]
+async fn movement_starting_after_create_insert_cannot_split_the_live_graph(pool: PgPool) {
+    const CREATE_AFTER_INSERT_GATE: i64 = 730_017;
+
+    install_candidate_index(&pool).await;
+    ensure_partition(&pool, date("2026-08-07")).await;
+    let graph = branching_graph(&pool, TerminalState::Completed).await;
+    let head_step_id = StepId(graph.group_id);
+    let new_step_id = Uuid::new_v4();
+
+    sqlx::query(
+        r#"
+        CREATE FUNCTION test_gate_after_response_step_insert()
+        RETURNS trigger
+        LANGUAGE plpgsql
+        AS $$
+        BEGIN
+            PERFORM pg_advisory_xact_lock(730017);
+            RETURN NULL;
+        END
+        $$
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        r#"
+        CREATE TRIGGER test_gate_after_response_step_insert
+        AFTER INSERT ON response_steps
+        FOR EACH STATEMENT
+        EXECUTE FUNCTION test_gate_after_response_step_insert()
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let mut create_gate = pool.acquire().await.unwrap();
+    sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(CREATE_AFTER_INSERT_GATE)
+        .execute(&mut *create_gate)
+        .await
+        .unwrap();
+    let (_, creator_manager) = managers(&pool).await;
+    let mut creator = tokio::spawn(async move {
+        creator_manager
+            .create_step(CreateStepInput {
+                id: Some(new_step_id),
+                request_id: None,
+                prev_step_id: Some(head_step_id),
+                parent_step_id: Some(head_step_id),
+                step_kind: StepKind::ToolCall,
+                step_sequence: 103,
+                request_payload: json!({"input": "post-insert-boundary"}),
+            })
+            .await
+    });
+    tokio::select! {
+        result = &mut creator => panic!("creator completed before the after-insert gate: {result:?}"),
+        () = wait_for_advisory_waiter_key(&pool, CREATE_AFTER_INSERT_GATE) => {}
+    }
+
+    // The INSERT holds foreign-key protection on its live predecessor until
+    // commit. A mover that starts now must skip the graph instead of moving
+    // the old topology without the uncommitted child.
+    let mover_manager = manager(&pool).await;
+    let outcome = archive(
+        &mover_manager,
+        &policy(&[("flex", 86_400), ("priority", 3 * 86_400)]),
+        1,
+        i64::MAX,
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcome.groups_archived, 0);
+    assert!(outcome.skipped_locked);
+    assert!(outcome.may_have_more);
+
+    let unlocked: bool = sqlx::query_scalar("SELECT pg_advisory_unlock($1)")
+        .bind(CREATE_AFTER_INSERT_GATE)
+        .fetch_one(&mut *create_gate)
+        .await
+        .unwrap();
+    assert!(unlocked);
+    assert_eq!(creator.await.unwrap().unwrap(), StepId(new_step_id));
+    assert_eq!(count_ids(&pool, "requests", &graph.request_ids).await, 2);
+    assert_eq!(count_ids(&pool, "response_steps", &graph.step_ids).await, 5);
+    assert_eq!(count_ids(&pool, "response_steps", &[new_step_id]).await, 1);
+    assert_eq!(retained_counts(&pool, graph.group_id).await, (0, 0, 0));
+}
+
+#[sqlx::test]
+async fn create_step_preserves_unrelated_foreign_key_error_without_active_route(pool: PgPool) {
+    let (_, step_manager) = managers(&pool).await;
+    let proposed_id = Uuid::new_v4();
+    let missing_predecessor = StepId(Uuid::new_v4());
+
+    let error = step_manager
+        .create_step(CreateStepInput {
+            id: Some(proposed_id),
+            request_id: None,
+            prev_step_id: Some(missing_predecessor),
+            parent_step_id: None,
+            step_kind: StepKind::ToolCall,
+            step_sequence: 102,
+            request_payload: json!({"input": "unrelated-fk-error"}),
+        })
+        .await
+        .expect_err("an unrelated missing predecessor must remain a database error");
+
+    assert!(
+        error
+            .to_string()
+            .starts_with("Failed to insert response_step:")
+    );
+    match &error {
+        fusillade_arsenal::error::FusilladeError::Other(source) => assert!(
+            source
+                .downcast_ref::<RetainedResponseStepConflict>()
+                .is_none()
+        ),
+        other => panic!("unexpected response-step insert error: {other:?}"),
+    }
+    assert_eq!(count_ids(&pool, "response_steps", &[proposed_id]).await, 0);
 }

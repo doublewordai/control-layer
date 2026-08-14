@@ -73,6 +73,12 @@ impl<P: PoolProvider> PostgresResponseStepManager<P> {
         crate::db::RetryingPgPool::new(self.pools.write(), &self.db_retry_config)
     }
 
+    async fn begin_write_transaction(&self) -> Result<sqlx::Transaction<'static, sqlx::Postgres>> {
+        crate::db::begin_transaction(self.pools.write(), &self.db_retry_config)
+            .await
+            .map_err(|_| FusilladeError::Other(anyhow!("Failed to begin response-step mutation")))
+    }
+
     async fn begin_primary_read(&self) -> Result<sqlx::Transaction<'static, sqlx::Postgres>> {
         let mut tx = crate::db::begin_transaction(self.pools.write(), &self.db_retry_config)
             .await
@@ -86,26 +92,73 @@ impl<P: PoolProvider> PostgresResponseStepManager<P> {
         Ok(tx)
     }
 
-    async fn retained_route_exists(
-        &self,
+    async fn retained_route_exists_in_transaction(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         step_ids: &[Uuid],
         request_id: Option<RequestId>,
     ) -> Result<bool> {
         sqlx::query_scalar(
             r#"
-            SELECT EXISTS (
-                SELECT 1 FROM retained_response_step_routes WHERE step_id = ANY($1)
+            WITH candidate_route AS (
+                SELECT route.group_id, route.delete_on
+                FROM retained_response_step_routes route
+                WHERE route.step_id = ANY($1)
+
                 UNION ALL
-                SELECT 1 FROM retained_response_request_routes
-                WHERE $2::uuid IS NOT NULL AND request_id = $2
+
+                SELECT route.group_id, route.delete_on
+                FROM retained_response_request_routes route
+                WHERE $2::uuid IS NOT NULL
+                  AND route.request_id = $2
+            )
+            SELECT EXISTS (
+                SELECT 1
+                FROM candidate_route route
+                JOIN retained_response_group_routes group_route
+                  ON group_route.group_id = route.group_id
+                 AND group_route.delete_on = route.delete_on
+                JOIN retained_response_buckets bucket
+                  ON bucket.delete_on = route.delete_on
+                JOIN pg_namespace namespace
+                  ON namespace.nspname = bucket.partition_schema
+                JOIN pg_class child
+                  ON child.relnamespace = namespace.oid
+                 AND child.relname = bucket.partition_table
+                 AND child.oid = bucket.partition_oid
+                JOIN pg_inherits inheritance
+                  ON inheritance.inhrelid = child.oid
+                 AND NOT inheritance.inhdetachpending
+                WHERE bucket.state = 'active'
+                  AND bucket.partition_schema = current_schema()
+                  AND bucket.partition_table =
+                      'retained_response_objects_d' || to_char(route.delete_on, 'YYYYMMDD')
+                  AND inheritance.inhparent =
+                      to_regclass(format('%I.retained_response_objects', current_schema()))
+                  AND pg_get_expr(child.relpartbound, child.oid) = format(
+                      'FOR VALUES FROM (%L) TO (%L)', route.delete_on, route.delete_on + 1
+                  )
             )
             "#,
         )
         .bind(step_ids)
         .bind(request_id.map(|id| id.0))
-        .fetch_one(self.write_executor())
+        .fetch_one(&mut **tx)
         .await
         .map_err(|_| FusilladeError::Other(anyhow!("Failed to check retained response route")))
+    }
+
+    async fn retained_route_exists(
+        &self,
+        step_ids: &[Uuid],
+        request_id: Option<RequestId>,
+    ) -> Result<bool> {
+        let mut tx = self.begin_write_transaction().await?;
+        let exists =
+            Self::retained_route_exists_in_transaction(&mut tx, step_ids, request_id).await?;
+        tx.commit()
+            .await
+            .map_err(|_| FusilladeError::Other(anyhow!("Failed to finish retained route check")))?;
+        Ok(exists)
     }
 
     async fn retained_conflict(&self, step_id: StepId) -> Result<Option<FusilladeError>> {
@@ -175,10 +228,14 @@ impl<P: PoolProvider> ResponseStepStore for PostgresResponseStepManager<P> {
         linked_step_ids.extend(input.prev_step_id.map(|step| step.0));
         linked_step_ids.extend(input.parent_step_id.map(|step| step.0));
 
-        if self
-            .retained_route_exists(&linked_step_ids, input.request_id)
+        let mut tx = self.begin_write_transaction().await?;
+
+        if Self::retained_route_exists_in_transaction(&mut tx, &linked_step_ids, input.request_id)
             .await?
         {
+            tx.rollback().await.map_err(|_| {
+                FusilladeError::Other(anyhow!("Failed to roll back response-step mutation"))
+            })?;
             return Err(FusilladeError::Other(anyhow::Error::new(
                 RetainedResponseStepConflict,
             )));
@@ -196,9 +253,12 @@ impl<P: PoolProvider> ResponseStepStore for PostgresResponseStepManager<P> {
         .bind(input.step_kind.as_str())
         .bind(input.step_sequence)
         .bind(&input.request_payload)
-        .execute(self.write_executor())
+        .execute(&mut *tx)
         .await;
         if let Err(error) = insert {
+            // Clear the failed transaction before checking a route that may
+            // have committed while the INSERT was waiting on a live FK/tuple.
+            let _ = tx.rollback().await;
             // Movement may commit after the precheck while this INSERT waits
             // on a request/parent FK. Recheck the exact content-free routes so
             // that ordering still surfaces the stable retained conflict.
@@ -215,6 +275,25 @@ impl<P: PoolProvider> ResponseStepStore for PostgresResponseStepManager<P> {
                 error
             )));
         }
+
+        // A same-ID unique check may wait for movement's DELETE and then
+        // succeed after movement commits. This second statement shares the
+        // creator's write transaction, so an active route rolls the INSERT
+        // back before it can become visible.
+        if Self::retained_route_exists_in_transaction(&mut tx, &linked_step_ids, input.request_id)
+            .await?
+        {
+            tx.rollback().await.map_err(|_| {
+                FusilladeError::Other(anyhow!("Failed to roll back response-step mutation"))
+            })?;
+            return Err(FusilladeError::Other(anyhow::Error::new(
+                RetainedResponseStepConflict,
+            )));
+        }
+
+        tx.commit().await.map_err(|_| {
+            FusilladeError::Other(anyhow!("Failed to finish response-step mutation"))
+        })?;
 
         Ok(StepId(id))
     }
