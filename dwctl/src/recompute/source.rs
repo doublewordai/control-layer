@@ -119,6 +119,12 @@ pub async fn load_corpus(pool: &PgPool, filter: &CorpusFilter) -> Result<Vec<Cor
         FROM http_analytics ha
         LEFT JOIN fusillade.requests r          ON r.id  = ha.fusillade_request_id
         LEFT JOIN fusillade.request_templates rt ON rt.id = r.template_id
+        -- Ordered so the planner drives off a timestamp index. There is NO index on
+        -- http_analytics.user_id, and ordering by `id` instead makes Postgres walk the
+        -- primary key filtering as it goes — on a 186M-row table that scans most of it
+        -- before the LIMIT is satisfied. The time window is the only selective thing here,
+        -- so it has to lead: idx_analytics_model_timestamp when a model is given, otherwise
+        -- idx_analytics_timestamp.
         WHERE ha.timestamp >= $1
           AND ha.timestamp <= $2
           AND ($3::uuid IS NULL OR ha.user_id = $3)
@@ -128,7 +134,7 @@ pub async fn load_corpus(pool: &PgPool, filter: &CorpusFilter) -> Result<Vec<Cor
           -- total_cost is a free model, where no charge was ever expected.
           AND ha.user_id IS NOT NULL
           AND ha.status_code BETWEEN 200 AND 299
-        ORDER BY ha.id
+        ORDER BY ha.timestamp DESC
         LIMIT $6
         "#,
         filter.start,

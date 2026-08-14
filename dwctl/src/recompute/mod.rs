@@ -112,6 +112,8 @@ pub mod cache_replay;
 pub mod replay;
 pub mod report;
 pub mod source;
+#[cfg(test)]
+mod verify_harness;
 
 use cache_fields::{CacheReading, CreationTier, cache_tokens_both_shapes};
 use replay::RecomputeError;
@@ -163,6 +165,14 @@ pub async fn recompute_corpus(
                     );
                     report::ReportRow::replayed(row, &usage, cost)
                 }
+                // A ZDR row is not a failure to classify: the plaintext does not exist, so
+                // only the stored columns are ever knowable. NotReplayable is for rows we
+                // could have read and could not.
+                Err(replay::RecomputeError::ZeroDataRetention) => report::ReportRow::unreplayable(
+                    row,
+                    report::Evidence::ColumnsOnly,
+                    "zero-data-retention: payload is encrypted, tokens cannot be verified".to_string(),
+                ),
                 Err(e) => report::ReportRow::unreplayable(row, report::Evidence::NotReplayable, e.to_string()),
             }
         })
@@ -178,6 +188,13 @@ pub async fn recompute_corpus(
                 continue;
             };
             let Some(body) = exchange.request_body.as_deref() else { continue };
+            // Never classify an encrypted body. It parses to no markers, which the classifier
+            // reports as a confident zero split - and comparing that against a row holding
+            // real cache tokens manufactures a disagreement that blames the serving path for
+            // our own inability to read the request.
+            if replay::is_zdr_envelope(Some(body)) {
+                continue;
+            }
 
             let historical = base.with_index(std::sync::Arc::new(cache_replay::HistoricalIndex::new(pool.clone(), row.timestamp)));
             match cache_replay::reconstruct_split(&historical, model, body, principal, row.timestamp).await {

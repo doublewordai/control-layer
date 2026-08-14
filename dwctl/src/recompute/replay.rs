@@ -52,6 +52,24 @@ pub enum RecomputeError {
     /// is a claim about whether the request succeeded that the data does not support.
     #[error("stored status code {0} is not a valid HTTP status")]
     BadStatus(u16),
+    /// The stored payload is a zero-data-retention envelope. Nothing about this request's
+    /// tokens can be verified, now or ever — the plaintext does not exist.
+    #[error("payload is zero-data-retention encrypted; tokens cannot be verified")]
+    ZeroDataRetention,
+}
+
+/// Envelope prefix written by the ZDR encryption path.
+const ZDR_ENVELOPE_PREFIX: &[u8] = b"dwzdr1:";
+
+/// Whether a stored body is a ZDR envelope rather than a payload.
+///
+/// This has to be checked before anything tries to parse or classify. An encrypted body is
+/// not merely unparseable: fed to the cache classifier it yields no markers, which the
+/// classifier correctly reports as "nothing cached" — a confident zero split. Comparing that
+/// against a row holding real cache tokens produces a *false disagreement*, which reads as
+/// "the serving classifier was wrong" when the truth is that we cannot see the request.
+pub fn is_zdr_envelope(body: Option<&[u8]>) -> bool {
+    body.is_some_and(|b| b.starts_with(ZDR_ENVELOPE_PREFIX))
 }
 
 /// One request as fusillade stored it, in the minimal form a replay needs.
@@ -91,6 +109,9 @@ impl StoredExchange {
         let Some(response_body) = &self.response_body else {
             return Err(RecomputeError::NoResponseBody);
         };
+        if is_zdr_envelope(Some(response_body)) || is_zdr_envelope(self.request_body.as_deref()) {
+            return Err(RecomputeError::ZeroDataRetention);
+        }
 
         let uri: Uri = self
             .endpoint
