@@ -10,13 +10,29 @@
 //!   `credits_transactions.amount` carries a `> 0` CHECK, so there was not even a row to
 //!   correct.
 //! - **Anthropic `/v1/messages`, August 2026** — `input_tokens` excludes cached tokens in
-//!   Anthropic's shape, but was recorded verbatim as `prompt_tokens`. Billing derives
-//!   uncached input as `prompt − cached`, so the cached tokens were subtracted twice and
-//!   billed at nothing (3.28M prompt tokens recorded against 19.34M processed).
+//!   Anthropic's shape, but was recorded verbatim as `prompt_tokens`, and cache creation
+//!   was dropped entirely. Billing derives uncached input as `prompt − cached`, so the
+//!   cached tokens were subtracted twice and billed at nothing. Measured: 1,044 rows,
+//!   prompt sum 5,086,592 against 32,401,267 actually processed — a 6.4× undercount.
 //!
 //! Both were fixed going forward. Neither fix repairs the rows already written, and both
 //! times that repair was a hand-rolled scripting exercise against production. This module
-//! is that repair, productised.
+//! is the arithmetic half of that repair, productised.
+//!
+//! # This module never writes
+//!
+//! It computes what a request's usage *should* have been and reports it. It does not amend
+//! `http_analytics`, does not touch `credits_transactions`, and has no database access at
+//! all. Applying a correction is four steps of reviewed SQL run by a human, documented in
+//! the `internal` repo as `runbooks/usage-recompute-repair.md`: amend the canonical row,
+//! append compensating ledger rows, heal the balance checkpoints, patch the daily usage
+//! rollup (which has a forward-only cursor and so never re-reads an amended row).
+//!
+//! That split is deliberate. The arithmetic is fiddly, testable and worth automating; the
+//! money is neither. It also means the questions a write path would have to answer
+//! prematurely — whether a debit correction should trip auto-topup, how the warehouse
+//! handles an analytics UPDATE — get answered by a person at the time, with the specific
+//! corpus in front of them.
 //!
 //! # How a recompute stays honest
 //!
