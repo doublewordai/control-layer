@@ -401,11 +401,26 @@ impl RetainedRequestPayloadV1 {
         if self.request.created_by.as_deref().is_none_or(str::is_empty) {
             return Err(RetainedResponseSerializationError::InvalidRequestSnapshot);
         }
+        self.request
+            .terminal_at()?
+            .ok_or(RetainedResponseSerializationError::InvalidRequestSnapshot)?;
+        Ok(())
+    }
+
+    fn validate_delete_on(
+        &self,
+        delete_on: NaiveDate,
+    ) -> std::result::Result<(), RetainedResponseSerializationError> {
+        self.validate()?;
         let terminal_at = self
             .request
             .terminal_at()?
             .ok_or(RetainedResponseSerializationError::InvalidRequestSnapshot)?;
-        if terminal_at < self.request.created_at {
+        let delete_at = delete_on
+            .and_hms_opt(0, 0, 0)
+            .expect("midnight is valid for every NaiveDate")
+            .and_utc();
+        if self.request.created_at >= delete_at || terminal_at >= delete_at {
             return Err(RetainedResponseSerializationError::InvalidRequestSnapshot);
         }
         Ok(())
@@ -999,7 +1014,7 @@ impl RetainedResponseObjectRow {
         head_step_id: Option<Uuid>,
         payload: &RetainedRequestPayloadV1,
     ) -> std::result::Result<Self, RetainedResponseSerializationError> {
-        payload.validate()?;
+        payload.validate_delete_on(delete_on)?;
         Ok(Self {
             delete_on,
             group_id,
@@ -1137,7 +1152,7 @@ impl RetainedResponseObjectRow {
         self.require_kind(RetainedObjectKind::Request)?;
         let envelope: RetainedRequestPayloadEnvelopeV1 = self.decode_payload()?;
         let payload = envelope.payload;
-        payload.validate()?;
+        payload.validate_delete_on(self.delete_on)?;
         if self.group_id != envelope.group_id
             || self.head_step_id != envelope.head_step_id
             || self.object_id != payload.request.id
@@ -1396,8 +1411,8 @@ const LIST_REQUESTS_COUNT_SQL: &str = r#"
           AND ($2::text IS NULL OR object.state = $2)
           AND ($3::text[] IS NULL OR object.model = ANY($3))
           AND ($4::timestamptz IS NULL OR object.created_at >= $4)
-          -- V1 proves created_at <= terminal_at < delete_on, so this
-          -- necessary lower bound enables daily partition pruning.
+          -- V1 proves created_at < delete_on, so this necessary lower
+          -- bound enables daily partition pruning.
           AND ($4::timestamptz IS NULL OR object.delete_on > ($4 AT TIME ZONE 'UTC')::date)
           AND ($5::timestamptz IS NULL OR object.created_at <= $5)
           AND ($6::text[] IS NULL OR object.service_tier = ANY($6))
@@ -1520,8 +1535,8 @@ fn list_requests_page_sql(active_first: bool) -> String {
               AND ($2::text IS NULL OR object.state = $2)
               AND ($3::text[] IS NULL OR object.model = ANY($3))
               AND ($4::timestamptz IS NULL OR object.created_at >= $4)
-              -- V1 proves created_at <= terminal_at < delete_on, so this
-              -- necessary lower bound enables daily partition pruning.
+              -- V1 proves created_at < delete_on, so this necessary lower
+              -- bound enables daily partition pruning.
               AND ($4::timestamptz IS NULL OR object.delete_on > ($4 AT TIME ZONE 'UTC')::date)
               AND ($5::timestamptz IS NULL OR object.created_at <= $5)
               AND ($6::text[] IS NULL OR object.service_tier = ANY($6))
@@ -1652,7 +1667,7 @@ const COUNT_OWNER_FLEX_REQUESTS_SQL: &str = r#"
           )
           AND object.created_by = $1
           AND object.created_at >= $2
-          -- V1 proves created_at <= terminal_at < delete_on.
+          -- V1 proves created_at < delete_on.
           AND object.delete_on > ($2 AT TIME ZONE 'UTC')::date
           AND object.service_tier = 'flex'
           AND NOT EXISTS (
@@ -1674,6 +1689,192 @@ pub(crate) async fn count_owner_flex_requests_since<P: PoolProvider>(
         .await
         .map_err(read_database_failure)
 }
+
+pub(crate) const TRAILING_DEMAND_SQL: &str = r#"
+    SELECT model, service_tier, outcome, SUM(count)::BIGINT AS count
+    FROM (
+    SELECT
+        request.model,
+        request.service_tier,
+        'completed'::text AS outcome,
+        COUNT(*)::BIGINT AS count
+    FROM requests request
+    WHERE request.state = 'completed'
+      AND request.completed_at >= $1
+      AND request.completed_at < $2
+      AND (cardinality($3::text[]) = 0 OR request.model = ANY($3))
+      AND request.service_tier IS DISTINCT FROM 'background'
+      AND (
+          request.template_id IS NOT NULL
+          OR (request.service_tier = 'priority' AND request.batch_id IS NULL)
+      )
+      AND (
+          $6 = 'any'
+          OR ($6 = 'include' AND (
+              (request.service_tier IS NOT NULL AND request.service_tier = ANY($4))
+              OR ($5 AND request.service_tier IS NULL)
+          ))
+          OR ($6 = 'exclude' AND (
+              (request.service_tier IS NULL AND NOT $5)
+              OR (request.service_tier IS NOT NULL AND request.service_tier <> ALL($4))
+          ))
+      )
+    GROUP BY request.model, request.service_tier
+
+    UNION ALL
+
+    SELECT
+        request.model,
+        request.service_tier,
+        'failed'::text AS outcome,
+        COUNT(*)::BIGINT AS count
+    FROM requests request
+    WHERE request.state = 'failed'
+      AND request.failed_at >= $1
+      AND request.failed_at < $2
+      AND (cardinality($3::text[]) = 0 OR request.model = ANY($3))
+      AND request.service_tier IS DISTINCT FROM 'background'
+      AND (
+          request.template_id IS NOT NULL
+          OR (request.service_tier = 'priority' AND request.batch_id IS NULL)
+      )
+      AND (
+          $6 = 'any'
+          OR ($6 = 'include' AND (
+              (request.service_tier IS NOT NULL AND request.service_tier = ANY($4))
+              OR ($5 AND request.service_tier IS NULL)
+          ))
+          OR ($6 = 'exclude' AND (
+              (request.service_tier IS NULL AND NOT $5)
+              OR (request.service_tier IS NOT NULL AND request.service_tier <> ALL($4))
+          ))
+      )
+    GROUP BY request.model, request.service_tier
+
+    UNION ALL
+
+    SELECT
+        retained.model,
+        retained.service_tier,
+        'completed'::text AS outcome,
+        COUNT(*)::BIGINT AS count
+    FROM retained_response_buckets bucket
+    JOIN pg_namespace namespace
+      ON namespace.nspname = bucket.partition_schema
+    JOIN pg_class child
+      ON child.relnamespace = namespace.oid
+     AND child.relname = bucket.partition_table
+     AND child.oid = bucket.partition_oid
+    JOIN pg_inherits inheritance
+      ON inheritance.inhrelid = child.oid
+     AND NOT inheritance.inhdetachpending
+    JOIN retained_response_objects retained
+      ON retained.delete_on = bucket.delete_on
+     AND retained.object_kind = 'request'
+    JOIN retained_response_request_routes route
+      ON route.request_id = retained.object_id
+     AND route.group_id = retained.group_id
+     AND route.delete_on = retained.delete_on
+    JOIN retained_response_group_routes group_route
+      ON group_route.group_id = retained.group_id
+     AND group_route.delete_on = retained.delete_on
+    WHERE bucket.state = 'active'
+      AND bucket.partition_schema = current_schema()
+      AND bucket.partition_table =
+          'retained_response_objects_d' || to_char(bucket.delete_on, 'YYYYMMDD')
+      AND inheritance.inhparent =
+          to_regclass(format('%I.retained_response_objects', current_schema()))
+      AND pg_get_expr(child.relpartbound, child.oid) = format(
+          'FOR VALUES FROM (%L) TO (%L)', bucket.delete_on, bucket.delete_on + 1
+      )
+      AND retained.state = 'completed'
+      AND retained.terminal_at >= $1
+      AND retained.terminal_at < $2
+      -- V1 proves terminal_at < delete_on, so this necessary lower
+      -- bound enables daily partition pruning for the trailing window.
+      AND retained.delete_on > ($1 AT TIME ZONE 'UTC')::date
+      AND (cardinality($3::text[]) = 0 OR retained.model = ANY($3))
+      AND retained.service_tier IS DISTINCT FROM 'background'
+      AND (
+          $6 = 'any'
+          OR ($6 = 'include' AND (
+              (retained.service_tier IS NOT NULL AND retained.service_tier = ANY($4))
+              OR ($5 AND retained.service_tier IS NULL)
+          ))
+          OR ($6 = 'exclude' AND (
+              (retained.service_tier IS NULL AND NOT $5)
+              OR (retained.service_tier IS NOT NULL AND retained.service_tier <> ALL($4))
+          ))
+      )
+      AND NOT EXISTS (
+          SELECT 1 FROM requests live
+          WHERE live.id = retained.object_id AND live.created_by IS NOT NULL
+      )
+    GROUP BY retained.model, retained.service_tier
+
+    UNION ALL
+
+    SELECT
+        retained.model,
+        retained.service_tier,
+        'failed'::text AS outcome,
+        COUNT(*)::BIGINT AS count
+    FROM retained_response_buckets bucket
+    JOIN pg_namespace namespace
+      ON namespace.nspname = bucket.partition_schema
+    JOIN pg_class child
+      ON child.relnamespace = namespace.oid
+     AND child.relname = bucket.partition_table
+     AND child.oid = bucket.partition_oid
+    JOIN pg_inherits inheritance
+      ON inheritance.inhrelid = child.oid
+     AND NOT inheritance.inhdetachpending
+    JOIN retained_response_objects retained
+      ON retained.delete_on = bucket.delete_on
+     AND retained.object_kind = 'request'
+    JOIN retained_response_request_routes route
+      ON route.request_id = retained.object_id
+     AND route.group_id = retained.group_id
+     AND route.delete_on = retained.delete_on
+    JOIN retained_response_group_routes group_route
+      ON group_route.group_id = retained.group_id
+     AND group_route.delete_on = retained.delete_on
+    WHERE bucket.state = 'active'
+      AND bucket.partition_schema = current_schema()
+      AND bucket.partition_table =
+          'retained_response_objects_d' || to_char(bucket.delete_on, 'YYYYMMDD')
+      AND inheritance.inhparent =
+          to_regclass(format('%I.retained_response_objects', current_schema()))
+      AND pg_get_expr(child.relpartbound, child.oid) = format(
+          'FOR VALUES FROM (%L) TO (%L)', bucket.delete_on, bucket.delete_on + 1
+      )
+      AND retained.state = 'failed'
+      AND retained.terminal_at >= $1
+      AND retained.terminal_at < $2
+      -- V1 proves terminal_at < delete_on, so this necessary lower
+      -- bound enables daily partition pruning for the trailing window.
+      AND retained.delete_on > ($1 AT TIME ZONE 'UTC')::date
+      AND (cardinality($3::text[]) = 0 OR retained.model = ANY($3))
+      AND retained.service_tier IS DISTINCT FROM 'background'
+      AND (
+          $6 = 'any'
+          OR ($6 = 'include' AND (
+              (retained.service_tier IS NOT NULL AND retained.service_tier = ANY($4))
+              OR ($5 AND retained.service_tier IS NULL)
+          ))
+          OR ($6 = 'exclude' AND (
+              (retained.service_tier IS NULL AND NOT $5)
+              OR (retained.service_tier IS NOT NULL AND retained.service_tier <> ALL($4))
+          ))
+      )
+      AND NOT EXISTS (
+          SELECT 1 FROM requests live
+          WHERE live.id = retained.object_id AND live.created_by IS NOT NULL
+      )
+    GROUP BY retained.model, retained.service_tier
+    ) terminal_counts
+    GROUP BY model, service_tier, outcome
+"#;
 
 pub(crate) async fn get_step(
     tx: &mut Transaction<'_, Postgres>,
@@ -2718,11 +2919,12 @@ async fn move_graph<P: PoolProvider>(
         {
             return Ok(MoveGraphOutcome::Deferred);
         }
-        if exact_expiry(terminal_at, seconds)? > archive_now {
+        let retention_anchor = terminal_at.max(request.created_at);
+        if exact_expiry(retention_anchor, seconds)? > archive_now {
             return Ok(MoveGraphOutcome::Deferred);
         }
         max_retention_seconds = max_retention_seconds.max(seconds);
-        let request_delete_on = RetentionSweepPolicy::delete_on(terminal_at, seconds)
+        let request_delete_on = RetentionSweepPolicy::delete_on(retention_anchor, seconds)
             .map_err(|_| incomplete_graph())?;
         delete_on = Some(delete_on.map_or(request_delete_on, |current: NaiveDate| {
             current.max(request_delete_on)
@@ -2732,11 +2934,13 @@ async fn move_graph<P: PoolProvider>(
         let Some(terminal_at) = step.step.terminal_at() else {
             return Err(incomplete_graph());
         };
-        if exact_expiry(terminal_at, max_retention_seconds)? > archive_now {
+        let retention_anchor = terminal_at.max(step.step.created_at);
+        if exact_expiry(retention_anchor, max_retention_seconds)? > archive_now {
             return Ok(MoveGraphOutcome::Deferred);
         }
-        let step_delete_on = RetentionSweepPolicy::delete_on(terminal_at, max_retention_seconds)
-            .map_err(|_| incomplete_graph())?;
+        let step_delete_on =
+            RetentionSweepPolicy::delete_on(retention_anchor, max_retention_seconds)
+                .map_err(|_| incomplete_graph())?;
         delete_on = Some(delete_on.map_or(step_delete_on, |current: NaiveDate| {
             current.max(step_delete_on)
         }));
@@ -3113,25 +3317,30 @@ mod tests {
         }
     }
 
-    fn plan_scans_relation(plan: &serde_json::Value, relation_name: &str) -> bool {
+    fn relation_actual_loops(plan: &serde_json::Value, relation_name: &str) -> u64 {
         match plan {
             serde_json::Value::Array(values) => values
                 .iter()
-                .any(|value| plan_scans_relation(value, relation_name)),
+                .map(|value| relation_actual_loops(value, relation_name))
+                .sum(),
             serde_json::Value::Object(fields) => {
-                let scans_this_relation =
-                    fields.get("Relation Name").and_then(|value| value.as_str())
-                        == Some(relation_name)
-                        && fields
-                            .get("Actual Loops")
-                            .and_then(|value| value.as_u64())
-                            .is_none_or(|loops| loops > 0);
-                scans_this_relation
-                    || fields
+                let this_relation = if fields.get("Relation Name").and_then(|value| value.as_str())
+                    == Some(relation_name)
+                {
+                    fields
+                        .get("Actual Loops")
+                        .and_then(|value| value.as_u64())
+                        .unwrap_or(0)
+                } else {
+                    0
+                };
+                this_relation
+                    + fields
                         .values()
-                        .any(|value| plan_scans_relation(value, relation_name))
+                        .map(|value| relation_actual_loops(value, relation_name))
+                        .sum::<u64>()
             }
-            _ => false,
+            _ => 0,
         }
     }
 
@@ -3156,16 +3365,80 @@ mod tests {
 
     #[sqlx::test]
     async fn retained_list_and_count_plans_prune_children_before_created_after(pool: PgPool) {
-        for delete_on in [
-            NaiveDate::from_ymd_opt(2026, 8, 3).unwrap(),
-            NaiveDate::from_ymd_opt(2026, 8, 20).unwrap(),
-        ] {
+        let relevant_delete_on = NaiveDate::from_ymd_opt(2026, 8, 20).unwrap();
+        let irrelevant_delete_on = NaiveDate::from_ymd_opt(2026, 8, 3).unwrap();
+        for delete_on in [irrelevant_delete_on, relevant_delete_on] {
             sqlx::query("SELECT ensure_retained_response_partition($1, NULL)")
                 .bind(delete_on)
                 .execute(&pool)
                 .await
                 .expect("planner fixture partition must be available");
         }
+        let planner_group_id = Uuid::from_u128(0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb);
+        let planner_request_id = Uuid::from_u128(0xcccccccccccccccccccccccccccccccc);
+        sqlx::query(
+            r#"
+            INSERT INTO retained_response_objects (
+                delete_on, group_id, object_kind, object_id, request_id,
+                head_step_id, created_by, service_tier, state, model,
+                created_at, terminal_at, step_sequence, schema_version, payload
+            ) VALUES (
+                $1, $2, 'request', $3, $3,
+                NULL, 'planner-owner', 'flex', 'completed', 'planner-model',
+                '2026-08-11T09:00:00Z', '2026-08-12T10:00:00Z', NULL, 1, '{}'::jsonb
+            )
+            "#,
+        )
+        .bind(relevant_delete_on)
+        .bind(planner_group_id)
+        .bind(planner_request_id)
+        .execute(&pool)
+        .await
+        .expect("matching retained planner row must insert");
+        sqlx::query(
+            "INSERT INTO retained_response_group_routes (group_id, delete_on) VALUES ($1, $2)",
+        )
+        .bind(planner_group_id)
+        .bind(relevant_delete_on)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO retained_response_request_routes (request_id, group_id, delete_on) VALUES ($1, $2, $3)",
+        )
+        .bind(planner_request_id)
+        .bind(planner_group_id)
+        .bind(relevant_delete_on)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let list_count: i64 = sqlx::query_scalar(LIST_REQUESTS_COUNT_SQL)
+            .bind(Option::<&str>::None)
+            .bind(Option::<&str>::None)
+            .bind(Option::<Vec<String>>::None)
+            .bind(Some(timestamp("2026-08-10T00:00:00Z")))
+            .bind(Option::<DateTime<Utc>>::None)
+            .bind(Option::<Vec<String>>::None)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(list_count, 1);
+        let page_rows = sqlx::query(&list_requests_page_sql(false))
+            .bind(Option::<&str>::None)
+            .bind(Option::<&str>::None)
+            .bind(Option::<Vec<String>>::None)
+            .bind(Some(timestamp("2026-08-10T00:00:00Z")))
+            .bind(Option::<DateTime<Utc>>::None)
+            .bind(Option::<Vec<String>>::None)
+            .bind(20_i64)
+            .bind(0_i64)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(page_rows.len(), 1);
+        assert!(page_rows[0].get::<bool, _>("retained"));
+        assert_eq!(page_rows[0].get::<Uuid, _>("object_id"), planner_request_id);
 
         for (label, sql, page) in [
             ("count", LIST_REQUESTS_COUNT_SQL.to_owned(), false),
@@ -3177,7 +3450,12 @@ mod tests {
                 "{label} plan must retain the relevant daily child: {plan}"
             );
             assert!(
-                !plan_scans_relation(&plan, "retained_response_objects_d20260803"),
+                relation_actual_loops(&plan, "retained_response_objects_d20260820") > 0,
+                "{label} plan must execute the relevant daily child: {plan}"
+            );
+            assert_eq!(
+                relation_actual_loops(&plan, "retained_response_objects_d20260803"),
+                0,
                 "{label} plan must remove or avoid scanning the irrelevant daily child: {plan}"
             );
         }
@@ -3190,13 +3468,61 @@ mod tests {
             .fetch_one(&pool)
             .await
             .expect("bounded retained flex-count SQL must be explainable");
+        let flex_count: i64 = sqlx::query_scalar(COUNT_OWNER_FLEX_REQUESTS_SQL)
+            .bind("planner-owner")
+            .bind(timestamp("2026-08-10T00:00:00Z"))
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(flex_count, 1);
         assert!(
             plan_mentions_relation(&flex_plan, "retained_response_objects_d20260820"),
             "flex-count plan must retain the relevant daily child: {flex_plan}"
         );
         assert!(
-            !plan_scans_relation(&flex_plan, "retained_response_objects_d20260803"),
+            relation_actual_loops(&flex_plan, "retained_response_objects_d20260820") > 0,
+            "flex-count plan must execute the relevant daily child: {flex_plan}"
+        );
+        assert_eq!(
+            relation_actual_loops(&flex_plan, "retained_response_objects_d20260803"),
+            0,
             "flex-count plan must remove or avoid scanning the irrelevant daily child: {flex_plan}"
+        );
+
+        let trailing_rows = sqlx::query(TRAILING_DEMAND_SQL)
+            .bind(timestamp("2026-08-10T00:00:00Z"))
+            .bind(timestamp("2026-08-15T00:00:00Z"))
+            .bind(vec!["planner-model".to_owned()])
+            .bind(vec!["flex".to_owned()])
+            .bind(false)
+            .bind("include")
+            .fetch_all(&pool)
+            .await
+            .expect("exact trailing-demand SQL must execute");
+        assert_eq!(trailing_rows.len(), 1);
+        assert_eq!(trailing_rows[0].get::<String, _>("model"), "planner-model");
+        assert_eq!(trailing_rows[0].get::<String, _>("outcome"), "completed");
+        assert_eq!(trailing_rows[0].get::<i64, _>("count"), 1);
+
+        let trailing_explain = format!("EXPLAIN (ANALYZE, FORMAT JSON) {TRAILING_DEMAND_SQL}");
+        let trailing_plan: serde_json::Value = sqlx::query_scalar(&trailing_explain)
+            .bind(timestamp("2026-08-10T00:00:00Z"))
+            .bind(timestamp("2026-08-15T00:00:00Z"))
+            .bind(vec!["planner-model".to_owned()])
+            .bind(vec!["flex".to_owned()])
+            .bind(false)
+            .bind("include")
+            .fetch_one(&pool)
+            .await
+            .expect("exact trailing-demand SQL must be explainable");
+        assert!(
+            relation_actual_loops(&trailing_plan, "retained_response_objects_d20260820") > 0,
+            "trailing plan must execute the relevant daily child: {trailing_plan}"
+        );
+        assert_eq!(
+            relation_actual_loops(&trailing_plan, "retained_response_objects_d20260803"),
+            0,
+            "trailing plan must remove or avoid scanning the irrelevant daily child: {trailing_plan}"
         );
     }
 
@@ -3492,6 +3818,59 @@ mod tests {
         ] {
             assert!(!debug.contains(secret));
         }
+    }
+
+    #[test]
+    fn request_decoder_accepts_anomalous_safe_chronology_before_delete_on() {
+        // Mutation caught: reintroducing terminal_at >= created_at as a V1
+        // requirement rejects historical rows that the live schema permits.
+        let payload = request_payload();
+        let mut row = RetainedResponseObjectRow::request(delete_on(), group_id(), None, &payload)
+            .expect("baseline request fixture must encode");
+        let anomalous_created_at = timestamp("2030-01-03T03:04:00.000001Z");
+        row.created_at = Some(anomalous_created_at);
+        row.payload["request"]["created_at"] = json!(anomalous_created_at);
+
+        let decoded = row
+            .decode_request()
+            .expect("both timestamps before delete_on must remain readable");
+        assert_eq!(decoded.request.created_at, anomalous_created_at);
+        assert_eq!(
+            decoded.request.completed_at,
+            Some(timestamp("2030-01-02T03:04:11.456789Z"))
+        );
+    }
+
+    #[test]
+    fn request_decoder_rejects_created_or_terminal_timestamp_at_delete_on() {
+        // Mutation caught: omitting either row.delete_on comparison would make
+        // the created_after/terminal-window partition bounds unsound.
+        let payload = request_payload();
+        let mut created_boundary =
+            RetainedResponseObjectRow::request(delete_on(), group_id(), None, &payload)
+                .expect("baseline request fixture must encode");
+        let anomalous_created_at = timestamp("2030-01-03T03:04:00.000001Z");
+        created_boundary.created_at = Some(anomalous_created_at);
+        created_boundary.payload["request"]["created_at"] = json!(anomalous_created_at);
+        created_boundary.delete_on =
+            NaiveDate::from_ymd_opt(2030, 1, 3).expect("fixture date must be valid");
+        assert_eq!(
+            created_boundary.decode_request(),
+            Err(RetainedResponseSerializationError::InvalidRequestSnapshot)
+        );
+
+        let mut terminal_boundary =
+            RetainedResponseObjectRow::request(delete_on(), group_id(), None, &payload)
+                .expect("baseline request fixture must encode");
+        let earlier_created_at = timestamp("2030-01-01T03:04:00.000001Z");
+        terminal_boundary.created_at = Some(earlier_created_at);
+        terminal_boundary.payload["request"]["created_at"] = json!(earlier_created_at);
+        terminal_boundary.delete_on =
+            NaiveDate::from_ymd_opt(2030, 1, 2).expect("fixture date must be valid");
+        assert_eq!(
+            terminal_boundary.decode_request(),
+            Err(RetainedResponseSerializationError::InvalidRequestSnapshot)
+        );
     }
 
     #[test]
