@@ -244,11 +244,37 @@ impl ContinuationRoutes {
         // with the default pool is the free first hop, typically dynamo, and
         // carries no continuation config of its own.) Falling back to plain
         // pool order keeps a single-member completions pool working.
+        //
+        // `render_kwargs` is the one field NOT taken from that representative
+        // row. **Selection rule: the first NON-NULL `render_kwargs` across the
+        // pool's members, in `sort_order`.** It describes how THE MODEL is
+        // served — the serving mode the prefix must be rendered in — not a
+        // property of whichever member answers, so any member stating it states
+        // it for the pool, and a member that is silent (NULL) must not shout
+        // down one that is not. First-member-wins got this wrong in production:
+        // a NULL at sort 0 (the blackhole/dynamo primary) beat the validated
+        // target's `{"thinking_mode": "chat"}` at sort 1, the resume prefix
+        // rendered in thinking mode, and a real model emitted a literal
+        // `</think>` into a client's content stream. Its eventual home is a
+        // pool-level (or composite-level) column, at which point this
+        // aggregate-over-members collapses into reading that column; the rule
+        // here is chosen to be what that column would say.
+        //
+        // `strip_leading_bos` keeps the representative row's value, because
+        // BOS-prepending genuinely IS per-member (see
+        // [`RouteInfo::strip_leading_bos`]): the pool can hold one member that
+        // prepends and one that does not, so no single pool-wide value is
+        // correct. It stays approximate until the strip moves into onwards'
+        // per-member request forwarding, where each member can be adjusted
+        // outbound.
         let rows = sqlx::query!(
             r#"
             SELECT DISTINCT ON (cm.alias)
                 cm.alias,
-                dmc.render_kwargs,
+                first_value(dmc.render_kwargs) OVER (
+                    PARTITION BY dmc.composite_model_id
+                    ORDER BY (dmc.render_kwargs IS NULL), dmc.sort_order ASC
+                ) AS render_kwargs,
                 dmc.strip_leading_bos
             FROM deployed_model_components dmc
             JOIN deployed_models cm ON cm.id = dmc.composite_model_id
@@ -592,6 +618,45 @@ mod tests {
             "the validated target's config wins over the shared first hop's defaults"
         );
         assert!(route.strip_leading_bos);
+    }
+
+    /// `render_kwargs` describes the MODEL's serving mode, so the first member
+    /// to state one states it for the pool. A silent (NULL) member ahead of it
+    /// must not win by position: that is exactly how a chat-mode route rendered
+    /// its resume prefix in thinking mode and leaked a `</think>` to a client.
+    #[sqlx::test]
+    async fn the_first_non_null_render_kwargs_in_the_pool_wins(pool: PgPool) {
+        let user = create_test_user(&pool, Role::PlatformManager).await;
+        let endpoint = create_test_endpoint(&pool, "ep", user.id).await;
+        let composite = create_composite(&pool, "dsv4-flash", user.id).await;
+        let blackhole = create_test_model(&pool, "m-dynamo", "dynamo", endpoint, user.id).await;
+        let fireworks = create_test_model(&pool, "m-fw", "fireworks", endpoint, user.id).await;
+
+        // Both members are completions-only (neither is in the default pool, so
+        // the shared-first-hop tie-break cannot save us here); the primary at
+        // sort 0 carries no render config at all.
+        add_component_at(&pool, composite, blackhole, "completions", 0).await;
+        add_component_at(&pool, composite, fireworks, "completions", 1).await;
+        sqlx::query!(
+            r#"UPDATE deployed_model_components
+               SET render_kwargs = '{"thinking_mode": "chat"}'::jsonb
+               WHERE composite_model_id = $1 AND deployed_model_id = $2 AND pool = 'completions'"#,
+            composite,
+            fireworks
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let routes = ContinuationRoutes::new();
+        routes.refresh(&pool).await.unwrap();
+        let route = routes.get("dsv4-flash").expect("the canary route");
+        assert_eq!(
+            route.render_kwargs,
+            Some(serde_json::json!({"thinking_mode": "chat"})),
+            "a NULL at sort 0 must not override the mode a later member states"
+        );
+        assert!(!route.thinking(), "a chat-mode route must not close a think tag");
     }
 
     #[test]
