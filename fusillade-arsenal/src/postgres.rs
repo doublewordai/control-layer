@@ -38,7 +38,10 @@ use crate::daemon::{
     Running,
 };
 use crate::error::{FusilladeError, Result};
-use crate::manager::{RetentionSweepCutoffs, RetentionSweepOutcome, TrailingDemandCount};
+use crate::manager::{
+    RetainedResponseArchiveOutcome, RetentionSweepCutoffs, RetentionSweepOutcome,
+    RetentionSweepPolicy, TrailingDemandCount,
+};
 use crate::request::{
     Canceled, CascadeTargetState, Claimed, Completed, CreateBackgroundInput, CreateFlexInput,
     CreateRealtimeInput, DaemonId, Failed, FailureReason, LeakStamp, Pending,
@@ -46,9 +49,9 @@ use crate::request::{
     ServiceTierFilter,
 };
 
-// The archive mover and archive-aware readers consume this module in later
-// rollout steps. Keep its reviewed V1 boundary available without coupling this
-// serialization-only change to movement or read routing.
+// Retained graph representation and movement stay isolated from the main
+// repository wiring. Archive-aware readers consume the same boundary in a
+// later rollout step.
 #[allow(dead_code)]
 pub(crate) mod retained_response;
 
@@ -8456,6 +8459,23 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
 impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
     fn supports_retention_sweeps(&self) -> bool {
         true
+    }
+
+    async fn archive_terminal_batchless_responses(
+        &self,
+        policy: &RetentionSweepPolicy,
+        cancel_grace_before: DateTime<Utc>,
+        max_groups: i64,
+        max_bytes: i64,
+    ) -> Result<RetainedResponseArchiveOutcome> {
+        retained_response::archive_terminal_batchless_responses(
+            self,
+            policy,
+            cancel_grace_before,
+            max_groups,
+            max_bytes,
+        )
+        .await
     }
 
     async fn persist_daemon<T: DaemonState + Clone>(&self, record: &DaemonRecord<T>) -> Result<()>
