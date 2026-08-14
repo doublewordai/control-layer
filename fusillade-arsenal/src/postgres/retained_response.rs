@@ -1233,9 +1233,15 @@ fn incomplete_graph() -> FusilladeError {
 }
 
 #[derive(Clone, Copy)]
+struct CandidateSeed {
+    request_id: Uuid,
+    group_id: Uuid,
+}
+
 struct Candidate {
     request_id: Uuid,
     group_id: Uuid,
+    discovered_topology: GraphTopology,
 }
 
 enum MoveGraphOutcome {
@@ -1452,8 +1458,7 @@ async fn graph_closure_is_exact(
 
 async fn selected_graph_is_absent(
     tx: &mut Transaction<'_, Postgres>,
-    candidate: Candidate,
-    topology: &GraphTopology,
+    candidate: &Candidate,
 ) -> MovementResult<bool> {
     sqlx::query_scalar(
         r#"
@@ -1470,8 +1475,8 @@ async fn selected_graph_is_absent(
         )
         "#,
     )
-    .bind(&topology.request_ids)
-    .bind(&topology.step_ids)
+    .bind(&candidate.discovered_topology.request_ids)
+    .bind(&candidate.discovered_topology.step_ids)
     .bind(candidate.group_id)
     .fetch_one(&mut **tx)
     .await
@@ -1875,7 +1880,7 @@ async fn insert_and_verify_routes(
 
 async fn move_graph<P: PoolProvider>(
     manager: &PostgresRequestManager<P>,
-    mut candidate: Candidate,
+    candidate: Candidate,
     policy: &RetentionSweepPolicy,
     archive_now: DateTime<Utc>,
     cancel_grace_before: DateTime<Utc>,
@@ -1883,22 +1888,21 @@ async fn move_graph<P: PoolProvider>(
     allow_oversized: bool,
 ) -> MovementResult<MoveGraphOutcome> {
     let mut tx = manager.begin_write().await.map_err(database_failure)?;
-    candidate.group_id = current_group_id(&mut tx, candidate.request_id).await?;
-    let initial_topology =
-        graph_topology(&mut tx, candidate.group_id, candidate.request_id).await?;
+    let group_id = current_group_id(&mut tx, candidate.request_id).await?;
+    let initial_topology = graph_topology(&mut tx, group_id, candidate.request_id).await?;
 
     match lock_requests(&mut tx, &initial_topology.request_ids).await? {
         LockSetOutcome::Locked => {}
         LockSetOutcome::Skipped => return Ok(MoveGraphOutcome::SkippedLocked),
         LockSetOutcome::Missing => {
-            if selected_graph_is_absent(&mut tx, candidate, &initial_topology).await? {
+            if selected_graph_is_absent(&mut tx, &candidate).await? {
                 return Ok(MoveGraphOutcome::AlreadyGone);
             }
             return Err(incomplete_graph());
         }
     }
     let locked_group_id = current_group_id(&mut tx, candidate.request_id).await?;
-    if locked_group_id != candidate.group_id {
+    if locked_group_id != group_id {
         return Err(incomplete_graph());
     }
     if !initial_topology.step_ids.is_empty() {
@@ -1909,8 +1913,7 @@ async fn move_graph<P: PoolProvider>(
         }
     }
 
-    let revalidated_topology =
-        graph_topology(&mut tx, candidate.group_id, candidate.request_id).await?;
+    let revalidated_topology = graph_topology(&mut tx, group_id, candidate.request_id).await?;
     if revalidated_topology != initial_topology
         || !graph_closure_is_exact(&mut tx, &revalidated_topology).await?
     {
@@ -2085,8 +2088,8 @@ async fn move_graph<P: PoolProvider>(
         })
         .collect::<MovementResult<Vec<_>>>()?;
     let group = RetainedGroup {
-        group_id: candidate.group_id,
-        head_step_id: (!revalidated_step_ids.is_empty()).then_some(candidate.group_id),
+        group_id,
+        head_step_id: (!revalidated_step_ids.is_empty()).then_some(group_id),
         request_ids: request_ids.clone(),
         step_ids: revalidated_step_ids.clone(),
     };
@@ -2106,11 +2109,11 @@ async fn move_graph<P: PoolProvider>(
         return Err(RetainedResponseMovementError::PartitionUnavailable.into_fusillade_error());
     }
 
-    insert_and_verify_objects(&mut tx, delete_on, candidate.group_id, &objects).await?;
+    insert_and_verify_objects(&mut tx, delete_on, group_id, &objects).await?;
     insert_and_verify_routes(
         &mut tx,
         delete_on,
-        candidate.group_id,
+        group_id,
         &request_ids,
         &revalidated_step_ids,
     )
@@ -2176,7 +2179,7 @@ async fn next_candidate<P: PoolProvider>(
     tiers: &[String],
     cutoffs: &[DateTime<Utc>],
     excluded_request_ids: &[Uuid],
-) -> MovementResult<Option<Candidate>> {
+) -> MovementResult<Option<CandidateSeed>> {
     let row: Option<(Uuid, Uuid)> = sqlx::query_as(
         r#"
         WITH policy(service_tier, expire_before) AS (
@@ -2221,17 +2224,17 @@ async fn next_candidate<P: PoolProvider>(
     .fetch_optional(manager.read_executor())
     .await
     .map_err(database_failure)?;
-    Ok(row.map(|(request_id, group_id)| Candidate {
+    Ok(row.map(|(request_id, group_id)| CandidateSeed {
         request_id,
         group_id,
     }))
 }
 
-async fn candidate_group_request_ids<P: PoolProvider>(
+async fn candidate_group_topology<P: PoolProvider>(
     manager: &PostgresRequestManager<P>,
-    candidate: Candidate,
-) -> MovementResult<Vec<Uuid>> {
-    let mut request_ids: Vec<Uuid> = sqlx::query_scalar(
+    candidate: CandidateSeed,
+) -> MovementResult<GraphTopology> {
+    let members: Vec<(Uuid, Option<Uuid>)> = sqlx::query_as(
         r#"
         WITH RECURSIVE graph_steps(id, request_id) AS (
             SELECT step.id, step.request_id
@@ -2250,21 +2253,30 @@ async fn candidate_group_request_ids<P: PoolProvider>(
                   AND child.request_id = member.request_id
               )
         )
-        SELECT DISTINCT request_id
+        SELECT id, request_id
         FROM graph_steps
-        WHERE request_id IS NOT NULL
-        ORDER BY request_id
+        ORDER BY id
         "#,
     )
     .bind(candidate.group_id)
     .fetch_all(manager.read_executor())
     .await
     .map_err(database_failure)?;
+    let step_ids = members.iter().map(|(step_id, _)| *step_id).collect();
+    let mut request_ids = members
+        .into_iter()
+        .filter_map(|(_, request_id)| request_id)
+        .collect::<Vec<_>>();
+    request_ids.sort_unstable();
+    request_ids.dedup();
     if !request_ids.contains(&candidate.request_id) {
         request_ids.push(candidate.request_id);
         request_ids.sort_unstable();
     }
-    Ok(request_ids)
+    Ok(GraphTopology {
+        request_ids,
+        step_ids,
+    })
 }
 
 pub(crate) async fn archive_terminal_batchless_responses<P: PoolProvider>(
@@ -2323,12 +2335,16 @@ pub(crate) async fn archive_terminal_batchless_responses<P: PoolProvider>(
             discovery_exhausted = true;
             break;
         };
-        let request_ids = candidate_group_request_ids(manager, candidate).await?;
-        excluded_request_ids.extend(request_ids);
+        let discovered_topology = candidate_group_topology(manager, candidate).await?;
+        excluded_request_ids.extend(discovered_topology.request_ids.iter().copied());
         excluded_request_ids.sort_unstable();
         excluded_request_ids.dedup();
         if seen_groups.insert(candidate.group_id) {
-            candidates.push(candidate);
+            candidates.push(Candidate {
+                request_id: candidate.request_id,
+                group_id: candidate.group_id,
+                discovered_topology,
+            });
         }
     }
     let mut outcome = RetainedResponseArchiveOutcome {
