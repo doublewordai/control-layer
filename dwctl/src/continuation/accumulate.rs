@@ -27,6 +27,7 @@ use crate::config::ContinuationConfig;
 use super::RouteInfo;
 
 use super::dsv4::Dsv4Reconstructor;
+use super::forward::{ForwardParser, PlainForward};
 use super::rewrap::Envelope;
 
 /// Why a stream stopped being reconstructable. Each maps to a bounded
@@ -93,10 +94,26 @@ pub trait StreamAccumulator: Send {
     /// holds content, so always. A structured reconstructor must say no when
     /// the seam sits inside reasoning or tool syntax: the completions leg
     /// would emit raw model markup (`</think>`, DSML) that plain reframing
-    /// exposes as answer text. v2's forward parser lifts this by decoding the
+    /// exposes as answer text. The forward parser lifts this by decoding the
     /// leg back into chat deltas.
     fn plain_resume_ok(&self) -> bool {
         true
+    }
+
+    /// The parser for the resume leg this accumulator's prefix will start,
+    /// seeded with the structure that was open at the death point.
+    ///
+    /// Deliberately a method on the accumulator rather than a second lookup in
+    /// [`for_model`]: the reconstructor is the only thing that knows both which
+    /// syntax the leg will come back in and where in that syntax the generation
+    /// stopped, so a reconstructor without its parser (or a parser seeded from
+    /// somewhere else) cannot be expressed. The default is
+    /// [`PlainForward`] — raw text is content — which is what every model
+    /// without a `model_reconstructors` entry keeps.
+    ///
+    /// Called once per leg, BEFORE any of that leg's output is fed back in.
+    fn forward_parser(&self) -> Box<dyn ForwardParser> {
+        Box::new(PlainForward)
     }
 }
 
