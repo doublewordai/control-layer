@@ -7,7 +7,11 @@
 //! - Batch requests (with X-Fusillade-Request-Id) don't create duplicate rows
 
 use crate::api::models::users::Role;
-use crate::test::utils::{add_auth_headers, create_test_admin_user, create_test_config, create_test_user};
+use std::collections::HashMap;
+
+use crate::test::utils::{add_auth_headers, create_test_admin_user, create_test_config, create_test_user, setup_fusillade_pool};
+use fusillade::{DaemonStorage, RetentionSweepPolicy};
+use fusillade_arsenal::{PostgresRequestManager, TestDbPools};
 use sqlx::PgPool;
 
 /// Helper to set up a test app with a wiremock endpoint, model, API key, and
@@ -357,6 +361,175 @@ async fn test_get_response_returns_404_for_unknown_id(pool: PgPool) {
         .await;
 
     assert_eq!(response.status_code(), 404);
+}
+
+async fn archive_response_graphs(pool: &PgPool, max_groups: i64) {
+    let fusillade_pool = setup_fusillade_pool(pool).await;
+    sqlx::query(
+        "CREATE INDEX idx_requests_batchless_retention_due ON requests (service_tier, (CASE state WHEN 'completed' THEN completed_at WHEN 'failed' THEN failed_at WHEN 'canceled' THEN canceled_at END), id) WHERE batch_id IS NULL AND state IN ('completed', 'failed', 'canceled')",
+    )
+    .execute(&fusillade_pool)
+    .await
+    .unwrap();
+    sqlx::query("SELECT ensure_retained_response_partition('2026-08-02', NULL)")
+        .execute(&fusillade_pool)
+        .await
+        .unwrap();
+    let manager = PostgresRequestManager::new(TestDbPools::new(fusillade_pool).await.unwrap(), Default::default());
+    manager
+        .archive_terminal_batchless_responses(
+            &RetentionSweepPolicy {
+                batchless_seconds_by_service_tier: HashMap::from([("priority".to_owned(), 1)]),
+                ..Default::default()
+            },
+            chrono::DateTime::parse_from_rfc3339("2026-08-10T00:00:00Z").unwrap().to_utc(),
+            max_groups,
+            i64::MAX,
+        )
+        .await
+        .expect("response graph must move into retained storage");
+}
+
+#[sqlx::test]
+#[test_log::test]
+async fn read_retained_singleton_preserves_response_and_fails_closed_after_drop(pool: PgPool) {
+    let mock_server = wiremock::MockServer::start().await;
+    mount_chat_completions_mock(&mock_server).await;
+    let (server, api_key, _bg) = setup_ai_test(pool.clone(), &mock_server, true).await;
+
+    server
+        .post("/ai/v1/chat/completions")
+        .add_header("Authorization", &format!("Bearer {api_key}"))
+        .add_header("Content-Type", "application/json")
+        .json(&serde_json::json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "retained singleton"}],
+            "service_tier": "priority"
+        }))
+        .await
+        .assert_status_ok();
+    let id = poll_completed_row(&pool, uuid::Uuid::nil()).await;
+    sqlx::query(
+        "UPDATE fusillade.requests SET created_at = '2026-08-01 08:00:00Z', claimed_at = '2026-08-01 09:58:00Z', started_at = '2026-08-01 09:59:00Z', completed_at = '2026-08-01 10:00:00Z', updated_at = '2026-08-01 10:00:00Z' WHERE id = $1",
+    )
+    .bind(id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let response_id = format!("resp_{id}");
+    let before = server
+        .get(&format!("/ai/v1/responses/{response_id}"))
+        .add_header("Authorization", &format!("Bearer {api_key}"))
+        .await;
+    before.assert_status_ok();
+    let before_json: serde_json::Value = before.json();
+
+    archive_response_graphs(&pool, 1).await;
+    let after = server
+        .get(&format!("/ai/v1/responses/{response_id}"))
+        .add_header("Authorization", &format!("Bearer {api_key}"))
+        .await;
+    after.assert_status_ok();
+    assert_eq!(after.json::<serde_json::Value>(), before_json);
+
+    sqlx::query("UPDATE fusillade.retained_response_buckets SET state = 'retiring' WHERE delete_on = '2026-08-02'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let retiring = server
+        .get(&format!("/ai/v1/responses/{response_id}"))
+        .add_header("Authorization", &format!("Bearer {api_key}"))
+        .await;
+    retiring.assert_status_not_found();
+
+    sqlx::query("ALTER TABLE fusillade.retained_response_objects DETACH PARTITION fusillade.retained_response_objects_d20260802")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DROP TABLE fusillade.retained_response_objects_d20260802")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let dropped = server
+        .get(&format!("/ai/v1/responses/{response_id}"))
+        .add_header("Authorization", &format!("Bearer {api_key}"))
+        .await;
+    dropped.assert_status_not_found();
+}
+
+#[sqlx::test]
+#[test_log::test]
+async fn read_retained_multistep_preserves_head_public_id_and_owner(pool: PgPool) {
+    let mock_server = wiremock::MockServer::start().await;
+    mount_chat_completions_mock(&mock_server).await;
+    let (server, api_key, _bg) = setup_ai_test(pool.clone(), &mock_server, true).await;
+
+    server
+        .post("/ai/v1/responses")
+        .add_header("Authorization", &format!("Bearer {api_key}"))
+        .add_header("Content-Type", "application/json")
+        .json(&serde_json::json!({"model": "gpt-4o", "input": "retained multi-step"}))
+        .await
+        .assert_status_ok();
+    let request_id = poll_completed_row(&pool, uuid::Uuid::nil()).await;
+    sqlx::query(
+        "UPDATE fusillade.requests SET created_at = '2026-08-01 08:00:00Z', claimed_at = '2026-08-01 09:58:00Z', started_at = '2026-08-01 09:59:00Z', completed_at = '2026-08-01 10:00:00Z', updated_at = '2026-08-01 10:00:00Z' WHERE id = $1",
+    )
+    .bind(request_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let head_id = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO fusillade.response_steps (id, request_id, step_kind, step_sequence, request_payload, response_payload, state, started_at, completed_at, created_at, updated_at) VALUES ($1, $2, 'model_call', 1, $3, $4, 'completed', '2026-08-01 09:59:00Z', '2026-08-01 10:00:00Z', '2026-08-01 09:58:00Z', '2026-08-01 10:00:00Z')",
+    )
+    .bind(head_id)
+    .bind(request_id)
+    .bind(serde_json::json!({"input": "retained multi-step"}))
+    .bind(serde_json::json!({"output": "retained multi-step"}))
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let response_id = format!("resp_{head_id}");
+    let before = server
+        .get(&format!("/ai/v1/responses/{response_id}"))
+        .add_header("Authorization", &format!("Bearer {api_key}"))
+        .await;
+    before.assert_status_ok();
+    let before_json: serde_json::Value = before.json();
+    assert_eq!(before_json["id"], response_id);
+    let other_user = create_test_user(&pool, Role::StandardUser).await;
+    let other_api_key = format!("sk-retained-owner-{}", uuid::Uuid::new_v4());
+    sqlx::query("INSERT INTO api_keys (id, name, secret, purpose, user_id, created_by) VALUES ($1, $2, $3, 'realtime', $4, $4)")
+        .bind(uuid::Uuid::new_v4())
+        .bind("Retained response ownership test key")
+        .bind(&other_api_key)
+        .bind(other_user.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let unauthorized_before = server
+        .get(&format!("/ai/v1/responses/{response_id}"))
+        .add_header("Authorization", &format!("Bearer {other_api_key}"))
+        .await;
+    unauthorized_before.assert_status_not_found();
+
+    archive_response_graphs(&pool, 1).await;
+    let after = server
+        .get(&format!("/ai/v1/responses/{response_id}"))
+        .add_header("Authorization", &format!("Bearer {api_key}"))
+        .await;
+    after.assert_status_ok();
+    let after_json: serde_json::Value = after.json();
+    assert_eq!(after_json, before_json);
+    assert_eq!(after_json["id"], response_id);
+    let unauthorized_after = server
+        .get(&format!("/ai/v1/responses/{response_id}"))
+        .add_header("Authorization", &format!("Bearer {other_api_key}"))
+        .await;
+    unauthorized_after.assert_status_not_found();
 }
 
 /// Test that requests with X-Fusillade-Request-Id header don't create

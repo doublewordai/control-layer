@@ -1,11 +1,13 @@
 //! Handler for retrieving Open Responses API responses.
 //!
-//! `GET /ai/v1/responses/{response_id}` reads directly from fusillade's
-//! `requests` table, mapping the row to an Open Responses API Response object.
+//! `GET /ai/v1/responses/{response_id}` resolves through fusillade's live or
+//! active retained-response route and maps the snapshot to an Open Responses
+//! API Response object.
 //!
 //! Authentication is via Bearer API key (same as AI proxy requests).
-//! Ownership is verified by checking the batch's `created_by` against the
-//! API key's `user_id` (which is the org ID for org-scoped keys).
+//! Ownership is verified by checking the resolved request snapshot's
+//! `created_by` against the API key's `user_id` (which is the org ID for
+//! org-scoped keys).
 
 use crate::inference::response_store::StoreError;
 use axum::{
@@ -55,7 +57,7 @@ pub enum ResponseDeletedObjectType {
 ///
 /// Authenticates via Bearer API key. The response_id is the head step's
 /// uuid (with optional `resp_` prefix); the head step's sub-request
-/// fusillade row carries `created_by` for ownership.
+/// live or retained fusillade request carries `created_by` for ownership.
 #[tracing::instrument(skip_all)]
 pub async fn get_response<P: PoolProvider>(
     State(state): State<AppState<P>>,
@@ -86,7 +88,7 @@ pub async fn get_response<P: PoolProvider>(
         id: response_id.clone(),
     })?;
 
-    // Resolve the row that carries `created_by` for ownership.
+    // Resolve the live row or retained snapshot that carries `created_by` for ownership.
     // Two paths, mirroring `FusilladeResponseStore::get_response`:
     //   * Multi-step — head step → its sub-request fusillade row.
     //   * Single-step — the id is itself a fusillade.requests row
