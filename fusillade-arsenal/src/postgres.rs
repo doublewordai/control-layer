@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::anyhow;
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc, Weekday};
 use futures::stream::Stream;
 use sqlx::QueryBuilder;
 use sqlx::Row;
@@ -3386,7 +3386,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                 FROM batch_requests_archive WHERE id = ANY($1)
             ) r
             JOIN batches b ON r.batch_id = b.id
-            LEFT JOIN request_templates_by_file t
+            LEFT JOIN request_templates t
               ON r.template_id = t.id
              AND t.file_id = b.file_id
             "#,
@@ -3924,7 +3924,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                 model AS "model!",
                 COUNT(*)::BIGINT as "request_count!",
                 SUM(body_byte_size)::BIGINT as "total_body_bytes!"
-            FROM request_templates_by_file
+            FROM request_templates
             WHERE file_id = $1
             GROUP BY model
             ORDER BY model
@@ -4541,7 +4541,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
             r#"
             INSERT INTO requests (batch_id, template_id, state, custom_id, retry_attempt, model, service_tier)
             SELECT $1, id, 'pending', custom_id, 0, model, $3
-            FROM request_templates_by_file
+            FROM request_templates
             WHERE file_id = $2
             "#,
             *batch_id as Uuid,
@@ -6070,7 +6070,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                   AND a.batch_id = $1
             ) r
             JOIN batches b ON r.batch_id = b.id
-            LEFT JOIN request_templates_by_file t
+            LEFT JOIN request_templates t
               ON r.template_id = t.id
              AND t.file_id = b.file_id
             WHERE b.deleted_at IS NULL
@@ -6803,55 +6803,19 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
             let completed_ats: Vec<DateTime<Utc>> =
                 to_insert.iter().map(|r| r.completed_at).collect();
 
-            sqlx::query("SELECT ensure_request_template_partition(NOW())")
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| {
-                    FusilladeError::Other(anyhow!(
-                        "Failed to ensure realtime template partition: {e}"
-                    ))
-                })?;
-
             sqlx::query!(
                 r#"
-                WITH input AS MATERIALIZED (
-                    SELECT id, endpoint, method, path, body, model, api_key,
-                           body_byte_size, NOW() AS created_at
-                    FROM UNNEST(
-                        $1::uuid[], $2::text[], $3::text[], $4::text[],
-                        $5::text[], $6::text[], $7::text[], $8::bigint[]
-                    ) AS t(id, endpoint, method, path, body, model, api_key,
-                           body_byte_size)
-                ), registry AS (
-                    INSERT INTO request_templates_legacy (
-                        id, file_id, endpoint, method, path, body, model,
-                        api_key, created_at, updated_at, custom_id, line_number,
-                        body_byte_size, metadata, retained_bucket
-                    )
-                    SELECT id, NULL, '', '', '', '', '', '', created_at,
-                           created_at, NULL, 0, 0, NULL, created_at
-                    FROM input
-                    RETURNING id
-                ), locator AS (
-                    INSERT INTO request_template_retained_keys (
-                        id, created_at, file_id, line_number
-                    )
-                    SELECT input.id, input.created_at, NULL, 0
-                    FROM input
-                    JOIN registry USING (id)
-                    RETURNING id
-                )
-                INSERT INTO request_templates_retained (
+                INSERT INTO request_templates (
                     id, file_id, custom_id, endpoint, method, path, body,
-                    model, api_key, created_at, updated_at, line_number,
-                    body_byte_size
+                    model, api_key, body_byte_size
                 )
-                SELECT input.id, NULL, NULL, input.endpoint, input.method,
-                       input.path, input.body, input.model, input.api_key,
-                       input.created_at, input.created_at, 0,
-                       input.body_byte_size
-                FROM input
-                JOIN locator USING (id)
+                SELECT id, NULL, NULL, endpoint, method, path, body, model,
+                       api_key, body_byte_size
+                FROM UNNEST(
+                    $1::uuid[], $2::text[], $3::text[], $4::text[],
+                    $5::text[], $6::text[], $7::text[], $8::bigint[]
+                ) AS t(id, endpoint, method, path, body, model, api_key,
+                       body_byte_size)
                 "#,
                 &template_ids as &[Uuid],
                 &endpoints as &[&str],
@@ -7388,70 +7352,19 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
         let line_numbers: Vec<i32> = templates.iter().map(|(_, line)| *line).collect();
         let body_byte_sizes: Vec<i64> = stored_bodies.iter().map(|b| b.len() as i64).collect();
 
-        sqlx::query("SELECT ensure_request_template_partition(NOW())")
-            .execute(&mut **tx)
-            .await
-            .map_err(|e| {
-                FusilladeError::Other(anyhow!("Failed to ensure template partition: {e}"))
-            })?;
-        sqlx::query(
-            r#"
-            INSERT INTO request_template_retained_file_buckets (file_id, bucket_start)
-            VALUES (
-                $1,
-                date_trunc('week', NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'
-            )
-            ON CONFLICT DO NOTHING
-            "#,
-        )
-        .bind(file_id)
-        .execute(&mut **tx)
-        .await
-        .map_err(|e| {
-            FusilladeError::Other(anyhow!("Failed to register template file bucket: {e}"))
-        })?;
-
         sqlx::query!(
             r#"
-            WITH input AS MATERIALIZED (
-                SELECT gen_random_uuid() AS id,
-                       NOW() AS created_at,
-                       custom_id, endpoint, method, path, body, model, api_key,
-                       line_number, body_byte_size
-                FROM UNNEST(
-                    $2::text[], $3::text[], $4::text[], $5::text[], $6::text[],
-                    $7::text[], $8::text[], $9::int[], $10::bigint[]
-                ) AS t(custom_id, endpoint, method, path, body, model, api_key,
-                       line_number, body_byte_size)
-            ), registry AS (
-                INSERT INTO request_templates_legacy (
-                    id, file_id, endpoint, method, path, body, model, api_key,
-                    created_at, updated_at, custom_id, line_number,
-                    body_byte_size, metadata, retained_bucket
-                )
-                SELECT id, $1, '', '', '', '', '', '', created_at, created_at,
-                       NULL, line_number, 0, NULL, created_at
-                FROM input
-                RETURNING id
-            ), locator AS (
-                INSERT INTO request_template_retained_keys (
-                    id, created_at, file_id, line_number
-                )
-                SELECT input.id, input.created_at, $1, input.line_number
-                FROM input
-                JOIN registry USING (id)
-                RETURNING id
+            INSERT INTO request_templates (
+                file_id, custom_id, endpoint, method, path, body, model,
+                api_key, line_number, body_byte_size
             )
-            INSERT INTO request_templates_retained (
-                id, file_id, custom_id, endpoint, method, path, body, model,
-                api_key, created_at, updated_at, line_number, body_byte_size
-            )
-            SELECT input.id, $1, input.custom_id, input.endpoint, input.method,
-                   input.path, input.body, input.model, input.api_key,
-                   input.created_at, input.created_at, input.line_number,
-                   input.body_byte_size
-            FROM input
-            JOIN locator USING (id)
+            SELECT $1, custom_id, endpoint, method, path, body, model, api_key,
+                   line_number, body_byte_size
+            FROM UNNEST(
+                $2::text[], $3::text[], $4::text[], $5::text[], $6::text[],
+                $7::text[], $8::text[], $9::int[], $10::bigint[]
+            ) AS t(custom_id, endpoint, method, path, body, model, api_key,
+                   line_number, body_byte_size)
             "#,
             file_id,
             &custom_ids as &[Option<&str>],
@@ -7504,7 +7417,7 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
                        model AS "model!",
                        api_key AS "api_key!",
                        line_number AS "line_number!"
-                FROM request_templates_by_file
+                FROM request_templates
                 WHERE file_id = $1 AND ($2 = -1 OR line_number > $2)
                   AND ($5::text IS NULL OR LOWER(custom_id) LIKE $5)
                 ORDER BY line_number ASC
@@ -7978,7 +7891,7 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
                     r.response_body,
                     r.error,
                     t.line_number
-                FROM request_templates_by_file t
+                FROM request_templates t
                 JOIN (
                     SELECT id, custom_id, model, state, response_body, error, template_id
                     FROM requests
@@ -8154,15 +8067,34 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
     }
 
     fn validate_partition_name<'a>(name: &'a str, prefix: &str) -> Result<&'a str> {
-        name.strip_prefix(prefix)
-            .filter(|suffix| suffix.len() == 7 && suffix.as_bytes()[4] == b'w')
-            .filter(|suffix| {
-                suffix[..4].bytes().all(|byte| byte.is_ascii_digit())
+        let suffix = name.strip_prefix(prefix).ok_or_else(|| {
+            FusilladeError::Other(anyhow!("Refusing to retire unexpected partition {name}"))
+        })?;
+        let valid = match prefix {
+            "batch_requests_archive_y" | "request_templates_retained_y" => {
+                suffix.len() == 7
+                    && suffix.as_bytes()[4] == b'w'
+                    && suffix[..4].bytes().all(|byte| byte.is_ascii_digit())
                     && suffix[5..].bytes().all(|byte| byte.is_ascii_digit())
-            })
-            .ok_or_else(|| {
-                FusilladeError::Other(anyhow!("Refusing to retire unexpected partition {name}"))
-            })
+                    && suffix[..4]
+                        .parse::<i32>()
+                        .ok()
+                        .zip(suffix[5..].parse::<u32>().ok())
+                        .and_then(|(year, week)| {
+                            NaiveDate::from_isoywd_opt(year, week, Weekday::Mon)
+                        })
+                        .is_some()
+            }
+            "retained_response_objects_d" => {
+                suffix.len() == 8
+                    && suffix.bytes().all(|byte| byte.is_ascii_digit())
+                    && NaiveDate::parse_from_str(suffix, "%Y%m%d").is_ok()
+            }
+            _ => false,
+        };
+        valid.then_some(suffix).ok_or_else(|| {
+            FusilladeError::Other(anyhow!("Refusing to retire unexpected partition {name}"))
+        })
     }
 
     async fn detach_and_drop_partition(
@@ -8511,132 +8443,6 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
         }
         .await
     }
-
-    /// Retire one past template partition once no active file or live request
-    /// still needs any payload in that partition. The locator table keeps this
-    /// check bounded to new, narrow rows.
-    async fn retire_expired_template_partition(&self) -> Result<u64> {
-        let mut connection = self.pools.write().acquire().await.map_err(|e| {
-            FusilladeError::Other(anyhow!(
-                "Failed to acquire template retirement connection: {e}"
-            ))
-        })?;
-        let schema: String = sqlx::query_scalar("SELECT current_schema()")
-            .fetch_one(&mut *connection)
-            .await
-            .map_err(|e| {
-                FusilladeError::Other(anyhow!("Failed to resolve template schema: {e}"))
-            })?;
-        let lease_owner = Uuid::new_v4();
-        async {
-            let unfinished = Self::claim_unfinished_partition_retirement(
-                &mut connection,
-                "request_templates_retained",
-                lease_owner,
-            )
-            .await?;
-            let (partition_name, partition_oid) = if let Some(partition) = unfinished {
-                partition
-            } else {
-                let candidate: Option<(String, i64)> = sqlx::query_as(
-                    r#"
-                    WITH template_children AS (
-                        SELECT child.relname, child.oid,
-                               to_date(
-                                   substring(child.relname FROM '_y([0-9]{4})w')
-                                   || substring(child.relname FROM 'w([0-9]{2})$') || '1',
-                                   'IYYYIWID'
-                               )::timestamp AT TIME ZONE 'UTC' AS bucket_start
-                        FROM pg_inherits inheritance
-                        JOIN pg_class parent ON parent.oid = inheritance.inhparent
-                        JOIN pg_class child ON child.oid = inheritance.inhrelid
-                        JOIN pg_namespace namespace ON namespace.oid = child.relnamespace
-                        WHERE parent.oid = 'request_templates_retained'::regclass
-                          AND namespace.nspname = current_schema()
-                          AND NOT inheritance.inhdetachpending
-                          AND child.relname ~ '^request_templates_retained_y[0-9]{4}w[0-9]{2}$'
-                          AND NOT EXISTS (
-                              SELECT 1
-                              FROM retention_partition_retirements retirement
-                              WHERE retirement.parent_table = 'request_templates_retained'
-                                AND retirement.completed_at IS NULL
-                          )
-                    )
-                    SELECT partition.relname, partition.oid::bigint
-                    FROM template_children partition
-                    WHERE partition.bucket_start + INTERVAL '7 days'
-                              <= date_trunc('week', NOW() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'
-                      AND NOT EXISTS (
-                          SELECT 1
-                          FROM request_template_retained_keys key
-                          LEFT JOIN files file ON file.id = key.file_id
-                          WHERE key.created_at >= partition.bucket_start
-                            AND key.created_at < partition.bucket_start + INTERVAL '7 days'
-                            AND (
-                                (key.file_id IS NOT NULL AND file.deleted_at IS NULL)
-                                OR (key.file_id IS NOT NULL AND EXISTS (
-                                    SELECT 1 FROM batches batch
-                                    WHERE batch.file_id = key.file_id
-                                      AND batch.deleted_at IS NULL
-                                ))
-                                OR (key.scrubbed_at IS NULL AND EXISTS (
-                                    SELECT 1 FROM requests request
-                                    WHERE request.template_id = key.id
-                                ))
-                            )
-                      )
-                    ORDER BY partition.bucket_start
-                    LIMIT 1
-                    "#,
-                )
-                .fetch_optional(&mut *connection)
-                .await
-                .map_err(|e| {
-                    FusilladeError::Other(anyhow!("Failed to select template partition: {e}"))
-                })?;
-                let Some(candidate) = candidate else {
-                    return Ok(0);
-                };
-                if !Self::journal_partition_retirement(
-                    &mut connection,
-                    "request_templates_retained",
-                    &candidate.0,
-                    candidate.1,
-                    lease_owner,
-                )
-                .await?
-                {
-                    return Ok(0);
-                }
-                candidate
-            };
-            Self::validate_partition_name(&partition_name, "request_templates_retained_y")?;
-            let completed = Self::detach_and_drop_partition(
-                &mut connection,
-                &schema,
-                "request_templates_retained",
-                &partition_name,
-                partition_oid,
-            )
-            .await?;
-            if !completed {
-                return Ok(0);
-            }
-            Self::complete_partition_retirement(
-                &mut connection,
-                "request_templates_retained",
-                &partition_name,
-                lease_owner,
-            )
-            .await?;
-            tracing::info!(
-                partition = partition_name,
-                "Retired expired template partition"
-            );
-            Ok(1)
-        }
-        .await
-    }
 }
 
 // Implement DaemonStorage trait
@@ -8979,79 +8785,32 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
         // requests.template_id via the FK, which is fine — requests are self-contained
         // once created (all template data is copied at claim time).
         // Same LATERAL pattern as step 1.
-        let mut template_tx = self.begin_write().await.map_err(|e| {
-            FusilladeError::Other(anyhow!("Failed to begin template purge transaction: {e}"))
-        })?;
-        let template_candidates = sqlx::query_as::<_, (Uuid, Option<DateTime<Utc>>)>(
+        let templates_deleted = sqlx::query!(
             r#"
-            SELECT candidate.id, candidate.retained_bucket
-            FROM (SELECT id FROM files
-                  WHERE deleted_at IS NOT NULL
-                    AND retention_expired_at IS NULL) file,
-            LATERAL (
-                SELECT id, retained_bucket
-                FROM request_templates_legacy
-                WHERE file_id = file.id
+            DELETE FROM request_templates
+            WHERE id IN (
+                SELECT template.id
+                FROM (SELECT id FROM files
+                      WHERE deleted_at IS NOT NULL
+                        AND retention_expired_at IS NULL) file,
+                LATERAL (
+                    SELECT id
+                    FROM request_templates
+                    WHERE file_id = file.id
+                    LIMIT $1
+                    FOR UPDATE SKIP LOCKED
+                ) template
                 LIMIT $1
-                FOR UPDATE SKIP LOCKED
-            ) candidate
-            LIMIT $1
+            )
             "#,
+            batch_size,
         )
-        .bind(batch_size)
-        .fetch_all(&mut *template_tx)
+        .execute(self.write_executor())
         .await
         .map_err(|e| {
-            FusilladeError::Other(anyhow!("Failed to select orphaned request templates: {e}"))
-        })?;
-        let template_ids: Vec<Uuid> = template_candidates.iter().map(|row| row.0).collect();
-        let retained_ids: Vec<Uuid> = template_candidates
-            .iter()
-            .filter_map(|row| row.1.map(|_| row.0))
-            .collect();
-        let retained_buckets: Vec<DateTime<Utc>> =
-            template_candidates.iter().filter_map(|row| row.1).collect();
-        if !retained_ids.is_empty() {
-            sqlx::query(
-                r#"
-                DELETE FROM request_templates_retained payload
-                USING UNNEST($1::uuid[], $2::timestamptz[]) target(id, created_at)
-                WHERE payload.id = target.id
-                  AND payload.created_at = target.created_at
-                "#,
-            )
-            .bind(&retained_ids)
-            .bind(&retained_buckets)
-            .execute(&mut *template_tx)
-            .await
-            .map_err(|e| {
-                FusilladeError::Other(anyhow!("Failed to purge retained template payloads: {e}"))
-            })?;
-        }
-        let templates_deleted = if template_ids.is_empty() {
-            0
-        } else {
-            let deleted = sqlx::query("DELETE FROM request_templates_legacy WHERE id = ANY($1)")
-                .bind(&template_ids)
-                .execute(&mut *template_tx)
-                .await
-                .map_err(|e| {
-                    FusilladeError::Other(anyhow!("Failed to purge template registry rows: {e}"))
-                })?
-                .rows_affected() as i64;
-            sqlx::query("DELETE FROM request_template_retained_keys WHERE id = ANY($1)")
-                .bind(&template_ids)
-                .execute(&mut *template_tx)
-                .await
-                .map_err(|e| {
-                    FusilladeError::Other(anyhow!("Failed to purge template locator rows: {e}"))
-                })?;
-            deleted
-        };
-        template_tx.commit().await.map_err(|e| {
-            FusilladeError::Other(anyhow!("Failed to commit template purge transaction: {e}"))
-        })?;
-
+            FusilladeError::Other(anyhow!("Failed to purge orphaned request templates: {e}"))
+        })?
+        .rows_affected() as i64;
         let total = (requests_deleted + archived_deleted + templates_deleted) as u64;
         if total > 0 {
             tracing::info!(
@@ -9544,17 +9303,6 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
                         "Failed to redact canceled batchless templates: {e}"
                     ))
                 })?;
-                sqlx::query(
-                    "UPDATE request_template_retained_keys SET scrubbed_at = NOW() WHERE id = ANY($1)",
-                )
-                .bind(&redact_template_ids)
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| {
-                    FusilladeError::Other(anyhow!(
-                        "Failed to mark canceled batchless templates scrubbed: {e}"
-                    ))
-                })?;
             }
 
             if !delete_template_ids.is_empty() {
@@ -9578,12 +9326,10 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
         }
 
         let limit = batch_size as u64;
-        outcome.template_partitions_retired = self.retire_expired_template_partition().await?;
         outcome.may_have_more = outcome.files_expired == limit
             || outcome.batches_expired == limit
             || batchless_candidates_processed == limit
             || outcome.archive_partitions_retired > 0;
-        outcome.may_have_more |= outcome.template_partitions_retired > 0;
         Ok(outcome)
     }
 
@@ -10128,27 +9874,14 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
     async fn ensure_archive_partitions(&self, weeks_ahead: i32) -> Result<(i64, i64)> {
         let row = sqlx::query!(
             r#"
-            WITH maintained AS (
-                SELECT ensure_archive_partitions($1) AS archive_created,
-                       ensure_request_template_partitions($1) AS template_created
-            )
-            SELECT maintained.archive_created AS "created!",
+            SELECT ensure_archive_partitions($1) AS "created!",
                    (SELECT COUNT(*) FROM generate_series(0, $1) AS w(i)
                     WHERE to_regclass(
                         'batch_requests_archive_y'
                         || to_char(date_trunc('week', now() AT TIME ZONE 'UTC')::date + (w.i * 7), 'IYYY')
                         || 'w'
                         || to_char(date_trunc('week', now() AT TIME ZONE 'UTC')::date + (w.i * 7), 'IW')
-                    ) IS NOT NULL) AS "ahead!",
-                   maintained.template_created AS "template_created!",
-                   (SELECT COUNT(*) FROM generate_series(0, $1) AS w(i)
-                    WHERE to_regclass(
-                        'request_templates_retained_y'
-                        || to_char(date_trunc('week', now() AT TIME ZONE 'UTC')::date + (w.i * 7), 'IYYY')
-                        || 'w'
-                        || to_char(date_trunc('week', now() AT TIME ZONE 'UTC')::date + (w.i * 7), 'IW')
-                    ) IS NOT NULL) AS "template_ahead!"
-            FROM maintained
+                    ) IS NOT NULL) AS "ahead!"
             "#,
             weeks_ahead,
         )
@@ -10157,14 +9890,6 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
         .map_err(|e| {
             FusilladeError::Other(anyhow!("Failed to ensure archive partitions: {}", e))
         })?;
-        metrics::gauge!("fusillade_template_partitions_ahead").set(row.template_ahead as f64);
-        if row.template_created > 0 {
-            tracing::info!(
-                created = row.template_created,
-                ahead = row.template_ahead,
-                "Created request template partitions"
-            );
-        }
         Ok((i64::from(row.created), row.ahead))
     }
 
@@ -10240,6 +9965,58 @@ mod tests {
     impl MockHttpClient {
         fn new() -> Self {
             Self
+        }
+    }
+
+    #[test]
+    fn partition_name_validation_accepts_only_exact_weekly_and_daily_names() {
+        type Manager = PostgresRequestManager<TestDbPools>;
+
+        assert!(
+            Manager::validate_partition_name(
+                "batch_requests_archive_y2038w07",
+                "batch_requests_archive_y",
+            )
+            .is_ok()
+        );
+        assert!(
+            Manager::validate_partition_name(
+                "request_templates_retained_y2038w07",
+                "request_templates_retained_y",
+            )
+            .is_ok()
+        );
+        assert!(
+            Manager::validate_partition_name(
+                "retained_response_objects_d20380517",
+                "retained_response_objects_d",
+            )
+            .is_ok()
+        );
+
+        for (name, prefix) in [
+            ("batch_requests_archive_y2038w7", "batch_requests_archive_y"),
+            (
+                "batch_requests_archive_y2038x07",
+                "batch_requests_archive_y",
+            ),
+            (
+                "request_templates_retained_y2038w54",
+                "request_templates_retained_y",
+            ),
+            (
+                "retained_response_objects_d20380230",
+                "retained_response_objects_d",
+            ),
+            (
+                "retained_response_objects_d20380517_extra",
+                "retained_response_objects_d",
+            ),
+        ] {
+            assert!(
+                Manager::validate_partition_name(name, prefix).is_err(),
+                "unexpected partition name accepted: {name}"
+            );
         }
     }
 
@@ -21343,220 +21120,6 @@ mod tests {
         );
         assert_eq!(current_row.1, "processed");
         assert!(current_row.2.is_none());
-    }
-
-    #[sqlx::test]
-    async fn retention_sweep_retires_an_eligible_template_partition(pool: sqlx::PgPool) {
-        let manager = PostgresRequestManager::with_client(
-            TestDbPools::new(pool.clone()).await.unwrap(),
-            Arc::new(MockHttpClient::new()),
-        );
-        let file_id = manager
-            .create_file("partitioned-template".to_string(), None, vec![])
-            .await
-            .unwrap();
-        let template_id = Uuid::new_v4();
-        sqlx::query(
-            r#"
-            INSERT INTO request_templates (
-                id, file_id, endpoint, method, path, body, model, api_key, created_at
-            ) VALUES (
-                $1, $2, '/v1/responses', 'POST', '/v1/responses',
-                '{"private":true}', 'test-model', 'secret', '2000-01-03 12:00:00+00'
-            )
-            "#,
-        )
-        .bind(template_id)
-        .bind(*file_id)
-        .execute(&pool)
-        .await
-        .unwrap();
-        let batch = manager
-            .create_background_batch(BackgroundBatchInput {
-                file_id,
-                endpoint: "/v1/responses".to_string(),
-                metadata: None,
-                created_by: Some("retention-test".to_string()),
-                api_key_id: None,
-                api_key: None,
-                total_requests: Some(1),
-            })
-            .await
-            .unwrap();
-        sqlx::query(
-            "UPDATE batches SET completed_at = NOW(), counts_frozen_at = NOW() WHERE id = $1",
-        )
-        .bind(*batch.id)
-        .execute(&pool)
-        .await
-        .unwrap();
-        sqlx::query(
-            "UPDATE files SET expires_at = NOW() - INTERVAL '1 second', status = 'expired' WHERE id = $1",
-        )
-        .bind(*file_id)
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        let first_outcome = manager
-            .sweep_expired_content(
-                &crate::manager::RetentionSweepPolicy {
-                    expire_files: true,
-                    ..Default::default()
-                }
-                .cutoffs_at(Utc::now(), 0.0)
-                .unwrap(),
-                10,
-            )
-            .await
-            .unwrap();
-        assert_eq!(first_outcome.files_expired, 1);
-        assert_eq!(first_outcome.template_partitions_retired, 0);
-
-        let partition_still_exists: bool = sqlx::query_scalar(
-            "SELECT to_regclass('request_templates_retained_y2000w01') IS NOT NULL",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert!(
-            partition_still_exists,
-            "an undeleted batch must retain the source template used by result reads"
-        );
-
-        sqlx::query(
-            "UPDATE batches SET deleted_at = NOW(), retention_expired_at = NOW() WHERE id = $1",
-        )
-        .bind(*batch.id)
-        .execute(&pool)
-        .await
-        .unwrap();
-        sqlx::query("DELETE FROM requests WHERE batch_id = $1")
-            .bind(*batch.id)
-            .execute(&pool)
-            .await
-            .unwrap();
-        let blockers: i64 = sqlx::query_scalar(
-            r#"
-            SELECT COUNT(*)
-            FROM request_template_retained_keys key
-            LEFT JOIN files file ON file.id = key.file_id
-            WHERE key.created_at >= '2000-01-03 00:00:00+00'
-              AND key.created_at < '2000-01-10 00:00:00+00'
-              AND (
-                  (key.file_id IS NOT NULL AND file.deleted_at IS NULL)
-                  OR (key.file_id IS NOT NULL AND EXISTS (
-                      SELECT 1 FROM batches batch
-                      WHERE batch.file_id = key.file_id
-                        AND batch.deleted_at IS NULL
-                  ))
-                  OR (key.scrubbed_at IS NULL AND EXISTS (
-                      SELECT 1 FROM requests request
-                      WHERE request.template_id = key.id
-                  ))
-              )
-            "#,
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(blockers, 0);
-        let retired_partition_oid: i64 = sqlx::query_scalar(
-            "SELECT 'request_templates_retained_y2000w01'::regclass::oid::bigint",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        let (first_retirement, competing_retirement) = tokio::join!(
-            manager.retire_expired_template_partition(),
-            manager.retire_expired_template_partition()
-        );
-        assert_eq!(
-            first_retirement.unwrap() + competing_retirement.unwrap(),
-            1,
-            "the journal lease must let only one replica retire a partition"
-        );
-        let partition_still_exists: bool = sqlx::query_scalar(
-            "SELECT to_regclass('request_templates_retained_y2000w01') IS NOT NULL",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert!(
-            !partition_still_exists,
-            "the payload partition may retire after its owning batch expires"
-        );
-        let stub_body: String =
-            sqlx::query_scalar("SELECT body FROM request_templates_legacy WHERE id = $1")
-                .bind(template_id)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert!(
-            stub_body.is_empty(),
-            "only the content-free identity stub may remain"
-        );
-
-        let mut connection = pool.acquire().await.unwrap();
-        assert!(
-            !PostgresRequestManager::<TestDbPools>::journal_partition_retirement(
-                &mut connection,
-                "request_templates_retained",
-                "request_templates_retained_y2000w01",
-                retired_partition_oid,
-                Uuid::new_v4(),
-            )
-            .await
-            .unwrap(),
-            "a stale caller must not reopen a completed relation generation"
-        );
-        sqlx::query(
-            "DELETE FROM retention_partition_retirements WHERE parent_table = 'request_templates_retained' AND partition_table = 'request_templates_retained_y2000w01'",
-        )
-        .execute(&mut *connection)
-        .await
-        .unwrap();
-        sqlx::query(
-            r#"
-            CREATE TABLE request_templates_retained_y2000w01
-            PARTITION OF request_templates_retained
-            FOR VALUES FROM ('2000-01-03 00:00:00+00') TO ('2000-01-10 00:00:00+00')
-            "#,
-        )
-        .execute(&mut *connection)
-        .await
-        .unwrap();
-        assert!(
-            !PostgresRequestManager::<TestDbPools>::journal_partition_retirement(
-                &mut connection,
-                "request_templates_retained",
-                "request_templates_retained_y2000w01",
-                retired_partition_oid,
-                Uuid::new_v4(),
-            )
-            .await
-            .unwrap(),
-            "claiming must atomically reject a replaced relation generation"
-        );
-        let stale_result = PostgresRequestManager::<TestDbPools>::detach_and_drop_partition(
-            &mut connection,
-            "public",
-            "request_templates_retained",
-            "request_templates_retained_y2000w01",
-            retired_partition_oid,
-        )
-        .await;
-        assert!(
-            stale_result.is_err(),
-            "a stale caller must not drop a replacement relation generation"
-        );
-        let replacement_exists: bool = sqlx::query_scalar(
-            "SELECT to_regclass('request_templates_retained_y2000w01') IS NOT NULL",
-        )
-        .fetch_one(&mut *connection)
-        .await
-        .unwrap();
-        assert!(replacement_exists);
     }
 
     #[sqlx::test]

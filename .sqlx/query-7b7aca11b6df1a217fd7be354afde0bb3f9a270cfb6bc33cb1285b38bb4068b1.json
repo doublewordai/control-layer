@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n                SELECT custom_id,\n                       endpoint AS \"endpoint!\",\n                       method AS \"method!\",\n                       path AS \"path!\",\n                       body AS \"body!\",\n                       model AS \"model!\",\n                       api_key AS \"api_key!\",\n                       line_number AS \"line_number!\"\n                FROM request_templates_by_file\n                WHERE file_id = $1 AND ($2 = -1 OR line_number > $2)\n                  AND ($5::text IS NULL OR LOWER(custom_id) LIKE $5)\n                ORDER BY line_number ASC\n                OFFSET $3\n                LIMIT $4\n                ",
+  "query": "\n                SELECT custom_id,\n                       endpoint AS \"endpoint!\",\n                       method AS \"method!\",\n                       path AS \"path!\",\n                       body AS \"body!\",\n                       model AS \"model!\",\n                       api_key AS \"api_key!\",\n                       line_number AS \"line_number!\"\n                FROM request_templates\n                WHERE file_id = $1 AND ($2 = -1 OR line_number > $2)\n                  AND ($5::text IS NULL OR LOWER(custom_id) LIKE $5)\n                ORDER BY line_number ASC\n                OFFSET $3\n                LIMIT $4\n                ",
   "describe": {
     "columns": [
       {
@@ -55,14 +55,14 @@
     },
     "nullable": [
       true,
-      true,
-      true,
-      true,
-      true,
-      true,
-      true,
-      true
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
     ]
   },
-  "hash": "4dcf7ecef4a25dce9b3c5b957bec4a56bdb267149da796c0008839f5b38d558a"
+  "hash": "7b7aca11b6df1a217fd7be354afde0bb3f9a270cfb6bc33cb1285b38bb4068b1"
 }
