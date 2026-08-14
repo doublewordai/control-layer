@@ -105,7 +105,32 @@ pub struct RecomputeReport {
     /// The corpus predicate, echoed back so the file is self-describing months later.
     pub corpus: serde_json::Value,
     pub summary: ReportSummary,
+    /// Conditions that limit what this report can be trusted for. Empty is the normal case.
+    pub warnings: Vec<String>,
     pub rows: Vec<ReportRow>,
+}
+
+/// Days of `prompt_cache_entries` history the cache sweeper will retain.
+///
+/// Beyond this the entries backing a cache-split reconstruction are pruned, so a corpus older
+/// than the grace cannot have its split re-derived — only carried through from the response,
+/// or not recovered at all if the response never reported one.
+pub const CACHE_GRACE_DAYS: i64 = 7;
+
+/// Warnings that depend on the corpus rather than any individual row.
+pub fn corpus_warnings(oldest: Option<DateTime<Utc>>) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(oldest) = oldest {
+        let age = (Utc::now() - oldest).num_days();
+        if age > CACHE_GRACE_DAYS {
+            out.push(format!(
+                "corpus reaches {age} days back, beyond the {CACHE_GRACE_DAYS}-day cache retention grace: \
+                 prompt_cache_entries for the older rows may already be pruned, so the cache split \
+                 cannot be re-derived for them and the tier cannot be resolved from ttl_tier"
+            ));
+        }
+    }
+    out
 }
 
 impl UsageFigures {
@@ -203,6 +228,29 @@ impl ReportRow {
             changed: false,
             note: Some(note),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn corpus_within_the_grace_warns_about_nothing() {
+        let recent = Utc::now() - chrono::Duration::days(CACHE_GRACE_DAYS - 1);
+        assert!(corpus_warnings(Some(recent)).is_empty());
+        assert!(corpus_warnings(None).is_empty(), "an empty corpus has nothing to warn about");
+    }
+
+    /// Beyond the grace the cache entries backing a split reconstruction may already be
+    /// pruned, so the report has to say so rather than silently reporting a split it could
+    /// not have re-derived.
+    #[test]
+    fn corpus_beyond_the_grace_warns() {
+        let old = Utc::now() - chrono::Duration::days(CACHE_GRACE_DAYS + 3);
+        let warnings = corpus_warnings(Some(old));
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("cache retention grace"), "got: {}", warnings[0]);
     }
 }
 

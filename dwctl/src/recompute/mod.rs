@@ -85,21 +85,27 @@
 //! since been fixed — rather than a second opinion from a parallel implementation that
 //! could itself be wrong.
 //!
-//! # The one thing a recompute cannot do
+//! # The cache split
 //!
-//! It cannot recalculate the **cache split** (`cache_read_input_tokens` and the three
-//! `cache_creation_*` tiers). A tokenizer returns a total; it cannot say how much of that
-//! total was a cache *read* (billed at the ~0.1x read multiplier) versus a cache *write*
-//! (1.25–2.5x). The state that decided this lived in `prompt_cache_entries`, which is a
-//! cache and not a ledger: rows are upserted in place under a UNIQUE key, `expires_at`
-//! slides forward on every read, and entries age out on a 5m/1h window. By the time
-//! anyone is remediating, the evidence is gone.
+//! The split is carried through from the stored response. Where the response reported it
+//! correctly — both incidents so far — re-deriving a number already held exactly can only
+//! introduce error.
 //!
-//! So the split is **carried through from the stored response, never invented**. If a
-//! future incident corrupts the split itself rather than the total, this module cannot
-//! repair it and the remediation is manual. That limitation is accepted and deliberate;
-//! it does not block the incidents above, where the split was recorded correctly and only
-//! the total was wrong.
+//! It is reconstructable when it has to be: recompute the request's prefix hashes
+//! (deterministic from the request body and the scope
+//! `(principal_id, virtual_model, tokenizer_version)`), then for each breakpoint ask whether
+//! an episode covering that hash was live at the request's timestamp. Live means a cache
+//! read; not live means a creation.
+//!
+//! Two bounds on that, both of which belong in any report built on it:
+//!
+//! - **Retention.** `prompt_cache_entries` currently retains expired rows, so all history is
+//!   available. Once the sweeper ships with its grace period (7 days), anything older cannot
+//!   be reconstructed.
+//! - **Accuracy before the episode-per-row cutover.** A post-expiry write revives the same
+//!   row in place and keeps the original `created_at`, so `[created_at, expires_at]` can
+//!   contain dead gaps and over-approximates liveness. Answers for that period classify some
+//!   creations as reads, which under-bills, and must be labelled approximate.
 
 use crate::pricing::TokenCounts;
 use crate::request_logging::serializers::{TokenMetrics, extract_from_last_usage, parse_ai_response};
@@ -164,8 +170,11 @@ pub async fn recompute_corpus(
         })
         .collect::<Vec<_>>();
 
+    let oldest = corpus.iter().map(|r| r.timestamp).min();
+
     Ok(report::RecomputeReport {
         generated_at: chrono::Utc::now(),
+        warnings: report::corpus_warnings(oldest),
         corpus: serde_json::json!({
             "start": filter.start,
             "end": filter.end,
