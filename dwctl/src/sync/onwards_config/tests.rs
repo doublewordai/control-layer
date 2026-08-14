@@ -967,6 +967,48 @@ async fn test_cache_shape_composite_model_routing_rules(pool: sqlx::PgPool) {
     assert_eq!(rules[1].match_labels.get("purpose"), Some(&"realtime".to_string()));
     assert!(matches!(rules[1].action, RoutingAction::Deny));
 }
+/// A model's traffic rules are the DEFAULT pool's rules. A named pool gets the
+/// deny half only: a redirect names another model alias, so following one out of
+/// the completions pool would serve a resume leg — a token-id prefix rendered
+/// against this model — from a different model entirely.
+#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base", "cache_traffic_routing_rules")))]
+async fn test_cache_shape_named_pool_inherits_denies_not_redirects(pool: sqlx::PgPool) {
+    // Give composite-priority a completions pool (it has batch → redirect and
+    // realtime → deny from the fixture).
+    sqlx::query!(
+        "UPDATE deployed_model_components SET pool = 'completions'
+         WHERE deployed_model_id = '40000000-0000-0000-0000-000000000005'"
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let targets = super::load_targets_from_db(&pool, &[], false, &RateLimitTiersConfig::default())
+        .await
+        .unwrap();
+    let composite = targets.targets.get("composite-priority").expect("composite-priority should exist");
+    assert_eq!(composite.value().pool_count(), 2, "the composite now has two pools");
+
+    // The default pool carries the model's rules unchanged.
+    assert_eq!(composite.value().default_pool().routing_rules().len(), 2);
+
+    let completions = composite.value().resolve(onwards::target::RequestClass::Completions);
+    let rules = completions.routing_rules();
+    assert_eq!(rules.len(), 1, "only the deny travels into the named pool");
+    assert_eq!(rules[0].match_labels.get("purpose"), Some(&"realtime".to_string()));
+    assert!(matches!(rules[0].action, RoutingAction::Deny));
+
+    let batch = std::collections::HashMap::from([("purpose".to_string(), "batch".to_string())]);
+    assert!(
+        completions.evaluate_routing_rules(&batch).is_none(),
+        "batch traffic routes normally within the completions pool instead of being redirected to another model"
+    );
+    assert!(matches!(
+        composite.value().default_pool().evaluate_routing_rules(&batch),
+        Some(RoutingAction::Redirect { .. })
+    ));
+}
+
 #[sqlx::test(fixtures(path = "fixtures", scripts("cache_base", "cache_component_b_invalid_endpoint")))]
 #[ignore = "Known limitation: invalid component endpoint cannot be isolated because regular target loading panics on invalid endpoint URLs"]
 async fn test_known_issue_composite_invalid_component_endpoint_should_be_skipped(pool: sqlx::PgPool) {

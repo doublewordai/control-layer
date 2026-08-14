@@ -13,6 +13,7 @@ use onwards::target::{
     Auth, BackoffConfig as OnwardsBackoffConfig, ConcurrencyLimitParameters, ConfigFile, FallbackConfig as OnwardsFallbackConfig,
     JitterStrategy as OnwardsJitterStrategy, KeyDefinition, LoadBalanceStrategy as OnwardsLoadBalanceStrategy, OpenResponsesConfig,
     PoolSpec, PoolsSpec, ProviderSpec, RateLimitParameters, RoutingAction, RoutingRule, TargetSpecOrList, Targets, WatchTargetsStream,
+    inheritable_routing_rules,
 };
 use sqlx::{PgPool, postgres::PgListener};
 use tokio::sync::{mpsc, watch};
@@ -1042,7 +1043,15 @@ fn convert_composite_to_target_spec(
     // Create a PoolSpec per pool, with the composite's settings applied to each.
     // Note: trusted is not set at the pool level for composite models
     // Each provider uses its own trusted setting via ProviderSpec.trusted
-    let make_pool = |providers: Vec<ProviderSpec>| PoolSpec {
+    //
+    // The model's traffic rules are the DEFAULT pool's rules. A named pool gets
+    // only the deny half (see `inheritable_routing_rules`): a redirect names
+    // another model alias, and following one out of a named pool would serve
+    // that class from a different model — for a `completions` resume leg, a
+    // token-id prefix rendered against model X decoded by model Y. Rules are
+    // per-model in the schema, so every pool we emit here is an inheriting
+    // pool; there is no such thing yet as a pool with rules of its own.
+    let make_pool = |pool_name: &str, providers: Vec<ProviderSpec>| PoolSpec {
         keys: keys.clone(),
         rate_limit: rate_limit.clone(),
         concurrency_limit: concurrency_limit.clone(),
@@ -1055,10 +1064,20 @@ fn convert_composite_to_target_spec(
         open_responses: Some(OpenResponsesConfig {
             adapter: composite.open_responses_adapter,
         }),
-        routing_rules: composite.routing_rules.clone(),
+        routing_rules: if pool_name == DEFAULT_COMPONENT_POOL {
+            composite.routing_rules.clone()
+        } else {
+            inheritable_routing_rules(&composite.routing_rules)
+        },
     };
 
-    let mut pools: HashMap<String, PoolSpec> = pool_providers.into_iter().map(|(name, p)| (name, make_pool(p))).collect();
+    let mut pools: HashMap<String, PoolSpec> = pool_providers
+        .into_iter()
+        .map(|(name, p)| {
+            let spec = make_pool(&name, p);
+            (name, spec)
+        })
+        .collect();
 
     // A composite with only a default pool emits the single-pool shape it always
     // emitted — no config churn for the models nobody has given a second pool.

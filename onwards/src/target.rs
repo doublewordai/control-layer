@@ -519,6 +519,32 @@ impl From<PoolSpec> for PoolConfig {
     }
 }
 
+/// The subset of an alias's routing rules a NAMED (non-`default`) pool may
+/// inherit: **deny rules only**.
+///
+/// The two actions are not the same kind of decision:
+/// - `Deny` is access control on the ALIAS. A model denied to batch traffic must
+///   stay denied whichever request class asks for it, or adding a `completions`
+///   pool would quietly open a batch-only model back up.
+/// - `Redirect` is a routing decision that names another model ALIAS, and it is
+///   only meaningful for the class the rule was written against. Following one
+///   from inside a named pool sends the request to a different model: for a
+///   resume leg that means token-ids rendered against model X being decoded by
+///   model Y — a prefix the target never produced, so it generates garbage from
+///   the first token. A redirect on the alias therefore does not apply within a
+///   non-default pool.
+///
+/// Inheritance only. A named pool that states rules of its own keeps them
+/// verbatim, redirects included: that is somebody deliberately routing this
+/// class, not a rule leaking in from another one.
+pub fn inheritable_routing_rules(rules: &[RoutingRule]) -> Vec<RoutingRule> {
+    rules
+        .iter()
+        .filter(|rule| matches!(rule.action, RoutingAction::Deny))
+        .cloned()
+        .collect()
+}
+
 impl TargetSpecOrList {
     /// Convert to the composite's named pools, `default` first.
     ///
@@ -527,10 +553,11 @@ impl TargetSpecOrList {
     /// called `default` is the same thing as today's single pool.
     ///
     /// Non-default pools inherit the default pool's **access control** (`keys`,
-    /// `routing_rules`) when they do not state their own. Access control is a
-    /// property of the alias, not of which upstream answers, so a pool added
-    /// for one request class must not become a way around the alias's keys or
-    /// deny rules.
+    /// and the DENY half of `routing_rules` — see
+    /// [`inheritable_routing_rules`]) when they do not state their own. Access
+    /// control is a property of the alias, not of which upstream answers, so a
+    /// pool added for one request class must not become a way around the
+    /// alias's keys or deny rules.
     pub fn into_pool_configs(self) -> Result<Vec<(String, PoolConfig)>, anyhow::Error> {
         let TargetSpecOrList::Pools(spec) = self else {
             return Ok(vec![(DEFAULT_POOL.to_string(), self.into_pool_config()?)]);
@@ -560,7 +587,7 @@ impl TargetSpecOrList {
                 config.keys = default.keys.clone();
             }
             if config.routing_rules.is_empty() {
-                config.routing_rules = default.routing_rules.clone();
+                config.routing_rules = inheritable_routing_rules(&default.routing_rules);
             }
             configs.push((name, config));
         }
@@ -995,8 +1022,9 @@ impl TargetPools {
     }
 
     /// Evaluate the composite's routing rules. Rules live on the default pool
-    /// (named pools inherit them when unset — see the sync layer), so the
-    /// default pool's rules ARE the composite's rules for label-based checks.
+    /// (named pools inherit its deny rules when unset — see
+    /// [`inheritable_routing_rules`]), so the default pool's rules ARE the
+    /// composite's rules for label-based checks.
     pub fn evaluate_routing_rules(
         &self,
         labels: &HashMap<String, String>,
@@ -3402,6 +3430,146 @@ mod tests {
             "completions pool must be behind the same keys"
         );
         assert_eq!(completions.routing_rules().len(), 1);
+    }
+
+    /// Deny is access control on the alias: a model closed to a label stays
+    /// closed to it through every pool, so a `completions` pool cannot be used
+    /// to reach a batch-denied model.
+    #[test]
+    fn a_named_pool_inherits_deny_rules() {
+        let json = r#"{
+            "targets": {
+                "dsv4-flash": {
+                    "pools": {
+                        "default": {
+                            "routing_rules": [
+                                {"match_labels": {"purpose": "batch"}, "action": {"type": "deny"}}
+                            ],
+                            "providers": [{"url": "https://dynamo.example.com/"}]
+                        },
+                        "completions": {
+                            "providers": [{"url": "https://fireworks.example.com/"}]
+                        }
+                    }
+                }
+            }
+        }"#;
+        let targets = Targets::from_config(serde_json::from_str(json).unwrap()).unwrap();
+        let entry = targets.targets.get("dsv4-flash").unwrap();
+        let batch = HashMap::from([("purpose".to_string(), "batch".to_string())]);
+
+        for class in [RequestClass::Normal, RequestClass::Completions] {
+            assert!(
+                matches!(
+                    entry.resolve(class).evaluate_routing_rules(&batch),
+                    Some(RoutingAction::Deny)
+                ),
+                "{class:?} traffic must hit the alias's deny rule"
+            );
+        }
+        // An unmatched label is still allowed everywhere.
+        let realtime = HashMap::from([("purpose".to_string(), "realtime".to_string())]);
+        assert!(
+            entry
+                .resolve(RequestClass::Completions)
+                .evaluate_routing_rules(&realtime)
+                .is_none()
+        );
+    }
+
+    /// A redirect names another model ALIAS. Following one out of a named pool
+    /// would serve this class from a different model — for a resume leg, a
+    /// token-id prefix rendered against one model decoded by another — so
+    /// redirects do not travel with inheritance.
+    #[test]
+    fn a_named_pool_does_not_inherit_redirect_rules() {
+        let json = r#"{
+            "targets": {
+                "dsv4-flash": {
+                    "pools": {
+                        "default": {
+                            "routing_rules": [
+                                {"match_labels": {"purpose": "batch"}, "action": {"type": "redirect", "target": "dsv4-flash-batch"}}
+                            ],
+                            "providers": [{"url": "https://dynamo.example.com/"}]
+                        },
+                        "completions": {
+                            "providers": [{"url": "https://fireworks.example.com/"}]
+                        }
+                    }
+                },
+                "dsv4-flash-batch": {"url": "https://batch.example.com/"}
+            }
+        }"#;
+        let targets = Targets::from_config(serde_json::from_str(json).unwrap()).unwrap();
+        let entry = targets.targets.get("dsv4-flash").unwrap();
+        let batch = HashMap::from([("purpose".to_string(), "batch".to_string())]);
+
+        // The class the rule was written against still redirects.
+        assert!(matches!(
+            entry
+                .resolve(RequestClass::Normal)
+                .evaluate_routing_rules(&batch),
+            Some(RoutingAction::Redirect { target }) if target == "dsv4-flash-batch"
+        ));
+        // The completions pool routes normally within itself: no rule fires, and
+        // the request is served by the pool's own members.
+        let completions = entry.resolve(RequestClass::Completions);
+        assert!(completions.routing_rules().is_empty());
+        assert!(completions.evaluate_routing_rules(&batch).is_none());
+        assert_eq!(
+            completions
+                .providers()
+                .iter()
+                .map(|p| p.target.url.to_string())
+                .collect::<Vec<_>>(),
+            vec!["https://fireworks.example.com/"]
+        );
+    }
+
+    /// Only inheritance filters. Rules written ON a named pool are somebody
+    /// deliberately routing that class, and are kept verbatim — redirects
+    /// included.
+    #[test]
+    fn a_named_pool_keeps_its_own_routing_rules() {
+        let json = r#"{
+            "targets": {
+                "dsv4-flash": {
+                    "pools": {
+                        "default": {
+                            "routing_rules": [
+                                {"match_labels": {"purpose": "batch"}, "action": {"type": "deny"}}
+                            ],
+                            "providers": [{"url": "https://dynamo.example.com/"}]
+                        },
+                        "completions": {
+                            "routing_rules": [
+                                {"match_labels": {"purpose": "batch"}, "action": {"type": "redirect", "target": "dsv4-flash-batch"}}
+                            ],
+                            "providers": [{"url": "https://fireworks.example.com/"}]
+                        }
+                    }
+                },
+                "dsv4-flash-batch": {"url": "https://batch.example.com/"}
+            }
+        }"#;
+        let targets = Targets::from_config(serde_json::from_str(json).unwrap()).unwrap();
+        let entry = targets.targets.get("dsv4-flash").unwrap();
+        let batch = HashMap::from([("purpose".to_string(), "batch".to_string())]);
+
+        let completions = entry.resolve(RequestClass::Completions);
+        assert_eq!(completions.routing_rules().len(), 1, "no inherited deny is added");
+        assert!(matches!(
+            completions.evaluate_routing_rules(&batch),
+            Some(RoutingAction::Redirect { target }) if target == "dsv4-flash-batch"
+        ));
+        // The default pool is untouched by any of this.
+        assert!(matches!(
+            entry
+                .resolve(RequestClass::Normal)
+                .evaluate_routing_rules(&batch),
+            Some(RoutingAction::Deny)
+        ));
     }
 
     /// A pool that states its own keys keeps them — inheritance fills a gap, it
