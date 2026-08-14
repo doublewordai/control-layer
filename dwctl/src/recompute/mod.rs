@@ -104,7 +104,7 @@
 //!   creations as reads, which under-bills, and must be labelled approximate.
 
 use crate::pricing::TokenCounts;
-use crate::request_logging::serializers::{TokenMetrics, extract_from_last_usage, parse_ai_response};
+use crate::request_logging::serializers::{TokenMetrics, extract_from_last_usage, parse_ai_response, raw_usage_tokens};
 use outlet::{RequestData, ResponseData};
 
 pub mod cache_fields;
@@ -179,6 +179,11 @@ pub async fn recompute_corpus(
                     if cache_mults.is_none() && row.stored_cache_total() > 0 {
                         rows_tariff_unresolvable += 1;
                     }
+                    // Rounded to `http_analytics.total_cost`'s scale — numeric(12,8), which
+                    // rounds half away from zero on insert — because the stored side already
+                    // was. Comparing at full precision manufactures sub-cent "changes" on any
+                    // tariff whose arithmetic doesn't land on 8dp (measured: 194 phantom
+                    // changed rows, net -$0.00000097, on a healthy 400-row corpus).
                     let cost = crate::pricing::charged_cost(
                         &usage.counts,
                         row.model.as_deref(),
@@ -186,7 +191,8 @@ pub async fn recompute_corpus(
                         row.output_price_per_token,
                         cache_mults,
                         crate::metrics::errors::component::ANALYTICS,
-                    );
+                    )
+                    .map(|c| c.round_dp_with_strategy(8, rust_decimal::RoundingStrategy::MidpointAwayFromZero));
                     report::ReportRow::replayed(row, &usage, cost)
                 }
                 // A ZDR row is not a failure to classify: the plaintext does not exist, so
@@ -389,15 +395,20 @@ pub fn recompute_from_stored_response(
     // never override a reading the serializer actually produced, so the healthy-no-op
     // property is preserved — and a response with no usage at all (the July shape) still
     // recomputes to zero, because there is nothing raw to read either.
-    if metrics.prompt_tokens == 0
-        && metrics.completion_tokens == 0
-        && metrics.total_tokens == 0
-        && let Some(raw) = extract_from_last_usage(response_data, raw_usage_tokens)
-    {
-        metrics.prompt_tokens = raw.prompt;
-        metrics.completion_tokens = raw.completion;
-        metrics.reasoning_tokens = raw.reasoning;
-        metrics.total_tokens = raw.total;
+    if metrics.prompt_tokens == 0 && metrics.completion_tokens == 0 && metrics.total_tokens == 0 {
+        match extract_from_last_usage(response_data, raw_usage_tokens) {
+            Some(raw) => {
+                metrics.prompt_tokens = raw.prompt;
+                metrics.completion_tokens = raw.completion;
+                metrics.reasoning_tokens = raw.reasoning;
+                metrics.total_tokens = raw.total;
+            }
+            // No usage object anywhere in the body — the July shape. A zero here is absence
+            // of evidence, not a measurement: reported as a recomputed zero it would either
+            // claim a broken row is healthy or propose zeroing out real usage. Refuse, so
+            // the row surfaces as un-replayable instead of silently passing.
+            None => return Err(RecomputeError::NoUsage),
+        }
     }
     let CacheReading {
         tokens: cache,
@@ -421,48 +432,6 @@ pub fn recompute_from_stored_response(
         cache_tier_inferred: tier_inferred,
         response_type: metrics.response_type,
         response_model: metrics.response_model,
-    })
-}
-
-/// Token counts read straight from a raw `usage` JSON object, for bodies the typed parse
-/// cannot represent. Field semantics mirror [`TokenMetrics`]'s arms exactly: an OpenAI
-/// `prompt_tokens` is already the total input; an Anthropic `input_tokens` excludes the
-/// cache buckets, which are added back — reading it verbatim is the August incident.
-struct RawUsageTokens {
-    prompt: i64,
-    completion: i64,
-    reasoning: i64,
-    total: i64,
-}
-
-/// Read [`RawUsageTokens`] out of one `usage` object, or `None` when it carries neither an
-/// OpenAI-shaped nor an Anthropic-shaped input count (nothing recognisable to bill on).
-fn raw_usage_tokens(usage: &serde_json::Value) -> Option<RawUsageTokens> {
-    use serde_json::Value;
-    let get = |k: &str| usage.get(k).and_then(Value::as_i64);
-    let prompt = match get("prompt_tokens") {
-        Some(p) => p,
-        None => {
-            get("input_tokens")?
-                + get("cache_read_input_tokens").unwrap_or(0).max(0)
-                + get("cache_creation_input_tokens").unwrap_or(0).max(0)
-        }
-    };
-    let completion = get("completion_tokens").or_else(|| get("output_tokens")).unwrap_or(0);
-    let reasoning = usage
-        .pointer("/completion_tokens_details/reasoning_tokens")
-        .and_then(Value::as_i64)
-        .unwrap_or(0);
-    // Floor everything at 0 (malformed bodies must not reach the cost maths), and derive the
-    // total where the shape reports none, as the Anthropic arm does.
-    let prompt = prompt.max(0);
-    let completion = completion.max(0);
-    let total = get("total_tokens").unwrap_or(prompt + completion).max(0);
-    Some(RawUsageTokens {
-        prompt,
-        completion,
-        reasoning: reasoning.max(0),
-        total,
     })
 }
 

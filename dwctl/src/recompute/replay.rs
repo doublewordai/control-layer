@@ -56,6 +56,14 @@ pub enum RecomputeError {
     /// tokens can be verified, now or ever — the plaintext does not exist.
     #[error("payload is zero-data-retention encrypted; tokens cannot be verified")]
     ZeroDataRetention,
+    /// The response parsed but carries no usage object at all — the July shape
+    /// (`"usage": null` on every non-`stop` finish). There is nothing to re-read: a zero
+    /// here is absence of evidence, not a measurement, and reporting it as a recomputed
+    /// zero either claims a broken row is healthy (stored zero) or proposes zeroing out
+    /// real usage (stored non-zero). Refused until the tokenizer path can count the
+    /// request independently.
+    #[error("response carries no usage object; tokens cannot be re-read from the body (needs the tokenizer path)")]
+    NoUsage,
 }
 
 /// Envelope prefix written by the ZDR encryption path.
@@ -352,21 +360,39 @@ mod tests {
         assert_eq!(got.prompt_source, TokenSource::Reported, "still the provider's own numbers");
     }
 
-    /// The July shape: `usage` is null, so there is genuinely nothing to read — the raw
-    /// fallback must not invent counts, and the row recomputes to zero as before (that class
-    /// is the tokenizer path's job, not this one's).
+    /// The July shape: `usage` is null, so there is genuinely nothing to read. The raw
+    /// fallback must not invent counts, and the row must be REFUSED rather than recomputed
+    /// to zero — a zero here would either report a broken row as healthy (stored zero, the
+    /// July incident itself) or propose zeroing out real usage (stored non-zero). Either
+    /// way it must land in front of a human as un-replayable.
     #[test]
-    fn null_usage_still_recomputes_to_zero() {
+    fn null_usage_is_refused_not_reported_as_a_healthy_zero() {
         let e = exchange(
             "/chat/completions",
             r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#,
             r#"{"choices":[{"finish_reason":"tool_calls","index":0,"message":{"role":"assistant","content":null}}],"created":1,"id":"c","model":"m","object":"chat.completion","usage":null}"#,
         );
         let (req, resp) = e.to_outlet_pair().unwrap();
+        let got = recompute_from_stored_response(&req, &resp, CreationTier::FiveMinute);
+        assert!(
+            matches!(got, Err(RecomputeError::NoUsage)),
+            "a usage-less body is absence of evidence, not a zero measurement: {got:?}"
+        );
+    }
+
+    /// A usage object that genuinely states zero is a measurement, not a refusal — the
+    /// distinction the NoUsage arm must not blur.
+    #[test]
+    fn an_explicit_zero_usage_object_is_a_measurement_not_a_refusal() {
+        let e = exchange(
+            "/chat/completions",
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#,
+            r#"{"choices":[{"finish_reason":"stop","index":0,"message":{"role":"assistant","content":""}}],"created":1,"id":"c","model":"m","object":"chat.completion","usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}}"#,
+        );
+        let (req, resp) = e.to_outlet_pair().unwrap();
         let got = recompute_from_stored_response(&req, &resp, CreationTier::FiveMinute).unwrap();
         assert_eq!(got.counts.prompt, 0);
         assert_eq!(got.counts.completion, 0);
-        assert_eq!(got.total, 0);
     }
 
     /// Reasoning tokens are their own column in `http_analytics`, so a repair that leaves

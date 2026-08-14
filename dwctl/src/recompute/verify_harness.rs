@@ -39,6 +39,12 @@ mod tests {
         let tokenizer_url = env("RECOMPUTE_TOKENIZER_URL").unwrap_or_else(|| "http://localhost:18088".into());
         let limit: i64 = env("RECOMPUTE_LIMIT").and_then(|v| v.parse().ok()).unwrap_or(200);
         let days: i64 = env("RECOMPUTE_DAYS").and_then(|v| v.parse().ok()).unwrap_or(2);
+        // Optional RFC3339 end bound, so a corpus can target an incident cluster that newer
+        // healthy traffic would otherwise push past the row limit.
+        let end = env("RECOMPUTE_END")
+            .and_then(|v| chrono::DateTime::parse_from_rfc3339(&v).ok())
+            .map(|t| t.with_timezone(&Utc))
+            .unwrap_or_else(Utc::now);
 
         let pool = sqlx::postgres::PgPoolOptions::new()
             .max_connections(4)
@@ -47,8 +53,8 @@ mod tests {
             .expect("connect");
 
         let filter = CorpusFilter {
-            start: Utc::now() - chrono::Duration::days(days),
-            end: Utc::now(),
+            start: end - chrono::Duration::days(days),
+            end,
             user_id: env("RECOMPUTE_USER_ID").and_then(|v| v.parse().ok()),
             uri_pattern: Some(env("RECOMPUTE_URI").unwrap_or_else(|| "%/chat/completions".into())),
             model: env("RECOMPUTE_MODEL"),

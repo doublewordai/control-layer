@@ -412,6 +412,87 @@ mod tests {
         assert!(report.warnings.is_empty(), "the tariff resolved; nothing to warn about");
     }
 
+    /// `http_analytics.total_cost` is numeric(12,8): the stored cost was rounded to 8dp by
+    /// the column on insert. The recompute must compare at that same scale — a tariff whose
+    /// arithmetic runs past 8dp (here read ×0.5714 on 1e-6/tok) otherwise shows every
+    /// healthy row as "changed" by a sub-cent phantom. Measured: 194 phantom rows on a
+    /// healthy 400-row Nemotron corpus before this rounding existed.
+    #[sqlx::test]
+    async fn cost_is_compared_at_the_stored_column_scale(pool: PgPool) {
+        setup_fusillade_pool(&pool).await;
+        let creator = crate::test::utils::create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
+        let endpoint = crate::test::utils::create_test_endpoint(&pool, "ep-scale", creator.id).await;
+        let model_id = crate::test::utils::create_test_model(&pool, "m", "m", endpoint, creator.id).await;
+        sqlx::query!(
+            r#"INSERT INTO model_cache_tariffs
+                 (deployed_model_id, write_multiplier_5m, write_multiplier_1h, write_multiplier_24h, read_multiplier, min_prefix_tokens)
+               VALUES ($1, 1.0, 1.0, 1.0, 0.5714, 1024)"#,
+            model_id,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // uncached 99·1e-6 + read 101·1e-6·0.5714 + completion 10·2e-6
+        //   = 0.000099 + 0.0000577114 + 0.00002 = 0.0001767114 — past 8dp.
+        // The column stored round8(that) = 0.00017671.
+        let (user_id, _) = seed(
+            &pool,
+            "/chat/completions",
+            r#"{"id":"c","object":"chat.completion","created":1,"model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"x"},"finish_reason":"stop"}],"usage":{"prompt_tokens":200,"completion_tokens":10,"total_tokens":210,"cache_read_input_tokens":101,"cache_creation_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0,"ephemeral_24h_input_tokens":0},"prompt_tokens_details":{"cached_tokens":101}}}"#,
+            200,
+            10,
+            101,
+            0,
+            Decimal::from_str_exact("0.00017671").unwrap(),
+        )
+        .await;
+
+        let report = recompute_corpus(&pool, &filter_for(user_id), CreationTier::FiveMinute, None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            report.summary.rows_changed, 0,
+            "a sub-8dp arithmetic tail must not read as a correction"
+        );
+        assert_eq!(report.summary.net_correction, Decimal::ZERO);
+    }
+
+    /// The July incident shape, end to end: the backend answered `"usage": null` and the
+    /// row was billed nothing. The recompute has nothing to re-read, so the row must surface
+    /// as not-replayable — NOT as "unchanged", which would certify a broken row as healthy.
+    #[sqlx::test]
+    async fn july_null_usage_row_surfaces_as_not_replayable(pool: PgPool) {
+        setup_fusillade_pool(&pool).await;
+        let (user_id, _) = seed(
+            &pool,
+            "/chat/completions",
+            r#"{"choices":[{"finish_reason":"tool_calls","index":0,"message":{"role":"assistant","content":null}}],"created":1,"id":"c","model":"m","object":"chat.completion","usage":null}"#,
+            0,
+            0,
+            0,
+            0,
+            Decimal::ZERO,
+        )
+        .await;
+
+        let report = recompute_corpus(&pool, &filter_for(user_id), CreationTier::FiveMinute, None)
+            .await
+            .unwrap();
+
+        assert_eq!(report.summary.rows_total, 1);
+        assert_eq!(report.summary.rows_not_replayable, 1, "no usage to re-read → needs a human");
+        assert_eq!(report.summary.rows_unchanged, 0, "must not be certified healthy");
+        assert_eq!(report.summary.rows_changed, 0);
+        let row = &report.rows[0];
+        assert!(
+            row.note.as_deref().is_some_and(|n| n.contains("no usage object")),
+            "the note must say why: {:?}",
+            row.note
+        );
+    }
+
     /// A request with no stored body cannot be checked at all. It must be reported as such
     /// rather than dropped, and must not be counted as a change.
     #[sqlx::test]
