@@ -587,6 +587,22 @@ mod tests {
         TierPolicy::from_config(&["5m".to_string(), "1h".to_string(), "24h".to_string()], "5m")
     }
 
+    /// Poll until `hash` is visible in the index for `scope`, or panic after ~5s.
+    ///
+    /// The commit runs on a spawned task whose Postgres round-trip needs wall time, not
+    /// scheduler turns — a bounded `yield_now` loop is a race that loses on a loaded CI
+    /// runner (observed as a flake on an unrelated PR's run).
+    async fn await_commit(idx: &PostgresIndex, scope: &IndexScope, hash: &crate::prompt_cache::PrefixHash, what: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if !idx.lookup(scope, std::slice::from_ref(hash)).await.unwrap().is_empty() {
+                return;
+            }
+            assert!(std::time::Instant::now() < deadline, "{what}: write did not commit within 5s");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
     /// Stand-in for onwards/upstream: a chat completion with a `usage` object.
     async fn mock_upstream() -> Json<serde_json::Value> {
         Json(serde_json::json!({
@@ -681,15 +697,7 @@ mod tests {
             .cumulative_hashes[0]
             .clone();
         let idx = PostgresIndex::new(pool.clone(), 1);
-        let mut committed = false;
-        for _ in 0..100 {
-            if !idx.lookup(&scope, std::slice::from_ref(&hash)).await.unwrap().is_empty() {
-                committed = true;
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-        assert!(committed, "the write should have committed after a 2xx");
+        await_commit(&idx, &scope, &hash, "the write should have committed after a 2xx").await;
 
         // Second identical request → now a read hit on the committed prefix.
         let r2 = server
@@ -806,15 +814,7 @@ mod tests {
         .cumulative_hashes[0]
             .clone();
         let idx = PostgresIndex::new(pool.clone(), 1);
-        let mut committed = false;
-        for _ in 0..100 {
-            if !idx.lookup(&scope, std::slice::from_ref(&hash)).await.unwrap().is_empty() {
-                committed = true;
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-        assert!(committed, "streaming write commits after a clean usage frame");
+        await_commit(&idx, &scope, &hash, "streaming write commits after a clean usage frame").await;
 
         // Second identical stream → a read hit, injected into the terminal frame.
         let r2 = server
@@ -1189,15 +1189,7 @@ mod tests {
         .cumulative_hashes[1]
             .clone();
         let idx = PostgresIndex::new(pool.clone(), 1);
-        let mut committed = false;
-        for _ in 0..100 {
-            if !idx.lookup(&scope, std::slice::from_ref(&hash)).await.unwrap().is_empty() {
-                committed = true;
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-        assert!(committed, "the query-param write should commit after a 2xx");
+        await_commit(&idx, &scope, &hash, "the query-param write should commit after a 2xx").await;
 
         let r2 = server
             .post("/v1/chat/completions")
