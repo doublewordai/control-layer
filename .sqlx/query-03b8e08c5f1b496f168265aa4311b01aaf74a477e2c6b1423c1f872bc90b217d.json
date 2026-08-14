@@ -1,0 +1,21 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                WITH input AS MATERIALIZED (\n                    SELECT id, endpoint, method, path, body, model, api_key,\n                           body_byte_size, NOW() AS created_at\n                    FROM UNNEST(\n                        $1::uuid[], $2::text[], $3::text[], $4::text[],\n                        $5::text[], $6::text[], $7::text[], $8::bigint[]\n                    ) AS t(id, endpoint, method, path, body, model, api_key,\n                           body_byte_size)\n                ), registry AS (\n                    INSERT INTO request_templates_legacy (\n                        id, file_id, endpoint, method, path, body, model,\n                        api_key, created_at, updated_at, custom_id, line_number,\n                        body_byte_size, metadata, retained_bucket\n                    )\n                    SELECT id, NULL, '', '', '', '', '', '', created_at,\n                           created_at, NULL, 0, 0, NULL, created_at\n                    FROM input\n                    RETURNING id\n                ), locator AS (\n                    INSERT INTO request_template_retained_keys (\n                        id, created_at, file_id, line_number\n                    )\n                    SELECT input.id, input.created_at, NULL, 0\n                    FROM input\n                    JOIN registry USING (id)\n                    RETURNING id\n                )\n                INSERT INTO request_templates_retained (\n                    id, file_id, custom_id, endpoint, method, path, body,\n                    model, api_key, created_at, updated_at, line_number,\n                    body_byte_size\n                )\n                SELECT input.id, NULL, NULL, input.endpoint, input.method,\n                       input.path, input.body, input.model, input.api_key,\n                       input.created_at, input.created_at, 0,\n                       input.body_byte_size\n                FROM input\n                JOIN locator USING (id)\n                ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "UuidArray",
+        "TextArray",
+        "TextArray",
+        "TextArray",
+        "TextArray",
+        "TextArray",
+        "TextArray",
+        "Int8Array"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "03b8e08c5f1b496f168265aa4311b01aaf74a477e2c6b1423c1f872bc90b217d"
+}

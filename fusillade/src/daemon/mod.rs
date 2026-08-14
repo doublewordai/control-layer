@@ -2018,6 +2018,10 @@ where
                                     .increment(outcome.files_expired);
                                 counter!("fusillade_retention_batches_expired_total")
                                     .increment(outcome.batches_expired);
+                                counter!("fusillade_retention_archive_partitions_retired_total")
+                                    .increment(outcome.archive_partitions_retired);
+                                counter!("fusillade_retention_template_partitions_retired_total")
+                                    .increment(outcome.template_partitions_retired);
                                 counter!("fusillade_retention_batchless_requests_deleted_total")
                                     .increment(outcome.batchless_requests_deleted);
                                 counter!("fusillade_retention_batchless_requests_redacted_total")
@@ -2035,6 +2039,9 @@ where
                                 tracing::info!(
                                     files_expired = outcome.files_expired,
                                     batches_expired = outcome.batches_expired,
+                                    archive_partitions_retired = outcome.archive_partitions_retired,
+                                    template_partitions_retired =
+                                        outcome.template_partitions_retired,
                                     batchless_requests_deleted = outcome.batchless_requests_deleted,
                                     batchless_requests_redacted =
                                         outcome.batchless_requests_redacted,
