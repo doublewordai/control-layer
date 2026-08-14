@@ -207,6 +207,111 @@ async fn adds_retained_response_parent_without_rewriting_live_heaps(pool: sqlx::
         "the deployment migration must not build an index on requests"
     );
 
+    sqlx::query(
+        r#"
+        CREATE INDEX idx_requests_batchless_retention_due
+        ON requests (service_tier, created_at, id)
+        WHERE batch_id IS NULL
+          AND state IN ('completed', 'failed', 'canceled')
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let wrong_archive_index_ready: bool =
+        sqlx::query_scalar("SELECT retained_response_archive_index_ready()")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(
+        !wrong_archive_index_ready,
+        "a same-name index with the wrong terminal expression must not enable movement"
+    );
+    sqlx::query("DROP INDEX idx_requests_batchless_retention_due")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    sqlx::query(
+        r#"
+        CREATE INDEX idx_requests_batchless_retention_due
+        ON requests (
+            service_tier,
+            (CASE state
+               WHEN 'completed' THEN completed_at
+               WHEN 'failed' THEN failed_at
+               WHEN 'canceled' THEN canceled_at
+             END),
+            id
+        )
+        WHERE batch_id IS NULL
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let wrong_archive_predicate_ready: bool =
+        sqlx::query_scalar("SELECT retained_response_archive_index_ready()")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(
+        !wrong_archive_predicate_ready,
+        "a same-name index with the wrong predicate must not enable movement"
+    );
+    sqlx::query("DROP INDEX idx_requests_batchless_retention_due")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    sqlx::raw_sql(
+        r#"
+        CREATE SCHEMA retained_response_non_owner;
+        CREATE TABLE retained_response_non_owner.retained_response_objects
+            (LIKE retained_response_objects INCLUDING ALL)
+            PARTITION BY RANGE (delete_on);
+        CREATE TABLE retained_response_non_owner.retained_response_buckets
+            (LIKE retained_response_buckets INCLUDING ALL);
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let non_owner_schema = sqlx::query(
+        "SELECT ensure_retained_response_partition(DATE '2038-06-15', 'retained_response_non_owner')",
+    )
+    .execute(&pool)
+    .await
+    .expect_err("the helper must reject a schema outside its stored search path");
+    assert_eq!(
+        non_owner_schema
+            .as_database_error()
+            .and_then(|error| error.code())
+            .as_deref(),
+        Some("3F000")
+    );
+    let split_bucket_state: bool = sqlx::query_scalar(
+        r#"
+        SELECT to_regclass(
+                   'retained_response_non_owner.retained_response_objects_d20380615'
+               ) IS NOT NULL
+            OR EXISTS (
+                SELECT 1
+                FROM retained_response_buckets
+                WHERE delete_on = DATE '2038-06-15'
+            )
+            OR EXISTS (
+                SELECT 1
+                FROM retained_response_non_owner.retained_response_buckets
+                WHERE delete_on = DATE '2038-06-15'
+            )
+        "#,
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(!split_bucket_state, "rejection must be side-effect free");
+
     sqlx::query("SELECT ensure_retained_response_partition(DATE '2038-05-17')")
         .execute(&pool)
         .await
@@ -280,6 +385,75 @@ async fn adds_retained_response_parent_without_rewriting_live_heaps(pool: sqlx::
             .await
             .unwrap();
     assert_eq!(created_again, 0);
+
+    let schema_name: String = sqlx::query_scalar("SELECT current_schema()")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let runway_lock_key: i64 = sqlx::query_scalar(
+        "SELECT hashtextextended('retained_response_objects.partition:' || $1 || ':2038-06-01', 0)",
+    )
+    .bind(&schema_name)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let mut runway_blocker = pool.acquire().await.unwrap();
+    sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(runway_lock_key)
+        .execute(&mut *runway_blocker)
+        .await
+        .unwrap();
+    let first_pool = pool.clone();
+    let first_runway = tokio::spawn(async move {
+        sqlx::query_scalar::<_, i32>(
+            "SELECT ensure_retained_response_partitions(DATE '2038-06-01', 2)",
+        )
+        .fetch_one(&first_pool)
+        .await
+    });
+    let second_pool = pool.clone();
+    let second_runway = tokio::spawn(async move {
+        sqlx::query_scalar::<_, i32>(
+            "SELECT ensure_retained_response_partitions(DATE '2038-06-01', 2)",
+        )
+        .fetch_one(&second_pool)
+        .await
+    });
+    let mut blocked_runways = 0_i64;
+    for _ in 0..1_000 {
+        blocked_runways = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*)
+            FROM pg_stat_activity
+            WHERE datname = current_database()
+              AND wait_event = 'advisory'
+              AND query LIKE '%ensure_retained_response_partitions%2038-06-01%'
+            "#,
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        if blocked_runways == 2 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
+    sqlx::query("SELECT pg_advisory_unlock($1)")
+        .bind(runway_lock_key)
+        .execute(&mut *runway_blocker)
+        .await
+        .unwrap();
+    assert_eq!(blocked_runways, 2, "both runway calls must reach the lock");
+    let mut runway_counts = [
+        first_runway.await.unwrap().unwrap(),
+        second_runway.await.unwrap().unwrap(),
+    ];
+    runway_counts.sort_unstable();
+    assert_eq!(
+        runway_counts,
+        [0, 3],
+        "concurrent runway calls must count each created partition exactly once"
+    );
 
     let (concurrent_first, concurrent_second) = tokio::join!(
         sqlx::query("SELECT ensure_retained_response_partition(DATE '2038-05-20')").execute(&pool),

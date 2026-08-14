@@ -174,16 +174,35 @@ AS $$
         JOIN pg_class heap ON heap.oid = index_catalog.indrelid
         JOIN pg_class index_relation ON index_relation.oid = index_catalog.indexrelid
         JOIN pg_namespace namespace ON namespace.oid = heap.relnamespace
+        JOIN pg_am access_method ON access_method.oid = index_relation.relam
         WHERE namespace.nspname = COALESCE(relation_schema, current_schema())
           AND heap.relname = 'requests'
           AND index_relation.relname = 'idx_requests_batchless_retention_due'
           AND index_catalog.indisready
           AND index_catalog.indisvalid
+          AND access_method.amname = 'btree'
+          AND index_catalog.indnkeyatts = 3
+          AND pg_get_indexdef(index_catalog.indexrelid, 1, TRUE) = 'service_tier'
+          AND lower(regexp_replace(
+                  regexp_replace(
+                      pg_get_indexdef(index_catalog.indexrelid, 2, TRUE),
+                      '::(text|timestamp with time zone)', '', 'g'
+                  ),
+                  '[[:space:]()]', '', 'g'
+              )) = 'casestatewhen''completed''thencompleted_atwhen''failed''thenfailed_atwhen''canceled''thencanceled_atelsenullend'
+          AND pg_get_indexdef(index_catalog.indexrelid, 3, TRUE) = 'id'
+          AND lower(regexp_replace(
+                  regexp_replace(
+                      pg_get_expr(index_catalog.indpred, index_catalog.indrelid, TRUE),
+                      '::text', '', 'g'
+                  ),
+                  '[[:space:]()]', '', 'g'
+              )) = 'batch_idisnullandstate=anyarray[''completed'',''failed'',''canceled'']'
     )
 $$;
 
 COMMENT ON FUNCTION retained_response_archive_index_ready(TEXT) IS
-    'True only when the operator-built batchless terminal candidate index is ready and valid.';
+    'True only when the operator-built batchless terminal candidate index has the canonical keys and predicate and is ready and valid.';
 
 CREATE FUNCTION ensure_retained_response_partition(
     target_delete_on DATE,
@@ -202,6 +221,12 @@ DECLARE
     attached_with_exact_bounds BOOLEAN;
     bucket_matches BOOLEAN;
 BEGIN
+    IF schema_name IS DISTINCT FROM current_schema() THEN
+        RAISE EXCEPTION USING
+            ERRCODE = 'invalid_schema_name',
+            MESSAGE = 'relation_schema must match the retained-response helper schema';
+    END IF;
+
     IF target_delete_on IS NULL THEN
         RAISE EXCEPTION USING
             ERRCODE = 'null_value_not_allowed',
@@ -327,7 +352,7 @@ END;
 $$;
 
 COMMENT ON FUNCTION ensure_retained_response_partition(DATE, TEXT) IS
-    'Idempotently creates and records one exact daily UTC delete_on partition using a transaction advisory lock.';
+    'Idempotently creates and records one exact daily UTC delete_on partition in the helper-owning schema using a transaction advisory lock.';
 
 CREATE FUNCTION ensure_retained_response_partitions(
     first_delete_on DATE,
@@ -357,6 +382,13 @@ BEGIN
         target_delete_on := first_delete_on + offset_days;
         partition_name := 'retained_response_objects_d'
             || to_char(target_delete_on, 'YYYYMMDD');
+        PERFORM pg_advisory_xact_lock(
+            hashtextextended(
+                'retained_response_objects.partition:' || current_schema() || ':'
+                    || target_delete_on::text,
+                0
+            )
+        );
         IF to_regclass(format('%I.%I', current_schema(), partition_name)) IS NULL THEN
             created := created + 1;
         END IF;
@@ -367,4 +399,4 @@ END;
 $$;
 
 COMMENT ON FUNCTION ensure_retained_response_partitions(DATE, INTEGER) IS
-    'Ensures exact daily partitions from first_delete_on through days_ahead, inclusive.';
+    'Concurrently ensures and exactly counts daily partitions from first_delete_on through days_ahead, inclusive.';
