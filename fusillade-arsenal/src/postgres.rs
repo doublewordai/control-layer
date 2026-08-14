@@ -46,6 +46,12 @@ use crate::request::{
     ServiceTierFilter,
 };
 
+// The archive mover and archive-aware readers consume this module in later
+// rollout steps. Keep its reviewed V1 boundary available without coupling this
+// serialization-only change to movement or read routing.
+#[allow(dead_code)]
+pub(crate) mod retained_response;
+
 use super::utils::{
     calculate_error_message_size, calculate_response_body_size, estimate_error_file_size,
     estimate_output_file_size,
