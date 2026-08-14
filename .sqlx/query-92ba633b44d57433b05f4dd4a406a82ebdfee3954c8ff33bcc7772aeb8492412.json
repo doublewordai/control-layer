@@ -1,0 +1,153 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT\n            ha.id                              AS \"analytics_id!\",\n            ha.user_id,\n            ha.model,\n            ha.timestamp                       AS \"timestamp!\",\n            ha.uri                             AS \"uri!\",\n            ha.status_code,\n            ha.fusillade_request_id,\n            ha.fusillade_batch_id,\n            ha.prompt_tokens                   AS \"prompt_tokens!\",\n            ha.completion_tokens               AS \"completion_tokens!\",\n            ha.reasoning_tokens                AS \"reasoning_tokens!\",\n            ha.total_tokens                    AS \"total_tokens!\",\n            ha.cache_read_input_tokens         AS \"cache_read!\",\n            ha.cache_creation_5m_input_tokens  AS \"cache_creation_5m!\",\n            ha.cache_creation_1h_input_tokens  AS \"cache_creation_1h!\",\n            ha.cache_creation_24h_input_tokens AS \"cache_creation_24h!\",\n            ha.total_cost,\n            ha.input_price_per_token,\n            ha.output_price_per_token,\n            -- `?` overrides sqlx's nullability inference: rt.body is NOT NULL in its own\n            -- table, but this is a LEFT JOIN, so it is absent for any row with no fusillade\n            -- link. Without the override sqlx types it as String and the None case vanishes.\n            rt.body                            AS \"request_body?\",\n            r.response_body                    AS \"response_body?\",\n            r.response_status                  AS \"response_status?\"\n        FROM http_analytics ha\n        LEFT JOIN fusillade.requests r          ON r.id  = ha.fusillade_request_id\n        LEFT JOIN fusillade.request_templates rt ON rt.id = r.template_id\n        WHERE ha.timestamp >= $1\n          AND ha.timestamp <= $2\n          AND ($3::uuid IS NULL OR ha.user_id = $3)\n          AND ($4::text IS NULL OR ha.uri LIKE $4)\n          AND ($5::text IS NULL OR ha.model = $5)\n          -- Only rows that were billed: attributed, successful, and priced. A NULL\n          -- total_cost is a free model, where no charge was ever expected.\n          AND ha.user_id IS NOT NULL\n          AND ha.status_code BETWEEN 200 AND 299\n        ORDER BY ha.id\n        LIMIT $6\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "analytics_id!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "user_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "model",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 3,
+        "name": "timestamp!",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 4,
+        "name": "uri!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 5,
+        "name": "status_code",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 6,
+        "name": "fusillade_request_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 7,
+        "name": "fusillade_batch_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 8,
+        "name": "prompt_tokens!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 9,
+        "name": "completion_tokens!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 10,
+        "name": "reasoning_tokens!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 11,
+        "name": "total_tokens!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 12,
+        "name": "cache_read!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 13,
+        "name": "cache_creation_5m!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 14,
+        "name": "cache_creation_1h!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 15,
+        "name": "cache_creation_24h!",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 16,
+        "name": "total_cost",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 17,
+        "name": "input_price_per_token",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 18,
+        "name": "output_price_per_token",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 19,
+        "name": "request_body?",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 20,
+        "name": "response_body?",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 21,
+        "name": "response_status?",
+        "type_info": "Int2"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Timestamptz",
+        "Timestamptz",
+        "Uuid",
+        "Text",
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      true,
+      true,
+      false,
+      false,
+      true,
+      true,
+      true,
+      true,
+      true,
+      false,
+      true,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      false,
+      true,
+      true
+    ]
+  },
+  "hash": "92ba633b44d57433b05f4dd4a406a82ebdfee3954c8ff33bcc7772aeb8492412"
+}

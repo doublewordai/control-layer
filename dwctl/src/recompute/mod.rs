@@ -101,21 +101,94 @@
 //! it does not block the incidents above, where the split was recorded correctly and only
 //! the total was wrong.
 
-// The engine lands before its callers: the dry-run job, the API handlers and the persisted
-// run/item tables are the next commits on this branch. Until those exist the only consumers
-// are this module's tests, so the whole surface reads as dead. Remove this attribute once
-// `recompute::job` is wired into `crate::tasks`.
-#![allow(dead_code)]
-
 use crate::pricing::TokenCounts;
 use crate::request_logging::serializers::{TokenMetrics, extract_from_last_usage, parse_ai_response};
 use outlet::{RequestData, ResponseData};
 
 pub mod cache_fields;
 pub mod replay;
+pub mod report;
+pub mod source;
 
 use cache_fields::{CacheReading, CreationTier, cache_tokens_both_shapes};
 use replay::RecomputeError;
+
+/// Recompute a whole corpus and build the report.
+///
+/// Read-only by construction: it takes a `&PgPool` it only ever `SELECT`s through, and the
+/// report it returns is a document. Nothing here writes, and nothing it returns is applied
+/// automatically — see the module docs.
+#[tracing::instrument(skip(pool, filter), fields(limit = filter.limit))]
+pub async fn recompute_corpus(
+    pool: &sqlx::PgPool,
+    filter: &source::CorpusFilter,
+    flat_tier: CreationTier,
+) -> Result<report::RecomputeReport, sqlx::Error> {
+    let corpus = source::load_corpus(pool, filter).await?;
+
+    let rows = corpus
+        .iter()
+        .map(|row| {
+            let Some(exchange) = &row.exchange else {
+                // No body at all. For a ZDR account this is permanent and expected; the
+                // tokens simply cannot be verified, only the dollars-from-stored-tokens
+                // check remains available.
+                return report::ReportRow::unreplayable(
+                    row,
+                    report::Evidence::ColumnsOnly,
+                    "no stored request/response body for this request".to_string(),
+                );
+            };
+
+            let replayed = exchange
+                .to_outlet_pair()
+                .and_then(|(req, resp)| recompute_from_stored_response(&req, &resp, flat_tier));
+
+            match replayed {
+                Ok(usage) => {
+                    // Price with the rates resolved at inference time, carried on the row.
+                    // Re-resolving the tariff here would silently re-base a correction onto
+                    // pricing that changed after the request was served.
+                    let cost = crate::pricing::charged_cost(
+                        &usage.counts,
+                        row.model.as_deref(),
+                        row.input_price_per_token,
+                        row.output_price_per_token,
+                        cache_multipliers_for(row),
+                        crate::metrics::errors::component::ANALYTICS,
+                    );
+                    report::ReportRow::replayed(row, &usage, cost)
+                }
+                Err(e) => report::ReportRow::unreplayable(row, report::Evidence::NotReplayable, e.to_string()),
+            }
+        })
+        .collect::<Vec<_>>();
+
+    Ok(report::RecomputeReport {
+        generated_at: chrono::Utc::now(),
+        corpus: serde_json::json!({
+            "start": filter.start,
+            "end": filter.end,
+            "user_id": filter.user_id,
+            "uri_pattern": filter.uri_pattern,
+            "model": filter.model,
+            "limit": filter.limit,
+        }),
+        summary: report::ReportSummary::of(&rows),
+        rows,
+    })
+}
+
+/// Whether dwctl's cache discount applied to this request, inferred from the row itself.
+///
+/// The live path gates the discount on a `model_cache_tariffs` row valid at inference time.
+/// A recompute cannot re-resolve that without risking a tariff that changed since, so it
+/// uses the evidence already on the row: a request that recorded cache tokens was, by
+/// definition, priced by a cache-enabled model at the time. One that recorded none gets no
+/// multipliers, which is exactly the "provider's own caching, not ours" case.
+fn cache_multipliers_for(row: &source::CorpusRow) -> Option<crate::pricing::CacheMultipliers> {
+    (row.stored_cache_total() > 0).then(crate::pricing::CacheMultipliers::default)
+}
 
 /// Where a recomputed figure came from, and therefore how much it can be trusted.
 ///
@@ -276,6 +349,12 @@ pub fn recompute_from_stored_response(
 ///   re-pricing a request on a contested count.
 ///
 /// The cache split is untouched in every branch.
+///
+// Not yet reachable: the corpus recompute reads usage from the stored response, which is
+// exact and covers both incidents seen so far. This is the entry point for the tokenizer
+// path — needed when a response carries no usage at all (the July shape) — and is kept with
+// its tests because the precedence rules it encodes are the hard part, not the plumbing.
+#[allow(dead_code)]
 pub fn fold_render(mut usage: RecomputedUsage, rendered_prompt: i64, tolerance_bps: i64) -> RecomputedUsage {
     let reported_prompt = usage.counts.prompt;
 
