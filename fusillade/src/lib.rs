@@ -32,7 +32,8 @@ pub use manager::DaemonExecutor;
 #[cfg(feature = "postgres")]
 pub use manager::PostgresDaemon;
 pub use manager::{
-    DaemonStorage, ModelFilter, ModelFilterState, RetentionSweepCutoffs, RetentionSweepOutcome,
+    DaemonStorage, ModelFilter, ModelFilterState, RetainedResponseArchiveOutcome, RetentionCutoffs,
+    RetentionMaintenanceOutcome, RetentionSweepCutoffs, RetentionSweepOutcome,
     RetentionSweepPolicy, Storage, TrailingDemandCount,
 };
 pub use processor::{CancellationFuture, DefaultRequestProcessor, RequestProcessor, ShouldRetry};
