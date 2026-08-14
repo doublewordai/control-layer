@@ -738,6 +738,58 @@ impl RetainedGroup {
         Ok(())
     }
 
+    fn validate_predecessor_tree(
+        &self,
+        steps: &[RetainedStepPayloadV1],
+        head_step_id: Uuid,
+    ) -> std::result::Result<(), RetainedResponseSerializationError> {
+        for payload in steps {
+            let step = &payload.step;
+            if step.id == head_step_id {
+                if step.prev_step_id.is_some() {
+                    return Err(RetainedResponseSerializationError::IncompleteGroup);
+                }
+            } else {
+                let Some(predecessor_id) = step.prev_step_id else {
+                    return Err(RetainedResponseSerializationError::IncompleteGroup);
+                };
+                if !self.step_ids.contains(&predecessor_id) {
+                    return Err(RetainedResponseSerializationError::IncompleteGroup);
+                }
+            }
+        }
+
+        for payload in steps {
+            if payload.step.id == head_step_id {
+                continue;
+            }
+
+            let mut current_step_id = payload.step.id;
+            let mut reached_head = false;
+            for _ in 0..steps.len() {
+                if current_step_id == head_step_id {
+                    reached_head = true;
+                    break;
+                }
+                let Some(current_step) = steps
+                    .iter()
+                    .find(|candidate| candidate.step.id == current_step_id)
+                else {
+                    return Err(RetainedResponseSerializationError::IncompleteGroup);
+                };
+                let Some(predecessor_id) = current_step.step.prev_step_id else {
+                    return Err(RetainedResponseSerializationError::IncompleteGroup);
+                };
+                current_step_id = predecessor_id;
+            }
+            if !reached_head {
+                return Err(RetainedResponseSerializationError::IncompleteGroup);
+            }
+        }
+
+        Ok(())
+    }
+
     fn validate_members(
         &self,
         requests: &[RetainedRequestPayloadV1],
@@ -781,12 +833,6 @@ impl RetainedGroup {
                     if step.id != head_step_id && step.parent_step_id != Some(head_step_id) {
                         return Err(RetainedResponseSerializationError::IncompleteGroup);
                     }
-                    if step
-                        .prev_step_id
-                        .is_some_and(|predecessor_id| !self.step_ids.contains(&predecessor_id))
-                    {
-                        return Err(RetainedResponseSerializationError::IncompleteGroup);
-                    }
                     match (step.step_kind, step.request_id) {
                         (StepKind::ModelCall, Some(request_id)) => {
                             model_request_ids.push(request_id)
@@ -795,6 +841,7 @@ impl RetainedGroup {
                         _ => return Err(RetainedResponseSerializationError::IncompleteGroup),
                     }
                 }
+                self.validate_predecessor_tree(steps, head_step_id)?;
                 if has_duplicate_ids(&model_request_ids)
                     || !same_id_set(&model_request_ids, &self.request_ids)
                 {
@@ -1272,6 +1319,13 @@ mod tests {
         }
     }
 
+    fn branching_tool_step() -> ResponseStep {
+        let mut step = tool_step();
+        step.id = StepId(branching_tool_step_id());
+        step.step_sequence = 12;
+        step
+    }
+
     fn other_request_id() -> Uuid {
         Uuid::from_u128(0x66666666666666666666666666666666)
     }
@@ -1282,6 +1336,10 @@ mod tests {
 
     fn other_step_id() -> Uuid {
         Uuid::from_u128(0x88888888888888888888888888888888)
+    }
+
+    fn branching_tool_step_id() -> Uuid {
+        Uuid::from_u128(0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa)
     }
 
     fn other_group_id() -> Uuid {
@@ -1638,6 +1696,74 @@ mod tests {
             foreign_predecessor,
             RetainedResponseSerializationError::IncompleteGroup
         );
+    }
+
+    #[test]
+    fn compose_rows_rejects_a_head_predecessor_to_its_descendant() {
+        // Mutation caught: a root with a predecessor is not a tree root, even
+        // when that predecessor is an otherwise valid in-group descendant.
+        let (group, request, mut head, tool) = complete_multi_step_group();
+        head.step.prev_step_id = Some(tool_step_id());
+
+        let error =
+            RetainedGroup::compose_rows(delete_on(), group, vec![request], vec![head, tool])
+                .expect_err("the declared head must not have a predecessor");
+
+        assert_eq!(error, RetainedResponseSerializationError::IncompleteGroup);
+    }
+
+    #[test]
+    fn compose_rows_rejects_a_nonhead_without_a_predecessor() {
+        // Mutation caught: a descendant without its unique tree edge becomes
+        // disconnected from the retained response despite sharing its parent.
+        let (group, request, head, mut tool) = complete_multi_step_group();
+        tool.step.prev_step_id = None;
+
+        let error =
+            RetainedGroup::compose_rows(delete_on(), group, vec![request], vec![head, tool])
+                .expect_err("every nonhead must have a predecessor");
+
+        assert_eq!(error, RetainedResponseSerializationError::IncompleteGroup);
+    }
+
+    #[test]
+    fn compose_rows_rejects_an_in_group_predecessor_cycle() {
+        // Mutation caught: membership checks alone cannot distinguish a cycle
+        // disconnected from the declared head from a retained response tree.
+        let (mut group, request, head, mut first_tool) = complete_multi_step_group();
+        let mut second_tool = RetainedStepPayloadV1::from_response_step(&branching_tool_step());
+        first_tool.step.prev_step_id = Some(branching_tool_step_id());
+        second_tool.step.prev_step_id = Some(tool_step_id());
+        group.step_ids.push(branching_tool_step_id());
+
+        let error = RetainedGroup::compose_rows(
+            delete_on(),
+            group,
+            vec![request],
+            vec![head, first_tool, second_tool],
+        )
+        .expect_err("every predecessor walk must terminate at the declared head");
+
+        assert_eq!(error, RetainedResponseSerializationError::IncompleteGroup);
+    }
+
+    #[test]
+    fn compose_rows_accepts_a_branching_predecessor_tree() {
+        // Regression caught: requiring a linear predecessor chain would reject
+        // valid parallel tool calls that share the head as their predecessor.
+        let (mut group, request, head, first_tool) = complete_multi_step_group();
+        let second_tool = RetainedStepPayloadV1::from_response_step(&branching_tool_step());
+        group.step_ids.push(branching_tool_step_id());
+
+        let rows = RetainedGroup::compose_rows(
+            delete_on(),
+            group,
+            vec![request],
+            vec![head, first_tool, second_tool],
+        )
+        .expect("parallel children of one predecessor must remain valid");
+
+        assert_eq!(rows.len(), 5);
     }
 
     #[test]
