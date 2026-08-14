@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use chrono::{DateTime, NaiveDate, TimeDelta, Utc};
 use fusillade_arsenal::manager::{
@@ -49,6 +49,33 @@ struct WriteSignalingPools {
     read: PgPool,
     write: PgPool,
     write_requested: Arc<AtomicBool>,
+}
+
+#[derive(Clone)]
+struct DiscoveryReadGatedPools {
+    read: PgPool,
+    gated_read: PgPool,
+    read_selections: Arc<AtomicUsize>,
+    gate_requested: Arc<AtomicBool>,
+}
+
+impl PoolProvider for DiscoveryReadGatedPools {
+    fn read(&self) -> &PgPool {
+        // Zero-based selection 3 is the old topology read after the index,
+        // timestamp, and seed reads. With atomic discovery it is the bounded
+        // look-ahead, after the first candidate snapshot is already complete.
+        if self.read_selections.fetch_add(1, Ordering::AcqRel) == 3 {
+            self.gate_requested.store(true, Ordering::Release);
+            &self.gated_read
+        } else {
+            &self.read
+        }
+    }
+
+    fn write(&self) -> &PgPool {
+        self.gate_requested.store(true, Ordering::Release);
+        &self.read
+    }
 }
 
 impl PoolProvider for WriteSignalingPools {
@@ -117,6 +144,35 @@ async fn write_gated_manager(
         PostgresStorageConfig::default(),
     );
     (manager, held_connection, write_requested)
+}
+
+async fn discovery_read_gated_manager(
+    pool: &PgPool,
+) -> (
+    PostgresRequestManager<DiscoveryReadGatedPools>,
+    PoolConnection<Postgres>,
+    Arc<AtomicBool>,
+) {
+    let gated_read = PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with(pool.connect_options().as_ref().clone())
+        .await
+        .expect("gated read pool must connect");
+    let held_connection = gated_read
+        .acquire()
+        .await
+        .expect("the sole gated read connection must be held");
+    let gate_requested = Arc::new(AtomicBool::new(false));
+    let manager = PostgresRequestManager::new(
+        DiscoveryReadGatedPools {
+            read: pool.clone(),
+            gated_read,
+            read_selections: Arc::new(AtomicUsize::new(0)),
+            gate_requested: Arc::clone(&gate_requested),
+        },
+        PostgresStorageConfig::default(),
+    );
+    (manager, held_connection, gate_requested)
 }
 
 async fn wait_for_write_request(write_requested: &AtomicBool) {
@@ -894,6 +950,68 @@ async fn partially_deleted_discovered_graph_never_returns_already_gone(pool: PgP
         .await
         .expect("mover task must finish")
         .expect_err("a partially remaining discovered graph must fail closed");
+    assert_eq!(
+        RetainedResponseMaintenanceError::from_fusillade_error(&error),
+        Some(RetainedResponseMaintenanceError::IncompleteGraph)
+    );
+
+    assert_eq!(count_ids(&pool, "requests", &[head_request_id]).await, 0);
+    assert_eq!(
+        count_ids(&pool, "requests", &sibling_request_ids).await,
+        sibling_request_ids.len() as i64
+    );
+    assert_eq!(count_ids(&pool, "response_steps", &graph.step_ids).await, 0);
+    assert_eq!(
+        count_ids(&pool, "request_templates", &graph.template_ids).await,
+        graph.template_ids.len() as i64
+    );
+    assert_eq!(retained_counts(&pool, graph.group_id).await, (0, 0, 0));
+}
+
+#[sqlx::test]
+async fn deleting_head_between_seed_and_topology_discovery_never_returns_already_gone(
+    pool: PgPool,
+) {
+    install_candidate_index(&pool).await;
+    ensure_partition(&pool, date("2026-08-03")).await;
+    let graph = branching_graph(&pool, TerminalState::Completed).await;
+    let head_request_id: Uuid = sqlx::query_scalar(
+        "SELECT request_id FROM response_steps WHERE id = $1 AND request_id IS NOT NULL",
+    )
+    .bind(graph.group_id)
+    .fetch_one(&pool)
+    .await
+    .expect("the response head must identify its request");
+    let sibling_request_ids = graph
+        .request_ids
+        .iter()
+        .copied()
+        .filter(|request_id| *request_id != head_request_id)
+        .collect::<Vec<_>>();
+    assert_eq!(sibling_request_ids.len(), 1);
+
+    let (gated_manager, held_connection, gate_requested) =
+        discovery_read_gated_manager(&pool).await;
+    let mut mover = tokio::spawn(async move {
+        archive(&gated_manager, &policy(&[("flex", 86_400)]), 1, i64::MAX).await
+    });
+
+    tokio::select! {
+        result = &mut mover => panic!("mover completed before the discovery gate: {result:?}"),
+        () = wait_for_write_request(&gate_requested) => {}
+    }
+
+    sqlx::query("DELETE FROM requests WHERE id = $1")
+        .bind(head_request_id)
+        .execute(&pool)
+        .await
+        .expect("the selected head request must delete before topology expansion");
+    drop(held_connection);
+
+    let error = mover
+        .await
+        .expect("mover task must finish")
+        .expect_err("a partially remaining discovery snapshot must fail closed");
     assert_eq!(
         RetainedResponseMaintenanceError::from_fusillade_error(&error),
         Some(RetainedResponseMaintenanceError::IncompleteGraph)

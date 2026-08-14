@@ -1232,12 +1232,6 @@ fn incomplete_graph() -> FusilladeError {
     RetainedResponseMaintenanceError::IncompleteGraph.into_fusillade_error()
 }
 
-#[derive(Clone, Copy)]
-struct CandidateSeed {
-    request_id: Uuid,
-    group_id: Uuid,
-}
-
 struct Candidate {
     request_id: Uuid,
     group_id: Uuid,
@@ -2174,72 +2168,51 @@ async fn move_graph<P: PoolProvider>(
     })
 }
 
-async fn next_candidate<P: PoolProvider>(
-    manager: &PostgresRequestManager<P>,
-    tiers: &[String],
-    cutoffs: &[DateTime<Utc>],
-    excluded_request_ids: &[Uuid],
-) -> MovementResult<Option<CandidateSeed>> {
-    let row: Option<(Uuid, Uuid)> = sqlx::query_as(
-        r#"
-        WITH policy(service_tier, expire_before) AS (
+// Seed selection and recursive membership must share one PostgreSQL statement
+// snapshot so the immutable Candidate cannot omit a concurrently deleted head's siblings.
+const CANDIDATE_DISCOVERY_SQL: &str = r#"
+        WITH RECURSIVE
+        policy(service_tier, expire_before) AS (
             SELECT * FROM UNNEST($1::text[], $2::timestamptz[])
-        )
-        SELECT candidate.id,
-               COALESCE(direct.parent_step_id, direct.id, candidate.id) AS group_id
-        FROM policy
-        CROSS JOIN LATERAL (
-            SELECT request.id,
-                   CASE request.state
-                       WHEN 'completed' THEN request.completed_at
-                       WHEN 'failed' THEN request.failed_at
-                       WHEN 'canceled' THEN request.canceled_at
-                   END AS terminal_at
-            FROM requests request
-            WHERE request.service_tier = policy.service_tier
-              AND request.batch_id IS NULL
-              AND request.state IN ('completed', 'failed', 'canceled')
-              AND NOT (request.id = ANY($3))
-              AND CASE request.state
-                      WHEN 'completed' THEN request.completed_at
-                      WHEN 'failed' THEN request.failed_at
-                      WHEN 'canceled' THEN request.canceled_at
-                  END <= policy.expire_before
-            ORDER BY CASE request.state
-                         WHEN 'completed' THEN request.completed_at
-                         WHEN 'failed' THEN request.failed_at
-                         WHEN 'canceled' THEN request.canceled_at
-                     END,
-                     request.id
+        ),
+        candidate_seed AS MATERIALIZED (
+            SELECT candidate.id AS request_id,
+                   COALESCE(direct.parent_step_id, direct.id, candidate.id) AS group_id,
+                   candidate.terminal_at
+            FROM policy
+            CROSS JOIN LATERAL (
+                SELECT request.id,
+                       CASE request.state
+                           WHEN 'completed' THEN request.completed_at
+                           WHEN 'failed' THEN request.failed_at
+                           WHEN 'canceled' THEN request.canceled_at
+                       END AS terminal_at
+                FROM requests request
+                WHERE request.service_tier = policy.service_tier
+                  AND request.batch_id IS NULL
+                  AND request.state IN ('completed', 'failed', 'canceled')
+                  AND NOT (request.id = ANY($3))
+                  AND CASE request.state
+                          WHEN 'completed' THEN request.completed_at
+                          WHEN 'failed' THEN request.failed_at
+                          WHEN 'canceled' THEN request.canceled_at
+                      END <= policy.expire_before
+                ORDER BY CASE request.state
+                             WHEN 'completed' THEN request.completed_at
+                             WHEN 'failed' THEN request.failed_at
+                             WHEN 'canceled' THEN request.canceled_at
+                         END,
+                         request.id
+                LIMIT 1
+            ) candidate
+            LEFT JOIN response_steps direct ON direct.request_id = candidate.id
+            ORDER BY candidate.terminal_at, candidate.id
             LIMIT 1
-        ) candidate
-        LEFT JOIN response_steps direct ON direct.request_id = candidate.id
-        ORDER BY candidate.terminal_at, candidate.id
-        LIMIT 1
-        "#,
-    )
-    .bind(tiers)
-    .bind(cutoffs)
-    .bind(excluded_request_ids)
-    .fetch_optional(manager.read_executor())
-    .await
-    .map_err(database_failure)?;
-    Ok(row.map(|(request_id, group_id)| CandidateSeed {
-        request_id,
-        group_id,
-    }))
-}
-
-async fn candidate_group_topology<P: PoolProvider>(
-    manager: &PostgresRequestManager<P>,
-    candidate: CandidateSeed,
-) -> MovementResult<GraphTopology> {
-    let members: Vec<(Uuid, Option<Uuid>)> = sqlx::query_as(
-        r#"
-        WITH RECURSIVE graph_steps(id, request_id) AS (
+        ),
+        graph_steps(id, request_id) AS (
             SELECT step.id, step.request_id
-            FROM response_steps step
-            WHERE step.id = $1
+            FROM candidate_seed candidate
+            JOIN response_steps step ON step.id = candidate.group_id
 
             UNION
 
@@ -2253,30 +2226,59 @@ async fn candidate_group_topology<P: PoolProvider>(
                   AND child.request_id = member.request_id
               )
         )
-        SELECT id, request_id
-        FROM graph_steps
-        ORDER BY id
-        "#,
-    )
-    .bind(candidate.group_id)
-    .fetch_all(manager.read_executor())
-    .await
-    .map_err(database_failure)?;
-    let step_ids = members.iter().map(|(step_id, _)| *step_id).collect();
-    let mut request_ids = members
+        SELECT candidate.request_id,
+               candidate.group_id,
+               step.id AS step_id,
+               step.request_id AS step_request_id
+        FROM candidate_seed candidate
+        LEFT JOIN graph_steps step ON TRUE
+        ORDER BY step.id
+        "#;
+
+async fn next_candidate<P: PoolProvider>(
+    manager: &PostgresRequestManager<P>,
+    tiers: &[String],
+    cutoffs: &[DateTime<Utc>],
+    excluded_request_ids: &[Uuid],
+) -> MovementResult<Option<Candidate>> {
+    let rows: Vec<(Uuid, Uuid, Option<Uuid>, Option<Uuid>)> =
+        sqlx::query_as(CANDIDATE_DISCOVERY_SQL)
+            .bind(tiers)
+            .bind(cutoffs)
+            .bind(excluded_request_ids)
+            .fetch_all(manager.read_executor())
+            .await
+            .map_err(database_failure)?;
+    let Some((request_id, group_id, _, _)) = rows.first().copied() else {
+        return Ok(None);
+    };
+    if rows.iter().any(|(row_request_id, row_group_id, _, _)| {
+        *row_request_id != request_id || *row_group_id != group_id
+    }) {
+        return Err(incomplete_graph());
+    }
+    let step_ids = rows
+        .iter()
+        .filter_map(|(_, _, step_id, _)| *step_id)
+        .collect();
+    let mut request_ids = rows
         .into_iter()
-        .filter_map(|(_, request_id)| request_id)
+        .filter_map(|(_, _, _, step_request_id)| step_request_id)
         .collect::<Vec<_>>();
     request_ids.sort_unstable();
     request_ids.dedup();
-    if !request_ids.contains(&candidate.request_id) {
-        request_ids.push(candidate.request_id);
+    if !request_ids.contains(&request_id) {
+        request_ids.push(request_id);
         request_ids.sort_unstable();
     }
-    Ok(GraphTopology {
-        request_ids,
-        step_ids,
-    })
+    Ok(Some(Candidate {
+        request_id,
+        group_id,
+        discovered_topology: GraphTopology {
+            request_ids,
+            step_ids,
+        },
+    }))
 }
 
 pub(crate) async fn archive_terminal_batchless_responses<P: PoolProvider>(
@@ -2335,16 +2337,11 @@ pub(crate) async fn archive_terminal_batchless_responses<P: PoolProvider>(
             discovery_exhausted = true;
             break;
         };
-        let discovered_topology = candidate_group_topology(manager, candidate).await?;
-        excluded_request_ids.extend(discovered_topology.request_ids.iter().copied());
+        excluded_request_ids.extend(candidate.discovered_topology.request_ids.iter().copied());
         excluded_request_ids.sort_unstable();
         excluded_request_ids.dedup();
         if seen_groups.insert(candidate.group_id) {
-            candidates.push(Candidate {
-                request_id: candidate.request_id,
-                group_id: candidate.group_id,
-                discovered_topology,
-            });
+            candidates.push(candidate);
         }
     }
     let mut outcome = RetainedResponseArchiveOutcome {
@@ -2397,6 +2394,7 @@ mod tests {
     use super::*;
     use chrono::{DateTime, NaiveDate, Utc};
     use serde_json::json;
+    use sqlx::PgPool;
     use uuid::Uuid;
 
     use crate::request::RequestId;
@@ -2406,6 +2404,60 @@ mod tests {
         DateTime::parse_from_rfc3339(value)
             .expect("fixture timestamp must be valid")
             .to_utc()
+    }
+
+    fn plan_uses_index(plan: &serde_json::Value, index_name: &str) -> bool {
+        match plan {
+            serde_json::Value::Array(values) => values
+                .iter()
+                .any(|value| plan_uses_index(value, index_name)),
+            serde_json::Value::Object(fields) => {
+                fields.get("Index Name").and_then(|value| value.as_str()) == Some(index_name)
+                    || fields
+                        .values()
+                        .any(|value| plan_uses_index(value, index_name))
+            }
+            _ => false,
+        }
+    }
+
+    #[sqlx::test]
+    async fn candidate_discovery_plan_uses_batchless_retention_due_index(pool: PgPool) {
+        sqlx::query(
+            r#"
+            CREATE INDEX idx_requests_batchless_retention_due
+            ON requests (
+              service_tier,
+              (CASE state WHEN 'completed' THEN completed_at
+                          WHEN 'failed' THEN failed_at
+                          WHEN 'canceled' THEN canceled_at END),
+              id
+            )
+            WHERE batch_id IS NULL
+              AND state IN ('completed', 'failed', 'canceled')
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("candidate index must install");
+        let mut tx = pool.begin().await.expect("planner transaction must begin");
+        sqlx::query("SET LOCAL enable_seqscan = off")
+            .execute(&mut *tx)
+            .await
+            .expect("sequential scans must be disabled for planner evidence");
+        let explain = format!("EXPLAIN (FORMAT JSON) {CANDIDATE_DISCOVERY_SQL}");
+        let plan: serde_json::Value = sqlx::query_scalar(&explain)
+            .bind(vec!["flex".to_owned()])
+            .bind(vec![timestamp("2026-08-08T00:00:00Z")])
+            .bind(Vec::<Uuid>::new())
+            .fetch_one(&mut *tx)
+            .await
+            .expect("candidate discovery must be explainable");
+
+        assert!(
+            plan_uses_index(&plan, "idx_requests_batchless_retention_due"),
+            "candidate seed must use the validated retention-due index: {plan}"
+        );
     }
 
     fn request_id() -> Uuid {
