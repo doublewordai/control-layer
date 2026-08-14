@@ -515,8 +515,20 @@ fn cache_tokens_from_usage(usage: &Value) -> CacheTokens {
 /// usage object (non-cache request, error body, or a stream that died before its usage
 /// frame) — which is exactly the no-cache-billing case.
 pub(crate) fn extract_cache_tokens(response_data: &ResponseData) -> CacheTokens {
+    extract_from_last_usage(response_data, cache_tokens_from_usage)
+}
+
+/// Locate the response's final `usage` object and map it with `from_usage`.
+///
+/// Factored out of [`extract_cache_tokens`] so that a caller reading a *raw upstream* body
+/// can apply different field semantics without duplicating the body handling — the
+/// decompress fallback and the SSE last-frame-wins scan are fiddly and must not diverge.
+/// The live path keeps [`cache_tokens_from_usage`]; [`crate::recompute`] passes a variant
+/// that also understands the provider's flat `cache_creation_input_tokens`, which appears
+/// in stored fusillade bodies but never in a body dwctl itself annotated.
+pub(crate) fn extract_from_last_usage<T: Default>(response_data: &ResponseData, from_usage: impl Fn(&Value) -> T) -> T {
     let Some(body) = &response_data.body else {
-        return CacheTokens::default();
+        return T::default();
     };
     // On a decompress failure (e.g. a mis-set Content-Encoding on an actually-plain body),
     // fall back to the raw bytes rather than silently returning zero cache tokens — zeroing
@@ -535,12 +547,12 @@ pub(crate) fn extract_cache_tokens(response_data: &ResponseData) -> CacheTokens 
     if let Ok(value) = serde_json::from_str::<Value>(body_str.trim())
         && let Some(usage) = value.get("usage").filter(|u| u.is_object())
     {
-        return cache_tokens_from_usage(usage);
+        return from_usage(usage);
     }
 
     // Streaming: scan SSE frames, keeping the last one that carries a usage object.
     // SSE allows `data:<value>` and `data: <value>` — strip the colon then an optional space.
-    let mut last = CacheTokens::default();
+    let mut last = T::default();
     for line in body_str.lines() {
         if let Some(data) = line.strip_prefix("data:") {
             let data = data.strip_prefix(' ').unwrap_or(data);
@@ -549,7 +561,7 @@ pub(crate) fn extract_cache_tokens(response_data: &ResponseData) -> CacheTokens 
                 && let Ok(value) = serde_json::from_str::<Value>(trimmed)
                 && let Some(usage) = value.get("usage").filter(|u| u.is_object())
             {
-                last = cache_tokens_from_usage(usage);
+                last = from_usage(usage);
             }
         }
     }

@@ -47,6 +47,11 @@ pub enum RecomputeError {
     /// wrong shape. Refused rather than guessed.
     #[error("stored endpoint {0:?} is not a valid request path")]
     BadEndpoint(String),
+    /// The stored HTTP status is not a valid status code, so this row is corrupt. Refused
+    /// rather than coerced: everything downstream gates on 2xx, so any substituted value
+    /// is a claim about whether the request succeeded that the data does not support.
+    #[error("stored status code {0} is not a valid HTTP status")]
+    BadStatus(u16),
 }
 
 /// One request as fusillade stored it, in the minimal form a replay needs.
@@ -92,6 +97,15 @@ impl StoredExchange {
             .parse()
             .map_err(|_| RecomputeError::BadEndpoint(self.endpoint.clone()))?;
 
+        // Refuse a corrupt status rather than substituting one. `from_u16` only rejects
+        // values outside 100-999, so this is a broken or never-populated row, and every
+        // consumer downstream gates on 2xx: only successful requests are billed, and the
+        // canonical `http_analytics` row an apply amends is chosen from among a request's
+        // 2xx rows. Coercing to 200 would assert success we cannot evidence; coercing to
+        // 500 would assert failure just as baselessly. Surfacing it as un-replayable puts
+        // the row in front of a human, consistent with the other refusals here.
+        let status = StatusCode::from_u16(self.status_code).map_err(|_| RecomputeError::BadStatus(self.status_code))?;
+
         // The serializer reads `x-fusillade-stream` to know a streaming response is coming
         // even when the captured body has no `stream:true` (onwards injects it downstream).
         // Setting it here is how a replay reproduces that dispatch.
@@ -115,14 +129,7 @@ impl StoredExchange {
             extensions: Default::default(),
             correlation_id: 0,
             timestamp: SystemTime::UNIX_EPOCH,
-            // Fail CLOSED on an unparseable stored status. `from_u16` only rejects values
-            // outside 100-999, so this is a corrupt or never-populated row — and defaulting
-            // it to 200 would present an unknown request as a success. Everything downstream
-            // of a recompute gates on 2xx (only successful requests are billed, and the
-            // canonical `http_analytics` row an apply amends is chosen among 2xx rows), so
-            // guessing OK biases towards billing a request we know nothing about. A 5xx
-            // makes it unbillable, which is the conservative direction.
-            status: StatusCode::from_u16(self.status_code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+            status,
             headers: HashMap::new(),
             body: Some(Bytes::from(response_body.clone())),
             // Durations are not re-derived: a recompute corrects token counts and cost, and
@@ -138,6 +145,7 @@ impl StoredExchange {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::recompute::cache_fields::CreationTier;
     use crate::recompute::{TokenSource, recompute_from_stored_response};
 
     fn exchange(endpoint: &str, request: &str, response: &str) -> StoredExchange {
@@ -161,7 +169,7 @@ mod tests {
             r#"{"id":"chatcmpl-1","object":"chat.completion","created":1,"model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":20000,"completion_tokens":8,"total_tokens":20008}}"#,
         );
         let (req, resp) = e.to_outlet_pair().unwrap();
-        let got = recompute_from_stored_response(&req, &resp).unwrap();
+        let got = recompute_from_stored_response(&req, &resp, CreationTier::FiveMinute).unwrap();
 
         assert_eq!(got.counts.prompt, 20_000);
         assert_eq!(got.counts.completion, 8);
@@ -181,7 +189,7 @@ mod tests {
             r#"{"id":"msg_1","type":"message","role":"assistant","model":"m","content":[],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":5000,"output_tokens":8,"cache_read_input_tokens":12000,"cache_creation_input_tokens":3000,"cache_creation":{"ephemeral_1h_input_tokens":3000}}}"#,
         );
         let (req, resp) = e.to_outlet_pair().unwrap();
-        let got = recompute_from_stored_response(&req, &resp).unwrap();
+        let got = recompute_from_stored_response(&req, &resp, CreationTier::FiveMinute).unwrap();
 
         assert_eq!(got.counts.prompt, 20_000, "cached tokens are folded back into the total");
         assert_eq!(got.counts.cache_read, 12_000, "the split is carried through untouched");
@@ -200,7 +208,7 @@ mod tests {
 
         for endpoint in ["/v1/messages", "/v1/chat/completions"] {
             let (req, resp) = exchange(endpoint, request, anthropic_body).to_outlet_pair().unwrap();
-            let got = recompute_from_stored_response(&req, &resp).unwrap();
+            let got = recompute_from_stored_response(&req, &resp, CreationTier::FiveMinute).unwrap();
             assert_eq!(got.counts.prompt, 5_000, "blocking shape recovered via {endpoint}");
         }
     }
@@ -225,14 +233,14 @@ mod tests {
         let mut right = exchange("/v1/messages", request, sse);
         right.streamed = true;
         let (req, resp) = right.to_outlet_pair().unwrap();
-        let right = recompute_from_stored_response(&req, &resp).unwrap();
+        let right = recompute_from_stored_response(&req, &resp, CreationTier::FiveMinute).unwrap();
         assert_eq!(right.counts.prompt, 20_000, "5000 input + 12000 read + 3000 creation");
         assert_eq!(right.counts.completion, 8);
 
         let mut wrong = exchange("/v1/chat/completions", request, sse);
         wrong.streamed = true;
         let (req, resp) = wrong.to_outlet_pair().unwrap();
-        let wrong = recompute_from_stored_response(&req, &resp).unwrap();
+        let wrong = recompute_from_stored_response(&req, &resp, CreationTier::FiveMinute).unwrap();
         assert_eq!(
             wrong.counts.prompt, 0,
             "the chat-completion SSE parser finds no usage in an Anthropic event stream"
@@ -263,11 +271,42 @@ mod tests {
         assert!(matches!(e.to_outlet_pair(), Err(RecomputeError::BadEndpoint(_))));
     }
 
-    /// A stored status we cannot parse means a corrupt or never-populated row. Replaying it
-    /// as 200 would present an unknown request as a success, and since everything downstream
-    /// gates on 2xx that biases towards billing it. Fail closed instead.
+    /// End-to-end against a real incident row (handover §2). The stored body carries the
+    /// upstream's FLAT `cache_creation_input_tokens` and no nested object — the shape the
+    /// live path's nested-only parser reads as zero. Analytics recorded prompt=565,
+    /// creation=0; the truth is prompt 18,734 with 538 creation tokens.
+    ///
+    /// This is the single most important test in the module: it is the incident.
     #[test]
-    fn an_unparseable_status_replays_as_a_server_error_not_ok() {
+    fn real_incident_row_recomputes_to_the_measured_truth() {
+        let e = exchange(
+            "/messages?beta=true",
+            r#"{"model":"deepseek-ai/DeepSeek-V4-Flash","messages":[{"role":"user","content":"hi"}],"max_tokens":1024}"#,
+            r#"{"id":"msg_1","type":"message","role":"assistant","model":"deepseek-ai/DeepSeek-V4-Flash","content":[],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":565,"output_tokens":658,"cache_read_input_tokens":17631,"cache_creation_input_tokens":538}}"#,
+        );
+        let (req, resp) = e.to_outlet_pair().unwrap();
+        let got = recompute_from_stored_response(&req, &resp, CreationTier::FiveMinute).unwrap();
+
+        // input + read + creation = the TOTAL input analytics means by prompt_tokens.
+        assert_eq!(got.counts.prompt, 18_734, "565 + 17631 + 538");
+        assert_eq!(got.counts.completion, 658);
+        assert_eq!(got.counts.cache_read, 17_631);
+        assert_eq!(got.counts.cache_creation_5m, 538, "flat creation must not read as zero");
+        assert!(got.cache_tier_inferred, "the body gave no tier - say so in the report");
+
+        // And the uncached residual that billing actually charges at full rate.
+        assert_eq!(
+            got.counts.prompt - got.counts.cache_read - got.counts.cache_creation_5m,
+            565,
+            "uncached input is the provider's input_tokens"
+        );
+    }
+
+    /// A stored status we cannot parse means a corrupt or never-populated row. Any
+    /// substitute value asserts something about success or failure that the data does not
+    /// support, and everything downstream gates on 2xx — so refuse the item instead.
+    #[test]
+    fn an_unparseable_status_is_refused_not_coerced() {
         let body = r#"{"id":"chatcmpl-1","object":"chat.completion","created":1,"model":"m","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12}}"#;
         for bogus in [0u16, 42, 1_000] {
             let e = StoredExchange {
@@ -277,11 +316,9 @@ mod tests {
                 status_code: bogus,
                 streamed: false,
             };
-            let (_, resp) = e.to_outlet_pair().unwrap();
-            assert_eq!(
-                resp.status,
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "status {bogus} must not be replayed as a success"
+            assert!(
+                matches!(e.to_outlet_pair(), Err(RecomputeError::BadStatus(s)) if s == bogus),
+                "status {bogus} must be refused, not replayed"
             );
         }
     }
@@ -323,7 +360,7 @@ mod tests {
         e.streamed = true;
 
         let (req, resp) = e.to_outlet_pair().unwrap();
-        let got = recompute_from_stored_response(&req, &resp).unwrap();
+        let got = recompute_from_stored_response(&req, &resp, CreationTier::FiveMinute).unwrap();
         assert_eq!(got.counts.prompt, 11);
         assert_eq!(got.counts.completion, 5);
     }

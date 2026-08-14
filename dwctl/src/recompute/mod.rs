@@ -54,11 +54,13 @@
 #![allow(dead_code)]
 
 use crate::pricing::TokenCounts;
-use crate::request_logging::serializers::{TokenMetrics, extract_cache_tokens, parse_ai_response};
+use crate::request_logging::serializers::{TokenMetrics, extract_from_last_usage, parse_ai_response};
 use outlet::{RequestData, ResponseData};
 
+pub mod cache_fields;
 pub mod replay;
 
+use cache_fields::{CacheReading, CreationTier, cache_tokens_both_shapes};
 use replay::RecomputeError;
 
 /// Where a recomputed figure came from, and therefore how much it can be trusted.
@@ -133,6 +135,10 @@ pub struct RecomputedUsage {
     pub completion_source: TokenSource,
     /// Set when the render and the reported total disagreed beyond tolerance.
     pub disagreement: Option<Disagreement>,
+    /// True when the cache-creation tier was assigned by rule because the stored body gave
+    /// only a flat total. The token count is solid; the price of those tokens rests on an
+    /// assumption, so the report must show it rather than bury it.
+    pub cache_tier_inferred: bool,
     /// `response_type` as the serializer classified it, for the report.
     pub response_type: String,
     /// The model the response claims, when it states one.
@@ -154,12 +160,22 @@ impl RecomputedUsage {
 /// the Anthropic class of bug — where the response held the right numbers all along and
 /// only our interpretation of them was wrong.
 ///
-/// The cache split comes from [`extract_cache_tokens`], unchanged. See the module docs for
-/// why that is not negotiable.
-pub fn recompute_from_stored_response(request_data: &RequestData, response_data: &ResponseData) -> Result<RecomputedUsage, RecomputeError> {
+/// The cache split is read from the stored body and never invented. It goes through
+/// [`cache_tokens_both_shapes`] rather than the live path's nested-only parser, because a
+/// stored fusillade body is the *upstream's* response and an Anthropic-shaped upstream
+/// reports creation as a flat total — see [`cache_fields`] for why that distinction is the
+/// difference between repairing the incident and reproducing half of it.
+pub fn recompute_from_stored_response(
+    request_data: &RequestData,
+    response_data: &ResponseData,
+    flat_tier: CreationTier,
+) -> Result<RecomputedUsage, RecomputeError> {
     let parsed = parse_ai_response(request_data, response_data).map_err(RecomputeError::Parse)?;
     let metrics = TokenMetrics::from(&parsed);
-    let cache = extract_cache_tokens(response_data);
+    let CacheReading {
+        tokens: cache,
+        tier_inferred,
+    } = extract_from_last_usage(response_data, |usage| cache_tokens_both_shapes(usage, flat_tier));
 
     Ok(RecomputedUsage {
         counts: TokenCounts {
@@ -173,6 +189,7 @@ pub fn recompute_from_stored_response(request_data: &RequestData, response_data:
         prompt_source: TokenSource::Reported,
         completion_source: TokenSource::Reported,
         disagreement: None,
+        cache_tier_inferred: tier_inferred,
         response_type: metrics.response_type,
         response_model: metrics.response_model,
     })
@@ -232,6 +249,7 @@ mod tests {
             prompt_source: TokenSource::Reported,
             completion_source: TokenSource::Reported,
             disagreement: None,
+            cache_tier_inferred: false,
             response_type: "chat_completion".to_string(),
             response_model: None,
         }
