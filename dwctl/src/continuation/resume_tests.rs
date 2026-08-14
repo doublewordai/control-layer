@@ -1212,10 +1212,7 @@ async fn a_resumed_dsml_leg_reaches_the_client_as_parsed_channels(pool: PgPool) 
             leg_text(" the weather.</thi", None),
             leg_text("nk>Checking now.\n\n<\u{ff5c}DSML\u{ff5c}tool_calls>\n", None),
             leg_text("<\u{ff5c}DSML\u{ff5c}invoke name=\"get_weather\">\n", None),
-            leg_text(
-                "<\u{ff5c}DSML\u{ff5c}parameter name=\"city\" string=\"true\">Par",
-                None,
-            ),
+            leg_text("<\u{ff5c}DSML\u{ff5c}parameter name=\"city\" string=\"true\">Par", None),
             leg_text(
                 "is</\u{ff5c}DSML\u{ff5c}parameter>\n</\u{ff5c}DSML\u{ff5c}invoke>\n</\u{ff5c}DSML\u{ff5c}tool_calls>",
                 Some("tool_calls"),
@@ -1265,10 +1262,7 @@ async fn a_resumed_dsml_leg_reaches_the_client_as_parsed_channels(pool: PgPool) 
         opened[0]["id"].as_str().is_some_and(|id| id.starts_with("call_")),
         "ids follow the serving parser's scheme"
     );
-    let arguments: String = calls
-        .iter()
-        .filter_map(|c| c["function"]["arguments"].as_str())
-        .collect();
+    let arguments: String = calls.iter().filter_map(|c| c["function"]["arguments"].as_str()).collect();
     assert_eq!(arguments, r#"{"city": "Paris"}"#);
 
     // And the stream is still one logical response.

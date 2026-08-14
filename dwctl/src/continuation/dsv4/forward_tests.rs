@@ -112,10 +112,7 @@ impl Channels {
         if let Some(pos) = self.calls.iter().position(|c| c.index == index) {
             return &mut self.calls[pos];
         }
-        self.calls.push(Call {
-            index,
-            ..Call::default()
-        });
+        self.calls.push(Call { index, ..Call::default() });
         self.calls.last_mut().expect("just pushed")
     }
 
@@ -519,7 +516,10 @@ fn the_seed_describes_the_structure_the_prefix_left_open() {
             }
         }
     }
-    assert!(seen.0 > 0 && seen.1 > 0 && seen.2 > 0 && seen.3 > 0, "all four seeds occur: {seen:?}");
+    assert!(
+        seen.0 > 0 && seen.1 > 0 && seen.2 > 0 && seen.3 > 0,
+        "all four seeds occur: {seen:?}"
+    );
 }
 
 /// The sub-state inside a call is derived from the arguments the CLIENT already

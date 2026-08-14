@@ -49,8 +49,7 @@ use uuid::Uuid;
 use crate::continuation::forward::{ForwardDelta, ForwardParser, ForwardSeed};
 
 use super::{
-    INVOKE_CLOSE, INVOKE_OPEN, PARAMETER_CLOSE, PARAMETER_OPEN, THINK_END, TOOL_CALLS_CLOSE, TOOL_CALLS_OPEN, Tail,
-    parse_partial_args,
+    INVOKE_CLOSE, INVOKE_OPEN, PARAMETER_CLOSE, PARAMETER_OPEN, THINK_END, TOOL_CALLS_CLOSE, TOOL_CALLS_OPEN, Tail, parse_partial_args,
 };
 
 /// Closes an invoke's open tag (`…name="NAME">`) and a parameter's
