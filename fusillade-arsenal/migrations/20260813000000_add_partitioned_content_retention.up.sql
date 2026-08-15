@@ -83,7 +83,7 @@ CREATE INDEX idx_retained_response_objects_step_object_id
     WHERE object_kind = 'step';
 CREATE INDEX idx_retained_response_objects_owner_created
     ON retained_response_objects
-       (created_by, created_at DESC, delete_on, object_id)
+       (created_by, created_at DESC, object_id DESC, delete_on)
     WHERE object_kind = 'request';
 CREATE INDEX idx_retained_response_objects_state_created
     ON retained_response_objects

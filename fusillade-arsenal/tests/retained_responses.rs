@@ -20,7 +20,7 @@ use fusillade_arsenal::{
     DaemonStorage, PoolProvider, PostgresRequestManager, PostgresResponseStepManager,
     PostgresStorageConfig, Storage, TestDbPools,
 };
-use serde_json::json;
+use serde_json::{Value, json};
 use sqlx::pool::PoolConnection;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Postgres, Row};
@@ -108,6 +108,18 @@ fn timestamp(value: &str) -> DateTime<Utc> {
 
 fn date(value: &str) -> NaiveDate {
     NaiveDate::parse_from_str(value, "%Y-%m-%d").expect("fixture date must be valid")
+}
+
+fn collect_plan_nodes<'a>(node: &'a Value, nodes: &mut Vec<&'a serde_json::Map<String, Value>>) {
+    let Some(object) = node.as_object() else {
+        return;
+    };
+    nodes.push(object);
+    if let Some(children) = object.get("Plans").and_then(Value::as_array) {
+        for child in children {
+            collect_plan_nodes(child, nodes);
+        }
+    }
 }
 
 fn policy(tiers: &[(&str, u64)]) -> RetentionSweepPolicy {
@@ -406,60 +418,300 @@ async fn creator_erasure_reports_progress_when_oldest_graph_is_busy(pool: PgPool
 }
 
 #[sqlx::test]
-async fn creator_candidate_sources_use_owner_created_indexes(pool: PgPool) {
-    ensure_partition(&pool, date("2026-08-03")).await;
-    let graph = singleton(
+async fn direct_erasure_restarts_when_a_singleton_gains_a_head_while_waiting(pool: PgPool) {
+    let mut graph = singleton(
         &pool,
         "flex",
         TerminalState::Completed,
         timestamp("2026-08-01T10:00:00Z"),
-        "creator-explain",
+        "erase-canonical-lock-race",
     )
     .await;
-    let manager = manager(&pool).await;
-    install_candidate_index(&pool).await;
-    archive(&manager, &policy(&[("flex", 86_400)]), 1, i64::MAX)
+    let request_id = graph.request_ids[0];
+    let head_id = Uuid::new_v4();
+
+    let mut singleton_locker = pool.acquire().await.unwrap();
+    let singleton_locker_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *singleton_locker)
         .await
         .unwrap();
-    let mut explain_tx = pool.begin().await.unwrap();
-    sqlx::query("SET LOCAL enable_seqscan = off")
-        .execute(&mut *explain_tx)
+    lock_session_response_graph(&mut singleton_locker, request_id).await;
+
+    let erase_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with(pool.connect_options().as_ref().clone())
+        .await
+        .unwrap();
+    let erase_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&erase_pool)
+        .await
+        .unwrap();
+    let erase_manager = manager(&erase_pool).await;
+    let mut eraser =
+        tokio::spawn(async move { erase_manager.delete_response_group(request_id).await });
+    tokio::select! {
+        result = &mut eraser => panic!("erasure completed before the tentative singleton lock was released: {result:?}"),
+        () = wait_for_backend_blocked_by(&pool, erase_pid, singleton_locker_pid) => {}
+    }
+
+    insert_step(
+        &pool,
+        StepFixture {
+            id: head_id,
+            request_id: Some(request_id),
+            prev_step_id: None,
+            parent_step_id: None,
+            sequence: 0,
+            state: TerminalState::Pending,
+            terminal_at: timestamp("2026-08-01T10:01:00Z"),
+        },
+    )
+    .await;
+    graph.group_id = head_id;
+    graph.step_ids.push(head_id);
+
+    let mut head_locker = pool.acquire().await.unwrap();
+    let head_locker_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *head_locker)
+        .await
+        .unwrap();
+    lock_session_response_graph(&mut head_locker, head_id).await;
+    unlock_session_response_graph(&mut singleton_locker, request_id).await;
+
+    tokio::select! {
+        result = &mut eraser => panic!("erasure used the obsolete singleton lock instead of restarting under the headed graph: {result:?}"),
+        () = wait_for_backend_blocked_by(&pool, erase_pid, head_locker_pid) => {}
+    }
+    unlock_session_response_graph(&mut head_locker, head_id).await;
+
+    assert_eq!(eraser.await.unwrap().unwrap(), 1);
+    assert_wholly_erased(&pool, &graph).await;
+}
+
+#[sqlx::test]
+async fn request_writer_restarts_when_a_singleton_gains_a_head_while_waiting(pool: PgPool) {
+    let mut graph = singleton(
+        &pool,
+        "flex",
+        TerminalState::Pending,
+        timestamp("2026-08-01T10:00:00Z"),
+        "writer-canonical-lock-race",
+    )
+    .await;
+    let request_id = graph.request_ids[0];
+    let head_id = Uuid::new_v4();
+
+    let mut singleton_locker = pool.acquire().await.unwrap();
+    let singleton_locker_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *singleton_locker)
+        .await
+        .unwrap();
+    lock_session_response_graph(&mut singleton_locker, request_id).await;
+
+    let writer_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with(pool.connect_options().as_ref().clone())
+        .await
+        .unwrap();
+    let writer_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&writer_pool)
+        .await
+        .unwrap();
+    let writer_manager = manager(&writer_pool).await;
+    let terminal = generic_terminal_write(&graph);
+    let mut writer = tokio::spawn(async move { writer_manager.persist(&terminal).await });
+    tokio::select! {
+        result = &mut writer => panic!("writer completed before the tentative singleton lock was released: {result:?}"),
+        () = wait_for_backend_blocked_by(&pool, writer_pid, singleton_locker_pid) => {}
+    }
+
+    insert_step(
+        &pool,
+        StepFixture {
+            id: head_id,
+            request_id: Some(request_id),
+            prev_step_id: None,
+            parent_step_id: None,
+            sequence: 0,
+            state: TerminalState::Pending,
+            terminal_at: timestamp("2026-08-01T10:01:00Z"),
+        },
+    )
+    .await;
+    graph.group_id = head_id;
+    graph.step_ids.push(head_id);
+
+    let mut head_locker = pool.acquire().await.unwrap();
+    let head_locker_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *head_locker)
+        .await
+        .unwrap();
+    lock_session_response_graph(&mut head_locker, head_id).await;
+    unlock_session_response_graph(&mut singleton_locker, request_id).await;
+
+    tokio::select! {
+        result = &mut writer => panic!("writer used the obsolete singleton lock instead of restarting under the headed graph: {result:?}"),
+        () = wait_for_backend_blocked_by(&pool, writer_pid, head_locker_pid) => {}
+    }
+    unlock_session_response_graph(&mut head_locker, head_id).await;
+
+    writer.await.unwrap().unwrap();
+    assert_wholly_live(&pool, &graph).await;
+    let state: String = sqlx::query_scalar("SELECT state FROM requests WHERE id = $1")
+        .bind(request_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(state, "completed");
+}
+
+#[sqlx::test]
+async fn retained_creator_seed_uses_bounded_owner_order_index_under_default_planner(pool: PgPool) {
+    ensure_partition(&pool, date("2026-08-03")).await;
+    ensure_partition(&pool, date("2026-08-07")).await;
+
+    sqlx::query(
+        r#"
+        INSERT INTO retained_response_objects (
+            delete_on, group_id, object_kind, object_id, created_by,
+            created_at, schema_version, payload
+        )
+        SELECT fixture.delete_on, fixture.object_id, 'request', fixture.object_id,
+               $1, fixture.created_at, 1, '{}'::jsonb
+        FROM (VALUES
+            ('2026-08-07'::date, '00000000-0000-0000-0000-000000000001'::uuid,
+             '2026-08-01T08:00:00Z'::timestamptz),
+            ('2026-08-03'::date, '00000000-0000-0000-0000-000000000002'::uuid,
+             '2026-08-01T08:00:00Z'::timestamptz),
+            ('2026-08-07'::date, '00000000-0000-0000-0000-000000000003'::uuid,
+             '2026-08-01T09:00:00Z'::timestamptz),
+            ('2026-08-03'::date, '00000000-0000-0000-0000-000000000004'::uuid,
+             '2026-08-01T10:00:00Z'::timestamptz)
+        ) AS fixture(delete_on, object_id, created_at)
+        "#,
+    )
+    .bind(OWNER)
+    .execute(&pool)
+    .await
+    .unwrap();
+    for (delete_on, prefix) in [
+        (date("2026-08-03"), "creator-plan-a-"),
+        (date("2026-08-07"), "creator-plan-b-"),
+    ] {
+        sqlx::query(
+            r#"
+            INSERT INTO retained_response_objects (
+                delete_on, group_id, object_kind, object_id, created_by,
+                created_at, schema_version, payload
+            )
+            SELECT $1, generated.object_id, 'request', generated.object_id,
+                   'different-owner',
+                   '2026-08-01T00:00:00Z'::timestamptz
+                       + generated.ordinal * interval '1 second',
+                   1, '{}'::jsonb
+            FROM (
+                SELECT ordinal, md5($2 || ordinal::text)::uuid AS object_id
+                FROM generate_series(1, 10000) ordinal
+            ) generated
+            "#,
+        )
+        .bind(delete_on)
+        .bind(prefix)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    sqlx::query("ANALYZE retained_response_objects")
+        .execute(&pool)
         .await
         .unwrap();
 
-    let live_plan = sqlx::query_scalar::<_, String>(
-        "EXPLAIN (COSTS OFF) SELECT id, created_at FROM requests \
-         WHERE batch_id IS NULL AND created_by = $1 \
-         ORDER BY created_at, id LIMIT 10",
-    )
-    .bind(OWNER)
-    .fetch_all(&mut *explain_tx)
-    .await
-    .unwrap()
-    .join("\n");
-    assert!(
-        live_plan.contains("idx_requests_user_created_sort"),
-        "live creator seed must use the installed owner/created index: {live_plan}"
-    );
-    let retained_plan = sqlx::query_scalar::<_, String>(
-        "EXPLAIN (COSTS OFF) SELECT object.group_id, object.object_id, object.created_at \
+    let expected = [
+        Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap(),
+        Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap(),
+        Uuid::parse_str("00000000-0000-0000-0000-000000000003").unwrap(),
+    ];
+    let selected: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT object.object_id \
          FROM retained_response_objects object \
          JOIN retained_response_buckets bucket ON bucket.delete_on = object.delete_on \
           AND bucket.state IN ('active', 'retiring') \
          WHERE object.object_kind = 'request' AND object.created_by = $1 \
-         ORDER BY object.created_at, object.object_id LIMIT 10",
+         ORDER BY object.created_at, object.object_id LIMIT 3",
     )
     .bind(OWNER)
-    .fetch_all(&mut *explain_tx)
+    .fetch_all(&pool)
     .await
-    .unwrap()
-    .join("\n");
-    assert!(
-        retained_plan.contains("Index Scan") && retained_plan.contains("created_by"),
-        "retained creator seed must use an owner/created index: {retained_plan}"
+    .unwrap();
+    assert_eq!(
+        selected, expected,
+        "retained seeds must be exactly oldest-first"
     );
-    explain_tx.rollback().await.unwrap();
-    assert_wholly_retained(&pool, &graph).await;
+
+    let explained: Value = sqlx::query_scalar(
+        "EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, FORMAT JSON) \
+         SELECT object.object_id \
+         FROM retained_response_objects object \
+         JOIN retained_response_buckets bucket ON bucket.delete_on = object.delete_on \
+          AND bucket.state IN ('active', 'retiring') \
+         WHERE object.object_kind = 'request' AND object.created_by = $1 \
+         ORDER BY object.created_at, object.object_id LIMIT 3",
+    )
+    .bind(OWNER)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let root = &explained[0]["Plan"];
+    let mut nodes = Vec::new();
+    collect_plan_nodes(root, &mut nodes);
+    assert!(
+        nodes.iter().all(|node| !matches!(
+            node.get("Node Type").and_then(Value::as_str),
+            Some("Sort" | "Incremental Sort")
+        )),
+        "the retained owner index must satisfy stable ordering before LIMIT: {explained:#}"
+    );
+    let intended_child_indexes: Vec<String> = sqlx::query_scalar(
+        r#"
+        SELECT child.relname
+        FROM pg_class parent
+        JOIN pg_namespace namespace ON namespace.oid = parent.relnamespace
+        JOIN pg_inherits inheritance ON inheritance.inhparent = parent.oid
+        JOIN pg_class child ON child.oid = inheritance.inhrelid
+        WHERE namespace.nspname = current_schema()
+          AND parent.relname = 'idx_retained_response_objects_owner_created'
+        ORDER BY child.relname
+        "#,
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    let intended_scans = nodes
+        .iter()
+        .filter(|node| {
+            node.get("Index Name")
+                .and_then(Value::as_str)
+                .is_some_and(|name| intended_child_indexes.iter().any(|index| index == name))
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        !intended_scans.is_empty(),
+        "the default planner must use a child of the retained owner index: {explained:#}"
+    );
+    for scan in intended_scans {
+        assert!(
+            scan.get("Actual Rows").and_then(Value::as_f64).unwrap() <= 3.0,
+            "each owner index scan must stop at the bounded seed limit: {explained:#}"
+        );
+        assert_eq!(
+            scan.get("Actual Loops").and_then(Value::as_f64),
+            Some(1.0),
+            "each owner index scan must execute once: {explained:#}"
+        );
+    }
+    assert_eq!(root["Node Type"], "Limit");
+    assert_eq!(root["Actual Rows"].as_f64(), Some(3.0));
+    assert_eq!(root["Actual Loops"].as_f64(), Some(1.0));
 }
 
 #[sqlx::test]
@@ -1644,6 +1896,56 @@ async fn wait_for_backend_lock_waiter(pool: &PgPool, backend_pid: i32) {
         }
         tokio::task::yield_now().await;
     }
+}
+
+async fn wait_for_backend_blocked_by(pool: &PgPool, waiter_pid: i32, blocker_pid: i32) {
+    loop {
+        let blocked: bool = sqlx::query_scalar("SELECT $2::int4 = ANY(pg_blocking_pids($1))")
+            .bind(waiter_pid)
+            .bind(blocker_pid)
+            .fetch_one(pool)
+            .await
+            .expect("the graph lock blocker must be observable");
+        if blocked {
+            return;
+        }
+        tokio::task::yield_now().await;
+    }
+}
+
+async fn lock_session_response_graph(connection: &mut PoolConnection<Postgres>, group_id: Uuid) {
+    sqlx::query(
+        r#"
+        SELECT pg_advisory_lock(
+            hashtextextended(
+                'retained_response_graph:' || current_schema() || ':' || $1::text,
+                0
+            )
+        )
+        "#,
+    )
+    .bind(group_id)
+    .execute(&mut **connection)
+    .await
+    .expect("the graph lock must be acquired");
+}
+
+async fn unlock_session_response_graph(connection: &mut PoolConnection<Postgres>, group_id: Uuid) {
+    let unlocked: bool = sqlx::query_scalar(
+        r#"
+        SELECT pg_advisory_unlock(
+            hashtextextended(
+                'retained_response_graph:' || current_schema() || ':' || $1::text,
+                0
+            )
+        )
+        "#,
+    )
+    .bind(group_id)
+    .fetch_one(&mut **connection)
+    .await
+    .expect("the graph lock must be released");
+    assert!(unlocked);
 }
 
 async fn install_candidate_index(pool: &PgPool) {

@@ -152,6 +152,25 @@ async fn adds_retained_response_parent_without_rewriting_live_heaps(pool: sqlx::
         );
     }
 
+    let owner_index_definition: String = sqlx::query_scalar(
+        r#"
+        SELECT pg_get_indexdef(index_relation.oid)
+        FROM pg_class index_relation
+        JOIN pg_namespace namespace ON namespace.oid = index_relation.relnamespace
+        WHERE namespace.nspname = current_schema()
+          AND index_relation.relname = 'idx_retained_response_objects_owner_created'
+        "#,
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        owner_index_definition.contains(
+            "(created_by, created_at DESC, object_id DESC, delete_on) WHERE (object_kind = 'request'::text)"
+        ),
+        "retained creator index must satisfy stable created_at/object_id ordering: {owner_index_definition}"
+    );
+
     let control_tables: Vec<String> = sqlx::query_scalar(
         r#"
         SELECT table_name
