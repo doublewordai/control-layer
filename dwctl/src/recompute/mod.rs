@@ -331,7 +331,7 @@ impl Disagreement {
 
 /// The result of recomputing one request.
 #[derive(Debug, Clone)]
-pub struct RecomputedUsage {
+pub(crate) struct RecomputedUsage {
     /// The counts to bill on, in the shape [`crate::pricing`] prices.
     pub counts: TokenCounts,
     /// Reasoning tokens, re-read from the response. A *subset* of `counts.completion` rather

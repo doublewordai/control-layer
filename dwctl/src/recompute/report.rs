@@ -258,7 +258,7 @@ impl ReconstructedCache {
 
 impl ReportRow {
     /// A row that was replayed successfully.
-    pub fn replayed(row: &CorpusRow, usage: &RecomputedUsage, cost: Option<Decimal>) -> Self {
+    pub(crate) fn replayed(row: &CorpusRow, usage: &RecomputedUsage, cost: Option<Decimal>) -> Self {
         let stored = UsageFigures::from_stored(row);
         let recomputed = UsageFigures::from_recomputed(usage, cost);
         let changed = stored.differs_from(&recomputed);
