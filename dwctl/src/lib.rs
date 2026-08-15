@@ -3203,6 +3203,7 @@ impl Application {
                 fusillade_pools.clone(),
                 fusillade_arsenal::PostgresStorageConfig::from(&fusillade_daemon_config),
             )
+            .with_retained_response_fence_seconds(fusillade_daemon_config.retention.max_late_writer_seconds)
             .with_download_buffer_size(config.batches.files.download_buffer_size)
             .with_batch_insert_strategy(fusillade_arsenal::BatchInsertStrategy::Batched {
                 batch_size: config.batches.files.batch_insert_size,

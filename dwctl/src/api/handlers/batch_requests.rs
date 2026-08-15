@@ -428,7 +428,17 @@ pub async fn delete_batch_request<P: PoolProvider>(
         });
     }
 
-    state.request_manager.delete_response_group(request_id).await.map_err(|e| match e {
+    let erasure = if can_delete_all {
+        state.request_manager.delete_response_group(request_id).await
+    } else {
+        // Bind the deletion to the creator identity that was authorized above;
+        // storage revalidates it while holding the complete graph lock.
+        state
+            .request_manager
+            .delete_owned_response_group(request_id, &detail.created_by)
+            .await
+    };
+    erasure.map_err(|e| match e {
         fusillade::FusilladeError::RequestNotFound(_) => Error::NotFound {
             resource: "Response".to_string(),
             id: request_id.to_string(),

@@ -671,6 +671,31 @@ async fn adds_retained_response_parent_without_rewriting_live_heaps(pool: sqlx::
         .execute(&pool)
         .await
         .unwrap();
+    let fenced_id = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO retained_response_resurrection_fences (object_id, reason, expires_at) \
+         VALUES ($1, 'erased', NOW() + INTERVAL '1 hour')",
+    )
+    .bind(fenced_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let rollback_with_fence = sqlx::raw_sql(down_sql)
+        .execute(&pool)
+        .await
+        .expect_err("nonempty resurrection fences must fence rollback");
+    assert_eq!(
+        rollback_with_fence
+            .as_database_error()
+            .and_then(|error| error.code())
+            .as_deref(),
+        Some("55000")
+    );
+    sqlx::query("DELETE FROM retained_response_resurrection_fences")
+        .execute(&pool)
+        .await
+        .unwrap();
+
     let rollback_with_active_bucket = sqlx::raw_sql(down_sql)
         .execute(&pool)
         .await

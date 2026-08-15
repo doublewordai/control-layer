@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use chrono::{DateTime, NaiveDate, TimeDelta, Utc};
+use fusillade_arsenal::batch::TemplateId;
 use fusillade_arsenal::manager::{
     RetainedResponseArchiveOutcome, RetainedResponseMaintenanceError, RetainedResponseWriteError,
     RetentionSweepPolicy,
@@ -11,8 +12,8 @@ use fusillade_arsenal::postgres_response_step::{
     ResponseStepNotFound, RetainedResponseStepConflict,
 };
 use fusillade_arsenal::request::{
-    CreateRealtimeInput, ListRequestsFilter, PersistCompletedRealtimeInput, RequestId,
-    ServiceTierFilter,
+    Completed, CreateRealtimeInput, DaemonId, ListRequestsFilter, PersistCompletedRealtimeInput,
+    Request, RequestData, RequestId, ServiceTierFilter,
 };
 use fusillade_arsenal::response_step::{CreateStepInput, ResponseStepStore, StepId, StepKind};
 use fusillade_arsenal::{
@@ -214,6 +215,62 @@ async fn erase_retained_branching_graph_by_head_or_member_is_atomic(pool: PgPool
 }
 
 #[sqlx::test]
+async fn erase_never_shortens_an_existing_fence_expiry(pool: PgPool) {
+    install_candidate_index(&pool).await;
+    ensure_partition(&pool, date("2026-08-03")).await;
+    let graph = singleton(
+        &pool,
+        "flex",
+        TerminalState::Completed,
+        timestamp("2026-08-01T10:00:00Z"),
+        "fence-expiry-monotonic",
+    )
+    .await;
+    let manager = manager(&pool).await;
+    archive(&manager, &policy(&[("flex", 86_400)]), 1, i64::MAX)
+        .await
+        .unwrap();
+    let protected_until = Utc::now() + TimeDelta::days(2);
+    sqlx::query(
+        "UPDATE retained_response_resurrection_fences SET expires_at = $1 \
+         WHERE object_id = ANY($2)",
+    )
+    .bind(protected_until)
+    .bind(
+        &std::iter::once(graph.group_id)
+            .chain(graph.request_ids.iter().copied())
+            .chain(graph.step_ids.iter().copied())
+            .collect::<Vec<_>>(),
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    manager.delete_response_group(graph.group_id).await.unwrap();
+
+    let fences: Vec<(String, DateTime<Utc>)> = sqlx::query_as(
+        "SELECT reason, expires_at FROM retained_response_resurrection_fences \
+         WHERE object_id = ANY($1)",
+    )
+    .bind(
+        &std::iter::once(graph.group_id)
+            .chain(graph.request_ids.iter().copied())
+            .chain(graph.step_ids.iter().copied())
+            .collect::<Vec<_>>(),
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert!(!fences.is_empty());
+    assert!(
+        fences
+            .iter()
+            .all(|(reason, expiry)| reason == "erased" && *expiry >= protected_until),
+        "a later lifecycle event may advance the reason but never shorten expiry"
+    );
+}
+
+#[sqlx::test]
 async fn erase_creator_retained_groups_in_stable_bounded_units(pool: PgPool) {
     install_candidate_index(&pool).await;
     ensure_partition(&pool, date("2026-08-03")).await;
@@ -252,6 +309,157 @@ async fn erase_creator_retained_groups_in_stable_bounded_units(pool: PgPool) {
     assert_eq!(manager.bulk_delete_data(OWNER, 1).await.unwrap(), 0);
     assert_wholly_erased(&pool, &branching).await;
     assert_wholly_erased(&pool, &singleton).await;
+}
+
+#[sqlx::test]
+async fn creator_erasure_selects_the_oldest_live_graph_before_aggregation(pool: PgPool) {
+    let oldest = singleton(
+        &pool,
+        "flex",
+        TerminalState::Completed,
+        timestamp("2026-08-01T08:00:00Z"),
+        "creator-oldest",
+    )
+    .await;
+    let middle = singleton(
+        &pool,
+        "flex",
+        TerminalState::Completed,
+        timestamp("2026-08-01T09:00:00Z"),
+        "creator-middle",
+    )
+    .await;
+    let newest = singleton(
+        &pool,
+        "flex",
+        TerminalState::Completed,
+        timestamp("2026-08-01T10:00:00Z"),
+        "creator-newest",
+    )
+    .await;
+    let manager = manager(&pool).await;
+
+    assert_eq!(manager.bulk_delete_data(OWNER, 1).await.unwrap(), 1);
+    assert_wholly_erased(&pool, &oldest).await;
+    assert_wholly_live(&pool, &middle).await;
+    assert_wholly_live(&pool, &newest).await;
+}
+
+#[sqlx::test]
+async fn creator_erasure_includes_attached_retiring_buckets(pool: PgPool) {
+    install_candidate_index(&pool).await;
+    ensure_partition(&pool, date("2026-08-03")).await;
+    let graph = singleton(
+        &pool,
+        "flex",
+        TerminalState::Completed,
+        timestamp("2026-08-01T10:00:00Z"),
+        "creator-retiring",
+    )
+    .await;
+    let manager = manager(&pool).await;
+    archive(&manager, &policy(&[("flex", 86_400)]), 1, i64::MAX)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE retained_response_buckets SET state = 'retiring' \
+         WHERE delete_on = '2026-08-03'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    assert_eq!(manager.bulk_delete_data(OWNER, 1).await.unwrap(), 1);
+    assert_wholly_erased(&pool, &graph).await;
+}
+
+#[sqlx::test]
+async fn creator_erasure_reports_progress_when_oldest_graph_is_busy(pool: PgPool) {
+    let graph = singleton(
+        &pool,
+        "flex",
+        TerminalState::Completed,
+        timestamp("2026-08-01T08:00:00Z"),
+        "creator-busy",
+    )
+    .await;
+    let manager = manager(&pool).await;
+    let mut holder = pool.begin().await.unwrap();
+    sqlx::query(
+        "SELECT pg_advisory_xact_lock(hashtextextended( \
+         'retained_response_graph:' || current_schema() || ':' || $1::text, 0))",
+    )
+    .bind(graph.group_id)
+    .execute(&mut *holder)
+    .await
+    .unwrap();
+
+    assert_eq!(
+        manager.bulk_delete_data(OWNER, 1).await.unwrap(),
+        1,
+        "temporary contention must not look like a fully drained creator"
+    );
+    assert_wholly_live(&pool, &graph).await;
+    holder.commit().await.unwrap();
+    assert_eq!(manager.bulk_delete_data(OWNER, 1).await.unwrap(), 1);
+    assert_wholly_erased(&pool, &graph).await;
+}
+
+#[sqlx::test]
+async fn creator_candidate_sources_use_owner_created_indexes(pool: PgPool) {
+    ensure_partition(&pool, date("2026-08-03")).await;
+    let graph = singleton(
+        &pool,
+        "flex",
+        TerminalState::Completed,
+        timestamp("2026-08-01T10:00:00Z"),
+        "creator-explain",
+    )
+    .await;
+    let manager = manager(&pool).await;
+    install_candidate_index(&pool).await;
+    archive(&manager, &policy(&[("flex", 86_400)]), 1, i64::MAX)
+        .await
+        .unwrap();
+    let mut explain_tx = pool.begin().await.unwrap();
+    sqlx::query("SET LOCAL enable_seqscan = off")
+        .execute(&mut *explain_tx)
+        .await
+        .unwrap();
+
+    let live_plan = sqlx::query_scalar::<_, String>(
+        "EXPLAIN (COSTS OFF) SELECT id, created_at FROM requests \
+         WHERE batch_id IS NULL AND created_by = $1 \
+         ORDER BY created_at, id LIMIT 10",
+    )
+    .bind(OWNER)
+    .fetch_all(&mut *explain_tx)
+    .await
+    .unwrap()
+    .join("\n");
+    assert!(
+        live_plan.contains("idx_requests_user_created_sort"),
+        "live creator seed must use the installed owner/created index: {live_plan}"
+    );
+    let retained_plan = sqlx::query_scalar::<_, String>(
+        "EXPLAIN (COSTS OFF) SELECT object.group_id, object.object_id, object.created_at \
+         FROM retained_response_objects object \
+         JOIN retained_response_buckets bucket ON bucket.delete_on = object.delete_on \
+          AND bucket.state IN ('active', 'retiring') \
+         WHERE object.object_kind = 'request' AND object.created_by = $1 \
+         ORDER BY object.created_at, object.object_id LIMIT 10",
+    )
+    .bind(OWNER)
+    .fetch_all(&mut *explain_tx)
+    .await
+    .unwrap()
+    .join("\n");
+    assert!(
+        retained_plan.contains("Index Scan") && retained_plan.contains("created_by"),
+        "retained creator seed must use an owner/created index: {retained_plan}"
+    );
+    explain_tx.rollback().await.unwrap();
+    assert_wholly_retained(&pool, &graph).await;
 }
 
 #[sqlx::test]
@@ -298,6 +506,291 @@ async fn erase_live_graph_preserves_a_template_shared_by_an_unrelated_request(po
         count_ids(&pool, "request_templates", &erased.template_ids).await,
         1
     );
+}
+
+#[sqlx::test]
+async fn owned_erasure_denies_a_mixed_owner_graph_without_mutation(pool: PgPool) {
+    let graph = branching_graph(&pool, TerminalState::Completed).await;
+    sqlx::query("UPDATE requests SET created_by = 'different-owner' WHERE id = $1")
+        .bind(graph.request_ids[1])
+        .execute(&pool)
+        .await
+        .unwrap();
+    let manager = manager(&pool).await;
+
+    let error = manager
+        .delete_owned_response_group(graph.group_id, OWNER)
+        .await
+        .expect_err("one differently-owned member must deny the whole graph");
+    assert!(matches!(
+        error,
+        fusillade_arsenal::error::FusilladeError::RequestNotFound(_)
+    ));
+    assert_eq!(count_ids(&pool, "requests", &graph.request_ids).await, 2);
+    assert_eq!(
+        count_ids(&pool, "response_steps", &graph.step_ids).await,
+        graph.step_ids.len() as i64
+    );
+    assert_eq!(
+        count_ids(&pool, "request_templates", &graph.template_ids).await,
+        2
+    );
+    let fences: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM retained_response_resurrection_fences WHERE object_id = ANY($1)",
+    )
+    .bind(
+        &std::iter::once(graph.group_id)
+            .chain(graph.request_ids.iter().copied())
+            .chain(graph.step_ids.iter().copied())
+            .collect::<Vec<_>>(),
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(fences, 0);
+
+    assert_eq!(
+        manager.delete_response_group(graph.group_id).await.unwrap(),
+        2,
+        "the explicit privileged erasure path must remain available"
+    );
+}
+
+#[sqlx::test]
+async fn owned_erasure_accepts_the_complete_owner_graph(pool: PgPool) {
+    let graph = branching_graph(&pool, TerminalState::Completed).await;
+    let manager = manager(&pool).await;
+
+    assert_eq!(
+        manager
+            .delete_owned_response_group(graph.step_ids[1], OWNER)
+            .await
+            .unwrap(),
+        2
+    );
+    assert_wholly_erased(&pool, &graph).await;
+}
+
+async fn assert_retained_erasure_rejects_corruption(
+    pool: &PgPool,
+    manager: &PostgresRequestManager<TestDbPools>,
+    graph: &LiveGraph,
+) {
+    let error = manager
+        .delete_response_group(graph.group_id)
+        .await
+        .expect_err("corrupt retained graph must fail closed");
+    assert_eq!(
+        RetainedResponseMaintenanceError::from_fusillade_error(&error),
+        Some(RetainedResponseMaintenanceError::IncompleteGraph)
+    );
+    assert_wholly_retained(pool, graph).await;
+    let erased_fences: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM retained_response_resurrection_fences \
+         WHERE object_id = ANY($1) AND reason = 'erased'",
+    )
+    .bind(
+        &std::iter::once(graph.group_id)
+            .chain(graph.request_ids.iter().copied())
+            .chain(graph.step_ids.iter().copied())
+            .collect::<Vec<_>>(),
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(erased_fences, 0);
+}
+
+#[sqlx::test]
+async fn retained_erasure_validates_all_rows_routes_and_payload_topology(pool: PgPool) {
+    install_candidate_index(&pool).await;
+    ensure_partition(&pool, date("2026-08-07")).await;
+    let graph = branching_graph(&pool, TerminalState::Completed).await;
+    let manager = manager(&pool).await;
+    archive(
+        &manager,
+        &policy(&[("flex", 86_400), ("priority", 3 * 86_400)]),
+        1,
+        i64::MAX,
+    )
+    .await
+    .unwrap();
+    let delete_on: NaiveDate = sqlx::query_scalar(
+        "SELECT delete_on FROM retained_response_group_routes WHERE group_id = $1",
+    )
+    .bind(graph.group_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let original_request: serde_json::Value = sqlx::query_scalar(
+        "SELECT payload FROM retained_response_objects \
+         WHERE delete_on = $1 AND group_id = $2 AND object_id = $3",
+    )
+    .bind(delete_on)
+    .bind(graph.group_id)
+    .bind(graph.request_ids[0])
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let original_step: serde_json::Value = sqlx::query_scalar(
+        "SELECT payload FROM retained_response_objects \
+         WHERE delete_on = $1 AND group_id = $2 AND object_id = $3",
+    )
+    .bind(delete_on)
+    .bind(graph.group_id)
+    .bind(graph.step_ids[0])
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    // A count-preserving object-kind substitution must not pass merely because
+    // the header and route cardinalities still match.
+    sqlx::query(
+        "UPDATE retained_response_objects SET payload = $1 \
+         WHERE delete_on = $2 AND group_id = $3 AND object_id = $4",
+    )
+    .bind(&original_step)
+    .bind(delete_on)
+    .bind(graph.group_id)
+    .bind(graph.request_ids[0])
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert_retained_erasure_rejects_corruption(&pool, &manager, &graph).await;
+    sqlx::query(
+        "UPDATE retained_response_objects SET payload = $1 \
+         WHERE delete_on = $2 AND group_id = $3 AND object_id = $4",
+    )
+    .bind(&original_request)
+    .bind(delete_on)
+    .bind(graph.group_id)
+    .bind(graph.request_ids[0])
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Row-vs-payload identities are checked for both request and step objects.
+    sqlx::query(
+        "UPDATE retained_response_objects \
+         SET payload = jsonb_set(payload, '{request,id}', to_jsonb($1::text)) \
+         WHERE delete_on = $2 AND group_id = $3 AND object_id = $4",
+    )
+    .bind(uuid::Uuid::new_v4())
+    .bind(delete_on)
+    .bind(graph.group_id)
+    .bind(graph.request_ids[0])
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert_retained_erasure_rejects_corruption(&pool, &manager, &graph).await;
+    sqlx::query(
+        "UPDATE retained_response_objects SET payload = $1 \
+         WHERE delete_on = $2 AND group_id = $3 AND object_id = $4",
+    )
+    .bind(&original_request)
+    .bind(delete_on)
+    .bind(graph.group_id)
+    .bind(graph.request_ids[0])
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE retained_response_objects \
+         SET payload = jsonb_set(payload, '{step,id}', to_jsonb($1::text)) \
+         WHERE delete_on = $2 AND group_id = $3 AND object_id = $4",
+    )
+    .bind(uuid::Uuid::new_v4())
+    .bind(delete_on)
+    .bind(graph.group_id)
+    .bind(graph.step_ids[0])
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert_retained_erasure_rejects_corruption(&pool, &manager, &graph).await;
+    sqlx::query(
+        "UPDATE retained_response_objects SET payload = $1 \
+         WHERE delete_on = $2 AND group_id = $3 AND object_id = $4",
+    )
+    .bind(&original_step)
+    .bind(delete_on)
+    .bind(graph.group_id)
+    .bind(graph.step_ids[0])
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // The request/template association and duplicated owner metadata are also
+    // part of the immutable retained representation.
+    sqlx::query(
+        "UPDATE retained_response_objects \
+         SET payload = jsonb_set(payload, '{request,template_id}', to_jsonb($1::text)) \
+         WHERE delete_on = $2 AND group_id = $3 AND object_id = $4",
+    )
+    .bind(uuid::Uuid::new_v4())
+    .bind(delete_on)
+    .bind(graph.group_id)
+    .bind(graph.request_ids[0])
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert_retained_erasure_rejects_corruption(&pool, &manager, &graph).await;
+    sqlx::query(
+        "UPDATE retained_response_objects SET payload = $1 \
+         WHERE delete_on = $2 AND group_id = $3 AND object_id = $4",
+    )
+    .bind(&original_request)
+    .bind(delete_on)
+    .bind(graph.group_id)
+    .bind(graph.request_ids[0])
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE retained_response_objects SET created_by = 'different-owner' \
+         WHERE delete_on = $1 AND group_id = $2 AND object_id = $3",
+    )
+    .bind(delete_on)
+    .bind(graph.group_id)
+    .bind(graph.request_ids[0])
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert_retained_erasure_rejects_corruption(&pool, &manager, &graph).await;
+    sqlx::query(
+        "UPDATE retained_response_objects SET created_by = $1, payload = $2 \
+         WHERE delete_on = $3 AND group_id = $4 AND object_id = $5",
+    )
+    .bind(OWNER)
+    .bind(&original_request)
+    .bind(delete_on)
+    .bind(graph.group_id)
+    .bind(graph.request_ids[0])
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let owner_error = manager
+        .delete_owned_response_group(graph.group_id, "different-owner")
+        .await
+        .expect_err("retained ownership mismatch must be a typed not-found");
+    assert!(matches!(
+        owner_error,
+        fusillade_arsenal::error::FusilladeError::RequestNotFound(_)
+    ));
+    assert_wholly_retained(&pool, &graph).await;
+
+    // Exact route membership is required even when every object remains.
+    sqlx::query("DELETE FROM retained_response_request_routes WHERE request_id = $1")
+        .bind(graph.request_ids[0])
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM retained_response_step_routes WHERE step_id = $1")
+        .bind(graph.step_ids[0])
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_retained_erasure_rejects_corruption(&pool, &manager, &graph).await;
 }
 
 #[sqlx::test]
@@ -370,11 +863,9 @@ async fn erase_racing_same_id_create_rolls_back_request_and_template(pool: PgPoo
             write: creator_pool,
             write_requested: Arc::new(AtomicBool::new(false)),
         },
-        PostgresStorageConfig {
-            max_late_writer_seconds: Some(3_600),
-            ..Default::default()
-        },
-    );
+        PostgresStorageConfig::default(),
+    )
+    .with_retained_response_fence_seconds(Some(3_600));
     let mut creator = tokio::spawn(async move {
         creator_manager
             .create_realtime(CreateRealtimeInput {
@@ -431,6 +922,200 @@ fn late_realtime_record(request_id: Uuid) -> PersistCompletedRealtimeInput {
         started_at: Utc::now(),
         completed_at: Utc::now(),
     }
+}
+
+fn generic_terminal_write(graph: &LiveGraph) -> Request<Completed> {
+    let now = Utc::now();
+    Request {
+        data: RequestData {
+            id: RequestId(graph.request_ids[0]),
+            batch_id: None,
+            template_id: TemplateId(graph.template_ids[0]),
+            custom_id: None,
+            endpoint: "https://example.invalid".to_owned(),
+            method: "POST".to_owned(),
+            path: "/v1/responses".to_owned(),
+            body: r#"{"must_not":"survive"}"#.to_owned(),
+            model: MODEL.to_owned(),
+            api_key: "must-not-survive".to_owned(),
+            created_by: OWNER.to_owned(),
+            batch_metadata: HashMap::new(),
+        },
+        state: Completed {
+            response_status: 200,
+            response_body: r#"{"must_not":"survive"}"#.to_owned(),
+            claimed_at: now,
+            started_at: now,
+            completed_at: now,
+            routed_model: MODEL.to_owned(),
+        },
+    }
+}
+
+#[sqlx::test]
+async fn bulk_duplicate_identical_id_persists_one_request_and_one_template(pool: PgPool) {
+    let manager = manager(&pool).await;
+    let request_id = Uuid::new_v4();
+    let record = late_realtime_record(request_id);
+
+    manager
+        .persist_completed_realtime_batch(&[record.clone(), record])
+        .await
+        .expect("an identical duplicate delivery is one idempotent write");
+
+    let rows: Vec<(Uuid, Option<Uuid>)> =
+        sqlx::query_as("SELECT id, template_id FROM requests WHERE id = $1")
+            .bind(request_id)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(rows.len(), 1);
+    let template_id = rows[0]
+        .1
+        .expect("the synthesized request must reference a template");
+    let templates: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM request_templates \
+         WHERE id = $1 OR body LIKE '%must_not%_synthesized%'",
+    )
+    .bind(template_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        templates, 1,
+        "no payload-bearing duplicate template may remain"
+    );
+}
+
+#[sqlx::test]
+async fn bulk_duplicate_conflicting_id_uses_first_record_without_orphans(pool: PgPool) {
+    let manager = manager(&pool).await;
+    let request_id = Uuid::new_v4();
+    let mut first = late_realtime_record(request_id);
+    first.request_body = r#"{"winner":"request"}"#.to_owned();
+    first.response_body = r#"{"winner":"response"}"#.to_owned();
+    first.model = "winner-model".to_owned();
+    first.api_key = "winner-key".to_owned();
+    first.created_by = "winner-owner".to_owned();
+    let mut second = first.clone();
+    second.request_body = r#"{"loser":"request"}"#.to_owned();
+    second.response_body = r#"{"loser":"response"}"#.to_owned();
+    second.model = "loser-model".to_owned();
+    second.api_key = "loser-key".to_owned();
+    second.created_by = "loser-owner".to_owned();
+
+    manager
+        .persist_completed_realtime_batch(&[first, second])
+        .await
+        .expect("the first occurrence defines a duplicate identity");
+
+    let row: (String, String, String, String, String) = sqlx::query_as(
+        r#"
+        SELECT request.response_body, request.model, request.created_by,
+               template.body, template.api_key
+        FROM requests request
+        JOIN request_templates template ON template.id = request.template_id
+        WHERE request.id = $1
+        "#,
+    )
+    .bind(request_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        row,
+        (
+            r#"{"winner":"response"}"#.to_owned(),
+            "winner-model".to_owned(),
+            "winner-owner".to_owned(),
+            r#"{"winner":"request"}"#.to_owned(),
+            "winner-key".to_owned(),
+        )
+    );
+    let templates: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM request_templates WHERE body LIKE '%winner%' OR body LIKE '%loser%'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        templates, 1,
+        "the losing duplicate must not allocate a template"
+    );
+}
+
+#[sqlx::test]
+async fn bulk_mixed_fenced_batch_rolls_back_live_and_fresh_siblings(pool: PgPool) {
+    install_candidate_index(&pool).await;
+    ensure_partition(&pool, date("2026-08-03")).await;
+    let retained = singleton(
+        &pool,
+        "flex",
+        TerminalState::Completed,
+        timestamp("2026-08-01T09:00:00Z"),
+        "bulk-mixed-retained",
+    )
+    .await;
+    let erased = singleton(
+        &pool,
+        "flex",
+        TerminalState::Completed,
+        timestamp("2026-08-01T10:00:00Z"),
+        "bulk-mixed-erased",
+    )
+    .await;
+    let manager = manager(&pool).await;
+    archive(&manager, &policy(&[("flex", 86_400)]), 2, i64::MAX)
+        .await
+        .unwrap();
+    manager
+        .delete_response_group(erased.request_ids[0])
+        .await
+        .unwrap();
+
+    let live_id = Uuid::new_v4();
+    manager
+        .create_realtime(CreateRealtimeInput {
+            request_id: live_id,
+            body: "bulk-live-body".to_owned(),
+            model: MODEL.to_owned(),
+            endpoint: "https://example.invalid".to_owned(),
+            method: "POST".to_owned(),
+            path: "/v1/responses".to_owned(),
+            api_key: "bulk-live-key".to_owned(),
+            created_by: OWNER.to_owned(),
+        })
+        .await
+        .unwrap();
+    let fresh_id = Uuid::new_v4();
+
+    let error = manager
+        .persist_completed_realtime_batch(&[
+            late_realtime_record(retained.request_ids[0]),
+            late_realtime_record(erased.request_ids[0]),
+            late_realtime_record(live_id),
+            late_realtime_record(fresh_id),
+        ])
+        .await
+        .expect_err("one fenced identity must fail the mixed transaction atomically");
+    assert_write_error(&error, RetainedResponseWriteError::NotFound);
+
+    let live_state: String = sqlx::query_scalar("SELECT state FROM requests WHERE id = $1")
+        .bind(live_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(live_state, "processing");
+    assert_eq!(count_ids(&pool, "requests", &[fresh_id]).await, 0);
+    assert_wholly_retained(&pool, &retained).await;
+    assert_wholly_erased(&pool, &erased).await;
+    let leaked: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM request_templates WHERE body LIKE '%must_not%_synthesized%'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(leaked, 0);
 }
 
 fn assert_write_error(
@@ -490,10 +1175,11 @@ async fn late_request_and_step_writers_cannot_resurrect_an_erased_graph(pool: Pg
     ] {
         assert_write_error(&error, RetainedResponseWriteError::NotFound);
     }
-    manager
+    let bulk_error = manager
         .persist_completed_realtime_batch(&[late_realtime_record(graph.request_ids[0])])
         .await
-        .expect("bulk late persistence is idempotently ignored");
+        .expect_err("bulk late persistence must report an erased identity");
+    assert_write_error(&bulk_error, RetainedResponseWriteError::NotFound);
 
     let pools = TestDbPools::new(pool.clone()).await.unwrap();
     let step_manager = PostgresResponseStepManager::new(pools);
@@ -580,6 +1266,150 @@ async fn late_request_writers_treat_an_active_retained_graph_as_terminal(pool: P
 }
 
 #[sqlx::test]
+async fn generic_persist_and_retry_paths_share_retained_and_fenced_outcomes(pool: PgPool) {
+    install_candidate_index(&pool).await;
+    ensure_partition(&pool, date("2026-08-03")).await;
+    let graph = singleton(
+        &pool,
+        "flex",
+        TerminalState::Failed,
+        timestamp("2026-08-01T10:00:00Z"),
+        "generic-writers",
+    )
+    .await;
+    let manager = manager(&pool).await;
+    archive(&manager, &policy(&[("flex", 86_400)]), 1, i64::MAX)
+        .await
+        .unwrap();
+    let terminal = generic_terminal_write(&graph);
+
+    assert_eq!(manager.persist(&terminal).await.unwrap(), None);
+    assert!(
+        !manager
+            .reschedule_for_retry(
+                RequestId(graph.request_ids[0]),
+                DaemonId(Uuid::new_v4()),
+                3,
+                None,
+            )
+            .await
+            .unwrap()
+    );
+    let retained_retry = manager
+        .retry_failed_requests(vec![RequestId(graph.request_ids[0])])
+        .await
+        .expect_err("manual retry must not thaw immutable retained content");
+    assert_write_error(&retained_retry, RetainedResponseWriteError::AlreadyRetained);
+    assert_wholly_retained(&pool, &graph).await;
+
+    manager.delete_response_group(graph.group_id).await.unwrap();
+    for error in [
+        manager
+            .persist(&terminal)
+            .await
+            .expect_err("generic persist must honor the erasure fence"),
+        manager
+            .reschedule_for_retry(
+                RequestId(graph.request_ids[0]),
+                DaemonId(Uuid::new_v4()),
+                4,
+                None,
+            )
+            .await
+            .expect_err("daemon retry must honor the erasure fence"),
+        manager
+            .retry_failed_requests(vec![RequestId(graph.request_ids[0])])
+            .await
+            .expect_err("manual retry must honor the erasure fence"),
+    ] {
+        assert_write_error(&error, RetainedResponseWriteError::NotFound);
+    }
+    assert_wholly_erased(&pool, &graph).await;
+}
+
+#[sqlx::test]
+async fn generic_persist_waits_for_erasure_then_observes_the_fence(pool: PgPool) {
+    const ERASE_GATE: i64 = 730_019;
+    let graph = singleton(
+        &pool,
+        "flex",
+        TerminalState::Pending,
+        timestamp("2026-08-01T10:00:00Z"),
+        "generic-erase-race",
+    )
+    .await;
+    sqlx::query(
+        r#"
+        CREATE FUNCTION gate_generic_persist_erasure() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN
+            PERFORM pg_advisory_xact_lock(730019);
+            RETURN NULL;
+        END
+        $$
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER gate_generic_persist_erasure AFTER DELETE ON requests \
+         FOR EACH STATEMENT EXECUTE FUNCTION gate_generic_persist_erasure()",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let mut gate = pool.acquire().await.unwrap();
+    sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(ERASE_GATE)
+        .execute(&mut *gate)
+        .await
+        .unwrap();
+    let erase_manager = manager(&pool).await;
+    let erase_id = graph.group_id;
+    let mut eraser =
+        tokio::spawn(async move { erase_manager.delete_response_group(erase_id).await });
+    tokio::select! {
+        result = &mut eraser => panic!("erasure completed before the delete gate: {result:?}"),
+        () = wait_for_advisory_waiter_key(&pool, ERASE_GATE) => {}
+    }
+
+    let persist_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with(pool.connect_options().as_ref().clone())
+        .await
+        .unwrap();
+    let persist_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&persist_pool)
+        .await
+        .unwrap();
+    let persist_manager = PostgresRequestManager::new(
+        TestDbPools::new(persist_pool).await.unwrap(),
+        PostgresStorageConfig::default(),
+    )
+    .with_retained_response_fence_seconds(Some(3_600));
+    let terminal = generic_terminal_write(&graph);
+    let mut persister = tokio::spawn(async move { persist_manager.persist(&terminal).await });
+    tokio::select! {
+        result = &mut persister => panic!("generic persist did not wait for the graph lifecycle lock: {result:?}"),
+        () = wait_for_backend_lock_waiter(&pool, persist_pid) => {}
+    }
+
+    let unlocked: bool = sqlx::query_scalar("SELECT pg_advisory_unlock($1)")
+        .bind(ERASE_GATE)
+        .fetch_one(&mut *gate)
+        .await
+        .unwrap();
+    assert!(unlocked);
+    assert_eq!(eraser.await.unwrap().unwrap(), 1);
+    let error = persister
+        .await
+        .unwrap()
+        .expect_err("persist must observe the committed erasure fence");
+    assert_write_error(&error, RetainedResponseWriteError::NotFound);
+    assert_wholly_erased(&pool, &graph).await;
+}
+
+#[sqlx::test]
 async fn late_synthesis_is_fenced_after_the_retained_partition_disappears(pool: PgPool) {
     install_candidate_index(&pool).await;
     let delete_on = date("2026-08-03");
@@ -611,10 +1441,11 @@ async fn late_synthesis_is_fenced_after_the_retained_partition_disappears(pool: 
         .await
         .unwrap();
 
-    manager
+    let bulk_error = manager
         .persist_completed_realtime_batch(&[late_realtime_record(graph.request_ids[0])])
         .await
-        .expect("retired bulk persistence is idempotently ignored");
+        .expect_err("retired bulk persistence must report an unavailable identity");
+    assert_write_error(&bulk_error, RetainedResponseWriteError::NotFound);
     let error = manager
         .create_realtime(CreateRealtimeInput {
             request_id: graph.request_ids[0],
@@ -640,16 +1471,13 @@ async fn late_synthesis_is_fenced_after_the_retained_partition_disappears(pool: 
 }
 
 async fn manager(pool: &PgPool) -> PostgresRequestManager<TestDbPools> {
-    let config = PostgresStorageConfig {
-        max_late_writer_seconds: Some(3_600),
-        ..PostgresStorageConfig::default()
-    };
     PostgresRequestManager::new(
         TestDbPools::new(pool.clone())
             .await
             .expect("test pools must initialize"),
-        config,
+        PostgresStorageConfig::default(),
     )
+    .with_retained_response_fence_seconds(Some(3_600))
 }
 
 async fn managers(
@@ -4202,7 +5030,7 @@ async fn movement_starting_after_create_insert_cannot_split_the_live_graph(pool:
 }
 
 #[sqlx::test]
-async fn create_step_preserves_unrelated_foreign_key_error_without_active_route(pool: PgPool) {
+async fn create_step_sanitizes_unrelated_foreign_key_error_without_active_route(pool: PgPool) {
     let (_, step_manager) = managers(&pool).await;
     let proposed_id = Uuid::new_v4();
     let missing_predecessor = StepId(Uuid::new_v4());
@@ -4220,11 +5048,10 @@ async fn create_step_preserves_unrelated_foreign_key_error_without_active_route(
         .await
         .expect_err("an unrelated missing predecessor must remain a database error");
 
-    assert!(
-        error
-            .to_string()
-            .starts_with("Failed to insert response_step:")
-    );
+    assert_eq!(error.to_string(), "Failed to insert response step");
+    let rendered = format!("{error:?}");
+    assert!(!rendered.contains(&missing_predecessor.0.to_string()));
+    assert!(!rendered.contains("unrelated-fk-error"));
     match &error {
         fusillade_arsenal::error::FusilladeError::Other(source) => assert!(
             source
