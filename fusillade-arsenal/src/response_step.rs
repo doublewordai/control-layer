@@ -32,6 +32,19 @@ impl std::fmt::Display for RetainedResponseStepConflict {
 
 impl std::error::Error for RetainedResponseStepConflict {}
 
+/// Content-free outcome for a step whose response graph was erased or whose
+/// retained partition is no longer readable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResponseStepNotFound;
+
+impl std::fmt::Display for ResponseStepNotFound {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Response step is no longer available")
+    }
+}
+
+impl std::error::Error for ResponseStepNotFound {}
+
 /// PostgreSQL implementation of [`ResponseStepStore`].
 ///
 /// Holds a [`PoolProvider`] for write/read pool selection, mirroring
@@ -92,83 +105,42 @@ impl<P: PoolProvider> PostgresResponseStepManager<P> {
         Ok(tx)
     }
 
-    async fn retained_route_exists_in_transaction(
+    async fn write_conflict_in_transaction(
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         step_ids: &[Uuid],
         request_id: Option<RequestId>,
-    ) -> Result<bool> {
-        sqlx::query_scalar(
-            r#"
-            WITH candidate_route AS (
-                SELECT route.group_id, route.delete_on
-                FROM retained_response_step_routes route
-                WHERE route.step_id = ANY($1)
-
-                UNION ALL
-
-                SELECT route.group_id, route.delete_on
-                FROM retained_response_request_routes route
-                WHERE $2::uuid IS NOT NULL
-                  AND route.request_id = $2
-            )
-            SELECT EXISTS (
-                SELECT 1
-                FROM candidate_route route
-                JOIN retained_response_group_routes group_route
-                  ON group_route.group_id = route.group_id
-                 AND group_route.delete_on = route.delete_on
-                JOIN retained_response_buckets bucket
-                  ON bucket.delete_on = route.delete_on
-                JOIN pg_namespace namespace
-                  ON namespace.nspname = bucket.partition_schema
-                JOIN pg_class child
-                  ON child.relnamespace = namespace.oid
-                 AND child.relname = bucket.partition_table
-                 AND child.oid = bucket.partition_oid
-                JOIN pg_inherits inheritance
-                  ON inheritance.inhrelid = child.oid
-                 AND NOT inheritance.inhdetachpending
-                WHERE bucket.state = 'active'
-                  AND bucket.partition_schema = current_schema()
-                  AND bucket.partition_table =
-                      'retained_response_objects_d' || to_char(route.delete_on, 'YYYYMMDD')
-                  AND inheritance.inhparent =
-                      to_regclass(format('%I.retained_response_objects', current_schema()))
-                  AND pg_get_expr(child.relpartbound, child.oid) = format(
-                      'FOR VALUES FROM (%L) TO (%L)', route.delete_on, route.delete_on + 1
-                  )
-            )
-            "#,
-        )
-        .bind(step_ids)
-        .bind(request_id.map(|id| id.0))
-        .fetch_one(&mut **tx)
-        .await
-        .map_err(|_| FusilladeError::Other(anyhow!("Failed to check retained response route")))
+    ) -> Result<Option<FusilladeError>> {
+        let mut object_ids = step_ids.to_vec();
+        object_ids.extend(request_id.map(|id| id.0));
+        crate::postgres::retained_response::classify_response_write(tx, &object_ids)
+            .await
+            .map(|disposition| {
+                disposition.map(|disposition| match disposition {
+                    crate::postgres::retained_response::ResponseWriteDisposition::AlreadyRetained => {
+                        FusilladeError::Other(anyhow::Error::new(RetainedResponseStepConflict))
+                    }
+                    crate::postgres::retained_response::ResponseWriteDisposition::NotFound => {
+                        FusilladeError::Other(anyhow::Error::new(ResponseStepNotFound))
+                    }
+                })
+            })
     }
 
-    async fn retained_route_exists(
+    async fn write_conflict(
         &self,
         step_ids: &[Uuid],
         request_id: Option<RequestId>,
-    ) -> Result<bool> {
+    ) -> Result<Option<FusilladeError>> {
         let mut tx = self.begin_write_transaction().await?;
-        let exists =
-            Self::retained_route_exists_in_transaction(&mut tx, step_ids, request_id).await?;
+        let conflict = Self::write_conflict_in_transaction(&mut tx, step_ids, request_id).await?;
         tx.commit()
             .await
             .map_err(|_| FusilladeError::Other(anyhow!("Failed to finish retained route check")))?;
-        Ok(exists)
+        Ok(conflict)
     }
 
     async fn retained_conflict(&self, step_id: StepId) -> Result<Option<FusilladeError>> {
-        self.retained_route_exists(&[step_id.0], None)
-            .await
-            .map(|exists| {
-                exists.then(|| {
-                    FusilladeError::Other(anyhow::Error::new(RetainedResponseStepConflict))
-                })
-            })
+        self.write_conflict(&[step_id.0], None).await
     }
 }
 
@@ -230,15 +202,13 @@ impl<P: PoolProvider> ResponseStepStore for PostgresResponseStepManager<P> {
 
         let mut tx = self.begin_write_transaction().await?;
 
-        if Self::retained_route_exists_in_transaction(&mut tx, &linked_step_ids, input.request_id)
-            .await?
+        if let Some(conflict) =
+            Self::write_conflict_in_transaction(&mut tx, &linked_step_ids, input.request_id).await?
         {
             tx.rollback().await.map_err(|_| {
                 FusilladeError::Other(anyhow!("Failed to roll back response-step mutation"))
             })?;
-            return Err(FusilladeError::Other(anyhow::Error::new(
-                RetainedResponseStepConflict,
-            )));
+            return Err(conflict);
         }
 
         let insert = sqlx::query(
@@ -262,13 +232,11 @@ impl<P: PoolProvider> ResponseStepStore for PostgresResponseStepManager<P> {
             // Movement may commit after the precheck while this INSERT waits
             // on a request/parent FK. Recheck the exact content-free routes so
             // that ordering still surfaces the stable retained conflict.
-            if self
-                .retained_route_exists(&linked_step_ids, input.request_id)
+            if let Some(conflict) = self
+                .write_conflict(&linked_step_ids, input.request_id)
                 .await?
             {
-                return Err(FusilladeError::Other(anyhow::Error::new(
-                    RetainedResponseStepConflict,
-                )));
+                return Err(conflict);
             }
             return Err(FusilladeError::Other(anyhow!(
                 "Failed to insert response_step: {}",
@@ -280,15 +248,13 @@ impl<P: PoolProvider> ResponseStepStore for PostgresResponseStepManager<P> {
         // succeed after movement commits. This second statement shares the
         // creator's write transaction, so an active route rolls the INSERT
         // back before it can become visible.
-        if Self::retained_route_exists_in_transaction(&mut tx, &linked_step_ids, input.request_id)
-            .await?
+        if let Some(conflict) =
+            Self::write_conflict_in_transaction(&mut tx, &linked_step_ids, input.request_id).await?
         {
             tx.rollback().await.map_err(|_| {
                 FusilladeError::Other(anyhow!("Failed to roll back response-step mutation"))
             })?;
-            return Err(FusilladeError::Other(anyhow::Error::new(
-                RetainedResponseStepConflict,
-            )));
+            return Err(conflict);
         }
 
         tx.commit().await.map_err(|_| {

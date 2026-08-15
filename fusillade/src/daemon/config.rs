@@ -602,6 +602,7 @@ mod tests {
                     "flex".to_string(),
                     120,
                 )]),
+                max_late_writer_seconds: Some(600),
             },
             retention_sweep_interval_ms: 250,
             ..DaemonConfig::default()

@@ -372,21 +372,15 @@ pub async fn get_batch_request<P: PoolProvider>(
 
 /// Delete a response (batchless fusillade request) by ID.
 ///
-/// Hard-deletes for right-to-erasure compliance. The fusillade primitive
-/// (`Storage::delete_request`) removes:
-/// * the `requests` row,
-/// * its dedicated batchless `request_templates` row (carrying the prompt
-///   body — 1:1 with the request when `file_id IS NULL`), and
-/// * all `response_steps` whose `request_id` matches (via FK cascade).
+/// Hard-deletes the complete live or retained response graph for
+/// right-to-erasure compliance.
 ///
-/// **Preserved**: `http_analytics` (token counts, cost, status code — no FK
-/// to requests) and `credits_transactions` (immutable; denormalizes
-/// `fusillade_batch_id` only, not `fusillade_request_id`). Billing and
-/// usage records survive the erasure.
+/// **Preserved**: `http_analytics` (token counts, cost, status code) and
+/// `credits_transactions` (the immutable billing ledger). Both denormalize
+/// response identifiers without foreign keys to the response-content graph.
 ///
-/// Multi-step Open Responses (with a step tree) are deleted via
-/// `DELETE /ai/v1/responses/{id}` instead — that handler walks the chain
-/// and calls this primitive for every backing sub-request.
+/// The same primitive backs multi-step Open Responses deletion and accepts a
+/// graph head, member request, or response step as its lookup key.
 #[utoipa::path(
     delete,
     path = "/admin/api/v1/batches/requests/{request_id}",
@@ -401,7 +395,7 @@ pub async fn get_batch_request<P: PoolProvider>(
     ),
     tag = "batch_requests",
 )]
-#[tracing::instrument(skip_all, fields(user_id = %current_user.id, request_id = %request_id))]
+#[tracing::instrument(skip_all)]
 pub async fn delete_batch_request<P: PoolProvider>(
     State(state): State<AppState<P>>,
     Path(request_id): Path<Uuid>,
@@ -420,12 +414,9 @@ pub async fn delete_batch_request<P: PoolProvider>(
                 resource: "Response".to_string(),
                 id: request_id.to_string(),
             },
-            other => {
-                tracing::error!(request_id = %request_id, error = %other, "failed to fetch response for delete");
-                Error::Internal {
-                    operation: format!("get response for delete: {}", other),
-                }
-            }
+            _ => Error::Internal {
+                operation: "get response for deletion".to_string(),
+            },
         })?;
 
     // 404 (not 403) avoids leaking existence of other users' responses.
@@ -437,19 +428,15 @@ pub async fn delete_batch_request<P: PoolProvider>(
         });
     }
 
-    state
-        .request_manager
-        .delete_request(fusillade::RequestId(request_id))
-        .await
-        .map_err(|e| match e {
-            fusillade::FusilladeError::RequestNotFound(_) => Error::NotFound {
-                resource: "Response".to_string(),
-                id: request_id.to_string(),
-            },
-            other => Error::Internal {
-                operation: format!("delete response: {}", other),
-            },
-        })?;
+    state.request_manager.delete_response_group(request_id).await.map_err(|e| match e {
+        fusillade::FusilladeError::RequestNotFound(_) => Error::NotFound {
+            resource: "Response".to_string(),
+            id: request_id.to_string(),
+        },
+        _ => Error::Internal {
+            operation: "delete response graph".to_string(),
+        },
+    })?;
 
     Ok(StatusCode::NO_CONTENT)
 }

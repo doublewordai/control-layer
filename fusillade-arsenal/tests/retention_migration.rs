@@ -162,6 +162,7 @@ async fn adds_retained_response_parent_without_rewriting_live_heaps(pool: sqlx::
               'retained_response_step_routes',
               'retained_response_group_routes',
               'retained_response_buckets',
+              'retained_response_resurrection_fences',
               'retention_partition_retirements'
           )
         ORDER BY table_name
@@ -170,7 +171,75 @@ async fn adds_retained_response_parent_without_rewriting_live_heaps(pool: sqlx::
     .fetch_all(&pool)
     .await
     .unwrap();
-    assert_eq!(control_tables.len(), 5);
+    assert_eq!(control_tables.len(), 6);
+
+    let fence_columns: Vec<String> = sqlx::query_scalar(
+        r#"
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_schema = current_schema()
+          AND table_name = 'retained_response_resurrection_fences'
+        ORDER BY ordinal_position
+        "#,
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        fence_columns,
+        ["object_id", "reason", "expires_at"].map(String::from),
+        "resurrection fences must contain UUID identity and bounded lifecycle metadata only",
+    );
+
+    let fence_id = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO retained_response_resurrection_fences (object_id, reason, expires_at) \
+         VALUES ($1, 'archived', NOW() + INTERVAL '1 hour')",
+    )
+    .bind(fence_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO retained_response_resurrection_fences (object_id, reason, expires_at) \
+         VALUES ($1, 'erased', NOW() + INTERVAL '2 hours') \
+         ON CONFLICT (object_id) DO UPDATE \
+         SET reason = EXCLUDED.reason, expires_at = EXCLUDED.expires_at",
+    )
+    .bind(fence_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let fence: (String, chrono::DateTime<chrono::Utc>) = sqlx::query_as(
+        "SELECT reason, expires_at FROM retained_response_resurrection_fences WHERE object_id = $1",
+    )
+    .bind(fence_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        fence.0, "erased",
+        "one UUID must coalesce across graph roles"
+    );
+
+    let invalid_reason = sqlx::query(
+        "UPDATE retained_response_resurrection_fences SET reason = 'unknown' WHERE object_id = $1",
+    )
+    .bind(fence_id)
+    .execute(&pool)
+    .await
+    .expect_err("unknown fence reasons must fail closed");
+    assert_eq!(
+        invalid_reason
+            .as_database_error()
+            .and_then(|error| error.code())
+            .as_deref(),
+        Some("23514")
+    );
+    sqlx::query("DELETE FROM retained_response_resurrection_fences")
+        .execute(&pool)
+        .await
+        .unwrap();
 
     let content_columns: Vec<(String, String)> = sqlx::query_as(
         r#"
@@ -182,6 +251,7 @@ async fn adds_retained_response_parent_without_rewriting_live_heaps(pool: sqlx::
               'retained_response_step_routes',
               'retained_response_group_routes',
               'retained_response_buckets',
+              'retained_response_resurrection_fences',
               'retention_partition_retirements'
           )
           AND column_name IN (
