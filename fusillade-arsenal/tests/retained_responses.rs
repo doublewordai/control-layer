@@ -4,10 +4,16 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use chrono::{DateTime, NaiveDate, TimeDelta, Utc};
 use fusillade_arsenal::manager::{
-    RetainedResponseArchiveOutcome, RetainedResponseMaintenanceError, RetentionSweepPolicy,
+    RetainedResponseArchiveOutcome, RetainedResponseMaintenanceError, RetainedResponseWriteError,
+    RetentionSweepPolicy,
 };
-use fusillade_arsenal::postgres_response_step::RetainedResponseStepConflict;
-use fusillade_arsenal::request::{ListRequestsFilter, RequestId, ServiceTierFilter};
+use fusillade_arsenal::postgres_response_step::{
+    ResponseStepNotFound, RetainedResponseStepConflict,
+};
+use fusillade_arsenal::request::{
+    CreateRealtimeInput, ListRequestsFilter, PersistCompletedRealtimeInput, RequestId,
+    ServiceTierFilter,
+};
 use fusillade_arsenal::response_step::{CreateStepInput, ResponseStepStore, StepId, StepKind};
 use fusillade_arsenal::{
     DaemonStorage, PoolProvider, PostgresRequestManager, PostgresResponseStepManager,
@@ -105,6 +111,7 @@ fn date(value: &str) -> NaiveDate {
 
 fn policy(tiers: &[(&str, u64)]) -> RetentionSweepPolicy {
     RetentionSweepPolicy {
+        max_late_writer_seconds: Some(3_600),
         batchless_seconds_by_service_tier: tiers
             .iter()
             .map(|(tier, seconds)| ((*tier).to_owned(), *seconds))
@@ -113,12 +120,535 @@ fn policy(tiers: &[(&str, u64)]) -> RetentionSweepPolicy {
     }
 }
 
+async fn assert_wholly_erased(pool: &PgPool, graph: &LiveGraph) {
+    assert_eq!(count_ids(pool, "requests", &graph.request_ids).await, 0);
+    assert_eq!(count_ids(pool, "response_steps", &graph.step_ids).await, 0);
+    assert_eq!(
+        count_ids(pool, "request_templates", &graph.template_ids).await,
+        0
+    );
+    assert_eq!(retained_counts(pool, graph.group_id).await, (0, 0, 0));
+    let route_count: i64 = sqlx::query_scalar(
+        r#"
+        SELECT (SELECT COUNT(*) FROM retained_response_group_routes WHERE group_id = $1)
+             + (SELECT COUNT(*) FROM retained_response_request_routes WHERE group_id = $1)
+             + (SELECT COUNT(*) FROM retained_response_step_routes WHERE group_id = $1)
+        "#,
+    )
+    .bind(graph.group_id)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(route_count, 0);
+    let fenced: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM retained_response_resurrection_fences \
+         WHERE object_id = ANY($1) AND reason = 'erased' AND expires_at > NOW()",
+    )
+    .bind(
+        &std::iter::once(graph.group_id)
+            .chain(graph.request_ids.iter().copied())
+            .chain(graph.step_ids.iter().copied())
+            .collect::<Vec<_>>(),
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    let expected = std::iter::once(graph.group_id)
+        .chain(graph.request_ids.iter().copied())
+        .chain(graph.step_ids.iter().copied())
+        .collect::<std::collections::HashSet<_>>()
+        .len() as i64;
+    assert_eq!(fenced, expected);
+}
+
+#[sqlx::test]
+async fn erase_retained_singleton_by_request_id_removes_the_complete_graph(pool: PgPool) {
+    install_candidate_index(&pool).await;
+    ensure_partition(&pool, date("2026-08-03")).await;
+    let graph = singleton(
+        &pool,
+        "flex",
+        TerminalState::Completed,
+        timestamp("2026-08-01T10:00:00Z"),
+        "erase-singleton",
+    )
+    .await;
+    let manager = manager(&pool).await;
+    archive(&manager, &policy(&[("flex", 86_400)]), 1, i64::MAX)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        manager
+            .delete_response_group(graph.request_ids[0])
+            .await
+            .unwrap(),
+        1
+    );
+    assert_wholly_erased(&pool, &graph).await;
+}
+
+#[sqlx::test]
+async fn erase_retained_branching_graph_by_head_or_member_is_atomic(pool: PgPool) {
+    install_candidate_index(&pool).await;
+    ensure_partition(&pool, date("2026-08-07")).await;
+    let graph = branching_graph(&pool, TerminalState::Completed).await;
+    let manager = manager(&pool).await;
+    archive(
+        &manager,
+        &policy(&[("flex", 86_400), ("priority", 3 * 86_400)]),
+        1,
+        i64::MAX,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        manager
+            .delete_response_group(graph.request_ids[1])
+            .await
+            .unwrap(),
+        2
+    );
+    assert_wholly_erased(&pool, &graph).await;
+}
+
+#[sqlx::test]
+async fn erase_creator_retained_groups_in_stable_bounded_units(pool: PgPool) {
+    install_candidate_index(&pool).await;
+    ensure_partition(&pool, date("2026-08-03")).await;
+    ensure_partition(&pool, date("2026-08-07")).await;
+    let branching = branching_graph(&pool, TerminalState::Completed).await;
+    let singleton = singleton(
+        &pool,
+        "flex",
+        TerminalState::Completed,
+        timestamp("2026-08-01T09:00:00Z"),
+        "creator-second-group",
+    )
+    .await;
+    let manager = manager(&pool).await;
+    archive(
+        &manager,
+        &policy(&[("flex", 86_400), ("priority", 3 * 86_400)]),
+        2,
+        i64::MAX,
+    )
+    .await
+    .unwrap();
+
+    let first = manager.bulk_delete_data(OWNER, 1).await.unwrap();
+    assert!(matches!(first, 1 | 2));
+    let remaining = [
+        retained_counts(&pool, branching.group_id).await.0,
+        retained_counts(&pool, singleton.group_id).await.0,
+    ]
+    .into_iter()
+    .sum::<i64>();
+    assert_eq!(remaining, 1, "one whole group must remain after one unit");
+
+    let second = manager.bulk_delete_data(OWNER, 1).await.unwrap();
+    assert!(matches!(second, 1 | 2));
+    assert_eq!(manager.bulk_delete_data(OWNER, 1).await.unwrap(), 0);
+    assert_wholly_erased(&pool, &branching).await;
+    assert_wholly_erased(&pool, &singleton).await;
+}
+
+#[sqlx::test]
+async fn erase_live_graph_preserves_a_template_shared_by_an_unrelated_request(pool: PgPool) {
+    let erased = singleton(
+        &pool,
+        "flex",
+        TerminalState::Completed,
+        timestamp("2026-08-01T10:00:00Z"),
+        "shared-template-erased",
+    )
+    .await;
+    let survivor = singleton(
+        &pool,
+        "flex",
+        TerminalState::Completed,
+        timestamp("2026-08-01T11:00:00Z"),
+        "shared-template-survivor",
+    )
+    .await;
+    sqlx::query("UPDATE requests SET template_id = $1 WHERE id = $2")
+        .bind(erased.template_ids[0])
+        .bind(survivor.request_ids[0])
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM request_templates WHERE id = $1")
+        .bind(survivor.template_ids[0])
+        .execute(&pool)
+        .await
+        .unwrap();
+    let manager = manager(&pool).await;
+
+    assert_eq!(
+        manager
+            .delete_response_group(erased.group_id)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(count_ids(&pool, "requests", &erased.request_ids).await, 0);
+    assert_eq!(count_ids(&pool, "requests", &survivor.request_ids).await, 1);
+    assert_eq!(
+        count_ids(&pool, "request_templates", &erased.template_ids).await,
+        1
+    );
+}
+
+#[sqlx::test]
+async fn erase_racing_same_id_create_rolls_back_request_and_template(pool: PgPool) {
+    const ERASE_AFTER_DELETE_GATE: i64 = 730_018;
+
+    let graph = singleton(
+        &pool,
+        "flex",
+        TerminalState::Completed,
+        timestamp("2026-08-01T10:00:00Z"),
+        "erase-create-race",
+    )
+    .await;
+    sqlx::query(
+        r#"
+        CREATE FUNCTION test_gate_after_request_erasure()
+        RETURNS trigger
+        LANGUAGE plpgsql
+        AS $$
+        BEGIN
+            PERFORM pg_advisory_xact_lock(730018);
+            RETURN NULL;
+        END
+        $$
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        r#"
+        CREATE TRIGGER test_gate_after_request_erasure
+        AFTER DELETE ON requests
+        FOR EACH STATEMENT
+        EXECUTE FUNCTION test_gate_after_request_erasure()
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let mut erase_gate = pool.acquire().await.unwrap();
+    sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(ERASE_AFTER_DELETE_GATE)
+        .execute(&mut *erase_gate)
+        .await
+        .unwrap();
+    let erase_manager = manager(&pool).await;
+    let erased_id = graph.request_ids[0];
+    let mut eraser =
+        tokio::spawn(async move { erase_manager.delete_response_group(erased_id).await });
+    tokio::select! {
+        result = &mut eraser => panic!("erasure completed before the after-delete gate: {result:?}"),
+        () = wait_for_advisory_waiter_key(&pool, ERASE_AFTER_DELETE_GATE) => {}
+    }
+
+    let creator_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with(pool.connect_options().as_ref().clone())
+        .await
+        .unwrap();
+    let creator_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&creator_pool)
+        .await
+        .unwrap();
+    let creator_manager = PostgresRequestManager::new(
+        WriteSignalingPools {
+            read: creator_pool.clone(),
+            write: creator_pool,
+            write_requested: Arc::new(AtomicBool::new(false)),
+        },
+        PostgresStorageConfig {
+            max_late_writer_seconds: Some(3_600),
+            ..Default::default()
+        },
+    );
+    let mut creator = tokio::spawn(async move {
+        creator_manager
+            .create_realtime(CreateRealtimeInput {
+                request_id: erased_id,
+                body: "must_not_survive".to_owned(),
+                model: MODEL.to_owned(),
+                endpoint: "https://example.invalid".to_owned(),
+                method: "POST".to_owned(),
+                path: "/v1/responses".to_owned(),
+                api_key: "must-not-survive".to_owned(),
+                created_by: OWNER.to_owned(),
+            })
+            .await
+    });
+    tokio::select! {
+        result = &mut creator => panic!("same-ID creator did not block on erasure: {result:?}"),
+        () = wait_for_backend_lock_waiter(&pool, creator_pid) => {}
+    }
+
+    let unlocked: bool = sqlx::query_scalar("SELECT pg_advisory_unlock($1)")
+        .bind(ERASE_AFTER_DELETE_GATE)
+        .fetch_one(&mut *erase_gate)
+        .await
+        .unwrap();
+    assert!(unlocked);
+    assert_eq!(eraser.await.unwrap().unwrap(), 1);
+    let error = creator
+        .await
+        .unwrap()
+        .expect_err("same-ID create must roll back after the erasure commits");
+    assert_write_error(&error, RetainedResponseWriteError::NotFound);
+    assert_eq!(count_ids(&pool, "requests", &graph.request_ids).await, 0);
+    let leaked: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM request_templates WHERE body = 'must_not_survive' OR api_key = 'must-not-survive'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(leaked, 0);
+}
+
+fn late_realtime_record(request_id: Uuid) -> PersistCompletedRealtimeInput {
+    PersistCompletedRealtimeInput {
+        request_id,
+        response_body: r#"{"must_not":"survive"}"#.to_owned(),
+        status_code: 200,
+        request_body: r#"{"must_not":"be_synthesized"}"#.to_owned(),
+        model: MODEL.to_owned(),
+        endpoint: "https://example.invalid".to_owned(),
+        method: "POST".to_owned(),
+        path: "/v1/responses".to_owned(),
+        api_key: "must-not-survive".to_owned(),
+        created_by: OWNER.to_owned(),
+        started_at: Utc::now(),
+        completed_at: Utc::now(),
+    }
+}
+
+fn assert_write_error(
+    error: &fusillade_arsenal::error::FusilladeError,
+    expected: RetainedResponseWriteError,
+) {
+    assert_eq!(
+        RetainedResponseWriteError::from_fusillade_error(error),
+        Some(expected)
+    );
+    let rendered = format!("{error:?}");
+    assert!(!rendered.contains("must_not"));
+}
+
+#[sqlx::test]
+async fn late_request_and_step_writers_cannot_resurrect_an_erased_graph(pool: PgPool) {
+    install_candidate_index(&pool).await;
+    ensure_partition(&pool, date("2026-08-07")).await;
+    let graph = branching_graph(&pool, TerminalState::Completed).await;
+    let manager = manager(&pool).await;
+    archive(
+        &manager,
+        &policy(&[("flex", 86_400), ("priority", 3 * 86_400)]),
+        1,
+        i64::MAX,
+    )
+    .await
+    .unwrap();
+    manager.delete_response_group(graph.group_id).await.unwrap();
+
+    for error in [
+        manager
+            .complete_request(
+                RequestId(graph.request_ids[0]),
+                r#"{"must_not":"survive"}"#,
+                200,
+            )
+            .await
+            .expect_err("a late completion must be fenced"),
+        manager
+            .fail_request(RequestId(graph.request_ids[0]), "must_not_survive", 500)
+            .await
+            .expect_err("a late failure must be fenced"),
+        manager
+            .create_realtime(CreateRealtimeInput {
+                request_id: graph.request_ids[0],
+                body: r#"{"must_not":"survive"}"#.to_owned(),
+                model: MODEL.to_owned(),
+                endpoint: "https://example.invalid".to_owned(),
+                method: "POST".to_owned(),
+                path: "/v1/responses".to_owned(),
+                api_key: "must-not-survive".to_owned(),
+                created_by: OWNER.to_owned(),
+            })
+            .await
+            .expect_err("a late create must be fenced"),
+    ] {
+        assert_write_error(&error, RetainedResponseWriteError::NotFound);
+    }
+    manager
+        .persist_completed_realtime_batch(&[late_realtime_record(graph.request_ids[0])])
+        .await
+        .expect("bulk late persistence is idempotently ignored");
+
+    let pools = TestDbPools::new(pool.clone()).await.unwrap();
+    let step_manager = PostgresResponseStepManager::new(pools);
+    let create_error = step_manager
+        .create_step(CreateStepInput {
+            id: Some(graph.step_ids[0]),
+            request_id: None,
+            prev_step_id: None,
+            parent_step_id: None,
+            step_kind: StepKind::ToolCall,
+            step_sequence: 100,
+            request_payload: json!({"must_not": "survive"}),
+        })
+        .await
+        .expect_err("an erased step must not be recreated");
+    assert!(matches!(
+        &create_error,
+        fusillade_arsenal::error::FusilladeError::Other(source)
+            if source.downcast_ref::<ResponseStepNotFound>().is_some()
+    ));
+    step_manager
+        .complete_step(StepId(graph.step_ids[0]), json!({"must_not": "survive"}))
+        .await
+        .expect_err("an erased step must remain absent");
+
+    assert_wholly_erased(&pool, &graph).await;
+}
+
+#[sqlx::test]
+async fn late_request_writers_treat_an_active_retained_graph_as_terminal(pool: PgPool) {
+    install_candidate_index(&pool).await;
+    ensure_partition(&pool, date("2026-08-03")).await;
+    let graph = singleton(
+        &pool,
+        "flex",
+        TerminalState::Completed,
+        timestamp("2026-08-01T10:00:00Z"),
+        "late-active-retained",
+    )
+    .await;
+    let manager = manager(&pool).await;
+    archive(&manager, &policy(&[("flex", 86_400)]), 1, i64::MAX)
+        .await
+        .unwrap();
+
+    for error in [
+        manager
+            .complete_request(RequestId(graph.request_ids[0]), "must_not_survive", 200)
+            .await
+            .expect_err("a retained completion must be terminal"),
+        manager
+            .fail_request(RequestId(graph.request_ids[0]), "must_not_survive", 500)
+            .await
+            .expect_err("a retained failure must be terminal"),
+        manager
+            .create_realtime(CreateRealtimeInput {
+                request_id: graph.request_ids[0],
+                body: "must_not_survive".to_owned(),
+                model: MODEL.to_owned(),
+                endpoint: "https://example.invalid".to_owned(),
+                method: "POST".to_owned(),
+                path: "/v1/responses".to_owned(),
+                api_key: "must-not-survive".to_owned(),
+                created_by: OWNER.to_owned(),
+            })
+            .await
+            .expect_err("a retained request must not be recreated"),
+    ] {
+        assert_write_error(&error, RetainedResponseWriteError::AlreadyRetained);
+    }
+    manager
+        .persist_completed_realtime_batch(&[late_realtime_record(graph.request_ids[0])])
+        .await
+        .expect("bulk replay is an idempotent terminal outcome");
+
+    assert_wholly_retained(&pool, &graph).await;
+    let orphan_templates: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM request_templates WHERE body LIKE '%must_not%' OR api_key = 'must-not-survive'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(orphan_templates, 0);
+}
+
+#[sqlx::test]
+async fn late_synthesis_is_fenced_after_the_retained_partition_disappears(pool: PgPool) {
+    install_candidate_index(&pool).await;
+    let delete_on = date("2026-08-03");
+    ensure_partition(&pool, delete_on).await;
+    let graph = singleton(
+        &pool,
+        "flex",
+        TerminalState::Completed,
+        timestamp("2026-08-01T10:00:00Z"),
+        "late-after-drop",
+    )
+    .await;
+    let manager = manager(&pool).await;
+    archive(&manager, &policy(&[("flex", 86_400)]), 1, i64::MAX)
+        .await
+        .unwrap();
+
+    sqlx::query("ALTER TABLE retained_response_objects DETACH PARTITION retained_response_objects_d20260803")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DROP TABLE retained_response_objects_d20260803")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE retained_response_buckets SET state = 'retired' WHERE delete_on = $1")
+        .bind(delete_on)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    manager
+        .persist_completed_realtime_batch(&[late_realtime_record(graph.request_ids[0])])
+        .await
+        .expect("retired bulk persistence is idempotently ignored");
+    let error = manager
+        .create_realtime(CreateRealtimeInput {
+            request_id: graph.request_ids[0],
+            body: r#"{"must_not":"survive"}"#.to_owned(),
+            model: MODEL.to_owned(),
+            endpoint: "https://example.invalid".to_owned(),
+            method: "POST".to_owned(),
+            path: "/v1/responses".to_owned(),
+            api_key: "must-not-survive".to_owned(),
+            created_by: OWNER.to_owned(),
+        })
+        .await
+        .expect_err("retired IDs must not synthesize new content");
+    assert_write_error(&error, RetainedResponseWriteError::NotFound);
+    assert_eq!(count_ids(&pool, "requests", &graph.request_ids).await, 0);
+    let orphan_templates: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM request_templates WHERE body LIKE '%must_not%' OR api_key = 'must-not-survive'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(orphan_templates, 0);
+}
+
 async fn manager(pool: &PgPool) -> PostgresRequestManager<TestDbPools> {
+    let config = PostgresStorageConfig {
+        max_late_writer_seconds: Some(3_600),
+        ..PostgresStorageConfig::default()
+    };
     PostgresRequestManager::new(
         TestDbPools::new(pool.clone())
             .await
             .expect("test pools must initialize"),
-        PostgresStorageConfig::default(),
+        config,
     )
 }
 

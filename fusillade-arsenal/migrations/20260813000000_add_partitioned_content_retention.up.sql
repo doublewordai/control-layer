@@ -144,6 +144,17 @@ COMMENT ON TABLE retained_response_request_routes IS
 COMMENT ON TABLE retained_response_step_routes IS
     'Content-free exact response-step-to-group-and-day routing metadata.';
 
+CREATE TABLE retained_response_resurrection_fences (
+    object_id UUID PRIMARY KEY,
+    reason TEXT NOT NULL CHECK (reason IN ('archived', 'erased', 'retired')),
+    expires_at TIMESTAMPTZ NOT NULL
+);
+CREATE INDEX idx_retained_response_resurrection_fences_expiry
+    ON retained_response_resurrection_fences (expires_at, object_id);
+
+COMMENT ON TABLE retained_response_resurrection_fences IS
+    'Content-free bounded UUID fences preventing destructive response lifecycle events from being undone by late writers.';
+
 -- One OID-fenced journal and transaction-pool-safe lease is shared by weekly
 -- batch partitions and daily retained-response partitions.
 CREATE TABLE retention_partition_retirements (
