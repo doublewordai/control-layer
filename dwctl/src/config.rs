@@ -1828,9 +1828,32 @@ pub struct DaemonConfig {
     #[serde(default)]
     pub retention: fusillade::RetentionSweepPolicy,
 
-    /// Automated retention sweep cadence in milliseconds. Zero disables it.
+    /// Move newly terminal batchless response graphs with the steady archive
+    /// worker. Disabled by default.
     #[serde(default)]
-    pub retention_sweep_interval_ms: u64,
+    pub batchless_archive_sweep_enabled: bool,
+
+    /// Move historical nonexpired batchless response graphs with the backfill
+    /// worker. Disabled by default.
+    #[serde(default)]
+    pub batchless_archive_backfill_enabled: bool,
+
+    /// Maximum complete response graphs moved by either worker per tick.
+    #[serde(default = "default_batchless_archive_groups_per_tick")]
+    pub batchless_archive_groups_per_tick: i64,
+
+    /// Maximum retained payload bytes moved by either worker per tick.
+    #[serde(default = "default_batchless_archive_bytes_per_tick")]
+    pub batchless_archive_bytes_per_tick: i64,
+
+    /// Daily retained-response partition runway maintained by the archive owner.
+    #[serde(default = "default_retained_response_partitions_days_ahead")]
+    pub retained_response_partitions_days_ahead: i32,
+
+    /// Allow daily retained-response partition retirement. Disabled by default;
+    /// the retirement implementation is introduced separately.
+    #[serde(default)]
+    pub retained_response_retirement_enabled: bool,
 
     /// Request paths whose batch traffic is dispatched as a stream so the provider
     /// reports token usage, then reassembled back into a single JSON body before it
@@ -1967,6 +1990,18 @@ pub struct DaemonConfig {
 
 fn default_batch_archive_sweep_interval_ms() -> u64 {
     5_000
+}
+
+fn default_batchless_archive_groups_per_tick() -> i64 {
+    fusillade::RetentionMaintenanceConfig::default().batchless_archive_groups_per_tick()
+}
+
+fn default_batchless_archive_bytes_per_tick() -> i64 {
+    fusillade::RetentionMaintenanceConfig::default().batchless_archive_bytes_per_tick()
+}
+
+fn default_retained_response_partitions_days_ahead() -> i32 {
+    fusillade::RetentionMaintenanceConfig::default().retained_response_partitions_days_ahead()
 }
 
 fn default_batch_archive_moves_per_tick() -> i64 {
@@ -2152,7 +2187,12 @@ impl Default for DaemonConfig {
             purge_batch_size: 1000,
             purge_throttle_ms: 100,
             retention: fusillade::RetentionSweepPolicy::default(),
-            retention_sweep_interval_ms: 0,
+            batchless_archive_sweep_enabled: false,
+            batchless_archive_backfill_enabled: false,
+            batchless_archive_groups_per_tick: default_batchless_archive_groups_per_tick(),
+            batchless_archive_bytes_per_tick: default_batchless_archive_bytes_per_tick(),
+            retained_response_partitions_days_ahead: default_retained_response_partitions_days_ahead(),
+            retained_response_retirement_enabled: false,
             streamable_endpoints: Vec::new(),
             urgency_weight: default_urgency_weight(),
             inject_deadline_priority: false,
@@ -2179,6 +2219,15 @@ impl Default for DaemonConfig {
 }
 
 impl DaemonConfig {
+    pub fn to_fusillade_retention_maintenance_config(&self) -> fusillade::RetentionMaintenanceConfig {
+        fusillade::RetentionMaintenanceConfig::new(self.retention.clone())
+            .with_batchless_archive_sweep_enabled(self.batchless_archive_sweep_enabled)
+            .with_batchless_archive_backfill_enabled(self.batchless_archive_backfill_enabled)
+            .with_batchless_archive_limits(self.batchless_archive_groups_per_tick, self.batchless_archive_bytes_per_tick)
+            .with_retained_response_partitions_days_ahead(self.retained_response_partitions_days_ahead)
+            .with_retained_response_retirement_enabled(self.retained_response_retirement_enabled)
+    }
+
     /// Convert to fusillade daemon config
     pub fn to_fusillade_config(&self) -> fusillade::daemon::DaemonConfig {
         self.to_fusillade_config_with_limits(None)
@@ -2237,8 +2286,6 @@ impl DaemonConfig {
             purge_interval_ms: self.purge_interval_ms,
             purge_batch_size: self.purge_batch_size,
             purge_throttle_ms: self.purge_throttle_ms,
-            retention: self.retention.clone(),
-            retention_sweep_interval_ms: self.retention_sweep_interval_ms,
             urgency_weight: self.urgency_weight,
             inject_deadline_priority: self.inject_deadline_priority,
             background_concurrency_limit: self.background_concurrency_limit,
@@ -2960,11 +3007,54 @@ impl Config {
                 operation: format!("Config validation: batch retention is invalid: {error}"),
             });
         }
-        let retention_enabled = self.background_services.batch_daemon.retention.is_enabled();
-        let retention_scheduled = self.background_services.batch_daemon.retention_sweep_interval_ms > 0;
-        if retention_enabled != retention_scheduled {
+        if self.background_services.batch_daemon.retention.expire_files
+            || self.background_services.batch_daemon.retention.terminal_batch_seconds.is_some()
+        {
             return Err(Error::Internal {
-                operation: "Config validation: retention rules and retention_sweep_interval_ms must be enabled or disabled together"
+                operation: "Config validation: scheduled file and batch retention is not supported by retained-response maintenance"
+                    .to_string(),
+            });
+        }
+        let retention_enabled = self.background_services.batch_daemon.retention.is_enabled();
+        let daemon = &self.background_services.batch_daemon;
+        let batchless_policy_configured = !daemon.retention.batchless_seconds_by_service_tier.is_empty();
+        let batchless_movement_enabled = daemon.batchless_archive_sweep_enabled || daemon.batchless_archive_backfill_enabled;
+        if (batchless_movement_enabled || daemon.retained_response_retirement_enabled) && !batchless_policy_configured {
+            return Err(Error::Internal {
+                operation: "Config validation: batchless retention policy is required for retained-response maintenance".to_string(),
+            });
+        }
+        if batchless_movement_enabled && (daemon.batchless_archive_groups_per_tick <= 0 || daemon.batchless_archive_bytes_per_tick <= 0) {
+            return Err(Error::Internal {
+                operation: "Config validation: batchless archive group and byte budgets must be positive".to_string(),
+            });
+        }
+        if batchless_policy_configured && daemon.retained_response_partitions_days_ahead <= 0 {
+            return Err(Error::Internal {
+                operation: "Config validation: retained-response partition runway must be positive".to_string(),
+            });
+        }
+        if batchless_movement_enabled
+            && daemon
+                .retention
+                .batchless_seconds_by_service_tier
+                .values()
+                .any(|seconds| daemon.batch_archive_sweep_dwell_secs >= *seconds as f64)
+        {
+            return Err(Error::Internal {
+                operation: "Config validation: batchless archive sweep dwell must be shorter than every configured retention period"
+                    .to_string(),
+            });
+        }
+        if batchless_movement_enabled
+            && daemon
+                .retention
+                .batchless_seconds_by_service_tier
+                .values()
+                .any(|seconds| daemon.batch_archive_cancel_grace_secs >= *seconds as f64)
+        {
+            return Err(Error::Internal {
+                operation: "Config validation: batchless archive cancellation grace must be shorter than every configured retention period"
                     .to_string(),
             });
         }
@@ -3294,21 +3384,53 @@ mod tests {
     }
 
     #[test]
-    fn retention_rules_and_schedule_must_be_enabled_together() {
-        let mut config = Config::default();
-        config.background_services.batch_daemon.retention.expire_files = true;
+    fn obsolete_retention_sweep_interval_is_rejected_on_a_complete_config() {
+        let mut serialized = serde_json::to_value(DaemonConfig::default()).unwrap();
+        serialized["retention_sweep_interval_ms"] = serde_json::json!(1_000);
 
-        let error = config.validate().unwrap_err().to_string();
-        assert!(error.contains("must be enabled or disabled together"));
+        let error = serde_json::from_value::<DaemonConfig>(serialized).expect_err("the removed standalone scheduler key must be rejected");
 
-        config.background_services.batch_daemon.retention_sweep_interval_ms = 250;
+        assert!(error.to_string().contains("retention_sweep_interval_ms"));
+    }
+
+    #[test]
+    fn retention_maintenance_controls_default_off_and_map_explicitly() {
+        let mut serialized = serde_json::to_value(DaemonConfig::default()).unwrap();
+        for key in [
+            "batchless_archive_sweep_enabled",
+            "batchless_archive_backfill_enabled",
+            "batchless_archive_groups_per_tick",
+            "batchless_archive_bytes_per_tick",
+            "retained_response_partitions_days_ahead",
+            "retained_response_retirement_enabled",
+        ] {
+            serialized.as_object_mut().unwrap().remove(key);
+        }
+
+        let daemon: DaemonConfig = serde_json::from_value(serialized).unwrap();
+        assert!(!daemon.batchless_archive_sweep_enabled);
+        assert!(!daemon.batchless_archive_backfill_enabled);
+        assert!(!daemon.retained_response_retirement_enabled);
+        assert!(daemon.batchless_archive_groups_per_tick > 0);
+        assert!(daemon.batchless_archive_bytes_per_tick > 0);
+        assert!(daemon.retained_response_partitions_days_ahead > 0);
+
+        let mapped = daemon.to_fusillade_retention_maintenance_config();
+        assert_eq!(mapped.policy(), &daemon.retention);
+        assert_eq!(mapped.batchless_archive_sweep_enabled(), daemon.batchless_archive_sweep_enabled);
         assert_eq!(
-            config
-                .background_services
-                .batch_daemon
-                .to_fusillade_config()
-                .retention_sweep_interval_ms,
-            250
+            mapped.batchless_archive_backfill_enabled(),
+            daemon.batchless_archive_backfill_enabled
+        );
+        assert_eq!(mapped.batchless_archive_groups_per_tick(), daemon.batchless_archive_groups_per_tick);
+        assert_eq!(mapped.batchless_archive_bytes_per_tick(), daemon.batchless_archive_bytes_per_tick);
+        assert_eq!(
+            mapped.retained_response_partitions_days_ahead(),
+            daemon.retained_response_partitions_days_ahead
+        );
+        assert_eq!(
+            mapped.retained_response_retirement_enabled(),
+            daemon.retained_response_retirement_enabled
         );
     }
 
@@ -3321,21 +3443,81 @@ mod tests {
             .retention
             .batchless_seconds_by_service_tier
             .insert("unknown".to_string(), 60);
-        config.background_services.batch_daemon.retention_sweep_interval_ms = 250;
-
         let error = config.validate().unwrap_err().to_string();
         assert!(error.contains("unsupported service tier"));
     }
 
     #[test]
-    fn retention_requires_a_runnable_batch_daemon() {
+    fn scheduled_file_and_batch_retention_fail_closed() {
         let mut config = Config::default();
-        config.background_services.batch_daemon.enabled = DaemonEnabled::Never;
         config.background_services.batch_daemon.retention.expire_files = true;
-        config.background_services.batch_daemon.retention_sweep_interval_ms = 250;
-
         let error = config.validate().unwrap_err().to_string();
-        assert!(error.contains("requires the batch daemon to run"));
+        assert!(error.contains("file and batch retention is not supported"));
+
+        let mut config = Config::default();
+        config.background_services.batch_daemon.retention.terminal_batch_seconds = Some(60);
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("file and batch retention is not supported"));
+    }
+
+    fn configure_batchless_retention(config: &mut Config) {
+        config.secret_key = Some("test-secret-key".to_string());
+        let daemon = &mut config.background_services.batch_daemon;
+        daemon.retention.batchless_seconds_by_service_tier.insert("flex".to_string(), 120);
+        daemon.retention.max_late_writer_seconds = Some(30);
+    }
+
+    #[test]
+    fn batchless_retention_validation_matrix_is_fail_closed() {
+        let mut config = Config::default();
+        config.background_services.batch_daemon.batchless_archive_sweep_enabled = true;
+        assert!(config.validate().unwrap_err().to_string().contains("batchless retention policy"));
+
+        let mut config = Config::default();
+        configure_batchless_retention(&mut config);
+        assert!(
+            config.validate().is_ok(),
+            "a configured policy must permit reader-safe runway preflight"
+        );
+
+        config.background_services.batch_daemon.retained_response_partitions_days_ahead = 0;
+        assert!(config.validate().unwrap_err().to_string().contains("partition runway"));
+
+        let mut config = Config::default();
+        configure_batchless_retention(&mut config);
+        let daemon = &mut config.background_services.batch_daemon;
+        daemon.batchless_archive_backfill_enabled = true;
+        daemon.batchless_archive_groups_per_tick = 0;
+        assert!(config.validate().unwrap_err().to_string().contains("group and byte budgets"));
+
+        let mut config = Config::default();
+        config.background_services.batch_daemon.retained_response_retirement_enabled = true;
+        assert!(config.validate().unwrap_err().to_string().contains("batchless retention policy"));
+    }
+
+    #[test]
+    fn batchless_movement_windows_precede_retention() {
+        let mut config = Config::default();
+        configure_batchless_retention(&mut config);
+        let daemon = &mut config.background_services.batch_daemon;
+        daemon.batchless_archive_sweep_enabled = true;
+        daemon.batch_archive_sweep_dwell_secs = 120.0;
+        assert!(config.validate().unwrap_err().to_string().contains("sweep dwell"));
+
+        let mut backfill = Config::default();
+        configure_batchless_retention(&mut backfill);
+        let daemon = &mut backfill.background_services.batch_daemon;
+        daemon.batchless_archive_backfill_enabled = true;
+        daemon.batch_archive_sweep_dwell_secs = 120.0;
+        assert!(backfill.validate().unwrap_err().to_string().contains("sweep dwell"));
+
+        let daemon = &mut config.background_services.batch_daemon;
+        daemon.batch_archive_sweep_dwell_secs = 119.0;
+        daemon.batch_archive_cancel_grace_secs = 120.0;
+        assert!(config.validate().unwrap_err().to_string().contains("cancellation grace"));
+
+        config.background_services.batch_daemon.batch_archive_cancel_grace_secs = 119.0;
+        assert!(config.validate().is_ok());
     }
     /// Stamping a key into a batch's metadata does NOTHING unless the key is also on this
     /// list: fusillade copies only the listed keys onto each claimed request, so an

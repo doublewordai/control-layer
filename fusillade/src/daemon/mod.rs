@@ -22,12 +22,15 @@ use crate::FusilladeError;
 use crate::batch::BatchId;
 use crate::error::Result;
 use crate::http::HttpClient;
-use crate::manager::{ArchiveOutcome, DaemonStorage, Storage};
+use crate::manager::{
+    ArchiveOutcome, DaemonStorage, RetainedResponseArchiveCutoffs, RetentionSweepPolicy, Storage,
+};
 use crate::processor::{DefaultRequestProcessor, RequestProcessor};
 use crate::request::{Claimed, DaemonId, FailureReason, Request, RequestCompletionResult};
 
 pub use config::{
-    DaemonConfig, DaemonMode, ModelEscalationConfig, ShouldRetryFn, default_should_retry,
+    DaemonConfig, DaemonMode, ModelEscalationConfig, RetentionMaintenanceConfig, ShouldRetryFn,
+    default_should_retry,
 };
 pub use fusillade_core::daemon_record::{
     AnyDaemonRecord, DaemonData, DaemonRecord, DaemonState, DaemonStats, DaemonStatus, Dead,
@@ -93,7 +96,6 @@ impl ClaimLoopKind {
 /// Reserved NVIDIA Dynamo priority for background work. Higher integer values
 /// are more important, so this is strictly below every SLA priority.
 pub const BACKGROUND_DYNAMO_PRIORITY: i32 = i32::MIN;
-const RETENTION_MAX_CHUNKS_PER_TICK: usize = 4;
 /// Lowest priority an SLA request may receive, reserving `i32::MIN` for
 /// background work.
 pub const MIN_SLA_DYNAMO_PRIORITY: i32 = i32::MIN + 1;
@@ -305,6 +307,10 @@ fn claim_loop_kinds_for_mode(
     Ok(kinds)
 }
 
+fn owns_archive_maintenance(claim_loop_kinds: &[ClaimLoopKind]) -> bool {
+    claim_loop_kinds.contains(&ClaimLoopKind::Batch)
+}
+
 fn get_hostname() -> String {
     hostname::get()
         .ok()
@@ -352,34 +358,600 @@ async fn until_shutdown<T>(
     }
 }
 
+async fn maintenance_query<T>(
+    shutdown: &tokio_util::sync::CancellationToken,
+    what: &'static str,
+    timeout: Duration,
+    fut: impl Future<Output = Result<T>>,
+) -> Result<Option<T>> {
+    until_shutdown(shutdown, with_query_timeout(what, timeout, fut))
+        .await
+        .transpose()
+}
+
+fn retained_archive_cutoffs_at(
+    observed_at: chrono::DateTime<chrono::Utc>,
+    dwell_secs: f64,
+    cancel_grace_secs: f64,
+) -> Result<RetainedResponseArchiveCutoffs> {
+    let dwell = Duration::try_from_secs_f64(dwell_secs).map_err(|_| {
+        FusilladeError::ValidationError(
+            "batchless archive dwell must be finite and non-negative".to_string(),
+        )
+    })?;
+    let cancel_grace = Duration::try_from_secs_f64(cancel_grace_secs).map_err(|_| {
+        FusilladeError::ValidationError(
+            "batchless archive cancellation grace must be finite and non-negative".to_string(),
+        )
+    })?;
+    let dwell = chrono::Duration::from_std(dwell).map_err(|_| {
+        FusilladeError::ValidationError("batchless archive dwell is out of range".to_string())
+    })?;
+    let cancel_grace = chrono::Duration::from_std(cancel_grace).map_err(|_| {
+        FusilladeError::ValidationError(
+            "batchless archive cancellation grace is out of range".to_string(),
+        )
+    })?;
+    let terminal_before = observed_at.checked_sub_signed(dwell).ok_or_else(|| {
+        FusilladeError::ValidationError(
+            "batchless archive terminal cutoff is out of range".to_string(),
+        )
+    })?;
+    let cancel_grace_before = observed_at
+        .checked_sub_signed(cancel_grace)
+        .ok_or_else(|| {
+            FusilladeError::ValidationError(
+                "batchless archive cancellation cutoff is out of range".to_string(),
+            )
+        })?;
+    RetainedResponseArchiveCutoffs::new(observed_at, terminal_before, cancel_grace_before)
+        .map_err(FusilladeError::ValidationError)
+}
+
+async fn run_archive_partition_maintenance_tick<S>(
+    storage: &S,
+    shutdown: &tokio_util::sync::CancellationToken,
+    query_timeout: Duration,
+    weeks_ahead: i32,
+    retention_policy: &RetentionSweepPolicy,
+    retained_days_ahead: i32,
+) -> bool
+where
+    S: DaemonStorage,
+{
+    match maintenance_query(
+        shutdown,
+        "batch archive partition ensure",
+        query_timeout,
+        storage.ensure_archive_partitions(weeks_ahead),
+    )
+    .await
+    {
+        Ok(Some((created, ahead))) => {
+            gauge!("fusillade_archive_partitions_ahead").set(ahead as f64);
+            if created > 0 {
+                tracing::info!(created, ahead, "Created batch archive partitions");
+            }
+        }
+        Ok(None) => return false,
+        Err(error) => {
+            crate::background_error!(
+                "archive_partition_ensure_failed",
+                Error,
+                error = %error,
+                "Failed to ensure batch archive partitions"
+            );
+        }
+    }
+
+    if retention_policy
+        .batchless_seconds_by_service_tier
+        .is_empty()
+    {
+        return true;
+    }
+
+    match maintenance_query(
+        shutdown,
+        "retained response partition ensure",
+        query_timeout,
+        storage.ensure_retained_response_partitions(retention_policy, retained_days_ahead),
+    )
+    .await
+    {
+        Ok(Some((created, ahead))) => {
+            gauge!("fusillade_retained_response_partitions_ahead").set(ahead as f64);
+            if created > 0 {
+                tracing::info!(created, ahead, "Created retained-response partitions");
+            }
+            true
+        }
+        Ok(None) => false,
+        Err(error) => {
+            crate::background_error!(
+                "retained_response_partition_ensure_failed",
+                Error,
+                error = %error,
+                "Failed to ensure retained-response partitions"
+            );
+            false
+        }
+    }
+}
+
+async fn initialize_archive_maintenance_if_owner<S>(
+    owns_archive_maintenance: bool,
+    storage: &S,
+    shutdown: &tokio_util::sync::CancellationToken,
+    query_timeout: Duration,
+    weeks_ahead: i32,
+    retention_policy: &RetentionSweepPolicy,
+    retained_days_ahead: i32,
+) -> Option<bool>
+where
+    S: DaemonStorage,
+{
+    if !owns_archive_maintenance {
+        return None;
+    }
+    Some(
+        run_archive_partition_maintenance_tick(
+            storage,
+            shutdown,
+            query_timeout,
+            weeks_ahead,
+            retention_policy,
+            retained_days_ahead,
+        )
+        .await,
+    )
+}
+
+async fn run_archive_partition_maintenance_loop<S>(
+    storage: Arc<S>,
+    shutdown: tokio_util::sync::CancellationToken,
+    query_timeout: Duration,
+    weeks_ahead: i32,
+    retention_policy: RetentionSweepPolicy,
+    retained_days_ahead: i32,
+    period: Duration,
+) where
+    S: DaemonStorage + 'static,
+{
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep(period) => {},
+            _ = shutdown.cancelled() => break,
+        }
+        let _ = run_archive_partition_maintenance_tick(
+            storage.as_ref(),
+            &shutdown,
+            query_timeout,
+            weeks_ahead,
+            &retention_policy,
+            retained_days_ahead,
+        )
+        .await;
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ArchiveMoverTick {
+    worker: &'static str,
+    batch_enabled: bool,
+    batchless_enabled: bool,
+    batch_limit: i64,
+    batch_concurrency: usize,
+    batch_dwell_secs: f64,
+    batchless_dwell_secs: f64,
+    cancel_grace_secs: f64,
+    batchless_group_limit: i64,
+    batchless_byte_limit: i64,
+}
+
+async fn run_batch_archive_phase<S>(
+    storage: Arc<S>,
+    shutdown: &tokio_util::sync::CancellationToken,
+    query_timeout: Duration,
+    tick: ArchiveMoverTick,
+) where
+    S: DaemonStorage + 'static,
+{
+    let ids = match maintenance_query(
+        shutdown,
+        "batch archive candidate list",
+        query_timeout,
+        storage.list_archivable_batches(
+            tick.batch_limit,
+            true,
+            tick.cancel_grace_secs,
+            tick.batch_dwell_secs,
+        ),
+    )
+    .await
+    {
+        Ok(Some(ids)) => ids,
+        Ok(None) => return,
+        Err(error) => {
+            crate::background_error!(
+                "archive_list_failed",
+                Error,
+                worker = tick.worker,
+                error = %error,
+                "Failed to list archivable batches"
+            );
+            return;
+        }
+    };
+
+    let mut abort_phase = false;
+    for wave in ids.chunks(tick.batch_concurrency.max(1)) {
+        if shutdown.is_cancelled() || abort_phase {
+            break;
+        }
+        let results = futures::future::join_all(wave.iter().map(|batch_id| {
+            let storage = storage.clone();
+            async move {
+                let started = std::time::Instant::now();
+                let result = maintenance_query(
+                    shutdown,
+                    "batch archive move",
+                    query_timeout,
+                    storage.archive_batch(*batch_id),
+                )
+                .await;
+                (started.elapsed(), result)
+            }
+        }))
+        .await;
+        for (elapsed, result) in results {
+            match result {
+                Ok(Some(ArchiveOutcome::Archived { rows })) => {
+                    counter!("fusillade_archive_moves_total", "worker" => tick.worker, "outcome" => "archived").increment(1);
+                    counter!("fusillade_archive_moved_rows_total", "worker" => tick.worker)
+                        .increment(rows);
+                    histogram!("fusillade_archive_move_duration_seconds", "worker" => tick.worker)
+                        .record(elapsed.as_secs_f64());
+                }
+                Ok(Some(outcome)) => {
+                    let label = match outcome {
+                        ArchiveOutcome::Archived { .. } => unreachable!(),
+                        ArchiveOutcome::SkippedNotFound => "skipped_not_found",
+                        ArchiveOutcome::SkippedNotLive => "skipped_not_live",
+                        ArchiveOutcome::SkippedNotFrozen => "skipped_not_frozen",
+                        ArchiveOutcome::SkippedNoPartition => "skipped_no_partition",
+                        ArchiveOutcome::SkippedResponseSteps => "skipped_response_steps",
+                        ArchiveOutcome::SkippedRetryRaced => "skipped_retry_raced",
+                    };
+                    counter!("fusillade_archive_moves_total", "worker" => tick.worker, "outcome" => label).increment(1);
+                    if outcome == ArchiveOutcome::SkippedNoPartition {
+                        crate::background_error!(
+                            "archive_partition_missing",
+                            Error,
+                            worker = tick.worker,
+                            "Archive partition missing for a batch move"
+                        );
+                    }
+                }
+                Ok(None) => return,
+                Err(error) => {
+                    if !abort_phase {
+                        crate::background_error!(
+                            "archive_move_failed",
+                            Error,
+                            worker = tick.worker,
+                            error = %error,
+                            "Failed to archive a batch"
+                        );
+                    }
+                    abort_phase = true;
+                }
+            }
+        }
+    }
+
+    if let Ok(Some(backlog)) = maintenance_query(
+        shutdown,
+        "batch archive backlog count",
+        query_timeout,
+        storage.count_archivable_batches(tick.cancel_grace_secs),
+    )
+    .await
+    {
+        gauge!("fusillade_archive_backlog").set(backlog as f64);
+    }
+}
+
+async fn run_batchless_archive_phase<S>(
+    storage: &S,
+    shutdown: &tokio_util::sync::CancellationToken,
+    query_timeout: Duration,
+    retention_policy: &RetentionSweepPolicy,
+    cutoffs: &RetainedResponseArchiveCutoffs,
+    tick: ArchiveMoverTick,
+) where
+    S: DaemonStorage,
+{
+    let started = std::time::Instant::now();
+    match maintenance_query(
+        shutdown,
+        "retained response archive move",
+        query_timeout,
+        storage.archive_terminal_batchless_responses(
+            retention_policy,
+            cutoffs,
+            tick.batchless_group_limit,
+            tick.batchless_byte_limit,
+        ),
+    )
+    .await
+    {
+        Ok(Some(outcome)) => {
+            counter!("fusillade_retained_response_groups_archived_total", "worker" => tick.worker)
+                .increment(outcome.groups_archived);
+            counter!("fusillade_retained_response_requests_archived_total", "worker" => tick.worker)
+                .increment(outcome.requests_archived);
+            counter!("fusillade_retained_response_steps_archived_total", "worker" => tick.worker)
+                .increment(outcome.steps_archived);
+            counter!("fusillade_retained_response_templates_archived_total", "worker" => tick.worker)
+                .increment(outcome.templates_archived);
+            counter!("fusillade_retained_response_bytes_archived_total", "worker" => tick.worker)
+                .increment(outcome.bytes_archived);
+            gauge!("fusillade_retained_response_archive_may_have_more", "worker" => tick.worker)
+                .set(u8::from(outcome.may_have_more) as f64);
+            histogram!("fusillade_retained_response_archive_duration_seconds", "worker" => tick.worker)
+                .record(started.elapsed().as_secs_f64());
+            if outcome.groups_archived > 0 || outcome.skipped_locked {
+                tracing::info!(
+                    worker = tick.worker,
+                    groups_archived = outcome.groups_archived,
+                    requests_archived = outcome.requests_archived,
+                    steps_archived = outcome.steps_archived,
+                    templates_archived = outcome.templates_archived,
+                    bytes_archived = outcome.bytes_archived,
+                    skipped_locked = outcome.skipped_locked,
+                    may_have_more = outcome.may_have_more,
+                    "Retained-response archive phase completed"
+                );
+            }
+        }
+        Ok(None) => {}
+        Err(error) => {
+            crate::background_error!(
+                "retained_response_archive_failed",
+                Error,
+                worker = tick.worker,
+                error = %error,
+                "Failed to archive retained-response graphs"
+            );
+        }
+    }
+}
+
+async fn run_archive_mover_tick<S>(
+    storage: Arc<S>,
+    shutdown: &tokio_util::sync::CancellationToken,
+    query_timeout: Duration,
+    retention_policy: &RetentionSweepPolicy,
+    tick: ArchiveMoverTick,
+) where
+    S: DaemonStorage + 'static,
+{
+    let observed_at = chrono::Utc::now();
+    if tick.batch_enabled {
+        run_batch_archive_phase(storage.clone(), shutdown, query_timeout, tick).await;
+    }
+    if tick.batchless_enabled {
+        let cutoffs = match retained_archive_cutoffs_at(
+            observed_at,
+            tick.batchless_dwell_secs,
+            tick.cancel_grace_secs,
+        ) {
+            Ok(cutoffs) => cutoffs,
+            Err(error) => {
+                crate::background_error!(
+                    "archive_mover_invalid_cutoffs",
+                    Error,
+                    worker = tick.worker,
+                    error = %error,
+                    "Archive mover could not resolve immutable cutoffs"
+                );
+                return;
+            }
+        };
+        run_batchless_archive_phase(
+            storage.as_ref(),
+            shutdown,
+            query_timeout,
+            retention_policy,
+            &cutoffs,
+            tick,
+        )
+        .await;
+    }
+}
+
+async fn await_daemon_handles(handles: Vec<(&'static str, tokio::task::JoinHandle<()>)>) -> usize {
+    futures::future::join_all(
+        handles
+            .into_iter()
+            .map(|(worker, handle)| async move { (worker, handle.await) }),
+    )
+    .await
+    .into_iter()
+    .filter(|(worker, result)| {
+        if let Err(error) = result {
+            crate::background_error!(
+                "daemon_child_task_panicked",
+                Critical,
+                worker = *worker,
+                error = %error,
+                "Daemon child task panicked during shutdown"
+            );
+            true
+        } else {
+            false
+        }
+    })
+    .count()
+}
+
+#[derive(Clone, Copy)]
+struct ArchiveMovementWindows {
+    sweep_dwell_secs: f64,
+    cancellation_grace_secs: f64,
+}
+
+impl ArchiveMovementWindows {
+    const fn new(sweep_dwell_secs: f64, cancellation_grace_secs: f64) -> Self {
+        Self {
+            sweep_dwell_secs,
+            cancellation_grace_secs,
+        }
+    }
+}
+
 fn validate_retention_startup(
-    config: &DaemonConfig,
+    config: &RetentionMaintenanceConfig,
+    requested_mode: DaemonMode,
+    owns_archive_maintenance: bool,
     storage_supports_retention: bool,
+    purge_interval_ms: u64,
+    purge_batch_size: i64,
+    movement_windows: ArchiveMovementWindows,
 ) -> Result<()> {
     config
-        .retention
-        .cutoffs_at(chrono::Utc::now(), config.batch_archive_cancel_grace_secs)
+        .policy()
+        .cutoffs_at(chrono::Utc::now(), movement_windows.cancellation_grace_secs)
         .map_err(|error| {
             FusilladeError::ValidationError(format!("invalid retention configuration: {error}"))
         })?;
-    let retention_enabled = config.retention.is_enabled();
-    let retention_scheduled = config.retention_sweep_interval_ms > 0;
-    if retention_enabled != retention_scheduled {
+
+    if requested_mode != DaemonMode::RequestOnly
+        && (config.policy().expire_files || config.policy().terminal_batch_seconds.is_some())
+    {
         return Err(FusilladeError::ValidationError(
-            "retention rules and retention_sweep_interval_ms must be enabled or disabled together"
+            "scheduled file and batch retention is not supported by retained-response maintenance"
                 .to_string(),
         ));
     }
-    if retention_enabled && !storage_supports_retention {
+
+    let batchless_policy_configured = !config.policy().batchless_seconds_by_service_tier.is_empty();
+    let movement_enabled =
+        config.batchless_archive_sweep_enabled() || config.batchless_archive_backfill_enabled();
+
+    if (movement_enabled || config.retained_response_retirement_enabled())
+        && !batchless_policy_configured
+    {
+        return Err(FusilladeError::ValidationError(
+            "batchless retention policy is required for retained-response maintenance".to_string(),
+        ));
+    }
+    if movement_enabled
+        && (config.batchless_archive_groups_per_tick() <= 0
+            || config.batchless_archive_bytes_per_tick() <= 0)
+    {
+        return Err(FusilladeError::ValidationError(
+            "batchless archive group and byte budgets must be positive".to_string(),
+        ));
+    }
+    if batchless_policy_configured && config.retained_response_partitions_days_ahead() <= 0 {
+        return Err(FusilladeError::ValidationError(
+            "retained-response partition runway must be positive".to_string(),
+        ));
+    }
+    let lifecycle_active = batchless_policy_configured
+        || movement_enabled
+        || config.retained_response_retirement_enabled();
+    if requested_mode != DaemonMode::RequestOnly && lifecycle_active && !owns_archive_maintenance {
+        return Err(FusilladeError::ValidationError(
+            "enabled batchless movement requires an effective batch-capable archive owner"
+                .to_string(),
+        ));
+    }
+    if requested_mode != DaemonMode::RequestOnly
+        && lifecycle_active
+        && owns_archive_maintenance
+        && !storage_supports_retention
+    {
         return Err(FusilladeError::ValidationError(
             "configured storage backend does not support automated retention".to_string(),
         ));
     }
-    if retention_enabled && (config.purge_interval_ms == 0 || config.purge_batch_size < 1) {
+
+    let retention_durations = config
+        .policy()
+        .batchless_seconds_by_service_tier
+        .values()
+        .copied()
+        .map(Duration::from_secs)
+        .collect::<Vec<_>>();
+    if movement_enabled {
+        let dwell =
+            Duration::try_from_secs_f64(movement_windows.sweep_dwell_secs).map_err(|_| {
+                FusilladeError::ValidationError(
+                    "batchless archive sweep dwell must be finite and non-negative".to_string(),
+                )
+            })?;
+        if retention_durations
+            .iter()
+            .any(|retention| dwell >= *retention)
+        {
+            return Err(FusilladeError::ValidationError(
+                "batchless archive sweep dwell must be shorter than every configured retention period"
+                    .to_string(),
+            ));
+        }
+    }
+    if movement_enabled {
+        let cancellation_grace = Duration::try_from_secs_f64(
+            movement_windows.cancellation_grace_secs,
+        )
+        .map_err(|_| {
+            FusilladeError::ValidationError(
+                "batchless archive cancellation grace must be finite and non-negative".to_string(),
+            )
+        })?;
+        if retention_durations
+            .iter()
+            .any(|retention| cancellation_grace >= *retention)
+        {
+            return Err(FusilladeError::ValidationError(
+                "batchless archive cancellation grace must be shorter than every configured retention period"
+                    .to_string(),
+            ));
+        }
+    }
+    if requested_mode != DaemonMode::RequestOnly
+        && config.policy().is_enabled()
+        && (purge_interval_ms == 0 || purge_batch_size < 1)
+    {
         return Err(FusilladeError::ValidationError(
             "automated retention requires an enabled orphan purge and a positive purge batch size"
                 .to_string(),
         ));
+    }
+    Ok(())
+}
+
+fn validate_daemon_intervals(config: &DaemonConfig) -> Result<()> {
+    for (name, interval_ms) in [
+        ("heartbeat_interval_ms", Some(config.heartbeat_interval_ms)),
+        (
+            "cancellation_poll_interval_ms",
+            Some(config.cancellation_poll_interval_ms),
+        ),
+        ("status_log_interval_ms", config.status_log_interval_ms),
+        (
+            "throughput_log_interval_ms",
+            config.throughput_log_interval_ms,
+        ),
+    ] {
+        if interval_ms == Some(0) {
+            return Err(FusilladeError::ValidationError(format!(
+                "{name} must be positive when enabled"
+            )));
+        }
     }
     Ok(())
 }
@@ -498,6 +1070,7 @@ where
     storage: Arc<S>,
     http_client: Arc<H>,
     config: DaemonConfig,
+    retention_maintenance: RetentionMaintenanceConfig,
     /// Per-claim processing hook. Defaults to [`DefaultRequestProcessor`],
     /// which preserves the existing fire-and-store pipeline byte-for-byte.
     /// Override via [`Daemon::with_processor`] to inject custom orchestration
@@ -599,6 +1172,7 @@ where
             storage,
             http_client,
             config,
+            retention_maintenance: RetentionMaintenanceConfig::default(),
             processor: Arc::new(DefaultRequestProcessor),
             requests_in_flight: Arc::new(dashmap::DashMap::new()),
             adaptive_concurrency,
@@ -629,6 +1203,13 @@ where
     /// outer processing span.
     pub fn with_processor(mut self, processor: Arc<dyn RequestProcessor<S, H>>) -> Self {
         self.processor = processor;
+        self
+    }
+
+    /// Install retained-response maintenance controls without changing the
+    /// source-compatible serialized daemon configuration.
+    pub fn with_retention_maintenance(mut self, config: RetentionMaintenanceConfig) -> Self {
+        self.retention_maintenance = config;
         self
     }
 
@@ -820,7 +1401,7 @@ where
 
         let mut consecutive_claim_failures: u32 = 0;
 
-        loop {
+        let run_result = loop {
             if self.shutdown_token.is_cancelled() {
                 tracing::info!(loop_name, "Shutdown signal received, stopping claim loop");
                 break Ok(());
@@ -948,7 +1529,10 @@ where
 
             let prepared = self.prepare_claimed_requests(claimed, kind);
             self.dispatch_claimed_requests(&mut join_set, prepared, kind);
-        }
+        };
+        join_set.abort_all();
+        while join_set.join_next().await.is_some() {}
+        run_result
     }
 
     async fn run_claim_loop(self: Arc<Self>, kind: ClaimLoopKind) -> Result<()> {
@@ -970,7 +1554,7 @@ where
 
         let mut consecutive_claim_failures: u32 = 0;
 
-        loop {
+        let run_result = loop {
             if self.shutdown_token.is_cancelled() {
                 tracing::info!(loop_name, "Shutdown signal received, stopping claim loop");
                 break Ok(());
@@ -1119,7 +1703,10 @@ where
 
             let prepared = self.prepare_claimed_requests(claimed, kind);
             self.dispatch_claimed_requests(&mut join_set, prepared, kind);
-        }
+        };
+        join_set.abort_all();
+        while join_set.join_next().await.is_some() {}
+        run_result
     }
 
     /// Raise the limit for every model that just used all of it.
@@ -1642,8 +2229,7 @@ where
     #[tracing::instrument(name = "fusillade.daemon.run_with_mode", skip(self), fields(daemon_id = %self.daemon_id, mode = ?mode))]
     pub async fn run_with_mode(self: Arc<Self>, mode: DaemonMode) -> Result<()> {
         tracing::info!("Daemon starting main processing loop");
-
-        validate_retention_startup(&self.config, self.storage.supports_retention_sweeps())?;
+        validate_daemon_intervals(&self.config)?;
 
         // Validate the configured claim topology before registering the daemon
         // or spawning any maintenance tasks. Background workers read this
@@ -1658,6 +2244,19 @@ where
             supports_background_claims,
             background_enabled,
             self.config.inject_deadline_priority,
+        )?;
+        let owns_archive_maintenance = owns_archive_maintenance(&claim_loop_kinds);
+        validate_retention_startup(
+            &self.retention_maintenance,
+            mode,
+            owns_archive_maintenance,
+            self.storage.supports_retention_sweeps(),
+            self.config.purge_interval_ms,
+            self.config.purge_batch_size,
+            ArchiveMovementWindows::new(
+                self.config.batch_archive_sweep_dwell_secs,
+                self.config.batch_archive_cancel_grace_secs,
+            ),
         )?;
 
         // Register daemon in database
@@ -1706,6 +2305,7 @@ where
         let mode_label = mode.metric_label();
         gauge!("fusillade_daemon_up", "mode" => mode_label).set(1.0);
         let _liveness_gauge_guard = LivenessGaugeGuard { mode_label };
+        let mut daemon_handles: Vec<(&'static str, tokio::task::JoinHandle<()>)> = Vec::new();
 
         // Spawn periodic heartbeat task
         let storage = self.storage.clone();
@@ -1714,6 +2314,8 @@ where
         let requests_failed = self.requests_failed.clone();
         let daemon_id = self.daemon_id;
         let heartbeat_interval_ms = self.config.heartbeat_interval_ms;
+        let heartbeat_query_timeout =
+            Duration::from_millis(heartbeat_interval_ms.saturating_mul(4));
         let shutdown_signal = self.shutdown_token.clone();
 
         let heartbeat_handle = tokio::spawn(async move {
@@ -1732,11 +2334,9 @@ where
                         // Clone the record so we preserve it if heartbeat fails
                         let current = daemon_record.clone();
                         let heartbeat_start = std::time::Instant::now();
-                        let heartbeat_timeout =
-                            Duration::from_millis(heartbeat_interval_ms.saturating_mul(4));
                         match with_query_timeout(
                             "heartbeat query",
-                            heartbeat_timeout,
+                            heartbeat_query_timeout,
                             current.heartbeat(stats, storage.as_ref()),
                         )
                         .await
@@ -1766,7 +2366,11 @@ where
                     _ = shutdown_signal.cancelled() => {
                         // Mark daemon as dead on shutdown
                         tracing::info!("Shutting down heartbeat task");
-                        if let Err(e) = daemon_record.shutdown(storage.as_ref()).await {
+                        if let Err(e) = with_query_timeout(
+                            "daemon shutdown query",
+                            heartbeat_query_timeout,
+                            daemon_record.shutdown(storage.as_ref()),
+                        ).await {
                             crate::background_error!(
                                 "shutdown_mark_failed", Error,
                                 daemon_id = %daemon_id,
@@ -1779,26 +2383,33 @@ where
                 }
             }
         });
+        daemon_handles.push(("heartbeat", heartbeat_handle));
 
         // Spawn periodic status logging task if configured
         if let Some(interval_ms) = self.config.status_log_interval_ms {
             let requests_in_flight = self.requests_in_flight.clone();
             let daemon_id = self.daemon_id;
-            tokio::spawn(async move {
+            let shutdown_token = self.shutdown_token.clone();
+            let handle = tokio::spawn(async move {
                 let mut interval = tokio::time::interval(Duration::from_millis(interval_ms));
                 loop {
-                    interval.tick().await;
-                    let count: usize = requests_in_flight
-                        .iter()
-                        .map(|e| e.value().load(Ordering::Relaxed))
-                        .sum();
-                    tracing::debug!(
-                        daemon_id = %daemon_id,
-                        requests_in_flight = count,
-                        "Daemon status"
-                    );
+                    tokio::select! {
+                        _ = interval.tick() => {
+                            let count: usize = requests_in_flight
+                                .iter()
+                                .map(|e| e.value().load(Ordering::Relaxed))
+                                .sum();
+                            tracing::debug!(
+                                daemon_id = %daemon_id,
+                                requests_in_flight = count,
+                                "Daemon status"
+                            );
+                        }
+                        _ = shutdown_token.cancelled() => break,
+                    }
                 }
             });
+            daemon_handles.push(("status_logger", handle));
         }
 
         // Spawn periodic per-user throughput emission task if configured
@@ -1807,7 +2418,7 @@ where
             let user_requests_in_flight = self.user_requests_in_flight.clone();
             let daemon_id = self.daemon_id;
             let shutdown_token = self.shutdown_token.clone();
-            tokio::spawn(async move {
+            let handle = tokio::spawn(async move {
                 let mut interval = tokio::time::interval(Duration::from_millis(interval_ms));
                 // Skip the immediate first tick to avoid a near-zero window on the first emission
                 interval.tick().await;
@@ -1870,6 +2481,7 @@ where
                     }
                 }
             });
+            daemon_handles.push(("throughput_logger", handle));
         }
 
         // Spawn periodic batch polling task for finalization and cancellation detection
@@ -1885,7 +2497,7 @@ where
         // acquisition rather than legitimately long work.
         let poll_query_timeout = Duration::from_millis(self.config.claim_query_timeout_ms);
 
-        tokio::spawn(async move {
+        let cancellation_poll_handle = tokio::spawn(async move {
             let mut interval =
                 tokio::time::interval(Duration::from_millis(cancellation_poll_interval_ms));
             tracing::info!(
@@ -1952,138 +2564,7 @@ where
                 }
             }
         });
-
-        // Spawn the policy-driven retention worker independently from orphan
-        // purging. Each call is bounded; a backlog is drained in paced chunks.
-        let retention_handle = if self.config.retention_sweep_interval_ms > 0 {
-            let storage = self.storage.clone();
-            let shutdown_token = self.shutdown_token.clone();
-            let interval_ms = self.config.retention_sweep_interval_ms;
-            let batch_size = self.config.purge_batch_size;
-            let throttle_ms = self.config.purge_throttle_ms;
-            let query_timeout = Duration::from_millis(self.config.claim_query_timeout_ms);
-            let policy = self.config.retention.clone();
-            let terminal_batch_cancel_grace_secs = self.config.batch_archive_cancel_grace_secs;
-
-            Some(tokio::spawn(async move {
-                tracing::info!(
-                    interval_ms,
-                    batch_size,
-                    throttle_ms,
-                    "Retention sweep task started"
-                );
-                loop {
-                    tokio::select! {
-                        _ = tokio::time::sleep(Duration::from_millis(interval_ms)) => {},
-                        _ = shutdown_token.cancelled() => {
-                            tracing::info!("Shutting down retention sweep task");
-                            break;
-                        }
-                    }
-
-                    let cutoffs = match policy
-                        .cutoffs_at(chrono::Utc::now(), terminal_batch_cancel_grace_secs)
-                    {
-                        Ok(cutoffs) => cutoffs,
-                        Err(error) => {
-                            crate::background_error!(
-                                "retention_configuration_invalid",
-                                Error,
-                                error,
-                                "Retention configuration became invalid"
-                            );
-                            return;
-                        }
-                    };
-                    for chunk_index in 0..RETENTION_MAX_CHUNKS_PER_TICK {
-                        let started = std::time::Instant::now();
-                        let Some(sweep_result) = until_shutdown(
-                            &shutdown_token,
-                            with_query_timeout(
-                                "retention sweep query",
-                                query_timeout,
-                                storage.sweep_expired_content(&cutoffs, batch_size),
-                            ),
-                        )
-                        .await
-                        else {
-                            tracing::info!("Shutting down retention sweep task during query");
-                            return;
-                        };
-                        match sweep_result {
-                            Ok(outcome) => {
-                                histogram!("fusillade_retention_sweep_duration_seconds")
-                                    .record(started.elapsed().as_secs_f64());
-                                counter!("fusillade_retention_files_expired_total")
-                                    .increment(outcome.files_expired);
-                                counter!("fusillade_retention_batches_expired_total")
-                                    .increment(outcome.batches_expired);
-                                counter!("fusillade_retention_archive_partitions_retired_total")
-                                    .increment(outcome.archive_partitions_retired);
-                                counter!("fusillade_retention_template_partitions_retired_total")
-                                    .increment(outcome.template_partitions_retired);
-                                counter!("fusillade_retention_batchless_requests_deleted_total")
-                                    .increment(outcome.batchless_requests_deleted);
-                                counter!("fusillade_retention_batchless_requests_redacted_total")
-                                    .increment(outcome.batchless_requests_redacted);
-                                if outcome.lease_skipped {
-                                    counter!("fusillade_retention_sweep_lease_skipped_total")
-                                        .increment(1);
-                                    tracing::debug!(
-                                        "Retention sweep skipped because another replica holds the lease"
-                                    );
-                                    break;
-                                }
-                                gauge!("fusillade_retention_sweep_may_have_more")
-                                    .set(if outcome.may_have_more { 1.0 } else { 0.0 });
-                                tracing::info!(
-                                    files_expired = outcome.files_expired,
-                                    batches_expired = outcome.batches_expired,
-                                    archive_partitions_retired = outcome.archive_partitions_retired,
-                                    template_partitions_retired =
-                                        outcome.template_partitions_retired,
-                                    batchless_requests_deleted = outcome.batchless_requests_deleted,
-                                    batchless_requests_redacted =
-                                        outcome.batchless_requests_redacted,
-                                    may_have_more = outcome.may_have_more,
-                                    "Retention sweep completed"
-                                );
-                                if !outcome.may_have_more {
-                                    break;
-                                }
-                                if chunk_index + 1 == RETENTION_MAX_CHUNKS_PER_TICK {
-                                    counter!(
-                                        "fusillade_retention_sweep_tick_budget_exhausted_total"
-                                    )
-                                    .increment(1);
-                                    break;
-                                }
-                            }
-                            Err(error) => {
-                                counter!("fusillade_retention_sweep_errors_total").increment(1);
-                                crate::background_error!(
-                                    "retention_sweep_failed",
-                                    Error,
-                                    error = %error,
-                                    "Retention sweep failed"
-                                );
-                                break;
-                            }
-                        }
-
-                        tokio::select! {
-                            _ = tokio::time::sleep(Duration::from_millis(throttle_ms)) => {},
-                            _ = shutdown_token.cancelled() => {
-                                tracing::info!("Shutting down retention sweep task during drain");
-                                return;
-                            }
-                        }
-                    }
-                }
-            }))
-        } else {
-            None
-        };
+        daemon_handles.push(("cancellation_poll", cancellation_poll_handle));
 
         // Spawn periodic purge task for orphaned rows (right-to-erasure compliance)
         if self.config.purge_interval_ms > 0 {
@@ -2096,7 +2577,7 @@ where
             let mf_keep_per_model = self.config.model_filters_keep_per_model;
             let mf_retention_secs = self.config.model_filters_retention_ms as f64 / 1000.0;
 
-            tokio::spawn(async move {
+            let handle = tokio::spawn(async move {
                 tracing::info!(
                     interval_ms = purge_interval_ms,
                     batch_size = purge_batch_size,
@@ -2116,15 +2597,16 @@ where
 
                     // Drain orphaned rows in batches
                     loop {
-                        match with_query_timeout(
+                        match maintenance_query(
+                            &shutdown_token,
                             "orphan purge query",
                             purge_query_timeout,
                             storage.purge_orphaned_rows(purge_batch_size),
                         )
                         .await
                         {
-                            Ok(0) => break,
-                            Ok(deleted) => {
+                            Ok(Some(0)) => break,
+                            Ok(Some(deleted)) => {
                                 counter!("fusillade_rows_purged_total").increment(deleted);
                                 tracing::debug!(deleted, "Purged orphaned rows");
                                 // Throttle between batches to avoid sustained DB load
@@ -2136,6 +2618,7 @@ where
                                     }
                                 }
                             }
+                            Ok(None) => return,
                             Err(e) => {
                                 crate::background_error!("purge_failed", Error, error = %e, "Failed to purge orphaned rows");
                                 break;
@@ -2147,7 +2630,8 @@ where
                     // keeping the latest events per model + the retention
                     // window so the claim gate never loses current state.
                     loop {
-                        match with_query_timeout(
+                        match maintenance_query(
+                            &shutdown_token,
                             "model_filters purge query",
                             purge_query_timeout,
                             storage.purge_model_filter_events(
@@ -2158,8 +2642,8 @@ where
                         )
                         .await
                         {
-                            Ok(0) => break,
-                            Ok(deleted) => {
+                            Ok(Some(0)) => break,
+                            Ok(Some(deleted)) => {
                                 counter!("fusillade_model_filter_events_purged_total")
                                     .increment(deleted);
                                 tracing::debug!(deleted, "Purged old model_filters events");
@@ -2171,6 +2655,7 @@ where
                                     }
                                 }
                             }
+                            Ok(None) => return,
                             Err(e) => {
                                 counter!("fusillade_purge_errors_total").increment(1);
                                 tracing::error!(error = %e, "Failed to purge model_filters events");
@@ -2180,6 +2665,7 @@ where
                     }
                 }
             });
+            daemon_handles.push(("purge", handle));
         }
 
         let mut claim_daemons: JoinSet<Result<()>> = JoinSet::new();
@@ -2191,51 +2677,49 @@ where
             );
         }
 
-        // ---- Batch-archive maintenance + movers ----
-        // Only batch-mode daemons touch the archive. The partition-runway
-        // tick ALWAYS runs for them (partitions must exist before anyone
-        // flips the move flags); the sweep/backfill movers are config-gated:
-        // deploys never move data — only these flags do, and only once every
-        // pod in the fleet understands location routing (blue/green
-        // invariant, see batches.location column comment).
-        let batch_mode = claim_loop_kinds.contains(&ClaimLoopKind::Batch);
-        if batch_mode && supports_batch_claims {
-            {
-                let storage = self.storage.clone();
-                let shutdown_token = self.shutdown_token.clone();
-                let weeks_ahead = self.config.batch_archive_partitions_weeks_ahead;
-                tokio::spawn(async move {
-                    loop {
-                        match storage.ensure_archive_partitions(weeks_ahead).await {
-                            Ok((created, ahead)) => {
-                                gauge!("fusillade_archive_partitions_ahead").set(ahead as f64);
-                                if created > 0 {
-                                    tracing::info!(created, ahead, "Created archive partitions");
-                                }
-                            }
-                            Err(e) => {
-                                crate::background_error!("archive_partition_ensure_failed", Error, error = %e, "Failed to ensure archive partitions");
-                            }
-                        }
-                        tokio::select! {
-                            _ = tokio::time::sleep(Duration::from_millis(86_400_000)) => {},
-                            _ = shutdown_token.cancelled() => break,
-                        }
-                    }
-                });
-            }
+        // ---- Archive maintenance + movers ----
+        // Exactly the effective batch owner maintains both partition families
+        // and runs both mover phases. An explicit request-only process never
+        // performs DDL or movement even when it shares the same opaque config.
+        let query_timeout = Duration::from_millis(self.config.claim_query_timeout_ms);
+        let retention_policy = self.retention_maintenance.policy().clone();
+        let retained_runway_ready = initialize_archive_maintenance_if_owner(
+            owns_archive_maintenance,
+            self.storage.as_ref(),
+            &self.shutdown_token,
+            query_timeout,
+            self.config.batch_archive_partitions_weeks_ahead,
+            &retention_policy,
+            self.retention_maintenance
+                .retained_response_partitions_days_ahead(),
+        )
+        .await;
+        if let Some(retained_runway_ready) = retained_runway_ready {
+            let daily_handle = tokio::spawn(run_archive_partition_maintenance_loop(
+                self.storage.clone(),
+                self.shutdown_token.clone(),
+                query_timeout,
+                self.config.batch_archive_partitions_weeks_ahead,
+                retention_policy.clone(),
+                self.retention_maintenance
+                    .retained_response_partitions_days_ahead(),
+                Duration::from_secs(86_400),
+            ));
+            daemon_handles.push(("archive_partition_maintenance", daily_handle));
 
-            // The sweeper (new terminals) and the historical backfill are the
-            // SAME mover on different pacing knobs — one tested code path.
-            // Both run OLDEST-first: in steady state the sweeper drains its
-            // whole candidate set every few ticks so order is cosmetic; under
-            // a backlog, the oldest batches are the least likely to ever be
-            // re-read, so early issues have minimal blast radius (same
-            // argument as the historical drain).
-            for (worker, enabled, interval_ms, per_tick, dwell, concurrency) in [
+            for (
+                worker,
+                batch_enabled,
+                batchless_configured,
+                interval_ms,
+                batch_limit,
+                batch_dwell_secs,
+                batch_concurrency,
+            ) in [
                 (
                     "sweep",
                     self.config.batch_archive_sweep_enabled,
+                    self.retention_maintenance.batchless_archive_sweep_enabled(),
                     self.config.batch_archive_sweep_interval_ms,
                     self.config.batch_archive_sweep_moves_per_tick,
                     self.config.batch_archive_sweep_dwell_secs,
@@ -2244,136 +2728,81 @@ where
                 (
                     "backfill",
                     self.config.batch_archive_backfill_enabled,
+                    self.retention_maintenance
+                        .batchless_archive_backfill_enabled(),
                     self.config.batch_archive_backfill_interval_ms,
                     self.config.batch_archive_backfill_moves_per_tick,
                     0.0,
                     self.config.batch_archive_backfill_concurrency,
                 ),
             ] {
-                if !enabled {
+                let batchless_enabled = batchless_configured && retained_runway_ready;
+                if batchless_configured && !retained_runway_ready {
+                    crate::background_error!(
+                        "retained_response_mover_not_ready",
+                        Error,
+                        worker,
+                        "Retained-response mover not started because its partition runway is unavailable"
+                    );
+                }
+                if !batch_enabled && !batchless_enabled {
                     continue;
                 }
+                if interval_ms == 0 || (batch_enabled && batch_limit <= 0) {
+                    crate::background_error!(
+                        "archive_mover_invalid_config",
+                        Error,
+                        worker,
+                        interval_ms,
+                        batch_limit,
+                        "Archive mover disabled due to invalid config"
+                    );
+                    continue;
+                }
+
                 let storage = self.storage.clone();
-                let shutdown_token = self.shutdown_token.clone();
-                let grace = self.config.batch_archive_cancel_grace_secs;
-                tokio::spawn(async move {
-                    // Misconfiguration guard: interval 0 would busy-loop the
-                    // DB, and per_tick <= 0 defeats "bounded per tick"
-                    // (Postgres treats LIMIT -1 as unlimited). Disable the
-                    // worker loudly rather than run it dangerously.
-                    if interval_ms == 0 || per_tick <= 0 {
-                        crate::background_error!(
-                            "archive_mover_invalid_config",
-                            Error,
-                            worker,
-                            interval_ms,
-                            per_tick,
-                            "Batch-archive mover disabled due to invalid config"
-                        );
-                        return;
-                    }
-                    tracing::info!(worker, interval_ms, per_tick, "Batch-archive mover started");
+                let shutdown = self.shutdown_token.clone();
+                let policy = retention_policy.clone();
+                let tick = ArchiveMoverTick {
+                    worker,
+                    batch_enabled,
+                    batchless_enabled,
+                    batch_limit,
+                    batch_concurrency,
+                    batch_dwell_secs,
+                    batchless_dwell_secs: self.config.batch_archive_sweep_dwell_secs,
+                    cancel_grace_secs: self.config.batch_archive_cancel_grace_secs,
+                    batchless_group_limit: self
+                        .retention_maintenance
+                        .batchless_archive_groups_per_tick(),
+                    batchless_byte_limit: self
+                        .retention_maintenance
+                        .batchless_archive_bytes_per_tick(),
+                };
+                let handle = tokio::spawn(async move {
+                    tracing::info!(
+                        worker,
+                        interval_ms,
+                        batch_enabled,
+                        batchless_enabled,
+                        "Archive mover started"
+                    );
                     loop {
                         tokio::select! {
                             _ = tokio::time::sleep(Duration::from_millis(interval_ms)) => {},
-                            _ = shutdown_token.cancelled() => {
-                                tracing::info!(worker, "Shutting down archive mover");
-                                break;
-                            }
+                            _ = shutdown.cancelled() => break,
                         }
-
-                        // Bounded work per tick (orphan-purge pattern) —
-                        // never drain-until-empty, so the mover can never
-                        // monopolize its loop or the database.
-                        let ids = match storage
-                            .list_archivable_batches(per_tick, true, grace, dwell)
-                            .await
-                        {
-                            Ok(ids) => ids,
-                            Err(e) => {
-                                crate::background_error!("archive_list_failed", Error, error = %e, "Failed to list archivable batches");
-                                continue;
-                            }
-                        };
-
-                        // Moves run in waves of `concurrency`: per-move cost
-                        // is dominated by fixed transaction overhead on small
-                        // batches, so concurrent moves — safe because the
-                        // batch lock is taken SKIP LOCKED — are what raise
-                        // throughput. An error stops further waves this tick;
-                        // the next tick retries (the queue is the data).
-                        let mut abort_tick = false;
-                        for wave in ids.chunks(concurrency.max(1)) {
-                            if shutdown_token.is_cancelled() {
-                                return;
-                            }
-                            if abort_tick {
-                                break;
-                            }
-                            let results = futures::future::join_all(wave.iter().map(|batch_id| {
-                                let storage = storage.clone();
-                                async move {
-                                    let started = std::time::Instant::now();
-                                    let result = storage.archive_batch(*batch_id).await;
-                                    // Elapsed measured HERE, inside the future:
-                                    // after join_all it would include waiting
-                                    // for slower wave-mates.
-                                    (*batch_id, started.elapsed(), result)
-                                }
-                            }))
-                            .await;
-                            for (batch_id, elapsed, result) in results {
-                                match result {
-                                    Ok(ArchiveOutcome::Archived { rows }) => {
-                                        counter!("fusillade_archive_moves_total", "worker" => worker, "outcome" => "archived").increment(1);
-                                        counter!("fusillade_archive_moved_rows_total", "worker" => worker).increment(rows);
-                                        histogram!("fusillade_archive_move_duration_seconds", "worker" => worker)
-                                            .record(elapsed.as_secs_f64());
-                                    }
-                                    Ok(outcome) => {
-                                        let label = match outcome {
-                                            ArchiveOutcome::Archived { .. } => unreachable!(),
-                                            ArchiveOutcome::SkippedNotFound => "skipped_not_found",
-                                            ArchiveOutcome::SkippedNotLive => "skipped_not_live",
-                                            ArchiveOutcome::SkippedNotFrozen => {
-                                                "skipped_not_frozen"
-                                            }
-                                            ArchiveOutcome::SkippedNoPartition => {
-                                                "skipped_no_partition"
-                                            }
-                                            ArchiveOutcome::SkippedResponseSteps => {
-                                                "skipped_response_steps"
-                                            }
-                                            ArchiveOutcome::SkippedRetryRaced => {
-                                                "skipped_retry_raced"
-                                            }
-                                        };
-                                        counter!("fusillade_archive_moves_total", "worker" => worker, "outcome" => label).increment(1);
-                                        if outcome == ArchiveOutcome::SkippedNoPartition {
-                                            // The one alert-worthy skip: the
-                                            // partition runway failed. The batch
-                                            // stays live and fully served.
-                                            crate::background_error!("archive_partition_missing", Error, batch_id = %batch_id, "Archive partition missing for batch bucket");
-                                        }
-                                    }
-                                    Err(e) => {
-                                        // One error per tick: a wave-wide DB
-                                        // failure would otherwise emit
-                                        // `concurrency` copies every tick.
-                                        if !abort_tick {
-                                            crate::background_error!("archive_move_failed", Error, error = %e, batch_id = %batch_id, "Failed to archive batch");
-                                        }
-                                        abort_tick = true;
-                                    }
-                                }
-                            }
-                        }
-
-                        if let Ok(backlog) = storage.count_archivable_batches(grace).await {
-                            gauge!("fusillade_archive_backlog").set(backlog as f64);
-                        }
+                        run_archive_mover_tick(
+                            storage.clone(),
+                            &shutdown,
+                            query_timeout,
+                            &policy,
+                            tick,
+                        )
+                        .await;
                     }
                 });
+                daemon_handles.push((worker, handle));
             }
         }
 
@@ -2387,7 +2816,8 @@ where
             let interval_ms = self.config.batch_finalizer_interval_ms;
             let cancelled_grace = self.config.batch_finalizer_cancelled_grace_secs;
             let cancelled_per_tick = self.config.batch_finalizer_cancelled_per_tick;
-            tokio::spawn(async move {
+            let query_timeout = Duration::from_millis(self.config.claim_query_timeout_ms);
+            let handle = tokio::spawn(async move {
                 // Misconfiguration guard, same rationale as the archive mover:
                 // interval 0 busy-loops, per_tick <= 0 unbounds the LIMIT.
                 if interval_ms == 0 || cancelled_per_tick <= 0 {
@@ -2410,26 +2840,39 @@ where
                         }
                     }
 
-                    match storage.finalize_terminal_batches().await {
-                        Ok(n) if n > 0 => {
+                    match maintenance_query(
+                        &shutdown_token,
+                        "terminal batch finalization",
+                        query_timeout,
+                        storage.finalize_terminal_batches(),
+                    )
+                    .await
+                    {
+                        Ok(Some(n)) if n > 0 => {
                             counter!("fusillade_finalized_batches_total", "kind" => "terminal")
                                 .increment(n as u64);
                         }
-                        Ok(_) => {}
+                        Ok(Some(_)) => {}
+                        Ok(None) => return,
                         Err(e) => {
                             crate::background_error!("finalize_terminal_failed", Error, error = %e, "Failed to finalize terminal batches");
                         }
                     }
 
-                    match storage
-                        .finalize_cancelled_batches(cancelled_grace, cancelled_per_tick)
-                        .await
+                    match maintenance_query(
+                        &shutdown_token,
+                        "cancelled batch finalization",
+                        query_timeout,
+                        storage.finalize_cancelled_batches(cancelled_grace, cancelled_per_tick),
+                    )
+                    .await
                     {
-                        Ok(n) if n > 0 => {
+                        Ok(Some(n)) if n > 0 => {
                             counter!("fusillade_finalized_batches_total", "kind" => "cancelled")
                                 .increment(n as u64);
                         }
-                        Ok(_) => {}
+                        Ok(Some(_)) => {}
+                        Ok(None) => return,
                         Err(e) => {
                             crate::background_error!("finalize_cancelled_failed", Error, error = %e, "Failed to finalize cancelled batches");
                         }
@@ -2439,11 +2882,19 @@ where
                     // archive loops are config-gated OFF by default and may
                     // not be running): sustained nonzero = batches stuck on
                     // the recount path, unable to archive.
-                    if let Ok(unfrozen) = storage.count_unfrozen_terminal_batches().await {
+                    if let Ok(Some(unfrozen)) = maintenance_query(
+                        &shutdown_token,
+                        "unfrozen terminal batch count",
+                        query_timeout,
+                        storage.count_unfrozen_terminal_batches(),
+                    )
+                    .await
+                    {
                         gauge!("fusillade_unfrozen_terminal_batches").set(unfrozen as f64);
                     }
                 }
             });
+            daemon_handles.push(("batch_finalizer", handle));
         }
 
         for claim_loop_kind in claim_loop_kinds {
@@ -2497,26 +2948,25 @@ where
             }
         };
         claim_daemons.abort_all();
+        while let Some(result) = claim_daemons.join_next().await {
+            if let Err(error) = result
+                && !error.is_cancelled()
+            {
+                crate::background_error!(
+                    "claim_daemon_shutdown_failed",
+                    Critical,
+                    error = %error,
+                    "Claim daemon failed while draining after abort"
+                );
+            }
+        }
         self.shutdown_token.cancel();
 
-        // Destructive maintenance must be fully stopped before this daemon is
-        // marked dead or its run future returns.
-        if let Some(retention_handle) = retention_handle
-            && let Err(error) = retention_handle.await
-        {
-            crate::background_error!(
-                "retention_task_panicked",
-                Critical,
-                error = %error,
-                "Retention sweep task panicked"
-            );
-        }
-
-        // Wait for heartbeat task to complete (it will mark daemon as dead)
-        tracing::info!("Waiting for heartbeat task to complete");
-        if let Err(e) = heartbeat_handle.await {
-            crate::background_error!("heartbeat_task_panicked", Critical, error = %e, "Heartbeat task panicked");
-        }
+        // Every child cooperates with the shared token. Join them concurrently
+        // so one panic is reported without preventing healthy siblings from
+        // completing their shutdown path. The heartbeat child marks the
+        // daemon record dead before it returns.
+        let _child_panics = await_daemon_handles(daemon_handles).await;
 
         run_result
     }
@@ -2603,6 +3053,168 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct FakeMaintenanceStorage {
+        weekly_calls: AtomicUsize,
+        retained_calls: AtomicUsize,
+        batch_list_calls: AtomicUsize,
+        batch_move_calls: AtomicUsize,
+        batchless_calls: AtomicUsize,
+        batchless_cutoffs: std::sync::Mutex<Vec<RetainedResponseArchiveCutoffs>>,
+        fail_weekly: std::sync::atomic::AtomicBool,
+        fail_retained: std::sync::atomic::AtomicBool,
+        fail_batch_list: std::sync::atomic::AtomicBool,
+        fail_batch_move: std::sync::atomic::AtomicBool,
+        batch_candidates: AtomicUsize,
+        events: std::sync::Mutex<Vec<&'static str>>,
+    }
+
+    impl FakeMaintenanceStorage {
+        fn fail() -> FusilladeError {
+            FusilladeError::Other(anyhow::anyhow!("injected maintenance failure"))
+        }
+
+        fn record(&self, event: &'static str) {
+            self.events.lock().unwrap().push(event);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl DaemonStorage for FakeMaintenanceStorage {
+        async fn persist_daemon<T: DaemonState + Clone>(
+            &self,
+            _record: &DaemonRecord<T>,
+        ) -> Result<()>
+        where
+            AnyDaemonRecord: From<DaemonRecord<T>>,
+        {
+            Ok(())
+        }
+
+        async fn get_daemon(&self, _daemon_id: DaemonId) -> Result<AnyDaemonRecord> {
+            Err(Self::fail())
+        }
+
+        async fn list_daemons(
+            &self,
+            _status_filter: Option<DaemonStatus>,
+        ) -> Result<Vec<AnyDaemonRecord>> {
+            Ok(Vec::new())
+        }
+
+        async fn purge_orphaned_rows(&self, _batch_size: i64) -> Result<u64> {
+            Ok(0)
+        }
+
+        fn supports_retention_sweeps(&self) -> bool {
+            true
+        }
+
+        async fn archive_terminal_batchless_responses(
+            &self,
+            _policy: &RetentionSweepPolicy,
+            cutoffs: &RetainedResponseArchiveCutoffs,
+            _max_groups: i64,
+            _max_bytes: i64,
+        ) -> Result<crate::RetainedResponseArchiveOutcome> {
+            self.batchless_calls.fetch_add(1, Ordering::SeqCst);
+            self.batchless_cutoffs.lock().unwrap().push(*cutoffs);
+            self.record("batchless_move");
+            Ok(crate::RetainedResponseArchiveOutcome::default())
+        }
+
+        async fn ensure_retained_response_partitions(
+            &self,
+            _policy: &RetentionSweepPolicy,
+            _days_ahead: i32,
+        ) -> Result<(i64, i64)> {
+            self.retained_calls.fetch_add(1, Ordering::SeqCst);
+            self.record("retained_runway");
+            if self.fail_retained.load(Ordering::SeqCst) {
+                Err(Self::fail())
+            } else {
+                Ok((0, 7))
+            }
+        }
+
+        async fn archive_batch(&self, _batch_id: BatchId) -> Result<ArchiveOutcome> {
+            self.batch_move_calls.fetch_add(1, Ordering::SeqCst);
+            self.record("batch_move");
+            if self.fail_batch_move.load(Ordering::SeqCst) {
+                Err(Self::fail())
+            } else {
+                Ok(ArchiveOutcome::Archived { rows: 1 })
+            }
+        }
+
+        async fn list_archivable_batches(
+            &self,
+            _limit: i64,
+            _oldest_first: bool,
+            _cancel_grace_secs: f64,
+            _min_frozen_age_secs: f64,
+        ) -> Result<Vec<BatchId>> {
+            self.batch_list_calls.fetch_add(1, Ordering::SeqCst);
+            self.record("batch_list");
+            if self.fail_batch_list.load(Ordering::SeqCst) {
+                return Err(Self::fail());
+            }
+            Ok((0..self.batch_candidates.load(Ordering::SeqCst))
+                .map(|_| BatchId::from(uuid::Uuid::new_v4()))
+                .collect())
+        }
+
+        async fn count_archivable_batches(&self, _cancel_grace_secs: f64) -> Result<i64> {
+            Ok(0)
+        }
+
+        async fn count_unfrozen_terminal_batches(&self) -> Result<i64> {
+            Ok(0)
+        }
+
+        async fn finalize_terminal_batches(&self) -> Result<i64> {
+            Ok(0)
+        }
+
+        async fn finalize_cancelled_batches(&self, _grace_secs: f64, _limit: i64) -> Result<i64> {
+            Ok(0)
+        }
+
+        async fn ensure_archive_partitions(&self, _weeks_ahead: i32) -> Result<(i64, i64)> {
+            self.weekly_calls.fetch_add(1, Ordering::SeqCst);
+            self.record("weekly_runway");
+            if self.fail_weekly.load(Ordering::SeqCst) {
+                Err(Self::fail())
+            } else {
+                Ok((0, 4))
+            }
+        }
+
+        async fn purge_model_filter_events(
+            &self,
+            _batch_size: i64,
+            _keep_per_model: i64,
+            _retention_secs: f64,
+        ) -> Result<u64> {
+            Ok(0)
+        }
+    }
+
+    fn mover_tick(batch_enabled: bool, batchless_enabled: bool) -> ArchiveMoverTick {
+        ArchiveMoverTick {
+            worker: "test",
+            batch_enabled,
+            batchless_enabled,
+            batch_limit: 1,
+            batch_concurrency: 1,
+            batch_dwell_secs: 1.0,
+            batchless_dwell_secs: 1.0,
+            cancel_grace_secs: 1.0,
+            batchless_group_limit: 1,
+            batchless_byte_limit: 1,
+        }
+    }
+
     #[test]
     fn claim_failure_backoff_grows_exponentially_and_caps() {
         assert_eq!(claim_failure_backoff(1, 1000), Duration::from_millis(2_000));
@@ -2631,27 +3243,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn retention_startup_rejects_an_unsupported_storage_backend() {
-        let config = DaemonConfig {
-            retention: crate::RetentionSweepPolicy {
-                expire_files: true,
-                ..Default::default()
-            },
-            retention_sweep_interval_ms: 1_000,
-            ..Default::default()
-        };
-
-        let error = validate_retention_startup(&config, false)
-            .expect_err("enabled retention must fail closed on an unsupported backend");
-        assert!(
-            error
-                .to_string()
-                .contains("storage backend does not support")
-        );
-        assert!(validate_retention_startup(&config, true).is_ok());
-    }
-
     #[tokio::test]
     async fn destructive_maintenance_future_is_cancelled_on_shutdown() {
         let shutdown = tokio_util::sync::CancellationToken::new();
@@ -2664,6 +3255,222 @@ mod tests {
         .await
         .expect("shutdown-aware maintenance should return promptly");
         assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn maintenance_query_is_bounded_by_timeout() {
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let error = maintenance_query(
+            &shutdown,
+            "test maintenance query",
+            Duration::from_millis(1),
+            std::future::pending::<Result<()>>(),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("timed out"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn archive_partition_maintenance_runs_initially_then_daily() {
+        let storage = Arc::new(FakeMaintenanceStorage::default());
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let policy = configured_batchless_maintenance().policy().clone();
+
+        assert!(
+            run_archive_partition_maintenance_tick(
+                storage.as_ref(),
+                &shutdown,
+                Duration::from_secs(1),
+                4,
+                &policy,
+                7,
+            )
+            .await
+        );
+        let handle = tokio::spawn(run_archive_partition_maintenance_loop(
+            storage.clone(),
+            shutdown.clone(),
+            Duration::from_secs(1),
+            4,
+            policy,
+            7,
+            Duration::from_secs(86_400),
+        ));
+
+        tokio::task::yield_now().await;
+        assert_eq!(storage.weekly_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(storage.retained_calls.load(Ordering::SeqCst), 1);
+        tokio::time::advance(Duration::from_secs(86_399)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(storage.retained_calls.load(Ordering::SeqCst), 1);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(storage.weekly_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(storage.retained_calls.load(Ordering::SeqCst), 2);
+
+        shutdown.cancel();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn daily_partition_phases_are_independent() {
+        let storage = FakeMaintenanceStorage::default();
+        storage.fail_weekly.store(true, Ordering::SeqCst);
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let policy = configured_batchless_maintenance().policy().clone();
+
+        assert!(
+            run_archive_partition_maintenance_tick(
+                &storage,
+                &shutdown,
+                Duration::from_secs(1),
+                4,
+                &policy,
+                7,
+            )
+            .await,
+            "weekly partition failure must not suppress the retained runway"
+        );
+        assert_eq!(storage.weekly_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(storage.retained_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn request_only_topology_performs_no_archive_ddl_or_movement() {
+        let storage = FakeMaintenanceStorage::default();
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let policy = configured_batchless_maintenance().policy().clone();
+        let kinds =
+            claim_loop_kinds_for_mode(DaemonMode::RequestOnly, true, true, true, true).unwrap();
+
+        let ready = initialize_archive_maintenance_if_owner(
+            owns_archive_maintenance(&kinds),
+            &storage,
+            &shutdown,
+            Duration::from_secs(1),
+            4,
+            &policy,
+            7,
+        )
+        .await;
+
+        assert_eq!(ready, None);
+        assert_eq!(storage.weekly_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(storage.retained_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(storage.batch_list_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(storage.batchless_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn mover_phases_are_independent_and_runway_happens_first() {
+        let storage = Arc::new(FakeMaintenanceStorage::default());
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let policy = configured_batchless_maintenance().policy().clone();
+
+        assert!(
+            run_archive_partition_maintenance_tick(
+                storage.as_ref(),
+                &shutdown,
+                Duration::from_secs(1),
+                4,
+                &policy,
+                7,
+            )
+            .await
+        );
+        storage.fail_batch_list.store(true, Ordering::SeqCst);
+        run_archive_mover_tick(
+            storage.clone(),
+            &shutdown,
+            Duration::from_secs(1),
+            &policy,
+            mover_tick(true, true),
+        )
+        .await;
+        assert_eq!(storage.batchless_calls.load(Ordering::SeqCst), 1);
+
+        storage.fail_batch_list.store(false, Ordering::SeqCst);
+        storage.fail_batch_move.store(true, Ordering::SeqCst);
+        storage.batch_candidates.store(1, Ordering::SeqCst);
+        run_archive_mover_tick(
+            storage.clone(),
+            &shutdown,
+            Duration::from_secs(1),
+            &policy,
+            mover_tick(true, true),
+        )
+        .await;
+        assert_eq!(storage.batch_move_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(storage.batchless_calls.load(Ordering::SeqCst), 2);
+
+        let events = storage.events.lock().unwrap();
+        let runway = events
+            .iter()
+            .position(|event| *event == "retained_runway")
+            .unwrap();
+        let first_move = events
+            .iter()
+            .position(|event| *event == "batchless_move")
+            .unwrap();
+        assert!(runway < first_move);
+    }
+
+    #[tokio::test]
+    async fn backfill_tick_uses_the_shared_batchless_dwell_cutoff() {
+        let storage = Arc::new(FakeMaintenanceStorage::default());
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let policy = configured_batchless_maintenance().policy().clone();
+        let mut tick = mover_tick(true, true);
+        tick.worker = "backfill";
+        tick.batch_dwell_secs = 0.0;
+        tick.batchless_dwell_secs = 37.0;
+
+        run_archive_mover_tick(
+            storage.clone(),
+            &shutdown,
+            Duration::from_secs(1),
+            &policy,
+            tick,
+        )
+        .await;
+
+        let cutoffs = storage.batchless_cutoffs.lock().unwrap();
+        assert_eq!(cutoffs.len(), 1);
+        assert_eq!(
+            cutoffs[0]
+                .observed_at()
+                .signed_duration_since(cutoffs[0].terminal_before()),
+            chrono::Duration::seconds(37)
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_awaits_every_maintenance_sibling_and_reports_panics() {
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let completed = Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::new();
+        for worker in ["purge", "daily"] {
+            let shutdown = shutdown.clone();
+            let completed = completed.clone();
+            handles.push((
+                worker,
+                tokio::spawn(async move {
+                    shutdown.cancelled().await;
+                    tokio::task::yield_now().await;
+                    completed.fetch_add(1, Ordering::SeqCst);
+                }),
+            ));
+        }
+        handles.push((
+            "mover",
+            tokio::spawn(async move { panic!("injected maintenance panic") }),
+        ));
+
+        shutdown.cancel();
+        let panics = await_daemon_handles(handles).await;
+        assert_eq!(panics, 1);
+        assert_eq!(completed.load(Ordering::SeqCst), 2);
     }
 
     #[test]
@@ -2717,6 +3524,291 @@ mod tests {
         // the gate is optional there.
         assert!(adaptive_concurrency_permitted(false, false));
         assert!(adaptive_concurrency_permitted(false, true));
+    }
+
+    #[test]
+    fn effective_claim_topology_selects_exactly_one_archive_owner() {
+        for (kinds, owns_archive) in [
+            (vec![ClaimLoopKind::Request], false),
+            (
+                vec![ClaimLoopKind::Request, ClaimLoopKind::BackgroundRequest],
+                false,
+            ),
+            (vec![ClaimLoopKind::Batch], true),
+            (vec![ClaimLoopKind::Request, ClaimLoopKind::Batch], true),
+            (
+                vec![
+                    ClaimLoopKind::Request,
+                    ClaimLoopKind::Batch,
+                    ClaimLoopKind::BackgroundRequest,
+                    ClaimLoopKind::BackgroundBatch,
+                ],
+                true,
+            ),
+        ] {
+            assert_eq!(owns_archive_maintenance(&kinds), owns_archive);
+        }
+    }
+
+    fn configured_batchless_maintenance() -> RetentionMaintenanceConfig {
+        RetentionMaintenanceConfig::new(crate::RetentionSweepPolicy {
+            batchless_seconds_by_service_tier: HashMap::from([("flex".to_owned(), 60)]),
+            max_late_writer_seconds: Some(600),
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn retention_startup_validation_is_fail_closed_and_owner_aware() {
+        let mut config =
+            RetentionMaintenanceConfig::default().with_batchless_archive_sweep_enabled(true);
+        assert!(
+            validate_retention_startup(
+                &config,
+                DaemonMode::Both,
+                true,
+                true,
+                1,
+                1,
+                ArchiveMovementWindows::new(0.0, 600.0),
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("batchless retention policy")
+        );
+
+        config = configured_batchless_maintenance();
+        config = config
+            .with_batchless_archive_sweep_enabled(true)
+            .with_batchless_archive_limits(0, 1);
+        assert!(
+            validate_retention_startup(
+                &config,
+                DaemonMode::Both,
+                true,
+                true,
+                1,
+                1,
+                ArchiveMovementWindows::new(0.0, 600.0),
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("group and byte budgets")
+        );
+
+        config = config.with_batchless_archive_limits(1, 0);
+        assert!(
+            validate_retention_startup(
+                &config,
+                DaemonMode::Both,
+                true,
+                true,
+                1,
+                1,
+                ArchiveMovementWindows::new(0.0, 600.0),
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("group and byte budgets")
+        );
+
+        config = config
+            .with_batchless_archive_limits(1, 1)
+            .with_retained_response_partitions_days_ahead(0)
+            .with_batchless_archive_sweep_enabled(false);
+        assert!(
+            validate_retention_startup(
+                &config,
+                DaemonMode::RequestOnly,
+                false,
+                false,
+                1,
+                1,
+                ArchiveMovementWindows::new(0.0, 600.0),
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("partition runway")
+        );
+
+        config = config.with_retained_response_partitions_days_ahead(1);
+        assert!(
+            validate_retention_startup(
+                &config,
+                DaemonMode::RequestOnly,
+                false,
+                false,
+                1,
+                1,
+                ArchiveMovementWindows::new(0.0, 600.0),
+            )
+            .is_ok()
+        );
+
+        config = config.with_batchless_archive_backfill_enabled(true);
+        assert!(
+            validate_retention_startup(
+                &config,
+                DaemonMode::RequestOnly,
+                false,
+                false,
+                1,
+                1,
+                ArchiveMovementWindows::new(0.0, 30.0),
+            )
+            .is_ok(),
+            "an intentional request-only process must ignore shared maintenance controls"
+        );
+        assert!(
+            validate_retention_startup(
+                &config,
+                DaemonMode::Both,
+                false,
+                false,
+                1,
+                1,
+                ArchiveMovementWindows::new(0.0, 30.0),
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("batch-capable archive owner")
+        );
+        assert!(
+            validate_retention_startup(
+                &config,
+                DaemonMode::Both,
+                true,
+                true,
+                1,
+                1,
+                ArchiveMovementWindows::new(0.0, 30.0),
+            )
+            .is_ok()
+        );
+
+        let retirement_without_policy =
+            RetentionMaintenanceConfig::default().with_retained_response_retirement_enabled(true);
+        assert!(
+            validate_retention_startup(
+                &retirement_without_policy,
+                DaemonMode::Both,
+                true,
+                true,
+                1,
+                1,
+                ArchiveMovementWindows::new(0.0, 600.0),
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("batchless retention policy")
+        );
+    }
+
+    #[test]
+    fn scheduled_file_and_batch_retention_are_rejected_until_supported() {
+        for policy in [
+            crate::RetentionSweepPolicy {
+                expire_files: true,
+                ..Default::default()
+            },
+            crate::RetentionSweepPolicy {
+                terminal_batch_seconds: Some(60),
+                ..Default::default()
+            },
+        ] {
+            let error = validate_retention_startup(
+                &RetentionMaintenanceConfig::new(policy),
+                DaemonMode::BatchOnly,
+                true,
+                true,
+                1,
+                1,
+                ArchiveMovementWindows::new(0.0, 0.0),
+            )
+            .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("file and batch retention is not supported")
+            );
+        }
+
+        let shared_request_only_config =
+            RetentionMaintenanceConfig::new(crate::RetentionSweepPolicy {
+                expire_files: true,
+                terminal_batch_seconds: Some(60),
+                ..Default::default()
+            });
+        assert!(
+            validate_retention_startup(
+                &shared_request_only_config,
+                DaemonMode::RequestOnly,
+                false,
+                false,
+                0,
+                0,
+                ArchiveMovementWindows::new(0.0, 0.0),
+            )
+            .is_ok(),
+            "an intentional request-only process must ignore shared lifecycle capabilities"
+        );
+    }
+
+    #[test]
+    fn movement_windows_must_leave_time_before_retention_expiry() {
+        let sweep = configured_batchless_maintenance()
+            .with_batchless_archive_sweep_enabled(true)
+            .with_batchless_archive_limits(1, 1);
+
+        for (dwell, grace, expected) in [
+            (60.0, 1.0, "sweep dwell"),
+            (f64::NAN, 1.0, "sweep dwell"),
+            (0.0, 60.0, "cancellation grace"),
+            (0.0, f64::INFINITY, "cancellation grace"),
+        ] {
+            let error = validate_retention_startup(
+                &sweep,
+                DaemonMode::Both,
+                true,
+                true,
+                1,
+                1,
+                ArchiveMovementWindows::new(dwell, grace),
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains(expected), "{error}");
+        }
+
+        assert!(
+            validate_retention_startup(
+                &sweep,
+                DaemonMode::Both,
+                true,
+                true,
+                1,
+                1,
+                ArchiveMovementWindows::new(59.0, 59.0),
+            )
+            .is_ok()
+        );
+
+        let backfill = configured_batchless_maintenance()
+            .with_batchless_archive_backfill_enabled(true)
+            .with_batchless_archive_limits(1, 1);
+        assert!(
+            validate_retention_startup(
+                &backfill,
+                DaemonMode::Both,
+                true,
+                true,
+                1,
+                1,
+                ArchiveMovementWindows::new(60.0, 1.0),
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("sweep dwell")
+        );
     }
 
     #[test]
@@ -2843,6 +3935,28 @@ mod tests {
     #[test]
     fn default_claim_query_timeout_is_three_minutes() {
         assert_eq!(DaemonConfig::default().claim_query_timeout_ms, 180_000);
+    }
+
+    #[test]
+    fn enabled_daemon_intervals_must_be_positive_before_tasks_spawn() {
+        let mutations: [fn(&mut DaemonConfig); 4] = [
+            |config: &mut DaemonConfig| config.heartbeat_interval_ms = 0,
+            |config: &mut DaemonConfig| config.cancellation_poll_interval_ms = 0,
+            |config: &mut DaemonConfig| config.status_log_interval_ms = Some(0),
+            |config: &mut DaemonConfig| config.throughput_log_interval_ms = Some(0),
+        ];
+        for mutate in mutations {
+            let mut config = DaemonConfig::default();
+            mutate(&mut config);
+            assert!(validate_daemon_intervals(&config).is_err());
+        }
+
+        let config = DaemonConfig {
+            status_log_interval_ms: None,
+            throughput_log_interval_ms: None,
+            ..Default::default()
+        };
+        assert!(validate_daemon_intervals(&config).is_ok());
     }
 
     #[tokio::test]

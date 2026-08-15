@@ -162,6 +162,116 @@ impl DaemonMode {
     }
 }
 
+/// Additive controls for retained-response maintenance.
+///
+/// This configuration is installed with [`super::Daemon::with_retention_maintenance`]
+/// so existing exhaustive [`DaemonConfig`] literals remain source compatible.
+/// The policy carries no implicit retention duration and every destructive
+/// action is disabled by default.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetentionMaintenanceConfig {
+    policy: crate::RetentionSweepPolicy,
+    batchless_archive_sweep_enabled: bool,
+    batchless_archive_backfill_enabled: bool,
+    batchless_archive_groups_per_tick: i64,
+    batchless_archive_bytes_per_tick: i64,
+    retained_response_partitions_days_ahead: i32,
+    retained_response_retirement_enabled: bool,
+}
+
+impl Default for RetentionMaintenanceConfig {
+    fn default() -> Self {
+        Self {
+            policy: crate::RetentionSweepPolicy::default(),
+            batchless_archive_sweep_enabled: false,
+            batchless_archive_backfill_enabled: false,
+            batchless_archive_groups_per_tick: 4,
+            batchless_archive_bytes_per_tick: 64 * 1_024 * 1_024,
+            retained_response_partitions_days_ahead: 7,
+            retained_response_retirement_enabled: false,
+        }
+    }
+}
+
+impl RetentionMaintenanceConfig {
+    /// Create disabled maintenance controls for an explicit retention policy.
+    pub fn new(policy: crate::RetentionSweepPolicy) -> Self {
+        Self {
+            policy,
+            ..Self::default()
+        }
+    }
+
+    /// Enable or disable steady movement of newly terminal batchless graphs.
+    pub fn with_batchless_archive_sweep_enabled(mut self, enabled: bool) -> Self {
+        self.batchless_archive_sweep_enabled = enabled;
+        self
+    }
+
+    /// Enable or disable historical batchless archive movement.
+    pub fn with_batchless_archive_backfill_enabled(mut self, enabled: bool) -> Self {
+        self.batchless_archive_backfill_enabled = enabled;
+        self
+    }
+
+    /// Set the complete-graph and retained-payload byte bounds per mover tick.
+    pub fn with_batchless_archive_limits(mut self, max_groups: i64, max_bytes: i64) -> Self {
+        self.batchless_archive_groups_per_tick = max_groups;
+        self.batchless_archive_bytes_per_tick = max_bytes;
+        self
+    }
+
+    /// Set the daily retained-response partition runway.
+    pub fn with_retained_response_partitions_days_ahead(mut self, days_ahead: i32) -> Self {
+        self.retained_response_partitions_days_ahead = days_ahead;
+        self
+    }
+
+    /// Set the independently gated retirement control.
+    ///
+    /// This release validates and carries the control but does not schedule
+    /// retained-response retirement.
+    pub fn with_retained_response_retirement_enabled(mut self, enabled: bool) -> Self {
+        self.retained_response_retirement_enabled = enabled;
+        self
+    }
+
+    /// Return the operator-supplied retention policy.
+    pub fn policy(&self) -> &crate::RetentionSweepPolicy {
+        &self.policy
+    }
+
+    /// Whether steady batchless archive movement is enabled.
+    pub fn batchless_archive_sweep_enabled(&self) -> bool {
+        self.batchless_archive_sweep_enabled
+    }
+
+    /// Whether historical batchless archive movement is enabled.
+    pub fn batchless_archive_backfill_enabled(&self) -> bool {
+        self.batchless_archive_backfill_enabled
+    }
+
+    /// Maximum complete response graphs moved per tick.
+    pub fn batchless_archive_groups_per_tick(&self) -> i64 {
+        self.batchless_archive_groups_per_tick
+    }
+
+    /// Maximum retained payload bytes moved per tick.
+    pub fn batchless_archive_bytes_per_tick(&self) -> i64 {
+        self.batchless_archive_bytes_per_tick
+    }
+
+    /// Number of future daily retained-response partitions to ensure.
+    pub fn retained_response_partitions_days_ahead(&self) -> i32 {
+        self.retained_response_partitions_days_ahead
+    }
+
+    /// Whether the reserved retained-response retirement control is enabled.
+    pub fn retained_response_retirement_enabled(&self) -> bool {
+        self.retained_response_retirement_enabled
+    }
+}
+
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct DaemonConfig {
     /// Claim-loop mode for this daemon process.
@@ -335,14 +445,6 @@ pub struct DaemonConfig {
     pub purge_interval_ms: u64,
     pub purge_batch_size: i64,
     pub purge_throttle_ms: u64,
-    /// Optional automated content-expiration rules. Empty by default: the
-    /// library never chooses retention periods for an operator.
-    #[serde(default)]
-    pub retention: crate::RetentionSweepPolicy,
-    /// Retention sweep cadence in milliseconds. Zero disables the worker.
-    /// A nonzero value requires at least one retention rule.
-    #[serde(default)]
-    pub retention_sweep_interval_ms: u64,
     /// Batch-archive sweeper (phase 3): moves frozen terminal batches' rows
     /// from `requests` into `batch_requests_archive`. OFF by default — the
     /// blue/green invariant is that deploys never move data; only flipping
@@ -615,8 +717,6 @@ impl Default for DaemonConfig {
             batch_finalizer_cancelled_per_tick: default_batch_finalizer_cancelled_per_tick(),
             purge_batch_size: 1000,
             purge_throttle_ms: 100,
-            retention: crate::RetentionSweepPolicy::default(),
-            retention_sweep_interval_ms: 0,
             throughput_log_interval_ms: Some(60_000),
             urgency_weight: 0.0,
             service_tier_completion_windows_ms: default_service_tier_completion_windows_ms(),
@@ -666,6 +766,19 @@ mod tests {
             status,
             body: body.to_string(),
         }
+    }
+
+    #[test]
+    fn retention_maintenance_defaults_are_safe_and_bounded() {
+        let config = RetentionMaintenanceConfig::default();
+
+        assert!(!config.policy.is_enabled());
+        assert!(!config.batchless_archive_sweep_enabled);
+        assert!(!config.batchless_archive_backfill_enabled);
+        assert!(!config.retained_response_retirement_enabled);
+        assert!(config.batchless_archive_groups_per_tick > 0);
+        assert!(config.batchless_archive_bytes_per_tick > 0);
+        assert!(config.retained_response_partitions_days_ahead > 0);
     }
 
     #[test]
@@ -764,37 +877,6 @@ mod tests {
         let decoded: DaemonConfig = serde_json::from_value(serialized).unwrap();
         assert!(!decoded.batch_archive_sweep_enabled);
         assert_eq!(decoded.batch_archive_partitions_weeks_ahead, 4);
-    }
-
-    #[test]
-    fn retention_defaults_off_and_explicit_rules_round_trip() {
-        let mut serialized = serde_json::to_value(DaemonConfig::default()).unwrap();
-        serialized.as_object_mut().unwrap().remove("retention");
-        serialized
-            .as_object_mut()
-            .unwrap()
-            .remove("retention_sweep_interval_ms");
-        let defaulted: DaemonConfig = serde_json::from_value(serialized).unwrap();
-        assert!(!defaulted.retention.is_enabled());
-        assert_eq!(defaulted.retention_sweep_interval_ms, 0);
-
-        let config = DaemonConfig {
-            retention: crate::RetentionSweepPolicy {
-                expire_files: true,
-                terminal_batch_seconds: Some(60),
-                batchless_seconds_by_service_tier: std::collections::HashMap::from([(
-                    "flex".to_string(),
-                    120,
-                )]),
-                max_late_writer_seconds: Some(600),
-            },
-            retention_sweep_interval_ms: 250,
-            ..DaemonConfig::default()
-        };
-        let decoded: DaemonConfig =
-            serde_json::from_value(serde_json::to_value(&config).unwrap()).unwrap();
-        assert_eq!(decoded.retention, config.retention);
-        assert_eq!(decoded.retention_sweep_interval_ms, 250);
     }
 
     #[test]

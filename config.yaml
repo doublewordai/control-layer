@@ -676,6 +676,23 @@ background_services:
     processing_timeout_ms: 600000 # Max time in "processing" state before auto-unclaim (10 minutes)
     pending_request_counts_timeout_ms: 60000 # Statement timeout for pending request count queries (1 minute)
 
+    # Retained-response lifecycle. No retention period is implied by the
+    # application defaults, and movement and retirement remain off unless
+    # explicitly enabled. Only terminal batchless response tiers are accepted
+    # for scheduled lifecycle management in this release; file and file-backed
+    # batch policies fail startup validation. Every configured tier also needs
+    # an explicit positive max_late_writer_seconds fence.
+    # retention:
+    #   batchless_seconds_by_service_tier:
+    #     flex: <seconds>
+    #   max_late_writer_seconds: <seconds>
+    # batchless_archive_sweep_enabled: false
+    # batchless_archive_backfill_enabled: false
+    # batchless_archive_groups_per_tick: <positive bound>
+    # batchless_archive_bytes_per_tick: <positive bound>
+    # retained_response_partitions_days_ahead: <positive runway>
+    # retained_response_retirement_enabled: false # Reserved; no retirement task runs yet
+
     # Batch archive (fusillade phase 3): moves frozen terminal batches' rows
     # from fusillade.requests into the partitioned batch_requests_archive.
     # BOTH movers ship DISABLED — deploys never move data, only these flags

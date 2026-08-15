@@ -283,80 +283,33 @@ inspection, or cancellation.
 
 ## Automated content retention
 
-The daemon can apply operator-defined retention rules without embedding a
-retention schedule in the library. `DaemonConfig::retention` accepts rules for
-existing file deadlines, terminal file-backed batches, and terminal
-batchless tiers. `retention_sweep_interval_ms` controls the worker
-cadence; both are disabled by default and must be enabled together.
+Retained-response maintenance is an additive daemon capability configured
+with `RetentionMaintenanceConfig`; it is deliberately outside the serialized
+`DaemonConfig` so existing exhaustive configuration literals remain source
+compatible. The default contains no retention duration and enables no data
+movement or retirement.
 
-Each sweep resolves relative periods to one set of absolute cutoffs, then:
+Current scheduled lifecycle support is limited to terminal batchless response
+graphs in the `priority`, `flex`, and `background` service tiers. Every
+configured tier needs an explicit positive duration, and batchless policy also
+requires an explicit positive late-writer fence. Scheduled file retention and
+terminal file-backed batch retention are rejected until their complete payload
+lifecycle is supported. Explicit deletion continues through the ordinary
+orphan purge and is independent of scheduled retention.
 
-- retires due files only when they are not referenced by active batches;
-- soft-deletes batches only after their terminal counters are frozen and the
-  existing `batch_archive_cancel_grace_secs` window no longer protects a
-  canceled, previously claimed request;
-- hard-deletes eligible terminal batchless requests; and
-- for a canceled request that was already dispatched, erases request,
-  response, template, and response-step content while retaining the minimal
-  lifecycle row needed to accept a late billed result. A later sweep
-  hard-deletes that row if the result supersedes the cancellation.
+The effective batch claim owner runs archive maintenance. It ensures the
+retained-response partition runway before enabling a batchless mover, then
+refreshes both archive partition families daily. Request-only daemons perform
+no archive DDL or movement. Steady and backfill movement are independently
+disabled by default and share the existing archive workers' pacing; both use
+positive graph and byte budgets. Each tick resolves one immutable observation,
+dwell, and cancellation-grace boundary for every graph considered in that
+pass. The dwell and grace must each be shorter than every enabled retention
+period.
 
-Batchless rules accept the persisted `priority`, `flex`, and `background`
-service tiers. Any unconfigured tier remains subject to explicit deletion.
-
-New request-template payloads are written to weekly partitions through a
-compatibility layer. The pre-cutover table is renamed in place and is not
-copied; it temporarily holds its existing payload rows plus content-free UUID
-routing stubs so the existing request foreign key remains valid. Bulk file
-ingest uses a set-based dual write to avoid per-template trigger overhead. A
-narrow file-to-week route keeps file reads set-oriented: each owning partition
-is range-scanned once instead of being probed once per template.
-The daily archive maintenance tick pre-creates both archive and template
-partitions.
-
-Scheduled batch content is retired by concurrently detaching and dropping a
-whole eligible archive partition. Scheduled template content is retired the
-same way once no active file, live request, or undeleted batch needs any
-payload in that weekly partition. A small journal makes an interrupted
-detach/finalize/drop sequence
-resumable. Explicit deletion remains row-targeted and does not wait for a
-partition boundary. Pre-cutover template payloads remain in their original
-generation; `request_template_legacy_retirement_ready(minimum_age)` is the
-gate for a one-time follow-up migration that drops that generation after the
-deployment retention age has elapsed and no live reference still needs it.
-
-Root selection is ordered, limited, and uses `FOR UPDATE SKIP LOCKED`. A
-nonblocking database lease prevents multiple daemon replicas from running the
-same phase concurrently. Each tick processes at most four bounded chunks so a
-backlog cannot monopolize the worker. A daemon also rejects enabled retention at startup
-unless its storage backend explicitly advertises sweep support. The
-ordinary orphan purge subsequently removes explicitly deleted request/template
-content. Scheduled archived content stays physically intact only until its
-whole weekly partition becomes eligible, avoiding row-delete churn. Aggregate
-metrics report sweep duration, affected rows by category, errors, and whether
-the current work budget was exhausted; no request identifiers or content are
-emitted.
-
-Deployments should supply their own periods and worker cadence through runtime
-configuration. Pre-create all four candidate indexes with `CONCURRENTLY` in
-each applicable environment before deploying the migration/release, following
-the statements in the retention-sweep migration. Use the application's
-component-schema `search_path` (or schema-qualify both indexes and tables), and
-verify `pg_index.indisready` and `pg_index.indisvalid` are both true for all
-four indexes. The migration uses a short lock timeout for its metadata-only
-rename and column additions. Enable the rules and worker cadence only after
-the new application generation is healthy. Keep the pre-cutover generation
-until the readiness function returns true for the configured retention age;
-the final drop is intentionally a separate deployment so it is never coupled
-to the initial cutover.
-
-The schema cutover is roll-forward-only after the first retained template is
-written: the down migration deliberately refuses to discard that data, and an
-older orphan-purge implementation cannot row-lock the compatibility union.
-Drain older daemon pods before allowing retained writes, and do not roll back
-to an older binary after that boundary. Recovery should deploy a corrected
-forward-compatible release; the initial migration can be reverted only while
-its retained generation is still empty.
+The retirement control is independently disabled and does not run a scheduled
+retirement task in this release. Movement and partition maintenance emit only
+aggregate counts and fixed phase labels, never request identifiers or content.
 
 Ordinary pending-count queries exclude background demand. To expose it, use an
 explicit `ServiceTierFilter::Include(vec![Some("background".to_string())])`; results use a
