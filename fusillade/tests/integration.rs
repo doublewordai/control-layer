@@ -1,6 +1,8 @@
 use fusillade::PostgresDaemon;
 use fusillade::batch::{BackgroundBatchInput, BatchInput, RequestTemplateInput};
-use fusillade::daemon::{DaemonConfig, ModelEscalationConfig, default_should_retry};
+use fusillade::daemon::{
+    DaemonConfig, ModelEscalationConfig, RetentionMaintenanceConfig, default_should_retry,
+};
 use fusillade::http::{HttpResponse, MockHttpClient};
 use fusillade::manager::{ModelFilter, ModelFilterState, Storage};
 use fusillade::request::{
@@ -94,6 +96,124 @@ fn call_priority(call: &fusillade::http::MockCall) -> i64 {
         ["priority"]
         .as_i64()
         .expect("daemon must inject an integer priority")
+}
+
+#[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
+async fn postgres_convenience_builder_installs_retained_response_fence(pool: sqlx::PgPool) {
+    let retention = RetentionMaintenanceConfig::new(fusillade::RetentionSweepPolicy {
+        batchless_seconds_by_service_tier: std::collections::HashMap::from([(
+            "flex".to_string(),
+            86_400,
+        )]),
+        max_late_writer_seconds: Some(7_200),
+        ..Default::default()
+    });
+    let daemon = PostgresDaemon::try_from_pools_with_retention(
+        TestDbPools::new(pool).await.unwrap(),
+        DaemonConfig::default(),
+        retention,
+    )
+    .expect("valid retention configuration must construct");
+    assert_eq!(
+        daemon.storage().retained_response_fence_seconds(),
+        Some(7_200)
+    );
+}
+
+#[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
+async fn postgres_run_rejects_invalid_structure_and_fence_before_spawning(pool: sqlx::PgPool) {
+    let config = DaemonConfig {
+        batch_archive_sweep_enabled: true,
+        batch_archive_sweep_interval_ms: 0,
+        ..Default::default()
+    };
+    let store = postgres_store(pool.clone(), &config).await;
+    let error = postgres_daemon(store, Arc::new(MockHttpClient::new()), config)
+        .run(CancellationToken::new())
+        .expect_err("invalid structural config must fail synchronously");
+    assert!(error.to_string().contains("sweep"));
+
+    let retention = RetentionMaintenanceConfig::new(fusillade::RetentionSweepPolicy {
+        batchless_seconds_by_service_tier: std::collections::HashMap::from([(
+            "flex".to_string(),
+            86_400,
+        )]),
+        max_late_writer_seconds: Some(7_200),
+        ..Default::default()
+    })
+    .with_batchless_archive_sweep_enabled(true);
+    let config = DaemonConfig::default();
+    let store = postgres_store(pool, &config).await;
+    let error = Arc::new(
+        PostgresDaemon::new(store, Arc::new(MockHttpClient::new()), config)
+            .with_retention_maintenance(retention),
+    )
+    .run(CancellationToken::new())
+    .expect_err("a mismatched store fence must fail synchronously");
+    assert!(error.to_string().contains("late-writer fence"));
+}
+
+#[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
+async fn default_claims_start_while_weekly_partition_ddl_is_blocked(pool: sqlx::PgPool) {
+    let mut blocker = pool.begin().await.expect("blocker transaction must start");
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext('ensure_archive_partitions')::bigint)")
+        .execute(&mut *blocker)
+        .await
+        .expect("weekly partition lock must be held");
+
+    let http_client = Arc::new(MockHttpClient::new());
+    http_client.add_response(
+        "POST /v1/ddl-independent",
+        Ok(HttpResponse {
+            status: 200,
+            body: r#"{"result":"claimed"}"#.to_string(),
+        }),
+    );
+    let limits = Arc::new(dashmap::DashMap::new());
+    limits.insert("ddl-independent-model".to_string(), 1);
+    let config = DaemonConfig {
+        claim_interval_ms: 10,
+        claim_batch_size: 1,
+        model_concurrency_limits: limits,
+        status_log_interval_ms: None,
+        throughput_log_interval_ms: None,
+        heartbeat_interval_ms: 10_000,
+        cancellation_poll_interval_ms: 100,
+        claim_query_timeout_ms: 5_000,
+        ..Default::default()
+    };
+    let manager = postgres_store(pool, &config).await;
+    manager
+        .create_flex(CreateFlexInput {
+            request_id: uuid::Uuid::new_v4(),
+            body: r#"{"prompt":"claim while DDL waits"}"#.to_string(),
+            model: "ddl-independent-model".to_string(),
+            endpoint: "https://api.example.com".to_string(),
+            method: "POST".to_string(),
+            path: "/v1/ddl-independent".to_string(),
+            api_key: "test-key".to_string(),
+            created_by: "ddl-independent-owner".to_string(),
+            metadata: None,
+        })
+        .await
+        .expect("request must seed");
+    mark_models_live_for_test(manager.as_ref(), &["ddl-independent-model"]).await;
+
+    let shutdown = CancellationToken::new();
+    let handle = postgres_daemon(manager, http_client.clone(), config)
+        .run(shutdown.clone())
+        .expect("default daemon structure must start");
+    tokio::time::timeout(Duration::from_secs(2), wait_for_mock_calls(&http_client, 1))
+        .await
+        .expect("claim loop must not await the blocked weekly DDL");
+
+    blocker.rollback().await.expect("blocker must release");
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(5), handle)
+        .await
+        .expect("daemon must stop")
+        .expect("daemon task must not panic")
+        .expect("daemon must stop cleanly");
 }
 
 #[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]

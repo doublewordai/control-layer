@@ -166,10 +166,10 @@ impl RetentionMaintenanceConfig {
         self
     }
 
-    /// Set the independently gated retirement control.
+    /// Set the reserved retirement control.
     ///
-    /// This release validates and carries the control but does not schedule
-    /// retained-response retirement.
+    /// Enabling this is rejected at startup until a later release installs a
+    /// supervised retained-response retirement consumer.
     pub fn with_retained_response_retirement_enabled(mut self, enabled: bool) -> Self {
         self.retained_response_retirement_enabled = enabled;
         self
