@@ -215,6 +215,36 @@ pub struct Config {
     /// tokenizer-svc URL, and the default pricing multipliers. See [`CacheConfig`].
     #[serde(default)]
     pub cache: CacheConfig,
+    /// PREVIEW-BRANCH SHIM — accepted and ignored.
+    ///
+    /// The shared preview environment values inject `DWCTL_CONTINUATION__*` for every
+    /// preview, but the continuation feature does not exist on this branch and config
+    /// parsing is strict, so without this field the pod rejects the unknown key at boot
+    /// and crash-loops. This tolerates the keys so the cl-1495 rehearsal env can run
+    /// without a change to the shared values on internal main (the proper fix,
+    /// internal#1403, removes the unconditional injection). This commit lives only on
+    /// `preview/usage-recompute` and must never merge to main.
+    #[serde(default)]
+    pub continuation: ContinuationShimConfig,
+}
+
+/// See [`Config::continuation`]: a tolerated, ignored stand-in for the continuation
+/// config section that this branch does not have.
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
+#[allow(dead_code)]
+pub struct ContinuationShimConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub origins: ContinuationShimOrigins,
+}
+
+/// See [`Config::continuation`].
+#[derive(Debug, Default, Clone, Deserialize, Serialize)]
+#[allow(dead_code)]
+pub struct ContinuationShimOrigins {
+    #[serde(default)]
+    pub batch: bool,
 }
 
 /// Controls exposure of the OpenAPI specs and Scalar doc UIs.
@@ -2516,6 +2546,7 @@ impl Default for Config {
             keystore: None,
             openapi: OpenApiConfig::default(),
             cache: CacheConfig::default(),
+            continuation: ContinuationShimConfig::default(),
         }
     }
 }
@@ -3165,6 +3196,26 @@ metadata:
             assert_eq!(config.metadata.region, Some("US East".to_string()));
             assert_eq!(config.metadata.organization, Some("Test Corp".to_string()));
 
+            Ok(())
+        });
+    }
+
+    /// The preview-branch shim: the exact env keys the shared preview values inject must
+    /// parse (strict config rejected them as unknown and every preview pod crash-looped).
+    #[test]
+    fn preview_continuation_env_keys_are_tolerated() {
+        Jail::expect_with(|jail| {
+            jail.create_file("test.yaml", "secret_key: hello\n")?;
+            jail.set_env("DWCTL_CONTINUATION__ENABLED", "true");
+            jail.set_env("DWCTL_CONTINUATION__ORIGINS__BATCH", "true");
+
+            let args = Args {
+                config: "test.yaml".into(),
+                validate: false,
+            };
+            let config = Config::load(&args)?;
+            assert!(config.continuation.enabled, "key accepted, not rejected as unknown");
+            assert!(config.continuation.origins.batch);
             Ok(())
         });
     }
