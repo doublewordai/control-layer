@@ -5,8 +5,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use chrono::{DateTime, NaiveDate, TimeDelta, Utc};
 use fusillade_arsenal::batch::TemplateId;
 use fusillade_arsenal::manager::{
-    RetainedResponseArchiveOutcome, RetainedResponseMaintenanceError, RetainedResponseWriteError,
-    RetentionSweepPolicy,
+    RetainedResponseArchiveCutoffs, RetainedResponseArchiveOutcome,
+    RetainedResponseMaintenanceError, RetainedResponseWriteError, RetentionSweepPolicy,
 };
 use fusillade_arsenal::postgres_response_step::{
     ResponseStepNotFound, RetainedResponseStepConflict,
@@ -29,6 +29,11 @@ use uuid::Uuid;
 
 const MODEL: &str = "retention-test-model";
 const OWNER: &str = "retention-test-owner";
+// Historical movement fixtures use a frozen observation time and a visible
+// policy offset so they always target a future partition. Exact retention
+// boundaries use `exact_policy` and compute their partition date directly.
+const FIXTURE_RETENTION_OFFSET_DAYS: i64 = 30;
+const FIXTURE_RETENTION_OFFSET_SECONDS: u64 = FIXTURE_RETENTION_OFFSET_DAYS as u64 * 86_400;
 
 #[derive(Clone, Copy)]
 enum TerminalState {
@@ -72,10 +77,11 @@ struct DiscoveryReadGatedPools {
 
 impl PoolProvider for DiscoveryReadGatedPools {
     fn read(&self) -> &PgPool {
-        // Zero-based selection 3 is the old topology read after the index,
-        // timestamp, and seed reads. With atomic discovery it is the bounded
-        // look-ahead, after the first candidate snapshot is already complete.
-        if self.read_selections.fetch_add(1, Ordering::AcqRel) == 3 {
+        // Zero-based selection 2 is the bounded look-ahead after the index
+        // readiness read and the first atomic candidate snapshot. The archive
+        // clock is supplied immutably by the caller, so it consumes no pool
+        // selection.
+        if self.read_selections.fetch_add(1, Ordering::AcqRel) == 2 {
             self.gate_requested.store(true, Ordering::Release);
             &self.gated_read
         } else {
@@ -106,7 +112,13 @@ fn timestamp(value: &str) -> DateTime<Utc> {
         .to_utc()
 }
 
-fn date(value: &str) -> NaiveDate {
+fn archive_date(value: &str) -> NaiveDate {
+    exact_date(value)
+        .checked_add_signed(TimeDelta::days(FIXTURE_RETENTION_OFFSET_DAYS))
+        .expect("fixture date offset must be valid")
+}
+
+fn exact_date(value: &str) -> NaiveDate {
     NaiveDate::parse_from_str(value, "%Y-%m-%d").expect("fixture date must be valid")
 }
 
@@ -123,6 +135,22 @@ fn collect_plan_nodes<'a>(node: &'a Value, nodes: &mut Vec<&'a serde_json::Map<S
 }
 
 fn policy(tiers: &[(&str, u64)]) -> RetentionSweepPolicy {
+    exact_policy(
+        &tiers
+            .iter()
+            .map(|(tier, seconds)| {
+                (
+                    *tier,
+                    seconds
+                        .checked_add(FIXTURE_RETENTION_OFFSET_SECONDS)
+                        .expect("fixture retention duration must be valid"),
+                )
+            })
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn exact_policy(tiers: &[(&str, u64)]) -> RetentionSweepPolicy {
     RetentionSweepPolicy {
         max_late_writer_seconds: Some(3_600),
         batchless_seconds_by_service_tier: tiers
@@ -177,7 +205,7 @@ async fn assert_wholly_erased(pool: &PgPool, graph: &LiveGraph) {
 #[sqlx::test]
 async fn erase_retained_singleton_by_request_id_removes_the_complete_graph(pool: PgPool) {
     install_candidate_index(&pool).await;
-    ensure_partition(&pool, date("2026-08-03")).await;
+    ensure_partition(&pool, archive_date("2026-08-03")).await;
     let graph = singleton(
         &pool,
         "flex",
@@ -204,7 +232,7 @@ async fn erase_retained_singleton_by_request_id_removes_the_complete_graph(pool:
 #[sqlx::test]
 async fn erase_retained_branching_graph_by_head_or_member_is_atomic(pool: PgPool) {
     install_candidate_index(&pool).await;
-    ensure_partition(&pool, date("2026-08-07")).await;
+    ensure_partition(&pool, archive_date("2026-08-07")).await;
     let graph = branching_graph(&pool, TerminalState::Completed).await;
     let manager = manager(&pool).await;
     archive(
@@ -229,7 +257,7 @@ async fn erase_retained_branching_graph_by_head_or_member_is_atomic(pool: PgPool
 #[sqlx::test]
 async fn erase_never_shortens_an_existing_fence_expiry(pool: PgPool) {
     install_candidate_index(&pool).await;
-    ensure_partition(&pool, date("2026-08-03")).await;
+    ensure_partition(&pool, archive_date("2026-08-03")).await;
     let graph = singleton(
         &pool,
         "flex",
@@ -285,8 +313,8 @@ async fn erase_never_shortens_an_existing_fence_expiry(pool: PgPool) {
 #[sqlx::test]
 async fn erase_creator_retained_groups_in_stable_bounded_units(pool: PgPool) {
     install_candidate_index(&pool).await;
-    ensure_partition(&pool, date("2026-08-03")).await;
-    ensure_partition(&pool, date("2026-08-07")).await;
+    ensure_partition(&pool, archive_date("2026-08-03")).await;
+    ensure_partition(&pool, archive_date("2026-08-07")).await;
     let branching = branching_graph(&pool, TerminalState::Completed).await;
     let singleton = singleton(
         &pool,
@@ -360,7 +388,7 @@ async fn creator_erasure_selects_the_oldest_live_graph_before_aggregation(pool: 
 #[sqlx::test]
 async fn creator_erasure_includes_attached_retiring_buckets(pool: PgPool) {
     install_candidate_index(&pool).await;
-    ensure_partition(&pool, date("2026-08-03")).await;
+    ensure_partition(&pool, archive_date("2026-08-03")).await;
     let graph = singleton(
         &pool,
         "flex",
@@ -375,8 +403,9 @@ async fn creator_erasure_includes_attached_retiring_buckets(pool: PgPool) {
         .unwrap();
     sqlx::query(
         "UPDATE retained_response_buckets SET state = 'retiring' \
-         WHERE delete_on = '2026-08-03'",
+         WHERE delete_on = $1",
     )
+    .bind(archive_date("2026-08-03"))
     .execute(&pool)
     .await
     .unwrap();
@@ -567,8 +596,8 @@ async fn request_writer_restarts_when_a_singleton_gains_a_head_while_waiting(poo
 
 #[sqlx::test]
 async fn retained_creator_seed_uses_bounded_owner_order_index_under_default_planner(pool: PgPool) {
-    ensure_partition(&pool, date("2026-08-03")).await;
-    ensure_partition(&pool, date("2026-08-07")).await;
+    ensure_partition(&pool, exact_date("2026-08-03")).await;
+    ensure_partition(&pool, exact_date("2026-08-07")).await;
 
     sqlx::query(
         r#"
@@ -595,8 +624,8 @@ async fn retained_creator_seed_uses_bounded_owner_order_index_under_default_plan
     .await
     .unwrap();
     for (delete_on, prefix) in [
-        (date("2026-08-03"), "creator-plan-a-"),
-        (date("2026-08-07"), "creator-plan-b-"),
+        (exact_date("2026-08-03"), "creator-plan-a-"),
+        (exact_date("2026-08-07"), "creator-plan-b-"),
     ] {
         sqlx::query(
             r#"
@@ -856,7 +885,7 @@ async fn assert_retained_erasure_rejects_corruption(
 #[sqlx::test]
 async fn retained_erasure_validates_all_rows_routes_and_payload_topology(pool: PgPool) {
     install_candidate_index(&pool).await;
-    ensure_partition(&pool, date("2026-08-07")).await;
+    ensure_partition(&pool, archive_date("2026-08-07")).await;
     let graph = branching_graph(&pool, TerminalState::Completed).await;
     let manager = manager(&pool).await;
     archive(
@@ -1299,7 +1328,7 @@ async fn bulk_duplicate_conflicting_id_uses_first_record_without_orphans(pool: P
 #[sqlx::test]
 async fn bulk_mixed_fenced_batch_rolls_back_live_and_fresh_siblings(pool: PgPool) {
     install_candidate_index(&pool).await;
-    ensure_partition(&pool, date("2026-08-03")).await;
+    ensure_partition(&pool, archive_date("2026-08-03")).await;
     let retained = singleton(
         &pool,
         "flex",
@@ -1385,7 +1414,7 @@ fn assert_write_error(
 #[sqlx::test]
 async fn late_request_and_step_writers_cannot_resurrect_an_erased_graph(pool: PgPool) {
     install_candidate_index(&pool).await;
-    ensure_partition(&pool, date("2026-08-07")).await;
+    ensure_partition(&pool, archive_date("2026-08-07")).await;
     let graph = branching_graph(&pool, TerminalState::Completed).await;
     let manager = manager(&pool).await;
     archive(
@@ -1463,7 +1492,7 @@ async fn late_request_and_step_writers_cannot_resurrect_an_erased_graph(pool: Pg
 #[sqlx::test]
 async fn late_request_writers_treat_an_active_retained_graph_as_terminal(pool: PgPool) {
     install_candidate_index(&pool).await;
-    ensure_partition(&pool, date("2026-08-03")).await;
+    ensure_partition(&pool, archive_date("2026-08-03")).await;
     let graph = singleton(
         &pool,
         "flex",
@@ -1520,7 +1549,7 @@ async fn late_request_writers_treat_an_active_retained_graph_as_terminal(pool: P
 #[sqlx::test]
 async fn generic_persist_and_retry_paths_share_retained_and_fenced_outcomes(pool: PgPool) {
     install_candidate_index(&pool).await;
-    ensure_partition(&pool, date("2026-08-03")).await;
+    ensure_partition(&pool, archive_date("2026-08-03")).await;
     let graph = singleton(
         &pool,
         "flex",
@@ -1664,7 +1693,7 @@ async fn generic_persist_waits_for_erasure_then_observes_the_fence(pool: PgPool)
 #[sqlx::test]
 async fn late_synthesis_is_fenced_after_the_retained_partition_disappears(pool: PgPool) {
     install_candidate_index(&pool).await;
-    let delete_on = date("2026-08-03");
+    let delete_on = archive_date("2026-08-03");
     ensure_partition(&pool, delete_on).await;
     let graph = singleton(
         &pool,
@@ -1679,11 +1708,11 @@ async fn late_synthesis_is_fenced_after_the_retained_partition_disappears(pool: 
         .await
         .unwrap();
 
-    sqlx::query("ALTER TABLE retained_response_objects DETACH PARTITION retained_response_objects_d20260803")
+    sqlx::query("ALTER TABLE retained_response_objects DETACH PARTITION retained_response_objects_d20260902")
         .execute(&pool)
         .await
         .unwrap();
-    sqlx::query("DROP TABLE retained_response_objects_d20260803")
+    sqlx::query("DROP TABLE retained_response_objects_d20260902")
         .execute(&pool)
         .await
         .unwrap();
@@ -2429,20 +2458,350 @@ async fn archive<P: PoolProvider>(
     max_groups: i64,
     max_bytes: i64,
 ) -> fusillade_arsenal::error::Result<RetainedResponseArchiveOutcome> {
+    archive_at(
+        manager,
+        policy,
+        timestamp("2026-08-31T00:00:00Z"),
+        timestamp("2026-08-31T00:00:00Z"),
+        max_groups,
+        max_bytes,
+    )
+    .await
+}
+
+async fn archive_at<P: PoolProvider>(
+    manager: &PostgresRequestManager<P>,
+    policy: &RetentionSweepPolicy,
+    terminal_before: DateTime<Utc>,
+    cancel_grace_before: DateTime<Utc>,
+    max_groups: i64,
+    max_bytes: i64,
+) -> fusillade_arsenal::error::Result<RetainedResponseArchiveOutcome> {
+    let cutoffs = RetainedResponseArchiveCutoffs::new(
+        terminal_before.max(cancel_grace_before),
+        terminal_before,
+        cancel_grace_before,
+    )
+    .expect("archive test cutoffs must be ordered");
     manager
-        .archive_terminal_batchless_responses(
-            policy,
-            timestamp("2026-08-09T00:00:00Z"),
-            max_groups,
-            max_bytes,
-        )
+        .archive_terminal_batchless_responses(policy, &cutoffs, max_groups, max_bytes)
         .await
+}
+
+async fn archive_clock(pool: &PgPool) -> (DateTime<Utc>, DateTime<Utc>) {
+    sqlx::query_as(
+        r#"
+        SELECT statement_timestamp(),
+               date_trunc('day', statement_timestamp() AT TIME ZONE 'UTC')
+                   AT TIME ZONE 'UTC'
+        "#,
+    )
+    .fetch_one(pool)
+    .await
+    .expect("archive clock must be readable")
+}
+
+#[sqlx::test]
+async fn newly_terminal_singleton_moves_before_expiry(pool: PgPool) {
+    install_candidate_index(&pool).await;
+    let (archive_now, _) = archive_clock(&pool).await;
+    let terminal_at = archive_now - TimeDelta::hours(2);
+    let terminal_before = archive_now - TimeDelta::hours(1);
+    let retention_seconds = 30 * 86_400;
+    let delete_on = RetentionSweepPolicy::delete_on(terminal_at, retention_seconds).unwrap();
+    ensure_partition(&pool, delete_on).await;
+    let graph = singleton(
+        &pool,
+        "flex",
+        TerminalState::Completed,
+        terminal_at,
+        "newly-terminal",
+    )
+    .await;
+    let manager = manager(&pool).await;
+
+    let outcome = archive_at(
+        &manager,
+        &exact_policy(&[("flex", retention_seconds)]),
+        terminal_before,
+        archive_now,
+        1,
+        i64::MAX,
+    )
+    .await
+    .expect("a dwell-eligible nonexpired graph must move");
+
+    assert_eq!(outcome.groups_archived, 1);
+    assert_wholly_retained(&pool, &graph).await;
+}
+
+#[sqlx::test]
+async fn graph_newer_than_terminal_cutoff_stays_wholly_live(pool: PgPool) {
+    install_candidate_index(&pool).await;
+    let (archive_now, _) = archive_clock(&pool).await;
+    let terminal_at = archive_now - TimeDelta::minutes(30);
+    let graph = singleton(
+        &pool,
+        "flex",
+        TerminalState::Completed,
+        terminal_at,
+        "inside-dwell",
+    )
+    .await;
+    let manager = manager(&pool).await;
+
+    let outcome = archive_at(
+        &manager,
+        &exact_policy(&[("flex", 30 * 86_400)]),
+        archive_now - TimeDelta::hours(1),
+        archive_now,
+        1,
+        i64::MAX,
+    )
+    .await
+    .expect("a graph inside the dwell period is not an error");
+
+    assert_eq!(outcome, RetainedResponseArchiveOutcome::default());
+    assert_wholly_live(&pool, &graph).await;
+}
+
+#[sqlx::test]
+async fn mixed_timestamp_graph_waits_for_latest_member_then_moves(pool: PgPool) {
+    install_candidate_index(&pool).await;
+    let (archive_now, _) = archive_clock(&pool).await;
+    let request_terminal = archive_now - TimeDelta::hours(3);
+    let step_terminal = archive_now - TimeDelta::minutes(30);
+    let retention_seconds = 30 * 86_400;
+    let delete_on = RetentionSweepPolicy::delete_on(step_terminal, retention_seconds).unwrap();
+    ensure_partition(&pool, delete_on).await;
+    let mut graph = singleton(
+        &pool,
+        "flex",
+        TerminalState::Completed,
+        request_terminal,
+        "mixed-dwell",
+    )
+    .await;
+    let head = Uuid::new_v4();
+    insert_step(
+        &pool,
+        StepFixture {
+            id: head,
+            request_id: Some(graph.request_ids[0]),
+            prev_step_id: None,
+            parent_step_id: None,
+            sequence: 1,
+            state: TerminalState::Completed,
+            terminal_at: step_terminal,
+        },
+    )
+    .await;
+    graph.group_id = head;
+    graph.step_ids = vec![head];
+    let manager = manager(&pool).await;
+    let policy = exact_policy(&[("flex", retention_seconds)]);
+
+    let waiting = archive_at(
+        &manager,
+        &policy,
+        archive_now - TimeDelta::hours(1),
+        archive_now,
+        1,
+        i64::MAX,
+    )
+    .await
+    .expect("a graph with a member inside dwell is deferred");
+    assert_eq!(waiting.groups_archived, 0);
+    assert!(waiting.may_have_more);
+    assert_wholly_live(&pool, &graph).await;
+
+    let moved = archive_at(&manager, &policy, archive_now, archive_now, 1, i64::MAX)
+        .await
+        .expect("the complete graph moves once its latest member clears dwell");
+    assert_eq!(moved.groups_archived, 1);
+    assert_wholly_retained(&pool, &graph).await;
+}
+
+#[sqlx::test]
+async fn due_legacy_graph_stays_live_and_does_not_report_discoverable_work(pool: PgPool) {
+    install_candidate_index(&pool).await;
+    let (archive_now, today_start) = archive_clock(&pool).await;
+    let retention_seconds = 86_400;
+    let terminal_at = today_start - TimeDelta::days(2);
+    let due_delete_on = RetentionSweepPolicy::delete_on(terminal_at, retention_seconds).unwrap();
+    ensure_partition(&pool, due_delete_on).await;
+    let graph = singleton(
+        &pool,
+        "flex",
+        TerminalState::Completed,
+        terminal_at,
+        "due-legacy",
+    )
+    .await;
+    let manager = manager(&pool).await;
+
+    let outcome = archive_at(
+        &manager,
+        &exact_policy(&[("flex", retention_seconds)]),
+        archive_now,
+        archive_now,
+        1,
+        i64::MAX,
+    )
+    .await
+    .expect("ordinary movement ignores due legacy content");
+
+    assert_eq!(outcome, RetainedResponseArchiveOutcome::default());
+    assert_wholly_live(&pool, &graph).await;
+    let retained: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM retained_response_objects WHERE delete_on = $1")
+            .bind(due_delete_on)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(retained, 0);
+}
+
+#[sqlx::test]
+async fn due_legacy_backlog_cannot_starve_an_older_nonexpired_tier(pool: PgPool) {
+    install_candidate_index(&pool).await;
+    let (archive_now, today_start) = archive_clock(&pool).await;
+    let short_retention = 86_400;
+    let long_retention = 30 * 86_400;
+    let mut due_graphs = Vec::new();
+    for offset in 0..12 {
+        due_graphs.push(
+            singleton(
+                &pool,
+                "flex",
+                TerminalState::Completed,
+                today_start - TimeDelta::days(2) + TimeDelta::minutes(offset),
+                &format!("due-backlog-{offset}"),
+            )
+            .await,
+        );
+    }
+    let eligible_terminal = today_start - TimeDelta::days(10);
+    let eligible_delete_on =
+        RetentionSweepPolicy::delete_on(eligible_terminal, long_retention).unwrap();
+    ensure_partition(&pool, eligible_delete_on).await;
+    let eligible = singleton(
+        &pool,
+        "priority",
+        TerminalState::Completed,
+        eligible_terminal,
+        "eligible-behind-due-backlog",
+    )
+    .await;
+    let manager = manager(&pool).await;
+
+    let outcome = archive_at(
+        &manager,
+        &exact_policy(&[("flex", short_retention), ("priority", long_retention)]),
+        archive_now,
+        archive_now,
+        1,
+        i64::MAX,
+    )
+    .await
+    .expect("due roots cannot consume bounded discovery");
+
+    assert_eq!(outcome.groups_archived, 1);
+    assert!(!outcome.may_have_more);
+    assert_wholly_retained(&pool, &eligible).await;
+    for graph in &due_graphs {
+        assert_wholly_live(&pool, graph).await;
+    }
+}
+
+#[sqlx::test]
+async fn seed_at_utc_window_lower_bound_is_discoverable(pool: PgPool) {
+    install_candidate_index(&pool).await;
+    let (archive_now, today_start) = archive_clock(&pool).await;
+    let retention_seconds = 86_400;
+    let terminal_at = today_start - TimeDelta::seconds(retention_seconds as i64);
+    let delete_on = RetentionSweepPolicy::delete_on(terminal_at, retention_seconds).unwrap();
+    ensure_partition(&pool, delete_on).await;
+    let graph = singleton(
+        &pool,
+        "flex",
+        TerminalState::Completed,
+        terminal_at,
+        "utc-lower-bound",
+    )
+    .await;
+    let manager = manager(&pool).await;
+
+    let outcome = archive_at(
+        &manager,
+        &exact_policy(&[("flex", retention_seconds)]),
+        archive_now,
+        archive_now,
+        1,
+        i64::MAX,
+    )
+    .await
+    .expect("the inclusive future-day boundary is movement eligible");
+
+    assert_eq!(outcome.groups_archived, 1);
+    assert_wholly_retained(&pool, &graph).await;
+}
+
+#[sqlx::test]
+async fn old_seed_with_newer_step_is_conservatively_left_for_legacy_handling(pool: PgPool) {
+    install_candidate_index(&pool).await;
+    let (archive_now, today_start) = archive_clock(&pool).await;
+    let retention_seconds = 86_400;
+    let request_terminal = today_start - TimeDelta::days(2);
+    let step_terminal = archive_now - TimeDelta::hours(1);
+    let future_delete_on =
+        RetentionSweepPolicy::delete_on(step_terminal, retention_seconds).unwrap();
+    ensure_partition(&pool, future_delete_on).await;
+    let mut graph = singleton(
+        &pool,
+        "flex",
+        TerminalState::Completed,
+        request_terminal,
+        "legacy-seed-new-step",
+    )
+    .await;
+    let head = Uuid::new_v4();
+    insert_step(
+        &pool,
+        StepFixture {
+            id: head,
+            request_id: Some(graph.request_ids[0]),
+            prev_step_id: None,
+            parent_step_id: None,
+            sequence: 1,
+            state: TerminalState::Completed,
+            terminal_at: step_terminal,
+        },
+    )
+    .await;
+    graph.group_id = head;
+    graph.step_ids = vec![head];
+    let manager = manager(&pool).await;
+
+    let outcome = archive_at(
+        &manager,
+        &exact_policy(&[("flex", retention_seconds)]),
+        archive_now,
+        archive_now,
+        1,
+        i64::MAX,
+    )
+    .await
+    .expect("a conservative discovery false negative is a safe no-op");
+
+    assert_eq!(outcome, RetainedResponseArchiveOutcome::default());
+    assert_wholly_live(&pool, &graph).await;
 }
 
 #[sqlx::test]
 async fn stale_singleton_candidate_never_cascade_deletes_a_new_response_graph(pool: PgPool) {
     install_candidate_index(&pool).await;
-    ensure_partition(&pool, date("2026-08-03")).await;
+    ensure_partition(&pool, archive_date("2026-08-03")).await;
     let mut graph = singleton(
         &pool,
         "flex",
@@ -2507,7 +2866,7 @@ async fn stale_singleton_candidate_never_cascade_deletes_a_new_response_graph(po
 #[sqlx::test]
 async fn nonhead_parent_cascade_edge_fails_closed_without_deleting_any_member(pool: PgPool) {
     install_candidate_index(&pool).await;
-    ensure_partition(&pool, date("2026-08-07")).await;
+    ensure_partition(&pool, archive_date("2026-08-07")).await;
     let mut graph = branching_graph(&pool, TerminalState::Completed).await;
     let nonhead = *graph
         .step_ids
@@ -2553,7 +2912,7 @@ async fn cross_head_predecessor_cascade_edge_fails_closed_without_deleting_any_m
     pool: PgPool,
 ) {
     install_candidate_index(&pool).await;
-    ensure_partition(&pool, date("2026-08-07")).await;
+    ensure_partition(&pool, archive_date("2026-08-07")).await;
     let mut graph = branching_graph(&pool, TerminalState::Completed).await;
     let nonhead = *graph
         .step_ids
@@ -2625,7 +2984,7 @@ async fn cross_head_predecessor_cascade_edge_fails_closed_without_deleting_any_m
 #[sqlx::test]
 async fn duplicate_loser_starting_after_winner_commit_returns_a_clean_noop(pool: PgPool) {
     install_candidate_index(&pool).await;
-    ensure_partition(&pool, date("2026-08-03")).await;
+    ensure_partition(&pool, archive_date("2026-08-03")).await;
     let graph = singleton(
         &pool,
         "flex",
@@ -2663,7 +3022,7 @@ async fn duplicate_loser_starting_after_winner_commit_returns_a_clean_noop(pool:
 #[sqlx::test]
 async fn partially_deleted_discovered_graph_never_returns_already_gone(pool: PgPool) {
     install_candidate_index(&pool).await;
-    ensure_partition(&pool, date("2026-08-07")).await;
+    ensure_partition(&pool, archive_date("2026-08-07")).await;
     let graph = branching_graph(&pool, TerminalState::Completed).await;
     let head_request_id: Uuid = sqlx::query_scalar(
         "SELECT request_id FROM response_steps WHERE id = $1 AND request_id IS NOT NULL",
@@ -2725,7 +3084,7 @@ async fn deleting_head_between_seed_and_topology_discovery_never_returns_already
     pool: PgPool,
 ) {
     install_candidate_index(&pool).await;
-    ensure_partition(&pool, date("2026-08-03")).await;
+    ensure_partition(&pool, archive_date("2026-08-03")).await;
     let graph = branching_graph(&pool, TerminalState::Completed).await;
     let head_request_id: Uuid = sqlx::query_scalar(
         "SELECT request_id FROM response_steps WHERE id = $1 AND request_id IS NOT NULL",
@@ -2785,7 +3144,7 @@ async fn deleting_head_between_seed_and_topology_discovery_never_returns_already
 #[sqlx::test]
 async fn retirement_transition_fences_movement_until_retiring_is_visible(pool: PgPool) {
     install_candidate_index(&pool).await;
-    let delete_on = date("2026-08-03");
+    let delete_on = archive_date("2026-08-03");
     ensure_partition(&pool, delete_on).await;
     let graph = singleton(
         &pool,
@@ -2841,7 +3200,7 @@ async fn retirement_transition_fences_movement_until_retiring_is_visible(pool: P
 #[sqlx::test]
 async fn locked_oldest_group_does_not_consume_the_movement_budget(pool: PgPool) {
     install_candidate_index(&pool).await;
-    ensure_partition(&pool, date("2026-08-03")).await;
+    ensure_partition(&pool, archive_date("2026-08-03")).await;
     let oldest = singleton(
         &pool,
         "flex",
@@ -2881,7 +3240,7 @@ async fn locked_oldest_group_does_not_consume_the_movement_budget(pool: PgPool) 
 #[sqlx::test]
 async fn deferred_oldest_group_does_not_consume_the_movement_budget(pool: PgPool) {
     install_candidate_index(&pool).await;
-    ensure_partition(&pool, date("2026-08-03")).await;
+    ensure_partition(&pool, archive_date("2026-08-03")).await;
     let mut deferred = singleton(
         &pool,
         "flex",
@@ -2890,10 +3249,7 @@ async fn deferred_oldest_group_does_not_consume_the_movement_budget(pool: PgPool
         "deferred-lookahead",
     )
     .await;
-    let future_terminal: DateTime<Utc> = sqlx::query_scalar("SELECT statement_timestamp()")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+    let future_terminal = timestamp("2026-09-01T00:00:00Z");
     let head = Uuid::new_v4();
     insert_step(
         &pool,
@@ -2933,8 +3289,8 @@ async fn deferred_oldest_group_does_not_consume_the_movement_budget(pool: PgPool
 #[sqlx::test]
 async fn many_requests_in_one_graph_count_once_toward_the_group_budget(pool: PgPool) {
     install_candidate_index(&pool).await;
-    ensure_partition(&pool, date("2026-08-06")).await;
-    ensure_partition(&pool, date("2026-08-07")).await;
+    ensure_partition(&pool, archive_date("2026-08-06")).await;
+    ensure_partition(&pool, archive_date("2026-08-07")).await;
     let mut first = branching_graph(&pool, TerminalState::Completed).await;
     let (third_request, third_template) = insert_request(
         &pool,
@@ -3020,7 +3376,7 @@ async fn many_requests_in_one_graph_count_once_toward_the_group_budget(pool: PgP
 #[sqlx::test]
 async fn archives_singleton_request_template_as_one_group(pool: PgPool) {
     install_candidate_index(&pool).await;
-    ensure_partition(&pool, date("2026-08-03")).await;
+    ensure_partition(&pool, archive_date("2026-08-03")).await;
     let graph = singleton(
         &pool,
         "flex",
@@ -3050,7 +3406,7 @@ async fn archives_parallel_and_nested_tool_descendants_with_one_conservative_dea
     install_candidate_index(&pool).await;
     // Latest member is 2026-08-03 14:00; the longest tier lasts three days,
     // so exact expiry is on Aug 6 and deletion starts strictly on Aug 7.
-    ensure_partition(&pool, date("2026-08-07")).await;
+    ensure_partition(&pool, archive_date("2026-08-07")).await;
     let graph = branching_graph(&pool, TerminalState::Completed).await;
     let manager = manager(&pool).await;
 
@@ -3075,13 +3431,13 @@ async fn archives_parallel_and_nested_tool_descendants_with_one_conservative_dea
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(delete_on, date("2026-08-07"));
+    assert_eq!(delete_on, archive_date("2026-08-07"));
 }
 
 #[sqlx::test]
 async fn locked_candidate_is_skipped_without_loading_or_moving_graph(pool: PgPool) {
     install_candidate_index(&pool).await;
-    ensure_partition(&pool, date("2026-08-03")).await;
+    ensure_partition(&pool, archive_date("2026-08-03")).await;
     let graph = singleton(
         &pool,
         "flex",
@@ -3111,7 +3467,7 @@ async fn locked_candidate_is_skipped_without_loading_or_moving_graph(pool: PgPoo
 #[sqlx::test]
 async fn nonterminal_member_fails_the_complete_graph_and_rolls_back(pool: PgPool) {
     install_candidate_index(&pool).await;
-    ensure_partition(&pool, date("2026-08-07")).await;
+    ensure_partition(&pool, archive_date("2026-08-07")).await;
     let graph = branching_graph(&pool, TerminalState::Pending).await;
     let manager = manager(&pool).await;
 
@@ -3134,7 +3490,7 @@ async fn nonterminal_member_fails_the_complete_graph_and_rolls_back(pool: PgPool
 #[sqlx::test]
 async fn pending_request_with_terminal_step_fails_closed(pool: PgPool) {
     install_candidate_index(&pool).await;
-    ensure_partition(&pool, date("2026-08-07")).await;
+    ensure_partition(&pool, archive_date("2026-08-07")).await;
     let graph =
         branching_graph_with_tail_states(&pool, TerminalState::Pending, TerminalState::Completed)
             .await;
@@ -3159,7 +3515,7 @@ async fn pending_request_with_terminal_step_fails_closed(pool: PgPool) {
 #[sqlx::test]
 async fn terminal_request_with_pending_step_fails_closed(pool: PgPool) {
     install_candidate_index(&pool).await;
-    ensure_partition(&pool, date("2026-08-07")).await;
+    ensure_partition(&pool, archive_date("2026-08-07")).await;
     let graph =
         branching_graph_with_tail_states(&pool, TerminalState::Completed, TerminalState::Pending)
             .await;
@@ -3184,7 +3540,7 @@ async fn terminal_request_with_pending_step_fails_closed(pool: PgPool) {
 #[sqlx::test]
 async fn shared_template_fails_closed_with_every_reference_live(pool: PgPool) {
     install_candidate_index(&pool).await;
-    ensure_partition(&pool, date("2026-08-07")).await;
+    ensure_partition(&pool, archive_date("2026-08-07")).await;
     let graph = branching_graph(&pool, TerminalState::Completed).await;
     let updated = sqlx::query(
         "UPDATE requests SET template_id = $1 WHERE id = ANY($2) AND template_id <> $1",
@@ -3217,7 +3573,7 @@ async fn shared_template_fails_closed_with_every_reference_live(pool: PgPool) {
 #[sqlx::test]
 async fn file_backed_template_fails_closed_with_the_file_reference_live(pool: PgPool) {
     install_candidate_index(&pool).await;
-    ensure_partition(&pool, date("2026-08-03")).await;
+    ensure_partition(&pool, archive_date("2026-08-03")).await;
     let graph = singleton(
         &pool,
         "flex",
@@ -3256,8 +3612,8 @@ async fn file_backed_template_fails_closed_with_the_file_reference_live(pool: Pg
 #[sqlx::test]
 async fn dispatched_cancellation_obeys_the_absolute_grace_cutoff(pool: PgPool) {
     install_candidate_index(&pool).await;
-    ensure_partition(&pool, date("2026-08-06")).await;
-    ensure_partition(&pool, date("2026-08-13")).await;
+    ensure_partition(&pool, archive_date("2026-08-06")).await;
+    ensure_partition(&pool, archive_date("2026-08-13")).await;
     let before_cutoff = singleton(
         &pool,
         "flex",
@@ -3276,9 +3632,16 @@ async fn dispatched_cancellation_obeys_the_absolute_grace_cutoff(pool: PgPool) {
     .await;
     let manager = manager(&pool).await;
 
-    let outcome = archive(&manager, &policy(&[("flex", 1)]), 2, i64::MAX)
-        .await
-        .expect("grace-ineligible groups are deferred, not partially moved");
+    let outcome = archive_at(
+        &manager,
+        &policy(&[("flex", 1)]),
+        timestamp("2026-08-13T00:00:00Z"),
+        timestamp("2026-08-09T00:00:00Z"),
+        2,
+        i64::MAX,
+    )
+    .await
+    .expect("grace-ineligible groups are deferred, not partially moved");
 
     assert_eq!(outcome.groups_archived, 1);
     assert_wholly_retained(&pool, &before_cutoff).await;
@@ -3312,7 +3675,7 @@ async fn missing_partition_fails_closed_with_the_whole_graph_live(pool: PgPool) 
 #[sqlx::test]
 async fn duplicate_movers_commit_exactly_one_copy(pool: PgPool) {
     install_candidate_index(&pool).await;
-    ensure_partition(&pool, date("2026-08-03")).await;
+    ensure_partition(&pool, archive_date("2026-08-03")).await;
     let graph = singleton(
         &pool,
         "flex",
@@ -3355,7 +3718,7 @@ async fn duplicate_movers_commit_exactly_one_copy(pool: PgPool) {
 #[sqlx::test]
 async fn exact_idempotent_replay_accepts_matching_objects_and_routes(pool: PgPool) {
     install_candidate_index(&pool).await;
-    ensure_partition(&pool, date("2026-08-03")).await;
+    ensure_partition(&pool, archive_date("2026-08-03")).await;
     let graph = singleton(
         &pool,
         "flex",
@@ -3404,7 +3767,7 @@ async fn exact_idempotent_replay_accepts_matching_objects_and_routes(pool: PgPoo
 #[sqlx::test]
 async fn forced_insert_count_mismatch_rolls_back_every_object(pool: PgPool) {
     install_candidate_index(&pool).await;
-    ensure_partition(&pool, date("2026-08-07")).await;
+    ensure_partition(&pool, archive_date("2026-08-07")).await;
     let graph = branching_graph(&pool, TerminalState::Completed).await;
     sqlx::query(
         r#"
@@ -3449,7 +3812,7 @@ async fn forced_insert_count_mismatch_rolls_back_every_object(pool: PgPool) {
 #[sqlx::test]
 async fn forced_sha256_mismatch_rolls_back_every_object(pool: PgPool) {
     install_candidate_index(&pool).await;
-    ensure_partition(&pool, date("2026-08-03")).await;
+    ensure_partition(&pool, archive_date("2026-08-03")).await;
     let graph = singleton(
         &pool,
         "flex",
@@ -3502,7 +3865,7 @@ async fn forced_sha256_mismatch_rolls_back_every_object(pool: PgPool) {
 #[sqlx::test]
 async fn explicit_deletion_lock_racing_movement_leaves_no_partial_archive(pool: PgPool) {
     install_candidate_index(&pool).await;
-    ensure_partition(&pool, date("2026-08-03")).await;
+    ensure_partition(&pool, archive_date("2026-08-03")).await;
     let graph = singleton(
         &pool,
         "flex",
@@ -3532,7 +3895,7 @@ async fn explicit_deletion_lock_racing_movement_leaves_no_partial_archive(pool: 
 #[sqlx::test]
 async fn late_completion_lock_racing_movement_keeps_the_graph_live(pool: PgPool) {
     install_candidate_index(&pool).await;
-    ensure_partition(&pool, date("2026-08-03")).await;
+    ensure_partition(&pool, archive_date("2026-08-03")).await;
     let graph = singleton(
         &pool,
         "flex",
@@ -3577,7 +3940,7 @@ async fn late_completion_lock_racing_movement_keeps_the_graph_live(pool: PgPool)
 #[sqlx::test]
 async fn group_budget_stops_after_the_requested_number_of_graphs(pool: PgPool) {
     install_candidate_index(&pool).await;
-    ensure_partition(&pool, date("2026-08-03")).await;
+    ensure_partition(&pool, archive_date("2026-08-03")).await;
     let first = singleton(
         &pool,
         "flex",
@@ -3618,7 +3981,7 @@ async fn group_budget_stops_after_the_requested_number_of_graphs(pool: PgPool) {
 #[sqlx::test]
 async fn byte_budget_defers_a_later_graph_but_allows_one_oversized_graph_alone(pool: PgPool) {
     install_candidate_index(&pool).await;
-    ensure_partition(&pool, date("2026-08-03")).await;
+    ensure_partition(&pool, archive_date("2026-08-03")).await;
     let probe = singleton(
         &pool,
         "flex",
@@ -3719,9 +4082,9 @@ async fn missing_validated_candidate_index_fails_closed(pool: PgPool) {
 #[sqlx::test]
 async fn retiring_partition_fails_closed_with_the_whole_graph_live(pool: PgPool) {
     install_candidate_index(&pool).await;
-    ensure_partition(&pool, date("2026-08-03")).await;
+    ensure_partition(&pool, archive_date("2026-08-03")).await;
     sqlx::query("UPDATE retained_response_buckets SET state = 'retiring' WHERE delete_on = $1")
-        .bind(date("2026-08-03"))
+        .bind(archive_date("2026-08-03"))
         .execute(&pool)
         .await
         .unwrap();
@@ -3749,8 +4112,8 @@ async fn retiring_partition_fails_closed_with_the_whole_graph_live(pool: PgPool)
 #[sqlx::test]
 async fn conflicting_route_rolls_back_objects_and_keeps_the_graph_live(pool: PgPool) {
     install_candidate_index(&pool).await;
-    ensure_partition(&pool, date("2026-08-03")).await;
-    ensure_partition(&pool, date("2026-08-04")).await;
+    ensure_partition(&pool, archive_date("2026-08-03")).await;
+    ensure_partition(&pool, archive_date("2026-08-04")).await;
     let graph = singleton(
         &pool,
         "flex",
@@ -3761,7 +4124,7 @@ async fn conflicting_route_rolls_back_objects_and_keeps_the_graph_live(pool: PgP
     .await;
     sqlx::query("INSERT INTO retained_response_group_routes (group_id, delete_on) VALUES ($1, $2)")
         .bind(graph.group_id)
-        .bind(date("2026-08-04"))
+        .bind(archive_date("2026-08-04"))
         .execute(&pool)
         .await
         .unwrap();
@@ -3781,7 +4144,7 @@ async fn conflicting_route_rolls_back_objects_and_keeps_the_graph_live(pool: PgP
 #[sqlx::test]
 async fn extra_request_route_for_group_and_bucket_causes_integrity_rollback(pool: PgPool) {
     install_candidate_index(&pool).await;
-    let delete_on = date("2026-08-03");
+    let delete_on = archive_date("2026-08-03");
     ensure_partition(&pool, delete_on).await;
     let graph = singleton(
         &pool,
@@ -3816,7 +4179,7 @@ async fn extra_request_route_for_group_and_bucket_causes_integrity_rollback(pool
 #[sqlx::test]
 async fn extra_step_route_for_group_and_bucket_causes_integrity_rollback(pool: PgPool) {
     install_candidate_index(&pool).await;
-    let delete_on = date("2026-08-03");
+    let delete_on = archive_date("2026-08-03");
     ensure_partition(&pool, delete_on).await;
     let graph = singleton(
         &pool,
@@ -3988,7 +4351,7 @@ async fn capture_public_reads(
 #[sqlx::test]
 async fn read_apis_preserve_exact_values_filters_pages_and_counts_after_move(pool: PgPool) {
     install_candidate_index(&pool).await;
-    ensure_partition(&pool, date("2026-08-07")).await;
+    ensure_partition(&pool, archive_date("2026-08-07")).await;
     let graph = branching_graph(&pool, TerminalState::Completed).await;
     let _pending = singleton(
         &pool,
@@ -4026,7 +4389,7 @@ async fn read_apis_preserve_exact_values_filters_pages_and_counts_after_move(poo
 #[sqlx::test]
 async fn anomalous_request_chronology_uses_later_created_at_for_safe_deadline(pool: PgPool) {
     install_candidate_index(&pool).await;
-    let expected_delete_on = date("2026-08-07");
+    let expected_delete_on = archive_date("2026-08-07");
     ensure_partition(&pool, expected_delete_on).await;
     let graph = singleton(
         &pool,
@@ -4079,7 +4442,7 @@ async fn assert_list_ids(
 #[sqlx::test]
 async fn retained_list_filters_each_discriminate_one_matching_request(pool: PgPool) {
     install_candidate_index(&pool).await;
-    ensure_partition(&pool, date("2026-08-12")).await;
+    ensure_partition(&pool, archive_date("2026-08-12")).await;
     let terminal_at = timestamp("2026-08-10T10:00:00Z");
     let target = singleton(
         &pool,
@@ -4282,19 +4645,16 @@ async fn retained_trailing_filters_discriminate_windows_models_and_tiers(pool: P
         .execute(&pool)
         .await
         .unwrap();
+    let retention_policy = policy(&[("flex", 1), ("priority", 1)]);
+    let retention_seconds = retention_policy.batchless_seconds_by_service_tier["flex"];
     for terminal_at in [target_terminal, older_terminal] {
-        let delete_on = RetentionSweepPolicy::delete_on(terminal_at, 1).unwrap();
+        let delete_on = RetentionSweepPolicy::delete_on(terminal_at, retention_seconds).unwrap();
         ensure_partition(&pool, delete_on).await;
     }
     let request_manager = manager(&pool).await;
-    let outcome = archive(
-        &request_manager,
-        &policy(&[("flex", 1), ("priority", 1)]),
-        4,
-        i64::MAX,
-    )
-    .await
-    .unwrap();
+    let outcome = archive(&request_manager, &retention_policy, 4, i64::MAX)
+        .await
+        .unwrap();
     assert_eq!(outcome.groups_archived, 4);
 
     let mut flex_rows = request_manager
@@ -4387,19 +4747,16 @@ async fn retained_failed_trailing_filters_discriminate_windows_models_and_tiers(
         .execute(&pool)
         .await
         .unwrap();
+    let retention_policy = policy(&[("flex", 1), ("priority", 1)]);
+    let retention_seconds = retention_policy.batchless_seconds_by_service_tier["flex"];
     for terminal_at in [target_terminal, older_terminal] {
-        let delete_on = RetentionSweepPolicy::delete_on(terminal_at, 1).unwrap();
+        let delete_on = RetentionSweepPolicy::delete_on(terminal_at, retention_seconds).unwrap();
         ensure_partition(&pool, delete_on).await;
     }
     let request_manager = manager(&pool).await;
-    let outcome = archive(
-        &request_manager,
-        &policy(&[("flex", 1), ("priority", 1)]),
-        4,
-        i64::MAX,
-    )
-    .await
-    .unwrap();
+    let outcome = archive(&request_manager, &retention_policy, 4, i64::MAX)
+        .await
+        .unwrap();
     assert_eq!(outcome.groups_archived, 4);
 
     let mut flex_rows = request_manager
@@ -4475,7 +4832,7 @@ async fn read_point_apis_never_observe_partial_data_during_atomic_movement(pool:
     const MOVEMENT_GATE_KEY: i64 = 730_006;
 
     install_candidate_index(&pool).await;
-    ensure_partition(&pool, date("2026-08-07")).await;
+    ensure_partition(&pool, archive_date("2026-08-07")).await;
     let graph = branching_graph(&pool, TerminalState::Completed).await;
     let (request_manager, step_manager) = managers(&pool).await;
     let before = capture_public_reads(&request_manager, &step_manager, &graph).await;
@@ -4566,7 +4923,7 @@ async fn set_bucket_state(pool: &PgPool, delete_on: NaiveDate, state: &str) {
 #[sqlx::test]
 async fn read_point_helpers_keep_one_primary_snapshot_across_route_lookup(pool: PgPool) {
     install_candidate_index(&pool).await;
-    let delete_on = date("2026-08-07");
+    let delete_on = archive_date("2026-08-07");
     ensure_partition(&pool, delete_on).await;
     let graph = branching_graph(&pool, TerminalState::Completed).await;
     let (request_manager, step_manager) = managers(&pool).await;
@@ -4689,7 +5046,7 @@ async fn read_point_helpers_keep_one_primary_snapshot_across_route_lookup(pool: 
 #[sqlx::test]
 async fn read_mixed_live_and_retained_rows_do_not_double_count_or_split_demand(pool: PgPool) {
     install_candidate_index(&pool).await;
-    ensure_partition(&pool, date("2026-08-03")).await;
+    ensure_partition(&pool, archive_date("2026-08-03")).await;
     let first = singleton(
         &pool,
         "flex",
@@ -4843,7 +5200,7 @@ async fn assert_graph_reads_not_found(
 #[sqlx::test]
 async fn read_apis_fail_closed_for_retiring_and_dropped_buckets(pool: PgPool) {
     install_candidate_index(&pool).await;
-    let delete_on = date("2026-08-07");
+    let delete_on = archive_date("2026-08-07");
     ensure_partition(&pool, delete_on).await;
     let graph = branching_graph(&pool, TerminalState::Completed).await;
     let (request_manager, step_manager) = managers(&pool).await;
@@ -4890,12 +5247,12 @@ async fn read_apis_fail_closed_for_retiring_and_dropped_buckets(pool: PgPool) {
     );
 
     sqlx::query(
-        "ALTER TABLE retained_response_objects DETACH PARTITION retained_response_objects_d20260807",
+        "ALTER TABLE retained_response_objects DETACH PARTITION retained_response_objects_d20260906",
     )
     .execute(&pool)
     .await
     .unwrap();
-    sqlx::query("DROP TABLE retained_response_objects_d20260807")
+    sqlx::query("DROP TABLE retained_response_objects_d20260906")
         .execute(&pool)
         .await
         .unwrap();
@@ -4912,8 +5269,8 @@ async fn read_apis_fail_closed_for_retiring_and_dropped_buckets(pool: PgPool) {
 #[sqlx::test]
 async fn read_point_routes_fail_closed_for_wrong_bucket_group_and_partition_oid(pool: PgPool) {
     install_candidate_index(&pool).await;
-    let delete_on = date("2026-08-07");
-    let wrong_delete_on = date("2026-08-08");
+    let delete_on = archive_date("2026-08-07");
+    let wrong_delete_on = archive_date("2026-08-08");
     ensure_partition(&pool, delete_on).await;
     ensure_partition(&pool, wrong_delete_on).await;
     let graph = branching_graph(&pool, TerminalState::Completed).await;
@@ -5030,7 +5387,7 @@ async fn read_point_routes_fail_closed_for_wrong_bucket_group_and_partition_oid(
 #[sqlx::test]
 async fn read_response_step_mutations_reject_retained_routes_without_content(pool: PgPool) {
     install_candidate_index(&pool).await;
-    ensure_partition(&pool, date("2026-08-07")).await;
+    ensure_partition(&pool, archive_date("2026-08-07")).await;
     let graph = branching_graph(&pool, TerminalState::Completed).await;
     let (request_manager, step_manager) = managers(&pool).await;
     archive(
@@ -5123,7 +5480,7 @@ async fn create_step_rolls_back_when_movement_commits_route_during_blocked_inser
     const MOVEMENT_AFTER_DELETE_GATE: i64 = 730_016;
 
     install_candidate_index(&pool).await;
-    ensure_partition(&pool, date("2026-08-07")).await;
+    ensure_partition(&pool, archive_date("2026-08-07")).await;
     let graph = branching_graph(&pool, TerminalState::Completed).await;
     let retained_step_id = StepId(graph.group_id);
 
@@ -5244,7 +5601,7 @@ async fn movement_starting_after_create_insert_cannot_split_the_live_graph(pool:
     const CREATE_AFTER_INSERT_GATE: i64 = 730_017;
 
     install_candidate_index(&pool).await;
-    ensure_partition(&pool, date("2026-08-07")).await;
+    ensure_partition(&pool, archive_date("2026-08-07")).await;
     let graph = branching_graph(&pool, TerminalState::Completed).await;
     let head_step_id = StepId(graph.group_id);
     let new_step_id = Uuid::new_v4();

@@ -4,8 +4,10 @@
 -- request_templates, or response_steps. Movement and retirement are runtime
 -- operations and remain disabled unless an operator enables them separately.
 --
--- Before enabling terminal-response movement, build this candidate index
--- outside a transaction and verify retained_response_archive_index_ready():
+-- Before enabling terminal-response movement, build this payload-free index
+-- outside a transaction and verify retained_response_archive_index_ready().
+-- Its expression supports the bounded terminal/dwell and future-day seed
+-- window; complete graph eligibility is revalidated after locking:
 --
 --   CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_requests_batchless_retention_due
 --     ON requests (
