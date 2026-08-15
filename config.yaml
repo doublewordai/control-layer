@@ -547,9 +547,9 @@ background_services:
     # batch_claim_size: 0            # Max rows per batch-claim iteration; 0 = inherit claim_batch_size
     # batch_claim_batch_size: 4      # Max batches selected per model per iteration (spill-over pool)
     # batch_claim_interval_ms: 0     # Batch-claim loop cadence; 0 = inherit claim_interval_ms
-    # batch_claim_require_live: false # Require an explicit `live` model_filters event to batch-claim;
-    #                                 # false treats no-event models (external providers) as live
-    # claim_ramp_exponent: 0.56      # Deadline-ramp curve: not-live batches become claimable within
+    # batch_claim_require_open: false # Require an explicit `open` gate entry to batch-claim;
+    #                                 # false treats no-entry models (external providers) as open
+    # claim_ramp_exponent: 0.56      # Deadline-ramp curve: throttled batches become claimable within
     #                                 # window_minutes^exponent minutes of deadline (~59m/24h, ~10m/1h)
     # background_concurrency_limit: 0 # Per-model foreground in-flight threshold below which
     #                                 # background workers may send; background work does not

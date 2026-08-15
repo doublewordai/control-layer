@@ -18,7 +18,7 @@ use crate::FusilladeError;
 use crate::batch::BatchId;
 use crate::error::Result;
 use crate::http::HttpClient;
-use crate::manager::{ArchiveOutcome, DaemonStorage, Storage};
+use crate::manager::{ArchiveOutcome, DaemonStorage, ModelGateState, Storage};
 use crate::processor::{DefaultRequestProcessor, RequestProcessor};
 use crate::request::{Claimed, DaemonId, Request, RequestCompletionResult};
 
@@ -495,6 +495,14 @@ where
             .collect()
     }
 
+    fn model_gate_states(&self) -> HashMap<String, ModelGateState> {
+        self.config
+            .model_gate_states
+            .iter()
+            .map(|entry| (entry.key().clone(), *entry.value()))
+            .collect()
+    }
+
     fn user_active_counts(&self) -> HashMap<String, usize> {
         self.user_requests_in_flight
             .iter()
@@ -614,6 +622,7 @@ where
             gauge!("fusillade_claim_capacity", "daemon" => loop_name).set(total_capacity as f64);
 
             let user_active_counts = self.user_active_counts();
+            let gate_states = self.model_gate_states();
             let claim_start = std::time::Instant::now();
             let claim_timeout = Duration::from_millis(self.config.claim_query_timeout_ms);
             let claim_size = kind.claim_size(&self.config);
@@ -627,6 +636,7 @@ where
                             self.daemon_id,
                             &available_capacity,
                             &user_active_counts,
+                            &gate_states,
                         ),
                     )
                     .await
@@ -641,6 +651,7 @@ where
                             self.daemon_id,
                             &available_capacity,
                             &user_active_counts,
+                            &gate_states,
                         ),
                     )
                     .await
@@ -773,6 +784,7 @@ where
             gauge!("fusillade_claim_capacity", "daemon" => loop_name).set(total_capacity as f64);
 
             let user_active_counts = self.user_active_counts();
+            let gate_states = self.model_gate_states();
             let leak_cooldown = if kind == ClaimLoopKind::Request {
                 self.leak_cooldown()
             } else {
@@ -792,6 +804,7 @@ where
                             &available_capacity,
                             &user_active_counts,
                             &leak_cooldown,
+                            &gate_states,
                         ),
                     )
                     .await
@@ -806,6 +819,7 @@ where
                             self.daemon_id,
                             &available_capacity,
                             &user_active_counts,
+                            &gate_states,
                         ),
                     )
                     .await

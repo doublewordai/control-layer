@@ -31,6 +31,8 @@ pub use http::{
 pub use manager::DaemonExecutor;
 #[cfg(feature = "postgres")]
 pub use manager::PostgresDaemon;
-pub use manager::{DaemonStorage, ModelFilter, ModelFilterState, Storage, TrailingDemandCount};
+pub use manager::{
+    DaemonStorage, ModelFilter, ModelFilterState, ModelGateState, Storage, TrailingDemandCount,
+};
 pub use processor::{CancellationFuture, DefaultRequestProcessor, RequestProcessor, ShouldRetry};
 pub use transform::ResponseTransformer;

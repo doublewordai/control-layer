@@ -81,8 +81,12 @@ pub enum ArchiveOutcome {
 /// `model_filters` is an event log, not a current-state table: the CURRENT
 /// state of a model is the latest event for it. An `Absent` event is an
 /// explicit tombstone (the controller retracted the model); a model with no events at
-/// all is also treated as absent. The daemon treats absence as "claim now,
-/// route to OpenRouter".
+/// all is also treated as absent.
+///
+/// DEPRECATED as a claim-gate source: the claim paths now read the injected
+/// [`ModelGateState`] map instead of this log. The log and its
+/// append/list/purge functions remain for the controller's own bookkeeping
+/// until the controller stops writing it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ModelFilterState {
@@ -143,6 +147,27 @@ pub struct ModelFilter {
     pub state: ModelFilterState,
     /// ETA when `state == Coming`.
     pub expected_ready_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Per-model claim-gate state injected into the daemon by its operator
+/// (dwctl). `Open` claims at full capacity; `Throttled` takes the
+/// deadline-ramp / leaky-bucket path. A model absent from the gate map is
+/// treated as `Open` — absence must never strangle a model.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ModelGateState {
+    #[default]
+    Open,
+    Throttled,
+}
+
+impl ModelGateState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ModelGateState::Open => "open",
+            ModelGateState::Throttled => "throttled",
+        }
+    }
 }
 
 /// Background queue modality selected by a dedicated daemon worker.
@@ -678,16 +703,16 @@ pub trait Storage: Send + Sync {
     /// proximity) via `DaemonConfig::urgency_weight`. See the PostgreSQL
     /// implementation for the composite scoring formula.
     ///
-    /// The claim gate consults the latest `model_filters` event per model:
-    /// `state = 'live'` **or no events at all** ⇒ claim at full capacity (a
-    /// model with no events is unmanaged by the controller, so there is no
-    /// internal capacity to wait for — it flows straight through to OpenRouter).
-    /// An EXPLICIT not-live event (`coming`/`absent`) ⇒ the request is either
-    /// claimed at full capacity (→ OpenRouter) when within `ramp(W)` of its
-    /// completion-window deadline, or otherwise released only via the
-    /// per-`(user, window-class, model)` leaky bucket. So with an empty `model_filters`
-    /// table the gate is a no-op (everything claims at full capacity) — it only
-    /// engages once the controller starts writing not-live events.
+    /// The claim gate consults `gate_states`, the per-model gate map injected
+    /// by the daemon: `Open` **or no entry at all** ⇒ claim at full capacity
+    /// (a model absent from the map is unmanaged, so there is no internal
+    /// capacity to wait for — it flows straight through to OpenRouter).
+    /// An EXPLICIT `Throttled` entry ⇒ the request is either claimed at full
+    /// capacity (→ OpenRouter) when within `ramp(W)` of its completion-window
+    /// deadline, or otherwise released only via the per-`(user, window-class,
+    /// model)` leaky bucket. So with an empty gate map the gate is a no-op
+    /// (everything claims at full capacity) — it only engages once the
+    /// operator starts marking models throttled.
     ///
     /// `leak_cooldown` is the set of `(user, window-class, model)` triples whose
     /// leaky bucket has no token this cycle (the daemon stamped `next_token_at`
@@ -702,6 +727,7 @@ pub trait Storage: Send + Sync {
         available_capacity: &std::collections::HashMap<String, usize>,
         user_active_counts: &std::collections::HashMap<String, usize>,
         leak_cooldown: &std::collections::HashSet<(String, String, String)>,
+        gate_states: &std::collections::HashMap<String, ModelGateState>,
     ) -> Result<Vec<Request<Claimed>>> {
         self.claim_requests(
             limit,
@@ -709,6 +735,7 @@ pub trait Storage: Send + Sync {
             available_capacity,
             user_active_counts,
             leak_cooldown,
+            gate_states,
         )
         .await
     }
@@ -727,20 +754,20 @@ pub trait Storage: Send + Sync {
         available_capacity: &std::collections::HashMap<String, usize>,
         user_active_counts: &std::collections::HashMap<String, usize>,
         leak_cooldown: &std::collections::HashSet<(String, String, String)>,
+        gate_states: &std::collections::HashMap<String, ModelGateState>,
     ) -> Result<Vec<Request<Claimed>>>;
 
-    /// Atomically claim pending requests that belong to live-model batches.
+    /// Atomically claim pending requests that belong to open-model batches.
     ///
     /// The batch daemon owns this policy. Implementations should select
     /// candidate batches before probing request rows, limit selected batches by
-    /// `batch_limit`, and gate on model liveness: models whose latest
-    /// `model_filters` event is `live` are always eligible; models with **no**
-    /// filter event (external / always-on providers that scouter does not
-    /// manage) are eligible unless `DaemonConfig::batch_claim_require_live` is
-    /// set; models whose latest event is `coming`/`absent` are eligible only
-    /// once the batch is within the deadline ramp (`claim_ramp_exponent`) —
-    /// the SLA escape hatch to fallback providers. No leaky-bucket trickle
-    /// applies to batched rows.
+    /// `batch_limit`, and gate on the injected `gate_states` map: models whose
+    /// gate is `Open` are always eligible; models with **no** gate entry
+    /// (external / always-on providers the operator does not manage) are
+    /// eligible unless `DaemonConfig::batch_claim_require_open` is set; models
+    /// whose gate is `Throttled` are eligible only once the batch is within
+    /// the deadline ramp (`claim_ramp_exponent`) — the SLA escape hatch to
+    /// fallback providers. No leaky-bucket trickle applies to batched rows.
     async fn claim_batch_requests(
         &self,
         limit: usize,
@@ -748,6 +775,7 @@ pub trait Storage: Send + Sync {
         daemon_id: DaemonId,
         available_capacity: &std::collections::HashMap<String, usize>,
         user_active_counts: &std::collections::HashMap<String, usize>,
+        gate_states: &std::collections::HashMap<String, ModelGateState>,
     ) -> Result<Vec<Request<Claimed>>> {
         let _ = (
             limit,
@@ -755,6 +783,7 @@ pub trait Storage: Send + Sync {
             daemon_id,
             available_capacity,
             user_active_counts,
+            gate_states,
         );
         // Fail loud rather than silently claiming nothing: a backend that
         // doesn't override this would otherwise run a batch daemon that never
@@ -779,6 +808,7 @@ pub trait Storage: Send + Sync {
 
     /// Atomically claim pending background requests for one queue modality.
     #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
     async fn claim_background_requests_by_kind(
         &self,
         kind: BackgroundClaimKind,
@@ -787,6 +817,7 @@ pub trait Storage: Send + Sync {
         daemon_id: DaemonId,
         available_capacity: &std::collections::HashMap<String, usize>,
         user_active_counts: &std::collections::HashMap<String, usize>,
+        gate_states: &std::collections::HashMap<String, ModelGateState>,
     ) -> Result<Vec<Request<Claimed>>> {
         let _ = (
             kind,
@@ -795,6 +826,7 @@ pub trait Storage: Send + Sync {
             daemon_id,
             available_capacity,
             user_active_counts,
+            gate_states,
         );
         Err(crate::error::FusilladeError::Other(anyhow::anyhow!(
             "background claims are not implemented for this storage backend"
@@ -808,6 +840,7 @@ pub trait Storage: Send + Sync {
         daemon_id: DaemonId,
         available_capacity: &std::collections::HashMap<String, usize>,
         user_active_counts: &std::collections::HashMap<String, usize>,
+        gate_states: &std::collections::HashMap<String, ModelGateState>,
     ) -> Result<Vec<Request<Claimed>>> {
         self.claim_background_requests_by_kind(
             BackgroundClaimKind::Batchless,
@@ -816,6 +849,7 @@ pub trait Storage: Send + Sync {
             daemon_id,
             available_capacity,
             user_active_counts,
+            gate_states,
         )
         .await
     }
@@ -828,6 +862,7 @@ pub trait Storage: Send + Sync {
         daemon_id: DaemonId,
         available_capacity: &std::collections::HashMap<String, usize>,
         user_active_counts: &std::collections::HashMap<String, usize>,
+        gate_states: &std::collections::HashMap<String, ModelGateState>,
     ) -> Result<Vec<Request<Claimed>>> {
         self.claim_background_requests_by_kind(
             BackgroundClaimKind::Batch,
@@ -836,6 +871,7 @@ pub trait Storage: Send + Sync {
             daemon_id,
             available_capacity,
             user_active_counts,
+            gate_states,
         )
         .await
     }
@@ -849,6 +885,7 @@ pub trait Storage: Send + Sync {
         daemon_id: DaemonId,
         available_capacity: &std::collections::HashMap<String, usize>,
         user_active_counts: &std::collections::HashMap<String, usize>,
+        gate_states: &std::collections::HashMap<String, ModelGateState>,
     ) -> Result<Vec<Request<Claimed>>> {
         let mut claimed = self
             .claim_background_batchless_requests(
@@ -856,6 +893,7 @@ pub trait Storage: Send + Sync {
                 daemon_id,
                 available_capacity,
                 user_active_counts,
+                gate_states,
             )
             .await?;
         let remaining = limit.saturating_sub(claimed.len());
@@ -876,6 +914,7 @@ pub trait Storage: Send + Sync {
                     daemon_id,
                     &remaining_capacity,
                     user_active_counts,
+                    gate_states,
                 )
                 .await?,
             );
@@ -891,9 +930,9 @@ pub trait Storage: Send + Sync {
     /// Append a single event to the `model_filters` log. Used by the controller
     /// when a model's internal liveness CHANGES (live / coming / absent).
     ///
-    /// The gate reads only `state` (live ⇒ claim full; coming/absent ⇒ not-live).
-    /// `expected_ready_at` is retained on the type/column for the controller's own
-    /// use but is **not read by the claim gate** — callers may leave it `None`.
+    /// The claim gate no longer reads this log (it consults the injected
+    /// [`ModelGateState`] map); the log is retained for the controller's own
+    /// use. `expected_ready_at` may be left `None`.
     ///
     /// This is append-only: there is no delete and no upsert. Retraction is
     /// appending an `Absent` event. Appending **only on change** (so the log

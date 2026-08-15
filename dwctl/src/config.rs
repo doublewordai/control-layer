@@ -1661,13 +1661,13 @@ pub struct DaemonConfig {
     #[serde(default)]
     pub batch_claim_interval_ms: u64,
 
-    /// Require an explicit `live` model_filters event before batch-claiming a
-    /// model. When false, models with NO filter events (external / always-on
-    /// providers that scouter does not manage) are treated as live — the
-    /// historical claim behaviour. Not-live (`coming`/`absent`) models remain
-    /// claimable only via the deadline ramp in either mode. Default: false.
-    #[serde(default)]
-    pub batch_claim_require_live: bool,
+    /// Require an explicit `open` gate entry before batch-claiming a model.
+    /// When false, models with NO gate entry (external / always-on providers
+    /// that dwctl does not manage) are treated as open — the historical claim
+    /// behaviour. Throttled models remain claimable only via the deadline
+    /// ramp in either mode. Default: false.
+    #[serde(default, alias = "batch_claim_require_live")]
+    pub batch_claim_require_open: bool,
 
     /// Exponent of the deadline-ramp curve: batches on not-live models become
     /// claimable at full capacity within `window_minutes ^ exponent` minutes
@@ -1933,7 +1933,7 @@ impl Default for DaemonConfig {
             batch_claim_size: 0,
             batch_claim_batch_size: default_batch_claim_batch_size(),
             batch_claim_interval_ms: 0,
-            batch_claim_require_live: false,
+            batch_claim_require_open: false,
             claim_ramp_exponent: default_claim_ramp_exponent(),
             claim_loop_max_consecutive_failures: default_claim_loop_max_consecutive_failures(),
             claim_query_timeout_ms: default_claim_query_timeout_ms(),
@@ -2012,7 +2012,7 @@ impl DaemonConfig {
             batch_claim_size: self.batch_claim_size,
             batch_claim_batch_size: self.batch_claim_batch_size,
             batch_claim_interval_ms: self.batch_claim_interval_ms,
-            batch_claim_require_live: self.batch_claim_require_live,
+            batch_claim_require_open: self.batch_claim_require_open,
             claim_ramp_exponent: self.claim_ramp_exponent,
             claim_loop_max_consecutive_failures: self.claim_loop_max_consecutive_failures,
             claim_query_timeout_ms: self.claim_query_timeout_ms,
