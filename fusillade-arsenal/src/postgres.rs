@@ -458,6 +458,18 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
         crate::db::begin_transaction(self.pools.write(), &self.db_retry_config).await
     }
 
+    async fn begin_response_write(
+        &self,
+        object_ids: &[Uuid],
+    ) -> Result<sqlx::Transaction<'static, sqlx::Postgres>> {
+        retained_response::begin_response_write_transaction(
+            self.pools.write(),
+            &self.db_retry_config,
+            object_ids,
+        )
+        .await
+    }
+
     async fn insert_batch_record(&self, input: NewBatchRecord) -> Result<Batch> {
         let mut tx = self
             .begin_write()
@@ -573,12 +585,7 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
         input: NewPendingRequest,
     ) -> Result<RequestId> {
         let template_id = Uuid::new_v4();
-        let mut tx = self
-            .begin_write()
-            .await
-            .map_err(|_| FusilladeError::Other(anyhow!("Failed to begin pending request")))?;
-
-        retained_response::lock_response_write_graphs(&mut tx, &[input.request_id]).await?;
+        let mut tx = self.begin_response_write(&[input.request_id]).await?;
 
         if let Some(disposition) =
             retained_response::classify_response_write(&mut tx, &[input.request_id]).await?
@@ -2920,11 +2927,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
             // attempt alongside fresh lifecycle transitions.
             let state_write_permit = self.state_write_limiter.acquire("persist").await?;
             let result: Result<Option<RequestId>> = async {
-                let mut tx = self.begin_write().await.map_err(|_| {
-                    FusilladeError::Other(anyhow!("Failed to begin request state transition"))
-                })?;
-                retained_response::lock_response_write_graphs(&mut tx, &[request.data.id.0])
-                    .await?;
+                let mut tx = self.begin_response_write(&[request.data.id.0]).await?;
                 match any_request {
                     AnyRequest::Pending(req) => {
                         // DELIBERATELY no terminal-state guard on this arm
@@ -3260,11 +3263,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         not_before: Option<DateTime<Utc>>,
     ) -> Result<bool> {
         let _state_write_permit = self.state_write_limiter.acquire("retry").await?;
-        let mut tx = self
-            .begin_write()
-            .await
-            .map_err(|_| FusilladeError::Other(anyhow!("Failed to begin request retry")))?;
-        retained_response::lock_response_write_graphs(&mut tx, &[request_id.0]).await?;
+        let mut tx = self.begin_response_write(&[request_id.0]).await?;
 
         // Fenced retry: only re-pend the row if it is still the in-flight claim
         // held by `owner`. The `state = 'processing' AND daemon_id = $2` guard is
@@ -5437,11 +5436,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         tracing::debug!(count = ids.len(), "Retrying failed requests");
 
         let lifecycle_ids = ids.iter().map(|id| id.0).collect::<Vec<_>>();
-        let mut lifecycle_tx = self
-            .begin_write()
-            .await
-            .map_err(|_| FusilladeError::Other(anyhow!("Failed to begin failed-request retry")))?;
-        retained_response::lock_response_write_graphs(&mut lifecycle_tx, &lifecycle_ids).await?;
+        let mut lifecycle_tx = self.begin_response_write(&lifecycle_ids).await?;
         if let Some(disposition) =
             retained_response::classify_response_write(&mut lifecycle_tx, &lifecycle_ids).await?
         {
@@ -5492,11 +5487,8 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         let repended: std::collections::HashSet<Uuid> = if retryable.is_empty() {
             Default::default()
         } else {
-            let mut tx = self.begin_write().await.map_err(|_| {
-                FusilladeError::Other(anyhow!("Failed to begin failed-request retry mutation"))
-            })?;
             let retry_object_ids = retryable.iter().map(|(id, _)| *id).collect::<Vec<_>>();
-            retained_response::lock_response_write_graphs(&mut tx, &retry_object_ids).await?;
+            let mut tx = self.begin_response_write(&retry_object_ids).await?;
             if let Some(disposition) =
                 retained_response::classify_response_write(&mut tx, &retry_object_ids).await?
             {
@@ -6258,12 +6250,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         let template_id = Uuid::new_v4();
         let now = Utc::now();
 
-        let mut tx = self
-            .begin_write()
-            .await
-            .map_err(|_| FusilladeError::Other(anyhow!("Failed to begin realtime request")))?;
-
-        retained_response::lock_response_write_graphs(&mut tx, &[input.request_id]).await?;
+        let mut tx = self.begin_response_write(&[input.request_id]).await?;
 
         if let Some(disposition) =
             retained_response::classify_response_write(&mut tx, &[input.request_id]).await?
@@ -6373,11 +6360,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         status_code: u16,
     ) -> Result<()> {
         let size = response_body.len() as i64;
-        let mut tx = self
-            .begin_write()
-            .await
-            .map_err(|_| FusilladeError::Other(anyhow!("Failed to begin request completion")))?;
-        retained_response::lock_response_write_graphs(&mut tx, &[request_id.0]).await?;
+        let mut tx = self.begin_response_write(&[request_id.0]).await?;
 
         // Try the UPDATE; if it doesn't match, surface whether the row is
         // missing or just in the wrong state. The previous "0 rows → NotFound"
@@ -6445,11 +6428,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         })?;
 
         let error_size = error_json.len() as i64;
-        let mut tx = self
-            .begin_write()
-            .await
-            .map_err(|_| FusilladeError::Other(anyhow!("Failed to begin request failure")))?;
-        retained_response::lock_response_write_graphs(&mut tx, &[request_id.0]).await?;
+        let mut tx = self.begin_response_write(&[request_id.0]).await?;
         let row: Option<(bool, Option<String>)> = sqlx::query_as(
             "WITH updated AS (
                  UPDATE requests
@@ -6514,12 +6493,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         }
 
         let all_ids: Vec<Uuid> = canonical.iter().map(|record| record.request_id).collect();
-        let mut tx = self
-            .begin_write()
-            .await
-            .map_err(|_| FusilladeError::Other(anyhow!("Failed to begin response write")))?;
-
-        retained_response::lock_response_write_graphs(&mut tx, &all_ids).await?;
+        let mut tx = self.begin_response_write(&all_ids).await?;
 
         // One fenced identity makes the storage call fail atomically. The
         // caller can then split the batch without losing valid siblings.

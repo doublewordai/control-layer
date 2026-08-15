@@ -82,10 +82,16 @@ impl<P: PoolProvider> PostgresResponseStepManager<P> {
         &self.db_retry_config
     }
 
-    async fn begin_write_transaction(&self) -> Result<sqlx::Transaction<'static, sqlx::Postgres>> {
-        crate::db::begin_transaction(self.pools.write(), &self.db_retry_config)
-            .await
-            .map_err(|_| FusilladeError::Other(anyhow!("Failed to begin response-step mutation")))
+    async fn begin_write_transaction(
+        &self,
+        object_ids: &[Uuid],
+    ) -> Result<sqlx::Transaction<'static, sqlx::Postgres>> {
+        crate::postgres::retained_response::begin_response_write_transaction(
+            self.pools.write(),
+            &self.db_retry_config,
+            object_ids,
+        )
+        .await
     }
 
     async fn begin_primary_read(&self) -> Result<sqlx::Transaction<'static, sqlx::Postgres>> {
@@ -182,11 +188,9 @@ impl<P: PoolProvider> ResponseStepStore for PostgresResponseStepManager<P> {
         linked_step_ids.extend(input.prev_step_id.map(|step| step.0));
         linked_step_ids.extend(input.parent_step_id.map(|step| step.0));
 
-        let mut tx = self.begin_write_transaction().await?;
         let mut lifecycle_ids = linked_step_ids.clone();
         lifecycle_ids.extend(input.request_id.map(|request_id| request_id.0));
-        crate::postgres::retained_response::lock_response_write_graphs(&mut tx, &lifecycle_ids)
-            .await?;
+        let mut tx = self.begin_write_transaction(&lifecycle_ids).await?;
 
         if let Some(conflict) =
             Self::write_conflict_in_transaction(&mut tx, &linked_step_ids, input.request_id).await?
@@ -322,8 +326,7 @@ impl<P: PoolProvider> ResponseStepStore for PostgresResponseStepManager<P> {
     }
 
     async fn mark_step_processing(&self, id: StepId) -> Result<()> {
-        let mut tx = self.begin_write_transaction().await?;
-        crate::postgres::retained_response::lock_response_write_graphs(&mut tx, &[id.0]).await?;
+        let mut tx = self.begin_write_transaction(&[id.0]).await?;
         let result = sqlx::query(
             "UPDATE response_steps \
              SET state = 'processing', started_at = NOW(), updated_at = NOW() \
@@ -358,8 +361,7 @@ impl<P: PoolProvider> ResponseStepStore for PostgresResponseStepManager<P> {
     }
 
     async fn complete_step(&self, id: StepId, response: serde_json::Value) -> Result<()> {
-        let mut tx = self.begin_write_transaction().await?;
-        crate::postgres::retained_response::lock_response_write_graphs(&mut tx, &[id.0]).await?;
+        let mut tx = self.begin_write_transaction(&[id.0]).await?;
         let result = sqlx::query(
             "UPDATE response_steps \
              SET state = 'completed', \
@@ -394,8 +396,7 @@ impl<P: PoolProvider> ResponseStepStore for PostgresResponseStepManager<P> {
     }
 
     async fn fail_step(&self, id: StepId, error: serde_json::Value) -> Result<()> {
-        let mut tx = self.begin_write_transaction().await?;
-        crate::postgres::retained_response::lock_response_write_graphs(&mut tx, &[id.0]).await?;
+        let mut tx = self.begin_write_transaction(&[id.0]).await?;
         let result = sqlx::query(
             "UPDATE response_steps \
              SET state = 'failed', \
@@ -428,8 +429,7 @@ impl<P: PoolProvider> ResponseStepStore for PostgresResponseStepManager<P> {
     }
 
     async fn cancel_step(&self, id: StepId) -> Result<()> {
-        let mut tx = self.begin_write_transaction().await?;
-        crate::postgres::retained_response::lock_response_write_graphs(&mut tx, &[id.0]).await?;
+        let mut tx = self.begin_write_transaction(&[id.0]).await?;
         let result = sqlx::query(
             "UPDATE response_steps \
              SET state = 'canceled', \
@@ -462,8 +462,7 @@ impl<P: PoolProvider> ResponseStepStore for PostgresResponseStepManager<P> {
     }
 
     async fn requeue_step_for_retry(&self, id: StepId) -> Result<()> {
-        let mut tx = self.begin_write_transaction().await?;
-        crate::postgres::retained_response::lock_response_write_graphs(&mut tx, &[id.0]).await?;
+        let mut tx = self.begin_write_transaction(&[id.0]).await?;
         let result = sqlx::query(
             "UPDATE response_steps \
              SET state = 'pending', \
