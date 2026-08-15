@@ -2685,6 +2685,132 @@ async fn retained_trailing_filters_discriminate_windows_models_and_tiers(pool: P
 }
 
 #[sqlx::test]
+async fn retained_failed_trailing_filters_discriminate_windows_models_and_tiers(pool: PgPool) {
+    install_candidate_index(&pool).await;
+    let fixture_now = Utc::now();
+    let target_terminal = fixture_now - TimeDelta::hours(2);
+    let older_terminal = fixture_now - TimeDelta::hours(8);
+    let target = singleton(
+        &pool,
+        "flex",
+        TerminalState::Failed,
+        target_terminal,
+        "failed-trailing-target",
+    )
+    .await;
+    let older = singleton(
+        &pool,
+        "flex",
+        TerminalState::Failed,
+        older_terminal,
+        "failed-trailing-older",
+    )
+    .await;
+    let priority = singleton(
+        &pool,
+        "priority",
+        TerminalState::Failed,
+        target_terminal,
+        "failed-trailing-priority",
+    )
+    .await;
+    let other_model = singleton(
+        &pool,
+        "flex",
+        TerminalState::Failed,
+        target_terminal,
+        "failed-trailing-model",
+    )
+    .await;
+    sqlx::query("UPDATE requests SET model = 'other-model' WHERE id = $1")
+        .bind(other_model.request_ids[0])
+        .execute(&pool)
+        .await
+        .unwrap();
+    for terminal_at in [target_terminal, older_terminal] {
+        let delete_on = RetentionSweepPolicy::delete_on(terminal_at, 1).unwrap();
+        ensure_partition(&pool, delete_on).await;
+    }
+    let request_manager = manager(&pool).await;
+    let outcome = archive(
+        &request_manager,
+        &policy(&[("flex", 1), ("priority", 1)]),
+        4,
+        i64::MAX,
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcome.groups_archived, 4);
+
+    let mut flex_rows = request_manager
+        .get_completed_request_counts_by_model_and_window(
+            &[
+                ("recent".to_owned(), -4 * 3_600, 0),
+                ("older".to_owned(), -10 * 3_600, -6 * 3_600),
+            ],
+            &[MODEL.to_owned()],
+            &ServiceTierFilter::Include(vec![Some("flex".to_owned())]),
+        )
+        .await
+        .unwrap();
+    flex_rows.sort_by(|left, right| left.window_label.cmp(&right.window_label));
+    assert_eq!(flex_rows.len(), 2);
+    assert_eq!(flex_rows[0].window_label, "older");
+    assert_eq!(flex_rows[0].model, MODEL);
+    assert_eq!(flex_rows[0].service_tier.as_deref(), Some("flex"));
+    assert_eq!(flex_rows[0].outcome, "failed");
+    assert_eq!(flex_rows[0].count, 1);
+    assert_eq!(flex_rows[1].window_label, "recent");
+    assert_eq!(flex_rows[1].model, MODEL);
+    assert_eq!(flex_rows[1].service_tier.as_deref(), Some("flex"));
+    assert_eq!(flex_rows[1].outcome, "failed");
+    assert_eq!(flex_rows[1].count, 1);
+
+    let priority_rows = request_manager
+        .get_completed_request_counts_by_model_and_window(
+            &[("recent".to_owned(), -4 * 3_600, 0)],
+            &[MODEL.to_owned()],
+            &ServiceTierFilter::Include(vec![Some("priority".to_owned())]),
+        )
+        .await
+        .unwrap();
+    assert_eq!(priority_rows.len(), 1);
+    assert_eq!(priority_rows[0].model, MODEL);
+    assert_eq!(priority_rows[0].service_tier.as_deref(), Some("priority"));
+    assert_eq!(priority_rows[0].outcome, "failed");
+    assert_eq!(priority_rows[0].count, 1);
+
+    let excluded_flex = request_manager
+        .get_completed_request_counts_by_model_and_window(
+            &[("recent".to_owned(), -4 * 3_600, 0)],
+            &[MODEL.to_owned()],
+            &ServiceTierFilter::Exclude(vec![Some("flex".to_owned())]),
+        )
+        .await
+        .unwrap();
+    assert_eq!(excluded_flex, priority_rows);
+
+    let other_model_rows = request_manager
+        .get_completed_request_counts_by_model_and_window(
+            &[("recent".to_owned(), -4 * 3_600, 0)],
+            &["other-model".to_owned()],
+            &ServiceTierFilter::Include(vec![Some("flex".to_owned())]),
+        )
+        .await
+        .unwrap();
+    assert_eq!(other_model_rows.len(), 1);
+    assert_eq!(other_model_rows[0].model, "other-model");
+    assert_eq!(other_model_rows[0].service_tier.as_deref(), Some("flex"));
+    assert_eq!(other_model_rows[0].outcome, "failed");
+    assert_eq!(other_model_rows[0].count, 1);
+
+    assert_wholly_retained(&pool, &target).await;
+    assert_wholly_retained(&pool, &older).await;
+    assert_wholly_retained(&pool, &priority).await;
+    assert_wholly_retained(&pool, &other_model).await;
+}
+
+#[sqlx::test]
 async fn read_point_apis_never_observe_partial_data_during_atomic_movement(pool: PgPool) {
     const MOVEMENT_GATE_KEY: i64 = 730_006;
 
