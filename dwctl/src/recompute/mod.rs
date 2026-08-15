@@ -285,12 +285,19 @@ pub enum TokenSource {
     /// Reconstructed with a per-finish-reason overhead constant. **Approximate.** This is
     /// the only option when the response carried no usage at all, and it is why an apply
     /// must not write these without an explicit opt-in.
+    // Not yet constructed: the July-class tokenizer path (`fold_render`'s caller) is the
+    // producer, and it hasn't shipped. Kept because `is_exact`/`as_str` already encode how
+    // an apply must treat it, and those rules are pinned by tests.
+    #[allow(dead_code)]
     Estimated,
 }
 
 impl TokenSource {
     /// Whether a figure from this source is exact enough to apply without an explicit
     /// operator opt-in.
+    // The consumer is the apply path, which hasn't shipped; the rule it will enforce is
+    // pinned by tests now so it can't drift before then.
+    #[allow(dead_code)]
     pub fn is_exact(&self) -> bool {
         matches!(self, Self::Reported | Self::Rendered)
     }
@@ -346,7 +353,10 @@ pub(crate) struct RecomputedUsage {
     pub total: i64,
     /// How `counts.prompt` was arrived at.
     pub prompt_source: TokenSource,
-    /// How `counts.completion` was arrived at.
+    /// How `counts.completion` was arrived at. Read (with `prompt_source`) by
+    /// [`RecomputedUsage::is_exact`], the apply path's gate; today's report keys on the
+    /// prompt side only, so outside tests this is written but not yet consumed.
+    #[allow(dead_code)]
     pub completion_source: TokenSource,
     /// Set when the render and the reported total disagreed beyond tolerance.
     pub disagreement: Option<Disagreement>,
@@ -354,14 +364,20 @@ pub(crate) struct RecomputedUsage {
     /// only a flat total. The token count is solid; the price of those tokens rests on an
     /// assumption, so the report must show it rather than bury it.
     pub cache_tier_inferred: bool,
-    /// `response_type` as the serializer classified it, for the report.
+    /// `response_type` as the serializer classified it. Not yet surfaced in the report;
+    /// kept because it is the one field that says *which parser arm* produced the counts,
+    /// which the apply path will want next to `token_source`.
+    #[allow(dead_code)]
     pub response_type: String,
-    /// The model the response claims, when it states one.
+    /// The model the response claims, when it states one. Same status as `response_type`.
+    #[allow(dead_code)]
     pub response_model: Option<String>,
 }
 
 impl RecomputedUsage {
     /// Whether every figure here is exact enough to apply without an opt-in.
+    // Same status as `TokenSource::is_exact`: the apply path is the consumer.
+    #[allow(dead_code)]
     pub fn is_exact(&self) -> bool {
         self.prompt_source.is_exact() && self.completion_source.is_exact()
     }
