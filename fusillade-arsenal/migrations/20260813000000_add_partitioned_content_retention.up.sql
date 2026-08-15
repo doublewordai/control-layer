@@ -195,6 +195,7 @@ AS $$
           AND index_catalog.indisvalid
           AND access_method.amname = 'btree'
           AND index_catalog.indnkeyatts = 3
+          AND index_catalog.indnatts = 3
           AND pg_get_indexdef(index_catalog.indexrelid, 1, TRUE) = 'service_tier'
           AND lower(regexp_replace(
                   regexp_replace(

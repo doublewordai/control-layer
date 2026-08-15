@@ -2802,6 +2802,11 @@ impl Config {
                 operation: "Config validation: batchless retention policy is required for retained-response maintenance".to_string(),
             });
         }
+        if daemon.retained_response_retirement_enabled {
+            return Err(Error::Internal {
+                operation: "Config validation: retained-response partition retirement is not scheduled in this release".to_string(),
+            });
+        }
         if batchless_movement_enabled && (daemon.batchless_archive_groups_per_tick <= 0 || daemon.batchless_archive_bytes_per_tick <= 0) {
             return Err(Error::Internal {
                 operation: "Config validation: batchless archive group and byte budgets must be positive".to_string(),
@@ -3262,6 +3267,19 @@ mod tests {
         let mut config = Config::default();
         config.background_services.batch_daemon.retained_response_retirement_enabled = true;
         assert!(config.validate().unwrap_err().to_string().contains("batchless retention policy"));
+    }
+
+    #[test]
+    fn retained_response_retirement_is_rejected_with_a_valid_batchless_policy() {
+        let mut config = Config::default();
+        configure_batchless_retention(&mut config);
+        config.background_services.batch_daemon.retained_response_retirement_enabled = true;
+
+        let error = config
+            .validate()
+            .expect_err("retirement has no scheduled consumer in this release")
+            .to_string();
+        assert!(error.contains("retirement is not scheduled"));
     }
 
     #[test]
