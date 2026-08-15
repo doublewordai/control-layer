@@ -393,8 +393,8 @@ pub fn recompute_from_stored_response(
     // request the live path recorded correctly. When that happens but the body plainly
     // carries a usage object, read the counts from the raw JSON. Strictly a fallback: it can
     // never override a reading the serializer actually produced, so the healthy-no-op
-    // property is preserved — and a response with no usage at all (the July shape) still
-    // recomputes to zero, because there is nothing raw to read either.
+    // property is preserved. A response with no usage at all (the July shape) is REFUSED
+    // below — absence of evidence is not a zero measurement.
     if metrics.prompt_tokens == 0 && metrics.completion_tokens == 0 && metrics.total_tokens == 0 {
         match extract_from_last_usage(response_data, raw_usage_tokens) {
             Some(raw) => {

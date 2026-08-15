@@ -60,7 +60,7 @@ pub struct RecomputeQuery {
 /// Recompute the usage of already-billed requests and report what changed.
 #[utoipa::path(
     get,
-    path = "/usage-recompute",
+    path = "/admin/api/v1/usage-recompute",
     tag = "analytics",
     summary = "Dry-run recompute of recorded usage",
     description = "Replays stored request/response payloads through the live serializer and re-prices them, \

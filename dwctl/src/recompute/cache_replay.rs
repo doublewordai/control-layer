@@ -27,6 +27,13 @@ use sqlx::PgPool;
 use crate::prompt_cache::{CacheEntry, CacheError, CacheIndex, CacheMatch, CacheResult, IndexScope, PrefixHash, TtlTier};
 
 /// How much the reconstructed split can be trusted.
+///
+/// Until the episode-per-row cutover ships, **every** entry's window over-approximates
+/// liveness, so [`reconstruct_split`] currently labels every past instant `Approximate` —
+/// `Exact` is deliberately unreachable today. The variant exists so reports produced now
+/// remain interpretable later: post-cutover reconstructions will mark themselves `Exact`,
+/// and consumers can already branch on the field instead of on a date they'd have to
+/// hard-code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Fidelity {
     /// Every episode covering the instant has an exact window.
@@ -66,7 +73,9 @@ impl CacheIndex for HistoricalIndex {
             return Ok(Vec::new());
         }
         // The live path asks `expires_at > now()`. The historical question is whether an
-        // episode *covered* the instant, which needs both ends of the window.
+        // episode *covered* the instant, which needs both ends of the window — with the SAME
+        // strict upper bound as the live predicate, so an entry at its exact expiry instant
+        // classifies identically to how the serving path would have seen it.
         let rows = sqlx::query_as!(
             LookupRow,
             r#"
@@ -75,7 +84,7 @@ impl CacheIndex for HistoricalIndex {
             FROM prompt_cache_entries
             WHERE principal_id = $1 AND virtual_model = $2 AND tokenizer_version = $3
               AND prefix_hash = ANY($4)
-              AND created_at <= $5 AND expires_at >= $5
+              AND created_at <= $5 AND expires_at > $5
             "#,
             scope.principal_id,
             scope.virtual_model,
@@ -86,17 +95,22 @@ impl CacheIndex for HistoricalIndex {
         .fetch_all(&self.pool)
         .await?;
 
-        Ok(rows
-            .into_iter()
-            .filter_map(|r| {
-                TtlTier::parse(&r.ttl_tier).map(|tier| CacheMatch {
+        // Row mapping mirrors `PostgresIndex::lookup` exactly: an unknown tier is an error,
+        // not a silently dropped row (in a verification tool, swallowing corrupt evidence
+        // manufactures a false "creation" where the data says "read"), and a negative count
+        // is clamped rather than wrapped into a huge u32.
+        rows.into_iter()
+            .map(|r| {
+                let ttl_tier =
+                    TtlTier::parse(&r.ttl_tier).ok_or_else(|| CacheError::Invalid(format!("unknown ttl_tier {:?}", r.ttl_tier)))?;
+                Ok(CacheMatch {
                     prefix_hash: r.prefix_hash,
-                    cumulative_token_count: r.cumulative_token_count as u32,
-                    ttl_tier: tier,
+                    cumulative_token_count: r.cumulative_token_count.max(0) as u32,
+                    ttl_tier,
                     expires_at: r.expires_at,
                 })
             })
-            .collect())
+            .collect()
     }
 
     async fn write(&self, _entry: &CacheEntry) -> CacheResult<()> {
@@ -167,6 +181,15 @@ mod tests {
             .await
             .unwrap();
         assert!(miss.is_empty(), "the episode had closed by then");
+
+        // AT the exact expiry instant: also a miss — the live predicate is the strict
+        // `expires_at > now()`, and the historical answer must classify boundary instants
+        // identically to how the serving path would have.
+        let miss = HistoricalIndex::new(pool.clone(), expires)
+            .lookup(&scope(principal), std::slice::from_ref(&hash))
+            .await
+            .unwrap();
+        assert!(miss.is_empty(), "an entry is not live at its own expiry instant");
 
         // Before it was ever written: also a creation.
         let before = created - chrono::Duration::minutes(1);
