@@ -39,8 +39,8 @@ use crate::daemon::{
 };
 use crate::error::{FusilladeError, Result};
 use crate::manager::{
-    RetainedResponseArchiveOutcome, RetainedResponseWriteError, RetentionSweepCutoffs,
-    RetentionSweepOutcome, RetentionSweepPolicy, TrailingDemandCount,
+    RetainedResponseArchiveCutoffs, RetainedResponseArchiveOutcome, RetainedResponseWriteError,
+    RetentionSweepCutoffs, RetentionSweepOutcome, RetentionSweepPolicy, TrailingDemandCount,
 };
 use crate::request::{
     Canceled, CascadeTargetState, Claimed, Completed, CreateBackgroundInput, CreateFlexInput,
@@ -8352,16 +8352,12 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
     async fn archive_terminal_batchless_responses(
         &self,
         policy: &RetentionSweepPolicy,
-        cancel_grace_before: DateTime<Utc>,
+        cutoffs: &RetainedResponseArchiveCutoffs,
         max_groups: i64,
         max_bytes: i64,
     ) -> Result<RetainedResponseArchiveOutcome> {
         retained_response::archive_terminal_batchless_responses(
-            self,
-            policy,
-            cancel_grace_before,
-            max_groups,
-            max_bytes,
+            self, policy, cutoffs, max_groups, max_bytes,
         )
         .await
     }
