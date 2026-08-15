@@ -289,6 +289,51 @@ impl RetainedResponseWriteError {
     }
 }
 
+/// Immutable wall-clock boundaries for one retained-response archive pass.
+///
+/// Callers resolve relative dwell and cancellation-grace configuration once,
+/// then every candidate in the pass is evaluated against the same instant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetainedResponseArchiveCutoffs {
+    observed_at: DateTime<Utc>,
+    terminal_before: DateTime<Utc>,
+    cancel_grace_before: DateTime<Utc>,
+}
+
+impl RetainedResponseArchiveCutoffs {
+    pub fn new(
+        observed_at: DateTime<Utc>,
+        terminal_before: DateTime<Utc>,
+        cancel_grace_before: DateTime<Utc>,
+    ) -> std::result::Result<Self, String> {
+        if terminal_before > observed_at {
+            return Err("terminal movement cutoff cannot be after its observation time".to_owned());
+        }
+        if cancel_grace_before > observed_at {
+            return Err(
+                "cancellation grace cutoff cannot be after its observation time".to_owned(),
+            );
+        }
+        Ok(Self {
+            observed_at,
+            terminal_before,
+            cancel_grace_before,
+        })
+    }
+
+    pub fn observed_at(&self) -> DateTime<Utc> {
+        self.observed_at
+    }
+
+    pub fn terminal_before(&self) -> DateTime<Utc> {
+        self.terminal_before
+    }
+
+    pub fn cancel_grace_before(&self) -> DateTime<Utc> {
+        self.cancel_grace_before
+    }
+}
+
 /// Aggregate, content-free result of atomically archiving bounded sets of
 /// complete retained batchless response graphs.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -506,10 +551,11 @@ mod retention_policy_tests {
         let now = DateTime::parse_from_rfc3339("2026-08-14T15:30:00Z")
             .unwrap()
             .to_utc();
+        let cutoffs = RetainedResponseArchiveCutoffs::new(now, now, now).unwrap();
 
         assert_maintenance_is_disabled(
             storage
-                .archive_terminal_batchless_responses(&policy, now, 1, 1)
+                .archive_terminal_batchless_responses(&policy, &cutoffs, 1, 1)
                 .await,
         );
         assert_maintenance_is_disabled(
@@ -525,6 +571,22 @@ mod retention_policy_tests {
                 .await,
         );
         assert_maintenance_is_disabled(storage.cleanup_retained_response_routes(1).await);
+    }
+
+    #[test]
+    fn retained_response_archive_cutoffs_reject_future_boundaries() {
+        let observed_at = DateTime::parse_from_rfc3339("2026-08-14T15:30:00Z")
+            .unwrap()
+            .to_utc();
+        let earlier = observed_at - chrono::Duration::hours(1);
+        let later = observed_at + chrono::Duration::nanoseconds(1);
+
+        let cutoffs = RetainedResponseArchiveCutoffs::new(observed_at, earlier, earlier).unwrap();
+        assert_eq!(cutoffs.observed_at(), observed_at);
+        assert_eq!(cutoffs.terminal_before(), earlier);
+        assert_eq!(cutoffs.cancel_grace_before(), earlier);
+        assert!(RetainedResponseArchiveCutoffs::new(observed_at, later, earlier).is_err());
+        assert!(RetainedResponseArchiveCutoffs::new(observed_at, earlier, later).is_err());
     }
 
     #[test]
@@ -1760,10 +1822,17 @@ pub trait DaemonStorage: Send + Sync {
     /// leave that entire graph live. Completed earlier groups may remain
     /// committed, so callers retry idempotently. Storage backends opt in
     /// explicitly; the default is disabled.
+    ///
+    /// [`RetainedResponseArchiveCutoffs::terminal_before`] is an immutable
+    /// dwell boundary, independent from retention expiry. Implementations
+    /// must revalidate every graph member against it and may move a graph only
+    /// when its conservative deletion day is after
+    /// [`RetainedResponseArchiveCutoffs::observed_at`]'s UTC date. Already-due
+    /// live graphs remain for an explicitly gated legacy path.
     async fn archive_terminal_batchless_responses(
         &self,
         _policy: &RetentionSweepPolicy,
-        _cancel_grace_before: DateTime<Utc>,
+        _cutoffs: &RetainedResponseArchiveCutoffs,
         _max_groups: i64,
         _max_bytes: i64,
     ) -> Result<RetainedResponseArchiveOutcome> {

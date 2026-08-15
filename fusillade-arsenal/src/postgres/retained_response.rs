@@ -16,8 +16,8 @@ use uuid::Uuid;
 use super::{PoolProvider, PostgresRequestManager};
 use crate::error::{FusilladeError, Result};
 use crate::manager::{
-    RetainedResponseArchiveOutcome, RetainedResponseMaintenanceError, RetainedResponseWriteError,
-    RetentionSweepPolicy,
+    RetainedResponseArchiveCutoffs, RetainedResponseArchiveOutcome,
+    RetainedResponseMaintenanceError, RetainedResponseWriteError, RetentionSweepPolicy,
 };
 use crate::request::{
     ListRequestsFilter, RequestDetail, RequestId, RequestListResult, RequestSummary,
@@ -3303,14 +3303,6 @@ async fn lock_steps(
     Ok(LockSetOutcome::Skipped)
 }
 
-fn exact_expiry(terminal_at: DateTime<Utc>, seconds: u64) -> MovementResult<DateTime<Utc>> {
-    let seconds = i64::try_from(seconds).map_err(|_| incomplete_graph())?;
-    let duration = chrono::Duration::try_seconds(seconds).ok_or_else(incomplete_graph)?;
-    terminal_at
-        .checked_add_signed(duration)
-        .ok_or_else(incomplete_graph)
-}
-
 fn canonical_payload_bytes(rows: &[RetainedResponseObjectRow]) -> MovementResult<Vec<u8>> {
     let mut bytes = Vec::new();
     for row in rows {
@@ -3639,8 +3631,7 @@ async fn move_graph<P: PoolProvider>(
     manager: &PostgresRequestManager<P>,
     candidate: Candidate,
     policy: &RetentionSweepPolicy,
-    archive_now: DateTime<Utc>,
-    cancel_grace_before: DateTime<Utc>,
+    cutoffs: &RetainedResponseArchiveCutoffs,
     remaining_bytes: u64,
     allow_oversized: bool,
 ) -> MovementResult<MoveGraphOutcome> {
@@ -3807,12 +3798,12 @@ async fn move_graph<P: PoolProvider>(
         };
         if request.state == "canceled"
             && request.claimed_at.is_some()
-            && terminal_at > cancel_grace_before
+            && terminal_at > cutoffs.cancel_grace_before()
         {
             return Ok(MoveGraphOutcome::Deferred);
         }
         let retention_anchor = terminal_at.max(request.created_at);
-        if exact_expiry(retention_anchor, seconds)? > archive_now {
+        if retention_anchor > cutoffs.terminal_before() {
             return Ok(MoveGraphOutcome::Deferred);
         }
         max_retention_seconds = max_retention_seconds.max(seconds);
@@ -3827,7 +3818,7 @@ async fn move_graph<P: PoolProvider>(
             return Err(incomplete_graph());
         };
         let retention_anchor = terminal_at.max(step.step.created_at);
-        if exact_expiry(retention_anchor, max_retention_seconds)? > archive_now {
+        if retention_anchor > cutoffs.terminal_before() {
             return Ok(MoveGraphOutcome::Deferred);
         }
         let step_delete_on =
@@ -3838,6 +3829,9 @@ async fn move_graph<P: PoolProvider>(
         }));
     }
     let delete_on = delete_on.ok_or_else(incomplete_graph)?;
+    if delete_on <= cutoffs.observed_at().date_naive() {
+        return Ok(MoveGraphOutcome::Deferred);
+    }
 
     let template_by_id = templates
         .into_iter()
@@ -3953,11 +3947,15 @@ async fn move_graph<P: PoolProvider>(
     })
 }
 
-// Seed selection and recursive membership must share one PostgreSQL statement
-// snapshot so the immutable Candidate cannot omit a concurrently deleted head's siblings.
+// Seed selection and recursive membership share one PostgreSQL statement
+// snapshot so the immutable Candidate cannot omit a concurrently deleted
+// head's siblings. The per-tier lower bound is the first terminal instant
+// whose request-level deletion day can still be in the future. This keeps an
+// arbitrary due legacy backlog outside the bounded probe budget while the
+// lock-time whole-graph checks remain authoritative.
 const CANDIDATE_DISCOVERY_SQL: &str = r#"
         WITH RECURSIVE
-        policy(service_tier, expire_before) AS (
+        policy(service_tier, archive_after) AS (
             SELECT * FROM UNNEST($1::text[], $2::timestamptz[])
         ),
         candidate_seed AS MATERIALIZED (
@@ -3976,12 +3974,17 @@ const CANDIDATE_DISCOVERY_SQL: &str = r#"
                 WHERE request.service_tier = policy.service_tier
                   AND request.batch_id IS NULL
                   AND request.state IN ('completed', 'failed', 'canceled')
-                  AND NOT (request.id = ANY($3))
+                  AND NOT (request.id = ANY($4))
                   AND CASE request.state
                           WHEN 'completed' THEN request.completed_at
                           WHEN 'failed' THEN request.failed_at
                           WHEN 'canceled' THEN request.canceled_at
-                      END <= policy.expire_before
+                      END >= policy.archive_after
+                  AND CASE request.state
+                          WHEN 'completed' THEN request.completed_at
+                          WHEN 'failed' THEN request.failed_at
+                          WHEN 'canceled' THEN request.canceled_at
+                      END <= $3
                 ORDER BY CASE request.state
                              WHEN 'completed' THEN request.completed_at
                              WHEN 'failed' THEN request.failed_at
@@ -4023,13 +4026,15 @@ const CANDIDATE_DISCOVERY_SQL: &str = r#"
 async fn next_candidate<P: PoolProvider>(
     manager: &PostgresRequestManager<P>,
     tiers: &[String],
-    cutoffs: &[DateTime<Utc>],
+    archive_after: &[DateTime<Utc>],
+    terminal_before: DateTime<Utc>,
     excluded_request_ids: &[Uuid],
 ) -> MovementResult<Option<Candidate>> {
     let rows: Vec<(Uuid, Uuid, Option<Uuid>, Option<Uuid>)> =
         sqlx::query_as(CANDIDATE_DISCOVERY_SQL)
             .bind(tiers)
-            .bind(cutoffs)
+            .bind(archive_after)
+            .bind(terminal_before)
             .bind(excluded_request_ids)
             .fetch_all(manager.read_executor())
             .await
@@ -4069,7 +4074,7 @@ async fn next_candidate<P: PoolProvider>(
 pub(crate) async fn archive_terminal_batchless_responses<P: PoolProvider>(
     manager: &PostgresRequestManager<P>,
     policy: &RetentionSweepPolicy,
-    cancel_grace_before: DateTime<Utc>,
+    cutoffs: &RetainedResponseArchiveCutoffs,
     max_groups: i64,
     max_bytes: i64,
 ) -> Result<RetainedResponseArchiveOutcome> {
@@ -4088,13 +4093,20 @@ pub(crate) async fn archive_terminal_batchless_responses<P: PoolProvider>(
     if !index_ready {
         return Err(RetainedResponseMovementError::CandidateIndexUnavailable.into_fusillade_error());
     }
-    let archive_now: DateTime<Utc> = sqlx::query_scalar("SELECT statement_timestamp()")
-        .fetch_one(manager.read_executor())
-        .await
-        .map_err(database_failure)?;
-    let mut tiers = Vec::with_capacity(policy.batchless_seconds_by_service_tier.len());
-    let mut cutoffs = Vec::with_capacity(policy.batchless_seconds_by_service_tier.len());
-    for (tier, seconds) in &policy.batchless_seconds_by_service_tier {
+    let observed_day_start = cutoffs
+        .observed_at()
+        .date_naive()
+        .and_hms_opt(0, 0, 0)
+        .expect("a date always has a UTC midnight")
+        .and_utc();
+    let mut policy_tiers = policy
+        .batchless_seconds_by_service_tier
+        .iter()
+        .collect::<Vec<_>>();
+    policy_tiers.sort_unstable_by_key(|(tier, _)| *tier);
+    let mut tiers = Vec::with_capacity(policy_tiers.len());
+    let mut archive_after = Vec::with_capacity(policy_tiers.len());
+    for (tier, seconds) in policy_tiers {
         tiers.push(tier.clone());
         let seconds = i64::try_from(*seconds).map_err(|_| {
             FusilladeError::ValidationError("automated retention period is too large".to_owned())
@@ -4102,9 +4114,15 @@ pub(crate) async fn archive_terminal_batchless_responses<P: PoolProvider>(
         let duration = chrono::Duration::try_seconds(seconds).ok_or_else(|| {
             FusilladeError::ValidationError("automated retention period is too large".to_owned())
         })?;
-        cutoffs.push(archive_now.checked_sub_signed(duration).ok_or_else(|| {
-            FusilladeError::ValidationError("automated retention cutoff is out of range".to_owned())
-        })?);
+        archive_after.push(
+            observed_day_start
+                .checked_sub_signed(duration)
+                .ok_or_else(|| {
+                    FusilladeError::ValidationError(
+                        "automated retention cutoff is out of range".to_owned(),
+                    )
+                })?,
+        );
     }
     let candidate_limit = max_groups.saturating_add(1);
     let max_probes = candidate_limit.saturating_mul(2);
@@ -4116,8 +4134,14 @@ pub(crate) async fn archive_terminal_batchless_responses<P: PoolProvider>(
         if candidates.len() as i64 == candidate_limit {
             break;
         }
-        let Some(candidate) =
-            next_candidate(manager, &tiers, &cutoffs, &excluded_request_ids).await?
+        let Some(candidate) = next_candidate(
+            manager,
+            &tiers,
+            &archive_after,
+            cutoffs.terminal_before(),
+            &excluded_request_ids,
+        )
+        .await?
         else {
             discovery_exhausted = true;
             break;
@@ -4139,8 +4163,7 @@ pub(crate) async fn archive_terminal_batchless_responses<P: PoolProvider>(
             manager,
             candidate,
             policy,
-            archive_now,
-            cancel_grace_before,
+            cutoffs,
             remaining_bytes,
             outcome.groups_archived == 0,
         )
@@ -4457,7 +4480,8 @@ mod tests {
         let explain = format!("EXPLAIN (FORMAT JSON) {CANDIDATE_DISCOVERY_SQL}");
         let plan: serde_json::Value = sqlx::query_scalar(&explain)
             .bind(vec!["flex".to_owned()])
-            .bind(vec![timestamp("2026-08-08T00:00:00Z")])
+            .bind(vec![timestamp("2026-08-01T00:00:00Z")])
+            .bind(timestamp("2026-08-08T00:00:00Z"))
             .bind(Vec::<Uuid>::new())
             .fetch_one(&mut *tx)
             .await
