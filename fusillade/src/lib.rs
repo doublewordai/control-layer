@@ -35,8 +35,9 @@ pub use manager::DaemonExecutor;
 pub use manager::PostgresDaemon;
 pub use manager::{
     DaemonStorage, ModelFilter, ModelFilterState, RetainedResponseArchiveCutoffs,
-    RetainedResponseArchiveOutcome, RetainedResponseMaintenanceError, RetainedResponseWriteError,
-    RetentionCutoffs, RetentionMaintenanceOutcome, RetentionSweepCutoffs, RetentionSweepOutcome,
+    RetainedResponseArchiveOutcome, RetainedResponseMaintenanceError,
+    RetainedResponsePartitionRunway, RetainedResponseWriteError, RetentionCutoffs,
+    RetentionMaintenanceOutcome, RetentionSweepCutoffs, RetentionSweepOutcome,
     RetentionSweepPolicy, Storage, TrailingDemandCount,
 };
 pub use processor::{CancellationFuture, DefaultRequestProcessor, RequestProcessor, ShouldRetry};

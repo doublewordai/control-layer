@@ -352,6 +352,26 @@ pub struct RetainedResponseArchiveOutcome {
     pub may_have_more: bool,
 }
 
+/// Content-free result of ensuring the complete retained-response partition
+/// runway required by the configured policy.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RetainedResponsePartitionRunway {
+    /// Partitions created by this maintenance pass.
+    pub created: i64,
+    /// Exact attached partitions in the continuous prefix beginning tomorrow.
+    pub contiguous_ahead: i64,
+    /// Exact number of partitions required through the retention horizon and
+    /// configured operator runway, inclusive.
+    pub required: i64,
+}
+
+impl RetainedResponsePartitionRunway {
+    /// Movement is safe only when every required deletion day is present.
+    pub fn is_complete(self) -> bool {
+        self.required > 0 && self.contiguous_ahead == self.required
+    }
+}
+
 /// Aggregate, content-free result of retention maintenance.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RetentionMaintenanceOutcome {
@@ -552,6 +572,9 @@ mod retention_policy_tests {
             .unwrap()
             .to_utc();
         let cutoffs = RetainedResponseArchiveCutoffs::new(now, now, now).unwrap();
+
+        assert!(!storage.supports_retained_response_lifecycle());
+        assert_maintenance_is_disabled(storage.retained_response_archive_index_ready().await);
 
         assert_maintenance_is_disabled(
             storage
@@ -1801,6 +1824,14 @@ pub trait DaemonStorage: Send + Sync {
         false
     }
 
+    /// Whether this backend explicitly implements the partitioned retained
+    /// response lifecycle. This capability is independent from legacy content
+    /// sweeps so a backend cannot accidentally opt into movement by supporting
+    /// only deletion.
+    fn supports_retained_response_lifecycle(&self) -> bool {
+        false
+    }
+
     async fn sweep_expired_content(
         &self,
         _cutoffs: &RetentionSweepCutoffs,
@@ -1839,13 +1870,20 @@ pub trait DaemonStorage: Send + Sync {
         Err(RetainedResponseMaintenanceError::Disabled.into_fusillade_error())
     }
 
+    /// Report whether the exact operator-managed archive candidate index is
+    /// ready and valid. Storage backends opt in explicitly; the default is
+    /// disabled.
+    async fn retained_response_archive_index_ready(&self) -> Result<bool> {
+        Err(RetainedResponseMaintenanceError::Disabled.into_fusillade_error())
+    }
+
     /// Ensure the daily partitions required for retained response graphs.
     /// Storage backends opt in explicitly; the default is disabled.
     async fn ensure_retained_response_partitions(
         &self,
         _policy: &RetentionSweepPolicy,
         _days_ahead: i32,
-    ) -> Result<(i64, i64)> {
+    ) -> Result<RetainedResponsePartitionRunway> {
         Err(RetainedResponseMaintenanceError::Disabled.into_fusillade_error())
     }
 

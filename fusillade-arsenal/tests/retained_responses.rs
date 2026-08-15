@@ -186,7 +186,7 @@ async fn assert_wholly_erased(pool: &PgPool, graph: &LiveGraph) {
          WHERE object_id = ANY($1) AND reason = 'erased' AND expires_at > NOW()",
     )
     .bind(
-        &std::iter::once(graph.group_id)
+        std::iter::once(graph.group_id)
             .chain(graph.request_ids.iter().copied())
             .chain(graph.step_ids.iter().copied())
             .collect::<Vec<_>>(),
@@ -277,7 +277,7 @@ async fn erase_never_shortens_an_existing_fence_expiry(pool: PgPool) {
     )
     .bind(protected_until)
     .bind(
-        &std::iter::once(graph.group_id)
+        std::iter::once(graph.group_id)
             .chain(graph.request_ids.iter().copied())
             .chain(graph.step_ids.iter().copied())
             .collect::<Vec<_>>(),
@@ -293,7 +293,7 @@ async fn erase_never_shortens_an_existing_fence_expiry(pool: PgPool) {
          WHERE object_id = ANY($1)",
     )
     .bind(
-        &std::iter::once(graph.group_id)
+        std::iter::once(graph.group_id)
             .chain(graph.request_ids.iter().copied())
             .chain(graph.step_ids.iter().copied())
             .collect::<Vec<_>>(),
@@ -820,7 +820,7 @@ async fn owned_erasure_denies_a_mixed_owner_graph_without_mutation(pool: PgPool)
         "SELECT COUNT(*) FROM retained_response_resurrection_fences WHERE object_id = ANY($1)",
     )
     .bind(
-        &std::iter::once(graph.group_id)
+        std::iter::once(graph.group_id)
             .chain(graph.request_ids.iter().copied())
             .chain(graph.step_ids.iter().copied())
             .collect::<Vec<_>>(),
@@ -871,7 +871,7 @@ async fn assert_retained_erasure_rejects_corruption(
          WHERE object_id = ANY($1) AND reason = 'erased'",
     )
     .bind(
-        &std::iter::once(graph.group_id)
+        std::iter::once(graph.group_id)
             .chain(graph.request_ids.iter().copied())
             .chain(graph.step_ids.iter().copied())
             .collect::<Vec<_>>(),
@@ -2499,6 +2499,135 @@ async fn archive_clock(pool: &PgPool) -> (DateTime<Utc>, DateTime<Utc>) {
     .fetch_one(pool)
     .await
     .expect("archive clock must be readable")
+}
+
+#[sqlx::test]
+async fn postgres_reports_exact_retained_response_index_readiness(pool: PgPool) {
+    let manager = manager(&pool).await;
+    assert!(manager.supports_retained_response_lifecycle());
+    assert!(
+        !manager
+            .retained_response_archive_index_ready()
+            .await
+            .expect("missing candidate index must be reported")
+    );
+
+    sqlx::query("CREATE INDEX idx_requests_batchless_retention_due ON requests (id)")
+        .execute(&pool)
+        .await
+        .expect("wrong-shape candidate index must install");
+    assert!(
+        !manager
+            .retained_response_archive_index_ready()
+            .await
+            .expect("wrong-shape candidate index must be reported")
+    );
+
+    sqlx::query("DROP INDEX idx_requests_batchless_retention_due")
+        .execute(&pool)
+        .await
+        .expect("wrong-shape candidate index must drop");
+    install_candidate_index(&pool).await;
+    assert!(
+        manager
+            .retained_response_archive_index_ready()
+            .await
+            .expect("canonical candidate index must be reported")
+    );
+}
+
+#[sqlx::test]
+async fn continuous_ninety_day_runway_enables_new_graph_move(pool: PgPool) {
+    install_candidate_index(&pool).await;
+    let (observed_at, _) = archive_clock(&pool).await;
+    let retention_seconds = 90 * 86_400;
+    let runway_days = 7;
+    let policy = exact_policy(&[("flex", retention_seconds)]);
+    let first_delete_on = observed_at
+        .date_naive()
+        .succ_opt()
+        .expect("test clock must have a following day");
+    let retention_horizon = RetentionSweepPolicy::delete_on(observed_at, retention_seconds)
+        .expect("retention horizon must be representable");
+    let last_delete_on = retention_horizon
+        .checked_add_signed(TimeDelta::days(i64::from(runway_days)))
+        .expect("runway horizon must be representable");
+    let expected_runway = (last_delete_on - first_delete_on).num_days() + 1;
+    let manager = manager(&pool).await;
+
+    let provisioned = manager
+        .ensure_retained_response_partitions(&policy, runway_days)
+        .await
+        .expect("continuous runway must provision");
+    assert_eq!(provisioned.created, expected_runway);
+    assert_eq!(provisioned.contiguous_ahead, expected_runway);
+    assert_eq!(provisioned.required, expected_runway);
+    assert!(provisioned.is_complete());
+
+    let idempotent = manager
+        .ensure_retained_response_partitions(&policy, runway_days)
+        .await
+        .expect("continuous runway provisioning must be idempotent");
+    assert_eq!(idempotent.created, 0);
+    assert_eq!(idempotent.contiguous_ahead, expected_runway);
+    assert_eq!(idempotent.required, expected_runway);
+    assert!(idempotent.is_complete());
+
+    let contiguous: i64 = sqlx::query_scalar(
+        r#"
+        SELECT COUNT(*)::BIGINT
+        FROM generate_series($1::date, $2::date, INTERVAL '1 day') AS day(delete_on)
+        WHERE EXISTS (
+            SELECT 1
+            FROM retained_response_buckets bucket
+            JOIN pg_class child ON child.oid = bucket.partition_oid
+            JOIN pg_namespace namespace ON namespace.oid = child.relnamespace
+            JOIN pg_inherits inheritance ON inheritance.inhrelid = child.oid
+            WHERE bucket.delete_on = day.delete_on::date
+              AND bucket.state = 'active'
+              AND bucket.partition_schema = current_schema()
+              AND bucket.partition_table = 'retained_response_objects_d'
+                  || to_char(day.delete_on, 'YYYYMMDD')
+              AND namespace.nspname = bucket.partition_schema
+              AND child.relname = bucket.partition_table
+              AND inheritance.inhparent = 'retained_response_objects'::regclass
+              AND NOT inheritance.inhdetachpending
+              AND pg_get_expr(child.relpartbound, child.oid) = format(
+                  'FOR VALUES FROM (%L) TO (%L)',
+                  day.delete_on::date,
+                  day.delete_on::date + 1
+              )
+        )
+        "#,
+    )
+    .bind(first_delete_on)
+    .bind(last_delete_on)
+    .fetch_one(&pool)
+    .await
+    .expect("continuous runway must be inspectable");
+    assert_eq!(contiguous, expected_runway);
+
+    let terminal_at = observed_at - TimeDelta::hours(2);
+    let graph = singleton(
+        &pool,
+        "flex",
+        TerminalState::Completed,
+        terminal_at,
+        "continuous-runway",
+    )
+    .await;
+    let outcome = archive_at(
+        &manager,
+        &policy,
+        observed_at - TimeDelta::hours(1),
+        observed_at,
+        1,
+        i64::MAX,
+    )
+    .await
+    .expect("a newly eligible graph must move into the provisioned runway");
+    assert_eq!(outcome.groups_archived, 1);
+    assert_wholly_retained(&pool, &graph).await;
 }
 
 #[sqlx::test]

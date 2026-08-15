@@ -39,8 +39,9 @@ use crate::daemon::{
 };
 use crate::error::{FusilladeError, Result};
 use crate::manager::{
-    RetainedResponseArchiveCutoffs, RetainedResponseArchiveOutcome, RetainedResponseWriteError,
-    RetentionSweepCutoffs, RetentionSweepOutcome, RetentionSweepPolicy, TrailingDemandCount,
+    RetainedResponseArchiveCutoffs, RetainedResponseArchiveOutcome,
+    RetainedResponsePartitionRunway, RetainedResponseWriteError, RetentionSweepCutoffs,
+    RetentionSweepOutcome, RetentionSweepPolicy, TrailingDemandCount,
 };
 use crate::request::{
     Canceled, CascadeTargetState, Claimed, Completed, CreateBackgroundInput, CreateFlexInput,
@@ -417,7 +418,8 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
         self
     }
 
-    pub(crate) fn retained_response_fence_seconds(&self) -> Option<u64> {
+    /// Return the configured content-free resurrection-fence lifetime.
+    pub fn retained_response_fence_seconds(&self) -> Option<u64> {
         self.retained_response_fence_seconds
     }
 
@@ -8347,6 +8349,141 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
 impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
     fn supports_retention_sweeps(&self) -> bool {
         true
+    }
+
+    fn supports_retained_response_lifecycle(&self) -> bool {
+        true
+    }
+
+    async fn retained_response_archive_index_ready(&self) -> Result<bool> {
+        sqlx::query_scalar("SELECT retained_response_archive_index_ready(current_schema())")
+            .fetch_one(self.read_executor())
+            .await
+            .map_err(|error| {
+                FusilladeError::Other(anyhow!(
+                    "Failed to inspect retained response archive index readiness: {}",
+                    error
+                ))
+            })
+    }
+
+    async fn ensure_retained_response_partitions(
+        &self,
+        policy: &RetentionSweepPolicy,
+        days_ahead: i32,
+    ) -> Result<RetainedResponsePartitionRunway> {
+        policy.validate().map_err(FusilladeError::ValidationError)?;
+        if days_ahead < 0 {
+            return Err(FusilladeError::ValidationError(
+                "retained response partition runway must not be negative".to_string(),
+            ));
+        }
+        let Some(max_retention_seconds) = policy
+            .batchless_seconds_by_service_tier
+            .values()
+            .copied()
+            .max()
+        else {
+            return Ok(RetainedResponsePartitionRunway::default());
+        };
+
+        let observed_at: DateTime<Utc> = sqlx::query_scalar("SELECT statement_timestamp()")
+            .fetch_one(self.write_executor())
+            .await
+            .map_err(|error| {
+                FusilladeError::Other(anyhow!(
+                    "Failed to read the retained response partition clock: {}",
+                    error
+                ))
+            })?;
+        let first_delete_on = observed_at.date_naive().succ_opt().ok_or_else(|| {
+            FusilladeError::ValidationError(
+                "retained response partition start is out of range".to_string(),
+            )
+        })?;
+        let retention_horizon = RetentionSweepPolicy::delete_on(observed_at, max_retention_seconds)
+            .map_err(FusilladeError::ValidationError)?;
+        let last_delete_on = retention_horizon
+            .checked_add_signed(chrono::Duration::days(i64::from(days_ahead)))
+            .ok_or_else(|| {
+                FusilladeError::ValidationError(
+                    "retained response partition runway is out of range".to_string(),
+                )
+            })?;
+        let offsets = (last_delete_on - first_delete_on).num_days();
+        let offsets = i32::try_from(offsets).map_err(|_| {
+            FusilladeError::ValidationError(
+                "retained response partition runway is too large".to_string(),
+            )
+        })?;
+
+        let created: i32 = sqlx::query_scalar("SELECT ensure_retained_response_partitions($1, $2)")
+            .bind(first_delete_on)
+            .bind(offsets)
+            .fetch_one(self.write_executor())
+            .await
+            .map_err(|error| {
+                FusilladeError::Other(anyhow!(
+                    "Failed to ensure retained response partitions: {}",
+                    error
+                ))
+            })?;
+
+        let contiguous: i64 = sqlx::query_scalar(
+            r#"
+            WITH expected AS (
+                SELECT day.delete_on::date AS delete_on
+                FROM generate_series($1::date, $2::date, INTERVAL '1 day')
+                    AS day(delete_on)
+            ), readiness AS (
+                SELECT expected.delete_on,
+                       EXISTS (
+                           SELECT 1
+                           FROM retained_response_buckets bucket
+                           JOIN pg_class child ON child.oid = bucket.partition_oid
+                           JOIN pg_namespace namespace ON namespace.oid = child.relnamespace
+                           JOIN pg_inherits inheritance ON inheritance.inhrelid = child.oid
+                           WHERE bucket.delete_on = expected.delete_on
+                             AND bucket.state = 'active'
+                             AND bucket.partition_schema = current_schema()
+                             AND bucket.partition_table = 'retained_response_objects_d'
+                                 || to_char(expected.delete_on, 'YYYYMMDD')
+                             AND namespace.nspname = bucket.partition_schema
+                             AND child.relname = bucket.partition_table
+                             AND inheritance.inhparent = 'retained_response_objects'::regclass
+                             AND NOT inheritance.inhdetachpending
+                             AND pg_get_expr(child.relpartbound, child.oid) = format(
+                                 'FOR VALUES FROM (%L) TO (%L)',
+                                 expected.delete_on,
+                                 expected.delete_on + 1
+                             )
+                       ) AS ready
+                FROM expected
+            ), prefix AS (
+                SELECT bool_and(ready) OVER (
+                           ORDER BY delete_on ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                       ) AS contiguous
+                FROM readiness
+            )
+            SELECT COUNT(*) FILTER (WHERE contiguous)::BIGINT FROM prefix
+            "#,
+        )
+        .bind(first_delete_on)
+        .bind(last_delete_on)
+        .fetch_one(self.write_executor())
+        .await
+        .map_err(|error| {
+            FusilladeError::Other(anyhow!(
+                "Failed to inspect retained response partition runway: {}",
+                error
+            ))
+        })?;
+
+        Ok(RetainedResponsePartitionRunway {
+            created: i64::from(created),
+            contiguous_ahead: contiguous,
+            required: i64::from(offsets) + 1,
+        })
     }
 
     async fn archive_terminal_batchless_responses(
