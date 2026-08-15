@@ -2496,6 +2496,115 @@ struct BackgroundTaskBuilder {
     names: std::collections::HashMap<tokio::task::Id, &'static str>,
 }
 
+const FUSILLADE_LEADERSHIP_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
+
+async fn stop_leader_fusillade_daemon(
+    leadership_shutdown: &tokio::sync::Mutex<Option<tokio_util::sync::CancellationToken>>,
+    daemon_handle: &tokio::sync::Mutex<Option<tokio::task::JoinHandle<fusillade::Result<()>>>>,
+    grace: std::time::Duration,
+) {
+    // Take both values out of their mutexes before awaiting. Cancellation is
+    // cooperative: Fusillade drains its destructive maintenance workers, so
+    // leadership loss must not abort the outer daemon task first.
+    let token = leadership_shutdown.lock().await.take();
+    if let Some(token) = token {
+        token.cancel();
+    }
+    let Some(mut handle) = daemon_handle.lock().await.take() else {
+        return;
+    };
+
+    match tokio::time::timeout(grace, &mut handle).await {
+        Ok(Ok(Ok(()))) => {
+            tracing::info!("Fusillade daemon stopped cooperatively after leadership loss");
+        }
+        Ok(Ok(Err(error))) => {
+            tracing::error!(
+                error = %error,
+                "Fusillade daemon failed while stopping after leadership loss"
+            );
+        }
+        Ok(Err(error)) => {
+            tracing::error!(
+                error = %error,
+                "Fusillade daemon task panicked while stopping after leadership loss"
+            );
+        }
+        Err(_) => {
+            tracing::warn!(
+                grace_seconds = grace.as_secs_f64(),
+                "Fusillade daemon exceeded the cooperative leadership-loss shutdown grace; aborting"
+            );
+            handle.abort();
+            if let Err(error) = handle.await
+                && !error.is_cancelled()
+            {
+                tracing::error!(
+                    error = %error,
+                    "Fusillade daemon task failed after leadership-loss abort"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod leadership_shutdown_tests {
+    use super::stop_leader_fusillade_daemon;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn leadership_loss_cancels_and_awaits_daemon_without_holding_mutex() {
+        let token = tokio_util::sync::CancellationToken::new();
+        let token_slot = tokio::sync::Mutex::new(Some(token.clone()));
+        let handle_slot = Arc::new(tokio::sync::Mutex::new(None));
+        let observed_unlocked = Arc::new(AtomicBool::new(false));
+
+        let handle_slot_for_task = handle_slot.clone();
+        let observed_unlocked_for_task = observed_unlocked.clone();
+        let handle = tokio::spawn(async move {
+            token.cancelled().await;
+            observed_unlocked_for_task.store(handle_slot_for_task.try_lock().is_ok(), Ordering::SeqCst);
+            Ok(())
+        });
+        *handle_slot.lock().await = Some(handle);
+
+        stop_leader_fusillade_daemon(&token_slot, handle_slot.as_ref(), Duration::from_secs(1)).await;
+
+        assert!(observed_unlocked.load(Ordering::SeqCst));
+        assert!(token_slot.lock().await.is_none());
+        assert!(handle_slot.lock().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn leadership_loss_aborts_and_awaits_after_explicit_grace() {
+        struct DropFlag(Arc<AtomicBool>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let token_slot = tokio::sync::Mutex::new(Some(tokio_util::sync::CancellationToken::new()));
+        let handle_slot = tokio::sync::Mutex::new(None);
+        let dropped = Arc::new(AtomicBool::new(false));
+        let guard = DropFlag(dropped.clone());
+        let handle = tokio::spawn(async move {
+            let _guard = guard;
+            std::future::pending::<fusillade::Result<()>>().await
+        });
+        *handle_slot.lock().await = Some(handle);
+        tokio::task::yield_now().await;
+
+        stop_leader_fusillade_daemon(&token_slot, &handle_slot, Duration::from_millis(1)).await;
+
+        assert!(dropped.load(Ordering::SeqCst));
+        assert!(handle_slot.lock().await.is_none());
+    }
+}
+
 impl BackgroundTaskBuilder {
     fn new() -> Self {
         Self {
@@ -2901,10 +3010,12 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
                     let daemon_handle = daemon_handle_lose.clone();
                     let leadership_shutdown = leadership_shutdown_lose.clone();
                     async move {
-                        // Cancel the leadership session token first, which will stop all background tasks gracefully
-                        if let Some(token) = leadership_shutdown.lock().await.take() {
-                            token.cancel();
-                        }
+                        stop_leader_fusillade_daemon(
+                            leadership_shutdown.as_ref(),
+                            daemon_handle.as_ref(),
+                            FUSILLADE_LEADERSHIP_SHUTDOWN_GRACE,
+                        )
+                        .await;
 
                         // Now stop all schedulers if probe scheduler was enabled
                         if config.background_services.probe_scheduler.enabled {
@@ -2912,12 +3023,6 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
                                 .stop_all()
                                 .await
                                 .map_err(|e| anyhow::anyhow!("Failed to stop probe scheduler: {}", e))?;
-                        }
-
-                        // Stop the fusillade daemon
-                        if let Some(handle) = daemon_handle.lock().await.take() {
-                            handle.abort();
-                            tracing::info!("Fusillade batch daemon stopped (lost leadership)");
                         }
 
                         Ok(())
@@ -3201,22 +3306,23 @@ impl Application {
             .background_services
             .batch_daemon
             .to_fusillade_config_with_limits(Some(model_capacity_limits.clone()));
+        let retention_maintenance_config = config.background_services.batch_daemon.to_fusillade_retention_maintenance_config();
 
         let request_manager = Arc::new(
             fusillade_arsenal::PostgresRequestManager::new(
                 fusillade_pools.clone(),
                 fusillade_arsenal::PostgresStorageConfig::from(&fusillade_daemon_config),
             )
-            .with_retained_response_fence_seconds(fusillade_daemon_config.retention.max_late_writer_seconds)
+            .with_retained_response_fence_seconds(config.background_services.batch_daemon.retention.max_late_writer_seconds)
             .with_download_buffer_size(config.batches.files.download_buffer_size)
             .with_batch_insert_strategy(fusillade_arsenal::BatchInsertStrategy::Batched {
                 batch_size: config.batches.files.batch_insert_size,
             }),
         );
-        let postgres_daemon = Arc::new(fusillade::PostgresDaemon::from_store(
-            request_manager.clone(),
-            fusillade_daemon_config.clone(),
-        ));
+        let postgres_daemon = Arc::new(
+            fusillade::PostgresDaemon::from_store(request_manager.clone(), fusillade_daemon_config.clone())
+                .with_retention_maintenance(retention_maintenance_config),
+        );
         let step_manager = Arc::new(fusillade_arsenal::PostgresResponseStepManager::new(fusillade_pools.clone()));
         // Build the ZDR keystore once and share it across the response store, the
         // daemon processor, and background services (which install the response
