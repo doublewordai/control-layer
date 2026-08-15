@@ -29,6 +29,13 @@ pub struct BatchModelInfo {
     pub allowed_windows: HashMap<String, Vec<String>>,
 }
 
+#[derive(Debug, Clone)]
+pub struct ServingModelEntry {
+    pub model_name: String,
+    pub is_composite: bool,
+    pub primary_component_alias: Option<String>,
+}
+
 /// Filter options for listing deployments
 #[derive(Debug, Clone)]
 pub struct DeploymentFilter {
@@ -1521,6 +1528,46 @@ impl<'c> Deployments<'c> {
         .await?;
 
         Ok(id)
+    }
+
+    pub async fn serving_model_entries_by_alias(&mut self) -> Result<HashMap<String, ServingModelEntry>> {
+        let rows = sqlx::query!(
+            r#"
+            SELECT
+                m.alias,
+                m.model_name,
+                m.is_composite,
+                pc.alias as "primary_component_alias?"
+            FROM deployed_models m
+            LEFT JOIN LATERAL (
+                SELECT dm.alias
+                FROM deployed_model_components dmc
+                INNER JOIN deployed_models dm ON dmc.deployed_model_id = dm.id
+                WHERE dmc.composite_model_id = m.id
+                  AND dmc.enabled = TRUE
+                  AND dm.deleted = FALSE
+                ORDER BY dmc.sort_order ASC, dmc.weight DESC, dmc.created_at ASC
+                LIMIT 1
+            ) pc ON m.is_composite
+            WHERE m.deleted = FALSE
+            "#
+        )
+        .fetch_all(&mut *self.db)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                (
+                    row.alias,
+                    ServingModelEntry {
+                        model_name: row.model_name,
+                        is_composite: row.is_composite,
+                        primary_component_alias: row.primary_component_alias,
+                    },
+                )
+            })
+            .collect())
     }
 
     /// Set traffic routing rules for a model (replace-all pattern).

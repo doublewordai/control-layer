@@ -16,6 +16,7 @@ use utoipa::{IntoParams, ToSchema};
 use crate::{
     AppState,
     auth::permissions::{RequiresPermission, operation, resource},
+    db::handlers::deployments::{Deployments, ServingModelEntry},
     errors::Error,
 };
 
@@ -38,6 +39,23 @@ pub enum DemandResponse {
     Flat(PendingCountsByModelAndWindow),
     /// `model -> window -> tier -> outcome -> count` (`group_by=service_tier`).
     Grouped(GroupedDemandByModelAndWindow),
+}
+
+const MAX_ALIAS_RESOLUTION_DEPTH: usize = 8;
+
+fn resolve_serving_model_name(catalog: &HashMap<String, ServingModelEntry>, requested: &str) -> String {
+    let mut current = requested;
+    for _ in 0..MAX_ALIAS_RESOLUTION_DEPTH {
+        match catalog.get(current) {
+            Some(entry) if entry.is_composite => match &entry.primary_component_alias {
+                Some(next) => current = next,
+                None => break,
+            },
+            Some(entry) => return entry.model_name.clone(),
+            None => break,
+        }
+    }
+    requested.to_string()
 }
 
 fn parse_service_tiers(raw: Option<&str>) -> Vec<Option<String>> {
@@ -238,16 +256,28 @@ pub async fn get_demand<P: PoolProvider>(
     let model_filter: Vec<String> = Vec::new();
     let service_tiers = parse_service_tiers(params.service_tiers.as_deref());
 
+    let catalog = {
+        let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
+        Deployments::new(&mut conn).serving_model_entries_by_alias().await?
+    };
+
     if !grouped {
         let service_tier_filter = ServiceTierFilter::Include(service_tiers);
 
-        let mut counts = state
+        let pending = state
             .request_manager
             .get_pending_request_counts_by_model_and_window(&windows, &states, &model_filter, &service_tier_filter, false)
             .await
             .map_err(|e| Error::Internal {
                 operation: format!("get demand by window: {}", e),
             })?;
+        let mut counts: PendingCountsByModelAndWindow = HashMap::new();
+        for (model, window_counts) in pending {
+            let folded = counts.entry(resolve_serving_model_name(&catalog, &model)).or_default();
+            for (window_label, count) in window_counts {
+                *folded.entry(window_label).or_insert(0) += count;
+            }
+        }
 
         if !trailing_windows.is_empty() {
             let trailing = state
@@ -258,7 +288,11 @@ pub async fn get_demand<P: PoolProvider>(
                     operation: format!("get trailing demand by window: {}", e),
                 })?;
             for row in trailing {
-                *counts.entry(row.model).or_default().entry(row.window_label).or_insert(0) += row.count;
+                *counts
+                    .entry(resolve_serving_model_name(&catalog, &row.model))
+                    .or_default()
+                    .entry(row.window_label)
+                    .or_insert(0) += row.count;
             }
         }
 
@@ -283,13 +317,15 @@ pub async fn get_demand<P: PoolProvider>(
         })?;
     for row in pending {
         let tier_key = row.service_tier.as_deref().unwrap_or("batch").to_string();
-        cube.entry(row.model)
+        *cube
+            .entry(resolve_serving_model_name(&catalog, &row.model))
             .or_default()
             .entry(row.window_label)
             .or_default()
             .entry(tier_key)
             .or_default()
-            .insert(row.outcome, row.count);
+            .entry(row.outcome)
+            .or_insert(0) += row.count;
     }
 
     if !trailing_windows.is_empty() {
@@ -302,13 +338,15 @@ pub async fn get_demand<P: PoolProvider>(
             })?;
         for row in trailing {
             let tier_key = row.service_tier.as_deref().unwrap_or("batch").to_string();
-            cube.entry(row.model)
+            *cube
+                .entry(resolve_serving_model_name(&catalog, &row.model))
                 .or_default()
                 .entry(row.window_label)
                 .or_default()
                 .entry(tier_key)
                 .or_default()
-                .insert(row.outcome, row.count);
+                .entry(row.outcome)
+                .or_insert(0) += row.count;
         }
     }
 
@@ -319,9 +357,14 @@ pub async fn get_demand<P: PoolProvider>(
 mod tests {
     use super::*;
     use crate::api::models::users::Role;
+    use crate::db::handlers::Repository;
+    use crate::db::models::deployments::{DeploymentComponentCreateDBRequest, DeploymentCreateDBRequest, LoadBalancingStrategy};
     use crate::test::utils::*;
+    use crate::types::{DeploymentId, UserId};
     use axum_test::TestServer;
     use sqlx::PgPool;
+    use sqlx::postgres::PgConnectOptions;
+    use sqlx_pool_router::TestDbPools;
 
     #[sqlx::test]
     async fn test_demand_endpoint_requires_system_permission(pool: sqlx::PgPool) {
@@ -868,5 +911,241 @@ mod tests {
         assert_eq!(window.get("batch").and_then(|t| t.get("pending")), Some(&1), "{cube:?}");
         assert_eq!(window.get("priority").and_then(|t| t.get("completed")), Some(&1), "{cube:?}");
         assert_eq!(window.get("priority").and_then(|t| t.get("failed")), Some(&1), "{cube:?}");
+    }
+
+    async fn fusillade_request_manager(pool: &PgPool) -> (fusillade_arsenal::PostgresRequestManager<TestDbPools>, PgPool) {
+        let base_opts: PgConnectOptions = pool.connect_options().as_ref().clone();
+        let fusillade_pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .min_connections(0)
+            .connect_with(base_opts.options([("search_path", "fusillade")]))
+            .await
+            .expect("Failed to create fusillade pool");
+        let fusillade_pools = TestDbPools::new(fusillade_pool.clone()).await.expect("TestDbPools");
+        (
+            fusillade_arsenal::PostgresRequestManager::new(fusillade_pools, Default::default()),
+            fusillade_pool,
+        )
+    }
+
+    async fn create_pending_batch_request(
+        request_manager: &fusillade_arsenal::PostgresRequestManager<TestDbPools>,
+        fusillade_pool: &PgPool,
+        model: &str,
+    ) {
+        use fusillade::{BatchInput, RequestTemplateInput};
+
+        let template = RequestTemplateInput {
+            custom_id: None,
+            endpoint: "https://api.example.com".to_string(),
+            method: "POST".to_string(),
+            path: "/v1/chat/completions".to_string(),
+            body: r#"{"input":"x"}"#.to_string(),
+            model: model.to_string(),
+            api_key: "key".to_string(),
+        };
+        let file_id = request_manager
+            .create_file(format!("alias-demand-{model}"), None, vec![template])
+            .await
+            .expect("create_file");
+        let batch = request_manager
+            .create_batch(BatchInput {
+                file_id,
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                created_by: None,
+                api_key_id: None,
+                api_key: None,
+                total_requests: None,
+            })
+            .await
+            .expect("create_batch");
+        sqlx::query("UPDATE batches SET expires_at = NOW() + interval '30 minutes' WHERE id = $1")
+            .bind(batch.id.0)
+            .execute(fusillade_pool)
+            .await
+            .expect("pin expires_at");
+    }
+
+    async fn create_composite_model(
+        pool: &PgPool,
+        created_by: UserId,
+        alias: &str,
+        components: &[(DeploymentId, bool, i32)],
+    ) -> DeploymentId {
+        let mut conn = pool.acquire().await.expect("acquire connection");
+        let mut repo = Deployments::new(&mut conn);
+        let composite = repo
+            .create(
+                &DeploymentCreateDBRequest::builder()
+                    .created_by(created_by)
+                    .model_name(alias.to_string())
+                    .alias(alias.to_string())
+                    .is_composite(true)
+                    .lb_strategy(LoadBalancingStrategy::Priority)
+                    .build(),
+            )
+            .await
+            .expect("create composite");
+        for (deployed_model_id, enabled, sort_order) in components {
+            repo.add_component(&DeploymentComponentCreateDBRequest {
+                composite_model_id: composite.id,
+                deployed_model_id: *deployed_model_id,
+                weight: 50,
+                enabled: *enabled,
+                sort_order: *sort_order,
+            })
+            .await
+            .expect("add component");
+        }
+        composite.id
+    }
+
+    #[sqlx::test]
+    async fn test_demand_resolves_composite_alias_to_primary_component_leaf(pool: PgPool) {
+        use fusillade::PersistCompletedRealtimeInput;
+
+        let (server, _bg): (TestServer, _) = create_test_app(pool.clone(), false).await;
+        let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let (request_manager, fusillade_pool) = fusillade_request_manager(&pool).await;
+
+        let leaf = create_test_deployment(&pool, admin.id, "upstream/leaf-a", "leaf-a").await;
+        create_composite_model(&pool, admin.id, "virtual-a", &[(leaf.id, true, 0)]).await;
+
+        create_pending_batch_request(&request_manager, &fusillade_pool, "virtual-a").await;
+
+        let now = chrono::Utc::now();
+        request_manager
+            .persist_completed_realtime_batch(&[PersistCompletedRealtimeInput {
+                request_id: uuid::Uuid::new_v4(),
+                response_body: r#"{"ok":true}"#.to_string(),
+                status_code: 200,
+                request_body: r#"{"input":"x"}"#.to_string(),
+                model: "virtual-a".to_string(),
+                endpoint: "http://localhost".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/responses".to_string(),
+                api_key: String::new(),
+                created_by: "queue-user".to_string(),
+                started_at: now - chrono::Duration::seconds(90),
+                completed_at: now - chrono::Duration::seconds(60),
+            }])
+            .await
+            .expect("persist realtime row");
+
+        let response = server
+            .get("/admin/api/v1/monitoring/demand?window=-1h:24h&service_tiers=batch,priority")
+            .add_header(&add_auth_headers(&admin)[0].0, &add_auth_headers(&admin)[0].1)
+            .add_header(&add_auth_headers(&admin)[1].0, &add_auth_headers(&admin)[1].1)
+            .await;
+        response.assert_status_ok();
+        let counts: HashMap<String, HashMap<String, i64>> = response.json();
+        assert!(!counts.contains_key("virtual-a"), "{counts:?}");
+        assert_eq!(counts.get("upstream/leaf-a").and_then(|m| m.get("-1h:24h")), Some(&2), "{counts:?}");
+    }
+
+    #[sqlx::test]
+    async fn test_demand_merges_aliases_sharing_leaf(pool: PgPool) {
+        let (server, _bg): (TestServer, _) = create_test_app(pool.clone(), false).await;
+        let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let (request_manager, fusillade_pool) = fusillade_request_manager(&pool).await;
+
+        let leaf = create_test_deployment(&pool, admin.id, "upstream/shared", "shared").await;
+        create_composite_model(&pool, admin.id, "virtual-1", &[(leaf.id, true, 0)]).await;
+        create_composite_model(&pool, admin.id, "virtual-2", &[(leaf.id, true, 0)]).await;
+
+        create_pending_batch_request(&request_manager, &fusillade_pool, "virtual-1").await;
+        create_pending_batch_request(&request_manager, &fusillade_pool, "virtual-2").await;
+
+        let response = server
+            .get("/admin/api/v1/monitoring/demand?window=24h")
+            .add_header(&add_auth_headers(&admin)[0].0, &add_auth_headers(&admin)[0].1)
+            .add_header(&add_auth_headers(&admin)[1].0, &add_auth_headers(&admin)[1].1)
+            .await;
+        response.assert_status_ok();
+        let counts: HashMap<String, HashMap<String, i64>> = response.json();
+        assert!(!counts.contains_key("virtual-1"), "{counts:?}");
+        assert!(!counts.contains_key("virtual-2"), "{counts:?}");
+        assert_eq!(counts.get("upstream/shared").and_then(|m| m.get("24h")), Some(&2), "{counts:?}");
+
+        let response = server
+            .get("/admin/api/v1/monitoring/demand?window=24h&group_by=service_tier")
+            .add_header(&add_auth_headers(&admin)[0].0, &add_auth_headers(&admin)[0].1)
+            .add_header(&add_auth_headers(&admin)[1].0, &add_auth_headers(&admin)[1].1)
+            .await;
+        response.assert_status_ok();
+        let cube: GroupedDemandByModelAndWindow = response.json();
+        assert_eq!(
+            cube.get("upstream/shared")
+                .and_then(|m| m.get("24h"))
+                .and_then(|w| w.get("batch"))
+                .and_then(|t| t.get("pending")),
+            Some(&2),
+            "{cube:?}"
+        );
+    }
+
+    #[sqlx::test]
+    async fn test_demand_skips_disabled_primary_component(pool: PgPool) {
+        let (server, _bg): (TestServer, _) = create_test_app(pool.clone(), false).await;
+        let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let (request_manager, fusillade_pool) = fusillade_request_manager(&pool).await;
+
+        let disabled = create_test_deployment(&pool, admin.id, "upstream/disabled", "disabled-component").await;
+        let enabled = create_test_deployment(&pool, admin.id, "upstream/enabled", "enabled-component").await;
+        create_composite_model(&pool, admin.id, "virtual-f", &[(disabled.id, false, 0), (enabled.id, true, 1)]).await;
+
+        create_pending_batch_request(&request_manager, &fusillade_pool, "virtual-f").await;
+
+        let response = server
+            .get("/admin/api/v1/monitoring/demand?window=24h")
+            .add_header(&add_auth_headers(&admin)[0].0, &add_auth_headers(&admin)[0].1)
+            .add_header(&add_auth_headers(&admin)[1].0, &add_auth_headers(&admin)[1].1)
+            .await;
+        response.assert_status_ok();
+        let counts: HashMap<String, HashMap<String, i64>> = response.json();
+        assert!(!counts.contains_key("upstream/disabled"), "{counts:?}");
+        assert!(!counts.contains_key("virtual-f"), "{counts:?}");
+        assert_eq!(counts.get("upstream/enabled").and_then(|m| m.get("24h")), Some(&1), "{counts:?}");
+    }
+
+    #[sqlx::test]
+    async fn test_demand_passes_through_unknown_model_names(pool: PgPool) {
+        let (server, _bg): (TestServer, _) = create_test_app(pool.clone(), false).await;
+        let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let (request_manager, fusillade_pool) = fusillade_request_manager(&pool).await;
+
+        create_pending_batch_request(&request_manager, &fusillade_pool, "not-in-catalog").await;
+
+        let response = server
+            .get("/admin/api/v1/monitoring/demand?window=24h")
+            .add_header(&add_auth_headers(&admin)[0].0, &add_auth_headers(&admin)[0].1)
+            .add_header(&add_auth_headers(&admin)[1].0, &add_auth_headers(&admin)[1].1)
+            .await;
+        response.assert_status_ok();
+        let counts: HashMap<String, HashMap<String, i64>> = response.json();
+        assert_eq!(counts.get("not-in-catalog").and_then(|m| m.get("24h")), Some(&1), "{counts:?}");
+    }
+
+    #[sqlx::test]
+    async fn test_demand_resolves_plain_alias_to_model_name(pool: PgPool) {
+        let (server, _bg): (TestServer, _) = create_test_app(pool.clone(), false).await;
+        let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let (request_manager, fusillade_pool) = fusillade_request_manager(&pool).await;
+
+        create_test_deployment(&pool, admin.id, "upstream/model-x", "friendly-x").await;
+
+        create_pending_batch_request(&request_manager, &fusillade_pool, "friendly-x").await;
+
+        let response = server
+            .get("/admin/api/v1/monitoring/demand?window=24h")
+            .add_header(&add_auth_headers(&admin)[0].0, &add_auth_headers(&admin)[0].1)
+            .add_header(&add_auth_headers(&admin)[1].0, &add_auth_headers(&admin)[1].1)
+            .await;
+        response.assert_status_ok();
+        let counts: HashMap<String, HashMap<String, i64>> = response.json();
+        assert!(!counts.contains_key("friendly-x"), "{counts:?}");
+        assert_eq!(counts.get("upstream/model-x").and_then(|m| m.get("24h")), Some(&1), "{counts:?}");
     }
 }

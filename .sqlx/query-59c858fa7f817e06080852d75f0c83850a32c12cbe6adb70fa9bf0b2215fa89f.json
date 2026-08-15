@@ -1,0 +1,38 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT\n                m.alias,\n                m.model_name,\n                m.is_composite,\n                pc.alias as \"primary_component_alias?\"\n            FROM deployed_models m\n            LEFT JOIN LATERAL (\n                SELECT dm.alias\n                FROM deployed_model_components dmc\n                INNER JOIN deployed_models dm ON dmc.deployed_model_id = dm.id\n                WHERE dmc.composite_model_id = m.id\n                  AND dmc.enabled = TRUE\n                  AND dm.deleted = FALSE\n                ORDER BY dmc.sort_order ASC, dmc.weight DESC, dmc.created_at ASC\n                LIMIT 1\n            ) pc ON m.is_composite\n            WHERE m.deleted = FALSE\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "alias",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 1,
+        "name": "model_name",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "is_composite",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 3,
+        "name": "primary_component_alias?",
+        "type_info": "Varchar"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "59c858fa7f817e06080852d75f0c83850a32c12cbe6adb70fa9bf0b2215fa89f"
+}
