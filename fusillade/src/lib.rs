@@ -16,7 +16,9 @@ pub mod transform;
 pub use fusillade_core::{batch, error, request, response_step};
 
 // Re-export commonly used types
-pub use daemon::{Daemon, DaemonConfig, DaemonMode, ModelEscalationConfig};
+pub use daemon::{
+    Daemon, DaemonConfig, DaemonMode, ModelEscalationConfig, RetentionMaintenanceConfig,
+};
 pub use fusillade_core::batch::*;
 pub use fusillade_core::error::{FusilladeError, Result};
 pub use fusillade_core::request::*;
@@ -32,9 +34,9 @@ pub use manager::DaemonExecutor;
 #[cfg(feature = "postgres")]
 pub use manager::PostgresDaemon;
 pub use manager::{
-    DaemonStorage, ModelFilter, ModelFilterState, RetainedResponseArchiveOutcome,
-    RetainedResponseMaintenanceError, RetainedResponseWriteError, RetentionCutoffs,
-    RetentionMaintenanceOutcome, RetentionSweepCutoffs, RetentionSweepOutcome,
+    DaemonStorage, ModelFilter, ModelFilterState, RetainedResponseArchiveCutoffs,
+    RetainedResponseArchiveOutcome, RetainedResponseMaintenanceError, RetainedResponseWriteError,
+    RetentionCutoffs, RetentionMaintenanceOutcome, RetentionSweepCutoffs, RetentionSweepOutcome,
     RetentionSweepPolicy, Storage, TrailingDemandCount,
 };
 pub use processor::{CancellationFuture, DefaultRequestProcessor, RequestProcessor, ShouldRetry};

@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::daemon::{Daemon, DaemonConfig, DaemonMode};
+use crate::daemon::{Daemon, DaemonConfig, DaemonMode, RetentionMaintenanceConfig};
 use crate::http::{HttpClient, ReqwestHttpClient};
 use crate::processor::RequestProcessor;
 
@@ -24,6 +24,7 @@ where
     storage: Arc<PostgresStore<P>>,
     http_client: Arc<H>,
     config: DaemonConfig,
+    retention_maintenance: RetentionMaintenanceConfig,
     processor: OnceLock<Arc<dyn RequestProcessor<PostgresStore<P>, H>>>,
 }
 
@@ -76,10 +77,7 @@ where
     /// Use [`PostgresDaemon::new`] when the store needs custom Arsenal
     /// configuration, such as database retry cadence.
     pub fn from_pools(pools: P, config: DaemonConfig) -> Self {
-        let storage = Arc::new(
-            PostgresStore::new(pools, (&config).into())
-                .with_retained_response_fence_seconds(config.retention.max_late_writer_seconds),
-        );
+        let storage = Arc::new(PostgresStore::new(pools, (&config).into()));
         Self::from_store(storage, config)
     }
 }
@@ -94,8 +92,15 @@ where
             storage,
             http_client,
             config,
+            retention_maintenance: RetentionMaintenanceConfig::default(),
             processor: OnceLock::new(),
         }
+    }
+
+    /// Install retained-response maintenance controls on the daemon runtime.
+    pub fn with_retention_maintenance(mut self, config: RetentionMaintenanceConfig) -> Self {
+        self.retention_maintenance = config;
+        self
     }
 
     pub fn with_processor(self, processor: Arc<dyn RequestProcessor<PostgresStore<P>, H>>) -> Self {
@@ -156,7 +161,8 @@ where
             self.http_client.clone(),
             self.config.clone(),
             shutdown_token,
-        );
+        )
+        .with_retention_maintenance(self.retention_maintenance.clone());
         if let Some(processor) = self.processor.get().cloned() {
             daemon = daemon.with_processor(processor);
         }
