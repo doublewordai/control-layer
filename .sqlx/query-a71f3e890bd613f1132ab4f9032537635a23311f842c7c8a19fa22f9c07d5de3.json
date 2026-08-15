@@ -1,0 +1,26 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT DISTINCT ON (cm.id) cm.alias AS composite_alias, dm.alias AS primary_alias\n        FROM deployed_models cm\n        INNER JOIN deployed_model_components dmc ON dmc.composite_model_id = cm.id AND dmc.enabled = TRUE\n        INNER JOIN deployed_models dm ON dm.id = dmc.deployed_model_id AND dm.deleted = FALSE\n        WHERE cm.deleted = FALSE\n          AND cm.is_composite = TRUE\n        ORDER BY cm.id, dmc.sort_order ASC, dmc.weight DESC, dmc.created_at ASC\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "composite_alias",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 1,
+        "name": "primary_alias",
+        "type_info": "Varchar"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "a71f3e890bd613f1132ab4f9032537635a23311f842c7c8a19fa22f9c07d5de3"
+}

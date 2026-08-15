@@ -215,6 +215,10 @@ pub struct Config {
     /// tokenizer-svc URL, and the default pricing multipliers. See [`CacheConfig`].
     #[serde(default)]
     pub cache: CacheConfig,
+    /// Health probe configuration (auto-creation policy). Probe *scheduling*
+    /// is configured separately under `background_services.probe_scheduler`.
+    #[serde(default)]
+    pub probes: ProbesConfig,
 }
 
 /// Controls exposure of the OpenAPI specs and Scalar doc UIs.
@@ -1954,12 +1958,13 @@ impl Default for DaemonConfig {
 impl DaemonConfig {
     /// Convert to fusillade daemon config
     pub fn to_fusillade_config(&self) -> fusillade::daemon::DaemonConfig {
-        self.to_fusillade_config_with_limits(None)
+        self.to_fusillade_config_with_limits(None, None)
     }
 
     pub fn to_fusillade_config_with_limits(
         &self,
         model_capacity_limits: Option<std::sync::Arc<dashmap::DashMap<String, usize>>>,
+        model_gate_states: Option<std::sync::Arc<dashmap::DashMap<String, fusillade::ModelGateState>>>,
     ) -> fusillade::daemon::DaemonConfig {
         // If the deprecated timeout_ms is set and the granular fields are at their
         // defaults, split it: 90% header (connect + TTFT), 10% body.
@@ -1983,6 +1988,7 @@ impl DaemonConfig {
             mode: self.mode.into(),
             claim_batch_size: self.claim_batch_size,
             model_concurrency_limits: model_capacity_limits.unwrap_or_else(|| std::sync::Arc::new(dashmap::DashMap::new())),
+            model_gate_states: model_gate_states.unwrap_or_else(|| std::sync::Arc::new(dashmap::DashMap::new())),
             model_escalations: Arc::new(DashMap::from_iter(self.model_escalations.clone())),
             claim_interval_ms: self.claim_interval_ms,
             max_retries: self.max_retries,
@@ -2219,6 +2225,23 @@ pub struct ProbeSchedulerConfig {
 impl Default for ProbeSchedulerConfig {
     fn default() -> Self {
         Self { enabled: true }
+    }
+}
+
+/// Health probe configuration.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProbesConfig {
+    /// Automatically create a health probe (`auto-<alias>`, 60s interval) for
+    /// every non-deleted, non-composite deployed model with a hosting endpoint
+    /// (default: true). Idempotent and multi-pod safe; never overwrites
+    /// manually created probes and never deletes probes.
+    pub auto_create: bool,
+}
+
+impl Default for ProbesConfig {
+    fn default() -> Self {
+        Self { auto_create: true }
     }
 }
 
@@ -2516,6 +2539,7 @@ impl Default for Config {
             keystore: None,
             openapi: OpenApiConfig::default(),
             cache: CacheConfig::default(),
+            probes: ProbesConfig::default(),
         }
     }
 }

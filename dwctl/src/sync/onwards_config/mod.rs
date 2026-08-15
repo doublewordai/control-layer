@@ -124,6 +124,8 @@ pub struct OnwardsConfigSync {
     /// Default rate-limit tiers applied to API keys based on the owning user's
     /// `verified` flag. Used when a key has no per-key override.
     rate_limit_tiers: RateLimitTiersConfig,
+    /// Auto-create health probes for leaf catalog entries on every full reload.
+    auto_create_probes: bool,
 }
 
 pub struct SyncConfig {
@@ -149,7 +151,7 @@ impl OnwardsConfigSync {
     #[cfg(test)]
     #[instrument(skip(db))]
     pub async fn new(db: PgPool) -> Result<(Self, Targets, WatchTargetsStream), anyhow::Error> {
-        Self::new_with_daemon_limits(db, None, 10, Vec::new(), false, RateLimitTiersConfig::default()).await
+        Self::new_with_daemon_limits(db, None, 10, Vec::new(), false, RateLimitTiersConfig::default(), false).await
     }
 
     /// Creates a new OnwardsConfigSync with optional daemon capacity limits map and escalation models
@@ -159,6 +161,7 @@ impl OnwardsConfigSync {
     /// `escalation_models` - Model aliases that batch API keys should have automatic access to.
     /// `strict_mode` - Enable strict mode with schema validation (only known OpenAI API paths accepted)
     /// `rate_limit_tiers` - Default rate limits applied per-key based on the owning user's `verified` flag.
+    /// `auto_create_probes` - Auto-create health probes for leaf catalog entries on startup and every full reload.
     #[instrument(skip(db, daemon_capacity_limits, escalation_models, rate_limit_tiers))]
     pub async fn new_with_daemon_limits(
         db: PgPool,
@@ -167,6 +170,7 @@ impl OnwardsConfigSync {
         escalation_models: Vec<String>,
         strict_mode: bool,
         rate_limit_tiers: RateLimitTiersConfig,
+        auto_create_probes: bool,
     ) -> Result<(Self, Targets, WatchTargetsStream), anyhow::Error> {
         // Load initial configuration (including composite models)
         let initial_targets = load_targets_from_db(&db, &escalation_models, strict_mode, &rate_limit_tiers).await?;
@@ -174,6 +178,10 @@ impl OnwardsConfigSync {
         // If daemon limits are provided, populate them
         if let Some(ref limits) = daemon_capacity_limits {
             update_daemon_capacity_limits(&db, limits, default_batch_capacity).await?;
+        }
+
+        if auto_create_probes {
+            crate::probes::auto::reconcile_auto_probes(&db).await?;
         }
 
         // Populate cache info metrics on startup
@@ -200,6 +208,7 @@ impl OnwardsConfigSync {
             cache_info_state,
             strict_mode,
             rate_limit_tiers,
+            auto_create_probes,
         };
         let stream = WatchTargetsStream::new(receiver);
 
@@ -409,6 +418,12 @@ impl OnwardsConfigSync {
                 "Failed to update daemon capacity limits: {}",
                 e
             );
+        }
+
+        if self.auto_create_probes
+            && let Err(e) = crate::probes::auto::reconcile_auto_probes(&self.db).await
+        {
+            crate::background_error!(ONWARDS_SYNC, "auto_probes", Error, "Failed to reconcile auto probes: {}", e);
         }
 
         // Update cache info metrics

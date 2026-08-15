@@ -1,0 +1,26 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT dm.alias, COALESCE(pr.success, TRUE) AS \"healthy!\"\n        FROM deployed_models dm\n        LEFT JOIN probes p ON p.deployment_id = dm.id AND p.active = TRUE\n        LEFT JOIN LATERAL (\n            SELECT r.success\n            FROM probe_results r\n            WHERE r.probe_id = p.id\n              AND r.executed_at >= NOW() - make_interval(secs => (3 * p.interval_seconds)::double precision)\n            ORDER BY r.executed_at DESC\n            LIMIT 1\n        ) pr ON TRUE\n        WHERE dm.deleted = FALSE\n          AND dm.is_composite = FALSE\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "alias",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 1,
+        "name": "healthy!",
+        "type_info": "Bool"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      null
+    ]
+  },
+  "hash": "4175ea058d52157f204f45246517fb025506c1bab8a104b07412434832d58378"
+}

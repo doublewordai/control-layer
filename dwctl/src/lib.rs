@@ -178,7 +178,7 @@ pub mod webhooks;
 #[cfg(test)]
 mod test;
 
-use crate::metrics::errors::component::{ONWARDS_HEARTBEAT, SUPERVISOR};
+use crate::metrics::errors::component::{CLAIM_GATE, ONWARDS_HEARTBEAT, SUPERVISOR};
 use crate::{
     api::models::{
         deployments::{DeployedModelCreate, StandardModelCreate},
@@ -2535,6 +2535,10 @@ pub(crate) struct BackgroundServicesInput {
     /// and the onwards config-sync writer. Built once by the caller and
     /// passed in by-clone here.
     pub model_capacity_limits: Arc<dashmap::DashMap<String, usize>>,
+    /// Shared map between the fusillade daemon's claim gate and the
+    /// claim-gate refresher spawned here. Sparse: only throttled models
+    /// appear; absent = Open.
+    pub model_gate_states: Arc<dashmap::DashMap<String, fusillade::ModelGateState>>,
     /// dwctl primary pool (used for probe scheduler, notification
     /// poller, and the inference middleware setup).
     pub pool: PgPool,
@@ -2559,6 +2563,7 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
         postgres_daemon,
         step_manager,
         model_capacity_limits,
+        model_gate_states,
         pool,
         fusillade_pools,
         outlet_pool,
@@ -2606,6 +2611,7 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
             escalation_models,
             config.onwards.strict_mode,
             config.auth.rate_limits.clone(),
+            config.probes.auto_create,
         )
         .await?;
 
@@ -2679,6 +2685,29 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
     // the metrics sampler; `fusillade_pools` is otherwise unused.
     let fusillade_pool_for_metrics = fusillade_pools.write().clone();
     drop(fusillade_pools);
+
+    // Claim-gate refresher: recomputes per-model gate states from probe
+    // health every 15s and updates the shared map the fusillade daemon's
+    // claim loops read. Gated on the same condition as the daemon itself
+    // (Always | Leader); with the daemon disabled the map has no reader.
+    if config.background_services.batch_daemon.enabled != crate::config::DaemonEnabled::Never {
+        let gate_pool = pool.clone();
+        let gate_shutdown = shutdown_token.clone();
+        background_tasks.spawn("claim-gate-refresh", async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(15));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    _ = gate_shutdown.cancelled() => return Ok(()),
+                    _ = ticker.tick() => {
+                        if let Err(e) = probes::gate::refresh_gate_states(&gate_pool, &model_gate_states).await {
+                            crate::background_error!(CLAIM_GATE, "refresh", Error, error = %e, "Failed to refresh claim gate states");
+                        }
+                    }
+                }
+            }
+        });
+    }
 
     let is_leader: bool;
 
@@ -3193,10 +3222,16 @@ impl Application {
         // we build it once here.
         let model_capacity_limits: Arc<dashmap::DashMap<String, usize>> = Arc::new(dashmap::DashMap::new());
 
+        // Shared `model_gate_states` map: the fusillade daemon's claim gate
+        // reads it; the claim-gate refresher (inside
+        // `setup_background_services`) writes it from probe health. Sparse by
+        // invariant - it only ever names throttled models; absent = Open.
+        let model_gate_states: Arc<dashmap::DashMap<String, fusillade::ModelGateState>> = Arc::new(dashmap::DashMap::new());
+
         let fusillade_daemon_config = config
             .background_services
             .batch_daemon
-            .to_fusillade_config_with_limits(Some(model_capacity_limits.clone()));
+            .to_fusillade_config_with_limits(Some(model_capacity_limits.clone()), Some(model_gate_states.clone()));
 
         let request_manager = Arc::new(
             fusillade_arsenal::PostgresRequestManager::new(
@@ -3262,6 +3297,7 @@ impl Application {
             postgres_daemon: postgres_daemon.clone(),
             step_manager: step_manager.clone(),
             model_capacity_limits,
+            model_gate_states,
             pool: (*db_pools).clone(),
             fusillade_pools: fusillade_pools.clone(),
             outlet_pool: outlet_pools.as_ref().map(|p| (**p).clone()),

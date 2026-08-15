@@ -492,6 +492,18 @@ cache:
   #   default_read_multiplier: 0.1
   #   default_min_prefix_tokens: 1024
 
+# Health probe configuration (probe *scheduling* is configured under
+# background_services.probe_scheduler)
+probes:
+  # Auto-create a health probe (named `auto-<alias>`, 60s interval, POST) for every
+  # non-deleted, non-composite deployed model with a hosting endpoint. Runs on startup and
+  # on every onwards config reload; idempotent and multi-pod safe. Never overwrites
+  # manually created probes and never deletes probes (model deletion cascades instead).
+  # Probe health drives the fusillade claim gate: a model whose probe recently failed is
+  # throttled rather than claimed at full capacity.
+  # Set via environment: DWCTL_PROBES__AUTO_CREATE=false
+  auto_create: true # Default: true
+
 # Background services configuration
 # Controls which background services run on this instance
 background_services:
