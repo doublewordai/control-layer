@@ -378,8 +378,12 @@ async fn run_retained_response_readiness_loop<S>(
                 }
                 runway.is_complete()
             }
-            Ok(None) => false,
+            Ok(None) => {
+                gauge!("fusillade_retained_response_partitions_ahead").set(0.0);
+                false
+            }
             Err(error) => {
+                gauge!("fusillade_retained_response_partitions_ahead").set(0.0);
                 crate::background_error!(
                     "retained_response_partition_ensure_failed",
                     Error,
@@ -389,6 +393,11 @@ async fn run_retained_response_readiness_loop<S>(
                 false
             }
         };
+        gauge!("fusillade_retained_response_partition_runway_ready").set(if runway_ready {
+            1.0
+        } else {
+            0.0
+        });
         ready.store(runway_ready, Ordering::Release);
         let next_tick = if runway_ready {
             period
@@ -2817,6 +2826,98 @@ where
 mod tests {
     use super::*;
 
+    #[derive(Default)]
+    struct GaugeHistory {
+        values: std::sync::Mutex<Vec<f64>>,
+    }
+
+    impl metrics::GaugeFn for GaugeHistory {
+        fn increment(&self, value: f64) {
+            let mut values = self.values.lock().unwrap();
+            let next = values.last().copied().unwrap_or_default() + value;
+            values.push(next);
+        }
+
+        fn decrement(&self, value: f64) {
+            self.increment(-value);
+        }
+
+        fn set(&self, value: f64) {
+            self.values.lock().unwrap().push(value);
+        }
+    }
+
+    #[derive(Default)]
+    struct GaugeHistoryRecorder {
+        gauges: std::sync::Mutex<HashMap<String, Arc<GaugeHistory>>>,
+    }
+
+    impl GaugeHistoryRecorder {
+        fn values(&self, name: &str) -> Vec<f64> {
+            self.gauges
+                .lock()
+                .unwrap()
+                .get(name)
+                .map(|gauge| gauge.values.lock().unwrap().clone())
+                .unwrap_or_default()
+        }
+    }
+
+    impl metrics::Recorder for GaugeHistoryRecorder {
+        fn describe_counter(
+            &self,
+            _key: metrics::KeyName,
+            _unit: Option<metrics::Unit>,
+            _description: metrics::SharedString,
+        ) {
+        }
+
+        fn describe_gauge(
+            &self,
+            _key: metrics::KeyName,
+            _unit: Option<metrics::Unit>,
+            _description: metrics::SharedString,
+        ) {
+        }
+
+        fn describe_histogram(
+            &self,
+            _key: metrics::KeyName,
+            _unit: Option<metrics::Unit>,
+            _description: metrics::SharedString,
+        ) {
+        }
+
+        fn register_counter(
+            &self,
+            _key: &metrics::Key,
+            _metadata: &metrics::Metadata<'_>,
+        ) -> metrics::Counter {
+            metrics::Counter::noop()
+        }
+
+        fn register_gauge(
+            &self,
+            key: &metrics::Key,
+            _metadata: &metrics::Metadata<'_>,
+        ) -> metrics::Gauge {
+            let mut gauges = self.gauges.lock().unwrap();
+            let gauge = gauges
+                .entry(key.name().to_string())
+                .or_insert_with(|| Arc::new(GaugeHistory::default()))
+                .clone();
+            metrics::Gauge::from_arc(gauge)
+        }
+
+        fn register_histogram(
+            &self,
+            _key: &metrics::Key,
+            _metadata: &metrics::Metadata<'_>,
+        ) -> metrics::Histogram {
+            metrics::Histogram::noop()
+        }
+    }
+
     struct FakeMaintenanceStorage {
         weekly_calls: AtomicUsize,
         retained_calls: AtomicUsize,
@@ -2826,6 +2927,7 @@ mod tests {
         batchless_cutoffs: std::sync::Mutex<Vec<RetainedResponseArchiveCutoffs>>,
         fail_weekly: std::sync::atomic::AtomicBool,
         fail_retained: std::sync::atomic::AtomicBool,
+        block_retained: std::sync::atomic::AtomicBool,
         fail_batch_list: std::sync::atomic::AtomicBool,
         fail_batch_move: std::sync::atomic::AtomicBool,
         index_ready: std::sync::atomic::AtomicBool,
@@ -2847,6 +2949,7 @@ mod tests {
                 batchless_cutoffs: std::sync::Mutex::new(Vec::new()),
                 fail_weekly: std::sync::atomic::AtomicBool::new(false),
                 fail_retained: std::sync::atomic::AtomicBool::new(false),
+                block_retained: std::sync::atomic::AtomicBool::new(false),
                 fail_batch_list: std::sync::atomic::AtomicBool::new(false),
                 fail_batch_move: std::sync::atomic::AtomicBool::new(false),
                 index_ready: std::sync::atomic::AtomicBool::new(true),
@@ -2929,6 +3032,9 @@ mod tests {
         ) -> Result<crate::RetainedResponsePartitionRunway> {
             self.retained_calls.fetch_add(1, Ordering::SeqCst);
             self.record("retained_runway");
+            if self.block_retained.load(Ordering::SeqCst) {
+                std::future::pending().await
+            }
             if self.fail_retained.load(Ordering::SeqCst) {
                 Err(Self::fail())
             } else {
@@ -3347,6 +3453,81 @@ mod tests {
 
         shutdown.cancel();
         handle.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true, flavor = "current_thread")]
+    async fn retained_runway_metrics_transition_from_ready_to_failed_closed() {
+        let recorder = GaugeHistoryRecorder::default();
+        let _recorder_guard = metrics::set_default_local_recorder(&recorder);
+        let storage = Arc::new(FakeMaintenanceStorage::default());
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let ready = Arc::new(AtomicBool::new(false));
+        let handle = tokio::spawn(run_retained_response_readiness_loop(
+            storage.clone(),
+            shutdown.clone(),
+            Duration::from_secs(1),
+            configured_batchless_maintenance().policy().clone(),
+            7,
+            ready.clone(),
+            Duration::from_secs(86_400),
+        ));
+
+        tokio::task::yield_now().await;
+        assert!(ready.load(Ordering::SeqCst));
+
+        storage.fail_retained.store(true, Ordering::SeqCst);
+        tokio::time::advance(Duration::from_secs(86_400)).await;
+        tokio::task::yield_now().await;
+        assert!(!ready.load(Ordering::SeqCst));
+
+        shutdown.cancel();
+        handle.await.unwrap();
+        assert_eq!(
+            recorder.values("fusillade_retained_response_partitions_ahead"),
+            vec![7.0, 0.0]
+        );
+        assert_eq!(
+            recorder.values("fusillade_retained_response_partition_runway_ready"),
+            vec![1.0, 0.0]
+        );
+    }
+
+    #[tokio::test(start_paused = true, flavor = "current_thread")]
+    async fn retained_runway_metrics_clear_when_shutdown_interrupts_ensure() {
+        let recorder = GaugeHistoryRecorder::default();
+        let _recorder_guard = metrics::set_default_local_recorder(&recorder);
+        let storage = Arc::new(FakeMaintenanceStorage::default());
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let ready = Arc::new(AtomicBool::new(false));
+        let handle = tokio::spawn(run_retained_response_readiness_loop(
+            storage.clone(),
+            shutdown.clone(),
+            Duration::from_secs(1),
+            configured_batchless_maintenance().policy().clone(),
+            7,
+            ready.clone(),
+            Duration::from_secs(86_400),
+        ));
+
+        tokio::task::yield_now().await;
+        assert!(ready.load(Ordering::SeqCst));
+
+        storage.block_retained.store(true, Ordering::SeqCst);
+        tokio::time::advance(Duration::from_secs(86_400)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(storage.retained_calls.load(Ordering::SeqCst), 2);
+
+        shutdown.cancel();
+        handle.await.unwrap();
+        assert!(!ready.load(Ordering::SeqCst));
+        assert_eq!(
+            recorder.values("fusillade_retained_response_partitions_ahead"),
+            vec![7.0, 0.0]
+        );
+        assert_eq!(
+            recorder.values("fusillade_retained_response_partition_runway_ready"),
+            vec![1.0, 0.0]
+        );
     }
 
     #[test]

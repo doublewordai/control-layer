@@ -2527,6 +2527,37 @@ async fn postgres_reports_exact_retained_response_index_readiness(pool: PgPool) 
         .execute(&pool)
         .await
         .expect("wrong-shape candidate index must drop");
+
+    sqlx::query(
+        r#"
+        CREATE INDEX idx_requests_batchless_retention_due
+        ON requests (
+          service_tier,
+          (CASE state WHEN 'completed' THEN completed_at
+                      WHEN 'failed' THEN failed_at
+                      WHEN 'canceled' THEN canceled_at END),
+          id
+        )
+        INCLUDE (response_body)
+        WHERE batch_id IS NULL
+          AND state IN ('completed', 'failed', 'canceled')
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .expect("candidate index with an included payload column must install");
+    assert!(
+        !manager
+            .retained_response_archive_index_ready()
+            .await
+            .expect("included payload column must be reported"),
+        "an index with an included payload column is not the exact operator prerequisite"
+    );
+
+    sqlx::query("DROP INDEX idx_requests_batchless_retention_due")
+        .execute(&pool)
+        .await
+        .expect("included-column candidate index must drop");
     install_candidate_index(&pool).await;
     assert!(
         manager
