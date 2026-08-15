@@ -226,6 +226,12 @@ async fn response_step_manager_retries_pool_acquisition_for_sqlx_queries() {
     .execute(&pool)
     .await
     .unwrap();
+    sqlx::query(
+        "CREATE TEMP TABLE retained_response_resurrection_fences (object_id uuid PRIMARY KEY, reason text NOT NULL CHECK (reason IN ('archived', 'erased', 'retired')), expires_at timestamptz NOT NULL)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
     let manager = PostgresResponseStepManager::new(LazyPools(pool.clone())).with_db_retry_config(
         DbRetryConfig::new(vec![
             Duration::from_millis(25),

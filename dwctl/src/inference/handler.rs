@@ -216,43 +216,9 @@ pub async fn delete_response<P: PoolProvider>(
         id: response_id.clone(),
     })?;
 
-    // Resolve only the ownership anchor. The storage erasure primitive does
-    // its own locked whole-graph resolution; the handler never materializes a
-    // second, potentially stale list of members.
-    let auth_request_id = match state.response_step_manager.as_ref() {
-        Some(step_manager) => step_manager
-            .get_step(fusillade::StepId(head_step_uuid))
-            .await
-            .map_err(|e| Error::Database(crate::db::errors::DbError::Other(anyhow::anyhow!("{e}"))))?
-            .and_then(|step| step.request_id)
-            .unwrap_or(fusillade::RequestId(head_step_uuid)),
-        None => fusillade::RequestId(head_step_uuid),
-    };
-
-    // Ownership check against the head row's created_by. 404 (not 403) to
-    // avoid leaking existence of other users' responses.
-    let detail = state
-        .request_manager
-        .get_request_detail(auth_request_id)
-        .await
-        .map_err(|e| match e {
-            fusillade::FusilladeError::RequestNotFound(_) => Error::NotFound {
-                resource: "response".to_string(),
-                id: response_id.clone(),
-            },
-            _ => Error::Database(crate::db::errors::DbError::Other(anyhow::anyhow!("{e}"))),
-        })?;
-
-    if detail.created_by.as_str() != owner_id {
-        return Err(Error::NotFound {
-            resource: "response".to_string(),
-            id: response_id,
-        });
-    }
-
     state
         .request_manager
-        .delete_response_group(head_step_uuid)
+        .delete_owned_response_group(head_step_uuid, &owner_id)
         .await
         .map_err(|error| match error {
             fusillade::FusilladeError::RequestNotFound(_) => Error::NotFound {

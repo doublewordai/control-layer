@@ -82,10 +82,6 @@ impl<P: PoolProvider> PostgresResponseStepManager<P> {
         &self.db_retry_config
     }
 
-    fn write_executor(&self) -> crate::db::RetryingPgPool {
-        crate::db::RetryingPgPool::new(self.pools.write(), &self.db_retry_config)
-    }
-
     async fn begin_write_transaction(&self) -> Result<sqlx::Transaction<'static, sqlx::Postgres>> {
         crate::db::begin_transaction(self.pools.write(), &self.db_retry_config)
             .await
@@ -124,23 +120,6 @@ impl<P: PoolProvider> PostgresResponseStepManager<P> {
                     }
                 })
             })
-    }
-
-    async fn write_conflict(
-        &self,
-        step_ids: &[Uuid],
-        request_id: Option<RequestId>,
-    ) -> Result<Option<FusilladeError>> {
-        let mut tx = self.begin_write_transaction().await?;
-        let conflict = Self::write_conflict_in_transaction(&mut tx, step_ids, request_id).await?;
-        tx.commit()
-            .await
-            .map_err(|_| FusilladeError::Other(anyhow!("Failed to finish retained route check")))?;
-        Ok(conflict)
-    }
-
-    async fn retained_conflict(&self, step_id: StepId) -> Result<Option<FusilladeError>> {
-        self.write_conflict(&[step_id.0], None).await
     }
 }
 
@@ -183,13 +162,16 @@ const STEP_COLUMNS: &str = "id, request_id, prev_step_id, parent_step_id, step_k
 /// Look up the current state of a step. Used by the lifecycle update
 /// methods to disambiguate "row not found" from "row in unexpected state"
 /// after a 0-rows-affected update.
-async fn fetch_state(executor: crate::db::RetryingPgPool, id: StepId) -> Result<Option<String>> {
+async fn fetch_state_in_transaction(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    id: StepId,
+) -> Result<Option<String>> {
     sqlx::query("SELECT state FROM response_steps WHERE id = $1")
         .bind(id.0)
-        .fetch_optional(executor)
+        .fetch_optional(&mut **tx)
         .await
         .map(|opt| opt.map(|row| row.get::<String, _>("state")))
-        .map_err(|e| FusilladeError::Other(anyhow!("Failed to fetch step state: {}", e)))
+        .map_err(|_| FusilladeError::Other(anyhow!("Failed to fetch response-step state")))
 }
 
 #[async_trait]
@@ -201,6 +183,10 @@ impl<P: PoolProvider> ResponseStepStore for PostgresResponseStepManager<P> {
         linked_step_ids.extend(input.parent_step_id.map(|step| step.0));
 
         let mut tx = self.begin_write_transaction().await?;
+        let mut lifecycle_ids = linked_step_ids.clone();
+        lifecycle_ids.extend(input.request_id.map(|request_id| request_id.0));
+        crate::postgres::retained_response::lock_response_write_graphs(&mut tx, &lifecycle_ids)
+            .await?;
 
         if let Some(conflict) =
             Self::write_conflict_in_transaction(&mut tx, &linked_step_ids, input.request_id).await?
@@ -226,21 +212,9 @@ impl<P: PoolProvider> ResponseStepStore for PostgresResponseStepManager<P> {
         .execute(&mut *tx)
         .await;
         if let Err(error) = insert {
-            // Clear the failed transaction before checking a route that may
-            // have committed while the INSERT was waiting on a live FK/tuple.
-            let _ = tx.rollback().await;
-            // Movement may commit after the precheck while this INSERT waits
-            // on a request/parent FK. Recheck the exact content-free routes so
-            // that ordering still surfaces the stable retained conflict.
-            if let Some(conflict) = self
-                .write_conflict(&linked_step_ids, input.request_id)
-                .await?
-            {
-                return Err(conflict);
-            }
+            let _ = error;
             return Err(FusilladeError::Other(anyhow!(
-                "Failed to insert response_step: {}",
-                error
+                "Failed to insert response step"
             )));
         }
 
@@ -348,34 +322,44 @@ impl<P: PoolProvider> ResponseStepStore for PostgresResponseStepManager<P> {
     }
 
     async fn mark_step_processing(&self, id: StepId) -> Result<()> {
+        let mut tx = self.begin_write_transaction().await?;
+        crate::postgres::retained_response::lock_response_write_graphs(&mut tx, &[id.0]).await?;
         let result = sqlx::query(
             "UPDATE response_steps \
              SET state = 'processing', started_at = NOW(), updated_at = NOW() \
              WHERE id = $1 AND state = 'pending'",
         )
         .bind(id.0)
-        .execute(self.write_executor())
+        .execute(&mut *tx)
         .await
-        .map_err(|e| FusilladeError::Other(anyhow!("Failed to mark step as processing: {}", e)))?;
+        .map_err(|_| {
+            FusilladeError::Other(anyhow!("Failed to mark response step as processing"))
+        })?;
 
         if result.rows_affected() == 0 {
             // Idempotent: the row may already be processing or terminal under
             // crash recovery; surface only if the row is genuinely missing.
-            if fetch_state(self.write_executor(), id).await?.is_none() {
-                if let Some(conflict) = self.retained_conflict(id).await? {
+            if fetch_state_in_transaction(&mut tx, id).await?.is_none() {
+                if let Some(conflict) =
+                    Self::write_conflict_in_transaction(&mut tx, &[id.0], None).await?
+                {
                     return Err(conflict);
                 }
-                return Err(FusilladeError::Other(anyhow!(
-                    "response_step not found: {}",
-                    id
+                return Err(FusilladeError::Other(anyhow::Error::new(
+                    ResponseStepNotFound,
                 )));
             }
         }
 
+        tx.commit().await.map_err(|_| {
+            FusilladeError::Other(anyhow!("Failed to finish response-step mutation"))
+        })?;
         Ok(())
     }
 
     async fn complete_step(&self, id: StepId, response: serde_json::Value) -> Result<()> {
+        let mut tx = self.begin_write_transaction().await?;
+        crate::postgres::retained_response::lock_response_write_graphs(&mut tx, &[id.0]).await?;
         let result = sqlx::query(
             "UPDATE response_steps \
              SET state = 'completed', \
@@ -386,27 +370,32 @@ impl<P: PoolProvider> ResponseStepStore for PostgresResponseStepManager<P> {
         )
         .bind(id.0)
         .bind(&response)
-        .execute(self.write_executor())
+        .execute(&mut *tx)
         .await
-        .map_err(|e| FusilladeError::Other(anyhow!("Failed to complete response_step: {}", e)))?;
+        .map_err(|_| FusilladeError::Other(anyhow!("Failed to complete response step")))?;
 
         if result.rows_affected() == 0 {
-            return Err(match fetch_state(self.write_executor(), id).await? {
-                Some(state) => FusilladeError::Other(anyhow!(
-                    "response_step {} not in completable state (current: {})",
-                    id,
-                    state
-                )),
-                None => self.retained_conflict(id).await?.unwrap_or_else(|| {
-                    FusilladeError::Other(anyhow!("response_step not found: {}", id))
-                }),
+            return Err(match fetch_state_in_transaction(&mut tx, id).await? {
+                Some(_) => {
+                    FusilladeError::Other(anyhow!("Response step is not in completable state"))
+                }
+                None => Self::write_conflict_in_transaction(&mut tx, &[id.0], None)
+                    .await?
+                    .unwrap_or_else(|| {
+                        FusilladeError::Other(anyhow::Error::new(ResponseStepNotFound))
+                    }),
             });
         }
 
+        tx.commit().await.map_err(|_| {
+            FusilladeError::Other(anyhow!("Failed to finish response-step mutation"))
+        })?;
         Ok(())
     }
 
     async fn fail_step(&self, id: StepId, error: serde_json::Value) -> Result<()> {
+        let mut tx = self.begin_write_transaction().await?;
+        crate::postgres::retained_response::lock_response_write_graphs(&mut tx, &[id.0]).await?;
         let result = sqlx::query(
             "UPDATE response_steps \
              SET state = 'failed', \
@@ -417,27 +406,30 @@ impl<P: PoolProvider> ResponseStepStore for PostgresResponseStepManager<P> {
         )
         .bind(id.0)
         .bind(&error)
-        .execute(self.write_executor())
+        .execute(&mut *tx)
         .await
-        .map_err(|e| FusilladeError::Other(anyhow!("Failed to fail response_step: {}", e)))?;
+        .map_err(|_| FusilladeError::Other(anyhow!("Failed to fail response step")))?;
 
         if result.rows_affected() == 0 {
-            return Err(match fetch_state(self.write_executor(), id).await? {
-                Some(state) => FusilladeError::Other(anyhow!(
-                    "response_step {} not in failable state (current: {})",
-                    id,
-                    state
-                )),
-                None => self.retained_conflict(id).await?.unwrap_or_else(|| {
-                    FusilladeError::Other(anyhow!("response_step not found: {}", id))
-                }),
+            return Err(match fetch_state_in_transaction(&mut tx, id).await? {
+                Some(_) => FusilladeError::Other(anyhow!("Response step is not in failable state")),
+                None => Self::write_conflict_in_transaction(&mut tx, &[id.0], None)
+                    .await?
+                    .unwrap_or_else(|| {
+                        FusilladeError::Other(anyhow::Error::new(ResponseStepNotFound))
+                    }),
             });
         }
 
+        tx.commit().await.map_err(|_| {
+            FusilladeError::Other(anyhow!("Failed to finish response-step mutation"))
+        })?;
         Ok(())
     }
 
     async fn cancel_step(&self, id: StepId) -> Result<()> {
+        let mut tx = self.begin_write_transaction().await?;
+        crate::postgres::retained_response::lock_response_write_graphs(&mut tx, &[id.0]).await?;
         let result = sqlx::query(
             "UPDATE response_steps \
              SET state = 'canceled', \
@@ -446,27 +438,32 @@ impl<P: PoolProvider> ResponseStepStore for PostgresResponseStepManager<P> {
              WHERE id = $1 AND state IN ('pending', 'processing')",
         )
         .bind(id.0)
-        .execute(self.write_executor())
+        .execute(&mut *tx)
         .await
-        .map_err(|e| FusilladeError::Other(anyhow!("Failed to cancel response_step: {}", e)))?;
+        .map_err(|_| FusilladeError::Other(anyhow!("Failed to cancel response step")))?;
 
         if result.rows_affected() == 0 {
-            return Err(match fetch_state(self.write_executor(), id).await? {
-                Some(state) => FusilladeError::Other(anyhow!(
-                    "response_step {} not in cancelable state (current: {})",
-                    id,
-                    state
-                )),
-                None => self.retained_conflict(id).await?.unwrap_or_else(|| {
-                    FusilladeError::Other(anyhow!("response_step not found: {}", id))
-                }),
+            return Err(match fetch_state_in_transaction(&mut tx, id).await? {
+                Some(_) => {
+                    FusilladeError::Other(anyhow!("Response step is not in cancelable state"))
+                }
+                None => Self::write_conflict_in_transaction(&mut tx, &[id.0], None)
+                    .await?
+                    .unwrap_or_else(|| {
+                        FusilladeError::Other(anyhow::Error::new(ResponseStepNotFound))
+                    }),
             });
         }
 
+        tx.commit().await.map_err(|_| {
+            FusilladeError::Other(anyhow!("Failed to finish response-step mutation"))
+        })?;
         Ok(())
     }
 
     async fn requeue_step_for_retry(&self, id: StepId) -> Result<()> {
+        let mut tx = self.begin_write_transaction().await?;
+        crate::postgres::retained_response::lock_response_write_graphs(&mut tx, &[id.0]).await?;
         let result = sqlx::query(
             "UPDATE response_steps \
              SET state = 'pending', \
@@ -476,23 +473,26 @@ impl<P: PoolProvider> ResponseStepStore for PostgresResponseStepManager<P> {
              WHERE id = $1 AND state = 'processing'",
         )
         .bind(id.0)
-        .execute(self.write_executor())
+        .execute(&mut *tx)
         .await
-        .map_err(|e| FusilladeError::Other(anyhow!("Failed to requeue response_step: {}", e)))?;
+        .map_err(|_| FusilladeError::Other(anyhow!("Failed to requeue response step")))?;
 
         if result.rows_affected() == 0 {
-            return Err(match fetch_state(self.write_executor(), id).await? {
-                Some(state) => FusilladeError::Other(anyhow!(
-                    "response_step {} not in retryable state (current: {})",
-                    id,
-                    state
-                )),
-                None => self.retained_conflict(id).await?.unwrap_or_else(|| {
-                    FusilladeError::Other(anyhow!("response_step not found: {}", id))
-                }),
+            return Err(match fetch_state_in_transaction(&mut tx, id).await? {
+                Some(_) => {
+                    FusilladeError::Other(anyhow!("Response step is not in retryable state"))
+                }
+                None => Self::write_conflict_in_transaction(&mut tx, &[id.0], None)
+                    .await?
+                    .unwrap_or_else(|| {
+                        FusilladeError::Other(anyhow::Error::new(ResponseStepNotFound))
+                    }),
             });
         }
 
+        tx.commit().await.map_err(|_| {
+            FusilladeError::Other(anyhow!("Failed to finish response-step mutation"))
+        })?;
         Ok(())
     }
 }

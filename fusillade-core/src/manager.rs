@@ -1019,6 +1019,9 @@ pub trait Storage: Send + Sync {
     ///
     /// Returns `RequestNotFound` if the request does not exist (or was already
     /// deleted).
+    #[deprecated(
+        note = "use delete_response_group or delete_owned_response_group to erase the complete logical response graph"
+    )]
     async fn delete_request(&self, request_id: RequestId) -> Result<()>;
 
     /// Atomically erase a complete batchless logical response graph.
@@ -1028,6 +1031,21 @@ pub trait Storage: Send + Sync {
     /// backends that do not implement complete-graph storage fail safely.
     async fn delete_response_group(&self, response_id: uuid::Uuid) -> Result<u64> {
         let _ = response_id;
+        Err(RetainedResponseMaintenanceError::Disabled.into_fusillade_error())
+    }
+
+    /// Atomically erase a complete batchless logical response graph only when
+    /// every request member is owned by `creator_id`.
+    ///
+    /// Ownership is revalidated while the graph is locked. A missing graph or
+    /// ownership mismatch is deliberately reported as `RequestNotFound` so an
+    /// authenticated caller cannot use this operation as an existence oracle.
+    async fn delete_owned_response_group(
+        &self,
+        response_id: uuid::Uuid,
+        creator_id: &str,
+    ) -> Result<u64> {
+        let _ = (response_id, creator_id);
         Err(RetainedResponseMaintenanceError::Disabled.into_fusillade_error())
     }
 
