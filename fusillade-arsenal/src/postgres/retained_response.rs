@@ -9,7 +9,7 @@ use std::fmt;
 use chrono::{DateTime, NaiveDate, Utc};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use sqlx::postgres::PgRow;
+use sqlx::postgres::{PgPool, PgRow};
 use sqlx::{Postgres, Row, Transaction};
 use uuid::Uuid;
 
@@ -2742,10 +2742,10 @@ async fn resolve_response_graph_identity(
     }
 }
 
-pub(crate) async fn lock_response_write_graphs(
+async fn response_write_graph_ids(
     tx: &mut Transaction<'_, Postgres>,
     object_ids: &[Uuid],
-) -> MovementResult<()> {
+) -> MovementResult<Vec<Uuid>> {
     let mut group_ids = Vec::with_capacity(object_ids.len());
     for object_id in object_ids {
         group_ids.push(
@@ -2756,10 +2756,38 @@ pub(crate) async fn lock_response_write_graphs(
     }
     group_ids.sort_unstable();
     group_ids.dedup();
-    for group_id in group_ids {
-        lock_response_graph(tx, group_id).await?;
+    Ok(group_ids)
+}
+
+/// Begin a response lifecycle write while holding its current canonical graph
+/// locks. A singleton request can gain a headed step while this task waits for
+/// its tentative request-ID lock. Re-resolving after acquisition detects that
+/// topology change; rolling back before retrying prevents waiting for the new
+/// head while retaining the obsolete lock, which would invert lock order with
+/// other graph writers.
+pub(crate) async fn begin_response_write_transaction(
+    pool: &PgPool,
+    retry_config: &crate::DbRetryConfig,
+    object_ids: &[Uuid],
+) -> Result<Transaction<'static, Postgres>> {
+    const MAX_CANONICAL_LOCK_ATTEMPTS: usize = 8;
+
+    for _ in 0..MAX_CANONICAL_LOCK_ATTEMPTS {
+        let mut tx = crate::db::begin_transaction(pool, retry_config)
+            .await
+            .map_err(database_failure)?;
+        let tentative_group_ids = response_write_graph_ids(&mut tx, object_ids).await?;
+        for group_id in tentative_group_ids.iter().copied() {
+            lock_response_graph(&mut tx, group_id).await?;
+        }
+        let locked_group_ids = response_write_graph_ids(&mut tx, object_ids).await?;
+        if locked_group_ids == tentative_group_ids {
+            return Ok(tx);
+        }
+        tx.rollback().await.map_err(database_failure)?;
     }
-    Ok(())
+
+    Err(incomplete_graph())
 }
 
 async fn erase_retained_graph(
@@ -2962,16 +2990,18 @@ async fn erase_retained_graph(
     Ok(header.request_ids.len() as u64)
 }
 
-async fn delete_response_group_in_transaction(
+async fn delete_locked_response_group_in_transaction(
     tx: &mut Transaction<'_, Postgres>,
     response_id: Uuid,
     expected_creator: Option<&str>,
     max_late_writer_seconds: Option<u64>,
 ) -> Result<u64> {
-    let Some(group_id) = resolve_response_graph_identity(tx, response_id).await? else {
+    if resolve_response_graph_identity(tx, response_id)
+        .await?
+        .is_none()
+    {
         return Err(FusilladeError::RequestNotFound(RequestId(response_id)));
-    };
-    lock_response_graph(tx, group_id).await?;
+    }
 
     if let Some((group_id, topology, template_ids)) =
         lock_live_graph_for_erasure(tx, response_id).await?
@@ -3056,8 +3086,8 @@ pub(crate) async fn delete_response_group<P: PoolProvider>(
     manager: &PostgresRequestManager<P>,
     response_id: Uuid,
 ) -> Result<u64> {
-    let mut tx = manager.begin_write().await.map_err(database_failure)?;
-    let deleted = delete_response_group_in_transaction(
+    let mut tx = manager.begin_response_write(&[response_id]).await?;
+    let deleted = delete_locked_response_group_in_transaction(
         &mut tx,
         response_id,
         None,
@@ -3073,8 +3103,8 @@ pub(crate) async fn delete_owned_response_group<P: PoolProvider>(
     response_id: Uuid,
     creator_id: &str,
 ) -> Result<u64> {
-    let mut tx = manager.begin_write().await.map_err(database_failure)?;
-    let deleted = delete_response_group_in_transaction(
+    let mut tx = manager.begin_response_write(&[response_id]).await?;
+    let deleted = delete_locked_response_group_in_transaction(
         &mut tx,
         response_id,
         Some(creator_id),
@@ -3146,7 +3176,17 @@ pub(crate) async fn delete_creator_response_groups(
             progress += 1;
             continue;
         }
-        match delete_response_group_in_transaction(
+        match resolve_response_graph_identity(tx, response_id).await? {
+            Some(locked_group_id) if locked_group_id == group_id => {}
+            // Candidate discovery raced a lifecycle/topology change. The
+            // creator path is deliberately non-blocking, so do not act under
+            // the stale lock or wait for a second graph while retaining it.
+            Some(_) | None => {
+                progress += 1;
+                continue;
+            }
+        }
+        match delete_locked_response_group_in_transaction(
             tx,
             response_id,
             Some(creator_id),
