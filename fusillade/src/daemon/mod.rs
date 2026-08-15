@@ -2,7 +2,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 mod adaptive_concurrency;
@@ -408,130 +408,101 @@ fn retained_archive_cutoffs_at(
         .map_err(FusilladeError::ValidationError)
 }
 
-async fn run_archive_partition_maintenance_tick<S>(
-    storage: &S,
-    shutdown: &tokio_util::sync::CancellationToken,
-    query_timeout: Duration,
-    weeks_ahead: i32,
-    retention_policy: &RetentionSweepPolicy,
-    retained_days_ahead: i32,
-) -> bool
-where
-    S: DaemonStorage,
-{
-    match maintenance_query(
-        shutdown,
-        "batch archive partition ensure",
-        query_timeout,
-        storage.ensure_archive_partitions(weeks_ahead),
-    )
-    .await
-    {
-        Ok(Some((created, ahead))) => {
-            gauge!("fusillade_archive_partitions_ahead").set(ahead as f64);
-            if created > 0 {
-                tracing::info!(created, ahead, "Created batch archive partitions");
-            }
-        }
-        Ok(None) => return false,
-        Err(error) => {
-            crate::background_error!(
-                "archive_partition_ensure_failed",
-                Error,
-                error = %error,
-                "Failed to ensure batch archive partitions"
-            );
-        }
-    }
-
-    if retention_policy
-        .batchless_seconds_by_service_tier
-        .is_empty()
-    {
-        return true;
-    }
-
-    match maintenance_query(
-        shutdown,
-        "retained response partition ensure",
-        query_timeout,
-        storage.ensure_retained_response_partitions(retention_policy, retained_days_ahead),
-    )
-    .await
-    {
-        Ok(Some((created, ahead))) => {
-            gauge!("fusillade_retained_response_partitions_ahead").set(ahead as f64);
-            if created > 0 {
-                tracing::info!(created, ahead, "Created retained-response partitions");
-            }
-            true
-        }
-        Ok(None) => false,
-        Err(error) => {
-            crate::background_error!(
-                "retained_response_partition_ensure_failed",
-                Error,
-                error = %error,
-                "Failed to ensure retained-response partitions"
-            );
-            false
-        }
-    }
-}
-
-async fn initialize_archive_maintenance_if_owner<S>(
-    owns_archive_maintenance: bool,
-    storage: &S,
-    shutdown: &tokio_util::sync::CancellationToken,
-    query_timeout: Duration,
-    weeks_ahead: i32,
-    retention_policy: &RetentionSweepPolicy,
-    retained_days_ahead: i32,
-) -> Option<bool>
-where
-    S: DaemonStorage,
-{
-    if !owns_archive_maintenance {
-        return None;
-    }
-    Some(
-        run_archive_partition_maintenance_tick(
-            storage,
-            shutdown,
-            query_timeout,
-            weeks_ahead,
-            retention_policy,
-            retained_days_ahead,
-        )
-        .await,
-    )
-}
-
-async fn run_archive_partition_maintenance_loop<S>(
+async fn run_weekly_archive_partition_maintenance_loop<S>(
     storage: Arc<S>,
     shutdown: tokio_util::sync::CancellationToken,
     query_timeout: Duration,
     weeks_ahead: i32,
-    retention_policy: RetentionSweepPolicy,
-    retained_days_ahead: i32,
     period: Duration,
 ) where
     S: DaemonStorage + 'static,
 {
     loop {
+        match maintenance_query(
+            &shutdown,
+            "batch archive partition ensure",
+            query_timeout,
+            storage.ensure_archive_partitions(weeks_ahead),
+        )
+        .await
+        {
+            Ok(Some((created, ahead))) => {
+                gauge!("fusillade_archive_partitions_ahead").set(ahead as f64);
+                if created > 0 {
+                    tracing::info!(created, ahead, "Created batch archive partitions");
+                }
+            }
+            Ok(None) => break,
+            Err(error) => {
+                crate::background_error!(
+                    "archive_partition_ensure_failed",
+                    Error,
+                    error = %error,
+                    "Failed to ensure batch archive partitions"
+                );
+            }
+        }
         tokio::select! {
             _ = tokio::time::sleep(period) => {},
             _ = shutdown.cancelled() => break,
         }
-        let _ = run_archive_partition_maintenance_tick(
-            storage.as_ref(),
+    }
+}
+
+async fn run_retained_response_readiness_loop<S>(
+    storage: Arc<S>,
+    shutdown: tokio_util::sync::CancellationToken,
+    query_timeout: Duration,
+    retention_policy: RetentionSweepPolicy,
+    retained_days_ahead: i32,
+    ready: Arc<AtomicBool>,
+    period: Duration,
+) where
+    S: DaemonStorage + 'static,
+{
+    loop {
+        let runway_ready = match maintenance_query(
             &shutdown,
+            "retained response partition ensure",
             query_timeout,
-            weeks_ahead,
-            &retention_policy,
-            retained_days_ahead,
+            storage.ensure_retained_response_partitions(&retention_policy, retained_days_ahead),
         )
-        .await;
+        .await
+        {
+            Ok(Some(runway)) => {
+                gauge!("fusillade_retained_response_partitions_ahead")
+                    .set(runway.contiguous_ahead as f64);
+                if runway.created > 0 {
+                    tracing::info!(
+                        created = runway.created,
+                        ahead = runway.contiguous_ahead,
+                        required = runway.required,
+                        "Created retained-response partitions"
+                    );
+                }
+                runway.is_complete()
+            }
+            Ok(None) => false,
+            Err(error) => {
+                crate::background_error!(
+                    "retained_response_partition_ensure_failed",
+                    Error,
+                    error = %error,
+                    "Failed to ensure retained-response partitions"
+                );
+                false
+            }
+        };
+        ready.store(runway_ready, Ordering::Release);
+        let next_tick = if runway_ready {
+            period
+        } else {
+            period.min(Duration::from_secs(30))
+        };
+        tokio::select! {
+            _ = tokio::time::sleep(next_tick) => {},
+            _ = shutdown.cancelled() => break,
+        }
     }
 }
 
@@ -734,6 +705,7 @@ async fn run_archive_mover_tick<S>(
     query_timeout: Duration,
     retention_policy: &RetentionSweepPolicy,
     tick: ArchiveMoverTick,
+    retained_runway_ready: &AtomicBool,
 ) where
     S: DaemonStorage + 'static,
 {
@@ -742,6 +714,32 @@ async fn run_archive_mover_tick<S>(
         run_batch_archive_phase(storage.clone(), shutdown, query_timeout, tick).await;
     }
     if tick.batchless_enabled {
+        let index_ready = match maintenance_query(
+            shutdown,
+            "retained response archive index readiness",
+            query_timeout,
+            storage.retained_response_archive_index_ready(),
+        )
+        .await
+        {
+            Ok(Some(ready)) => ready,
+            Ok(None) => false,
+            Err(error) => {
+                crate::background_error!(
+                    "retained_response_index_readiness_failed",
+                    Error,
+                    worker = tick.worker,
+                    error = %error,
+                    "Failed to inspect retained-response archive index readiness"
+                );
+                false
+            }
+        };
+        if !index_ready || !retained_runway_ready.load(Ordering::Acquire) {
+            gauge!("fusillade_retained_response_archive_ready", "worker" => tick.worker).set(0.0);
+            return;
+        }
+        gauge!("fusillade_retained_response_archive_ready", "worker" => tick.worker).set(1.0);
         let cutoffs = match retained_archive_cutoffs_at(
             observed_at,
             tick.batchless_dwell_secs,
@@ -771,29 +769,73 @@ async fn run_archive_mover_tick<S>(
     }
 }
 
-async fn await_daemon_handles(handles: Vec<(&'static str, tokio::task::JoinHandle<()>)>) -> usize {
-    futures::future::join_all(
-        handles
-            .into_iter()
-            .map(|(worker, handle)| async move { (worker, handle.await) }),
-    )
-    .await
-    .into_iter()
-    .filter(|(worker, result)| {
-        if let Err(error) = result {
-            crate::background_error!(
-                "daemon_child_task_panicked",
-                Critical,
-                worker = *worker,
-                error = %error,
-                "Daemon child task panicked during shutdown"
-            );
-            true
-        } else {
-            false
+fn supervise_daemon_handles(
+    handles: Vec<(&'static str, tokio::task::JoinHandle<()>)>,
+) -> JoinSet<(
+    &'static str,
+    std::result::Result<(), tokio::task::JoinError>,
+)> {
+    let mut children = JoinSet::new();
+    for (worker, handle) in handles {
+        children.spawn(async move { (worker, handle.await) });
+    }
+    children
+}
+
+async fn supervise_next_daemon_child(
+    children: &mut JoinSet<(
+        &'static str,
+        std::result::Result<(), tokio::task::JoinError>,
+    )>,
+) -> Result<()> {
+    match children.join_next().await {
+        Some(Ok((worker, Ok(())))) => Err(FusilladeError::Other(anyhow::anyhow!(
+            "daemon child task `{worker}` exited unexpectedly"
+        ))),
+        Some(Ok((worker, Err(error)))) => Err(FusilladeError::Other(anyhow::anyhow!(
+            "daemon child task `{worker}` panicked: {error}"
+        ))),
+        Some(Err(error)) => Err(FusilladeError::Other(anyhow::anyhow!(
+            "daemon child supervisor panicked: {error}"
+        ))),
+        None => Err(FusilladeError::Other(anyhow::anyhow!(
+            "all daemon child tasks exited unexpectedly"
+        ))),
+    }
+}
+
+async fn drain_supervised_daemon_children(
+    children: &mut JoinSet<(
+        &'static str,
+        std::result::Result<(), tokio::task::JoinError>,
+    )>,
+) -> usize {
+    let mut panics = 0;
+    while let Some(result) = children.join_next().await {
+        match result {
+            Ok((worker, Err(error))) => {
+                panics += 1;
+                crate::background_error!(
+                    "daemon_child_task_panicked",
+                    Critical,
+                    worker,
+                    error = %error,
+                    "Daemon child task panicked during shutdown"
+                );
+            }
+            Err(error) => {
+                panics += 1;
+                crate::background_error!(
+                    "daemon_child_supervisor_panicked",
+                    Critical,
+                    error = %error,
+                    "Daemon child supervisor panicked during shutdown"
+                );
+            }
+            Ok((_, Ok(()))) => {}
         }
-    })
-    .count()
+    }
+    panics
 }
 
 #[derive(Clone, Copy)]
@@ -815,17 +857,22 @@ fn validate_retention_startup(
     config: &RetentionMaintenanceConfig,
     requested_mode: DaemonMode,
     owns_archive_maintenance: bool,
-    storage_supports_retention: bool,
+    storage_supports_retained_lifecycle: bool,
     purge_interval_ms: u64,
     purge_batch_size: i64,
     movement_windows: ArchiveMovementWindows,
 ) -> Result<()> {
-    config
-        .policy()
-        .cutoffs_at(chrono::Utc::now(), movement_windows.cancellation_grace_secs)
-        .map_err(|error| {
-            FusilladeError::ValidationError(format!("invalid retention configuration: {error}"))
-        })?;
+    config.policy().validate().map_err(|error| {
+        FusilladeError::ValidationError(format!("invalid retention configuration: {error}"))
+    })?;
+    if config.retained_response_retirement_enabled() {
+        return Err(FusilladeError::ValidationError(
+            "retained-response partition retirement is not scheduled in this release".to_string(),
+        ));
+    }
+    if requested_mode == DaemonMode::RequestOnly {
+        return Ok(());
+    }
 
     if requested_mode != DaemonMode::RequestOnly
         && (config.policy().expire_files || config.policy().terminal_batch_seconds.is_some())
@@ -872,10 +919,11 @@ fn validate_retention_startup(
     if requested_mode != DaemonMode::RequestOnly
         && lifecycle_active
         && owns_archive_maintenance
-        && !storage_supports_retention
+        && !storage_supports_retained_lifecycle
     {
         return Err(FusilladeError::ValidationError(
-            "configured storage backend does not support automated retention".to_string(),
+            "configured storage backend does not support the retained-response lifecycle"
+                .to_string(),
         ));
     }
 
@@ -932,6 +980,109 @@ fn validate_retention_startup(
         ));
     }
     Ok(())
+}
+
+fn validate_maintenance_worker_config(
+    config: &DaemonConfig,
+    retention: &RetentionMaintenanceConfig,
+    requested_mode: DaemonMode,
+    owns_archive_maintenance: bool,
+) -> Result<()> {
+    if requested_mode == DaemonMode::RequestOnly || !owns_archive_maintenance {
+        return Ok(());
+    }
+
+    let sweep_enabled =
+        config.batch_archive_sweep_enabled || retention.batchless_archive_sweep_enabled();
+    if sweep_enabled && config.batch_archive_sweep_interval_ms == 0 {
+        return Err(FusilladeError::ValidationError(
+            "archive sweep interval must be positive when enabled".to_string(),
+        ));
+    }
+    if config.batch_archive_sweep_enabled && config.batch_archive_sweep_moves_per_tick <= 0 {
+        return Err(FusilladeError::ValidationError(
+            "batch archive sweep moves per tick must be positive when enabled".to_string(),
+        ));
+    }
+
+    let backfill_enabled =
+        config.batch_archive_backfill_enabled || retention.batchless_archive_backfill_enabled();
+    if backfill_enabled && config.batch_archive_backfill_interval_ms == 0 {
+        return Err(FusilladeError::ValidationError(
+            "archive backfill interval must be positive when enabled".to_string(),
+        ));
+    }
+    if config.batch_archive_backfill_enabled {
+        if config.batch_archive_backfill_moves_per_tick <= 0 {
+            return Err(FusilladeError::ValidationError(
+                "batch archive backfill moves per tick must be positive when enabled".to_string(),
+            ));
+        }
+        if config.batch_archive_backfill_concurrency == 0 {
+            return Err(FusilladeError::ValidationError(
+                "batch archive backfill concurrency must be positive when enabled".to_string(),
+            ));
+        }
+    }
+
+    if config.batch_archive_sweep_enabled
+        && (!config.batch_archive_sweep_dwell_secs.is_finite()
+            || config.batch_archive_sweep_dwell_secs < 0.0)
+    {
+        return Err(FusilladeError::ValidationError(
+            "batch archive sweep dwell must be finite and non-negative".to_string(),
+        ));
+    }
+    if (sweep_enabled || backfill_enabled)
+        && (!config.batch_archive_cancel_grace_secs.is_finite()
+            || config.batch_archive_cancel_grace_secs < 0.0)
+    {
+        return Err(FusilladeError::ValidationError(
+            "archive cancellation grace must be finite and non-negative".to_string(),
+        ));
+    }
+    if config.batch_archive_partitions_weeks_ahead < 0 {
+        return Err(FusilladeError::ValidationError(
+            "batch archive partition runway must not be negative".to_string(),
+        ));
+    }
+    if config.batch_finalizer_enabled {
+        if config.batch_finalizer_interval_ms == 0 || config.batch_finalizer_cancelled_per_tick <= 0
+        {
+            return Err(FusilladeError::ValidationError(
+                "batch finalizer interval and per-tick bound must be positive when enabled"
+                    .to_string(),
+            ));
+        }
+        if !config.batch_finalizer_cancelled_grace_secs.is_finite()
+            || config.batch_finalizer_cancelled_grace_secs < 0.0
+        {
+            return Err(FusilladeError::ValidationError(
+                "batch finalizer cancellation grace must be finite and non-negative".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn daemon_config_snapshot(
+    config: &DaemonConfig,
+    retention: &RetentionMaintenanceConfig,
+) -> serde_json::Value {
+    let mut snapshot = serde_json::to_value(config).expect("Failed to serialize daemon config");
+    snapshot["retention_maintenance"] = serde_json::json!({
+        "policy": retention.policy(),
+        "controls": {
+            "batchless_archive_sweep_enabled": retention.batchless_archive_sweep_enabled(),
+            "batchless_archive_backfill_enabled": retention.batchless_archive_backfill_enabled(),
+            "batchless_archive_groups_per_tick": retention.batchless_archive_groups_per_tick(),
+            "batchless_archive_bytes_per_tick": retention.batchless_archive_bytes_per_tick(),
+            "retained_response_partitions_days_ahead": retention.retained_response_partitions_days_ahead(),
+            "retained_response_retirement_enabled": retention.retained_response_retirement_enabled(),
+        },
+        "required_gates": ["candidate_index", "continuous_partition_runway"],
+    });
+    snapshot
 }
 
 fn validate_daemon_intervals(config: &DaemonConfig) -> Result<()> {
@@ -1211,6 +1362,40 @@ where
     pub fn with_retention_maintenance(mut self, config: RetentionMaintenanceConfig) -> Self {
         self.retention_maintenance = config;
         self
+    }
+
+    /// Validate the complete startup structure without performing I/O or
+    /// spawning children. Concrete runtimes call this before returning a
+    /// leader handle; [`Daemon::run_with_mode`] repeats it defensively for
+    /// direct library users.
+    pub(crate) fn validate_startup(&self, mode: DaemonMode) -> Result<()> {
+        validate_daemon_intervals(&self.config)?;
+        let claim_loop_kinds = claim_loop_kinds_for_mode(
+            mode,
+            self.storage.supports_batch_claims(),
+            self.storage.supports_background_claims(),
+            self.config.background_concurrency_limit > 0,
+            self.config.inject_deadline_priority,
+        )?;
+        let owns_archive_maintenance = owns_archive_maintenance(&claim_loop_kinds);
+        validate_maintenance_worker_config(
+            &self.config,
+            &self.retention_maintenance,
+            mode,
+            owns_archive_maintenance,
+        )?;
+        validate_retention_startup(
+            &self.retention_maintenance,
+            mode,
+            owns_archive_maintenance,
+            self.storage.supports_retained_response_lifecycle(),
+            self.config.purge_interval_ms,
+            self.config.purge_batch_size,
+            ArchiveMovementWindows::new(
+                self.config.batch_archive_sweep_dwell_secs,
+                self.config.batch_archive_cancel_grace_secs,
+            ),
+        )
     }
 
     fn poll_processing_tasks(join_set: &mut JoinSet<Result<()>>) {
@@ -2229,7 +2414,7 @@ where
     #[tracing::instrument(name = "fusillade.daemon.run_with_mode", skip(self), fields(daemon_id = %self.daemon_id, mode = ?mode))]
     pub async fn run_with_mode(self: Arc<Self>, mode: DaemonMode) -> Result<()> {
         tracing::info!("Daemon starting main processing loop");
-        validate_daemon_intervals(&self.config)?;
+        self.validate_startup(mode)?;
 
         // Validate the configured claim topology before registering the daemon
         // or spawning any maintenance tasks. Background workers read this
@@ -2246,18 +2431,6 @@ where
             self.config.inject_deadline_priority,
         )?;
         let owns_archive_maintenance = owns_archive_maintenance(&claim_loop_kinds);
-        validate_retention_startup(
-            &self.retention_maintenance,
-            mode,
-            owns_archive_maintenance,
-            self.storage.supports_retention_sweeps(),
-            self.config.purge_interval_ms,
-            self.config.purge_batch_size,
-            ArchiveMovementWindows::new(
-                self.config.batch_archive_sweep_dwell_secs,
-                self.config.batch_archive_cancel_grace_secs,
-            ),
-        )?;
 
         // Register daemon in database
         let daemon_record = DaemonRecord {
@@ -2266,8 +2439,7 @@ where
                 hostname: get_hostname(),
                 pid: get_pid(),
                 version: get_version(),
-                config_snapshot: serde_json::to_value(&self.config)
-                    .expect("Failed to serialize daemon config"),
+                config_snapshot: daemon_config_snapshot(&self.config, &self.retention_maintenance),
             },
             state: Initializing {
                 started_at: chrono::Utc::now(),
@@ -2683,29 +2855,33 @@ where
         // performs DDL or movement even when it shares the same opaque config.
         let query_timeout = Duration::from_millis(self.config.claim_query_timeout_ms);
         let retention_policy = self.retention_maintenance.policy().clone();
-        let retained_runway_ready = initialize_archive_maintenance_if_owner(
-            owns_archive_maintenance,
-            self.storage.as_ref(),
-            &self.shutdown_token,
-            query_timeout,
-            self.config.batch_archive_partitions_weeks_ahead,
-            &retention_policy,
-            self.retention_maintenance
-                .retained_response_partitions_days_ahead(),
-        )
-        .await;
-        if let Some(retained_runway_ready) = retained_runway_ready {
-            let daily_handle = tokio::spawn(run_archive_partition_maintenance_loop(
+        let retained_runway_ready = Arc::new(AtomicBool::new(false));
+        if owns_archive_maintenance {
+            let weekly_handle = tokio::spawn(run_weekly_archive_partition_maintenance_loop(
                 self.storage.clone(),
                 self.shutdown_token.clone(),
                 query_timeout,
                 self.config.batch_archive_partitions_weeks_ahead,
-                retention_policy.clone(),
-                self.retention_maintenance
-                    .retained_response_partitions_days_ahead(),
                 Duration::from_secs(86_400),
             ));
-            daemon_handles.push(("archive_partition_maintenance", daily_handle));
+            daemon_handles.push(("archive_partition_maintenance", weekly_handle));
+
+            if !retention_policy
+                .batchless_seconds_by_service_tier
+                .is_empty()
+            {
+                let retained_handle = tokio::spawn(run_retained_response_readiness_loop(
+                    self.storage.clone(),
+                    self.shutdown_token.clone(),
+                    query_timeout,
+                    retention_policy.clone(),
+                    self.retention_maintenance
+                        .retained_response_partitions_days_ahead(),
+                    retained_runway_ready.clone(),
+                    Duration::from_secs(86_400),
+                ));
+                daemon_handles.push(("retained_response_readiness", retained_handle));
+            }
 
             for (
                 worker,
@@ -2736,33 +2912,15 @@ where
                     self.config.batch_archive_backfill_concurrency,
                 ),
             ] {
-                let batchless_enabled = batchless_configured && retained_runway_ready;
-                if batchless_configured && !retained_runway_ready {
-                    crate::background_error!(
-                        "retained_response_mover_not_ready",
-                        Error,
-                        worker,
-                        "Retained-response mover not started because its partition runway is unavailable"
-                    );
-                }
+                let batchless_enabled = batchless_configured;
                 if !batch_enabled && !batchless_enabled {
-                    continue;
-                }
-                if interval_ms == 0 || (batch_enabled && batch_limit <= 0) {
-                    crate::background_error!(
-                        "archive_mover_invalid_config",
-                        Error,
-                        worker,
-                        interval_ms,
-                        batch_limit,
-                        "Archive mover disabled due to invalid config"
-                    );
                     continue;
                 }
 
                 let storage = self.storage.clone();
                 let shutdown = self.shutdown_token.clone();
                 let policy = retention_policy.clone();
+                let retained_runway_ready = retained_runway_ready.clone();
                 let tick = ArchiveMoverTick {
                     worker,
                     batch_enabled,
@@ -2798,6 +2956,7 @@ where
                             query_timeout,
                             &policy,
                             tick,
+                            retained_runway_ready.as_ref(),
                         )
                         .await;
                     }
@@ -2810,7 +2969,7 @@ where
         // cancelled batches settle-then-freeze) so that finalization never
         // depends on anyone reading the batch or on notification delivery.
         // Notification is a downstream consumer of counts_frozen_at.
-        if self.config.batch_finalizer_enabled {
+        if owns_archive_maintenance && self.config.batch_finalizer_enabled {
             let storage = self.storage.clone();
             let shutdown_token = self.shutdown_token.clone();
             let interval_ms = self.config.batch_finalizer_interval_ms;
@@ -2818,18 +2977,6 @@ where
             let cancelled_per_tick = self.config.batch_finalizer_cancelled_per_tick;
             let query_timeout = Duration::from_millis(self.config.claim_query_timeout_ms);
             let handle = tokio::spawn(async move {
-                // Misconfiguration guard, same rationale as the archive mover:
-                // interval 0 busy-loops, per_tick <= 0 unbounds the LIMIT.
-                if interval_ms == 0 || cancelled_per_tick <= 0 {
-                    crate::background_error!(
-                        "batch_finalizer_invalid_config",
-                        Error,
-                        interval_ms,
-                        cancelled_per_tick,
-                        "Batch finalizer disabled due to invalid config"
-                    );
-                    return;
-                }
                 tracing::info!(interval_ms, "Batch finalizer started");
                 loop {
                     tokio::select! {
@@ -2918,8 +3065,18 @@ where
             }
         }
 
+        let mut daemon_children = supervise_daemon_handles(daemon_handles);
         let run_result = loop {
             tokio::select! {
+                biased;
+                _ = self.shutdown_token.cancelled() => {
+                    tracing::info!("Shutdown signal received, stopping daemon");
+                    break Ok(());
+                }
+                child_result = supervise_next_daemon_child(&mut daemon_children), if !daemon_children.is_empty() => {
+                    self.shutdown_token.cancel();
+                    break child_result;
+                }
                 result = claim_daemons.join_next() => {
                     match result {
                         Some(Ok(Ok(()))) => {
@@ -2940,10 +3097,6 @@ where
                         }
                         None => break Ok(()),
                     }
-                }
-                _ = self.shutdown_token.cancelled() => {
-                    tracing::info!("Shutdown signal received, stopping daemon");
-                    break Ok(());
                 }
             }
         };
@@ -2966,7 +3119,7 @@ where
         // so one panic is reported without preventing healthy siblings from
         // completing their shutdown path. The heartbeat child marks the
         // daemon record dead before it returns.
-        let _child_panics = await_daemon_handles(daemon_handles).await;
+        let _child_panics = drain_supervised_daemon_children(&mut daemon_children).await;
 
         run_result
     }
@@ -3053,7 +3206,6 @@ mod tests {
         }
     }
 
-    #[derive(Default)]
     struct FakeMaintenanceStorage {
         weekly_calls: AtomicUsize,
         retained_calls: AtomicUsize,
@@ -3065,8 +3217,35 @@ mod tests {
         fail_retained: std::sync::atomic::AtomicBool,
         fail_batch_list: std::sync::atomic::AtomicBool,
         fail_batch_move: std::sync::atomic::AtomicBool,
+        index_ready: std::sync::atomic::AtomicBool,
+        index_readiness_calls: AtomicUsize,
+        retained_contiguous_ahead: AtomicUsize,
+        retained_required: AtomicUsize,
         batch_candidates: AtomicUsize,
         events: std::sync::Mutex<Vec<&'static str>>,
+    }
+
+    impl Default for FakeMaintenanceStorage {
+        fn default() -> Self {
+            Self {
+                weekly_calls: AtomicUsize::new(0),
+                retained_calls: AtomicUsize::new(0),
+                batch_list_calls: AtomicUsize::new(0),
+                batch_move_calls: AtomicUsize::new(0),
+                batchless_calls: AtomicUsize::new(0),
+                batchless_cutoffs: std::sync::Mutex::new(Vec::new()),
+                fail_weekly: std::sync::atomic::AtomicBool::new(false),
+                fail_retained: std::sync::atomic::AtomicBool::new(false),
+                fail_batch_list: std::sync::atomic::AtomicBool::new(false),
+                fail_batch_move: std::sync::atomic::AtomicBool::new(false),
+                index_ready: std::sync::atomic::AtomicBool::new(true),
+                index_readiness_calls: AtomicUsize::new(0),
+                retained_contiguous_ahead: AtomicUsize::new(7),
+                retained_required: AtomicUsize::new(7),
+                batch_candidates: AtomicUsize::new(0),
+                events: std::sync::Mutex::new(Vec::new()),
+            }
+        }
     }
 
     impl FakeMaintenanceStorage {
@@ -3110,6 +3289,15 @@ mod tests {
             true
         }
 
+        fn supports_retained_response_lifecycle(&self) -> bool {
+            true
+        }
+
+        async fn retained_response_archive_index_ready(&self) -> Result<bool> {
+            self.index_readiness_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(self.index_ready.load(Ordering::SeqCst))
+        }
+
         async fn archive_terminal_batchless_responses(
             &self,
             _policy: &RetentionSweepPolicy,
@@ -3127,13 +3315,17 @@ mod tests {
             &self,
             _policy: &RetentionSweepPolicy,
             _days_ahead: i32,
-        ) -> Result<(i64, i64)> {
+        ) -> Result<crate::RetainedResponsePartitionRunway> {
             self.retained_calls.fetch_add(1, Ordering::SeqCst);
             self.record("retained_runway");
             if self.fail_retained.load(Ordering::SeqCst) {
                 Err(Self::fail())
             } else {
-                Ok((0, 7))
+                Ok(crate::RetainedResponsePartitionRunway {
+                    created: 0,
+                    contiguous_ahead: self.retained_contiguous_ahead.load(Ordering::SeqCst) as i64,
+                    required: self.retained_required.load(Ordering::SeqCst) as i64,
+                })
             }
         }
 
@@ -3277,30 +3469,28 @@ mod tests {
         let shutdown = tokio_util::sync::CancellationToken::new();
         let policy = configured_batchless_maintenance().policy().clone();
 
-        assert!(
-            run_archive_partition_maintenance_tick(
-                storage.as_ref(),
-                &shutdown,
-                Duration::from_secs(1),
-                4,
-                &policy,
-                7,
-            )
-            .await
-        );
-        let handle = tokio::spawn(run_archive_partition_maintenance_loop(
+        let retained_runway_ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let weekly_handle = tokio::spawn(run_weekly_archive_partition_maintenance_loop(
             storage.clone(),
             shutdown.clone(),
             Duration::from_secs(1),
             4,
+            Duration::from_secs(86_400),
+        ));
+        let retained_handle = tokio::spawn(run_retained_response_readiness_loop(
+            storage.clone(),
+            shutdown.clone(),
+            Duration::from_secs(1),
             policy,
             7,
+            retained_runway_ready.clone(),
             Duration::from_secs(86_400),
         ));
 
         tokio::task::yield_now().await;
         assert_eq!(storage.weekly_calls.load(Ordering::SeqCst), 1);
         assert_eq!(storage.retained_calls.load(Ordering::SeqCst), 1);
+        assert!(retained_runway_ready.load(Ordering::SeqCst));
         tokio::time::advance(Duration::from_secs(86_399)).await;
         tokio::task::yield_now().await;
         assert_eq!(storage.retained_calls.load(Ordering::SeqCst), 1);
@@ -3310,52 +3500,81 @@ mod tests {
         assert_eq!(storage.retained_calls.load(Ordering::SeqCst), 2);
 
         shutdown.cancel();
+        weekly_handle.await.unwrap();
+        retained_handle.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn non_leading_retained_runway_gap_remains_fail_closed() {
+        let storage = Arc::new(FakeMaintenanceStorage::default());
+        storage.retained_contiguous_ahead.store(3, Ordering::SeqCst);
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let ready = Arc::new(AtomicBool::new(false));
+        let handle = tokio::spawn(run_retained_response_readiness_loop(
+            storage.clone(),
+            shutdown.clone(),
+            Duration::from_secs(1),
+            configured_batchless_maintenance().policy().clone(),
+            7,
+            ready.clone(),
+            Duration::from_secs(86_400),
+        ));
+
+        tokio::task::yield_now().await;
+        assert_eq!(storage.retained_calls.load(Ordering::SeqCst), 1);
+        assert!(
+            !ready.load(Ordering::SeqCst),
+            "a later gap inside the required runway must keep movement disabled"
+        );
+
+        shutdown.cancel();
         handle.await.unwrap();
     }
 
     #[tokio::test]
     async fn daily_partition_phases_are_independent() {
-        let storage = FakeMaintenanceStorage::default();
+        let storage = Arc::new(FakeMaintenanceStorage::default());
         storage.fail_weekly.store(true, Ordering::SeqCst);
         let shutdown = tokio_util::sync::CancellationToken::new();
         let policy = configured_batchless_maintenance().policy().clone();
+        let ready = Arc::new(AtomicBool::new(false));
 
-        assert!(
-            run_archive_partition_maintenance_tick(
-                &storage,
-                &shutdown,
-                Duration::from_secs(1),
-                4,
-                &policy,
-                7,
-            )
-            .await,
-            "weekly partition failure must not suppress the retained runway"
-        );
+        let weekly_handle = tokio::spawn(run_weekly_archive_partition_maintenance_loop(
+            storage.clone(),
+            shutdown.clone(),
+            Duration::from_secs(1),
+            4,
+            Duration::from_secs(86_400),
+        ));
+        let retained_handle = tokio::spawn(run_retained_response_readiness_loop(
+            storage.clone(),
+            shutdown.clone(),
+            Duration::from_secs(1),
+            policy,
+            7,
+            ready.clone(),
+            Duration::from_secs(86_400),
+        ));
+        tokio::task::yield_now().await;
+
         assert_eq!(storage.weekly_calls.load(Ordering::SeqCst), 1);
         assert_eq!(storage.retained_calls.load(Ordering::SeqCst), 1);
+        assert!(
+            ready.load(Ordering::SeqCst),
+            "weekly partition failure must not suppress the retained runway"
+        );
+        shutdown.cancel();
+        weekly_handle.await.unwrap();
+        retained_handle.await.unwrap();
     }
 
     #[tokio::test]
     async fn request_only_topology_performs_no_archive_ddl_or_movement() {
         let storage = FakeMaintenanceStorage::default();
-        let shutdown = tokio_util::sync::CancellationToken::new();
-        let policy = configured_batchless_maintenance().policy().clone();
         let kinds =
             claim_loop_kinds_for_mode(DaemonMode::RequestOnly, true, true, true, true).unwrap();
-
-        let ready = initialize_archive_maintenance_if_owner(
-            owns_archive_maintenance(&kinds),
-            &storage,
-            &shutdown,
-            Duration::from_secs(1),
-            4,
-            &policy,
-            7,
-        )
-        .await;
-
-        assert_eq!(ready, None);
+        assert!(!owns_archive_maintenance(&kinds));
+        tokio::task::yield_now().await;
         assert_eq!(storage.weekly_calls.load(Ordering::SeqCst), 0);
         assert_eq!(storage.retained_calls.load(Ordering::SeqCst), 0);
         assert_eq!(storage.batch_list_calls.load(Ordering::SeqCst), 0);
@@ -3368,17 +3587,11 @@ mod tests {
         let shutdown = tokio_util::sync::CancellationToken::new();
         let policy = configured_batchless_maintenance().policy().clone();
 
-        assert!(
-            run_archive_partition_maintenance_tick(
-                storage.as_ref(),
-                &shutdown,
-                Duration::from_secs(1),
-                4,
-                &policy,
-                7,
-            )
+        storage
+            .ensure_retained_response_partitions(&policy, 7)
             .await
-        );
+            .unwrap();
+        let retained_runway_ready = std::sync::atomic::AtomicBool::new(true);
         storage.fail_batch_list.store(true, Ordering::SeqCst);
         run_archive_mover_tick(
             storage.clone(),
@@ -3386,6 +3599,7 @@ mod tests {
             Duration::from_secs(1),
             &policy,
             mover_tick(true, true),
+            &retained_runway_ready,
         )
         .await;
         assert_eq!(storage.batchless_calls.load(Ordering::SeqCst), 1);
@@ -3399,6 +3613,7 @@ mod tests {
             Duration::from_secs(1),
             &policy,
             mover_tick(true, true),
+            &retained_runway_ready,
         )
         .await;
         assert_eq!(storage.batch_move_calls.load(Ordering::SeqCst), 1);
@@ -3432,6 +3647,7 @@ mod tests {
             Duration::from_secs(1),
             &policy,
             tick,
+            &std::sync::atomic::AtomicBool::new(true),
         )
         .await;
 
@@ -3443,6 +3659,180 @@ mod tests {
                 .signed_duration_since(cutoffs[0].terminal_before()),
             chrono::Duration::seconds(37)
         );
+    }
+
+    #[tokio::test]
+    async fn batchless_movement_gates_recover_without_restart() {
+        let storage = Arc::new(FakeMaintenanceStorage::default());
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let policy = configured_batchless_maintenance().policy().clone();
+        let retained_runway_ready = std::sync::atomic::AtomicBool::new(false);
+
+        run_archive_mover_tick(
+            storage.clone(),
+            &shutdown,
+            Duration::from_secs(1),
+            &policy,
+            mover_tick(false, true),
+            &retained_runway_ready,
+        )
+        .await;
+        assert_eq!(storage.batchless_calls.load(Ordering::SeqCst), 0);
+
+        retained_runway_ready.store(true, Ordering::SeqCst);
+        storage.index_ready.store(false, Ordering::SeqCst);
+        run_archive_mover_tick(
+            storage.clone(),
+            &shutdown,
+            Duration::from_secs(1),
+            &policy,
+            mover_tick(false, true),
+            &retained_runway_ready,
+        )
+        .await;
+        assert_eq!(storage.batchless_calls.load(Ordering::SeqCst), 0);
+
+        storage.index_ready.store(true, Ordering::SeqCst);
+        run_archive_mover_tick(
+            storage.clone(),
+            &shutdown,
+            Duration::from_secs(1),
+            &policy,
+            mover_tick(false, true),
+            &retained_runway_ready,
+        )
+        .await;
+        assert_eq!(storage.batchless_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(storage.index_readiness_calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retained_runway_failure_retries_on_bounded_cadence_and_recovers() {
+        let storage = Arc::new(FakeMaintenanceStorage::default());
+        storage.fail_retained.store(true, Ordering::SeqCst);
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let ready = Arc::new(AtomicBool::new(false));
+        let handle = tokio::spawn(run_retained_response_readiness_loop(
+            storage.clone(),
+            shutdown.clone(),
+            Duration::from_secs(1),
+            configured_batchless_maintenance().policy().clone(),
+            7,
+            ready.clone(),
+            Duration::from_secs(86_400),
+        ));
+
+        tokio::task::yield_now().await;
+        assert_eq!(storage.retained_calls.load(Ordering::SeqCst), 1);
+        assert!(!ready.load(Ordering::SeqCst));
+        storage.fail_retained.store(false, Ordering::SeqCst);
+        tokio::time::advance(Duration::from_secs(29)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(storage.retained_calls.load(Ordering::SeqCst), 1);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(storage.retained_calls.load(Ordering::SeqCst), 2);
+        assert!(ready.load(Ordering::SeqCst));
+
+        shutdown.cancel();
+        handle.await.unwrap();
+    }
+
+    #[test]
+    fn enabled_archive_workers_reject_invalid_intervals_and_bounds() {
+        let retention = configured_batchless_maintenance()
+            .with_batchless_archive_sweep_enabled(true)
+            .with_batchless_archive_backfill_enabled(true);
+        let mutations: [fn(&mut DaemonConfig); 5] = [
+            |config| config.batch_archive_sweep_interval_ms = 0,
+            |config| config.batch_archive_backfill_interval_ms = 0,
+            |config| {
+                config.batch_archive_sweep_enabled = true;
+                config.batch_archive_sweep_moves_per_tick = 0;
+            },
+            |config| {
+                config.batch_archive_backfill_enabled = true;
+                config.batch_archive_backfill_moves_per_tick = 0;
+            },
+            |config| {
+                config.batch_archive_backfill_enabled = true;
+                config.batch_archive_backfill_concurrency = 0;
+            },
+        ];
+        for mutate in mutations {
+            let mut config = DaemonConfig::default();
+            mutate(&mut config);
+            assert!(
+                validate_maintenance_worker_config(&config, &retention, DaemonMode::Both, true,)
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_batch_phase_fails_instead_of_disabling_valid_batchless_phase() {
+        let config = DaemonConfig {
+            batch_archive_sweep_enabled: true,
+            batch_archive_sweep_moves_per_tick: 0,
+            ..Default::default()
+        };
+        let retention = configured_batchless_maintenance()
+            .with_batchless_archive_sweep_enabled(true)
+            .with_batchless_archive_limits(1, 1);
+        assert!(
+            validate_maintenance_worker_config(&config, &retention, DaemonMode::Both, true)
+                .unwrap_err()
+                .to_string()
+                .contains("sweep")
+        );
+    }
+
+    #[test]
+    fn retention_snapshot_is_content_free_and_complete() {
+        let retention = configured_batchless_maintenance()
+            .with_batchless_archive_sweep_enabled(true)
+            .with_batchless_archive_limits(3, 4096)
+            .with_retained_response_partitions_days_ahead(9);
+        let snapshot = daemon_config_snapshot(&DaemonConfig::default(), &retention);
+        let summary = &snapshot["retention_maintenance"];
+        assert_eq!(
+            summary["policy"],
+            serde_json::to_value(retention.policy()).unwrap()
+        );
+        assert_eq!(summary["controls"]["batchless_archive_sweep_enabled"], true);
+        assert_eq!(summary["controls"]["batchless_archive_groups_per_tick"], 3);
+        assert_eq!(
+            summary["controls"]["batchless_archive_bytes_per_tick"],
+            4096
+        );
+        assert_eq!(
+            summary["controls"]["retained_response_partitions_days_ahead"],
+            9
+        );
+        assert_eq!(
+            summary["required_gates"],
+            serde_json::json!(["candidate_index", "continuous_partition_runway"])
+        );
+        let encoded = serde_json::to_string(summary).unwrap();
+        for forbidden in ["request_id", "group_id", "payload", "created_by", "api_key"] {
+            assert!(!encoded.contains(forbidden));
+        }
+    }
+
+    #[tokio::test]
+    async fn unexpected_maintenance_completion_and_panic_are_failures() {
+        for handle in [
+            tokio::spawn(async {}),
+            tokio::spawn(async { panic!("injected child panic") }),
+        ] {
+            let mut children = supervise_daemon_handles(vec![("test_child", handle)]);
+            let error = supervise_next_daemon_child(&mut children)
+                .await
+                .expect_err("every pre-shutdown child exit must fail the daemon");
+            assert!(
+                error.to_string().contains("test_child") || error.to_string().contains("panicked")
+            );
+        }
     }
 
     #[tokio::test]
@@ -3468,7 +3858,8 @@ mod tests {
         ));
 
         shutdown.cancel();
-        let panics = await_daemon_handles(handles).await;
+        let mut children = supervise_daemon_handles(handles);
+        let panics = drain_supervised_daemon_children(&mut children).await;
         assert_eq!(panics, 1);
         assert_eq!(completed.load(Ordering::SeqCst), 2);
     }
@@ -3626,9 +4017,8 @@ mod tests {
                 1,
                 ArchiveMovementWindows::new(0.0, 600.0),
             )
-            .unwrap_err()
-            .to_string()
-            .contains("partition runway")
+            .is_ok(),
+            "request-only mode must ignore owner-only runway controls"
         );
 
         config = config.with_retained_response_partitions_days_ahead(1);
@@ -3688,20 +4078,22 @@ mod tests {
 
         let retirement_without_policy =
             RetentionMaintenanceConfig::default().with_retained_response_retirement_enabled(true);
-        assert!(
-            validate_retention_startup(
-                &retirement_without_policy,
-                DaemonMode::Both,
-                true,
-                true,
-                1,
-                1,
-                ArchiveMovementWindows::new(0.0, 600.0),
-            )
-            .unwrap_err()
-            .to_string()
-            .contains("batchless retention policy")
-        );
+        for mode in [DaemonMode::Both, DaemonMode::RequestOnly] {
+            assert!(
+                validate_retention_startup(
+                    &retirement_without_policy,
+                    mode,
+                    mode != DaemonMode::RequestOnly,
+                    true,
+                    1,
+                    1,
+                    ArchiveMovementWindows::new(0.0, 600.0),
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("retirement is not scheduled")
+            );
+        }
     }
 
     #[test]

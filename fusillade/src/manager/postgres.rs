@@ -79,6 +79,27 @@ where
         let storage = Arc::new(PostgresStore::new(pools, (&config).into()));
         Self::from_store(storage, config)
     }
+
+    /// Build a PostgreSQL daemon and install one retention policy on both the
+    /// scheduling runtime and every store-side late-writer fence path.
+    /// Existing constructors remain unchanged for source compatibility.
+    pub fn try_from_pools_with_retention(
+        pools: P,
+        config: DaemonConfig,
+        retention: RetentionMaintenanceConfig,
+    ) -> crate::Result<Self> {
+        retention.policy().validate().map_err(|error| {
+            crate::FusilladeError::ValidationError(format!(
+                "invalid retention configuration: {error}"
+            ))
+        })?;
+        let fence_seconds = retention.policy().max_late_writer_seconds;
+        let storage = Arc::new(
+            PostgresStore::new(pools, (&config).into())
+                .with_retained_response_fence_seconds(fence_seconds),
+        );
+        Ok(Self::from_store(storage, config).with_retention_maintenance(retention))
+    }
 }
 
 impl<P, H> PostgresDaemon<P, H>
@@ -165,7 +186,21 @@ where
         if let Some(processor) = self.processor.get().cloned() {
             daemon = daemon.with_processor(processor);
         }
+        if mode != DaemonMode::RequestOnly
+            && !self
+                .retention_maintenance
+                .policy()
+                .batchless_seconds_by_service_tier
+                .is_empty()
+            && self.storage.retained_response_fence_seconds()
+                != self.retention_maintenance.policy().max_late_writer_seconds
+        {
+            return Err(crate::FusilladeError::ValidationError(
+                "PostgreSQL late-writer fence does not match retained-response policy".to_string(),
+            ));
+        }
         let daemon = Arc::new(daemon);
+        daemon.validate_startup(mode)?;
 
         let handle = tokio::spawn(async move { daemon.run_with_mode(mode).await });
 

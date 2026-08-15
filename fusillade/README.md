@@ -297,18 +297,51 @@ terminal file-backed batch retention are rejected until their complete payload
 lifecycle is supported. Explicit deletion continues through the ordinary
 orphan purge and is independent of scheduled retention.
 
-The effective batch claim owner runs archive maintenance. It ensures the
-retained-response partition runway before enabling a batchless mover, then
-refreshes both archive partition families daily. Request-only daemons perform
-no archive DDL or movement. Steady and backfill movement are independently
+The effective batch claim owner runs archive maintenance. Weekly archive DDL
+starts asynchronously and never delays claim-loop startup. A separate retained
+gate maintains the continuous daily range from tomorrow through the furthest
+configured retention horizon plus its runway. Request-only daemons perform no
+archive DDL or movement. Steady and backfill movement are independently
 disabled by default and share the existing archive workers' pacing; both use
 positive graph and byte budgets. Each tick resolves one immutable observation,
 dwell, and cancellation-grace boundary for every graph considered in that
 pass. The dwell and grace must each be shorter than every enabled retention
 period.
 
-The retirement control is independently disabled and does not run a scheduled
-retirement task in this release. Movement and partition maintenance emit only
+Before enabling retained-response movement, an operator must build the exact
+payload-free candidate index outside a transaction:
+
+```sql
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_requests_batchless_retention_due
+  ON requests (
+    service_tier,
+    (CASE state WHEN 'completed' THEN completed_at
+                WHEN 'failed' THEN failed_at
+                WHEN 'canceled' THEN canceled_at END),
+    id
+  )
+  WHERE batch_id IS NULL
+    AND state IN ('completed', 'failed', 'canceled');
+```
+
+Verify its keys, predicate, validity, and readiness through the migration-owned
+guard rather than by name alone:
+
+```sql
+SELECT retained_response_archive_index_ready(current_schema());
+```
+
+The safe enable order is: deploy the archive-aware schema and readers; create
+the index concurrently; verify the readiness query returns `true`; configure
+the retention durations, late-writer fence, and partition runway while movers
+remain disabled; then enable the steady mover and, if needed, backfill. Both
+the exact index and continuous runway are checked fail closed. Missing,
+invalid, or transiently unavailable prerequisites prevent batchless movement,
+and bounded background checks allow movement to recover without a restart
+once both become ready.
+
+The retirement control is independently disabled; setting it to `true` is
+rejected at startup because this release has no retirement consumer. Movement and partition maintenance emit only
 aggregate counts and fixed phase labels, never request identifiers or content.
 
 Ordinary pending-count queries exclude background demand. To expose it, use an
