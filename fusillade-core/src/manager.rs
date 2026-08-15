@@ -61,6 +61,11 @@ pub struct RetentionSweepPolicy {
     /// Age terminal batchless requests out by their exact service-tier label.
     /// Missing tiers remain subject to explicit deletion.
     pub batchless_seconds_by_service_tier: HashMap<String, u64>,
+    /// Keep content-free UUID resurrection fences for at most this many
+    /// seconds after the latest destructive response lifecycle event. `None`
+    /// disables fence creation; the public library deliberately supplies no
+    /// retention default for this independent metadata policy.
+    pub max_late_writer_seconds: Option<u64>,
 }
 
 impl RetentionSweepPolicy {
@@ -74,6 +79,7 @@ impl RetentionSweepPolicy {
     /// Reject labels that cannot match a persisted service tier safely.
     pub fn validate(&self) -> std::result::Result<(), String> {
         if self.terminal_batch_seconds == Some(0)
+            || self.max_late_writer_seconds == Some(0)
             || self
                 .batchless_seconds_by_service_tier
                 .values()
@@ -84,6 +90,7 @@ impl RetentionSweepPolicy {
         let periods = self
             .terminal_batch_seconds
             .into_iter()
+            .chain(self.max_late_writer_seconds)
             .chain(self.batchless_seconds_by_service_tier.values().copied());
         if periods.into_iter().any(|seconds| {
             i64::try_from(seconds)
@@ -99,6 +106,13 @@ impl RetentionSweepPolicy {
             .any(|tier| !matches!(tier.as_str(), "priority" | "flex" | "background"))
         {
             return Err("batchless retention contains an unsupported service tier".to_string());
+        }
+        if !self.batchless_seconds_by_service_tier.is_empty()
+            && self.max_late_writer_seconds.is_none()
+        {
+            return Err(
+                "batchless retention requires an explicit late-writer fence period".to_string(),
+            );
         }
         Ok(())
     }
@@ -228,6 +242,10 @@ pub enum RetainedResponseMaintenanceError {
     /// A batchless logical response graph is missing a required member.
     #[error("Retained response graph is incomplete")]
     IncompleteGraph,
+    /// A destructive retained-response lifecycle action has no configured
+    /// period for its durable content-free resurrection fence.
+    #[error("Retained response resurrection fence period is not configured")]
+    FencePolicyMissing,
 }
 
 impl RetainedResponseMaintenanceError {
@@ -240,6 +258,32 @@ impl RetainedResponseMaintenanceError {
     }
 
     /// Wrap this maintenance failure in the stable outer Fusillade error type.
+    pub fn into_fusillade_error(self) -> crate::error::FusilladeError {
+        crate::error::FusilladeError::Other(anyhow::Error::new(self))
+    }
+}
+
+/// Content-free, matchable outcomes for writers that arrive after a response
+/// graph has left the live tables.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum RetainedResponseWriteError {
+    /// The immutable retained graph still exists, so the terminal write is an
+    /// idempotent replay rather than a missing request.
+    #[error("Response is already retained")]
+    AlreadyRetained,
+    /// The graph was erased or its retained partition is no longer readable.
+    #[error("Response content is no longer available")]
+    NotFound,
+}
+
+impl RetainedResponseWriteError {
+    pub fn from_fusillade_error(error: &crate::error::FusilladeError) -> Option<Self> {
+        match error {
+            crate::error::FusilladeError::Other(error) => error.downcast_ref::<Self>().copied(),
+            _ => None,
+        }
+    }
+
     pub fn into_fusillade_error(self) -> crate::error::FusilladeError {
         crate::error::FusilladeError::Other(anyhow::Error::new(self))
     }
@@ -281,6 +325,7 @@ mod retention_policy_tests {
     fn policy() -> RetentionSweepPolicy {
         RetentionSweepPolicy {
             batchless_seconds_by_service_tier: HashMap::from([("flex".to_string(), 90 * 86_400)]),
+            max_late_writer_seconds: Some(3_600),
             ..Default::default()
         }
     }
@@ -497,7 +542,28 @@ mod retention_policy_tests {
     fn retention_is_disabled_by_default() {
         let policy = RetentionSweepPolicy::default();
         assert!(!policy.is_enabled());
+        assert_eq!(policy.max_late_writer_seconds, None);
         assert!(policy.validate().is_ok());
+    }
+
+    #[test]
+    fn late_writer_window_is_independent_from_content_retention() {
+        let policy = RetentionSweepPolicy {
+            max_late_writer_seconds: Some(600),
+            ..Default::default()
+        };
+
+        assert!(!policy.is_enabled());
+        assert!(policy.validate().is_ok());
+    }
+
+    #[test]
+    fn batchless_retention_requires_an_explicit_late_writer_window() {
+        let policy = RetentionSweepPolicy {
+            batchless_seconds_by_service_tier: HashMap::from([("flex".to_owned(), 600)]),
+            ..Default::default()
+        };
+        assert!(policy.validate().is_err());
     }
 
     #[test]
@@ -512,6 +578,7 @@ mod retention_policy_tests {
 
         let realtime = RetentionSweepPolicy {
             batchless_seconds_by_service_tier: HashMap::from([("priority".to_string(), 1)]),
+            max_late_writer_seconds: Some(1),
             ..Default::default()
         };
         assert!(
@@ -527,6 +594,7 @@ mod retention_policy_tests {
 
         let batchless = RetentionSweepPolicy {
             batchless_seconds_by_service_tier: HashMap::from([("flex".to_string(), 0)]),
+            max_late_writer_seconds: Some(1),
             ..Default::default()
         };
         assert!(batchless.validate().is_err());
@@ -546,6 +614,7 @@ mod retention_policy_tests {
             expire_files: true,
             terminal_batch_seconds: Some(60),
             batchless_seconds_by_service_tier: HashMap::from([("flex".to_string(), 120)]),
+            max_late_writer_seconds: Some(600),
         };
         let cutoffs = policy.cutoffs_at(now, 600.0).unwrap();
         assert_eq!(cutoffs.expire_files_before, Some(now));
@@ -951,6 +1020,16 @@ pub trait Storage: Send + Sync {
     /// Returns `RequestNotFound` if the request does not exist (or was already
     /// deleted).
     async fn delete_request(&self, request_id: RequestId) -> Result<()>;
+
+    /// Atomically erase a complete batchless logical response graph.
+    ///
+    /// `response_id` may name the graph head, any member request, or any
+    /// response step. The return value counts erased request objects. Storage
+    /// backends that do not implement complete-graph storage fail safely.
+    async fn delete_response_group(&self, response_id: uuid::Uuid) -> Result<u64> {
+        let _ = response_id;
+        Err(RetainedResponseMaintenanceError::Disabled.into_fusillade_error())
+    }
 
     /// Erase all of a creator's fusillade data, for right-to-erasure compliance.
     ///

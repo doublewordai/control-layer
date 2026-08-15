@@ -14,7 +14,8 @@ mod utils;
 
 pub use fusillade_core::manager::{
     ArchiveOutcome, BackgroundClaimKind, DaemonStorage, ModelFilter, ModelFilterState,
-    RetentionSweepCutoffs, RetentionSweepOutcome, RetentionSweepPolicy, Storage,
+    RetainedResponseWriteError, RetentionSweepCutoffs, RetentionSweepOutcome, RetentionSweepPolicy,
+    Storage,
 };
 pub use fusillade_core::request::AnyRequest;
 pub use fusillade_core::response_step;
@@ -80,6 +81,10 @@ pub struct PostgresStorageConfig {
     pub model_filters_keep_per_model: i64,
     #[serde(default = "default_model_filters_retention_ms")]
     pub model_filters_retention_ms: u64,
+    /// Optional content-free response resurrection-fence window. This is
+    /// independent from content retention and intentionally has no default.
+    #[serde(default)]
+    pub max_late_writer_seconds: Option<u64>,
 }
 
 fn default_batch_metadata_fields() -> Vec<String> {
@@ -142,6 +147,7 @@ impl Default for PostgresStorageConfig {
             leaks_per_window: default_leaks_per_window(),
             model_filters_keep_per_model: default_model_filters_keep_per_model(),
             model_filters_retention_ms: default_model_filters_retention_ms(),
+            max_late_writer_seconds: None,
         }
     }
 }
@@ -420,5 +426,18 @@ mod tests {
         let reencoded = serde_json::to_value(decoded).unwrap();
 
         assert_eq!(reencoded["max_concurrent_state_writes"], 17);
+    }
+
+    #[test]
+    fn resurrection_fence_window_has_no_storage_default() {
+        let mut serialized = serde_json::to_value(PostgresStorageConfig::default()).unwrap();
+
+        assert_eq!(
+            serialized["max_late_writer_seconds"],
+            serde_json::Value::Null
+        );
+        serialized["max_late_writer_seconds"] = serde_json::json!(600);
+        let configured: PostgresStorageConfig = serde_json::from_value(serialized).unwrap();
+        assert_eq!(configured.max_late_writer_seconds, Some(600));
     }
 }

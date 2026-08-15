@@ -46,6 +46,7 @@ impl From<&DaemonConfig> for fusillade_arsenal::PostgresStorageConfig {
             leaks_per_window: config.leaks_per_window,
             model_filters_keep_per_model: config.model_filters_keep_per_model,
             model_filters_retention_ms: config.model_filters_retention_ms,
+            max_late_writer_seconds: config.retention.max_late_writer_seconds,
         }
     }
 }

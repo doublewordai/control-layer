@@ -375,11 +375,18 @@ async fn archive_response_graphs(pool: &PgPool, max_groups: i64) {
         .execute(&fusillade_pool)
         .await
         .unwrap();
-    let manager = PostgresRequestManager::new(TestDbPools::new(fusillade_pool).await.unwrap(), Default::default());
+    let manager = PostgresRequestManager::new(
+        TestDbPools::new(fusillade_pool).await.unwrap(),
+        fusillade_arsenal::PostgresStorageConfig {
+            max_late_writer_seconds: Some(3_600),
+            ..Default::default()
+        },
+    );
     manager
         .archive_terminal_batchless_responses(
             &RetentionSweepPolicy {
                 batchless_seconds_by_service_tier: HashMap::from([("priority".to_owned(), 1)]),
+                max_late_writer_seconds: Some(3_600),
                 ..Default::default()
             },
             chrono::DateTime::parse_from_rfc3339("2026-08-10T00:00:00Z").unwrap().to_utc(),
@@ -611,6 +618,37 @@ async fn test_delete_response_removes_fusillade_row(pool: PgPool) {
     }
     assert_ne!(id, uuid::Uuid::nil(), "row should reach completed state");
 
+    // Denormalized analytics and billing records are intentionally outside
+    // the response-content graph and must survive right-to-erasure deletion.
+    let analytics_id: i64 = sqlx::query_scalar(
+        "INSERT INTO http_analytics \
+         (instance_id, correlation_id, timestamp, method, uri, fusillade_request_id) \
+         VALUES ($1, 1, NOW(), 'POST', '/ai/v1/responses', $2) RETURNING id",
+    )
+    .bind(uuid::Uuid::new_v4())
+    .bind(id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let owner_id: uuid::Uuid = sqlx::query_scalar("SELECT user_id FROM api_keys WHERE secret = $1")
+        .bind(&api_key)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let billing_id = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO credits_transactions \
+         (id, user_id, transaction_type, amount, source_id, balance_after, fusillade_request_id) \
+         VALUES ($1, $2, 'usage', 0.01, $3, 0, $4)",
+    )
+    .bind(billing_id)
+    .bind(owner_id)
+    .bind(format!("response-erasure-fixture-{billing_id}"))
+    .bind(id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
     // DELETE the response — spec returns 200 with {id, object: "response",
     // deleted: true}.
     let response_id = format!("resp_{}", id);
@@ -631,6 +669,18 @@ async fn test_delete_response_removes_fusillade_row(pool: PgPool) {
         .await
         .unwrap();
     assert_eq!(count.0, 0, "fusillade row should be hard-deleted");
+    let analytics_survives: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM http_analytics WHERE id = $1)")
+        .bind(analytics_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let billing_survives: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM credits_transactions WHERE id = $1)")
+        .bind(billing_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(analytics_survives, "analytics fixture must be preserved");
+    assert!(billing_survives, "billing fixture must be preserved");
 
     // GET now returns 404.
     let get = server

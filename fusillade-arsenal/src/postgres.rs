@@ -360,6 +360,21 @@ macro_rules! batch_status_from_dynamic_row {
 }
 
 impl<P: PoolProvider> PostgresRequestManager<P> {
+    async fn response_write_disposition(
+        &self,
+        object_ids: &[Uuid],
+    ) -> Result<Option<retained_response::ResponseWriteDisposition>> {
+        let mut tx = self
+            .begin_write()
+            .await
+            .map_err(|_| FusilladeError::Other(anyhow!("Failed to classify response write")))?;
+        let disposition = retained_response::classify_response_write(&mut tx, object_ids).await?;
+        tx.commit()
+            .await
+            .map_err(|_| FusilladeError::Other(anyhow!("Failed to finish response write check")))?;
+        Ok(disposition)
+    }
+
     /// Create a new PostgreSQL storage manager.
     pub fn new(pools: P, config: PostgresStorageConfig) -> Self {
         let state_write_limiter = StateWriteLimiter::new(config.max_concurrent_state_writes);
@@ -563,6 +578,12 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
             .await
             .map_err(|e| FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e)))?;
 
+        if let Some(disposition) =
+            retained_response::classify_response_write(&mut tx, &[input.request_id]).await?
+        {
+            return Err(disposition.into_fusillade_error());
+        }
+
         let stored_body = sanitize_outbound_body(&input.body);
         let body_byte_size = stored_body.len() as i64;
         sqlx::query(
@@ -585,7 +606,7 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
         })?;
 
         let created_by = Some(input.created_by.trim()).filter(|owner| !owner.is_empty());
-        sqlx::query(
+        let inserted = sqlx::query(
             "INSERT INTO requests (id, batch_id, template_id, model, custom_id, state, retry_attempt, service_tier, created_by)
              VALUES ($1, NULL, $2, $3, NULL, 'pending', 0, $4, $5)",
         )
@@ -595,10 +616,23 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
         .bind(input.service_tier)
         .bind(created_by)
         .execute(&mut *tx)
-        .await
-        .map_err(|e| {
-            FusilladeError::Other(anyhow!("Failed to insert pending request: {}", e))
-        })?;
+        .await;
+        if let Err(error) = inserted {
+            let _ = tx.rollback().await;
+            if let Some(disposition) = self.response_write_disposition(&[input.request_id]).await? {
+                return Err(disposition.into_fusillade_error());
+            }
+            return Err(FusilladeError::Other(anyhow!(
+                "Failed to insert pending request: {}",
+                error
+            )));
+        }
+
+        if let Some(disposition) =
+            retained_response::classify_response_write(&mut tx, &[input.request_id]).await?
+        {
+            return Err(disposition.into_fusillade_error());
+        }
 
         tx.commit().await.map_err(|e| {
             FusilladeError::Other(anyhow!(
@@ -874,7 +908,11 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
                 })?;
 
         match current {
-            None => Err(FusilladeError::RequestNotFound(request_id)),
+            None => match self.response_write_disposition(&[request_id.0]).await? {
+                Some(retained_response::ResponseWriteDisposition::AlreadyRetained) => Ok(None),
+                Some(disposition) => Err(disposition.into_fusillade_error()),
+                None => Err(FusilladeError::RequestNotFound(request_id)),
+            },
             Some(state) => {
                 tracing::warn!(
                     request_id = %request_id,
@@ -2925,7 +2963,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                         .rows_affected();
 
                         if rows_affected == 0 {
-                            return Err(FusilladeError::RequestNotFound(req.data.id));
+                            return self.dropped_or_missing(req.data.id).await;
                         }
                     }
                     AnyRequest::Claimed(req) => {
@@ -3272,8 +3310,14 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
             FusilladeError::Other(anyhow!("Failed to reschedule request for retry: {}", e))
         })?
         .rows_affected();
-
-        Ok(rows_affected > 0)
+        if rows_affected > 0 {
+            return Ok(true);
+        }
+        match self.response_write_disposition(&[request_id.0]).await? {
+            Some(retained_response::ResponseWriteDisposition::AlreadyRetained) => Ok(false),
+            Some(disposition) => Err(disposition.into_fusillade_error()),
+            None => Ok(false),
+        }
     }
 
     #[tracing::instrument(skip(self, ids), fields(count = ids.len()))]
@@ -5269,6 +5313,10 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         Ok(())
     }
 
+    async fn delete_response_group(&self, response_id: Uuid) -> Result<u64> {
+        retained_response::delete_response_group(self, response_id).await
+    }
+
     async fn bulk_delete_data(&self, creator_id: &str, batch_size: i64) -> Result<u64> {
         // Guard invalid chunk sizes before opening a transaction: a negative
         // LIMIT errors in Postgres, and 0 would do nothing. Treat both as
@@ -5303,49 +5351,17 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to lock user files: {}", e)))?;
 
-        // Stage 0: Hard-delete batchless (realtime/flex) requests and their
-        // dedicated templates. These have batch_id IS NULL, so they have no
-        // soft-deleted parent batch for the orphan-purge daemon to key off —
-        // if we don't remove them here the erasure is incomplete (the batchless
-        // template still carries the prompt body). This mirrors `delete_request`
-        // in bulk: delete the requests (response_steps cascade), capturing their
-        // template_ids, then delete the templates that are batchless (file_id
-        // IS NULL — file-backed templates are shared and handled via Stage 2).
-        let batchless_template_ids: Vec<Option<Uuid>> = sqlx::query_scalar!(
-            r#"
-            DELETE FROM requests
-            WHERE id IN (
-                SELECT id FROM requests
-                WHERE created_by = $1
-                  AND batch_id IS NULL
-                LIMIT $2
-                FOR UPDATE SKIP LOCKED
-            )
-            RETURNING template_id
-            "#,
+        // Stage 0: erase batchless responses in stable whole-graph units.
+        // Both live and retained graphs use the same lock/revalidation/fence
+        // primitive, so a bounded creator pass can never strand sibling
+        // requests, steps, routes, or dedicated templates.
+        let batchless_requests = retained_response::delete_creator_response_groups(
+            &mut tx,
             creator_id,
             batch_size,
+            self.config.max_late_writer_seconds,
         )
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(|e| {
-            FusilladeError::Other(anyhow!("Failed to delete batchless requests: {}", e))
-        })?;
-
-        let batchless_requests = batchless_template_ids.len() as u64;
-
-        let template_ids: Vec<Uuid> = batchless_template_ids.into_iter().flatten().collect();
-        if !template_ids.is_empty() {
-            sqlx::query!(
-                r#"DELETE FROM request_templates WHERE id = ANY($1) AND file_id IS NULL"#,
-                &template_ids,
-            )
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| {
-                FusilladeError::Other(anyhow!("Failed to delete batchless templates: {}", e))
-            })?;
-        }
+        .await?;
 
         // Stage 1: Soft-delete batches, cancel active ones, and nullify metadata
         // (it can carry the user's email). Child requests are hard-deleted on a
@@ -6235,6 +6251,12 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
             .await
             .map_err(|e| FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e)))?;
 
+        if let Some(disposition) =
+            retained_response::classify_response_write(&mut tx, &[input.request_id]).await?
+        {
+            return Err(disposition.into_fusillade_error());
+        }
+
         // Insert template row (file_id = NULL for daemon-managed requests)
         let stored_body = sanitize_outbound_body(&input.body);
         let body_byte_size = stored_body.len() as i64;
@@ -6266,7 +6288,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         // slip into the listing. Matches the SQL `NULLIF(TRIM(...), '')`
         // used by persist_completed_realtime_batch.
         let created_by = Some(input.created_by.trim()).filter(|s| !s.is_empty());
-        sqlx::query(
+        let inserted = sqlx::query(
             "INSERT INTO requests (id, batch_id, template_id, model, custom_id, state, retry_attempt, service_tier, created_by, daemon_id, claimed_at, started_at)
              VALUES ($1, NULL, $2, $3, NULL, 'processing', 0, 'priority', $4, $5, $6, $6)",
         )
@@ -6277,8 +6299,23 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         .bind(Uuid::nil())
         .bind(now)
         .execute(&mut *tx)
-        .await
-        .map_err(|e| FusilladeError::Other(anyhow!("Failed to insert realtime request: {}", e)))?;
+        .await;
+        if let Err(error) = inserted {
+            let _ = tx.rollback().await;
+            if let Some(disposition) = self.response_write_disposition(&[input.request_id]).await? {
+                return Err(disposition.into_fusillade_error());
+            }
+            return Err(FusilladeError::Other(anyhow!(
+                "Failed to insert realtime request: {}",
+                error
+            )));
+        }
+
+        if let Some(disposition) =
+            retained_response::classify_response_write(&mut tx, &[input.request_id]).await?
+        {
+            return Err(disposition.into_fusillade_error());
+        }
 
         tx.commit().await.map_err(|e| {
             FusilladeError::Other(anyhow!(
@@ -6331,6 +6368,10 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         status_code: u16,
     ) -> Result<()> {
         let size = response_body.len() as i64;
+        let mut tx = self
+            .begin_write()
+            .await
+            .map_err(|_| FusilladeError::Other(anyhow!("Failed to begin request completion")))?;
 
         // Try the UPDATE; if it doesn't match, surface whether the row is
         // missing or just in the wrong state. The previous "0 rows → NotFound"
@@ -6357,19 +6398,29 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         .bind(status_code as i16)
         .bind(response_body)
         .bind(size)
-        .fetch_optional(self.write_executor())
+        .fetch_optional(&mut *tx)
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to complete request: {}", e)))?;
 
         match row {
-            Some((true, _)) => Ok(()),
+            Some((true, _)) => {
+                tx.commit().await.map_err(|_| {
+                    FusilladeError::Other(anyhow!("Failed to finish request completion"))
+                })?;
+                Ok(())
+            }
             Some((false, Some(current_state))) => Err(FusilladeError::RequestStateConflict {
                 id: request_id,
                 current_state,
                 expected: "processing",
             }),
             // Fallback: row vanished between the CTE and the SELECT, or no row exists.
-            Some((false, None)) | None => Err(FusilladeError::RequestNotFound(request_id)),
+            Some((false, None)) | None => {
+                match retained_response::classify_response_write(&mut tx, &[request_id.0]).await? {
+                    Some(disposition) => Err(disposition.into_fusillade_error()),
+                    None => Err(FusilladeError::RequestNotFound(request_id)),
+                }
+            }
         }
     }
 
@@ -6388,6 +6439,10 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         })?;
 
         let error_size = error_json.len() as i64;
+        let mut tx = self
+            .begin_write()
+            .await
+            .map_err(|_| FusilladeError::Other(anyhow!("Failed to begin request failure")))?;
         let row: Option<(bool, Option<String>)> = sqlx::query_as(
             "WITH updated AS (
                  UPDATE requests
@@ -6405,18 +6460,28 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         .bind(request_id.0)
         .bind(&error_json)
         .bind(error_size)
-        .fetch_optional(self.write_executor())
+        .fetch_optional(&mut *tx)
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to fail request: {}", e)))?;
 
         match row {
-            Some((true, _)) => Ok(()),
+            Some((true, _)) => {
+                tx.commit().await.map_err(|_| {
+                    FusilladeError::Other(anyhow!("Failed to finish request failure"))
+                })?;
+                Ok(())
+            }
             Some((false, Some(current_state))) => Err(FusilladeError::RequestStateConflict {
                 id: request_id,
                 current_state,
                 expected: "processing",
             }),
-            Some((false, None)) | None => Err(FusilladeError::RequestNotFound(request_id)),
+            Some((false, None)) | None => {
+                match retained_response::classify_response_write(&mut tx, &[request_id.0]).await? {
+                    Some(disposition) => Err(disposition.into_fusillade_error()),
+                    None => Err(FusilladeError::RequestNotFound(request_id)),
+                }
+            }
         }
     }
 
@@ -6509,6 +6574,25 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         let updated_set: std::collections::HashSet<Uuid> =
             updated_rows.iter().map(|r| r.id).collect();
 
+        // Terminal live rows, batch archive rows, active retained routes, and
+        // unexpired resurrection fences are all idempotent terminal outcomes.
+        // Exclude them before allocating templates so a replay cannot create
+        // an orphan carrying request content.
+        let existing_ids: std::collections::HashSet<Uuid> = sqlx::query_scalar(
+            r#"
+            SELECT id FROM requests WHERE id = ANY($1)
+            UNION
+            SELECT id FROM batch_requests_archive WHERE id = ANY($1)
+            "#,
+        )
+        .bind(&ids)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|_| FusilladeError::Other(anyhow!("Failed to classify existing requests")))?
+        .into_iter()
+        .collect();
+        let protected_ids = retained_response::protected_response_write_ids(&mut tx, &ids).await?;
+
         // Non-background realtime: no row existed yet. Synthesize a template
         // + a request row directly in 'completed' state. The two INSERTs run
         // in the same transaction; commit happens once at the end.
@@ -6516,10 +6600,14 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         // ON CONFLICT (id) DO NOTHING on the request INSERT handles the rare
         // case where a row appeared in a terminal state between our UPDATE
         // and INSERT (duplicate enqueues, late completions for flex
-        // slip-through). Leaves an orphan template that's cheap to ignore.
+        // slip-through). Unused templates are removed below before commit.
         let to_insert: Vec<&PersistCompletedRealtimeInput> = records
             .iter()
-            .filter(|r| !updated_set.contains(&r.request_id))
+            .filter(|r| {
+                !updated_set.contains(&r.request_id)
+                    && !existing_ids.contains(&r.request_id)
+                    && !protected_ids.contains(&r.request_id)
+            })
             .collect();
 
         if !to_insert.is_empty() {
@@ -6596,7 +6684,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
             // (buffered) insert moment. NULLIF(TRIM(...), '') on created_by mirrors
             // create_realtime's coercion of empty-string to NULL (XOR check
             // rejects empty attribution loudly rather than producing a phantom row).
-            sqlx::query!(
+            let inserted_rows = sqlx::query_scalar::<_, Uuid>(
                 r#"
                 INSERT INTO requests (
                     id, batch_id, template_id, model, custom_id,
@@ -6617,20 +6705,21 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                     $10::timestamptz[], $11::timestamptz[]
                 ) AS v(id, template_id, model, created_by, status, body, size, error, started_at, completed_at)
                 ON CONFLICT (id) DO NOTHING
+                RETURNING id
                 "#,
-                Uuid::nil(),
-                &request_ids as &[Uuid],
-                &template_ids as &[Uuid],
-                &models as &[&str],
-                &created_bys as &[&str],
-                &insert_response_statuses as &[i16],
-                &insert_response_bodies as &[&str],
-                &insert_response_sizes as &[i64],
-                &insert_errors as &[Option<String>],
-                &started_ats as &[DateTime<Utc>],
-                &completed_ats as &[DateTime<Utc>],
             )
-            .execute(&mut *tx)
+            .bind(Uuid::nil())
+            .bind(&request_ids)
+            .bind(&template_ids)
+            .bind(&models)
+            .bind(&created_bys)
+            .bind(&insert_response_statuses)
+            .bind(&insert_response_bodies)
+            .bind(&insert_response_sizes)
+            .bind(&insert_errors)
+            .bind(&started_ats)
+            .bind(&completed_ats)
+            .fetch_all(&mut *tx)
             .await
             .map_err(|e| {
                 FusilladeError::Other(anyhow!(
@@ -6638,6 +6727,42 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                     e
                 ))
             })?;
+
+            let inserted_ids: std::collections::HashSet<Uuid> = inserted_rows.into_iter().collect();
+            let post_insert_protected = retained_response::protected_response_write_ids(
+                &mut tx,
+                &inserted_ids.iter().copied().collect::<Vec<_>>(),
+            )
+            .await?;
+            if !post_insert_protected.is_empty() {
+                let protected_request_ids =
+                    post_insert_protected.iter().copied().collect::<Vec<_>>();
+                sqlx::query("DELETE FROM requests WHERE id = ANY($1)")
+                    .bind(&protected_request_ids)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|_| {
+                        FusilladeError::Other(anyhow!("Failed to discard protected requests"))
+                    })?;
+            }
+            let orphan_template_ids: Vec<Uuid> = request_ids
+                .iter()
+                .zip(template_ids.iter())
+                .filter_map(|(request_id, template_id)| {
+                    (!inserted_ids.contains(request_id)
+                        || post_insert_protected.contains(request_id))
+                    .then_some(*template_id)
+                })
+                .collect();
+            if !orphan_template_ids.is_empty() {
+                sqlx::query("DELETE FROM request_templates WHERE id = ANY($1) AND file_id IS NULL")
+                    .bind(&orphan_template_ids)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|_| {
+                        FusilladeError::Other(anyhow!("Failed to discard unused templates"))
+                    })?;
+            }
         }
 
         tx.commit()
@@ -21483,6 +21608,7 @@ mod tests {
                         "background".to_string(),
                         60,
                     )]),
+                    max_late_writer_seconds: Some(3_600),
                     ..Default::default()
                 }
                 .cutoffs_at(Utc::now(), 0.0)
@@ -21624,6 +21750,7 @@ mod tests {
                         "priority".to_string(),
                         60,
                     )]),
+                    max_late_writer_seconds: Some(3_600),
                     ..Default::default()
                 }
                 .cutoffs_at(Utc::now(), 0.0)
@@ -21729,6 +21856,7 @@ mod tests {
                         "priority".to_string(),
                         60,
                     )]),
+                    max_late_writer_seconds: Some(3_600),
                     ..Default::default()
                 }
                 .cutoffs_at(Utc::now(), 0.0)
@@ -21788,6 +21916,7 @@ mod tests {
                         "priority".to_string(),
                         60,
                     )]),
+                    max_late_writer_seconds: Some(3_600),
                     ..Default::default()
                 }
                 .cutoffs_at(Utc::now(), 0.0)
@@ -25661,7 +25790,11 @@ mod tests {
         let manager = PostgresRequestManager::with_client(
             TestDbPools::new(pool.clone()).await.unwrap(),
             Arc::new(MockHttpClient::new()),
-        );
+        )
+        .with_config(PostgresStorageConfig {
+            max_late_writer_seconds: Some(3_600),
+            ..PostgresStorageConfig::default()
+        });
 
         make_realtime(&manager, "user-A").await;
         make_realtime(&manager, "user-A").await;
@@ -25848,7 +25981,11 @@ mod tests {
         let manager = PostgresRequestManager::with_client(
             TestDbPools::new(pool.clone()).await.unwrap(),
             Arc::new(MockHttpClient::new()),
-        );
+        )
+        .with_config(PostgresStorageConfig {
+            max_late_writer_seconds: Some(3_600),
+            ..PostgresStorageConfig::default()
+        });
         for _ in 0..5 {
             make_realtime(&manager, "user-A").await;
         }

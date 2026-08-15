@@ -15,8 +15,8 @@ pub use postgres::PostgresDaemon;
 
 pub use fusillade_core::manager::{
     ArchiveOutcome, BackgroundClaimKind, DaemonStorage, ModelFilter, ModelFilterState,
-    RetainedResponseArchiveOutcome, RetainedResponseMaintenanceError, RetentionCutoffs,
-    RetentionMaintenanceOutcome, RetentionSweepCutoffs, RetentionSweepOutcome,
+    RetainedResponseArchiveOutcome, RetainedResponseMaintenanceError, RetainedResponseWriteError,
+    RetentionCutoffs, RetentionMaintenanceOutcome, RetentionSweepCutoffs, RetentionSweepOutcome,
     RetentionSweepPolicy, Storage, TrailingDemandCount,
 };
 
