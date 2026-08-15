@@ -9,8 +9,10 @@
 use crate::api::models::users::Role;
 use std::collections::HashMap;
 
-use crate::test::utils::{add_auth_headers, create_test_admin_user, create_test_config, create_test_user, setup_fusillade_pool};
-use fusillade::{DaemonStorage, RetentionSweepPolicy};
+use crate::test::utils::{
+    add_auth_headers, create_test_admin_user, create_test_api_key_for_user, create_test_config, create_test_user, setup_fusillade_pool,
+};
+use fusillade::{DaemonStorage, RetentionSweepPolicy, Storage};
 use fusillade_arsenal::{PostgresRequestManager, TestDbPools};
 use sqlx::PgPool;
 
@@ -376,11 +378,9 @@ async fn archive_response_graphs(pool: &PgPool, max_groups: i64) {
         .unwrap();
     let manager = PostgresRequestManager::new(
         TestDbPools::new(fusillade_pool).await.unwrap(),
-        fusillade_arsenal::PostgresStorageConfig {
-            max_late_writer_seconds: Some(3_600),
-            ..Default::default()
-        },
-    );
+        fusillade_arsenal::PostgresStorageConfig::default(),
+    )
+    .with_retained_response_fence_seconds(Some(3_600));
     manager
         .archive_terminal_batchless_responses(
             &RetentionSweepPolicy {
@@ -394,6 +394,251 @@ async fn archive_response_graphs(pool: &PgPool, max_groups: i64) {
         )
         .await
         .expect("response graph must move into retained storage");
+}
+
+async fn response_lifecycle_manager(pool: &PgPool) -> (PgPool, PostgresRequestManager<TestDbPools>) {
+    let fusillade_pool = setup_fusillade_pool(pool).await;
+    let manager = PostgresRequestManager::new(
+        TestDbPools::new(fusillade_pool.clone()).await.unwrap(),
+        fusillade_arsenal::PostgresStorageConfig::default(),
+    )
+    .with_retained_response_fence_seconds(Some(3_600));
+    (fusillade_pool, manager)
+}
+
+fn synthetic_context<'a>(request_id: uuid::Uuid, api_key: &'a str) -> crate::inference::store::CreateContext<'a> {
+    crate::inference::store::CreateContext {
+        request_id,
+        request_body: r#"{"prompt":"must_not_leak"}"#,
+        model: "store-test-model",
+        endpoint: "/v1/responses",
+        base_url: "https://example.invalid",
+        api_key: Some(api_key),
+    }
+}
+
+async fn seed_archivable_response(pool: &PgPool, manager: &PostgresRequestManager<TestDbPools>, request_id: uuid::Uuid, owner: &str) {
+    manager
+        .create_realtime(fusillade::CreateRealtimeInput {
+            request_id,
+            body: r#"{"prompt":"archived"}"#.to_owned(),
+            model: "store-test-model".to_owned(),
+            endpoint: "https://example.invalid".to_owned(),
+            method: "POST".to_owned(),
+            path: "/v1/responses".to_owned(),
+            api_key: "store-test-key".to_owned(),
+            created_by: owner.to_owned(),
+        })
+        .await
+        .unwrap();
+    manager
+        .complete_request(fusillade::RequestId(request_id), r#"{"answer":"archived"}"#, 200)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE fusillade.requests SET service_tier = 'priority', \
+         created_at = '2026-08-01 08:00:00Z', claimed_at = '2026-08-01 09:58:00Z', \
+         started_at = '2026-08-01 09:59:00Z', completed_at = '2026-08-01 10:00:00Z', \
+         updated_at = '2026-08-01 10:00:00Z' WHERE id = $1",
+    )
+    .bind(request_id)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+#[sqlx::test]
+async fn complete_response_treats_active_retained_graph_as_idempotent(pool: PgPool) {
+    let user = create_test_user(&pool, Role::StandardUser).await;
+    let key = create_test_api_key_for_user(&pool, user.id).await;
+    let (fusillade_pool, manager) = response_lifecycle_manager(&pool).await;
+    let request_id = uuid::Uuid::new_v4();
+    seed_archivable_response(&pool, &manager, request_id, &user.id.to_string()).await;
+    archive_response_graphs(&pool, 1).await;
+
+    crate::inference::store::complete_response_idempotent(
+        &manager,
+        &pool,
+        &format!("resp_{request_id}"),
+        r#"{"must_not":"overwrite"}"#,
+        200,
+        synthetic_context(request_id, &key.secret),
+    )
+    .await
+    .expect("an active retained response is an idempotent terminal write");
+
+    let retained: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM retained_response_request_routes WHERE request_id = $1")
+        .bind(request_id)
+        .fetch_one(&fusillade_pool)
+        .await
+        .unwrap();
+    assert_eq!(retained, 1);
+}
+
+#[sqlx::test]
+async fn complete_response_fails_closed_for_erased_identity_without_synthesis(pool: PgPool) {
+    let user = create_test_user(&pool, Role::StandardUser).await;
+    let key = create_test_api_key_for_user(&pool, user.id).await;
+    let (fusillade_pool, manager) = response_lifecycle_manager(&pool).await;
+    let request_id = uuid::Uuid::new_v4();
+    seed_archivable_response(&pool, &manager, request_id, &user.id.to_string()).await;
+    archive_response_graphs(&pool, 1).await;
+    manager.delete_response_group(request_id).await.unwrap();
+
+    let error = crate::inference::store::complete_response_idempotent(
+        &manager,
+        &pool,
+        &format!("resp_{request_id}"),
+        r#"{"must_not":"survive"}"#,
+        200,
+        synthetic_context(request_id, &key.secret),
+    )
+    .await
+    .expect_err("an erased identity must terminate without synthesis");
+    assert_eq!(error.to_string(), "Response not found: Response unavailable");
+    assert!(!format!("{error:?}").contains("must_not"));
+    let live: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM requests WHERE id = $1")
+        .bind(request_id)
+        .fetch_one(&fusillade_pool)
+        .await
+        .unwrap();
+    assert_eq!(live, 0);
+    let leaked_templates: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_templates WHERE body LIKE '%must_not_leak%'")
+        .fetch_one(&fusillade_pool)
+        .await
+        .unwrap();
+    assert_eq!(leaked_templates, 0);
+}
+
+async fn wait_for_api_key_lock_waiter(pool: &PgPool) {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let waiting: bool = sqlx::query_scalar(
+                "SELECT EXISTS ( \
+                 SELECT 1 FROM pg_locks lock \
+                 JOIN pg_class relation ON relation.oid = lock.relation \
+                 WHERE relation.relname = 'api_keys' AND NOT lock.granted)",
+            )
+            .fetch_one(pool)
+            .await
+            .unwrap();
+            if waiting {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the attribution lookup must reach the deterministic table-lock gate");
+}
+
+#[sqlx::test]
+async fn complete_response_rechecks_a_fence_created_after_the_initial_miss(pool: PgPool) {
+    let user = create_test_user(&pool, Role::StandardUser).await;
+    let key = create_test_api_key_for_user(&pool, user.id).await;
+    let (fusillade_pool, manager) = response_lifecycle_manager(&pool).await;
+    let request_id = uuid::Uuid::new_v4();
+    let mut gate = pool.begin().await.unwrap();
+    sqlx::query("LOCK TABLE api_keys IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *gate)
+        .await
+        .unwrap();
+    let task_pool = pool.clone();
+    let key_secret = key.secret;
+    let mut completion = tokio::spawn(async move {
+        crate::inference::store::complete_response_idempotent(
+            &manager,
+            &task_pool,
+            &format!("resp_{request_id}"),
+            r#"{"must_not":"survive"}"#,
+            200,
+            synthetic_context(request_id, &key_secret),
+        )
+        .await
+    });
+    tokio::select! {
+        result = &mut completion => panic!("completion passed the attribution gate before fencing: {result:?}"),
+        () = wait_for_api_key_lock_waiter(&pool) => {}
+    }
+    sqlx::query(
+        "INSERT INTO retained_response_resurrection_fences \
+         (object_id, reason, expires_at) VALUES ($1, 'erased', NOW() + INTERVAL '1 hour')",
+    )
+    .bind(request_id)
+    .execute(&fusillade_pool)
+    .await
+    .unwrap();
+    gate.commit().await.unwrap();
+
+    let error = completion
+        .await
+        .unwrap()
+        .expect_err("the post-miss synthesis must recheck the new fence");
+    assert_eq!(error.to_string(), "Response not found: Response unavailable");
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM requests WHERE id = $1")
+            .bind(request_id)
+            .fetch_one(&fusillade_pool)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM request_templates WHERE body LIKE '%must_not_leak%'",)
+            .fetch_one(&fusillade_pool)
+            .await
+            .unwrap(),
+        0
+    );
+}
+
+#[sqlx::test]
+async fn complete_response_does_not_ignore_an_unproven_synthetic_create_error(pool: PgPool) {
+    let user = create_test_user(&pool, Role::StandardUser).await;
+    let key = create_test_api_key_for_user(&pool, user.id).await;
+    let (fusillade_pool, manager) = response_lifecycle_manager(&pool).await;
+    sqlx::query(
+        r#"
+        CREATE FUNCTION reject_synthetic_template() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN
+            RAISE EXCEPTION 'must_not_leak_database_detail';
+        END
+        $$
+        "#,
+    )
+    .execute(&fusillade_pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER reject_synthetic_template BEFORE INSERT ON request_templates \
+         FOR EACH ROW EXECUTE FUNCTION reject_synthetic_template()",
+    )
+    .execute(&fusillade_pool)
+    .await
+    .unwrap();
+    let request_id = uuid::Uuid::new_v4();
+
+    let error = crate::inference::store::complete_response_idempotent(
+        &manager,
+        &pool,
+        &format!("resp_{request_id}"),
+        r#"{"must_not":"survive"}"#,
+        200,
+        synthetic_context(request_id, &key.secret),
+    )
+    .await
+    .expect_err("a failed create without a concurrent winner must be returned");
+    assert_eq!(error.to_string(), "Storage error: Failed to synthesize response row");
+    let rendered = format!("{error:?}");
+    assert!(!rendered.contains("must_not"));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM requests WHERE id = $1")
+            .bind(request_id)
+            .fetch_one(&fusillade_pool)
+            .await
+            .unwrap(),
+        0
+    );
 }
 
 #[sqlx::test]

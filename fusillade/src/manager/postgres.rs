@@ -46,7 +46,6 @@ impl From<&DaemonConfig> for fusillade_arsenal::PostgresStorageConfig {
             leaks_per_window: config.leaks_per_window,
             model_filters_keep_per_model: config.model_filters_keep_per_model,
             model_filters_retention_ms: config.model_filters_retention_ms,
-            max_late_writer_seconds: config.retention.max_late_writer_seconds,
         }
     }
 }
@@ -76,7 +75,10 @@ where
     /// Use [`PostgresDaemon::new`] when the store needs custom Arsenal
     /// configuration, such as database retry cadence.
     pub fn from_pools(pools: P, config: DaemonConfig) -> Self {
-        let storage = Arc::new(PostgresStore::new(pools, (&config).into()));
+        let storage = Arc::new(
+            PostgresStore::new(pools, (&config).into())
+                .with_retained_response_fence_seconds(config.retention.max_late_writer_seconds),
+        );
         Self::from_store(storage, config)
     }
 }

@@ -43,6 +43,24 @@ impl ResponseWriteDisposition {
     }
 }
 
+#[derive(Debug, Default)]
+pub(crate) struct ResponseWriteDispositions {
+    pub(crate) already_retained: std::collections::HashSet<Uuid>,
+    pub(crate) unavailable: std::collections::HashSet<Uuid>,
+}
+
+impl ResponseWriteDispositions {
+    fn disposition_for(&self, object_id: Uuid) -> Option<ResponseWriteDisposition> {
+        if self.already_retained.contains(&object_id) {
+            Some(ResponseWriteDisposition::AlreadyRetained)
+        } else if self.unavailable.contains(&object_id) {
+            Some(ResponseWriteDisposition::NotFound)
+        } else {
+            None
+        }
+    }
+}
+
 /// Classify UUIDs without consulting retained payloads. Active routes win
 /// over fences; once a bucket is retiring, detached, dropped, or its routes
 /// have been cleaned, the durable unexpired fence yields a fixed not-found.
@@ -53,79 +71,29 @@ pub(crate) async fn classify_response_write(
     if object_ids.is_empty() {
         return Ok(None);
     }
-    let active: bool = sqlx::query_scalar(
-        r#"
-        WITH candidate_route AS (
-            SELECT route.group_id, route.delete_on
-            FROM retained_response_group_routes route
-            WHERE route.group_id = ANY($1)
-            UNION
-            SELECT route.group_id, route.delete_on
-            FROM retained_response_request_routes route
-            WHERE route.request_id = ANY($1)
-            UNION
-            SELECT route.group_id, route.delete_on
-            FROM retained_response_step_routes route
-            WHERE route.step_id = ANY($1)
-        )
-        SELECT EXISTS (
-            SELECT 1
-            FROM candidate_route route
-            JOIN retained_response_group_routes group_route
-              ON group_route.group_id = route.group_id
-             AND group_route.delete_on = route.delete_on
-            JOIN retained_response_buckets bucket
-              ON bucket.delete_on = route.delete_on
-            JOIN pg_namespace namespace
-              ON namespace.nspname = bucket.partition_schema
-            JOIN pg_class child
-              ON child.relnamespace = namespace.oid
-             AND child.relname = bucket.partition_table
-             AND child.oid = bucket.partition_oid
-            JOIN pg_inherits inheritance
-              ON inheritance.inhrelid = child.oid
-             AND NOT inheritance.inhdetachpending
-            WHERE bucket.state = 'active'
-              AND bucket.partition_schema = current_schema()
-              AND bucket.partition_table =
-                  'retained_response_objects_d' || to_char(route.delete_on, 'YYYYMMDD')
-              AND inheritance.inhparent =
-                  to_regclass(format('%I.retained_response_objects', current_schema()))
-              AND pg_get_expr(child.relpartbound, child.oid) = format(
-                  'FOR VALUES FROM (%L) TO (%L)', route.delete_on, route.delete_on + 1
-              )
-        )
-        "#,
-    )
-    .bind(object_ids)
-    .fetch_one(&mut **tx)
-    .await
-    .map_err(|_| FusilladeError::Other(anyhow::anyhow!("Failed to classify response write")))?;
-    if active {
+    let dispositions = classify_response_write_ids(tx, object_ids).await?;
+    if object_ids
+        .iter()
+        .any(|object_id| dispositions.already_retained.contains(object_id))
+    {
         return Ok(Some(ResponseWriteDisposition::AlreadyRetained));
     }
-    let fenced: bool = sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM retained_response_resurrection_fences \
-         WHERE object_id = ANY($1) AND expires_at > clock_timestamp())",
-    )
-    .bind(object_ids)
-    .fetch_one(&mut **tx)
-    .await
-    .map_err(|_| FusilladeError::Other(anyhow::anyhow!("Failed to classify response write")))?;
-    Ok(fenced.then_some(ResponseWriteDisposition::NotFound))
+    Ok(object_ids
+        .iter()
+        .find_map(|object_id| dispositions.disposition_for(*object_id)))
 }
 
-/// Return every input UUID protected by either an exact active retained route
-/// or an unexpired resurrection fence. Bulk synthesis uses this before it
-/// allocates any payload-bearing template rows.
-pub(crate) async fn protected_response_write_ids(
+/// Classify every input UUID independently. Exact active routes take
+/// precedence over archival fences; an identity is unavailable only when it
+/// has no readable active route and still has an unexpired fence.
+pub(crate) async fn classify_response_write_ids(
     tx: &mut Transaction<'_, Postgres>,
     object_ids: &[Uuid],
-) -> Result<std::collections::HashSet<Uuid>> {
+) -> Result<ResponseWriteDispositions> {
     if object_ids.is_empty() {
-        return Ok(std::collections::HashSet::new());
+        return Ok(ResponseWriteDispositions::default());
     }
-    let protected: Vec<Uuid> = sqlx::query_scalar(
+    let classified: Vec<(Uuid, bool)> = sqlx::query_as(
         r#"
         WITH input_ids AS (
             SELECT DISTINCT object_id
@@ -172,17 +140,30 @@ pub(crate) async fn protected_response_write_ids(
             JOIN retained_response_resurrection_fences fence
               ON fence.object_id = input.object_id
             WHERE fence.expires_at > clock_timestamp()
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM active_ids active
+                  WHERE active.object_id = input.object_id
+              )
         )
-        SELECT object_id FROM active_ids
-        UNION
-        SELECT object_id FROM fenced_ids
+        SELECT object_id, TRUE AS active FROM active_ids
+        UNION ALL
+        SELECT object_id, FALSE AS active FROM fenced_ids
         "#,
     )
     .bind(object_ids)
     .fetch_all(&mut **tx)
     .await
     .map_err(|_| FusilladeError::Other(anyhow::anyhow!("Failed to classify response writes")))?;
-    Ok(protected.into_iter().collect())
+    let mut dispositions = ResponseWriteDispositions::default();
+    for (object_id, active) in classified {
+        if active {
+            dispositions.already_retained.insert(object_id);
+        } else {
+            dispositions.unavailable.insert(object_id);
+        }
+    }
+    Ok(dispositions)
 }
 
 /// Content-free errors for the retained-response serialization boundary.
@@ -2700,6 +2681,87 @@ async fn resolve_retained_route(
     }
 }
 
+async fn lock_response_graph(
+    tx: &mut Transaction<'_, Postgres>,
+    group_id: Uuid,
+) -> MovementResult<()> {
+    sqlx::query(
+        r#"
+        SELECT pg_advisory_xact_lock(
+            hashtextextended(
+                'retained_response_graph:' || current_schema() || ':' || $1::text,
+                0
+            )
+        )
+        "#,
+    )
+    .bind(group_id)
+    .execute(&mut **tx)
+    .await
+    .map_err(database_failure)?;
+    Ok(())
+}
+
+async fn try_lock_response_graph(
+    tx: &mut Transaction<'_, Postgres>,
+    group_id: Uuid,
+) -> MovementResult<bool> {
+    sqlx::query_scalar(
+        r#"
+        SELECT pg_try_advisory_xact_lock(
+            hashtextextended(
+                'retained_response_graph:' || current_schema() || ':' || $1::text,
+                0
+            )
+        )
+        "#,
+    )
+    .bind(group_id)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(database_failure)
+}
+
+async fn resolve_response_graph_identity(
+    tx: &mut Transaction<'_, Postgres>,
+    response_id: Uuid,
+) -> MovementResult<Option<Uuid>> {
+    let live_group = resolve_live_group_seed(tx, response_id)
+        .await?
+        .map(|(group_id, _)| group_id);
+    let retained_group = resolve_retained_route(tx, response_id)
+        .await?
+        .map(|(group_id, _)| group_id);
+    match (live_group, retained_group) {
+        (None, None) => Ok(None),
+        (Some(group_id), None) | (None, Some(group_id)) => Ok(Some(group_id)),
+        (Some(live_group), Some(retained_group)) if live_group == retained_group => {
+            Ok(Some(live_group))
+        }
+        _ => Err(incomplete_graph()),
+    }
+}
+
+pub(crate) async fn lock_response_write_graphs(
+    tx: &mut Transaction<'_, Postgres>,
+    object_ids: &[Uuid],
+) -> MovementResult<()> {
+    let mut group_ids = Vec::with_capacity(object_ids.len());
+    for object_id in object_ids {
+        group_ids.push(
+            resolve_response_graph_identity(tx, *object_id)
+                .await?
+                .unwrap_or(*object_id),
+        );
+    }
+    group_ids.sort_unstable();
+    group_ids.dedup();
+    for group_id in group_ids {
+        lock_response_graph(tx, group_id).await?;
+    }
+    Ok(())
+}
+
 async fn erase_retained_graph(
     tx: &mut Transaction<'_, Postgres>,
     group_id: Uuid,
@@ -2785,22 +2847,49 @@ async fn erase_retained_graph(
     .await
     .map_err(database_failure)?;
 
-    let header_row = sqlx::query(&format!(
+    let object_rows = sqlx::query(&format!(
         "SELECT {RETAINED_OBJECT_COLUMNS} FROM retained_response_objects object \
          WHERE object.delete_on = $1 AND object.group_id = $2 \
-           AND object.object_kind = 'group' AND object.object_id = $2"
+         ORDER BY object.object_kind, object.object_id"
     ))
     .bind(delete_on)
     .bind(group_id)
-    .fetch_optional(&mut **tx)
+    .fetch_all(&mut **tx)
     .await
-    .map_err(database_failure)?
-    .ok_or_else(incomplete_graph)?;
-    let header_row =
-        RetainedResponseObjectRow::from_pg_row(&header_row).map_err(|_| incomplete_graph())?;
-    let mut header = header_row.decode_group().map_err(|_| incomplete_graph())?;
+    .map_err(database_failure)?;
+    let object_rows = object_rows
+        .iter()
+        .map(RetainedResponseObjectRow::from_pg_row)
+        .collect::<Result<Vec<_>>>()?;
+    let mut headers = Vec::new();
+    let mut requests = Vec::new();
+    let mut steps = Vec::new();
+    for row in &object_rows {
+        if row.delete_on != delete_on || row.group_id != group_id {
+            return Err(incomplete_graph());
+        }
+        match row.object_kind {
+            RetainedObjectKind::Group => {
+                headers.push(row.decode_group().map_err(|_| incomplete_graph())?)
+            }
+            RetainedObjectKind::Request => {
+                requests.push(row.decode_request().map_err(|_| incomplete_graph())?)
+            }
+            RetainedObjectKind::Step => {
+                steps.push(row.decode_step().map_err(|_| incomplete_graph())?)
+            }
+        }
+    }
+    let [header] = headers.as_mut_slice() else {
+        return Err(incomplete_graph());
+    };
     header.request_ids.sort_unstable();
     header.step_ids.sort_unstable();
+    requests.sort_unstable_by_key(|payload| payload.request.id);
+    steps.sort_unstable_by_key(|payload| payload.step.id);
+    header
+        .validate_members(&requests, &steps)
+        .map_err(|_| incomplete_graph())?;
     let routed_request_ids = request_routes
         .iter()
         .map(|(request_id, route_group_id, route_delete_on)| {
@@ -2822,15 +2911,7 @@ async fn erase_retained_graph(
     if routed_request_ids != header.request_ids || routed_step_ids != header.step_ids {
         return Err(incomplete_graph());
     }
-    let object_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM retained_response_objects \
-         WHERE delete_on = $1 AND group_id = $2",
-    )
-    .bind(delete_on)
-    .bind(group_id)
-    .fetch_one(&mut **tx)
-    .await
-    .map_err(database_failure)?;
+    let object_count = object_rows.len() as i64;
     if object_count != 1 + header.request_ids.len() as i64 + header.step_ids.len() as i64 {
         return Err(incomplete_graph());
     }
@@ -2887,6 +2968,11 @@ async fn delete_response_group_in_transaction(
     expected_creator: Option<&str>,
     max_late_writer_seconds: Option<u64>,
 ) -> Result<u64> {
+    let Some(group_id) = resolve_response_graph_identity(tx, response_id).await? else {
+        return Err(FusilladeError::RequestNotFound(RequestId(response_id)));
+    };
+    lock_response_graph(tx, group_id).await?;
+
     if let Some((group_id, topology, template_ids)) =
         lock_live_graph_for_erasure(tx, response_id).await?
     {
@@ -2902,7 +2988,7 @@ async fn delete_response_group_in_transaction(
             .await
             .map_err(database_failure)?;
             if !owned {
-                return Err(RetainedResponseWriteError::NotFound.into_fusillade_error());
+                return Err(FusilladeError::RequestNotFound(RequestId(response_id)));
             }
         }
         let fence_ids = std::iter::once(group_id)
@@ -2955,7 +3041,7 @@ async fn delete_response_group_in_transaction(
             .await
             .map_err(database_failure)?;
             if !owned {
-                return Err(RetainedResponseWriteError::NotFound.into_fusillade_error());
+                return Err(FusilladeError::RequestNotFound(RequestId(response_id)));
             }
         }
         let deleted =
@@ -2975,7 +3061,24 @@ pub(crate) async fn delete_response_group<P: PoolProvider>(
         &mut tx,
         response_id,
         None,
-        manager.config().max_late_writer_seconds,
+        manager.retained_response_fence_seconds(),
+    )
+    .await?;
+    tx.commit().await.map_err(database_failure)?;
+    Ok(deleted)
+}
+
+pub(crate) async fn delete_owned_response_group<P: PoolProvider>(
+    manager: &PostgresRequestManager<P>,
+    response_id: Uuid,
+    creator_id: &str,
+) -> Result<u64> {
+    let mut tx = manager.begin_write().await.map_err(database_failure)?;
+    let deleted = delete_response_group_in_transaction(
+        &mut tx,
+        response_id,
+        Some(creator_id),
+        manager.retained_response_fence_seconds(),
     )
     .await?;
     tx.commit().await.map_err(database_failure)?;
@@ -2988,47 +3091,43 @@ pub(crate) async fn delete_creator_response_groups(
     group_limit: i64,
     max_late_writer_seconds: Option<u64>,
 ) -> Result<u64> {
-    let candidates: Vec<(Uuid, Uuid, DateTime<Utc>, String)> = sqlx::query_as(
+    let candidates: Vec<(Uuid, Uuid, DateTime<Utc>)> = sqlx::query_as(
         r#"
-        WITH live_members AS (
-            SELECT COALESCE(step.parent_step_id, step.id, request.id) AS group_id,
-                   request.id AS response_id,
-                   request.created_by,
-                   request.created_at
+        WITH live_seeds AS MATERIALIZED (
+            SELECT request.id, request.created_at
             FROM requests request
-            LEFT JOIN response_steps step ON step.request_id = request.id
             WHERE request.batch_id IS NULL
-        ), live_groups AS (
-            SELECT group_id,
-                   (ARRAY_AGG(response_id ORDER BY response_id))[1] AS response_id,
-                   MIN(created_at) AS sort_at,
-                   'live'::text AS location
-            FROM live_members
-            GROUP BY group_id
-            HAVING COALESCE(BOOL_AND(created_by = $1), FALSE)
-        ), retained_groups AS (
-            SELECT object.group_id,
-                   (ARRAY_AGG(object.object_id ORDER BY object.object_id))[1] AS response_id,
-                   MIN(object.created_at) AS sort_at,
-                   'retained'::text AS location
+              AND request.created_by = $1
+            ORDER BY request.created_at, request.id
+            LIMIT $2
+        ), live_members AS (
+            SELECT COALESCE(step.parent_step_id, step.id, seed.id) AS group_id,
+                   seed.id AS response_id,
+                   seed.created_at
+            FROM live_seeds seed
+            LEFT JOIN response_steps step ON step.request_id = seed.id
+        ), retained_members AS MATERIALIZED (
+            SELECT object.group_id, object.object_id AS response_id,
+                   object.created_at
             FROM retained_response_objects object
-            JOIN retained_response_group_routes route
-              ON route.group_id = object.group_id
-             AND route.delete_on = object.delete_on
             JOIN retained_response_buckets bucket
               ON bucket.delete_on = object.delete_on
-             AND bucket.state = 'active'
+             AND bucket.state IN ('active', 'retiring')
             WHERE object.object_kind = 'request'
-            GROUP BY object.group_id
-            HAVING COALESCE(BOOL_AND(object.created_by = $1), FALSE)
-        )
-        SELECT group_id, response_id, sort_at, location
-        FROM (
-            SELECT * FROM live_groups
+              AND object.created_by = $1
+            ORDER BY object.created_at, object.object_id
+            LIMIT $2
+        ), bounded_members AS (
+            SELECT * FROM live_members
             UNION ALL
-            SELECT * FROM retained_groups
-        ) groups
-        ORDER BY sort_at, group_id, location
+            SELECT * FROM retained_members
+        )
+        SELECT group_id,
+               (ARRAY_AGG(response_id ORDER BY response_id))[1] AS response_id,
+               MIN(created_at) AS sort_at
+        FROM bounded_members
+        GROUP BY group_id
+        ORDER BY sort_at, group_id
         LIMIT $2
         "#,
     )
@@ -3038,17 +3137,40 @@ pub(crate) async fn delete_creator_response_groups(
     .await
     .map_err(database_failure)?;
 
-    let mut deleted_requests = 0_u64;
-    for (_, response_id, _, _) in candidates {
-        deleted_requests += delete_response_group_in_transaction(
+    let mut progress = 0_u64;
+    for (group_id, response_id, _) in candidates {
+        if !try_lock_response_graph(tx, group_id).await? {
+            // This is a loop-termination signal, not a deletion count. A busy
+            // candidate proves work remains and prevents a concurrent purge
+            // caller from treating temporary lock contention as completion.
+            progress += 1;
+            continue;
+        }
+        match delete_response_group_in_transaction(
             tx,
             response_id,
             Some(creator_id),
             max_late_writer_seconds,
         )
-        .await?;
+        .await
+        {
+            Ok(deleted) => progress += deleted,
+            Err(FusilladeError::RequestNotFound(_)) => {
+                if resolve_response_graph_identity(tx, response_id)
+                    .await?
+                    .is_none()
+                {
+                    // A concurrent lifecycle action completed after candidate
+                    // discovery. Count that disappearance as forward progress.
+                    progress += 1;
+                } else {
+                    return Err(incomplete_graph());
+                }
+            }
+            Err(error) => return Err(error),
+        }
     }
-    Ok(deleted_requests)
+    Ok(progress)
 }
 
 async fn selected_graph_is_absent(
@@ -3484,6 +3606,13 @@ async fn move_graph<P: PoolProvider>(
 ) -> MovementResult<MoveGraphOutcome> {
     let mut tx = manager.begin_write().await.map_err(database_failure)?;
     let group_id = current_group_id(&mut tx, candidate.request_id).await?;
+    if !try_lock_response_graph(&mut tx, group_id).await? {
+        return Ok(MoveGraphOutcome::SkippedLocked);
+    }
+    let locked_group_id = current_group_id(&mut tx, candidate.request_id).await?;
+    if locked_group_id != group_id {
+        return Err(incomplete_graph());
+    }
     let initial_topology = graph_topology(&mut tx, group_id, candidate.request_id).await?;
 
     match lock_requests(&mut tx, &initial_topology.request_ids).await? {
