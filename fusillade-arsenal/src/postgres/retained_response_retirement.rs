@@ -942,6 +942,51 @@ pub(super) async fn retire_expired_response_partition<P: PoolProvider>(
     }
 }
 
+pub(super) async fn cleanup_expired_response_fences<P: PoolProvider>(
+    manager: &PostgresRequestManager<P>,
+    limit: i64,
+) -> Result<u64> {
+    if limit < 0 {
+        return Err(FusilladeError::ValidationError(
+            "retained response fence cleanup limit must not be negative".to_string(),
+        ));
+    }
+    if limit == 0 {
+        return Ok(0);
+    }
+
+    // Candidates are locked with SKIP LOCKED so a concurrent destructive
+    // lifecycle action holding a fence row never blocks cleanup, and the
+    // outer expiry predicate re-verifies each locked row version so a fence
+    // renewed or upgraded after candidate selection survives.
+    let mut transaction = manager.begin_write().await.map_err(|_| failed())?;
+    let deleted = sqlx::query_scalar::<_, i64>(
+        r#"
+        WITH candidates AS MATERIALIZED (
+            SELECT fence.object_id
+            FROM retained_response_resurrection_fences fence
+            WHERE fence.expires_at <= statement_timestamp()
+            ORDER BY fence.expires_at, fence.object_id
+            FOR UPDATE SKIP LOCKED
+            LIMIT $1
+        ), removed AS (
+            DELETE FROM retained_response_resurrection_fences fence
+            USING candidates
+            WHERE fence.object_id = candidates.object_id
+              AND fence.expires_at <= statement_timestamp()
+            RETURNING 1
+        )
+        SELECT COUNT(*)::bigint FROM removed
+        "#,
+    )
+    .bind(limit)
+    .fetch_one(&mut *transaction)
+    .await
+    .map_err(|_| failed())?;
+    transaction.commit().await.map_err(|_| failed())?;
+    u64::try_from(deleted).map_err(|_| failed())
+}
+
 pub(super) async fn cleanup_retained_response_routes<P: PoolProvider>(
     manager: &PostgresRequestManager<P>,
     limit: i64,

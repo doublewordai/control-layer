@@ -498,6 +498,28 @@ async fn run_retained_response_route_cleanup_loop<S>(
                 );
             }
         }
+        // Expired-fence removal is an independent phase: a route-cleanup
+        // failure above must not suppress it, and vice versa.
+        match maintenance_query(
+            &shutdown,
+            "retained response fence cleanup",
+            query_timeout,
+            storage.cleanup_expired_response_fences(limit),
+        )
+        .await
+        {
+            Ok(Some(deleted)) => {
+                counter!("fusillade_retained_response_fences_cleaned_total").increment(deleted);
+            }
+            Ok(None) => break,
+            Err(_) => {
+                crate::background_error!(
+                    "retained_response_fence_cleanup_failed",
+                    Error,
+                    "Failed to clean expired retained-response fences"
+                );
+            }
+        }
         tokio::select! {
             _ = tokio::time::sleep(period) => {},
             _ = shutdown.cancelled() => break,
@@ -3066,6 +3088,8 @@ mod tests {
         retirement_buckets: AtomicUsize,
         retirement_select_new: std::sync::Mutex<Vec<bool>>,
         route_cleanup_calls: AtomicUsize,
+        fence_cleanup_calls: AtomicUsize,
+        fail_route_cleanup: std::sync::atomic::AtomicBool,
         batchless_cutoffs: std::sync::Mutex<Vec<RetainedResponseArchiveCutoffs>>,
         fail_weekly: std::sync::atomic::AtomicBool,
         fail_retained: std::sync::atomic::AtomicBool,
@@ -3092,6 +3116,8 @@ mod tests {
                 retirement_buckets: AtomicUsize::new(0),
                 retirement_select_new: std::sync::Mutex::new(Vec::new()),
                 route_cleanup_calls: AtomicUsize::new(0),
+                fence_cleanup_calls: AtomicUsize::new(0),
+                fail_route_cleanup: std::sync::atomic::AtomicBool::new(false),
                 batchless_cutoffs: std::sync::Mutex::new(Vec::new()),
                 fail_weekly: std::sync::atomic::AtomicBool::new(false),
                 fail_retained: std::sync::atomic::AtomicBool::new(false),
@@ -3143,10 +3169,6 @@ mod tests {
 
         async fn purge_orphaned_rows(&self, _batch_size: i64) -> Result<u64> {
             Ok(0)
-        }
-
-        fn supports_retention_sweeps(&self) -> bool {
-            true
         }
 
         fn supports_retained_response_lifecycle(&self) -> bool {
@@ -3219,6 +3241,16 @@ mod tests {
         async fn cleanup_retained_response_routes(&self, _limit: i64) -> Result<u64> {
             self.route_cleanup_calls.fetch_add(1, Ordering::SeqCst);
             self.record("response_route_cleanup");
+            if self.fail_route_cleanup.load(Ordering::SeqCst) {
+                Err(Self::fail())
+            } else {
+                Ok(0)
+            }
+        }
+
+        async fn cleanup_expired_response_fences(&self, _limit: i64) -> Result<u64> {
+            self.fence_cleanup_calls.fetch_add(1, Ordering::SeqCst);
+            self.record("response_fence_cleanup");
             Ok(0)
         }
 
@@ -3401,6 +3433,7 @@ mod tests {
     async fn recovery_and_route_cleanup_run_even_when_runway_creation_fails() {
         let storage = Arc::new(FakeMaintenanceStorage::default());
         storage.fail_retained.store(true, Ordering::SeqCst);
+        storage.fail_route_cleanup.store(true, Ordering::SeqCst);
         let shutdown = tokio_util::sync::CancellationToken::new();
         let ready = Arc::new(AtomicBool::new(false));
         let runway = tokio::spawn(run_retained_response_readiness_loop(
@@ -3431,6 +3464,11 @@ mod tests {
         assert_eq!(storage.retained_calls.load(Ordering::SeqCst), 1);
         assert_eq!(storage.retirement_calls.load(Ordering::SeqCst), 1);
         assert_eq!(storage.route_cleanup_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            storage.fence_cleanup_calls.load(Ordering::SeqCst),
+            1,
+            "a route-cleanup failure must not suppress expired-fence cleanup"
+        );
         assert_eq!(
             *storage.retirement_select_new.lock().unwrap(),
             vec![false],
