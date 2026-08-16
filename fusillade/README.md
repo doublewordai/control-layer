@@ -277,8 +277,30 @@ invalid, or transiently unavailable prerequisites prevent batchless movement,
 and bounded background checks allow movement to recover without a restart
 once both become ready.
 
-The retirement control is independently disabled; setting it to `true` is
-rejected at startup because this release has no retirement consumer. Movement and partition maintenance emit only
+Daily partition retirement is independently disabled by default. When
+enabled, the archive-maintenance owner retires at most one expired
+retained-response partition per pass: it journals the exact partition
+identity (schema, schema OID, parent OID, child name and OID, and daily
+bounds), fences the bucket `retiring` in the same transaction so every read
+fails closed, detaches the partition concurrently, drops only the exact
+journaled relation, and records completion durably. PostgreSQL's own UTC
+date decides eligibility; a partition for the current day is retired only
+after the database clock passes its `delete_on`, never early and never from
+the pod clock. Recovery resumes an unfinished journal before selecting new
+work, refuses any renamed, replaced, rebounded, or reparented relation, and
+treats lock or statement timeouts as retryable no-ops.
+
+Retirement DDL requires an explicitly installed single-session maintenance
+pool (`with_partition_maintenance_pool`, max one connection, min zero) whose
+target is attested against the primary at startup; server-side lock and
+statement timeouts are set on that session. Enabling the flag without the
+pool fails startup validation, and an unfinished journal must keep an
+enabled owner until it completes — disabling retirement mid-journal is not a
+rollback. After physical retirement, every retained identifier is moved to a
+durable content-free resurrection fence before its routes are deleted in
+bounded chunks by an independent cleanup phase.
+
+Movement and partition maintenance emit only
 aggregate counts and fixed phase labels, never request identifiers or content.
 
 Ordinary pending-count queries exclude background demand. To expose it, use an

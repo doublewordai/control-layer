@@ -246,6 +246,23 @@ pub enum RetainedResponseMaintenanceError {
     /// period for its durable content-free resurrection fence.
     #[error("Retained response resurrection fence period is not configured")]
     FencePolicyMissing,
+    /// Destructive partition DDL has no explicitly installed single-session
+    /// connection boundary.
+    #[error("Retained response partition maintenance pool is not configured")]
+    PartitionMaintenancePoolMissing,
+    /// Durable identity and PostgreSQL's catalogs no longer describe the
+    /// exact same retained-response partition generation.
+    #[error("Retained response partition retirement identity is inconsistent")]
+    RetirementIdentityMismatch,
+    /// PostgreSQL could not complete retirement for a non-retryable reason.
+    /// The database error is deliberately omitted because it can contain
+    /// identifiers and bind values.
+    #[error("Retained response partition retirement failed")]
+    RetirementFailed,
+    /// Creator erasure encountered content whose partition lifecycle is still
+    /// in progress and must retry after physical retirement completes.
+    #[error("Retained response partition retirement is pending")]
+    RetirementPending,
 }
 
 impl RetainedResponseMaintenanceError {
@@ -370,6 +387,18 @@ impl RetainedResponsePartitionRunway {
     pub fn is_complete(self) -> bool {
         self.required > 0 && self.contiguous_ahead == self.required
     }
+}
+
+/// Content-free result of one retained-response partition retirement tick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetainedResponseRetirementOutcome {
+    /// No unfinished retirement exists and no new bucket was selected.
+    NoCandidate,
+    /// The exact retirement remains durable but could not make progress due
+    /// to bounded lock or statement timeout contention.
+    Retryable,
+    /// One exact daily partition was physically retired.
+    Retired,
 }
 
 /// Aggregate, content-free result of retention maintenance.
@@ -574,6 +603,8 @@ mod retention_policy_tests {
         let cutoffs = RetainedResponseArchiveCutoffs::new(now, now, now).unwrap();
 
         assert!(!storage.supports_retained_response_lifecycle());
+        assert!(!storage.supports_retained_response_partition_retirement());
+        assert!(!storage.supports_retained_response_route_cleanup());
         assert_maintenance_is_disabled(storage.retained_response_archive_index_ready().await);
 
         assert_maintenance_is_disabled(
@@ -586,13 +617,7 @@ mod retention_policy_tests {
                 .ensure_retained_response_partitions(&policy, 1)
                 .await,
         );
-        assert_maintenance_is_disabled(
-            storage
-                .retire_expired_response_partition(
-                    chrono::NaiveDate::from_ymd_opt(2026, 8, 14).unwrap(),
-                )
-                .await,
-        );
+        assert_maintenance_is_disabled(storage.retire_expired_response_partition(false).await);
         assert_maintenance_is_disabled(storage.cleanup_retained_response_routes(1).await);
     }
 
@@ -1832,6 +1857,19 @@ pub trait DaemonStorage: Send + Sync {
         false
     }
 
+    /// Whether this storage instance has an explicitly installed
+    /// single-session connection boundary for retained-response partition
+    /// retirement. This is instance capability, not merely backend support.
+    fn supports_retained_response_partition_retirement(&self) -> bool {
+        false
+    }
+
+    /// Whether this storage instance can transfer retired route identifiers
+    /// into bounded resurrection fences.
+    fn supports_retained_response_route_cleanup(&self) -> bool {
+        false
+    }
+
     async fn sweep_expired_content(
         &self,
         _cutoffs: &RetentionSweepCutoffs,
@@ -1889,7 +1927,10 @@ pub trait DaemonStorage: Send + Sync {
 
     /// Retire one daily retained-response partition only after it is eligible.
     /// Storage backends opt in explicitly; the default is disabled.
-    async fn retire_expired_response_partition(&self, _today: chrono::NaiveDate) -> Result<u64> {
+    async fn retire_expired_response_partition(
+        &self,
+        _select_new: bool,
+    ) -> Result<RetainedResponseRetirementOutcome> {
         Err(RetainedResponseMaintenanceError::Disabled.into_fusillade_error())
     }
 

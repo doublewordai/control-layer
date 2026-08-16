@@ -23,7 +23,7 @@ use fusillade_arsenal::{
 use serde_json::{Value, json};
 use sqlx::pool::PoolConnection;
 use sqlx::postgres::PgPoolOptions;
-use sqlx::{PgPool, Postgres, Row};
+use sqlx::{PgPool, Postgres, Row, Transaction};
 use tokio::sync::Barrier;
 use uuid::Uuid;
 
@@ -386,7 +386,7 @@ async fn creator_erasure_selects_the_oldest_live_graph_before_aggregation(pool: 
 }
 
 #[sqlx::test]
-async fn creator_erasure_includes_attached_retiring_buckets(pool: PgPool) {
+async fn creator_erasure_retries_an_orphan_retiring_fence(pool: PgPool) {
     install_candidate_index(&pool).await;
     ensure_partition(&pool, archive_date("2026-08-03")).await;
     let graph = singleton(
@@ -410,8 +410,15 @@ async fn creator_erasure_includes_attached_retiring_buckets(pool: PgPool) {
     .await
     .unwrap();
 
-    assert_eq!(manager.bulk_delete_data(OWNER, 1).await.unwrap(), 1);
-    assert_wholly_erased(&pool, &graph).await;
+    let error = manager
+        .bulk_delete_data(OWNER, 1)
+        .await
+        .expect_err("an orphan retiring fence cannot certify physical deletion");
+    assert_eq!(
+        RetainedResponseMaintenanceError::from_fusillade_error(&error),
+        Some(RetainedResponseMaintenanceError::RetirementPending)
+    );
+    assert_wholly_retained(&pool, &graph).await;
 }
 
 #[sqlx::test]
@@ -1751,6 +1758,306 @@ async fn late_synthesis_is_fenced_after_the_retained_partition_disappears(pool: 
     assert_eq!(orphan_templates, 0);
 }
 
+#[sqlx::test]
+async fn retiring_route_blocks_late_synthesis_after_archive_fence_expiry(pool: PgPool) {
+    install_candidate_index(&pool).await;
+    let delete_on = archive_date("2026-08-03");
+    ensure_partition(&pool, delete_on).await;
+    let graph = singleton(
+        &pool,
+        "flex",
+        TerminalState::Completed,
+        timestamp("2026-08-01T10:00:00Z"),
+        "late-after-fence-expiry",
+    )
+    .await;
+    let manager = manager(&pool).await;
+    archive(&manager, &policy(&[("flex", 86_400)]), 1, i64::MAX)
+        .await
+        .expect("graph movement must succeed");
+    sqlx::query(
+        "UPDATE retained_response_resurrection_fences \
+         SET reason = 'archived', expires_at = NOW() - INTERVAL '1 second' \
+         WHERE object_id = ANY($1)",
+    )
+    .bind(
+        std::iter::once(graph.group_id)
+            .chain(graph.request_ids.iter().copied())
+            .chain(graph.step_ids.iter().copied())
+            .collect::<Vec<_>>(),
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let mut retiring = pool.begin().await.unwrap();
+    fence_partition_for_retirement(&mut retiring, delete_on).await;
+    retiring.commit().await.unwrap();
+
+    let error = manager
+        .create_realtime(CreateRealtimeInput {
+            request_id: graph.request_ids[0],
+            body: r#"{"must_not":"survive"}"#.to_owned(),
+            model: MODEL.to_owned(),
+            endpoint: "https://example.invalid".to_owned(),
+            method: "POST".to_owned(),
+            path: "/v1/responses".to_owned(),
+            api_key: "must-not-survive".to_owned(),
+            created_by: OWNER.to_owned(),
+        })
+        .await
+        .expect_err("a retiring route is an unconditional resurrection fence");
+    assert_write_error(&error, RetainedResponseWriteError::NotFound);
+    assert_eq!(count_ids(&pool, "requests", &graph.request_ids).await, 0);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM request_templates \
+             WHERE body LIKE '%must_not%' OR api_key = 'must-not-survive'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        0
+    );
+    for owner in [OWNER, "different-owner"] {
+        let error = manager
+            .delete_owned_response_group(graph.request_ids[0], owner)
+            .await
+            .expect_err("retirement must not become an ownership oracle");
+        assert!(matches!(
+            error,
+            fusillade_arsenal::error::FusilladeError::RequestNotFound(_)
+        ));
+    }
+}
+
+#[sqlx::test]
+async fn explicit_erasure_of_an_already_retired_route_is_idempotently_unavailable(pool: PgPool) {
+    install_candidate_index(&pool).await;
+    let delete_on = archive_date("2026-08-03");
+    ensure_partition(&pool, delete_on).await;
+    let graph = singleton(
+        &pool,
+        "flex",
+        TerminalState::Completed,
+        timestamp("2026-08-01T10:00:00Z"),
+        "erase-after-retirement",
+    )
+    .await;
+    let manager = manager(&pool).await;
+    archive(&manager, &policy(&[("flex", 86_400)]), 1, i64::MAX)
+        .await
+        .expect("graph movement must succeed");
+    let mut retirement = pool.begin().await.unwrap();
+    fence_partition_for_retirement(&mut retirement, delete_on).await;
+    retirement.commit().await.unwrap();
+    sqlx::query(
+        "ALTER TABLE retained_response_objects \
+         DETACH PARTITION retained_response_objects_d20260902",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("DROP TABLE retained_response_objects_d20260902")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        r#"
+        WITH completion AS (SELECT clock_timestamp() AS completed_at),
+        bucket_update AS (
+            UPDATE retained_response_buckets
+            SET state = 'retired', state_changed_at = completion.completed_at
+            FROM completion
+            WHERE delete_on = $1
+            RETURNING state_changed_at
+        )
+        UPDATE retention_partition_retirements journal
+        SET completed_at = bucket_update.state_changed_at
+        FROM bucket_update
+        WHERE journal.parent_table = 'retained_response_objects'
+          AND journal.lower_bound = $1
+        "#,
+    )
+    .bind(delete_on)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    assert_eq!(
+        manager
+            .delete_response_group(graph.request_ids[0])
+            .await
+            .expect("retired content is already unavailable"),
+        0
+    );
+    assert_eq!(count_ids(&pool, "requests", &graph.request_ids).await, 0);
+    assert_eq!(count_ids(&pool, "response_steps", &graph.step_ids).await, 0);
+}
+
+#[sqlx::test]
+async fn explicit_erasure_of_a_retiring_route_never_races_partition_retirement(pool: PgPool) {
+    install_candidate_index(&pool).await;
+    let delete_on = archive_date("2026-08-03");
+    ensure_partition(&pool, delete_on).await;
+    let graph = singleton(
+        &pool,
+        "flex",
+        TerminalState::Completed,
+        timestamp("2026-08-01T10:00:00Z"),
+        "erase-during-retirement",
+    )
+    .await;
+    let manager = manager(&pool).await;
+    archive(&manager, &policy(&[("flex", 86_400)]), 1, i64::MAX)
+        .await
+        .expect("graph movement must succeed");
+    sqlx::query("UPDATE retained_response_buckets SET state = 'retiring' WHERE delete_on = $1")
+        .bind(delete_on)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let error = manager
+        .delete_response_group(graph.request_ids[0])
+        .await
+        .expect_err("an orphan retiring fence cannot certify deletion");
+    assert_eq!(
+        RetainedResponseMaintenanceError::from_fusillade_error(&error),
+        Some(RetainedResponseMaintenanceError::RetirementIdentityMismatch)
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM retained_response_objects \
+             WHERE delete_on = $1 AND group_id = $2",
+        )
+        .bind(delete_on)
+        .bind(graph.group_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        2,
+        "explicit erasure must not inspect or mutate a retiring partition",
+    );
+}
+
+#[sqlx::test]
+async fn retirement_fence_winning_the_partition_lock_prevents_payload_erasure(pool: PgPool) {
+    install_candidate_index(&pool).await;
+    let delete_on = archive_date("2026-08-03");
+    ensure_partition(&pool, delete_on).await;
+    let graph = singleton(
+        &pool,
+        "flex",
+        TerminalState::Completed,
+        timestamp("2026-08-01T10:00:00Z"),
+        "erase-partition-lock-race",
+    )
+    .await;
+    let manager = Arc::new(manager(&pool).await);
+    archive(&manager, &policy(&[("flex", 86_400)]), 1, i64::MAX)
+        .await
+        .unwrap();
+
+    let mut retirement = pool.begin().await.unwrap();
+    sqlx::query(
+        "SELECT pg_advisory_xact_lock(\
+             hashtextextended(\
+                 'retained_response_objects.partition:' || current_schema() || ':'\
+                     || to_char($1::date, 'YYYYMMDD'),\
+                 0\
+             )\
+         )",
+    )
+    .bind(delete_on)
+    .execute(&mut *retirement)
+    .await
+    .unwrap();
+    let request_id = graph.request_ids[0];
+    let eraser = {
+        let manager = Arc::clone(&manager);
+        tokio::spawn(async move { manager.delete_response_group(request_id).await })
+    };
+    wait_for_advisory_waiter(&pool).await;
+    fence_partition_for_retirement(&mut retirement, delete_on).await;
+    retirement.commit().await.unwrap();
+
+    assert_eq!(eraser.await.unwrap().unwrap(), 0);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM retained_response_objects \
+             WHERE delete_on = $1 AND group_id = $2",
+        )
+        .bind(delete_on)
+        .bind(graph.group_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        2,
+    );
+}
+
+#[sqlx::test]
+async fn creator_erasure_retries_a_partition_retirement_race(pool: PgPool) {
+    install_candidate_index(&pool).await;
+    let delete_on = archive_date("2026-08-03");
+    ensure_partition(&pool, delete_on).await;
+    let graph = singleton(
+        &pool,
+        "flex",
+        TerminalState::Completed,
+        timestamp("2026-08-01T10:00:00Z"),
+        "creator-partition-lock-race",
+    )
+    .await;
+    let manager = Arc::new(manager(&pool).await);
+    archive(&manager, &policy(&[("flex", 86_400)]), 1, i64::MAX)
+        .await
+        .unwrap();
+
+    let mut retirement = pool.begin().await.unwrap();
+    sqlx::query(
+        "SELECT pg_advisory_xact_lock(\
+             hashtextextended(\
+                 'retained_response_objects.partition:' || current_schema() || ':'\
+                     || to_char($1::date, 'YYYYMMDD'),\
+                 0\
+             )\
+         )",
+    )
+    .bind(delete_on)
+    .execute(&mut *retirement)
+    .await
+    .unwrap();
+    let eraser = {
+        let manager = Arc::clone(&manager);
+        tokio::spawn(async move { manager.bulk_delete_data(OWNER, 10).await })
+    };
+    wait_for_advisory_waiter(&pool).await;
+    fence_partition_for_retirement(&mut retirement, delete_on).await;
+    retirement.commit().await.unwrap();
+
+    let error = eraser
+        .await
+        .unwrap()
+        .expect_err("creator erasure must retry until physical retirement is proven");
+    assert_eq!(
+        RetainedResponseMaintenanceError::from_fusillade_error(&error),
+        Some(RetainedResponseMaintenanceError::RetirementPending)
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM retained_response_objects \
+             WHERE delete_on = $1 AND group_id = $2",
+        )
+        .bind(delete_on)
+        .bind(graph.group_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        2,
+    );
+}
+
 async fn manager(pool: &PgPool) -> PostgresRequestManager<TestDbPools> {
     PostgresRequestManager::new(
         TestDbPools::new(pool.clone())
@@ -2008,6 +2315,38 @@ async fn ensure_partition(pool: &PgPool, delete_on: NaiveDate) {
         .execute(pool)
         .await
         .expect("retained response partition must be available");
+}
+
+async fn fence_partition_for_retirement(tx: &mut Transaction<'_, Postgres>, delete_on: NaiveDate) {
+    sqlx::query(
+        r#"
+        INSERT INTO retention_partition_retirements (
+            parent_table, partition_table, partition_oid,
+            partition_schema, partition_schema_oid, parent_oid,
+            lower_bound, upper_bound
+        )
+        SELECT 'retained_response_objects', bucket.partition_table, child.oid,
+               namespace.nspname, namespace.oid, parent.oid, $1, $1 + 1
+        FROM retained_response_buckets bucket
+        JOIN pg_class child ON child.oid = bucket.partition_oid
+        JOIN pg_namespace namespace ON namespace.oid = child.relnamespace
+        JOIN pg_class parent ON parent.oid = 'retained_response_objects'::regclass
+        WHERE bucket.delete_on = $1
+        "#,
+    )
+    .bind(delete_on)
+    .execute(&mut **tx)
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE retained_response_buckets \
+         SET state = 'retiring', state_changed_at = statement_timestamp() \
+         WHERE delete_on = $1 AND state = 'active'",
+    )
+    .bind(delete_on)
+    .execute(&mut **tx)
+    .await
+    .unwrap();
 }
 
 async fn insert_request(
@@ -3319,7 +3658,8 @@ async fn retirement_transition_fences_movement_until_retiring_is_visible(pool: P
         r#"
         SELECT pg_advisory_xact_lock(
             hashtextextended(
-                'retained_response_objects.partition:' || current_schema() || ':' || $1::text,
+                'retained_response_objects.partition:' || current_schema() || ':'
+                    || to_char($1::date, 'YYYYMMDD'),
                 0
             )
         )
