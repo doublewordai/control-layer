@@ -18,9 +18,10 @@ pub use daemon_record::{
 pub use error::{FusilladeError, Result};
 pub use manager::{
     DaemonStorage, ModelFilter, ModelFilterState, RetainedResponseArchiveOutcome,
-    RetainedResponseMaintenanceError, RetainedResponsePartitionRunway, RetentionCutoffs,
-    RetentionMaintenanceOutcome, RetentionSweepCutoffs, RetentionSweepOutcome,
-    RetentionSweepPolicy, Storage, TrailingDemandCount,
+    RetainedResponseMaintenanceError, RetainedResponsePartitionRunway,
+    RetainedResponseRetirementOutcome, RetentionCutoffs, RetentionMaintenanceOutcome,
+    RetentionSweepCutoffs, RetentionSweepOutcome, RetentionSweepPolicy, Storage,
+    TrailingDemandCount,
 };
 pub use request::*;
 pub use response_step::{

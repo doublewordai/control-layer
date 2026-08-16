@@ -62,8 +62,9 @@ impl ResponseWriteDispositions {
 }
 
 /// Classify UUIDs without consulting retained payloads. Active routes win
-/// over fences; once a bucket is retiring, detached, dropped, or its routes
-/// have been cleaned, the durable unexpired fence yields a fixed not-found.
+/// over archival fences. A route whose canonical bucket is retiring or
+/// retired is itself an unconditional unavailability fence; after route
+/// cleanup, the durable unexpired resurrection fence carries that decision.
 pub(crate) async fn classify_response_write(
     tx: &mut Transaction<'_, Postgres>,
     object_ids: &[Uuid],
@@ -84,8 +85,8 @@ pub(crate) async fn classify_response_write(
 }
 
 /// Classify every input UUID independently. Exact active routes take
-/// precedence over archival fences; an identity is unavailable only when it
-/// has no readable active route and still has an unexpired fence.
+/// precedence over archival fences; an identity is unavailable when its route
+/// is retiring/retired or, after route cleanup, it has an unexpired fence.
 pub(crate) async fn classify_response_write_ids(
     tx: &mut Transaction<'_, Postgres>,
     object_ids: &[Uuid],
@@ -134,6 +135,22 @@ pub(crate) async fn classify_response_write_ids(
               AND pg_get_expr(child.relpartbound, child.oid) = format(
                   'FOR VALUES FROM (%L) TO (%L)', route.delete_on, route.delete_on + 1
               )
+        ), retiring_ids AS (
+            SELECT DISTINCT route.object_id
+            FROM candidate_route route
+            JOIN retained_response_group_routes group_route
+              ON group_route.group_id = route.group_id
+             AND group_route.delete_on = route.delete_on
+            JOIN retained_response_buckets bucket ON bucket.delete_on = route.delete_on
+            WHERE bucket.state IN ('retiring', 'retired')
+              AND bucket.partition_schema = current_schema()
+              AND bucket.partition_table =
+                  'retained_response_objects_d' || to_char(route.delete_on, 'YYYYMMDD')
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM active_ids active
+                  WHERE active.object_id = route.object_id
+              )
         ), fenced_ids AS (
             SELECT input.object_id
             FROM input_ids input
@@ -148,7 +165,13 @@ pub(crate) async fn classify_response_write_ids(
         )
         SELECT object_id, TRUE AS active FROM active_ids
         UNION ALL
+        SELECT object_id, FALSE AS active FROM retiring_ids
+        UNION ALL
         SELECT object_id, FALSE AS active FROM fenced_ids
+        WHERE NOT EXISTS (
+            SELECT 1 FROM retiring_ids retiring
+            WHERE retiring.object_id = fenced_ids.object_id
+        )
         "#,
     )
     .bind(object_ids)
@@ -2793,14 +2816,17 @@ pub(crate) async fn begin_response_write_transaction(
 async fn erase_retained_graph(
     tx: &mut Transaction<'_, Postgres>,
     group_id: Uuid,
+    response_id: Uuid,
     delete_on: NaiveDate,
+    expected_creator: Option<&str>,
     max_late_writer_seconds: Option<u64>,
-) -> MovementResult<u64> {
+) -> MovementResult<DeleteResponseGroupOutcome> {
     sqlx::query(
         r#"
         SELECT pg_advisory_xact_lock(
             hashtextextended(
-                'retained_response_objects.partition:' || current_schema() || ':' || $1::text,
+                'retained_response_objects.partition:' || current_schema() || ':'
+                    || to_char($1::date, 'YYYYMMDD'),
                 0
             )
         )
@@ -2810,6 +2836,129 @@ async fn erase_retained_graph(
     .execute(&mut **tx)
     .await
     .map_err(database_failure)?;
+
+    // This is the authoritative lifecycle check. Retirement takes the same
+    // partition advisory lock before changing the bucket fence, so only an
+    // exact `active` bucket observed here may reach payload SQL. A caller that
+    // discovered an active route before waiting on this lock cannot race the
+    // committed `retiring` transition.
+    let bucket: Option<(
+        String,
+        String,
+        String,
+        sqlx::postgres::types::Oid,
+        DateTime<Utc>,
+    )> = sqlx::query_as(
+        r#"
+        SELECT bucket.state, bucket.partition_schema, bucket.partition_table,
+               bucket.partition_oid, bucket.state_changed_at
+        FROM retained_response_buckets bucket
+        WHERE bucket.delete_on = $1
+        FOR UPDATE
+        "#,
+    )
+    .bind(delete_on)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(database_failure)?;
+    let Some((state, schema, child, child_oid, state_changed_at)) = bucket else {
+        return Err(incomplete_graph());
+    };
+    if schema
+        != sqlx::query_scalar::<_, String>("SELECT current_schema()")
+            .fetch_one(&mut **tx)
+            .await
+            .map_err(database_failure)?
+        || child != format!("retained_response_objects_d{}", delete_on.format("%Y%m%d"))
+    {
+        return Err(
+            RetainedResponseMaintenanceError::RetirementIdentityMismatch.into_fusillade_error()
+        );
+    }
+    match state.as_str() {
+        "retiring" => {
+            let exact_pending: bool = sqlx::query_scalar(
+                r#"
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM retention_partition_retirements journal
+                    JOIN pg_namespace namespace
+                      ON namespace.nspname = $2
+                     AND namespace.oid = journal.partition_schema_oid
+                    JOIN pg_class parent
+                      ON parent.relnamespace = namespace.oid
+                     AND parent.relname = 'retained_response_objects'
+                     AND parent.oid = journal.parent_oid
+                    JOIN pg_class child
+                      ON child.relnamespace = namespace.oid
+                     AND child.relname = $3
+                     AND child.oid = $4::oid
+                    WHERE journal.parent_table = 'retained_response_objects'
+                      AND journal.partition_schema = $2
+                      AND journal.partition_table = $3
+                      AND journal.partition_oid = $4::oid
+                      AND journal.lower_bound = $1
+                      AND journal.upper_bound = $1 + 1
+                      AND journal.completed_at IS NULL
+                )
+                "#,
+            )
+            .bind(delete_on)
+            .bind(&schema)
+            .bind(&child)
+            .bind(child_oid)
+            .fetch_one(&mut **tx)
+            .await
+            .map_err(database_failure)?;
+            if exact_pending {
+                return Ok(DeleteResponseGroupOutcome::Unavailable);
+            }
+            return Err(
+                RetainedResponseMaintenanceError::RetirementIdentityMismatch.into_fusillade_error()
+            );
+        }
+        "retired" => {
+            let exact_completed: bool = sqlx::query_scalar(
+                r#"
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM retention_partition_retirements journal
+                    JOIN pg_namespace namespace
+                      ON namespace.nspname = $2
+                     AND namespace.oid = journal.partition_schema_oid
+                    JOIN pg_class parent
+                      ON parent.relnamespace = namespace.oid
+                     AND parent.relname = 'retained_response_objects'
+                     AND parent.oid = journal.parent_oid
+                    WHERE journal.parent_table = 'retained_response_objects'
+                      AND journal.partition_schema = $2
+                      AND journal.partition_table = $3
+                      AND journal.partition_oid = $4::oid
+                      AND journal.lower_bound = $1
+                      AND journal.upper_bound = $1 + 1
+                      AND journal.completed_at = $5
+                      AND NOT EXISTS (SELECT 1 FROM pg_class WHERE oid = $4::oid)
+                )
+                "#,
+            )
+            .bind(delete_on)
+            .bind(&schema)
+            .bind(&child)
+            .bind(child_oid)
+            .bind(state_changed_at)
+            .fetch_one(&mut **tx)
+            .await
+            .map_err(database_failure)?;
+            if exact_completed {
+                return Ok(DeleteResponseGroupOutcome::Unavailable);
+            }
+            return Err(
+                RetainedResponseMaintenanceError::RetirementIdentityMismatch.into_fusillade_error()
+            );
+        }
+        "active" => {}
+        _ => return Err(incomplete_graph()),
+    }
 
     let bucket_valid: bool = sqlx::query_scalar(
         r#"
@@ -2826,7 +2975,7 @@ async fn erase_retained_graph(
               ON inheritance.inhrelid = child.oid
              AND NOT inheritance.inhdetachpending
             WHERE bucket.delete_on = $1
-              AND bucket.state IN ('active', 'retiring')
+              AND bucket.state = 'active'
               AND bucket.partition_schema = current_schema()
               AND bucket.partition_table =
                   'retained_response_objects_d' || to_char($1::date, 'YYYYMMDD')
@@ -2845,6 +2994,23 @@ async fn erase_retained_graph(
     .map_err(database_failure)?;
     if !bucket_valid {
         return Err(RetainedResponseMaintenanceError::IncompleteGraph.into_fusillade_error());
+    }
+
+    if let Some(expected_creator) = expected_creator {
+        let owned: bool = sqlx::query_scalar(
+            "SELECT COALESCE(BOOL_AND(created_by = $3), FALSE) \
+             FROM retained_response_objects \
+             WHERE delete_on = $1 AND group_id = $2 AND object_kind = 'request'",
+        )
+        .bind(delete_on)
+        .bind(group_id)
+        .bind(expected_creator)
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(database_failure)?;
+        if !owned {
+            return Err(FusilladeError::RequestNotFound(RequestId(response_id)));
+        }
     }
 
     let group_route: Option<(Uuid, NaiveDate)> = sqlx::query_as(
@@ -2987,7 +3153,15 @@ async fn erase_retained_graph(
     {
         return Err(incomplete_graph());
     }
-    Ok(header.request_ids.len() as u64)
+    Ok(DeleteResponseGroupOutcome::Deleted(
+        header.request_ids.len() as u64,
+    ))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeleteResponseGroupOutcome {
+    Deleted(u64),
+    Unavailable,
 }
 
 async fn delete_locked_response_group_in_transaction(
@@ -2995,7 +3169,7 @@ async fn delete_locked_response_group_in_transaction(
     response_id: Uuid,
     expected_creator: Option<&str>,
     max_late_writer_seconds: Option<u64>,
-) -> Result<u64> {
+) -> Result<DeleteResponseGroupOutcome> {
     if resolve_response_graph_identity(tx, response_id)
         .await?
         .is_none()
@@ -3054,29 +3228,19 @@ async fn delete_locked_response_group_in_transaction(
         {
             return Err(incomplete_graph());
         }
-        return Ok(deleted_requests);
+        return Ok(DeleteResponseGroupOutcome::Deleted(deleted_requests));
     }
 
     if let Some((group_id, delete_on)) = resolve_retained_route(tx, response_id).await? {
-        if let Some(expected_creator) = expected_creator {
-            let owned: bool = sqlx::query_scalar(
-                "SELECT COALESCE(BOOL_AND(created_by = $3), FALSE) \
-                 FROM retained_response_objects \
-                 WHERE delete_on = $1 AND group_id = $2 AND object_kind = 'request'",
-            )
-            .bind(delete_on)
-            .bind(group_id)
-            .bind(expected_creator)
-            .fetch_one(&mut **tx)
-            .await
-            .map_err(database_failure)?;
-            if !owned {
-                return Err(FusilladeError::RequestNotFound(RequestId(response_id)));
-            }
-        }
-        let deleted =
-            erase_retained_graph(tx, group_id, delete_on, max_late_writer_seconds).await?;
-        return Ok(deleted);
+        return erase_retained_graph(
+            tx,
+            group_id,
+            response_id,
+            delete_on,
+            expected_creator,
+            max_late_writer_seconds,
+        )
+        .await;
     }
 
     Err(FusilladeError::RequestNotFound(RequestId(response_id)))
@@ -3095,7 +3259,10 @@ pub(crate) async fn delete_response_group<P: PoolProvider>(
     )
     .await?;
     tx.commit().await.map_err(database_failure)?;
-    Ok(deleted)
+    Ok(match deleted {
+        DeleteResponseGroupOutcome::Deleted(deleted) => deleted,
+        DeleteResponseGroupOutcome::Unavailable => 0,
+    })
 }
 
 pub(crate) async fn delete_owned_response_group<P: PoolProvider>(
@@ -3112,7 +3279,12 @@ pub(crate) async fn delete_owned_response_group<P: PoolProvider>(
     )
     .await?;
     tx.commit().await.map_err(database_failure)?;
-    Ok(deleted)
+    match deleted {
+        DeleteResponseGroupOutcome::Deleted(deleted) => Ok(deleted),
+        DeleteResponseGroupOutcome::Unavailable => {
+            Err(FusilladeError::RequestNotFound(RequestId(response_id)))
+        }
+    }
 }
 
 pub(crate) async fn delete_creator_response_groups(
@@ -3142,7 +3314,7 @@ pub(crate) async fn delete_creator_response_groups(
             FROM retained_response_objects object
             JOIN retained_response_buckets bucket
               ON bucket.delete_on = object.delete_on
-             AND bucket.state IN ('active', 'retiring')
+             AND bucket.state = 'active'
             WHERE object.object_kind = 'request'
               AND object.created_by = $1
             ORDER BY object.created_at, object.object_id
@@ -3194,7 +3366,15 @@ pub(crate) async fn delete_creator_response_groups(
         )
         .await
         {
-            Ok(deleted) => progress += deleted,
+            Ok(DeleteResponseGroupOutcome::Deleted(deleted)) => progress += deleted,
+            Ok(DeleteResponseGroupOutcome::Unavailable) => {
+                // Retirement owns the payload now, but it has not yet proved
+                // physical deletion. The at-least-once creator-erasure job
+                // must retry instead of certifying this graph as erased.
+                return Err(
+                    RetainedResponseMaintenanceError::RetirementPending.into_fusillade_error()
+                );
+            }
             Err(FusilladeError::RequestNotFound(_)) => {
                 if resolve_response_graph_identity(tx, response_id)
                     .await?
@@ -3208,6 +3388,39 @@ pub(crate) async fn delete_creator_response_groups(
                 }
             }
             Err(error) => return Err(error),
+        }
+    }
+    if progress == 0 {
+        let retirement_pending: bool = sqlx::query_scalar(
+            r#"
+            SELECT EXISTS (
+                SELECT 1
+                FROM retention_partition_retirements journal
+                WHERE journal.parent_table = 'retained_response_objects'
+                  AND journal.completed_at IS NULL
+            ) OR EXISTS (
+                SELECT 1
+                FROM retained_response_buckets bucket
+                WHERE bucket.state = 'retiring'
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM retention_partition_retirements journal
+                      WHERE journal.parent_table = 'retained_response_objects'
+                        AND journal.partition_schema = bucket.partition_schema
+                        AND journal.partition_table = bucket.partition_table
+                        AND journal.partition_oid = bucket.partition_oid
+                        AND journal.lower_bound = bucket.delete_on
+                        AND journal.upper_bound = bucket.delete_on + 1
+                        AND journal.completed_at IS NULL
+                  )
+            )
+            "#,
+        )
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(database_failure)?;
+        if retirement_pending {
+            return Err(RetainedResponseMaintenanceError::RetirementPending.into_fusillade_error());
         }
     }
     Ok(progress)
@@ -3350,7 +3563,8 @@ async fn lock_active_partition(
         r#"
         SELECT pg_advisory_xact_lock(
             hashtextextended(
-                'retained_response_objects.partition:' || current_schema() || ':' || $1::text,
+                'retained_response_objects.partition:' || current_schema() || ':'
+                    || to_char($1::date, 'YYYYMMDD'),
                 0
             )
         )
