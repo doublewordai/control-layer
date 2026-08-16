@@ -18,7 +18,7 @@ use crate::request::{
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use futures::stream::Stream;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::pin::Pin;
 
 /// Outcome of [`DaemonStorage::archive_batch`]. Skips are NORMAL sweeper
@@ -135,102 +135,7 @@ impl RetentionSweepPolicy {
             .succ_opt()
             .ok_or_else(|| "automated retention deletion date is out of range".to_string())
     }
-
-    /// Resolve relative configuration into immutable cutoffs for one sweep.
-    pub fn cutoffs_at(
-        &self,
-        now: DateTime<Utc>,
-        terminal_batch_cancel_grace_secs: f64,
-    ) -> std::result::Result<RetentionCutoffs, String> {
-        self.validate()?;
-        if !terminal_batch_cancel_grace_secs.is_finite() || terminal_batch_cancel_grace_secs < 0.0 {
-            return Err(
-                "terminal batch cancellation grace must be finite and non-negative".to_string(),
-            );
-        }
-        let cutoff = |seconds: u64| {
-            let seconds = i64::try_from(seconds)
-                .map_err(|_| "automated retention period is too large".to_string())?;
-            let duration = chrono::Duration::try_seconds(seconds)
-                .ok_or_else(|| "automated retention period is too large".to_string())?;
-            now.checked_sub_signed(duration)
-                .ok_or_else(|| "automated retention cutoff is out of range".to_string())
-        };
-        let terminal_batch_before = self.terminal_batch_seconds.map(cutoff).transpose()?;
-        let legacy_cancel_grace =
-            std::time::Duration::try_from_secs_f64(terminal_batch_cancel_grace_secs)
-                .map_err(|_| "terminal batch cancellation grace is out of range".to_string())?;
-        let cancel_grace_before = chrono::Duration::from_std(legacy_cancel_grace)
-            .map_err(|_| "terminal batch cancellation grace is out of range".to_string())?;
-        let cancel_grace_before = now
-            .checked_sub_signed(cancel_grace_before)
-            .ok_or_else(|| "terminal batch cancellation cutoff is out of range".to_string())?;
-        let batchless_seconds_by_service_tier = self
-            .batchless_seconds_by_service_tier
-            .iter()
-            .map(|(tier, seconds)| (tier.clone(), *seconds))
-            .collect();
-        let legacy_batchless_before_by_service_tier = self
-            .batchless_seconds_by_service_tier
-            .iter()
-            .map(|(tier, seconds)| Ok((tier.clone(), cutoff(*seconds)?)))
-            .collect::<std::result::Result<BTreeMap<_, _>, String>>()?;
-        Ok(RetentionCutoffs {
-            expire_files_before: self.expire_files.then_some(now),
-            terminal_batch_before,
-            cancel_grace_before,
-            batchless_seconds_by_service_tier,
-            legacy_cancel_grace,
-            legacy_batchless_before_by_service_tier,
-        })
-    }
 }
-
-/// Deterministic retention boundaries and batchless durations for one sweep.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct RetentionCutoffs {
-    pub(crate) expire_files_before: Option<DateTime<Utc>>,
-    pub(crate) terminal_batch_before: Option<DateTime<Utc>>,
-    pub(crate) cancel_grace_before: DateTime<Utc>,
-    pub(crate) batchless_seconds_by_service_tier: BTreeMap<String, u64>,
-    #[doc(hidden)]
-    pub(crate) legacy_cancel_grace: std::time::Duration,
-    #[doc(hidden)]
-    pub(crate) legacy_batchless_before_by_service_tier: BTreeMap<String, DateTime<Utc>>,
-}
-
-impl RetentionCutoffs {
-    pub fn expire_files_before(&self) -> Option<DateTime<Utc>> {
-        self.expire_files_before
-    }
-
-    pub fn terminal_batch_before(&self) -> Option<DateTime<Utc>> {
-        self.terminal_batch_before
-    }
-
-    pub fn cancel_grace_before(&self) -> DateTime<Utc> {
-        self.cancel_grace_before
-    }
-
-    pub fn batchless_seconds_by_service_tier(&self) -> &BTreeMap<String, u64> {
-        &self.batchless_seconds_by_service_tier
-    }
-
-    /// Legacy relative cancellation-grace accessor retained until storage
-    /// backends have migrated to [`Self::cancel_grace_before`].
-    pub fn terminal_batch_cancel_grace_secs(&self) -> f64 {
-        self.legacy_cancel_grace.as_secs_f64()
-    }
-
-    /// Legacy per-tier timestamp accessor retained until storage backends have
-    /// migrated to [`Self::batchless_seconds_by_service_tier`].
-    pub fn batchless_before_by_service_tier(&self) -> &BTreeMap<String, DateTime<Utc>> {
-        &self.legacy_batchless_before_by_service_tier
-    }
-}
-
-/// Backwards-compatible name for legacy storage consumers.
-pub type RetentionSweepCutoffs = RetentionCutoffs;
 
 /// Content-free, matchable retained-response maintenance failures carried in
 /// [`crate::error::FusilladeError::Other`].
@@ -401,17 +306,6 @@ pub enum RetainedResponseRetirementOutcome {
     Retired,
 }
 
-/// Aggregate, content-free result of retention maintenance.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct RetentionMaintenanceOutcome {
-    pub files_expired: u64,
-    pub batches_expired: u64,
-    pub archive_partitions_retired: u64,
-    pub template_partitions_retired: u64,
-    pub response_partitions_retired: u64,
-    pub routes_deleted: u64,
-}
-
 #[cfg(test)]
 mod retention_policy_tests {
     use super::*;
@@ -460,49 +354,6 @@ mod retention_policy_tests {
         // Mutation caught: omitting `succ_opt` can wrap the first eligible
         // deletion date past the last representable UTC date.
         assert!(RetentionSweepPolicy::delete_on(DateTime::<Utc>::MAX_UTC, 0).is_err());
-    }
-
-    #[test]
-    fn cancellation_grace_is_resolved_to_one_absolute_cutoff() {
-        let now = DateTime::parse_from_rfc3339("2026-08-14T15:30:00Z")
-            .unwrap()
-            .to_utc();
-        let cutoffs = policy().cutoffs_at(now, 600.0).unwrap();
-        assert_eq!(
-            cutoffs.cancel_grace_before(),
-            now - chrono::Duration::minutes(10)
-        );
-    }
-
-    #[test]
-    fn legacy_cutoffs_keep_their_default_relative_accessors() {
-        // Mutation caught: replacing the legacy cutoff value with a name-only
-        // alias removes its default and legacy accessor contract.
-        let cutoffs = RetentionSweepCutoffs::default();
-        assert_eq!(cutoffs.terminal_batch_cancel_grace_secs(), 0.0);
-        assert!(cutoffs.batchless_before_by_service_tier().is_empty());
-    }
-
-    #[test]
-    fn legacy_cutoff_accessors_preserve_resolved_values() {
-        // Mutation caught: retaining the old methods while discarding their
-        // resolved values breaks existing storage consumers at runtime.
-        let now = DateTime::parse_from_rfc3339("2026-08-14T15:30:00Z")
-            .unwrap()
-            .to_utc();
-        let cutoffs = policy().cutoffs_at(now, 600.0).unwrap();
-        assert_eq!(cutoffs.terminal_batch_cancel_grace_secs(), 600.0);
-        assert_eq!(
-            cutoffs
-                .batchless_before_by_service_tier()
-                .get("flex")
-                .copied(),
-            Some(
-                DateTime::parse_from_rfc3339("2026-05-16T15:30:00Z")
-                    .unwrap()
-                    .to_utc()
-            )
-        );
     }
 
     struct DefaultDisabledStorage;
@@ -619,6 +470,7 @@ mod retention_policy_tests {
         );
         assert_maintenance_is_disabled(storage.retire_expired_response_partition(false).await);
         assert_maintenance_is_disabled(storage.cleanup_retained_response_routes(1).await);
+        assert_maintenance_is_disabled(storage.cleanup_expired_response_fences(1).await);
     }
 
     #[test]
@@ -714,65 +566,6 @@ mod retention_policy_tests {
             ..Default::default()
         };
         assert!(oversized.validate().is_err());
-        assert!(oversized.cutoffs_at(Utc::now(), 0.0).is_err());
-    }
-
-    #[test]
-    fn policy_resolves_absolute_cutoffs_once() {
-        let now = Utc::now();
-        let policy = RetentionSweepPolicy {
-            expire_files: true,
-            terminal_batch_seconds: Some(60),
-            batchless_seconds_by_service_tier: HashMap::from([("flex".to_string(), 120)]),
-            max_late_writer_seconds: Some(600),
-        };
-        let cutoffs = policy.cutoffs_at(now, 600.0).unwrap();
-        assert_eq!(cutoffs.expire_files_before, Some(now));
-        assert_eq!(
-            cutoffs.terminal_batch_before,
-            now.checked_sub_signed(chrono::Duration::seconds(60))
-        );
-        assert_eq!(
-            cutoffs.cancel_grace_before,
-            now.checked_sub_signed(chrono::Duration::minutes(10))
-                .unwrap()
-        );
-        assert_eq!(
-            cutoffs.batchless_seconds_by_service_tier,
-            BTreeMap::from([("flex".to_string(), 120)])
-        );
-    }
-}
-
-/// Aggregate, content-free result of one bounded retention sweep.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct RetentionSweepOutcome {
-    /// Files newly marked expired.
-    pub files_expired: u64,
-    /// Terminal batches newly soft-deleted.
-    pub batches_expired: u64,
-    /// Weekly terminal-request archive partitions retired as one DDL unit.
-    pub archive_partitions_retired: u64,
-    /// Weekly request-template payload partitions retired as one DDL unit.
-    pub template_partitions_retired: u64,
-    /// Terminal batchless requests and their dedicated templates hard-deleted.
-    pub batchless_requests_deleted: u64,
-    /// Canceled, previously dispatched batchless requests whose content was
-    /// erased while retaining the lifecycle row for a possible late result.
-    pub batchless_requests_redacted: u64,
-    /// Another replica owns the transaction-scoped sweep lease.
-    pub lease_skipped: bool,
-    /// At least one category filled its per-category work budget and may have
-    /// more immediately eligible rows.
-    pub may_have_more: bool,
-}
-
-impl RetentionSweepOutcome {
-    pub fn affected_rows(self) -> u64 {
-        self.files_expired
-            + self.batches_expired
-            + self.batchless_requests_deleted
-            + self.batchless_requests_redacted
     }
 }
 
@@ -1839,16 +1632,6 @@ pub trait DaemonStorage: Send + Sync {
     /// the daemon purge task for right-to-erasure compliance.
     async fn purge_orphaned_rows(&self, batch_size: i64) -> Result<u64>;
 
-    /// Apply operator-supplied absolute cutoffs in bounded chunks.
-    ///
-    /// Implementations must not delete active work. File-backed batches are
-    /// soft-deleted so the ordinary orphan purge can remove their content;
-    /// eligible batchless content should be removed atomically with its
-    /// dedicated request template.
-    fn supports_retention_sweeps(&self) -> bool {
-        false
-    }
-
     /// Whether this backend explicitly implements the partitioned retained
     /// response lifecycle. This capability is independent from legacy content
     /// sweeps so a backend cannot accidentally opt into movement by supporting
@@ -1868,17 +1651,6 @@ pub trait DaemonStorage: Send + Sync {
     /// into bounded resurrection fences.
     fn supports_retained_response_route_cleanup(&self) -> bool {
         false
-    }
-
-    async fn sweep_expired_content(
-        &self,
-        _cutoffs: &RetentionSweepCutoffs,
-        batch_size: i64,
-    ) -> Result<RetentionSweepOutcome> {
-        let _ = batch_size;
-        Err(crate::error::FusilladeError::ValidationError(
-            "automated content retention is not supported by this storage backend".to_string(),
-        ))
     }
 
     /// Archive terminal batchless logical response graphs in bounded groups.
@@ -1937,6 +1709,13 @@ pub trait DaemonStorage: Send + Sync {
     /// Remove bounded stale routing metadata for retained responses. Storage
     /// backends opt in explicitly; the default is disabled.
     async fn cleanup_retained_response_routes(&self, _limit: i64) -> Result<u64> {
+        Err(RetainedResponseMaintenanceError::Disabled.into_fusillade_error())
+    }
+
+    /// Remove bounded expired content-free resurrection fences. A fence that
+    /// a concurrent lifecycle action renews or upgrades at deletion time must
+    /// survive. Storage backends opt in explicitly; the default is disabled.
+    async fn cleanup_expired_response_fences(&self, _limit: i64) -> Result<u64> {
         Err(RetainedResponseMaintenanceError::Disabled.into_fusillade_error())
     }
 

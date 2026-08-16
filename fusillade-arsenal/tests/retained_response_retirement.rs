@@ -1181,3 +1181,94 @@ async fn route_cleanup_is_bounded_and_fences_every_identifier_before_deletion(po
         }
     }
 }
+
+async fn install_fence(pool: &PgPool, id: Uuid, reason: &str, expired: bool) {
+    let offset = if expired {
+        "- INTERVAL '1 second'"
+    } else {
+        "+ INTERVAL '1 hour'"
+    };
+    sqlx::query(&format!(
+        "INSERT INTO retained_response_resurrection_fences (object_id, reason, expires_at) \
+         VALUES ($1, $2, statement_timestamp() {offset})",
+    ))
+    .bind(id)
+    .bind(reason)
+    .execute(pool)
+    .await
+    .expect("fence fixture must insert");
+}
+
+#[sqlx::test]
+async fn expired_fence_cleanup_is_bounded_and_idempotent(pool: PgPool) {
+    let manager = retirement_manager(&pool).await;
+    let expired: Vec<Uuid> = (0..3).map(|_| Uuid::new_v4()).collect();
+    for id in &expired {
+        install_fence(&pool, *id, "archived", true).await;
+    }
+    let live = Uuid::new_v4();
+    install_fence(&pool, live, "erased", false).await;
+
+    assert_eq!(manager.cleanup_expired_response_fences(2).await.unwrap(), 2);
+    assert_eq!(manager.cleanup_expired_response_fences(2).await.unwrap(), 1);
+    assert_eq!(manager.cleanup_expired_response_fences(2).await.unwrap(), 0);
+    let survivors: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT object_id FROM retained_response_resurrection_fences ORDER BY object_id",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(survivors, vec![live]);
+}
+
+#[sqlx::test]
+async fn expired_fence_cleanup_rechecks_a_concurrent_renewal_at_deletion_time(pool: PgPool) {
+    let manager = retirement_manager(&pool).await;
+    let contended = Uuid::new_v4();
+    install_fence(&pool, contended, "archived", true).await;
+
+    // A concurrent destructive lifecycle action holds the fence row lock and
+    // upgrades/renews it. SKIP LOCKED must skip the row, and after the renewal
+    // commits the deletion-time recheck must observe the extended expiry.
+    let mut renewal = pool.begin().await.unwrap();
+    sqlx::query(
+        "UPDATE retained_response_resurrection_fences \
+         SET reason = 'erased', \
+             expires_at = GREATEST(expires_at, statement_timestamp() + INTERVAL '1 hour') \
+         WHERE object_id = $1",
+    )
+    .bind(contended)
+    .execute(&mut *renewal)
+    .await
+    .unwrap();
+    assert_eq!(
+        manager.cleanup_expired_response_fences(10).await.unwrap(),
+        0
+    );
+    renewal.commit().await.unwrap();
+
+    assert_eq!(
+        manager.cleanup_expired_response_fences(10).await.unwrap(),
+        0
+    );
+    let (reason, live): (String, bool) = sqlx::query_as(
+        "SELECT reason, expires_at > statement_timestamp() \
+         FROM retained_response_resurrection_fences WHERE object_id = $1",
+    )
+    .bind(contended)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(reason, "erased");
+    assert!(
+        live,
+        "a renewed explicit-erasure fence must survive cleanup"
+    );
+}
+
+#[sqlx::test]
+async fn expired_fence_cleanup_validates_its_bound(pool: PgPool) {
+    let manager = retirement_manager(&pool).await;
+    assert!(manager.cleanup_expired_response_fences(-1).await.is_err());
+    assert_eq!(manager.cleanup_expired_response_fences(0).await.unwrap(), 0);
+}
