@@ -213,8 +213,6 @@ mod tests {
 
     #[sqlx::test(migrations = false)]
     async fn failed_gain_cleans_up_unlocks_and_retries(pool: PgPool) {
-        tokio::time::pause();
-
         let lock_id = 8_204_921_019_i64;
         let is_leader = Arc::new(AtomicBool::new(false));
         let gain_attempts = Arc::new(AtomicUsize::new(0));
@@ -222,7 +220,13 @@ mod tests {
         let shutdown = CancellationToken::new();
         // Hold this session for the whole test so lock checks cannot reuse the
         // leader's pooled session and get PostgreSQL's re-entrant-lock result.
+        // Every physical connection is established BEFORE pausing time: under a
+        // paused clock, tokio auto-advance can expire sqlx's acquire timeout
+        // while a fresh TCP connect is still in flight.
         let mut contender = pool.acquire().await.unwrap();
+        let warm_leader_connection = pool.acquire().await.unwrap();
+        drop(warm_leader_connection);
+        tokio::time::pause();
 
         let task = tokio::spawn(leader_election_task(
             pool.clone(),
