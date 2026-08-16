@@ -366,6 +366,48 @@ bounded chunks by an independent cleanup phase.
 Movement and partition maintenance emit only
 aggregate counts and fixed phase labels, never request identifiers or content.
 
+### Rollout ordering and rollback boundaries
+
+The complete deployment sequence is expand-only and each destructive control
+is enabled separately, in order, only after the previous stage has been
+observed healthy:
+
+1. Build the candidate index with `CREATE INDEX CONCURRENTLY` as a monitored
+   standalone operation; application migrations never build indexes on
+   existing hot tables.
+2. Apply the expand-only migration. It only adds new relations and helpers;
+   it never scans, rewrites, or locks the existing request, template, or
+   response-step heaps, and deploying it moves no data.
+3. Roll out an archive-aware reader fleet everywhere before any movement, so
+   every running process can resolve retained routes.
+4. Verify prerequisites with the read-only preflight
+   (`.github/scripts/check-retained-response-indexes.sql`): exact index
+   readiness, exactly attached daily partitions, no unexplained
+   detach-pending child, and the installed schema generation. Confirm the
+   partition-runway gauge reports the full configured horizon.
+5. Enable steady-state movement with minimal graph and byte budgets, observe
+   write amplification, replication, pool, and latency signals, then ramp.
+6. Enable backfill for non-expired history under the same bounds.
+7. Run the separately gated one-time drain for content that is already past
+   its retention period.
+8. Enable daily partition retirement last, after installing the dedicated
+   single-session maintenance connection.
+
+Rollback boundaries: before step 5 every change is reversible by disabling
+flags and (only on an empty lifecycle) reverting the expand migration — the
+down migration fails closed while any retained object, route, or unfinished
+retirement exists. After movement has run, roll back only to archive-aware
+reader versions; content already in retained partitions is served through
+routes and must not be abandoned by downgrading readers below step 3. After
+the first partition drop, retirement is irreversible by design; an unfinished
+retirement journal must keep an enabled maintenance owner until it completes.
+
+Abort and hold conditions: stop the ramp if the preflight fails, the runway
+gauge falls behind the horizon, retirement retries persist, mover integrity
+errors appear, or read-parity/latency regressions are observed. All of these
+are content-free signals exported by the daemon; none require inspecting
+customer data.
+
 Ordinary pending-count queries exclude background demand. To expose it, use an
 explicit `ServiceTierFilter::Include(vec![Some("background".to_string())])`; results use a
 separate `"background"` bucket per model and combine batched and batchless
