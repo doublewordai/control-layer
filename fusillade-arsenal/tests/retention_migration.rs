@@ -856,3 +856,66 @@ async fn adds_retained_response_parent_without_rewriting_live_heaps(pool: sqlx::
         .expect("the empty up/down cycle must remain reversible");
     assert_eq!(live_heap_identities(&pool).await, live_heaps_before);
 }
+
+#[sqlx::test]
+async fn preflight_script_verifies_index_partitions_and_journal_state(pool: sqlx::PgPool) {
+    let script = include_str!("../../.github/scripts/check-retained-response-indexes.sql");
+
+    // Without the operator-built candidate index the preflight must fail.
+    let error = sqlx::raw_sql(script)
+        .execute(&pool)
+        .await
+        .expect_err("preflight must fail before the candidate index exists");
+    assert!(
+        error
+            .to_string()
+            .contains("idx_requests_batchless_retention_due"),
+        "unexpected preflight failure: {error}"
+    );
+
+    sqlx::raw_sql(
+        r#"
+        CREATE INDEX idx_requests_batchless_retention_due
+        ON requests (
+          service_tier,
+          (CASE state WHEN 'completed' THEN completed_at
+                      WHEN 'failed' THEN failed_at
+                      WHEN 'canceled' THEN canceled_at END),
+          id
+        )
+        WHERE batch_id IS NULL
+          AND state IN ('completed', 'failed', 'canceled')
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("SELECT ensure_retained_response_partitions(CURRENT_DATE, 2)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::raw_sql(script)
+        .execute(&pool)
+        .await
+        .expect("a fully prepared schema must pass the preflight");
+
+    // A partition the lifecycle metadata does not describe must fail closed.
+    sqlx::raw_sql(
+        "CREATE TABLE retained_response_objects_d20990101
+             PARTITION OF retained_response_objects
+             FOR VALUES FROM ('2099-01-01') TO ('2099-01-02')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let error = sqlx::raw_sql(script)
+        .execute(&pool)
+        .await
+        .expect_err("an unmanaged partition must fail the preflight");
+    assert!(
+        error
+            .to_string()
+            .contains("not described by a lifecycle bucket"),
+        "unexpected preflight failure: {error}"
+    );
+}
