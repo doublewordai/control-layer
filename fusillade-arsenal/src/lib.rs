@@ -14,8 +14,7 @@ mod utils;
 
 pub use fusillade_core::manager::{
     ArchiveOutcome, BackgroundClaimKind, DaemonStorage, ModelFilter, ModelFilterState,
-    RetainedResponseWriteError, RetentionSweepCutoffs, RetentionSweepOutcome, RetentionSweepPolicy,
-    Storage,
+    RetainedResponseWriteError, RetentionSweepPolicy, Storage,
 };
 pub use fusillade_core::request::AnyRequest;
 pub use fusillade_core::response_step;

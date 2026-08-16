@@ -17,9 +17,8 @@ pub use fusillade_core::manager::{
     ArchiveOutcome, BackgroundClaimKind, DaemonStorage, ModelFilter, ModelFilterState,
     RetainedResponseArchiveCutoffs, RetainedResponseArchiveOutcome,
     RetainedResponseMaintenanceError, RetainedResponsePartitionRunway,
-    RetainedResponseRetirementOutcome, RetainedResponseWriteError, RetentionCutoffs,
-    RetentionMaintenanceOutcome, RetentionSweepCutoffs, RetentionSweepOutcome,
-    RetentionSweepPolicy, Storage, TrailingDemandCount,
+    RetainedResponseRetirementOutcome, RetainedResponseWriteError, RetentionSweepPolicy, Storage,
+    TrailingDemandCount,
 };
 
 /// Daemon executor trait for runtime orchestration.
