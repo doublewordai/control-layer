@@ -227,10 +227,8 @@ impl RetentionMaintenanceConfig {
         self
     }
 
-    /// Set the reserved retirement control.
-    ///
-    /// Enabling this is rejected at startup until a later release installs a
-    /// supervised retained-response retirement consumer.
+    /// Enable or disable selection of newly eligible daily response buckets.
+    /// Durable unfinished retirements remain recoverable while this is false.
     pub fn with_retained_response_retirement_enabled(mut self, enabled: bool) -> Self {
         self.retained_response_retirement_enabled = enabled;
         self
@@ -266,7 +264,7 @@ impl RetentionMaintenanceConfig {
         self.retained_response_partitions_days_ahead
     }
 
-    /// Whether the reserved retained-response retirement control is enabled.
+    /// Whether selection of newly eligible retained-response buckets is enabled.
     pub fn retained_response_retirement_enabled(&self) -> bool {
         self.retained_response_retirement_enabled
     }

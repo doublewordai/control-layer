@@ -4,6 +4,101 @@ use fusillade_arsenal::MIGRATOR;
 
 const RETENTION_MIGRATION: i64 = 20260813000000;
 
+#[sqlx::test]
+async fn retained_response_retirement_journal_requires_full_daily_identity(pool: sqlx::PgPool) {
+    let columns: Vec<String> = sqlx::query_scalar(
+        r#"
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_schema = current_schema()
+          AND table_name = 'retention_partition_retirements'
+        ORDER BY ordinal_position
+        "#,
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("retirement journal columns must be readable");
+    for required in [
+        "partition_schema",
+        "partition_schema_oid",
+        "parent_oid",
+        "lower_bound",
+        "upper_bound",
+    ] {
+        assert!(
+            columns.iter().any(|column| column == required),
+            "missing exact retirement identity column {required}"
+        );
+    }
+
+    sqlx::query(
+        "INSERT INTO retention_partition_retirements \
+         (parent_table, partition_table, partition_oid) \
+         VALUES ('batch_requests_archive', 'batch_requests_archive_y2038w20', 1)",
+    )
+    .execute(&pool)
+    .await
+    .expect("legacy weekly journal rows may omit daily identity");
+
+    let incomplete = sqlx::query(
+        "INSERT INTO retention_partition_retirements \
+         (parent_table, partition_table, partition_oid) \
+         VALUES ('retained_response_objects', 'retained_response_objects_d20380517', 2)",
+    )
+    .execute(&pool)
+    .await
+    .expect_err("daily retirement identity must be complete");
+    assert_eq!(
+        incomplete
+            .as_database_error()
+            .and_then(|error| error.code())
+            .as_deref(),
+        Some("23514")
+    );
+
+    let wrong_bounds = sqlx::query(
+        r#"
+        INSERT INTO retention_partition_retirements (
+            parent_table, partition_table, partition_oid,
+            partition_schema, partition_schema_oid, parent_oid,
+            lower_bound, upper_bound
+        ) VALUES (
+            'retained_response_objects', 'retained_response_objects_d20380517', 2,
+            current_schema(), 3, 4, DATE '2038-05-17', DATE '2038-05-19'
+        )
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .expect_err("retained-response journal bounds must span exactly one day");
+    assert_eq!(
+        wrong_bounds
+            .as_database_error()
+            .and_then(|error| error.code())
+            .as_deref(),
+        Some("23514")
+    );
+
+    let cleanup_index: Option<String> = sqlx::query_scalar(
+        r#"
+        SELECT pg_get_indexdef(index_relation.oid)
+        FROM pg_class index_relation
+        JOIN pg_namespace namespace ON namespace.oid = index_relation.relnamespace
+        WHERE namespace.nspname = current_schema()
+          AND index_relation.relname = 'idx_retained_response_group_routes_bucket_group'
+        "#,
+    )
+    .fetch_optional(&pool)
+    .await
+    .expect("cleanup index catalog must be readable");
+    assert!(
+        cleanup_index
+            .as_deref()
+            .is_some_and(|definition| definition.contains("(delete_on, group_id)")),
+        "route cleanup requires ordered delete-day/group lookup support"
+    );
+}
+
 async fn live_heap_identities(pool: &sqlx::PgPool) -> Vec<(String, i64, i64)> {
     sqlx::query_as(
         r#"
@@ -480,7 +575,7 @@ async fn adds_retained_response_parent_without_rewriting_live_heaps(pool: sqlx::
         .await
         .unwrap();
     let runway_lock_key: i64 = sqlx::query_scalar(
-        "SELECT hashtextextended('retained_response_objects.partition:' || $1 || ':2038-06-01', 0)",
+        "SELECT hashtextextended('retained_response_objects.partition:' || $1 || ':20380601', 0)",
     )
     .bind(&schema_name)
     .fetch_one(&pool)

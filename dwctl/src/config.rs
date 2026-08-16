@@ -1628,6 +1628,33 @@ pub enum DaemonMode {
     BatchOnly,
 }
 
+/// A database endpoint accepted from configuration but never exposed through
+/// debug output or serialized configuration snapshots.
+#[derive(Clone, Deserialize)]
+#[serde(transparent)]
+pub struct SensitiveDatabaseUrl(String);
+
+impl SensitiveDatabaseUrl {
+    pub(crate) fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for SensitiveDatabaseUrl {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("<redacted>")
+    }
+}
+
+impl Serialize for SensitiveDatabaseUrl {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str("<redacted>")
+    }
+}
+
 impl From<DaemonMode> for fusillade::DaemonMode {
     fn from(mode: DaemonMode) -> Self {
         match mode {
@@ -1854,6 +1881,14 @@ pub struct DaemonConfig {
     /// the retirement implementation is introduced separately.
     #[serde(default)]
     pub retained_response_retirement_enabled: bool,
+
+    /// Explicit direct/session-capable primary endpoint used only for
+    /// retained-response partition DDL. Dedicated Fusillade databases require
+    /// this attestation; schema mode may reuse the application's already-direct
+    /// primary while preserving its search path. Never serialized in config
+    /// snapshots and redacted from debug output.
+    #[serde(default, skip_serializing)]
+    pub retained_response_partition_maintenance_url: Option<SensitiveDatabaseUrl>,
 
     /// Request paths whose batch traffic is dispatched as a stream so the provider
     /// reports token usage, then reassembled back into a single JSON body before it
@@ -2193,6 +2228,7 @@ impl Default for DaemonConfig {
             batchless_archive_bytes_per_tick: default_batchless_archive_bytes_per_tick(),
             retained_response_partitions_days_ahead: default_retained_response_partitions_days_ahead(),
             retained_response_retirement_enabled: false,
+            retained_response_partition_maintenance_url: None,
             streamable_endpoints: Vec::new(),
             urgency_weight: default_urgency_weight(),
             inject_deadline_priority: false,
@@ -3017,29 +3053,41 @@ impl Config {
         }
         let retention_enabled = self.background_services.batch_daemon.retention.is_enabled();
         let daemon = &self.background_services.batch_daemon;
+        let owns_archive_maintenance = !matches!(daemon.mode, DaemonMode::RequestOnly);
         let batchless_policy_configured = !daemon.retention.batchless_seconds_by_service_tier.is_empty();
         let batchless_movement_enabled = daemon.batchless_archive_sweep_enabled || daemon.batchless_archive_backfill_enabled;
-        if (batchless_movement_enabled || daemon.retained_response_retirement_enabled) && !batchless_policy_configured {
+        if owns_archive_maintenance
+            && (batchless_movement_enabled || daemon.retained_response_retirement_enabled)
+            && !batchless_policy_configured
+        {
             return Err(Error::Internal {
                 operation: "Config validation: batchless retention policy is required for retained-response maintenance".to_string(),
             });
         }
-        if daemon.retained_response_retirement_enabled {
+        if owns_archive_maintenance
+            && daemon.retained_response_retirement_enabled
+            && matches!(self.database.fusillade(), ComponentDb::Dedicated { .. })
+            && daemon.retained_response_partition_maintenance_url.is_none()
+        {
             return Err(Error::Internal {
-                operation: "Config validation: retained-response partition retirement is not scheduled in this release".to_string(),
+                operation: "Config validation: retained-response partition retirement on a dedicated database requires an explicit direct session endpoint".to_string(),
             });
         }
-        if batchless_movement_enabled && (daemon.batchless_archive_groups_per_tick <= 0 || daemon.batchless_archive_bytes_per_tick <= 0) {
+        if owns_archive_maintenance
+            && batchless_movement_enabled
+            && (daemon.batchless_archive_groups_per_tick <= 0 || daemon.batchless_archive_bytes_per_tick <= 0)
+        {
             return Err(Error::Internal {
                 operation: "Config validation: batchless archive group and byte budgets must be positive".to_string(),
             });
         }
-        if batchless_policy_configured && daemon.retained_response_partitions_days_ahead <= 0 {
+        if owns_archive_maintenance && batchless_policy_configured && daemon.retained_response_partitions_days_ahead <= 0 {
             return Err(Error::Internal {
                 operation: "Config validation: retained-response partition runway must be positive".to_string(),
             });
         }
-        if batchless_movement_enabled
+        if owns_archive_maintenance
+            && batchless_movement_enabled
             && daemon
                 .retention
                 .batchless_seconds_by_service_tier
@@ -3051,7 +3099,8 @@ impl Config {
                     .to_string(),
             });
         }
-        if batchless_movement_enabled
+        if owns_archive_maintenance
+            && batchless_movement_enabled
             && daemon
                 .retention
                 .batchless_seconds_by_service_tier
@@ -3063,12 +3112,13 @@ impl Config {
                     .to_string(),
             });
         }
-        if retention_enabled && self.background_services.batch_daemon.enabled == DaemonEnabled::Never {
+        if owns_archive_maintenance && retention_enabled && self.background_services.batch_daemon.enabled == DaemonEnabled::Never {
             return Err(Error::Internal {
                 operation: "Config validation: automated retention requires the batch daemon to run".to_string(),
             });
         }
-        if retention_enabled
+        if owns_archive_maintenance
+            && retention_enabled
             && (self.background_services.batch_daemon.purge_interval_ms == 0 || self.background_services.batch_daemon.purge_batch_size < 1)
         {
             return Err(Error::Internal {
@@ -3416,6 +3466,7 @@ mod tests {
         assert!(!daemon.batchless_archive_sweep_enabled);
         assert!(!daemon.batchless_archive_backfill_enabled);
         assert!(!daemon.retained_response_retirement_enabled);
+        assert!(daemon.retained_response_partition_maintenance_url.is_none());
         assert!(daemon.batchless_archive_groups_per_tick > 0);
         assert!(daemon.batchless_archive_bytes_per_tick > 0);
         assert!(daemon.retained_response_partitions_days_ahead > 0);
@@ -3501,16 +3552,45 @@ mod tests {
     }
 
     #[test]
-    fn retained_response_retirement_is_rejected_with_a_valid_batchless_policy() {
+    fn retained_response_retirement_accepts_a_valid_batchless_policy_in_schema_mode() {
         let mut config = Config::default();
         configure_batchless_retention(&mut config);
         config.background_services.batch_daemon.retained_response_retirement_enabled = true;
 
-        let error = config
-            .validate()
-            .expect_err("retirement has no scheduled consumer in this release")
-            .to_string();
-        assert!(error.contains("retirement is not scheduled"));
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn maintenance_endpoint_is_redacted_and_never_serialized() {
+        let mut daemon = DaemonConfig::default();
+        daemon.retained_response_partition_maintenance_url = Some(SensitiveDatabaseUrl(
+            "postgres://secret-user:secret-password@db.invalid/fusillade".to_string(),
+        ));
+        let debug = format!("{daemon:?}");
+        assert!(!debug.contains("secret-user"));
+        assert!(!debug.contains("secret-password"));
+        let serialized = serde_json::to_value(&daemon).unwrap();
+        assert!(serialized.get("retained_response_partition_maintenance_url").is_none());
+
+        let mut input = serde_json::to_value(DaemonConfig::default()).unwrap();
+        input["retained_response_partition_maintenance_url"] = serde_json::json!("postgres://configured.invalid/fusillade");
+        let parsed: DaemonConfig = serde_json::from_value(input).unwrap();
+        assert_eq!(
+            parsed
+                .retained_response_partition_maintenance_url
+                .as_ref()
+                .map(SensitiveDatabaseUrl::expose),
+            Some("postgres://configured.invalid/fusillade")
+        );
+    }
+
+    #[test]
+    fn request_only_ignores_shared_retirement_selection_configuration() {
+        let mut config = Config::default();
+        config.secret_key = Some("test-secret-key".to_string());
+        config.background_services.batch_daemon.mode = DaemonMode::RequestOnly;
+        config.background_services.batch_daemon.retained_response_retirement_enabled = true;
+        assert!(config.validate().is_ok());
     }
 
     #[test]

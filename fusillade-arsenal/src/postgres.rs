@@ -40,8 +40,8 @@ use crate::daemon::{
 use crate::error::{FusilladeError, Result};
 use crate::manager::{
     RetainedResponseArchiveCutoffs, RetainedResponseArchiveOutcome,
-    RetainedResponsePartitionRunway, RetainedResponseWriteError, RetentionSweepCutoffs,
-    RetentionSweepOutcome, RetentionSweepPolicy, TrailingDemandCount,
+    RetainedResponsePartitionRunway, RetainedResponseRetirementOutcome, RetainedResponseWriteError,
+    RetentionSweepCutoffs, RetentionSweepOutcome, RetentionSweepPolicy, TrailingDemandCount,
 };
 use crate::request::{
     Canceled, CascadeTargetState, Claimed, Completed, CreateBackgroundInput, CreateFlexInput,
@@ -55,6 +55,7 @@ use crate::request::{
 // later rollout step.
 #[allow(dead_code)]
 pub(crate) mod retained_response;
+pub(crate) mod retained_response_retirement;
 
 use super::utils::{
     calculate_error_message_size, calculate_response_body_size, estimate_error_file_size,
@@ -140,6 +141,9 @@ pub struct PostgresRequestManager<P: PoolProvider> {
     pools: P,
     config: PostgresStorageConfig,
     retained_response_fence_seconds: Option<u64>,
+    partition_maintenance_pool: Option<sqlx::PgPool>,
+    partition_maintenance_attested: bool,
+    partition_maintenance_lease_owner: Uuid,
     state_write_limiter: StateWriteLimiter,
     db_retry_config: crate::DbRetryConfig,
     download_buffer_size: usize,
@@ -369,6 +373,9 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
             pools,
             config,
             retained_response_fence_seconds: None,
+            partition_maintenance_pool: None,
+            partition_maintenance_attested: false,
+            partition_maintenance_lease_owner: Uuid::new_v4(),
             state_write_limiter,
             db_retry_config: crate::DbRetryConfig::default(),
             download_buffer_size: 100,
@@ -421,6 +428,139 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
     /// Return the configured content-free resurrection-fence lifetime.
     pub fn retained_response_fence_seconds(&self) -> Option<u64> {
         self.retained_response_fence_seconds
+    }
+
+    /// Install the single-session pool used only for partition-maintenance
+    /// DDL. The pool shape is validated here so enabling retirement can be
+    /// checked synchronously before a daemon acquires leadership.
+    pub fn with_partition_maintenance_pool(mut self, pool: sqlx::PgPool) -> Result<Self> {
+        if pool.options().get_max_connections() != 1 || pool.options().get_min_connections() != 0 {
+            return Err(FusilladeError::ValidationError(
+                "partition maintenance pool must use max_connections=1 and min_connections=0"
+                    .to_string(),
+            ));
+        }
+        self.partition_maintenance_pool = Some(pool);
+        self.partition_maintenance_attested = false;
+        Ok(self)
+    }
+
+    /// Prove that the installed session pool targets the same live writable
+    /// database, role, schema generation, and retained-response parent as the
+    /// ordinary primary pool. Callers perform this once during startup;
+    /// retirement capability remains unavailable until it succeeds.
+    pub async fn attest_partition_maintenance_pool(mut self) -> Result<Self> {
+        use sqlx::postgres::types::Oid;
+
+        /// One pool's observed identity: database, role, schema, schema OID,
+        /// retained parent OID, primary/writable flags, and parent ownership.
+        type MaintenanceTarget = (String, String, String, Oid, Option<Oid>, bool, bool, bool);
+
+        let maintenance = self.partition_maintenance_pool.as_ref().ok_or_else(|| {
+            crate::manager::RetainedResponseMaintenanceError::PartitionMaintenancePoolMissing
+                .into_fusillade_error()
+        })?;
+        let target_sql = r#"
+            SELECT current_database(), current_user, current_schema(),
+                   namespace.oid,
+                   parent.oid,
+                   NOT pg_is_in_recovery(),
+                   current_setting('transaction_read_only') = 'off',
+                   COALESCE(pg_has_role(current_user, parent.relowner, 'USAGE'), FALSE)
+            FROM pg_namespace namespace
+            LEFT JOIN pg_class parent
+              ON parent.relnamespace = namespace.oid
+             AND parent.relname = 'retained_response_objects'
+            WHERE namespace.nspname = current_schema()
+        "#;
+        let ordinary: Option<MaintenanceTarget> = sqlx::query_as(target_sql)
+            .fetch_optional(self.pools.write())
+            .await
+            .map_err(|_| {
+                FusilladeError::ValidationError(
+                    "partition maintenance target attestation failed".to_string(),
+                )
+            })?;
+        let session: Option<MaintenanceTarget> = sqlx::query_as(target_sql)
+            .fetch_optional(maintenance)
+            .await
+            .map_err(|_| {
+                FusilladeError::ValidationError(
+                    "partition maintenance target attestation failed".to_string(),
+                )
+            })?;
+        let exact = ordinary
+            .as_ref()
+            .is_some_and(|target| target.4.is_some() && target.5 && target.6 && target.7)
+            && ordinary == session;
+        if !exact {
+            return Err(FusilladeError::ValidationError(
+                "partition maintenance pool must target the exact writable retained response schema"
+                    .to_string(),
+            ));
+        }
+
+        // Static catalog identity alone can false-pass against a database
+        // cloned from the same template. Prove both pools reach the same live
+        // advisory-lock namespace using transaction-scoped locks so cleanup
+        // is guaranteed by rollback and cannot leak through a pooled session.
+        let lock_key = i64::from_ne_bytes(
+            *Uuid::new_v4()
+                .as_bytes()
+                .first_chunk()
+                .expect("a UUID always contains at least eight bytes"),
+        );
+        let attestation_failed = || {
+            FusilladeError::ValidationError(
+                "partition maintenance target attestation failed".to_string(),
+            )
+        };
+        let mut ordinary_transaction = self
+            .pools
+            .write()
+            .begin()
+            .await
+            .map_err(|_| attestation_failed())?;
+        if sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(lock_key)
+            .execute(&mut *ordinary_transaction)
+            .await
+            .is_err()
+        {
+            ordinary_transaction
+                .rollback()
+                .await
+                .map_err(|_| attestation_failed())?;
+            return Err(attestation_failed());
+        }
+        let mut maintenance_transaction = match maintenance.begin().await {
+            Ok(transaction) => transaction,
+            Err(_) => {
+                ordinary_transaction
+                    .rollback()
+                    .await
+                    .map_err(|_| attestation_failed())?;
+                return Err(attestation_failed());
+            }
+        };
+        let try_lock = sqlx::query_scalar::<_, bool>("SELECT pg_try_advisory_xact_lock($1)")
+            .bind(lock_key)
+            .fetch_one(&mut *maintenance_transaction)
+            .await;
+        let maintenance_rollback = maintenance_transaction.rollback().await;
+        let ordinary_rollback = ordinary_transaction.rollback().await;
+        if maintenance_rollback.is_err() || ordinary_rollback.is_err() {
+            return Err(attestation_failed());
+        }
+        let same_live_database = !try_lock.map_err(|_| attestation_failed())?;
+        if !same_live_database {
+            return Err(FusilladeError::ValidationError(
+                "partition maintenance pool must target the exact writable retained response schema"
+                    .to_string(),
+            ));
+        }
+        self.partition_maintenance_attested = true;
+        Ok(self)
     }
 
     /// Set the retry cadence for transient database failures.
@@ -8353,6 +8493,25 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
 
     fn supports_retained_response_lifecycle(&self) -> bool {
         true
+    }
+
+    fn supports_retained_response_partition_retirement(&self) -> bool {
+        self.partition_maintenance_pool.is_some() && self.partition_maintenance_attested
+    }
+
+    fn supports_retained_response_route_cleanup(&self) -> bool {
+        self.retained_response_fence_seconds.is_some()
+    }
+
+    async fn retire_expired_response_partition(
+        &self,
+        select_new: bool,
+    ) -> Result<RetainedResponseRetirementOutcome> {
+        retained_response_retirement::retire_expired_response_partition(self, select_new).await
+    }
+
+    async fn cleanup_retained_response_routes(&self, limit: i64) -> Result<u64> {
+        retained_response_retirement::cleanup_retained_response_routes(self, limit).await
     }
 
     async fn retained_response_archive_index_ready(&self) -> Result<bool> {

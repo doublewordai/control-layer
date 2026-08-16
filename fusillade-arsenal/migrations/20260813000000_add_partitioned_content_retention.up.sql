@@ -118,6 +118,8 @@ CREATE TABLE retained_response_group_routes (
     group_id UUID PRIMARY KEY,
     delete_on DATE NOT NULL REFERENCES retained_response_buckets(delete_on)
 );
+CREATE INDEX idx_retained_response_group_routes_bucket_group
+    ON retained_response_group_routes (delete_on, group_id);
 
 CREATE TABLE retained_response_request_routes (
     request_id UUID PRIMARY KEY,
@@ -163,11 +165,29 @@ CREATE TABLE retention_partition_retirements (
     parent_table TEXT NOT NULL,
     partition_table TEXT NOT NULL,
     partition_oid OID NOT NULL,
+    partition_schema TEXT,
+    partition_schema_oid OID,
+    parent_oid OID,
+    lower_bound DATE,
+    upper_bound DATE,
     requested_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     completed_at TIMESTAMPTZ,
     lease_owner UUID,
     lease_expires_at TIMESTAMPTZ,
-    PRIMARY KEY (parent_table, partition_table)
+    PRIMARY KEY (parent_table, partition_table),
+    CONSTRAINT retained_response_retirement_identity_complete CHECK (
+        parent_table <> 'retained_response_objects'
+        OR (
+            partition_schema IS NOT NULL
+            AND partition_schema_oid IS NOT NULL
+            AND parent_oid IS NOT NULL
+            AND lower_bound IS NOT NULL
+            AND upper_bound IS NOT NULL
+            AND upper_bound = lower_bound + 1
+            AND partition_table =
+                'retained_response_objects_d' || to_char(lower_bound, 'YYYYMMDD')
+        )
+    )
 );
 
 COMMENT ON TABLE retention_partition_retirements IS
@@ -260,7 +280,7 @@ BEGIN
     PERFORM pg_advisory_xact_lock(
         hashtextextended(
             'retained_response_objects.partition:' || schema_name || ':'
-                || target_delete_on::text,
+                || to_char(target_delete_on, 'YYYYMMDD'),
             0
         )
     );
@@ -399,7 +419,7 @@ BEGIN
         PERFORM pg_advisory_xact_lock(
             hashtextextended(
                 'retained_response_objects.partition:' || current_schema() || ':'
-                    || target_delete_on::text,
+                    || to_char(target_delete_on, 'YYYYMMDD'),
                 0
             )
         );

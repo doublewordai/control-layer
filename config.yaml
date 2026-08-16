@@ -691,7 +691,15 @@ background_services:
     # batchless_archive_groups_per_tick: <positive bound>
     # batchless_archive_bytes_per_tick: <positive bound>
     # retained_response_partitions_days_ahead: <positive runway>
-    # retained_response_retirement_enabled: false # Reserved; no retirement task runs yet
+    # Daily partition retirement irreversibly drops whole expired
+    # retained-response partitions. It is independently disabled and needs a
+    # session-capable direct primary connection: in schema mode the primary
+    # connection is reused, while a dedicated fusillade database requires the
+    # explicit direct (non-pooled) endpoint below. Keep the endpoint
+    # configured until every journaled retirement has completed, even if the
+    # enable flag is turned back off.
+    # retained_response_retirement_enabled: false
+    # retained_response_partition_maintenance_url: <direct session-capable postgres endpoint>
 
     # Batch archive (fusillade phase 3): moves frozen terminal batches' rows
     # from fusillade.requests into the partitioned batch_requests_archive.

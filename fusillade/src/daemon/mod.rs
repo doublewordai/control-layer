@@ -23,7 +23,8 @@ use crate::batch::BatchId;
 use crate::error::Result;
 use crate::http::HttpClient;
 use crate::manager::{
-    ArchiveOutcome, DaemonStorage, RetainedResponseArchiveCutoffs, RetentionSweepPolicy, Storage,
+    ArchiveOutcome, DaemonStorage, RetainedResponseArchiveCutoffs,
+    RetainedResponseRetirementOutcome, RetentionSweepPolicy, Storage,
 };
 use crate::processor::{DefaultRequestProcessor, RequestProcessor};
 use crate::request::{Claimed, DaemonId, FailureReason, Request, RequestCompletionResult};
@@ -515,6 +516,99 @@ async fn run_retained_response_readiness_loop<S>(
     }
 }
 
+async fn run_retained_response_retirement_loop<S>(
+    storage: Arc<S>,
+    shutdown: tokio_util::sync::CancellationToken,
+    query_timeout: Duration,
+    select_new: bool,
+    period: Duration,
+) where
+    S: DaemonStorage + 'static,
+{
+    loop {
+        let outcome = maintenance_query(
+            &shutdown,
+            "retained response partition retirement",
+            query_timeout,
+            storage.retire_expired_response_partition(select_new),
+        )
+        .await;
+        let next_tick = match outcome {
+            Ok(Some(RetainedResponseRetirementOutcome::Retired)) => {
+                counter!("fusillade_retained_response_partitions_retired_total").increment(1);
+                // Each storage transaction still retires at most one exact
+                // relation. A short yield drains an existing multi-day
+                // backlog without turning completion into a hot loop.
+                period.min(Duration::from_secs(1))
+            }
+            Ok(Some(RetainedResponseRetirementOutcome::Retryable)) => {
+                counter!("fusillade_retained_response_partition_retirement_retries_total")
+                    .increment(1);
+                period.min(Duration::from_secs(30))
+            }
+            // PostgreSQL's UTC date remains authoritative. Polling at a
+            // bounded cadence notices a new database day without relying on
+            // the pod clock or sleeping a nearly full extra day.
+            Ok(Some(RetainedResponseRetirementOutcome::NoCandidate)) => {
+                period.min(Duration::from_secs(300))
+            }
+            Ok(None) => break,
+            Err(_) => {
+                // The storage contract intentionally returns only content-free
+                // failures here. Keep logs aggregate-only even for alternate
+                // backend implementations.
+                crate::background_error!(
+                    "retained_response_partition_retirement_failed",
+                    Error,
+                    "Failed to retire retained-response partition"
+                );
+                period.min(Duration::from_secs(30))
+            }
+        };
+        tokio::select! {
+            _ = tokio::time::sleep(next_tick) => {},
+            _ = shutdown.cancelled() => break,
+        }
+    }
+}
+
+async fn run_retained_response_route_cleanup_loop<S>(
+    storage: Arc<S>,
+    shutdown: tokio_util::sync::CancellationToken,
+    query_timeout: Duration,
+    limit: i64,
+    period: Duration,
+) where
+    S: DaemonStorage + 'static,
+{
+    loop {
+        match maintenance_query(
+            &shutdown,
+            "retained response route cleanup",
+            query_timeout,
+            storage.cleanup_retained_response_routes(limit),
+        )
+        .await
+        {
+            Ok(Some(deleted)) => {
+                counter!("fusillade_retained_response_routes_cleaned_total").increment(deleted);
+            }
+            Ok(None) => break,
+            Err(_) => {
+                crate::background_error!(
+                    "retained_response_route_cleanup_failed",
+                    Error,
+                    "Failed to clean retained-response routes"
+                );
+            }
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(period) => {},
+            _ = shutdown.cancelled() => break,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct ArchiveMoverTick {
     worker: &'static str,
@@ -874,11 +968,6 @@ fn validate_retention_startup(
     config.policy().validate().map_err(|error| {
         FusilladeError::ValidationError(format!("invalid retention configuration: {error}"))
     })?;
-    if config.retained_response_retirement_enabled() {
-        return Err(FusilladeError::ValidationError(
-            "retained-response partition retirement is not scheduled in this release".to_string(),
-        ));
-    }
     if requested_mode == DaemonMode::RequestOnly {
         return Ok(());
     }
@@ -985,6 +1074,19 @@ fn validate_retention_startup(
     {
         return Err(FusilladeError::ValidationError(
             "automated retention requires an enabled orphan purge and a positive purge batch size"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_retirement_capability(
+    config: &RetentionMaintenanceConfig,
+    storage_supports_partition_retirement: bool,
+) -> Result<()> {
+    if config.retained_response_retirement_enabled() && !storage_supports_partition_retirement {
+        return Err(FusilladeError::ValidationError(
+            "retained-response partition retirement requires an explicit session-capable maintenance pool"
                 .to_string(),
         ));
     }
@@ -1393,6 +1495,13 @@ where
             mode,
             owns_archive_maintenance,
         )?;
+        if owns_archive_maintenance {
+            validate_retirement_capability(
+                &self.retention_maintenance,
+                self.storage
+                    .supports_retained_response_partition_retirement(),
+            )?;
+        }
         validate_retention_startup(
             &self.retention_maintenance,
             mode,
@@ -2892,6 +3001,35 @@ where
                 daemon_handles.push(("retained_response_readiness", retained_handle));
             }
 
+            if self
+                .storage
+                .supports_retained_response_partition_retirement()
+            {
+                let retirement_handle = tokio::spawn(run_retained_response_retirement_loop(
+                    self.storage.clone(),
+                    self.shutdown_token.clone(),
+                    query_timeout,
+                    self.retention_maintenance
+                        .retained_response_retirement_enabled(),
+                    Duration::from_secs(86_400),
+                ));
+                daemon_handles.push(("retained_response_retirement", retirement_handle));
+            }
+
+            if self.storage.supports_retained_response_route_cleanup()
+                && self.config.purge_interval_ms > 0
+                && self.config.purge_batch_size > 0
+            {
+                let route_cleanup_handle = tokio::spawn(run_retained_response_route_cleanup_loop(
+                    self.storage.clone(),
+                    self.shutdown_token.clone(),
+                    query_timeout,
+                    self.config.purge_batch_size,
+                    Duration::from_millis(self.config.purge_interval_ms),
+                ));
+                daemon_handles.push(("retained_response_route_cleanup", route_cleanup_handle));
+            }
+
             for (
                 worker,
                 batch_enabled,
@@ -3313,6 +3451,10 @@ mod tests {
         batch_list_calls: AtomicUsize,
         batch_move_calls: AtomicUsize,
         batchless_calls: AtomicUsize,
+        retirement_calls: AtomicUsize,
+        retirement_buckets: AtomicUsize,
+        retirement_select_new: std::sync::Mutex<Vec<bool>>,
+        route_cleanup_calls: AtomicUsize,
         batchless_cutoffs: std::sync::Mutex<Vec<RetainedResponseArchiveCutoffs>>,
         fail_weekly: std::sync::atomic::AtomicBool,
         fail_retained: std::sync::atomic::AtomicBool,
@@ -3335,6 +3477,10 @@ mod tests {
                 batch_list_calls: AtomicUsize::new(0),
                 batch_move_calls: AtomicUsize::new(0),
                 batchless_calls: AtomicUsize::new(0),
+                retirement_calls: AtomicUsize::new(0),
+                retirement_buckets: AtomicUsize::new(0),
+                retirement_select_new: std::sync::Mutex::new(Vec::new()),
+                route_cleanup_calls: AtomicUsize::new(0),
                 batchless_cutoffs: std::sync::Mutex::new(Vec::new()),
                 fail_weekly: std::sync::atomic::AtomicBool::new(false),
                 fail_retained: std::sync::atomic::AtomicBool::new(false),
@@ -3396,6 +3542,10 @@ mod tests {
             true
         }
 
+        fn supports_retained_response_partition_retirement(&self) -> bool {
+            true
+        }
+
         async fn retained_response_archive_index_ready(&self) -> Result<bool> {
             self.index_readiness_calls.fetch_add(1, Ordering::SeqCst);
             Ok(self.index_ready.load(Ordering::SeqCst))
@@ -3433,6 +3583,32 @@ mod tests {
                     required: self.retained_required.load(Ordering::SeqCst) as i64,
                 })
             }
+        }
+
+        async fn retire_expired_response_partition(
+            &self,
+            select_new: bool,
+        ) -> Result<crate::RetainedResponseRetirementOutcome> {
+            self.retirement_calls.fetch_add(1, Ordering::SeqCst);
+            self.retirement_select_new.lock().unwrap().push(select_new);
+            self.record("response_retirement");
+            let retired = self
+                .retirement_buckets
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    (remaining > 0).then(|| remaining - 1)
+                })
+                .is_ok();
+            Ok(if retired {
+                crate::RetainedResponseRetirementOutcome::Retired
+            } else {
+                crate::RetainedResponseRetirementOutcome::NoCandidate
+            })
+        }
+
+        async fn cleanup_retained_response_routes(&self, _limit: i64) -> Result<u64> {
+            self.route_cleanup_calls.fetch_add(1, Ordering::SeqCst);
+            self.record("response_route_cleanup");
+            Ok(0)
         }
 
         async fn archive_batch(&self, _batch_id: BatchId) -> Result<ArchiveOutcome> {
@@ -3608,6 +3784,94 @@ mod tests {
         shutdown.cancel();
         weekly_handle.await.unwrap();
         retained_handle.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn recovery_and_route_cleanup_run_even_when_runway_creation_fails() {
+        let storage = Arc::new(FakeMaintenanceStorage::default());
+        storage.fail_retained.store(true, Ordering::SeqCst);
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let ready = Arc::new(AtomicBool::new(false));
+        let runway = tokio::spawn(run_retained_response_readiness_loop(
+            storage.clone(),
+            shutdown.clone(),
+            Duration::from_secs(1),
+            configured_batchless_maintenance().policy().clone(),
+            7,
+            ready,
+            Duration::from_secs(86_400),
+        ));
+        let retirement = tokio::spawn(run_retained_response_retirement_loop(
+            storage.clone(),
+            shutdown.clone(),
+            Duration::from_secs(1),
+            false,
+            Duration::from_secs(86_400),
+        ));
+        let cleanup = tokio::spawn(run_retained_response_route_cleanup_loop(
+            storage.clone(),
+            shutdown.clone(),
+            Duration::from_secs(1),
+            10,
+            Duration::from_secs(60),
+        ));
+
+        tokio::task::yield_now().await;
+        assert_eq!(storage.retained_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(storage.retirement_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(storage.route_cleanup_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            *storage.retirement_select_new.lock().unwrap(),
+            vec![false],
+            "a disabled flag must still permit unfinished-journal recovery"
+        );
+
+        shutdown.cancel();
+        runway.await.unwrap();
+        retirement.await.unwrap();
+        cleanup.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retirement_drains_backlog_promptly_then_polls_the_date_boundary() {
+        let storage = Arc::new(FakeMaintenanceStorage::default());
+        storage.retirement_buckets.store(3, Ordering::SeqCst);
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let handle = tokio::spawn(run_retained_response_retirement_loop(
+            storage.clone(),
+            shutdown.clone(),
+            Duration::from_secs(30),
+            true,
+            Duration::from_secs(86_400),
+        ));
+
+        tokio::task::yield_now().await;
+        assert_eq!(storage.retirement_calls.load(Ordering::SeqCst), 1);
+        for expected_calls in 2..=4 {
+            tokio::time::advance(Duration::from_secs(1)).await;
+            tokio::task::yield_now().await;
+            assert_eq!(
+                storage.retirement_calls.load(Ordering::SeqCst),
+                expected_calls,
+                "each completed relation should lead to one bounded follow-up tick"
+            );
+        }
+        assert_eq!(storage.retirement_buckets.load(Ordering::SeqCst), 0);
+
+        tokio::time::advance(Duration::from_secs(299)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(storage.retirement_calls.load(Ordering::SeqCst), 4);
+        storage.retirement_buckets.store(1, Ordering::SeqCst);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            storage.retirement_calls.load(Ordering::SeqCst),
+            5,
+            "a newly eligible UTC day must be noticed on bounded cadence"
+        );
+
+        shutdown.cancel();
+        handle.await.unwrap();
     }
 
     #[tokio::test(start_paused = true)]
@@ -4259,22 +4523,81 @@ mod tests {
 
         let retirement_without_policy =
             RetentionMaintenanceConfig::default().with_retained_response_retirement_enabled(true);
-        for mode in [DaemonMode::Both, DaemonMode::RequestOnly] {
-            assert!(
-                validate_retention_startup(
-                    &retirement_without_policy,
-                    mode,
-                    mode != DaemonMode::RequestOnly,
-                    true,
-                    1,
-                    1,
-                    ArchiveMovementWindows::new(0.0, 600.0),
-                )
+        assert!(
+            validate_retention_startup(
+                &retirement_without_policy,
+                DaemonMode::Both,
+                true,
+                true,
+                1,
+                1,
+                ArchiveMovementWindows::new(0.0, 600.0),
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("batchless retention policy")
+        );
+        assert!(
+            validate_retention_startup(
+                &retirement_without_policy,
+                DaemonMode::RequestOnly,
+                false,
+                true,
+                1,
+                1,
+                ArchiveMovementWindows::new(0.0, 600.0),
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn enabled_retirement_requires_the_session_capability_before_startup() {
+        let config =
+            configured_batchless_maintenance().with_retained_response_retirement_enabled(true);
+        assert!(
+            validate_retirement_capability(&config, false)
                 .unwrap_err()
                 .to_string()
-                .contains("retirement is not scheduled")
-            );
-        }
+                .contains("session-capable maintenance pool")
+        );
+        assert!(validate_retirement_capability(&config, true).is_ok());
+        assert!(
+            validate_retirement_capability(&RetentionMaintenanceConfig::default(), false).is_ok()
+        );
+    }
+
+    #[sqlx::test]
+    async fn request_only_daemon_ignores_a_shared_retirement_flag_without_a_ddl_pool(
+        pool: sqlx::PgPool,
+    ) {
+        let storage = Arc::new(fusillade_arsenal::PostgresRequestManager::new(
+            fusillade_arsenal::TestDbPools::new(pool)
+                .await
+                .expect("test pools must initialize"),
+            fusillade_arsenal::PostgresStorageConfig::default(),
+        ));
+        let daemon = Daemon::new(
+            storage,
+            Arc::new(crate::MockHttpClient::new()),
+            DaemonConfig::default(),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .with_retention_maintenance(
+            configured_batchless_maintenance().with_retained_response_retirement_enabled(true),
+        );
+
+        daemon
+            .validate_startup(DaemonMode::RequestOnly)
+            .expect("a request-only daemon must not require the archive owner's DDL pool");
+        let error = daemon
+            .validate_startup(DaemonMode::Both)
+            .expect_err("an archive owner must fail closed without the DDL pool");
+        assert!(
+            error
+                .to_string()
+                .contains("session-capable maintenance pool")
+        );
     }
 
     #[test]
