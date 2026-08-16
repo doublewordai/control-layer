@@ -258,11 +258,22 @@ mod tests {
         wait_until(|| loss_calls.load(Ordering::Relaxed) == 1).await;
         assert!(!is_leader.load(Ordering::Relaxed));
 
-        let acquired = sqlx::query_scalar::<_, bool>("SELECT pg_try_advisory_lock($1)")
-            .bind(lock_id)
-            .fetch_one(&mut *contender)
-            .await
-            .unwrap();
+        // The lose callback resolves before the cleanup's unlock round-trip
+        // finishes, so poll for the release instead of asserting on the first
+        // observation.
+        let mut acquired = false;
+        for _ in 0..1_000 {
+            acquired = sqlx::query_scalar::<_, bool>("SELECT pg_try_advisory_lock($1)")
+                .bind(lock_id)
+                .fetch_one(&mut *contender)
+                .await
+                .unwrap();
+            if acquired {
+                break;
+            }
+            tokio::time::advance(Duration::from_millis(1)).await;
+            tokio::task::yield_now().await;
+        }
         assert!(acquired, "failed gain must release its advisory lock");
         assert!(
             sqlx::query_scalar::<_, bool>("SELECT pg_advisory_unlock($1)")
