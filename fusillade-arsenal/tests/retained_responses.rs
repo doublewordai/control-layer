@@ -270,7 +270,9 @@ async fn erase_never_shortens_an_existing_fence_expiry(pool: PgPool) {
     archive(&manager, &policy(&[("flex", 86_400)]), 1, i64::MAX)
         .await
         .unwrap();
-    let protected_until = Utc::now() + TimeDelta::days(2);
+    // Truncate to PostgreSQL's microsecond resolution: a nanosecond remainder
+    // would make the round-tripped fence expiry compare strictly smaller.
+    let protected_until = chrono::SubsecRound::trunc_subsecs(Utc::now() + TimeDelta::days(2), 6);
     sqlx::query(
         "UPDATE retained_response_resurrection_fences SET expires_at = $1 \
          WHERE object_id = ANY($2)",
