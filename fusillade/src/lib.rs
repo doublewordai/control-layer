@@ -37,7 +37,7 @@ pub use manager::{
     DaemonStorage, ModelFilter, ModelFilterState, RetainedResponseArchiveCutoffs,
     RetainedResponseArchiveOutcome, RetainedResponseMaintenanceError,
     RetainedResponsePartitionRunway, RetainedResponseRetirementOutcome, RetainedResponseWriteError,
-    RetentionSweepPolicy, Storage, TrailingDemandCount,
+    RetentionPolicy, Storage, TrailingDemandCount,
 };
 pub use processor::{CancellationFuture, DefaultRequestProcessor, RequestProcessor, ShouldRetry};
 pub use transform::ResponseTransformer;

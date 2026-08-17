@@ -6,7 +6,7 @@ use chrono::{DateTime, NaiveDate, TimeDelta, Utc};
 use fusillade_arsenal::batch::TemplateId;
 use fusillade_arsenal::manager::{
     RetainedResponseArchiveCutoffs, RetainedResponseArchiveOutcome,
-    RetainedResponseMaintenanceError, RetainedResponseWriteError, RetentionSweepPolicy,
+    RetainedResponseMaintenanceError, RetainedResponseWriteError, RetentionPolicy,
 };
 use fusillade_arsenal::postgres_response_step::{
     ResponseStepNotFound, RetainedResponseStepConflict,
@@ -134,7 +134,7 @@ fn collect_plan_nodes<'a>(node: &'a Value, nodes: &mut Vec<&'a serde_json::Map<S
     }
 }
 
-fn policy(tiers: &[(&str, u64)]) -> RetentionSweepPolicy {
+fn policy(tiers: &[(&str, u64)]) -> RetentionPolicy {
     exact_policy(
         &tiers
             .iter()
@@ -150,8 +150,8 @@ fn policy(tiers: &[(&str, u64)]) -> RetentionSweepPolicy {
     )
 }
 
-fn exact_policy(tiers: &[(&str, u64)]) -> RetentionSweepPolicy {
-    RetentionSweepPolicy {
+fn exact_policy(tiers: &[(&str, u64)]) -> RetentionPolicy {
+    RetentionPolicy {
         max_late_writer_seconds: Some(3_600),
         batchless_seconds_by_service_tier: tiers
             .iter()
@@ -2795,7 +2795,7 @@ async fn assert_wholly_retained(pool: &PgPool, graph: &LiveGraph) {
 
 async fn archive<P: PoolProvider>(
     manager: &PostgresRequestManager<P>,
-    policy: &RetentionSweepPolicy,
+    policy: &RetentionPolicy,
     max_groups: i64,
     max_bytes: i64,
 ) -> fusillade_arsenal::error::Result<RetainedResponseArchiveOutcome> {
@@ -2812,7 +2812,7 @@ async fn archive<P: PoolProvider>(
 
 async fn archive_at<P: PoolProvider>(
     manager: &PostgresRequestManager<P>,
-    policy: &RetentionSweepPolicy,
+    policy: &RetentionPolicy,
     terminal_before: DateTime<Utc>,
     cancel_grace_before: DateTime<Utc>,
     max_groups: i64,
@@ -2919,7 +2919,7 @@ async fn continuous_ninety_day_runway_enables_new_graph_move(pool: PgPool) {
         .date_naive()
         .succ_opt()
         .expect("test clock must have a following day");
-    let retention_horizon = RetentionSweepPolicy::delete_on(observed_at, retention_seconds)
+    let retention_horizon = RetentionPolicy::delete_on(observed_at, retention_seconds)
         .expect("retention horizon must be representable");
     let last_delete_on = retention_horizon
         .checked_add_signed(TimeDelta::days(i64::from(runway_days)))
@@ -3009,7 +3009,7 @@ async fn newly_terminal_singleton_moves_before_expiry(pool: PgPool) {
     let terminal_at = archive_now - TimeDelta::hours(2);
     let terminal_before = archive_now - TimeDelta::hours(1);
     let retention_seconds = 30 * 86_400;
-    let delete_on = RetentionSweepPolicy::delete_on(terminal_at, retention_seconds).unwrap();
+    let delete_on = RetentionPolicy::delete_on(terminal_at, retention_seconds).unwrap();
     ensure_partition(&pool, delete_on).await;
     let graph = singleton(
         &pool,
@@ -3073,7 +3073,7 @@ async fn mixed_timestamp_graph_waits_for_latest_member_then_moves(pool: PgPool) 
     let request_terminal = archive_now - TimeDelta::hours(3);
     let step_terminal = archive_now - TimeDelta::minutes(30);
     let retention_seconds = 30 * 86_400;
-    let delete_on = RetentionSweepPolicy::delete_on(step_terminal, retention_seconds).unwrap();
+    let delete_on = RetentionPolicy::delete_on(step_terminal, retention_seconds).unwrap();
     ensure_partition(&pool, delete_on).await;
     let mut graph = singleton(
         &pool,
@@ -3129,7 +3129,7 @@ async fn due_legacy_graph_stays_live_and_does_not_report_discoverable_work(pool:
     let (archive_now, today_start) = archive_clock(&pool).await;
     let retention_seconds = 86_400;
     let terminal_at = today_start - TimeDelta::days(2);
-    let due_delete_on = RetentionSweepPolicy::delete_on(terminal_at, retention_seconds).unwrap();
+    let due_delete_on = RetentionPolicy::delete_on(terminal_at, retention_seconds).unwrap();
     ensure_partition(&pool, due_delete_on).await;
     let graph = singleton(
         &pool,
@@ -3183,8 +3183,7 @@ async fn due_legacy_backlog_cannot_starve_an_older_nonexpired_tier(pool: PgPool)
         );
     }
     let eligible_terminal = today_start - TimeDelta::days(10);
-    let eligible_delete_on =
-        RetentionSweepPolicy::delete_on(eligible_terminal, long_retention).unwrap();
+    let eligible_delete_on = RetentionPolicy::delete_on(eligible_terminal, long_retention).unwrap();
     ensure_partition(&pool, eligible_delete_on).await;
     let eligible = singleton(
         &pool,
@@ -3221,7 +3220,7 @@ async fn seed_at_utc_window_lower_bound_is_discoverable(pool: PgPool) {
     let (archive_now, today_start) = archive_clock(&pool).await;
     let retention_seconds = 86_400;
     let terminal_at = today_start - TimeDelta::seconds(retention_seconds as i64);
-    let delete_on = RetentionSweepPolicy::delete_on(terminal_at, retention_seconds).unwrap();
+    let delete_on = RetentionPolicy::delete_on(terminal_at, retention_seconds).unwrap();
     ensure_partition(&pool, delete_on).await;
     let graph = singleton(
         &pool,
@@ -3255,8 +3254,7 @@ async fn old_seed_with_newer_step_is_conservatively_left_for_legacy_handling(poo
     let retention_seconds = 86_400;
     let request_terminal = today_start - TimeDelta::days(2);
     let step_terminal = archive_now - TimeDelta::hours(1);
-    let future_delete_on =
-        RetentionSweepPolicy::delete_on(step_terminal, retention_seconds).unwrap();
+    let future_delete_on = RetentionPolicy::delete_on(step_terminal, retention_seconds).unwrap();
     ensure_partition(&pool, future_delete_on).await;
     let mut graph = singleton(
         &pool,
@@ -5150,7 +5148,7 @@ async fn retained_trailing_filters_discriminate_windows_models_and_tiers(pool: P
     let retention_policy = policy(&[("flex", 1), ("priority", 1)]);
     let retention_seconds = retention_policy.batchless_seconds_by_service_tier["flex"];
     for terminal_at in [target_terminal, older_terminal] {
-        let delete_on = RetentionSweepPolicy::delete_on(terminal_at, retention_seconds).unwrap();
+        let delete_on = RetentionPolicy::delete_on(terminal_at, retention_seconds).unwrap();
         ensure_partition(&pool, delete_on).await;
     }
     let request_manager = manager(&pool).await;
@@ -5252,7 +5250,7 @@ async fn retained_failed_trailing_filters_discriminate_windows_models_and_tiers(
     let retention_policy = policy(&[("flex", 1), ("priority", 1)]);
     let retention_seconds = retention_policy.batchless_seconds_by_service_tier["flex"];
     for terminal_at in [target_terminal, older_terminal] {
-        let delete_on = RetentionSweepPolicy::delete_on(terminal_at, retention_seconds).unwrap();
+        let delete_on = RetentionPolicy::delete_on(terminal_at, retention_seconds).unwrap();
         ensure_partition(&pool, delete_on).await;
     }
     let request_manager = manager(&pool).await;

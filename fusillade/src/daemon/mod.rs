@@ -20,7 +20,7 @@ use crate::error::Result;
 use crate::http::HttpClient;
 use crate::manager::{
     ArchiveOutcome, DaemonStorage, RetainedResponseArchiveCutoffs,
-    RetainedResponseRetirementOutcome, RetentionSweepPolicy, Storage,
+    RetainedResponseRetirementOutcome, RetentionPolicy, Storage,
 };
 use crate::processor::{DefaultRequestProcessor, RequestProcessor};
 use crate::request::{Claimed, DaemonId, Request, RequestCompletionResult};
@@ -350,7 +350,7 @@ async fn run_retained_response_readiness_loop<S>(
     storage: Arc<S>,
     shutdown: tokio_util::sync::CancellationToken,
     query_timeout: Duration,
-    retention_policy: RetentionSweepPolicy,
+    retention_policy: RetentionPolicy,
     retained_days_ahead: i32,
     ready: Arc<AtomicBool>,
     period: Duration,
@@ -658,7 +658,7 @@ async fn run_batchless_archive_phase<S>(
     storage: &S,
     shutdown: &tokio_util::sync::CancellationToken,
     query_timeout: Duration,
-    retention_policy: &RetentionSweepPolicy,
+    retention_policy: &RetentionPolicy,
     cutoffs: &RetainedResponseArchiveCutoffs,
     tick: ArchiveMoverTick,
 ) where
@@ -724,7 +724,7 @@ async fn run_archive_mover_tick<S>(
     storage: Arc<S>,
     shutdown: &tokio_util::sync::CancellationToken,
     query_timeout: Duration,
-    retention_policy: &RetentionSweepPolicy,
+    retention_policy: &RetentionPolicy,
     tick: ArchiveMoverTick,
     retained_runway_ready: &AtomicBool,
 ) where
@@ -3186,7 +3186,7 @@ mod tests {
 
         async fn archive_terminal_batchless_responses(
             &self,
-            _policy: &RetentionSweepPolicy,
+            _policy: &RetentionPolicy,
             cutoffs: &RetainedResponseArchiveCutoffs,
             _max_groups: i64,
             _max_bytes: i64,
@@ -3199,7 +3199,7 @@ mod tests {
 
         async fn ensure_retained_response_partitions(
             &self,
-            _policy: &RetentionSweepPolicy,
+            _policy: &RetentionPolicy,
             _days_ahead: i32,
         ) -> Result<crate::RetainedResponsePartitionRunway> {
             self.retained_calls.fetch_add(1, Ordering::SeqCst);
@@ -4023,7 +4023,7 @@ mod tests {
     }
 
     fn configured_batchless_maintenance() -> RetentionMaintenanceConfig {
-        RetentionMaintenanceConfig::new(crate::RetentionSweepPolicy {
+        RetentionMaintenanceConfig::new(crate::RetentionPolicy {
             batchless_seconds_by_service_tier: HashMap::from([("flex".to_owned(), 60)]),
             max_late_writer_seconds: Some(600),
             ..Default::default()
@@ -4239,11 +4239,11 @@ mod tests {
     #[test]
     fn scheduled_file_and_batch_retention_are_rejected_until_supported() {
         for policy in [
-            crate::RetentionSweepPolicy {
+            crate::RetentionPolicy {
                 expire_files: true,
                 ..Default::default()
             },
-            crate::RetentionSweepPolicy {
+            crate::RetentionPolicy {
                 terminal_batch_seconds: Some(60),
                 ..Default::default()
             },
@@ -4265,12 +4265,11 @@ mod tests {
             );
         }
 
-        let shared_request_only_config =
-            RetentionMaintenanceConfig::new(crate::RetentionSweepPolicy {
-                expire_files: true,
-                terminal_batch_seconds: Some(60),
-                ..Default::default()
-            });
+        let shared_request_only_config = RetentionMaintenanceConfig::new(crate::RetentionPolicy {
+            expire_files: true,
+            terminal_batch_seconds: Some(60),
+            ..Default::default()
+        });
         assert!(
             validate_retention_startup(
                 &shared_request_only_config,

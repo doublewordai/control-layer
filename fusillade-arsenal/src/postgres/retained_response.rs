@@ -17,7 +17,7 @@ use super::{PoolProvider, PostgresRequestManager};
 use crate::error::{FusilladeError, Result};
 use crate::manager::{
     RetainedResponseArchiveCutoffs, RetainedResponseArchiveOutcome,
-    RetainedResponseMaintenanceError, RetainedResponseWriteError, RetentionSweepPolicy,
+    RetainedResponseMaintenanceError, RetainedResponseWriteError, RetentionPolicy,
 };
 use crate::request::{
     ListRequestsFilter, RequestDetail, RequestId, RequestListResult, RequestSummary,
@@ -3844,7 +3844,7 @@ async fn insert_and_verify_routes(
 async fn move_graph<P: PoolProvider>(
     manager: &PostgresRequestManager<P>,
     candidate: Candidate,
-    policy: &RetentionSweepPolicy,
+    policy: &RetentionPolicy,
     cutoffs: &RetainedResponseArchiveCutoffs,
     remaining_bytes: u64,
     allow_oversized: bool,
@@ -4021,7 +4021,7 @@ async fn move_graph<P: PoolProvider>(
             return Ok(MoveGraphOutcome::Deferred);
         }
         max_retention_seconds = max_retention_seconds.max(seconds);
-        let request_delete_on = RetentionSweepPolicy::delete_on(retention_anchor, seconds)
+        let request_delete_on = RetentionPolicy::delete_on(retention_anchor, seconds)
             .map_err(|_| incomplete_graph())?;
         delete_on = Some(delete_on.map_or(request_delete_on, |current: NaiveDate| {
             current.max(request_delete_on)
@@ -4035,9 +4035,8 @@ async fn move_graph<P: PoolProvider>(
         if retention_anchor > cutoffs.terminal_before() {
             return Ok(MoveGraphOutcome::Deferred);
         }
-        let step_delete_on =
-            RetentionSweepPolicy::delete_on(retention_anchor, max_retention_seconds)
-                .map_err(|_| incomplete_graph())?;
+        let step_delete_on = RetentionPolicy::delete_on(retention_anchor, max_retention_seconds)
+            .map_err(|_| incomplete_graph())?;
         delete_on = Some(delete_on.map_or(step_delete_on, |current: NaiveDate| {
             current.max(step_delete_on)
         }));
@@ -4287,7 +4286,7 @@ async fn next_candidate<P: PoolProvider>(
 
 pub(crate) async fn archive_terminal_batchless_responses<P: PoolProvider>(
     manager: &PostgresRequestManager<P>,
-    policy: &RetentionSweepPolicy,
+    policy: &RetentionPolicy,
     cutoffs: &RetainedResponseArchiveCutoffs,
     max_groups: i64,
     max_bytes: i64,

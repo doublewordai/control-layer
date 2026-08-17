@@ -19,7 +19,7 @@ pub use error::{FusilladeError, Result};
 pub use manager::{
     DaemonStorage, ModelFilter, ModelFilterState, RetainedResponseArchiveOutcome,
     RetainedResponseMaintenanceError, RetainedResponsePartitionRunway,
-    RetainedResponseRetirementOutcome, RetentionSweepPolicy, Storage, TrailingDemandCount,
+    RetainedResponseRetirementOutcome, RetentionPolicy, Storage, TrailingDemandCount,
 };
 pub use request::*;
 pub use response_step::{

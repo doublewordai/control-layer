@@ -17,7 +17,7 @@ pub use fusillade_core::manager::{
     ArchiveOutcome, BackgroundClaimKind, DaemonStorage, ModelFilter, ModelFilterState,
     RetainedResponseArchiveCutoffs, RetainedResponseArchiveOutcome,
     RetainedResponseMaintenanceError, RetainedResponsePartitionRunway,
-    RetainedResponseRetirementOutcome, RetainedResponseWriteError, RetentionSweepPolicy, Storage,
+    RetainedResponseRetirementOutcome, RetainedResponseWriteError, RetentionPolicy, Storage,
     TrailingDemandCount,
 };
 
