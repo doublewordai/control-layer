@@ -323,12 +323,31 @@ pub fn parse_ai_response(request_data: &RequestData, response_data: &ResponseDat
                         utils::parse_responses_non_streaming_response(&body_str).or_else(|_| utils::parse_non_streaming_response(&body_str))
                     }
                 } else {
+                    // The stream flag must survive a request the strict variants could
+                    // not model. A single unrecognised field or enum value - e.g.
+                    // `reasoning_effort: "max"`, which `crate::reasoning::ReasoningEffort`
+                    // defines and the platform routes on - drops the request into
+                    // `AiRequest::Other`. Reading the flag off the typed variant alone
+                    // used to lose it there, send a streamed body to the non-streaming
+                    // parser, and bill the request ZERO tokens. `Other` carries the raw
+                    // `Value`, so take the flag from that instead of re-parsing the body.
+                    let is_streaming = fusillade_stream
+                        || match &parsed_request.request {
+                            AiRequest::ChatCompletions(req) => req.stream.unwrap_or(false),
+                            AiRequest::Completions(req) => req.stream.unwrap_or(false),
+                            AiRequest::Other(value) => value.get("stream").and_then(Value::as_bool).unwrap_or(false),
+                            AiRequest::Embeddings(_) => false,
+                        };
+                    // Endpoint choice still comes from the typed request (it tells chat
+                    // from completions from embeddings). An unmodelled request (`Other`)
+                    // on a streaming body falls back to the chat streaming parser - chat
+                    // is the only streaming endpoint reachable here besides
+                    // `/completions`, and the legacy parser rejects a chat SSE body.
                     match parsed_request.request {
-                        AiRequest::ChatCompletions(chat_req) if chat_req.stream.unwrap_or(false) || fusillade_stream => {
-                            utils::parse_streaming_response(&body_str)
-                        }
-                        AiRequest::Completions(completion_req) if completion_req.stream.unwrap_or(false) || fusillade_stream => {
-                            utils::parse_completions_streaming_response(&body_str)
+                        AiRequest::ChatCompletions(_) if is_streaming => utils::parse_streaming_response(&body_str),
+                        AiRequest::Completions(_) if is_streaming => utils::parse_completions_streaming_response(&body_str),
+                        AiRequest::Other(_) if is_streaming => {
+                            utils::parse_streaming_response(&body_str).or_else(|_| utils::parse_completions_streaming_response(&body_str))
                         }
                         _ => utils::parse_non_streaming_response(&body_str),
                     }
@@ -400,7 +419,28 @@ impl UsageMetrics {
 
         // Token metrics come from the single parse of the response into `AiResponse`
         // (the same value request logging stores), normalised to one currency here.
-        let metrics = TokenMetrics::from(parsed_response);
+        let mut metrics = TokenMetrics::from(parsed_response);
+
+        // Raw-usage fallback: some upstreams answer 200 with real usage in a shape the typed
+        // parse cannot represent — OpenRouter emits `finish_reason: "error"` (not a variant
+        // of the enum), Dynamo omits the message `role` — and the untagged parse falls
+        // through to `Other`, reading zero. Billing zero for a request the provider counted
+        // (and charges us for) is a silent revenue leak, and it writes the impossible
+        // `prompt < read + creation` signature because the cache split below is read from
+        // the raw body and survives. When the typed parse produced no counts but the body
+        // plainly carries a usage object, read the counts from the raw JSON. Measured before
+        // this existed: 149 such rows for one user in 10 days, 3.75M prompt tokens billed
+        // at nothing (~$7.09).
+        if metrics.prompt_tokens == 0
+            && metrics.completion_tokens == 0
+            && metrics.total_tokens == 0
+            && let Some(raw) = extract_from_last_usage(response_data, raw_usage_tokens)
+        {
+            metrics.prompt_tokens = raw.prompt;
+            metrics.completion_tokens = raw.completion;
+            metrics.reasoning_tokens = raw.reasoning;
+            metrics.total_tokens = raw.total;
+        }
 
         // The cache split lives in extension fields the typed parse drops, so read it from
         // the raw `usage` object. It only exists on a successful response that carried a
@@ -461,12 +501,16 @@ fn ai_response_stream_errored(response: &AiResponse) -> bool {
 }
 
 /// The cache token split read from a response `usage` object.
+///
+/// Visible to the crate because [`crate::recompute`] replays a stored response through this
+/// same extractor rather than re-implementing it — a recompute that read the split
+/// differently from the live path would "correct" healthy requests.
 #[derive(Debug, Clone, Copy, Default)]
-struct CacheTokens {
-    read: i64,
-    creation_5m: i64,
-    creation_1h: i64,
-    creation_24h: i64,
+pub(crate) struct CacheTokens {
+    pub read: i64,
+    pub creation_5m: i64,
+    pub creation_1h: i64,
+    pub creation_24h: i64,
 }
 
 /// Pull the cache split out of a single `usage` JSON object. Reads come **only** from
@@ -510,9 +554,65 @@ fn cache_tokens_from_usage(usage: &Value) -> CacheTokens {
 /// terminal `data:` frame (take the last one seen). Returns all-zero when there is no
 /// usage object (non-cache request, error body, or a stream that died before its usage
 /// frame) — which is exactly the no-cache-billing case.
-fn extract_cache_tokens(response_data: &ResponseData) -> CacheTokens {
+pub(crate) fn extract_cache_tokens(response_data: &ResponseData) -> CacheTokens {
+    extract_from_last_usage(response_data, cache_tokens_from_usage)
+}
+
+/// Token counts read straight from a raw `usage` JSON object, for bodies the typed parse
+/// cannot represent. Field semantics mirror [`TokenMetrics`]'s arms exactly: an OpenAI
+/// `prompt_tokens` is already the total input; an Anthropic `input_tokens` excludes the
+/// cache buckets, which are added back — reading it verbatim is the August incident.
+///
+/// Shared by the live path's raw-usage fallback and [`crate::recompute`]'s replay of stored
+/// fusillade bodies, so the two can never read the same unrepresentable body differently.
+pub(crate) struct RawUsageTokens {
+    pub prompt: i64,
+    pub completion: i64,
+    pub reasoning: i64,
+    pub total: i64,
+}
+
+/// Read [`RawUsageTokens`] out of one `usage` object, or `None` when it carries neither an
+/// OpenAI-shaped nor an Anthropic-shaped input count (nothing recognisable to bill on).
+pub(crate) fn raw_usage_tokens(usage: &Value) -> Option<RawUsageTokens> {
+    let get = |k: &str| usage.get(k).and_then(Value::as_i64);
+    let prompt = match get("prompt_tokens") {
+        Some(p) => p,
+        None => {
+            get("input_tokens")?
+                + get("cache_read_input_tokens").unwrap_or(0).max(0)
+                + get("cache_creation_input_tokens").unwrap_or(0).max(0)
+        }
+    };
+    let completion = get("completion_tokens").or_else(|| get("output_tokens")).unwrap_or(0);
+    let reasoning = usage
+        .pointer("/completion_tokens_details/reasoning_tokens")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    // Floor everything at 0 (malformed bodies must not reach the cost maths), and derive the
+    // total where the shape reports none, as the Anthropic arm does.
+    let prompt = prompt.max(0);
+    let completion = completion.max(0);
+    let total = get("total_tokens").unwrap_or(prompt + completion).max(0);
+    Some(RawUsageTokens {
+        prompt,
+        completion,
+        reasoning: reasoning.max(0),
+        total,
+    })
+}
+
+/// Locate the response's final `usage` object and map it with `from_usage`.
+///
+/// Factored out of [`extract_cache_tokens`] so that a caller reading a *raw upstream* body
+/// can apply different field semantics without duplicating the body handling — the
+/// decompress fallback and the SSE last-frame-wins scan are fiddly and must not diverge.
+/// The live path keeps [`cache_tokens_from_usage`]; [`crate::recompute`] passes a variant
+/// that also understands the provider's flat `cache_creation_input_tokens`, which appears
+/// in stored fusillade bodies but never in a body dwctl itself annotated.
+pub(crate) fn extract_from_last_usage<T: Default>(response_data: &ResponseData, from_usage: impl Fn(&Value) -> T) -> T {
     let Some(body) = &response_data.body else {
-        return CacheTokens::default();
+        return T::default();
     };
     // On a decompress failure (e.g. a mis-set Content-Encoding on an actually-plain body),
     // fall back to the raw bytes rather than silently returning zero cache tokens — zeroing
@@ -531,12 +631,12 @@ fn extract_cache_tokens(response_data: &ResponseData) -> CacheTokens {
     if let Ok(value) = serde_json::from_str::<Value>(body_str.trim())
         && let Some(usage) = value.get("usage").filter(|u| u.is_object())
     {
-        return cache_tokens_from_usage(usage);
+        return from_usage(usage);
     }
 
     // Streaming: scan SSE frames, keeping the last one that carries a usage object.
     // SSE allows `data:<value>` and `data: <value>` — strip the colon then an optional space.
-    let mut last = CacheTokens::default();
+    let mut last = T::default();
     for line in body_str.lines() {
         if let Some(data) = line.strip_prefix("data:") {
             let data = data.strip_prefix(' ').unwrap_or(data);
@@ -545,7 +645,7 @@ fn extract_cache_tokens(response_data: &ResponseData) -> CacheTokens {
                 && let Ok(value) = serde_json::from_str::<Value>(trimmed)
                 && let Some(usage) = value.get("usage").filter(|u| u.is_object())
             {
-                last = cache_tokens_from_usage(usage);
+                last = from_usage(usage);
             }
         }
     }
@@ -630,15 +730,21 @@ fn extract_finish_reason(response: &AiResponse) -> Option<String> {
     }
 }
 
-/// Helper struct for extracting token metrics from responses
+/// Helper struct for extracting token metrics from responses.
+///
+/// Visible to the crate because [`crate::recompute`] replays a stored response through
+/// `From<&AiResponse>` rather than re-deriving counts of its own. That is what makes a
+/// recompute of healthy traffic a guaranteed no-op: it is the same code that produced the
+/// original row, so any delta it reports is a real change in what this code believes — not
+/// a second opinion.
 #[derive(Debug, Clone)]
-struct TokenMetrics {
-    prompt_tokens: i64,
-    completion_tokens: i64,
-    reasoning_tokens: i64,
-    total_tokens: i64,
-    response_type: String,
-    response_model: Option<String>,
+pub(crate) struct TokenMetrics {
+    pub prompt_tokens: i64,
+    pub completion_tokens: i64,
+    pub reasoning_tokens: i64,
+    pub total_tokens: i64,
+    pub response_type: String,
+    pub response_model: Option<String>,
 }
 
 fn extract_completion_reasoning_tokens(usage: &async_openai::types::chat::CompletionUsage) -> i64 {
@@ -852,8 +958,17 @@ impl From<&AiResponse> for TokenMetrics {
             AiResponse::Anthropic(response) => {
                 // Anthropic reports no `total_tokens` (sum the two) and folds any thinking
                 // tokens into `output_tokens`, so there is no separate reasoning count.
-                let prompt_tokens = response.usage.input_tokens as i64;
-                let completion_tokens = response.usage.output_tokens as i64;
+                //
+                // `input_tokens` EXCLUDES cached tokens in Anthropic's shape, but
+                // `prompt_tokens` means TOTAL input everywhere else in dwctl — billing
+                // derives uncached input as `prompt - read - creations`, so recording the
+                // reduced value subtracts the cached tokens twice and bills them at
+                // nothing. Add the cache buckets back to recover the full prompt.
+                let usage = &response.usage;
+                let prompt_tokens = (usage.input_tokens
+                    + usage.cache_read_input_tokens.unwrap_or(0)
+                    + usage.cache_creation_input_tokens.unwrap_or(0)) as i64;
+                let completion_tokens = usage.output_tokens as i64;
                 Self {
                     prompt_tokens,
                     completion_tokens,
@@ -867,9 +982,18 @@ impl From<&AiResponse> for TokenMetrics {
                 // Anthropic splits usage across the stream: `message_start` carries the
                 // model and input tokens; the reframer also puts both input and output on
                 // `message_delta` (non-standard, see the streaming module), so prefer it.
+                // As in the blocking branch, `input_tokens` excludes the cache buckets;
+                // they are added back so `prompt_tokens` is the TOTAL input dwctl means
+                // everywhere else. Cache counts ride the same frames as the input count.
                 let mut input = 0i64;
+                let mut cached = 0i64;
                 let mut output = 0i64;
                 let mut model = None;
+                let cache_total = |usage: &Value| -> Option<i64> {
+                    let read = usage.get("cache_read_input_tokens").and_then(Value::as_i64);
+                    let creation = usage.get("cache_creation_input_tokens").and_then(Value::as_i64);
+                    (read.is_some() || creation.is_some()).then(|| read.unwrap_or(0).max(0) + creation.unwrap_or(0).max(0))
+                };
                 for event in events {
                     match event.get("type").and_then(|v| v.as_str()).unwrap_or_default() {
                         "message_start" => {
@@ -883,11 +1007,17 @@ impl From<&AiResponse> for TokenMetrics {
                             {
                                 input = i;
                             }
+                            if let Some(c) = event.pointer("/message/usage").and_then(cache_total) {
+                                cached = c;
+                            }
                         }
                         "message_delta" => {
                             if let Some(usage) = event.get("usage").filter(|u| !u.is_null()) {
                                 if let Some(i) = usage.get("input_tokens").and_then(Value::as_i64).filter(|i| *i > 0) {
                                     input = i;
+                                }
+                                if let Some(c) = cache_total(usage) {
+                                    cached = c;
                                 }
                                 output = usage.get("output_tokens").and_then(Value::as_i64).unwrap_or(output);
                             }
@@ -895,6 +1025,7 @@ impl From<&AiResponse> for TokenMetrics {
                         _ => {}
                     }
                 }
+                let input = input + cached;
                 Self {
                     prompt_tokens: input,
                     completion_tokens: output,
@@ -1265,6 +1396,98 @@ mod tests {
             }
             other => panic!("Expected ChatCompletionsStream, got {:?}", std::mem::discriminant(other)),
         }
+    }
+
+    /// The OpenRouter `finish_reason: "error"` shape, from a real prod row (analytics_id
+    /// 184786706): HTTP 200, a full usage object the provider counted (and charges us for),
+    /// but a finish_reason value the typed enum doesn't have — so the untagged parse falls
+    /// to `Other` and billing read zero. The raw-usage fallback must recover the counts;
+    /// the cache split is read from the raw body either way. Before the fallback existed
+    /// this billed 149 rows (3.75M prompt tokens, ~$7) at nothing for one user in 10 days,
+    /// and wrote the impossible `prompt < read + creation` signature.
+    #[test]
+    fn unrepresentable_finish_reason_still_bills_from_the_raw_usage() {
+        let request_data = RequestData {
+            correlation_id: 1,
+            timestamp: SystemTime::now(),
+            method: axum::http::Method::POST,
+            uri: "/chat/completions".parse::<Uri>().unwrap(),
+            headers: HashMap::new(),
+            body: Some(Bytes::from(r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#)),
+            trace_id: None,
+            span_id: None,
+        };
+        let body = r#"{"id":"resp_1","object":"chat.completion","created":1786498035,"model":"m","choices":[{"finish_reason":"error","index":0,"message":{"role":"assistant","refusal":null,"reasoning_details":[{"text":"...","type":"reasoning.text","index":0,"format":"unknown"}]}}],"usage":{"prompt_tokens":29366,"completion_tokens":97,"total_tokens":29463,"completion_tokens_details":{"reasoning_tokens":97},"cache_read_input_tokens":25351,"cache_creation_input_tokens":4015,"cache_creation":{"ephemeral_5m_input_tokens":4015,"ephemeral_1h_input_tokens":0,"ephemeral_24h_input_tokens":0}}}"#;
+        let response_data = ResponseData {
+            extensions: Default::default(),
+            correlation_id: 1,
+            timestamp: SystemTime::now(),
+            status: StatusCode::OK,
+            headers: HashMap::new(),
+            body: Some(Bytes::from(body)),
+            duration: Duration::from_millis(100),
+            duration_to_first_byte: Duration::from_millis(50),
+        };
+
+        let parsed = parse_ai_response(&request_data, &response_data).unwrap();
+        assert!(
+            matches!(parsed, AiResponse::Other(_)),
+            "pins the mechanism: the typed parse cannot represent finish_reason \"error\""
+        );
+
+        let metrics = UsageMetrics::extract(
+            uuid::Uuid::nil(),
+            &request_data,
+            &response_data,
+            &parsed,
+            &crate::config::Config::default(),
+        );
+        assert_eq!(metrics.prompt_tokens, 29_366, "recovered from the raw usage object");
+        assert_eq!(metrics.completion_tokens, 97);
+        assert_eq!(metrics.reasoning_tokens, 97);
+        assert_eq!(metrics.total_tokens, 29_463);
+        assert_eq!(metrics.cache_read_input_tokens, 25_351, "split read from the raw body as before");
+        assert_eq!(metrics.cache_creation_5m_input_tokens, 4_015);
+    }
+
+    /// The July shape on the live path: `usage` is null, so there is genuinely nothing to
+    /// read and the fallback must not invent counts — the row records zero, exactly as
+    /// before the fallback existed.
+    #[test]
+    fn null_usage_still_records_zero_on_the_live_path() {
+        let request_data = RequestData {
+            correlation_id: 1,
+            timestamp: SystemTime::now(),
+            method: axum::http::Method::POST,
+            uri: "/chat/completions".parse::<Uri>().unwrap(),
+            headers: HashMap::new(),
+            body: Some(Bytes::from(r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#)),
+            trace_id: None,
+            span_id: None,
+        };
+        let body = r#"{"id":"c","object":"chat.completion","created":1,"model":"m","choices":[{"finish_reason":"tool_calls","index":0,"message":{"role":"assistant","content":null}}],"usage":null}"#;
+        let response_data = ResponseData {
+            extensions: Default::default(),
+            correlation_id: 1,
+            timestamp: SystemTime::now(),
+            status: StatusCode::OK,
+            headers: HashMap::new(),
+            body: Some(Bytes::from(body)),
+            duration: Duration::from_millis(100),
+            duration_to_first_byte: Duration::from_millis(50),
+        };
+
+        let parsed = parse_ai_response(&request_data, &response_data).unwrap();
+        let metrics = UsageMetrics::extract(
+            uuid::Uuid::nil(),
+            &request_data,
+            &response_data,
+            &parsed,
+            &crate::config::Config::default(),
+        );
+        assert_eq!(metrics.prompt_tokens, 0, "no usage anywhere → nothing invented");
+        assert_eq!(metrics.completion_tokens, 0);
+        assert_eq!(metrics.total_tokens, 0);
     }
 
     #[test]
@@ -2000,6 +2223,61 @@ mod tests {
         }
     }
 
+    /// `reasoning_effort: "max"` is a canonical value (`crate::reasoning::ReasoningEffort`)
+    /// that async-openai 0.34 does not know. Chat requests are typed against onwards'
+    /// strict schema, which models the field as a permissive `Value`, so the request
+    /// must still classify as `ChatCompletions` rather than collapsing to `Other`.
+    #[test]
+    fn chat_request_with_reasoning_effort_max_is_not_downgraded_to_other() {
+        let body = r#"{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}],"reasoning_effort":"max"}"#;
+        let mut data = responses_request_data(None);
+        data.uri = "/v1/chat/completions".parse::<Uri>().unwrap();
+        data.body = Some(Bytes::from(body));
+
+        match parse_ai_request(&data).unwrap().request {
+            AiRequest::ChatCompletions(req) => {
+                assert_eq!(req.model, "gpt-4o");
+                assert_eq!(req.reasoning_effort, Some(serde_json::json!("max")));
+            }
+            other => panic!("expected ChatCompletions, got {other:?}"),
+        }
+    }
+
+    /// Billing regression guard: a STREAMED chat request whose body the typed parser
+    /// cannot fully model must still be parsed with the streaming response parser.
+    /// Reading `stream` from the typed request used to lose the flag, feed an SSE body
+    /// to the non-streaming parser, and bill the request zero tokens.
+    #[test]
+    fn streaming_response_is_parsed_even_when_request_type_is_unrecognised() {
+        // `messages` is deliberately malformed for every typed variant, so the request
+        // lands as `AiRequest::Other` - standing in for any future schema drift.
+        let body = r#"{"model":"gpt-4o","messages":42,"stream":true}"#;
+        let mut req = responses_request_data(None);
+        req.uri = "/v1/chat/completions".parse::<Uri>().unwrap();
+        req.body = Some(Bytes::from(body));
+        assert!(
+            matches!(parse_ai_request(&req).unwrap().request, AiRequest::Other(_)),
+            "fixture must produce an unrecognised request for this guard to mean anything"
+        );
+
+        let sse = concat!(
+            "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-4o\",",
+            "\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n",
+            "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-4o\",",
+            "\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":7,\"total_tokens\":12}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let parsed = parse_ai_response(&req, &responses_response_data(sse.to_string())).expect("streamed body should parse");
+
+        match &parsed {
+            AiResponse::ChatCompletionsStream(chunks) => assert!(!chunks.is_empty()),
+            other => panic!("expected ChatCompletionsStream, got {other:?}"),
+        }
+        let metrics = crate::request_logging::serializers::TokenMetrics::from(&parsed);
+        assert_eq!(metrics.completion_tokens, 7, "streamed request must not bill zero tokens");
+        assert_eq!(metrics.prompt_tokens, 5);
+    }
+
     #[test]
     fn test_parse_ai_request_responses_path_not_classified_as_embeddings() {
         // Both embeddings and responses requests have an `input` field.
@@ -2235,6 +2513,122 @@ mod tests {
         assert_eq!(metrics.reasoning_tokens, 0);
         assert_eq!(metrics.response_type, "anthropic_message");
         assert_eq!(metrics.status_code, 200);
+    }
+
+    /// The bug this guards: Anthropic's `input_tokens` EXCLUDES cached tokens, so
+    /// recording it verbatim made `prompt_tokens` mean "uncached input" on this ingress
+    /// while meaning "total input" everywhere else. Billing derives uncached input as
+    /// `prompt - read - creations`, so the cached tokens were subtracted twice and billed
+    /// at nothing (observed: 3.28M prompt tokens recorded against 19.34M processed).
+    /// The assertion that matters is PARITY: the SAME conversation, billed through either
+    /// ingress, must report the same `prompt_tokens` — that is the invariant billing
+    /// relies on, and the one nothing checked before.
+    #[test]
+    fn anthropic_prompt_tokens_include_cached_and_match_chat_completions() {
+        // One conversation, 20k total input: 12k read from cache, 3k written, 5k uncached.
+        // Anthropic splits it as input_tokens=5000 + the two cache buckets; chat
+        // completions reports prompt_tokens=20000 with the cached share as a detail.
+        let anthropic_request = messages_request_data(false);
+        let anthropic_response = ok_response(
+            r#"{"id":"msg_1","type":"message","role":"assistant","model":"claude-3-5-sonnet","content":[],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":5000,"output_tokens":8,"cache_read_input_tokens":12000,"cache_creation_input_tokens":3000,"cache_creation":{"ephemeral_1h_input_tokens":3000}}}"#,
+        );
+        let anthropic_parsed = parse_ai_response(&anthropic_request, &anthropic_response).unwrap();
+        let anthropic = UsageMetrics::extract(
+            Uuid::new_v4(),
+            &anthropic_request,
+            &anthropic_response,
+            &anthropic_parsed,
+            &crate::test::utils::create_test_config(),
+        );
+
+        let chat_request = RequestData {
+            correlation_id: 2,
+            timestamp: SystemTime::now(),
+            method: Method::POST,
+            uri: "/v1/chat/completions".parse::<Uri>().unwrap(),
+            headers: HashMap::new(),
+            body: Some(Bytes::from(
+                r#"{"model":"claude-3-5-sonnet","messages":[{"role":"user","content":"hi"}]}"#,
+            )),
+            trace_id: None,
+            span_id: None,
+        };
+        let chat_response = ok_response(
+            r#"{"id":"chatcmpl-1","object":"chat.completion","created":1,"model":"claude-3-5-sonnet","choices":[{"index":0,"message":{"role":"assistant","content":""},"finish_reason":"stop"}],"usage":{"prompt_tokens":20000,"completion_tokens":8,"total_tokens":20008,"prompt_tokens_details":{"cached_tokens":12000},"cache_read_input_tokens":12000,"cache_creation_input_tokens":3000,"cache_creation":{"ephemeral_1h_input_tokens":3000}}}"#,
+        );
+        let chat_parsed = parse_ai_response(&chat_request, &chat_response).unwrap();
+        let chat = UsageMetrics::extract(
+            Uuid::new_v4(),
+            &chat_request,
+            &chat_response,
+            &chat_parsed,
+            &crate::test::utils::create_test_config(),
+        );
+
+        assert_eq!(
+            anthropic.prompt_tokens, chat.prompt_tokens,
+            "the same conversation must report the same prompt_tokens on both ingresses"
+        );
+        assert_eq!(
+            anthropic.prompt_tokens, 20000,
+            "prompt_tokens must be TOTAL input (5000 uncached + 12000 read + 3000 written)"
+        );
+        assert_eq!(anthropic.completion_tokens, chat.completion_tokens);
+        assert_eq!(anthropic.total_tokens, 20008);
+        // The CACHE SPLIT must also survive both ingresses identically — the
+        // batcher prices reads at the read multiplier and each creation tier at
+        // its own write premium, so a bucket lost in translation bills wrong.
+        assert_eq!(anthropic.cache_read_input_tokens, 12000);
+        assert_eq!(anthropic.cache_read_input_tokens, chat.cache_read_input_tokens);
+        assert_eq!(anthropic.cache_creation_1h_input_tokens, 3000);
+        assert_eq!(anthropic.cache_creation_1h_input_tokens, chat.cache_creation_1h_input_tokens);
+    }
+
+    /// Same split, streaming. Anthropic splits usage across `message_start` and
+    /// `message_delta`; the cache buckets must be folded in from whichever frame
+    /// carries them.
+    #[test]
+    fn anthropic_stream_prompt_tokens_include_cached() {
+        let request_data = messages_request_data(true);
+        let sse = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-3-5-sonnet\",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":5000,\"output_tokens\":0,\"cache_read_input_tokens\":12000,\"cache_creation_input_tokens\":3000}}}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\",\"stop_sequence\":null},\"usage\":{\"input_tokens\":5000,\"output_tokens\":8,\"cache_read_input_tokens\":12000,\"cache_creation_input_tokens\":3000}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        let response_data = ok_response(sse);
+        let parsed = parse_ai_response(&request_data, &response_data).unwrap();
+        let metrics = UsageMetrics::extract(
+            Uuid::new_v4(),
+            &request_data,
+            &response_data,
+            &parsed,
+            &crate::test::utils::create_test_config(),
+        );
+
+        assert_eq!(metrics.prompt_tokens, 20000, "streaming must fold the cache buckets in too");
+        assert_eq!(metrics.completion_tokens, 8);
+        assert_eq!(metrics.total_tokens, 20008);
+    }
+
+    /// A response with no cache activity must be unchanged by the fix.
+    #[test]
+    fn anthropic_prompt_tokens_unchanged_without_caching() {
+        let request_data = messages_request_data(false);
+        let body = r#"{"id":"msg_1","type":"message","role":"assistant","model":"claude-3-5-sonnet","content":[],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":12,"output_tokens":8}}"#;
+        let response_data = ok_response(body);
+        let parsed = parse_ai_response(&request_data, &response_data).unwrap();
+        let metrics = UsageMetrics::extract(
+            Uuid::new_v4(),
+            &request_data,
+            &response_data,
+            &parsed,
+            &crate::test::utils::create_test_config(),
+        );
+        assert_eq!(metrics.prompt_tokens, 12);
+        assert_eq!(metrics.total_tokens, 20);
     }
 
     #[test]

@@ -197,3 +197,14 @@ pub fn record_body_read_failed() {
 pub fn record_markers_rejected(reason: &'static str) {
     counter!("dwctl_cache_markers_rejected_total", "reason" => reason).increment(1);
 }
+
+/// A `cacheBreakpoint` query param was seen on a cacheable request (see `super::query` — the
+/// out-of-band form of the top-level automatic-caching marker). `outcome` ∈ `applied` (marker
+/// injected into the body) | `body_field_wins` (body already had a non-null top-level
+/// `cache_control`; explicit wins) | `invalid` (unrecognized value → 400) | `not_json` /
+/// `not_an_object` (nowhere to inject; onwards rejects the body downstream) |
+/// `reserialize_failed` (defensive: forwarded un-injected). Adoption/rollout signal for the
+/// param, distinct from `marker_requests` which counts the injected marker as body adoption.
+pub fn record_query_breakpoint(outcome: &'static str) {
+    counter!("dwctl_cache_query_breakpoint_total", "outcome" => outcome).increment(1);
+}

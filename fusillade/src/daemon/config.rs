@@ -264,6 +264,22 @@ pub struct DaemonConfig {
     /// Weekly-partition runway maintained by the daily maintenance tick.
     #[serde(default = "default_archive_partitions_weeks_ahead")]
     pub batch_archive_partitions_weeks_ahead: i32,
+    /// Batch finalizer: stamps terminal timestamps and freezes final counts
+    /// for batches whose rows have all settled — including cancelled batches,
+    /// whose leftover rows it settles first. Runs wherever the batch daemon
+    /// runs, independent of notification delivery (which merely consumes
+    /// frozen batches). ON by default: frozen counts gate archiving.
+    #[serde(default = "default_batch_finalizer_enabled")]
+    pub batch_finalizer_enabled: bool,
+    #[serde(default = "default_batch_finalizer_interval_ms")]
+    pub batch_finalizer_interval_ms: u64,
+    /// Grace after cancelled_at before the finalizer settles + freezes a
+    /// cancelled batch, letting in-flight daemon aborts drain naturally.
+    #[serde(default = "default_batch_finalizer_cancelled_grace_secs")]
+    pub batch_finalizer_cancelled_grace_secs: f64,
+    /// Bounded cancelled-batch finalizations per tick.
+    #[serde(default = "default_batch_finalizer_cancelled_per_tick")]
+    pub batch_finalizer_cancelled_per_tick: i64,
     pub throughput_log_interval_ms: Option<u64>,
     #[serde(default)]
     pub streamable_endpoints: Vec<String>,
@@ -348,6 +364,22 @@ fn default_archive_moves_per_tick() -> i64 {
     4
 }
 
+fn default_batch_finalizer_enabled() -> bool {
+    true
+}
+
+fn default_batch_finalizer_interval_ms() -> u64 {
+    10_000
+}
+
+fn default_batch_finalizer_cancelled_grace_secs() -> f64 {
+    3_600.0
+}
+
+fn default_batch_finalizer_cancelled_per_tick() -> i64 {
+    50
+}
+
 fn default_archive_cancel_grace_secs() -> f64 {
     600.0
 }
@@ -430,6 +462,10 @@ impl Default for DaemonConfig {
             batch_archive_backfill_moves_per_tick: default_archive_moves_per_tick(),
             batch_archive_backfill_concurrency: default_archive_backfill_concurrency(),
             batch_archive_partitions_weeks_ahead: default_archive_partitions_weeks_ahead(),
+            batch_finalizer_enabled: default_batch_finalizer_enabled(),
+            batch_finalizer_interval_ms: default_batch_finalizer_interval_ms(),
+            batch_finalizer_cancelled_grace_secs: default_batch_finalizer_cancelled_grace_secs(),
+            batch_finalizer_cancelled_per_tick: default_batch_finalizer_cancelled_per_tick(),
             purge_batch_size: 1000,
             purge_throttle_ms: 100,
             throughput_log_interval_ms: Some(60_000),
