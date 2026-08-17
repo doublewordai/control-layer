@@ -434,9 +434,6 @@ fn tee(response: Response, state: ContinuationState, ctx: RequestContext) -> Res
         let mut current: LegStream = Box::pin(SseBufferedStream::new(leg_one));
         // Is `current` a resume leg (text_completion chunks needing reframing)?
         let mut resuming = false;
-        // Has leg 1 produced its first complete SSE event? The stall timer
-        // arms only after it has (see the read below).
-        let mut leg_one_started = false;
         let mut saw_usage = false;
         // The terminating frames, held rather than forwarded: we may need to put
         // a synthesized usage frame in front of `[DONE]`, and a death frame must
@@ -454,15 +451,20 @@ fn tee(response: Response, state: ContinuationState, ctx: RequestContext) -> Res
 
         'chain: loop {
             let verdict = loop {
-                // The stall timer arms only once leg 1 has produced its first
-                // event: pre-first-token silence is admission-queue/prefill
-                // time, which this layer must never bound — the platform has no
-                // first-token deadline, and severing here would fabricate an
-                // empty success out of a healthy slow stream (nothing has been
-                // generated, so there is nothing to resume either). Resume legs
-                // are timed from their first read: their time-to-first-token IS
+                // The stall timer arms only once there is something to resume
+                // FROM — leg 1 has accumulated generated text. Pre-first-token
+                // silence is admission-queue/prefill time, which this layer must
+                // never bound: the platform has no first-token deadline, and
+                // severing there would fabricate an empty success out of a
+                // healthy slow stream. Keyed on accumulated bytes rather than
+                // "any frame seen" because engines differ on whether they emit
+                // a content-less `role` preamble before or after the first
+                // token; a preamble is not a generation. (A disarmed accumulator
+                // is empty, so a disarmed stream is never severed either —
+                // exactly the pre-continuation passthrough.) Resume legs are
+                // timed from their first read: their time-to-first-token IS
                 // the seam the deadline exists to bound.
-                let next_item = if resuming || leg_one_started {
+                let next_item = if resuming || acc.len_bytes() > 0 {
                     match tokio::time::timeout(stall, current.next()).await {
                         Err(_) => break detect::classify(&DeathEvent::Stall),
                         Ok(item) => item,
@@ -485,7 +487,6 @@ fn tee(response: Response, state: ContinuationState, ctx: RequestContext) -> Res
                     Some(Err(_)) => break detect::classify(&DeathEvent::TransportError),
                     Some(Ok(bytes)) => bytes,
                 };
-                leg_one_started = true;
 
                 let payload = frame_payload(&item);
                 if payload == Some("[DONE]") {

@@ -506,22 +506,51 @@ async fn a_slow_first_token_is_never_severed(pool: PgPool) {
         "id": "chatcmpl-1", "object": "chat.completion.chunk", "created": 1_700_000_000, "model": MODEL,
         "choices": [], "usage": {"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4}
     }));
-    let fake = Fake::new(
-        // First token arrives well past the 1s deadline, then a normal close.
-        vec![Chunk::Delay(1_400), content("chatcmpl-1", "Hello"), finished, usage, done()],
-        vec![],
-    );
-    let tokenizer = render_stub(vec![1], 4, 1).await;
-    let cfg = ContinuationConfig {
-        resume_deadline_secs: 1,
-        ..test_config()
-    };
-    let st = state(pool, &fake, tokenizer.uri(), cfg);
+    // Some engines emit a content-less `role` preamble the moment the request
+    // is admitted, long before the first token. A preamble is not a
+    // generation: it must not arm the stall timer either (observed live in the
+    // preview: the sim's preamble armed the first-frame rule and the stream
+    // was still severed into an empty 200 at the deadline).
+    let preamble = frame(json!({
+        "id": "chatcmpl-1", "object": "chat.completion.chunk", "created": 1_700_000_000, "model": MODEL,
+        "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": null}]
+    }));
+    for (label, script) in [
+        (
+            "silent until first token",
+            vec![
+                Chunk::Delay(1_400),
+                content("chatcmpl-1", "Hello"),
+                finished.clone(),
+                usage.clone(),
+                done(),
+            ],
+        ),
+        (
+            "role preamble then silence",
+            vec![
+                preamble,
+                Chunk::Delay(1_400),
+                content("chatcmpl-1", "Hello"),
+                finished,
+                usage,
+                done(),
+            ],
+        ),
+    ] {
+        let fake = Fake::new(script, vec![]);
+        let tokenizer = render_stub(vec![1], 4, 1).await;
+        let cfg = ContinuationConfig {
+            resume_deadline_secs: 1,
+            ..test_config()
+        };
+        let st = state(pool.clone(), &fake, tokenizer.uri(), cfg);
 
-    let payloads = collect_payloads(app(&fake, st).oneshot(chat_request(streaming_body())).await.unwrap()).await;
-    assert_eq!(contents(&parsed(&payloads)), "Hello", "the late stream arrives intact");
-    assert!(fake.resume_requests().is_empty(), "a healthy slow stream is not a death");
-    assert_eq!(payloads.last().unwrap(), "[DONE]");
+        let payloads = collect_payloads(app(&fake, st).oneshot(chat_request(streaming_body())).await.unwrap()).await;
+        assert_eq!(contents(&parsed(&payloads)), "Hello", "{label}: the late stream arrives intact");
+        assert!(fake.resume_requests().is_empty(), "{label}: a healthy slow stream is not a death");
+        assert_eq!(payloads.last().unwrap(), "[DONE]", "{label}");
+    }
 }
 
 /// An unparseable `data:` frame on leg 1 is forwarded to the client — we never
