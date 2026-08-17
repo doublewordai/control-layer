@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use crate::test::utils::{
     add_auth_headers, create_test_admin_user, create_test_api_key_for_user, create_test_config, create_test_user, setup_fusillade_pool,
 };
-use fusillade::{DaemonStorage, RetainedResponseArchiveCutoffs, RetentionSweepPolicy, Storage};
+use fusillade::{DaemonStorage, RetainedResponseArchiveCutoffs, RetentionPolicy, Storage};
 use fusillade_arsenal::{PostgresRequestManager, TestDbPools};
 use sqlx::PgPool;
 
@@ -386,7 +386,7 @@ async fn archive_response_graphs(pool: &PgPool, max_groups: i64) {
     let cutoffs = RetainedResponseArchiveCutoffs::new(observed_at, terminal_before, observed_at).unwrap();
     manager
         .archive_terminal_batchless_responses(
-            &RetentionSweepPolicy {
+            &RetentionPolicy {
                 batchless_seconds_by_service_tier: HashMap::from([("priority".to_owned(), 1)]),
                 max_late_writer_seconds: Some(3_600),
                 ..Default::default()

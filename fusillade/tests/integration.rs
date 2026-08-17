@@ -100,7 +100,7 @@ fn call_priority(call: &fusillade::http::MockCall) -> i64 {
 
 #[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
 async fn postgres_convenience_builder_installs_retained_response_fence(pool: sqlx::PgPool) {
-    let retention = RetentionMaintenanceConfig::new(fusillade::RetentionSweepPolicy {
+    let retention = RetentionMaintenanceConfig::new(fusillade::RetentionPolicy {
         batchless_seconds_by_service_tier: std::collections::HashMap::from([(
             "flex".to_string(),
             86_400,
@@ -133,7 +133,7 @@ async fn postgres_run_rejects_invalid_structure_and_fence_before_spawning(pool: 
         .expect_err("invalid structural config must fail synchronously");
     assert!(error.to_string().contains("sweep"));
 
-    let retention = RetentionMaintenanceConfig::new(fusillade::RetentionSweepPolicy {
+    let retention = RetentionMaintenanceConfig::new(fusillade::RetentionPolicy {
         batchless_seconds_by_service_tier: std::collections::HashMap::from([(
             "flex".to_string(),
             86_400,

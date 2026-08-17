@@ -1853,7 +1853,7 @@ pub struct DaemonConfig {
     /// Optional automated content-expiration rules. The application ships
     /// with no time-based content deletion until an operator configures it.
     #[serde(default)]
-    pub retention: fusillade::RetentionSweepPolicy,
+    pub retention: fusillade::RetentionPolicy,
 
     /// Move newly terminal batchless response graphs with the steady archive
     /// worker. Disabled by default.
@@ -2221,7 +2221,7 @@ impl Default for DaemonConfig {
             purge_interval_ms: 600_000,
             purge_batch_size: 1000,
             purge_throttle_ms: 100,
-            retention: fusillade::RetentionSweepPolicy::default(),
+            retention: fusillade::RetentionPolicy::default(),
             batchless_archive_sweep_enabled: false,
             batchless_archive_backfill_enabled: false,
             batchless_archive_groups_per_tick: default_batchless_archive_groups_per_tick(),

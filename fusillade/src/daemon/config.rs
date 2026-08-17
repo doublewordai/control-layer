@@ -170,7 +170,7 @@ impl DaemonMode {
 /// action is disabled by default.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetentionMaintenanceConfig {
-    policy: crate::RetentionSweepPolicy,
+    policy: crate::RetentionPolicy,
     batchless_archive_sweep_enabled: bool,
     batchless_archive_backfill_enabled: bool,
     batchless_archive_groups_per_tick: i64,
@@ -182,7 +182,7 @@ pub struct RetentionMaintenanceConfig {
 impl Default for RetentionMaintenanceConfig {
     fn default() -> Self {
         Self {
-            policy: crate::RetentionSweepPolicy::default(),
+            policy: crate::RetentionPolicy::default(),
             batchless_archive_sweep_enabled: false,
             batchless_archive_backfill_enabled: false,
             batchless_archive_groups_per_tick: 4,
@@ -195,7 +195,7 @@ impl Default for RetentionMaintenanceConfig {
 
 impl RetentionMaintenanceConfig {
     /// Create disabled maintenance controls for an explicit retention policy.
-    pub fn new(policy: crate::RetentionSweepPolicy) -> Self {
+    pub fn new(policy: crate::RetentionPolicy) -> Self {
         Self {
             policy,
             ..Self::default()
@@ -235,7 +235,7 @@ impl RetentionMaintenanceConfig {
     }
 
     /// Return the operator-supplied retention policy.
-    pub fn policy(&self) -> &crate::RetentionSweepPolicy {
+    pub fn policy(&self) -> &crate::RetentionPolicy {
         &self.policy
     }
 

@@ -52,7 +52,7 @@ pub struct TrailingDemandCount {
 /// out, while omitted classes remain subject to explicit deletion.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
-pub struct RetentionSweepPolicy {
+pub struct RetentionPolicy {
     /// Mark files whose existing `expires_at` deadline has passed as expired.
     pub expire_files: bool,
     /// Age terminal file-backed batches out this many seconds after their
@@ -68,7 +68,7 @@ pub struct RetentionSweepPolicy {
     pub max_late_writer_seconds: Option<u64>,
 }
 
-impl RetentionSweepPolicy {
+impl RetentionPolicy {
     /// Whether this policy contains at least one automated expiration rule.
     pub fn is_enabled(&self) -> bool {
         self.expire_files
@@ -310,8 +310,8 @@ pub enum RetainedResponseRetirementOutcome {
 mod retention_policy_tests {
     use super::*;
 
-    fn policy() -> RetentionSweepPolicy {
-        RetentionSweepPolicy {
+    fn policy() -> RetentionPolicy {
+        RetentionPolicy {
             batchless_seconds_by_service_tier: HashMap::from([("flex".to_string(), 90 * 86_400)]),
             max_late_writer_seconds: Some(3_600),
             ..Default::default()
@@ -324,7 +324,7 @@ mod retention_policy_tests {
             .unwrap()
             .to_utc();
         assert_eq!(
-            RetentionSweepPolicy::delete_on(terminal_at, 90 * 86_400).unwrap(),
+            RetentionPolicy::delete_on(terminal_at, 90 * 86_400).unwrap(),
             chrono::NaiveDate::from_ymd_opt(2026, 11, 13).unwrap()
         );
     }
@@ -337,7 +337,7 @@ mod retention_policy_tests {
             .unwrap()
             .to_utc();
         assert_eq!(
-            RetentionSweepPolicy::delete_on(terminal_at, 90 * 86_400).unwrap(),
+            RetentionPolicy::delete_on(terminal_at, 90 * 86_400).unwrap(),
             chrono::NaiveDate::from_ymd_opt(2026, 11, 13).unwrap()
         );
     }
@@ -346,14 +346,14 @@ mod retention_policy_tests {
     fn batchless_delete_on_rejects_timestamp_overflow() {
         // Mutation caught: unchecked expiry arithmetic can wrap or silently
         // select a deletion date after the representable timestamp range.
-        assert!(RetentionSweepPolicy::delete_on(DateTime::<Utc>::MAX_UTC, 1).is_err());
+        assert!(RetentionPolicy::delete_on(DateTime::<Utc>::MAX_UTC, 1).is_err());
     }
 
     #[test]
     fn batchless_delete_on_rejects_deletion_date_overflow() {
         // Mutation caught: omitting `succ_opt` can wrap the first eligible
         // deletion date past the last representable UTC date.
-        assert!(RetentionSweepPolicy::delete_on(DateTime::<Utc>::MAX_UTC, 0).is_err());
+        assert!(RetentionPolicy::delete_on(DateTime::<Utc>::MAX_UTC, 0).is_err());
     }
 
     struct DefaultDisabledStorage;
@@ -447,7 +447,7 @@ mod retention_policy_tests {
     #[tokio::test]
     async fn retained_response_maintenance_is_disabled_without_backend_opt_in() {
         let storage = DefaultDisabledStorage;
-        let policy = RetentionSweepPolicy::default();
+        let policy = RetentionPolicy::default();
         let now = DateTime::parse_from_rfc3339("2026-08-14T15:30:00Z")
             .unwrap()
             .to_utc();
@@ -502,7 +502,7 @@ mod retention_policy_tests {
 
     #[test]
     fn retention_is_disabled_by_default() {
-        let policy = RetentionSweepPolicy::default();
+        let policy = RetentionPolicy::default();
         assert!(!policy.is_enabled());
         assert_eq!(policy.max_late_writer_seconds, None);
         assert!(policy.validate().is_ok());
@@ -510,7 +510,7 @@ mod retention_policy_tests {
 
     #[test]
     fn late_writer_window_is_independent_from_content_retention() {
-        let policy = RetentionSweepPolicy {
+        let policy = RetentionPolicy {
             max_late_writer_seconds: Some(600),
             ..Default::default()
         };
@@ -521,7 +521,7 @@ mod retention_policy_tests {
 
     #[test]
     fn batchless_retention_requires_an_explicit_late_writer_window() {
-        let policy = RetentionSweepPolicy {
+        let policy = RetentionPolicy {
             batchless_seconds_by_service_tier: HashMap::from([("flex".to_owned(), 600)]),
             ..Default::default()
         };
@@ -531,14 +531,14 @@ mod retention_policy_tests {
     #[test]
     fn retention_rejects_ambiguous_or_immediate_rules() {
         for tier in ["", "unknown"] {
-            let policy = RetentionSweepPolicy {
+            let policy = RetentionPolicy {
                 batchless_seconds_by_service_tier: HashMap::from([(tier.to_string(), 1)]),
                 ..Default::default()
             };
             assert!(policy.validate().is_err());
         }
 
-        let realtime = RetentionSweepPolicy {
+        let realtime = RetentionPolicy {
             batchless_seconds_by_service_tier: HashMap::from([("priority".to_string(), 1)]),
             max_late_writer_seconds: Some(1),
             ..Default::default()
@@ -548,20 +548,20 @@ mod retention_policy_tests {
             "persisted realtime content must be configurable for retention"
         );
 
-        let batch = RetentionSweepPolicy {
+        let batch = RetentionPolicy {
             terminal_batch_seconds: Some(0),
             ..Default::default()
         };
         assert!(batch.validate().is_err());
 
-        let batchless = RetentionSweepPolicy {
+        let batchless = RetentionPolicy {
             batchless_seconds_by_service_tier: HashMap::from([("flex".to_string(), 0)]),
             max_late_writer_seconds: Some(1),
             ..Default::default()
         };
         assert!(batchless.validate().is_err());
 
-        let oversized = RetentionSweepPolicy {
+        let oversized = RetentionPolicy {
             terminal_batch_seconds: Some(i64::MAX as u64),
             ..Default::default()
         };
@@ -1633,9 +1633,8 @@ pub trait DaemonStorage: Send + Sync {
     async fn purge_orphaned_rows(&self, batch_size: i64) -> Result<u64>;
 
     /// Whether this backend explicitly implements the partitioned retained
-    /// response lifecycle. This capability is independent from legacy content
-    /// sweeps so a backend cannot accidentally opt into movement by supporting
-    /// only deletion.
+    /// response lifecycle. Backends must opt in; the default keeps movement
+    /// and retirement unavailable.
     fn supports_retained_response_lifecycle(&self) -> bool {
         false
     }
@@ -1672,7 +1671,7 @@ pub trait DaemonStorage: Send + Sync {
     /// live graphs remain for an explicitly gated legacy path.
     async fn archive_terminal_batchless_responses(
         &self,
-        _policy: &RetentionSweepPolicy,
+        _policy: &RetentionPolicy,
         _cutoffs: &RetainedResponseArchiveCutoffs,
         _max_groups: i64,
         _max_bytes: i64,
@@ -1691,7 +1690,7 @@ pub trait DaemonStorage: Send + Sync {
     /// Storage backends opt in explicitly; the default is disabled.
     async fn ensure_retained_response_partitions(
         &self,
-        _policy: &RetentionSweepPolicy,
+        _policy: &RetentionPolicy,
         _days_ahead: i32,
     ) -> Result<RetainedResponsePartitionRunway> {
         Err(RetainedResponseMaintenanceError::Disabled.into_fusillade_error())
