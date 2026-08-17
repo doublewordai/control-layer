@@ -302,6 +302,44 @@ mod tests {
         );
     }
 
+    /// Reasoning tokens are their own column in `http_analytics`, so a repair that leaves
+    /// them stale makes the row internally inconsistent. They were being computed by the
+    /// serializer and then dropped on the floor; this pins that they survive.
+    #[test]
+    fn reasoning_and_total_are_recomputed_not_dropped() {
+        let e = exchange(
+            "/v1/chat/completions",
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#,
+            r#"{"id":"chatcmpl-1","object":"chat.completion","created":1,"model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"x"},"finish_reason":"stop"}],"usage":{"prompt_tokens":100,"completion_tokens":80,"total_tokens":180,"completion_tokens_details":{"reasoning_tokens":60}}}"#,
+        );
+        let (req, resp) = e.to_outlet_pair().unwrap();
+        let got = recompute_from_stored_response(&req, &resp, CreationTier::FiveMinute).unwrap();
+
+        assert_eq!(got.counts.prompt, 100);
+        assert_eq!(got.counts.completion, 80);
+        assert_eq!(got.reasoning, 60, "reasoning is a subset of completion, not an addition");
+        assert_eq!(got.total, 180);
+    }
+
+    /// Anthropic reports no `total_tokens` and folds thinking into `output_tokens`, so total
+    /// is derived and reasoning is legitimately zero. Pinned so a future change to that
+    /// branch cannot silently start reporting a total of 0 for a whole ingress.
+    #[test]
+    fn anthropic_total_is_derived_and_reasoning_is_zero() {
+        let e = exchange(
+            "/v1/messages",
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}],"max_tokens":16}"#,
+            r#"{"id":"msg_1","type":"message","role":"assistant","model":"m","content":[],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":565,"output_tokens":658,"cache_read_input_tokens":17631,"cache_creation_input_tokens":538}}"#,
+        );
+        let (req, resp) = e.to_outlet_pair().unwrap();
+        let got = recompute_from_stored_response(&req, &resp, CreationTier::FiveMinute).unwrap();
+
+        assert_eq!(got.counts.prompt, 18_734);
+        assert_eq!(got.counts.completion, 658);
+        assert_eq!(got.reasoning, 0, "Anthropic folds thinking into output_tokens");
+        assert_eq!(got.total, 18_734 + 658, "no total reported - derived from the two");
+    }
+
     /// A stored status we cannot parse means a corrupt or never-populated row. Any
     /// substitute value asserts something about success or failure that the data does not
     /// support, and everything downstream gates on 2xx — so refuse the item instead.
