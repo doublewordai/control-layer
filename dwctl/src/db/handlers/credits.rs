@@ -957,6 +957,103 @@ mod tests {
         assert_eq!(balance, Decimal::from_str("100.50").unwrap());
     }
 
+    /// A usage transaction carrying a `fusillade_batch_id` is NOT listed individually —
+    /// the grouped query's non-batch arm filters `WHERE fusillade_batch_id IS NULL`, and
+    /// batched spend reaches the customer only through `batch_aggregates`.
+    ///
+    /// This is a trap for anyone amending billing by hand. A compensating correction for a
+    /// batched request, written with the batch id set and without also folding
+    /// `batch_aggregates.total_amount`, is charged to the customer and appears **nowhere**
+    /// in their transaction history. The internal usage-repair runbook therefore writes
+    /// batch corrections with a NULL batch id so they surface as their own line; this test
+    /// pins the behaviour that advice depends on.
+    #[sqlx::test]
+    #[test_log::test]
+    async fn batched_transaction_is_invisible_without_an_aggregate_row(pool: PgPool) {
+        let user_id = create_test_user(&pool).await;
+        let batch_id = Uuid::new_v4();
+        let mut conn = pool.acquire().await.expect("Failed to acquire connection");
+
+        // A usage row tagged with a batch, but no batch_aggregates row to surface it.
+        sqlx::query!(
+            r#"INSERT INTO credits_transactions
+               (user_id, transaction_type, amount, source_id, description, fusillade_batch_id, service_tier)
+               VALUES ($1, 'usage', $2, $3, 'batched usage', $4, 'batch')"#,
+            user_id,
+            Decimal::from_str("1.25").unwrap(),
+            format!("test-batched-{}", Uuid::new_v4()),
+            batch_id,
+        )
+        .execute(&mut *conn)
+        .await
+        .expect("insert batched usage");
+
+        let mut credits = Credits::new(&mut conn);
+        let listed = credits
+            .list_transactions_with_batches(user_id, 0, 50, &TransactionFilters::default())
+            .await
+            .expect("list transactions");
+
+        assert!(
+            listed.is_empty(),
+            "a batched transaction with no aggregate row must not appear; got {listed:?}"
+        );
+
+        // The ledger row is real - the money is recorded, it simply cannot be seen.
+        let ledger: Decimal = sqlx::query_scalar!(
+            r#"SELECT COALESCE(SUM(CASE WHEN transaction_type IN ('admin_grant','purchase')
+                                        THEN amount ELSE -amount END), 0) AS "total!"
+               FROM credits_transactions WHERE user_id = $1"#,
+            user_id
+        )
+        .fetch_one(&mut *conn)
+        .await
+        .expect("sum ledger");
+        assert_eq!(ledger, Decimal::from_str("-1.25").unwrap(), "the charge is in the ledger");
+
+        // ...and the balance read model has NOT moved, because a raw INSERT never folds it.
+        // That is the second half of the same trap, and why the repair runbook must run the
+        // balance heal after any manual ledger surgery.
+        let mut credits = Credits::new(&mut conn);
+        let balance = credits.get_user_balance(user_id).await.expect("Failed to get balance");
+        assert_eq!(
+            balance,
+            Decimal::ZERO,
+            "a hand-written ledger row does not fold the checkpoint - heal is required"
+        );
+    }
+
+    /// The same correction written WITHOUT a batch id does surface, which is why the
+    /// runbook writes them that way.
+    #[sqlx::test]
+    #[test_log::test]
+    async fn unbatched_correction_surfaces_as_its_own_line(pool: PgPool) {
+        let user_id = create_test_user(&pool).await;
+        let mut conn = pool.acquire().await.expect("Failed to acquire connection");
+
+        sqlx::query!(
+            r#"INSERT INTO credits_transactions
+               (user_id, transaction_type, amount, source_id, description, fusillade_batch_id, service_tier)
+               VALUES ($1, 'usage', $2, $3, 'usage correction', NULL, 'batch')"#,
+            user_id,
+            Decimal::from_str("1.25").unwrap(),
+            format!("test-correction-{}", Uuid::new_v4()),
+        )
+        .execute(&mut *conn)
+        .await
+        .expect("insert correction");
+
+        let mut credits = Credits::new(&mut conn);
+        let listed = credits
+            .list_transactions_with_batches(user_id, 0, 50, &TransactionFilters::default())
+            .await
+            .expect("list transactions");
+
+        assert_eq!(listed.len(), 1, "the correction must be visible to the customer");
+        assert_eq!(listed[0].transaction.description.as_deref(), Some("usage correction"));
+        assert_eq!(listed[0].batch_id, None);
+    }
+
     #[sqlx::test]
     #[test_log::test]
     async fn test_get_user_balance_after_transactions(pool: PgPool) {

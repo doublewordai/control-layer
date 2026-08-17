@@ -160,9 +160,11 @@ mod metrics;
 mod notifications;
 mod openapi;
 mod payment_providers;
+pub mod pricing;
 mod probes;
 pub mod prompt_cache;
 pub mod reasoning;
+mod recompute;
 mod request_logging;
 pub mod sample_files;
 mod static_assets;
@@ -1530,6 +1532,10 @@ pub async fn build_router(
         .route("/requests/aggregate", get(api::handlers::requests::aggregate_requests))
         .route("/requests/aggregate-by-user", get(api::handlers::requests::aggregate_by_user))
         .route("/usage", get(api::handlers::requests::get_usage))
+        // Dry-run recompute of recorded usage. Read-only by construction — it is handed the
+        // read pool and has no write handle; corrections are applied by a documented human
+        // procedure, not by this endpoint.
+        .route("/usage-recompute", get(api::handlers::recompute::recompute_usage))
         // Probes management
         .route("/probes", get(api::handlers::probes::list_probes))
         .route("/probes", post(api::handlers::probes::create_probe))
