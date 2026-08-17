@@ -681,7 +681,7 @@ pub async fn target_message_handler<T: HttpClient>(
     let mut attempt_number: u32 = 0;
     let mut total_backoff_ms: u64 = 0;
     let pool_max_attempts = pool.fallback_max_attempts();
-    for (member_idx, target, connection_guard) in pool.select_iter() {
+    for (_member_idx, target, connection_guard) in pool.select_iter() {
         any_attempted = true;
         attempt_number += 1;
 
@@ -746,22 +746,24 @@ pub async fn target_message_handler<T: HttpClient>(
         let mut attempt_body = body_bytes.clone();
 
         // Within a non-default pool, `priority` (the dynamo scheduler's queue
-        // field) is only meaningful to the pool's PRIMARY member; third-party
-        // fallback members reject unknown fields outright (Fireworks:
-        // "Extra inputs are not permitted"). Strip it from every non-primary
-        // attempt — `member_idx` is the member's stable position in pool
-        // order, so 0 is the primary under the Priority strategy these pools
-        // use. Default-pool traffic is untouched: batch/flex deadline
-        // priorities must keep reaching dynamo exactly as today.
+        // field) is only meaningful to a member whose serving stack understands
+        // it (`accepts_scheduling_priority` — the dynamo frontend); third-party
+        // members reject unknown fields outright (Fireworks: "Extra inputs are
+        // not permitted"). Strip it from every attempt whose provider lacks
+        // the capability, REGARDLESS of position: keying on member index broke
+        // the moment the dynamo member was disabled during an incident and a
+        // third party became index 0 (every resume 400'd). Default-pool
+        // traffic is untouched: batch/flex deadline priorities must keep
+        // reaching dynamo exactly as today.
         if resolved_pool_name.is_some()
-            && member_idx > 0
+            && !target.accepts_scheduling_priority
             && attempt_body.windows(10).any(|w| w == b"\"priority\"")
             && let Ok(mut parsed) = serde_json::from_slice::<serde_json::Value>(&attempt_body)
             && let Some(obj) = parsed.as_object_mut()
             && obj.remove("priority").is_some()
             && let Ok(stripped) = serde_json::to_vec(&parsed)
         {
-            debug!("Stripped scheduler priority for non-primary pool member");
+            debug!("Stripped scheduler priority for a pool member that does not accept it");
             attempt_body = stripped.into();
         }
 
@@ -2520,6 +2522,7 @@ mod tests {
             trusted,
             propagate_trace_context,
             reasoning_translation: None,
+            accepts_scheduling_priority: false,
         }
     }
 

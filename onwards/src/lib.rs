@@ -1218,20 +1218,22 @@ mod tests {
         fallback_targets(alias, n, vec![429])
     }
 
-    /// A composite whose COMPLETIONS pool has `n` members (Priority order,
-    /// embedded-429 retry) alongside a single-member default pool. Mirrors the
-    /// continuation-pool shape: dynamo primary, third-party fallback.
-    fn completions_pool_targets(alias: &str, n: usize) -> target::Targets {
+    /// A composite whose COMPLETIONS pool has one member per entry of
+    /// `accepts_priority` (Priority order, embedded-429 retry) alongside a
+    /// single-member default pool. Mirrors the continuation-pool shape; each
+    /// member's `accepts_scheduling_priority` capability is given explicitly.
+    fn completions_pool_targets(alias: &str, accepts_priority: &[bool]) -> target::Targets {
         use crate::load_balancer::{Provider, ProviderPool};
         use crate::target::{FallbackConfig, LoadBalanceStrategy, Target, TargetPools};
 
-        let make_pool = |urls: Vec<String>| {
-            let providers = urls
+        let make_pool = |members: Vec<(String, bool)>| {
+            let providers = members
                 .into_iter()
-                .map(|u| {
+                .map(|(u, accepts)| {
                     let t = Target::builder()
                         .url(u.parse().unwrap())
                         .request_timeout_secs(5)
+                        .accepts_scheduling_priority(accepts)
                         .build();
                     Provider::new(t, 1)
                 })
@@ -1251,10 +1253,12 @@ mod tests {
                 Vec::new(),
             )
         };
-        let default_pool = make_pool(vec!["https://chat.example.com/".to_string()]);
+        let default_pool = make_pool(vec![("https://chat.example.com/".to_string(), false)]);
         let completions_pool = make_pool(
-            (0..n)
-                .map(|i| format!("https://c{i}.example.com/"))
+            accepts_priority
+                .iter()
+                .enumerate()
+                .map(|(i, accepts)| (format!("https://c{i}.example.com/"), *accepts))
                 .collect(),
         );
         let mut extra = std::collections::HashMap::new();
@@ -1274,13 +1278,15 @@ mod tests {
         }
     }
 
-    /// The dynamo scheduler's `priority` field must reach a non-default pool's
-    /// PRIMARY member and be stripped for every fallback member: third-party
-    /// completions targets reject unknown fields outright (Fireworks:
-    /// "Extra inputs are not permitted, field: 'priority'"), which turned every
-    /// continuation resume-leg fallback into a 400 in the cl-1453 canary.
+    /// The dynamo scheduler's `priority` field reaches a non-default pool
+    /// member iff that member's serving stack accepts it
+    /// (`accepts_scheduling_priority`), regardless of position. Third-party
+    /// completions targets reject unknown fields outright (Fireworks: "Extra
+    /// inputs are not permitted, field: 'priority'"): keyed on position, the
+    /// cl-1453 canary 400'd on every fallback leg, and later — with the dynamo
+    /// member disabled — on every PRIMARY leg too.
     #[tokio::test]
-    async fn non_primary_completions_member_never_sees_priority() {
+    async fn completions_member_sees_priority_iff_it_accepts_it() {
         let error_frame =
             "data: {\"error\":{\"code\":429,\"message\":\"Provider returned error\"}}\n\n"
                 .to_string();
@@ -1291,7 +1297,9 @@ mod tests {
                 vec![OK_CONTENT_FRAME.to_string()], // fallback member serves
             ],
         );
-        let app_state = AppState::with_client(completions_pool_targets("gpt-4", 2), mock.clone());
+        // dynamo (accepts) first, third party (does not) second: the wave-1 shape.
+        let app_state =
+            AppState::with_client(completions_pool_targets("gpt-4", &[true, false]), mock.clone());
         let server = TestServer::new(build_router(app_state)).unwrap();
 
         let response = server
@@ -1308,17 +1316,46 @@ mod tests {
         let second: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
         assert_eq!(
             first["priority"], 100,
-            "the primary (dynamo) member must receive the scheduler priority"
+            "a member that accepts the field receives the scheduler priority"
         );
         assert!(
             second.get("priority").is_none(),
-            "a non-primary member must never see the dynamo-only field"
+            "a member that does not accept it must never see the dynamo-only field"
         );
         assert_eq!(
             second["prompt"],
             json!([1, 2, 3]),
             "the rest of the body is untouched"
         );
+    }
+
+    /// The incident shape: the dynamo member is disabled/removed and a third
+    /// party sits at index 0. Position must not decide — the field is stripped
+    /// for the first attempt too, or every resume leg 400s exactly when the
+    /// feature is needed most.
+    #[tokio::test]
+    async fn a_non_accepting_primary_never_sees_priority_either() {
+        let mock = MockHttpClient::new_streaming(StatusCode::OK, vec![OK_CONTENT_FRAME.to_string()]);
+        let app_state =
+            AppState::with_client(completions_pool_targets("gpt-4", &[false]), mock.clone());
+        let server = TestServer::new(build_router(app_state)).unwrap();
+
+        let response = server
+            .post("/v1/completions")
+            .json(&json!({
+                "model": "gpt-4", "prompt": [1, 2, 3], "stream": true, "priority": 100
+            }))
+            .await;
+
+        assert_eq!(response.status_code(), 200);
+        let requests = mock.get_requests();
+        assert_eq!(requests.len(), 1);
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert!(
+            body.get("priority").is_none(),
+            "index 0 is not 'dynamo'; a non-accepting primary is stripped too"
+        );
+        assert_eq!(body["prompt"], json!([1, 2, 3]));
     }
 
     /// Control: default-pool fallbacks keep `priority` on every attempt —

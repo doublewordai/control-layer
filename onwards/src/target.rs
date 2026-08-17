@@ -156,6 +156,15 @@ pub struct ProviderSpec {
     /// Translate canonical OpenAI reasoning controls into this provider's request shape.
     #[serde(default)]
     pub reasoning_translation: Option<ReasoningTranslationConfig>,
+
+    /// This provider's serving stack understands the scheduling `priority`
+    /// body field (the dynamo frontend does; third-party APIs reject unknown
+    /// fields — Fireworks: "Extra inputs are not permitted"). Within a named
+    /// pool the field is stripped from every attempt whose provider lacks
+    /// this, regardless of the member's position. Defaults to false: the safe
+    /// failure is a leg queued at priority 0, never a leg rejected outright.
+    #[serde(default)]
+    pub accepts_scheduling_priority: bool,
 }
 
 /// Configuration for Open Responses API behavior
@@ -435,6 +444,11 @@ pub struct TargetSpec {
     #[serde(default)]
     pub propagate_trace_context: Option<bool>,
 
+    /// See [`ProviderSpec::accepts_scheduling_priority`].
+    #[serde(default)]
+    #[builder(default)]
+    pub accepts_scheduling_priority: bool,
+
     /// Request timeout in seconds. If specified, requests exceeding this duration
     /// will be cancelled and return a 504 Gateway Timeout error.
     /// If fallback is enabled, the next provider will be tried.
@@ -645,6 +659,7 @@ impl TargetSpecOrList {
                         // an unset value still inherits the resolved trusted value.
                         propagate_trace_context: t.propagate_trace_context,
                         reasoning_translation: t.reasoning_translation,
+                        accepts_scheduling_priority: t.accepts_scheduling_priority,
                     })
                     .collect();
                 Ok(PoolConfig {
@@ -686,6 +701,7 @@ impl TargetSpecOrList {
                     // YAML form would be silently dropped.
                     propagate_trace_context: spec.propagate_trace_context,
                     reasoning_translation: spec.reasoning_translation,
+                    accepts_scheduling_priority: spec.accepts_scheduling_priority,
                 };
                 Ok(PoolConfig {
                     keys,
@@ -741,6 +757,7 @@ impl From<TargetSpec> for Target {
             trusted: None,
             propagate_trace_context: value.propagate_trace_context,
             reasoning_translation: value.reasoning_translation,
+            accepts_scheduling_priority: value.accepts_scheduling_priority,
         }
     }
 }
@@ -767,6 +784,7 @@ impl From<ProviderSpec> for Target {
             trusted: value.trusted,
             propagate_trace_context: value.propagate_trace_context,
             reasoning_translation: value.reasoning_translation,
+            accepts_scheduling_priority: value.accepts_scheduling_priority,
         }
     }
 }
@@ -917,6 +935,9 @@ pub struct Target {
     pub propagate_trace_context: Option<bool>,
     /// Provider-specific translation for canonical OpenAI reasoning controls.
     pub reasoning_translation: Option<ReasoningTranslationConfig>,
+    /// See [`ProviderSpec::accepts_scheduling_priority`].
+    #[builder(default)]
+    pub accepts_scheduling_priority: bool,
 }
 
 impl Target {
@@ -2643,6 +2664,7 @@ mod tests {
                 trusted: None,
                 propagate_trace_context: None,
                 reasoning_translation: None,
+                accepts_scheduling_priority: false,
             }],
         };
 

@@ -91,6 +91,10 @@ struct OnwardsTarget {
     endpoint_api_key: Option<String>,
     auth_header_name: String,
     auth_header_prefix: String,
+    /// The endpoint's serving stack understands the scheduling `priority`
+    /// body field (dynamo). Onwards strips the field from named-pool attempts
+    /// to members without it, regardless of position.
+    endpoint_accepts_scheduling_priority: bool,
 
     // API keys that have access to this deployment
     api_keys: Vec<OnwardsApiKey>,
@@ -549,7 +553,8 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
             ie.url as "endpoint_url!",
             ie.api_key as endpoint_api_key,
             ie.auth_header_name,
-            ie.auth_header_prefix
+            ie.auth_header_prefix,
+            ie.accepts_scheduling_priority as endpoint_accepts_scheduling_priority
         FROM deployed_models cm
         INNER JOIN deployed_model_components dmc ON cm.id = dmc.composite_model_id
         INNER JOIN deployed_models dm ON dmc.deployed_model_id = dm.id
@@ -809,6 +814,7 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                     endpoint_api_key: row.endpoint_api_key.clone(),
                     auth_header_name: row.auth_header_name.clone(),
                     auth_header_prefix: row.auth_header_prefix.clone(),
+                    endpoint_accepts_scheduling_priority: row.endpoint_accepts_scheduling_priority,
                     api_keys: Vec::new(),
                 },
             });
@@ -1020,6 +1026,7 @@ fn convert_composite_to_target_spec(
                     // leaked to them.
                     propagate_trace_context: None,
                     reasoning_translation: target.reasoning_translation.clone().map(Into::into),
+                    accepts_scheduling_priority: target.endpoint_accepts_scheduling_priority,
                 }
             }
         };
@@ -1230,6 +1237,7 @@ fn convert_to_config_file(
                 // context, third-party providers do not.
                 propagate_trace_context: None,
                 reasoning_translation: target.reasoning_translation.clone().map(Into::into),
+                accepts_scheduling_priority: target.endpoint_accepts_scheduling_priority,
             };
 
             // Build fallback configuration. For single-provider (standard)
@@ -1365,6 +1373,7 @@ pub async fn load_targets_from_db(
             ie.api_key as endpoint_api_key,
             ie.auth_header_name,
             ie.auth_header_prefix,
+            ie.accepts_scheduling_priority as endpoint_accepts_scheduling_priority,
             ak.id as "api_key_id?",
             ak.secret as "api_key_secret?",
             ak.purpose as "api_key_purpose?",
@@ -1518,6 +1527,7 @@ pub async fn load_targets_from_db(
                 endpoint_api_key: row.endpoint_api_key.clone(),
                 auth_header_name: row.auth_header_name.clone(),
                 auth_header_prefix: row.auth_header_prefix.clone(),
+                endpoint_accepts_scheduling_priority: row.endpoint_accepts_scheduling_priority,
                 api_keys: Vec::new(),
             }
         });

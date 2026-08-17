@@ -53,6 +53,7 @@ fn create_test_target(model_name: &str, alias: &str, endpoint_url: &str) -> Onwa
         endpoint_api_key: None,
         auth_header_name: "Authorization".to_string(),
         auth_header_prefix: "Bearer ".to_string(),
+        endpoint_accepts_scheduling_priority: false,
         api_keys: Vec::new(),
     }
 }
@@ -753,6 +754,41 @@ async fn test_continuation_key_reaches_gated_and_priced_composites(pool: sqlx::P
     );
 }
 
+/// `inference_endpoints.accepts_scheduling_priority` (migration 135) reaches
+/// each provider of every pool it hosts, so onwards can strip the dynamo-only
+/// `priority` field per member instead of per position. component-a is hosted
+/// on endpoint 0001 (unflagged), component-b on 0002 (flagged here).
+#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
+async fn test_endpoint_accepts_scheduling_priority_reaches_each_provider(pool: sqlx::PgPool) {
+    sqlx::query("UPDATE inference_endpoints SET accepts_scheduling_priority = true WHERE id = '30000000-0000-0000-0000-000000000002'")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let targets = super::load_targets_from_db(&pool, &[], false, &RateLimitTiersConfig::default())
+        .await
+        .unwrap();
+    let composite = targets.targets.get("composite-priority").expect("composite-priority should exist");
+    let providers = composite.value().default_pool().providers();
+    // Fixture order: component-b (weight 30, sort 0) then component-a.
+    assert_eq!(providers[0].target.onwards_model.as_deref(), Some("component-b-model"));
+    assert!(
+        providers[0].target.accepts_scheduling_priority,
+        "a member hosted on a flagged endpoint accepts the scheduling field"
+    );
+    assert!(
+        !providers[1].target.accepts_scheduling_priority,
+        "a member hosted on an unflagged endpoint does not (default false)"
+    );
+
+    // Regular (non-composite) models carry it too.
+    let private = targets.targets.get("regular-private").expect("regular-private should exist");
+    assert!(
+        private.value().default_pool().providers()[0].target.accepts_scheduling_priority,
+        "regular-private is hosted on the flagged custom endpoint"
+    );
+}
+
 /// A named pool's ordering is a validated failover list (dynamo first, the
 /// harness-validated target behind it), never a load-balancing surface: under
 /// the composite's own strategy (DB default weighted_random) resume legs would
@@ -1254,6 +1290,7 @@ async fn test_onwards_config_reloads_on_tariff_change(pool: sqlx::PgPool) {
             auth_header_name: Some("Authorization".to_string()),
             auth_header_prefix: Some("Bearer ".to_string()),
             reasoning_translation: None,
+            accepts_scheduling_priority: false,
         })
         .await
         .unwrap();
@@ -1477,6 +1514,7 @@ async fn test_batch_api_key_access_to_composite_escalation_target(pool: sqlx::Pg
             auth_header_name: Some("Authorization".to_string()),
             auth_header_prefix: Some("Bearer ".to_string()),
             reasoning_translation: None,
+            accepts_scheduling_priority: false,
         })
         .await
         .unwrap();

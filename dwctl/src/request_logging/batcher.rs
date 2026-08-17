@@ -1855,6 +1855,7 @@ mod integration_tests {
                 auth_header_name: Some("Authorization".to_string()),
                 auth_header_prefix: Some("Bearer ".to_string()),
                 reasoning_translation: None,
+                accepts_scheduling_priority: false,
             })
             .await
             .unwrap();
