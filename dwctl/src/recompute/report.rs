@@ -82,6 +82,19 @@ pub struct ReportRow {
     /// model was not cache-enabled for this principal, which is different from a split of
     /// zero.
     pub reconstructed_cache: Option<ReconstructedCache>,
+
+    /// The exact chat-templated token count of the stored request from tokenizer-svc's
+    /// `/v1/render`, when a tokenizer was available and the model is mapped. Recorded NEXT
+    /// TO the provider's count, never adopted over it — replacing an agreeing count with
+    /// ours ± template drift would flip every healthy row to "changed".
+    pub prompt_render_total: Option<i64>,
+    /// Whether the render agrees with the recomputed prompt within tolerance. `None` when
+    /// no render ran; `Some(false)` is a per-row finding for the operator, not a change.
+    pub prompt_render_agrees: Option<bool>,
+    /// How the completion figure was arrived at (`reported` / `estimated`). An `estimated`
+    /// completion — a tokenizer count of extracted response text, used only when the body
+    /// carries no usage — must not be applied without an explicit opt-in.
+    pub completion_token_source: Option<String>,
 }
 
 /// A cache split re-derived from the prefix index, and whether it agrees with the row.
@@ -123,6 +136,13 @@ pub struct ReportSummary {
     /// Of those, how many disagreed with the split stored on the row. Non-zero is a finding:
     /// either the classifier was wrong at serving time, or the index no longer reflects it.
     pub rows_cache_disagreed: i64,
+    /// Rows whose prompt was independently re-counted by `/v1/render`.
+    pub rows_render_checked: i64,
+    /// Of those, how many diverged beyond tolerance from the provider's count.
+    pub rows_render_disagreed: i64,
+    /// Usage-less rows rescued by the tokenizer (rendered prompt + estimated completion).
+    /// These carry `completion_token_source: "estimated"` and are gated from auto-apply.
+    pub rows_tokenizer_rescued: i64,
     pub stored_prompt_tokens: i64,
     pub recomputed_prompt_tokens: i64,
     pub stored_completion_tokens: i64,
@@ -134,6 +154,12 @@ pub struct ReportSummary {
     /// `recomputed_cost − stored_cost`. Positive means undercharged.
     #[schema(value_type = String)]
     pub net_correction: Decimal,
+    /// The share of `net_correction` that rests on ESTIMATED completions (tokenizer
+    /// rescues). Not exact by construction — the apply step must exclude these rows unless
+    /// explicitly opted in, so the two figures are separated here rather than leaving the
+    /// operator to discover the mix per row.
+    #[schema(value_type = String)]
+    pub net_correction_estimated: Decimal,
 }
 
 /// The document.
@@ -276,6 +302,9 @@ impl ReportRow {
             changed,
             note: None,
             reconstructed_cache: None,
+            prompt_render_total: None,
+            prompt_render_agrees: None,
+            completion_token_source: Some(usage.completion_source.as_str().to_string()),
         }
     }
 
@@ -296,6 +325,9 @@ impl ReportRow {
             changed: false,
             note: Some(note),
             reconstructed_cache: None,
+            prompt_render_total: None,
+            prompt_render_agrees: None,
+            completion_token_source: None,
         }
     }
 }
@@ -344,6 +376,15 @@ impl ReportSummary {
                     s.rows_cache_disagreed += 1;
                 }
             }
+            if let Some(agrees) = r.prompt_render_agrees {
+                s.rows_render_checked += 1;
+                if !agrees {
+                    s.rows_render_disagreed += 1;
+                }
+            }
+            if r.completion_token_source.as_deref() == Some("estimated") {
+                s.rows_tokenizer_rescued += 1;
+            }
             s.stored_prompt_tokens += r.stored.prompt_tokens;
             s.stored_completion_tokens += r.stored.completion_tokens;
             s.stored_cost += r.stored.cost.unwrap_or_default();
@@ -358,6 +399,9 @@ impl ReportSummary {
                     s.recomputed_prompt_tokens += rec.prompt_tokens;
                     s.recomputed_completion_tokens += rec.completion_tokens;
                     s.recomputed_cost += rec.cost.unwrap_or_default();
+                    if r.completion_token_source.as_deref() == Some("estimated") {
+                        s.net_correction_estimated += rec.cost.unwrap_or_default() - r.stored.cost.unwrap_or_default();
+                    }
                 }
                 // An un-replayed row contributes its STORED figures to the recomputed totals,
                 // so the two sides stay comparable and `net_correction` is the real delta

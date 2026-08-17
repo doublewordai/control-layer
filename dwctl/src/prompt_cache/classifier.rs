@@ -256,8 +256,14 @@ impl Classifier {
                 }
                 // Best-effort: degrade to no caching (uniform zeros). Log at debug so the
                 // silent degradation is diagnosable without warn-level noise on every odd body.
+                // Marked degraded: on the SERVING path this arm is defensive (the layer
+                // 400-rejects malformed markers before the fork), so a body reaching it is
+                // an anomaly — and a *replay* hitting it (e.g. an empty stored template from
+                // a capture gap) must read "no evidence", not a confident zero split.
+                // Measured: 40/40 empty-template rows reconstructed as zero-split
+                // disagreements against real stored splits before this flag.
                 tracing::debug!(error = %e, virtual_model = req.virtual_model, "cache classify: body not cacheable (invalid cache_control markers / unparseable JSON)");
-                return Ok(ClassifyOutcome::zero_active());
+                return Ok(ClassifyOutcome::zero_active_degraded());
             }
         };
         if parsed.breakpoints.is_empty() {

@@ -204,10 +204,37 @@ pub async fn load_corpus(pool: &PgPool, filter: &CorpusFilter) -> Result<Vec<Cor
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::prompt_cache::TokenizerClient;
     use crate::recompute::cache_fields::CreationTier;
     use crate::recompute::recompute_corpus;
     use crate::test::utils::setup_fusillade_pool;
     use sqlx::PgPool;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// A tokenizer-svc double: `/v1/render` answers `render_total` for any request,
+    /// `/v1/tokenize` answers `tokenize_total`.
+    async fn mock_tokenizer(render_total: u32, tokenize_total: u32) -> (MockServer, TokenizerClient) {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/render"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "virtual_model": "m", "tokenizer_version": "tok-v1", "template_version": "tpl-v1",
+                "total": render_total, "prefix_counts": []
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/tokenize"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "virtual_model": "m", "tokenizer_version": "tok-v1",
+                "segment_counts": [tokenize_total], "cumulative": [tokenize_total], "total": tokenize_total
+            })))
+            .mount(&server)
+            .await;
+        let client = TokenizerClient::new(server.uri());
+        (server, client)
+    }
 
     /// Seed one already-billed request with its stored payload, as the live path would have
     /// left it. Returns the analytics row id.
@@ -317,7 +344,7 @@ mod tests {
         )
         .await;
 
-        let report = recompute_corpus(&pool, &filter_for(user_id), CreationTier::FiveMinute, None)
+        let report = recompute_corpus(&pool, &filter_for(user_id), CreationTier::FiveMinute, None, None)
             .await
             .unwrap();
 
@@ -345,7 +372,7 @@ mod tests {
         )
         .await;
 
-        let report = recompute_corpus(&pool, &filter_for(user_id), CreationTier::FiveMinute, None)
+        let report = recompute_corpus(&pool, &filter_for(user_id), CreationTier::FiveMinute, None, None)
             .await
             .unwrap();
 
@@ -399,7 +426,7 @@ mod tests {
         )
         .await;
 
-        let report = recompute_corpus(&pool, &filter_for(user_id), CreationTier::FiveMinute, None)
+        let report = recompute_corpus(&pool, &filter_for(user_id), CreationTier::FiveMinute, None, None)
             .await
             .unwrap();
 
@@ -448,7 +475,7 @@ mod tests {
         )
         .await;
 
-        let report = recompute_corpus(&pool, &filter_for(user_id), CreationTier::FiveMinute, None)
+        let report = recompute_corpus(&pool, &filter_for(user_id), CreationTier::FiveMinute, None, None)
             .await
             .unwrap();
 
@@ -477,7 +504,7 @@ mod tests {
         )
         .await;
 
-        let report = recompute_corpus(&pool, &filter_for(user_id), CreationTier::FiveMinute, None)
+        let report = recompute_corpus(&pool, &filter_for(user_id), CreationTier::FiveMinute, None, None)
             .await
             .unwrap();
 
@@ -490,6 +517,112 @@ mod tests {
             row.note.as_deref().is_some_and(|n| n.contains("no usage object")),
             "the note must say why: {:?}",
             row.note
+        );
+    }
+
+    /// The render verifies, it never replaces: a healthy row whose provider count the
+    /// tokenizer contradicts stays UNCHANGED — the disagreement is a per-row finding, not a
+    /// correction. Adopting "agreeing" renders instead would replace every healthy count
+    /// with ours ± template drift and destroy the no-op guarantee.
+    #[sqlx::test]
+    async fn render_disagreement_is_annotated_but_never_adopted(pool: PgPool) {
+        setup_fusillade_pool(&pool).await;
+        let (user_id, _) = seed(
+            &pool,
+            "/chat/completions",
+            r#"{"id":"c","object":"chat.completion","created":1,"model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"x"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1000,"completion_tokens":100,"total_tokens":1100}}"#,
+            1000,
+            100,
+            0,
+            0,
+            Decimal::from_str_exact("0.0012").unwrap(),
+        )
+        .await;
+
+        // Render says 2000 against a reported 1000 — a 50% divergence, far beyond tolerance.
+        let (_server, tokenizer) = mock_tokenizer(2000, 0).await;
+        let report = recompute_corpus(&pool, &filter_for(user_id), CreationTier::FiveMinute, None, Some(&tokenizer))
+            .await
+            .unwrap();
+
+        assert_eq!(report.summary.rows_changed, 0, "a contested count is a finding, not a correction");
+        assert_eq!(report.summary.rows_render_checked, 1);
+        assert_eq!(report.summary.rows_render_disagreed, 1);
+        let row = &report.rows[0];
+        assert_eq!(row.recomputed.as_ref().unwrap().prompt_tokens, 1000, "provider count kept");
+        assert_eq!(row.prompt_render_total, Some(2000));
+        assert_eq!(row.prompt_render_agrees, Some(false));
+    }
+
+    /// An agreeing render annotates the row and moves nothing.
+    #[sqlx::test]
+    async fn render_agreement_is_annotated(pool: PgPool) {
+        setup_fusillade_pool(&pool).await;
+        let (user_id, _) = seed(
+            &pool,
+            "/chat/completions",
+            r#"{"id":"c","object":"chat.completion","created":1,"model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"x"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1000,"completion_tokens":100,"total_tokens":1100}}"#,
+            1000,
+            100,
+            0,
+            0,
+            Decimal::from_str_exact("0.0012").unwrap(),
+        )
+        .await;
+
+        // 1005 vs 1000 = 50 bps, inside the 1% tolerance.
+        let (_server, tokenizer) = mock_tokenizer(1005, 0).await;
+        let report = recompute_corpus(&pool, &filter_for(user_id), CreationTier::FiveMinute, None, Some(&tokenizer))
+            .await
+            .unwrap();
+
+        assert_eq!(report.summary.rows_changed, 0);
+        assert_eq!(report.summary.rows_render_checked, 1);
+        assert_eq!(report.summary.rows_render_disagreed, 0);
+        let row = &report.rows[0];
+        assert_eq!(row.recomputed.as_ref().unwrap().prompt_tokens, 1000, "never adopted, even agreeing");
+        assert_eq!(row.prompt_render_agrees, Some(true));
+    }
+
+    /// The July shape WITH a tokenizer: the row is rescued instead of refused — prompt from
+    /// the exact render, completion estimated from the response text, priced, and gated
+    /// (`completion_token_source: "estimated"`) so the apply step demands an opt-in.
+    #[sqlx::test]
+    async fn usage_less_row_is_rescued_by_the_tokenizer(pool: PgPool) {
+        setup_fusillade_pool(&pool).await;
+        let (user_id, analytics_id) = seed(
+            &pool,
+            "/chat/completions",
+            r#"{"choices":[{"finish_reason":"tool_calls","index":0,"message":{"role":"assistant","content":"partial answer"}}],"created":1,"id":"c","model":"m","object":"chat.completion","usage":null}"#,
+            0,
+            0,
+            0,
+            0,
+            Decimal::ZERO,
+        )
+        .await;
+
+        let (_server, tokenizer) = mock_tokenizer(4096, 512).await;
+        let report = recompute_corpus(&pool, &filter_for(user_id), CreationTier::FiveMinute, None, Some(&tokenizer))
+            .await
+            .unwrap();
+
+        assert_eq!(report.summary.rows_not_replayable, 0, "rescued, not refused");
+        assert_eq!(report.summary.rows_changed, 1);
+        assert_eq!(report.summary.rows_tokenizer_rescued, 1);
+        let row = report.rows.iter().find(|r| r.analytics_id == analytics_id).unwrap();
+        let rec = row.recomputed.as_ref().expect("rescued row is replayed");
+        assert_eq!(rec.prompt_tokens, 4096, "prompt is the exact render");
+        assert_eq!(rec.completion_tokens, 512, "completion is the text estimate");
+        assert_eq!(rec.cache_read, 0, "no usage object → no split to read, none invented");
+        assert_eq!(row.token_source.as_deref(), Some("rendered"));
+        assert_eq!(row.completion_token_source.as_deref(), Some("estimated"));
+        // 4096 × 1e-6 + 512 × 2e-6, at the row's stored unit prices.
+        assert_eq!(rec.cost, Some(Decimal::from_str_exact("0.00512").unwrap()));
+        assert!(report.summary.net_correction > Decimal::ZERO, "recovered usage, undercharge");
+        assert_eq!(
+            report.summary.net_correction_estimated, report.summary.net_correction,
+            "the whole correction rests on an estimate here, and the summary must say so"
         );
     }
 
@@ -519,7 +652,7 @@ mod tests {
         .await
         .unwrap();
 
-        let report = recompute_corpus(&pool, &filter_for(user_id), CreationTier::FiveMinute, None)
+        let report = recompute_corpus(&pool, &filter_for(user_id), CreationTier::FiveMinute, None, None)
             .await
             .unwrap();
 

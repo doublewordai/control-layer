@@ -61,6 +61,7 @@ mod tests {
             limit,
         };
 
+        let tokenizer_client = TokenizerClient::new(tokenizer_url.clone());
         let classifier = Classifier::new(
             PrincipalResolver::new(pool.clone()),
             ModelConfigResolver::new(pool.clone()),
@@ -72,9 +73,10 @@ mod tests {
             true,
         );
 
-        let report = crate::recompute::recompute_corpus(&pool, &filter, CreationTier::FiveMinute, Some(&classifier))
-            .await
-            .expect("recompute");
+        let report =
+            crate::recompute::recompute_corpus(&pool, &filter, CreationTier::FiveMinute, Some(&classifier), Some(&tokenizer_client))
+                .await
+                .expect("recompute");
 
         let s = &report.summary;
         println!("\n=== corpus ===");
@@ -87,6 +89,10 @@ mod tests {
         println!("\n=== cache split reconstruction ===");
         println!("reconstructed     {}", s.rows_cache_reconstructed);
         println!("disagreed         {}", s.rows_cache_disagreed);
+        println!("\n=== tokenizer verification ===");
+        println!("render checked    {}", s.rows_render_checked);
+        println!("render disagreed  {}", s.rows_render_disagreed);
+        println!("rescued           {}", s.rows_tokenizer_rescued);
         println!("\n=== totals ===");
         println!("stored prompt     {}", s.stored_prompt_tokens);
         println!("recomputed prompt {}", s.recomputed_prompt_tokens);
