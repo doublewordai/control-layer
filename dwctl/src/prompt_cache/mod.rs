@@ -19,6 +19,7 @@ pub mod model_config;
 pub mod parse;
 pub mod postgres;
 pub mod principal;
+pub mod query;
 pub mod sse;
 pub mod stats;
 pub mod tokenizer;

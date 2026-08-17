@@ -33,11 +33,14 @@
 //! - **Batch enrichment**: User and pricing lookups are batched using `IN` clauses,
 //!   reducing from O(N) queries to O(1) per batch.
 
-use crate::config::{CachePricingConfig, Config, ONWARDS_CONFIG_CHANGED_CHANNEL};
+use crate::config::{Config, ONWARDS_CONFIG_CHANGED_CHANNEL};
 
 use crate::db::models::api_keys::ApiKeyPurpose;
 use crate::metrics::MetricsRecorder;
 use crate::metrics::errors::component::ANALYTICS_BATCHER;
+use crate::pricing::{
+    CacheTariffRow, ModelInfo, TariffInfo, TokenCounts, charged_cost, find_best_tariff, list_price, resolve_cache_multipliers,
+};
 use crate::request_logging::serializers::HttpAnalyticsRow;
 use chrono::{DateTime, Utc};
 use metrics::{counter, histogram};
@@ -170,177 +173,27 @@ struct KeyLookup {
     cap_scope_root: Option<Uuid>,
 }
 
-/// A `model_cache_tariffs` row (per model, per tier), with its validity window so batch
-/// requests can be priced as of their creation time (mirrors `model_tariffs` handling).
-/// One `model_cache_tariffs` version: all three tiers in a single row, plus the validity
-/// window so a batch request prices as of its creation time. Completeness is guaranteed by
-/// the schema (every multiplier is NOT NULL), so there is no missing-tier case to default.
-#[derive(Clone)]
-struct CacheTariffRow {
-    write_multiplier_5m: Decimal,
-    write_multiplier_1h: Decimal,
-    write_multiplier_24h: Decimal,
-    read_multiplier: Decimal,
-    valid_from: DateTime<Utc>,
-    valid_until: Option<DateTime<Utc>>,
-}
-
-/// The cache multipliers resolved for one request at a point in time.
-#[derive(Clone, Copy)]
-struct CacheMultipliers {
-    read: Decimal,
-    write_5m: Decimal,
-    write_1h: Decimal,
-    write_24h: Decimal,
-}
-
-impl CacheMultipliers {
-    /// The operator-configured defaults ([`CachePricingConfig`]) — the same values a freshly
-    /// enabled tariff would get. Used as the fallback when a request carries cache tokens with
-    /// no tariff valid at its time (unreachable in practice — classify gates on an active row,
-    /// and the call site emits a `cache_tariff_missing` background error if it ever happens).
-    fn from_config(c: &CachePricingConfig) -> Self {
+/// The price-relevant token counts for a record, in the shape [`crate::pricing`] works in.
+///
+/// `prompt_tokens` is the TOTAL input including the cached share — see
+/// [`crate::pricing::TokenCounts`] for why that invariant matters.
+impl From<&RawAnalyticsRecord> for TokenCounts {
+    fn from(raw: &RawAnalyticsRecord) -> Self {
         Self {
-            read: c.default_read_multiplier,
-            write_5m: c.default_write_multiplier_5m,
-            write_1h: c.default_write_multiplier_1h,
-            write_24h: c.default_write_multiplier_24h,
+            prompt: raw.prompt_tokens,
+            completion: raw.completion_tokens,
+            cache_read: raw.cache_read_input_tokens,
+            cache_creation_5m: raw.cache_creation_5m_input_tokens,
+            cache_creation_1h: raw.cache_creation_1h_input_tokens,
+            cache_creation_24h: raw.cache_creation_24h_input_tokens,
         }
     }
 }
 
-impl Default for CacheMultipliers {
-    /// Mirrors the shipped [`CachePricingConfig`] defaults (read 0.1, writes 1.25/2.0/2.5) so
-    /// the hardcoded default and the config defaults can't drift. Production reads the live
-    /// config via [`CacheMultipliers::from_config`]; this is for tests/standalone callers.
-    fn default() -> Self {
-        Self::from_config(&CachePricingConfig::default())
-    }
-}
-
-/// Resolve the multipliers from the model's cache-tariff row valid at `timestamp` — the
-/// most-recently-effective version still in its window. One row carries all tiers, so
-/// there is no per-tier resolution or gap. `None` when no version was valid at `timestamp`
-/// (so the caller can distinguish "no tariff" from a real row and fall back deliberately).
-fn resolve_cache_multipliers(rows: &[CacheTariffRow], timestamp: DateTime<Utc>) -> Option<CacheMultipliers> {
-    rows.iter()
-        .filter(|r| r.valid_from <= timestamp && r.valid_until.is_none_or(|u| u > timestamp))
-        .max_by_key(|r| r.valid_from)
-        .map(|r| CacheMultipliers {
-            read: r.read_multiplier,
-            write_5m: r.write_multiplier_5m,
-            write_1h: r.write_multiplier_1h,
-            write_24h: r.write_multiplier_24h,
-        })
-}
-
-/// The charged cost for a record, gating the cache discount on dwctl enablement: when a
-/// tariff was valid at inference (`cache_mults` is `Some`) apply the cache-adjusted pricing;
-/// otherwise bill the full input at list price. The `None` case deliberately ignores any
-/// cache_* tokens in the response — without an active tariff those are the upstream
-/// provider's own caching, not dwctl's, and must not earn dwctl's discount.
-fn charged_cost(
-    raw: &RawAnalyticsRecord,
-    input_price: Option<Decimal>,
-    output_price: Option<Decimal>,
-    cache_mults: Option<CacheMultipliers>,
-) -> Option<Decimal> {
-    match cache_mults {
-        Some(m) => compute_total_cost(raw, input_price, output_price, &m),
-        None => compute_list_price(raw, input_price, output_price),
-    }
-}
-
-/// The cache-adjusted request cost. Reduces to the plain
-/// `prompt × input + completion × output` when there are no cache tokens, so non-cache
-/// requests are unaffected. `None` when the model has no pricing at all (→ no ledger row),
-/// matching the old generated `total_cost`'s NULL.
-fn compute_total_cost(
-    raw: &RawAnalyticsRecord,
-    input_price: Option<Decimal>,
-    output_price: Option<Decimal>,
-    m: &CacheMultipliers,
-) -> Option<Decimal> {
-    if input_price.is_none() && output_price.is_none() {
-        return None;
-    }
-    let inp = input_price.unwrap_or(Decimal::ZERO);
-    let outp = output_price.unwrap_or(Decimal::ZERO);
-
-    let mut read = Decimal::from(raw.cache_read_input_tokens.max(0));
-    let c5 = Decimal::from(raw.cache_creation_5m_input_tokens.max(0));
-    let c1 = Decimal::from(raw.cache_creation_1h_input_tokens.max(0));
-    let c24 = Decimal::from(raw.cache_creation_24h_input_tokens.max(0));
-    let prompt = Decimal::from(raw.prompt_tokens.max(0));
-    let creations = c5 + c1 + c24;
-
-    // Billing safety, two tiers. The classifier's tokenizer counts the request CONTENT
-    // while the engine's prompt_tokens counts its chat-template rendering, so the two
-    // legitimately disagree by a small margin — on fully-marked prompts (agent traffic)
-    // the classifier's sum routinely lands a percent or so ABOVE prompt_tokens. That is
-    // drift, not corruption: CAP the split to the prompt by removing the excess from the
-    // read count (the cheapest-rate bucket — deterministic and audit-simple; keeping the
-    // premium-billed write buckets intact means the reduction lands where it lowers the
-    // bill the least, so the cap is conservative: it slightly favors the house, never the
-    // reverse).
-    //
-    // Only when the WRITE counts alone exceed the whole prompt is the split genuinely
-    // corrupt (writes bill at a premium, so trusting them could overcharge): distrust it
-    // entirely and bill the input at base rate, loudly.
-    if creations > prompt {
-        crate::background_error!(
-            ANALYTICS_BATCHER,
-            "cache_split_exceeds_prompt",
-            Warning,
-            model = raw.request_model.as_deref().unwrap_or("?"),
-            prompt_tokens = raw.prompt_tokens,
-            "cache write counts alone exceed prompt_tokens; ignoring the split and billing at base rate"
-        );
-        return list_price(raw.prompt_tokens, raw.completion_tokens, input_price, output_price);
-    }
-    if read + creations > prompt {
-        metrics::counter!("dwctl_cache_split_capped_total").increment(1);
-        tracing::debug!(
-            model = raw.request_model.as_deref().unwrap_or("?"),
-            prompt_tokens = raw.prompt_tokens,
-            overrun = %(read + creations - prompt),
-            "cached token split exceeds prompt_tokens; capping the read count to fit"
-        );
-        read = prompt - creations;
-    }
-    let cached_total = read + creations;
-
-    // Uncached = full input minus the cached portion, floored at zero (our tokenizer and
-    // the provider's can differ; never let the cached count drive uncached negative).
-    let uncached = (prompt - cached_total).max(Decimal::ZERO);
-
-    let input_cost = uncached * inp + read * inp * m.read + c5 * inp * m.write_5m + c1 * inp * m.write_1h + c24 * inp * m.write_24h;
-    let output_cost = Decimal::from(raw.completion_tokens.max(0)) * outp;
-    Some(input_cost + output_cost)
-}
-
-/// List price for raw token counts: `prompt·input + completion·output`, or `None` when the
-/// model has no pricing at all. The single source of the base-cost arithmetic — used by the
-/// no-cache `total_cost` path ([`charged_cost`]) and by `uncached_cost`, and exposed so test
-/// fixtures derive their cost the same way production does instead of re-implementing it.
-pub(crate) fn list_price(
-    prompt_tokens: i64,
-    completion_tokens: i64,
-    input_price: Option<Decimal>,
-    output_price: Option<Decimal>,
-) -> Option<Decimal> {
-    if input_price.is_none() && output_price.is_none() {
-        return None;
-    }
-    let inp = input_price.unwrap_or(Decimal::ZERO);
-    let outp = output_price.unwrap_or(Decimal::ZERO);
-    Some(Decimal::from(prompt_tokens.max(0)) * inp + Decimal::from(completion_tokens.max(0)) * outp)
-}
-
 /// The un-discounted list price (`http_analytics.uncached_cost`): the full input + output
 /// at base rates, ignoring any cache split. `None` under the same no-pricing condition as
-/// [`compute_total_cost`], so the two columns are NULL in lockstep. Equals `total_cost`
-/// whenever the request cached nothing.
+/// [`crate::pricing::compute_total_cost`], so the two columns are NULL in lockstep. Equals
+/// `total_cost` whenever the request cached nothing.
 fn compute_list_price(raw: &RawAnalyticsRecord, input_price: Option<Decimal>, output_price: Option<Decimal>) -> Option<Decimal> {
     list_price(raw.prompt_tokens, raw.completion_tokens, input_price, output_price)
 }
@@ -685,7 +538,7 @@ where
             let (provider_name, input_price, output_price) = if let Some(ref model_alias) = raw.request_model {
                 if let Some(model_info) = model_map.get(model_alias) {
                     // Find best matching tariff
-                    let (input, output) = self.find_best_tariff(
+                    let (input, output) = find_best_tariff(
                         &model_info.tariffs,
                         api_key_purpose.as_ref(),
                         raw.batch_completion_window.as_deref(),
@@ -728,7 +581,14 @@ where
                     "response carried cache tokens but the model is not dwctl-cache-enabled; ignoring them and billing at list price"
                 );
             }
-            let total_cost = charged_cost(&raw, input_price, output_price, cache_mults_resolved);
+            let total_cost = charged_cost(
+                &TokenCounts::from(&raw),
+                raw.request_model.as_deref(),
+                input_price,
+                output_price,
+                cache_mults_resolved,
+                ANALYTICS_BATCHER,
+            );
             let uncached_cost = compute_list_price(&raw, input_price, output_price);
 
             enriched.push(EnrichedRecord {
@@ -927,58 +787,6 @@ where
 
         trace!(count = map.len(), "Batch lookup cache tariffs completed");
         Ok(map)
-    }
-
-    /// Find the best matching tariff for a record.
-    ///
-    /// Implements fallback logic:
-    /// 1. Try exact match (purpose + completion_window + timestamp)
-    /// 2. Fall back to generic tariff for that purpose (completion_window = None)
-    /// 3. Fall back to realtime purpose (generic)
-    fn find_best_tariff(
-        &self,
-        tariffs: &[TariffInfo],
-        api_key_purpose: Option<&ApiKeyPurpose>,
-        completion_window: Option<&str>,
-        timestamp: DateTime<Utc>,
-    ) -> (Option<Decimal>, Option<Decimal>) {
-        let purpose = api_key_purpose.unwrap_or(&ApiKeyPurpose::Realtime);
-
-        // Filter tariffs valid at timestamp:
-        // effective_from <= timestamp AND (valid_until IS NULL OR valid_until > timestamp)
-        let valid_tariffs: Vec<_> = tariffs
-            .iter()
-            .filter(|t| t.effective_from <= timestamp && t.valid_until.is_none_or(|valid_until| valid_until > timestamp))
-            .collect();
-
-        // Try exact match with completion_window (for batch tariffs with specific priority)
-        if let Some(cw) = completion_window
-            && let Some(tariff) = valid_tariffs
-                .iter()
-                .find(|t| &t.purpose == purpose && t.completion_window.as_deref() == Some(cw))
-        {
-            return (Some(tariff.input_price_per_token), Some(tariff.output_price_per_token));
-        }
-
-        // Try generic tariff for this purpose (completion_window = None)
-        // This ensures we don't accidentally match a different priority tier
-        if let Some(tariff) = valid_tariffs
-            .iter()
-            .find(|t| &t.purpose == purpose && t.completion_window.is_none())
-        {
-            return (Some(tariff.input_price_per_token), Some(tariff.output_price_per_token));
-        }
-
-        // Fall back to generic realtime tariff
-        if purpose != &ApiKeyPurpose::Realtime
-            && let Some(tariff) = valid_tariffs
-                .iter()
-                .find(|t| t.purpose == ApiKeyPurpose::Realtime && t.completion_window.is_none())
-        {
-            return (Some(tariff.input_price_per_token), Some(tariff.output_price_per_token));
-        }
-
-        (None, None)
     }
 
     /// Write enriched records to the database in a single transaction.
@@ -1842,24 +1650,6 @@ where
     }
 }
 
-/// Model info with tariffs
-#[derive(Debug)]
-struct ModelInfo {
-    provider_name: String,
-    tariffs: Vec<TariffInfo>,
-}
-
-/// Tariff info for pricing lookup
-#[derive(Debug)]
-struct TariffInfo {
-    purpose: ApiKeyPurpose,
-    effective_from: DateTime<Utc>,
-    valid_until: Option<DateTime<Utc>>,
-    input_price_per_token: Decimal,
-    output_price_per_token: Decimal,
-    completion_window: Option<String>,
-}
-
 /// Parse API key purpose from string
 fn parse_api_key_purpose(s: &str) -> ApiKeyPurpose {
     match s {
@@ -2023,109 +1813,20 @@ mod tests {
         Decimal::new(2, 3)
     }
 
+    /// The mapping the batcher owns: a `RawAnalyticsRecord`'s token fields into the shape
+    /// `crate::pricing` prices. The arithmetic itself is tested in `crate::pricing`; what
+    /// matters here is that every field lands in the right slot — a transposed cache tier
+    /// would silently bill reads at a write multiplier.
     #[test]
-    fn cost_without_cache_is_plain_arithmetic() {
-        // No cache tokens → identical to the old prompt×input + completion×output.
-        let r = cost_record(1000, 100, 0, 0, 0, 0);
-        let cost = compute_total_cost(&r, Some(inp()), Some(outp()), &CacheMultipliers::default()).unwrap();
-        assert_eq!(cost, Decimal::new(12, 1)); // 1000*0.001 + 100*0.002 = 1.2
-    }
-
-    #[test]
-    fn cost_with_cache_applies_per_tier_multipliers() {
-        // 2000 input: 1000 read + 500 1h-creation + 500 uncached; completion 100.
-        let r = cost_record(2000, 100, 1000, 0, 500, 0);
-        let m = CacheMultipliers {
-            read: Decimal::new(1, 1), // 0.1
-            write_5m: Decimal::ONE,
-            write_1h: Decimal::from(2), // 2.0
-            write_24h: Decimal::ONE,
-        };
-        let cost = compute_total_cost(&r, Some(inp()), Some(outp()), &m).unwrap();
-        // 500*0.001 (uncached) + 1000*0.001*0.1 (read) + 500*0.001*2.0 (1h write) + 100*0.002 (out)
-        // = 0.5 + 0.1 + 1.0 + 0.2 = 1.8
-        assert_eq!(cost, Decimal::new(18, 1));
-    }
-
-    #[test]
-    fn cost_none_when_no_pricing() {
-        let r = cost_record(1000, 100, 0, 0, 0, 0);
-        assert!(compute_total_cost(&r, None, None, &CacheMultipliers::default()).is_none());
-    }
-
-    #[test]
-    fn corrupt_writes_exceeding_prompt_bill_at_base_rate() {
-        // WRITE counts alone (150) exceed the prompt (100) — impossible, corrupt. The
-        // split is distrusted and the whole input is billed at base rate (the list
-        // price), never at the cache write premium that would overcharge on a mistake.
-        let r = cost_record(100, 5, 0, 150, 0, 0);
-        let cost = compute_total_cost(&r, Some(inp()), Some(outp()), &CacheMultipliers::default()).unwrap();
-        // list price = 100*0.001 + 5*0.002 = 0.11
-        assert_eq!(cost, Decimal::new(11, 2));
-        // No savings shown for a distrusted split: total == un-discounted list price.
-        assert_eq!(cost, compute_list_price(&r, Some(inp()), Some(outp())).unwrap());
-    }
-
-    #[test]
-    fn drifted_split_is_capped_by_reducing_read_not_discarded() {
-        // The tokenizer-drift shape (detail.dev, 2026-07): markers cover the whole prompt
-        // and the classifier's count lands ~1% above the engine's prompt_tokens
-        // (10_000 read + 200 write vs 10_100 prompt = 100-token overrun). The overrun
-        // comes off the READ count; the discount survives.
-        let m = CacheMultipliers::default(); // read 0.1, write_5m 1.25
-        let r = cost_record(10_100, 5, 10_000, 200, 0, 0);
-        let cost = compute_total_cost(&r, Some(inp()), Some(outp()), &m).unwrap();
-        // capped read = 10_100 - 200 = 9_900; uncached = 0
-        // input = 9_900*0.001*0.1 + 200*0.001*1.25 = 0.99 + 0.25 = 1.24; output = 5*0.002 = 0.01
-        assert_eq!(cost, Decimal::new(125, 2));
-        // The whole point: massively cheaper than the discarded-split list price.
-        assert!(cost < compute_list_price(&r, Some(inp()), Some(outp())).unwrap());
-    }
-
-    #[test]
-    fn split_exactly_at_prompt_is_untouched() {
-        // cached_total == prompt: no cap, no distrust — billed exactly as reported.
-        let m = CacheMultipliers::default();
-        let r = cost_record(10_000, 0, 9_800, 200, 0, 0);
-        let cost = compute_total_cost(&r, Some(inp()), Some(outp()), &m).unwrap();
-        // 9_800*0.001*0.1 + 200*0.001*1.25 = 0.98 + 0.25
-        assert_eq!(cost, Decimal::new(123, 2));
-    }
-
-    #[test]
-    fn cap_can_consume_the_entire_read() {
-        // Writes fill the whole prompt and read overruns entirely: read caps to zero and
-        // the writes bill at their premium — still a trusted, capped split (writes alone
-        // do NOT exceed the prompt, so this is drift, not corruption).
-        let m = CacheMultipliers::default();
-        let r = cost_record(1_000, 0, 50, 1_000, 0, 0);
-        let cost = compute_total_cost(&r, Some(inp()), Some(outp()), &m).unwrap();
-        // read capped to 0; 1_000*0.001*1.25 = 1.25
-        assert_eq!(cost, Decimal::new(125, 2));
-    }
-
-    #[test]
-    fn charged_cost_gates_discount_on_enablement() {
-        // 600 cache-read tokens reported on the response.
-        let r = cost_record(1000, 100, 600, 0, 0, 0);
-
-        // Not dwctl-cache-enabled (no tariff → None): the provider's cache tokens are ignored
-        // and the full input is billed at list price — no read discount.
-        let not_enabled = charged_cost(&r, Some(inp()), Some(outp()), None).unwrap();
-        assert_eq!(not_enabled, compute_list_price(&r, Some(inp()), Some(outp())).unwrap());
-        assert_eq!(not_enabled, Decimal::new(12, 1)); // 1000*0.001 + 100*0.002
-
-        // Cache-enabled (Some): the read discount applies, so it costs strictly less.
-        let m = CacheMultipliers {
-            read: Decimal::new(1, 1), // 0.1
-            write_5m: Decimal::ONE,
-            write_1h: Decimal::ONE,
-            write_24h: Decimal::ONE,
-        };
-        let enabled = charged_cost(&r, Some(inp()), Some(outp()), Some(m)).unwrap();
-        // 400 uncached*0.001 + 600 read*0.001*0.1 + 100*0.002 = 0.66
-        assert_eq!(enabled, Decimal::new(66, 2));
-        assert!(enabled < not_enabled, "the discount must make the enabled case cheaper");
+    fn token_counts_from_raw_record_maps_every_field() {
+        let r = cost_record(1000, 100, 500, 1, 2, 3);
+        let c = TokenCounts::from(&r);
+        assert_eq!(c.prompt, 1000);
+        assert_eq!(c.completion, 100);
+        assert_eq!(c.cache_read, 500);
+        assert_eq!(c.cache_creation_5m, 1);
+        assert_eq!(c.cache_creation_1h, 2);
+        assert_eq!(c.cache_creation_24h, 3);
     }
 
     #[test]
@@ -2135,50 +1836,6 @@ mod tests {
         let list = compute_list_price(&r, Some(inp()), Some(outp())).unwrap();
         assert_eq!(list, Decimal::new(12, 1)); // 1000*0.001 + 100*0.002 = 1.2
         assert!(compute_list_price(&r, None, None).is_none(), "no pricing → NULL list price");
-    }
-
-    fn tariff_row(write_1h: Decimal, from_hrs: i64, valid_until: Option<DateTime<Utc>>) -> CacheTariffRow {
-        CacheTariffRow {
-            write_multiplier_5m: Decimal::new(125, 2), // 1.25
-            write_multiplier_1h: write_1h,
-            write_multiplier_24h: Decimal::new(25, 1), // 2.5
-            read_multiplier: Decimal::new(1, 1),       // 0.1
-            valid_from: chrono::Utc::now() - chrono::Duration::hours(from_hrs),
-            valid_until,
-        }
-    }
-
-    #[test]
-    fn resolve_multipliers_picks_latest_valid_version() {
-        let now = chrono::Utc::now();
-        // Two versions; the newer (valid_from 1h ago) wins over the older (5h ago).
-        let rows = vec![tariff_row(Decimal::from(2), 1, None), tariff_row(Decimal::from(3), 5, None)];
-        let m = resolve_cache_multipliers(&rows, now).expect("a valid version exists");
-        assert_eq!(m.write_1h, Decimal::from(2), "latest valid version wins");
-        assert_eq!(m.write_5m, Decimal::new(125, 2), "all tiers come from that one row");
-        assert_eq!(m.write_24h, Decimal::new(25, 1));
-        assert_eq!(m.read, Decimal::new(1, 1));
-    }
-
-    #[test]
-    fn resolve_multipliers_none_when_empty_or_expired() {
-        let now = chrono::Utc::now();
-        // empty → no version valid → None (the caller falls back to defaults deliberately).
-        assert!(resolve_cache_multipliers(&[], now).is_none(), "no rows → None");
-        // expired version ignored → None.
-        let expired = vec![tariff_row(Decimal::from(5), 2, Some(now - chrono::Duration::hours(1)))];
-        assert!(resolve_cache_multipliers(&expired, now).is_none(), "expired version ignored → None");
-    }
-
-    #[test]
-    fn default_multipliers_mirror_config_pricing_defaults() {
-        // Default delegates to CachePricingConfig::default() so the two can't drift.
-        let m = CacheMultipliers::default();
-        let c = CachePricingConfig::default();
-        assert_eq!(m.read, c.default_read_multiplier, "read = config default (0.1)");
-        assert_eq!(m.write_5m, c.default_write_multiplier_5m, "5m = config default (1.25)");
-        assert_eq!(m.write_1h, c.default_write_multiplier_1h, "1h = config default (2.0)");
-        assert_eq!(m.write_24h, c.default_write_multiplier_24h, "24h = config default (2.5)");
     }
 
     #[test]
@@ -2204,302 +1861,6 @@ mod tests {
         assert_eq!(compute_request_origin(Some(&ApiKeyPurpose::Realtime), None), "api");
         assert_eq!(compute_request_origin(Some(&ApiKeyPurpose::Platform), None), "api");
     }
-
-    /// Helper to create test tariffs
-    fn make_tariff(
-        purpose: ApiKeyPurpose,
-        effective_from: DateTime<Utc>,
-        valid_until: Option<DateTime<Utc>>,
-        input_price: &str,
-        output_price: &str,
-        completion_window: Option<&str>,
-    ) -> TariffInfo {
-        TariffInfo {
-            purpose,
-            effective_from,
-            valid_until,
-            input_price_per_token: Decimal::from_str(input_price).unwrap(),
-            output_price_per_token: Decimal::from_str(output_price).unwrap(),
-            completion_window: completion_window.map(|s| s.to_string()),
-        }
-    }
-
-    /// Helper to call find_best_tariff without needing a full batcher
-    fn find_tariff(
-        tariffs: &[TariffInfo],
-        api_key_purpose: Option<&ApiKeyPurpose>,
-        completion_window: Option<&str>,
-        timestamp: DateTime<Utc>,
-    ) -> (Option<Decimal>, Option<Decimal>) {
-        let purpose = api_key_purpose.unwrap_or(&ApiKeyPurpose::Realtime);
-
-        let valid_tariffs: Vec<_> = tariffs
-            .iter()
-            .filter(|t| t.effective_from <= timestamp && t.valid_until.is_none_or(|valid_until| valid_until > timestamp))
-            .collect();
-
-        if let Some(cw) = completion_window
-            && let Some(tariff) = valid_tariffs
-                .iter()
-                .find(|t| &t.purpose == purpose && t.completion_window.as_deref() == Some(cw))
-        {
-            return (Some(tariff.input_price_per_token), Some(tariff.output_price_per_token));
-        }
-
-        if let Some(tariff) = valid_tariffs
-            .iter()
-            .find(|t| &t.purpose == purpose && t.completion_window.is_none())
-        {
-            return (Some(tariff.input_price_per_token), Some(tariff.output_price_per_token));
-        }
-
-        if purpose != &ApiKeyPurpose::Realtime
-            && let Some(tariff) = valid_tariffs
-                .iter()
-                .find(|t| t.purpose == ApiKeyPurpose::Realtime && t.completion_window.is_none())
-        {
-            return (Some(tariff.input_price_per_token), Some(tariff.output_price_per_token));
-        }
-
-        (None, None)
-    }
-
-    #[test]
-    fn test_find_best_tariff_exact_match() {
-        let now = chrono::Utc::now();
-        let tariffs = vec![make_tariff(
-            ApiKeyPurpose::Realtime,
-            now - chrono::Duration::days(1),
-            None,
-            "0.00010",
-            "0.00020",
-            None,
-        )];
-
-        let (input, output) = find_tariff(&tariffs, Some(&ApiKeyPurpose::Realtime), None, now);
-        assert_eq!(input, Some(Decimal::from_str("0.00010").unwrap()));
-        assert_eq!(output, Some(Decimal::from_str("0.00020").unwrap()));
-    }
-
-    #[test]
-    fn test_find_best_tariff_batch_vs_realtime() {
-        let now = chrono::Utc::now();
-        let tariffs = vec![
-            make_tariff(
-                ApiKeyPurpose::Realtime,
-                now - chrono::Duration::days(1),
-                None,
-                "0.00010",
-                "0.00020",
-                None,
-            ),
-            make_tariff(
-                ApiKeyPurpose::Batch,
-                now - chrono::Duration::days(1),
-                None,
-                "0.00005",
-                "0.00010",
-                None,
-            ),
-        ];
-
-        // Batch purpose should get batch pricing
-        let (input, output) = find_tariff(&tariffs, Some(&ApiKeyPurpose::Batch), None, now);
-        assert_eq!(input, Some(Decimal::from_str("0.00005").unwrap()));
-        assert_eq!(output, Some(Decimal::from_str("0.00010").unwrap()));
-
-        // Realtime purpose should get realtime pricing
-        let (input, output) = find_tariff(&tariffs, Some(&ApiKeyPurpose::Realtime), None, now);
-        assert_eq!(input, Some(Decimal::from_str("0.00010").unwrap()));
-        assert_eq!(output, Some(Decimal::from_str("0.00020").unwrap()));
-    }
-
-    #[test]
-    fn test_find_best_tariff_fallback_to_realtime() {
-        // When batch tariff is missing, should fall back to realtime
-        let now = chrono::Utc::now();
-        let tariffs = vec![make_tariff(
-            ApiKeyPurpose::Realtime,
-            now - chrono::Duration::days(1),
-            None,
-            "0.00015",
-            "0.00030",
-            None,
-        )];
-
-        // Batch purpose with no batch tariff should fall back to realtime
-        let (input, output) = find_tariff(&tariffs, Some(&ApiKeyPurpose::Batch), None, now);
-        assert_eq!(input, Some(Decimal::from_str("0.00015").unwrap()));
-        assert_eq!(output, Some(Decimal::from_str("0.00030").unwrap()));
-    }
-
-    #[test]
-    fn test_find_best_tariff_historical_pricing() {
-        // Test that expired tariffs are not selected for current requests
-        // but ARE selected for historical timestamps
-        let now = chrono::Utc::now();
-        let old_tariff_start = now - chrono::Duration::days(30);
-        let old_tariff_end = now - chrono::Duration::days(10);
-        let new_tariff_start = now - chrono::Duration::days(10);
-
-        let tariffs = vec![
-            // Old tariff: valid from 30 days ago until 10 days ago
-            make_tariff(
-                ApiKeyPurpose::Realtime,
-                old_tariff_start,
-                Some(old_tariff_end),
-                "0.00020", // Old higher price
-                "0.00040",
-                None,
-            ),
-            // New tariff: valid from 10 days ago, still active
-            make_tariff(
-                ApiKeyPurpose::Realtime,
-                new_tariff_start,
-                None,
-                "0.00010", // New lower price
-                "0.00020",
-                None,
-            ),
-        ];
-
-        // Current request should use new pricing
-        let (input, output) = find_tariff(&tariffs, Some(&ApiKeyPurpose::Realtime), None, now);
-        assert_eq!(
-            input,
-            Some(Decimal::from_str("0.00010").unwrap()),
-            "Current request should use new pricing"
-        );
-        assert_eq!(output, Some(Decimal::from_str("0.00020").unwrap()));
-
-        // Historical request (20 days ago) should use old pricing
-        let historical_time = now - chrono::Duration::days(20);
-        let (input, output) = find_tariff(&tariffs, Some(&ApiKeyPurpose::Realtime), None, historical_time);
-        assert_eq!(
-            input,
-            Some(Decimal::from_str("0.00020").unwrap()),
-            "Historical request should use old pricing"
-        );
-        assert_eq!(output, Some(Decimal::from_str("0.00040").unwrap()));
-    }
-
-    #[test]
-    fn test_find_best_tariff_completion_window_exact_match() {
-        // Test that completion_window-specific tariffs are matched correctly
-        let now = chrono::Utc::now();
-        let tariffs = vec![
-            // Generic batch tariff (no completion_window)
-            make_tariff(
-                ApiKeyPurpose::Batch,
-                now - chrono::Duration::days(1),
-                None,
-                "0.00010",
-                "0.00020",
-                None,
-            ),
-            // Priority-specific batch tariff for 24h window
-            make_tariff(
-                ApiKeyPurpose::Batch,
-                now - chrono::Duration::days(1),
-                None,
-                "0.00005", // Cheaper for 24h priority
-                "0.00010",
-                Some("24h"),
-            ),
-        ];
-
-        // Request with 24h completion window should get the priority-specific pricing
-        let (input, output) = find_tariff(&tariffs, Some(&ApiKeyPurpose::Batch), Some("24h"), now);
-        assert_eq!(
-            input,
-            Some(Decimal::from_str("0.00005").unwrap()),
-            "24h priority should get specific pricing"
-        );
-        assert_eq!(output, Some(Decimal::from_str("0.00010").unwrap()));
-
-        // Request without completion window should get generic batch pricing
-        let (input, output) = find_tariff(&tariffs, Some(&ApiKeyPurpose::Batch), None, now);
-        assert_eq!(
-            input,
-            Some(Decimal::from_str("0.00010").unwrap()),
-            "No priority should get generic pricing"
-        );
-        assert_eq!(output, Some(Decimal::from_str("0.00020").unwrap()));
-    }
-
-    #[test]
-    fn test_find_best_tariff_completion_window_fallback_to_generic() {
-        // Test that unknown completion_window falls back to generic tariff, not another priority
-        let now = chrono::Utc::now();
-        let tariffs = vec![
-            // Generic batch tariff
-            make_tariff(
-                ApiKeyPurpose::Batch,
-                now - chrono::Duration::days(1),
-                None,
-                "0.00010",
-                "0.00020",
-                None,
-            ),
-            // 24h priority tariff
-            make_tariff(
-                ApiKeyPurpose::Batch,
-                now - chrono::Duration::days(1),
-                None,
-                "0.00005",
-                "0.00010",
-                Some("24h"),
-            ),
-            // 7d priority tariff
-            make_tariff(
-                ApiKeyPurpose::Batch,
-                now - chrono::Duration::days(1),
-                None,
-                "0.00003",
-                "0.00006",
-                Some("7d"),
-            ),
-        ];
-
-        // Request with unknown "1h" priority should fall back to generic, NOT to 24h or 7d
-        let (input, output) = find_tariff(&tariffs, Some(&ApiKeyPurpose::Batch), Some("1h"), now);
-        assert_eq!(
-            input,
-            Some(Decimal::from_str("0.00010").unwrap()),
-            "Unknown priority should fall back to generic, not another priority"
-        );
-        assert_eq!(output, Some(Decimal::from_str("0.00020").unwrap()));
-    }
-
-    #[test]
-    fn test_find_best_tariff_no_matching_tariff() {
-        let now = chrono::Utc::now();
-        let tariffs = vec![];
-
-        let (input, output) = find_tariff(&tariffs, Some(&ApiKeyPurpose::Realtime), None, now);
-        assert_eq!(input, None);
-        assert_eq!(output, None);
-    }
-
-    #[test]
-    fn test_find_best_tariff_future_tariff_not_used() {
-        // Tariff that starts in the future should not be selected
-        let now = chrono::Utc::now();
-        let tariffs = vec![make_tariff(
-            ApiKeyPurpose::Realtime,
-            now + chrono::Duration::days(1), // Starts tomorrow
-            None,
-            "0.00010",
-            "0.00020",
-            None,
-        )];
-
-        let (input, output) = find_tariff(&tariffs, Some(&ApiKeyPurpose::Realtime), None, now);
-        assert_eq!(input, None, "Future tariff should not be selected");
-        assert_eq!(output, None);
-    }
-
-    use rust_decimal::prelude::FromStr;
 }
 
 /// Integration tests for the batcher that require database access
