@@ -1,0 +1,31 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE user_organizations\n            SET invite_token_hash = $3, expires_at = $4\n            WHERE id = $1 AND organization_id = $2 AND status = 'pending'\n            RETURNING invite_email, role\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "invite_email",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 1,
+        "name": "role",
+        "type_info": "Varchar"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Varchar",
+        "Timestamptz"
+      ]
+    },
+    "nullable": [
+      true,
+      false
+    ]
+  },
+  "hash": "35b903d04e51d26dd5b3fb186e7535374f93b8936ee03173e1b2977cd189b0dd"
+}

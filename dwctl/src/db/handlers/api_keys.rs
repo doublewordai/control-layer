@@ -58,6 +58,7 @@ struct ApiKey {
     pub spend_limit: Option<Decimal>,
     pub spend_limit_interval: Option<String>,
     pub parent_api_key_id: Option<ApiKeyId>,
+    pub secret_revealed_at: Option<DateTime<Utc>>,
 }
 
 impl From<(Vec<DeploymentId>, ApiKey)> for ApiKeyDBResponse {
@@ -96,6 +97,7 @@ impl From<(Vec<DeploymentId>, ApiKey)> for ApiKeyDBResponse {
             spend_limit: api_key.spend_limit,
             spend_limit_interval: api_key.spend_limit_interval,
             parent_api_key_id: api_key.parent_api_key_id,
+            secret_revealed_at: api_key.secret_revealed_at,
         }
     }
 }
@@ -153,7 +155,7 @@ impl<'c> Repository for ApiKeys<'c> {
     async fn get_by_id(&mut self, id: Self::Id) -> Result<Option<Self::Response>> {
         let api_key = sqlx::query_as!(
             ApiKey,
-            "SELECT id, name, description, secret, purpose, user_id, created_by, created_at, last_used, requests_per_second, burst_size, hidden, is_deleted, spend_limit, spend_limit_interval, parent_api_key_id FROM api_keys WHERE id = $1 AND is_deleted = false",
+            "SELECT id, name, description, secret, purpose, user_id, created_by, created_at, last_used, requests_per_second, burst_size, hidden, is_deleted, spend_limit, spend_limit_interval, parent_api_key_id, secret_revealed_at FROM api_keys WHERE id = $1 AND is_deleted = false",
             id
         )
             .fetch_optional(&mut *self.db)
@@ -169,7 +171,7 @@ impl<'c> Repository for ApiKeys<'c> {
     async fn get_bulk(&mut self, ids: Vec<Self::Id>) -> Result<HashMap<Self::Id, Self::Response>> {
         let api_keys = sqlx::query_as!(
             ApiKey,
-            "SELECT id, name, description, secret, purpose, user_id, created_by, created_at, last_used, requests_per_second, burst_size, hidden, is_deleted, spend_limit, spend_limit_interval, parent_api_key_id FROM api_keys WHERE id = ANY($1) AND is_deleted = false",
+            "SELECT id, name, description, secret, purpose, user_id, created_by, created_at, last_used, requests_per_second, burst_size, hidden, is_deleted, spend_limit, spend_limit_interval, parent_api_key_id, secret_revealed_at FROM api_keys WHERE id = ANY($1) AND is_deleted = false",
             &ids
         )
             .fetch_all(&mut *self.db)
@@ -187,7 +189,7 @@ impl<'c> Repository for ApiKeys<'c> {
     async fn list(&mut self, filter: &Self::Filter) -> Result<Vec<Self::Response>> {
         let api_keys = sqlx::query_as!(
             ApiKey,
-            r#"SELECT id, name, description, secret, purpose, user_id, created_by, created_at, last_used, requests_per_second, burst_size, hidden, is_deleted, spend_limit, spend_limit_interval, parent_api_key_id
+            r#"SELECT id, name, description, secret, purpose, user_id, created_by, created_at, last_used, requests_per_second, burst_size, hidden, is_deleted, spend_limit, spend_limit_interval, parent_api_key_id, secret_revealed_at
             FROM api_keys
             WHERE hidden = false AND is_deleted = false
               AND ($1::uuid IS NULL OR user_id = $1)
@@ -696,6 +698,46 @@ impl<'c> ApiKeys<'c> {
         Ok(secret)
     }
 
+    /// Flag a freshly-issued key as awaiting its holder's one-off reveal
+    /// (see migration 131). Called only by the create handler when a manager
+    /// issues a key to a different user — every other insert path leaves the
+    /// column at its born-revealed default.
+    #[instrument(skip(self), fields(api_key_id = %abbrev_uuid(&id)), err)]
+    pub async fn mark_secret_reveal_pending(&mut self, id: ApiKeyId) -> Result<()> {
+        let result = sqlx::query!(
+            "UPDATE api_keys SET secret_revealed_at = NULL WHERE id = $1 AND is_deleted = false",
+            id
+        )
+        .execute(&mut *self.db)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            return Err(DbError::NotFound);
+        }
+        Ok(())
+    }
+
+    /// Consume a key's one-off reveal: atomically stamp `secret_revealed_at`
+    /// and return the secret. The `IS NULL` guard makes this race-safe —
+    /// exactly one caller ever gets the secret; a concurrent second reveal
+    /// matches zero rows and returns None (handler surfaces a conflict). The
+    /// caller performs holder/authorization checks BEFORE calling this.
+    #[instrument(skip(self), fields(api_key_id = %abbrev_uuid(&id)), err)]
+    pub async fn reveal_secret_once(&mut self, id: ApiKeyId) -> Result<Option<String>> {
+        let secret = sqlx::query_scalar!(
+            r#"
+            UPDATE api_keys SET secret_revealed_at = NOW()
+            WHERE id = $1 AND secret_revealed_at IS NULL
+              AND is_deleted = false AND hidden = false AND parent_api_key_id IS NULL
+            RETURNING secret
+            "#,
+            id
+        )
+        .fetch_optional(&mut *self.db)
+        .await?;
+        Ok(secret)
+    }
+
     /// Fire the onwards config NOTIFY after a spend-window re-arm.
     ///
     /// A pure window reset writes only to `api_key_spend_checkpoints`, which
@@ -882,7 +924,8 @@ impl<'c> ApiKeys<'c> {
                 ak.is_deleted as "is_deleted!",
                 ak.spend_limit,
                 ak.spend_limit_interval,
-                ak.parent_api_key_id
+                ak.parent_api_key_id,
+                ak.secret_revealed_at
             FROM api_keys ak
             WHERE ak.user_id = $2  -- System user has access to all deployments
 
@@ -904,7 +947,8 @@ impl<'c> ApiKeys<'c> {
                 ak.is_deleted as "is_deleted!",
                 ak.spend_limit,
                 ak.spend_limit_interval,
-                ak.parent_api_key_id
+                ak.parent_api_key_id,
+                ak.secret_revealed_at
             FROM api_keys ak
             INNER JOIN user_groups ug ON ak.user_id = ug.user_id
             INNER JOIN deployment_groups dg ON ug.group_id = dg.group_id
@@ -949,7 +993,8 @@ impl<'c> ApiKeys<'c> {
                 ak.is_deleted as "is_deleted!",
                 ak.spend_limit,
                 ak.spend_limit_interval,
-                ak.parent_api_key_id
+                ak.parent_api_key_id,
+                ak.secret_revealed_at
             FROM api_keys ak
             INNER JOIN deployment_groups dg ON dg.group_id = '00000000-0000-0000-0000-000000000000'
             INNER JOIN deployed_models dm ON dg.deployment_id = dm.id

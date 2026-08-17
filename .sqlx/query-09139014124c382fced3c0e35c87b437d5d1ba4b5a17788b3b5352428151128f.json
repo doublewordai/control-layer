@@ -82,6 +82,11 @@
         "ordinal": 15,
         "name": "parent_api_key_id",
         "type_info": "Uuid"
+      },
+      {
+        "ordinal": 16,
+        "name": "secret_revealed_at",
+        "type_info": "Timestamptz"
       }
     ],
     "parameters": {
@@ -107,6 +112,7 @@
       false,
       false,
       false,
+      true,
       true,
       true,
       true

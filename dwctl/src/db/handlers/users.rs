@@ -119,6 +119,18 @@ struct User {
     pub verified: bool,
     pub zero_data_retention: bool,
     pub invoicing_enabled: bool,
+    /// Organizations only: admit signups from the claimed domain without
+    /// review.
+    ///
+    /// Present solely because several queries below use `RETURNING *` and so
+    /// must mirror the table. **Do not read it from here** — the hand-built
+    /// `User` literals in this file leave it `false` regardless of the stored
+    /// value, because their queries don't project it. It is deliberately not
+    /// carried on `UserDBResponse` either: both real readers hold an
+    /// organization id and go through `Organizations::auto_join_enabled`,
+    /// which is always accurate.
+    #[allow(dead_code)]
+    pub auto_join_enabled: bool,
 }
 
 pub struct Users<'c> {
@@ -295,6 +307,8 @@ impl<'c> Repository for Users<'c> {
                 verified: row.verified,
                 invoicing_enabled: row.invoicing_enabled,
                 zero_data_retention: row.zero_data_retention,
+                // Not projected by this query; never read from `User`. See the field doc.
+                auto_join_enabled: false,
             };
 
             let roles = row.roles.unwrap_or_default();
@@ -386,6 +400,8 @@ impl<'c> Repository for Users<'c> {
                 verified: row.verified,
                 invoicing_enabled: row.invoicing_enabled,
                 zero_data_retention: row.zero_data_retention,
+                // Not projected by this query; never read from `User`. See the field doc.
+                auto_join_enabled: false,
             };
 
             let roles = row.roles.unwrap_or_default();

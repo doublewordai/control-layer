@@ -427,7 +427,7 @@ pub fn extract_model_from_request(headers: &HeaderMap, body_bytes: &[u8]) -> Opt
         }
         None => {
             let extracted: ExtractedModel = serde_json::from_slice(body_bytes).ok()?;
-            Some(extracted.model.to_string())
+            Some(extracted.model.into_owned())
         }
     }
 }
@@ -926,6 +926,36 @@ mod tests {
     /// Helper to create a single-provider pool from a target
     fn pool(target: Target) -> ProviderPool {
         target.into_pool()
+    }
+
+    /// RFC 8259 permits escaping any character in a JSON string, including the
+    /// solidus (`\/`) that PHP's `json_encode` escapes by default. Extraction
+    /// must decode escapes rather than reject strings containing them.
+    #[test]
+    fn test_extract_model_decodes_json_escapes() {
+        let headers = HeaderMap::new();
+        for body in [
+            br#"{"model":"zai-org/GLM-5.2-FP8","messages":[]}"#.as_slice(),
+            br#"{"model":"zai-org\/GLM-5.2-FP8","messages":[]}"#.as_slice(),
+            br#"{"model":"zai-org\u002FGLM-5.2-FP8","messages":[]}"#.as_slice(),
+        ] {
+            assert_eq!(
+                extract_model_from_request(&headers, body).as_deref(),
+                Some("zai-org/GLM-5.2-FP8"),
+                "body: {}",
+                String::from_utf8_lossy(body)
+            );
+        }
+    }
+
+    #[test]
+    fn test_extract_model_decodes_escaped_backslash() {
+        let headers = HeaderMap::new();
+        let body = br#"{"model":"weird\\model","messages":[]}"#;
+        assert_eq!(
+            extract_model_from_request(&headers, body).as_deref(),
+            Some(r"weird\model")
+        );
     }
 
     #[tokio::test]

@@ -15,25 +15,3 @@ pub(crate) fn ensure_field(
         object.insert(key.to_string(), default());
     }
 }
-
-/// Remove caller-supplied completion/response identifiers captured by
-/// `#[serde(flatten)]` request extras before forwarding to an upstream LLM.
-pub(crate) fn scrub_request_id_fields_from_extra(extra: &mut Option<Value>) {
-    let Some(Value::Object(object)) = extra.as_mut() else {
-        return;
-    };
-
-    for key in [
-        "id",
-        "completion_id",
-        "completionId",
-        "response_id",
-        "responseId",
-    ] {
-        object.remove(key);
-    }
-
-    if object.is_empty() {
-        *extra = None;
-    }
-}

@@ -354,12 +354,26 @@ pub fn create_test_config() -> crate::config::Config {
     }
 }
 
+/// A test user on a caller-chosen email domain.
+///
+/// Organizations claim their owner's email domain as their username, so tests
+/// that create more than one organization need owners on *different* domains -
+/// and tests about domain collisions need them on the same one. The default
+/// helper puts everyone on example.com, which makes both impossible to express.
+pub async fn create_test_user_on_domain(pool: &PgPool, role: Role, domain: &str) -> UserResponse {
+    create_test_user_inner(pool, role, Some(domain)).await
+}
+
 pub async fn create_test_user(pool: &PgPool, role: Role) -> UserResponse {
+    create_test_user_inner(pool, role, None).await
+}
+
+async fn create_test_user_inner(pool: &PgPool, role: Role, domain: Option<&str>) -> UserResponse {
     let mut conn = pool.acquire().await.expect("Failed to acquire connection");
     let mut users_repo = Users::new(&mut conn);
     let user_id = Uuid::new_v4();
     let username = format!("testuser_{}", user_id.simple());
-    let email = format!("{username}@example.com");
+    let email = format!("{username}@{}", domain.unwrap_or("example.com"));
 
     let roles = vec![role];
 

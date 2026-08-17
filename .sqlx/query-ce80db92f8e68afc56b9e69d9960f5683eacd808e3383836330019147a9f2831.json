@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE user_organizations\n            SET status = 'active', role = $3\n            WHERE id = $1 AND organization_id = $2 AND status = 'requested'\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Varchar"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "ce80db92f8e68afc56b9e69d9960f5683eacd808e3383836330019147a9f2831"
+}

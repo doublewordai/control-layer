@@ -1,8 +1,12 @@
 //! Serde model for the Anthropic Messages API.
 //!
-//! Inbound request types are `Deserialize`; outbound response/error types are
-//! `Serialize`. Unknown request fields are ignored so forward-compatible clients
-//! do not break. The translated Chat Completions request is built as JSON in
+//! Inbound request types are `Deserialize`. Outbound response types are both
+//! `Serialize` (to emit to the client) and `Deserialize` (so the request-logging
+//! / analytics layer, which sits outside the translation middleware, can parse
+//! the Anthropic-shaped body dwctl produced back into a type for logging +
+//! billing). The error/models-list types stay `Serialize`-only. Unknown request
+//! fields are ignored so forward-compatible clients do not break. The translated
+//! Chat Completions request is built as JSON in
 //! [`super::request`] (it targets onwards' own schema), but the Anthropic
 //! response we own is modelled as typed structs here.
 
@@ -17,8 +21,10 @@ pub struct MessagesRequest {
     pub max_tokens: u32,
     #[serde(default)]
     pub messages: Vec<InputMessage>,
+    /// Top-level `system`: either a string or an array of content blocks —
+    /// the same shape as message content, so it reuses [`Content`].
     #[serde(default)]
-    pub system: Option<System>,
+    pub system: Option<Content>,
     #[serde(default)]
     pub stream: bool,
     #[serde(default)]
@@ -50,14 +56,6 @@ pub struct MessagesRequest {
     /// to synthesize a breakpoint on the last block (and strips it before the upstream call).
     #[serde(default)]
     pub cache_control: Option<Value>,
-}
-
-/// Top-level `system`: either a string or an array of content blocks.
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-pub enum System {
-    Text(String),
-    Blocks(Vec<ContentBlock>),
 }
 
 /// A single conversation message.
@@ -145,7 +143,12 @@ pub struct Tool {
 // ---------------------------------------------------------------------------
 
 /// An outbound Anthropic Messages response.
-#[derive(Debug, Serialize)]
+///
+/// `Deserialize` as well as `Serialize`: the request-logging / analytics layer
+/// sits outside the translation middleware, so it captures this Anthropic-shaped
+/// body (the one dwctl's translator produced) and parses it back with the same
+/// type for logging + billing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MessagesResponse {
     pub id: String,
     #[serde(rename = "type")]
@@ -159,21 +162,21 @@ pub struct MessagesResponse {
 }
 
 /// Always `"message"`.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MessageType {
     Message,
 }
 
 /// Always `"assistant"` on a response.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ResponseRole {
     Assistant,
 }
 
 /// A content block in an outbound response.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ResponseContentBlock {
     /// Model reasoning, surfaced from the backend's `reasoning_content` (or
@@ -198,7 +201,7 @@ pub enum ResponseContentBlock {
 /// us a stop sequence matched (vLLM/sglang put the matched string in
 /// `choices[].stop_reason`); standard OpenAI does not, so we fall back to
 /// `EndTurn` there.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StopReason {
     EndTurn,
@@ -208,9 +211,10 @@ pub enum StopReason {
 }
 
 /// Token usage on a response. Per Anthropic's usage shape, `input_tokens`
-/// excludes cached prompt tokens, which are reported separately. The cache
-/// fields are omitted entirely when zero/absent.
-#[derive(Debug, Serialize)]
+/// excludes BOTH cache buckets (reads and creations), which are reported
+/// separately — `input + cache_read + cache_creation` is the full prompt.
+/// The cache fields are omitted entirely when zero/absent.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Usage {
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -218,6 +222,24 @@ pub struct Usage {
     pub cache_read_input_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_creation_input_tokens: Option<u64>,
+    /// Per-TTL creation breakdown (Anthropic's `cache_creation` object; the 24h
+    /// field is a dwctl extension). Billing prices each tier at its own write
+    /// premium, so dropping this on translation billed creations at list.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_creation: Option<CacheCreation>,
+}
+
+/// The `cache_creation` per-TTL breakdown. Field names match what the cache
+/// layer splices into the OpenAI frame, so the analytics extractor reads either
+/// shape with one code path.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CacheCreation {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ephemeral_5m_input_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ephemeral_1h_input_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ephemeral_24h_input_tokens: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------
