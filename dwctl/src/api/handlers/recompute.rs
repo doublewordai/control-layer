@@ -138,8 +138,14 @@ pub async fn recompute_usage<P: PoolProvider>(
         )
     });
 
+    // The tokenizer stands alone from the cache flag: render verification and the
+    // usage-less rescue only need tokenizer-svc reachable, not caching enabled. An empty
+    // URL disables both, and rows simply carry no render columns.
+    let tokenizer =
+        (!cfg.cache.tokenizer_url.is_empty()).then(|| crate::prompt_cache::TokenizerClient::new(cfg.cache.tokenizer_url.clone()));
+
     // The read pool, deliberately: this path has no write handle at all.
-    let report = crate::recompute::recompute_corpus(state.db.read(), &filter, flat_tier, classifier.as_ref())
+    let report = crate::recompute::recompute_corpus(state.db.read(), &filter, flat_tier, classifier.as_ref(), tokenizer.as_ref())
         .await
         .map_err(|e| Error::Internal {
             operation: format!("recompute usage: {e}"),
