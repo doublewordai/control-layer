@@ -41,7 +41,7 @@ use crate::error::{FusilladeError, Result};
 use crate::manager::{
     RetainedResponseArchiveCutoffs, RetainedResponseArchiveOutcome,
     RetainedResponsePartitionRunway, RetainedResponseRetirementOutcome, RetainedResponseWriteError,
-    RetentionSweepPolicy, TrailingDemandCount,
+    RetentionPolicy, TrailingDemandCount,
 };
 use crate::request::{
     Canceled, CascadeTargetState, Claimed, Completed, CreateBackgroundInput, CreateFlexInput,
@@ -8150,7 +8150,7 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
 
     async fn ensure_retained_response_partitions(
         &self,
-        policy: &RetentionSweepPolicy,
+        policy: &RetentionPolicy,
         days_ahead: i32,
     ) -> Result<RetainedResponsePartitionRunway> {
         policy.validate().map_err(FusilladeError::ValidationError)?;
@@ -8182,7 +8182,7 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
                 "retained response partition start is out of range".to_string(),
             )
         })?;
-        let retention_horizon = RetentionSweepPolicy::delete_on(observed_at, max_retention_seconds)
+        let retention_horizon = RetentionPolicy::delete_on(observed_at, max_retention_seconds)
             .map_err(FusilladeError::ValidationError)?;
         let last_delete_on = retention_horizon
             .checked_add_signed(chrono::Duration::days(i64::from(days_ahead)))
@@ -8269,7 +8269,7 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
 
     async fn archive_terminal_batchless_responses(
         &self,
-        policy: &RetentionSweepPolicy,
+        policy: &RetentionPolicy,
         cutoffs: &RetainedResponseArchiveCutoffs,
         max_groups: i64,
         max_bytes: i64,

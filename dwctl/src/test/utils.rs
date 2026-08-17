@@ -309,7 +309,7 @@ pub fn create_test_config() -> crate::config::Config {
             probe_scheduler: ProbeSchedulerConfig { enabled: false },
             batch_daemon: DaemonConfig {
                 enabled: DaemonEnabled::Never,
-                retention: fusillade::RetentionSweepPolicy {
+                retention: fusillade::RetentionPolicy {
                     max_late_writer_seconds: Some(3_600),
                     ..Default::default()
                 },
