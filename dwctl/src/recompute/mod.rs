@@ -56,10 +56,6 @@
 //! the July one broke *everything*, because the response carried no usage at all — and a
 //! recompute that only looks where the last bug was is a recompute that misses the next one.
 //!
-//! So the only thing this module treats as un-recomputable is the cache split (below), and
-//! that is a property of the data being gone, not a judgement about which fields are
-//! trustworthy.
-//!
 //! Two findings from that work belong here, because whatever eventually reports or applies
 //! these corrections has to honour them:
 //!
@@ -108,73 +104,221 @@
 //!   creations as reads, which under-bills, and must be labelled approximate.
 
 use crate::pricing::TokenCounts;
-use crate::request_logging::serializers::{TokenMetrics, extract_from_last_usage, parse_ai_response};
+use crate::request_logging::serializers::{TokenMetrics, extract_from_last_usage, parse_ai_response, raw_usage_tokens};
 use outlet::{RequestData, ResponseData};
 
 pub mod cache_fields;
+pub mod cache_replay;
 pub mod replay;
 pub mod report;
 pub mod source;
+#[cfg(test)]
+mod verify_harness;
 
 use cache_fields::{CacheReading, CreationTier, cache_tokens_both_shapes};
 use replay::RecomputeError;
+
+/// Divergence beyond which a render is *reported* as disagreeing with the provider's
+/// prompt count. 1% — the same threshold as the live path's render-drift alarm, because
+/// they measure the same seam (our chat-template bake vs the serving engine's).
+const RENDER_TOLERANCE_BPS: i64 = 100;
 
 /// Recompute a whole corpus and build the report.
 ///
 /// Read-only by construction: it takes a `&PgPool` it only ever `SELECT`s through, and the
 /// report it returns is a document. Nothing here writes, and nothing it returns is applied
 /// automatically — see the module docs.
-#[tracing::instrument(skip(pool, filter), fields(limit = filter.limit))]
+#[tracing::instrument(skip(pool, filter, classifier, tokenizer), fields(limit = filter.limit))]
 pub async fn recompute_corpus(
     pool: &sqlx::PgPool,
     filter: &source::CorpusFilter,
     flat_tier: CreationTier,
+    classifier: Option<&crate::prompt_cache::Classifier>,
+    tokenizer: Option<&crate::prompt_cache::TokenizerClient>,
 ) -> Result<report::RecomputeReport, sqlx::Error> {
     let corpus = source::load_corpus(pool, filter).await?;
 
-    let rows = corpus
-        .iter()
-        .map(|row| {
-            let Some(exchange) = &row.exchange else {
-                // No body at all. For a ZDR account this is permanent and expected; the
-                // tokens simply cannot be verified, only the dollars-from-stored-tokens
-                // check remains available.
-                return report::ReportRow::unreplayable(
-                    row,
-                    report::Evidence::ColumnsOnly,
-                    "no stored request/response body for this request".to_string(),
-                );
-            };
+    // Tariff history for every model in the corpus, resolved per row below at the row's own
+    // pricing timestamp. The ledger is temporal (versions are closed, never rewritten), so
+    // this reproduces the exact multipliers the live path billed with — including across a
+    // tariff change mid-corpus.
+    let mut aliases: Vec<String> = corpus.iter().filter_map(|r| r.model.clone()).collect();
+    aliases.sort();
+    aliases.dedup();
+    let cache_tariffs = crate::pricing::lookup_cache_tariffs(pool, &aliases).await?;
+    // Rows that recorded cache tokens but whose tariff history no longer resolves (e.g. the
+    // deployed model was deleted, cascading its tariffs away). Those re-price at list rate,
+    // which is NOT what the live path charged — the report must say so rather than present
+    // the difference as a correction.
+    let mut rows_tariff_unresolvable = 0i64;
 
-            let replayed = exchange
-                .to_outlet_pair()
-                .and_then(|(req, resp)| recompute_from_stored_response(&req, &resp, flat_tier));
+    // Price with the per-token rates resolved at inference time, carried on the row, and
+    // the cache multipliers from the tariff version valid at the row's pricing timestamp —
+    // exactly the live batcher's resolution. `None` means the model was not
+    // dwctl-cache-enabled then: any cache tokens on the row are the provider's own and
+    // bill at list price, as they did live. The result is rounded to
+    // `http_analytics.total_cost`'s scale — numeric(12,8), half away from zero — because
+    // the stored side already was; comparing at full precision manufactures sub-cent
+    // "changes" on any tariff whose arithmetic doesn't land on 8dp (measured: 194 phantom
+    // changed rows, net -$0.00000097, on a healthy 400-row corpus).
+    let mut rows_tariff_unresolvable_count = |row: &source::CorpusRow, mults: &Option<crate::pricing::CacheMultipliers>| {
+        if mults.is_none() && row.stored_cache_total() > 0 {
+            rows_tariff_unresolvable += 1;
+        }
+    };
+    let price = |row: &source::CorpusRow, usage: &RecomputedUsage, mults: Option<crate::pricing::CacheMultipliers>| {
+        crate::pricing::charged_cost(
+            &usage.counts,
+            row.model.as_deref(),
+            row.input_price_per_token,
+            row.output_price_per_token,
+            mults,
+            crate::metrics::errors::component::ANALYTICS,
+        )
+        .map(|c| c.round_dp_with_strategy(8, rust_decimal::RoundingStrategy::MidpointAwayFromZero))
+    };
 
-            match replayed {
-                Ok(usage) => {
-                    // Price with the rates resolved at inference time, carried on the row.
-                    // Re-resolving the tariff here would silently re-base a correction onto
-                    // pricing that changed after the request was served.
-                    let cost = crate::pricing::charged_cost(
-                        &usage.counts,
-                        row.model.as_deref(),
-                        row.input_price_per_token,
-                        row.output_price_per_token,
-                        cache_multipliers_for(row),
-                        crate::metrics::errors::component::ANALYTICS,
-                    );
-                    report::ReportRow::replayed(row, &usage, cost)
+    let mut rows: Vec<report::ReportRow> = Vec::with_capacity(corpus.len());
+    for row in corpus.iter() {
+        let Some(exchange) = &row.exchange else {
+            // No body at all. For a ZDR account this is permanent and expected; the
+            // tokens simply cannot be verified, only the dollars-from-stored-tokens
+            // check remains available.
+            rows.push(report::ReportRow::unreplayable(
+                row,
+                report::Evidence::ColumnsOnly,
+                "no stored request/response body for this request".to_string(),
+            ));
+            continue;
+        };
+
+        let replayed = exchange
+            .to_outlet_pair()
+            .and_then(|(req, resp)| recompute_from_stored_response(&req, &resp, flat_tier));
+
+        let report_row = match replayed {
+            Ok(usage) => {
+                let cache_mults = row
+                    .model
+                    .as_deref()
+                    .and_then(|alias| cache_tariffs.get(alias))
+                    .and_then(|versions| crate::pricing::resolve_cache_multipliers(versions, row.pricing_timestamp()));
+                rows_tariff_unresolvable_count(row, &cache_mults);
+                let cost = price(row, &usage, cache_mults);
+                let mut report_row = report::ReportRow::replayed(row, &usage, cost);
+
+                // Tokenizer verification: an exact chat-templated count of the request,
+                // recorded NEXT TO the provider's number, never adopted over it. Adopting
+                // on agreement would replace every healthy row's count with ours ± template
+                // drift and destroy the healthy-corpus-is-a-no-op guarantee; the render's
+                // job here is to say, per row, whether the number billed on survives an
+                // independent count (measured on the Aug-11..14 sweep: exact or
+                // provider-lower on every sampled row).
+                if let (Some(tok), Some(model)) = (tokenizer, row.model.as_deref())
+                    && usage.counts.prompt > 0
+                    && let Some(total) = render_request_total(tok, model, exchange).await
+                {
+                    let divergence = Disagreement {
+                        reported_prompt: usage.counts.prompt,
+                        rendered_prompt: total,
+                    };
+                    report_row.prompt_render_total = Some(total);
+                    report_row.prompt_render_agrees = Some(divergence.divergence_bps() <= RENDER_TOLERANCE_BPS);
                 }
-                Err(e) => report::ReportRow::unreplayable(row, report::Evidence::NotReplayable, e.to_string()),
+                report_row
             }
-        })
-        .collect::<Vec<_>>();
+            // The July shape: the body parses but carries no usage at all. With a tokenizer
+            // available the row is *rescued* — the prompt from `/v1/render` (exact: the same
+            // templated bytes the engine tokenized) and the completion from tokenizing the
+            // response text (approximate: text extraction cannot see every channel a
+            // provider counts, so it is marked `estimated` and the runbook refuses to apply
+            // it without an explicit opt-in). Without a tokenizer the row surfaces as
+            // un-replayable, exactly as before.
+            Err(replay::RecomputeError::NoUsage) => {
+                let rescued = match (tokenizer, row.model.as_deref()) {
+                    (Some(tok), Some(model)) => rescue_usage_less_row(tok, model, exchange, flat_tier).await,
+                    _ => None,
+                };
+                match rescued {
+                    Some(usage) => {
+                        let cache_mults = row
+                            .model
+                            .as_deref()
+                            .and_then(|alias| cache_tariffs.get(alias))
+                            .and_then(|versions| crate::pricing::resolve_cache_multipliers(versions, row.pricing_timestamp()));
+                        rows_tariff_unresolvable_count(row, &cache_mults);
+                        let cost = price(row, &usage, cache_mults);
+                        let mut report_row = report::ReportRow::replayed(row, &usage, cost);
+                        report_row.prompt_render_total = Some(usage.counts.prompt);
+                        report_row
+                    }
+                    None => {
+                        report::ReportRow::unreplayable(row, report::Evidence::NotReplayable, replay::RecomputeError::NoUsage.to_string())
+                    }
+                }
+            }
+            // A ZDR row is not a failure to classify: the plaintext does not exist, so
+            // only the stored columns are ever knowable. NotReplayable is for rows we
+            // could have read and could not.
+            Err(replay::RecomputeError::ZeroDataRetention) => report::ReportRow::unreplayable(
+                row,
+                report::Evidence::ColumnsOnly,
+                "zero-data-retention: payload is encrypted, tokens cannot be verified".to_string(),
+            ),
+            Err(e) => report::ReportRow::unreplayable(row, report::Evidence::NotReplayable, e.to_string()),
+        };
+        rows.push(report_row);
+    }
+
+    // Independently re-derive each row's cache split from the prefix index as it stood at
+    // the request's timestamp. This is what turns the report from "the response and the row
+    // agree" into "the billing pipeline was right": the counts come from replaying the
+    // request through the serving classifier, not from anything the response said.
+    if let Some(base) = classifier {
+        for (report_row, row) in rows.iter_mut().zip(corpus.iter()) {
+            let (Some(principal), Some(model), Some(exchange)) = (row.user_id, row.model.as_deref(), row.exchange.as_ref()) else {
+                continue;
+            };
+            let Some(body) = exchange.request_body.as_deref().filter(|b| !b.is_empty()) else {
+                continue;
+            };
+            // Never classify an encrypted body. It parses to no markers, which the classifier
+            // reports as a confident zero split - and comparing that against a row holding
+            // real cache tokens manufactures a disagreement that blames the serving path for
+            // our own inability to read the request.
+            if replay::is_zdr_envelope(Some(body)) {
+                continue;
+            }
+
+            let historical = base.with_index(std::sync::Arc::new(cache_replay::HistoricalIndex::new(pool.clone(), row.timestamp)));
+            match cache_replay::reconstruct_split(&historical, model, body, principal, row.timestamp).await {
+                Ok(Some(split)) => {
+                    report_row.reconstructed_cache = Some(report::ReconstructedCache::compare(&split, row));
+                }
+                // Not cache-enabled for this principal: no split to reconstruct, which is not
+                // the same as a split of zero, so the field stays absent.
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::debug!(analytics_id = row.analytics_id, error = %e, "cache split reconstruction failed");
+                }
+            }
+        }
+    }
 
     let oldest = corpus.iter().map(|r| r.timestamp).min();
 
+    let mut warnings = report::corpus_warnings(oldest);
+    if rows_tariff_unresolvable > 0 {
+        warnings.push(format!(
+            "{rows_tariff_unresolvable} row(s) recorded cache tokens but no cache tariff resolves at their \
+             pricing time (tariff history deleted with its model?): they re-price at list rate, which is not \
+             what was charged — do not apply their cost deltas without resolving the tariff first"
+        ));
+    }
+
     Ok(report::RecomputeReport {
         generated_at: chrono::Utc::now(),
-        warnings: report::corpus_warnings(oldest),
+        warnings,
         corpus: serde_json::json!({
             "start": filter.start,
             "end": filter.end,
@@ -186,17 +330,6 @@ pub async fn recompute_corpus(
         summary: report::ReportSummary::of(&rows),
         rows,
     })
-}
-
-/// Whether dwctl's cache discount applied to this request, inferred from the row itself.
-///
-/// The live path gates the discount on a `model_cache_tariffs` row valid at inference time.
-/// A recompute cannot re-resolve that without risking a tariff that changed since, so it
-/// uses the evidence already on the row: a request that recorded cache tokens was, by
-/// definition, priced by a cache-enabled model at the time. One that recorded none gets no
-/// multipliers, which is exactly the "provider's own caching, not ours" case.
-fn cache_multipliers_for(row: &source::CorpusRow) -> Option<crate::pricing::CacheMultipliers> {
-    (row.stored_cache_total() > 0).then(crate::pricing::CacheMultipliers::default)
 }
 
 /// Where a recomputed figure came from, and therefore how much it can be trusted.
@@ -222,6 +355,9 @@ pub enum TokenSource {
 impl TokenSource {
     /// Whether a figure from this source is exact enough to apply without an explicit
     /// operator opt-in.
+    // The consumer is the apply path, which hasn't shipped; the rule it will enforce is
+    // pinned by tests now so it can't drift before then.
+    #[allow(dead_code)]
     pub fn is_exact(&self) -> bool {
         matches!(self, Self::Reported | Self::Rendered)
     }
@@ -262,7 +398,7 @@ impl Disagreement {
 
 /// The result of recomputing one request.
 #[derive(Debug, Clone)]
-pub struct RecomputedUsage {
+pub(crate) struct RecomputedUsage {
     /// The counts to bill on, in the shape [`crate::pricing`] prices.
     pub counts: TokenCounts,
     /// Reasoning tokens, re-read from the response. A *subset* of `counts.completion` rather
@@ -277,22 +413,27 @@ pub struct RecomputedUsage {
     pub total: i64,
     /// How `counts.prompt` was arrived at.
     pub prompt_source: TokenSource,
-    /// How `counts.completion` was arrived at.
+    /// How `counts.completion` was arrived at. Surfaced per row in the report so the apply
+    /// step can refuse `estimated` completions without an explicit opt-in.
     pub completion_source: TokenSource,
-    /// Set when the render and the reported total disagreed beyond tolerance.
-    pub disagreement: Option<Disagreement>,
     /// True when the cache-creation tier was assigned by rule because the stored body gave
     /// only a flat total. The token count is solid; the price of those tokens rests on an
     /// assumption, so the report must show it rather than bury it.
     pub cache_tier_inferred: bool,
-    /// `response_type` as the serializer classified it, for the report.
+    /// `response_type` as the serializer classified it. Not yet surfaced in the report;
+    /// kept because it is the one field that says *which parser arm* produced the counts,
+    /// which the apply path will want next to `token_source`.
+    #[allow(dead_code)]
     pub response_type: String,
-    /// The model the response claims, when it states one.
+    /// The model the response claims, when it states one. Same status as `response_type`.
+    #[allow(dead_code)]
     pub response_model: Option<String>,
 }
 
 impl RecomputedUsage {
     /// Whether every figure here is exact enough to apply without an opt-in.
+    // Same status as `TokenSource::is_exact`: the apply path is the consumer.
+    #[allow(dead_code)]
     pub fn is_exact(&self) -> bool {
         self.prompt_source.is_exact() && self.completion_source.is_exact()
     }
@@ -317,7 +458,30 @@ pub fn recompute_from_stored_response(
     flat_tier: CreationTier,
 ) -> Result<RecomputedUsage, RecomputeError> {
     let parsed = parse_ai_response(request_data, response_data).map_err(RecomputeError::Parse)?;
-    let metrics = TokenMetrics::from(&parsed);
+    let mut metrics = TokenMetrics::from(&parsed);
+    // A stored fusillade body is the *upstream's* bytes, not the bytes the live serializer
+    // parsed — and some upstreams omit fields the typed parse requires (Dynamo leaves `role`
+    // off the message), so the untagged parse falls through to `Other` and reads zero for a
+    // request the live path recorded correctly. When that happens but the body plainly
+    // carries a usage object, read the counts from the raw JSON. Strictly a fallback: it can
+    // never override a reading the serializer actually produced, so the healthy-no-op
+    // property is preserved. A response with no usage at all (the July shape) is REFUSED
+    // below — absence of evidence is not a zero measurement.
+    if metrics.prompt_tokens == 0 && metrics.completion_tokens == 0 && metrics.total_tokens == 0 {
+        match extract_from_last_usage(response_data, raw_usage_tokens) {
+            Some(raw) => {
+                metrics.prompt_tokens = raw.prompt;
+                metrics.completion_tokens = raw.completion;
+                metrics.reasoning_tokens = raw.reasoning;
+                metrics.total_tokens = raw.total;
+            }
+            // No usage object anywhere in the body — the July shape. A zero here is absence
+            // of evidence, not a measurement: reported as a recomputed zero it would either
+            // claim a broken row is healthy or propose zeroing out real usage. Refuse, so
+            // the row surfaces as un-replayable instead of silently passing.
+            None => return Err(RecomputeError::NoUsage),
+        }
+    }
     let CacheReading {
         tokens: cache,
         tier_inferred,
@@ -336,54 +500,157 @@ pub fn recompute_from_stored_response(
         total: metrics.total_tokens,
         prompt_source: TokenSource::Reported,
         completion_source: TokenSource::Reported,
-        disagreement: None,
         cache_tier_inferred: tier_inferred,
         response_type: metrics.response_type,
         response_model: metrics.response_model,
     })
 }
 
-/// Fold a tokenizer-svc render into a recomputed reading.
+/// Render the stored request through tokenizer-svc: the exact chat-templated token count
+/// of what the engine was sent, including tool schemas and template overhead.
 ///
-/// Precedence, and why:
-///
-/// - The response reported nothing usable (`prompt == 0`) — the GLM-5.2 shape. The render
-///   is the only source there is, so take it. The completion side has no such rescue and
-///   stays whatever the caller marked it.
-/// - The two agree within `tolerance_bps` — take the render (it counts the exact templated
-///   bytes the engine saw) and mark it [`TokenSource::Rendered`].
-/// - They disagree beyond tolerance — keep the **reported** figure and record the
-///   [`Disagreement`]. Deliberately conservative: the reported number is what the provider
-///   billed us on, so an operator reviews the conflict rather than the tool silently
-///   re-pricing a request on a contested count.
-///
-/// The cache split is untouched in every branch.
-///
-// Not yet reachable: the corpus recompute reads usage from the stored response, which is
-// exact and covers both incidents seen so far. This is the entry point for the tokenizer
-// path — needed when a response carries no usage at all (the July shape) — and is kept with
-// its tests because the precedence rules it encodes are the hard part, not the plumbing.
-#[allow(dead_code)]
-pub fn fold_render(mut usage: RecomputedUsage, rendered_prompt: i64, tolerance_bps: i64) -> RecomputedUsage {
-    let reported_prompt = usage.counts.prompt;
-
-    if reported_prompt <= 0 {
-        usage.counts.prompt = rendered_prompt;
-        usage.prompt_source = TokenSource::Rendered;
-        return usage;
+/// `None` on any failure — an unmapped model, a transport error, an unparseable request
+/// body. Verification is strictly additive: a tokenizer outage must degrade to "no render
+/// column on these rows", never to failed rows or (worse) fabricated agreement.
+async fn render_request_total(
+    tokenizer: &crate::prompt_cache::TokenizerClient,
+    model: &str,
+    exchange: &replay::StoredExchange,
+) -> Option<i64> {
+    let body = exchange.request_body.as_deref()?;
+    if replay::is_zdr_envelope(Some(body)) {
+        return None;
     }
+    let req: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let messages = req.get("messages")?.clone();
+    let tools = req.get("tools");
+    match tokenizer.render(model, &messages, tools, true, &[]).await {
+        Ok(resp) => Some(i64::from(resp.total)),
+        Err(e) => {
+            tracing::debug!(model, error = %e, "recompute render skipped");
+            None
+        }
+    }
+}
 
-    let disagreement = Disagreement {
-        reported_prompt,
-        rendered_prompt,
-    };
-    if disagreement.divergence_bps() <= tolerance_bps {
-        usage.counts.prompt = rendered_prompt;
-        usage.prompt_source = TokenSource::Rendered;
+/// Rescue a row whose response carries no usage object at all (the July shape).
+///
+/// Prompt: `/v1/render` — exact, [`TokenSource::Rendered`]. Completion: `/v1/tokenize` of
+/// the response text — a floor, not an exact count (text extraction cannot see every
+/// channel a provider's tokenizer counts; measured 20% low on Nemotron reasoning traffic),
+/// so it is [`TokenSource::Estimated`] and the apply step must not take it without an
+/// explicit opt-in. The cache split is zero by construction: dwctl's split lives inside the
+/// usage object this body does not have, and inventing one would put a fabricated discount
+/// on the correction.
+///
+/// `None` when either side cannot be produced — a prompt-only rescue would propose zeroing
+/// the completion of a request that plainly generated text.
+async fn rescue_usage_less_row(
+    tokenizer: &crate::prompt_cache::TokenizerClient,
+    model: &str,
+    exchange: &replay::StoredExchange,
+    _flat_tier: CreationTier,
+) -> Option<RecomputedUsage> {
+    let prompt = render_request_total(tokenizer, model, exchange).await?;
+    let texts = raw_completion_texts(exchange.response_body.as_deref()?)?;
+    let completion = if texts.is_empty() {
+        0
     } else {
-        usage.disagreement = Some(disagreement);
+        match tokenizer.tokenize(model, &texts).await {
+            Ok(resp) => i64::from(resp.total),
+            Err(e) => {
+                tracing::debug!(model, error = %e, "recompute rescue tokenize failed");
+                return None;
+            }
+        }
+    };
+
+    Some(RecomputedUsage {
+        counts: TokenCounts {
+            prompt,
+            completion,
+            cache_read: 0,
+            cache_creation_5m: 0,
+            cache_creation_1h: 0,
+            cache_creation_24h: 0,
+        },
+        // Indistinguishable from completion text under estimation; a repair writes 0 rather
+        // than inventing a split of the estimate.
+        reasoning: 0,
+        total: prompt + completion,
+        prompt_source: TokenSource::Rendered,
+        completion_source: TokenSource::Estimated,
+        cache_tier_inferred: false,
+        response_type: "tokenizer_rescue".to_string(),
+        response_model: None,
+    })
+}
+
+/// Extract the generated text from a raw response body — the completion side's input for a
+/// tokenizer estimate when there is no usage object to read.
+///
+/// Handles the two shapes fusillade stores: a blocking chat/completions JSON object
+/// (`choices[].message.{content,reasoning_content,reasoning}` / `choices[].text`, plus
+/// serialized tool calls), and an SSE stream (`choices[].delta` accumulated across
+/// frames). `None` when the body is neither — an unparseable body cannot be estimated,
+/// only refused.
+fn raw_completion_texts(body: &[u8]) -> Option<Vec<String>> {
+    use serde_json::Value;
+
+    fn texts_from_message(m: &Value, out: &mut Vec<String>) {
+        for key in ["content", "reasoning_content", "reasoning", "text"] {
+            if let Some(s) = m.get(key).and_then(Value::as_str)
+                && !s.is_empty()
+            {
+                out.push(s.to_string());
+            }
+        }
+        if let Some(calls) = m.get("tool_calls").and_then(Value::as_array) {
+            for call in calls {
+                if let Some(f) = call.get("function") {
+                    for key in ["name", "arguments"] {
+                        if let Some(s) = f.get(key).and_then(Value::as_str) {
+                            out.push(s.to_string());
+                        }
+                    }
+                }
+            }
+        }
     }
-    usage
+
+    let text = String::from_utf8_lossy(body);
+    let mut out = Vec::new();
+
+    if let Ok(v) = serde_json::from_str::<Value>(text.trim()) {
+        for choice in v.get("choices")?.as_array()? {
+            if let Some(m) = choice.get("message") {
+                texts_from_message(m, &mut out);
+            }
+            texts_from_message(choice, &mut out); // legacy completions: choices[].text
+        }
+        return Some(out);
+    }
+
+    // SSE: accumulate delta text across frames. Parsing at least one data frame is what
+    // distinguishes "a stream with no text" from "not a stream at all".
+    let mut saw_frame = false;
+    for line in text.lines() {
+        let Some(data) = line.strip_prefix("data:") else { continue };
+        let trimmed = data.trim();
+        if trimmed == "[DONE]" {
+            continue;
+        }
+        let Ok(chunk) = serde_json::from_str::<Value>(trimmed) else {
+            continue;
+        };
+        saw_frame = true;
+        for choice in chunk.get("choices").and_then(Value::as_array).unwrap_or(&Vec::new()) {
+            if let Some(d) = choice.get("delta") {
+                texts_from_message(d, &mut out);
+            }
+        }
+    }
+    saw_frame.then_some(out)
 }
 
 #[cfg(test)]
@@ -404,7 +671,6 @@ mod tests {
             total: prompt + 50,
             prompt_source: TokenSource::Reported,
             completion_source: TokenSource::Reported,
-            disagreement: None,
             cache_tier_inferred: false,
             response_type: "chat_completion".to_string(),
             response_model: None,
@@ -412,49 +678,25 @@ mod tests {
     }
 
     #[test]
-    fn render_is_taken_when_it_agrees_within_tolerance() {
-        // 20_000 vs 20_100 = 50 bps of drift, inside a 100 bps tolerance.
-        let got = fold_render(usage(20_000, 12_000, 3_000), 20_100, 100);
-        assert_eq!(got.counts.prompt, 20_100, "the exact templated count wins");
-        assert_eq!(got.prompt_source, TokenSource::Rendered);
-        assert!(got.disagreement.is_none());
+    fn completion_texts_from_blocking_chat_body() {
+        let body = br#"{"choices":[{"message":{"content":"answer","reasoning_content":"thinking",
+            "tool_calls":[{"function":{"name":"f","arguments":"{\"x\":1}"}}]}}]}"#;
+        let texts = raw_completion_texts(body).expect("blocking JSON parses");
+        assert_eq!(texts, vec!["answer", "thinking", "f", "{\"x\":1}"]);
     }
 
     #[test]
-    fn disagreement_keeps_the_reported_figure_and_is_surfaced() {
-        // A 50% gap is not drift. Keep what the provider billed us on and escalate.
-        let got = fold_render(usage(20_000, 12_000, 3_000), 10_000, 100);
-        assert_eq!(got.counts.prompt, 20_000, "a contested count is not silently re-priced");
-        assert_eq!(got.prompt_source, TokenSource::Reported);
-        let d = got.disagreement.expect("the conflict must be surfaced");
-        assert_eq!(d.reported_prompt, 20_000);
-        assert_eq!(d.rendered_prompt, 10_000);
-        assert_eq!(d.divergence_bps(), 5_000);
+    fn completion_texts_from_sse_deltas() {
+        let body = b"data: {\"choices\":[{\"delta\":{\"content\":\"hel\"}}]}\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"lo\"}}]}\n\ndata: [DONE]\n\n";
+        let texts = raw_completion_texts(body).expect("SSE parses");
+        assert_eq!(texts, vec!["hel", "lo"]);
     }
 
     #[test]
-    fn render_rescues_a_response_that_reported_no_usage() {
-        // The GLM-5.2 shape: usage was null, so the row was billed as zero tokens. The
-        // render is the only source of truth available.
-        let got = fold_render(usage(0, 0, 0), 4_096, 100);
-        assert_eq!(got.counts.prompt, 4_096);
-        assert_eq!(got.prompt_source, TokenSource::Rendered);
-        assert!(got.disagreement.is_none(), "there was nothing to disagree with");
-    }
-
-    /// The invariant the whole design turns on: whatever the tokenizer says, the cache
-    /// split is carried through untouched. Inventing one would put a fabricated discount
-    /// rate on a customer's invoice.
-    #[test]
-    fn folding_a_render_never_touches_the_cache_split() {
-        let before = usage(20_000, 12_000, 3_000);
-        for (rendered, tolerance) in [(20_100, 100), (10_000, 100), (0, 100)] {
-            let after = fold_render(before.clone(), rendered, tolerance);
-            assert_eq!(after.counts.cache_read, before.counts.cache_read);
-            assert_eq!(after.counts.cache_creation_5m, before.counts.cache_creation_5m);
-            assert_eq!(after.counts.cache_creation_1h, before.counts.cache_creation_1h);
-            assert_eq!(after.counts.cache_creation_24h, before.counts.cache_creation_24h);
-        }
+    fn completion_texts_refuse_an_unparseable_body() {
+        assert!(raw_completion_texts(b"not json, not sse").is_none());
+        // An empty generation is a real (empty) answer, distinct from unreadable.
+        assert_eq!(raw_completion_texts(br#"{"choices":[]}"#), Some(vec![]));
     }
 
     #[test]

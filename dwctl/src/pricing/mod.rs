@@ -111,6 +111,63 @@ pub(crate) struct TariffInfo {
     pub completion_window: Option<String>,
 }
 
+/// Load the full cache-tariff history (including expired versions) for a set of model
+/// aliases: alias → versions, ready for [`resolve_cache_multipliers`] at any timestamp.
+///
+/// Shared by the live batcher and the recompute for the same reason the arithmetic is:
+/// the ledger is temporal (`valid_from` / `valid_until`, closed rather than updated), so
+/// resolving as-of a request's time yields the exact multipliers the live path billed
+/// with — and both callers must load it the same way or their answers drift. Models with
+/// no tariff history simply don't appear.
+pub(crate) async fn lookup_cache_tariffs(
+    pool: &sqlx::PgPool,
+    aliases: &[String],
+) -> Result<std::collections::HashMap<String, Vec<CacheTariffRow>>, sqlx::Error> {
+    struct Row {
+        alias: String,
+        write_multiplier_5m: Decimal,
+        write_multiplier_1h: Decimal,
+        write_multiplier_24h: Decimal,
+        read_multiplier: Decimal,
+        valid_from: DateTime<Utc>,
+        valid_until: Option<DateTime<Utc>>,
+    }
+
+    let rows: Vec<Row> = sqlx::query_as!(
+        Row,
+        r#"
+        SELECT
+            dm.alias,
+            mct.write_multiplier_5m,
+            mct.write_multiplier_1h,
+            mct.write_multiplier_24h,
+            mct.read_multiplier,
+            mct.valid_from,
+            mct.valid_until
+        FROM deployed_models dm
+        JOIN model_cache_tariffs mct ON mct.deployed_model_id = dm.id
+        WHERE dm.alias = ANY($1)
+        ORDER BY dm.alias, mct.valid_from DESC
+        "#,
+        aliases
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let mut map: std::collections::HashMap<String, Vec<CacheTariffRow>> = std::collections::HashMap::new();
+    for row in rows {
+        map.entry(row.alias).or_default().push(CacheTariffRow {
+            write_multiplier_5m: row.write_multiplier_5m,
+            write_multiplier_1h: row.write_multiplier_1h,
+            write_multiplier_24h: row.write_multiplier_24h,
+            read_multiplier: row.read_multiplier,
+            valid_from: row.valid_from,
+            valid_until: row.valid_until,
+        });
+    }
+    Ok(map)
+}
+
 /// Resolve the multipliers from the model's cache-tariff row valid at `timestamp` — the
 /// most-recently-effective version still in its window. One row carries all tiers, so
 /// there is no per-tier resolution or gap. `None` when no version was valid at `timestamp`

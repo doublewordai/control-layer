@@ -51,6 +51,9 @@ pub struct CorpusRow {
     /// Present on batch traffic. Carried because a batch corpus needs its `batch_aggregates`
     /// analytics columns delta-folded, and that is not inferable from the numbers alone.
     pub fusillade_batch_id: Option<Uuid>,
+    /// When the batch was created, for batch traffic. Carried because the live path prices
+    /// a batch request as of its batch's creation — tariffs included — not as of processing.
+    pub batch_created_at: Option<DateTime<Utc>>,
 
     // What is stored today — the "before" side of every delta.
     pub stored_prompt_tokens: i64,
@@ -78,6 +81,13 @@ impl CorpusRow {
     /// Whether the cache split is all zero, i.e. this request recorded no caching at all.
     pub fn stored_cache_total(&self) -> i64 {
         self.stored_cache_read + self.stored_cache_creation_5m + self.stored_cache_creation_1h + self.stored_cache_creation_24h
+    }
+
+    /// The instant tariffs are resolved at — batch creation for batch traffic, else the
+    /// request's own time. Must match the live batcher's `pricing_timestamp` exactly, or a
+    /// recompute across a tariff change would "correct" rows the live path priced right.
+    pub fn pricing_timestamp(&self) -> DateTime<Utc> {
+        self.batch_created_at.unwrap_or(self.timestamp)
     }
 }
 
@@ -115,10 +125,18 @@ pub async fn load_corpus(pool: &PgPool, filter: &CorpusFilter) -> Result<Vec<Cor
             -- link. Without the override sqlx types it as String and the None case vanishes.
             rt.body                            AS "request_body?",
             r.response_body                    AS "response_body?",
-            r.response_status                  AS "response_status?"
+            r.response_status                  AS "response_status?",
+            b.created_at                       AS "batch_created_at?"
         FROM http_analytics ha
         LEFT JOIN fusillade.requests r          ON r.id  = ha.fusillade_request_id
         LEFT JOIN fusillade.request_templates rt ON rt.id = r.template_id
+        LEFT JOIN fusillade.batches b            ON b.id  = ha.fusillade_batch_id
+        -- Ordered so the planner drives off a timestamp index. There is NO index on
+        -- http_analytics.user_id, and ordering by `id` instead makes Postgres walk the
+        -- primary key filtering as it goes — on a 186M-row table that scans most of it
+        -- before the LIMIT is satisfied. The time window is the only selective thing here,
+        -- so it has to lead: idx_analytics_model_timestamp when a model is given, otherwise
+        -- idx_analytics_timestamp.
         WHERE ha.timestamp >= $1
           AND ha.timestamp <= $2
           AND ($3::uuid IS NULL OR ha.user_id = $3)
@@ -128,7 +146,7 @@ pub async fn load_corpus(pool: &PgPool, filter: &CorpusFilter) -> Result<Vec<Cor
           -- total_cost is a free model, where no charge was ever expected.
           AND ha.user_id IS NOT NULL
           AND ha.status_code BETWEEN 200 AND 299
-        ORDER BY ha.id
+        ORDER BY ha.timestamp DESC
         LIMIT $6
         "#,
         filter.start,
@@ -165,6 +183,7 @@ pub async fn load_corpus(pool: &PgPool, filter: &CorpusFilter) -> Result<Vec<Cor
                 timestamp: r.timestamp,
                 fusillade_request_id: r.fusillade_request_id,
                 fusillade_batch_id: r.fusillade_batch_id,
+                batch_created_at: r.batch_created_at,
                 stored_prompt_tokens: r.prompt_tokens,
                 stored_completion_tokens: r.completion_tokens,
                 stored_reasoning_tokens: r.reasoning_tokens,
@@ -185,10 +204,37 @@ pub async fn load_corpus(pool: &PgPool, filter: &CorpusFilter) -> Result<Vec<Cor
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::prompt_cache::TokenizerClient;
     use crate::recompute::cache_fields::CreationTier;
     use crate::recompute::recompute_corpus;
     use crate::test::utils::setup_fusillade_pool;
     use sqlx::PgPool;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// A tokenizer-svc double: `/v1/render` answers `render_total` for any request,
+    /// `/v1/tokenize` answers `tokenize_total`.
+    async fn mock_tokenizer(render_total: u32, tokenize_total: u32) -> (MockServer, TokenizerClient) {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/render"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "virtual_model": "m", "tokenizer_version": "tok-v1", "template_version": "tpl-v1",
+                "total": render_total, "prefix_counts": []
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/tokenize"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "virtual_model": "m", "tokenizer_version": "tok-v1",
+                "segment_counts": [tokenize_total], "cumulative": [tokenize_total], "total": tokenize_total
+            })))
+            .mount(&server)
+            .await;
+        let client = TokenizerClient::new(server.uri());
+        (server, client)
+    }
 
     /// Seed one already-billed request with its stored payload, as the live path would have
     /// left it. Returns the analytics row id.
@@ -298,7 +344,7 @@ mod tests {
         )
         .await;
 
-        let report = recompute_corpus(&pool, &filter_for(user_id), CreationTier::FiveMinute)
+        let report = recompute_corpus(&pool, &filter_for(user_id), CreationTier::FiveMinute, None, None)
             .await
             .unwrap();
 
@@ -326,7 +372,7 @@ mod tests {
         )
         .await;
 
-        let report = recompute_corpus(&pool, &filter_for(user_id), CreationTier::FiveMinute)
+        let report = recompute_corpus(&pool, &filter_for(user_id), CreationTier::FiveMinute, None, None)
             .await
             .unwrap();
 
@@ -340,6 +386,244 @@ mod tests {
         assert_eq!(rec.cache_creation_5m, 538, "recovered from the FLAT field");
         assert!(row.cache_tier_inferred, "the body never stated a tier");
         assert!(report.summary.net_correction > Decimal::ZERO, "an undercharge");
+    }
+
+    /// A dwctl-cached request re-prices with the tariff version valid at its time — not the
+    /// config defaults, and not a version that superseded it. Measured failure this pins:
+    /// healthy GLM-5.2 traffic (tariff read ×0.8, writes ×1.0) re-priced with the defaults
+    /// (read ×0.1, write ×1.25) and reported a −$0.06 "overcharge" on 25 healthy rows.
+    #[sqlx::test]
+    async fn cached_row_reprices_with_the_tariff_valid_at_its_time(pool: PgPool) {
+        setup_fusillade_pool(&pool).await;
+
+        // The model behind alias 'm', with a superseded tariff version and the live one.
+        // Neither matches the config defaults, so resolving wrongly cannot pass by luck.
+        let creator = crate::test::utils::create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
+        let endpoint = crate::test::utils::create_test_endpoint(&pool, "ep-tariff", creator.id).await;
+        let model_id = crate::test::utils::create_test_model(&pool, "m", "m", endpoint, creator.id).await;
+        sqlx::query!(
+            r#"INSERT INTO model_cache_tariffs
+                 (deployed_model_id, write_multiplier_5m, write_multiplier_1h, write_multiplier_24h, read_multiplier, min_prefix_tokens, valid_from, valid_until)
+               VALUES ($1, 2.0, 2.0, 2.5, 0.5, 1024, now() - interval '2 hours', now() - interval '1 hour'),
+                      ($1, 1.0, 1.0, 1.0, 0.8, 1024, now() - interval '1 hour', NULL)"#,
+            model_id,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // The live path's arithmetic for prompt 31840 (read 30723 @ ×0.8, creation 251 @ ×1.0,
+        // uncached 866) at 1e-6/2e-6: (866 + 30723·0.8 + 251·1.0)·1e-6 + 709·2e-6.
+        let (user_id, _) = seed(
+            &pool,
+            "/chat/completions",
+            r#"{"id":"c","object":"chat.completion","created":1,"model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"x"},"finish_reason":"stop"}],"usage":{"prompt_tokens":31840,"completion_tokens":709,"total_tokens":32549,"cache_read_input_tokens":30723,"cache_creation_input_tokens":251,"cache_creation":{"ephemeral_5m_input_tokens":251,"ephemeral_1h_input_tokens":0,"ephemeral_24h_input_tokens":0},"prompt_tokens_details":{"cached_tokens":30723}}}"#,
+            31840,
+            709,
+            30723,
+            251,
+            Decimal::from_str_exact("0.0271134").unwrap(),
+        )
+        .await;
+
+        let report = recompute_corpus(&pool, &filter_for(user_id), CreationTier::FiveMinute, None, None)
+            .await
+            .unwrap();
+
+        assert_eq!(report.summary.rows_total, 1);
+        assert_eq!(
+            report.summary.rows_changed, 0,
+            "a healthy cached row must re-price to exactly what the live tariff charged"
+        );
+        assert_eq!(report.summary.net_correction, Decimal::ZERO);
+        assert!(report.warnings.is_empty(), "the tariff resolved; nothing to warn about");
+    }
+
+    /// `http_analytics.total_cost` is numeric(12,8): the stored cost was rounded to 8dp by
+    /// the column on insert. The recompute must compare at that same scale — a tariff whose
+    /// arithmetic runs past 8dp (here read ×0.5714 on 1e-6/tok) otherwise shows every
+    /// healthy row as "changed" by a sub-cent phantom. Measured: 194 phantom rows on a
+    /// healthy 400-row Nemotron corpus before this rounding existed.
+    #[sqlx::test]
+    async fn cost_is_compared_at_the_stored_column_scale(pool: PgPool) {
+        setup_fusillade_pool(&pool).await;
+        let creator = crate::test::utils::create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
+        let endpoint = crate::test::utils::create_test_endpoint(&pool, "ep-scale", creator.id).await;
+        let model_id = crate::test::utils::create_test_model(&pool, "m", "m", endpoint, creator.id).await;
+        sqlx::query!(
+            r#"INSERT INTO model_cache_tariffs
+                 (deployed_model_id, write_multiplier_5m, write_multiplier_1h, write_multiplier_24h, read_multiplier, min_prefix_tokens)
+               VALUES ($1, 1.0, 1.0, 1.0, 0.5714, 1024)"#,
+            model_id,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // uncached 99·1e-6 + read 101·1e-6·0.5714 + completion 10·2e-6
+        //   = 0.000099 + 0.0000577114 + 0.00002 = 0.0001767114 — past 8dp.
+        // The column stored round8(that) = 0.00017671.
+        let (user_id, _) = seed(
+            &pool,
+            "/chat/completions",
+            r#"{"id":"c","object":"chat.completion","created":1,"model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"x"},"finish_reason":"stop"}],"usage":{"prompt_tokens":200,"completion_tokens":10,"total_tokens":210,"cache_read_input_tokens":101,"cache_creation_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":0,"ephemeral_1h_input_tokens":0,"ephemeral_24h_input_tokens":0},"prompt_tokens_details":{"cached_tokens":101}}}"#,
+            200,
+            10,
+            101,
+            0,
+            Decimal::from_str_exact("0.00017671").unwrap(),
+        )
+        .await;
+
+        let report = recompute_corpus(&pool, &filter_for(user_id), CreationTier::FiveMinute, None, None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            report.summary.rows_changed, 0,
+            "a sub-8dp arithmetic tail must not read as a correction"
+        );
+        assert_eq!(report.summary.net_correction, Decimal::ZERO);
+    }
+
+    /// The July incident shape, end to end: the backend answered `"usage": null` and the
+    /// row was billed nothing. The recompute has nothing to re-read, so the row must surface
+    /// as not-replayable — NOT as "unchanged", which would certify a broken row as healthy.
+    #[sqlx::test]
+    async fn july_null_usage_row_surfaces_as_not_replayable(pool: PgPool) {
+        setup_fusillade_pool(&pool).await;
+        let (user_id, _) = seed(
+            &pool,
+            "/chat/completions",
+            r#"{"choices":[{"finish_reason":"tool_calls","index":0,"message":{"role":"assistant","content":null}}],"created":1,"id":"c","model":"m","object":"chat.completion","usage":null}"#,
+            0,
+            0,
+            0,
+            0,
+            Decimal::ZERO,
+        )
+        .await;
+
+        let report = recompute_corpus(&pool, &filter_for(user_id), CreationTier::FiveMinute, None, None)
+            .await
+            .unwrap();
+
+        assert_eq!(report.summary.rows_total, 1);
+        assert_eq!(report.summary.rows_not_replayable, 1, "no usage to re-read → needs a human");
+        assert_eq!(report.summary.rows_unchanged, 0, "must not be certified healthy");
+        assert_eq!(report.summary.rows_changed, 0);
+        let row = &report.rows[0];
+        assert!(
+            row.note.as_deref().is_some_and(|n| n.contains("no usage object")),
+            "the note must say why: {:?}",
+            row.note
+        );
+    }
+
+    /// The render verifies, it never replaces: a healthy row whose provider count the
+    /// tokenizer contradicts stays UNCHANGED — the disagreement is a per-row finding, not a
+    /// correction. Adopting "agreeing" renders instead would replace every healthy count
+    /// with ours ± template drift and destroy the no-op guarantee.
+    #[sqlx::test]
+    async fn render_disagreement_is_annotated_but_never_adopted(pool: PgPool) {
+        setup_fusillade_pool(&pool).await;
+        let (user_id, _) = seed(
+            &pool,
+            "/chat/completions",
+            r#"{"id":"c","object":"chat.completion","created":1,"model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"x"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1000,"completion_tokens":100,"total_tokens":1100}}"#,
+            1000,
+            100,
+            0,
+            0,
+            Decimal::from_str_exact("0.0012").unwrap(),
+        )
+        .await;
+
+        // Render says 2000 against a reported 1000 — a 50% divergence, far beyond tolerance.
+        let (_server, tokenizer) = mock_tokenizer(2000, 0).await;
+        let report = recompute_corpus(&pool, &filter_for(user_id), CreationTier::FiveMinute, None, Some(&tokenizer))
+            .await
+            .unwrap();
+
+        assert_eq!(report.summary.rows_changed, 0, "a contested count is a finding, not a correction");
+        assert_eq!(report.summary.rows_render_checked, 1);
+        assert_eq!(report.summary.rows_render_disagreed, 1);
+        let row = &report.rows[0];
+        assert_eq!(row.recomputed.as_ref().unwrap().prompt_tokens, 1000, "provider count kept");
+        assert_eq!(row.prompt_render_total, Some(2000));
+        assert_eq!(row.prompt_render_agrees, Some(false));
+    }
+
+    /// An agreeing render annotates the row and moves nothing.
+    #[sqlx::test]
+    async fn render_agreement_is_annotated(pool: PgPool) {
+        setup_fusillade_pool(&pool).await;
+        let (user_id, _) = seed(
+            &pool,
+            "/chat/completions",
+            r#"{"id":"c","object":"chat.completion","created":1,"model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"x"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1000,"completion_tokens":100,"total_tokens":1100}}"#,
+            1000,
+            100,
+            0,
+            0,
+            Decimal::from_str_exact("0.0012").unwrap(),
+        )
+        .await;
+
+        // 1005 vs 1000 = 50 bps, inside the 1% tolerance.
+        let (_server, tokenizer) = mock_tokenizer(1005, 0).await;
+        let report = recompute_corpus(&pool, &filter_for(user_id), CreationTier::FiveMinute, None, Some(&tokenizer))
+            .await
+            .unwrap();
+
+        assert_eq!(report.summary.rows_changed, 0);
+        assert_eq!(report.summary.rows_render_checked, 1);
+        assert_eq!(report.summary.rows_render_disagreed, 0);
+        let row = &report.rows[0];
+        assert_eq!(row.recomputed.as_ref().unwrap().prompt_tokens, 1000, "never adopted, even agreeing");
+        assert_eq!(row.prompt_render_agrees, Some(true));
+    }
+
+    /// The July shape WITH a tokenizer: the row is rescued instead of refused — prompt from
+    /// the exact render, completion estimated from the response text, priced, and gated
+    /// (`completion_token_source: "estimated"`) so the apply step demands an opt-in.
+    #[sqlx::test]
+    async fn usage_less_row_is_rescued_by_the_tokenizer(pool: PgPool) {
+        setup_fusillade_pool(&pool).await;
+        let (user_id, analytics_id) = seed(
+            &pool,
+            "/chat/completions",
+            r#"{"choices":[{"finish_reason":"tool_calls","index":0,"message":{"role":"assistant","content":"partial answer"}}],"created":1,"id":"c","model":"m","object":"chat.completion","usage":null}"#,
+            0,
+            0,
+            0,
+            0,
+            Decimal::ZERO,
+        )
+        .await;
+
+        let (_server, tokenizer) = mock_tokenizer(4096, 512).await;
+        let report = recompute_corpus(&pool, &filter_for(user_id), CreationTier::FiveMinute, None, Some(&tokenizer))
+            .await
+            .unwrap();
+
+        assert_eq!(report.summary.rows_not_replayable, 0, "rescued, not refused");
+        assert_eq!(report.summary.rows_changed, 1);
+        assert_eq!(report.summary.rows_tokenizer_rescued, 1);
+        let row = report.rows.iter().find(|r| r.analytics_id == analytics_id).unwrap();
+        let rec = row.recomputed.as_ref().expect("rescued row is replayed");
+        assert_eq!(rec.prompt_tokens, 4096, "prompt is the exact render");
+        assert_eq!(rec.completion_tokens, 512, "completion is the text estimate");
+        assert_eq!(rec.cache_read, 0, "no usage object → no split to read, none invented");
+        assert_eq!(row.token_source.as_deref(), Some("rendered"));
+        assert_eq!(row.completion_token_source.as_deref(), Some("estimated"));
+        // 4096 × 1e-6 + 512 × 2e-6, at the row's stored unit prices.
+        assert_eq!(rec.cost, Some(Decimal::from_str_exact("0.00512").unwrap()));
+        assert!(report.summary.net_correction > Decimal::ZERO, "recovered usage, undercharge");
+        assert_eq!(
+            report.summary.net_correction_estimated, report.summary.net_correction,
+            "the whole correction rests on an estimate here, and the summary must say so"
+        );
     }
 
     /// A request with no stored body cannot be checked at all. It must be reported as such
@@ -368,7 +652,7 @@ mod tests {
         .await
         .unwrap();
 
-        let report = recompute_corpus(&pool, &filter_for(user_id), CreationTier::FiveMinute)
+        let report = recompute_corpus(&pool, &filter_for(user_id), CreationTier::FiveMinute, None, None)
             .await
             .unwrap();
 
