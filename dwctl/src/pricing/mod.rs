@@ -36,7 +36,7 @@ use crate::db::models::api_keys::ApiKeyPurpose;
 /// The split usually reconciles to `prompt` but is not guaranteed to; see
 /// [`compute_total_cost`] for the two-tier safety rule that handles drift and corruption.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct TokenCounts {
+pub struct TokenCounts {
     pub prompt: i64,
     pub completion: i64,
     pub cache_read: i64,
