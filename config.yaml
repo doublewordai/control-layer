@@ -605,6 +605,13 @@ background_services:
     # configured until every journaled retirement has completed, even if the
     # enable flag is turned back off.
     # retained_response_retirement_enabled: false
+    # Weekly batch-archive retirement irreversibly drops whole expired
+    # archive partitions once every batch in the week is past the
+    # finalization-anchored retention period below. Batch metadata rows are
+    # stamped retention-expired, never deleted. Requires the same
+    # session-capable maintenance endpoint as response retirement.
+    # batch_archive_retirement_enabled: false
+    # batch_archive_retention_days: <positive days>
     # retained_response_partition_maintenance_url: <direct session-capable postgres endpoint>
 
     # Batch archive (fusillade phase 3): moves frozen terminal batches' rows

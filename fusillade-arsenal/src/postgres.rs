@@ -54,6 +54,8 @@ use crate::request::{
 // repository wiring. Archive-aware readers consume the same boundary in a
 // later rollout step.
 #[allow(dead_code)]
+pub(crate) mod batch_archive_retirement;
+pub(crate) mod partition_retirement;
 pub(crate) mod retained_response;
 pub(crate) mod retained_response_retirement;
 
@@ -8134,6 +8136,19 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
 
     async fn cleanup_expired_response_fences(&self, limit: i64) -> Result<u64> {
         retained_response_retirement::cleanup_expired_response_fences(self, limit).await
+    }
+
+    async fn retire_expired_batch_archive_partition(
+        &self,
+        select_new: bool,
+        retention_days: i32,
+    ) -> Result<RetainedResponseRetirementOutcome> {
+        batch_archive_retirement::retire_expired_batch_archive_partition(
+            self,
+            select_new,
+            retention_days,
+        )
+        .await
     }
 
     async fn retained_response_archive_index_ready(&self) -> Result<bool> {

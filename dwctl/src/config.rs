@@ -1673,6 +1673,16 @@ pub struct DaemonConfig {
     #[serde(default)]
     pub retained_response_retirement_enabled: bool,
 
+    /// Allow weekly batch-archive partition retirement. Disabled by default
+    /// and additionally requires an explicit retention period.
+    #[serde(default)]
+    pub batch_archive_retirement_enabled: bool,
+
+    /// Finalization-anchored batch content retention period in days. No
+    /// default: enabling batch-archive retirement without it fails startup.
+    #[serde(default)]
+    pub batch_archive_retention_days: Option<u32>,
+
     /// Explicit direct/session-capable primary endpoint used only for
     /// retained-response partition DDL. Dedicated Fusillade databases require
     /// this attestation; schema mode may reuse the application's already-direct
@@ -2012,6 +2022,8 @@ impl Default for DaemonConfig {
             batchless_archive_bytes_per_tick: default_batchless_archive_bytes_per_tick(),
             retained_response_partitions_days_ahead: default_retained_response_partitions_days_ahead(),
             retained_response_retirement_enabled: false,
+            batch_archive_retirement_enabled: false,
+            batch_archive_retention_days: None,
             retained_response_partition_maintenance_url: None,
             streamable_endpoints: Vec::new(),
             urgency_weight: default_urgency_weight(),
@@ -2046,6 +2058,8 @@ impl DaemonConfig {
             .with_batchless_archive_limits(self.batchless_archive_groups_per_tick, self.batchless_archive_bytes_per_tick)
             .with_retained_response_partitions_days_ahead(self.retained_response_partitions_days_ahead)
             .with_retained_response_retirement_enabled(self.retained_response_retirement_enabled)
+            .with_batch_archive_retirement_enabled(self.batch_archive_retirement_enabled)
+            .with_batch_archive_retention_days(self.batch_archive_retention_days)
     }
 
     /// Convert to fusillade daemon config
@@ -2843,12 +2857,22 @@ impl Config {
             });
         }
         if owns_archive_maintenance
-            && daemon.retained_response_retirement_enabled
+            && (daemon.retained_response_retirement_enabled || daemon.batch_archive_retirement_enabled)
             && matches!(self.database.fusillade(), ComponentDb::Dedicated { .. })
             && daemon.retained_response_partition_maintenance_url.is_none()
         {
             return Err(Error::Internal {
                 operation: "Config validation: retained-response partition retirement on a dedicated database requires an explicit direct session endpoint".to_string(),
+            });
+        }
+        if owns_archive_maintenance
+            && daemon.batch_archive_retirement_enabled
+            && daemon.batch_archive_retention_days.is_none_or(|days| days < 1)
+        {
+            return Err(Error::Internal {
+                operation:
+                    "Config validation: batch-archive partition retirement requires an explicit positive batch_archive_retention_days"
+                        .to_string(),
             });
         }
         if owns_archive_maintenance
@@ -3227,6 +3251,8 @@ mod tests {
             "batchless_archive_bytes_per_tick",
             "retained_response_partitions_days_ahead",
             "retained_response_retirement_enabled",
+            "batch_archive_retirement_enabled",
+            "batch_archive_retention_days",
         ] {
             serialized.as_object_mut().unwrap().remove(key);
         }
@@ -3257,6 +3283,8 @@ mod tests {
             mapped.retained_response_retirement_enabled(),
             daemon.retained_response_retirement_enabled
         );
+        assert_eq!(mapped.batch_archive_retirement_enabled(), daemon.batch_archive_retirement_enabled);
+        assert_eq!(mapped.batch_archive_retention_days(), daemon.batch_archive_retention_days);
     }
 
     #[test]
