@@ -8,12 +8,8 @@ use std::collections::HashMap;
 // model - notably `reasoning_content` on streaming deltas, a vLLM/DeepSeek
 // extension async-openai has no field for, so reasoning text was lost on the way
 // into the request log.
-use onwards::strict::schemas::chat_completions::{
-    ChatCompletionChunk as ChatChunk, ChatCompletionRequest, ChatCompletionResponse,
-};
-use onwards::strict::schemas::completions::{
-    CompletionChunk as CompletionStreamChunk, CompletionRequest, CompletionResponse,
-};
+use onwards::strict::schemas::chat_completions::{ChatCompletionChunk as ChatChunk, ChatCompletionRequest, ChatCompletionResponse};
+use onwards::strict::schemas::completions::{CompletionChunk as CompletionStreamChunk, CompletionRequest, CompletionResponse};
 use onwards::strict::schemas::embeddings::{EmbeddingsRequest, EmbeddingsResponse};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
