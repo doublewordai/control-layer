@@ -2,16 +2,19 @@
 
 use std::collections::HashMap;
 
-use async_openai::types::chat::{CreateChatCompletionResponse, CreateChatCompletionStreamResponse};
-use async_openai::types::completions::{CreateCompletionRequest, CreateCompletionResponse};
-use async_openai::types::embeddings::{CreateBase64EmbeddingResponse, CreateEmbeddingRequest, CreateEmbeddingResponse};
-// Chat REQUESTS use onwards' strict schema, not async-openai's. onwards owns the
-// chat request shape (dwctl already reuses it in translation) and models
-// `reasoning_effort` as a permissive `serde_json::Value`, so canonical values
-// async-openai has not caught up with - notably `max`, which
-// `crate::reasoning::ReasoningEffort` defines and the platform routes on - still
-// deserialize instead of collapsing the request to `AiRequest::Other`.
-use onwards::strict::schemas::chat_completions::ChatCompletionRequest;
+// One set of OpenAI-shape structs across onwards and dwctl: onwards owns them,
+// dwctl reuses them. The request-logging layer previously parsed with
+// async-openai's types instead, which silently dropped any field they did not
+// model - notably `reasoning_content` on streaming deltas, a vLLM/DeepSeek
+// extension async-openai has no field for, so reasoning text was lost on the way
+// into the request log.
+use onwards::strict::schemas::chat_completions::{
+    ChatCompletionChunk as ChatChunk, ChatCompletionRequest, ChatCompletionResponse,
+};
+use onwards::strict::schemas::completions::{
+    CompletionChunk as CompletionStreamChunk, CompletionRequest, CompletionResponse,
+};
+use onwards::strict::schemas::embeddings::{EmbeddingsRequest, EmbeddingsResponse};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
@@ -32,15 +35,13 @@ pub enum SseParseError {
 #[serde(untagged)]
 #[allow(clippy::large_enum_variant)]
 pub enum AiRequest {
+    // `AiRequest` is untagged, so classification depends on each variant's REQUIRED
+    // fields and on declaration order. Chat requires `messages`; embeddings requires
+    // `input`; completions requires only `model`, so it must come last or it would
+    // swallow the others. The ordering is load-bearing.
     ChatCompletions(ChatCompletionRequest),
-    // NOT onwards' schemas, deliberately: `AiRequest` is untagged, so classification
-    // depends on each variant's REQUIRED fields to disambiguate. onwards'
-    // `CompletionRequest` requires only `model`, so it would swallow embeddings (and
-    // anything else) before the right variant was tried. async-openai's stricter
-    // shapes are what make the untagged match work. Chat is safe on onwards' schema
-    // because `messages` is required there and it is tried first.
-    Completions(CreateCompletionRequest),
-    Embeddings(CreateEmbeddingRequest),
+    Embeddings(EmbeddingsRequest),
+    Completions(CompletionRequest),
     Other(Value),
 }
 
@@ -61,31 +62,36 @@ pub struct ParsedAIRequest {
     pub responses_request: Option<ResponsesRequest>,
 }
 
-/// SSE chunk emitted by an upstream provider when it fails mid-stream.
+/// SSE frame emitted by an upstream provider when it fails mid-stream.
 ///
-/// OpenAI-compatible inference engines (Dynamo, vLLM, etc.) signal errors that occur
-/// after the 200 OK headers have been sent by emitting a `data:` frame whose payload is
-/// `{"error": {...}}` instead of the usual `chat.completion.chunk` shape. Capturing this
-/// variant lets the analytics layer reclassify the request as failed, even though the
-/// HTTP status was 200.
+/// OpenAI-compatible inference engines signal errors that occur after the 200 OK
+/// headers by emitting a `data:` frame whose payload is `{"error": {...}}` instead
+/// of the endpoint's usual chunk shape. Capturing this lets the analytics layer
+/// reclassify the request as failed even though the HTTP status was 200.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamErrorChunk {
     pub error: Value,
 }
 
+/// One frame of a chat-completions SSE stream.
+///
+/// Only the classification lives here; the chunk shape itself is onwards'
+/// [`ChatChunk`], not a second copy of those fields. Nothing outside request
+/// logging needs this distinction, so it is not in onwards.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ChatCompletionChunk {
-    Normal(CreateChatCompletionStreamResponse),
+    Chunk(ChatChunk),
     Error(StreamErrorChunk),
     #[serde(rename = "[DONE]")]
     Done,
 }
 
+/// One frame of a legacy-completions SSE stream. See [`ChatCompletionChunk`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum CompletionChunk {
-    Normal(CreateCompletionResponse), //async-openai reuses this type for streaming
+    Chunk(CompletionStreamChunk),
     Error(StreamErrorChunk),
     #[serde(rename = "[DONE]")]
     Done,
@@ -109,12 +115,13 @@ pub enum CompletionChunk {
 #[serde(untagged)]
 #[allow(clippy::large_enum_variant)]
 pub enum AiResponse {
-    ChatCompletions(CreateChatCompletionResponse),
+    ChatCompletions(ChatCompletionResponse),
     ChatCompletionsStream(Vec<ChatCompletionChunk>),
-    Completions(CreateCompletionResponse),
+    Completions(CompletionResponse),
     CompletionsStream(Vec<CompletionChunk>),
-    Embeddings(CreateEmbeddingResponse),
-    Base64Embeddings(CreateBase64EmbeddingResponse),
+    /// Covers float and base64 embeddings alike: the `Embedding` enum is untagged
+    /// over both, so one variant serves what previously needed two.
+    Embeddings(EmbeddingsResponse),
     /// Non-streaming /v1/responses response object (dwctl-owned schema).
     Responses(ResponsesResponse),
     /// Streaming /v1/responses – SSE events collected until stream end.
