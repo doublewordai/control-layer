@@ -706,6 +706,10 @@ background_services:
     # session-capable maintenance endpoint as response retirement.
     # batch_archive_retirement_enabled: false
     # batch_archive_retention_days: <positive days>
+    # Route NEW file-backed request templates into weekly generation-2
+    # partitions (reads stay generation-transparent). Prerequisite for the
+    # template retention lifecycle; the legacy heap freezes once enabled.
+    # template_generation_writes_enabled: false
     # retained_response_partition_maintenance_url: <direct session-capable postgres endpoint>
 
     # Batch archive (fusillade phase 3): moves frozen terminal batches' rows

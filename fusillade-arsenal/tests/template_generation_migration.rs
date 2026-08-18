@@ -283,3 +283,98 @@ async fn routes_resolve_generation_and_prune_to_one_partition(pool: PgPool) {
     .unwrap();
     assert_eq!(unrouted, None);
 }
+
+#[sqlx::test]
+async fn generation_two_writes_land_with_routes_and_read_identically(pool: PgPool) {
+    use fusillade_arsenal::batch::RequestTemplateInput;
+    use fusillade_arsenal::manager::DaemonStorage;
+    use fusillade_arsenal::{PostgresRequestManager, PostgresStorageConfig, Storage, TestDbPools};
+
+    let template = |n: u8| RequestTemplateInput {
+        custom_id: Some(format!("cut-{n}")),
+        endpoint: "https://example.invalid".to_string(),
+        method: "POST".to_string(),
+        path: "/v1/x".to_string(),
+        body: format!("{{\"cut\":{n}}}"),
+        model: "test-model".to_string(),
+        api_key: "test-key".to_string(),
+    };
+
+    let legacy_manager = PostgresRequestManager::new(
+        TestDbPools::new(pool.clone()).await.unwrap(),
+        PostgresStorageConfig::default(),
+    );
+    let legacy_file = legacy_manager
+        .create_file("legacy-cutover".to_string(), None, vec![template(1)])
+        .await
+        .unwrap();
+
+    let g2_manager = PostgresRequestManager::new(
+        TestDbPools::new(pool.clone()).await.unwrap(),
+        PostgresStorageConfig::default(),
+    )
+    .with_template_generation_writes(true);
+    let g2_file = g2_manager
+        .create_file(
+            "g2-cutover".to_string(),
+            None,
+            vec![template(2), template(3)],
+        )
+        .await
+        .unwrap();
+
+    // Physical placement: the flag decides the generation of NEW writes.
+    let legacy_rows: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM request_templates WHERE file_id = $1")
+            .bind(*legacy_file)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(legacy_rows, 1);
+    let (g2_rows, g2_routes, g2_legacy_rows): (i64, i64, i64) = sqlx::query_as(
+        "SELECT (SELECT COUNT(*) FROM request_templates_g2 WHERE file_id = $1), \
+                (SELECT COUNT(*) FROM request_template_routes route \
+                 JOIN request_templates_g2 g2 ON g2.id = route.template_id \
+                 WHERE g2.file_id = $1), \
+                (SELECT COUNT(*) FROM request_templates WHERE file_id = $1)",
+    )
+    .bind(*g2_file)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        (g2_rows, g2_routes, g2_legacy_rows),
+        (2, 2, 0),
+        "generation-2 writes must land with routes and never touch the legacy heap"
+    );
+
+    // Read parity: per-model statistics resolve either generation.
+    let legacy_stats = legacy_manager
+        .get_file_template_stats(legacy_file)
+        .await
+        .unwrap();
+    let g2_stats = legacy_manager
+        .get_file_template_stats(g2_file)
+        .await
+        .unwrap();
+    assert_eq!(legacy_stats.len(), 1);
+    assert_eq!(g2_stats.len(), 1);
+    assert_eq!(g2_stats[0].request_count, 2);
+
+    // Explicit erasure reaches generation 2 and removes routes with rows.
+    g2_manager.delete_file(g2_file).await.unwrap();
+    while g2_manager.purge_orphaned_rows(100).await.unwrap() > 0 {}
+    let (left_rows, left_routes): (i64, i64) = sqlx::query_as(
+        "SELECT (SELECT COUNT(*) FROM request_templates_g2 WHERE file_id = $1), \
+                (SELECT COUNT(*) FROM request_template_routes)",
+    )
+    .bind(*g2_file)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        (left_rows, left_routes),
+        (0, 0),
+        "explicit erasure must remove generation-2 rows and their routes"
+    );
+}

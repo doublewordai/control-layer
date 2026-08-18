@@ -1887,6 +1887,11 @@ pub struct DaemonConfig {
     #[serde(default)]
     pub batch_archive_retirement_enabled: bool,
 
+    /// Route new file-backed request templates into the weekly generation-2
+    /// store. Reads are generation-transparent either way.
+    #[serde(default)]
+    pub template_generation_writes_enabled: bool,
+
     /// Finalization-anchored batch content retention period in days. No
     /// default: enabling batch-archive retirement without it fails startup.
     #[serde(default)]
@@ -2240,6 +2245,7 @@ impl Default for DaemonConfig {
             retained_response_retirement_enabled: false,
             batch_archive_retirement_enabled: false,
             batch_archive_retention_days: None,
+            template_generation_writes_enabled: false,
             retained_response_partition_maintenance_url: None,
             streamable_endpoints: Vec::new(),
             urgency_weight: default_urgency_weight(),
@@ -3484,6 +3490,7 @@ mod tests {
             "retained_response_retirement_enabled",
             "batch_archive_retirement_enabled",
             "batch_archive_retention_days",
+            "template_generation_writes_enabled",
         ] {
             serialized.as_object_mut().unwrap().remove(key);
         }

@@ -294,20 +294,44 @@ COMMENT ON FUNCTION ensure_request_template_partitions(DATE, INTEGER) IS
 -- buckets out via the state predicate.
 DROP VIEW IF EXISTS active_request_templates;
 CREATE VIEW active_request_templates AS
+-- Legacy arm: preserves 20260507000000's semantics exactly — dedicated
+-- batchless templates (file_id IS NULL) stay visible to the claim join, and
+-- file-backed templates disappear with their soft-deleted file.
 SELECT rt.id, rt.file_id, rt.endpoint, rt.method, rt.path, rt.body, rt.model,
        rt.api_key, rt.created_at, rt.updated_at, rt.custom_id, rt.line_number,
        rt.body_byte_size, rt.metadata
 FROM request_templates rt
-JOIN files f ON rt.file_id = f.id
-WHERE f.deleted_at IS NULL
+LEFT JOIN files f ON rt.file_id = f.id
+WHERE rt.file_id IS NULL OR f.deleted_at IS NULL
+UNION ALL
+-- The generation-2 arm resolves through the route oracle so a lookup by
+-- template id probes exactly one weekly partition, and through the bucket
+-- fence so retiring content disappears before any destructive DDL.
+SELECT g2.id, g2.file_id, g2.endpoint, g2.method, g2.path, g2.body, g2.model,
+       g2.api_key, g2.created_at, g2.updated_at, g2.custom_id, g2.line_number,
+       g2.body_byte_size, g2.metadata
+FROM request_template_routes route
+JOIN request_template_buckets bucket
+  ON bucket.week_start = route.week_start
+ AND bucket.state = 'active'
+JOIN request_templates_g2 g2
+  ON g2.created_on >= route.week_start
+ AND g2.created_on < route.week_start + 7
+ AND g2.id = route.template_id
+JOIN files f ON g2.file_id = f.id
+WHERE f.deleted_at IS NULL;
+
+-- Generation-transparent raw union for internal file-keyed reads (statistics,
+-- streaming, request materialization). No liveness or fence predicates: it
+-- mirrors direct base-table access, and both arms serve `file_id` lookups
+-- from their own indexes.
+CREATE VIEW request_templates_all AS
+SELECT rt.id, rt.file_id, rt.endpoint, rt.method, rt.path, rt.body, rt.model,
+       rt.api_key, rt.created_at, rt.updated_at, rt.custom_id, rt.line_number,
+       rt.body_byte_size, rt.metadata
+FROM request_templates rt
 UNION ALL
 SELECT g2.id, g2.file_id, g2.endpoint, g2.method, g2.path, g2.body, g2.model,
        g2.api_key, g2.created_at, g2.updated_at, g2.custom_id, g2.line_number,
        g2.body_byte_size, g2.metadata
-FROM request_templates_g2 g2
-JOIN files f ON g2.file_id = f.id
-JOIN request_template_buckets bucket
-  ON g2.created_on >= bucket.week_start
- AND g2.created_on < bucket.week_start + 7
-WHERE f.deleted_at IS NULL
-  AND bucket.state = 'active';
+FROM request_templates_g2 g2;
