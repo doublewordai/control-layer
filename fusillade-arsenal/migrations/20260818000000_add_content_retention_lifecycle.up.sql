@@ -462,6 +462,15 @@ COMMENT ON FUNCTION ensure_retained_response_partitions(DATE, INTEGER) IS
 -- on reference proofs over files/batches metadata.
 -- ---------------------------------------------------------------------------
 
+-- Template lifetime is now managed by whole-partition drops (and, for the
+-- legacy heap, its eventual wholesale retirement), so the row-level FK from
+-- requests can no longer describe it: generation-2 template ids do not live
+-- in the legacy table, and a partition drop could never fire SET NULL row
+-- actions anyway. Readers already resolve templates through LEFT JOINs and
+-- tolerate absent rows, which preserves the previous ON DELETE SET NULL
+-- read behavior exactly.
+ALTER TABLE requests DROP CONSTRAINT requests_template_id_fkey;
+
 CREATE TABLE request_templates_g2 (
     created_on DATE NOT NULL,
     id UUID NOT NULL DEFAULT gen_random_uuid(),
