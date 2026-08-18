@@ -670,7 +670,9 @@ fn partition_maintenance_required(daemon: &config::DaemonConfig, state: Retained
     if state.identity_mismatch {
         anyhow::bail!("retained-response retirement recovery identity is inconsistent");
     }
-    if (daemon.retained_response_retirement_enabled || daemon.batch_archive_retirement_enabled) && !archive_daemon_enabled {
+    if (daemon.retained_response_retirement_enabled || daemon.batch_archive_retirement_enabled || daemon.template_retirement_enabled)
+        && !archive_daemon_enabled
+    {
         anyhow::bail!("retained-response partition retirement requires an enabled archive daemon");
     }
     if state.unfinished_retirements > 0 && !archive_daemon_enabled {

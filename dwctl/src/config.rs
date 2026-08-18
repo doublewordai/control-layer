@@ -1892,6 +1892,17 @@ pub struct DaemonConfig {
     #[serde(default)]
     pub template_generation_writes_enabled: bool,
 
+    /// Allow file-content expiry and weekly template partition retirement.
+    /// Disabled by default and additionally requires an explicit retention
+    /// period.
+    #[serde(default)]
+    pub template_retirement_enabled: bool,
+
+    /// Creation-anchored input-content retention period in days. No default:
+    /// enabling template retirement without it fails startup.
+    #[serde(default)]
+    pub template_retention_days: Option<u32>,
+
     /// Finalization-anchored batch content retention period in days. No
     /// default: enabling batch-archive retirement without it fails startup.
     #[serde(default)]
@@ -2246,6 +2257,8 @@ impl Default for DaemonConfig {
             batch_archive_retirement_enabled: false,
             batch_archive_retention_days: None,
             template_generation_writes_enabled: false,
+            template_retirement_enabled: false,
+            template_retention_days: None,
             retained_response_partition_maintenance_url: None,
             streamable_endpoints: Vec::new(),
             urgency_weight: default_urgency_weight(),
@@ -2282,6 +2295,8 @@ impl DaemonConfig {
             .with_retained_response_retirement_enabled(self.retained_response_retirement_enabled)
             .with_batch_archive_retirement_enabled(self.batch_archive_retirement_enabled)
             .with_batch_archive_retention_days(self.batch_archive_retention_days)
+            .with_template_retirement_enabled(self.template_retirement_enabled)
+            .with_template_retention_days(self.template_retention_days)
     }
 
     /// Convert to fusillade daemon config
@@ -3491,6 +3506,8 @@ mod tests {
             "batch_archive_retirement_enabled",
             "batch_archive_retention_days",
             "template_generation_writes_enabled",
+            "template_retirement_enabled",
+            "template_retention_days",
         ] {
             serialized.as_object_mut().unwrap().remove(key);
         }

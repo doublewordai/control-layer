@@ -1728,6 +1728,30 @@ pub trait DaemonStorage: Send + Sync {
         Err(RetainedResponseMaintenanceError::Disabled.into_fusillade_error())
     }
 
+    /// Retire one weekly generation-2 template partition once it is past the
+    /// horizon and no live file still owns templates in it. Storage backends
+    /// opt in explicitly; the default is disabled.
+    async fn retire_expired_template_partition(
+        &self,
+        _select_new: bool,
+        _retention_days: i32,
+    ) -> Result<RetainedResponseRetirementOutcome> {
+        Err(RetainedResponseMaintenanceError::Disabled.into_fusillade_error())
+    }
+
+    /// Tombstone aged-out input file metadata (content-free bounded update)
+    /// once every referencing batch's content is expired or erased. Storage
+    /// backends opt in explicitly; the default is disabled.
+    async fn expire_file_content(&self, _retention_days: i32, _batch_size: i64) -> Result<u64> {
+        Err(RetainedResponseMaintenanceError::Disabled.into_fusillade_error())
+    }
+
+    /// Remove bounded stale template routes whose bucket has retired. Storage
+    /// backends opt in explicitly; the default is disabled.
+    async fn cleanup_retired_template_routes(&self, _limit: i64) -> Result<u64> {
+        Err(RetainedResponseMaintenanceError::Disabled.into_fusillade_error())
+    }
+
     /// Remove bounded expired content-free resurrection fences. A fence that
     /// a concurrent lifecycle action renews or upgrades at deletion time must
     /// survive. Storage backends opt in explicitly; the default is disabled.

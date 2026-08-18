@@ -710,6 +710,13 @@ background_services:
     # partitions (reads stay generation-transparent). Prerequisite for the
     # template retention lifecycle; the legacy heap freezes once enabled.
     # template_generation_writes_enabled: false
+    # File-content expiry + weekly template partition retirement. Tombstones
+    # aged input-file metadata (rows survive) once every referencing batch's
+    # content is expired, then drops whole template weeks that no live file
+    # references. Requires the generation-2 write cutover above and the same
+    # session-capable maintenance endpoint.
+    # template_retirement_enabled: false
+    # template_retention_days: <positive days>
     # retained_response_partition_maintenance_url: <direct session-capable postgres endpoint>
 
     # Batch archive (fusillade phase 3): moves frozen terminal batches' rows
