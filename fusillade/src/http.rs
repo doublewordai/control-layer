@@ -2325,4 +2325,88 @@ mod tests {
         assert_eq!(sink.seen, 4);
         assert_eq!(sink.finish().unwrap(), "a\nb");
     }
+
+    /// End-to-end at realistic scale, through the real client and a real socket.
+    ///
+    /// The frame shape is the one seen from an upstream that emits content-free
+    /// keepalives: a well-formed `chat.completion.chunk` whose delta fields are
+    /// all null. Thousands of them wrap a small amount of real content. The
+    /// assembled body must be identical to the same stream with the keepalives
+    /// removed, which is what the incremental fold has to guarantee and what the
+    /// two-frame tests above cannot show.
+    #[tokio::test]
+    async fn test_streaming_keepalive_frames_do_not_change_the_assembled_body() {
+        use axum::{Router, http::StatusCode, routing::post};
+
+        const KEEPALIVES: usize = 5_000;
+
+        fn sse_stream(keepalives: usize) -> String {
+            let keepalive = "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4\",\"usage\":null,\"choices\":[{\"index\":0,\"delta\":{\"role\":null,\"content\":null,\"refusal\":null,\"tool_calls\":null,\"function_call\":null}}],\"service_tier\":null,\"system_fingerprint\":null}\n\n";
+            let mut sse = String::new();
+            sse.push_str("data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hello\"},\"finish_reason\":null}]}\n\n");
+            for _ in 0..keepalives {
+                sse.push_str(keepalive);
+            }
+            sse.push_str("data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\" world\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2,\"total_tokens\":7}}\n\n");
+            sse.push_str("data: [DONE]\n\n");
+            sse
+        }
+
+        async fn assembled_body(keepalives: usize) -> String {
+            let app = Router::new().route(
+                "/v1/chat/completions",
+                post(move || async move {
+                    (
+                        StatusCode::OK,
+                        [("content-type", "text/event-stream")],
+                        sse_stream(keepalives),
+                    )
+                }),
+            );
+
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+            let request = RequestData {
+                id: RequestId::from(uuid::Uuid::new_v4()),
+                batch_id: Some(crate::batch::BatchId::from(uuid::Uuid::new_v4())),
+                template_id: crate::batch::TemplateId::from(uuid::Uuid::new_v4()),
+                custom_id: None,
+                endpoint: format!("http://{}", addr),
+                method: "POST".to_string(),
+                path: "/v1/chat/completions".to_string(),
+                body: r#"{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}"#
+                    .to_string(),
+                model: "gpt-4".to_string(),
+                api_key: "".to_string(),
+                created_by: String::new(),
+                batch_metadata: std::collections::HashMap::new(),
+            };
+
+            let client = ReqwestHttpClient::new(
+                ONE_DAY_DURATION,
+                ONE_DAY_DURATION,
+                ONE_DAY_DURATION,
+                vec!["/v1/chat/completions".to_string()],
+            );
+            let response = client.execute(&request, "").await.unwrap();
+            assert_eq!(response.status, 200);
+            response.body
+        }
+
+        let noisy = assembled_body(KEEPALIVES).await;
+        let clean = assembled_body(0).await;
+
+        assert_eq!(
+            noisy, clean,
+            "{KEEPALIVES} content-free frames changed the assembled body"
+        );
+
+        let body: serde_json::Value = serde_json::from_str(&noisy).unwrap();
+        assert_eq!(body["choices"][0]["message"]["content"], "Hello world");
+        assert_eq!(body["choices"][0]["finish_reason"], "stop");
+        assert_eq!(body["usage"]["total_tokens"], 7);
+    }
 }
