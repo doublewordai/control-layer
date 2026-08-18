@@ -20997,16 +20997,21 @@ mod tests {
         .unwrap();
         assert_eq!(request_count, 1, "Request should still exist");
 
-        let null_template_count: i64 = sqlx::query_scalar!(
-            "SELECT count(*) as \"count!\" FROM requests WHERE batch_id = $1 AND template_id IS NULL",
+        // Template lifetime is partition/purge-managed now (no row-level FK
+        // action), so the request keeps its template_id but the reference
+        // resolves to nothing in either generation.
+        let dangling_count: i64 = sqlx::query_scalar!(
+            "SELECT count(*) as \"count!\" FROM requests r \
+             LEFT JOIN request_templates_all t ON t.id = r.template_id \
+             WHERE r.batch_id = $1 AND r.template_id IS NOT NULL AND t.id IS NULL",
             *batch.id as Uuid,
         )
         .fetch_one(&pool)
         .await
         .unwrap();
         assert_eq!(
-            null_template_count, 1,
-            "Request template_id should be NULL after template deletion"
+            dangling_count, 1,
+            "the deleted template must resolve to absent, not break the request"
         );
 
         // Verify input file is no longer accessible (soft-deleted)
