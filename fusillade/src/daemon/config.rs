@@ -177,6 +177,8 @@ pub struct RetentionMaintenanceConfig {
     batchless_archive_bytes_per_tick: i64,
     retained_response_partitions_days_ahead: i32,
     retained_response_retirement_enabled: bool,
+    batch_archive_retirement_enabled: bool,
+    batch_archive_retention_days: Option<u32>,
 }
 
 impl Default for RetentionMaintenanceConfig {
@@ -189,6 +191,8 @@ impl Default for RetentionMaintenanceConfig {
             batchless_archive_bytes_per_tick: 64 * 1_024 * 1_024,
             retained_response_partitions_days_ahead: 7,
             retained_response_retirement_enabled: false,
+            batch_archive_retirement_enabled: false,
+            batch_archive_retention_days: None,
         }
     }
 }
@@ -234,6 +238,22 @@ impl RetentionMaintenanceConfig {
         self
     }
 
+    /// Enable or disable selection of newly eligible weekly batch-archive
+    /// buckets. Durable unfinished retirements remain recoverable while this
+    /// is false.
+    pub fn with_batch_archive_retirement_enabled(mut self, enabled: bool) -> Self {
+        self.batch_archive_retirement_enabled = enabled;
+        self
+    }
+
+    /// Set the finalization-anchored batch content retention period. There is
+    /// deliberately no default; enabling batch-archive retirement without an
+    /// explicit period fails validation.
+    pub fn with_batch_archive_retention_days(mut self, days: Option<u32>) -> Self {
+        self.batch_archive_retention_days = days;
+        self
+    }
+
     /// Return the operator-supplied retention policy.
     pub fn policy(&self) -> &crate::RetentionPolicy {
         &self.policy
@@ -267,6 +287,16 @@ impl RetentionMaintenanceConfig {
     /// Whether selection of newly eligible retained-response buckets is enabled.
     pub fn retained_response_retirement_enabled(&self) -> bool {
         self.retained_response_retirement_enabled
+    }
+
+    /// Whether selection of newly eligible batch-archive buckets is enabled.
+    pub fn batch_archive_retirement_enabled(&self) -> bool {
+        self.batch_archive_retirement_enabled
+    }
+
+    /// The finalization-anchored batch content retention period, when set.
+    pub fn batch_archive_retention_days(&self) -> Option<u32> {
+        self.batch_archive_retention_days
     }
 }
 

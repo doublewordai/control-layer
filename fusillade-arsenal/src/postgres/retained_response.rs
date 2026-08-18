@@ -239,6 +239,7 @@ impl RetainedResponseSerializationError {
         FusilladeError::Other(anyhow::Error::new(self))
     }
 
+    #[cfg(test)]
     pub(crate) fn from_fusillade_error(error: &FusilladeError) -> Option<Self> {
         match error {
             FusilladeError::Other(error) => error.downcast_ref::<Self>().copied(),
@@ -807,6 +808,7 @@ pub(crate) struct RetainedStepPayloadV1 {
 }
 
 impl RetainedStepPayloadV1 {
+    #[cfg(test)]
     pub(crate) fn from_response_step(step: &ResponseStep) -> Self {
         Self {
             step: RetainedStepSnapshot {

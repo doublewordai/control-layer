@@ -572,6 +572,53 @@ async fn run_retained_response_retirement_loop<S>(
     }
 }
 
+async fn run_batch_archive_retirement_loop<S>(
+    storage: Arc<S>,
+    shutdown: tokio_util::sync::CancellationToken,
+    query_timeout: Duration,
+    select_new: bool,
+    retention_days: i32,
+    period: Duration,
+) where
+    S: DaemonStorage + 'static,
+{
+    loop {
+        let outcome = maintenance_query(
+            &shutdown,
+            "batch archive partition retirement",
+            query_timeout,
+            storage.retire_expired_batch_archive_partition(select_new, retention_days),
+        )
+        .await;
+        let next_tick = match outcome {
+            Ok(Some(RetainedResponseRetirementOutcome::Retired)) => {
+                counter!("fusillade_batch_archive_partitions_retired_total").increment(1);
+                period.min(Duration::from_secs(1))
+            }
+            Ok(Some(RetainedResponseRetirementOutcome::Retryable)) => {
+                counter!("fusillade_batch_archive_partition_retirement_retries_total").increment(1);
+                period.min(Duration::from_secs(30))
+            }
+            Ok(Some(RetainedResponseRetirementOutcome::NoCandidate)) => {
+                period.min(Duration::from_secs(300))
+            }
+            Ok(None) => break,
+            Err(_) => {
+                crate::background_error!(
+                    "batch_archive_partition_retirement_failed",
+                    Error,
+                    "Failed to retire batch-archive partition"
+                );
+                period.min(Duration::from_secs(30))
+            }
+        };
+        tokio::select! {
+            _ = tokio::time::sleep(next_tick) => {},
+            _ = shutdown.cancelled() => break,
+        }
+    }
+}
+
 async fn run_retained_response_route_cleanup_loop<S>(
     storage: Arc<S>,
     shutdown: tokio_util::sync::CancellationToken,
@@ -1109,6 +1156,22 @@ fn validate_retirement_capability(
     if config.retained_response_retirement_enabled() && !storage_supports_partition_retirement {
         return Err(FusilladeError::ValidationError(
             "retained-response partition retirement requires an explicit session-capable maintenance pool"
+                .to_string(),
+        ));
+    }
+    if config.batch_archive_retirement_enabled() && !storage_supports_partition_retirement {
+        return Err(FusilladeError::ValidationError(
+            "batch-archive partition retirement requires an explicit session-capable maintenance pool"
+                .to_string(),
+        ));
+    }
+    if config.batch_archive_retirement_enabled()
+        && !config
+            .batch_archive_retention_days()
+            .is_some_and(|days| (1..=i32::MAX as u32).contains(&days))
+    {
+        return Err(FusilladeError::ValidationError(
+            "batch-archive partition retirement requires an explicit positive retention period"
                 .to_string(),
         ));
     }
@@ -3036,6 +3099,27 @@ where
                     Duration::from_secs(86_400),
                 ));
                 daemon_handles.push(("retained_response_retirement", retirement_handle));
+
+                // Recovery of an unfinished batch-archive retirement must
+                // survive the flag or period being withdrawn, so the loop
+                // always runs; it selects NEW buckets only when both are set.
+                let batch_retention_days = self
+                    .retention_maintenance
+                    .batch_archive_retention_days()
+                    .and_then(|days| i32::try_from(days).ok());
+                let batch_select_new = self
+                    .retention_maintenance
+                    .batch_archive_retirement_enabled()
+                    && batch_retention_days.is_some();
+                let batch_handle = tokio::spawn(run_batch_archive_retirement_loop(
+                    self.storage.clone(),
+                    self.shutdown_token.clone(),
+                    query_timeout,
+                    batch_select_new,
+                    batch_retention_days.unwrap_or(0),
+                    Duration::from_secs(86_400),
+                ));
+                daemon_handles.push(("batch_archive_retirement", batch_handle));
             }
 
             if self.storage.supports_retained_response_route_cleanup()
@@ -3474,6 +3558,8 @@ mod tests {
         batch_move_calls: AtomicUsize,
         batchless_calls: AtomicUsize,
         retirement_calls: AtomicUsize,
+        batch_retirement_calls: AtomicUsize,
+        batch_retirement_select_new: std::sync::Mutex<Vec<(bool, i32)>>,
         retirement_buckets: AtomicUsize,
         retirement_select_new: std::sync::Mutex<Vec<bool>>,
         route_cleanup_calls: AtomicUsize,
@@ -3502,6 +3588,8 @@ mod tests {
                 batch_move_calls: AtomicUsize::new(0),
                 batchless_calls: AtomicUsize::new(0),
                 retirement_calls: AtomicUsize::new(0),
+                batch_retirement_calls: AtomicUsize::new(0),
+                batch_retirement_select_new: std::sync::Mutex::new(Vec::new()),
                 retirement_buckets: AtomicUsize::new(0),
                 retirement_select_new: std::sync::Mutex::new(Vec::new()),
                 route_cleanup_calls: AtomicUsize::new(0),
@@ -3625,6 +3713,20 @@ mod tests {
             } else {
                 crate::RetainedResponseRetirementOutcome::NoCandidate
             })
+        }
+
+        async fn retire_expired_batch_archive_partition(
+            &self,
+            select_new: bool,
+            retention_days: i32,
+        ) -> Result<crate::RetainedResponseRetirementOutcome> {
+            self.batch_retirement_calls.fetch_add(1, Ordering::SeqCst);
+            self.batch_retirement_select_new
+                .lock()
+                .unwrap()
+                .push((select_new, retention_days));
+            self.record("batch_archive_retirement");
+            Ok(crate::RetainedResponseRetirementOutcome::NoCandidate)
         }
 
         async fn cleanup_retained_response_routes(&self, _limit: i64) -> Result<u64> {
@@ -3848,6 +3950,14 @@ mod tests {
             10,
             Duration::from_secs(60),
         ));
+        let batch_retirement = tokio::spawn(run_batch_archive_retirement_loop(
+            storage.clone(),
+            shutdown.clone(),
+            Duration::from_secs(1),
+            false,
+            0,
+            Duration::from_secs(86_400),
+        ));
 
         tokio::task::yield_now().await;
         assert_eq!(storage.retained_calls.load(Ordering::SeqCst), 1);
@@ -3863,11 +3973,17 @@ mod tests {
             vec![false],
             "a disabled flag must still permit unfinished-journal recovery"
         );
+        assert_eq!(
+            *storage.batch_retirement_select_new.lock().unwrap(),
+            vec![(false, 0)],
+            "batch-archive recovery must run even while selection is disabled"
+        );
 
         shutdown.cancel();
         runway.await.unwrap();
         retirement.await.unwrap();
         cleanup.await.unwrap();
+        batch_retirement.await.unwrap();
     }
 
     #[tokio::test(start_paused = true)]

@@ -471,6 +471,11 @@ mod retention_policy_tests {
         assert_maintenance_is_disabled(storage.retire_expired_response_partition(false).await);
         assert_maintenance_is_disabled(storage.cleanup_retained_response_routes(1).await);
         assert_maintenance_is_disabled(storage.cleanup_expired_response_fences(1).await);
+        assert_maintenance_is_disabled(
+            storage
+                .retire_expired_batch_archive_partition(false, 365)
+                .await,
+        );
     }
 
     #[test]
@@ -1708,6 +1713,18 @@ pub trait DaemonStorage: Send + Sync {
     /// Remove bounded stale routing metadata for retained responses. Storage
     /// backends opt in explicitly; the default is disabled.
     async fn cleanup_retained_response_routes(&self, _limit: i64) -> Result<u64> {
+        Err(RetainedResponseMaintenanceError::Disabled.into_fusillade_error())
+    }
+
+    /// Retire one weekly batch-archive partition whose every batch is past
+    /// the finalization-anchored `retention_days`. Batch metadata rows are
+    /// stamped, never deleted. Storage backends opt in explicitly; the
+    /// default is disabled.
+    async fn retire_expired_batch_archive_partition(
+        &self,
+        _select_new: bool,
+        _retention_days: i32,
+    ) -> Result<RetainedResponseRetirementOutcome> {
         Err(RetainedResponseMaintenanceError::Disabled.into_fusillade_error())
     }
 

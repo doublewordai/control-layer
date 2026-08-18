@@ -670,7 +670,7 @@ fn partition_maintenance_required(daemon: &config::DaemonConfig, state: Retained
     if state.identity_mismatch {
         anyhow::bail!("retained-response retirement recovery identity is inconsistent");
     }
-    if daemon.retained_response_retirement_enabled && !archive_daemon_enabled {
+    if (daemon.retained_response_retirement_enabled || daemon.batch_archive_retirement_enabled) && !archive_daemon_enabled {
         anyhow::bail!("retained-response partition retirement requires an enabled archive daemon");
     }
     if state.unfinished_retirements > 0 && !archive_daemon_enabled {
@@ -682,7 +682,8 @@ fn partition_maintenance_required(daemon: &config::DaemonConfig, state: Retained
     if state.retired_routes_exist && (!archive_daemon_enabled || daemon.purge_interval_ms == 0 || daemon.purge_batch_size < 1) {
         anyhow::bail!("retired response route cleanup requires an enabled positive bounded cleanup configuration");
     }
-    Ok(archive_daemon_enabled && (daemon.retained_response_retirement_enabled || state.unfinished_retirements > 0))
+    Ok(archive_daemon_enabled
+        && (daemon.retained_response_retirement_enabled || daemon.batch_archive_retirement_enabled || state.unfinished_retirements > 0))
 }
 
 #[cfg(test)]
@@ -975,8 +976,7 @@ async fn setup_database(
             SELECT
                 (SELECT COUNT(*)::bigint
                  FROM retention_partition_retirements
-                 WHERE parent_table = 'retained_response_objects'
-                   AND completed_at IS NULL),
+                 WHERE completed_at IS NULL),
                 EXISTS (
                     SELECT 1
                     FROM retained_response_buckets bucket
