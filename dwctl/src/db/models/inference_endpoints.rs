@@ -18,7 +18,7 @@ pub struct InferenceEndpointCreateDBRequest {
     pub auth_header_prefix: Option<String>,
     pub reasoning_translation: Option<ReasoningTranslationConfig>,
     /// The endpoint's serving stack understands the scheduling `priority`
-    /// request field (dynamo frontend). See migration 135.
+    /// request field (dynamo frontend). See migration 136.
     pub accepts_scheduling_priority: bool,
 }
 

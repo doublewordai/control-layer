@@ -754,7 +754,7 @@ async fn test_continuation_key_reaches_gated_and_priced_composites(pool: sqlx::P
     );
 }
 
-/// `inference_endpoints.accepts_scheduling_priority` (migration 135) reaches
+/// `inference_endpoints.accepts_scheduling_priority` (migration 136) reaches
 /// each provider of every pool it hosts, so onwards can strip the dynamo-only
 /// `priority` field per member instead of per position. component-a is hosted
 /// on endpoint 0001 (unflagged), component-b on 0002 (flagged here).
