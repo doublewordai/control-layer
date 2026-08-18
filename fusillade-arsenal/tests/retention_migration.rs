@@ -2,7 +2,7 @@ use std::borrow::Cow;
 
 use fusillade_arsenal::MIGRATOR;
 
-const RETENTION_MIGRATION: i64 = 20260813000000;
+const RETENTION_MIGRATION: i64 = 20260818000000;
 
 #[sqlx::test]
 async fn retained_response_retirement_journal_requires_full_daily_identity(pool: sqlx::PgPool) {
@@ -776,7 +776,7 @@ async fn adds_retained_response_parent_without_rewriting_live_heaps(pool: sqlx::
     .unwrap();
 
     let down_sql =
-        include_str!("../migrations/20260813000000_add_partitioned_content_retention.down.sql");
+        include_str!("../migrations/20260818000000_add_content_retention_lifecycle.down.sql");
     let rollback_with_route = sqlx::raw_sql(down_sql)
         .execute(&pool)
         .await
