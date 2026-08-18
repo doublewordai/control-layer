@@ -118,6 +118,8 @@ pub struct RetentionMaintenanceConfig {
     retained_response_retirement_enabled: bool,
     batch_archive_retirement_enabled: bool,
     batch_archive_retention_days: Option<u32>,
+    template_retirement_enabled: bool,
+    template_retention_days: Option<u32>,
 }
 
 impl Default for RetentionMaintenanceConfig {
@@ -132,6 +134,8 @@ impl Default for RetentionMaintenanceConfig {
             retained_response_retirement_enabled: false,
             batch_archive_retirement_enabled: false,
             batch_archive_retention_days: None,
+            template_retirement_enabled: false,
+            template_retention_days: None,
         }
     }
 }
@@ -236,6 +240,32 @@ impl RetentionMaintenanceConfig {
     /// The finalization-anchored batch content retention period, when set.
     pub fn batch_archive_retention_days(&self) -> Option<u32> {
         self.batch_archive_retention_days
+    }
+
+    /// Enable or disable file-content expiry and selection of newly eligible
+    /// weekly template buckets. Durable unfinished retirements remain
+    /// recoverable while this is false.
+    pub fn with_template_retirement_enabled(mut self, enabled: bool) -> Self {
+        self.template_retirement_enabled = enabled;
+        self
+    }
+
+    /// Set the creation-anchored input-content retention period. There is
+    /// deliberately no default; enabling template retirement without an
+    /// explicit period fails validation.
+    pub fn with_template_retention_days(mut self, days: Option<u32>) -> Self {
+        self.template_retention_days = days;
+        self
+    }
+
+    /// Whether file-content expiry and template bucket selection are enabled.
+    pub fn template_retirement_enabled(&self) -> bool {
+        self.template_retirement_enabled
+    }
+
+    /// The creation-anchored input-content retention period, when set.
+    pub fn template_retention_days(&self) -> Option<u32> {
+        self.template_retention_days
     }
 }
 

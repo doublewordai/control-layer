@@ -58,6 +58,7 @@ pub(crate) mod batch_archive_retirement;
 pub(crate) mod partition_retirement;
 pub(crate) mod retained_response;
 pub(crate) mod retained_response_retirement;
+pub(crate) mod template_retirement;
 
 use super::utils::{
     calculate_error_message_size, calculate_response_body_size, estimate_error_file_size,
@@ -8234,6 +8235,23 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
             retention_days,
         )
         .await
+    }
+
+    async fn retire_expired_template_partition(
+        &self,
+        select_new: bool,
+        retention_days: i32,
+    ) -> Result<RetainedResponseRetirementOutcome> {
+        template_retirement::retire_expired_template_partition(self, select_new, retention_days)
+            .await
+    }
+
+    async fn expire_file_content(&self, retention_days: i32, batch_size: i64) -> Result<u64> {
+        template_retirement::expire_file_content(self, retention_days, batch_size).await
+    }
+
+    async fn cleanup_retired_template_routes(&self, limit: i64) -> Result<u64> {
+        template_retirement::cleanup_retired_template_routes(self, limit).await
     }
 
     async fn retained_response_archive_index_ready(&self) -> Result<bool> {

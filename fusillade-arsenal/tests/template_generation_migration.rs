@@ -378,3 +378,184 @@ async fn generation_two_writes_land_with_routes_and_read_identically(pool: PgPoo
         "explicit erasure must remove generation-2 rows and their routes"
     );
 }
+
+async fn retirement_manager(
+    pool: &PgPool,
+) -> fusillade_arsenal::PostgresRequestManager<fusillade_arsenal::TestDbPools> {
+    use fusillade_arsenal::{PostgresRequestManager, PostgresStorageConfig, TestDbPools};
+    let maintenance_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .min_connections(0)
+        .connect_with(pool.connect_options().as_ref().clone())
+        .await
+        .unwrap();
+    PostgresRequestManager::new(
+        TestDbPools::new(pool.clone()).await.unwrap(),
+        PostgresStorageConfig::default(),
+    )
+    .with_partition_maintenance_pool(maintenance_pool)
+    .unwrap()
+    .attest_partition_maintenance_pool()
+    .await
+    .unwrap()
+}
+
+async fn aged_file(pool: &PgPool, days_old: i64) -> Uuid {
+    sqlx::query_scalar(
+        "INSERT INTO files (name, size_bytes, size_finalized, status, purpose, created_at) \
+         VALUES ('aged-' || gen_random_uuid(), 0, TRUE, 'processed', 'batch', \
+                 NOW() - make_interval(days => $1::int)) RETURNING id",
+    )
+    .bind(days_old as i32)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+#[sqlx::test]
+async fn file_content_expiry_tombstones_only_released_files(pool: PgPool) {
+    use fusillade_arsenal::manager::DaemonStorage;
+
+    let released = aged_file(&pool, 400).await;
+    let pinned = aged_file(&pool, 400).await;
+    sqlx::query(
+        "INSERT INTO batches (file_id, endpoint, completion_window, expires_at, \
+                              location, archive_bucket, counts_frozen_at) \
+         VALUES ($1, '/v1/x', '24h', NOW(), 'archive', \
+                 date_trunc('week', NOW() AT TIME ZONE 'UTC')::date, \
+                 NOW() - INTERVAL '10 days')",
+    )
+    .bind(pinned)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let young = aged_file(&pool, 5).await;
+
+    let manager = retirement_manager(&pool).await;
+    let expired = manager.expire_file_content(365, 100).await.unwrap();
+    assert_eq!(expired, 1, "only the released aged file may expire");
+
+    let rows: Vec<(Uuid, Option<String>, bool, bool)> = sqlx::query_as(
+        "SELECT id, name, deleted_at IS NOT NULL, retention_expired_at IS NOT NULL \
+         FROM files WHERE id = ANY($1) ORDER BY created_at",
+    )
+    .bind(vec![released, pinned, young])
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    for (id, name, deleted, stamped) in rows {
+        assert!(name.is_some(), "file metadata (name) must be retained");
+        if id == released {
+            assert!(deleted && stamped, "released aged file must be tombstoned");
+        } else {
+            assert!(!deleted && !stamped, "pinned/young files must survive");
+        }
+    }
+
+    // Once the pinned file's batch content expires, the next pass releases it.
+    sqlx::query("UPDATE batches SET retention_expired_at = NOW() WHERE file_id = $1")
+        .bind(pinned)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(manager.expire_file_content(365, 100).await.unwrap(), 1);
+    assert_eq!(manager.expire_file_content(365, 100).await.unwrap(), 0);
+}
+
+#[sqlx::test]
+async fn template_week_retires_only_after_every_file_releases(pool: PgPool) {
+    use fusillade_arsenal::manager::{DaemonStorage, RetainedResponseRetirementOutcome};
+
+    let week = monday(&pool, -60).await;
+    sqlx::query("SELECT ensure_request_template_partition($1, NULL)")
+        .bind(week)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let file = aged_file(&pool, 500).await;
+    let template_id = insert_g2_template(&pool, week, file).await;
+
+    let manager = retirement_manager(&pool).await;
+    let blocked = manager
+        .retire_expired_template_partition(true, 365)
+        .await
+        .unwrap();
+    assert_eq!(
+        blocked,
+        RetainedResponseRetirementOutcome::NoCandidate,
+        "a live file must pin its template week"
+    );
+
+    // File-content expiry releases the window (no batches reference it).
+    assert_eq!(manager.expire_file_content(365, 100).await.unwrap(), 1);
+    let retired = manager
+        .retire_expired_template_partition(true, 365)
+        .await
+        .unwrap();
+    assert_eq!(retired, RetainedResponseRetirementOutcome::Retired);
+    let child_exists: Option<i64> = sqlx::query_scalar("SELECT to_regclass($1)::oid::bigint")
+        .bind(format!(
+            "request_templates_g2_y{}w{:02}",
+            {
+                use chrono::Datelike;
+                week.iso_week().year()
+            },
+            {
+                use chrono::Datelike;
+                week.iso_week().week()
+            }
+        ))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        child_exists, None,
+        "the weekly template partition must drop"
+    );
+
+    // Routes survive the drop and are removed by the bounded cleanup phase.
+    let routed: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM request_template_routes WHERE template_id = $1")
+            .bind(template_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(routed, 1);
+    assert_eq!(
+        manager.cleanup_retired_template_routes(10).await.unwrap(),
+        1
+    );
+    assert_eq!(
+        manager.cleanup_retired_template_routes(10).await.unwrap(),
+        0
+    );
+}
+
+#[sqlx::test]
+async fn an_unowned_template_row_fails_the_gate_closed(pool: PgPool) {
+    use fusillade_arsenal::manager::{DaemonStorage, RetainedResponseRetirementOutcome};
+
+    let week = monday(&pool, -60).await;
+    sqlx::query("SELECT ensure_request_template_partition($1, NULL)")
+        .bind(week)
+        .execute(&pool)
+        .await
+        .unwrap();
+    // A row with no owning file (file_id NULL) must never be dropped
+    // implicitly by scheduled retention.
+    sqlx::query(
+        "INSERT INTO request_templates_g2 (created_on, endpoint, method, path, model, api_key) \
+         VALUES ($1, 'e', 'POST', '/x', 'm', 'k')",
+    )
+    .bind(week)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let manager = retirement_manager(&pool).await;
+    let blocked = manager
+        .retire_expired_template_partition(true, 365)
+        .await
+        .unwrap();
+    assert_eq!(blocked, RetainedResponseRetirementOutcome::NoCandidate);
+}

@@ -468,6 +468,86 @@ async fn run_retained_response_retirement_loop<S>(
     }
 }
 
+async fn run_template_retirement_loop<S>(
+    storage: Arc<S>,
+    shutdown: tokio_util::sync::CancellationToken,
+    query_timeout: Duration,
+    select_new: bool,
+    retention_days: i32,
+    expiry_batch_size: i64,
+    period: Duration,
+) where
+    S: DaemonStorage + 'static,
+{
+    loop {
+        // Phase 1: bounded file-content expiry unpins template windows. A
+        // failure here must not suppress retirement recovery below.
+        if select_new {
+            loop {
+                match maintenance_query(
+                    &shutdown,
+                    "file content expiry",
+                    query_timeout,
+                    storage.expire_file_content(retention_days, expiry_batch_size),
+                )
+                .await
+                {
+                    Ok(Some(expired)) => {
+                        counter!("fusillade_file_content_expired_total").increment(expired);
+                        if (expired as i64) < expiry_batch_size {
+                            break;
+                        }
+                    }
+                    Ok(None) => return,
+                    Err(_) => {
+                        crate::background_error!(
+                            "file_content_expiry_failed",
+                            Error,
+                            "Failed to expire aged file content"
+                        );
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Phase 2: at most one weekly template partition per pass.
+        let outcome = maintenance_query(
+            &shutdown,
+            "template partition retirement",
+            query_timeout,
+            storage.retire_expired_template_partition(select_new, retention_days),
+        )
+        .await;
+        let next_tick = match outcome {
+            Ok(Some(RetainedResponseRetirementOutcome::Retired)) => {
+                counter!("fusillade_template_partitions_retired_total").increment(1);
+                period.min(Duration::from_secs(1))
+            }
+            Ok(Some(RetainedResponseRetirementOutcome::Retryable)) => {
+                counter!("fusillade_template_partition_retirement_retries_total").increment(1);
+                period.min(Duration::from_secs(30))
+            }
+            Ok(Some(RetainedResponseRetirementOutcome::NoCandidate)) => {
+                period.min(Duration::from_secs(300))
+            }
+            Ok(None) => break,
+            Err(_) => {
+                crate::background_error!(
+                    "template_partition_retirement_failed",
+                    Error,
+                    "Failed to retire template partition"
+                );
+                period.min(Duration::from_secs(30))
+            }
+        };
+        tokio::select! {
+            _ = tokio::time::sleep(next_tick) => {},
+            _ = shutdown.cancelled() => break,
+        }
+    }
+}
+
 async fn run_batch_archive_retirement_loop<S>(
     storage: Arc<S>,
     shutdown: tokio_util::sync::CancellationToken,
@@ -542,6 +622,27 @@ async fn run_retained_response_route_cleanup_loop<S>(
                     "retained_response_route_cleanup_failed",
                     Error,
                     "Failed to clean retained-response routes"
+                );
+            }
+        }
+        // Retired template routes are an independent phase too.
+        match maintenance_query(
+            &shutdown,
+            "template route cleanup",
+            query_timeout,
+            storage.cleanup_retired_template_routes(limit),
+        )
+        .await
+        {
+            Ok(Some(deleted)) => {
+                counter!("fusillade_template_routes_cleaned_total").increment(deleted);
+            }
+            Ok(None) => break,
+            Err(_) => {
+                crate::background_error!(
+                    "template_route_cleanup_failed",
+                    Error,
+                    "Failed to clean retired template routes"
                 );
             }
         }
@@ -1068,6 +1169,22 @@ fn validate_retirement_capability(
     {
         return Err(FusilladeError::ValidationError(
             "batch-archive partition retirement requires an explicit positive retention period"
+                .to_string(),
+        ));
+    }
+    if config.template_retirement_enabled() && !storage_supports_partition_retirement {
+        return Err(FusilladeError::ValidationError(
+            "template partition retirement requires an explicit session-capable maintenance pool"
+                .to_string(),
+        ));
+    }
+    if config.template_retirement_enabled()
+        && !config
+            .template_retention_days()
+            .is_some_and(|days| (1..=i32::MAX as u32).contains(&days))
+    {
+        return Err(FusilladeError::ValidationError(
+            "template partition retirement requires an explicit positive retention period"
                 .to_string(),
         ));
     }
@@ -2808,6 +2925,23 @@ where
                     Duration::from_secs(86_400),
                 ));
                 daemon_handles.push(("batch_archive_retirement", batch_handle));
+
+                let template_retention_days = self
+                    .retention_maintenance
+                    .template_retention_days()
+                    .and_then(|days| i32::try_from(days).ok());
+                let template_select_new = self.retention_maintenance.template_retirement_enabled()
+                    && template_retention_days.is_some();
+                let template_handle = tokio::spawn(run_template_retirement_loop(
+                    self.storage.clone(),
+                    self.shutdown_token.clone(),
+                    query_timeout,
+                    template_select_new,
+                    template_retention_days.unwrap_or(0),
+                    self.config.purge_batch_size.max(1),
+                    Duration::from_secs(86_400),
+                ));
+                daemon_handles.push(("template_retirement", template_handle));
             }
 
             if self.storage.supports_retained_response_route_cleanup()
@@ -3338,6 +3472,25 @@ mod tests {
                 .push((select_new, retention_days));
             self.record("batch_archive_retirement");
             Ok(crate::RetainedResponseRetirementOutcome::NoCandidate)
+        }
+
+        async fn retire_expired_template_partition(
+            &self,
+            _select_new: bool,
+            _retention_days: i32,
+        ) -> Result<crate::RetainedResponseRetirementOutcome> {
+            self.record("template_retirement");
+            Ok(crate::RetainedResponseRetirementOutcome::NoCandidate)
+        }
+
+        async fn expire_file_content(&self, _retention_days: i32, _batch_size: i64) -> Result<u64> {
+            self.record("file_content_expiry");
+            Ok(0)
+        }
+
+        async fn cleanup_retired_template_routes(&self, _limit: i64) -> Result<u64> {
+            self.record("template_route_cleanup");
+            Ok(0)
         }
 
         async fn cleanup_retained_response_routes(&self, _limit: i64) -> Result<u64> {
