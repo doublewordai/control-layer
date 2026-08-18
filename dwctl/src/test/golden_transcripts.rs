@@ -205,7 +205,13 @@ fn normalize(text: &str, api_key: &str) -> String {
     let text = text.replace(api_key, "<api-key>");
     let text = uuid.replace_all(&text, "<uuid>");
     let text = port.replace_all(&text, "127.0.0.1:<port>");
+    // Output-item ids come from a process-global counter
+    // (`translation/responses/response.rs::generate_item_id`), so their value
+    // depends on how many responses this PROCESS translated before — differs
+    // between `cargo test` (shared process) and nextest/CI (process per test).
+    let item_id = regex::Regex::new(r"item_[0-9a-f]{16}").unwrap();
     let text = iso_ts.replace_all(&text, "<ts>");
+    let text = item_id.replace_all(&text, "item_<n>");
     let text = epoch_fields.replace_all(&text, r#""$1":0"#).to_string();
     text
 }

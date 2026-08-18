@@ -4,7 +4,7 @@ expression: "transcript(status, &body, &upstream, &outlet, &fusillade, &f)"
 ---
 === client ===
 status: 200
-body: {"id":"resp_<uuid>","object":"response","created_at":1,"completed_at":1,"status":"completed","incomplete_details":null,"model":"gpt-4o","previous_response_id":null,"instructions":null,"output":[{"content":[{"annotations":[],"logprobs":[],"text":"Hello from the gateway","type":"output_text"}],"id":"item_0000000000000001","role":"assistant","status":"completed","type":"message"}],"error":null,"tools":[],"tool_choice":"auto","truncation":"disabled","parallel_tool_calls":true,"text":{"format":{"type":"text"}},"top_p":1.0,"presence_penalty":0.0,"frequency_penalty":0.0,"top_logprobs":0,"temperature":1.0,"reasoning":null,"usage":{"input_tokens":10,"output_tokens":4,"total_tokens":14,"input_tokens_details":{"cached_tokens":0},"output_tokens_details":{"reasoning_tokens":0}},"max_output_tokens":null,"max_tool_calls":null,"store":false,"background":false,"service_tier":"default","metadata":null,"safety_identifier":null,"prompt_cache_key":null}
+body: {"id":"resp_<uuid>","object":"response","created_at":1,"completed_at":1,"status":"completed","incomplete_details":null,"model":"gpt-4o","previous_response_id":null,"instructions":null,"output":[{"content":[{"annotations":[],"logprobs":[],"text":"Hello from the gateway","type":"output_text"}],"id":"item_<n>","role":"assistant","status":"completed","type":"message"}],"error":null,"tools":[],"tool_choice":"auto","truncation":"disabled","parallel_tool_calls":true,"text":{"format":{"type":"text"}},"top_p":1.0,"presence_penalty":0.0,"frequency_penalty":0.0,"top_logprobs":0,"temperature":1.0,"reasoning":null,"usage":{"input_tokens":10,"output_tokens":4,"total_tokens":14,"input_tokens_details":{"cached_tokens":0},"output_tokens_details":{"reasoning_tokens":0}},"max_output_tokens":null,"max_tool_calls":null,"store":false,"background":false,"service_tier":"default","metadata":null,"safety_identifier":null,"prompt_cache_key":null}
 
 === upstream ===
 --- upstream request 0 ---
@@ -69,7 +69,7 @@ body: {"messages":[{"content":"golden-responses-blocking-sentinel","role":"user"
             "type": "output_text"
           }
         ],
-        "id": "item_0000000000000001",
+        "id": "item_<n>",
         "role": "assistant",
         "status": "completed",
         "type": "message"

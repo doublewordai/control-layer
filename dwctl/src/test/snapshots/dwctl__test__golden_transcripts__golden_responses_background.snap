@@ -7,7 +7,7 @@ status: 202
 body: --- 202 accepted ---
 {"background":true,"id":"resp_<uuid>","model":"gpt-4o","object":"response","output":[],"status":"in_progress"}
 --- final GET ---
-{"background":false,"completed_at":0,"created_at":0,"id":"resp_<uuid>","model":"gpt-4o","object":"response","output":[{"content":[{"annotations":[],"logprobs":[],"text":"Hello from the gateway","type":"output_text"}],"id":"item_0000000000000000","role":"assistant","status":"completed","type":"message"}],"service_tier":"priority","status":"completed","usage":{"input_tokens":10,"input_tokens_details":{"cached_tokens":0},"output_tokens":4,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":14}}
+{"background":false,"completed_at":0,"created_at":0,"id":"resp_<uuid>","model":"gpt-4o","object":"response","output":[{"content":[{"annotations":[],"logprobs":[],"text":"Hello from the gateway","type":"output_text"}],"id":"item_<n>","role":"assistant","status":"completed","type":"message"}],"service_tier":"priority","status":"completed","usage":{"input_tokens":10,"input_tokens_details":{"cached_tokens":0},"output_tokens":4,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":14}}
 
 === upstream ===
 --- upstream request 0 ---
@@ -73,7 +73,7 @@ body: {"messages":[{"content":"golden-responses-background-sentinel","role":"use
             "type": "output_text"
           }
         ],
-        "id": "item_0000000000000000",
+        "id": "item_<n>",
         "role": "assistant",
         "status": "completed",
         "type": "message"
