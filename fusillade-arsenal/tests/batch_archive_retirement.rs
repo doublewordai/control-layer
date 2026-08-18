@@ -355,7 +355,9 @@ async fn stamping_never_regresses_an_earlier_expiry(pool: PgPool) {
     let week = monday(10);
     ensure_week(&pool, week).await;
     let batch = archived_batch(&pool, week, Utc::now() - Duration::days(60)).await;
-    let earlier = Utc::now() - Duration::days(5);
+    // Truncate to PostgreSQL's microsecond resolution so the round-tripped
+    // stamp compares exactly equal.
+    let earlier = chrono::SubsecRound::trunc_subsecs(Utc::now() - Duration::days(5), 6);
     sqlx::query("UPDATE batches SET retention_expired_at = $2 WHERE id = $1")
         .bind(batch.batch_id)
         .bind(earlier)
