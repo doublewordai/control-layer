@@ -228,12 +228,41 @@ pub fn parse_ai_request(request_data: &RequestData) -> Result<ParsedAIRequest, S
         };
     }
 
-    match serde_json::from_str(&body_str) {
-        Ok(request) => Ok(ParsedAIRequest {
-            headers,
-            request,
-            responses_request: None,
-        }),
+    // On a known endpoint the path is authoritative and the body is not. Untagged
+    // classification disambiguates on each variant's required fields, and the
+    // completions shape requires only `model`, so a chat body that fails its own
+    // parse (malformed `messages`, say) would otherwise fall through and be recorded
+    // as a completions request rather than as unrecognised. Same reasoning that
+    // already drives the /responses branch above.
+    //
+    // An unknown path keeps the untagged parse, so callers that do not carry a real
+    // endpoint path behave exactly as before.
+    let path = request_data.uri.path();
+    let known_endpoint = |value: Value| -> Option<AiRequest> {
+        if path.ends_with("/chat/completions") {
+            Some(serde_json::from_value(value.clone()).map_or(AiRequest::Other(value), AiRequest::ChatCompletions))
+        } else if path.ends_with("/embeddings") {
+            Some(serde_json::from_value(value.clone()).map_or(AiRequest::Other(value), AiRequest::Embeddings))
+        } else if path.ends_with("/completions") {
+            Some(serde_json::from_value(value.clone()).map_or(AiRequest::Other(value), AiRequest::Completions))
+        } else {
+            None
+        }
+    };
+
+    match serde_json::from_str::<Value>(&body_str) {
+        Ok(value) => {
+            let request = match known_endpoint(value.clone()) {
+                Some(request) => request,
+                // Unknown path: untagged, as before.
+                None => serde_json::from_value(value.clone()).unwrap_or(AiRequest::Other(value)),
+            };
+            Ok(ParsedAIRequest {
+                headers,
+                request,
+                responses_request: None,
+            })
+        }
         Err(e) => {
             // Always base64 encode unparseable content to avoid PostgreSQL issues
             let base64_encoded = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes);
@@ -930,9 +959,10 @@ impl From<&AiResponse> for TokenMetrics {
                 let usage = &response.usage;
                 // One variant now covers both encodings, so the analytics label is
                 // read back off the payload rather than off the variant.
-                let base64 = response.data.first().is_some_and(|d| {
-                    matches!(d.embedding, onwards::strict::schemas::embeddings::Embedding::Base64(_))
-                });
+                let base64 = response
+                    .data
+                    .first()
+                    .is_some_and(|d| matches!(d.embedding, onwards::strict::schemas::embeddings::Embedding::Base64(_)));
                 Self {
                     prompt_tokens: usage.prompt_tokens as i64,
                     completion_tokens: 0, // Embeddings don't have completion tokens
@@ -1047,13 +1077,11 @@ impl From<&AiResponse> for TokenMetrics {
 mod tests {
     use super::{UsageMetrics, extract_cache_tokens, extract_finish_reason, parse_ai_request, parse_ai_response};
     use crate::request_logging::models::{AiRequest, AiResponse};
-    use onwards::strict::schemas::chat_completions::{
-        ChatCompletionChunk as ChatChunk, ChatCompletionResponse, Usage as ChatUsage,
-    };
-    use onwards::strict::schemas::completions::CompletionResponse;
-    use onwards::strict::schemas::embeddings::{Embedding, EmbeddingData, EmbeddingsResponse, EmbeddingsUsage};
     use axum::http::{Method, StatusCode, Uri};
     use bytes::Bytes;
+    use onwards::strict::schemas::chat_completions::{ChatCompletionChunk as ChatChunk, ChatCompletionResponse, Usage as ChatUsage};
+    use onwards::strict::schemas::completions::CompletionResponse;
+    use onwards::strict::schemas::embeddings::{Embedding, EmbeddingData, EmbeddingsResponse, EmbeddingsUsage};
     use outlet::{RequestData, ResponseData};
     use std::{
         collections::HashMap,
@@ -1428,9 +1456,12 @@ mod tests {
         };
 
         let parsed = parse_ai_response(&request_data, &response_data).unwrap();
+        // onwards types `finish_reason` as a plain string, so the shape that used to
+        // defeat the typed parse now goes through it. The counts below are the point
+        // either way: they must come out right whichever path produced them.
         assert!(
-            matches!(parsed, AiResponse::Other(_)),
-            "pins the mechanism: the typed parse cannot represent finish_reason \"error\""
+            matches!(parsed, AiResponse::ChatCompletions(_)),
+            "onwards represents an unrepresentable-by-enum finish_reason"
         );
 
         let metrics = UsageMetrics::extract(
