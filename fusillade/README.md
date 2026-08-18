@@ -327,8 +327,18 @@ observed healthy:
 6. Enable backfill for non-expired history under the same bounds.
 7. Run the separately gated one-time drain for content that is already past
    its retention period.
-8. Enable daily partition retirement last, after installing the dedicated
+8. Enable daily response-partition retirement after installing the dedicated
    single-session maintenance connection.
+9. Enable weekly batch-archive retirement with an explicit
+   finalization-anchored retention period. Every batch in a week must be
+   fully archived, frozen, and individually past its period before the week
+   drops; completion stamps batch metadata rows (which are never deleted).
+10. Enable the generation-2 template write cutover, then file-content expiry
+    and weekly template retirement with an explicit creation-anchored period.
+    A template week drops only when no live file still owns rows in it; file
+    rows are tombstoned, never deleted. The frozen legacy template heap is
+    dropped later as one relation, in a separately approved forward
+    migration, once its whole horizon has passed.
 
 Rollback boundaries: before step 5 every change is reversible by disabling
 flags and (only on an empty lifecycle) reverting the expand migration — the
