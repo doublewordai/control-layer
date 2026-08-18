@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT\n                model AS \"model!\",\n                COUNT(*)::BIGINT as \"request_count!\",\n                SUM(body_byte_size)::BIGINT as \"total_body_bytes!\"\n            FROM request_templates\n            WHERE file_id = $1\n            GROUP BY model\n            ORDER BY model\n            ",
+  "query": "\n            SELECT\n                model AS \"model!\",\n                COUNT(*)::BIGINT as \"request_count!\",\n                SUM(body_byte_size)::BIGINT as \"total_body_bytes!\"\n            FROM request_templates_all\n            WHERE file_id = $1\n            GROUP BY model\n            ORDER BY model\n            ",
   "describe": {
     "columns": [
       {
@@ -25,10 +25,10 @@
       ]
     },
     "nullable": [
-      false,
+      true,
       null,
       null
     ]
   },
-  "hash": "3f74b7032acb96dd0d5f7ffc1713cf0083ac8f7d930cdd32b8259ba13ccf08dd"
+  "hash": "56e7ec3a433e13cd9ba9ca44dd457026e44976fee786600e67e35c313191937a"
 }
