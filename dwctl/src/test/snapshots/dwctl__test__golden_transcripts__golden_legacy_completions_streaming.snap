@@ -1,0 +1,105 @@
+---
+source: dwctl/src/test/golden_transcripts.rs
+expression: "transcript(status, &body, &upstream, &outlet, &fusillade, &f)"
+---
+=== client ===
+status: 200
+body: data: {"id":"cmpl-1","object":"text_completion","created":1,"model":"gpt-4o","choices":[{"text":"Hello","index":0}]}
+
+data: {"id":"cmpl-1","object":"text_completion","created":1,"model":"gpt-4o","choices":[{"text":"","index":0,"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":3}}
+
+data: [DONE]
+
+
+
+=== upstream ===
+--- upstream request 0 ---
+POST /completions
+authorization: <absent>
+content-type: application/json
+x-fusillade-request-id: <absent>
+x-onwards-response-id: <absent>
+x-onwards-endpoint: <absent>
+x-onwards-model: <absent>
+x-fusillade-stream: <absent>
+x-fusillade-batch-zdr: <absent>
+body: {"model":"gpt-4o","prompt":"golden-legacy-completions-sentinel","stream":true,"stream_options":{"include_usage":true}}
+--- upstream request 1 ---
+POST /chat/completions
+authorization: <absent>
+content-type: application/json
+x-fusillade-request-id: <uuid>
+x-onwards-response-id: resp_<uuid>
+x-onwards-endpoint: /v1/chat/completions
+x-onwards-model: gpt-4o
+x-fusillade-stream: <absent>
+x-fusillade-batch-zdr: <absent>
+body: {"messages":[{"content":"golden-legacy-barrier-sentinel","role":"user"}],"model":"gpt-4o","stream":true,"stream_options":{"include_usage":true}}
+
+=== outlet ===
+--- outlet http_requests ---
+{
+  "body": {
+    "headers": {
+      "authorization": "Bearer <api-key>",
+      "content-type": "application/json"
+    },
+    "request": {
+      "model": "gpt-4o",
+      "prompt": "golden-legacy-completions-sentinel",
+      "stream": true
+    }
+  },
+  "body_parsed": true,
+  "instance_id": "<uuid>",
+  "method": "POST",
+  "span_id": null,
+  "trace_id": null,
+  "uri": "http://localhost/completions"
+}
+--- outlet http_responses ---
+{
+  "body": [
+    {
+      "choices": [
+        {
+          "index": 0,
+          "text": "Hello"
+        }
+      ],
+      "created": 1,
+      "id": "cmpl-1",
+      "model": "gpt-4o",
+      "object": "text_completion",
+      "system_fingerprint": null,
+      "usage": null
+    },
+    {
+      "choices": [
+        {
+          "finish_reason": "stop",
+          "index": 0,
+          "text": ""
+        }
+      ],
+      "created": 1,
+      "id": "cmpl-1",
+      "model": "gpt-4o",
+      "object": "text_completion",
+      "system_fingerprint": null,
+      "usage": {
+        "completion_tokens": 1,
+        "prompt_tokens": 2,
+        "total_tokens": 3
+      }
+    },
+    null
+  ],
+  "body_parsed": true,
+  "instance_id": "<uuid>",
+  "status_code": 200
+}
+
+=== fusillade ===
+--- fusillade row (legacy /completions) ---
+(no row — legacy /completions is not intercepted)

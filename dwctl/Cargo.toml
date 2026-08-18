@@ -194,3 +194,6 @@ criterion = { version = "0.8", features = ["async_tokio"] }
 tempfile = "3.0"
 wiremock = "0.6"
 serde_urlencoded = "0.7"
+# Golden equivalence transcripts for the /ai/v1 inference pipeline (src/test/golden_transcripts.rs).
+insta = "1"
+regex = "1"

@@ -1,0 +1,81 @@
+---
+source: dwctl/src/test/golden_transcripts.rs
+expression: "transcript(status, &body, &upstream, &outlet, &fusillade, &f)"
+---
+=== client ===
+status: 200
+body: {"id":"resp_<uuid>","type":"message","role":"assistant","model":"gpt-4o","content":[{"type":"text","text":"Hello from the gateway"}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":4}}
+
+=== upstream ===
+--- upstream request 0 ---
+POST /chat/completions
+authorization: <absent>
+content-type: application/json
+x-fusillade-request-id: <uuid>
+x-onwards-response-id: resp_<uuid>
+x-onwards-endpoint: /v1/messages
+x-onwards-model: gpt-4o
+x-fusillade-stream: <absent>
+x-fusillade-batch-zdr: <absent>
+body: {"max_tokens":64,"messages":[{"content":"be terse","role":"system"},{"content":"golden-anthropic-blocking-sentinel","role":"user"}],"model":"gpt-4o"}
+
+=== outlet ===
+--- outlet http_requests ---
+{
+  "body": {
+    "headers": {
+      "anthropic-version": "2023-06-01",
+      "content-type": "application/json",
+      "x-api-key": "<api-key>",
+      "x-fusillade-request-id": "<uuid>",
+      "x-onwards-endpoint": "/v1/messages",
+      "x-onwards-model": "gpt-4o",
+      "x-onwards-response-id": "resp_<uuid>"
+    },
+    "request": {
+      "max_tokens": 64,
+      "messages": [
+        {
+          "content": "golden-anthropic-blocking-sentinel",
+          "role": "user"
+        }
+      ],
+      "model": "gpt-4o",
+      "system": "be terse"
+    }
+  },
+  "body_parsed": true,
+  "instance_id": "<uuid>",
+  "method": "POST",
+  "span_id": null,
+  "trace_id": null,
+  "uri": "http://localhost/messages"
+}
+--- outlet http_responses ---
+{
+  "body": {
+    "content": [
+      {
+        "text": "Hello from the gateway",
+        "type": "text"
+      }
+    ],
+    "id": "resp_<uuid>",
+    "model": "gpt-4o",
+    "role": "assistant",
+    "stop_reason": "end_turn",
+    "stop_sequence": null,
+    "type": "message",
+    "usage": {
+      "input_tokens": 10,
+      "output_tokens": 4
+    }
+  },
+  "body_parsed": true,
+  "instance_id": "<uuid>",
+  "status_code": 200
+}
+
+=== fusillade ===
+--- fusillade row ---
+(no terminal row)
