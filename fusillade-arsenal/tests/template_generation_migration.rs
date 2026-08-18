@@ -559,3 +559,61 @@ async fn an_unowned_template_row_fails_the_gate_closed(pool: PgPool) {
         .unwrap();
     assert_eq!(blocked, RetainedResponseRetirementOutcome::NoCandidate);
 }
+
+#[sqlx::test]
+async fn a_batch_materializes_requests_from_generation_two_templates(pool: PgPool) {
+    use fusillade_arsenal::batch::{BatchInput, RequestTemplateInput};
+    use fusillade_arsenal::{PostgresRequestManager, PostgresStorageConfig, Storage, TestDbPools};
+
+    let manager = PostgresRequestManager::new(
+        TestDbPools::new(pool.clone()).await.unwrap(),
+        PostgresStorageConfig::default(),
+    )
+    .with_template_generation_writes(true);
+    let file_id = manager
+        .create_file(
+            "g2-batch-source".to_string(),
+            None,
+            vec![RequestTemplateInput {
+                custom_id: Some("g2-req".to_string()),
+                endpoint: "https://example.invalid".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/x".to_string(),
+                body: "{\"gen\":2}".to_string(),
+                model: "test-model".to_string(),
+                api_key: "test-key".to_string(),
+            }],
+        )
+        .await
+        .unwrap();
+
+    // Regression: requests.template_id previously carried a foreign key to
+    // the legacy heap, so materializing from generation-2 ids failed.
+    let batch = manager
+        .create_batch(BatchInput {
+            file_id,
+            endpoint: "/v1/chat/completions".to_string(),
+            completion_window: "24h".to_string(),
+            metadata: None,
+            created_by: None,
+            api_key_id: None,
+            api_key: None,
+            total_requests: None,
+        })
+        .await
+        .unwrap();
+    let (count, joined): (i64, i64) = sqlx::query_as(
+        "SELECT COUNT(*), COUNT(*) FILTER (WHERE t.id IS NOT NULL) \
+         FROM requests r LEFT JOIN request_templates_all t ON t.id = r.template_id \
+         WHERE r.batch_id = $1",
+    )
+    .bind(*batch.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        (count, joined),
+        (1, 1),
+        "requests must materialize from and resolve back to generation-2 templates"
+    );
+}

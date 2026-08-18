@@ -111,6 +111,14 @@ DROP TABLE request_template_routes;
 DROP TABLE request_template_buckets;
 DROP TABLE request_templates_g2;
 
+-- Recreate the legacy row-level template reference NOT VALID so the revert
+-- stays metadata-only on a large heap; existing rows keep their previous
+-- read semantics either way.
+ALTER TABLE requests
+    ADD CONSTRAINT requests_template_id_fkey
+    FOREIGN KEY (template_id) REFERENCES request_templates(id)
+    ON DELETE SET NULL NOT VALID;
+
 -- Retained-response teardown.
 DROP FUNCTION ensure_retained_response_partitions(DATE, INTEGER);
 DROP FUNCTION ensure_retained_response_partition(DATE, TEXT);
