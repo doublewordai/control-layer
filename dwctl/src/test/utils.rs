@@ -38,7 +38,8 @@ pub async fn create_test_app_state_with_config(pool: PgPool, config: crate::conf
 
     let request_manager = std::sync::Arc::new(
         fusillade_arsenal::PostgresRequestManager::new(fusillade_pools, Default::default())
-            .with_retained_response_fence_seconds(config.background_services.batch_daemon.retention.max_late_writer_seconds),
+            .with_retained_response_fence_seconds(config.background_services.batch_daemon.retention.max_late_writer_seconds)
+            .with_template_generation_writes(config.background_services.batch_daemon.template_generation_writes_enabled),
     );
     let limiters = crate::limits::Limiters::new(&config.limits);
     let shared_config = crate::SharedConfig::new(config);
@@ -134,7 +135,8 @@ pub async fn create_test_app_state_with_database_pools(
         .expect("Failed to create fusillade TestDbPools");
     let request_manager = std::sync::Arc::new(
         fusillade_arsenal::PostgresRequestManager::new(fusillade_test_pools, Default::default())
-            .with_retained_response_fence_seconds(config.background_services.batch_daemon.retention.max_late_writer_seconds),
+            .with_retained_response_fence_seconds(config.background_services.batch_daemon.retention.max_late_writer_seconds)
+            .with_template_generation_writes(config.background_services.batch_daemon.template_generation_writes_enabled),
     );
     let limiters = crate::limits::Limiters::new(&config.limits);
     let shared_config = crate::SharedConfig::new(config);

@@ -143,6 +143,7 @@ pub struct PostgresRequestManager<P: PoolProvider> {
     pools: P,
     config: PostgresStorageConfig,
     retained_response_fence_seconds: Option<u64>,
+    template_generation_writes_enabled: bool,
     partition_maintenance_pool: Option<sqlx::PgPool>,
     partition_maintenance_attested: bool,
     partition_maintenance_lease_owner: Uuid,
@@ -375,6 +376,7 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
             pools,
             config,
             retained_response_fence_seconds: None,
+            template_generation_writes_enabled: false,
             partition_maintenance_pool: None,
             partition_maintenance_attested: false,
             partition_maintenance_lease_owner: Uuid::new_v4(),
@@ -430,6 +432,19 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
     /// Return the configured content-free resurrection-fence lifetime.
     pub fn retained_response_fence_seconds(&self) -> Option<u64> {
         self.retained_response_fence_seconds
+    }
+
+    /// Route new file-backed template writes into the weekly generation-2
+    /// store. Reads are generation-transparent either way; disabling the flag
+    /// again only redirects NEW writes back to the legacy heap.
+    pub fn with_template_generation_writes(mut self, enabled: bool) -> Self {
+        self.template_generation_writes_enabled = enabled;
+        self
+    }
+
+    /// Whether new file-backed templates are written to generation 2.
+    pub fn template_generation_writes_enabled(&self) -> bool {
+        self.template_generation_writes_enabled
     }
 
     /// Install the single-session pool used only for partition-maintenance
@@ -3483,7 +3498,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                 FROM batch_requests_archive WHERE id = ANY($1)
             ) r
             JOIN batches b ON r.batch_id = b.id
-            LEFT JOIN request_templates t
+            LEFT JOIN request_templates_all t
               ON r.template_id = t.id
              AND t.file_id = b.file_id
             "#,
@@ -3820,8 +3835,13 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
 
                     // Flush buffer if it reaches batch size
                     if template_buffer.len() >= batch_size {
-                        Self::insert_template_batch(&mut tx, file_id.unwrap(), &template_buffer)
-                            .await?;
+                        Self::insert_template_batch(
+                            &mut tx,
+                            file_id.unwrap(),
+                            &template_buffer,
+                            self.template_generation_writes_enabled,
+                        )
+                        .await?;
                         template_buffer.clear();
                     }
                 }
@@ -3847,7 +3867,13 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         // Flush any remaining templates in buffer
         if !template_buffer.is_empty() {
             // file_id is guaranteed to be Some if buffer has items
-            Self::insert_template_batch(&mut tx, file_id.unwrap(), &template_buffer).await?;
+            Self::insert_template_batch(
+                &mut tx,
+                file_id.unwrap(),
+                &template_buffer,
+                self.template_generation_writes_enabled,
+            )
+            .await?;
         }
 
         // If no templates were received, still create an empty file with whatever metadata we have
@@ -4021,7 +4047,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                 model AS "model!",
                 COUNT(*)::BIGINT as "request_count!",
                 SUM(body_byte_size)::BIGINT as "total_body_bytes!"
-            FROM request_templates
+            FROM request_templates_all
             WHERE file_id = $1
             GROUP BY model
             ORDER BY model
@@ -4638,7 +4664,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
             r#"
             INSERT INTO requests (batch_id, template_id, state, custom_id, retry_attempt, model, service_tier)
             SELECT $1, id, 'pending', custom_id, 0, model, $3
-            FROM request_templates
+            FROM request_templates_all
             WHERE file_id = $2
             "#,
             *batch_id as Uuid,
@@ -6154,7 +6180,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                   AND a.batch_id = $1
             ) r
             JOIN batches b ON r.batch_id = b.id
-            LEFT JOIN request_templates t
+            LEFT JOIN request_templates_all t
               ON r.template_id = t.id
              AND t.file_id = b.file_id
             WHERE b.deleted_at IS NULL
@@ -7367,6 +7393,7 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         file_id: Uuid,
         templates: &[(RequestTemplateInput, i32)],
+        generation_two: bool,
     ) -> Result<()> {
         if templates.is_empty() {
             return Ok(());
@@ -7392,6 +7419,64 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
         let api_keys: Vec<&str> = templates.iter().map(|(t, _)| t.api_key.as_str()).collect();
         let line_numbers: Vec<i32> = templates.iter().map(|(_, line)| *line).collect();
         let body_byte_sizes: Vec<i64> = stored_bodies.iter().map(|b| b.len() as i64).collect();
+
+        if generation_two {
+            // Lazily guarantee this UTC week's partition. The fast path is a
+            // catalog lookup; the advisory-locked helper runs only while the
+            // partition is genuinely missing (once per week per schema).
+            sqlx::query(
+                "SELECT ensure_request_template_partition( \
+                     date_trunc('week', statement_timestamp() AT TIME ZONE 'UTC')::date, NULL) \
+                 WHERE to_regclass( \
+                     'request_templates_g2_y' \
+                         || to_char(date_trunc('week', statement_timestamp() AT TIME ZONE 'UTC')::date, 'IYYY') \
+                         || 'w' \
+                         || to_char(date_trunc('week', statement_timestamp() AT TIME ZONE 'UTC')::date, 'IW') \
+                 ) IS NULL",
+            )
+            .execute(&mut **tx)
+            .await
+            .map_err(|e| {
+                FusilladeError::Other(anyhow!("Failed to ensure template partition: {}", e))
+            })?;
+            sqlx::query(
+                r#"
+                WITH inserted AS (
+                    INSERT INTO request_templates_g2 (
+                        created_on, file_id, custom_id, endpoint, method, path,
+                        body, model, api_key, line_number, body_byte_size
+                    )
+                    SELECT (statement_timestamp() AT TIME ZONE 'UTC')::date,
+                           $1, custom_id, endpoint, method, path, body, model,
+                           api_key, line_number, body_byte_size
+                    FROM UNNEST(
+                        $2::text[], $3::text[], $4::text[], $5::text[], $6::text[],
+                        $7::text[], $8::text[], $9::int[], $10::bigint[]
+                    ) AS t(custom_id, endpoint, method, path, body, model, api_key,
+                           line_number, body_byte_size)
+                    RETURNING id, created_on
+                )
+                INSERT INTO request_template_routes (template_id, week_start)
+                SELECT id, date_trunc('week', created_on)::date FROM inserted
+                "#,
+            )
+            .bind(file_id)
+            .bind(&custom_ids as &[Option<&str>])
+            .bind(&endpoints as &[&str])
+            .bind(&methods as &[&str])
+            .bind(&paths as &[&str])
+            .bind(&bodies as &[&str])
+            .bind(&models as &[&str])
+            .bind(&api_keys as &[&str])
+            .bind(&line_numbers as &[i32])
+            .bind(&body_byte_sizes as &[i64])
+            .execute(&mut **tx)
+            .await
+            .map_err(|e| {
+                FusilladeError::Other(anyhow!("Failed to batch insert templates: {}", e))
+            })?;
+            return Ok(());
+        }
 
         sqlx::query!(
             r#"
@@ -7458,7 +7543,7 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
                        model AS "model!",
                        api_key AS "api_key!",
                        line_number AS "line_number!"
-                FROM request_templates
+                FROM request_templates_all
                 WHERE file_id = $1 AND ($2 = -1 OR line_number > $2)
                   AND ($5::text IS NULL OR LOWER(custom_id) LIKE $5)
                 ORDER BY line_number ASC
@@ -8656,12 +8741,55 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
             FusilladeError::Other(anyhow!("Failed to purge orphaned request templates: {e}"))
         })?
         .rows_affected() as i64;
-        let total = (requests_deleted + archived_deleted + templates_deleted) as u64;
+
+        // Step 2b: the generation-2 twin of step 2. Same explicit-deletion
+        // tombstone rule (`retention_expired_at IS NULL`); routes are removed
+        // atomically with their template rows so no dangling location oracle
+        // survives an erasure.
+        let g2_templates_deleted = sqlx::query(
+            r#"
+            WITH doomed AS (
+                SELECT template.created_on, template.id
+                FROM (SELECT id FROM files
+                      WHERE deleted_at IS NOT NULL
+                        AND retention_expired_at IS NULL) file,
+                LATERAL (
+                    SELECT created_on, id
+                    FROM request_templates_g2
+                    WHERE file_id = file.id
+                    LIMIT $1
+                    FOR UPDATE SKIP LOCKED
+                ) template
+                LIMIT $1
+            ), removed AS (
+                DELETE FROM request_templates_g2 template
+                USING doomed
+                WHERE template.created_on = doomed.created_on
+                  AND template.id = doomed.id
+                RETURNING template.id
+            )
+            DELETE FROM request_template_routes route
+            USING removed
+            WHERE route.template_id = removed.id
+            "#,
+        )
+        .bind(batch_size)
+        .execute(self.write_executor())
+        .await
+        .map_err(|e| {
+            FusilladeError::Other(anyhow!(
+                "Failed to purge orphaned generation-2 templates: {e}"
+            ))
+        })?
+        .rows_affected() as i64;
+        let total =
+            (requests_deleted + archived_deleted + templates_deleted + g2_templates_deleted) as u64;
         if total > 0 {
             tracing::info!(
                 requests_deleted,
                 archived_deleted,
                 templates_deleted,
+                g2_templates_deleted,
                 "Purged orphaned rows"
             );
         }

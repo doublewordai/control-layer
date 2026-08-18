@@ -31,14 +31,38 @@ async fn retained_response_retirement_journal_requires_full_daily_identity(pool:
         );
     }
 
-    sqlx::query(
+    // Weekly batch-archive journal rows carry the same complete identity
+    // contract as daily response rows: omitting it is unrepresentable.
+    let weekly_incomplete = sqlx::query(
         "INSERT INTO retention_partition_retirements \
          (parent_table, partition_table, partition_oid) \
          VALUES ('batch_requests_archive', 'batch_requests_archive_y2038w20', 1)",
     )
     .execute(&pool)
     .await
-    .expect("legacy weekly journal rows may omit daily identity");
+    .expect_err("weekly retirement identity must be complete");
+    assert_eq!(
+        weekly_incomplete
+            .as_database_error()
+            .and_then(|error| error.code())
+            .as_deref(),
+        Some("23514")
+    );
+    sqlx::query(
+        r#"
+        INSERT INTO retention_partition_retirements (
+            parent_table, partition_table, partition_oid,
+            partition_schema, partition_schema_oid, parent_oid,
+            lower_bound, upper_bound
+        ) SELECT
+            'batch_requests_archive', 'batch_requests_archive_y2038w20', 1,
+            current_schema(), 30, 40, monday, monday + 7
+        FROM (SELECT to_date('2038-20-1', 'IYYY-IW-ID') AS monday) week
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .expect("a complete weekly identity must be representable");
 
     let incomplete = sqlx::query(
         "INSERT INTO retention_partition_retirements \

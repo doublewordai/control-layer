@@ -24,14 +24,15 @@ BEGIN
 END;
 $$;
 
--- Restore the single-generation view exactly as defined by
--- 20260129000001_update_active_views.up.sql.
+-- Restore the single-generation view exactly as last defined by
+-- 20260731010000_add_request_template_metadata.up.sql.
+DROP VIEW IF EXISTS request_templates_all;
 DROP VIEW IF EXISTS active_request_templates;
 CREATE VIEW active_request_templates AS
 SELECT rt.*
 FROM request_templates rt
-JOIN files f ON rt.file_id = f.id
-WHERE f.deleted_at IS NULL;
+LEFT JOIN files f ON rt.file_id = f.id
+WHERE rt.file_id IS NULL OR f.deleted_at IS NULL;
 
 DROP FUNCTION ensure_request_template_partitions(DATE, INTEGER);
 DROP FUNCTION ensure_request_template_partition(DATE, TEXT);
