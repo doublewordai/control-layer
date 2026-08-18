@@ -804,8 +804,8 @@ impl<'c> Users<'c> {
                 external_user_id,
                 email
             );
-            let display_name = crate::auth::utils::generate_random_display_name();
-            tracing::debug!("Generated display name: {}", display_name);
+            let display_name = crate::auth::utils::default_display_name(email);
+            tracing::trace!("Defaulted display name to email prefix");
 
             let create_request = UserCreateDBRequest {
                 username: external_user_id.to_string(),

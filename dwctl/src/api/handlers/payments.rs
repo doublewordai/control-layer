@@ -92,8 +92,9 @@ struct BillingTarget {
     invoicing_enabled: bool,
     /// Name to put on the payment-provider customer. Set for organizations
     /// (a real, user-provided org name), but `None` for individuals: their
-    /// display_name is only ever a randomly generated placeholder, never the
-    /// real IdP name, so we don't want it on Stripe customers / receipts.
+    /// display_name is only ever a placeholder derived from the email prefix,
+    /// never the real IdP name, so we don't want it on Stripe customers /
+    /// receipts.
     display_name: Option<String>,
 }
 
@@ -145,7 +146,8 @@ async fn resolve_billing_target(user: &CurrentUser, conn: &mut sqlx::PgConnectio
             email: user.email.clone(),
             invoicing_enabled,
             // Intentionally omitted: an individual's display_name is a
-            // generated placeholder, not their real name (see BillingTarget).
+            // placeholder derived from the email prefix, not their real name
+            // (see BillingTarget).
             display_name: None,
         })
     }
