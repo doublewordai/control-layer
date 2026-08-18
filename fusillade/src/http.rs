@@ -881,8 +881,9 @@ impl ReqwestHttpClient {
         // vec. The callback runs outside `stream.next()`, so its time
         // counts against `body_timeout` (not `chunk_timeout`) — see the
         // `StreamEventCallback` trait docs for the rationale.
-        let mut sink = StreamSink::new(self.reassemble_streams && status < 400);
+        let reassemble = self.reassemble_streams && status < 400;
         let collected = tokio::time::timeout(self.body_timeout, async {
+            let mut sink = StreamSink::new(reassemble);
             if let Some(event) = first_event {
                 fire_callback(on_event.as_deref(), &event);
                 sink.absorb(&event);
