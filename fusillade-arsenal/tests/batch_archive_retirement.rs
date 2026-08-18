@@ -1,4 +1,4 @@
-use chrono::{DateTime, Datelike, Duration, NaiveDate, Utc, Weekday};
+use chrono::{DateTime, Datelike, Duration, NaiveDate, Utc};
 use fusillade_arsenal::manager::RetainedResponseRetirementOutcome;
 use fusillade_arsenal::{
     DaemonStorage, PostgresRequestManager, PostgresStorageConfig, TestDbPools,
