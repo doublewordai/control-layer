@@ -5,12 +5,6 @@
 
 use crate::error::Result;
 pub use crate::request::HttpResponse;
-/// Function signature for stream reassemblers.
-///
-/// A reassembler takes a slice of collected SSE events and produces a single
-/// response body string. Use [`openai_reassembler::reassemble`] for
-/// OpenAI-compatible endpoints.
-pub type StreamReassembler = fn(&[eventsource_stream::Event]) -> anyhow::Result<String>;
 use crate::request::RequestData;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -181,7 +175,7 @@ pub struct ReqwestHttpClient {
     upload_stall_timeout: Duration,
     upload_chunk_bytes: usize,
     upload_stall_poll: Duration,
-    stream_reassembler: Option<StreamReassembler>,
+    reassemble_streams: bool,
     streamable_endpoints: Vec<String>,
 }
 
@@ -211,7 +205,7 @@ impl ReqwestHttpClient {
             upload_stall_timeout: DEFAULT_UPLOAD_STALL_TIMEOUT,
             upload_chunk_bytes: DEFAULT_UPLOAD_CHUNK_BYTES,
             upload_stall_poll: DEFAULT_UPLOAD_STALL_POLL,
-            stream_reassembler: Some(openai_reassembler::reassemble),
+            reassemble_streams: true,
             streamable_endpoints,
         }
     }
@@ -257,18 +251,11 @@ impl ReqwestHttpClient {
         self
     }
 
-    /// Set a stream reassembler function that converts collected SSE events
-    /// into a single response body. Without this, streaming responses are stored as
-    /// newline-delimited event data payloads.
-    ///
-    /// # Example
-    /// ```ignore
-    /// use openai_reassembler::reassemble;
-    /// let client = ReqwestHttpClient::new(...)
-    ///     .with_stream_reassembler(|events| reassemble(events).map_err(Into::into));
-    /// ```
-    pub fn with_stream_reassembler(mut self, reassembler: StreamReassembler) -> Self {
-        self.stream_reassembler = Some(reassembler);
+    /// Store streaming responses as newline-delimited event data instead of
+    /// reassembling them into a single response body. Reassembly is on by
+    /// default; error responses use the raw form regardless.
+    pub fn without_stream_reassembly(mut self) -> Self {
+        self.reassemble_streams = false;
         self
     }
 }
@@ -295,6 +282,66 @@ const ONE_DAY_DURATION: Duration = Duration::from_secs(86_400);
 fn fire_callback(on_event: Option<&dyn StreamEventCallback>, event: &eventsource_stream::Event) {
     if let Some(cb) = on_event {
         cb.on_event(&StreamEvent::from(event));
+    }
+}
+
+/// Folds an SSE stream as it arrives so the raw frames need not be retained.
+///
+/// A streaming response can carry far more bytes on the wire than the body it
+/// assembles to: every frame is a full JSON envelope around a few bytes of
+/// token delta, and some upstreams add content-free keepalive frames at a high
+/// rate for the life of the request. Buffering the frames and processing them
+/// once the stream closes makes memory scale with stream length rather than
+/// with the result, which is what this avoids.
+struct StreamSink {
+    /// Assembles the response body. Only fed when reassembling.
+    reassembler: openai_reassembler::Reassembler,
+    /// Newline-joined raw event data, built only when not reassembling.
+    raw: String,
+    /// Data of the first event carrying a provider error envelope.
+    embedded_error: Option<String>,
+    /// Events seen, for the stall diagnostic.
+    seen: usize,
+    reassemble: bool,
+}
+
+impl StreamSink {
+    fn new(reassemble: bool) -> Self {
+        Self {
+            reassembler: openai_reassembler::Reassembler::new(),
+            raw: String::new(),
+            embedded_error: None,
+            seen: 0,
+            reassemble,
+        }
+    }
+
+    /// Fold one event. The caller may drop it as soon as this returns.
+    fn absorb(&mut self, event: &eventsource_stream::Event) {
+        self.seen += 1;
+
+        // Some providers answer HTTP 200 with an error embedded in the stream.
+        // First one wins, matching the previous scan from the start.
+        if self.embedded_error.is_none() && event.data.starts_with("{\"error\"") {
+            self.embedded_error = Some(event.data.clone());
+        }
+
+        if self.reassemble {
+            self.reassembler.push(event);
+        } else if !event.data.is_empty() && event.data != "[DONE]" {
+            if !self.raw.is_empty() {
+                self.raw.push('\n');
+            }
+            self.raw.push_str(&event.data);
+        }
+    }
+
+    fn finish(self) -> anyhow::Result<String> {
+        if self.reassemble {
+            self.reassembler.finish()
+        } else {
+            Ok(self.raw)
+        }
     }
 }
 
@@ -834,17 +881,17 @@ impl ReqwestHttpClient {
         // vec. The callback runs outside `stream.next()`, so its time
         // counts against `body_timeout` (not `chunk_timeout`) — see the
         // `StreamEventCallback` trait docs for the rationale.
+        let mut sink = StreamSink::new(self.reassemble_streams && status < 400);
         let collected = tokio::time::timeout(self.body_timeout, async {
-            let mut events: Vec<eventsource_stream::Event> = Vec::new();
             if let Some(event) = first_event {
                 fire_callback(on_event.as_deref(), &event);
-                events.push(event);
+                sink.absorb(&event);
             }
             loop {
                 match tokio::time::timeout(self.chunk_timeout, stream.next()).await {
                     Ok(Some(Ok(event))) => {
                         fire_callback(on_event.as_deref(), &event);
-                        events.push(event);
+                        sink.absorb(&event);
                     }
                     Ok(Some(Err(e))) => {
                         return Err(anyhow::anyhow!("SSE parse error from {}: {}", url, e).into());
@@ -855,12 +902,12 @@ impl ReqwestHttpClient {
                             "SSE stream stalled from {} after {}ms ({} events received)",
                             url,
                             self.chunk_timeout.as_millis(),
-                            events.len()
+                            sink.seen
                         )));
                     }
                 }
             }
-            Ok(events)
+            Ok(sink)
         })
         .await
         .map_err(|_| {
@@ -876,8 +923,8 @@ impl ReqwestHttpClient {
         // the error JSON directly as the body and override the status with the
         // embedded code so downstream retry logic classifies it correctly.
         // The reassembler doesn't handle error objects and would mangle them.
-        if let Some(event) = collected.iter().find(|e| e.data.starts_with("{\"error\""))
-            && let Ok(envelope) = serde_json::from_str::<EmbeddedErrorEnvelope>(&event.data)
+        if let Some(data) = &collected.embedded_error
+            && let Ok(envelope) = serde_json::from_str::<EmbeddedErrorEnvelope>(data)
         {
             let code = envelope
                 .error
@@ -896,23 +943,11 @@ impl ReqwestHttpClient {
 
             return Ok(HttpResponse {
                 status: code,
-                body: event.data.clone(),
+                body: data.clone(),
             });
         }
 
-        let body = match &self.stream_reassembler {
-            // Only reassemble successful streams. An error response (empty or a
-            // contentless chunk) must not be synthesized into a degenerate
-            // `{"choices":[],"usage":null}` completion — return its raw payload
-            // so the real HTTP status drives retry classification.
-            Some(reassemble) if status < 400 => reassemble(&collected)?,
-            _ => collected
-                .iter()
-                .filter(|e| !e.data.is_empty() && e.data != "[DONE]")
-                .map(|e| e.data.as_str())
-                .collect::<Vec<_>>()
-                .join("\n"),
-        };
+        let body = collected.finish()?;
 
         tracing::debug!(
             request_id = %request.id,
@@ -2247,5 +2282,46 @@ mod tests {
             "callback fired on a non-streaming response: {:?}",
             captured.lock()
         );
+    }
+
+    /// Build a bare SSE event carrying `data`.
+    fn sink_event(data: &str) -> eventsource_stream::Event {
+        eventsource_stream::Event {
+            data: data.to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// The embedded-error scan used to run over the whole collected vec and
+    /// take the first match. Folding as events arrive has to preserve that: a
+    /// later error frame must not displace the one that arrived first.
+    #[test]
+    fn stream_sink_keeps_the_first_embedded_error() {
+        let mut sink = StreamSink::new(true);
+        sink.absorb(&sink_event(
+            r#"{"id":"1","choices":[{"index":0,"delta":{"content":"hi"}}]}"#,
+        ));
+        sink.absorb(&sink_event(r#"{"error":{"code":429,"message":"first"}}"#));
+        sink.absorb(&sink_event(r#"{"error":{"code":500,"message":"second"}}"#));
+
+        assert_eq!(sink.seen, 3);
+        let embedded = sink.embedded_error.as_deref().expect("error not captured");
+        assert!(embedded.contains("first"), "got: {embedded}");
+        assert!(!embedded.contains("second"));
+    }
+
+    /// Without reassembly the body is the newline-joined event data with empty
+    /// and `[DONE]` frames dropped, unchanged from the collect-then-join it
+    /// replaces.
+    #[test]
+    fn stream_sink_raw_mode_joins_and_filters() {
+        let mut sink = StreamSink::new(false);
+        sink.absorb(&sink_event("a"));
+        sink.absorb(&sink_event(""));
+        sink.absorb(&sink_event("[DONE]"));
+        sink.absorb(&sink_event("b"));
+
+        assert_eq!(sink.seen, 4);
+        assert_eq!(sink.finish().unwrap(), "a\nb");
     }
 }

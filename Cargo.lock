@@ -4382,7 +4382,6 @@ dependencies = [
  "hyper-util",
  "metrics",
  "notify",
- "openai-reassembler",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
@@ -4431,9 +4430,9 @@ checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
 
 [[package]]
 name = "openai-reassembler"
-version = "0.3.0"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8f57fdc5018773d7eccd0b28ae14c09ad19d6f94ffd3d9bec32e6de02fa71ae3"
+checksum = "ec36463a4a852a85ed378040be873a26ce1316c61ee2a33a2080e45b4d20e0a0"
 dependencies = [
  "anyhow",
  "eventsource-stream",
