@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            UPDATE users SET\n                display_name = COALESCE($2, display_name),\n                avatar_url = COALESCE($3, avatar_url),\n                email = COALESCE($4, email),\n                batch_notifications_enabled = COALESCE($5, batch_notifications_enabled),\n                low_balance_threshold = CASE\n                    WHEN $6::boolean THEN $7\n                    ELSE low_balance_threshold\n                END,\n                low_balance_notification_sent = CASE\n                    WHEN $6::boolean THEN false\n                    ELSE low_balance_notification_sent\n                END,\n                zero_data_retention = COALESCE($8, zero_data_retention),\n                updated_at = NOW()\n            WHERE id = $1 AND user_type = 'organization' AND is_deleted = false\n            RETURNING id, username, email, display_name, avatar_url, auth_source, created_at, updated_at,\n                      is_admin, password_hash, external_user_id, payment_provider_id,\n                      batch_notifications_enabled, first_batch_email_sent,\n                      low_balance_notification_sent, low_balance_threshold,\n                      auto_topup_amount, auto_topup_threshold, auto_topup_monthly_limit, user_type, verified, zero_data_retention\n            ",
+  "query": "\n            UPDATE users SET\n                display_name = COALESCE($2, display_name),\n                avatar_url = COALESCE($3, avatar_url),\n                email = COALESCE($4, email),\n                batch_notifications_enabled = COALESCE($5, batch_notifications_enabled),\n                low_balance_threshold = CASE\n                    WHEN $6::boolean THEN $7\n                    ELSE low_balance_threshold\n                END,\n                low_balance_notification_sent = CASE\n                    WHEN $6::boolean THEN false\n                    ELSE low_balance_notification_sent\n                END,\n                zero_data_retention = COALESCE($8, zero_data_retention),\n                updated_at = NOW()\n            WHERE id = $1 AND user_type = 'organization' AND is_deleted = false\n            RETURNING id, username, email, display_name, avatar_url, auth_source, created_at, updated_at,\n                      is_admin, password_hash, external_user_id, payment_provider_id,\n                      batch_notifications_enabled, first_batch_email_sent,\n                      low_balance_notification_sent, low_balance_threshold,\n                      auto_topup_amount, auto_topup_threshold, auto_topup_monthly_limit, user_type, verified, invoicing_enabled, zero_data_retention\n            ",
   "describe": {
     "columns": [
       {
@@ -110,6 +110,11 @@
       },
       {
         "ordinal": 21,
+        "name": "invoicing_enabled",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 22,
         "name": "zero_data_retention",
         "type_info": "Bool"
       }
@@ -148,8 +153,9 @@
       true,
       false,
       false,
+      false,
       false
     ]
   },
-  "hash": "d480667b0bcb0a773591594ddcf85dc51db63def9d92e8714fbd102f147469f5"
+  "hash": "598de7b5ac212cc23bc35777ef69bde1c3e66e3c8dfed78d18533bc28273850f"
 }

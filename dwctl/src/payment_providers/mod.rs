@@ -244,6 +244,33 @@ pub trait PaymentProvider: Send + Sync {
     /// It only validates the session so the caller can safely enable auto top-up.
     async fn process_auto_topup_session(&self, db_pool: &PgPool, session_id: &str) -> Result<AutoTopupSetupResult>;
 
+    /// Accrue `amount_cents` onto the account's next invoice instead of
+    /// charging a card now.
+    ///
+    /// For accounts with `users.invoicing_enabled` - enterprise customers whose
+    /// procurement can't pay by card on demand. The charge is parked as a
+    /// *pending* line on the provider's customer record; the provider raises,
+    /// emails and chases one invoice per billing period covering everything
+    /// accrued in it. One invoice a month, not one per top-up, which is the
+    /// point of the feature.
+    ///
+    /// Needs **no saved payment method**: these accounts may never have a card.
+    ///
+    /// This is post-pay. Credits are granted at accrual, before any money
+    /// arrives - the account is being extended credit on terms, which is why
+    /// `invoicing_enabled` is set by us after approval rather than self-served.
+    /// Waiting for payment instead would leave an invoice-billed account at a
+    /// zero balance all month, with auto top-up unable to top anything up.
+    ///
+    /// Returns the provider's line-item ID for reconciliation.
+    ///
+    /// # Arguments
+    /// * `amount_cents` - Amount to accrue in cents
+    /// * `customer_id` - Payment provider customer ID
+    /// * `description` - Line description shown on the invoice
+    /// * `idempotency_key` - Prevents the same top-up accruing twice
+    async fn accrue_invoice_item(&self, amount_cents: i64, customer_id: &str, description: &str, idempotency_key: &str) -> Result<String>;
+
     /// Charge a saved payment method off-session for auto top-up.
     ///
     /// Creates a payment intent using the saved payment method and customer ID.

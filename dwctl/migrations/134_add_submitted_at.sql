@@ -1,0 +1,72 @@
+-- When the customer submitted the work, as opposed to when we dispatched it.
+--
+-- `timestamp` is the moment WE made the upstream call. For anything routed through
+-- fusillade — batch, async, AND flex — that is minutes to hours after the customer
+-- handed us the work, because the daemon dispatches on its own schedule. So for deferred
+-- work `timestamp` measures OUR dispatch behaviour rather than the customer's, and
+-- nothing currently records the difference.
+--
+-- That gap is the queue delay, and it is the one number needed to answer questions
+-- nothing can answer today:
+--
+--   * How long does deferrable work actually wait? (`timestamp - submitted_at`)
+--   * What does demand look like as SUBMITTED, so arrival patterns describe customers
+--     rather than the dispatcher? Fitting a daily shape or a burstiness figure to
+--     `timestamp` currently describes fusillade's scheduling.
+--   * Are we meeting the completion windows customers bought?
+--
+-- WHY A COLUMN AND NOT A JOIN
+--
+-- The value already reaches this service. fusillade stamps `x-fusillade-batch-created-at`
+-- on every dispatched request, `analytics_handler` already extracts it, and the batcher
+-- already carries it as `batch_created_at` — it is used to price at batch-creation time
+-- (`pricing_timestamp`) and then dropped. This migration persists what we already have.
+--
+-- The alternatives were worse. Exporting `fusillade.requests` for analysis would carry
+-- `body`, `response_body` and `api_key` — customer prompts and credentials — across tens
+-- of millions of rows. Exporting `fusillade.batches` avoids that but covers only batch and
+-- async: flex requests carry no batch id on the analytics row, so they would stay
+-- unmeasured entirely. A column on this table costs one timestamp per row, needs no join,
+-- and covers every tier uniformly.
+--
+-- FLEX IS COVERED. The header is not batch-specific despite its name: fusillade's claim
+-- path forwards a batchless request's metadata from its template "under the same header
+-- names as a batch's", sourcing the value from the request's own `created_at`. The column
+-- is therefore named `submitted_at` rather than `batch_created_at` — for flex there is no
+-- batch, and a name implying one would mislead every future reader.
+--
+-- ⚠ NULL MAY NOT SURVIVE AS NULL DOWNSTREAM
+--
+-- Analytics consumers of this table do not necessarily preserve nullability: a NULL can
+-- arrive as the type's zero instead. That is already true for text columns here, which is
+-- why `finish_reason` and `user_agent` treat the empty string as their not-measured
+-- sentinel rather than expecting NULL. For a timestamp, the zero is **the Unix epoch**.
+--
+-- So a duration computed as `submitted_at` to `timestamp` can come out as roughly 56 YEARS
+-- for every row that predates this migration, and for every realtime row. It will not
+-- error, it will not look obviously wrong on an axis labelled "seconds", and it would
+-- quietly make deferred work look catastrophically slow.
+--
+-- Every consumer must therefore exclude epoch values before computing a duration, and
+-- treat epoch as "not measured" rather than as a date.
+--
+-- NULLABLE, NO DEFAULT, NO BACKFILL, matching 125/126. Historical rows stay NULL because
+-- the value was never recorded and cannot be recovered: fusillade purges dispatched
+-- requests, so there is nothing left to join back to. Rows fill in from the deploy
+-- onwards, exactly as `user_agent` did.
+--
+-- Realtime rows are expected to be NULL rather than equal to `timestamp`. Nothing
+-- submits them ahead of time, so there is no distinct submission moment to record, and
+-- writing one would invent a zero-length queue that is really an absent concept. Read
+-- "no submitted_at" as "not deferred".
+
+ALTER TABLE http_analytics
+    ADD COLUMN IF NOT EXISTS submitted_at TIMESTAMPTZ;
+
+COMMENT ON COLUMN http_analytics.submitted_at IS
+    'When the customer submitted the work, for anything dispatched via fusillade (batch, async, flex). NULL for realtime and for rows predating migration 134. Queue delay is timestamp - submitted_at. NOTE: downstream consumers may surface NULL as the Unix epoch; exclude epoch before computing a duration.';
+
+-- Deliberately NO INDEX. This table is very large and the column is analytical, not
+-- transactional: nothing in the serving path filters or sorts on it, and the queries that
+-- do are served elsewhere. An index here would cost write throughput on the hottest
+-- insert path in the system to serve queries that never run against this database.
