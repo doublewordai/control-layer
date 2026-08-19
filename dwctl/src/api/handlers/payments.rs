@@ -502,9 +502,13 @@ pub async fn webhook_handler<P: PoolProvider>(
             // Routine in a multi-region deployment, not a fault: one Stripe
             // account serves both regional planes, and Stripe fans every
             // account-level event out to every configured endpoint, so each
-            // plane sees the other's sessions. Retrying cannot make a user this
-            // plane does not own appear, so anything but 2xx is an infinite
-            // retry loop.
+            // plane sees the other's sessions.
+            //
+            // Acked explicitly here rather than by the catch-all below, and
+            // deliberately NOT via the shared StatusCode mapping, which returns
+            // 404 for the front-channel caller. Retrying cannot make a user
+            // this plane does not own appear, so the webhook must tell Stripe
+            // to stop.
             //
             // warn rather than error because it is expected, and rather than
             // info because a genuinely orphaned *local* session is
