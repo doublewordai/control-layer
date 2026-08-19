@@ -3,17 +3,17 @@
 //! With `adaptive_concurrency` on, the controller discovers a model's
 //! sustainable in-flight count from downstream backpressure rather than running
 //! at its configured limit unconditionally. The configured limit is where each
-//! model starts; from there the controller owns the number, and
-//! `max_total_in_flight` is what bounds the process.
+//! model starts; from there the controller owns the number, and the daemon's
+//! memory gate is what bounds the process.
 //!
 //! There is deliberately no per-model ceiling. A static number is too high at
 //! one model replica and far too low at a hundred, which is the whole reason for
 //! this; capping the controller with one would leave the "too low" half unfixed.
-//! Memory is bounded by total in-flight across all models, not per model, so
-//! `max_total_in_flight` is the guard that actually corresponds to the risk -
-//! and if one model's discovered limit crowds out the others under that cap,
-//! that is a signal to scale fusillade out rather than something to arbitrate
-//! here.
+//!
+//! Because the configured limit is a starting point rather than a cap, this
+//! controller must not run without that gate: nothing here bounds growth, and
+//! nothing upstream reports local memory pressure. The daemon refuses to enable
+//! adaptive concurrency unless a gate is configured.
 //!
 //! Turning `adaptive_concurrency` off returns a model to running at its
 //! configured limit, exactly as before, so the flag is a safe thing to flip.
@@ -240,74 +240,8 @@ pub(super) fn available_capacity_for_model(limit: usize, in_flight: usize) -> us
     limit.saturating_sub(in_flight)
 }
 
-/// Scale per-model capacities down so their total fits the process-wide
-/// in-flight ceiling.
-///
-/// This is the only bound once the controller is running, and it is the one that
-/// matches the risk: memory is total in-flight times request size, across all
-/// models. Without it the first successful ramp exhausts the instance.
-///
-/// Hitting it is a signal to scale fusillade out rather than a state to sit in.
-/// Scaling is proportional so no model is starved
-/// outright, with any rounding remainder handed out largest-first so the result
-/// is deterministic.
-pub(super) fn apply_total_in_flight_cap(
-    capacities: &mut std::collections::HashMap<String, usize>,
-    total_in_flight: usize,
-    max_total_in_flight: usize,
-) {
-    if max_total_in_flight == 0 {
-        return;
-    }
-
-    let headroom = max_total_in_flight.saturating_sub(total_in_flight);
-    let requested: usize = capacities.values().sum();
-    if requested <= headroom {
-        return;
-    }
-    if headroom == 0 {
-        capacities.clear();
-        return;
-    }
-
-    let mut scaled: Vec<(String, usize)> = capacities
-        .iter()
-        .map(|(model, capacity)| {
-            // Integer division floors, so the scaled total never exceeds
-            // headroom before the remainder is distributed.
-            let share = (*capacity as u128 * headroom as u128 / requested as u128) as usize;
-            (model.clone(), share)
-        })
-        .collect();
-
-    // Largest original capacity first, model name as a tiebreak, so two daemons
-    // with identical inputs make identical decisions.
-    scaled.sort_by(|(left_model, _), (right_model, _)| {
-        let left = capacities.get(left_model).copied().unwrap_or(0);
-        let right = capacities.get(right_model).copied().unwrap_or(0);
-        right.cmp(&left).then_with(|| left_model.cmp(right_model))
-    });
-
-    let mut remainder = headroom.saturating_sub(scaled.iter().map(|(_, share)| *share).sum());
-    for (_, share) in scaled.iter_mut() {
-        if remainder == 0 {
-            break;
-        }
-        *share += 1;
-        remainder -= 1;
-    }
-
-    capacities.clear();
-    for (model, share) in scaled {
-        if share > 0 {
-            capacities.insert(model, share);
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
 
     use super::*;
 
@@ -489,56 +423,5 @@ mod tests {
 
         assert_eq!(controller.limit("a", 100), 80);
         assert_eq!(controller.limit("b", 100), 100);
-    }
-
-    #[test]
-    fn total_cap_leaves_capacities_alone_when_they_fit() {
-        let mut capacities = HashMap::from([("a".to_string(), 10), ("b".to_string(), 20)]);
-        apply_total_in_flight_cap(&mut capacities, 100, 1000);
-        assert_eq!(
-            capacities,
-            HashMap::from([("a".into(), 10), ("b".into(), 20)])
-        );
-    }
-
-    #[test]
-    fn total_cap_is_disabled_by_zero() {
-        let mut capacities = HashMap::from([("a".to_string(), 10)]);
-        apply_total_in_flight_cap(&mut capacities, 10_000, 0);
-        assert_eq!(capacities, HashMap::from([("a".into(), 10)]));
-    }
-
-    #[test]
-    fn total_cap_scales_proportionally_and_never_exceeds_headroom() {
-        // 60 in flight against a ceiling of 100 leaves 40 to hand out, against
-        // 120 requested.
-        let mut capacities = HashMap::from([
-            ("a".to_string(), 60),
-            ("b".to_string(), 40),
-            ("c".to_string(), 20),
-        ]);
-        apply_total_in_flight_cap(&mut capacities, 60, 100);
-
-        let total: usize = capacities.values().sum();
-        assert_eq!(total, 40);
-        assert!(capacities["a"] > capacities["b"]);
-        assert!(capacities["b"] > capacities["c"]);
-    }
-
-    #[test]
-    fn total_cap_yields_nothing_when_already_at_the_ceiling() {
-        let mut capacities = HashMap::from([("a".to_string(), 10)]);
-        apply_total_in_flight_cap(&mut capacities, 100, 100);
-        assert!(capacities.is_empty());
-    }
-
-    #[test]
-    fn total_cap_keeps_small_models_alive_via_the_remainder() {
-        // Proportional flooring alone would give the small model zero and starve
-        // it entirely; the remainder pass has to be there.
-        let mut capacities = HashMap::from([("big".to_string(), 100), ("small".to_string(), 1)]);
-        apply_total_in_flight_cap(&mut capacities, 0, 10);
-
-        assert_eq!(capacities.values().sum::<usize>(), 10);
     }
 }

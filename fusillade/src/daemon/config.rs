@@ -111,7 +111,7 @@ pub struct DaemonConfig {
     ///
     /// With `adaptive_concurrency` off these are the limits, unchanged. With it
     /// on they are where each model starts, and the controller owns the number
-    /// from there - bounded by `max_total_in_flight`, not per model.
+    /// from there - bounded by the memory gate, not per model.
     #[serde(
         default = "default_model_concurrency_limits",
         serialize_with = "serialize_model_concurrency_limits",
@@ -123,8 +123,9 @@ pub struct DaemonConfig {
     ///
     /// Off by default, and turning it off returns every model to its configured
     /// value exactly as before, so the flag is safe to flip either way. While it
-    /// is on a model's limit can go above its configured value, so
-    /// `max_total_in_flight` needs setting first.
+    /// is on a model's limit can go above its configured value, so the daemon
+    /// refuses to enable it unless `memory_gate_high_fraction` is set - there
+    /// would otherwise be nothing bounding growth.
     #[serde(default)]
     pub adaptive_concurrency: bool,
     /// What to multiply a model's limit by each time it goes up.
@@ -141,16 +142,27 @@ pub struct DaemonConfig {
     /// dropped.
     #[serde(default = "default_adaptive_cut_factor")]
     pub adaptive_cut_factor: f64,
-    /// Hard ceiling on this process's total in-flight requests across all
-    /// models. Zero disables it.
+    /// Fraction of this process's own memory limit at or above which claiming
+    /// stops. Zero disables the gate.
     ///
-    /// This is the bound that matters when `adaptive_concurrency` is on: memory
-    /// is total in-flight times request size, across all models, so a per-model
-    /// cap would not correspond to the risk. When it binds, per-model capacities
-    /// are scaled down proportionally - which is a signal to scale fusillade out
-    /// rather than a state to sit in.
+    /// A count of in-flight requests cannot express this: per-request bytes
+    /// vary by more than an order of magnitude between workloads, so no count is
+    /// safe across all of them. This bounds the thing that actually kills the
+    /// process, by measuring it rather than predicting it: above the mark the
+    /// daemon claims nothing, in-flight drains as
+    /// requests finish, and claiming resumes below
+    /// `memory_gate_low_fraction`. Nothing upstream signals local memory
+    /// pressure, so with `adaptive_concurrency` on this is the only control that
+    /// corresponds to running out of memory.
     #[serde(default)]
-    pub max_total_in_flight: usize,
+    pub memory_gate_high_fraction: f64,
+    /// Fraction of the memory limit below which claiming resumes. Must be above
+    /// zero and below `memory_gate_high_fraction`, or the gate stays off.
+    ///
+    /// Separate from the high mark so the gate does not flip on and off every
+    /// claim cycle while usage sits on the boundary.
+    #[serde(default = "default_memory_gate_low_fraction")]
+    pub memory_gate_low_fraction: f64,
     #[serde(skip, default = "default_model_escalations")]
     pub model_escalations: Arc<dashmap::DashMap<String, ModelEscalationConfig>>,
     #[serde(default)]
@@ -394,6 +406,12 @@ fn default_upload_stall_poll_ms() -> u64 {
     crate::http::DEFAULT_UPLOAD_STALL_POLL.as_millis() as u64
 }
 
+/// Ten points under a 0.75 high mark: wide enough that the gate does not flap,
+/// narrow enough that a pod does not sit idle far below its ceiling.
+fn default_memory_gate_low_fraction() -> f64 {
+    0.65
+}
+
 fn default_adaptive_growth_factor() -> f64 {
     1.5
 }
@@ -467,7 +485,8 @@ impl Default for DaemonConfig {
             adaptive_concurrency: false,
             adaptive_growth_factor: default_adaptive_growth_factor(),
             adaptive_cut_factor: default_adaptive_cut_factor(),
-            max_total_in_flight: 0,
+            memory_gate_high_fraction: 0.0,
+            memory_gate_low_fraction: default_memory_gate_low_fraction(),
             model_escalations: default_model_escalations(),
             inject_deadline_priority: false,
             background_concurrency_limit: 0,
@@ -592,7 +611,7 @@ mod tests {
         // queue. It has to be a deliberate flip.
         let config = DaemonConfig::default();
         assert!(!config.adaptive_concurrency);
-        assert_eq!(config.max_total_in_flight, 0);
+        assert_eq!(config.memory_gate_high_fraction, 0.0);
     }
 
     #[test]
@@ -608,19 +627,19 @@ mod tests {
             serialized.remove("adaptive_concurrency");
             serialized.remove("adaptive_growth_factor");
             serialized.remove("adaptive_cut_factor");
-            serialized.remove("max_total_in_flight");
+            serialized.remove("memory_gate_high_fraction");
         }
         let decoded: DaemonConfig = serde_json::from_value(serialized).unwrap();
         assert!(!decoded.adaptive_concurrency);
         assert_eq!(decoded.adaptive_growth_factor, 1.5);
         assert_eq!(decoded.adaptive_cut_factor, 0.8);
-        assert_eq!(decoded.max_total_in_flight, 0);
+        assert_eq!(decoded.memory_gate_high_fraction, 0.0);
 
         let configured = DaemonConfig {
             adaptive_concurrency: true,
             adaptive_growth_factor: 2.0,
             adaptive_cut_factor: 0.5,
-            max_total_in_flight: 40_000,
+            memory_gate_high_fraction: 0.75,
             ..DaemonConfig::default()
         };
         let decoded: DaemonConfig =
@@ -628,7 +647,7 @@ mod tests {
         assert!(decoded.adaptive_concurrency);
         assert_eq!(decoded.adaptive_growth_factor, 2.0);
         assert_eq!(decoded.adaptive_cut_factor, 0.5);
-        assert_eq!(decoded.max_total_in_flight, 40_000);
+        assert_eq!(decoded.memory_gate_high_fraction, 0.75);
     }
 
     #[test]

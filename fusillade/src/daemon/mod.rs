@@ -7,8 +7,10 @@ use std::time::Duration;
 
 mod adaptive_concurrency;
 pub mod config;
+mod memory_gate;
 
 use adaptive_concurrency::{AdaptiveConcurrencyController, ConcurrencyAdjustment};
+use memory_gate::{CgroupMemorySource, MemoryGate};
 use metrics::{counter, gauge, histogram};
 use tokio::task::JoinSet;
 
@@ -94,6 +96,17 @@ pub const BACKGROUND_DYNAMO_PRIORITY: i32 = i32::MIN;
 /// Lowest priority an SLA request may receive, reserving `i32::MIN` for
 /// background work.
 pub const MIN_SLA_DYNAMO_PRIORITY: i32 = i32::MIN + 1;
+
+/// Whether the adaptive controller may run.
+///
+/// It treats a model's configured limit as a starting point and grows past it,
+/// so with it on nothing else bounds in-flight work. Pairing it with the memory
+/// gate is not advice, it is the only thing standing between a successful ramp
+/// and an OOM, so the daemon refuses the combination rather than trusting it to
+/// be configured correctly.
+fn adaptive_concurrency_permitted(requested: bool, has_memory_gate: bool) -> bool {
+    !requested || has_memory_gate
+}
 
 fn background_capacity(ordinary_limit: usize, background_limit: usize, in_flight: usize) -> usize {
     ordinary_limit
@@ -416,6 +429,12 @@ where
     /// ceiling; HTTP 529 responses reduce this daemon's effective ceiling and
     /// successful responses recover it gradually.
     adaptive_concurrency: Arc<AdaptiveConcurrencyController>,
+    /// Suppresses claiming while this process is near its own memory limit.
+    /// `None` when disabled by config or when there is no readable cgroup limit.
+    /// The adaptive controller grows on success and nothing upstream reports
+    /// local memory pressure, so this is the only bound that corresponds to
+    /// running out of memory.
+    memory_gate: Option<Arc<MemoryGate>>,
     /// Per-user in-flight request counts across all models, used to prioritise
     /// users with fewer active requests during claim (per-user fair scheduling).
     user_requests_in_flight: Arc<dashmap::DashMap<String, AtomicUsize>>,
@@ -462,8 +481,36 @@ where
             config.adaptive_growth_factor,
             config.adaptive_cut_factor,
         ));
+        let memory_gate = MemoryGate::new(
+            config.memory_gate_high_fraction,
+            config.memory_gate_low_fraction,
+            Box::new(CgroupMemorySource),
+        )
+        .map(Arc::new);
+
+        // The controller treats a model's configured limit as a starting point
+        // and grows past it, so with it on nothing else bounds in-flight work.
+        // Running that combination is how a pod OOMs itself, so refuse it: fall
+        // back to the configured limits, which is the behaviour without the
+        // controller and is known to be survivable.
+        let adaptive_concurrency_enabled = if adaptive_concurrency_permitted(
+            config.adaptive_concurrency,
+            memory_gate.is_some(),
+        ) {
+            config.adaptive_concurrency
+        } else {
+            crate::background_error!(
+                "adaptive_concurrency_without_memory_gate",
+                Critical,
+                "adaptive_concurrency is on but no memory gate is configured; refusing to enable \
+                 it. Set memory_gate_high_fraction (and keep memory_gate_low_fraction below it). \
+                 Running at configured per-model limits instead."
+            );
+            false
+        };
         let config = DaemonConfig {
             should_retry,
+            adaptive_concurrency: adaptive_concurrency_enabled,
             ..config
         };
 
@@ -475,6 +522,7 @@ where
             processor: Arc::new(DefaultRequestProcessor),
             requests_in_flight: Arc::new(dashmap::DashMap::new()),
             adaptive_concurrency,
+            memory_gate,
             user_requests_in_flight: Arc::new(dashmap::DashMap::new()),
             leak_buckets: Arc::new(dashmap::DashMap::new()),
             user_throughput: Arc::new(dashmap::DashMap::new()),
@@ -542,8 +590,22 @@ where
             .sum()
     }
 
+    /// Whether local memory pressure should suppress claiming this cycle.
+    ///
+    /// Checked before per-model capacity is computed, because when it bites the
+    /// answer is "nothing, from any model" - unlike the total in-flight cap,
+    /// which scales models down proportionally.
+    fn memory_pressure_blocks_claiming(&self) -> bool {
+        self.memory_gate
+            .as_ref()
+            .is_some_and(|gate| gate.should_block(self.total_in_flight()))
+    }
+
     fn available_capacity(&self) -> HashMap<String, usize> {
-        let mut capacities: HashMap<String, usize> = self
+        if self.memory_pressure_blocks_claiming() {
+            return HashMap::new();
+        }
+        let capacities: HashMap<String, usize> = self
             .config
             .model_concurrency_limits
             .iter()
@@ -562,17 +624,15 @@ where
             })
             .collect();
 
-        adaptive_concurrency::apply_total_in_flight_cap(
-            &mut capacities,
-            self.total_in_flight(),
-            self.config.max_total_in_flight,
-        );
         capacities
     }
 
     fn background_available_capacity(&self) -> HashMap<String, usize> {
+        if self.memory_pressure_blocks_claiming() {
+            return HashMap::new();
+        }
         let background_limit = self.config.background_concurrency_limit;
-        let mut capacities: HashMap<String, usize> = self
+        let capacities: HashMap<String, usize> = self
             .config
             .model_concurrency_limits
             .iter()
@@ -592,11 +652,6 @@ where
 
         // Background work occupies the same memory as foreground work, so it
         // has to answer to the same process-wide ceiling.
-        adaptive_concurrency::apply_total_in_flight_cap(
-            &mut capacities,
-            self.total_in_flight(),
-            self.config.max_total_in_flight,
-        );
         capacities
     }
 
@@ -2334,6 +2389,19 @@ mod tests {
             claim_loop_kinds_for_mode(DaemonMode::BatchOnly, false, false, false, false).is_err(),
             "batch-only mode should fail loudly when storage cannot claim batches"
         );
+    }
+
+    /// The controller grows past a model's configured limit, so with it on the
+    /// memory gate is the only bound left. Enabling one without the other is the
+    /// configuration that OOMs a pod, so it is refused rather than trusted.
+    #[test]
+    fn adaptive_concurrency_requires_a_memory_gate() {
+        assert!(!adaptive_concurrency_permitted(true, false), "unbounded");
+        assert!(adaptive_concurrency_permitted(true, true));
+        // Without the controller a model cannot exceed its configured limit, so
+        // the gate is optional there.
+        assert!(adaptive_concurrency_permitted(false, false));
+        assert!(adaptive_concurrency_permitted(false, true));
     }
 
     #[test]

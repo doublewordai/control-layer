@@ -1475,6 +1475,10 @@ impl From<DaemonMode> for fusillade::DaemonMode {
     }
 }
 
+fn default_memory_gate_low_fraction() -> f64 {
+    0.65
+}
+
 fn default_adaptive_growth_factor() -> f64 {
     1.5
 }
@@ -1510,8 +1514,9 @@ pub struct DaemonConfig {
     /// using its configured value as a hard ceiling (default: false).
     ///
     /// When on, `default_model_concurrency` and per-model `batch_capacity`
-    /// become starting points rather than ceilings, and `max_total_in_flight`
-    /// becomes the ceiling.
+    /// become starting points rather than ceilings, and the memory gate becomes
+    /// the bound. The daemon refuses to enable this without
+    /// `memory_gate_high_fraction` set, since nothing else would bound growth.
     #[serde(default)]
     pub adaptive_concurrency: bool,
 
@@ -1524,13 +1529,20 @@ pub struct DaemonConfig {
     #[serde(default = "default_adaptive_cut_factor")]
     pub adaptive_cut_factor: f64,
 
-    /// Hard ceiling on this instance's total in-flight requests across all
-    /// models; 0 disables it (default: 0).
+    /// Fraction of the daemon's own memory limit at or above which it stops
+    /// claiming (default: 0, disabled).
     ///
-    /// Per-model ceilings still apply, but they bound each model separately and
-    /// can sum well above what one instance can hold.
+    /// This is the process-wide bound. A count of in-flight requests cannot be
+    /// it, because per-request memory varies by more than an order of magnitude
+    /// between workloads; this measures the pod's actual usage instead. Required
+    /// when `adaptive_concurrency` is on.
     #[serde(default)]
-    pub max_total_in_flight: usize,
+    pub memory_gate_high_fraction: f64,
+
+    /// Fraction of the memory limit below which claiming resumes
+    /// (default: 0.65). Must be below `memory_gate_high_fraction`.
+    #[serde(default = "default_memory_gate_low_fraction")]
+    pub memory_gate_low_fraction: f64,
 
     /// How long to sleep between claim iterations in milliseconds (default: 1000)
     pub claim_interval_ms: u64,
@@ -1940,7 +1952,8 @@ impl Default for DaemonConfig {
             adaptive_concurrency: false,
             adaptive_growth_factor: default_adaptive_growth_factor(),
             adaptive_cut_factor: default_adaptive_cut_factor(),
-            max_total_in_flight: 0,
+            memory_gate_high_fraction: 0.0,
+            memory_gate_low_fraction: default_memory_gate_low_fraction(),
             claim_interval_ms: 1000,
             max_retries: Some(1000),
             stop_before_deadline_ms: Some(900_000),
@@ -2024,7 +2037,8 @@ impl DaemonConfig {
             adaptive_concurrency: self.adaptive_concurrency,
             adaptive_growth_factor: self.adaptive_growth_factor,
             adaptive_cut_factor: self.adaptive_cut_factor,
-            max_total_in_flight: self.max_total_in_flight,
+            memory_gate_high_fraction: self.memory_gate_high_fraction,
+            memory_gate_low_fraction: self.memory_gate_low_fraction,
             model_escalations: Arc::new(DashMap::from_iter(self.model_escalations.clone())),
             claim_interval_ms: self.claim_interval_ms,
             max_retries: self.max_retries,
@@ -4027,7 +4041,7 @@ background_services:
             assert!(!fusillade_config.adaptive_concurrency);
             assert_eq!(fusillade_config.adaptive_growth_factor, 1.5);
             assert_eq!(fusillade_config.adaptive_cut_factor, 0.8);
-            assert_eq!(fusillade_config.max_total_in_flight, 0);
+            assert_eq!(fusillade_config.memory_gate_high_fraction, 0.0);
 
             jail.create_file(
                 "test.yaml",
@@ -4038,7 +4052,7 @@ background_services:
     adaptive_concurrency: true
     adaptive_growth_factor: 2.0
     adaptive_cut_factor: 0.5
-    max_total_in_flight: 40000
+    memory_gate_high_fraction: 0.75
 "#,
             )?;
             let config = Config::load(&args)?;
@@ -4046,7 +4060,7 @@ background_services:
             assert!(fusillade_config.adaptive_concurrency);
             assert_eq!(fusillade_config.adaptive_growth_factor, 2.0);
             assert_eq!(fusillade_config.adaptive_cut_factor, 0.5);
-            assert_eq!(fusillade_config.max_total_in_flight, 40_000);
+            assert_eq!(fusillade_config.memory_gate_high_fraction, 0.75);
 
             Ok(())
         });
