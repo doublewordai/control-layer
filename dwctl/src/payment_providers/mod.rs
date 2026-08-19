@@ -64,6 +64,19 @@ pub enum PaymentError {
 
     #[error("Automatic top-up payment was declined: {0:?}")]
     AutoTopupDeclined(AutoTopupDeclineKind),
+
+    /// The session's `client_reference_id` names a user this plane has never
+    /// heard of, which in a multi-region deployment overwhelmingly means the
+    /// session belongs to another region.
+    ///
+    /// Stripe delivers account-level events to *every* configured endpoint
+    /// regardless of which plane created the session, so with one Stripe
+    /// account and two planes each receives the other's events as a matter of
+    /// course. Treating that as an error makes Stripe retry a foreign event
+    /// against this plane forever, so it is deliberately a 2xx no-op — see the
+    /// StatusCode mapping below.
+    #[error("Payment session references a user unknown to this plane: {0}")]
+    UnknownReference(String),
 }
 
 impl From<PaymentError> for StatusCode {
@@ -72,6 +85,9 @@ impl From<PaymentError> for StatusCode {
             PaymentError::PaymentNotCompleted => StatusCode::PAYMENT_REQUIRED,
             PaymentError::InvalidData(_) | PaymentError::NoCustomerId => StatusCode::BAD_REQUEST,
             PaymentError::AlreadyProcessed => StatusCode::OK,
+            // 2xx on purpose: retrying cannot make a user this plane does not
+            // own appear, so any other status buys an infinite Stripe retry.
+            PaymentError::UnknownReference(_) => StatusCode::OK,
             PaymentError::AutoTopupDeclined(_) => StatusCode::PAYMENT_REQUIRED,
             PaymentError::ProviderApi(_) | PaymentError::Database(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }

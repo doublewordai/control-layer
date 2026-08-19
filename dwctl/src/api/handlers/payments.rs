@@ -498,6 +498,27 @@ pub async fn webhook_handler<P: PoolProvider>(
             tracing::trace!("Webhook event already processed (idempotent): {}", event.event_type);
             StatusCode::OK
         }
+        Err(payment_providers::PaymentError::UnknownReference(reference)) => {
+            // Routine in a multi-region deployment, not a fault: one Stripe
+            // account serves both regional planes, and Stripe fans every
+            // account-level event out to every configured endpoint, so each
+            // plane sees the other's sessions. Retrying cannot make a user this
+            // plane does not own appear, so anything but 2xx is an infinite
+            // retry loop.
+            //
+            // warn rather than error because it is expected, and rather than
+            // info because a genuinely orphaned *local* session is
+            // indistinguishable from here and must stay visible. The volume is
+            // the other region's payment count — events, not requests — so this
+            // stays quiet. `client_reference_id` is structured for alerting if
+            // orphans ever need chasing.
+            tracing::warn!(
+                event_type = %event.event_type,
+                client_reference_id = %reference,
+                "Ignoring payment webhook for a user unknown to this plane (expected for another region's events)"
+            );
+            StatusCode::OK
+        }
         Err(payment_providers::PaymentError::Database(_)) => {
             // Transient DB errors: return 500 so the payment provider retries
             tracing::error!("Transient database error processing webhook event: {}", event.event_type);

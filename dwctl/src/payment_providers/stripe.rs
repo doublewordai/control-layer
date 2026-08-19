@@ -636,14 +636,22 @@ impl PaymentProvider for StripeProvider {
         let description = {
             let mut users = crate::db::handlers::users::Users::new(&mut conn);
 
-            // Verify creditor user exists before proceeding
+            // Verify creditor user exists before proceeding.
+            //
+            // Bail rather than continue. With one Stripe account serving both
+            // regional planes, every plane receives every plane's events, so an
+            // unknown creditor is the *expected* shape of a foreign region's
+            // session rather than a rarity. Continuing would drive the credit
+            // insert below onto a user_id with no row, failing its foreign key
+            // as a plain sqlx error — which maps to 500 and makes Stripe retry
+            // the other region's event against this plane indefinitely.
+            //
+            // A genuinely orphaned local session is indistinguishable from here
+            // and gets the same treatment; the log line in the webhook handler
+            // is what keeps it visible.
             let creditor_user = users.get_by_id(payment_session.creditor_id).await?;
             if creditor_user.is_none() {
-                tracing::error!(
-                    "Creditor user {} not found for payment session {}. This indicates a data integrity issue.",
-                    payment_session.creditor_id,
-                    session_id
-                );
+                return Err(PaymentError::UnknownReference(payment_session.creditor_id.to_string()));
             }
 
             // Build description with payer information
@@ -1069,6 +1077,34 @@ mod tests {
             stripe::ApiErrorsType::InvalidRequestError,
         ));
         assert!(matches!(err, PaymentError::AlreadyProcessed), "got {err:?}");
+    }
+
+    // The whole point of COR-594: a foreign region's event must not be retried
+    // forever. Stripe fans account-level events out to every endpoint, so with
+    // one account and two planes each sees the other's sessions; anything but a
+    // 2xx here is an infinite retry loop, because retrying cannot make a user
+    // this plane does not own appear.
+    #[test]
+    fn test_unknown_reference_is_acknowledged_not_retried() {
+        let status: axum::http::StatusCode = PaymentError::UnknownReference("some-user-id".to_string()).into();
+        assert_eq!(
+            status,
+            axum::http::StatusCode::OK,
+            "an unknown creditor must be acked, or Stripe retries it forever"
+        );
+    }
+
+    // The other half of the same guarantee. Widening the ack to cover genuine
+    // database failures would silently drop real payments, so the distinction
+    // between "not ours" and "we could not process it" has to hold.
+    #[test]
+    fn test_database_errors_are_still_retried() {
+        let status: axum::http::StatusCode = PaymentError::Database(sqlx::Error::PoolClosed).into();
+        assert_eq!(
+            status,
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "transient database failures must keep asking Stripe to retry"
+        );
     }
 
     #[test]
