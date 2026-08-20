@@ -1528,8 +1528,11 @@ pub(crate) async fn get_request_detail<P: PoolProvider>(
 }
 
 const LIST_REQUESTS_COUNT_SQL: &str = r#"
-    WITH candidates AS (
-        SELECT request.id
+    -- Two independent scalar counts, NOT one union CTE: the CTE fences the
+    -- planner out of a parallel scan on the large live arm, turning a
+    -- seconds-long count into tens of seconds at production scale.
+    SELECT (
+        SELECT COUNT(*)
         FROM requests request
         WHERE request.created_by IS NOT NULL
           AND ($1::text IS NULL OR request.created_by = $1)
@@ -1538,10 +1541,8 @@ const LIST_REQUESTS_COUNT_SQL: &str = r#"
           AND ($4::timestamptz IS NULL OR request.created_at >= $4)
           AND ($5::timestamptz IS NULL OR request.created_at <= $5)
           AND ($6::text[] IS NULL OR request.service_tier = ANY($6))
-
-        UNION ALL
-
-        SELECT object.object_id
+    ) + (
+        SELECT COUNT(*)
         FROM retained_response_buckets bucket
         JOIN pg_namespace namespace
           ON namespace.nspname = bucket.partition_schema
@@ -1585,8 +1586,7 @@ const LIST_REQUESTS_COUNT_SQL: &str = r#"
               SELECT 1 FROM requests live
               WHERE live.id = object.object_id AND live.created_by IS NOT NULL
           )
-    )
-    SELECT COUNT(*)::bigint FROM candidates
+    )::bigint
 "#;
 
 fn list_requests_page_sql(active_first: bool) -> String {
@@ -1595,10 +1595,24 @@ fn list_requests_page_sql(active_first: bool) -> String {
     } else {
         "sort_created_at DESC, sort_id DESC"
     };
+    // Each arm carries its own ORDER BY + LIMIT so the planner can satisfy
+    // the page from ordered indexes (Merge Append over two bounded arms)
+    // instead of sorting the whole union. The live arm's expressions mirror
+    // idx_requests_active_first_tier / idx_requests_created_tier exactly.
+    let live_order = if active_first {
+        "CASE request.state WHEN 'processing' THEN 0 WHEN 'claimed' THEN 1 WHEN 'pending' THEN 2 ELSE 3 END ASC, request.created_at DESC, request.id DESC"
+    } else {
+        "request.created_at DESC, request.id DESC"
+    };
+    let retained_order = if active_first {
+        "CASE object.state WHEN 'processing' THEN 0 WHEN 'claimed' THEN 1 WHEN 'pending' THEN 2 ELSE 3 END ASC, object.created_at DESC, object.object_id DESC"
+    } else {
+        "object.created_at DESC, object.object_id DESC"
+    };
     format!(
         r#"
         WITH candidates AS (
-            SELECT
+            (SELECT
                 request.id AS sort_id,
                 request.state AS sort_state,
                 request.created_at AS sort_created_at,
@@ -1642,10 +1656,12 @@ fn list_requests_page_sql(active_first: bool) -> String {
               AND ($4::timestamptz IS NULL OR request.created_at >= $4)
               AND ($5::timestamptz IS NULL OR request.created_at <= $5)
               AND ($6::text[] IS NULL OR request.service_tier = ANY($6))
+            ORDER BY {live_order}
+            LIMIT $7 + $8)
 
             UNION ALL
 
-            SELECT
+            (SELECT
                 object.object_id AS sort_id,
                 object.state AS sort_state,
                 object.created_at AS sort_created_at,
@@ -1709,6 +1725,8 @@ fn list_requests_page_sql(active_first: bool) -> String {
                   SELECT 1 FROM requests live
                   WHERE live.id = object.object_id AND live.created_by IS NOT NULL
               )
+            ORDER BY {retained_order}
+            LIMIT $7 + $8)
         )
         SELECT retained, live_summary, delete_on, group_id, object_kind,
                object_id, request_id, head_step_id, created_by, service_tier,
