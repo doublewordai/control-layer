@@ -745,6 +745,11 @@ async fn test_daemon_cuts_claim_capacity_after_escalated_model_529(pool: sqlx::P
         model_concurrency_limits,
         model_escalations,
         adaptive_concurrency: true,
+        // The controller is refused without a gate, since the configured limit
+        // becomes a starting point and nothing else would bound growth. There is
+        // no cgroup limit under test, so the gate permits the controller and then
+        // never engages.
+        memory_gate_high_fraction: 0.75,
         // Larger than anything this test dispatches, so the limit only moves
         // downward and the assertion is about the cut alone.
         max_retries: Some(3),
@@ -883,6 +888,11 @@ async fn adaptive_concurrency_grows_past_the_configured_limit(pool: sqlx::PgPool
         claim_interval_ms: 10,
         model_concurrency_limits,
         adaptive_concurrency: true,
+        // The controller is refused without a gate, since the configured limit
+        // becomes a starting point and nothing else would bound growth. There is
+        // no cgroup limit under test, so the gate permits the controller and then
+        // never engages.
+        memory_gate_high_fraction: 0.75,
         max_retries: Some(3),
         stop_before_deadline_ms: None,
         status_log_interval_ms: None,
@@ -985,6 +995,11 @@ async fn background_529_does_not_throttle_foreground_claims(pool: sqlx::PgPool) 
         background_concurrency_limit: 4,
         inject_deadline_priority: true,
         adaptive_concurrency: true,
+        // The controller is refused without a gate, since the configured limit
+        // becomes a starting point and nothing else would bound growth. There is
+        // no cgroup limit under test, so the gate permits the controller and then
+        // never engages.
+        memory_gate_high_fraction: 0.75,
         max_retries: Some(3),
         stop_before_deadline_ms: None,
         backoff_ms: 60_000,
