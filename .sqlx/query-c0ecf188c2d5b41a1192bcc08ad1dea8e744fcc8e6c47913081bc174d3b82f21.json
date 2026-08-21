@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "DELETE FROM api_keys WHERE user_id = $1",
+  "query": "DELETE FROM api_keys WHERE user_id = $1 OR created_by = $1",
   "describe": {
     "columns": [],
     "parameters": {
@@ -10,5 +10,5 @@
     },
     "nullable": []
   },
-  "hash": "818ac4c6c5e147033835caf32d30dd4ba7eb4bb57de4bfbd714330daf81ceb36"
+  "hash": "c0ecf188c2d5b41a1192bcc08ad1dea8e744fcc8e6c47913081bc174d3b82f21"
 }
