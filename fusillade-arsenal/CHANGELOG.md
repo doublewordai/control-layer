@@ -1,5 +1,12 @@
 # Changelog
 
+## [4.1.0](https://github.com/doublewordai/control-layer/compare/fusillade-arsenal-v4.0.0...fusillade-arsenal-v4.1.0) (2026-08-21)
+
+
+### Features
+
+* **fusillade:** own batch finalization in a daemon loop, decouple no… ([#1462](https://github.com/doublewordai/control-layer/issues/1462)) ([83066bb](https://github.com/doublewordai/control-layer/commit/83066bb951405f67569d2776ad96ca61a5c372e6))
+
 ## [4.0.0](https://github.com/doublewordai/control-layer/compare/fusillade-arsenal-v3.1.0...fusillade-arsenal-v4.0.0) (2026-08-06)
 
 
