@@ -492,6 +492,66 @@ cache:
   #   default_read_multiplier: 0.1
   #   default_min_prefix_tokens: 1024
 
+# Mid-stream continuation (the resume layer): when a streaming generation dies
+# mid-output, rebuild the prompt + partial output as token-ids (tokenizer-svc
+# /v1/render) and resume it as a /v1/completions request through the model's
+# completions pool, splicing the result into the client's still-open stream with
+# merged billing. Per-model activation is DATA, not config: a model rescues only
+# when its composite carries a completions pool with an enabled member.
+continuation:
+  # Global kill switch. When false (default), the layer is not added to the
+  # stack and the request path is byte-identical to a build without it.
+  # Set via environment: DWCTL_CONTINUATION__ENABLED=true
+  enabled: false
+  # Base URL of the tokenizer-svc used to render resume prefixes. Unset
+  # (default) falls back to cache.tokenizer_url — the same service serves both
+  # layers; set only to split them.
+  # Set via environment: DWCTL_CONTINUATION__TOKENIZER_URL=http://tokenizer-svc:8088
+  # tokenizer_url: http://localhost:8088
+  # Per-origin eligibility gates (derived from the API key's purpose, the same
+  # signal analytics uses for request_origin). Permanent config, not rollout
+  # scaffolding: resume economics differ per origin (paying a provider again vs
+  # a plain retry behind fusillade's masking).
+  origins:
+    # Set via environment: DWCTL_CONTINUATION__ORIGINS__REALTIME=true
+    realtime: true
+    # Set via environment: DWCTL_CONTINUATION__ORIGINS__BATCH=true
+    batch: false
+    # Set via environment: DWCTL_CONTINUATION__ORIGINS__PLAYGROUND=true
+    playground: false
+  # Maximum resume legs for one logical stream (a leg that itself dies re-enters
+  # the chain). Exhausted -> the ORIGINAL death surfaces, exactly as unresumed.
+  # Set via environment: DWCTL_CONTINUATION__MAX_ATTEMPTS=2
+  max_attempts: 2
+  # Seconds per resume attempt (render + continuation-target time-to-first-byte)
+  # AND the inter-frame stall timer. The stall timer arms only after leg 1's
+  # first event — pre-first-token time is admission/prefill and is never bounded
+  # here. Cold provider prefill dominates on long prompts; harness TTFB curves
+  # inform the value.
+  # Set via environment: DWCTL_CONTINUATION__RESUME_DEADLINE_SECS=20
+  resume_deadline_secs: 20
+  # Cap on the retained request body + accumulated generation per stream.
+  # Exceeded -> the stream is marked non-resumable (outcome cap_exceeded) and
+  # the buffer dropped; the stream itself is unaffected.
+  # Set via environment: DWCTL_CONTINUATION__MAX_BUFFER_BYTES=2097152
+  max_buffer_bytes: 2097152
+  # Dynamo scheduler priority on resume legs. Realtime runs 0, batch negative —
+  # positive puts resumes ahead of new work, deliberately: a resume finishes a
+  # stream already accepted, on a seam budget. Onwards strips the field for
+  # pool members that would reject it (third-party providers).
+  # Set via environment: DWCTL_CONTINUATION__PRIORITY=100
+  priority: 100
+  # Per-model cap on concurrently in-flight resume legs — bounds the stampede a
+  # flapping model can send at its continuation provider during an incident.
+  # Set via environment: DWCTL_CONTINUATION__MAX_INFLIGHT_PER_MODEL=8
+  max_inflight_per_model: 8
+  # Reconstructor per model alias, for models whose reasoning/tool-call streams
+  # have a byte-exactness verdict from the fidelity harness ("dsv4" = the
+  # DeepSeek-V4/DSML family). Absent from the map -> plain-content only;
+  # reasoning/tool streams disarm safely instead of resuming.
+  # Set via environment: DWCTL_CONTINUATION__MODEL_RECONSTRUCTORS='{"deepseek-ai/DeepSeek-V4-Flash":"dsv4"}'
+  model_reconstructors: {}
+
 # Background services configuration
 # Controls which background services run on this instance
 background_services:

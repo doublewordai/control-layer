@@ -150,6 +150,7 @@ mod tests {
                 auth_header_name: None,
                 auth_header_prefix: None,
                 reasoning_translation: None,
+                accepts_scheduling_priority: false,
                 created_by: user.id,
             })
             .await
@@ -206,6 +207,7 @@ mod tests {
                 auth_header_name: None,
                 auth_header_prefix: None,
                 reasoning_translation: None,
+                accepts_scheduling_priority: false,
                 created_by: user.id,
             })
             .await
@@ -374,6 +376,7 @@ mod tests {
                 auth_header_name: None,
                 auth_header_prefix: None,
                 reasoning_translation: None,
+                accepts_scheduling_priority: false,
                 created_by: user.id,
             })
             .await
@@ -443,6 +446,7 @@ mod tests {
                 auth_header_name: None,
                 auth_header_prefix: None,
                 reasoning_translation: None,
+                accepts_scheduling_priority: false,
                 created_by: user.id,
             })
             .await
@@ -556,6 +560,7 @@ mod tests {
                 auth_header_name: None,
                 auth_header_prefix: None,
                 reasoning_translation: None,
+                accepts_scheduling_priority: false,
                 created_by: jwt_user.id,
             })
             .await
@@ -673,6 +678,7 @@ mod tests {
                 auth_header_name: None,
                 auth_header_prefix: None,
                 reasoning_translation: None,
+                accepts_scheduling_priority: false,
                 created_by: user.id,
             })
             .await
@@ -788,6 +794,7 @@ mod tests {
                 auth_header_name: None,
                 auth_header_prefix: None,
                 reasoning_translation: None,
+                accepts_scheduling_priority: false,
                 created_by: Uuid::nil(), // Use nil for system creation
             })
             .await
@@ -872,6 +879,7 @@ mod tests {
                 auth_header_name: None,
                 auth_header_prefix: None,
                 reasoning_translation: None,
+                accepts_scheduling_priority: false,
                 created_by: user.id,
             })
             .await
@@ -972,6 +980,7 @@ mod tests {
                 auth_header_name: None,
                 auth_header_prefix: None,
                 reasoning_translation: None,
+                accepts_scheduling_priority: false,
                 created_by: user.id,
             })
             .await

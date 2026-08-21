@@ -838,6 +838,57 @@ impl DeployedModelResponse {
 
 // ===== Composite Model Component Types =====
 
+/// Which of a composite's named pools a membership belongs to.
+///
+/// A composite is a set of named pools, and onwards resolves `request class ->
+/// pool` before it selects a provider. `Default` is the pool that serves every
+/// class without a pool of its own — exactly the single member list that
+/// existed before pools — so an unqualified component is unchanged.
+///
+/// The same hosted model may be a member of more than one pool (dynamo at
+/// position 0 of both), with independent ordering in each.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ComponentPool {
+    /// Serves every request class that has no pool of its own. The default, so
+    /// adding a component never silently creates a continuation target.
+    #[default]
+    Default,
+    /// Serves `/v1/completions` — token-id continuation resume legs and
+    /// ordinary completions traffic alike. Members here are validated
+    /// continuation targets; "never serves chat" is structural, because they
+    /// are simply not members of the default pool.
+    Completions,
+}
+
+impl ComponentPool {
+    /// The stored/wire value, bounded by the column's CHECK constraint.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ComponentPool::Default => "default",
+            ComponentPool::Completions => "completions",
+        }
+    }
+
+    /// Parse a stored value, falling back to the column default for anything
+    /// unrecognised (a row can only hold what the CHECK constraint allows).
+    pub fn from_db(value: &str) -> Self {
+        match value {
+            "completions" => ComponentPool::Completions,
+            _ => ComponentPool::Default,
+        }
+    }
+}
+
+/// Which pool a component request addresses. Omitted ⇒ `default`, so every
+/// existing caller keeps addressing the pool it always did.
+#[derive(Debug, Clone, Copy, Default, Deserialize, IntoParams)]
+pub struct ComponentPoolQuery {
+    /// The pool this component belongs to. Defaults to `default`.
+    #[serde(default)]
+    pub pool: ComponentPool,
+}
+
 /// Request to add a component to a composite model
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ModelComponentCreate {
@@ -852,6 +903,10 @@ pub struct ModelComponentCreate {
     /// PATCH endpoint's `sort_order` to reorder. Retained for API compatibility.
     #[serde(default)]
     pub sort_order: i32,
+    /// Which of the composite's pools to add this member to. Defaults to
+    /// `default`.
+    #[serde(default)]
+    pub pool: ComponentPool,
 }
 
 fn default_weight() -> i32 {
@@ -874,6 +929,9 @@ pub struct ModelComponentUpdate {
     /// dense, unique 0..n-1 sequence — two components can never share a position.
     /// Out-of-range values are clamped. Omit to leave the order unchanged.
     pub sort_order: Option<i32>,
+    // A component's pool is not updatable: it is part of which membership this
+    // is (the request addresses it with `?pool=`), not a property of one. Move
+    // a member between pools by removing it from one and adding it to the other.
 }
 
 /// Summary of a model used as a component in a composite model
@@ -915,6 +973,8 @@ pub struct ModelComponentResponse {
     pub weight: i32,
     /// Whether this component is enabled
     pub enabled: bool,
+    /// Which of the composite's pools this membership belongs to
+    pub pool: ComponentPool,
     /// Sort order for priority-based routing (lower = higher priority)
     pub sort_order: i32,
     /// When this component was added

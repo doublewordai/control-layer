@@ -74,6 +74,7 @@ impl From<(Vec<DeploymentId>, ApiKey)> for ApiKeyDBResponse {
                 "realtime" => Some(ApiKeyPurpose::Realtime),
                 "batch" => Some(ApiKeyPurpose::Batch),
                 "playground" => Some(ApiKeyPurpose::Playground),
+                "continuation" => Some(ApiKeyPurpose::Continuation),
                 // Legacy: map old "inference" to "realtime" for backwards compatibility
                 "inference" => Some(ApiKeyPurpose::Realtime),
                 _ => None,
@@ -125,6 +126,7 @@ impl<'c> Repository for ApiKeys<'c> {
             ApiKeyPurpose::Realtime => "realtime",
             ApiKeyPurpose::Batch => "batch",
             ApiKeyPurpose::Playground => "playground",
+            ApiKeyPurpose::Continuation => "continuation",
         };
 
         let api_key = sqlx::query_as!(
@@ -344,6 +346,7 @@ impl<'c> ApiKeys<'c> {
             ApiKeyPurpose::Realtime => "realtime",
             ApiKeyPurpose::Batch => "batch",
             ApiKeyPurpose::Playground => "playground",
+            ApiKeyPurpose::Continuation => "continuation",
         };
 
         // Upsert: insert a hidden key or return the existing one.
@@ -406,6 +409,7 @@ impl<'c> ApiKeys<'c> {
             ApiKeyPurpose::Realtime => "realtime",
             ApiKeyPurpose::Batch => "batch",
             ApiKeyPurpose::Playground => "playground",
+            ApiKeyPurpose::Continuation => "continuation",
         };
 
         // Upsert: insert a hidden key or return the existing one.
@@ -801,6 +805,7 @@ impl<'c> ApiKeys<'c> {
             ApiKeyPurpose::Realtime => "realtime",
             ApiKeyPurpose::Batch => "batch",
             ApiKeyPurpose::Playground => "playground",
+            ApiKeyPurpose::Continuation => "continuation",
         };
 
         let key_ids = sqlx::query_scalar!(
@@ -831,6 +836,7 @@ impl<'c> ApiKeys<'c> {
             ApiKeyPurpose::Realtime => "realtime",
             ApiKeyPurpose::Batch => "batch",
             ApiKeyPurpose::Playground => "playground",
+            ApiKeyPurpose::Continuation => "continuation",
         };
 
         let key_ids = sqlx::query_scalar!(
@@ -1123,6 +1129,7 @@ impl<'c> ApiKeys<'c> {
                     "realtime" => Some(ApiKeyPurpose::Realtime),
                     "batch" => Some(ApiKeyPurpose::Batch),
                     "playground" => Some(ApiKeyPurpose::Playground),
+                    "continuation" => Some(ApiKeyPurpose::Continuation),
                     // Legacy: map old "inference" to "realtime" for backwards compatibility
                     "inference" => Some(ApiKeyPurpose::Realtime),
                     _ => None,
@@ -2607,6 +2614,7 @@ mod tests {
             image_normalizer: Default::default(),
             openapi: Default::default(),
             cache: Default::default(),
+            continuation: Default::default(),
             keystore: None,
         };
         crate::seed_database(&config.model_sources, &pool).await.unwrap();

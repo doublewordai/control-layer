@@ -1033,12 +1033,23 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
   const queryClient = useQueryClient();
 
   const {
-    data: components,
+    data: allComponents,
     isLoading,
     error,
   } = useModelComponents(model.id, {
     enabled: model.is_composite === true,
   });
+
+  // This tab manages CHAT serving, i.e. the default pool only. The list
+  // endpoint returns memberships from every pool, and the PATCH/DELETE
+  // endpoints default to the default-pool membership — so rendering (and
+  // reordering/toggling) completions-pool rows here would silently write to
+  // the wrong membership and scramble chat failover. Completions pools get
+  // their own pool-aware surface later.
+  const components = React.useMemo(
+    () => allComponents?.filter((c) => (c.pool ?? "default") === "default"),
+    [allComponents],
+  );
 
   const updateComponentMutation = useUpdateModelComponent();
   const removeMutation = useRemoveModelComponent();
@@ -1108,8 +1119,10 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
     const previousComponents =
       queryClient.getQueryData<ModelComponent[]>(queryKey);
 
-    // Create optimistically updated components with new sort_order
-    const optimisticComponents = components.map((component) => {
+    // Create optimistically updated components with new sort_order. Built from
+    // the UNFILTERED list: the query cache holds every pool's memberships, and
+    // the updates only ever address default-pool rows.
+    const optimisticComponents = (allComponents ?? []).map((component) => {
       const update = updates.find(
         (u) => u.componentModelId === component.model.id,
       );
