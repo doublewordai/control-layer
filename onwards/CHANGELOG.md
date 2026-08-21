@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.38.2](https://github.com/doublewordai/control-layer/compare/onwards-v0.38.1...onwards-v0.38.2) (2026-08-21)
+
+
+### Bug Fixes
+
+* fold SSE streams incrementally and drop async-openai from dwctl ([#1503](https://github.com/doublewordai/control-layer/issues/1503)) ([2995d73](https://github.com/doublewordai/control-layer/commit/2995d734bd966070ca337e61e50cd2dc7cd5392e))
+
 ## [0.38.1](https://github.com/doublewordai/control-layer/compare/onwards-v0.38.0...onwards-v0.38.1) (2026-08-13)
 
 
