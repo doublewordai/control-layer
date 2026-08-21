@@ -3,6 +3,8 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use fusillade_core::manager::ModelGateState;
+
 use crate::http::HttpResponse;
 
 /// Predicate function to determine if a response should be retried.
@@ -64,6 +66,42 @@ where
     Ok(Arc::new(map))
 }
 
+fn default_model_gate_states() -> Arc<dashmap::DashMap<String, ModelGateState>> {
+    Arc::new(dashmap::DashMap::new())
+}
+
+fn serialize_model_gate_states<S>(
+    states: &Arc<dashmap::DashMap<String, ModelGateState>>,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    use serde::Serialize;
+
+    let states: HashMap<String, ModelGateState> = states
+        .iter()
+        .map(|entry| (entry.key().clone(), *entry.value()))
+        .collect();
+    states.serialize(serializer)
+}
+
+fn deserialize_model_gate_states<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Arc<dashmap::DashMap<String, ModelGateState>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+
+    let states = HashMap::<String, ModelGateState>::deserialize(deserializer)?;
+    let map = dashmap::DashMap::new();
+    for (model, state) in states {
+        map.insert(model, state);
+    }
+    Ok(Arc::new(map))
+}
+
 fn default_escalation_threshold_seconds() -> i64 {
     900
 }
@@ -113,6 +151,15 @@ pub struct DaemonConfig {
         deserialize_with = "deserialize_model_concurrency_limits"
     )]
     pub model_concurrency_limits: Arc<dashmap::DashMap<String, usize>>,
+    /// Per-model claim-gate states injected by the operator (dwctl). A model
+    /// absent from the map claims at full capacity (`Open` is the default),
+    /// so an empty map keeps the gate a no-op.
+    #[serde(
+        default = "default_model_gate_states",
+        serialize_with = "serialize_model_gate_states",
+        deserialize_with = "deserialize_model_gate_states"
+    )]
+    pub model_gate_states: Arc<dashmap::DashMap<String, ModelGateState>>,
     #[serde(skip, default = "default_model_escalations")]
     pub model_escalations: Arc<dashmap::DashMap<String, ModelEscalationConfig>>,
     #[serde(default)]
@@ -129,8 +176,8 @@ pub struct DaemonConfig {
     pub batch_claim_size: usize,
     #[serde(default = "default_batch_claim_batch_size")]
     pub batch_claim_batch_size: usize,
-    #[serde(default)]
-    pub batch_claim_require_live: bool,
+    #[serde(default, alias = "batch_claim_require_live")]
+    pub batch_claim_require_open: bool,
     #[serde(default = "default_batch_claim_interval_ms")]
     pub batch_claim_interval_ms: u64,
     #[serde(default = "default_claim_loop_max_consecutive_failures")]
@@ -418,13 +465,14 @@ impl Default for DaemonConfig {
             mode: DaemonMode::default(),
             claim_batch_size: 100,
             model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
+            model_gate_states: default_model_gate_states(),
             model_escalations: default_model_escalations(),
             inject_deadline_priority: false,
             background_concurrency_limit: 0,
             claim_interval_ms: 1000,
             batch_claim_size: default_batch_claim_size(),
             batch_claim_batch_size: default_batch_claim_batch_size(),
-            batch_claim_require_live: false,
+            batch_claim_require_open: false,
             batch_claim_interval_ms: default_batch_claim_interval_ms(),
             claim_loop_max_consecutive_failures: default_claim_loop_max_consecutive_failures(),
             claim_query_timeout_ms: default_claim_query_timeout_ms(),

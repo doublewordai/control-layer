@@ -350,6 +350,7 @@ pub fn create_test_config() -> crate::config::Config {
         image_normalizer: Default::default(),
         openapi: Default::default(),
         cache: Default::default(),
+        probes: Default::default(),
         keystore: None,
     }
 }

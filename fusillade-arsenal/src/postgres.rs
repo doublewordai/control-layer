@@ -24,7 +24,8 @@ use tokio_stream::wrappers::ReceiverStream;
 use uuid::Uuid;
 
 use super::{
-    ArchiveOutcome, BackgroundClaimKind, DaemonStorage, ModelFilter, ModelFilterState, Storage,
+    ArchiveOutcome, BackgroundClaimKind, DaemonStorage, ModelFilter, ModelFilterState,
+    ModelGateState, Storage,
 };
 use crate::PostgresStorageConfig;
 use crate::batch::{
@@ -1966,6 +1967,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         available_capacity: &std::collections::HashMap<String, usize>,
         user_active_counts: &std::collections::HashMap<String, usize>,
         leak_cooldown: &HashSet<(String, String, String)>,
+        gate_states: &std::collections::HashMap<String, ModelGateState>,
     ) -> Result<Vec<Request<Claimed>>> {
         // First, unclaim any stale requests (self-healing for daemon crashes)
         let unclaimed_count = self.unclaim_stale_requests().await?;
@@ -2033,8 +2035,17 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
             cooldown_model_arr.push(model.clone());
         }
 
+        // Per-model gate map as two aligned arrays for the `model_gates` CTE.
+        // Built in a single pass so the columns cannot misalign.
+        let mut gate_models_arr: Vec<String> = Vec::with_capacity(gate_states.len());
+        let mut gate_states_arr: Vec<String> = Vec::with_capacity(gate_states.len());
+        for (model, state) in gate_states {
+            gate_models_arr.push(model.clone());
+            gate_states_arr.push(state.as_str().to_string());
+        }
+
         // Deadline ramp exponent: `ramp_minutes = W_minutes ^ exponent`. A
-        // not-live request within `ramp(W)` of its deadline is claimed at full
+        // throttled request within `ramp(W)` of its deadline is claimed at full
         // capacity (→ OpenRouter) rather than trickled.
         let ramp_exponent = self.config.claim_ramp_exponent;
 
@@ -2063,6 +2074,9 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
             user_priority AS (
                 SELECT * FROM unnest($6::TEXT[], $7::BIGINT[]) AS u(user_id, active_count)
             ),
+            model_gates AS (
+                SELECT model, state FROM unnest($16::TEXT[], $17::TEXT[]) AS mg(model, state)
+            ),
             to_claim AS (
                 SELECT claimed.id, claimed.template_id, claimed.batch_id, claimed.effective_expires_at,
                        claimed.leaked, claimed.window_class, claimed.window_secs
@@ -2082,11 +2096,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                                    calc.blend AS ord_blend, e.eff AS ord_exp, r.id AS ord_id
                             FROM requests r
                             LEFT JOIN user_priority up ON r.created_by = up.user_id
-                            LEFT JOIN LATERAL (
-                                SELECT mfe.state FROM model_filters mfe
-                                WHERE mfe.model = m.model
-                                ORDER BY mfe.created_at DESC, mfe.id DESC LIMIT 1
-                            ) mf ON true
+                            LEFT JOIN model_gates g ON g.model = m.model
                             CROSS JOIN LATERAL (
                                 SELECT COALESCE(
                                     (SELECT stw.window_ms FROM unnest($10::TEXT[], $11::BIGINT[]) AS stw(tier, window_ms)
@@ -2110,7 +2120,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                               AND r.template_id IS NOT NULL
                               AND r.service_tier IS DISTINCT FROM 'background'
                               AND (r.not_before IS NULL OR r.not_before <= $3)
-                              AND ((mf.state IS NULL OR mf.state = 'live')
+                              AND ((g.state IS NULL OR g.state = 'open')
                                    OR (EXTRACT(EPOCH FROM (e.eff - $3))
                                        <= power(GREATEST(e.w_secs, 0.0) / 60.0, $9::DOUBLE PRECISION) * 60.0))
                             ORDER BY calc.blend ASC, e.eff ASC, r.id ASC
@@ -2138,11 +2148,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                                            e.window_class, e.w_secs, e.eff, calc.blend
                                     FROM requests r
                                     LEFT JOIN user_priority up ON r.created_by = up.user_id
-                                    LEFT JOIN LATERAL (
-                                        SELECT mfe.state FROM model_filters mfe
-                                        WHERE mfe.model = m.model
-                                        ORDER BY mfe.created_at DESC, mfe.id DESC LIMIT 1
-                                    ) mf ON true
+                                    LEFT JOIN model_gates g ON g.model = m.model
                                     CROSS JOIN LATERAL (
                                         SELECT COALESCE(
                                             (SELECT stw.window_ms FROM unnest($10::TEXT[], $11::BIGINT[]) AS stw(tier, window_ms)
@@ -2166,7 +2172,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                                       AND r.template_id IS NOT NULL
                                       AND r.service_tier IS DISTINCT FROM 'background'
                                       AND (r.not_before IS NULL OR r.not_before <= $3)
-                                      AND NOT ((mf.state IS NULL OR mf.state = 'live')
+                                      AND NOT ((g.state IS NULL OR g.state = 'open')
                                                OR (EXTRACT(EPOCH FROM (e.eff - $3))
                                                    <= power(GREATEST(e.w_secs, 0.0) / 60.0, $9::DOUBLE PRECISION) * 60.0))
                                       AND NOT EXISTS (
@@ -2240,6 +2246,8 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
             &cooldown_user_arr,
             &cooldown_window_arr,
             &cooldown_model_arr,
+            &gate_models_arr,
+            &gate_states_arr,
         )
         .fetch_all(self.write_executor())
         .await
@@ -2272,6 +2280,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         daemon_id: DaemonId,
         available_capacity: &std::collections::HashMap<String, usize>,
         user_active_counts: &std::collections::HashMap<String, usize>,
+        gate_states: &std::collections::HashMap<String, ModelGateState>,
     ) -> Result<Vec<Request<Claimed>>> {
         // NOTE: stale-request reclamation deliberately does NOT run here. The
         // request daemon's `claim_batchless_requests` already runs
@@ -2312,6 +2321,13 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
             .collect();
         let batch_limit = batch_limit.max(1) as i64;
 
+        let mut gate_models_arr: Vec<String> = Vec::with_capacity(gate_states.len());
+        let mut gate_states_arr: Vec<String> = Vec::with_capacity(gate_states.len());
+        for (model, state) in gate_states {
+            gate_models_arr.push(model.clone());
+            gate_states_arr.push(state.as_str().to_string());
+        }
+
         let rows = sqlx::query_as!(
             ClaimedRequestRow,
             r#"
@@ -2322,13 +2338,8 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
             user_priority AS (
                 SELECT * FROM unnest($7::TEXT[], $8::BIGINT[]) AS u(user_id, active_count)
             ),
-            latest_model_filters AS (
-                -- Scoped to the capacity-eligible models: DISTINCT ON over the
-                -- whole event log would grow with the table for no benefit.
-                SELECT DISTINCT ON (model) model, state
-                FROM model_filters
-                WHERE model = ANY($4::TEXT[])
-                ORDER BY model, created_at DESC, id DESC
+            model_gates AS (
+                SELECT model, state FROM unnest($12::TEXT[], $13::TEXT[]) AS mg(model, state)
             ),
             -- Distinct batch_ids that still have pending rows for each
             -- capacity-eligible model, via an index-only "loose index scan"
@@ -2376,15 +2387,15 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                      AND b.failed_at IS NULL
                      AND b.cancelled_at IS NULL
                      AND b.service_tier IS DISTINCT FROM 'background'
-                    -- Liveness gate: models whose latest filter event is `live`
-                    -- are always eligible. Models with NO filter event (external /
-                    -- always-on providers that scouter does not manage) are only
-                    -- eligible when `batch_claim_require_live` is false (default),
-                    -- matching the historical NULL-is-live claim behaviour. Models
-                    -- whose latest event is `coming`/`absent` are only eligible
-                    -- via the deadline-ramp escape hatch (see WHERE below).
-                    LEFT JOIN latest_model_filters mf
-                      ON mf.model = g.model
+                    -- Claim gate: models whose injected gate is `open` are
+                    -- always eligible. Models with NO gate entry (external /
+                    -- always-on providers the operator does not manage) are only
+                    -- eligible when `batch_claim_require_open` is false (default),
+                    -- matching the historical NULL-is-open claim behaviour.
+                    -- `throttled` models are only eligible via the deadline-ramp
+                    -- escape hatch (see WHERE below).
+                    LEFT JOIN model_gates mg
+                      ON mg.model = g.model
                     LEFT JOIN user_priority up ON b.created_by = up.user_id
                     CROSS JOIN LATERAL (
                         SELECT
@@ -2395,10 +2406,10 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                                 * LEAST(GREATEST(EXTRACT(EPOCH FROM b.expires_at - $3), 0.0) / 86400.0, 1.0) AS pr
                     ) calc
                     WHERE (
-                            mf.state = 'live'
-                            OR (NOT $10::BOOLEAN AND mf.state IS NULL)
+                            mg.state = 'open'
+                            OR (NOT $10::BOOLEAN AND mg.state IS NULL)
                             -- SLA escape hatch (deadline ramp): regardless of
-                            -- liveness, once a batch is within ramp(W) of its
+                            -- the gate, once a batch is within ramp(W) of its
                             -- deadline it becomes claimable at full capacity so
                             -- it can overflow to fallback providers instead of
                             -- missing SLA waiting for the model. Same formula
@@ -2499,8 +2510,10 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
             &user_ids_arr,
             &user_counts_arr,
             self.config.urgency_weight,
-            self.config.batch_claim_require_live,
+            self.config.batch_claim_require_open,
             self.config.claim_ramp_exponent,
+            &gate_models_arr,
+            &gate_states_arr,
         )
         .fetch_all(self.write_executor())
         .await
@@ -2526,6 +2539,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         daemon_id: DaemonId,
         available_capacity: &HashMap<String, usize>,
         user_active_counts: &HashMap<String, usize>,
+        gate_states: &HashMap<String, ModelGateState>,
     ) -> Result<Vec<Request<Claimed>>> {
         let now = Utc::now();
         let claim_batches = kind == BackgroundClaimKind::Batch;
@@ -2558,6 +2572,13 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
             .map(|owner| *user_active_counts.get(owner).unwrap_or(&0) as i64)
             .collect();
 
+        let mut gate_models_arr: Vec<String> = Vec::with_capacity(gate_states.len());
+        let mut gate_states_arr: Vec<String> = Vec::with_capacity(gate_states.len());
+        for (model, state) in gate_states {
+            gate_models_arr.push(model.clone());
+            gate_states_arr.push(state.as_str().to_string());
+        }
+
         let rows = sqlx::query_as!(
             ClaimedRequestRow,
             r#"
@@ -2569,6 +2590,9 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
             user_priority AS (
                 SELECT *
                 FROM unnest($6::TEXT[], $7::BIGINT[]) AS u(user_id, active_count)
+            ),
+            model_gates AS (
+                SELECT model, state FROM unnest($11::TEXT[], $12::TEXT[]) AS mg(model, state)
             ),
             active_counts AS (
                 SELECT locked.model, COUNT(active.id)::BIGINT AS active_count
@@ -2589,14 +2613,9 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                        m.model_order
                 FROM locked_models m
                 JOIN active_counts active ON active.model = m.model
-                JOIN LATERAL (
-                    SELECT mf.state
-                    FROM model_filters mf
-                    WHERE mf.model = m.model
-                    ORDER BY mf.created_at DESC, mf.id DESC
-                    LIMIT 1
-                ) latest ON latest.state = 'live'
-                WHERE active.active_count < $9::BIGINT
+                LEFT JOIN model_gates mg ON mg.model = m.model
+                WHERE (mg.state IS NULL OR mg.state = 'open')
+                  AND active.active_count < $9::BIGINT
                   AND NOT EXISTS (
                     SELECT 1
                     FROM requests sla
@@ -2753,6 +2772,8 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
             batch_limit as i64,
             self.config.background_concurrency_limit as i64,
             claim_batches,
+            &gate_models_arr,
+            &gate_states_arr,
         )
         .fetch_all(self.write_executor())
         .await
@@ -2778,6 +2799,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         available_capacity: &std::collections::HashMap<String, usize>,
         user_active_counts: &std::collections::HashMap<String, usize>,
         leak_cooldown: &HashSet<(String, String, String)>,
+        gate_states: &std::collections::HashMap<String, ModelGateState>,
     ) -> Result<Vec<Request<Claimed>>> {
         self.claim_batchless_requests(
             limit,
@@ -2785,6 +2807,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
             available_capacity,
             user_active_counts,
             leak_cooldown,
+            gate_states,
         )
         .await
     }
@@ -8877,22 +8900,6 @@ mod tests {
         }
     }
 
-    async fn mark_models_live_for_test(
-        manager: &PostgresRequestManager<TestDbPools>,
-        models: impl IntoIterator<Item = impl AsRef<str>>,
-    ) {
-        let filters: Vec<ModelFilter> = models
-            .into_iter()
-            .map(|model| ModelFilter {
-                model: model.as_ref().to_string(),
-                state: ModelFilterState::Live,
-                expected_ready_at: None,
-            })
-            .collect();
-
-        manager.append_model_filter_events(&filters).await.unwrap();
-    }
-
     async fn create_background_batch_for_test(
         manager: &PostgresRequestManager<TestDbPools>,
         model: &str,
@@ -8959,7 +8966,6 @@ mod tests {
         available_capacity: &HashMap<String, usize>,
         user_active_counts: &HashMap<String, usize>,
     ) -> Vec<Request<Claimed>> {
-        mark_models_live_for_test(manager, available_capacity.keys()).await;
         // The batch claim itself no longer reclaims stale rows — in production
         // the request daemon's claim cycle runs `unclaim_stale_requests` every
         // interval (covering batched rows too). Mirror that here so tests that
@@ -8975,6 +8981,7 @@ mod tests {
                 daemon_id,
                 available_capacity,
                 user_active_counts,
+                &HashMap::new(),
             )
             .await
             .expect("batch claim failed")
@@ -10060,7 +10067,7 @@ mod tests {
     // Request claiming, cancellation, and retrieval
 
     #[sqlx::test]
-    async fn background_claims_require_explicit_live_and_separate_modalities(pool: sqlx::PgPool) {
+    async fn background_claims_respect_gate_and_separate_modalities(pool: sqlx::PgPool) {
         let manager = PostgresRequestManager::with_client(
             TestDbPools::new(pool.clone()).await.unwrap(),
             Arc::new(MockHttpClient::new()),
@@ -10076,32 +10083,42 @@ mod tests {
         let capacity = HashMap::from([("background-model".to_string(), 10)]);
         let daemon_id = DaemonId::from(Uuid::new_v4());
 
-        let unmanaged = manager
-            .claim_background_batchless_requests(10, daemon_id, &capacity, &HashMap::new())
+        // A throttled gate holds background work entirely — no ramp, no trickle.
+        let throttled = mark_throttled(&["background-model"]);
+        let held = manager
+            .claim_background_batchless_requests(
+                10,
+                daemon_id,
+                &capacity,
+                &HashMap::new(),
+                &throttled,
+            )
             .await
             .expect("background claim should be supported");
-        assert!(
-            unmanaged.is_empty(),
-            "a missing liveness event is ineligible"
-        );
+        assert!(held.is_empty(), "a throttled gate holds background work");
 
-        manager
-            .append_model_filter_events(&[ModelFilter {
-                model: "background-model".to_string(),
-                state: ModelFilterState::Coming,
-                expected_ready_at: None,
-            }])
+        let held_batches = manager
+            .claim_background_batch_requests(
+                10,
+                10,
+                daemon_id,
+                &capacity,
+                &HashMap::new(),
+                &throttled,
+            )
             .await
             .unwrap();
-        let coming = manager
-            .claim_background_batch_requests(10, 10, daemon_id, &capacity, &HashMap::new())
-            .await
-            .unwrap();
-        assert!(coming.is_empty());
+        assert!(held_batches.is_empty());
 
-        mark_models_live_for_test(&manager, ["background-model"]).await;
+        // No gate entry = open: background claims proceed (absence never strangles).
         let batchless_claimed = manager
-            .claim_background_batchless_requests(10, daemon_id, &capacity, &HashMap::new())
+            .claim_background_batchless_requests(
+                10,
+                daemon_id,
+                &capacity,
+                &HashMap::new(),
+                &HashMap::new(),
+            )
             .await
             .unwrap();
         assert_eq!(batchless_claimed.len(), 1);
@@ -10109,7 +10126,14 @@ mod tests {
         assert_eq!(batchless_claimed[0].data.batch_id, None);
 
         let batch_claimed = manager
-            .claim_background_batch_requests(10, 10, daemon_id, &capacity, &HashMap::new())
+            .claim_background_batch_requests(
+                10,
+                10,
+                daemon_id,
+                &capacity,
+                &HashMap::new(),
+                &HashMap::new(),
+            )
             .await
             .unwrap();
         assert_eq!(batch_claimed.len(), 1);
@@ -10186,7 +10210,6 @@ mod tests {
 
         create_background_request_for_test(&first_manager, "global-model", "owner-a").await;
         create_background_request_for_test(&first_manager, "global-model", "owner-b").await;
-        mark_models_live_for_test(&first_manager, ["global-model"]).await;
 
         let capacity = HashMap::from([("global-model".to_string(), 1)]);
         let first = first_manager
@@ -10194,6 +10217,7 @@ mod tests {
                 10,
                 DaemonId::from(Uuid::new_v4()),
                 &capacity,
+                &HashMap::new(),
                 &HashMap::new(),
             )
             .await
@@ -10205,6 +10229,7 @@ mod tests {
                 10,
                 DaemonId::from(Uuid::new_v4()),
                 &capacity,
+                &HashMap::new(),
                 &HashMap::new(),
             )
             .await
@@ -10235,7 +10260,6 @@ mod tests {
             })
             .await
             .unwrap();
-        mark_models_live_for_test(&first_manager, ["foreground-saturated-model"]).await;
         let foreground_capacity = HashMap::from([("foreground-saturated-model".to_string(), 1)]);
         let foreground = first_manager
             .claim_batchless_requests(
@@ -10244,6 +10268,7 @@ mod tests {
                 &foreground_capacity,
                 &HashMap::new(),
                 &HashSet::new(),
+                &HashMap::new(),
             )
             .await
             .unwrap();
@@ -10254,6 +10279,7 @@ mod tests {
                 10,
                 DaemonId::from(Uuid::new_v4()),
                 &foreground_capacity,
+                &HashMap::new(),
                 &HashMap::new(),
             )
             .await
@@ -10292,12 +10318,18 @@ mod tests {
             })
             .await
             .unwrap();
-        mark_models_live_for_test(&manager, ["shared-model"]).await;
         let capacity = HashMap::from([("shared-model".to_string(), 1)]);
         let daemon_id = DaemonId::from(Uuid::new_v4());
 
         let blocked = manager
-            .claim_background_requests(10, 10, daemon_id, &capacity, &HashMap::new())
+            .claim_background_requests(
+                10,
+                10,
+                daemon_id,
+                &capacity,
+                &HashMap::new(),
+                &HashMap::new(),
+            )
             .await
             .unwrap();
         assert!(
@@ -10306,14 +10338,28 @@ mod tests {
         );
 
         let sla = manager
-            .claim_batchless_requests(10, daemon_id, &capacity, &HashMap::new(), &HashSet::new())
+            .claim_batchless_requests(
+                10,
+                daemon_id,
+                &capacity,
+                &HashMap::new(),
+                &HashSet::new(),
+                &HashMap::new(),
+            )
             .await
             .unwrap();
         assert_eq!(sla.len(), 1);
         assert_eq!(sla[0].data.id, flex_id);
 
         let background = manager
-            .claim_background_requests(10, 10, daemon_id, &capacity, &HashMap::new())
+            .claim_background_requests(
+                10,
+                10,
+                daemon_id,
+                &capacity,
+                &HashMap::new(),
+                &HashMap::new(),
+            )
             .await
             .unwrap();
         assert_eq!(background.len(), 1);
@@ -10353,7 +10399,6 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        mark_models_live_for_test(&manager, ["retry-model"]).await;
         let capacity = HashMap::from([("retry-model".to_string(), 1)]);
 
         let claimed = manager
@@ -10362,6 +10407,7 @@ mod tests {
                 10,
                 DaemonId::from(Uuid::new_v4()),
                 &capacity,
+                &HashMap::new(),
                 &HashMap::new(),
             )
             .await
@@ -10400,13 +10446,13 @@ mod tests {
             })
             .await
             .unwrap();
-        mark_models_live_for_test(&manager, ["batch-blocked-model"]).await;
         let blocked = manager
             .claim_background_requests(
                 10,
                 10,
                 DaemonId::from(Uuid::new_v4()),
                 &HashMap::from([("batch-blocked-model".to_string(), 1)]),
+                &HashMap::new(),
                 &HashMap::new(),
             )
             .await
@@ -10430,12 +10476,18 @@ mod tests {
             create_background_request_for_test(&manager, "bounded-model", "busy-owner").await;
         let idle_owner =
             create_background_request_for_test(&manager, "bounded-model", "idle-owner").await;
-        mark_models_live_for_test(&manager, ["bounded-model"]).await;
         let capacity = HashMap::from([("bounded-model".to_string(), 1)]);
         let active = HashMap::from([("busy-owner".to_string(), 5)]);
 
         let first = manager
-            .claim_background_requests(10, 0, DaemonId::from(Uuid::new_v4()), &capacity, &active)
+            .claim_background_requests(
+                10,
+                0,
+                DaemonId::from(Uuid::new_v4()),
+                &capacity,
+                &active,
+                &HashMap::new(),
+            )
             .await
             .unwrap();
         assert_eq!(first.len(), 1, "per-model capacity must cap the claim");
@@ -10451,6 +10503,7 @@ mod tests {
                 10,
                 DaemonId::from(Uuid::new_v4()),
                 &HashMap::from([("bounded-model".to_string(), 10)]),
+                &HashMap::new(),
                 &HashMap::new(),
             )
             .await
@@ -10474,7 +10527,6 @@ mod tests {
         create_background_request_for_test(&manager, "shared-capacity-model", "request-owner")
             .await;
         create_background_batch_for_test(&manager, "shared-capacity-model", "batch-owner").await;
-        mark_models_live_for_test(&manager, ["shared-capacity-model"]).await;
 
         let claimed = manager
             .claim_background_requests(
@@ -10482,6 +10534,7 @@ mod tests {
                 10,
                 DaemonId::from(Uuid::new_v4()),
                 &HashMap::from([("shared-capacity-model".to_string(), 1)]),
+                &HashMap::new(),
                 &HashMap::new(),
             )
             .await
@@ -10502,18 +10555,31 @@ mod tests {
         );
         create_background_batch_for_test(&manager, "isolated-model", "batch-owner").await;
         create_background_request_for_test(&manager, "isolated-model", "request-owner").await;
-        mark_models_live_for_test(&manager, ["isolated-model"]).await;
         let capacity = HashMap::from([("isolated-model".to_string(), 10)]);
         let daemon_id = DaemonId::from(Uuid::new_v4());
 
         let batchless = manager
-            .claim_batchless_requests(10, daemon_id, &capacity, &HashMap::new(), &HashSet::new())
+            .claim_batchless_requests(
+                10,
+                daemon_id,
+                &capacity,
+                &HashMap::new(),
+                &HashSet::new(),
+                &HashMap::new(),
+            )
             .await
             .unwrap();
         assert!(batchless.is_empty());
 
         let batched = manager
-            .claim_batch_requests(10, 10, daemon_id, &capacity, &HashMap::new())
+            .claim_batch_requests(
+                10,
+                10,
+                daemon_id,
+                &capacity,
+                &HashMap::new(),
+                &HashMap::new(),
+            )
             .await
             .unwrap();
         assert!(batched.is_empty());
@@ -10531,7 +10597,6 @@ mod tests {
         });
         create_background_batch_for_test(&manager, "count-model", "batch-owner").await;
         create_background_request_for_test(&manager, "count-model", "request-owner").await;
-        mark_models_live_for_test(&manager, ["count-model"]).await;
 
         let windows = vec![("24h".to_string(), None, 86_400)];
         let states = vec!["pending".to_string()];
@@ -10638,21 +10703,12 @@ mod tests {
             })
             .await
             .unwrap();
-        mark_models_live_for_test(
-            &manager,
-            [
-                "available-model",
-                "background-active-model",
-                "full-model",
-                "sla-blocked-model",
-            ],
-        )
-        .await;
         let claimed_background = manager
             .claim_background_batchless_requests(
                 1,
                 DaemonId::from(Uuid::new_v4()),
                 &HashMap::from([("background-active-model".to_string(), 1)]),
+                &HashMap::new(),
                 &HashMap::new(),
             )
             .await
@@ -10735,7 +10791,14 @@ mod tests {
         let daemon_id = DaemonId::from(Uuid::new_v4());
         let capacity = HashMap::from([("test".to_string(), 10)]);
         let claimed = manager
-            .claim_batchless_requests(10, daemon_id, &capacity, &HashMap::new(), &HashSet::new())
+            .claim_batchless_requests(
+                10,
+                daemon_id,
+                &capacity,
+                &HashMap::new(),
+                &HashSet::new(),
+                &HashMap::new(),
+            )
             .await
             .expect("Failed to claim batchless requests");
 
@@ -10792,6 +10855,7 @@ mod tests {
                 &HashMap::from([("test".to_string(), 10)]),
                 &HashMap::new(),
                 &HashSet::new(),
+                &HashMap::new(),
             )
             .await
             .expect("Failed to claim batchless requests");
@@ -10868,6 +10932,7 @@ mod tests {
                 DaemonId::from(Uuid::new_v4()),
                 &HashMap::from([("test".to_string(), 10)]),
                 &HashMap::new(),
+                &HashMap::new(),
             )
             .await
             .expect("Failed to claim batch requests");
@@ -10916,6 +10981,7 @@ mod tests {
                 &HashMap::from([("test".to_string(), 10)]),
                 &HashMap::new(),
                 &HashSet::new(),
+                &HashMap::new(),
             )
             .await
             .expect("Failed to claim batchless requests");
@@ -10934,13 +11000,13 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn test_claim_batch_requests_only_uses_live_batches(pool: sqlx::PgPool) {
+    async fn test_claim_batch_requests_only_uses_open_batches(pool: sqlx::PgPool) {
         let manager = PostgresRequestManager::with_client(
             TestDbPools::new(pool.clone()).await.unwrap(),
             Arc::new(MockHttpClient::new()),
         );
 
-        for model in ["live-model", "coming-model", "unmanaged-model"] {
+        for model in ["open-model", "throttled-model", "unmanaged-model"] {
             let file_id = manager
                 .create_file(
                     format!("{model}-batch"),
@@ -10972,55 +11038,44 @@ mod tests {
                 .unwrap();
         }
 
-        manager
-            .append_model_filter_events(&[
-                ModelFilter {
-                    model: "live-model".to_string(),
-                    state: ModelFilterState::Live,
-                    expected_ready_at: None,
-                },
-                ModelFilter {
-                    model: "coming-model".to_string(),
-                    state: ModelFilterState::Coming,
-                    expected_ready_at: Some(Utc::now() + chrono::Duration::minutes(10)),
-                },
-            ])
-            .await
-            .unwrap();
+        let gates = HashMap::from([
+            ("open-model".to_string(), ModelGateState::Open),
+            ("throttled-model".to_string(), ModelGateState::Throttled),
+        ]);
 
         let daemon_id = DaemonId::from(Uuid::new_v4());
         let capacity = HashMap::from([
-            ("live-model".to_string(), 10),
-            ("coming-model".to_string(), 10),
+            ("open-model".to_string(), 10),
+            ("throttled-model".to_string(), 10),
             ("unmanaged-model".to_string(), 10),
         ]);
 
-        // Strict mode (`batch_claim_require_live = true`): only models whose
-        // latest filter event is `live` are eligible — the unmanaged
-        // (no-event) model is excluded alongside `coming`.
+        // Strict mode (`batch_claim_require_open = true`): only models whose
+        // gate is `open` are eligible — the unmanaged (no-entry) model is
+        // excluded alongside `throttled`.
         let strict_manager = PostgresRequestManager::with_client(
             TestDbPools::new(pool.clone()).await.unwrap(),
             Arc::new(MockHttpClient::new()),
         )
         .with_config(DaemonConfig {
-            batch_claim_require_live: true,
+            batch_claim_require_open: true,
             ..Default::default()
         });
         let claimed = strict_manager
-            .claim_batch_requests(10, 1, daemon_id, &capacity, &HashMap::new())
+            .claim_batch_requests(10, 1, daemon_id, &capacity, &HashMap::new(), &gates)
             .await
             .expect("Failed to claim batch requests");
         assert_eq!(claimed.len(), 1);
-        assert_eq!(claimed[0].data.model, "live-model");
+        assert_eq!(claimed[0].data.model, "open-model");
         assert!(claimed[0].data.batch_id.is_some());
 
-        // Default mode (`batch_claim_require_live = false`): models with NO
-        // filter event (external / always-on providers that scouter does not
-        // manage) are treated as live — the historical claim behaviour.
-        // live-model's only row was claimed above, so this picks up exactly
-        // the unmanaged model; `coming` stays excluded in either mode.
+        // Default mode (`batch_claim_require_open = false`): models with NO
+        // gate entry (external / always-on providers the operator does not
+        // manage) are treated as open — the historical claim behaviour.
+        // open-model's only row was claimed above, so this picks up exactly
+        // the unmanaged model; `throttled` stays excluded in either mode.
         let claimed = manager
-            .claim_batch_requests(10, 1, daemon_id, &capacity, &HashMap::new())
+            .claim_batch_requests(10, 1, daemon_id, &capacity, &HashMap::new(), &gates)
             .await
             .expect("Failed to claim batch requests");
         assert_eq!(claimed.len(), 1);
@@ -11065,32 +11120,25 @@ mod tests {
             .await
             .unwrap();
 
-        // Model is explicitly NOT live.
-        manager
-            .append_model_filter_events(&[ModelFilter {
-                model: "ramp-model".to_string(),
-                state: ModelFilterState::Coming,
-                expected_ready_at: Some(Utc::now() + chrono::Duration::minutes(30)),
-            }])
-            .await
-            .unwrap();
+        // Model's gate is explicitly throttled.
+        let gates = mark_throttled(&["ramp-model"]);
 
         let daemon_id = DaemonId::from(Uuid::new_v4());
         let capacity = HashMap::from([("ramp-model".to_string(), 10)]);
 
         // Far from the deadline (1h window → ramp opens ~10 minutes out):
-        // a not-live model's batch is NOT claimable.
+        // a throttled model's batch is NOT claimable.
         let claimed = manager
-            .claim_batch_requests(10, 1, daemon_id, &capacity, &HashMap::new())
+            .claim_batch_requests(10, 1, daemon_id, &capacity, &HashMap::new(), &gates)
             .await
             .expect("Failed to claim batch requests");
         assert!(
             claimed.is_empty(),
-            "not-live batch outside ramp must not be claimed"
+            "throttled batch outside ramp must not be claimed"
         );
 
         // Push the batch inside the ramp window (~10 min for a 1h window):
-        // the SLA escape hatch opens regardless of liveness. Shift created_at
+        // the SLA escape hatch opens regardless of the gate. Shift created_at
         // too so the batch's window (expires_at - created_at) stays 1h — the
         // ramp bound is computed from the actual window length.
         sqlx::query(
@@ -11104,19 +11152,19 @@ mod tests {
         .unwrap();
 
         let claimed = manager
-            .claim_batch_requests(10, 1, daemon_id, &capacity, &HashMap::new())
+            .claim_batch_requests(10, 1, daemon_id, &capacity, &HashMap::new(), &gates)
             .await
             .expect("Failed to claim batch requests");
         assert_eq!(
             claimed.len(),
             1,
-            "within-ramp batch must be claimable despite not-live model"
+            "within-ramp batch must be claimable despite throttled model"
         );
         assert_eq!(claimed[0].data.model, "ramp-model");
     }
 
     #[sqlx::test]
-    async fn test_claim_batch_requests_limits_batches_per_live_model(pool: sqlx::PgPool) {
+    async fn test_claim_batch_requests_limits_batches_per_open_model(pool: sqlx::PgPool) {
         let manager = PostgresRequestManager::with_client(
             TestDbPools::new(pool.clone()).await.unwrap(),
             Arc::new(MockHttpClient::new()),
@@ -11156,26 +11204,12 @@ mod tests {
             }
         }
 
-        manager
-            .append_model_filter_events(&[
-                ModelFilter {
-                    model: "live-a".to_string(),
-                    state: ModelFilterState::Live,
-                    expected_ready_at: None,
-                },
-                ModelFilter {
-                    model: "live-b".to_string(),
-                    state: ModelFilterState::Live,
-                    expected_ready_at: None,
-                },
-            ])
-            .await
-            .unwrap();
+        let gates = mark_open(&["live-a", "live-b"]);
 
         let daemon_id = DaemonId::from(Uuid::new_v4());
         let capacity = HashMap::from([("live-a".to_string(), 10), ("live-b".to_string(), 10)]);
         let claimed = manager
-            .claim_batch_requests(10, 1, daemon_id, &capacity, &HashMap::new())
+            .claim_batch_requests(10, 1, daemon_id, &capacity, &HashMap::new(), &gates)
             .await
             .expect("Failed to claim batch requests");
 
@@ -11257,7 +11291,14 @@ mod tests {
         // Claim 3 batchless requests through the compatibility alias.
         let capacity = HashMap::from([("test".to_string(), 10)]);
         let claimed = manager
-            .claim_requests(3, daemon_id, &capacity, &HashMap::new(), &HashSet::new())
+            .claim_requests(
+                3,
+                daemon_id,
+                &capacity,
+                &HashMap::new(),
+                &HashSet::new(),
+                &HashMap::new(),
+            )
             .await
             .expect("Failed to claim requests");
 
@@ -11271,7 +11312,14 @@ mod tests {
 
         // Try to claim again - should get the remaining 2 batchless rows.
         let claimed2 = manager
-            .claim_requests(10, daemon_id, &capacity, &HashMap::new(), &HashSet::new())
+            .claim_requests(
+                10,
+                daemon_id,
+                &capacity,
+                &HashMap::new(),
+                &HashSet::new(),
+                &HashMap::new(),
+            )
             .await
             .expect("Failed to claim requests");
 
@@ -17058,7 +17106,6 @@ mod tests {
             })
             .await
             .unwrap();
-        mark_models_live_for_test(manager.as_ref(), ["model-a"]).await;
 
         // Set up triggered responses that won't complete until we tell them to
         http_client.clear_calls();
@@ -18617,7 +18664,7 @@ mod tests {
     }
 
     // ─────────────────────────────────────────────────────────────────────
-    // ASYNC MODEL-FILTERS CLAIM GATE TESTS (COR-432)
+    // ASYNC CLAIM GATE TESTS (COR-432; gate map injected since COR-611)
     // ─────────────────────────────────────────────────────────────────────
 
     /// Create a single pending batchless request for `model` owned by `user`,
@@ -18695,51 +18742,54 @@ mod tests {
         .unwrap();
     }
 
-    /// Append an explicit not-live (`coming`) event so the model takes the
-    /// leaky-bucket / ramp path. A model with NO events is "unmanaged" and
-    /// claims at full capacity, so the leaky-bucket tests must mark it.
-    async fn mark_not_live(manager: &PostgresRequestManager<TestDbPools>, model: &str) {
-        manager
-            .append_model_filter_event(&ModelFilter {
-                model: model.to_string(),
-                state: ModelFilterState::Coming,
-                expected_ready_at: None,
-            })
-            .await
-            .unwrap();
+    /// Gate map holding the given models `Throttled` so they take the
+    /// leaky-bucket / ramp path. A model with NO entry is "open" and claims at
+    /// full capacity, so the leaky-bucket tests must mark it.
+    fn mark_throttled(models: &[&str]) -> HashMap<String, ModelGateState> {
+        models
+            .iter()
+            .map(|model| (model.to_string(), ModelGateState::Throttled))
+            .collect()
+    }
+
+    fn mark_open(models: &[&str]) -> HashMap<String, ModelGateState> {
+        models
+            .iter()
+            .map(|model| (model.to_string(), ModelGateState::Open))
+            .collect()
     }
 
     #[sqlx::test]
-    async fn test_live_model_claims_full_capacity(pool: sqlx::PgPool) {
+    async fn test_open_gate_claims_full_capacity(pool: sqlx::PgPool) {
         let manager = PostgresRequestManager::with_client(
             TestDbPools::new(pool.clone()).await.unwrap(),
             Arc::new(MockHttpClient::new()),
         )
         .with_config(filter_test_config());
 
-        // Far deadline => not within ramp; only liveness yields full-capacity claims.
+        // Far deadline => not within ramp; only an open gate yields full-capacity claims.
         let expires_at = Utc::now() + chrono::Duration::hours(12);
-        setup_filter_request(&manager, &pool, "u1", "live-model", expires_at).await;
-        setup_filter_request(&manager, &pool, "u2", "live-model", expires_at).await;
-        manager
-            .append_model_filter_event(&ModelFilter {
-                model: "live-model".to_string(),
-                state: ModelFilterState::Live,
-                expected_ready_at: None,
-            })
-            .await
-            .unwrap();
+        setup_filter_request(&manager, &pool, "u1", "open-model", expires_at).await;
+        setup_filter_request(&manager, &pool, "u2", "open-model", expires_at).await;
+        let gates = mark_open(&["open-model"]);
 
         let daemon_id = DaemonId::from(Uuid::new_v4());
-        let capacity = HashMap::from([("live-model".to_string(), 5)]);
+        let capacity = HashMap::from([("open-model".to_string(), 5)]);
         let claimed = manager
-            .claim_requests(10, daemon_id, &capacity, &HashMap::new(), &HashSet::new())
+            .claim_requests(
+                10,
+                daemon_id,
+                &capacity,
+                &HashMap::new(),
+                &HashSet::new(),
+                &gates,
+            )
             .await
             .unwrap();
         assert_eq!(
             claimed.len(),
             2,
-            "a live model drains its backlog at full capacity"
+            "an open-gate model drains its backlog at full capacity"
         );
         assert!(
             claimed.iter().all(|r| r.state.leak.is_none()),
@@ -18748,50 +18798,43 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn test_live_overrides_cooldown(pool: sqlx::PgPool) {
+    async fn test_open_gate_overrides_cooldown(pool: sqlx::PgPool) {
         let manager = PostgresRequestManager::with_client(
             TestDbPools::new(pool.clone()).await.unwrap(),
             Arc::new(MockHttpClient::new()),
         )
         .with_config(filter_test_config());
 
-        // A live model is claimed even when this user's (window-class, model)
+        // An open-gate model is claimed even when this user's (window-class, model)
         // bucket is in cooldown — Source A ignores the leaky bucket entirely.
         let expires_at = Utc::now() + chrono::Duration::hours(12);
-        setup_filter_request(&manager, &pool, "heavy", "live-model", expires_at).await;
-        manager
-            .append_model_filter_event(&ModelFilter {
-                model: "live-model".to_string(),
-                state: ModelFilterState::Live,
-                expected_ready_at: None,
-            })
-            .await
-            .unwrap();
+        setup_filter_request(&manager, &pool, "heavy", "open-model", expires_at).await;
+        let gates = mark_open(&["open-model"]);
 
         let daemon_id = DaemonId::from(Uuid::new_v4());
-        let capacity = HashMap::from([("live-model".to_string(), 5)]);
+        let capacity = HashMap::from([("open-model".to_string(), 5)]);
         let cooldown = HashSet::from([(
             "heavy".to_string(),
             "default".to_string(),
-            "live-model".to_string(),
+            "open-model".to_string(),
         )]);
         let claimed = manager
-            .claim_requests(10, daemon_id, &capacity, &HashMap::new(), &cooldown)
+            .claim_requests(10, daemon_id, &capacity, &HashMap::new(), &cooldown, &gates)
             .await
             .unwrap();
         assert_eq!(
             claimed.len(),
             1,
-            "a live model claims regardless of cooldown"
+            "an open-gate model claims regardless of cooldown"
         );
         assert!(claimed[0].state.leak.is_none());
     }
 
     #[sqlx::test]
-    async fn test_becoming_live_releases_throttled_backlog(pool: sqlx::PgPool) {
-        // The transition that matters operationally: a not-live model whose
-        // backlog is being trickled flips to `live` and the remaining work is
-        // claimed at full capacity on the very next cycle.
+    async fn test_reopening_gate_releases_throttled_backlog(pool: sqlx::PgPool) {
+        // The transition that matters operationally: a throttled model whose
+        // backlog is being trickled flips back to `open` and the remaining
+        // work is claimed at full capacity on the very next cycle.
         let manager = PostgresRequestManager::with_client(
             TestDbPools::new(pool.clone()).await.unwrap(),
             Arc::new(MockHttpClient::new()),
@@ -18803,67 +18846,74 @@ mod tests {
         for _ in 0..3 {
             setup_filter_request(&manager, &pool, "u", "m", expires_at).await;
         }
-        mark_not_live(&manager, "m").await;
+        let gates = mark_throttled(&["m"]);
 
         let daemon_id = DaemonId::from(Uuid::new_v4());
         let capacity = HashMap::from([("m".to_string(), 5)]);
 
-        // Not-live: the leaky bucket trickles exactly one (≤1 per bucket), tagged
+        // Throttled: the leaky bucket trickles exactly one (≤1 per bucket), tagged
         // leaked; the other two are held.
         let throttled = manager
-            .claim_requests(10, daemon_id, &capacity, &HashMap::new(), &HashSet::new())
+            .claim_requests(
+                10,
+                daemon_id,
+                &capacity,
+                &HashMap::new(),
+                &HashSet::new(),
+                &gates,
+            )
             .await
             .unwrap();
-        assert_eq!(throttled.len(), 1, "not-live model trickles one per cycle");
+        assert_eq!(throttled.len(), 1, "throttled model trickles one per cycle");
         assert!(throttled[0].state.leak.is_some());
 
-        // The controller (scouter) marks it live. The next cycle claims ALL the
+        // The operator (dwctl) reopens the gate. The next cycle claims ALL the
         // remaining pending work at full capacity, none of it leaked — even
         // though the bucket is now in cooldown from the leak above.
-        manager
-            .append_model_filter_event(&ModelFilter {
-                model: "m".to_string(),
-                state: ModelFilterState::Live,
-                expected_ready_at: None,
-            })
-            .await
-            .unwrap();
+        let gates = mark_open(&["m"]);
         let cooldown = HashSet::from([("u".to_string(), "default".to_string(), "m".to_string())]);
         let released = manager
-            .claim_requests(10, daemon_id, &capacity, &HashMap::new(), &cooldown)
+            .claim_requests(10, daemon_id, &capacity, &HashMap::new(), &cooldown, &gates)
             .await
             .unwrap();
         assert_eq!(
             released.len(),
             2,
-            "becoming live releases the full remaining backlog at capacity"
+            "reopening the gate releases the full remaining backlog at capacity"
         );
         assert!(
             released.iter().all(|r| r.state.leak.is_none()),
-            "live claims are full-capacity, never leaked"
+            "open-gate claims are full-capacity, never leaked"
         );
     }
 
     #[sqlx::test]
-    async fn test_not_live_leaky_bucket_one_per_user_window(pool: sqlx::PgPool) {
+    async fn test_throttled_leaky_bucket_one_per_user_window(pool: sqlx::PgPool) {
         let manager = PostgresRequestManager::with_client(
             TestDbPools::new(pool.clone()).await.unwrap(),
             Arc::new(MockHttpClient::new()),
         )
         .with_config(filter_test_config());
 
-        // Two batches, same user, same window-class (24h), not-live, far deadline.
+        // Two batches, same user, same window-class (24h), throttled, far deadline.
         // Source B claims AT MOST ONE (one (user, window-class) bucket), tagged
         // leaked; with that bucket in cooldown the next cycle claims none.
         let expires_at = Utc::now() + chrono::Duration::hours(12);
         setup_filter_request(&manager, &pool, "u", "nl-model", expires_at).await;
         setup_filter_request(&manager, &pool, "u", "nl-model", expires_at).await;
-        mark_not_live(&manager, "nl-model").await;
+        let gates = mark_throttled(&["nl-model"]);
 
         let daemon_id = DaemonId::from(Uuid::new_v4());
         let capacity = HashMap::from([("nl-model".to_string(), 5)]);
         let claimed = manager
-            .claim_requests(10, daemon_id, &capacity, &HashMap::new(), &HashSet::new())
+            .claim_requests(
+                10,
+                daemon_id,
+                &capacity,
+                &HashMap::new(),
+                &HashSet::new(),
+                &gates,
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -18875,7 +18925,7 @@ mod tests {
             .state
             .leak
             .as_ref()
-            .expect("a not-live before-ramp claim is leaked");
+            .expect("a throttled before-ramp claim is leaked");
         assert_eq!(leak.window_class.as_str(), "default");
 
         // The bucket is now in cooldown => nothing leaks.
@@ -18885,7 +18935,7 @@ mod tests {
             "nl-model".to_string(),
         )]);
         let claimed = manager
-            .claim_requests(10, daemon_id, &capacity, &HashMap::new(), &cooldown)
+            .claim_requests(10, daemon_id, &capacity, &HashMap::new(), &cooldown, &gates)
             .await
             .unwrap();
         assert_eq!(claimed.len(), 0, "a bucket in cooldown does not leak");
@@ -18903,12 +18953,19 @@ mod tests {
         let expires_at = Utc::now() + chrono::Duration::hours(12);
         setup_filter_request(&manager, &pool, "a", "nl-model", expires_at).await;
         setup_filter_request(&manager, &pool, "b", "nl-model", expires_at).await;
-        mark_not_live(&manager, "nl-model").await;
+        let gates = mark_throttled(&["nl-model"]);
 
         let daemon_id = DaemonId::from(Uuid::new_v4());
         let capacity = HashMap::from([("nl-model".to_string(), 5)]);
         let claimed = manager
-            .claim_requests(10, daemon_id, &capacity, &HashMap::new(), &HashSet::new())
+            .claim_requests(
+                10,
+                daemon_id,
+                &capacity,
+                &HashMap::new(),
+                &HashSet::new(),
+                &gates,
+            )
             .await
             .unwrap();
         assert_eq!(claimed.len(), 2, "two distinct buckets each leak one");
@@ -18923,14 +18980,13 @@ mod tests {
         )
         .with_config(filter_test_config());
 
-        // Same user, same window-class (24h), but TWO distinct not-live models.
+        // Same user, same window-class (24h), but TWO distinct throttled models.
         // The bucket key is (user, window-class, model), so a cooldown on one
         // model must NOT block the same user+window on the other model.
         let expires_at = Utc::now() + chrono::Duration::hours(12);
         setup_filter_request(&manager, &pool, "u", "model-a", expires_at).await;
         setup_filter_request(&manager, &pool, "u", "model-b", expires_at).await;
-        mark_not_live(&manager, "model-a").await;
-        mark_not_live(&manager, "model-b").await;
+        let gates = mark_throttled(&["model-a", "model-b"]);
 
         let daemon_id = DaemonId::from(Uuid::new_v4());
         let capacity = HashMap::from([("model-a".to_string(), 5), ("model-b".to_string(), 5)]);
@@ -18943,7 +18999,7 @@ mod tests {
             "model-a".to_string(),
         )]);
         let claimed = manager
-            .claim_requests(10, daemon_id, &capacity, &HashMap::new(), &cooldown)
+            .claim_requests(10, daemon_id, &capacity, &HashMap::new(), &cooldown, &gates)
             .await
             .unwrap();
         assert_eq!(
@@ -18961,28 +19017,28 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn test_not_live_within_ramp_claims_full_capacity(pool: sqlx::PgPool) {
+    async fn test_throttled_within_ramp_claims_full_capacity(pool: sqlx::PgPool) {
         let manager = PostgresRequestManager::with_client(
             TestDbPools::new(pool.clone()).await.unwrap(),
             Arc::new(MockHttpClient::new()),
         )
         .with_config(filter_test_config());
 
-        // Not-live, but within ramp(W): W ≈ 2h05m (ramp ≈ 15 min) and the deadline
+        // Throttled, but within ramp(W): W ≈ 2h05m (ramp ≈ 15 min) and the deadline
         // is only 5 min away => Source A claims at full capacity, not leaked —
         // even with the bucket in cooldown.
         let created_at = Utc::now() - chrono::Duration::hours(2);
         let expires_at = Utc::now() + chrono::Duration::minutes(5);
         let bid = setup_filter_request(&manager, &pool, "u", "nl-ramp", Utc::now()).await;
         set_batch_window(&pool, bid, created_at, expires_at).await;
-        mark_not_live(&manager, "nl-ramp").await;
+        let gates = mark_throttled(&["nl-ramp"]);
 
         let daemon_id = DaemonId::from(Uuid::new_v4());
         let capacity = HashMap::from([("nl-ramp".to_string(), 5)]);
         let cooldown =
             HashSet::from([("u".to_string(), "flex".to_string(), "nl-ramp".to_string())]);
         let claimed = manager
-            .claim_requests(10, daemon_id, &capacity, &HashMap::new(), &cooldown)
+            .claim_requests(10, daemon_id, &capacity, &HashMap::new(), &cooldown, &gates)
             .await
             .unwrap();
         assert_eq!(
@@ -19001,7 +19057,7 @@ mod tests {
         // Edge of the ramp: a request whose deadline is already in the PAST is
         // trivially within ramp(W) (now - expires is negative, always ≤ the
         // non-negative ramp), so it claims at full capacity (→ OpenRouter)
-        // regardless of liveness — never trickled, never held. Also guards the
+        // regardless of the gate — never trickled, never held. Also guards the
         // NaN edge: W is GREATEST(..., 0) so power() never sees a negative base.
         let manager = PostgresRequestManager::with_client(
             TestDbPools::new(pool.clone()).await.unwrap(),
@@ -19013,7 +19069,7 @@ mod tests {
         let expires_at = Utc::now() - chrono::Duration::minutes(5); // already overdue
         let bid = setup_filter_request(&manager, &pool, "u", "nl-expired", Utc::now()).await;
         set_batch_window(&pool, bid, created_at, expires_at).await;
-        mark_not_live(&manager, "nl-expired").await;
+        let gates = mark_throttled(&["nl-expired"]);
 
         let daemon_id = DaemonId::from(Uuid::new_v4());
         let capacity = HashMap::from([("nl-expired".to_string(), 5)]);
@@ -19024,7 +19080,7 @@ mod tests {
             "nl-expired".to_string(),
         )]);
         let claimed = manager
-            .claim_requests(10, daemon_id, &capacity, &HashMap::new(), &cooldown)
+            .claim_requests(10, daemon_id, &capacity, &HashMap::new(), &cooldown, &gates)
             .await
             .unwrap();
         assert_eq!(
@@ -19046,7 +19102,7 @@ mod tests {
         )
         .with_config(filter_test_config());
 
-        // Both requests are ~50 min from their deadline and not-live, but have
+        // Both requests are ~50 min from their deadline and throttled, but have
         // very different windows. ramp(24h) ≈ 59 min > 50 => the long-window
         // request is WITHIN ramp (full-capacity, not leaked). ramp(1h) ≈ 10 min
         // < 50 => the short-window request is BEFORE ramp (Source B, leaked).
@@ -19068,12 +19124,19 @@ mod tests {
             now + chrono::Duration::minutes(50),
         )
         .await;
-        mark_not_live(&manager, "ramp-model").await;
+        let gates = mark_throttled(&["ramp-model"]);
 
         let daemon_id = DaemonId::from(Uuid::new_v4());
         let capacity = HashMap::from([("ramp-model".to_string(), 5)]);
         let claimed = manager
-            .claim_requests(10, daemon_id, &capacity, &HashMap::new(), &HashSet::new())
+            .claim_requests(
+                10,
+                daemon_id,
+                &capacity,
+                &HashMap::new(),
+                &HashSet::new(),
+                &gates,
+            )
             .await
             .unwrap();
         assert_eq!(claimed.len(), 2, "both requests are claimed this cycle");
@@ -19272,43 +19335,51 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn test_leaving_treated_as_not_live(pool: sqlx::PgPool) {
+    async fn test_claim_gate_ignores_model_filter_events(pool: sqlx::PgPool) {
         let manager = PostgresRequestManager::with_client(
             TestDbPools::new(pool.clone()).await.unwrap(),
             Arc::new(MockHttpClient::new()),
         )
         .with_config(filter_test_config());
 
-        // Two requests, same user, far deadline (not within ramp). A `leaving` model
-        // must take the not-live leaky-bucket path (≤1 leaked per cycle), exactly
-        // like `coming`/`absent` — proving the claim gate's `state = 'live'`
-        // predicate treats `leaving` as not-live with no special-casing.
+        // Two requests, same user, far deadline (not within ramp). The model's
+        // latest `model_filters` event says `live`, but the injected gate map
+        // says `Throttled` — the claim path must obey the map and trickle,
+        // proving the deprecated event log is no longer a claim-gate source.
         let expires_at = Utc::now() + chrono::Duration::hours(12);
         setup_filter_request(&manager, &pool, "u", "drain-model", expires_at).await;
         setup_filter_request(&manager, &pool, "u", "drain-model", expires_at).await;
         manager
             .append_model_filter_event(&ModelFilter {
                 model: "drain-model".to_string(),
-                state: ModelFilterState::Leaving,
+                state: ModelFilterState::Live,
                 expected_ready_at: None,
             })
             .await
             .unwrap();
+        let gates = mark_throttled(&["drain-model"]);
 
         let daemon_id = DaemonId::from(Uuid::new_v4());
         let capacity = HashMap::from([("drain-model".to_string(), 5)]);
         let claimed = manager
-            .claim_requests(10, daemon_id, &capacity, &HashMap::new(), &HashSet::new())
+            .claim_requests(
+                10,
+                daemon_id,
+                &capacity,
+                &HashMap::new(),
+                &HashSet::new(),
+                &gates,
+            )
             .await
             .unwrap();
         assert_eq!(
             claimed.len(),
             1,
-            "a leaving model is not-live: leaky-bucket trickles ≤1, not full capacity"
+            "a throttled gate trickles ≤1 even when the event log says live"
         );
         assert!(
             claimed[0].state.leak.is_some(),
-            "the leaving model's claim is leaked (not-live path)"
+            "the throttled model's claim is leaked (trickle path)"
         );
     }
 
@@ -19357,7 +19428,7 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn test_tombstone_absent_model_is_claimed(pool: sqlx::PgPool) {
+    async fn test_model_absent_from_gate_map_claims_full_capacity(pool: sqlx::PgPool) {
         let manager = PostgresRequestManager::with_client(
             TestDbPools::new(pool.clone()).await.unwrap(),
             Arc::new(MockHttpClient::new()),
@@ -19365,36 +19436,33 @@ mod tests {
         .with_config(filter_test_config());
 
         let expires_at = Utc::now() + chrono::Duration::hours(12);
-        setup_filter_request(&manager, &pool, "idle-user", "tomb-model", expires_at).await;
+        setup_filter_request(&manager, &pool, "idle-user", "unmanaged-model", expires_at).await;
 
-        // coming (would hold) then absent tombstone (latest) => claim.
-        manager
-            .append_model_filter_event(&ModelFilter {
-                model: "tomb-model".to_string(),
-                state: ModelFilterState::Coming,
-                expected_ready_at: Some(Utc::now() + chrono::Duration::seconds(30)),
-            })
-            .await
-            .unwrap();
-        manager
-            .append_model_filter_event(&ModelFilter {
-                model: "tomb-model".to_string(),
-                state: ModelFilterState::Absent,
-                expected_ready_at: None,
-            })
-            .await
-            .unwrap();
+        // The gate map throttles a DIFFERENT model only: absence from the map
+        // must never strangle — the unmanaged model claims at full capacity.
+        let gates = mark_throttled(&["some-other-model"]);
 
         let daemon_id = DaemonId::from(Uuid::new_v4());
-        let capacity = HashMap::from([("tomb-model".to_string(), 5)]);
+        let capacity = HashMap::from([("unmanaged-model".to_string(), 5)]);
         let claimed = manager
-            .claim_requests(10, daemon_id, &capacity, &HashMap::new(), &HashSet::new())
+            .claim_requests(
+                10,
+                daemon_id,
+                &capacity,
+                &HashMap::new(),
+                &HashSet::new(),
+                &gates,
+            )
             .await
             .unwrap();
         assert_eq!(
             claimed.len(),
             1,
-            "latest event is absent tombstone => claim (route to OR), not hold"
+            "a model with no gate entry claims at full capacity (route to OR), not held"
+        );
+        assert!(
+            claimed[0].state.leak.is_none(),
+            "an absent-from-map claim is full-capacity, not leaked"
         );
     }
 
