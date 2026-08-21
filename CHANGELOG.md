@@ -1,5 +1,13 @@
 # Changelog
 
+## [10.13.1](https://github.com/doublewordai/control-layer/compare/v10.13.0...v10.13.1) (2026-08-21)
+
+
+### Bug Fixes
+
+* fold SSE streams incrementally and drop async-openai from dwctl ([#1503](https://github.com/doublewordai/control-layer/issues/1503)) ([2995d73](https://github.com/doublewordai/control-layer/commit/2995d734bd966070ca337e61e50cd2dc7cd5392e))
+* **payments:** ack webhooks for users this plane does not own (COR-594) ([#1506](https://github.com/doublewordai/control-layer/issues/1506)) ([068455c](https://github.com/doublewordai/control-layer/commit/068455c2f530bfe0fa645e502876653aa3471ae1))
+
 ## [10.13.0](https://github.com/doublewordai/control-layer/compare/v10.12.0...v10.13.0) (2026-08-18)
 
 
