@@ -1475,6 +1475,18 @@ impl From<DaemonMode> for fusillade::DaemonMode {
     }
 }
 
+fn default_memory_gate_low_fraction() -> f64 {
+    0.65
+}
+
+fn default_adaptive_growth_factor() -> f64 {
+    1.5
+}
+
+fn default_adaptive_cut_factor() -> f64 {
+    0.8
+}
+
 /// The daemon processes batch requests asynchronously in the background.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
@@ -1497,6 +1509,40 @@ pub struct DaemonConfig {
 
     /// Default concurrency limit per model (default: 10)
     pub default_model_concurrency: usize,
+
+    /// Discover each model's concurrency limit from downstream 529s instead of
+    /// using its configured value as a hard ceiling (default: false).
+    ///
+    /// When on, `default_model_concurrency` and per-model `batch_capacity`
+    /// become starting points rather than ceilings, and the memory gate becomes
+    /// the bound. The daemon refuses to enable this without
+    /// `memory_gate_high_fraction` set, since nothing else would bound growth.
+    #[serde(default)]
+    pub adaptive_concurrency: bool,
+
+    /// Multiplier applied to a model's limit each time it goes up
+    /// (default: 1.5).
+    #[serde(default = "default_adaptive_growth_factor")]
+    pub adaptive_growth_factor: f64,
+
+    /// Multiplier applied to a model's limit on downstream 529 (default: 0.8).
+    #[serde(default = "default_adaptive_cut_factor")]
+    pub adaptive_cut_factor: f64,
+
+    /// Fraction of the daemon's own memory limit at or above which it stops
+    /// claiming (default: 0, disabled).
+    ///
+    /// This is the process-wide bound. A count of in-flight requests cannot be
+    /// it, because per-request memory varies by more than an order of magnitude
+    /// between workloads; this measures the pod's actual usage instead. Required
+    /// when `adaptive_concurrency` is on.
+    #[serde(default)]
+    pub memory_gate_high_fraction: f64,
+
+    /// Fraction of the memory limit below which claiming resumes
+    /// (default: 0.65). Must be below `memory_gate_high_fraction`.
+    #[serde(default = "default_memory_gate_low_fraction")]
+    pub memory_gate_low_fraction: f64,
 
     /// How long to sleep between claim iterations in milliseconds (default: 1000)
     pub claim_interval_ms: u64,
@@ -1903,6 +1949,11 @@ impl Default for DaemonConfig {
             mode: DaemonMode::Both,
             claim_batch_size: 100,
             default_model_concurrency: 10,
+            adaptive_concurrency: false,
+            adaptive_growth_factor: default_adaptive_growth_factor(),
+            adaptive_cut_factor: default_adaptive_cut_factor(),
+            memory_gate_high_fraction: 0.0,
+            memory_gate_low_fraction: default_memory_gate_low_fraction(),
             claim_interval_ms: 1000,
             max_retries: Some(1000),
             stop_before_deadline_ms: Some(900_000),
@@ -1983,6 +2034,11 @@ impl DaemonConfig {
             mode: self.mode.into(),
             claim_batch_size: self.claim_batch_size,
             model_concurrency_limits: model_capacity_limits.unwrap_or_else(|| std::sync::Arc::new(dashmap::DashMap::new())),
+            adaptive_concurrency: self.adaptive_concurrency,
+            adaptive_growth_factor: self.adaptive_growth_factor,
+            adaptive_cut_factor: self.adaptive_cut_factor,
+            memory_gate_high_fraction: self.memory_gate_high_fraction,
+            memory_gate_low_fraction: self.memory_gate_low_fraction,
             model_escalations: Arc::new(DashMap::from_iter(self.model_escalations.clone())),
             claim_interval_ms: self.claim_interval_ms,
             max_retries: self.max_retries,
@@ -3963,6 +4019,48 @@ background_services:
                     .additional_retryable_statuses
                     .is_empty()
             );
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_adaptive_concurrency_default_override_and_mapping() {
+        Jail::expect_with(|jail| {
+            jail.create_file("test.yaml", "secret_key: test-secret-key\n")?;
+            let args = Args {
+                config: "test.yaml".into(),
+                validate: false,
+            };
+
+            // Off by default: turning it on lets a model's limit exceed its
+            // configured value, so it has to be a deliberate opt-in.
+            let config = Config::load(&args)?;
+            assert!(!config.background_services.batch_daemon.adaptive_concurrency);
+            let fusillade_config = config.background_services.batch_daemon.to_fusillade_config();
+            assert!(!fusillade_config.adaptive_concurrency);
+            assert_eq!(fusillade_config.adaptive_growth_factor, 1.5);
+            assert_eq!(fusillade_config.adaptive_cut_factor, 0.8);
+            assert_eq!(fusillade_config.memory_gate_high_fraction, 0.0);
+
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: test-secret-key
+background_services:
+  batch_daemon:
+    adaptive_concurrency: true
+    adaptive_growth_factor: 2.0
+    adaptive_cut_factor: 0.5
+    memory_gate_high_fraction: 0.75
+"#,
+            )?;
+            let config = Config::load(&args)?;
+            let fusillade_config = config.background_services.batch_daemon.to_fusillade_config();
+            assert!(fusillade_config.adaptive_concurrency);
+            assert_eq!(fusillade_config.adaptive_growth_factor, 2.0);
+            assert_eq!(fusillade_config.adaptive_cut_factor, 0.5);
+            assert_eq!(fusillade_config.memory_gate_high_fraction, 0.75);
 
             Ok(())
         });

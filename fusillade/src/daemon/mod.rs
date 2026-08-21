@@ -5,8 +5,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
+mod adaptive_concurrency;
 pub mod config;
+mod memory_gate;
 
+use adaptive_concurrency::{AdaptiveConcurrencyController, ConcurrencyAdjustment};
+use memory_gate::{CgroupMemorySource, MemoryGate};
 use metrics::{counter, gauge, histogram};
 use tokio::task::JoinSet;
 
@@ -20,7 +24,7 @@ use crate::error::Result;
 use crate::http::HttpClient;
 use crate::manager::{ArchiveOutcome, DaemonStorage, Storage};
 use crate::processor::{DefaultRequestProcessor, RequestProcessor};
-use crate::request::{Claimed, DaemonId, Request, RequestCompletionResult};
+use crate::request::{Claimed, DaemonId, FailureReason, Request, RequestCompletionResult};
 
 pub use config::{
     DaemonConfig, DaemonMode, ModelEscalationConfig, ShouldRetryFn, default_should_retry,
@@ -34,6 +38,17 @@ pub use fusillade_core::daemon_record::{
 struct UserThroughputStats {
     completed: AtomicU64,
     failed: AtomicU64,
+}
+
+/// A claimed request after route-at-claim-time rewriting.
+///
+/// `request.data.model` is the downstream model that receives the request.
+/// `capacity_model` is the configured model whose claim slot this request
+/// consumes. They differ when escalation rewrites the route after the storage
+/// claim has already been made.
+struct PreparedRequest {
+    request: Request<Claimed>,
+    capacity_model: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,10 +97,65 @@ pub const BACKGROUND_DYNAMO_PRIORITY: i32 = i32::MIN;
 /// background work.
 pub const MIN_SLA_DYNAMO_PRIORITY: i32 = i32::MIN + 1;
 
+/// Whether the adaptive controller may run.
+///
+/// It treats a model's configured limit as a starting point and grows past it,
+/// so with it on nothing else bounds in-flight work. Pairing it with the memory
+/// gate is not advice, it is the only thing standing between a successful ramp
+/// and an OOM, so the daemon refuses the combination rather than trusting it to
+/// be configured correctly.
+fn adaptive_concurrency_permitted(requested: bool, has_memory_gate: bool) -> bool {
+    !requested || has_memory_gate
+}
+
 fn background_capacity(ordinary_limit: usize, background_limit: usize, in_flight: usize) -> usize {
     ordinary_limit
         .min(background_limit)
         .saturating_sub(in_flight)
+}
+
+/// Whether a failure means "the model had nowhere to put this request".
+///
+/// Only an exact 529. A timeout or a connection reset happened to a request the
+/// model had already accepted, so it says nothing about how many more it could
+/// take - counting those would shrink the limit every time the network hiccuped.
+///
+/// Note that onwards returns 429, not 529, when its own concurrency limit is
+/// full. If that turns out to be the limit we hit in practice, this is where to
+/// add it.
+fn is_downstream_overload(reason: &FailureReason) -> bool {
+    matches!(
+        reason,
+        FailureReason::RetriableHttpStatus { status: 529, .. }
+            | FailureReason::NonRetriableHttpStatus { status: 529, .. }
+    )
+}
+
+fn emit_concurrency_decrease(model: &str, adjustment: ConcurrencyAdjustment) {
+    counter!("fusillade_adaptive_concurrency_decreases_total", "model" => model.to_owned())
+        .increment(1);
+    gauge!("fusillade_adaptive_concurrency_limit", "model" => model.to_owned())
+        .set(adjustment.new_limit as f64);
+    tracing::warn!(
+        model,
+        previous_limit = adjustment.previous_limit,
+        new_limit = adjustment.new_limit,
+        status = 529,
+        "Reduced model concurrency after downstream overload"
+    );
+}
+
+fn emit_concurrency_increase(model: &str, adjustment: ConcurrencyAdjustment) {
+    counter!("fusillade_adaptive_concurrency_increases_total", "model" => model.to_owned())
+        .increment(1);
+    gauge!("fusillade_adaptive_concurrency_limit", "model" => model.to_owned())
+        .set(adjustment.new_limit as f64);
+    tracing::debug!(
+        model,
+        previous_limit = adjustment.previous_limit,
+        new_limit = adjustment.new_limit,
+        "Raised model concurrency: the model used every slot without a 529"
+    );
 }
 
 fn sla_dynamo_priority(deadline: chrono::DateTime<chrono::Utc>) -> i32 {
@@ -355,6 +425,16 @@ where
     /// daemon behavior.
     processor: Arc<dyn RequestProcessor<S, H>>,
     requests_in_flight: Arc<dashmap::DashMap<String, AtomicUsize>>,
+    /// Per-model AIMD state. The configured concurrency remains the hard
+    /// ceiling; HTTP 529 responses reduce this daemon's effective ceiling and
+    /// successful responses recover it gradually.
+    adaptive_concurrency: Arc<AdaptiveConcurrencyController>,
+    /// Suppresses claiming while this process is near its own memory limit.
+    /// `None` when disabled by config or when there is no readable cgroup limit.
+    /// The adaptive controller grows on success and nothing upstream reports
+    /// local memory pressure, so this is the only bound that corresponds to
+    /// running out of memory.
+    memory_gate: Option<Arc<MemoryGate>>,
     /// Per-user in-flight request counts across all models, used to prioritise
     /// users with fewer active requests during claim (per-user fair scheduling).
     user_requests_in_flight: Arc<dashmap::DashMap<String, AtomicUsize>>,
@@ -397,8 +477,40 @@ where
         shutdown_token: tokio_util::sync::CancellationToken,
     ) -> Self {
         let should_retry = config.retry_predicate();
+        let adaptive_concurrency = Arc::new(AdaptiveConcurrencyController::new(
+            config.adaptive_growth_factor,
+            config.adaptive_cut_factor,
+        ));
+        let memory_gate = MemoryGate::new(
+            config.memory_gate_high_fraction,
+            config.memory_gate_low_fraction,
+            Box::new(CgroupMemorySource),
+        )
+        .map(Arc::new);
+
+        // The controller treats a model's configured limit as a starting point
+        // and grows past it, so with it on nothing else bounds in-flight work.
+        // Running that combination is how a pod OOMs itself, so refuse it: fall
+        // back to the configured limits, which is the behaviour without the
+        // controller and is known to be survivable.
+        let adaptive_concurrency_enabled = if adaptive_concurrency_permitted(
+            config.adaptive_concurrency,
+            memory_gate.is_some(),
+        ) {
+            config.adaptive_concurrency
+        } else {
+            crate::background_error!(
+                "adaptive_concurrency_without_memory_gate",
+                Critical,
+                "adaptive_concurrency is on but no memory gate is configured; refusing to enable \
+                 it. Set memory_gate_high_fraction (and keep memory_gate_low_fraction below it). \
+                 Running at configured per-model limits instead."
+            );
+            false
+        };
         let config = DaemonConfig {
             should_retry,
+            adaptive_concurrency: adaptive_concurrency_enabled,
             ..config
         };
 
@@ -409,6 +521,8 @@ where
             config,
             processor: Arc::new(DefaultRequestProcessor),
             requests_in_flight: Arc::new(dashmap::DashMap::new()),
+            adaptive_concurrency,
+            memory_gate,
             user_requests_in_flight: Arc::new(dashmap::DashMap::new()),
             leak_buckets: Arc::new(dashmap::DashMap::new()),
             user_throughput: Arc::new(dashmap::DashMap::new()),
@@ -454,36 +568,78 @@ where
         }
     }
 
+    /// The concurrency ceiling in force for a model: the controller's discovered
+    /// limit, or the configured value when the controller is off.
+    fn effective_model_limit(&self, model: &str, configured_limit: usize) -> usize {
+        if self.config.adaptive_concurrency {
+            self.adaptive_concurrency.limit(model, configured_limit)
+        } else {
+            configured_limit
+        }
+    }
+
+    /// Total in-flight across every model, for the process-wide ceiling.
+    ///
+    /// Summed from the live counters rather than from the configured model list,
+    /// so escalation traffic and models removed from config still count against
+    /// the budget they are actually consuming.
+    fn total_in_flight(&self) -> usize {
+        self.requests_in_flight
+            .iter()
+            .map(|entry| entry.value().load(Ordering::Relaxed))
+            .sum()
+    }
+
+    /// Whether local memory pressure should suppress claiming this cycle.
+    ///
+    /// Checked before per-model capacity is computed, because when it bites the
+    /// answer is "nothing, from any model" - unlike the total in-flight cap,
+    /// which scales models down proportionally.
+    fn memory_pressure_blocks_claiming(&self) -> bool {
+        self.memory_gate
+            .as_ref()
+            .is_some_and(|gate| gate.should_block(self.total_in_flight()))
+    }
+
     fn available_capacity(&self) -> HashMap<String, usize> {
-        self.config
+        if self.memory_pressure_blocks_claiming() {
+            return HashMap::new();
+        }
+        let capacities: HashMap<String, usize> = self
+            .config
             .model_concurrency_limits
             .iter()
             .filter_map(|entry| {
                 let model = entry.key().clone();
-                let limit = *entry.value();
+                let configured_limit = *entry.value();
                 let in_flight = self
                     .requests_in_flight
                     .get(&model)
                     .map(|e| e.value().load(Ordering::Relaxed))
                     .unwrap_or(0);
-                let available = limit.saturating_sub(in_flight);
-                if available > 0 {
-                    Some((model, available))
-                } else {
-                    None
-                }
+                let limit = self.effective_model_limit(&model, configured_limit);
+                let available =
+                    adaptive_concurrency::available_capacity_for_model(limit, in_flight);
+                (available > 0).then_some((model, available))
             })
-            .collect()
+            .collect();
+
+        capacities
     }
 
     fn background_available_capacity(&self) -> HashMap<String, usize> {
+        if self.memory_pressure_blocks_claiming() {
+            return HashMap::new();
+        }
         let background_limit = self.config.background_concurrency_limit;
-        self.config
+        let capacities: HashMap<String, usize> = self
+            .config
             .model_concurrency_limits
             .iter()
             .filter_map(|entry| {
                 let model = entry.key().clone();
-                let ordinary_limit = *entry.value();
+                let configured_limit = *entry.value();
+                let ordinary_limit = self.effective_model_limit(&model, configured_limit);
                 let in_flight = self
                     .requests_in_flight
                     .get(&model)
@@ -492,7 +648,11 @@ where
                 let available = background_capacity(ordinary_limit, background_limit, in_flight);
                 (available > 0).then_some((model, available))
             })
-            .collect()
+            .collect();
+
+        // Background work occupies the same memory as foreground work, so it
+        // has to answer to the same process-wide ceiling.
+        capacities
     }
 
     fn user_active_counts(&self) -> HashMap<String, usize> {
@@ -648,7 +808,7 @@ where
                 _ => unreachable!("foreground kind passed to background claim loop"),
             };
 
-            let mut claimed = match claim_result {
+            let claimed = match claim_result {
                 Ok(claimed) => {
                     consecutive_claim_failures = 0;
                     claimed
@@ -706,8 +866,8 @@ where
                 "Claimed requests from storage"
             );
 
-            self.prepare_claimed_requests(&mut claimed, kind);
-            self.dispatch_claimed_requests(&mut join_set, claimed, kind);
+            let prepared = self.prepare_claimed_requests(claimed, kind);
+            self.dispatch_claimed_requests(&mut join_set, prepared, kind);
         }
     }
 
@@ -813,7 +973,7 @@ where
                 _ => unreachable!("background kind passed to foreground claim loop"),
             };
 
-            let mut claimed = match claim_result {
+            let claimed = match claim_result {
                 Ok(claimed) => {
                     consecutive_claim_failures = 0;
                     claimed
@@ -875,13 +1035,70 @@ where
                 self.stamp_leaks(&claimed);
             }
 
-            self.prepare_claimed_requests(&mut claimed, kind);
-            self.dispatch_claimed_requests(&mut join_set, claimed, kind);
+            self.grow_saturated_models(&claimed, &available_capacity);
+
+            let prepared = self.prepare_claimed_requests(claimed, kind);
+            self.dispatch_claimed_requests(&mut join_set, prepared, kind);
         }
     }
 
-    fn prepare_claimed_requests(&self, claimed: &mut [Request<Claimed>], kind: ClaimLoopKind) {
-        for request in claimed.iter_mut() {
+    /// Raise the limit for every model that just used all of it.
+    ///
+    /// We offer each model a number of slots and see how many rows come back. If
+    /// it took all of them, it had more work queued than we allowed through, so
+    /// giving it more slots next time will actually be used. If it took fewer,
+    /// it ran out of work (or the claim loop could not keep up) and a bigger
+    /// limit would sit unused until a burst arrived and dispatched the lot at
+    /// once.
+    ///
+    /// One known blind spot: when `claim_batch_size` trims a claim that several
+    /// models were competing for, the trimmed model looks like it ran out of
+    /// work and misses a raise. It errs toward not raising, and goes away once
+    /// claim size is comfortably above the limits in play.
+    fn grow_saturated_models(
+        &self,
+        claimed: &[Request<Claimed>],
+        available_capacity: &HashMap<String, usize>,
+    ) {
+        if !self.config.adaptive_concurrency {
+            return;
+        }
+
+        let mut claimed_per_model: HashMap<&str, usize> = HashMap::new();
+        for request in claimed {
+            *claimed_per_model
+                .entry(request.data.model.as_str())
+                .or_default() += 1;
+        }
+
+        for (model, offered) in available_capacity {
+            if *offered == 0 {
+                continue;
+            }
+            if claimed_per_model.get(model.as_str()).copied().unwrap_or(0) < *offered {
+                continue;
+            }
+            if let Some(adjustment) = self.adaptive_concurrency.try_grow(model) {
+                emit_concurrency_increase(model, adjustment);
+            }
+        }
+    }
+
+    fn prepare_claimed_requests(
+        &self,
+        claimed: Vec<Request<Claimed>>,
+        kind: ClaimLoopKind,
+    ) -> Vec<PreparedRequest> {
+        let mut prepared: Vec<_> = claimed
+            .into_iter()
+            .map(|request| PreparedRequest {
+                capacity_model: request.data.model.clone(),
+                request,
+            })
+            .collect();
+
+        for prepared_request in &mut prepared {
+            let request = &mut prepared_request.request;
             if kind.is_background() {
                 continue;
             }
@@ -920,7 +1137,8 @@ where
             }
         }
 
-        for request in claimed {
+        for prepared_request in &mut prepared {
+            let request = &mut prepared_request.request;
             let priority = if kind.is_background() {
                 BACKGROUND_DYNAMO_PRIORITY
             } else if self.config.inject_deadline_priority {
@@ -933,18 +1151,20 @@ where
             };
             inject_dynamo_priority(&mut request.data.body, priority);
         }
+
+        prepared
     }
 
     fn dispatch_claimed_requests(
         self: &Arc<Self>,
         join_set: &mut JoinSet<Result<()>>,
-        claimed: Vec<Request<Claimed>>,
+        claimed: Vec<PreparedRequest>,
         kind: ClaimLoopKind,
     ) {
         let mut by_model: HashMap<String, Vec<_>> = HashMap::new();
-        for request in claimed {
-            let model = request.data.model.clone();
-            by_model.entry(model).or_default().push(request);
+        for prepared_request in claimed {
+            let model = prepared_request.request.data.model.clone();
+            by_model.entry(model).or_default().push(prepared_request);
         }
 
         tracing::debug!(
@@ -956,7 +1176,11 @@ where
         for (model, requests) in by_model {
             tracing::debug!(model = %model, count = requests.len(), "Processing requests for model");
 
-            for request in requests {
+            for prepared_request in requests {
+                let PreparedRequest {
+                    request,
+                    capacity_model,
+                } = prepared_request;
                 let request_id = request.data.id;
                 let batch_id = request.data.batch_id;
 
@@ -968,6 +1192,7 @@ where
                 );
 
                 let model_clone = model.clone();
+                let capacity_model_clone = capacity_model.clone();
                 let user_id = request.data.created_by.clone();
                 let is_background = kind.is_background();
                 let uses_foreground_accounting = kind.uses_foreground_accounting();
@@ -1000,6 +1225,8 @@ where
                 let processor = self.processor.clone();
                 let retry_config: crate::request::transitions::RetryConfig = (&self.config).into();
                 let requests_in_flight = self.requests_in_flight.clone();
+                let adaptive_concurrency = self.adaptive_concurrency.clone();
+                let model_concurrency_limits = self.config.model_concurrency_limits.clone();
                 let user_throughput = self.user_throughput.clone();
                 let user_requests_in_flight = self.user_requests_in_flight.clone();
                 let requests_processed = self.requests_processed.clone();
@@ -1013,15 +1240,33 @@ where
                     None => tokio_util::sync::CancellationToken::new(),
                 };
 
+                // Record which version of the limit this request is being sent
+                // under, so that if it comes back 529 we can tell whether that
+                // is news or an echo of an overload we already reacted to.
+                //
+                // Background work is left out. It runs on top of the foreground
+                // limit rather than inside it, and only when foreground is
+                // quiet, so a background rejection means background overflowed -
+                // reacting to it would shrink the SLA-bearing traffic because
+                // the spare-capacity traffic bounced.
+                let control_generation =
+                    (!is_background && self.config.adaptive_concurrency).then(|| {
+                        let seed = model_concurrency_limits
+                            .get(&capacity_model_clone)
+                            .map(|limit| *limit)
+                            .unwrap_or(0);
+                        adaptive_concurrency.stamp(&capacity_model_clone, seed)
+                    });
+
                 if is_background {
                     gauge!("fusillade_background_requests_in_flight", "model" => model_clone.clone())
                         .increment(1.0);
                 } else {
                     requests_in_flight
-                        .entry(model_clone.clone())
+                        .entry(capacity_model_clone.clone())
                         .or_default()
                         .fetch_add(1, Ordering::Relaxed);
-                    gauge!("fusillade_requests_in_flight", "model" => model_clone.clone())
+                    gauge!("fusillade_requests_in_flight", "model" => capacity_model_clone.clone())
                         .increment(1.0);
 
                     user_requests_in_flight
@@ -1040,6 +1285,7 @@ where
                     request_id = %request_id,
                     batch_id = ?batch_id,
                     model = %model,
+                    capacity_model = %capacity_model,
                     outcome = tracing::field::Empty,
                 );
 
@@ -1051,7 +1297,7 @@ where
                     }
 
                     let processing_start = std::time::Instant::now();
-                    let model_for_guard = model_clone.clone();
+                    let model_for_guard = capacity_model_clone.clone();
                     let user_for_guard = user_id.clone();
                     let cw_for_guard = completion_window.clone();
                     let in_flight_for_guard = requests_in_flight.clone();
@@ -1106,6 +1352,13 @@ where
                     match completion_result {
                         Ok(RequestCompletionResult::Completed(completed)) => {
                             tracing::Span::current().record("outcome", "completed");
+                            // Deliberately nothing for the concurrency
+                            // controller here. Raising the limit every time a
+                            // request succeeds would push a model with five
+                            // requests of work up to a limit of thousands, since
+                            // all five keep succeeding. Raises happen in the
+                            // claim loop instead, where we can see whether the
+                            // model actually wanted the slots.
                             requests_processed.fetch_add(1, Ordering::Relaxed);
                             user_throughput.entry(user_id.clone()).or_insert_with(|| UserThroughputStats {
                                 completed: AtomicU64::new(0),
@@ -1136,8 +1389,16 @@ where
                         }
                         Ok(RequestCompletionResult::Failed(failed)) => {
                             tracing::Span::current().record("outcome", "failed");
+                            if is_downstream_overload(&failed.state.reason)
+                                && let Some(generation) = control_generation
+                                && let Some(adjustment) = adaptive_concurrency
+                                    .record_overload(&capacity_model_clone, generation)
+                            {
+                                emit_concurrency_decrease(&capacity_model_clone, adjustment);
+                            }
                             let retry_attempt = failed.state.retry_attempt;
                             let reason_label = failed.state.reason.metric_label();
+                            let status_code_label = failed.state.reason.status_code_label();
                             if failed.state.reason.is_retriable() {
                                 match failed.can_retry(retry_attempt, retry_config.clone()) {
                                     Ok(pending) => {
@@ -1150,10 +1411,23 @@ where
                                             )
                                             .await?;
                                         if rescheduled {
+                                            // `reason`/`status_code` matter more
+                                            // than they look: a retried failure
+                                            // never lands in
+                                            // `fusillade_requests_completed_total`
+                                            // (that only records terminal
+                                            // outcomes), so without them a
+                                            // sustained stream of rejections is
+                                            // invisible in metrics, and there is
+                                            // no way to tell an upstream 529
+                                            // from a 429 at the proxy's own
+                                            // concurrency limit.
                                             counter!(
                                                 "fusillade_requests_retried_total",
                                                 "model" => model_clone.clone(),
-                                                "attempt" => (retry_attempt + 1).to_string()
+                                                "attempt" => (retry_attempt + 1).to_string(),
+                                                "reason" => reason_label,
+                                                "status_code" => status_code_label.clone()
                                             )
                                             .increment(1);
                                             tracing::info!(
@@ -2019,6 +2293,35 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::request::FailureReason;
+
+    #[test]
+    fn only_http_529_is_a_downstream_overload_signal() {
+        for reason in [
+            FailureReason::RetriableHttpStatus {
+                status: 529,
+                body: String::new(),
+            },
+            FailureReason::NonRetriableHttpStatus {
+                status: 529,
+                body: String::new(),
+            },
+        ] {
+            assert!(is_downstream_overload(&reason));
+        }
+
+        for reason in [
+            FailureReason::RetriableHttpStatus {
+                status: 503,
+                body: String::new(),
+            },
+            FailureReason::NetworkError {
+                error: "connection reset".to_string(),
+            },
+        ] {
+            assert!(!is_downstream_overload(&reason));
+        }
+    }
 
     #[test]
     fn claim_failure_backoff_grows_exponentially_and_caps() {
@@ -2086,6 +2389,19 @@ mod tests {
             claim_loop_kinds_for_mode(DaemonMode::BatchOnly, false, false, false, false).is_err(),
             "batch-only mode should fail loudly when storage cannot claim batches"
         );
+    }
+
+    /// The controller grows past a model's configured limit, so with it on the
+    /// memory gate is the only bound left. Enabling one without the other is the
+    /// configuration that OOMs a pod, so it is refused rather than trusted.
+    #[test]
+    fn adaptive_concurrency_requires_a_memory_gate() {
+        assert!(!adaptive_concurrency_permitted(true, false), "unbounded");
+        assert!(adaptive_concurrency_permitted(true, true));
+        // Without the controller a model cannot exceed its configured limit, so
+        // the gate is optional there.
+        assert!(adaptive_concurrency_permitted(false, false));
+        assert!(adaptive_concurrency_permitted(false, true));
     }
 
     #[test]
