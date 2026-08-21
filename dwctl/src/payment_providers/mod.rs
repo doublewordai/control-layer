@@ -64,6 +64,20 @@ pub enum PaymentError {
 
     #[error("Automatic top-up payment was declined: {0:?}")]
     AutoTopupDeclined(AutoTopupDeclineKind),
+
+    /// The session references a user this plane has never heard of, which in a
+    /// multi-region deployment overwhelmingly means it belongs to another
+    /// region: Stripe delivers account-level events to *every* configured
+    /// endpoint regardless of which plane created the session, so with one
+    /// Stripe account and two planes each receives the other's events as a
+    /// matter of course.
+    ///
+    /// Maps to 404, which is the honest answer for the front-channel
+    /// `PATCH /payments/{id}` caller. The webhook handler deliberately acks it
+    /// with 200 instead — see the arm there — because Stripe must be told to
+    /// stop redelivering an event this plane can never process.
+    #[error("Payment session references a user unknown to this plane: {0}")]
+    UnknownReference(String),
 }
 
 impl From<PaymentError> for StatusCode {
@@ -72,6 +86,11 @@ impl From<PaymentError> for StatusCode {
             PaymentError::PaymentNotCompleted => StatusCode::PAYMENT_REQUIRED,
             PaymentError::InvalidData(_) | PaymentError::NoCustomerId => StatusCode::BAD_REQUEST,
             PaymentError::AlreadyProcessed => StatusCode::OK,
+            // NOT ok here. A 2xx belongs to the webhook, where it stops Stripe
+            // redelivering; this mapping also serves the front-channel
+            // PATCH /payments/{id}, where reporting success for a session we
+            // cannot process would be a lie to the caller.
+            PaymentError::UnknownReference(_) => StatusCode::NOT_FOUND,
             PaymentError::AutoTopupDeclined(_) => StatusCode::PAYMENT_REQUIRED,
             PaymentError::ProviderApi(_) | PaymentError::Database(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
