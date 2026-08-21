@@ -1,6 +1,7 @@
 pub mod anthropic;
 pub mod cache_classifier;
 pub mod databases;
+pub mod golden_transcripts;
 pub mod responses;
 pub mod sigterm_drain;
 pub mod sla;

@@ -1,0 +1,133 @@
+---
+source: dwctl/src/test/golden_transcripts.rs
+expression: "transcript(status, &body, &upstream, &outlet, &fusillade, &f)"
+---
+=== client ===
+status: 200
+body: event: message_start
+data: {"message":{"content":[],"id":"c1","model":"gpt-4o","role":"assistant","stop_reason":null,"stop_sequence":null,"type":"message","usage":{"input_tokens":0,"output_tokens":0}},"type":"message_start"}
+
+event: content_block_start
+data: {"content_block":{"text":"","type":"text"},"index":0,"type":"content_block_start"}
+
+event: content_block_delta
+data: {"delta":{"text":"Hello","type":"text_delta"},"index":0,"type":"content_block_delta"}
+
+event: content_block_stop
+data: {"index":0,"type":"content_block_stop"}
+
+event: message_delta
+data: {"delta":{"stop_reason":"end_turn","stop_sequence":null},"type":"message_delta","usage":{"input_tokens":10,"output_tokens":1}}
+
+event: message_stop
+data: {"type":"message_stop"}
+
+
+
+=== upstream ===
+--- upstream request 0 ---
+POST /chat/completions
+authorization: <absent>
+content-type: application/json
+x-fusillade-request-id: <uuid>
+x-onwards-response-id: resp_<uuid>
+x-onwards-endpoint: /v1/messages
+x-onwards-model: gpt-4o
+x-fusillade-stream: <absent>
+x-fusillade-batch-zdr: <absent>
+body: {"max_tokens":64,"messages":[{"content":"golden-anthropic-streaming-sentinel","role":"user"}],"model":"gpt-4o","stream":true,"stream_options":{"include_usage":true}}
+
+=== outlet ===
+--- outlet http_requests ---
+{
+  "body": {
+    "headers": {
+      "anthropic-version": "2023-06-01",
+      "content-type": "application/json",
+      "x-api-key": "<api-key>",
+      "x-fusillade-request-id": "<uuid>",
+      "x-onwards-endpoint": "/v1/messages",
+      "x-onwards-model": "gpt-4o",
+      "x-onwards-response-id": "resp_<uuid>"
+    },
+    "request": {
+      "max_tokens": 64,
+      "messages": [
+        {
+          "content": "golden-anthropic-streaming-sentinel",
+          "role": "user"
+        }
+      ],
+      "model": "gpt-4o",
+      "stream": true
+    }
+  },
+  "body_parsed": true,
+  "instance_id": "<uuid>",
+  "method": "POST",
+  "span_id": null,
+  "trace_id": null,
+  "uri": "http://localhost/messages"
+}
+--- outlet http_responses ---
+{
+  "body": [
+    {
+      "message": {
+        "content": [],
+        "id": "c1",
+        "model": "gpt-4o",
+        "role": "assistant",
+        "stop_reason": null,
+        "stop_sequence": null,
+        "type": "message",
+        "usage": {
+          "input_tokens": 0,
+          "output_tokens": 0
+        }
+      },
+      "type": "message_start"
+    },
+    {
+      "content_block": {
+        "text": "",
+        "type": "text"
+      },
+      "index": 0,
+      "type": "content_block_start"
+    },
+    {
+      "delta": {
+        "text": "Hello",
+        "type": "text_delta"
+      },
+      "index": 0,
+      "type": "content_block_delta"
+    },
+    {
+      "index": 0,
+      "type": "content_block_stop"
+    },
+    {
+      "delta": {
+        "stop_reason": "end_turn",
+        "stop_sequence": null
+      },
+      "type": "message_delta",
+      "usage": {
+        "input_tokens": 10,
+        "output_tokens": 1
+      }
+    },
+    {
+      "type": "message_stop"
+    }
+  ],
+  "body_parsed": true,
+  "instance_id": "<uuid>",
+  "status_code": 200
+}
+
+=== fusillade ===
+--- fusillade row ---
+(no terminal row)

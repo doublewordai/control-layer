@@ -1,0 +1,146 @@
+---
+source: dwctl/src/test/golden_transcripts.rs
+expression: "transcript(status, &body, &upstream, &outlet, &fusillade, &f)"
+---
+=== client ===
+status: 200
+body: data: {"id":"c1","object":"chat.completion.chunk","created":1,"model":"gpt-4o","choices":[{"index":0,"delta":{"role":"assistant"}}]}
+
+data: {"id":"c1","object":"chat.completion.chunk","created":1,"model":"gpt-4o","choices":[{"index":0,"delta":{"content":"Hello"}}]}
+
+data: {"id":"c1","object":"chat.completion.chunk","created":1,"model":"gpt-4o","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":1,"total_tokens":11}}
+
+data: [DONE]
+
+
+
+=== upstream ===
+--- upstream request 0 ---
+POST /chat/completions
+authorization: <absent>
+content-type: application/json
+x-fusillade-request-id: <uuid>
+x-onwards-response-id: resp_<uuid>
+x-onwards-endpoint: /v1/chat/completions
+x-onwards-model: gpt-4o
+x-fusillade-stream: <absent>
+x-fusillade-batch-zdr: <absent>
+body: {"messages":[{"content":"golden-chat-streaming-sentinel","role":"user"}],"model":"gpt-4o","stream":true,"stream_options":{"include_usage":true}}
+
+=== outlet ===
+--- outlet http_requests ---
+{
+  "body": {
+    "headers": {
+      "authorization": "Bearer <api-key>",
+      "content-type": "application/json",
+      "x-fusillade-request-id": "<uuid>",
+      "x-onwards-endpoint": "/v1/chat/completions",
+      "x-onwards-model": "gpt-4o",
+      "x-onwards-response-id": "resp_<uuid>"
+    },
+    "request": {
+      "messages": [
+        {
+          "content": "golden-chat-streaming-sentinel",
+          "role": "user"
+        }
+      ],
+      "model": "gpt-4o",
+      "stream": true
+    }
+  },
+  "body_parsed": true,
+  "instance_id": "<uuid>",
+  "method": "POST",
+  "span_id": null,
+  "trace_id": null,
+  "uri": "http://localhost/chat/completions"
+}
+--- outlet http_responses ---
+{
+  "body": [
+    {
+      "choices": [
+        {
+          "delta": {
+            "content": null,
+            "function_call": null,
+            "refusal": null,
+            "role": "assistant",
+            "tool_calls": null
+          },
+          "index": 0
+        }
+      ],
+      "created": 1,
+      "id": "c1",
+      "model": "gpt-4o",
+      "object": "chat.completion.chunk",
+      "service_tier": null,
+      "system_fingerprint": null,
+      "usage": null
+    },
+    {
+      "choices": [
+        {
+          "delta": {
+            "content": "Hello",
+            "function_call": null,
+            "refusal": null,
+            "role": null,
+            "tool_calls": null
+          },
+          "index": 0
+        }
+      ],
+      "created": 1,
+      "id": "c1",
+      "model": "gpt-4o",
+      "object": "chat.completion.chunk",
+      "service_tier": null,
+      "system_fingerprint": null,
+      "usage": null
+    },
+    {
+      "choices": [
+        {
+          "delta": {
+            "content": null,
+            "function_call": null,
+            "refusal": null,
+            "role": null,
+            "tool_calls": null
+          },
+          "finish_reason": "stop",
+          "index": 0
+        }
+      ],
+      "created": 1,
+      "id": "c1",
+      "model": "gpt-4o",
+      "object": "chat.completion.chunk",
+      "service_tier": null,
+      "system_fingerprint": null,
+      "usage": {
+        "completion_tokens": 1,
+        "prompt_tokens": 10,
+        "total_tokens": 11
+      }
+    },
+    null
+  ],
+  "body_parsed": true,
+  "instance_id": "<uuid>",
+  "status_code": 200
+}
+
+=== fusillade ===
+--- fusillade row ---
+state: completed
+service_tier: priority
+model: gpt-4o
+method: POST
+path: /v1/chat/completions
+endpoint: 
+body: {"messages":[{"content":"golden-chat-streaming-sentinel","role":"user"}],"model":"gpt-4o","stream":true}
