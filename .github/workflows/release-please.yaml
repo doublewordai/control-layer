@@ -37,7 +37,7 @@ jobs:
         pr: ${{ fromJSON(needs.release-please.outputs.prs) }}
     steps:
       - name: Checkout release PR
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           token: ${{ secrets.RELEASE_TOKEN }}
           ref: ${{ matrix.pr.headBranchName }}
