@@ -991,9 +991,7 @@ impl From<&AiResponse> for TokenMetrics {
                 // reduced value subtracts the cached tokens twice and bills them at
                 // nothing. Add the cache buckets back to recover the full prompt.
                 let usage = &response.usage;
-                let prompt_tokens = (usage.input_tokens
-                    + usage.cache_read_input_tokens.unwrap_or(0)
-                    + usage.cache_creation_input_tokens.unwrap_or(0)) as i64;
+                let prompt_tokens = (usage.input_tokens + usage.cache_read_input_tokens + usage.cache_creation_input_tokens) as i64;
                 let completion_tokens = usage.output_tokens as i64;
                 Self {
                     prompt_tokens,
