@@ -8,6 +8,47 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, instrument};
 
+async fn release_leader_connection(leader_conn: &mut Option<sqlx::pool::PoolConnection<sqlx::Postgres>>, lock_id: i64) {
+    let Some(mut conn) = leader_conn.take() else {
+        return;
+    };
+
+    match sqlx::query_scalar::<_, bool>("SELECT pg_advisory_unlock($1)")
+        .bind(lock_id)
+        .fetch_one(&mut *conn)
+        .await
+    {
+        Ok(true) => debug!("Released leader advisory lock"),
+        Ok(false) => {
+            crate::background_error!(
+                LEADER_ELECTION,
+                "unlock_missing",
+                Warning,
+                "Leader connection no longer held the advisory lock"
+            );
+        }
+        Err(e) => {
+            crate::background_error!(LEADER_ELECTION, "unlock", Warning, "Failed to release leader advisory lock: {}", e);
+
+            // Returning a connection with an uncertain session lock to the pool
+            // could strand leadership. Closing it makes PostgreSQL release every
+            // session-scoped advisory lock even when the explicit unlock failed.
+            if let Err(close_error) = conn.close().await {
+                crate::background_error!(
+                    LEADER_ELECTION,
+                    "unlock_close",
+                    Warning,
+                    "Failed to close leader connection after unlock error: {}",
+                    close_error
+                );
+            }
+            return;
+        }
+    }
+
+    drop(conn);
+}
+
 /// Background task for leader election
 /// Runs periodically to maintain leadership or attempt to acquire it
 ///
@@ -46,6 +87,7 @@ pub async fn leader_election_task<F1, F2, Fut1, Fut2>(
                         crate::background_error!(LEADER_ELECTION, "lose_callback", Error, "Failed to execute on_lose_leadership callback during shutdown: {}", e);
                     }
                 }
+                release_leader_connection(&mut leader_conn, lock_id).await;
                 break;
             }
         }
@@ -76,6 +118,18 @@ pub async fn leader_election_task<F1, F2, Fut1, Fut2>(
                                     "Failed to execute on_gain_leadership callback: {}",
                                     e
                                 );
+
+                                is_leader.store(false, Ordering::Relaxed);
+                                if let Err(e) = on_lose_leadership(pool.clone(), config.clone()).await {
+                                    crate::background_error!(
+                                        LEADER_ELECTION,
+                                        "lose_callback",
+                                        Error,
+                                        "Failed to clean up after on_gain_leadership callback failure: {}",
+                                        e
+                                    );
+                                }
+                                release_leader_connection(&mut leader_conn, lock_id).await;
                             }
                         }
                         Ok(false) => {
@@ -135,5 +189,131 @@ pub async fn leader_election_task<F1, F2, Fut1, Fut2>(
                 is_leader.store(false, Ordering::Relaxed);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+    use std::time::Duration;
+
+    async fn wait_until(mut predicate: impl FnMut() -> bool) {
+        for _ in 0..1_000 {
+            if predicate() {
+                return;
+            }
+
+            tokio::time::advance(Duration::from_millis(1)).await;
+            tokio::task::yield_now().await;
+        }
+
+        panic!("condition was not met before the test deadline");
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn failed_gain_cleans_up_unlocks_and_retries(pool: PgPool) {
+        let lock_id = 8_204_921_019_i64;
+        let is_leader = Arc::new(AtomicBool::new(false));
+        let gain_attempts = Arc::new(AtomicUsize::new(0));
+        let loss_calls = Arc::new(AtomicUsize::new(0));
+        let shutdown = CancellationToken::new();
+        // Hold this session for the whole test so lock checks cannot reuse the
+        // leader's pooled session and get PostgreSQL's re-entrant-lock result.
+        // Every physical connection is established BEFORE pausing time: under a
+        // paused clock, tokio auto-advance can expire sqlx's acquire timeout
+        // while a fresh TCP connect is still in flight.
+        let mut contender = pool.acquire().await.unwrap();
+        let warm_leader_connection = pool.acquire().await.unwrap();
+        drop(warm_leader_connection);
+        tokio::time::pause();
+
+        let task = tokio::spawn(leader_election_task(
+            pool.clone(),
+            config::Config::default(),
+            is_leader.clone(),
+            lock_id,
+            shutdown.clone(),
+            {
+                let gain_attempts = gain_attempts.clone();
+                move |_, _| {
+                    let attempt = gain_attempts.fetch_add(1, Ordering::Relaxed);
+                    async move {
+                        if attempt == 0 {
+                            anyhow::bail!("intentional first-attempt failure");
+                        }
+                        Ok(())
+                    }
+                }
+            },
+            {
+                let loss_calls = loss_calls.clone();
+                move |_, _| {
+                    loss_calls.fetch_add(1, Ordering::Relaxed);
+                    async { Ok(()) }
+                }
+            },
+        ));
+
+        wait_until(|| loss_calls.load(Ordering::Relaxed) == 1).await;
+        assert!(!is_leader.load(Ordering::Relaxed));
+
+        // The lose callback resolves before the cleanup's unlock round-trip
+        // finishes, so poll for the release instead of asserting on the first
+        // observation.
+        let mut acquired = false;
+        for _ in 0..1_000 {
+            acquired = sqlx::query_scalar::<_, bool>("SELECT pg_try_advisory_lock($1)")
+                .bind(lock_id)
+                .fetch_one(&mut *contender)
+                .await
+                .unwrap();
+            if acquired {
+                break;
+            }
+            tokio::time::advance(Duration::from_millis(1)).await;
+            tokio::task::yield_now().await;
+        }
+        assert!(acquired, "failed gain must release its advisory lock");
+        assert!(
+            sqlx::query_scalar::<_, bool>("SELECT pg_advisory_unlock($1)")
+                .bind(lock_id)
+                .fetch_one(&mut *contender)
+                .await
+                .unwrap()
+        );
+
+        tokio::time::advance(Duration::from_secs(30)).await;
+        wait_until(|| gain_attempts.load(Ordering::Relaxed) == 2).await;
+        assert!(is_leader.load(Ordering::Relaxed));
+        assert!(
+            !sqlx::query_scalar::<_, bool>("SELECT pg_try_advisory_lock($1)")
+                .bind(lock_id)
+                .fetch_one(&mut *contender)
+                .await
+                .unwrap(),
+            "the successful retry must hold the advisory lock"
+        );
+
+        shutdown.cancel();
+        task.await.unwrap();
+        assert_eq!(loss_calls.load(Ordering::Relaxed), 2);
+        assert!(!is_leader.load(Ordering::Relaxed));
+
+        let acquired = sqlx::query_scalar::<_, bool>("SELECT pg_try_advisory_lock($1)")
+            .bind(lock_id)
+            .fetch_one(&mut *contender)
+            .await
+            .unwrap();
+        assert!(acquired, "shutdown must release its advisory lock");
+        assert!(
+            sqlx::query_scalar::<_, bool>("SELECT pg_advisory_unlock($1)")
+                .bind(lock_id)
+                .fetch_one(&mut *contender)
+                .await
+                .unwrap()
+        );
+        drop(contender);
+        tokio::time::resume();
     }
 }

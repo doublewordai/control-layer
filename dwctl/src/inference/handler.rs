@@ -1,11 +1,13 @@
 //! Handler for retrieving Open Responses API responses.
 //!
-//! `GET /ai/v1/responses/{response_id}` reads directly from fusillade's
-//! `requests` table, mapping the row to an Open Responses API Response object.
+//! `GET /ai/v1/responses/{response_id}` resolves through fusillade's live or
+//! active retained-response route and maps the snapshot to an Open Responses
+//! API Response object.
 //!
 //! Authentication is via Bearer API key (same as AI proxy requests).
-//! Ownership is verified by checking the batch's `created_by` against the
-//! API key's `user_id` (which is the org ID for org-scoped keys).
+//! Ownership is verified by checking the resolved request snapshot's
+//! `created_by` against the API key's `user_id` (which is the org ID for
+//! org-scoped keys).
 
 use crate::inference::response_store::StoreError;
 use axum::{
@@ -16,7 +18,6 @@ use axum::{
 use fusillade::{ResponseStepStore, Storage};
 use serde::{Deserialize, Serialize};
 use sqlx_pool_router::PoolProvider;
-use std::collections::HashSet;
 use utoipa::ToSchema;
 
 use crate::AppState;
@@ -55,7 +56,7 @@ pub enum ResponseDeletedObjectType {
 ///
 /// Authenticates via Bearer API key. The response_id is the head step's
 /// uuid (with optional `resp_` prefix); the head step's sub-request
-/// fusillade row carries `created_by` for ownership.
+/// live or retained fusillade request carries `created_by` for ownership.
 #[tracing::instrument(skip_all)]
 pub async fn get_response<P: PoolProvider>(
     State(state): State<AppState<P>>,
@@ -86,7 +87,7 @@ pub async fn get_response<P: PoolProvider>(
         id: response_id.clone(),
     })?;
 
-    // Resolve the row that carries `created_by` for ownership.
+    // Resolve the live row or retained snapshot that carries `created_by` for ownership.
     // Two paths, mirroring `FusilladeResponseStore::get_response`:
     //   * Multi-step — head step → its sub-request fusillade row.
     //   * Single-step — the id is itself a fusillade.requests row
@@ -152,13 +153,8 @@ pub async fn get_response<P: PoolProvider>(
 
 /// Delete a response by ID.
 ///
-/// Right-to-erasure: hard-deletes every `fusillade.requests` row that backs
-/// the response (and each row's dedicated batchless `request_templates`
-/// row carrying the prompt body — see `fusillade::Storage::delete_request`).
-/// For multi-step responses, walks the `response_steps` chain from the head
-/// step and deletes each step's sub-request — the `response_steps` rows
-/// themselves cascade via FK. For single-step responses (chat completions
-/// / embeddings retrieved via the same GET surface), deletes the one row.
+/// Right-to-erasure: atomically hard-deletes the complete live or retained
+/// response graph, including every dedicated batchless template.
 ///
 /// **Preserved by design**: `http_analytics` has no FK to requests (token
 /// counts, cost, status code), and `credits_transactions` is immutable
@@ -195,7 +191,7 @@ schema and survive the erasure.",
     ),
     security(("BearerAuth" = []))
 )]
-#[tracing::instrument(skip_all, fields(response_id = %response_id))]
+#[tracing::instrument(skip_all)]
 pub async fn delete_response<P: PoolProvider>(
     State(state): State<AppState<P>>,
     headers: HeaderMap,
@@ -220,121 +216,17 @@ pub async fn delete_response<P: PoolProvider>(
         id: response_id.clone(),
     })?;
 
-    // Resolve which fusillade.requests rows back this response, mirroring
-    // `get_response`'s resolution:
-    //   * Multi-step — head_step exists; walk the chain and collect every
-    //     `request_id` from its rows (`None` on tool_call steps, which have
-    //     no backing fusillade row — tool dispatch lives in
-    //     `tool_call_analytics`).
-    //   * Single-step — head_step_uuid is itself the fusillade.requests id.
-    //
-    // For the ownership check we use the head row's `created_by` (same row
-    // `get_response` authorizes against): the chain is owned end-to-end by
-    // the user who initiated the response, so authorizing the head implies
-    // authorizing every sub-request in it.
-    let (auth_request_id, request_ids_to_delete): (fusillade::RequestId, Vec<fusillade::RequestId>) =
-        match state.response_step_manager.as_ref() {
-            Some(step_manager) => match step_manager
-                .get_step(fusillade::StepId(head_step_uuid))
-                .await
-                .map_err(|e| Error::Database(crate::db::errors::DbError::Other(anyhow::anyhow!("{e}"))))?
-            {
-                Some(head_step) => {
-                    let chain = step_manager
-                        .list_chain(fusillade::StepId(head_step_uuid))
-                        .await
-                        .map_err(|e| Error::Database(crate::db::errors::DbError::Other(anyhow::anyhow!("{e}"))))?;
-                    let ids: Vec<fusillade::RequestId> = chain
-                        .iter()
-                        .filter_map(|s| s.request_id)
-                        .collect::<HashSet<_>>()
-                        .into_iter()
-                        .collect();
-                    // Fallback: a pure tool_call head with no model_call descendants
-                    // has an empty chain (no `request_id`s anywhere). Treat the head
-                    // step uuid as a fusillade.requests id — the delete loop below
-                    // tolerates `RequestNotFound` so this resolves to a 404 on the
-                    // ownership check rather than a 500.
-                    let auth_id = head_step.request_id.unwrap_or(fusillade::RequestId(head_step_uuid));
-                    let ids = if ids.is_empty() { vec![auth_id] } else { ids };
-                    (auth_id, ids)
-                }
-                None => {
-                    let id = fusillade::RequestId(head_step_uuid);
-                    (id, vec![id])
-                }
-            },
-            None => {
-                let id = fusillade::RequestId(head_step_uuid);
-                (id, vec![id])
-            }
-        };
-
-    // Ownership check against the head row's created_by. 404 (not 403) to
-    // avoid leaking existence of other users' responses.
-    let detail = state
+    state
         .request_manager
-        .get_request_detail(auth_request_id)
+        .delete_owned_response_group(head_step_uuid, &owner_id)
         .await
-        .map_err(|e| match e {
+        .map_err(|error| match error {
             fusillade::FusilladeError::RequestNotFound(_) => Error::NotFound {
                 resource: "response".to_string(),
                 id: response_id.clone(),
             },
-            _ => Error::Database(crate::db::errors::DbError::Other(anyhow::anyhow!("{e}"))),
+            _ => Error::Database(crate::db::errors::DbError::Other(anyhow::anyhow!("Response erasure failed"))),
         })?;
-
-    if detail.created_by.as_str() != owner_id {
-        return Err(Error::NotFound {
-            resource: "response".to_string(),
-            id: response_id,
-        });
-    }
-
-    // Best-effort multi-row deletion. Each delete_request call is atomic in
-    // fusillade (single transaction), but the loop itself isn't — if a row
-    // delete fails partway through a chain, earlier rows are already gone.
-    // We continue past failures (instead of bailing on the first one) so the
-    // erasure makes maximum progress; remaining rows can be cleaned up by a
-    // retry of the DELETE call (RequestNotFound is tolerated for already-
-    // deleted rows). Per-row failures are logged at error level so partial
-    // states are reconcilable from logs.
-    //
-    // A future fusillade primitive that accepts `Vec<RequestId>` and deletes
-    // them in one transaction would close this gap entirely.
-    let total = request_ids_to_delete.len();
-    let mut failed: Vec<fusillade::RequestId> = Vec::new();
-    for id in request_ids_to_delete {
-        match state.request_manager.delete_request(id).await {
-            Ok(()) => {}
-            Err(fusillade::FusilladeError::RequestNotFound(_)) => {}
-            Err(e) => {
-                tracing::error!(
-                    response_id = %response_id,
-                    request_id = %*id,
-                    error = %e,
-                    "delete_response: per-row delete failed; continuing to maximize erasure progress",
-                );
-                failed.push(id);
-            }
-        }
-    }
-
-    if !failed.is_empty() {
-        tracing::error!(
-            response_id = %response_id,
-            failed_count = failed.len(),
-            total_count = total,
-            "delete_response: partial failure; client may retry the DELETE to clean up remaining rows",
-        );
-        return Err(Error::Database(crate::db::errors::DbError::Other(anyhow::anyhow!(
-            "deleted {}/{} backing rows for response {}; {} remain — retry to complete erasure",
-            total - failed.len(),
-            total,
-            response_id,
-            failed.len(),
-        ))));
-    }
 
     // Echo the id back in the canonical OpenAI form (with `resp_` prefix if
     // the caller used it). Matches the OpenAI Responses API delete shape so

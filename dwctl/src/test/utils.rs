@@ -36,7 +36,11 @@ pub async fn create_test_app_state_with_config(pool: PgPool, config: crate::conf
         .await
         .expect("Failed to create fusillade TestDbPools");
 
-    let request_manager = std::sync::Arc::new(fusillade_arsenal::PostgresRequestManager::new(fusillade_pools, Default::default()));
+    let request_manager = std::sync::Arc::new(
+        fusillade_arsenal::PostgresRequestManager::new(fusillade_pools, Default::default())
+            .with_retained_response_fence_seconds(config.background_services.batch_daemon.retention.max_late_writer_seconds)
+            .with_template_generation_writes(config.background_services.batch_daemon.template_generation_writes_enabled),
+    );
     let limiters = crate::limits::Limiters::new(&config.limits);
     let shared_config = crate::SharedConfig::new(config);
 
@@ -129,10 +133,11 @@ pub async fn create_test_app_state_with_database_pools(
     let fusillade_test_pools = TestDbPools::new(fusillade_pool)
         .await
         .expect("Failed to create fusillade TestDbPools");
-    let request_manager = std::sync::Arc::new(fusillade_arsenal::PostgresRequestManager::new(
-        fusillade_test_pools,
-        Default::default(),
-    ));
+    let request_manager = std::sync::Arc::new(
+        fusillade_arsenal::PostgresRequestManager::new(fusillade_test_pools, Default::default())
+            .with_retained_response_fence_seconds(config.background_services.batch_daemon.retention.max_late_writer_seconds)
+            .with_template_generation_writes(config.background_services.batch_daemon.template_generation_writes_enabled),
+    );
     let limiters = crate::limits::Limiters::new(&config.limits);
     let shared_config = crate::SharedConfig::new(config);
 
@@ -306,6 +311,10 @@ pub fn create_test_config() -> crate::config::Config {
             probe_scheduler: ProbeSchedulerConfig { enabled: false },
             batch_daemon: DaemonConfig {
                 enabled: DaemonEnabled::Never,
+                retention: fusillade::RetentionPolicy {
+                    max_late_writer_seconds: Some(3_600),
+                    ..Default::default()
+                },
                 ..Default::default()
             },
             leader_election: LeaderElectionConfig { enabled: false },

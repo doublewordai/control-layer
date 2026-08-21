@@ -16,7 +16,11 @@ pub use daemon_record::{
     Initializing, Running,
 };
 pub use error::{FusilladeError, Result};
-pub use manager::{DaemonStorage, ModelFilter, ModelFilterState, Storage, TrailingDemandCount};
+pub use manager::{
+    DaemonStorage, ModelFilter, ModelFilterState, RetainedResponseArchiveOutcome,
+    RetainedResponseMaintenanceError, RetainedResponsePartitionRunway,
+    RetainedResponseRetirementOutcome, RetentionPolicy, Storage, TrailingDemandCount,
+};
 pub use request::*;
 pub use response_step::{
     CreateStepInput, ResponseStep, ResponseStepStore, StepId, StepKind, StepState,

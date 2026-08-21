@@ -1,13 +1,14 @@
 //! Fusillade-backed implementation of onwards' `ResponseStore` trait
 //! and standalone functions for creating/completing response records.
 //!
-//! All fusillade operations go through the `Storage` trait via `request_manager`.
-//! The only raw SQL is the `api_keys` lookup which queries a dwctl-owned table.
+//! All response reads go through fusillade's request/step stores, which resolve
+//! either the live tables or an active retained-response route. The only raw
+//! SQL is the `api_keys` lookup which queries a dwctl-owned table.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use fusillade::{RequestId, ResponseStepStore, StepId, Storage};
+use fusillade::{RequestId, ResponseStepStore, RetainedResponseWriteError, StepId, Storage};
 use fusillade_arsenal::{PostgresRequestManager, PostgresResponseStepManager};
 use sqlx_pool_router::PoolProvider;
 use uuid::Uuid;
@@ -60,11 +61,11 @@ impl<P: PoolProvider + Clone> FusilladeResponseStore<P> {
     /// Two retrieval paths:
     ///
     /// * **Multi-step** — the id is a head step's uuid. We look up the
-    ///   head step, walk to its sub-request fusillade row, build the
-    ///   response envelope from that row (created_at, status, model,
+    ///   live or retained head step, walk to its sub-request snapshot, build
+    ///   the response envelope from that request (created_at, status, model,
     ///   response_body) and stamp `resp_<head_step_uuid>` as the id.
     ///
-    /// * **Single-step** — the id is itself a `fusillade.requests` id
+    /// * **Single-step** — the id is itself a fusillade request id
     ///   (a `/v1/chat/completions` or `/v1/embeddings` row created by
     ///   the realtime path). When no head step matches, we fall back
     ///   to the legacy lookup so `/v1/chat/completions` results stay
@@ -223,34 +224,29 @@ pub async fn complete_response_idempotent<P: PoolProvider + Clone>(
     match request_manager.complete_request(RequestId(id), response_body, status_code).await {
         Ok(()) => return Ok(()),
         Err(fusillade::FusilladeError::RequestStateConflict { current_state, .. }) if is_terminal(&current_state) => {
-            tracing::info!(
-                response_id = %response_id,
-                final_state = %current_state,
-                "complete-response: row already in terminal state — idempotent success"
-            );
+            tracing::info!("complete-response observed a terminal row");
             return Ok(());
         }
-        Err(fusillade::FusilladeError::RequestStateConflict { current_state, .. }) => {
+        Err(fusillade::FusilladeError::RequestStateConflict { .. }) => {
             // Row exists in some non-terminal, non-processing state (e.g.
             // 'pending' or 'claimed'). This shouldn't happen for the realtime
             // path, but it's not our place to force-complete. Bubble up.
-            return Err(StoreError::StorageError(format!(
-                "Row exists for response {response_id} in unexpected state '{current_state}'"
-            )));
+            return Err(StoreError::StorageError("Response is not writable in its current state".to_owned()));
         }
         Err(fusillade::FusilladeError::RequestNotFound(_)) => {} // synthesize below
-        Err(e) => return Err(StoreError::StorageError(format!("Failed to complete request: {e}"))),
+        Err(error) => match RetainedResponseWriteError::from_fusillade_error(&error) {
+            Some(RetainedResponseWriteError::AlreadyRetained) => return Ok(()),
+            Some(RetainedResponseWriteError::NotFound) => return Err(response_unavailable()),
+            None => {
+                return Err(StoreError::StorageError("Failed to complete response".to_owned()));
+            }
+        },
     }
 
     // Row doesn't exist — synthesize it. create-response may race us; if it
     // wins between our failed UPDATE and our INSERT, the INSERT hits a PK
     // conflict and the retry UPDATE below sorts it out.
-    tracing::info!(
-        response_id = %response_id,
-        model = %create_ctx.model,
-        endpoint = %create_ctx.endpoint,
-        "complete-response synthesizing row (create-response hasn't run yet)"
-    );
+    tracing::info!("complete-response is synthesizing a missing row");
     if create_ctx.endpoint.is_empty() {
         // Empty endpoint means an upstream header is missing; better to fail
         // loudly than silently insert a row the /responses lookup can't find.
@@ -269,39 +265,40 @@ pub async fn complete_response_idempotent<P: PoolProvider + Clone>(
         api_key: create_ctx.api_key.unwrap_or("").to_string(),
         created_by: created_by.unwrap_or_default(),
     };
-    match request_manager.create_realtime(realtime_input).await {
-        Ok(_) => tracing::info!(
-            response_id = %response_id,
-            "Synthetic create from complete-response succeeded — row now exists in 'processing'"
-        ),
-        Err(e) => tracing::info!(
-            response_id = %response_id,
-            error = %e,
-            "Synthetic create from complete-response failed (likely create-response won the race) — proceeding to UPDATE"
-        ),
-    }
+    let create_failed = match request_manager.create_realtime(realtime_input).await {
+        Ok(_) => false,
+        Err(error) => match RetainedResponseWriteError::from_fusillade_error(&error) {
+            Some(RetainedResponseWriteError::AlreadyRetained) => return Ok(()),
+            Some(RetainedResponseWriteError::NotFound) => return Err(response_unavailable()),
+            None => true,
+        },
+    };
 
     // Retry the UPDATE. Same idempotency rules as the fast path: another
     // writer may have raced ahead to a terminal state in the window between
     // our first UPDATE and this retry.
     match request_manager.complete_request(RequestId(id), response_body, status_code).await {
         Ok(()) => {
-            tracing::info!(response_id = %response_id, "Second-attempt UPDATE succeeded — row now 'completed'");
+            tracing::info!("complete-response persisted the terminal row");
             Ok(())
         }
         Err(fusillade::FusilladeError::RequestStateConflict { current_state, .. }) if is_terminal(&current_state) => {
-            tracing::info!(
-                response_id = %response_id,
-                final_state = %current_state,
-                "complete-response: row already terminal after synthesis — idempotent success"
-            );
+            tracing::info!("complete-response observed a terminal row after synthesis");
             Ok(())
         }
-        Err(e) => {
-            tracing::warn!(response_id = %response_id, error = %e, "Second-attempt UPDATE failed");
-            Err(StoreError::StorageError(format!("Failed to complete after create: {e}")))
+        Err(fusillade::FusilladeError::RequestNotFound(_)) if create_failed => {
+            Err(StoreError::StorageError("Failed to synthesize response row".to_owned()))
         }
+        Err(error) => match RetainedResponseWriteError::from_fusillade_error(&error) {
+            Some(RetainedResponseWriteError::AlreadyRetained) => Ok(()),
+            Some(RetainedResponseWriteError::NotFound) => Err(response_unavailable()),
+            None => Err(StoreError::StorageError("Failed to complete synthesized response".to_owned())),
+        },
     }
+}
+
+fn response_unavailable() -> StoreError {
+    StoreError::NotFound("Response unavailable".to_owned())
 }
 
 /// True when the row has reached a state where re-completing it would be a
@@ -392,11 +389,11 @@ pub async fn lookup_created_by(pool: &sqlx::PgPool, api_key: Option<&str>) -> Op
             Some(user_id.to_string())
         }
         Ok(None) => {
-            tracing::warn!(key_prefix = &key[..8.min(key.len())], "API key not found for attribution");
+            tracing::warn!("API key was not found for response attribution");
             None
         }
-        Err(e) => {
-            tracing::error!(error = %e, "Failed to look up API key for attribution");
+        Err(_) => {
+            tracing::error!("Failed to look up response attribution");
             None
         }
     }
@@ -683,7 +680,7 @@ pub fn detail_to_chat_completion_object(detail: &fusillade::RequestDetail) -> (u
             }),
         ),
         other => {
-            tracing::warn!(state = %other, request_id = %detail.id, "detail_to_chat_completion_object called on non-terminal state");
+            tracing::warn!(state = %other, "detail_to_chat_completion_object called on non-terminal state");
             (
                 500,
                 serde_json::json!({
