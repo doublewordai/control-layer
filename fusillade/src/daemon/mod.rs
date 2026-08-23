@@ -114,21 +114,41 @@ fn background_capacity(ordinary_limit: usize, background_limit: usize, in_flight
         .saturating_sub(in_flight)
 }
 
+/// The error code onwards returns from its own concurrency limiter, alongside a
+/// 429. Distinguishes "too many at once", which lowering concurrency fixes, from
+/// a provider's token-per-minute quota, which it does not.
+const ONWARDS_CONCURRENCY_LIMIT_CODE: &str = "concurrency_limit_exceeded";
+
 /// Whether a failure means "the model had nowhere to put this request".
 ///
-/// Only an exact 529. A timeout or a connection reset happened to a request the
-/// model had already accepted, so it says nothing about how many more it could
-/// take - counting those would shrink the limit every time the network hiccuped.
+/// Two shapes count. An exact 529 is the upstream provider saying it is
+/// overloaded. A 429 carrying `concurrency_limit_exceeded` is onwards' own
+/// limiter, which is the wall this daemon actually reaches first: onwards sits
+/// between fusillade and every provider and never emits 529 itself, so matching
+/// 529 alone leaves the controller with a brake that cannot fire.
 ///
-/// Note that onwards returns 429, not 529, when its own concurrency limit is
-/// full. If that turns out to be the limit we hit in practice, this is where to
-/// add it.
+/// That matters because the increase side grows on *demand* - a model that fills
+/// every slot it is offered is raised - so without a working decrease signal the
+/// limit only ever ratchets up.
+///
+/// A bare 429 without that code is deliberately excluded. It is a provider rate
+/// limit, usually tokens per minute, and fewer concurrent requests does not
+/// necessarily mean fewer tokens per minute; cutting on it would shrink the
+/// limit for a wall that concurrency does not control.
+///
+/// Timeouts and connection resets are also excluded: they happened to a request
+/// the model had already accepted, so they say nothing about how many more it
+/// could take, and counting them would shrink the limit on every network hiccup.
 fn is_downstream_overload(reason: &FailureReason) -> bool {
-    matches!(
-        reason,
+    match reason {
         FailureReason::RetriableHttpStatus { status: 529, .. }
-            | FailureReason::NonRetriableHttpStatus { status: 529, .. }
-    )
+        | FailureReason::NonRetriableHttpStatus { status: 529, .. } => true,
+        FailureReason::RetriableHttpStatus { status: 429, body }
+        | FailureReason::NonRetriableHttpStatus { status: 429, body } => {
+            body.contains(ONWARDS_CONCURRENCY_LIMIT_CODE)
+        }
+        _ => false,
+    }
 }
 
 fn emit_concurrency_decrease(model: &str, adjustment: ConcurrencyAdjustment) {
@@ -2295,8 +2315,14 @@ mod tests {
     use super::*;
     use crate::request::FailureReason;
 
+    /// A 529 is a provider saying it is overloaded; a 429 carrying onwards'
+    /// concurrency code is onwards' own limiter, which is the wall this daemon
+    /// reaches first once the controller grows past a model's configured limit.
+    /// Matching 529 alone leaves the cut path unreachable in this deployment.
     #[test]
-    fn only_http_529_is_a_downstream_overload_signal() {
+    fn provider_529_and_onwards_concurrency_429_are_overload_signals() {
+        let onwards_429 =
+            r#"{"error":{"type":"rate_limit_error","code":"concurrency_limit_exceeded"}}"#;
         for reason in [
             FailureReason::RetriableHttpStatus {
                 status: 529,
@@ -2306,11 +2332,34 @@ mod tests {
                 status: 529,
                 body: String::new(),
             },
+            FailureReason::RetriableHttpStatus {
+                status: 429,
+                body: onwards_429.to_string(),
+            },
+            FailureReason::NonRetriableHttpStatus {
+                status: 429,
+                body: onwards_429.to_string(),
+            },
         ] {
-            assert!(is_downstream_overload(&reason));
+            assert!(is_downstream_overload(&reason), "{reason:?}");
         }
+    }
 
+    /// Everything else must leave the limit alone. A bare 429 is a provider rate
+    /// limit, usually tokens per minute, which fewer concurrent requests does not
+    /// necessarily reduce; timeouts and resets happened to a request the model had
+    /// already accepted, so they say nothing about how many more it could take.
+    #[test]
+    fn other_failures_do_not_cut_the_limit() {
         for reason in [
+            FailureReason::RetriableHttpStatus {
+                status: 429,
+                body: r#"{"error":{"code":"rate_limit_exceeded"}}"#.to_string(),
+            },
+            FailureReason::RetriableHttpStatus {
+                status: 429,
+                body: String::new(),
+            },
             FailureReason::RetriableHttpStatus {
                 status: 503,
                 body: String::new(),
@@ -2318,8 +2367,11 @@ mod tests {
             FailureReason::NetworkError {
                 error: "connection reset".to_string(),
             },
+            FailureReason::Timeout {
+                error: "tokens timeout".to_string(),
+            },
         ] {
-            assert!(!is_downstream_overload(&reason));
+            assert!(!is_downstream_overload(&reason), "{reason:?}");
         }
     }
 
