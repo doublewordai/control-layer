@@ -151,7 +151,21 @@ impl MemoryGate {
         gauge!("fusillade_memory_working_set_ratio").set(used);
 
         let was_engaged = self.engaged.load(Ordering::Relaxed);
-        let engaged = if was_engaged {
+        let engaged = if in_flight == 0 {
+            // Nothing is in flight, so no amount of further waiting frees
+            // anything: the memory still held is not attached to a request.
+            // Holding here is not merely useless, it deadlocks - claiming is the
+            // only thing that changes memory, so a gate that stays shut keeps
+            // the reading it is waiting on frozen exactly where it is.
+            //
+            // Observed in staging with the low mark set below the process's
+            // resting footprint: work drained to zero, the allocator kept ~1.1GB
+            // rather than returning it, and the gate held with queued work it
+            // would never claim. Production marks sit far above the resting
+            // footprint so it would not have triggered there, but the failure
+            // mode should not depend on that margin being right.
+            false
+        } else if was_engaged {
             // Stay engaged until usage falls back under the low mark.
             used > self.low
         } else {
@@ -288,6 +302,45 @@ mod tests {
         assert!(
             MemoryGate::new(1.5, 0.5, src()).is_none(),
             "high above the limit"
+        );
+    }
+
+    /// A gate that stays shut with nothing in flight deadlocks: claiming is the
+    /// only thing that moves memory, so refusing to claim freezes the reading it
+    /// is waiting on. Whatever is still held is not attached to a request and
+    /// will not be released by waiting.
+    #[test]
+    fn releases_once_nothing_is_in_flight() {
+        // Well above both marks, and it stays there - the allocator is holding
+        // memory that completing work cannot give back.
+        let gate = MemoryGate::new(0.75, 0.65, FixedSource::new(vec![at(0.9)])).unwrap();
+
+        assert!(gate.should_block(500), "engages while work is in flight");
+        assert!(
+            !gate.should_block(0),
+            "must release once nothing is in flight, however high the reading"
+        );
+    }
+
+    /// The idle release must not leak into the normal path: with work in flight
+    /// the marks are still what decide.
+    #[test]
+    fn work_in_flight_still_obeys_the_marks() {
+        let gate = MemoryGate::new(
+            0.75,
+            0.65,
+            FixedSource::new(vec![at(0.9), at(0.7), at(0.5)]),
+        )
+        .unwrap();
+
+        assert!(gate.should_block(10), "0.9 is above the high mark");
+        assert!(
+            gate.should_block(10),
+            "0.7 is above the low mark, stays shut"
+        );
+        assert!(
+            !gate.should_block(10),
+            "0.5 is below the low mark, releases"
         );
     }
 
