@@ -741,50 +741,7 @@ where
     #[tracing::instrument(skip_all)]
     async fn batch_lookup_cache_tariffs(&self, aliases: &[&str]) -> Result<HashMap<String, Vec<CacheTariffRow>>, sqlx::Error> {
         let aliases_vec: Vec<String> = aliases.iter().map(|s| s.to_string()).collect();
-
-        struct Row {
-            alias: String,
-            write_multiplier_5m: Decimal,
-            write_multiplier_1h: Decimal,
-            write_multiplier_24h: Decimal,
-            read_multiplier: Decimal,
-            valid_from: DateTime<Utc>,
-            valid_until: Option<DateTime<Utc>>,
-        }
-
-        let rows: Vec<Row> = sqlx::query_as!(
-            Row,
-            r#"
-            SELECT
-                dm.alias,
-                mct.write_multiplier_5m,
-                mct.write_multiplier_1h,
-                mct.write_multiplier_24h,
-                mct.read_multiplier,
-                mct.valid_from,
-                mct.valid_until
-            FROM deployed_models dm
-            JOIN model_cache_tariffs mct ON mct.deployed_model_id = dm.id
-            WHERE dm.alias = ANY($1)
-            ORDER BY dm.alias, mct.valid_from DESC
-            "#,
-            &aliases_vec
-        )
-        .fetch_all(&self.pool)
-        .await?;
-
-        let mut map: HashMap<String, Vec<CacheTariffRow>> = HashMap::new();
-        for row in rows {
-            map.entry(row.alias).or_default().push(CacheTariffRow {
-                write_multiplier_5m: row.write_multiplier_5m,
-                write_multiplier_1h: row.write_multiplier_1h,
-                write_multiplier_24h: row.write_multiplier_24h,
-                read_multiplier: row.read_multiplier,
-                valid_from: row.valid_from,
-                valid_until: row.valid_until,
-            });
-        }
-
+        let map = crate::pricing::lookup_cache_tariffs(&self.pool, &aliases_vec).await?;
         trace!(count = map.len(), "Batch lookup cache tariffs completed");
         Ok(map)
     }
@@ -863,6 +820,7 @@ where
         let mut served_by_vec: Vec<Option<String>> = Vec::with_capacity(records.len());
         let mut finish_reason_vec: Vec<Option<String>> = Vec::with_capacity(records.len());
         let mut user_agent_vec: Vec<Option<String>> = Vec::with_capacity(records.len());
+        let mut submitted_at_vec: Vec<Option<DateTime<Utc>>> = Vec::with_capacity(records.len());
 
         for record in records {
             instance_ids.push(record.raw.instance_id);
@@ -910,6 +868,9 @@ where
             served_by_vec.push(record.raw.served_by.clone());
             finish_reason_vec.push(record.raw.finish_reason.clone());
             user_agent_vec.push(record.raw.user_agent.clone());
+            // Already carried for batch-creation pricing; now also persisted, so the
+            // queue delay (timestamp - submitted_at) survives past this process.
+            submitted_at_vec.push(record.raw.batch_created_at);
         }
 
         let rows = sqlx::query!(
@@ -922,7 +883,7 @@ where
                 request_origin, batch_sla, batch_request_source, api_key_id, trace_id,
                 cache_read_input_tokens, cache_creation_input_tokens,
                 cache_creation_5m_input_tokens, cache_creation_1h_input_tokens, cache_creation_24h_input_tokens,
-                total_cost, uncached_cost, served_by, finish_reason, user_agent
+                total_cost, uncached_cost, served_by, finish_reason, user_agent, submitted_at
             )
             SELECT * FROM UNNEST(
                 $1::uuid[], $2::bigint[], $3::timestamptz[], $4::text[], $5::text[], $6::text[],
@@ -932,7 +893,8 @@ where
                 $22::text[], $23::text[], $24::text[], $25::uuid[], $26::text[],
                 $27::bigint[], $28::bigint[],
                 $29::bigint[], $30::bigint[], $31::bigint[],
-                $32::numeric[], $33::numeric[], $34::text[], $35::text[], $36::text[]
+                $32::numeric[], $33::numeric[], $34::text[], $35::text[], $36::text[],
+                $37::timestamptz[]
             )
             ON CONFLICT (instance_id, correlation_id)
             DO UPDATE SET
@@ -965,7 +927,8 @@ where
                 uncached_cost = EXCLUDED.uncached_cost,
                 served_by = EXCLUDED.served_by,
                 finish_reason = EXCLUDED.finish_reason,
-                user_agent = EXCLUDED.user_agent
+                user_agent = EXCLUDED.user_agent,
+                submitted_at = EXCLUDED.submitted_at
             RETURNING id, instance_id, correlation_id, (xmax = 0) AS "newly_inserted!"
             "#,
             &instance_ids,
@@ -1004,6 +967,7 @@ where
             &served_by_vec as &[Option<String>],
             &finish_reason_vec as &[Option<String>],
             &user_agent_vec as &[Option<String>],
+            &submitted_at_vec as &[Option<DateTime<Utc>>],
         )
         .fetch_all(&mut **tx)
         .await?;
@@ -2476,6 +2440,57 @@ mod integration_tests {
             .await
             .expect("the analytics row should exist");
         assert_eq!(stored.as_deref(), Some("claude-cli/1.2.3"));
+    }
+
+    /// The same last hop for `submitted_at`. The value already reached this struct — it
+    /// has been read for batch-creation pricing for as long as the header has existed —
+    /// so the only thing that can break is the write, and a dropped bind would leave the
+    /// column silently NULL on every row.
+    ///
+    /// Worth testing rather than assuming, because NULL here does not necessarily stay
+    /// NULL for downstream consumers — a missing value can surface as the Unix epoch, and
+    /// any duration computed from it then reads as decades of queue delay.
+    #[sqlx::test]
+    #[test_log::test]
+    async fn batcher_persists_the_submitted_at_to_http_analytics(pool: PgPool) {
+        create_test_model(&pool, "submitted-at-test").await;
+
+        let submitted = Utc::now() - chrono::Duration::minutes(90);
+        let mut record = create_raw_record("submitted-at-test", None, 10, 5);
+        record.batch_created_at = Some(submitted);
+        run_batcher_with_records(&pool, vec![record]).await;
+
+        let stored: Option<DateTime<Utc>> = sqlx::query_scalar("SELECT submitted_at FROM http_analytics WHERE model = 'submitted-at-test'")
+            .fetch_one(&pool)
+            .await
+            .expect("the analytics row should exist");
+
+        let stored = stored.expect("submitted_at should be persisted, not NULL");
+        assert!(
+            (stored - submitted).num_seconds().abs() < 1,
+            "expected {submitted}, stored {stored}"
+        );
+    }
+
+    /// Realtime work is not submitted ahead of time, so there is no distinct submission
+    /// moment and the column must stay NULL rather than being backfilled from `timestamp`.
+    /// Writing one would invent a zero-length queue for a request that never queued, and
+    /// "no submitted_at" is how a consumer tells deferred work from immediate.
+    #[sqlx::test]
+    #[test_log::test]
+    async fn realtime_rows_have_no_submitted_at(pool: PgPool) {
+        create_test_model(&pool, "realtime-no-submit").await;
+
+        let record = create_raw_record("realtime-no-submit", None, 10, 5);
+        assert!(record.batch_created_at.is_none(), "fixture should be realtime");
+        run_batcher_with_records(&pool, vec![record]).await;
+
+        let stored: Option<DateTime<Utc>> =
+            sqlx::query_scalar("SELECT submitted_at FROM http_analytics WHERE model = 'realtime-no-submit'")
+                .fetch_one(&pool)
+                .await
+                .expect("the analytics row should exist");
+        assert!(stored.is_none(), "realtime should leave submitted_at NULL, got {stored:?}");
     }
 
     #[sqlx::test]

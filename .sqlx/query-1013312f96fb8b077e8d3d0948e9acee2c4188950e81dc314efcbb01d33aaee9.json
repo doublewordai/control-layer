@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT u.id, u.email, u.username, u.display_name,\n                   u.payment_provider_id as \"payment_provider_id!\",\n                   u.auto_topup_threshold::decimal(20, 9) as \"auto_topup_threshold!\",\n                   u.auto_topup_amount::decimal(20, 9) as \"auto_topup_amount!\",\n                   c.balance as \"checkpoint_balance?\",\n                   u.auto_topup_monthly_limit::decimal(20, 9) as \"auto_topup_monthly_limit?\",\n                   u.auto_topup_limit_notification_sent,\n                   u.auto_topup_soft_failure_count\n            FROM users u\n            LEFT JOIN user_balance_checkpoints c ON c.user_id = u.id\n            WHERE u.id != '00000000-0000-0000-0000-000000000000'\n              AND u.is_deleted = false\n              AND u.auto_topup_threshold IS NOT NULL\n              AND u.auto_topup_amount IS NOT NULL\n              AND u.payment_provider_id IS NOT NULL\n              AND (u.auto_topup_retry_after IS NULL OR u.auto_topup_retry_after <= NOW())\n            ",
+  "query": "\n            SELECT u.id, u.email, u.username, u.display_name,\n                   u.payment_provider_id as \"payment_provider_id!\",\n                   u.auto_topup_threshold::decimal(20, 9) as \"auto_topup_threshold!\",\n                   u.auto_topup_amount::decimal(20, 9) as \"auto_topup_amount!\",\n                   c.balance as \"checkpoint_balance?\",\n                   u.auto_topup_monthly_limit::decimal(20, 9) as \"auto_topup_monthly_limit?\",\n                   u.auto_topup_limit_notification_sent,\n                   u.auto_topup_soft_failure_count,\n                   u.invoicing_enabled\n            FROM users u\n            LEFT JOIN user_balance_checkpoints c ON c.user_id = u.id\n            WHERE u.id != '00000000-0000-0000-0000-000000000000'\n              AND u.is_deleted = false\n              AND u.auto_topup_threshold IS NOT NULL\n              AND u.auto_topup_amount IS NOT NULL\n              AND u.payment_provider_id IS NOT NULL\n              AND (u.auto_topup_retry_after IS NULL OR u.auto_topup_retry_after <= NOW())\n            ",
   "describe": {
     "columns": [
       {
@@ -57,6 +57,11 @@
         "ordinal": 10,
         "name": "auto_topup_soft_failure_count",
         "type_info": "Int4"
+      },
+      {
+        "ordinal": 11,
+        "name": "invoicing_enabled",
+        "type_info": "Bool"
       }
     ],
     "parameters": {
@@ -73,8 +78,9 @@
       true,
       null,
       false,
+      false,
       false
     ]
   },
-  "hash": "2effb4373a8f9073e94b51971f1fede91325b4662fb2f9d1f183bda5b307c2f8"
+  "hash": "1013312f96fb8b077e8d3d0948e9acee2c4188950e81dc314efcbb01d33aaee9"
 }

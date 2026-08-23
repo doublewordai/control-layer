@@ -228,12 +228,41 @@ pub fn parse_ai_request(request_data: &RequestData) -> Result<ParsedAIRequest, S
         };
     }
 
-    match serde_json::from_str(&body_str) {
-        Ok(request) => Ok(ParsedAIRequest {
-            headers,
-            request,
-            responses_request: None,
-        }),
+    // On a known endpoint the path is authoritative and the body is not. Untagged
+    // classification disambiguates on each variant's required fields, and the
+    // completions shape requires only `model`, so a chat body that fails its own
+    // parse (malformed `messages`, say) would otherwise fall through and be recorded
+    // as a completions request rather than as unrecognised. Same reasoning that
+    // already drives the /responses branch above.
+    //
+    // An unknown path keeps the untagged parse, so callers that do not carry a real
+    // endpoint path behave exactly as before.
+    let path = request_data.uri.path();
+    let known_endpoint = |value: Value| -> Option<AiRequest> {
+        if path.ends_with("/chat/completions") {
+            Some(serde_json::from_value(value.clone()).map_or(AiRequest::Other(value), AiRequest::ChatCompletions))
+        } else if path.ends_with("/embeddings") {
+            Some(serde_json::from_value(value.clone()).map_or(AiRequest::Other(value), AiRequest::Embeddings))
+        } else if path.ends_with("/completions") {
+            Some(serde_json::from_value(value.clone()).map_or(AiRequest::Other(value), AiRequest::Completions))
+        } else {
+            None
+        }
+    };
+
+    match serde_json::from_str::<Value>(&body_str) {
+        Ok(value) => {
+            let request = match known_endpoint(value.clone()) {
+                Some(request) => request,
+                // Unknown path: untagged, as before.
+                None => serde_json::from_value(value.clone()).unwrap_or(AiRequest::Other(value)),
+            };
+            Ok(ParsedAIRequest {
+                headers,
+                request,
+                responses_request: None,
+            })
+        }
         Err(e) => {
             // Always base64 encode unparseable content to avoid PostgreSQL issues
             let base64_encoded = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes);
@@ -388,7 +417,7 @@ impl UsageMetrics {
     ) -> Self {
         // Extract model from request.
         // First try typed deserialization (ChatCompletions, Completions, Embeddings).
-        // If that fails (e.g. request uses content types async_openai doesn't know about,
+        // If that fails (e.g. request uses content types the strict schemas don't model,
         // like Responses API's input_text/input_image), fall back to extracting the
         // "model" field from raw JSON.
         let request_model = match parse_ai_request(request_data) {
@@ -419,7 +448,28 @@ impl UsageMetrics {
 
         // Token metrics come from the single parse of the response into `AiResponse`
         // (the same value request logging stores), normalised to one currency here.
-        let metrics = TokenMetrics::from(parsed_response);
+        let mut metrics = TokenMetrics::from(parsed_response);
+
+        // Raw-usage fallback: some upstreams answer 200 with real usage in a shape the typed
+        // parse cannot represent — OpenRouter emits `finish_reason: "error"` (not a variant
+        // of the enum), Dynamo omits the message `role` — and the untagged parse falls
+        // through to `Other`, reading zero. Billing zero for a request the provider counted
+        // (and charges us for) is a silent revenue leak, and it writes the impossible
+        // `prompt < read + creation` signature because the cache split below is read from
+        // the raw body and survives. When the typed parse produced no counts but the body
+        // plainly carries a usage object, read the counts from the raw JSON. Measured before
+        // this existed: 149 such rows for one user in 10 days, 3.75M prompt tokens billed
+        // at nothing (~$7.09).
+        if metrics.prompt_tokens == 0
+            && metrics.completion_tokens == 0
+            && metrics.total_tokens == 0
+            && let Some(raw) = extract_from_last_usage(response_data, raw_usage_tokens)
+        {
+            metrics.prompt_tokens = raw.prompt;
+            metrics.completion_tokens = raw.completion;
+            metrics.reasoning_tokens = raw.reasoning;
+            metrics.total_tokens = raw.total;
+        }
 
         // The cache split lives in extension fields the typed parse drops, so read it from
         // the raw `usage` object. It only exists on a successful response that carried a
@@ -537,6 +587,50 @@ pub(crate) fn extract_cache_tokens(response_data: &ResponseData) -> CacheTokens 
     extract_from_last_usage(response_data, cache_tokens_from_usage)
 }
 
+/// Token counts read straight from a raw `usage` JSON object, for bodies the typed parse
+/// cannot represent. Field semantics mirror [`TokenMetrics`]'s arms exactly: an OpenAI
+/// `prompt_tokens` is already the total input; an Anthropic `input_tokens` excludes the
+/// cache buckets, which are added back — reading it verbatim is the August incident.
+///
+/// Shared by the live path's raw-usage fallback and [`crate::recompute`]'s replay of stored
+/// fusillade bodies, so the two can never read the same unrepresentable body differently.
+pub(crate) struct RawUsageTokens {
+    pub prompt: i64,
+    pub completion: i64,
+    pub reasoning: i64,
+    pub total: i64,
+}
+
+/// Read [`RawUsageTokens`] out of one `usage` object, or `None` when it carries neither an
+/// OpenAI-shaped nor an Anthropic-shaped input count (nothing recognisable to bill on).
+pub(crate) fn raw_usage_tokens(usage: &Value) -> Option<RawUsageTokens> {
+    let get = |k: &str| usage.get(k).and_then(Value::as_i64);
+    let prompt = match get("prompt_tokens") {
+        Some(p) => p,
+        None => {
+            get("input_tokens")?
+                + get("cache_read_input_tokens").unwrap_or(0).max(0)
+                + get("cache_creation_input_tokens").unwrap_or(0).max(0)
+        }
+    };
+    let completion = get("completion_tokens").or_else(|| get("output_tokens")).unwrap_or(0);
+    let reasoning = usage
+        .pointer("/completion_tokens_details/reasoning_tokens")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    // Floor everything at 0 (malformed bodies must not reach the cost maths), and derive the
+    // total where the shape reports none, as the Anthropic arm does.
+    let prompt = prompt.max(0);
+    let completion = completion.max(0);
+    let total = get("total_tokens").unwrap_or(prompt + completion).max(0);
+    Some(RawUsageTokens {
+        prompt,
+        completion,
+        reasoning: reasoning.max(0),
+        total,
+    })
+}
+
 /// Locate the response's final `usage` object and map it with `from_usage`.
 ///
 /// Factored out of [`extract_cache_tokens`] so that a caller reading a *raw upstream* body
@@ -647,12 +741,12 @@ fn extract_finish_reason(response: &AiResponse) -> Option<String> {
     match response {
         AiResponse::ChatCompletions(r) => r.choices.first()?.finish_reason.as_ref().and_then(as_wire),
         AiResponse::ChatCompletionsStream(chunks) => chunks.iter().rev().find_map(|c| match c {
-            ChatCompletionChunk::Normal(n) => n.choices.first()?.finish_reason.as_ref().and_then(as_wire),
+            ChatCompletionChunk::Chunk(n) => n.choices.first()?.finish_reason.as_ref().and_then(as_wire),
             _ => None,
         }),
         AiResponse::Completions(r) => r.choices.first()?.finish_reason.as_ref().and_then(as_wire),
         AiResponse::CompletionsStream(chunks) => chunks.iter().rev().find_map(|c| match c {
-            CompletionChunk::Normal(n) => n.choices.first()?.finish_reason.as_ref().and_then(as_wire),
+            CompletionChunk::Chunk(n) => n.choices.first()?.finish_reason.as_ref().and_then(as_wire),
             _ => None,
         }),
         // Neither the Responses API nor Anthropic Messages has an OpenAI-style finish_reason.
@@ -661,7 +755,7 @@ fn extract_finish_reason(response: &AiResponse) -> Option<String> {
         // guessed at here, so a NULL means "not extracted yet" rather than "no tool call".
         AiResponse::Responses(_) | AiResponse::ResponsesStream(_) => None,
         AiResponse::Anthropic(_) | AiResponse::AnthropicStream(_) => None,
-        AiResponse::Embeddings(_) | AiResponse::Base64Embeddings(_) | AiResponse::Other(_) => None,
+        AiResponse::Embeddings(_) | AiResponse::Other(_) => None,
     }
 }
 
@@ -682,12 +776,14 @@ pub(crate) struct TokenMetrics {
     pub response_model: Option<String>,
 }
 
-fn extract_completion_reasoning_tokens(usage: &async_openai::types::chat::CompletionUsage) -> i64 {
+fn extract_completion_reasoning_tokens(usage: &onwards::strict::schemas::chat_completions::Usage) -> i64 {
+    // onwards models `completion_tokens_details` as a permissive `Value` rather than
+    // a typed struct, so providers can add fields without the parse collapsing.
     usage
         .completion_tokens_details
         .as_ref()
-        .and_then(|d| d.reasoning_tokens)
-        .map(|t| t as i64)
+        .and_then(|d| d.get("reasoning_tokens"))
+        .and_then(serde_json::Value::as_i64)
         .unwrap_or(0)
 }
 
@@ -755,12 +851,12 @@ impl From<&AiResponse> for TokenMetrics {
                 // For streaming responses, token usage and model are in the last Normal chunk (not Done marker)
                 // Find the last Normal chunk, prioritizing those with usage data
                 let last_normal_with_usage = chunks.iter().rev().find_map(|chunk| match chunk {
-                    ChatCompletionChunk::Normal(normal_chunk) if normal_chunk.usage.is_some() => Some(normal_chunk),
+                    ChatCompletionChunk::Chunk(normal_chunk) if normal_chunk.usage.is_some() => Some(normal_chunk),
                     _ => None,
                 });
 
                 let model = chunks.iter().find_map(|chunk| match chunk {
-                    ChatCompletionChunk::Normal(c) => Some(c.model.clone()),
+                    ChatCompletionChunk::Chunk(c) => Some(c.model.clone()),
                     _ => None,
                 });
 
@@ -798,12 +894,12 @@ impl From<&AiResponse> for TokenMetrics {
             }
             AiResponse::CompletionsStream(chunks) => {
                 let last_normal_with_usage = chunks.iter().rev().find_map(|chunk| match chunk {
-                    CompletionChunk::Normal(normal_chunk) if normal_chunk.usage.is_some() => Some(normal_chunk),
+                    CompletionChunk::Chunk(normal_chunk) if normal_chunk.usage.is_some() => Some(normal_chunk),
                     _ => None,
                 });
 
                 let model = chunks.iter().find_map(|chunk| match chunk {
-                    CompletionChunk::Normal(c) => Some(c.model.clone()),
+                    CompletionChunk::Chunk(c) => Some(c.model.clone()),
                     _ => None,
                 });
 
@@ -861,23 +957,18 @@ impl From<&AiResponse> for TokenMetrics {
             }
             AiResponse::Embeddings(response) => {
                 let usage = &response.usage;
+                // One variant now covers both encodings, so the analytics label is
+                // read back off the payload rather than off the variant.
+                let base64 = response
+                    .data
+                    .first()
+                    .is_some_and(|d| matches!(d.embedding, onwards::strict::schemas::embeddings::Embedding::Base64(_)));
                 Self {
                     prompt_tokens: usage.prompt_tokens as i64,
                     completion_tokens: 0, // Embeddings don't have completion tokens
                     reasoning_tokens: 0,
                     total_tokens: usage.total_tokens as i64,
-                    response_type: "embeddings".to_string(),
-                    response_model: Some(response.model.clone()),
-                }
-            }
-            AiResponse::Base64Embeddings(response) => {
-                let usage = &response.usage;
-                Self {
-                    prompt_tokens: usage.prompt_tokens as i64,
-                    completion_tokens: 0, // Embeddings don't have completion tokens
-                    reasoning_tokens: 0,
-                    total_tokens: usage.total_tokens as i64,
-                    response_type: "base64_embeddings".to_string(),
+                    response_type: if base64 { "base64_embeddings" } else { "embeddings" }.to_string(),
                     response_model: Some(response.model.clone()),
                 }
             }
@@ -986,11 +1077,11 @@ impl From<&AiResponse> for TokenMetrics {
 mod tests {
     use super::{UsageMetrics, extract_cache_tokens, extract_finish_reason, parse_ai_request, parse_ai_response};
     use crate::request_logging::models::{AiRequest, AiResponse};
-    use async_openai::types::chat::{CreateChatCompletionResponse, CreateChatCompletionStreamResponse};
-    use async_openai::types::completions::CreateCompletionResponse;
-    use async_openai::types::embeddings::{CreateBase64EmbeddingResponse, CreateEmbeddingResponse, EmbeddingUsage};
     use axum::http::{Method, StatusCode, Uri};
     use bytes::Bytes;
+    use onwards::strict::schemas::chat_completions::{ChatCompletionChunk as ChatChunk, ChatCompletionResponse, Usage as ChatUsage};
+    use onwards::strict::schemas::completions::CompletionResponse;
+    use onwards::strict::schemas::embeddings::{Embedding, EmbeddingData, EmbeddingsResponse, EmbeddingsUsage};
     use outlet::{RequestData, ResponseData};
     use std::{
         collections::HashMap,
@@ -1331,6 +1422,101 @@ mod tests {
             }
             other => panic!("Expected ChatCompletionsStream, got {:?}", std::mem::discriminant(other)),
         }
+    }
+
+    /// The OpenRouter `finish_reason: "error"` shape, from a real prod row (analytics_id
+    /// 184786706): HTTP 200, a full usage object the provider counted (and charges us for),
+    /// but a finish_reason value the typed enum doesn't have — so the untagged parse falls
+    /// to `Other` and billing read zero. The raw-usage fallback must recover the counts;
+    /// the cache split is read from the raw body either way. Before the fallback existed
+    /// this billed 149 rows (3.75M prompt tokens, ~$7) at nothing for one user in 10 days,
+    /// and wrote the impossible `prompt < read + creation` signature.
+    #[test]
+    fn unrepresentable_finish_reason_still_bills_from_the_raw_usage() {
+        let request_data = RequestData {
+            correlation_id: 1,
+            timestamp: SystemTime::now(),
+            method: axum::http::Method::POST,
+            uri: "/chat/completions".parse::<Uri>().unwrap(),
+            headers: HashMap::new(),
+            body: Some(Bytes::from(r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#)),
+            trace_id: None,
+            span_id: None,
+        };
+        let body = r#"{"id":"resp_1","object":"chat.completion","created":1786498035,"model":"m","choices":[{"finish_reason":"error","index":0,"message":{"role":"assistant","refusal":null,"reasoning_details":[{"text":"...","type":"reasoning.text","index":0,"format":"unknown"}]}}],"usage":{"prompt_tokens":29366,"completion_tokens":97,"total_tokens":29463,"completion_tokens_details":{"reasoning_tokens":97},"cache_read_input_tokens":25351,"cache_creation_input_tokens":4015,"cache_creation":{"ephemeral_5m_input_tokens":4015,"ephemeral_1h_input_tokens":0,"ephemeral_24h_input_tokens":0}}}"#;
+        let response_data = ResponseData {
+            extensions: Default::default(),
+            correlation_id: 1,
+            timestamp: SystemTime::now(),
+            status: StatusCode::OK,
+            headers: HashMap::new(),
+            body: Some(Bytes::from(body)),
+            duration: Duration::from_millis(100),
+            duration_to_first_byte: Duration::from_millis(50),
+        };
+
+        let parsed = parse_ai_response(&request_data, &response_data).unwrap();
+        // onwards types `finish_reason` as a plain string, so the shape that used to
+        // defeat the typed parse now goes through it. The counts below are the point
+        // either way: they must come out right whichever path produced them.
+        assert!(
+            matches!(parsed, AiResponse::ChatCompletions(_)),
+            "onwards represents an unrepresentable-by-enum finish_reason"
+        );
+
+        let metrics = UsageMetrics::extract(
+            uuid::Uuid::nil(),
+            &request_data,
+            &response_data,
+            &parsed,
+            &crate::config::Config::default(),
+        );
+        assert_eq!(metrics.prompt_tokens, 29_366, "recovered from the raw usage object");
+        assert_eq!(metrics.completion_tokens, 97);
+        assert_eq!(metrics.reasoning_tokens, 97);
+        assert_eq!(metrics.total_tokens, 29_463);
+        assert_eq!(metrics.cache_read_input_tokens, 25_351, "split read from the raw body as before");
+        assert_eq!(metrics.cache_creation_5m_input_tokens, 4_015);
+    }
+
+    /// The July shape on the live path: `usage` is null, so there is genuinely nothing to
+    /// read and the fallback must not invent counts — the row records zero, exactly as
+    /// before the fallback existed.
+    #[test]
+    fn null_usage_still_records_zero_on_the_live_path() {
+        let request_data = RequestData {
+            correlation_id: 1,
+            timestamp: SystemTime::now(),
+            method: axum::http::Method::POST,
+            uri: "/chat/completions".parse::<Uri>().unwrap(),
+            headers: HashMap::new(),
+            body: Some(Bytes::from(r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#)),
+            trace_id: None,
+            span_id: None,
+        };
+        let body = r#"{"id":"c","object":"chat.completion","created":1,"model":"m","choices":[{"finish_reason":"tool_calls","index":0,"message":{"role":"assistant","content":null}}],"usage":null}"#;
+        let response_data = ResponseData {
+            extensions: Default::default(),
+            correlation_id: 1,
+            timestamp: SystemTime::now(),
+            status: StatusCode::OK,
+            headers: HashMap::new(),
+            body: Some(Bytes::from(body)),
+            duration: Duration::from_millis(100),
+            duration_to_first_byte: Duration::from_millis(50),
+        };
+
+        let parsed = parse_ai_response(&request_data, &response_data).unwrap();
+        let metrics = UsageMetrics::extract(
+            uuid::Uuid::nil(),
+            &request_data,
+            &response_data,
+            &parsed,
+            &crate::config::Config::default(),
+        );
+        assert_eq!(metrics.prompt_tokens, 0, "no usage anywhere → nothing invented");
+        assert_eq!(metrics.completion_tokens, 0);
+        assert_eq!(metrics.total_tokens, 0);
     }
 
     #[test]
@@ -1695,13 +1881,13 @@ mod tests {
 
         // Response with usage data
         #[allow(deprecated)]
-        let chat_response = CreateChatCompletionResponse {
+        let chat_response = ChatCompletionResponse {
             id: "chatcmpl-123".to_string(),
             object: "chat.completion".to_string(),
             created: 1677652288,
             model: "gpt-5".to_string(),
             choices: vec![],
-            usage: Some(async_openai::types::chat::CompletionUsage {
+            usage: Some(ChatUsage {
                 prompt_tokens: 15,
                 completion_tokens: 25,
                 total_tokens: 40,
@@ -1765,13 +1951,13 @@ mod tests {
 
         // Streaming response with usage in the last chunk
         #[allow(deprecated)]
-        let stream_chunk = CreateChatCompletionStreamResponse {
+        let stream_chunk = ChatChunk {
             id: "chatcmpl-123".to_string(),
             object: "chat.completion.chunk".to_string(),
             created: 1677652288,
             model: "gpt-4".to_string(),
             choices: vec![],
-            usage: Some(async_openai::types::chat::CompletionUsage {
+            usage: Some(ChatUsage {
                 prompt_tokens: 8,
                 completion_tokens: 12,
                 total_tokens: 20,
@@ -1783,7 +1969,7 @@ mod tests {
         };
 
         let parsed_response =
-            AiResponse::ChatCompletionsStream(vec![crate::request_logging::models::ChatCompletionChunk::Normal(stream_chunk)]);
+            AiResponse::ChatCompletionsStream(vec![crate::request_logging::models::ChatCompletionChunk::Chunk(stream_chunk)]);
 
         let metrics = UsageMetrics::extract(
             instance_id,
@@ -1826,7 +2012,7 @@ mod tests {
             duration_to_first_byte: Duration::from_millis(50),
         };
 
-        let chat_response: CreateChatCompletionResponse = serde_json::from_value(serde_json::json!({
+        let chat_response: ChatCompletionResponse = serde_json::from_value(serde_json::json!({
             "id": "chatcmpl-123",
             "object": "chat.completion",
             "created": 1677652288,
@@ -1883,11 +2069,11 @@ mod tests {
             duration_to_first_byte: Duration::from_millis(50),
         };
 
-        let embeddings_response = CreateEmbeddingResponse {
+        let embeddings_response = EmbeddingsResponse {
             object: "list".to_string(),
             data: vec![],
             model: "text-embedding-ada-002".to_string(),
-            usage: EmbeddingUsage {
+            usage: EmbeddingsUsage {
                 prompt_tokens: 6,
                 total_tokens: 6,
             },
@@ -1936,13 +2122,13 @@ mod tests {
         };
 
         #[allow(deprecated)]
-        let completions_response = CreateCompletionResponse {
+        let completions_response = CompletionResponse {
             id: "cmpl-123".to_string(),
             object: "text_completion".to_string(),
             created: 1677652288,
             model: "gpt-3.5-turbo-instruct".to_string(),
             choices: vec![],
-            usage: Some(async_openai::types::chat::CompletionUsage {
+            usage: Some(ChatUsage {
                 prompt_tokens: 10,
                 completion_tokens: 15,
                 total_tokens: 25,
@@ -1994,17 +2180,24 @@ mod tests {
             duration_to_first_byte: Duration::from_millis(50),
         };
 
-        let base64_embeddings_response = CreateBase64EmbeddingResponse {
+        // A base64 payload now rides the single Embeddings variant; the analytics
+        // label is read back off the untagged `Embedding` rather than the variant,
+        // so the data has to carry one entry for the label to be derivable.
+        let base64_embeddings_response = EmbeddingsResponse {
             object: "list".to_string(),
-            data: vec![],
+            data: vec![EmbeddingData {
+                object: "embedding".to_string(),
+                embedding: Embedding::Base64("ZmFrZQ==".to_string()),
+                index: 0,
+            }],
             model: "text-embedding-3-large".to_string(),
-            usage: EmbeddingUsage {
+            usage: EmbeddingsUsage {
                 prompt_tokens: 4,
                 total_tokens: 4,
             },
         };
 
-        let parsed_response = AiResponse::Base64Embeddings(base64_embeddings_response);
+        let parsed_response = AiResponse::Embeddings(base64_embeddings_response);
 
         let metrics = UsageMetrics::extract(
             instance_id,

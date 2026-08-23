@@ -25,7 +25,6 @@ pub use fusillade_core::response_step::{
 };
 pub use http::{
     HttpClient, HttpResponse, MockHttpClient, ReqwestHttpClient, StreamEvent, StreamEventCallback,
-    StreamReassembler,
 };
 #[cfg(feature = "postgres")]
 pub use manager::DaemonExecutor;

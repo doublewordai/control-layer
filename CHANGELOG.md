@@ -1,5 +1,33 @@
 # Changelog
 
+## [10.13.1](https://github.com/doublewordai/control-layer/compare/v10.13.0...v10.13.1) (2026-08-21)
+
+
+### Bug Fixes
+
+* fold SSE streams incrementally and drop async-openai from dwctl ([#1503](https://github.com/doublewordai/control-layer/issues/1503)) ([2995d73](https://github.com/doublewordai/control-layer/commit/2995d734bd966070ca337e61e50cd2dc7cd5392e))
+* **payments:** ack webhooks for users this plane does not own (COR-594) ([#1506](https://github.com/doublewordai/control-layer/issues/1506)) ([068455c](https://github.com/doublewordai/control-layer/commit/068455c2f530bfe0fa645e502876653aa3471ae1))
+
+## [10.13.0](https://github.com/doublewordai/control-layer/compare/v10.12.0...v10.13.0) (2026-08-18)
+
+
+### Features
+
+* **analytics:** record when work was submitted, not just dispatched ([#1478](https://github.com/doublewordai/control-layer/issues/1478)) ([e54f08d](https://github.com/doublewordai/control-layer/commit/e54f08d8b1e0ff0f09aa450ef4fa448ece121ba2))
+* **dwctl:** default display name to email prefix instead of random words ([#1469](https://github.com/doublewordai/control-layer/issues/1469)) ([b9043bb](https://github.com/doublewordai/control-layer/commit/b9043bb81c914814a5c5b4594b4b70c13581cf39))
+* **payments:** scaffold invoice billing for enterprise accounts ([#1429](https://github.com/doublewordai/control-layer/issues/1429)) ([ca2da40](https://github.com/doublewordai/control-layer/commit/ca2da40f15b2c661f3a5f9923e14c1110593a464))
+* **recompute:** add the read-only dry-run endpoint ([#1492](https://github.com/doublewordai/control-layer/issues/1492)) ([840484d](https://github.com/doublewordai/control-layer/commit/840484d0eb55f69faaa538936f8180bd47782909))
+* **recompute:** reconstruct the cache split as of a past instant ([#1494](https://github.com/doublewordai/control-layer/issues/1494)) ([f42548c](https://github.com/doublewordai/control-layer/commit/f42548ca6e54ca9bebb39fe689d02826706f9656))
+* **recompute:** surface reasoning and total tokens ([#1491](https://github.com/doublewordai/control-layer/issues/1491)) ([2493605](https://github.com/doublewordai/control-layer/commit/2493605da41313e8ce383f987e8b92ed05f9acdb))
+
+## [10.12.0](https://github.com/doublewordai/control-layer/compare/v10.11.2...v10.12.0) (2026-08-14)
+
+
+### Features
+
+* **cache:** cacheBreakpoint query param for automatic caching ([#1493](https://github.com/doublewordai/control-layer/issues/1493)) ([20a6aa0](https://github.com/doublewordai/control-layer/commit/20a6aa0d5a6985085e4680b37e06e162a84d0318))
+* **recompute:** usage recompute engine (dry-run foundation) ([#1473](https://github.com/doublewordai/control-layer/issues/1473)) ([8a3b144](https://github.com/doublewordai/control-layer/commit/8a3b144f6d85bddf20347c9ae7cb8f8b6d79d1df))
+
 ## [10.11.2](https://github.com/doublewordai/control-layer/compare/v10.11.1...v10.11.2) (2026-08-13)
 
 
