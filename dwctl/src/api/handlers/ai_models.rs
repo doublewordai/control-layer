@@ -126,6 +126,11 @@ fn parse_optional_bool(param: &'static str, value: Option<&str>) -> Result<Optio
 /// This intentionally does not filter by credit balance. Credit balance controls
 /// dispatch eligibility in the onwards key sync; model discovery should reflect
 /// access grants so users can still see what would be available after top-up.
+// An axum handler's error type is the response it will send, so the `Err`
+// variant is a whole `Response` by construction. Boxing it to satisfy the lint
+// would add an allocation on every error path and make this handler's signature
+// differ from every other one for no benefit.
+#[allow(clippy::result_large_err)]
 pub async fn list_ai_models<P: PoolProvider>(
     State(state): State<AppState<P>>,
     Query(query): Query<ModelsListQuery>,
