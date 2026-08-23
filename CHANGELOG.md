@@ -1,5 +1,12 @@
 # Changelog
 
+## [10.14.0](https://github.com/doublewordai/control-layer/compare/v10.13.1...v10.14.0) (2026-08-23)
+
+
+### Features
+
+* **fusillade:** discover per-model concurrency from 529 backpressure ([#1486](https://github.com/doublewordai/control-layer/issues/1486)) ([c26e0de](https://github.com/doublewordai/control-layer/commit/c26e0dea90476bad29cc9b49c2dc36caf7c2e246))
+
 ## [10.13.1](https://github.com/doublewordai/control-layer/compare/v10.13.0...v10.13.1) (2026-08-21)
 
 
