@@ -602,6 +602,21 @@ background_services:
     default_model_concurrency: 10 # Default concurrent requests per model
     claim_interval_ms: 1000 # Milliseconds to sleep between claim iterations
 
+    # Adaptive per-model concurrency. Discovers the sustainable in-flight count
+    # from downstream 529s instead of running flat out at a static number.
+    #
+    # default_model_concurrency and per-model batch_capacity become the value
+    # each model STARTS at; the controller owns the number from there and can go
+    # above it. Turning this off puts every model back on its configured value,
+    # so the flag is safe to flip either way. Set max_total_in_flight first - it
+    # is what bounds this instance's memory once per-model values stop capping.
+    #
+    # adaptive_concurrency: false
+    # adaptive_growth_factor: 1.5    # Multiplier applied each time a limit goes up
+    # adaptive_cut_factor: 0.8       # Multiplier applied on downstream 529
+    # max_total_in_flight: 0         # Hard cap on this instance's total in-flight
+    #                                # requests across all models; 0 disables
+
     # Split claim daemons (fusillade >= 20): batched and batchless (flex) rows
     # are claimed by independent loops. All optional:
     # batch_claim_size: 0            # Max rows per batch-claim iteration; 0 = inherit claim_batch_size

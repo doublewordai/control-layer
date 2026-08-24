@@ -107,12 +107,62 @@ pub struct DaemonConfig {
     #[serde(default)]
     pub mode: DaemonMode,
     pub claim_batch_size: usize,
+    /// Per-model concurrency.
+    ///
+    /// With `adaptive_concurrency` off these are the limits, unchanged. With it
+    /// on they are where each model starts, and the controller owns the number
+    /// from there - bounded by the memory gate, not per model.
     #[serde(
         default = "default_model_concurrency_limits",
         serialize_with = "serialize_model_concurrency_limits",
         deserialize_with = "deserialize_model_concurrency_limits"
     )]
     pub model_concurrency_limits: Arc<dashmap::DashMap<String, usize>>,
+    /// Discover each model's concurrency from downstream backpressure instead of
+    /// running flat out at its configured value.
+    ///
+    /// Off by default, and turning it off returns every model to its configured
+    /// value exactly as before, so the flag is safe to flip either way. While it
+    /// is on a model's limit can go above its configured value, so the daemon
+    /// refuses to enable it unless `memory_gate_high_fraction` is set - there
+    /// would otherwise be nothing bounding growth.
+    #[serde(default)]
+    pub adaptive_concurrency: bool,
+    /// What to multiply a model's limit by each time it goes up.
+    ///
+    /// Clamped to `1.01..=10.0`. Higher recovers faster from a cut but overshoots
+    /// the model's real capacity further before a 529 says so, and every request
+    /// past that point is a retry and a database write.
+    #[serde(default = "default_adaptive_growth_factor")]
+    pub adaptive_growth_factor: f64,
+    /// What to multiply a model's limit by when it returns a 529.
+    ///
+    /// Clamped to `0.05..=0.99`. Closer to 1 gives up less throughput per
+    /// rejection but takes more steps to get down when capacity really has
+    /// dropped.
+    #[serde(default = "default_adaptive_cut_factor")]
+    pub adaptive_cut_factor: f64,
+    /// Fraction of this process's own memory limit at or above which claiming
+    /// stops. Zero disables the gate.
+    ///
+    /// A count of in-flight requests cannot express this: per-request bytes
+    /// vary by more than an order of magnitude between workloads, so no count is
+    /// safe across all of them. This bounds the thing that actually kills the
+    /// process, by measuring it rather than predicting it: above the mark the
+    /// daemon claims nothing, in-flight drains as
+    /// requests finish, and claiming resumes below
+    /// `memory_gate_low_fraction`. Nothing upstream signals local memory
+    /// pressure, so with `adaptive_concurrency` on this is the only control that
+    /// corresponds to running out of memory.
+    #[serde(default)]
+    pub memory_gate_high_fraction: f64,
+    /// Fraction of the memory limit below which claiming resumes. Must be above
+    /// zero and below `memory_gate_high_fraction`, or the gate stays off.
+    ///
+    /// Separate from the high mark so the gate does not flip on and off every
+    /// claim cycle while usage sits on the boundary.
+    #[serde(default = "default_memory_gate_low_fraction")]
+    pub memory_gate_low_fraction: f64,
     #[serde(skip, default = "default_model_escalations")]
     pub model_escalations: Arc<dashmap::DashMap<String, ModelEscalationConfig>>,
     #[serde(default)]
@@ -356,6 +406,20 @@ fn default_upload_stall_poll_ms() -> u64 {
     crate::http::DEFAULT_UPLOAD_STALL_POLL.as_millis() as u64
 }
 
+/// Ten points under a 0.75 high mark: wide enough that the gate does not flap,
+/// narrow enough that a pod does not sit idle far below its ceiling.
+fn default_memory_gate_low_fraction() -> f64 {
+    0.65
+}
+
+fn default_adaptive_growth_factor() -> f64 {
+    1.5
+}
+
+fn default_adaptive_cut_factor() -> f64 {
+    0.8
+}
+
 fn default_archive_sweep_interval_ms() -> u64 {
     5_000
 }
@@ -418,6 +482,11 @@ impl Default for DaemonConfig {
             mode: DaemonMode::default(),
             claim_batch_size: 100,
             model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
+            adaptive_concurrency: false,
+            adaptive_growth_factor: default_adaptive_growth_factor(),
+            adaptive_cut_factor: default_adaptive_cut_factor(),
+            memory_gate_high_fraction: 0.0,
+            memory_gate_low_fraction: default_memory_gate_low_fraction(),
             model_escalations: default_model_escalations(),
             inject_deadline_priority: false,
             background_concurrency_limit: 0,
@@ -533,6 +602,52 @@ mod tests {
             let serde_encoding = serde_json::to_value(mode).unwrap();
             assert_eq!(serde_encoding.as_str().unwrap(), mode.metric_label());
         }
+    }
+
+    #[test]
+    fn adaptive_concurrency_ships_dark() {
+        // Turning it on lets a model's limit grow past its configured value, so
+        // the failure mode for defaulting it on is an OOM rather than a slow
+        // queue. It has to be a deliberate flip.
+        let config = DaemonConfig::default();
+        assert!(!config.adaptive_concurrency);
+        assert_eq!(config.memory_gate_high_fraction, 0.0);
+    }
+
+    #[test]
+    fn adaptive_concurrency_knobs_default_and_round_trip() {
+        let default_config = DaemonConfig::default();
+        assert_eq!(default_config.adaptive_growth_factor, 1.5);
+        assert_eq!(default_config.adaptive_cut_factor, 0.8);
+
+        // Configs serialized before these keys existed must keep deserializing.
+        let mut serialized = serde_json::to_value(&default_config).unwrap();
+        {
+            let serialized = serialized.as_object_mut().unwrap();
+            serialized.remove("adaptive_concurrency");
+            serialized.remove("adaptive_growth_factor");
+            serialized.remove("adaptive_cut_factor");
+            serialized.remove("memory_gate_high_fraction");
+        }
+        let decoded: DaemonConfig = serde_json::from_value(serialized).unwrap();
+        assert!(!decoded.adaptive_concurrency);
+        assert_eq!(decoded.adaptive_growth_factor, 1.5);
+        assert_eq!(decoded.adaptive_cut_factor, 0.8);
+        assert_eq!(decoded.memory_gate_high_fraction, 0.0);
+
+        let configured = DaemonConfig {
+            adaptive_concurrency: true,
+            adaptive_growth_factor: 2.0,
+            adaptive_cut_factor: 0.5,
+            memory_gate_high_fraction: 0.75,
+            ..DaemonConfig::default()
+        };
+        let decoded: DaemonConfig =
+            serde_json::from_value(serde_json::to_value(configured).unwrap()).unwrap();
+        assert!(decoded.adaptive_concurrency);
+        assert_eq!(decoded.adaptive_growth_factor, 2.0);
+        assert_eq!(decoded.adaptive_cut_factor, 0.5);
+        assert_eq!(decoded.memory_gate_high_fraction, 0.75);
     }
 
     #[test]

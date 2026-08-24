@@ -1,6 +1,6 @@
 [package]
 name = "dwctl"
-version = "10.13.0" # x-release-please-version
+version = "10.14.0" # x-release-please-version
 edition = "2024"
 publish = false
 description = "The Doubleword Control Layer - A self-hostable observability and analytics platform for LLM applications"
@@ -91,12 +91,6 @@ metrics = "0.24"
 metrics-exporter-prometheus = "0.18"
 outlet = "0.9.1"
 outlet-postgres = "0.6.0"
-async-openai = { version = "0.34.0", default-features = false, features = [
-  "chat-completion-types",
-  "completion-types",
-  "embedding-types",
-  "response-types",
-] }
 brotli = "8.0"
 flate2 = "1"
 lettre = { version = "0.11", features = [

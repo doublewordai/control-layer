@@ -636,14 +636,35 @@ impl PaymentProvider for StripeProvider {
         let description = {
             let mut users = crate::db::handlers::users::Users::new(&mut conn);
 
-            // Verify creditor user exists before proceeding
+            // Bail if either party is unknown to this plane.
+            //
+            // With one Stripe account serving both regional planes, every plane
+            // receives every plane's events, so unknown users are the *expected*
+            // shape of a foreign region's session rather than a rarity.
+            //
+            // The creditee is checked first because it is the one that gets
+            // written: the credit insert below uses it as user_id, and a row
+            // that does not exist fails the foreign key. Today that surfaces as
+            // DbError -> InvalidData, which the webhook's catch-all already
+            // turns into a 200 while logging at ERROR — so the present symptom
+            // is a misleading error-level log and a wasted Stripe round trip
+            // rather than a retry storm. Relying on that is still wrong: it
+            // depends on a constraint rather than a decision, it would credit a
+            // nonexistent user if the constraint were ever relaxed, and it
+            // buries a routine multi-region event in the error stream.
+            //
+            // The creditor is checked too, because it is read for the
+            // description and written by set_verified further down.
+            //
+            // A genuinely orphaned local session is indistinguishable from here
+            // and gets the same treatment; the webhook handler's log line is
+            // what keeps it visible.
+            if users.get_by_id(payment_session.creditee_id).await?.is_none() {
+                return Err(PaymentError::UnknownReference(payment_session.creditee_id.to_string()));
+            }
             let creditor_user = users.get_by_id(payment_session.creditor_id).await?;
             if creditor_user.is_none() {
-                tracing::error!(
-                    "Creditor user {} not found for payment session {}. This indicates a data integrity issue.",
-                    payment_session.creditor_id,
-                    session_id
-                );
+                return Err(PaymentError::UnknownReference(payment_session.creditor_id.to_string()));
             }
 
             // Build description with payer information
@@ -1069,6 +1090,37 @@ mod tests {
             stripe::ApiErrorsType::InvalidRequestError,
         ));
         assert!(matches!(err, PaymentError::AlreadyProcessed), "got {err:?}");
+    }
+
+    // The whole point of COR-594: a foreign region's event must not be retried
+    // forever. Stripe fans account-level events out to every endpoint, so with
+    // one account and two planes each sees the other's sessions; anything but a
+    // 2xx here is an infinite retry loop, because retrying cannot make a user
+    // this plane does not own appear.
+    #[test]
+    fn test_unknown_reference_is_not_found_for_direct_callers() {
+        // The webhook acks these explicitly in its own arm. This mapping serves
+        // the front-channel PATCH /payments/{id}, where claiming success for a
+        // session we cannot process would mislead the caller.
+        let status: axum::http::StatusCode = PaymentError::UnknownReference("some-user-id".to_string()).into();
+        assert_eq!(
+            status,
+            axum::http::StatusCode::NOT_FOUND,
+            "direct callers must be told the session is not ours"
+        );
+    }
+
+    // The other half of the same guarantee. Widening the ack to cover genuine
+    // database failures would silently drop real payments, so the distinction
+    // between "not ours" and "we could not process it" has to hold.
+    #[test]
+    fn test_database_errors_are_still_retried() {
+        let status: axum::http::StatusCode = PaymentError::Database(sqlx::Error::PoolClosed).into();
+        assert_eq!(
+            status,
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "transient database failures must keep asking Stripe to retry"
+        );
     }
 
     #[test]

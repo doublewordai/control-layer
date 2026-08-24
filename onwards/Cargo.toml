@@ -18,7 +18,6 @@ async-trait = "0.1.88"
 brotli = "8"
 bytes = "1.10"
 eventsource-stream = "0.2"
-openai-reassembler = "0.3"
 axum = "0.8.4"
 flate2 = "1"
 clap = { version = "4.5.40", features = ["derive", "env"] }

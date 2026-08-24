@@ -417,7 +417,7 @@ mod tests {
         match result {
             AiResponse::ChatCompletionsStream(parsed_chunks) => {
                 assert_eq!(parsed_chunks.len(), 2);
-                assert!(matches!(parsed_chunks[0], ChatCompletionChunk::Normal(_)));
+                assert!(matches!(parsed_chunks[0], ChatCompletionChunk::Chunk(_)));
                 match &parsed_chunks[1] {
                     ChatCompletionChunk::Error(e) => {
                         assert_eq!(e.error.get("code").and_then(|v| v.as_i64()), Some(500));
