@@ -504,6 +504,7 @@ where
         let memory_gate = MemoryGate::new(
             config.memory_gate_high_fraction,
             config.memory_gate_low_fraction,
+            config.memory_gate_release_in_flight_fraction,
             Box::new(CgroupMemorySource),
         )
         .map(Arc::new);
