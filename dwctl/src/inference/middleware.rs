@@ -138,34 +138,6 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
         .and_then(|s| s.strip_prefix("Bearer "))
         .map(|s| s.to_string());
 
-    // Inject server-side resolved tools into the request body so the
-    // multi-step path's transition function (which reads `body["tools"]`
-    // and forwards them to upstream model_call payloads) sees them.
-    // Without this, tools registered in the dwctl tool registry never
-    // reach the model — it can't issue real tool_calls and the loop
-    // runs as a single model_call.
-    //
-    // The single-step (onwards-routed) path injects tools via the
-    // strict-mode handlers; the multi-step path bypasses onwards for
-    // model_calls so we have to do it here. Skipped if the user
-    // already supplied tools (their list takes precedence).
-    //
-    // The cross-cutting `tool_injection_middleware` runs *inside* this
-    // layer (axum applies later-added layers as outer wrappers, so
-    // when inference_middleware fires, tool_injection hasn't yet
-    // populated request.extensions::<ResolvedTools>). We do the same
-    // DB resolve directly here.
-    if request_value.get("tools").is_none()
-        && is_responses_api
-        && let Some(key) = api_key.as_deref()
-        && let Ok(Some(resolved)) = crate::inference::tools::resolve_tools_for_request(&state.dwctl_pool, key, Some(model)).await
-    {
-        let openai_tools = resolved.to_openai_tools_array();
-        if !openai_tools.is_empty() {
-            request_value["tools"] = serde_json::Value::Array(openai_tools);
-        }
-    }
-
     // `previous_response_id` hydration (Responses control plane). Inline the prior
     // turn's output items ahead of the current input, in the Responses domain,
     // BEFORE the edge translation (one layer inside this one) converts the request

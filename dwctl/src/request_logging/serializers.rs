@@ -714,8 +714,6 @@ impl Auth {
 /// loop. The client executes the tool itself and sends a fresh request, so the follow-up
 /// arrives with its own `fusillade_request_id` and is otherwise indistinguishable from an
 /// ordinary multi-turn message. Without this the whole class of usage is invisible.
-/// (Server-side tool loops are a different thing entirely, counted by `tool_iterations`
-/// and detailed in `tool_call_analytics`.)
 ///
 /// Deliberately a free function over the already-deserialised `AiResponse` rather than a
 /// field on `TokenMetrics`: nothing new is parsed, and none of the nine `TokenMetrics`

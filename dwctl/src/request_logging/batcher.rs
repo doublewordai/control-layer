@@ -89,8 +89,7 @@ pub struct RawAnalyticsRecord {
     pub response_type: String,
     /// Why the model stopped — `stop`, `length`, `tool_calls`, ... `None` when the
     /// response shape has no such concept (embeddings, the Responses API) or it could not
-    /// be read. `tool_calls` is what makes CLIENT-side tool loops visible; server-side
-    /// loops are counted separately by `tool_iterations` / `tool_call_analytics`.
+    /// be read. `tool_calls` is what makes CLIENT-side tool loops visible.
     ///
     /// Extracted by `serializers::extract_finish_reason`, like every other field on this
     /// struct that comes off the payload. The batcher deliberately never sees a request or
