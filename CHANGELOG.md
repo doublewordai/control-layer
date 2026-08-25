@@ -1,5 +1,13 @@
 # Changelog
 
+## [10.14.1](https://github.com/doublewordai/control-layer/compare/v10.14.0...v10.14.1) (2026-08-25)
+
+
+### Bug Fixes
+
+* **fusillade:** give the memory gate an exit that can actually be reached ([#1513](https://github.com/doublewordai/control-layer/issues/1513)) ([9c8e57c](https://github.com/doublewordai/control-layer/commit/9c8e57caedd22957b5859accc01f66847aeabcc5))
+* **onwards:** retry slow empty SSE streams ([#1510](https://github.com/doublewordai/control-layer/issues/1510)) ([4df7a30](https://github.com/doublewordai/control-layer/commit/4df7a30f657dd3f87bfc6cf9c07c0a33180cd3a5))
+
 ## [10.14.0](https://github.com/doublewordai/control-layer/compare/v10.13.1...v10.14.0) (2026-08-23)
 
 
