@@ -195,8 +195,13 @@ impl MemoryGate {
         let was_engaged = self.engaged.load(Ordering::Relaxed);
         let engaged = if was_engaged {
             let engaged_at = self.in_flight_when_engaged.load(Ordering::Relaxed);
-            let drained_enough = engaged_at == 0
-                || (in_flight as f64) < (engaged_at as f64) * self.release_in_flight_fraction;
+            // A zero fraction disables this exit, and so does engaging with
+            // nothing in flight: without a level to have fallen from there is no
+            // drain to measure, so fall back to the memory reading rather than
+            // treating an unknown as satisfied.
+            let drained_enough = self.release_in_flight_fraction > 0.0
+                && engaged_at > 0
+                && (in_flight as f64) <= (engaged_at as f64) * self.release_in_flight_fraction;
             // Either exit will do: usage back under the low mark, or enough of
             // the work that was in flight at engagement has completed.
             used > self.low && !drained_enough
@@ -357,6 +362,33 @@ mod tests {
         assert!(
             gate.should_block(1),
             "no in-flight exit when the fraction is zero"
+        );
+        assert!(
+            gate.should_block(0),
+            "not even at zero in flight: the fraction is what disables it"
+        );
+    }
+
+    /// "Fallen to" the fraction includes landing exactly on it.
+    #[test]
+    fn releases_exactly_at_the_threshold() {
+        let gate = MemoryGate::new(0.75, 0.65, 0.5, FixedSource::new(vec![at(0.9)])).unwrap();
+
+        assert!(gate.should_block(1000));
+        assert!(!gate.should_block(500), "500 is half of 1000");
+    }
+
+    /// Engaging with nothing in flight leaves no drain to measure. Treating that
+    /// as satisfied would release on the next cycle however high usage was, so
+    /// the memory reading has to stay in charge.
+    #[test]
+    fn engaging_with_nothing_in_flight_does_not_release_on_its_own() {
+        let gate = MemoryGate::new(0.75, 0.65, 0.5, FixedSource::new(vec![at(0.9)])).unwrap();
+
+        assert!(gate.should_block(0), "engages on usage alone");
+        assert!(
+            gate.should_block(0),
+            "still held: usage is high and there was never any work to drain"
         );
     }
 
