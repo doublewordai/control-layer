@@ -19,4 +19,4 @@ hurl = "latest"   # API integration tests
 
 # The `sqlx` binary db-setup runs migrations with. Features match CI:
 # skipping the MySQL and SQLite drivers keeps the build short.
-"cargo:sqlx-cli" = { version = "0.8", features = "native-tls,postgres", default-features = "false" }
+"cargo:sqlx-cli" = { version = "0.8", features = "native-tls,postgres", default-features = false }
