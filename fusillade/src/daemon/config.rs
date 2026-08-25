@@ -149,11 +149,15 @@ pub struct DaemonConfig {
     /// vary by more than an order of magnitude between workloads, so no count is
     /// safe across all of them. This bounds the thing that actually kills the
     /// process, by measuring it rather than predicting it: above the mark the
-    /// daemon claims nothing, in-flight drains as
-    /// requests finish, and claiming resumes below
-    /// `memory_gate_low_fraction`. Nothing upstream signals local memory
-    /// pressure, so with `adaptive_concurrency` on this is the only control that
-    /// corresponds to running out of memory.
+    /// daemon claims nothing and in-flight drains as requests finish. Nothing
+    /// upstream signals local memory pressure, so with `adaptive_concurrency` on
+    /// this is the only control that corresponds to running out of memory.
+    ///
+    /// Claiming resumes on either of two conditions: usage falling below
+    /// `memory_gate_low_fraction`, or in-flight falling to
+    /// `memory_gate_release_in_flight_fraction` of what it was when the gate
+    /// engaged. The second exists because the first is not always reachable -
+    /// see that field for why.
     #[serde(default)]
     pub memory_gate_high_fraction: f64,
     /// Fraction of the memory limit below which claiming resumes. Must be above
@@ -163,6 +167,18 @@ pub struct DaemonConfig {
     /// claim cycle while usage sits on the boundary.
     #[serde(default = "default_memory_gate_low_fraction")]
     pub memory_gate_low_fraction: f64,
+    /// Fraction of the in-flight count at engagement that in-flight must fall
+    /// to before claiming resumes, whatever the memory reading says.
+    ///
+    /// The low mark alone cannot release the gate. Freed memory goes back to the
+    /// allocator rather than the OS, so the cgroup working set behaves as a
+    /// high-water mark: it does not fall when requests complete, and the
+    /// remaining in-flight work pushes it up. Since the gate engages by reaching
+    /// the high mark, the reading pins at or above it, leaving no reachable low
+    /// mark below and no useful one above. In-flight is the one quantity certain
+    /// to fall once claiming stops, so it is what guarantees an exit.
+    #[serde(default = "default_release_in_flight_fraction")]
+    pub memory_gate_release_in_flight_fraction: f64,
     #[serde(skip, default = "default_model_escalations")]
     pub model_escalations: Arc<dashmap::DashMap<String, ModelEscalationConfig>>,
     #[serde(default)]
@@ -412,6 +428,15 @@ fn default_memory_gate_low_fraction() -> f64 {
     0.65
 }
 
+/// Half the work in flight at engagement. Low enough that a genuinely loaded pod
+/// holds for a meaningful stretch rather than flapping, high enough that it
+/// always recovers well before a full drain. If memory is still over the high
+/// mark when it resumes, the next cycle re-engages, so the cost of releasing too
+/// early is one claim batch.
+fn default_release_in_flight_fraction() -> f64 {
+    0.5
+}
+
 fn default_adaptive_growth_factor() -> f64 {
     1.5
 }
@@ -487,6 +512,7 @@ impl Default for DaemonConfig {
             adaptive_cut_factor: default_adaptive_cut_factor(),
             memory_gate_high_fraction: 0.0,
             memory_gate_low_fraction: default_memory_gate_low_fraction(),
+            memory_gate_release_in_flight_fraction: default_release_in_flight_fraction(),
             model_escalations: default_model_escalations(),
             inject_deadline_priority: false,
             background_concurrency_limit: 0,
