@@ -29,7 +29,7 @@ import {
   useUserBalance,
   useTransactions,
 } from "../../../api/control-layer/hooks";
-import { UserAvatar } from "../../ui";
+import { UserAvatar, Tooltip, TooltipContent, TooltipTrigger } from "../../ui";
 import { useAuthorization } from "../../../utils";
 import { useAuth } from "../../../contexts/auth";
 import { useSettings, useOrganizationContext } from "../../../contexts";
@@ -442,14 +442,36 @@ export function AppLayout({ children }: { children: React.ReactNode }) {
                 <>
                   {config.region && (
                     <>
-                      <div className="hidden lg:flex items-center gap-2">
-                        <span className="text-muted-foreground/70">
-                          Region:
-                        </span>
-                        <span className="font-medium text-foreground">
-                          {config.region}
-                        </span>
-                      </div>
+                      {/* Explains what the region label means. A deployment
+                          split across regions keeps each region's data in
+                          that region, so this is not a preference the user
+                          can toggle — reaching another region means signing
+                          in against that region's URL. Distinct from moving
+                          an existing account's data between regions, which
+                          is an operator-run transfer, so the copy promises
+                          only the sign-in.
+
+                          SidebarProvider already wraps the app in a
+                          TooltipProvider, so Radix handles the
+                          aria-describedby wiring for us here. */}
+                      <Tooltip>
+                        <TooltipTrigger asChild>
+                          <div className="hidden lg:flex items-center gap-2 cursor-help">
+                            <span className="text-muted-foreground/70">
+                              Region:
+                            </span>
+                            <span className="font-medium text-foreground">
+                              {config.region}
+                            </span>
+                          </div>
+                        </TooltipTrigger>
+                        <TooltipContent className="max-w-xs">
+                          Your account and its data live in the{" "}
+                          {config.region} region. To use an account in a
+                          different region, sign out and sign in at that
+                          region's URL.
+                        </TooltipContent>
+                      </Tooltip>
                       <div className="hidden lg:block w-px h-4 bg-border"></div>
                     </>
                   )}
