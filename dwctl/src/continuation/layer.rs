@@ -461,6 +461,11 @@ fn tee(response: Response, state: ContinuationState, ctx: RequestContext) -> Res
         // a later leg's error — is what an exhausted chain surfaces.
         let mut done_bytes: Option<Bytes> = None;
         let mut first_death: Option<Bytes> = None;
+        // The FIRST death's family label — what a rescued stream was rescued
+        // FROM. `resumed` outcomes carry it as their reason so dashboards can
+        // split catches by fault type; `ok` never appears there (a defused
+        // stream records nothing).
+        let mut first_death_reason: Option<&'static str> = None;
         let mut refusal: Option<Bytes> = None;
         let mut attempts = 0u32;
         let mut last_render: Option<RenderedPrefix> = None;
@@ -623,7 +628,7 @@ fn tee(response: Response, state: ContinuationState, ctx: RequestContext) -> Res
                     }
                     yield Ok(done_bytes.unwrap_or_else(|| Bytes::from_static(DONE_FRAME)));
                     if attempts > 0 {
-                        outcome.record("resumed", "ok");
+                        outcome.record("resumed", first_death_reason.unwrap_or("ok"));
                     } else {
                         outcome.defuse();
                     }
@@ -650,6 +655,9 @@ fn tee(response: Response, state: ContinuationState, ctx: RequestContext) -> Res
                     break 'chain;
                 }
                 Verdict::Resume(reason) => {
+                    if first_death_reason.is_none() {
+                        first_death_reason = Some(reason);
+                    }
                     let Some(text) = acc.continuation_text() else {
                         // Disarmed, or nothing generated yet: resume-from-zero is
                         // a plain retry, which is not this feature's job.

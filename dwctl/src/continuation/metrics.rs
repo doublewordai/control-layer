@@ -30,7 +30,8 @@ pub fn record_layer_wired(wired: bool) {
 
 /// Terminal outcome for one armed (or rejected) stream.
 ///
-/// `outcome` ∈ `resumed` (a resume leg carried the stream to completion) |
+/// `outcome` ∈ `resumed` (a resume leg carried the stream to completion — its
+/// `reason` is the death family the stream was rescued FROM) |
 /// `failed` (we tried and could not) | `ineligible` (never armed) | `disarmed`
 /// (armed, then something made the stream non-reconstructable).
 ///
