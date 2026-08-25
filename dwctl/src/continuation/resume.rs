@@ -234,6 +234,7 @@ mod tests {
             path: "/chat/completions".to_string(),
             response_id: None,
             route: crate::continuation::RouteInfo::default(),
+            origin: "realtime",
         }
     }
 

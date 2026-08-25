@@ -145,6 +145,9 @@ pub struct RequestContext {
     /// armed. Held on the context rather than re-read per leg so a mid-stream
     /// config change cannot make leg 2 render differently from leg 1.
     pub route: RouteInfo,
+    /// Metric label for the request origin (realtime / batch / playground),
+    /// resolved at arm time from the API key purpose.
+    pub origin: &'static str,
 }
 
 impl RequestContext {
@@ -194,6 +197,15 @@ impl Origin {
             Some(ApiKeyPurpose::Batch) => Origin::Batch,
             Some(ApiKeyPurpose::Playground) => Origin::Playground,
             _ => Origin::Realtime,
+        }
+    }
+
+    /// Bounded metric label.
+    fn label(self) -> &'static str {
+        match self {
+            Origin::Realtime => "realtime",
+            Origin::Batch => "batch",
+            Origin::Playground => "playground",
         }
     }
 
@@ -317,11 +329,11 @@ pub async fn continuation_middleware(State(state): State<ContinuationState>, req
     // spec's own stated cheapest-first principle. Only the recorded `reason`
     // label differs when several gates would fail.
     let Some(route) = state.routes.get(&model) else {
-        metrics::record_outcome("ineligible", "no_route");
+        metrics::record_outcome("ineligible", "no_route", "unknown");
         return next.run(forward(parts, body_bytes)).await;
     };
     if is_structured_output(&body, &model) {
-        metrics::record_outcome("ineligible", "structured_output");
+        metrics::record_outcome("ineligible", "structured_output", "unknown");
         return next.run(forward(parts, body_bytes)).await;
     }
     // `n > 1` never arms: providers stream multiple choices as alternating
@@ -329,7 +341,7 @@ pub async fn continuation_middleware(State(state): State<ContinuationState>, req
     // interleaved prefix. The accumulator's own `choice.index != 0` disarm is
     // the backstop for providers that emit extra choices unasked.
     if body.get("n").and_then(Value::as_u64).is_some_and(|n| n > 1) {
-        metrics::record_outcome("ineligible", "multi_choice");
+        metrics::record_outcome("ineligible", "multi_choice", "unknown");
         return next.run(forward(parts, body_bytes)).await;
     }
     let origin = Origin::from_purpose(match token.as_deref() {
@@ -337,12 +349,12 @@ pub async fn continuation_middleware(State(state): State<ContinuationState>, req
         None => None,
     });
     if !origin.is_enabled(&state.cfg) {
-        metrics::record_outcome("ineligible", "origin_disabled");
+        metrics::record_outcome("ineligible", "origin_disabled", origin.label());
         return next.run(forward(parts, body_bytes)).await;
     }
     if body_bytes.len() > state.cfg.max_buffer_bytes {
         // We would have to retain this body for the life of the stream.
-        metrics::record_outcome("ineligible", "cap_exceeded");
+        metrics::record_outcome("ineligible", "cap_exceeded", origin.label());
         return next.run(forward(parts, body_bytes)).await;
     }
 
@@ -352,8 +364,9 @@ pub async fn continuation_middleware(State(state): State<ContinuationState>, req
         path,
         response_id,
         route,
+        origin: origin.label(),
     };
-    metrics::record_eligible_stream(&ctx.model);
+    metrics::record_eligible_stream(&ctx.model, ctx.origin);
 
     let response = next.run(forward(parts, body_bytes)).await;
 
@@ -361,11 +374,11 @@ pub async fn continuation_middleware(State(state): State<ContinuationState>, req
     // generated, so there is nothing to continue, and error enrichment above
     // already gives those their final shape.
     if !response.status().is_success() {
-        metrics::record_outcome("disarmed", "non_2xx");
+        metrics::record_outcome("disarmed", "non_2xx", ctx.origin);
         return response;
     }
     if !is_sse(&response) {
-        metrics::record_outcome("disarmed", "not_streaming");
+        metrics::record_outcome("disarmed", "not_streaming", ctx.origin);
         return response;
     }
 
@@ -379,17 +392,18 @@ pub async fn continuation_middleware(State(state): State<ContinuationState>, req
 /// the streams whose resume work would have been wasted).
 struct OutcomeGuard {
     recorded: bool,
+    origin: &'static str,
 }
 
 impl OutcomeGuard {
-    fn new() -> Self {
-        Self { recorded: false }
+    fn new(origin: &'static str) -> Self {
+        Self { recorded: false, origin }
     }
 
     fn record(&mut self, outcome: &'static str, reason: &'static str) {
         if !self.recorded {
             self.recorded = true;
-            metrics::record_outcome(outcome, reason);
+            metrics::record_outcome(outcome, reason, self.origin);
         }
     }
 
@@ -402,7 +416,7 @@ impl OutcomeGuard {
 impl Drop for OutcomeGuard {
     fn drop(&mut self) {
         if !self.recorded {
-            metrics::record_outcome("disarmed", "client_disconnect");
+            metrics::record_outcome("disarmed", "client_disconnect", self.origin);
         }
     }
 }
@@ -427,13 +441,18 @@ fn tee(response: Response, state: ContinuationState, ctx: RequestContext) -> Res
     let stall = state.attempt_deadline();
 
     let stream = async_stream::stream! {
-        let mut outcome = OutcomeGuard::new();
+        let mut outcome = OutcomeGuard::new(ctx.origin);
         // Which reconstructor this stream gets is a per-model capability lookup;
         // see `accumulate::for_model`.
         let mut acc: Box<dyn StreamAccumulator> = accumulate::for_model(&ctx.model, &state.cfg, &ctx.route);
         let mut current: LegStream = Box::pin(SseBufferedStream::new(leg_one));
         // Is `current` a resume leg (text_completion chunks needing reframing)?
         let mut resuming = false;
+        // Which upstream serves the CURRENT leg ("dynamo" / "external"),
+        // detected from the leg's first frame (dynamo ids are `dyn-*`). Reset
+        // per leg; used to label seams and leg-token metrics so dashboards can
+        // split the free dynamo hop from paid external rescues.
+        let mut leg_provider: Option<&'static str> = None;
         let mut saw_usage = false;
         // The terminating frames, held rather than forwarded: we may need to put
         // a synthesized usage frame in front of `[DONE]`, and a death frame must
@@ -544,6 +563,19 @@ fn tee(response: Response, state: ContinuationState, ctx: RequestContext) -> Res
                 }
 
                 // ── resume leg: reframe onto the client's original stream ──
+                if leg_provider.is_none() {
+                    let provider = if value.get("id").and_then(Value::as_str).is_some_and(|id| id.starts_with("dyn-")) {
+                        "dynamo"
+                    } else {
+                        "external"
+                    };
+                    leg_provider = Some(provider);
+                    metrics::record_leg_served(
+                        &ctx.model,
+                        provider,
+                        last_render.as_ref().map(|r| r.total as u64).unwrap_or(0),
+                    );
+                }
                 let Some(env) = acc.envelope().cloned() else {
                     // Leg 1 never produced a usable envelope; without one we
                     // cannot address the client's stream. Should be unreachable
@@ -566,7 +598,7 @@ fn tee(response: Response, state: ContinuationState, ctx: RequestContext) -> Res
                 }
                 if let Some(chat) = rewrap::reframe_chunk(&value, &env) {
                     if let Some(died) = death_at.take() {
-                        metrics::record_seam(&ctx.model, died.elapsed().as_secs_f64());
+                        metrics::record_seam(&ctx.model, leg_provider.unwrap_or("external"), died.elapsed().as_secs_f64());
                     }
                     // The reframed chunk is what the client received, so it — not
                     // the completions chunk — is what a further resume continues from.
@@ -694,6 +726,7 @@ fn tee(response: Response, state: ContinuationState, ctx: RequestContext) -> Res
                             last_render = Some(l.render);
                             current = l.stream;
                             resuming = true;
+                            leg_provider = None;
                             refusal = None;
                         }
                         None => {
@@ -804,6 +837,7 @@ mod tests {
             path: "/chat/completions".to_string(),
             response_id: None,
             route: RouteInfo::default(),
+            origin: "realtime",
         };
         assert_eq!(ctx.messages()[0]["role"], "user");
         assert!(ctx.tools().is_some());
@@ -817,6 +851,7 @@ mod tests {
             path: "/chat/completions".to_string(),
             response_id: None,
             route: RouteInfo::default(),
+            origin: "realtime",
         };
         assert_eq!(ctx.max_tokens(), Some(42));
         assert!(ctx.tools().is_none());

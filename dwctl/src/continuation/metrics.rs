@@ -41,15 +41,17 @@ pub fn record_layer_wired(wired: bool) {
 /// | death families from [`super::detect`] (`transport_error`, `truncated`,
 /// `error_envelope`, `error_envelope_4xx`, `cancelled_499`, `stall`) | `ok` for
 /// a clean completion.
-pub fn record_outcome(outcome: &'static str, reason: &'static str) {
-    counter!("dwctl_continuation_outcome_total", "outcome" => outcome, "reason" => reason).increment(1);
+/// `origin` ∈ `realtime` | `batch` | `playground` | `unknown` (gates that run
+/// before the key purpose is resolved).
+pub fn record_outcome(outcome: &'static str, reason: &'static str, origin: &'static str) {
+    counter!("dwctl_continuation_outcome_total", "outcome" => outcome, "reason" => reason, "origin" => origin).increment(1);
 }
 
 /// An armed tee: a streaming request on a continuation-enabled model that we are
 /// prepared to resume. The denominator for every resume ratio. `model` is bounded
 /// (see the module docs: emitted only past the route gate).
-pub fn record_eligible_stream(model: &str) {
-    counter!("dwctl_continuation_eligible_streams_total", "model" => model.to_owned()).increment(1);
+pub fn record_eligible_stream(model: &str, origin: &'static str) {
+    counter!("dwctl_continuation_eligible_streams_total", "model" => model.to_owned(), "origin" => origin).increment(1);
 }
 
 /// One dispatched resume leg. `attempt` is the 1-based chain position, clamped to
@@ -77,8 +79,23 @@ fn attempt_label(attempt: u32) -> &'static str {
 /// The seam: death detected → first resumed content token reaching the client.
 /// This is what a user perceives as the gap, and what the resume deadline is
 /// spent on (render + a cold provider prefill).
-pub fn record_seam(model: &str, seconds: f64) {
-    histogram!("dwctl_continuation_seam_seconds", "model" => model.to_owned()).record(seconds);
+/// `provider` ∈ `dynamo` (free self-hosted hop) | `external` (paid third
+/// party) — detected from the serving leg's first frame.
+pub fn record_seam(model: &str, provider: &'static str, seconds: f64) {
+    histogram!("dwctl_continuation_seam_seconds", "model" => model.to_owned(), "provider" => provider).record(seconds);
+}
+
+/// One resume leg that produced its first frame, attributed to the upstream
+/// that served it, with the leg's rendered prompt size. `leg_served_tokens ×
+/// the external provider's input price` is the paid-rescue cost line (the
+/// dynamo share is the free-hop counterfactual); `eaten_prompt_tokens_total`
+/// stays the dispatch-side total (dead legs included).
+pub fn record_leg_served(model: &str, provider: &'static str, prompt_tokens: u64) {
+    counter!("dwctl_continuation_legs_served_total", "model" => model.to_owned(), "provider" => provider).increment(1);
+    if prompt_tokens > 0 {
+        counter!("dwctl_continuation_leg_served_tokens_total", "model" => model.to_owned(), "provider" => provider)
+            .increment(prompt_tokens);
+    }
 }
 
 /// Prompt tokens re-paid on a resume leg — each leg re-prefills the WHOLE prompt
