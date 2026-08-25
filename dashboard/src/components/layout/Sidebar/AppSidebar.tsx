@@ -451,12 +451,22 @@ export function AppLayout({ children }: { children: React.ReactNode }) {
                           is an operator-run transfer, so the copy promises
                           only the sign-in.
 
-                          SidebarProvider already wraps the app in a
-                          TooltipProvider, so Radix handles the
-                          aria-describedby wiring for us here. */}
+                          SidebarProvider already mounts a TooltipProvider
+                          above this, so Radix works here without one being
+                          added. The aria-describedby wiring comes from the
+                          trigger/content pair itself, which is why no
+                          sr-only span is needed.
+
+                          tabIndex makes the trigger reachable: Radix opens
+                          the tooltip on focus as well as hover, but a plain
+                          div is not a tab stop, so without this the
+                          explanation would be mouse-only. */}
                       <Tooltip>
                         <TooltipTrigger asChild>
-                          <div className="hidden lg:flex items-center gap-2 cursor-help">
+                          <div
+                            tabIndex={0}
+                            className="hidden lg:flex items-center gap-2 cursor-help rounded-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                          >
                             <span className="text-muted-foreground/70">
                               Region:
                             </span>
