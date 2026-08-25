@@ -177,7 +177,23 @@ async fn adds_retained_response_parent_without_rewriting_live_heaps(pool: sqlx::
     let live_heaps_before = live_heap_identities(&pool).await;
     let live_heap_indexes_before = live_heap_index_identities(&pool).await;
 
-    MIGRATOR.run(&pool).await.unwrap();
+    // Apply migrations only through the retention migration so this guard
+    // asserts about exactly that migration's effect: later unrelated
+    // migrations may legitimately index live heaps (e.g. the batchless
+    // demand index) without weakening this contract.
+    let through_retention = sqlx::migrate::Migrator {
+        migrations: Cow::Owned(
+            MIGRATOR
+                .iter()
+                .filter(|migration| migration.version <= RETENTION_MIGRATION)
+                .cloned()
+                .collect(),
+        ),
+        ignore_missing: false,
+        locking: true,
+        no_tx: false,
+    };
+    through_retention.run(&pool).await.unwrap();
 
     let range_partitioned: bool = sqlx::query_scalar(
         r#"
