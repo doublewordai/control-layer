@@ -13,9 +13,11 @@ get-admin-email:
 # - macOS or Linux
 # - Homebrew (recommended for tool installation)
 #
-# First-time setup:
-#   brew install docker hurl postgresql
-#   just setup
+# First-time setup (cargo comes from rustup, not Homebrew):
+#   brew install hurl postgresql pnpm
+#   brew install --cask docker
+#   cargo install sqlx-cli --version '^0.8' --no-default-features --features native-tls,postgres --locked
+#   just check
 check:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -26,7 +28,7 @@ check:
     missing_tools=()
 
     # Required tools
-    required_tools=("docker" "hurl" "psql" "createdb" "cargo" "pnpm")
+    required_tools=("docker" "hurl" "psql" "createdb" "cargo" "pnpm" "sqlx")
     for tool in "${required_tools[@]}"; do
         if ! command -v "$tool" >/dev/null 2>&1; then
             missing_tools+=("$tool")

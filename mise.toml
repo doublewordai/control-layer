@@ -1,0 +1,22 @@
+# Optional record of this repo's tooling, for anyone using mise
+# (https://mise.jdx.dev). Install everything with `mise install`.
+#
+# Nothing here is required: `just check` verifies the same set and does not
+# care how you installed it.
+#
+# Not mise-managed:
+#   - a Docker runtime, for `just dev`, `just up` and `just db-start`
+#   - the PostgreSQL client binaries (psql, createdb, pg_isready) that
+#     db-setup and dev-native shell out to; install libpq or the full
+#     PostgreSQL client package
+
+[tools]
+rust = "stable"   # CI builds on stable; the release image pins 1.93.0
+node = "24"       # dashboard, matches CI
+pnpm = "latest"
+just = "latest"
+hurl = "latest"   # API integration tests
+
+# The `sqlx` binary db-setup runs migrations with. Features match CI:
+# skipping the MySQL and SQLite drivers keeps the build short.
+"cargo:sqlx-cli" = { version = "0.8", features = "native-tls,postgres", default-features = "false" }
