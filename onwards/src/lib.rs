@@ -721,6 +721,38 @@ pub mod test_utils {
             }
         }
 
+        pub fn new_delayed_streaming_sequence(
+            status: StatusCode,
+            responses: Vec<(std::time::Duration, Vec<String>)>,
+        ) -> Self {
+            let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            Self {
+                requests: Arc::new(Mutex::new(Vec::new())),
+                custom_headers: Arc::new(Mutex::new(Vec::new())),
+                response_builder: Arc::new(move || {
+                    use axum::body::Body;
+
+                    let idx = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let (delay, chunks) = responses.get(idx).cloned().unwrap_or_default();
+
+                    let stream = async_stream::stream! {
+                        tokio::time::sleep(delay).await;
+                        for chunk in chunks {
+                            yield Ok::<_, std::io::Error>(chunk.into_bytes());
+                        }
+                    };
+
+                    axum::response::Response::builder()
+                        .status(status)
+                        .header("content-type", "text/event-stream")
+                        .header("cache-control", "no-cache")
+                        .header("connection", "keep-alive")
+                        .body(Body::from_stream(stream))
+                        .unwrap()
+                }),
+            }
+        }
+
         pub fn get_requests(&self) -> Vec<MockRequest> {
             self.requests.lock().unwrap().clone()
         }
@@ -1560,6 +1592,117 @@ mod tests {
             mock.get_requests().len(),
             2,
             "empty stream must trigger a retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_slow_streaming_empty_body_retries_then_succeeds() {
+        // Regression for a stream that stays idle past the SSE peek budget, then
+        // closes without any frames. It is still a terminal empty response and
+        // must not be forwarded as a bodyless 200.
+        let mock = MockHttpClient::new_delayed_streaming_sequence(
+            StatusCode::OK,
+            vec![
+                (std::time::Duration::from_millis(20), vec![]),
+                (
+                    std::time::Duration::ZERO,
+                    vec![OK_CONTENT_FRAME.to_string()],
+                ),
+            ],
+        );
+        let app_state =
+            AppState::with_client(fallback_targets("gpt-4", 2, vec![502]), mock.clone());
+        let server = TestServer::new(build_router(app_state)).unwrap();
+
+        let response = server
+            .post("/v1/chat/completions")
+            .json(&json!({
+                "model": "gpt-4", "stream": true,
+                "messages": [{"role": "user", "content": "Hello"}]
+            }))
+            .await;
+
+        assert_eq!(response.status_code(), 200, "the retry's success is served");
+        assert!(
+            response.text().contains("hi"),
+            "client receives the healthy provider's content"
+        );
+        assert_eq!(
+            mock.get_requests().len(),
+            2,
+            "slow empty stream must trigger a retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_slow_streaming_content_is_not_retried() {
+        // A valid stream may be slow to first token. Once it produces data, the
+        // original stream must be forwarded intact without duplicate work.
+        let mock = MockHttpClient::new_delayed_streaming_sequence(
+            StatusCode::OK,
+            vec![(
+                std::time::Duration::from_millis(20),
+                vec![OK_CONTENT_FRAME.to_string()],
+            )],
+        );
+        let app_state =
+            AppState::with_client(fallback_targets("gpt-4", 2, vec![502]), mock.clone());
+        let server = TestServer::new(build_router(app_state)).unwrap();
+
+        let response = server
+            .post("/v1/chat/completions")
+            .json(&json!({
+                "model": "gpt-4", "stream": true,
+                "messages": [{"role": "user", "content": "Hello"}]
+            }))
+            .await;
+
+        assert_eq!(response.status_code(), 200);
+        assert!(
+            response.text().contains("hi"),
+            "client receives the slow provider's content"
+        );
+        assert_eq!(
+            mock.get_requests().len(),
+            1,
+            "slow content must not trigger a retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_idle_stream_after_decisive_wait_is_forwarded_not_retried() {
+        // If an upstream opens an SSE response and then stays idle past both the
+        // initial peek and bounded decisive wait, the handler must not withhold
+        // response headers indefinitely. The still-open stream is forwarded and
+        // any later content is delivered from the original provider.
+        let mock = MockHttpClient::new_delayed_streaming_sequence(
+            StatusCode::OK,
+            vec![(
+                std::time::Duration::from_millis(75),
+                vec![OK_CONTENT_FRAME.to_string()],
+            )],
+        );
+        let app_state =
+            AppState::with_client(fallback_targets("gpt-4", 2, vec![502]), mock.clone());
+        let server = TestServer::new(build_router(app_state)).unwrap();
+
+        let response = server
+            .post("/v1/chat/completions")
+            .json(&json!({
+                "model": "gpt-4", "stream": true,
+                "messages": [{"role": "user", "content": "Hello"}]
+            }))
+            .await;
+
+        assert_eq!(response.status_code(), 200);
+        assert!(
+            response.text().contains("hi"),
+            "client receives the original provider's delayed content"
+        );
+        assert_eq!(
+            mock.get_requests().len(),
+            1,
+            "idle-but-open stream must not retry before a terminal empty is observed"
         );
     }
 

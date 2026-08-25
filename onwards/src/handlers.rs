@@ -1108,11 +1108,23 @@ pub async fn target_message_handler<T: HttpClient>(
                 // one. Holding the `200` headers until the first frame costs
                 // nothing in time-to-first-*token* (onwards must receive it to
                 // forward it anyway). The whole peek is bounded by a short fixed
-                // budget — NOT the request timeout, which governs header receipt —
-                // so a `200`-then-idle stream isn't withheld from the client; on
-                // timeout we forward whatever we have, unmodified (no retry).
+                // budget — NOT the request timeout, which governs header receipt.
+                // If that budget expires, keep control for a bounded second window
+                // until the next decisive event: terminal empty is retryable, while
+                // the first real content frame is reattached and forwarded without
+                // retry. If the upstream remains idle beyond that, forward the
+                // still-open stream instead of withholding headers indefinitely.
                 use futures_util::StreamExt;
+                #[cfg(not(test))]
                 const SSE_PEEK_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+                #[cfg(test)]
+                const SSE_PEEK_BUDGET: std::time::Duration = std::time::Duration::from_millis(10);
+                #[cfg(not(test))]
+                const SSE_DECISIVE_WAIT_BUDGET: std::time::Duration =
+                    std::time::Duration::from_secs(30);
+                #[cfg(test)]
+                const SSE_DECISIVE_WAIT_BUDGET: std::time::Duration =
+                    std::time::Duration::from_millis(50);
                 const SSE_PEEK_MAX_EVENTS: usize = 4;
 
                 let (parts, body) = response.into_parts();
@@ -1156,9 +1168,44 @@ pub async fn target_message_handler<T: HttpClient>(
                         }
                     }
                 };
-                let timed_out = tokio::time::timeout(SSE_PEEK_BUDGET, peek).await.is_err();
-                if timed_out {
-                    debug!("Timed out peeking SSE lead frames; forwarding stream unmodified");
+                if tokio::time::timeout(SSE_PEEK_BUDGET, peek).await.is_err() {
+                    debug!("Timed out peeking SSE lead frames; waiting for first terminal frame");
+                    let decisive_wait = async {
+                        for _ in 0..SSE_PEEK_MAX_EVENTS {
+                            match events.next().await {
+                                Some(Ok(chunk)) => match classify_sse_event(&chunk) {
+                                    SseEventKind::Error(status) => {
+                                        embedded = Some(status);
+                                        peeked.push(Ok(chunk));
+                                        break;
+                                    }
+                                    SseEventKind::Data => {
+                                        saw_data = true;
+                                        peeked.push(Ok(chunk));
+                                        break;
+                                    }
+                                    SseEventKind::Comment => peeked.push(Ok(chunk)),
+                                },
+                                Some(Err(e)) => {
+                                    stream_ended = true;
+                                    peeked.push(Err(e));
+                                    break;
+                                }
+                                None => {
+                                    stream_ended = true;
+                                    break;
+                                }
+                            }
+                        };
+                    };
+                    if tokio::time::timeout(SSE_DECISIVE_WAIT_BUDGET, decisive_wait)
+                        .await
+                        .is_err()
+                    {
+                        debug!(
+                            "Timed out waiting for decisive SSE frame; forwarding stream unmodified"
+                        );
+                    }
                 }
                 // Forward the consumed frames followed by the remainder, so a clean
                 // (or slow) stream is intact; on a retry path below this `response`
@@ -1167,11 +1214,11 @@ pub async fn target_message_handler<T: HttpClient>(
                 response = Response::from_parts(parts, axum::body::Body::from_stream(rest));
                 if let Some(status) = embedded {
                     Scan2xx::Embedded(status)
-                } else if !timed_out && stream_ended && !saw_data {
+                } else if stream_ended && !saw_data {
                     // Stream closed/errored before any content frame: nothing was
-                    // forwarded, so retrying is safe. A *timeout* (stream still open,
-                    // just slow to first token) deliberately falls through to `Clean`
-                    // — that's the valid-but-slow case we must never retry.
+                    // forwarded, so retrying is safe. A valid-but-slow stream that
+                    // eventually produces content falls through to `Clean` with the
+                    // consumed frames reattached below.
                     Scan2xx::EmptyBody
                 } else {
                     Scan2xx::Clean
