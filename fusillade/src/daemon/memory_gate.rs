@@ -15,6 +15,12 @@
 //!
 //! Two thresholds rather than one: without hysteresis the gate would sit on the
 //! boundary flipping every claim cycle.
+//!
+//! The low mark cannot be the only way out, though. Freed memory goes back to
+//! the allocator rather than to the OS, so the reading behaves as a high-water
+//! mark and does not fall when requests complete - which leaves no low mark that
+//! is both reachable and useful. Claiming therefore also resumes once enough of
+//! the work that was in flight at engagement has drained. See `should_block`.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -112,16 +118,30 @@ pub(super) struct MemoryGate {
     /// the per-pod ceiling, measured rather than assumed, and it is what a
     /// replica count should be derived from.
     peak_in_flight_at_gate: AtomicU64,
+    /// In-flight at the most recent engagement, and the fraction of it that
+    /// in-flight must fall to before claiming resumes regardless of the memory
+    /// reading. See `should_block` for why a memory-only release cannot work.
+    in_flight_when_engaged: AtomicU64,
+    release_in_flight_fraction: f64,
 }
 
 impl MemoryGate {
     /// Build a gate. Returns `None` when disabled (`high` of zero) or when the
     /// thresholds are not a usable pair, in which case claiming is never
     /// suppressed.
-    pub(super) fn new(high: f64, low: f64, source: Box<dyn MemorySource>) -> Option<Self> {
+    pub(super) fn new(
+        high: f64,
+        low: f64,
+        release_in_flight_fraction: f64,
+        source: Box<dyn MemorySource>,
+    ) -> Option<Self> {
         if high <= 0.0 || high > 1.0 || low <= 0.0 || low >= high {
             return None;
         }
+        // Out-of-range values would silently disable the in-flight release and
+        // reintroduce the deadlock, so clamp rather than reject: a bad number
+        // here should not take the gate's only reliable exit away.
+        let release_in_flight_fraction = release_in_flight_fraction.clamp(0.0, 1.0);
         Some(Self {
             source,
             high,
@@ -129,13 +149,35 @@ impl MemoryGate {
             engaged: AtomicBool::new(false),
             warned_unavailable: AtomicBool::new(false),
             peak_in_flight_at_gate: AtomicU64::new(0),
+            in_flight_when_engaged: AtomicU64::new(0),
+            release_in_flight_fraction,
         })
     }
 
     /// Whether claiming should be suppressed this cycle.
     ///
-    /// `in_flight` is recorded when the gate first engages so the ceiling can be
-    /// read off a dashboard; it does not affect the decision.
+    /// Engaging is decided purely on the memory reading: that is what the OOM
+    /// killer acts on, so being conservative there is correct.
+    ///
+    /// Releasing cannot be, and this is the subtle part. Freed memory returns to
+    /// the allocator rather than to the OS, so the cgroup working set is a
+    /// high-water mark rather than a level: completing a request does not lower
+    /// it. On a load rig, thousands of completions after the gate engaged
+    /// returned almost none of the memory they had taken, while the in-flight
+    /// requests that remained kept accumulating and pushed the reading *up*.
+    ///
+    /// That rules out fixing this by moving the low mark. The gate engages
+    /// because the reading hit `high`, and retention pins it there, so the cap
+    /// on the reading is at or above `high` by construction. Any low mark below
+    /// `high` is unreachable; any low mark above it releases immediately and
+    /// makes the gate a no-op. No valid value exists between them.
+    ///
+    /// So claiming also resumes once in-flight has fallen to
+    /// `release_in_flight_fraction` of what it was when the gate engaged.
+    /// In-flight is the one signal guaranteed to fall while claiming is
+    /// suppressed. If memory really is still high the next cycle re-engages, so
+    /// the worst case is admitting one claim batch, which bounds the overshoot
+    /// and degrades to a duty cycle instead of a stall.
     pub(super) fn should_block(&self, in_flight: usize) -> bool {
         let Some(reading) = self.source.read() else {
             if !self.warned_unavailable.swap(true, Ordering::Relaxed) {
@@ -152,8 +194,17 @@ impl MemoryGate {
 
         let was_engaged = self.engaged.load(Ordering::Relaxed);
         let engaged = if was_engaged {
-            // Stay engaged until usage falls back under the low mark.
-            used > self.low
+            let engaged_at = self.in_flight_when_engaged.load(Ordering::Relaxed);
+            // A zero fraction disables this exit, and so does engaging with
+            // nothing in flight: without a level to have fallen from there is no
+            // drain to measure, so fall back to the memory reading rather than
+            // treating an unknown as satisfied.
+            let drained_enough = self.release_in_flight_fraction > 0.0
+                && engaged_at > 0
+                && (in_flight as f64) <= (engaged_at as f64) * self.release_in_flight_fraction;
+            // Either exit will do: usage back under the low mark, or enough of
+            // the work that was in flight at engagement has completed.
+            used > self.low && !drained_enough
         } else {
             used >= self.high
         };
@@ -163,6 +214,8 @@ impl MemoryGate {
         if engaged && !was_engaged {
             counter!("fusillade_memory_gate_engagements_total").increment(1);
             let in_flight = in_flight as u64;
+            self.in_flight_when_engaged
+                .store(in_flight, Ordering::Relaxed);
             self.peak_in_flight_at_gate
                 .fetch_max(in_flight, Ordering::Relaxed);
             gauge!("fusillade_in_flight_at_gate").set(in_flight as f64);
@@ -225,13 +278,13 @@ mod tests {
 
     #[test]
     fn stays_open_below_the_high_mark() {
-        let gate = MemoryGate::new(0.75, 0.65, FixedSource::new(vec![at(0.5)])).unwrap();
+        let gate = MemoryGate::new(0.75, 0.65, 0.0, FixedSource::new(vec![at(0.5)])).unwrap();
         assert!(!gate.should_block(100));
     }
 
     #[test]
     fn engages_at_the_high_mark() {
-        let gate = MemoryGate::new(0.75, 0.65, FixedSource::new(vec![at(0.8)])).unwrap();
+        let gate = MemoryGate::new(0.75, 0.65, 0.0, FixedSource::new(vec![at(0.8)])).unwrap();
         assert!(gate.should_block(100));
     }
 
@@ -242,6 +295,7 @@ mod tests {
         let gate = MemoryGate::new(
             0.75,
             0.65,
+            0.0,
             FixedSource::new(vec![at(0.8), at(0.7), at(0.7)]),
         )
         .unwrap();
@@ -257,6 +311,7 @@ mod tests {
         let gate = MemoryGate::new(
             0.75,
             0.65,
+            0.0,
             FixedSource::new(vec![at(0.8), at(0.6), at(0.6)]),
         )
         .unwrap();
@@ -264,11 +319,84 @@ mod tests {
         assert!(!gate.should_block(100), "released once under the low mark");
     }
 
+    /// The case the low mark cannot handle: usage stays pinned above it because
+    /// freed memory sits in the allocator rather than going back to the OS. Only
+    /// the in-flight fall gets the gate open again.
+    #[test]
+    fn releases_once_enough_in_flight_has_drained() {
+        let gate = MemoryGate::new(0.75, 0.65, 0.5, FixedSource::new(vec![at(0.9)])).unwrap();
+
+        assert!(gate.should_block(1000), "engages at the high mark");
+        assert!(
+            gate.should_block(600),
+            "still held: usage pinned high and only 40% drained"
+        );
+        assert!(
+            !gate.should_block(499),
+            "released once in-flight halved, despite usage never falling"
+        );
+    }
+
+    /// The fraction is a floor on how long the hold lasts, not a licence to
+    /// release early: a pod that is still saturated keeps claiming suppressed.
+    #[test]
+    fn does_not_release_while_in_flight_holds_up() {
+        let gate = MemoryGate::new(0.75, 0.65, 0.5, FixedSource::new(vec![at(0.9)])).unwrap();
+
+        assert!(gate.should_block(1000));
+        for still_in_flight in [999, 900, 700, 501] {
+            assert!(
+                gate.should_block(still_in_flight),
+                "held at {still_in_flight} in flight"
+            );
+        }
+    }
+
+    /// A zero fraction disables the in-flight exit, leaving the memory-only
+    /// behaviour the earlier tests describe.
+    #[test]
+    fn a_zero_fraction_leaves_only_the_memory_release() {
+        let gate = MemoryGate::new(0.75, 0.65, 0.0, FixedSource::new(vec![at(0.9)])).unwrap();
+
+        assert!(gate.should_block(1000));
+        assert!(
+            gate.should_block(1),
+            "no in-flight exit when the fraction is zero"
+        );
+        assert!(
+            gate.should_block(0),
+            "not even at zero in flight: the fraction is what disables it"
+        );
+    }
+
+    /// "Fallen to" the fraction includes landing exactly on it.
+    #[test]
+    fn releases_exactly_at_the_threshold() {
+        let gate = MemoryGate::new(0.75, 0.65, 0.5, FixedSource::new(vec![at(0.9)])).unwrap();
+
+        assert!(gate.should_block(1000));
+        assert!(!gate.should_block(500), "500 is half of 1000");
+    }
+
+    /// Engaging with nothing in flight leaves no drain to measure. Treating that
+    /// as satisfied would release on the next cycle however high usage was, so
+    /// the memory reading has to stay in charge.
+    #[test]
+    fn engaging_with_nothing_in_flight_does_not_release_on_its_own() {
+        let gate = MemoryGate::new(0.75, 0.65, 0.5, FixedSource::new(vec![at(0.9)])).unwrap();
+
+        assert!(gate.should_block(0), "engages on usage alone");
+        assert!(
+            gate.should_block(0),
+            "still held: usage is high and there was never any work to drain"
+        );
+    }
+
     /// A daemon outside a limited cgroup (local runs, tests) must not have its
     /// claiming suppressed by a source it cannot read.
     #[test]
     fn an_unreadable_source_never_blocks() {
-        let gate = MemoryGate::new(0.75, 0.65, Box::new(NoSource)).unwrap();
+        let gate = MemoryGate::new(0.75, 0.65, 0.0, Box::new(NoSource)).unwrap();
         assert!(!gate.should_block(100));
         assert!(!gate.should_block(100));
     }
@@ -276,17 +404,20 @@ mod tests {
     #[test]
     fn disabled_or_nonsensical_thresholds_produce_no_gate() {
         let src = || FixedSource::new(vec![at(0.9)]);
-        assert!(MemoryGate::new(0.0, 0.0, src()).is_none(), "zero disables");
         assert!(
-            MemoryGate::new(0.65, 0.75, src()).is_none(),
+            MemoryGate::new(0.0, 0.0, 0.0, src()).is_none(),
+            "zero disables"
+        );
+        assert!(
+            MemoryGate::new(0.65, 0.75, 0.0, src()).is_none(),
             "low above high"
         );
         assert!(
-            MemoryGate::new(0.75, 0.75, src()).is_none(),
+            MemoryGate::new(0.75, 0.75, 0.0, src()).is_none(),
             "equal marks flap"
         );
         assert!(
-            MemoryGate::new(1.5, 0.5, src()).is_none(),
+            MemoryGate::new(1.5, 0.5, 0.0, src()).is_none(),
             "high above the limit"
         );
     }
@@ -298,6 +429,7 @@ mod tests {
         let gate = MemoryGate::new(
             0.75,
             0.65,
+            0.0,
             FixedSource::new(vec![at(0.8), at(0.5), at(0.9)]),
         )
         .unwrap();
@@ -315,7 +447,7 @@ mod tests {
             working_set: 400,
             limit: 1000,
         };
-        let gate = MemoryGate::new(0.75, 0.65, FixedSource::new(vec![reading])).unwrap();
+        let gate = MemoryGate::new(0.75, 0.65, 0.0, FixedSource::new(vec![reading])).unwrap();
         assert!(!gate.should_block(100));
     }
 }
