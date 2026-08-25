@@ -1,5 +1,12 @@
 # Changelog
 
+## [10.14.2](https://github.com/doublewordai/control-layer/compare/v10.14.1...v10.14.2) (2026-08-25)
+
+
+### Performance Improvements
+
+* **fusillade:** index the batchless branch of the demand query ([#1516](https://github.com/doublewordai/control-layer/issues/1516)) ([6833cb0](https://github.com/doublewordai/control-layer/commit/6833cb08f464b0df14782d3b3eeb1fc4126c7c9c))
+
 ## [10.14.1](https://github.com/doublewordai/control-layer/compare/v10.14.0...v10.14.1) (2026-08-25)
 
 
